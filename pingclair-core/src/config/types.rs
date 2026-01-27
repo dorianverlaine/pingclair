@@ -170,6 +170,26 @@ pub enum HandlerConfig {
         code: u16,
     },
 
+    /// URI rewrite (internal - does not send redirect to client)
+    /// Similar to Caddy's uri and rewrite directives
+    Rewrite {
+        /// Strip prefix from path (e.g., "/api" removes "/api/users" -> "/users")
+        #[serde(default)]
+        strip_prefix: Option<String>,
+        /// Strip suffix from path
+        #[serde(default)]
+        strip_suffix: Option<String>,
+        /// Replace path entirely with this value (supports {placeholders})
+        #[serde(default)]
+        replace: Option<String>,
+        /// Regex pattern to match
+        #[serde(default)]
+        regex: Option<String>,
+        /// Replacement string for regex (supports capture groups $1, $2, etc)
+        #[serde(default)]
+        regex_replace: Option<String>,
+    },
+
     /// Respond with static content
     Respond {
         #[serde(default = "default_status_code")]

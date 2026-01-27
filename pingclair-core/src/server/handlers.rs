@@ -151,6 +151,29 @@ pub fn execute_handler(config: &HandlerConfig) -> HandlerResult {
             execute_handler(&HandlerConfig::Pipeline(handlers.clone()))
         }
 
+        HandlerConfig::Rewrite { strip_prefix, strip_suffix, replace, regex: _, regex_replace: _ } => {
+            // Rewrite handler modifies the request path
+            // This is a signal to the proxy layer to modify the URI before forwarding
+            // We return a special response that indicates a rewrite is needed
+            let mut response = HandlerResponse::status(200);
+            
+            // Set special headers to communicate rewrite intent to proxy layer
+            if let Some(prefix) = strip_prefix {
+                response.headers.insert("X-Pingclair-Strip-Prefix".to_string(), prefix.clone());
+            }
+            if let Some(suffix) = strip_suffix {
+                response.headers.insert("X-Pingclair-Strip-Suffix".to_string(), suffix.clone());
+            }
+            if let Some(replacement) = replace {
+                response.headers.insert("X-Pingclair-Replace-Path".to_string(), replacement.clone());
+            }
+            // Note: regex support would need the regex crate here
+            // For now, regex rewrites are handled separately
+            
+            response.headers.insert("X-Pingclair-Rewrite".to_string(), "true".to_string());
+            Ok(response)
+        }
+
         HandlerConfig::Plugin { name, args: _ } => {
             Err(HandlerError::Config(format!("Plugin {} is not yet implemented", name)))
         }
