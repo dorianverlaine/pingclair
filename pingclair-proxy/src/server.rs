@@ -340,6 +340,7 @@ impl PingclairProxy {
                 }
                 let body_bytes = body.as_deref().unwrap_or("").as_bytes();
                 resp.insert_header("Content-Length", body_bytes.len().to_string()).unwrap();
+                resp.insert_header("Server", "Pingclair").unwrap();
                 session.write_response_header(Box::new(resp), false).await?;
                 session.write_response_body(Some(Bytes::copy_from_slice(body_bytes)), true).await?;
                 Ok(true)
@@ -347,6 +348,7 @@ impl PingclairProxy {
             HandlerConfig::Redirect { to, code } => {
                 let mut resp = ResponseHeader::build(*code, Some(3)).unwrap();
                 resp.insert_header("Location", to.as_str()).unwrap();
+                resp.insert_header("Server", "Pingclair").unwrap();
                 session.write_response_header(Box::new(resp), true).await?;
                 Ok(true)
             }
@@ -381,6 +383,7 @@ impl PingclairProxy {
                             header.insert_header("Content-Encoding", encoding.as_str()).unwrap();
                         }
                         header.insert_header("Accept-Ranges", "bytes").unwrap();
+                        header.insert_header("Server", "Pingclair").unwrap();
                         
                         session.write_response_header(Box::new(header), false).await?;
                         session.write_response_body(Some(Bytes::from(file.content)), true).await?;
@@ -510,6 +513,7 @@ impl ProxyHttp for PingclairProxy {
                      if cl > limit {
                          let mut header = pingora_http::ResponseHeader::build(413, Some(4)).unwrap();
                          header.insert_header("Connection", "close").unwrap();
+                         header.insert_header("Server", "Pingclair").unwrap();
                          session.write_response_header(Box::new(header), true).await?;
                          return Ok(true);
                      }
@@ -538,6 +542,7 @@ impl ProxyHttp for PingclairProxy {
                                    }
                                }
                            }
+                           header.insert_header("Server", "Pingclair").unwrap();
                            session.write_response_header(Box::new(header), true).await?;
                            return Ok(true);
                       }
