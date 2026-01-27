@@ -1,7 +1,7 @@
 //! Admin API Server
 
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::convert::Infallible;
 
 use hyper::server::conn::http1;
@@ -13,7 +13,7 @@ use http_body_util::{BodyExt, Full};
 use bytes::Bytes;
 
 use pingclair_core::config::ServerConfig;
-use pingclair_proxy::server::ProxyState;
+
 
 /// Run the admin server
 pub async fn run_admin_server(
@@ -72,6 +72,32 @@ async fn handle_request(
             
             let json = serde_json::to_string_pretty(&configs).unwrap_or_default();
             Ok(Response::new(Full::new(Bytes::from(json))))
+        },
+        (&Method::POST, path) if path.starts_with("/config") => {
+            let body_bytes = req.collect().await.unwrap().to_bytes();
+            let config: ServerConfig = match serde_json::from_slice(&body_bytes) {
+                Ok(c) => c,
+                Err(e) => return Ok(response(StatusCode::BAD_REQUEST, &format!("Invalid config: {}", e))),
+            };
+
+            let proxies_guard = proxies.read().unwrap();
+            let mut updated = 0;
+
+            for addr in &config.listen {
+                if let Some(proxy) = proxies_guard.get(addr) {
+                    proxy.add_server(config.clone());
+                    updated += 1;
+                    tracing::info!("Hot reloaded config for {}", addr);
+                } else {
+                    tracing::warn!("No proxy found for listen address: {}", addr);
+                }
+            }
+            
+            if updated > 0 {
+                Ok(response(StatusCode::OK, "Config updated"))
+            } else {
+                Ok(response(StatusCode::NOT_FOUND, "No matching server found"))
+            }
         },
         _ => Ok(response(StatusCode::NOT_FOUND, "Not Found")),
     }

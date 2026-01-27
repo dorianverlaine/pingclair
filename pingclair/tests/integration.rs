@@ -163,7 +163,6 @@ async fn test_admin_api_hot_reload() {
     
     // 2. Perform Hot Reload (JSON Payload)
     let new_config_obj = serde_json::json!({
-        "name": "reloaded-server",
         "listen": ["127.0.0.1:9093"],
         "routes": [
             {
