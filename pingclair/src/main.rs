@@ -149,23 +149,30 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Start QUIC servers for HTTP/3
             for _addr in https_ports {
                 if let Ok(socket_addr) = _addr.parse::<std::net::SocketAddr>() {
                     let _tls_m = tls_manager.clone();
+                    let port_proxies = port_proxies.clone();
+                    let addr_str = _addr.clone();
+                    
                     tokio::spawn(async move {
-                        let mut quic_config = pingclair_tls::QuicConfig::default();
+                        let mut quic_config = pingclair_proxy::quic::QuicConfig::default();
                         quic_config.listen = socket_addr;
                         
-                        let _quic_server = pingclair_tls::QuicServer::new(quic_config);
+                        let mut quic_server = pingclair_proxy::quic::QuicServer::new(quic_config);
                         
-                        // Bridge: QUIC server needs to resolve certificates too
-                        // For now, QUIC server has a simple load_certificate method.
-                        // We might need to update QuicServer to use TlsManager directly.
+                        // Inject proxy logic
+                        if let Some(proxy) = port_proxies.read().get(&addr_str) {
+                            quic_server.set_proxy(std::sync::Arc::new(proxy.clone()));
+                        }
+
+                        // Bridge: QUIC server needs to resolve certificates
+                        // TODO: Integrate TlsManager with QuicServer more deeply
                         tracing::info!("🚀 Starting HTTP/3 server on {}", socket_addr);
                         
-                        // Placeholder: QuicServer needs a certificate to start
-                        // In production, it would also use SNI
+                        if let Err(e) = quic_server.start().await {
+                            tracing::error!("HTTP/3 server failed: {}", e);
+                        }
                     });
                 }
             }

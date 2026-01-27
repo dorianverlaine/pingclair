@@ -26,3 +26,11 @@ bytes.workspace = true
 parking_lot = "0.12"
 prometheus.workspace = true
 
+# HTTP/3
+quinn.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+rustls.workspace = true
+thiserror.workspace = true
+rustls-pemfile = "2"
+

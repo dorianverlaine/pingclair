@@ -9,6 +9,7 @@
 pub mod health_check;
 pub mod rate_limit;
 pub mod metrics;
+pub mod quic;
 mod load_balancer;
 mod upstream;
 

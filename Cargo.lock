@@ -2317,6 +2317,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "h3",
+ "h3-quinn",
  "http 1.4.0",
  "parking_lot",
  "pingclair-core",
@@ -2327,6 +2329,10 @@ dependencies = [
  "pingora-load-balancing",
  "pingora-proxy",
  "prometheus",
+ "quinn",
+ "rustls",
+ "rustls-pemfile 2.2.0",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]

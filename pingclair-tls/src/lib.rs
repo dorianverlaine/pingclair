@@ -9,11 +9,9 @@
 pub mod acme;
 pub mod auto_https;
 pub mod cert_store;
-pub mod quic;
 pub mod manager;
 
 pub use acme::{AcmeClient, AcmeError, Certificate, ChallengeHandler, ChallengeType, ChallengeResponse};
 pub use auto_https::{AutoHttps, AutoHttpsConfig, AutoHttpsError};
 pub use cert_store::{CertStore, CertStoreError};
-pub use quic::{QuicServer, QuicConfig};
 pub use manager::TlsManager;

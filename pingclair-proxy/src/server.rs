@@ -194,19 +194,43 @@ impl PingclairProxy {
 
     /// Add a server configuration to this proxy
     pub fn add_server(&self, config: ServerConfig) {
-        let name = config.name.clone();
-        let state = ProxyState::new(config);
+        let state = ProxyState::new(config.clone());
         
-        if let Some(hostname) = name {
-            // Check if it's a wildcard or simple hostname
-            // For now, simple match
-            self.hosts.write().insert(hostname, state);
+        // Add to hosts map for each domain
+        let mut hosts = self.hosts.write();
+        let mut default = self.default.write();
+        
+        if let Some(domain) = &config.name {
+            if domain == "_" || domain == "*" {
+                *default = Some(state.clone());
+            } else {
+                hosts.insert(domain.clone(), state.clone());
+            }
         } else {
-            let mut def = self.default.write();
-            *def = Some(state);
+            *default = Some(state.clone());
         }
     }
     
+    /// Resolve a request to a handler state
+    /// Used by HTTP/3 server to reuse routing logic
+    pub fn match_route(&self, host: &str, path: &str, method: &str, headers: &pingora_http::RequestHeader, remote_ip: &str) -> Option<(ProxyState, Option<usize>, Option<HandlerConfig>)> {
+        // 1. Get state for this host
+        let state = self.get_state(host)?;
+        
+        // 2. Match route
+        // Identify protocol (stub)
+        let protocol = "https"; 
+        
+        if let Some(route) = state.router.match_request(path, method, &headers.headers, host, remote_ip, protocol) {
+            let idx = route.index;
+            let handler = state.config.routes.get(idx).map(|r| r.handler.clone());
+            Some((state, Some(idx), handler))
+        } else {
+            // No route matched
+            Some((state, None, None))
+        }
+    }
+
     /// Get the state for a specific host
     fn get_state(&self, host: &str) -> Option<ProxyState> {
         // 1. Exact match
