@@ -1,0 +1,91 @@
+# 🦀 Pingclair 配置文件示例
+# ---------------------------------------------------
+# 此文件展示了 Pingclair 的核心功能与语法。
+# 语法灵感来源于 Caddy 和 Rust，简单直观。
+
+# ⚡️ 全局配置 (可选)
+debug: false
+
+# 🏠 虚拟主机 1: 静态文件服务 + 自动 HTTPS
+server "example.com" {
+    # 监听地址 (支持 IPv4/IPv6)
+    listen: "0.0.0.0:443";
+    listen: "[::]:443";
+
+    # 🔐 自动 HTTPS (通过 Let's Encrypt / ZeroSSL)
+    # 只需一行，自动申请、续期并配置证书。
+    tls auto;
+
+    # 🛤 路由块
+    route {
+        # 1. 匹配特定路径并重写
+        match path("/old-api/*") => {
+            rewrite "/old-api/(.*)" "/new-api/$1";
+        }
+
+        # 2. 静态文件服务
+        match path("/static/*") => {
+            file_server "./public";
+        }
+
+        # 3. 兜底处理 (Catch-all)
+        _ => {
+            file_server "./public/index.html";
+        }
+    }
+}
+
+# 🔄 虚拟主机 2: 反向代理 + 负载均衡 + 速率限制
+server "api.example.com" {
+    listen: "0.0.0.0:80";
+
+    route {
+        match path("/v1/*") => {
+            # 🚦 速率限制 (10秒内最多100个请求)
+            rate_limit {
+                requests: 100;
+                window: "10s";
+            }
+
+            # 🚀 高性能反向代理
+            proxy {
+                # 上游服务器列表
+                to "localhost:8080";
+                to "localhost:8081";
+
+                # 负载均衡策略: round_robin (默认), random, least_conn, ip_hash
+                load_balance {
+                    strategy: "round_robin";
+                }
+
+                # 健康检查 (每5秒检查一次)
+                health_check {
+                    path: "/health";
+                    interval: "5s";
+                }
+            }
+        }
+
+        # 404 自定义返回
+        _ => {
+            respond 404 {
+                body: "API Endpoint Not Found";
+                header: "X-Server" "Pingclair";
+            }
+        }
+    }
+}
+
+# 🌎 虚拟主机 3: 默认服务器 (通配符)
+# 匹配所有未被其他 server 块捕获的域名
+server "_" {
+    listen: "0.0.0.0:80";
+
+    route {
+        _ => {
+            respond 200 {
+                body: "Welcome to Pingclair! Default server active.";
+            }
+        }
+    }
+}

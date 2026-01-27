@@ -70,23 +70,38 @@ fi
 echo "Setting capabilities..."
 setcap cap_net_bind_service=+ep /usr/local/bin/pingclair
 
-# 7. Directory Structure
-echo "Configuring directories..."
+# 7. Directory Structure & Assets
+echo "Configuring directories and assets..."
 mkdir -p /etc/Pingclair
-mkdir -p /var/lib/pingclair
+mkdir -p /var/lib/pingclair/html
 mkdir -p /var/log/pingclair
+
+# Download/Install Premium Assets
+BASE_RAW_URL="https://raw.githubusercontent.com/$REPO/main"
+
+echo "Fetching default landing page..."
+curl -s -L -o /var/lib/pingclair/html/index.html "$BASE_RAW_URL/examples/public/index.html" || {
+    echo "Fallback: Creating minimal landing page..."
+    echo "<h1>Pingclair is Running!</h1>" > /var/lib/pingclair/html/index.html
+}
+
+echo "Fetching example configuration..."
+curl -s -L -o /etc/Pingclair/Pingclairfile.example "$BASE_RAW_URL/examples/Pingclairfile.example"
 
 # Default Config if missing
 if [ ! -f /etc/Pingclair/Pingclairfile ]; then
+    echo "Creating default Pingclairfile..."
     cat > /etc/Pingclair/Pingclairfile <<EOF
+# 🦀 Pingclair 默认配置文件
+# 管理命令: pc service <start|stop|reload|status>
+
 server "default" {
     listen: "0.0.0.0:80";
+    
     route {
-        match path("/ping") => {
-            respond 200 { body: "Pong from Pingclair!"; }
-        }
+        # 欢迎页面
         _ => {
-            respond 404 { body: "Welcome to Pingclair (Default Config)"; }
+            file_server "/var/lib/pingclair/html";
         }
     }
 }
