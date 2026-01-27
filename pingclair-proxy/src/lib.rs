@@ -4,14 +4,17 @@
 //! - Upstream management
 //! - Load balancing strategies
 //! - Health checking
+//! - Rate limiting
 
 pub mod health_check;
+pub mod rate_limit;
 mod load_balancer;
 mod upstream;
 
 pub mod server;
 
 pub use health_check::HealthChecker;
+pub use rate_limit::{RateLimiter, RateLimitConfig, RateLimitInfo};
 pub use load_balancer::{LoadBalancer, Strategy};
 pub use upstream::{Upstream, UpstreamPool};
 pub use server::PingclairProxy;

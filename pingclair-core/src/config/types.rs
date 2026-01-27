@@ -226,6 +226,23 @@ pub enum HandlerConfig {
         credentials: Vec<BasicAuthCredential>,
     },
 
+    /// Rate limiting handler
+    /// Limits requests per time window with optional burst
+    RateLimit {
+        /// Maximum requests per window
+        #[serde(default = "default_rate_limit_requests")]
+        requests: u64,
+        /// Window duration in seconds
+        #[serde(default = "default_rate_limit_window")]
+        window_secs: u64,
+        /// Rate limit by IP address (default: true)
+        #[serde(default = "default_bool_true")]
+        by_ip: bool,
+        /// Extra burst allowance
+        #[serde(default)]
+        burst: u64,
+    },
+
     /// Plugin invocation
     Plugin { name: String, args: Vec<String> },
 }
@@ -244,6 +261,14 @@ fn default_status_code() -> u16 {
 
 fn default_auth_realm() -> String {
     "Restricted".to_string()
+}
+
+fn default_rate_limit_requests() -> u64 {
+    100
+}
+
+fn default_rate_limit_window() -> u64 {
+    60
 }
 
 /// Basic auth credential
