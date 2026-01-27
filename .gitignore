@@ -40,3 +40,7 @@ lcov.info
 
 # Compiled examples
 examples/*.bin
+
+# Benchmark artifacts
+pingclair-linux-amd64
+bench_*

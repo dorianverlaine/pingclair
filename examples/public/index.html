@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>✨ Pingclair 运作正常！ 🚀🎉✨</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🦀</text></svg>">
+    <style>
+        * {
+            box-sizing: border-box;
+            padding: 0;
+            margin: 0;
+        }
+
+        body {
+            background: #f4f6f8;
+            font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            font-size: 18px;
+            color: #333;
+            line-height: 1.6;
+        }
+
+        a {
+            color: #d9534f; /* Rust color-ish */
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        a:hover {
+            text-decoration: underline;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 60px auto;
+            padding: 40px;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+            position: relative;
+            overflow: hidden;
+        }
+
+        /* Decorative top border */
+        .container::before {
+            content: "";
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 6px;
+            background: linear-gradient(90deg, #ff4b1f, #ff9068);
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            margin-bottom: 1rem;
+            color: #1a1a1a;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        h2 {
+            font-size: 1.8rem;
+            margin-top: 2rem;
+            margin-bottom: 1rem;
+            color: #2c3e50;
+        }
+
+        p {
+            margin-bottom: 1.2rem;
+        }
+
+        code {
+            background: #f5f7f9;
+            color: #d63384;
+            padding: 0.2em 0.4em;
+            border-radius: 4px;
+            font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+            font-size: 0.9em;
+        }
+
+        ul, ol {
+            margin-bottom: 1.2rem;
+            padding-left: 1.5rem;
+        }
+
+        li {
+            margin-bottom: 0.5rem;
+        }
+
+        .logo {
+            font-size: 4rem;
+            margin-bottom: 20px;
+            display: inline-block;
+            animation: float 3s ease-in-out infinite;
+        }
+
+        @keyframes float {
+            0% { transform: translateY(0px); }
+            50% { transform: translateY(-10px); }
+            100% { transform: translateY(0px); }
+        }
+
+        .status-badge {
+            display: inline-block;
+            background: #e6fffa;
+            color: #00b894;
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            font-weight: bold;
+            margin-bottom: 20px;
+            border: 1px solid #b2f5ea;
+        }
+
+        footer {
+            margin-top: 50px;
+            text-align: center;
+            font-size: 0.9rem;
+            color: #888;
+            border-top: 1px solid #eee;
+            padding-top: 20px;
+        }
+
+        .emoji-list {
+            font-size: 1.5rem;
+            margin: 10px 0;
+        }
+
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <div class="logo">🦀</div>
+        <div class="status-badge">✨ System Operational</div>
+        
+        <h1>Pingclair 运作正常！</h1>
+        
+        <p class="emoji-list">🎊 🎉 🥳 ✨ 🚀</p>
+
+        <p>
+            您的 <strong>Pingclair</strong> Web 服务器已经成功启动并正在运行！💪
+            这是一个基于 <strong>Rust</strong> 和 <strong>Pingora</strong> 构建的现代高性能服务器。
+        </p>
+
+        <h2>🚀 下一步做什么？</h2>
+        
+        <ol>
+            <li>📝 <strong>配置站点</strong>: 编辑您的 <code>Pingclairfile</code> (通常位于 <code>/etc/pingclair/</code> 或当前目录)。</li>
+            <li>📂 <strong>部署内容</strong>: 将您的静态文件放到配置的 <code>root</code> 目录中（例如 <code>./public</code>）。</li>
+            <li>🔄 <strong>反向代理</strong>: 如果您需要代理到后端应用，请在配置文件中使用 <code>proxy</code> 指令。</li>
+            <li>🔐 <strong>HTTPS</strong>: 只需要一行 <code>tls auto;</code>，Pingclair 就会为您自动管理证书！</li>
+        </ol>
+
+        <h2>⚙️ 配置示例</h2>
+        <p>一个简单的配置看起来像这样：</p>
+        <pre><code>server "example.com" {
+    listen: "0.0.0.0:80";
+    
+    route {
+        _ => {
+            file_server "./public";
+        }
+    }
+}</code></pre>
+
+        <h2>🤔 遇到问题？</h2>
+        <p>别担心，通常很容易解决！检查以下几点：</p>
+        <ul>
+            <li>📜 查看日志输出 (运行时的 stdout/stderr)。</li>
+            <li>🔍 确保您的配置文件语法正确。</li>
+            <li>🔌 检查端口是否被占用或被防火墙拦截。</li>
+        </ul>
+
+        <h2>🔗 链接与支持</h2>
+        <p>Pingclair 是开源软件，由 <strong>Sinclair</strong> 和社区贡献者用 ❤️ 打造。</p>
+        <ul>
+            <li>🐙 <strong>GitHub</strong>: <a href="https://github.com/SinclairChao/pingclair">SinclairChao/pingclair</a></li>
+            <li>🐞 <strong>提交 Bug</strong>: <a href="https://github.com/SinclairChao/pingclair/issues">Issue Tracker</a></li>
+        </ul>
+
+        <footer>
+            &copy; 2026 Sinclair & Pingclair Contributors.<br>
+            Powered by Rust 🦀 & Cloudflare Pingora ⚡️
+        </footer>
+    </div>
+</body>
+</html>
