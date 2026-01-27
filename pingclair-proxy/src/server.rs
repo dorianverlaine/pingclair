@@ -10,6 +10,7 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result as PingoraResult;
 use pingora_proxy::{ProxyHttp, Session};
 use pingora_http::{RequestHeader, ResponseHeader};
+use pingora_core::protocols::tls::server::TlsAcceptor;
 use std::sync::Arc;
 use std::collections::HashMap;
 use parking_lot::RwLock;
@@ -459,6 +460,36 @@ impl ProxyHttp for PingclairProxy {
     
     fn new_ctx(&self) -> Self::CTX {
         RequestCtx::default()
+    }
+
+    /// Resolve TLS certificate for SNI
+    async fn resolve_tls_ctx(
+        &self,
+        session: &mut Session,
+    ) -> pingora_core::Result<Option<TlsAcceptor>> {
+        if let Some(tls_manager) = &self.tls_manager {
+            let sni = session.get_header("Host")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .split(':')
+                .next()
+                .unwrap_or("");
+            
+            if sni.is_empty() {
+                return Ok(None);
+            }
+
+            if let Some(cert) = tls_manager.resolve_cert(sni).await {
+                let acceptor = TlsAcceptor::from_certified_key(cert)
+                    .map_err(|e| pingora_core::Error::because(
+                        pingora_core::ErrorType::TLSHandshakeFailure,
+                        "Failed to create TlsAcceptor",
+                        e
+                    ))?;
+                return Ok(Some(acceptor));
+            }
+        }
+        Ok(None)
     }
     
     /// Request filter (Handle static files and early return)
