@@ -250,7 +250,7 @@ fn main() -> anyhow::Result<()> {
 
                 match status {
                     Ok(s) if s.success() => {
-                        let past_tense = match action {
+                        let past_tense = match _action {
                             ServiceAction::Start => "started",
                             ServiceAction::Stop => "stopped",
                             ServiceAction::Restart => "restarted",
