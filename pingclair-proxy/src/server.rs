@@ -468,7 +468,7 @@ impl ProxyHttp for PingclairProxy {
         session: &mut Session,
     ) -> pingora_core::Result<Option<TlsAcceptor>> {
         if let Some(tls_manager) = &self.tls_manager {
-            let sni = session.get_header("Host")
+            let sni = session.req_header().headers.get("Host")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .split(':')
