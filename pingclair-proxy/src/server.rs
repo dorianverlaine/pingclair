@@ -100,6 +100,8 @@ impl ProxyState {
                              interval: std::time::Duration::from_secs(hc_config.interval),
                              timeout: std::time::Duration::from_secs(hc_config.timeout),
                              threshold: hc_config.threshold,
+                             expected_status: (200, 299),
+                             http_check: true,
                         };
                         
                         let hc = Arc::new(HealthChecker::new(hc_conf));
