@@ -46,7 +46,7 @@
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/zhaoyikai/pingclair.git
+git clone https://github.com/SinclairChao/pingclair.git
 cd pingclair
 
 # 2. 编译并安装 (release 模式)
