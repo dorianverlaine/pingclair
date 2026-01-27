@@ -102,6 +102,47 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         }
     }
     
+    // Process generic directives for settings like tls, client_max_body_size
+    for directive in &server.directives {
+        if let Directive::Setting { key, value } = directive {
+            match key.as_str() {
+                "client_max_body_size" => {
+                    if let Expr::Integer(size) = value {
+                        config.client_max_body_size = *size as u64;
+                    }
+                }
+                "tls" => {
+                    let mut tls = TlsConfig::default();
+                    match value {
+                        Expr::Ident(id) if id == "auto" => {
+                            tls.auto = true;
+                        }
+                        Expr::Map(map) => {
+                            if let Some(Expr::Bool(b)) = map.get("auto") {
+                                tls.auto = *b;
+                            }
+                            if let Some(Expr::String(s)) = map.get("cert") {
+                                tls.cert = Some(s.clone());
+                            }
+                            if let Some(Expr::String(s)) = map.get("key") {
+                                tls.key = Some(s.clone());
+                            }
+                            if let Some(Expr::String(s)) = map.get("acme_email") {
+                                tls.acme_email = Some(s.clone());
+                            }
+                            if let Some(Expr::Bool(b)) = map.get("http3") {
+                                tls.http3 = *b;
+                            }
+                        }
+                        _ => {}
+                    }
+                    config.tls = Some(tls);
+                }
+                _ => {}
+            }
+        }
+    }
+    
     Ok(config)
 }
 
