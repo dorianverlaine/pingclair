@@ -15,6 +15,8 @@ pub struct FileServerConfig {
     pub browse: bool,
     /// Enable compression
     pub compress: bool,
+    /// Check for pre-compressed files (.br, .gz, .zst)
+    pub precompressed: bool,
 }
 
 impl Default for FileServerConfig {
@@ -24,6 +26,7 @@ impl Default for FileServerConfig {
             index: vec!["index.html".to_string(), "index.htm".to_string()],
             browse: false,
             compress: true,
+            precompressed: true,  // Default to checking for pre-compressed files
         }
     }
 }
@@ -166,12 +169,29 @@ impl FileServer {
             .first_or_octet_stream()
             .to_string();
 
-        // Apply compression only if:
+        // Check for pre-compressed files first (much faster than on-the-fly compression)
+        // Only for complete (non-range) requests
+        if self.config.precompressed && status == 200 {
+            if let Some((precompressed_content, encoding)) = self.try_precompressed(&file_path, accept_encoding).await {
+                tracing::debug!("✅ Using pre-compressed file: {} ({})", file_path.display(), encoding);
+                return Ok(Some(ServedFile {
+                    content: precompressed_content,
+                    mime_type,
+                    path: file_path,
+                    status,
+                    content_range,
+                    last_modified,
+                    etag: Some(etag),
+                    content_encoding: Some(encoding.to_string()),
+                }));
+            }
+        }
+
+        // Fall back to on-the-fly compression if:
         // 1. Configured
         // 2. Not a range request (partial content compression is complex)
         // 3. Client supports it
-        // 4. File size > min threshold (optional optimization, skipped for simplicity)
-        // 5. Mime type is compressible (optional, skipped for simplicity)
+        // 4. No pre-compressed file was found
         let (content, content_encoding) = if self.config.compress && status == 200 {
             self.compress_content(&content, accept_encoding).await?
         } else {
@@ -188,6 +208,40 @@ impl FileServer {
             etag: Some(etag),
             content_encoding,
         }))
+    }
+
+    /// Try to find and load a pre-compressed version of the file
+    /// Checks for .br, .gz, .zst files in order of preference based on Accept-Encoding
+    async fn try_precompressed(&self, original_path: &std::path::Path, accept_encoding: Option<&str>) -> Option<(Vec<u8>, &'static str)> {
+        let accept = accept_encoding?;
+        
+        // Priority order based on compression ratio and modern support:
+        // 1. Brotli (.br) - best for web
+        // 2. Zstd (.zst) - fastest decompression
+        // 3. Gzip (.gz) - widest support
+        let candidates: Vec<(&'static str, &'static str)> = vec![
+            ("br", ".br"),
+            ("zstd", ".zst"),
+            ("gzip", ".gz"),
+        ];
+        
+        for (encoding, ext) in candidates {
+            if !accept.contains(encoding) {
+                continue;
+            }
+            
+            // Build precompressed path
+            let mut precompressed_path = original_path.as_os_str().to_owned();
+            precompressed_path.push(ext);
+            let precompressed_path = std::path::PathBuf::from(precompressed_path);
+            
+            // Check if pre-compressed file exists and is readable
+            if let Ok(content) = tokio::fs::read(&precompressed_path).await {
+                return Some((content, encoding));
+            }
+        }
+        
+        None
     }
 
     async fn compress_content(&self, input: &[u8], accept_header: Option<&str>) -> Result<(Vec<u8>, Option<String>)> {

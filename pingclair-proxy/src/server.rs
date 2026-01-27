@@ -12,6 +12,7 @@ use pingora_proxy::{ProxyHttp, Session};
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::sync::Arc;
 use std::collections::HashMap;
+use parking_lot::RwLock;
 
 use crate::{LoadBalancer, Strategy, Upstream, UpstreamPool, HealthChecker};
 use bytes::Bytes;
@@ -122,7 +123,8 @@ impl ProxyState {
                         root: std::path::PathBuf::from(root),
                         index: if index.is_empty() { vec!["index.html".to_string()] } else { index.clone() },
                         browse: *browse,
-                        compress: *compress, 
+                        compress: *compress,
+                        precompressed: true,  // Enable pre-compressed file detection by default
                     };
                     
                     let fs = Arc::new(pingclair_static::FileServer::new(config));
@@ -155,9 +157,9 @@ impl ProxyState {
 #[derive(Clone)]
 pub struct PingclairProxy {
     /// Map of hostname -> server state
-    pub hosts: Arc<std::sync::RwLock<HashMap<String, ProxyState>>>,
+    pub hosts: Arc<RwLock<HashMap<String, ProxyState>>>,
     /// Default server state (catch-all)
-    pub default: Arc<std::sync::RwLock<Option<ProxyState>>>,
+    pub default: Arc<RwLock<Option<ProxyState>>>,
     /// TLS Manager for certificate resolution
     pub tls_manager: Option<Arc<pingclair_tls::manager::TlsManager>>,
 }
@@ -165,8 +167,8 @@ pub struct PingclairProxy {
 impl Default for PingclairProxy {
     fn default() -> Self {
         Self {
-            hosts: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            default: Arc::new(std::sync::RwLock::new(None)),
+            hosts: Arc::new(RwLock::new(HashMap::new())),
+            default: Arc::new(RwLock::new(None)),
             tls_manager: None,
         }
     }
@@ -181,8 +183,8 @@ impl PingclairProxy {
     /// Create a new proxy with TLS manager
     pub fn with_tls(tls_manager: Arc<pingclair_tls::manager::TlsManager>) -> Self {
         Self {
-            hosts: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            default: Arc::new(std::sync::RwLock::new(None)),
+            hosts: Arc::new(RwLock::new(HashMap::new())),
+            default: Arc::new(RwLock::new(None)),
             tls_manager: Some(tls_manager),
         }
     }
@@ -195,9 +197,9 @@ impl PingclairProxy {
         if let Some(hostname) = name {
             // Check if it's a wildcard or simple hostname
             // For now, simple match
-            self.hosts.write().unwrap().insert(hostname, state);
+            self.hosts.write().insert(hostname, state);
         } else {
-            let mut def = self.default.write().unwrap();
+            let mut def = self.default.write();
             *def = Some(state);
         }
     }
@@ -205,14 +207,14 @@ impl PingclairProxy {
     /// Get the state for a specific host
     fn get_state(&self, host: &str) -> Option<ProxyState> {
         // 1. Exact match
-        if let Some(state) = self.hosts.read().unwrap().get(host) {
+        if let Some(state) = self.hosts.read().get(host) {
             return Some(state.clone());
         }
         
         // 2. TODO: Wildcard matches (*.example.com)
         
         // 3. Default
-        self.default.read().unwrap().clone()
+        self.default.read().clone()
     }
     
     /// Select an upstream using the load balancer
@@ -492,6 +494,9 @@ impl ProxyHttp for PingclairProxy {
         for (key, value) in &ctx.headers_down {
             upstream_response.insert_header(key.clone(), value.as_str())?;
         }
+        
+        // Add server identification headers
+        upstream_response.insert_header("Server", "Pingclair")?;
         
         // Add security headers
         upstream_response.insert_header("X-Content-Type-Options", "nosniff")?;

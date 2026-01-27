@@ -21,3 +21,5 @@ hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 bytes = "1.0"
 pingclair-proxy = { path = "../pingclair-proxy" }
+parking_lot = "0.12"
+

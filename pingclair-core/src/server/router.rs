@@ -5,6 +5,54 @@
 use crate::config::{RouteConfig, Matcher, MatcherCondition};
 use matchit::Router as RadixRouter;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Pre-compiled matcher with cached regex
+#[derive(Debug, Clone)]
+pub struct CompiledMatcher {
+    /// Original matcher
+    pub matcher: Matcher,
+    /// Pre-compiled regex patterns (keyed by pattern string)
+    pub compiled_regexes: HashMap<String, Arc<regex::Regex>>,
+}
+
+impl CompiledMatcher {
+    /// Compile a matcher, pre-compiling any regex patterns
+    pub fn compile(matcher: &Matcher) -> Self {
+        let mut compiled_regexes = HashMap::new();
+        Self::collect_regexes(matcher, &mut compiled_regexes);
+        Self {
+            matcher: matcher.clone(),
+            compiled_regexes,
+        }
+    }
+    
+    /// Recursively collect and compile all regex patterns in a matcher
+    fn collect_regexes(matcher: &Matcher, regexes: &mut HashMap<String, Arc<regex::Regex>>) {
+        match matcher {
+            Matcher::Header { condition, .. } | Matcher::Query { condition, .. } => {
+                if let MatcherCondition::Regex(pattern) = condition {
+                    if let Ok(re) = regex::Regex::new(pattern) {
+                        regexes.insert(pattern.clone(), Arc::new(re));
+                    }
+                }
+            }
+            Matcher::And(left, right) | Matcher::Or(left, right) => {
+                Self::collect_regexes(left, regexes);
+                Self::collect_regexes(right, regexes);
+            }
+            Matcher::Not(inner) => {
+                Self::collect_regexes(inner, regexes);
+            }
+            _ => {}
+        }
+    }
+    
+    /// Get a pre-compiled regex by pattern
+    pub fn get_regex(&self, pattern: &str) -> Option<&regex::Regex> {
+        self.compiled_regexes.get(pattern).map(|r| r.as_ref())
+    }
+}
 
 /// Route entry with precompiled matchers
 #[derive(Debug, Clone)]
@@ -13,6 +61,8 @@ pub struct CompiledRoute {
     pub config: RouteConfig,
     /// Route index for handler lookup
     pub index: usize,
+    /// Pre-compiled matcher (if route has one)
+    pub compiled_matcher: Option<CompiledMatcher>,
 }
 
 /// High-performance router using radix tree
@@ -33,9 +83,13 @@ impl Router {
         let mut path_groups: HashMap<String, Vec<CompiledRoute>> = HashMap::new();
         
         for (index, config) in routes.iter().enumerate() {
+            // Pre-compile matcher if present
+            let compiled_matcher = config.matcher.as_ref().map(CompiledMatcher::compile);
+            
             let compiled = CompiledRoute {
                 config: config.clone(),
                 index,
+                compiled_matcher,
             };
             
             // Normalize path for radix tree
@@ -106,9 +160,9 @@ impl Router {
                 }
             }
             
-            // Check additional matchers
-            if let Some(matcher) = &route.config.matcher {
-                if !Self::evaluate_matcher(matcher, path, method, headers, host, remote_ip, protocol) {
+            // Check additional matchers (using pre-compiled version)
+            if let Some(compiled) = &route.compiled_matcher {
+                if !Self::evaluate_matcher_compiled(compiled, path, method, headers, host, remote_ip, protocol) {
                     continue;
                 }
             }
@@ -119,9 +173,23 @@ impl Router {
         None
     }
     
-    /// Evaluate a matcher against request context
-    fn evaluate_matcher(
+    /// Evaluate a pre-compiled matcher against request context
+    fn evaluate_matcher_compiled(
+        compiled: &CompiledMatcher,
+        path: &str,
+        method: &str,
+        headers: &http::HeaderMap,
+        host: &str,
+        remote_ip: &str,
+        protocol: &str,
+    ) -> bool {
+        Self::evaluate_matcher_inner(&compiled.matcher, compiled, path, method, headers, host, remote_ip, protocol)
+    }
+    
+    /// Inner matcher evaluation with access to pre-compiled regexes
+    fn evaluate_matcher_inner(
         matcher: &Matcher,
+        compiled: &CompiledMatcher,
         path: &str,
         method: &str,
         headers: &http::HeaderMap,
@@ -136,7 +204,7 @@ impl Router {
             Matcher::Header { name, condition } => {
                 let header_value = headers.get(name)
                     .and_then(|v| v.to_str().ok());
-                Self::evaluate_condition(header_value, condition)
+                Self::evaluate_condition(header_value, condition, compiled)
             }
             Matcher::Method { methods } => {
                 methods.iter().any(|m| m.eq_ignore_ascii_case(method))
@@ -155,21 +223,21 @@ impl Router {
                 protocols.iter().any(|p| p.eq_ignore_ascii_case(protocol))
             }
             Matcher::And(left, right) => {
-                Self::evaluate_matcher(left, path, method, headers, host, remote_ip, protocol)
-                    && Self::evaluate_matcher(right, path, method, headers, host, remote_ip, protocol)
+                Self::evaluate_matcher_inner(left, compiled, path, method, headers, host, remote_ip, protocol)
+                    && Self::evaluate_matcher_inner(right, compiled, path, method, headers, host, remote_ip, protocol)
             }
             Matcher::Or(left, right) => {
-                Self::evaluate_matcher(left, path, method, headers, host, remote_ip, protocol)
-                    || Self::evaluate_matcher(right, path, method, headers, host, remote_ip, protocol)
+                Self::evaluate_matcher_inner(left, compiled, path, method, headers, host, remote_ip, protocol)
+                    || Self::evaluate_matcher_inner(right, compiled, path, method, headers, host, remote_ip, protocol)
             }
             Matcher::Not(inner) => {
-                !Self::evaluate_matcher(inner, path, method, headers, host, remote_ip, protocol)
+                !Self::evaluate_matcher_inner(inner, compiled, path, method, headers, host, remote_ip, protocol)
             }
         }
     }
     
-    /// Evaluate a condition against a value
-    fn evaluate_condition(value: Option<&str>, condition: &MatcherCondition) -> bool {
+    /// Evaluate a condition against a value (using pre-compiled regex)
+    fn evaluate_condition(value: Option<&str>, condition: &MatcherCondition, compiled: &CompiledMatcher) -> bool {
         match condition {
             MatcherCondition::Exists => value.is_some(),
             MatcherCondition::Equals(expected) => {
@@ -185,9 +253,11 @@ impl Router {
                 value.map(|v| v.ends_with(suffix)).unwrap_or(false)
             }
             MatcherCondition::Regex(pattern) => {
-                if let Ok(re) = regex::Regex::new(pattern) {
+                // Use pre-compiled regex for performance
+                if let Some(re) = compiled.get_regex(pattern) {
                     value.map(|v| re.is_match(v)).unwrap_or(false)
                 } else {
+                    // Fallback (shouldn't happen normally)
                     false
                 }
             }

@@ -113,11 +113,11 @@ fn main() -> anyhow::Result<()> {
 
             // Group servers by listen address
             let port_proxies = std::collections::HashMap::new();
-            let port_proxies = std::sync::Arc::new(std::sync::RwLock::new(port_proxies));
+            let port_proxies = std::sync::Arc::new(parking_lot::RwLock::new(port_proxies));
 
             for server_config in config.servers {
                 let addr = server_config.listen.first().cloned().unwrap_or_else(|| "0.0.0.0:80".to_string());
-                let mut proxies_guard = port_proxies.write().unwrap();
+                let mut proxies_guard = port_proxies.write();
                 let proxy = proxies_guard.entry(addr.clone()).or_insert_with(|| {
                     pingclair_proxy::server::PingclairProxy::with_tls(tls_manager.clone())
                 });
@@ -127,7 +127,7 @@ fn main() -> anyhow::Result<()> {
             // Create services for each proxy
             let mut https_ports = Vec::new();
             {
-                let proxies_guard = port_proxies.read().unwrap();
+                let proxies_guard = port_proxies.read();
                 for (addr, proxy_logic) in proxies_guard.iter() {
                     tracing::info!("   📡 Listening on {}", addr);
                     
