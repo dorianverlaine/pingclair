@@ -215,6 +215,17 @@ pub enum HandlerConfig {
     /// Exclusive routing group
     Handle(Vec<HandlerConfig>),
 
+    /// HTTP Basic Authentication
+    /// Requires valid credentials before allowing access
+    BasicAuth {
+        /// Realm name shown to user
+        #[serde(default = "default_auth_realm")]
+        realm: String,
+        /// List of allowed username:password_hash pairs
+        /// Password should be bcrypt hashed for security
+        credentials: Vec<BasicAuthCredential>,
+    },
+
     /// Plugin invocation
     Plugin { name: String, args: Vec<String> },
 }
@@ -229,6 +240,22 @@ fn default_redirect_code() -> u16 {
 
 fn default_status_code() -> u16 {
     200
+}
+
+fn default_auth_realm() -> String {
+    "Restricted".to_string()
+}
+
+/// Basic auth credential
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BasicAuthCredential {
+    /// Username
+    pub username: String,
+    /// Password hash (bcrypt recommended) or plain text (not recommended for production)
+    pub password: String,
+    /// If true, password is bcrypt hashed; if false, plain text comparison
+    #[serde(default)]
+    pub hashed: bool,
 }
 
 /// Reverse proxy configuration

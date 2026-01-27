@@ -174,6 +174,23 @@ pub fn execute_handler(config: &HandlerConfig) -> HandlerResult {
             Ok(response)
         }
 
+        HandlerConfig::BasicAuth { realm, credentials: _ } => {
+            // BasicAuth handler - this returns a 401 response that prompts for credentials
+            // The actual validation is done at the proxy layer by checking the Authorization header
+            // Here we just signal that BasicAuth is required with this realm
+            let mut response = HandlerResponse::status(401);
+            response.headers.insert(
+                "WWW-Authenticate".to_string(),
+                format!("Basic realm=\"{}\"", realm)
+            );
+            response.headers.insert(
+                "X-Pingclair-BasicAuth".to_string(),
+                "required".to_string()
+            );
+            response.body = Some(bytes::Bytes::from("Unauthorized"));
+            Ok(response)
+        }
+
         HandlerConfig::Plugin { name, args: _ } => {
             Err(HandlerError::Config(format!("Plugin {} is not yet implemented", name)))
         }
