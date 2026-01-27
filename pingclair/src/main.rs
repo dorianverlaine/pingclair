@@ -5,6 +5,10 @@
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 /// Pingclair - Modern web server inspired by Caddy, powered by Pingora
 #[derive(Parser)]
 #[command(name = "pingclair")]

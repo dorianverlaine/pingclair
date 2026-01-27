@@ -13,6 +13,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use std::sync::Arc;
 use std::collections::HashMap;
 use parking_lot::RwLock;
+use async_recursion::async_recursion;
 
 use crate::{LoadBalancer, Strategy, Upstream, UpstreamPool, HealthChecker};
 use crate::metrics;
@@ -60,6 +61,8 @@ pub struct ProxyState {
     pub health_checkers: Vec<Option<Arc<HealthChecker>>>,
     /// File servers per route
     pub file_servers: Vec<Option<Arc<pingclair_static::FileServer>>>,
+    /// Rate limiters per route
+    pub rate_limiters: Vec<Option<Arc<crate::rate_limit::RateLimiter>>>,
 }
 
 impl ProxyState {
@@ -67,9 +70,11 @@ impl ProxyState {
         let router = Router::new(config.routes.clone());
         
         // Initialize load balancers for each route
+        // Initialize load balancers for each route
         let mut load_balancers = Vec::new();
         let mut health_checkers = Vec::new();
         let mut file_servers = Vec::new();
+        let mut rate_limiters = Vec::new();
 
         for route in &config.routes {
             match &route.handler {
@@ -143,6 +148,15 @@ impl ProxyState {
                     health_checkers.push(None);
                     file_servers.push(None);
                 }
+                }
+
+            // Check for rate limit config
+            if let Some(rl_config) = find_rate_limit_config(&route.handler) {
+                use crate::rate_limit::RateLimiter;
+                rate_limiters.push(Some(RateLimiter::new(rl_config)));
+                tracing::info!("🚦 Initialized rate limiter for route {}", route.path);
+            } else {
+                rate_limiters.push(None);
             }
         }
         
@@ -152,6 +166,7 @@ impl ProxyState {
             load_balancers,
             health_checkers,
             file_servers,
+            rate_limiters,
         }
     }
 }
@@ -287,6 +302,7 @@ impl PingclairProxy {
     }
 
     /// Handle a specific handler configuration
+    #[async_recursion]
     async fn handle_config(&self, session: &mut Session, ctx: &mut RequestCtx, handler: &HandlerConfig, path: &str, route_idx: usize) -> PingoraResult<bool> {
         match handler {
             HandlerConfig::Respond { status, body, headers } => {
@@ -347,8 +363,54 @@ impl PingclairProxy {
                 }
                 Ok(false)
             }
-            HandlerConfig::Pipeline(_handlers) | HandlerConfig::Handle(_handlers) => {
-                // TODO: Support nested pipelines without recursion issues
+            HandlerConfig::Pipeline(handlers) => {
+                for h in handlers {
+                    if self.handle_config(session, ctx, h, path, route_idx).await? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            HandlerConfig::Handle(handlers) => {
+                 for h in handlers {
+                    if self.handle_config(session, ctx, h, path, route_idx).await? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            HandlerConfig::HandlePath { prefix, handlers } => {
+                let new_path = if path.starts_with(prefix) {
+                    let p = &path[prefix.len()..];
+                     if p.is_empty() {
+                         "/"
+                     } else if !p.starts_with('/') {
+                         // Should ensure leading slash if we want strict path compliance, 
+                         // but Caddy handle_path strips exact prefix.
+                         // Let's assume absolute paths are preferred.
+                         p // Simple strip
+                     } else {
+                         p
+                     }
+                } else {
+                    path
+                };
+                
+                for h in handlers {
+                    if self.handle_config(session, ctx, h, new_path, route_idx).await? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            HandlerConfig::HandleErrors { .. } => {
+                // Error handlers are configured separately or handled by middleware.
+                // This config node is a placeholder for attached error handlers.
+                Ok(false)
+            }
+            HandlerConfig::RateLimit { .. } => {
+                // Rate limiting is handled in request_filter (TODO: verify integration)
+                // Returning Ok(false) to proceed
                 Ok(false)
             }
             HandlerConfig::Headers { set, add: _, remove: _ } => {
@@ -373,7 +435,7 @@ impl ProxyHttp for PingclairProxy {
     /// Request filter (Handle static files and early return)
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> pingora_core::Result<bool> {
         // Match route in a scope to release borrow of session
-        let (path_str, route_idx, handler) = {
+        let (path_str, route_idx, handler, remote_ip) = {
             let req_header = session.req_header();
             let path = req_header.uri.path();
             let method = req_header.method.as_str();
@@ -405,14 +467,56 @@ impl ProxyHttp for PingclairProxy {
             if let Some(route) = state.router.match_request(path, method, &req_header.headers, host, &remote_ip, protocol) {
                 let idx = route.index;
                 let handler = state.config.routes.get(idx).map(|r| r.handler.clone());
-                (path.to_string(), Some(idx), handler)
+                (path.to_string(), Some(idx), handler, remote_ip)
             } else {
-                (path.to_string(), None, None)
+                (path.to_string(), None, None, remote_ip)
             }
         };
 
+        // Check request body size (Content-Length)
+        if let Some(state) = &ctx.state {
+             let limit = state.config.client_max_body_size;
+             if limit > 0 {
+                 if let Some(cl) = session.req_header().headers.get("content-length")
+                     .and_then(|v| v.to_str().ok())
+                     .and_then(|v| v.parse::<u64>().ok()) 
+                 {
+                     if cl > limit {
+                         let mut header = pingora_http::ResponseHeader::build(413, Some(4)).unwrap();
+                         header.insert_header("Connection", "close").unwrap();
+                         session.write_response_header(Box::new(header), true).await?;
+                         return Ok(true);
+                     }
+                 }
+             }
+        }
+
         if let Some(idx) = route_idx {
             ctx.route = Some(idx);
+
+            // Check rate limit
+            if let Some(state) = &ctx.state {
+                 if let Some(limiter) = state.rate_limiters.get(idx).and_then(|l| l.as_ref()) {
+                      let key = if limiter.config.by_ip {
+                           Some(remote_ip.as_str())
+                      } else {
+                           None
+                      };
+                      
+                      if let Err(info) = limiter.check(key) {
+                           let mut header = pingora_http::ResponseHeader::build(429, Some(4)).unwrap();
+                           for (k, v) in info.to_headers() {
+                               if let Ok(val) = http::header::HeaderValue::from_str(&v) {
+                                   if let Ok(name) = http::header::HeaderName::from_bytes(k.as_bytes()) {
+                                        header.insert_header(name, val).unwrap();
+                                   }
+                               }
+                           }
+                           session.write_response_header(Box::new(header), true).await?;
+                           return Ok(true);
+                      }
+                 }
+            }
             
             if let Some(h) = handler {
                 if self.handle_config(session, ctx, &h, &path_str, idx).await? {
@@ -589,5 +693,28 @@ impl ProxyHttp for PingclairProxy {
 
         metrics::REQUESTS_TOTAL.with_label_values(&[&method, &status, &host]).inc();
         metrics::REQUEST_DURATION_SECONDS.with_label_values(&[&method, &status, &host]).observe(elapsed);
+    }
+}
+
+// Helper for finding rate limit config
+fn find_rate_limit_config(handler: &HandlerConfig) -> Option<crate::rate_limit::RateLimitConfig> {
+    match handler {
+        HandlerConfig::RateLimit { requests, window_secs, by_ip, burst } => {
+            Some(crate::rate_limit::RateLimitConfig {
+                requests_per_window: *requests,
+                window: std::time::Duration::from_secs(*window_secs),
+                by_ip: *by_ip,
+                burst: *burst,
+            })
+        },
+        HandlerConfig::Pipeline(handlers) | HandlerConfig::Handle(handlers) | HandlerConfig::HandlePath { prefix: _, handlers } => {
+            for h in handlers {
+                if let Some(c) = find_rate_limit_config(h) {
+                     return Some(c);
+                }
+            }
+            None
+        },
+        _ => None,
     }
 }

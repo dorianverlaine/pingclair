@@ -64,6 +64,7 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         routes: Vec::new(),
         tls: None,
         log: None,
+        client_max_body_size: 1024 * 1024, // 1MB default
     };
     
     // Listen address

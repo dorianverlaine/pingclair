@@ -46,6 +46,14 @@ pub struct ServerConfig {
     /// Log configuration for this server
     #[serde(default)]
     pub log: Option<LogConfig>,
+
+    /// Maximum request body size in bytes (default: 1MB)
+    #[serde(default = "default_body_limit")]
+    pub client_max_body_size: u64,
+}
+
+fn default_body_limit() -> u64 {
+    1024 * 1024 // 1MB
 }
 
 /// TLS configuration

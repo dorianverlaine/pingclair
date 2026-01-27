@@ -92,7 +92,7 @@ impl TokenBucket {
 
 /// Rate limiter using token bucket algorithm
 pub struct RateLimiter {
-    config: RateLimitConfig,
+    pub config: RateLimitConfig,
     /// Per-key buckets (IP address or route)
     buckets: RwLock<HashMap<String, TokenBucket>>,
     /// Global bucket (if by_ip is false)
