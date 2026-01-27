@@ -6,7 +6,9 @@ use crate::auto_https::{AutoHttps, AutoHttpsConfig};
 use crate::cert_store::CertStore;
 use crate::acme::MemoryChallengeHandler;
 use std::sync::Arc;
+use std::collections::HashMap;
 use tokio_rustls::rustls;
+use parking_lot::RwLock;
 
 /// 🛡️ TLS Manager for Pingclair
 pub struct TlsManager {
@@ -15,7 +17,10 @@ pub struct TlsManager {
     /// Challenge handler (HTTP-01)
     challenge_handler: Arc<MemoryChallengeHandler>,
     /// Fallback/Manual certificates (domain -> cert)
-    manual_certs: std::collections::HashMap<String, Arc<rustls::sign::CertifiedKey>>,
+    manual_certs: HashMap<String, Arc<rustls::sign::CertifiedKey>>,
+    /// Cached parsed CertifiedKey from ACME certs (domain -> cached key)
+    /// Avoids expensive PEM parsing on every TLS handshake
+    cached_certs: RwLock<HashMap<String, Arc<rustls::sign::CertifiedKey>>>,
 }
 
 impl TlsManager {
@@ -36,7 +41,8 @@ impl TlsManager {
         Self {
             auto_https,
             challenge_handler,
-            manual_certs: std::collections::HashMap::new(),
+            manual_certs: HashMap::new(),
+            cached_certs: RwLock::new(HashMap::new()),
         }
     }
     
@@ -74,19 +80,24 @@ impl TlsManager {
         if let Some(cert) = self.manual_certs.get(domain) {
             return Some(cert.clone());
         }
+        
+        // 2. Check cached CertifiedKey (fast path - no PEM parsing)
+        if let Some(cached) = self.cached_certs.read().get(domain) {
+            tracing::debug!("🔐 Using cached CertifiedKey for {}", domain);
+            return Some(cached.clone());
+        }
  
-        // 2. Auto HTTPS
+        // 3. Auto HTTPS (may need to fetch/renew from ACME)
         if let Some(auto) = &self.auto_https {
-             // In a real high-perf scenario we wouldn't block here for issuance
-             // We would return None -> Tls fallback, or have a "certificate loading" state.
-             // But for this MVP: try to get or renew
              match auto.get_certificate(domain, self.challenge_handler.as_ref()).await {
                  Ok(cert) => {
-                     // Convert to rustls CertifiedKey
-                     // Use rustls-pemfile to parse
-                     // Note: This conversion is CPU intensive, should cache the CertifiedKey result
+                     // Convert to rustls CertifiedKey and cache it
                      if let Ok(key) = self.convert_to_rustls(&cert) {
-                         return Some(Arc::new(key));
+                         let key_arc = Arc::new(key);
+                         // Cache the converted key to avoid future PEM parsing
+                         self.cached_certs.write().insert(domain.to_string(), key_arc.clone());
+                         tracing::info!("🔐 Cached new CertifiedKey for {}", domain);
+                         return Some(key_arc);
                      }
                  },
                  Err(e) => {

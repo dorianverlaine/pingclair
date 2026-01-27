@@ -67,6 +67,28 @@ impl FileServer {
         self.config.browse = enable;
         self
     }
+    
+    /// Try multiple file paths and return the first one that exists
+    /// This is commonly used for SPA (Single Page Application) fallback
+    /// Example: try_files(["{path}", "{path}/index.html", "/index.html"])
+    pub async fn try_files(
+        &self, 
+        request_path: &str, 
+        patterns: &[String], 
+        accept_encoding: Option<&str>,
+    ) -> Result<Option<ServedFile>> {
+        for pattern in patterns {
+            // Replace {path} placeholder with actual request path
+            let path = pattern.replace("{path}", request_path.trim_start_matches('/'));
+            
+            // Try to serve this path
+            if let Ok(Some(file)) = self.serve(&path, None, accept_encoding).await {
+                return Ok(Some(file));
+            }
+        }
+        Ok(None)
+    }
+
 
     /// Serve a file request
     pub async fn serve(&self, path: &str, range_header: Option<&str>, accept_encoding: Option<&str>) -> Result<Option<ServedFile>> {

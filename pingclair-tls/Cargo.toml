@@ -40,5 +40,6 @@ bytes.workspace = true
 # 文件系统
 dirs.workspace = true
 futures = "0.3.31"
+parking_lot = "0.12"
 
 
