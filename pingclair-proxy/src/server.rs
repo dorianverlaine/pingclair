@@ -10,7 +10,7 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result as PingoraResult;
 use pingora_proxy::{ProxyHttp, Session};
 use pingora_http::{RequestHeader, ResponseHeader};
-use pingora_core::protocols::tls::server::TlsAcceptor;
+use pingora_core::protocols::tls::TlsAcceptor;
 use std::sync::Arc;
 use std::collections::HashMap;
 use parking_lot::RwLock;
@@ -466,6 +466,7 @@ impl ProxyHttp for PingclairProxy {
     async fn resolve_tls_ctx(
         &self,
         session: &mut Session,
+        _ctx: &mut Self::CTX,
     ) -> pingora_core::Result<Option<TlsAcceptor>> {
         if let Some(tls_manager) = &self.tls_manager {
             let sni = session.req_header().headers.get("Host")
