@@ -75,6 +75,17 @@ cargo install --path ./pingclair
 
 安装完成后，`pingclair` 命令将被添加到你的系统 PATH 中。
 
+### Ubuntu/Debian 极简安装 (推荐)
+
+如果你在 Ubuntu 或 Debian 系统上，可以使用一键安装脚本。该脚本会自动下载（或编译）二进制文件，配置 `systemd` 服务，并创建 `pingclair` 低权限用户（使用 `setcap` 绑定端口）。
+
+```bash
+# 运行安装脚本 (需要 sudo 权限)
+curl -fsSL https://raw.githubusercontent.com/SinclairChao/pingclair/main/scripts/install.sh | sudo bash
+```
+
+安装完成后，你可以使用 `pc` (pingclair 的缩写) 命令来管理服务。
+
 ## 🏃 快速上手
 
 Pingclair 提供了两种运行模式：**CLI 命令行模式**（适用于快速测试）和 **配置文件模式**（适用于生产环境）。
@@ -91,6 +102,16 @@ pingclair file-server --listen :8080 --root .
 将本地 8080 端口的流量转发到后端的 3000 端口：
 ```bash
 pingclair reverse-proxy --from :8080 --to localhost:3000
+```
+
+**管理系统服务 (Linux)**
+安装后可以使用内置命令管理 `systemd` 服务：
+```bash
+pc service start    # 启动
+pc service stop     # 停止
+pc service status   # 状态查询
+pc service reload   # 平滑重载配置 (SIGHUP)
+pc service restart  # 重启
 ```
 
 ### 2. 配置文件模式 (推荐)

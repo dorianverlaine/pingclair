@@ -64,7 +64,28 @@ enum Commands {
 
     /// Show version information
     Version,
+
+    /// Manage the system service (Linux only)
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
 }
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Start the service
+    Start,
+    /// Stop the service
+    Stop,
+    /// Restart the service
+    Restart,
+    /// Reload the service
+    Reload,
+    /// Show service status
+    Status,
+}
+
 
 fn main() -> anyhow::Result<()> {
     // Initialize tracing
@@ -92,7 +113,7 @@ fn main() -> anyhow::Result<()> {
                 }
             };
             
-            run_server(config);
+            run_server(config_path.clone(), config);
         }
 
         Commands::ReverseProxy { from, to } => {
@@ -141,7 +162,7 @@ fn main() -> anyhow::Result<()> {
 
             config.servers.push(server);
             
-            run_server(config);
+            run_server("".to_string(), config);
         }
 
         Commands::FileServer { listen, root } => {
@@ -189,7 +210,7 @@ fn main() -> anyhow::Result<()> {
 
             config.servers.push(server);
             
-            run_server(config);
+            run_server("".to_string(), config);
         }
 
         Commands::Validate { config } => {
@@ -206,15 +227,59 @@ fn main() -> anyhow::Result<()> {
         }
 
         Commands::Version => {
-            println!("Pingclair {}", env!("CARGO_PKG_VERSION"));
-            println!("Built with Pingora");
+            println!("Pingclair v{}", env!("CARGO_PKG_VERSION"));
+            println!("Built with ❤️ in Rust");
+        }
+
+        Commands::Service { action: _action } => {
+            #[cfg(target_os = "linux")]
+            {
+                let cmd = match _action {
+                    ServiceAction::Start => "start",
+                    ServiceAction::Stop => "stop",
+                    ServiceAction::Restart => "restart",
+                    ServiceAction::Reload => "reload",
+                    ServiceAction::Status => "status",
+                };
+
+                tracing::info!("Managing service: {}", cmd);
+                let status = std::process::Command::new("systemctl")
+                    .arg(cmd)
+                    .arg("pingclair")
+                    .status();
+
+                match status {
+                    Ok(s) if s.success() => {
+                        let past_tense = match action {
+                            ServiceAction::Start => "started",
+                            ServiceAction::Stop => "stopped",
+                            ServiceAction::Restart => "restarted",
+                            ServiceAction::Reload => "reloaded",
+                            ServiceAction::Status => "queried",
+                        };
+                        println!("✅ Service {} successfully", past_tense);
+                    }
+                    Ok(s) => {
+                        eprintln!("❌ Failed to {} service (exit code: {})", cmd, s);
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Failed to execute systemctl: {}", e);
+                    }
+                }
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            {
+                eprintln!("❌ Service management is only supported on Linux.");
+                std::process::exit(1);
+            }
         }
     }
 
     Ok(())
 }
 
-fn run_server(config: pingclair_core::config::PingclairConfig) {
+fn run_server(_config_path: String, config: pingclair_core::config::PingclairConfig) {
     if config.servers.is_empty() {
         tracing::warn!("⚠️ No servers configured!");
         return;
@@ -268,8 +333,6 @@ fn run_server(config: pingclair_core::config::PingclairConfig) {
             server.add_service(service);
 
             // Check if this port should also support HTTP/3
-            // In a real app we'd check ServerConfigs for this port
-            // For now, if port is 443, we assume HTTPS + H3
             if addr.ends_with(":443") || addr.ends_with(":8443") {
                 https_ports.push(addr.clone());
             }
@@ -293,8 +356,6 @@ fn run_server(config: pingclair_core::config::PingclairConfig) {
                     quic_server.set_proxy(std::sync::Arc::new(proxy.clone()));
                 }
 
-                // Bridge: QUIC server needs to resolve certificates
-                // TODO: Integrate TlsManager with QuicServer more deeply
                 tracing::info!("🚀 Starting HTTP/3 server on {}", socket_addr);
                 
                 if let Err(e) = quic_server.start().await {
@@ -313,7 +374,6 @@ fn run_server(config: pingclair_core::config::PingclairConfig) {
                 std::thread::spawn(move || {
                     let rt = tokio::runtime::Runtime::new().expect("Failed to create admin runtime");
                     rt.block_on(async {
-                        // Parse address
                         let addr = listen.parse().expect("Invalid admin listen address");
                         if let Err(e) = pingclair_api::run_admin_server(addr, proxies).await {
                             tracing::error!("Admin server error: {}", e);
@@ -321,6 +381,56 @@ fn run_server(config: pingclair_core::config::PingclairConfig) {
                     });
                 });
             }
+    }
+
+    // ========================================
+    // 🔔 Signal Handling for SIGHUP (Reload)
+    // ========================================
+    #[cfg(target_os = "linux")]
+    if !_config_path.is_empty() {
+        let config_path = _config_path.clone();
+        let port_proxies = port_proxies.clone();
+        
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            
+            let mut stream = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("❌ Failed to create SIGHUP listener: {}", e);
+                    return;
+                }
+            };
+            
+            tracing::info!("📡 SIGHUP listener active (Config: {})", config_path);
+            
+            while stream.recv().await.is_some() {
+                tracing::info!("🔔 Received SIGHUP, reloading configuration...");
+                
+                match pingclair_config::compile_file(&config_path) {
+                    Ok(new_config) => {
+                        let mut new_config_by_port = std::collections::HashMap::new();
+                        for s in new_config.servers {
+                            let addr = s.listen.first().cloned().unwrap_or_else(|| "0.0.0.0:80".to_string());
+                            new_config_by_port.entry(addr).or_insert_with(Vec::new).push(s);
+                        }
+
+                        let proxies_guard = port_proxies.read();
+                        for (addr, servers) in new_config_by_port {
+                            if let Some(proxy) = proxies_guard.get(&addr) {
+                                proxy.update_config(servers);
+                            } else {
+                                tracing::warn!("⚠️ New listen address {} found in config during reload. Restart required for new ports.", addr);
+                            }
+                        }
+                        println!("✅ Configuration reloaded successfully");
+                    }
+                    Err(e) => {
+                        tracing::error!("❌ Failed to reload config: {}", e);
+                    }
+                }
+            }
+        });
     }
     
     println!("🚀 Pingclair running...");

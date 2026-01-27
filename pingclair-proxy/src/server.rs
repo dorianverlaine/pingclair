@@ -225,6 +225,32 @@ impl PingclairProxy {
             *default = Some(state.clone());
         }
     }
+
+    /// Replace all server configurations with a new list
+    pub fn update_config(&self, servers: Vec<ServerConfig>) {
+        let mut new_hosts = HashMap::new();
+        let mut new_default = None;
+
+        for config in servers {
+            let state = ProxyState::new(config.clone());
+            if let Some(domain) = &config.name {
+                if domain == "_" || domain == "*" {
+                    new_default = Some(state);
+                } else {
+                    new_hosts.insert(domain.clone(), state);
+                }
+            } else {
+                new_default = Some(state);
+            }
+        }
+
+        let mut hosts = self.hosts.write();
+        let mut default = self.default.write();
+        *hosts = new_hosts;
+        *default = new_default;
+        
+        tracing::info!("♻️ Configuration reloaded successfully");
+    }
     
     /// Resolve a request to a handler state
     /// Used by HTTP/3 server to reuse routing logic
