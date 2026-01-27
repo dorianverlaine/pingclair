@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use parking_lot::RwLock;
 
 use crate::{LoadBalancer, Strategy, Upstream, UpstreamPool, HealthChecker};
+use crate::metrics;
 use bytes::Bytes;
 
 /// Context for each request
@@ -538,5 +539,31 @@ impl ProxyHttp for PingclairProxy {
             "❌ Proxy error"
         );
         e
+    }
+
+    /// Called after response is sent
+    async fn logging(
+        &self,
+        session: &mut Session,
+        _e: Option<&pingora_core::Error>,
+        ctx: &mut Self::CTX,
+    ) {
+        let elapsed = ctx.start_time.elapsed().as_secs_f64();
+        
+        let status = session.response_written()
+            .map(|r| r.status.as_u16().to_string())
+            .unwrap_or_else(|| "0".to_string());
+            
+        let method = session.req_header().method.as_str().to_string();
+        
+        // Extract host header (preferred over uri host for proxying)
+        let host = session.req_header().headers.get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_else(|| session.req_header().uri.host().unwrap_or("unknown"))
+            .split(':').next().unwrap_or("unknown")
+            .to_string();
+
+        metrics::REQUESTS_TOTAL.with_label_values(&[&method, &status, &host]).inc();
+        metrics::REQUEST_DURATION_SECONDS.with_label_values(&[&method, &status, &host]).observe(elapsed);
     }
 }

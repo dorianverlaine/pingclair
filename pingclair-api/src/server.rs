@@ -57,6 +57,14 @@ async fn handle_request(
         (&Method::GET, "/health") => {
             Ok(Response::new(Full::new(Bytes::from(r#"{"status":"healthy"}"#))))
         },
+        (&Method::GET, "/metrics") => {
+            let buffer = pingclair_proxy::metrics::gather();
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/plain; version=0.0.4")
+                .body(Full::new(Bytes::from(buffer)))
+                .unwrap())
+        },
         (&Method::GET, "/config") => {
             let mut configs = std::collections::HashMap::new();
             let proxies_guard = proxies.read();

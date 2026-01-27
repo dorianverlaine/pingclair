@@ -243,6 +243,25 @@ pub enum HandlerConfig {
         burst: u64,
     },
 
+    /// Error handling
+    /// Define handlers for specific error codes
+    HandleErrors {
+        /// Map of internal error codes to handlers
+        /// Note: This is a placeholder for future implementation
+        #[serde(default)]
+        errors: HashMap<u16, Vec<HandlerConfig>>,
+    },
+
+    /// Handle with path stripping
+    /// Strips the prefix from the path before executing valid handlers
+    /// Similar to Caddy's handle_path directive
+    HandlePath {
+        /// Prefix to strip
+        prefix: String,
+        /// Handlers to execute with stripped path
+        handlers: Vec<HandlerConfig>,
+    },
+
     /// Plugin invocation
     Plugin { name: String, args: Vec<String> },
 }

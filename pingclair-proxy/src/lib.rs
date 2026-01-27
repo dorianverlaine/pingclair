@@ -8,6 +8,7 @@
 
 pub mod health_check;
 pub mod rate_limit;
+pub mod metrics;
 mod load_balancer;
 mod upstream;
 

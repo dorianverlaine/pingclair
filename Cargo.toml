@@ -76,3 +76,11 @@ dirs = "6"
 
 # 字符串处理
 smartstring = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
+

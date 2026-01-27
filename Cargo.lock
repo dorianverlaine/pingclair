@@ -2326,6 +2326,7 @@ dependencies = [
  "pingora-http",
  "pingora-load-balancing",
  "pingora-proxy",
+ "prometheus",
  "tokio",
  "tracing",
 ]

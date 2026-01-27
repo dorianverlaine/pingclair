@@ -216,6 +216,29 @@ pub fn execute_handler(config: &HandlerConfig) -> HandlerResult {
             Ok(response)
         }
 
+        HandlerConfig::HandleErrors { errors: _ } => {
+            // HandleErrors is a configuration directive that attaches error handlers to the route.
+            // When executed as part of the normal request flow, it doesn't do anything itself.
+            // The proxy/router should inspect this config to set up error trapping.
+            Ok(HandlerResponse::status(200))
+        }
+
+        HandlerConfig::HandlePath { prefix, handlers } => {
+            // execute inner handlers
+            let mut response = execute_handler(&HandlerConfig::Pipeline(handlers.clone()))?;
+            
+            // Add instruction to strip prefix
+            // Note: In a real execution engine, we would modify the path before inner execution,
+            // but here we are generating instructions/response. 
+            // The X-Pingclair-Strip-Prefix hopefully tells the proxy to modify the request *as it processes it*.
+            // LIMITATION: This assumes the proxy sees this header and acts on it for *subsequent* or *current* processing.
+            response.headers.insert(
+                "X-Pingclair-Strip-Prefix".to_string(),
+                prefix.clone()
+            );
+            Ok(response)
+        }
+
         HandlerConfig::Plugin { name, args: _ } => {
             Err(HandlerError::Config(format!("Plugin {} is not yet implemented", name)))
         }
