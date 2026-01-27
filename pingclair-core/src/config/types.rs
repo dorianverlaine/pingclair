@@ -486,6 +486,7 @@ mod tests {
             tls: None,
             routes: vec![],
             log: None,
+            client_max_body_size: 1024 * 1024,
         };
         assert_eq!(config.name, Some("example.com".to_string()));
     }
