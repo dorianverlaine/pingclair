@@ -1,0 +1,78 @@
+[workspace]
+resolver = "2"
+members = [
+    "pingclair",
+    "pingclair-core",
+    "pingclair-proxy",
+    "pingclair-static",
+    "pingclair-tls",
+    "pingclair-config",
+    "pingclair-api",
+    "pingclair-plugin",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Pingclair Contributors"]
+license = "Apache-2.0"
+repository = "https://github.com/zhaoyikai/pingclair"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Pingora 核心
+pingora = "0.6"
+pingora-core = "0.6"
+pingora-proxy = "0.6"
+pingora-http = "0.6"
+pingora-timeout = "0.6"
+pingora-load-balancing = "0.6"
+
+# Async 运行时
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# 配置解析
+logos = "0.15"
+ariadne = "0.5"      # 错误报告
+
+# TLS/证书
+rustls = "0.23"
+rcgen = "0.13"
+x509-parser = "0.16"
+
+# HTTP/3 (QUIC)
+quinn = "0.11"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+
+# HTTP
+http = "1"
+bytes = "1"
+mime_guess = "2"
+
+# 日志和监控
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+prometheus = "0.13"
+
+# 错误处理
+thiserror = "2"
+anyhow = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# 测试
+criterion = "0.5"
+
+# 文件系统
+dirs = "6"
+
+# 字符串处理
+smartstring = "1"

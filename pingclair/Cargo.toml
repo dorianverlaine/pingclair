@@ -1,0 +1,39 @@
+[package]
+name = "pingclair"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "A modern, high-performance web server built on Pingora"
+
+[[bin]]
+name = "pingclair"
+path = "src/main.rs"
+
+[dependencies]
+pingclair-core = { path = "../pingclair-core" }
+pingclair-config = { path = "../pingclair-config" }
+pingclair-proxy = { path = "../pingclair-proxy" }
+pingclair-static = { path = "../pingclair-static" }
+pingclair-tls = { path = "../pingclair-tls" }
+pingclair-api = { path = "../pingclair-api" }
+pingclair-plugin = { path = "../pingclair-plugin" }
+
+pingora = { workspace = true, features = ["proxy"] }
+pingora-core.workspace = true
+pingora-proxy.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+reqwest = { version = "0.11", features = ["json", "blocking"] }
+tokio = { workspace = true, features = ["full"] }
+tempfile = "3.8"
+uuid = { version = "1.0", features = ["v4"] }
+flate2 = "1.0"

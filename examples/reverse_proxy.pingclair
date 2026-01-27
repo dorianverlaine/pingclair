@@ -1,0 +1,22 @@
+// Reverse proxy example with load balancing and health checks
+
+server "api.example.com" {
+    tls auto;
+    http3;  // Enable HTTP/3
+
+    route "/api/*" {
+        reverse_proxy ["http://localhost:8080", "http://localhost:8081", "http://localhost:8082"] {
+            load_balance round_robin;
+            
+            health_check "/health" {
+                interval 30s;
+                timeout 5s;
+                threshold 3;
+            }
+        }
+    }
+
+    route "/" {
+        redirect "/api/";
+    }
+}

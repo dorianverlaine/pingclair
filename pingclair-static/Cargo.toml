@@ -1,0 +1,21 @@
+[package]
+name = "pingclair-static"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Static file server module for Pingclair"
+
+[dependencies]
+pingclair-core = { path = "../pingclair-core" }
+tokio = { workspace = true, features = ["fs"] }
+async-trait.workspace = true
+tracing.workspace = true
+http.workspace = true
+bytes.workspace = true
+mime_guess.workspace = true
+httpdate = "1.0"
+anyhow.workspace = true
+async-compression = { version = "0.4", features = ["gzip", "brotli", "zstd", "tokio"] }

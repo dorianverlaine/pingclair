@@ -1,0 +1,93 @@
+// Full-featured example demonstrating all capabilities
+
+// Global settings
+global {
+    debug true;
+    
+    http3 {
+        enabled true;
+        alt_svc_max_age 86400;
+    }
+    
+    logging {
+        level "info";
+        format "json";
+    }
+}
+
+// Admin API
+admin {
+    listen "localhost:2019";
+    auth {
+        api_key "your-secret-key-here";
+    }
+}
+
+// Main website
+server "example.com" {
+    tls auto;
+    http3;
+
+    // Compression middleware for all routes
+    compress ["gzip", "br", "zstd"];
+
+    // Security headers
+    headers {
+        add "X-Frame-Options" "DENY";
+        add "X-Content-Type-Options" "nosniff";
+        add "Strict-Transport-Security" "max-age=31536000; includeSubDomains";
+    }
+
+    // Static files
+    route "/" {
+        file_server "./public" {
+            index ["index.html"];
+            browse false;
+        }
+    }
+
+    // API backend
+    route "/api/*" {
+        rate_limit {
+            requests 100;
+            window 60;
+        }
+
+        reverse_proxy ["http://localhost:3000"] {
+            load_balance least_conn;
+            
+            health_check "/health" {
+                interval 10s;
+                timeout 3s;
+            }
+        }
+    }
+
+    // WebSocket support
+    route "/ws" {
+        reverse_proxy ["http://localhost:3001"];
+    }
+
+    // Redirect www to non-www
+    route "/redirect-test" {
+        redirect "https://example.com/" 301;
+    }
+}
+
+// API subdomain
+server "api.example.com" {
+    tls auto;
+    http3;
+
+    route "/*" {
+        cors {
+            origins ["https://example.com", "https://app.example.com"];
+            methods ["GET", "POST", "PUT", "DELETE"];
+            headers ["Authorization", "Content-Type"];
+        }
+
+        reverse_proxy ["http://localhost:3000", "http://localhost:3001"] {
+            load_balance round_robin;
+        }
+    }
+}

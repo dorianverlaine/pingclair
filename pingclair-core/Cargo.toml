@@ -1,0 +1,35 @@
+[package]
+name = "pingclair-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Core library for Pingclair web server"
+
+[dependencies]
+pingora.workspace = true
+pingora-core.workspace = true
+pingora-proxy.workspace = true
+pingora-http.workspace = true
+pingora-load-balancing.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+http.workspace = true
+
+# Router
+regex = "1"
+matchit = "0.8"  # Radix tree router
+pingclair-tls = { version = "0.1.0", path = "../pingclair-tls" }
+
+
+[dev-dependencies]
+criterion.workspace = true
+

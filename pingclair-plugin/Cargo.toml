@@ -1,0 +1,15 @@
+[package]
+name = "pingclair-plugin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Plugin system for Pingclair"
+
+[dependencies]
+pingclair-core = { path = "../pingclair-core" }
+async-trait.workspace = true
+tracing.workspace = true
+serde.workspace = true

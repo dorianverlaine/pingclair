@@ -1,0 +1,19 @@
+[Unit]
+Description=Pingclair Modern Web Server
+After=network.target
+
+[Service]
+Type=simple
+User=pingclair
+Group=pingclair
+WorkingDirectory=/var/lib/pingclair
+ExecStart=/usr/local/bin/pingclair run /etc/pingclair/Pingclairfile
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+# Capability for binding to privileged ports (< 1024)
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

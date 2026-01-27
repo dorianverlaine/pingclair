@@ -1,0 +1,42 @@
+# Build artifacts
+/target/
+**/target/
+
+# Cargo lock for libraries (keep for binaries)
+# Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Test coverage
+*.profraw
+*.profdata
+coverage/
+lcov.info
+
+# Certificates (development)
+*.pem
+*.key
+*.crt
+*.csr
+!examples/*.pem
+
+# Compiled examples
+examples/*.bin

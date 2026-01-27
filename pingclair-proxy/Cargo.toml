@@ -1,0 +1,25 @@
+[package]
+name = "pingclair-proxy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Reverse proxy module for Pingclair"
+
+[dependencies]
+
+pingclair-core = { path = "../pingclair-core" }
+pingclair-static = { path = "../pingclair-static" }
+pingclair-tls = { path = "../pingclair-tls" }
+
+pingora-proxy.workspace = true
+pingora-load-balancing.workspace = true
+pingora-core.workspace = true
+pingora-http.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+http.workspace = true
+bytes.workspace = true

@@ -1,0 +1,20 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running tests/integration.rs (/Users/zhaoyikai/code/pingclair/target/debug/deps/integration-6de97bbcd9339fe3)
+
+running 1 test
+
+thread 'test_compression' (1105838) panicked at pingclair/tests/integration.rs:242:5:
+assertion `left == right` failed
+  left: "\u{1f}�\u{8}\0\0\0\0\0\0�\u{b}��KO�I�,Rp��-(J-.���S\u{8}I-.Q\u{8}\u{18}�\u{1a}\r�Ѵ1�\u{1d}F\u{b}���p�v\u{18}�\u{10}G�\u{7}�-�b\u{1a}�\u{f}\u{1}�cr�\n\0\0"
+ right: "Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test Pingclair Compression Test "
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test test_compression ... FAILED
+
+failures:
+
+failures:
+    test_compression
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.84s
+
+error: test failed, to rerun pass `--test integration`

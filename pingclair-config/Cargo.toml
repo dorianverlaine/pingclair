@@ -1,0 +1,23 @@
+[package]
+name = "pingclair-config"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Configuration parser for Pingclair (Pingclairfile)"
+
+[dependencies]
+pingclair-core = { path = "../pingclair-core" }
+logos.workspace = true
+ariadne.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+smartstring.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true

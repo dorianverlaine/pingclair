@@ -1,0 +1,23 @@
+[package]
+name = "pingclair-api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Admin REST API for Pingclair"
+
+[dependencies]
+pingclair-core = { path = "../pingclair-core" }
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+http.workspace = true
+hyper = { version = "1.0", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+bytes = "1.0"
+pingclair-proxy = { path = "../pingclair-proxy" }
