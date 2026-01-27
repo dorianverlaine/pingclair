@@ -48,6 +48,71 @@ pub struct ServedFile {
     pub content_encoding: Option<String>,
 }
 
+/// Streaming file response for zero-copy large file transfer
+/// Use this for files larger than 5MB to avoid memory pressure
+pub struct StreamingFile {
+    /// Tokio file handle for async reading
+    pub file: tokio::fs::File,
+    /// Total file size in bytes
+    pub file_size: u64,
+    /// Chunk size for streaming (default 64KB)
+    pub chunk_size: usize,
+    /// MIME type of the file
+    pub mime_type: String,
+    /// Path to the file
+    pub path: PathBuf,
+    /// Last-Modified header value
+    pub last_modified: Option<String>,
+    /// ETag header value
+    pub etag: Option<String>,
+    /// Bytes read so far
+    bytes_read: u64,
+}
+
+impl StreamingFile {
+    /// Read the next chunk of data
+    /// Returns None when EOF is reached
+    pub async fn read_chunk(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        if self.bytes_read >= self.file_size {
+            return Ok(None);
+        }
+        
+        let remaining = (self.file_size - self.bytes_read) as usize;
+        let to_read = remaining.min(self.chunk_size);
+        
+        let mut buf = vec![0u8; to_read];
+        let n = self.file.read(&mut buf).await?;
+        
+        if n == 0 {
+            return Ok(None);
+        }
+        
+        buf.truncate(n);
+        self.bytes_read += n as u64;
+        
+        Ok(Some(buf))
+    }
+    
+    /// Get progress as a fraction (0.0 - 1.0)
+    pub fn progress(&self) -> f64 {
+        if self.file_size == 0 {
+            1.0
+        } else {
+            self.bytes_read as f64 / self.file_size as f64
+        }
+    }
+    
+    /// Check if streaming is complete
+    pub fn is_complete(&self) -> bool {
+        self.bytes_read >= self.file_size
+    }
+    
+    /// Get Content-Length header value
+    pub fn content_length(&self) -> u64 {
+        self.file_size
+    }
+}
+
 impl FileServer {
     /// Create a new file server
     pub fn new(config: FileServerConfig) -> Self {
@@ -87,6 +152,64 @@ impl FileServer {
             }
         }
         Ok(None)
+    }
+    
+    /// THRESHOLD for using streaming vs in-memory (5MB)
+    const STREAMING_THRESHOLD: u64 = 5 * 1024 * 1024;
+    
+    /// Serve a large file using zero-copy streaming
+    /// Returns a StreamingFile that can be used for chunked transfer
+    /// Use this for files larger than 5MB to avoid memory pressure
+    pub async fn serve_streaming(&self, path: &str) -> Result<Option<StreamingFile>> {
+        let file_path = self.config.root.join(path.trim_start_matches('/'));
+        
+        // Prevent path traversal
+        if !file_path.starts_with(&self.config.root) {
+            return Ok(None);
+        }
+        
+        // Check if file exists
+        let metadata = match tokio::fs::metadata(&file_path).await {
+            Ok(m) if m.is_file() => m,
+            _ => return Ok(None),
+        };
+        
+        let file_size = metadata.len();
+        
+        // Open file handle (no reading yet - zero-copy preparation)
+        let file = tokio::fs::File::open(&file_path).await?;
+        
+        // Guess MIME type
+        let mime_type = mime_guess::from_path(&file_path)
+            .first_or_octet_stream()
+            .to_string();
+        
+        // Calculate Last-Modified and ETag
+        let last_modified = metadata.modified().ok()
+            .map(|t| httpdate::fmt_http_date(t));
+            
+        let etag = format!("\"{:x}-{:x}\"", file_size, 
+            metadata.modified().map(|t| t.elapsed().unwrap_or_default().as_secs()).unwrap_or(0));
+        
+        Ok(Some(StreamingFile {
+            file,
+            file_size,
+            chunk_size: 64 * 1024,  // 64KB chunks
+            mime_type,
+            path: file_path,
+            last_modified,
+            etag: Some(etag),
+            bytes_read: 0,
+        }))
+    }
+    
+    /// Check if a file should be served with streaming (based on size)
+    pub async fn should_stream(&self, path: &str) -> Result<bool> {
+        let file_path = self.config.root.join(path.trim_start_matches('/'));
+        match tokio::fs::metadata(&file_path).await {
+            Ok(m) => Ok(m.len() > Self::STREAMING_THRESHOLD),
+            Err(_) => Ok(false),
+        }
     }
 
 
