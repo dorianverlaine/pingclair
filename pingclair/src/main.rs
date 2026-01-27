@@ -231,10 +231,16 @@ fn main() -> anyhow::Result<()> {
             println!("Built with ❤️ in Rust");
         }
 
-        Commands::Service { action: _action } => {
+        Commands::Service { action } => {
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = action;
+                eprintln!("❌ Service management is only supported on Linux.");
+            }
+
             #[cfg(target_os = "linux")]
             {
-                let cmd = match _action {
+                let cmd = match action {
                     ServiceAction::Start => "start",
                     ServiceAction::Stop => "stop",
                     ServiceAction::Restart => "restart",
@@ -250,7 +256,7 @@ fn main() -> anyhow::Result<()> {
 
                 match status {
                     Ok(s) if s.success() => {
-                        let past_tense = match _action {
+                        let past_tense = match action {
                             ServiceAction::Start => "started",
                             ServiceAction::Stop => "stopped",
                             ServiceAction::Restart => "restarted",
@@ -279,7 +285,22 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_server(_config_path: String, config: pingclair_core::config::PingclairConfig) {
+fn run_server(config_path: String, config: pingclair_core::config::PingclairConfig) {
+    #[cfg(not(target_os = "linux"))]
+    let _ = config_path;
+
+    // Create a background Tokio runtime for async tasks (HTTP/3, SIGHUP, etc.)
+    // We do this in a separate thread to avoid conflicts with Pingora's runtime.
+    let bg_runtime = tokio::runtime::Runtime::new().expect("Failed to create background runtime");
+    let bg_handle = bg_runtime.handle().clone();
+    
+    std::thread::spawn(move || {
+        bg_runtime.block_on(async {
+            // Keep the runtime alive
+            std::future::pending::<()>().await;
+        });
+    });
+
     if config.servers.is_empty() {
         tracing::warn!("⚠️ No servers configured!");
         return;
@@ -345,7 +366,7 @@ fn run_server(_config_path: String, config: pingclair_core::config::PingclairCon
             let port_proxies = port_proxies.clone();
             let addr_str = _addr.clone();
             
-            tokio::spawn(async move {
+            bg_handle.spawn(async move {
                 let mut quic_config = pingclair_proxy::quic::QuicConfig::default();
                 quic_config.listen = socket_addr;
                 
@@ -387,11 +408,11 @@ fn run_server(_config_path: String, config: pingclair_core::config::PingclairCon
     // 🔔 Signal Handling for SIGHUP (Reload)
     // ========================================
     #[cfg(target_os = "linux")]
-    if !_config_path.is_empty() {
-        let config_path = _config_path.clone();
+    if !config_path.is_empty() {
+        let config_path = config_path.clone();
         let port_proxies = port_proxies.clone();
         
-        tokio::spawn(async move {
+        bg_handle.spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
             
             let mut stream = match signal(SignalKind::hangup()) {

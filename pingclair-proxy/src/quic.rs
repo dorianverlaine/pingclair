@@ -12,7 +12,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use bytes::Bytes;
-use http::{Request, Response, StatusCode};
+use http::{Request, Response};
 
 use crate::server::PingclairProxy;
 use pingclair_core::config::HandlerConfig;
