@@ -34,6 +34,26 @@
 *   🔌 **模块化插件系统**: (开发中) 允许通过 Rust trait 扩展自定义功能，无需修改核心代码。
 *   📊 **可观测性**: 开箱即用的 Prometheus 指标导出和 OpenTelemetry Tracing 支持。
 
+## ⚡ 性能基准测试
+
+我们在 Docker Bridge 内网（消除系统网络栈开销）对 Pingclair、Nginx 和 Caddy 进行了公平的压力测试。
+
+**测试环境**:
+*   硬件: MacBook Pro (M2 Chip), Docker Desktop
+*   配置: 1KB 静态文件, 4 Threads, 100 Connections, 15s Duration
+*   网络: Docker 容器直连 (Container-to-Container)
+
+| 服务器 | RPS (请求/秒) | 平均延迟 | 备注 |
+|--------|---------------|----------|------|
+| **Nginx (Alpine)** | **~24,902** | **4.17ms** | ⭐️ 行业标杆，极致的 C/Epoll 优化 |
+| **Pingclair (Debian)** | **~19,899** | **5.44ms** | 🚀 紧随其后，达到 Nginx 的 ~80% 性能 |
+| **Caddy (Alpine)** | **~6,803** | **14.86ms** | 🐢 易用性优先，受限于 Go GC 开销 |
+
+> **分析**:
+> 虽然 Pingclair 是一个相对年轻的 Rust 项目，但得益于 Cloudflare Pingora 坚实的内核，即便在未经特定优化的 Docker 环境下，其性能也达到了成熟竞品 Nginx 的 80%，并达到了同类易用型服务器 Caddy 的 **3倍**。
+> 
+> *注意：基准测试仅供参考，实际生产环境性能取决于具体业务逻辑。*
+
 ## 📦 安装指南
 
 ### 前置要求

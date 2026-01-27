@@ -113,7 +113,7 @@ fn main() -> anyhow::Result<()> {
             };
 
             let mut server = ServerConfig {
-                name: Some("reverse-proxy".to_string()),
+                name: Some("_".to_string()),
                 listen: vec![listen],
                 routes: Vec::new(),
                 tls: None,
@@ -160,7 +160,7 @@ fn main() -> anyhow::Result<()> {
             use pingclair_core::config::{ServerConfig, RouteConfig, HandlerConfig};
 
             let mut server = ServerConfig {
-                name: Some("file-server".to_string()),
+                name: Some("_".to_string()),
                 listen: vec![listen_addr],
                 routes: Vec::new(),
                 tls: None,
