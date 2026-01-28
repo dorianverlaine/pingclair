@@ -1,6 +1,13 @@
-//! Lexer for Pingclairfile
+//! Lexer for Pingclairfile (Caddyfile Syntax)
 //!
-//! Tokenizes the Pingclairfile DSL using logos for high-performance lexing.
+//! Tokenizes the Caddyfile-style DSL.
+//! 
+//! Key features:
+//! - Whitespace sensitive (Newlines invoke statement termination)
+//! - Directives are just Words
+//! - { } for blocks
+//! - "..." for quoted strings
+//! - # for comments (skipped)
 
 use logos::{Logos, Span};
 use std::fmt;
@@ -37,369 +44,69 @@ impl<T> Spanned<T> {
     }
 }
 
-/// Token types for Pingclairfile
+/// Token types for Caddyfile-compatible syntax
 #[derive(Logos, Debug, Clone, PartialEq)]
-#[logos(skip r"[ \t\r\n\f]+")]  // Skip whitespace
 pub enum Token {
-    // Comments are handled as part of whitespace skip
-    // Line comments: //...
-    // Block comments: /*...*/ (not supported for simplicity)
-    
-    // ============================================================
-    // Keywords
-    // ============================================================
-    #[token("global")]
-    Global,
+    // Skip whitespace (spaces and tabs), but NOT newlines
+    #[regex(r"[ \t\f]+", logos::skip)]
+    Whitespace,
 
-    #[token("server")]
-    Server,
-
-    #[token("route")]
-    Route,
-
-    #[token("match")]
-    Match,
-
-    #[token("macro")]
-    Macro,
-
-    #[token("use")]
-    Use,
-
-    #[token("proxy")]
-    Proxy,
-
-    #[token("headers")]
-    Headers,
-
-    #[token("header_up")]
-    HeaderUp,
-
-    #[token("log")]
-    Log,
-
-    #[token("compress")]
-    Compress,
-
-    #[token("bind")]
-    Bind,
-
-    #[token("listen")]
-    Listen,
-
-    #[token("transport")]
-    Transport,
-
-    #[token("respond")]
-    Respond,
-
-    #[token("redirect")]
-    Redirect,
-
-    #[token("output")]
-    Output,
-
-    #[token("format")]
-    Format,
-
-    #[token("filter")]
-    Filter,
-
-    #[token("exclude")]
-    Exclude,
-
-    #[token("set")]
-    Set,
-
-    #[token("remove")]
-    Remove,
-
-    #[token("add")]
-    Add,
-
-    #[token("body")]
-    Body,
-
-    #[token("path")]
-    Path,
-
-    #[token("header")]
-    Header,
-
-    #[token("method")]
-    Method,
-
-    #[token("query")]
-    Query,
-
-    #[token("handle")]
-    Handle,
-
-    #[token("host")]
-    Host,
-
-    #[token("remote_ip")]
-    RemoteIp,
-
-    #[token("protocol")]
-    Protocol,
-
-    #[token("plugin")]
-    Plugin,
-
-    #[token("file_server")]
-    FileServer,
-
-    #[token("protocols")]
-    Protocols,
-
-    #[token("debug")]
-    Debug,
-
-    #[token("logging")]
-    Logging,
-
-    #[token("level")]
-    Level,
-
-    #[token("flush_interval")]
-    FlushInterval,
-
-    #[token("read_timeout")]
-    ReadTimeout,
-
-    #[token("write_timeout")]
-    WriteTimeout,
+    // Comments handling: Start with #, go until newline. 
+    // We treat comments as skipped, but ensuring they consume until newline is important.
+    // Actually, distinct newlines are significant, so comments should probably stop BEFORE the newline
+    // so the newline can be emitted as a separte token if needed?
+    // Caddyfile: Newline after comment is a terminator.
+    #[regex(r"#[^\n]*", logos::skip)]
+    Comment,
 
     // ============================================================
-    // Type Keywords / Constants
-    // ============================================================
-    #[token("H1")]
-    H1,
-
-    #[token("H2")]
-    H2,
-
-    #[token("H3")]
-    H3,
-
-    #[token("Http")]
-    Http,
-
-    #[token("Https")]
-    Https,
-
-    #[token("Gzip")]
-    Gzip,
-
-    #[token("Br")]
-    Br,
-
-    #[token("Zstd")]
-    Zstd,
-
-    #[token("Immediate")]
-    Immediate,
-
-    #[token("Json")]
-    Json,
-
-    #[token("Text")]
-    Text,
-
-    #[token("File")]
-    File,
-
-    #[token("Stdout")]
-    Stdout,
-
-    #[token("Stderr")]
-    Stderr,
-
-    #[token("Info")]
-    Info,
-
-    #[token("Warn")]
-    Warn,
-
-    #[token("Error")]
-    Error,
-
-    #[token("Trace")]
-    Trace,
-
-    #[token("true")]
-    True,
-
-    #[token("false")]
-    False,
-
-    #[token("exists")]
-    Exists,
-
-    #[token("not")]
-    Not,
-
-    #[token("contains")]
-    Contains,
-
-    #[token("starts_with")]
-    StartsWith,
-
-    #[token("ends_with")]
-    EndsWith,
-
-    #[token("regex")]
-    Regex,
-
-    // ============================================================
-    // Operators
-    // ============================================================
-    #[token("=>")]
-    Arrow,
-
-    #[token("|>")]
-    Pipe,
-
-    #[token("::")]
-    DoubleColon,
-
-    #[token("|")]
-    Or,
-
-    #[token("!")]
-    Bang,
-
-    #[token("&&")]
-    And,
-
-    #[token("||")]
-    OrOr,
-
-    #[token("==")]
-    Eq,
-
-    #[token("!=")]
-    Ne,
-
-    #[token("=")]
-    Assign,
-
-    #[token("*")]
-    Star,
-
-    #[token("?")]
-    Question,
-
-    // ============================================================
-    // Delimiters
+    // Structural
     // ============================================================
     #[token("{")]
-    BraceOpen,
+    BlockOpen,
 
     #[token("}")]
-    BraceClose,
+    BlockClose,
 
-    #[token("[")]
-    BracketOpen,
-
-    #[token("]")]
-    BracketClose,
-
-    #[token("(")]
-    ParenOpen,
-
-    #[token(")")]
-    ParenClose,
-
-    #[token(";")]
-    Semicolon,
-
-    #[token(":")]
-    Colon,
-
-    #[token(",")]
-    Comma,
-
-    #[token(".")]
-    Dot,
-
-    #[token("_", priority = 5)]
-    Underscore,
+    #[regex(r"\r?\n")]
+    Newline,
 
     // ============================================================
-    // Literals
+    // Values
     // ============================================================
-    
-    /// String literal: "..."
+
+    /// Quoted string literal: "..."
     #[regex(r#""([^"\\]|\\.)*""#, |lex| {
         let s = lex.slice();
         // Remove quotes and unescape
         unescape_string(&s[1..s.len()-1])
     })]
-    String(String),
+    QuotedString(String),
 
-    /// Integer literal
-    #[regex(r"-?[0-9]+", |lex| lex.slice().parse::<i64>().ok())]
-    Integer(i64),
-
-    /// Duration literal: 10s, 5m, 1h, 2d, 100ms
-    #[regex(r"[0-9]+(?:ms|s|m|h|d)", |lex| parse_duration(lex.slice()))]
-    Duration(u64),  // Always stored as milliseconds
-
-    /// Identifier: starts with letter or underscore
-    #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
-    Identifier(String),
-
-    /// Variable: ${...}
-    #[regex(r"\$\{[^}]+\}", |lex| {
+    /// Environment Variable shorthand: {$VAR}
+    /// We capture this as a specific token to allow the parser/adapter to handle expansion specially if needed,
+    /// or we can treat it as a Word. Caddy often mandates `{$VAR}` (with $) for replacment at parse time.
+    #[regex(r"\{\$[a-zA-Z_][a-zA-Z0-9_]*\}", |lex| {
         let s = lex.slice();
-        s[2..s.len()-1].to_string()  // Remove ${ and }
+        s[2..s.len()-1].to_string() // Extract VAR from {$VAR}
     })]
-    Variable(String),
+    EnvVar(String),
 
-    /// URL literal: http://... or https://...
-    #[regex(r"https?://[a-zA-Z0-9.:/_\-@]+", |lex| lex.slice().to_string())]
-    Url(String),
-
-    /// Path pattern: /path/to/something or /api/* (with string quotes)
-    PathPattern(String),
-
-    /// IP address with optional port
-    #[regex(r"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?", |lex| lex.slice().to_string())]
-    IpAddr(String),
+    /// Generic Word (unquoted string, numbers, paths, etc.)
+    /// Matches anything that isn't whitespace, braces, quotes, or comment start.
+    #[regex(r#"[^ \t\r\n\f{}#"]+"#, |lex| lex.slice().to_string())]
+    Word(String),
 }
 
 impl fmt::Display for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Token::Global => write!(f, "global"),
-            Token::Server => write!(f, "server"),
-            Token::Route => write!(f, "route"),
-            Token::Match => write!(f, "match"),
-            Token::Macro => write!(f, "macro"),
-            Token::Use => write!(f, "use"),
-            Token::Proxy => write!(f, "proxy"),
-            Token::Headers => write!(f, "headers"),
-            Token::HeaderUp => write!(f, "header_up"),
-            Token::Log => write!(f, "log"),
-            Token::Compress => write!(f, "compress"),
-            Token::Bind => write!(f, "bind"),
-            Token::Listen => write!(f, "listen"),
-            Token::Transport => write!(f, "transport"),
-            Token::Respond => write!(f, "respond"),
-            Token::Redirect => write!(f, "redirect"),
-            Token::Arrow => write!(f, "=>"),
-            Token::Pipe => write!(f, "|>"),
-            Token::BraceOpen => write!(f, "{{"),
-            Token::BraceClose => write!(f, "}}"),
-            Token::String(s) => write!(f, "\"{}\"", s),
-            Token::Integer(n) => write!(f, "{}", n),
-            Token::Duration(ms) => write!(f, "{}ms", ms),
-            Token::Identifier(s) => write!(f, "{}", s),
-            Token::Variable(s) => write!(f, "${{{}}}", s),
-            Token::Url(s) => write!(f, "{}", s),
-            Token::PathPattern(s) => write!(f, "{}", s),
+            Token::BlockOpen => write!(f, "{{"),
+            Token::BlockClose => write!(f, "}}"),
+            Token::Newline => write!(f, "\\n"),
+            Token::QuotedString(s) => write!(f, "\"{}\"", s),
+            Token::EnvVar(s) => write!(f, "{{${}}}", s),
+            Token::Word(s) => write!(f, "{}", s),
             _ => write!(f, "{:?}", self),
         }
     }
@@ -432,23 +139,6 @@ fn unescape_string(s: &str) -> String {
     result
 }
 
-/// Parse a duration string into milliseconds
-fn parse_duration(s: &str) -> u64 {
-    if s.ends_with("ms") {
-        s[..s.len()-2].parse().unwrap_or(0)
-    } else if s.ends_with("s") {
-        s[..s.len()-1].parse::<u64>().unwrap_or(0) * 1000
-    } else if s.ends_with("m") {
-        s[..s.len()-1].parse::<u64>().unwrap_or(0) * 60 * 1000
-    } else if s.ends_with("h") {
-        s[..s.len()-1].parse::<u64>().unwrap_or(0) * 60 * 60 * 1000
-    } else if s.ends_with("d") {
-        s[..s.len()-1].parse::<u64>().unwrap_or(0) * 24 * 60 * 60 * 1000
-    } else {
-        0
-    }
-}
-
 /// Lexer result type
 pub type LexResult = Result<Vec<Spanned<Token>>, LexError>;
 
@@ -457,9 +147,6 @@ pub type LexResult = Result<Vec<Spanned<Token>>, LexError>;
 pub enum LexError {
     #[error("Unexpected character at position {position}")]
     UnexpectedChar { position: usize },
-    
-    #[error("Unterminated string at position {position}")]
-    UnterminatedString { position: usize },
 }
 
 /// Tokenize a Pingclairfile source string
@@ -469,10 +156,17 @@ pub fn tokenize(source: &str) -> LexResult {
     
     for (result, span) in lexer.spanned() {
         match result {
+            Ok(Token::Whitespace) | Ok(Token::Comment) => {
+                // Should have been skipped by logos attribute, but if we catch them here, just ignore
+                continue;
+            },
             Ok(token) => {
                 tokens.push(Spanned::new(token, span));
             }
             Err(_) => {
+                // Logos returns Error for things it can't match?
+                // Our Word regex is pretty permissive "[^...]+".
+                // So mismatch is unlikely unless invalid utf8 maybe.
                 return Err(LexError::UnexpectedChar { position: span.start });
             }
         }
@@ -486,138 +180,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_keywords() {
-        let tokens = tokenize("global server route match macro use").unwrap();
-        assert_eq!(tokens.len(), 6);
-        assert_eq!(tokens[0].value, Token::Global);
-        assert_eq!(tokens[1].value, Token::Server);
-        assert_eq!(tokens[2].value, Token::Route);
-        assert_eq!(tokens[3].value, Token::Match);
-        assert_eq!(tokens[4].value, Token::Macro);
-        assert_eq!(tokens[5].value, Token::Use);
+    fn test_basic_directive() {
+        let tokens = tokenize("bind 127.0.0.1").unwrap();
+        assert_eq!(tokens[0].value, Token::Word("bind".to_string()));
+        assert_eq!(tokens[1].value, Token::Word("127.0.0.1".to_string()));
     }
 
     #[test]
-    fn test_operators() {
-        let tokens = tokenize("=> |> :: | ! && ||").unwrap();
-        assert_eq!(tokens[0].value, Token::Arrow);
-        assert_eq!(tokens[1].value, Token::Pipe);
-        assert_eq!(tokens[2].value, Token::DoubleColon);
-        assert_eq!(tokens[3].value, Token::Or);
-        assert_eq!(tokens[4].value, Token::Bang);
-        assert_eq!(tokens[5].value, Token::And);
-        assert_eq!(tokens[6].value, Token::OrOr);
+    fn test_block() {
+        let tokens = tokenize("example.com {\n  root *\n}").unwrap();
+        // example.com { \n root * \n }
+        // 0: Word("example.com")
+        // 1: BlockOpen
+        // 2: Newline
+        // 3: Word("root")
+        // 4: Word("*")
+        // 5: Newline
+        // 6: BlockClose
+        
+        let valid_tokens: Vec<Token> = tokens.into_iter().map(|s| s.value).collect();
+        assert_eq!(valid_tokens[0], Token::Word("example.com".to_string()));
+        assert_eq!(valid_tokens[1], Token::BlockOpen);
+        assert_eq!(valid_tokens[2], Token::Newline);
+        assert_eq!(valid_tokens[3], Token::Word("root".to_string()));
+        assert_eq!(valid_tokens[4], Token::Word("*".to_string()));
+        assert_eq!(valid_tokens[5], Token::Newline);
+        assert_eq!(valid_tokens[6], Token::BlockClose);
     }
 
     #[test]
-    fn test_string_literal() {
-        let tokens = tokenize(r#""hello world""#).unwrap();
-        assert_eq!(tokens[0].value, Token::String("hello world".to_string()));
-    }
-
-    #[test]
-    fn test_string_escape() {
-        let tokens = tokenize(r#""hello\nworld""#).unwrap();
-        assert_eq!(tokens[0].value, Token::String("hello\nworld".to_string()));
-    }
-
-    #[test]
-    fn test_duration() {
-        let tokens = tokenize("10s 5m 1h 2d 100ms").unwrap();
-        assert_eq!(tokens[0].value, Token::Duration(10000));      // 10s = 10000ms
-        assert_eq!(tokens[1].value, Token::Duration(300000));     // 5m = 300000ms
-        assert_eq!(tokens[2].value, Token::Duration(3600000));    // 1h
-        assert_eq!(tokens[3].value, Token::Duration(172800000));  // 2d
-        assert_eq!(tokens[4].value, Token::Duration(100));        // 100ms
-    }
-
-    #[test]
-    fn test_variable() {
-        let tokens = tokenize(r#"${req.header["CF-Connecting-IP"]}"#).unwrap();
-        assert_eq!(tokens[0].value, Token::Variable(r#"req.header["CF-Connecting-IP"]"#.to_string()));
-    }
-
-    #[test]
-    fn test_url() {
-        let tokens = tokenize("http://127.0.0.1:3210 https://example.com").unwrap();
-        assert_eq!(tokens[0].value, Token::Url("http://127.0.0.1:3210".to_string()));
-        assert_eq!(tokens[1].value, Token::Url("https://example.com".to_string()));
-    }
-
-    #[test]
-    fn test_path_in_string() {
-        // Paths are now represented as strings in Pingclairfile
-        let tokens = tokenize(r#""/api/*" "/assets/image.png""#).unwrap();
-        assert_eq!(tokens[0].value, Token::String("/api/*".to_string()));
-        assert_eq!(tokens[1].value, Token::String("/assets/image.png".to_string()));
-    }
-
-    #[test]
-    fn test_ip_address() {
-        let tokens = tokenize("127.0.0.1 192.168.1.1:8080").unwrap();
-        assert_eq!(tokens[0].value, Token::IpAddr("127.0.0.1".to_string()));
-        assert_eq!(tokens[1].value, Token::IpAddr("192.168.1.1:8080".to_string()));
-    }
-
-    #[test]
-    fn test_type_keywords() {
-        let tokens = tokenize("H1 H2 H3 Gzip Br Zstd Json Immediate").unwrap();
-        assert_eq!(tokens[0].value, Token::H1);
-        assert_eq!(tokens[1].value, Token::H2);
-        assert_eq!(tokens[2].value, Token::H3);
-        assert_eq!(tokens[3].value, Token::Gzip);
-        assert_eq!(tokens[4].value, Token::Br);
-        assert_eq!(tokens[5].value, Token::Zstd);
-        assert_eq!(tokens[6].value, Token::Json);
-        assert_eq!(tokens[7].value, Token::Immediate);
-    }
-
-    #[test]
-    fn test_source_without_comments() {
-        // Comments were removed from lexer for simplicity
-        // Real parsing should preprocess to remove comments
-        let tokens = tokenize(r#"
-            global { }
-        "#).unwrap();
-        assert_eq!(tokens.len(), 3);
-        assert_eq!(tokens[0].value, Token::Global);
-        assert_eq!(tokens[1].value, Token::BraceOpen);
-        assert_eq!(tokens[2].value, Token::BraceClose);
-    }
-
-    #[test]
-    fn test_macro_syntax() {
-        let tokens = tokenize("macro security_headers!() { }").unwrap();
-        assert_eq!(tokens[0].value, Token::Macro);
-        assert_eq!(tokens[1].value, Token::Identifier("security_headers".to_string()));
-        assert_eq!(tokens[2].value, Token::Bang);
-        assert_eq!(tokens[3].value, Token::ParenOpen);
-        assert_eq!(tokens[4].value, Token::ParenClose);
-    }
-
-    #[test]
-    fn test_match_syntax() {
-        let tokens = tokenize(r#"match path("/api/*") => { }"#).unwrap();
-        assert_eq!(tokens[0].value, Token::Match);
-        assert_eq!(tokens[1].value, Token::Path);
-        assert_eq!(tokens[2].value, Token::ParenOpen);
-        assert_eq!(tokens[3].value, Token::String("/api/*".to_string()));
-        assert_eq!(tokens[4].value, Token::ParenClose);
-        assert_eq!(tokens[5].value, Token::Arrow);
-    }
-
-    #[test]
-    fn test_full_server_block() {
+    fn test_quotes_and_comments() {
         let source = r#"
-            server "example.com" {
-                listen: "http://127.0.0.1:8080";
-                bind: "127.0.0.1";
-                compress: [Gzip, Br];
-            }
+            # This is a comment
+            root "/var/www/html" # Inline comment
         "#;
         let tokens = tokenize(source).unwrap();
-        assert!(tokens.len() > 10);
-        assert_eq!(tokens[0].value, Token::Server);
-        assert_eq!(tokens[1].value, Token::String("example.com".to_string()));
+        // Newline (initial empty line might be skipped if I strictly look at content)
+        // Tokens:
+        // Newline (from line 1 empty?)
+        // Newline (end of comment line)
+        // Word("root")
+        // QuotedString("/var/www/html")
+        // Newline
+        
+        let t: Vec<Token> = tokens.into_iter().filter(|t| !matches!(t.value, Token::Newline)).map(|s| s.value).collect();
+        assert_eq!(t[0], Token::Word("root".to_string()));
+        assert_eq!(t[1], Token::QuotedString("/var/www/html".to_string()));
+    }
+    
+    #[test]
+    fn test_env_var() {
+        let tokens = tokenize("listen {$PORT}").unwrap();
+        assert_eq!(tokens[0].value, Token::Word("listen".to_string()));
+        assert_eq!(tokens[1].value, Token::EnvVar("PORT".to_string()));
     }
 }

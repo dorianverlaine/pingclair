@@ -381,24 +381,41 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
     
     server.bootstrap();
     
-    // Initialize TLS Manager
+    // Initialize TLS Manager with global settings
     let tls_store_path = std::path::Path::new("/var/lib/pingclair/certs");
     if !tls_store_path.exists() {
         let _ = std::fs::create_dir_all(tls_store_path);
     }
-    let tls_manager = std::sync::Arc::new(pingclair_tls::manager::TlsManager::new(Some(AutoHttpsConfig::default()), tls_store_path));
+
+    let mut auto_https_config = pingclair_tls::auto_https::AutoHttpsConfig::default();
+    if let Some(email) = &config.global.email {
+        auto_https_config.email = Some(email.clone());
+    }
+    if config.global.auto_https == pingclair_core::config::AutoHttpsMode::Off {
+        auto_https_config.enabled = false;
+    }
+
+    let tls_manager = std::sync::Arc::new(pingclair_tls::manager::TlsManager::new(Some(auto_https_config), tls_store_path));
 
     // Group servers by listen address
     let port_proxies = std::collections::HashMap::new();
     let port_proxies = std::sync::Arc::new(parking_lot::RwLock::new(port_proxies));
 
     for server_config in config.servers {
-        let addr = server_config.listen.first().cloned().unwrap_or_else(|| "0.0.0.0:80".to_string());
-        let mut proxies_guard = port_proxies.write();
-        let proxy = proxies_guard.entry(addr.clone()).or_insert_with(|| {
-            pingclair_proxy::server::PingclairProxy::with_tls(tls_manager.clone())
-        });
-        proxy.add_server(server_config.clone());
+        tracing::debug!("🚀 Processing ServerConfig: name={:?}, listens={:?}", server_config.name, server_config.listen);
+        let listen_addrs = if server_config.listen.is_empty() {
+            vec!["0.0.0.0:80".to_string()]
+        } else {
+            server_config.listen.clone()
+        };
+
+        for addr in listen_addrs {
+            let mut proxies_guard = port_proxies.write();
+            let proxy = proxies_guard.entry(addr.clone()).or_insert_with(|| {
+                pingclair_proxy::server::PingclairProxy::with_tls(tls_manager.clone())
+            });
+            proxy.add_server(server_config.clone());
+        }
     }
 
     // Create services for each proxy

@@ -1,14 +1,6 @@
-// Basic Pingclairfile example
-// A simple static file server with automatic HTTPS
+# Basic Pingclairfile example
+# A simple static file server
 
-server "localhost" {
-    // Listen on HTTP and HTTPS
-    // tls auto;  // Uncomment for production
-
-    route "/" {
-        file_server "./public" {
-            index ["index.html", "index.htm"];
-            browse false;
-        }
-    }
+localhost {
+    file_server
 }

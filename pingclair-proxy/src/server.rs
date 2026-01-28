@@ -217,7 +217,7 @@ impl PingclairProxy {
         let mut default = self.default.write();
         
         if let Some(domain) = &config.name {
-            if domain == "_" || domain == "*" {
+            if domain == "_" || domain == "*" || domain.starts_with(':') {
                 *default = Some(state.clone());
             } else {
                 hosts.insert(domain.clone(), state.clone());
@@ -235,7 +235,7 @@ impl PingclairProxy {
         for config in servers {
             let state = ProxyState::new(config.clone());
             if let Some(domain) = &config.name {
-                if domain == "_" || domain == "*" {
+                if domain == "_" || domain == "*" || domain.starts_with(':') {
                     new_default = Some(state);
                 } else {
                     new_hosts.insert(domain.clone(), state);

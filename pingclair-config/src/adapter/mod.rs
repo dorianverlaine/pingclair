@@ -1,7 +1,7 @@
 //! Configuration adapters
 
-mod caddyfile;
-mod json;
+pub mod caddyfile;
+pub mod json;
 
-pub use caddyfile::CaddyfileAdapter;
+pub use caddyfile::{adapt, AdapterError};
 pub use json::JsonAdapter;

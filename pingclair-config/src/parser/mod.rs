@@ -3,6 +3,7 @@
 //! This module provides the lexer, AST, and parser for the Pingclairfile DSL.
 
 pub mod ast;
+pub mod caddy_ast;
 pub mod lexer;
 pub mod parser;
 pub mod variables;
@@ -14,14 +15,21 @@ pub use parser::{parse, ParseError, Parser};
 pub use variables::{VariableResolver, ResolvedVariable};
 pub use semantic::{SemanticAnalyzer, SemanticError};
 
-/// Parse and analyze a Pingclairfile
+pub use crate::adapter::caddyfile::{adapt, AdapterError};
+
+/// Parse and analyze a Pingclairfile (Caddyfile syntax)
 pub fn compile(source: &str) -> Result<ast::Ast, CompileError> {
-    // Parse
-    let ast = parse(source)?;
+    // 1. Parse into generic directives (Caddyfile AST)
+    let directives = parse(source)?;
     
-    // Semantic analysis (macro expansion, validation)
+    // 2. Adapt into intermediate Typed AST
+    let typed_ast = adapt(directives)?;
+    
+    // 3. Semantic analysis (validation, etc.)
+    // Note: SemanticAnalyzer might need updates for new AST structure if changed
+    // For now we use the adapted AST which is already somewhat validated
     let mut analyzer = SemanticAnalyzer::new();
-    let analyzed = analyzer.analyze(ast)?;
+    let analyzed = analyzer.analyze(typed_ast)?;
     
     Ok(analyzed)
 }
@@ -31,6 +39,9 @@ pub fn compile(source: &str) -> Result<ast::Ast, CompileError> {
 pub enum CompileError {
     #[error("Parse error: {0}")]
     Parse(#[from] ParseError),
+    
+    #[error("Adapt error: {0}")]
+    Adapt(#[from] AdapterError),
     
     #[error("Semantic error: {0}")]
     Semantic(#[from] SemanticError),

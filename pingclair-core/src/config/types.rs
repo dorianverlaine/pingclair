@@ -20,9 +20,34 @@ pub struct PingclairConfig {
     #[serde(default)]
     pub admin: Option<AdminConfig>,
 
+    /// Global configuration
+    #[serde(default)]
+    pub global: GlobalConfig,
+
     /// Global logging configuration
     #[serde(default)]
     pub logging: LoggingConfig,
+}
+
+/// Global configuration options
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GlobalConfig {
+    /// Global ACME email
+    pub email: Option<String>,
+    
+    /// Global auto-HTTPS setting
+    #[serde(default)]
+    pub auto_https: AutoHttpsMode,
+}
+
+/// Auto-HTTPS modes
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoHttpsMode {
+    #[default]
+    On,
+    Off,
+    DisableRedirects,
 }
 
 /// Server (virtual host) configuration

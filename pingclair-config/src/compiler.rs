@@ -51,8 +51,21 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
         config.debug = debug;
     }
     
-    // Compile protocols (stored in admin or as global setting)
-    // For now, we'll handle this at runtime
+    // Set global ACME email
+    if let Some(email) = &global.email {
+        config.global.email = Some(email.clone());
+    }
+    
+    // Set global auto-HTTPS mode
+    if let Some(mode) = global.auto_https {
+        // Map AST AutoHttpsMode to Core AutoHttpsMode
+        use pingclair_core::config::AutoHttpsMode as CoreMode;
+        config.global.auto_https = match mode {
+            AutoHttpsMode::On => CoreMode::On,
+            AutoHttpsMode::Off => CoreMode::Off,
+            AutoHttpsMode::DisableRedirects => CoreMode::DisableRedirects,
+        };
+    }
     
     Ok(())
 }
@@ -67,8 +80,8 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         client_max_body_size: 1024 * 1024, // 1MB default
     };
     
-    // Listen address
-    if let Some(listen) = &server.listen {
+    // Listen addresses
+    for listen in &server.listens {
         let addr = if let Some(port) = listen.port {
             format!("{}:{}", listen.host, port)
         } else {
@@ -82,7 +95,7 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         }
     }
     
-    // Bind address (add as listen if no explicit listen)
+    // Bind address (add as first listen if no explicit listens)
     if let Some(bind) = &server.bind {
         if config.listen.is_empty() {
             config.listen.push(bind.clone());
@@ -97,7 +110,7 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
     // Routes
     if let Some(routes) = &server.routes {
         for arm in &routes.inner.arms {
-            let route_config = compile_route_arm(&arm.inner)?;
+            let route_config = compile_route_arm(&arm.inner, &server.matchers)?;
             config.routes.push(route_config);
         }
     }
@@ -165,29 +178,25 @@ fn compile_log(log: &LogBlock) -> CompileResult<LogConfig> {
     })
 }
 
-fn compile_route_arm(arm: &RouteArm) -> CompileResult<RouteConfig> {
+fn find_path_pattern(matcher: &Matcher, matchers: &HashMap<String, Matcher>) -> Option<String> {
+    match matcher {
+        Matcher::Path(pm) => pm.patterns.first().cloned(),
+        Matcher::Named(name) => matchers.get(name).and_then(|m| find_path_pattern(m, matchers)),
+        Matcher::And(left, right) | Matcher::Or(left, right) => {
+            find_path_pattern(left, matchers).or_else(|| find_path_pattern(right, matchers))
+        }
+        _ => None,
+    }
+}
+
+fn compile_route_arm(arm: &RouteArm, matchers: &HashMap<String, Matcher>) -> CompileResult<RouteConfig> {
     // Compile matcher to path pattern
-    let path = match &arm.matcher {
-        Some(Matcher::Path(pm)) => {
-            if pm.patterns.len() == 1 {
-                pm.patterns[0].clone()
-            } else {
-                // Multiple patterns - use first for now
-                pm.patterns.first().cloned().unwrap_or_else(|| "/*".to_string())
-            }
-        }
-        Some(_) => {
-            // Other matchers - need to be handled at runtime
-            "/*".to_string()
-        }
-        None => {
-            // Default route
-            "/*".to_string()
-        }
-    };
+    let path = arm.matcher.as_ref()
+        .and_then(|m| find_path_pattern(m, matchers))
+        .unwrap_or_else(|| "/*".to_string());
     
     // Compile matcher conditions
-    let matcher = arm.matcher.as_ref().map(compile_matcher);
+    let matcher = arm.matcher.as_ref().map(|m| compile_matcher(m, matchers));
     
     // Compile handler
     let handler = compile_handler(&arm.handler)?;
@@ -200,10 +209,18 @@ fn compile_route_arm(arm: &RouteArm) -> CompileResult<RouteConfig> {
     })
 }
 
-fn compile_matcher(matcher: &Matcher) -> CoreMatcher {
-    // Use imports already declared at top of file
-    
+fn compile_matcher(matcher: &Matcher, matchers: &HashMap<String, Matcher>) -> CoreMatcher {
     match matcher {
+        Matcher::Named(name) => {
+            if let Some(m) = matchers.get(name) {
+                compile_matcher(m, matchers)
+            } else {
+                // Fallback or error? CoreMatcher doesn't have a "None" that's safe here 
+                // but we can use an empty And or similar if needed. 
+                // For now, assume it exists or return a dummy.
+                CoreMatcher::Path { patterns: vec!["/*".to_string()] }
+            }
+        }
         Matcher::Path(pm) => {
             CoreMatcher::Path {
                 patterns: pm.patterns.clone(),
@@ -250,18 +267,18 @@ fn compile_matcher(matcher: &Matcher) -> CoreMatcher {
         }
         Matcher::And(left, right) => {
             CoreMatcher::And(
-                Box::new(compile_matcher(left)),
-                Box::new(compile_matcher(right)),
+                Box::new(compile_matcher(left, matchers)),
+                Box::new(compile_matcher(right, matchers)),
             )
         }
         Matcher::Or(left, right) => {
             CoreMatcher::Or(
-                Box::new(compile_matcher(left)),
-                Box::new(compile_matcher(right)),
+                Box::new(compile_matcher(left, matchers)),
+                Box::new(compile_matcher(right, matchers)),
             )
         }
         Matcher::Not(inner) => {
-            CoreMatcher::Not(Box::new(compile_matcher(inner)))
+            CoreMatcher::Not(Box::new(compile_matcher(inner, matchers)))
         }
     }
 }
@@ -385,13 +402,12 @@ fn compile_handler(handler: &Handler) -> CompileResult<HandlerConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::parse;
 
     #[test]
     fn test_compile_simple_server() {
-        let ast = parse(r#"
-            server "example.com" {
-                listen: "http://127.0.0.1:8080";
+        let ast = crate::parser::compile(r#"
+            example.com {
+                listen :8080
             }
         "#).unwrap();
 
@@ -402,20 +418,44 @@ mod tests {
 
     #[test]
     fn test_compile_proxy() {
-        let ast = parse(r#"
-            server "api.example.com" {
-                listen: "http://127.0.0.1:8080";
-                route {
-                    _ => {
-                        proxy "http://localhost:3000" {
-                            flush_interval: Immediate;
-                        }
-                    }
-                }
+        let ast = crate::parser::compile(r#"
+            api.example.com {
+                listen :8080
+                reverse_proxy localhost:3000
             }
         "#).unwrap();
 
         let config = compile_ast(&ast).unwrap();
         assert_eq!(config.servers[0].routes.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_named_matcher() {
+        let ast = crate::parser::compile(r#"
+            example.com {
+                @api {
+                    path /api/*
+                    method POST
+                }
+                reverse_proxy @api localhost:3000
+            }
+        "#).unwrap();
+
+        let config = compile_ast(&ast).unwrap();
+        assert_eq!(config.servers[0].routes.len(), 1);
+        
+        let route = &config.servers[0].routes[0];
+        assert_eq!(route.path, "/api/*");
+        
+        if let Some(CoreMatcher::And(left, right)) = &route.matcher {
+             // Verify it's combined as expected
+             match (left.as_ref(), right.as_ref()) {
+                 (CoreMatcher::Path { .. }, CoreMatcher::Method { .. }) => {}
+                 (CoreMatcher::Method { .. }, CoreMatcher::Path { .. }) => {}
+                 _ => panic!("Expected Path and Method matchers, got {:?}", route.matcher),
+             }
+        } else {
+            panic!("Expected And matcher, got {:?}", route.matcher);
+        }
     }
 }

@@ -268,8 +268,8 @@ impl SemanticAnalyzer {
         for server_node in &ast.servers {
             let server = &server_node.inner;
             
-            // Check that server has at least listen or routes
-            if server.listen.is_none() && server.routes.is_none() {
+            // Check that server has at least listens or routes
+            if server.listens.is_empty() && server.routes.is_none() {
                 return Err(SemanticError::InvalidConfig {
                     message: format!("Server '{}' needs at least 'listen' or 'route' block", server.name),
                 });
@@ -304,90 +304,47 @@ impl Default for SemanticAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::parse;
 
     #[test]
     fn test_duplicate_server_detection() {
-        let ast = parse(r#"
-            server "example.com" {
-                listen: "http://127.0.0.1:80";
+        // We use two separate blocks with same name
+        let source = r#"
+            example.com {
+                listen :80
             }
-            server "example.com" {
-                listen: "http://127.0.0.1:8080";
+            example.com {
+                listen :8080
             }
-        "#).unwrap();
-
+        "#;
+        
         let mut analyzer = SemanticAnalyzer::new();
+        // Since compile() now calls analyzer internally, we can either:
+        // 1. Call parse + adapt manually
+        // 2. Call compile and check if it errors with DuplicateServer
+        
+        let directives = crate::parser::parse(source).unwrap();
+        let ast = crate::adapter::caddyfile::adapt(directives).unwrap();
         let result = analyzer.analyze(ast);
         
         assert!(matches!(result, Err(SemanticError::DuplicateServer { .. })));
     }
 
     #[test]
-    fn test_undefined_macro() {
-        let ast = parse(r#"
-            server "example.com" {
-                listen: "http://127.0.0.1:80";
-                use undefined_macro!();
-            }
-        "#).unwrap();
-
-        let mut analyzer = SemanticAnalyzer::new();
-        let result = analyzer.analyze(ast);
-        
-        assert!(matches!(result, Err(SemanticError::UndefinedMacro { .. })));
-    }
-
-    #[test]
-    fn test_macro_expansion() {
-        let ast = parse(r#"
-            macro security!() {
-                headers {
-                    remove: ["Server"];
-                    set: {
-                        "X-Frame-Options": "DENY",
-                    };
-                }
-            }
-
-            server "example.com" {
-                listen: "http://127.0.0.1:80";
-                use security!();
-            }
-        "#).unwrap();
-
-        let mut analyzer = SemanticAnalyzer::new();
-        let result = analyzer.analyze(ast);
-        
-        assert!(result.is_ok());
-        let analyzed = result.unwrap();
-        assert!(!analyzed.servers[0].inner.directives.is_empty());
-    }
-
-    #[test]
     fn test_valid_configuration() {
-        let ast = parse(r#"
+        let source = r#"
             global {
-                protocols: [H1, H2];
+                protocols H1 H2
             }
 
-            server "example.com" {
-                listen: "http://127.0.0.1:80";
+            example.com {
+                listen :80
                 
-                route {
-                    match path("/api/*") => {
-                        proxy "http://localhost:3000"
-                    }
-                    _ => {
-                        respond 404
-                    }
-                }
+                reverse_proxy localhost:3000
+                respond 404
             }
-        "#).unwrap();
+        "#;
 
-        let mut analyzer = SemanticAnalyzer::new();
-        let result = analyzer.analyze(ast);
-        
+        let result = crate::parser::compile(source);
         assert!(result.is_ok());
     }
 }

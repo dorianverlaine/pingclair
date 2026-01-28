@@ -83,95 +83,41 @@ mod tests {
     #[test]
     fn test_full_compile() {
         let source = r#"
-            server "example.com" {
-                listen: "http://127.0.0.1:8080";
+            example.com {
+                listen :8080
                 
-                route {
-                    match path("/api/*") => {
-                        proxy "http://localhost:3000" {
-                            flush_interval: Immediate;
-                        }
-                    }
-                    
-                    _ => {
-                        respond 404 { body: "Not Found"; }
-                    }
-                }
+                reverse_proxy localhost:3000
+                
+                respond 404 "Not Found"
             }
         "#;
 
         let config = compile(source).unwrap();
         assert_eq!(config.servers.len(), 1);
         assert_eq!(config.servers[0].name, Some("example.com".to_string()));
-        assert_eq!(config.servers[0].routes.len(), 2);
-    }
-
-    #[test]
-    fn test_compile_with_macros() {
-        let source = r#"
-            macro security!() {
-                headers {
-                    remove: ["Server"];
-                    set: {
-                        "X-Frame-Options": "DENY",
-                    };
-                }
-            }
-
-            server "example.com" {
-                listen: "http://127.0.0.1:8080";
-                use security!();
-            }
-        "#;
-
-        let config = compile(source).unwrap();
-        assert_eq!(config.servers.len(), 1);
+        // Note: reverse_proxy and respond are grouped into a single default route (Pipeline)
+        assert_eq!(config.servers[0].routes.len(), 1);
     }
 
     #[test]
     fn test_compile_complex() {
         let source = r#"
             global {
-                protocols: [H1, H2];
-                debug: false;
+                protocols H1 H2
+                debug false
             }
 
-            macro cf_headers!() {
-                headers {
-                    set: {
-                        "X-Forwarded-Proto": "https",
-                    };
-                }
-            }
-
-            server "ai.408timeout.com" {
-                listen: "http://127.0.0.1:20615";
-                bind: "127.0.0.1";
-                compress: [Gzip];
+            ai.408timeout.com {
+                listen :20615
+                bind 127.0.0.1
+                compress Gzip
                 
-                log {
-                    output: File("/var/log/pingclair/ai.log");
-                    format: Json;
-                }
-                
-                route {
-                    match path("/_next/static/*" | "/assets/*") => {
-                        headers {
-                            set: { "Cache-Control": "public, max-age=31536000, immutable" };
-                        }
-                    }
-                    
-                    _ => {
-                        proxy "http://127.0.0.1:3210" {
-                            flush_interval: Immediate;
-                        }
-                    }
-                }
+                reverse_proxy http://127.0.0.1:3210
             }
         "#;
 
         let config = compile(source).unwrap();
         assert_eq!(config.servers.len(), 1);
-        assert_eq!(config.servers[0].routes.len(), 2);
+        assert_eq!(config.servers[0].routes.len(), 1);
     }
 }

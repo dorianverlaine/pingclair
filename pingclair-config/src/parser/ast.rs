@@ -41,7 +41,17 @@ pub struct GlobalBlock {
     pub protocols: Vec<Protocol>,
     pub debug: Option<bool>,
     pub logging: Option<LoggingConfig>,
+    pub email: Option<String>,
+    pub auto_https: Option<AutoHttpsMode>,
     pub directives: Vec<Directive>,
+}
+
+/// Auto-HTTPS modes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoHttpsMode {
+    On,
+    Off,
+    DisableRedirects,
 }
 
 /// Protocol types
@@ -96,8 +106,8 @@ pub struct ServerBlock {
     /// Server name / hostname
     pub name: String,
     
-    /// Listen address
-    pub listen: Option<ListenAddr>,
+    /// Listen addresses
+    pub listens: Vec<ListenAddr>,
     
     /// Bind address
     pub bind: Option<String>,
@@ -110,6 +120,9 @@ pub struct ServerBlock {
     
     /// Route definitions
     pub routes: Option<Node<RouteBlock>>,
+
+    /// Named matcher definitions
+    pub matchers: HashMap<String, Matcher>,
     
     /// Other directives (including macro calls)
     pub directives: Vec<Directive>,
@@ -248,6 +261,9 @@ pub enum Matcher {
     
     /// Negated matcher
     Not(Box<Matcher>),
+
+    /// Named matcher reference: @api
+    Named(String),
 }
 
 /// Path matcher
@@ -471,11 +487,12 @@ impl ServerBlock {
     pub fn new(name: String) -> Self {
         Self {
             name,
-            listen: None,
+            listens: Vec::new(),
             bind: None,
             compress: Vec::new(),
             log: None,
             routes: None,
+            matchers: HashMap::new(),
             directives: Vec::new(),
         }
     }
@@ -519,7 +536,7 @@ mod tests {
     fn test_server_block_new() {
         let server = ServerBlock::new("example.com".to_string());
         assert_eq!(server.name, "example.com");
-        assert!(server.listen.is_none());
+        assert!(server.listens.is_empty());
         assert!(server.compress.is_empty());
     }
 }
