@@ -29,7 +29,7 @@ COPY pingclair-tls pingclair-tls
 RUN cargo build --release --workspace
 
 # Runtime Stage
-FROM debian:bookworm-slim
+FROM debian:sid-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \

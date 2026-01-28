@@ -12,6 +12,7 @@ use pingclair_tls::manager::TlsManager;
 use openssl::ssl::NameType;
 use openssl::x509::X509;
 use openssl::pkey::PKey;
+use pingclair_tls::auto_https::AutoHttpsConfig;
 
 #[cfg(target_os = "linux")]
 #[global_allocator]
@@ -385,7 +386,7 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
     if !tls_store_path.exists() {
         let _ = std::fs::create_dir_all(tls_store_path);
     }
-    let tls_manager = std::sync::Arc::new(pingclair_tls::manager::TlsManager::new(None, tls_store_path));
+    let tls_manager = std::sync::Arc::new(pingclair_tls::manager::TlsManager::new(Some(AutoHttpsConfig::default()), tls_store_path));
 
     // Group servers by listen address
     let port_proxies = std::collections::HashMap::new();

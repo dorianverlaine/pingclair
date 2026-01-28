@@ -469,6 +469,32 @@ impl ProxyHttp for PingclairProxy {
     
     /// Request filter (Handle static files and early return)
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> pingora_core::Result<bool> {
+        // Handle ACME Challenges (HTTP-01)
+        let req_header = session.req_header();
+        let path = req_header.uri.path();
+        
+        if path.starts_with("/.well-known/acme-challenge/") {
+            if let Some(manager) = &self.tls_manager {
+                 // Extract token
+                 let token = path.trim_start_matches("/.well-known/acme-challenge/");
+                 
+                 // Lookup token in challenge handler
+                 let handler = manager.challenge_handler();
+                 if let Some(key_auth) = handler.get_token(token).await {
+                     tracing::info!("🔐 Serving ACME challenge for token: {}", token);
+                     
+                     let mut header = pingora_http::ResponseHeader::build(200, Some(2)).unwrap();
+                     header.insert_header("Content-Type", "application/octet-stream").unwrap();
+                     header.insert_header("Content-Length", key_auth.len().to_string()).unwrap();
+                     session.write_response_header(Box::new(header), false).await?;
+                     session.write_response_body(Some(Bytes::from(key_auth)), true).await?;
+                     return Ok(true);
+                 } else {
+                     tracing::warn!("⚠️ ACME challenge token not found: {}", token);
+                 }
+            }
+        }
+
         // Match route in a scope to release borrow of session
         let (path_str, route_idx, handler, remote_ip) = {
             let req_header = session.req_header();
