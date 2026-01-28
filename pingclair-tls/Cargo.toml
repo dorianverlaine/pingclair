@@ -31,15 +31,22 @@ h3-quinn.workspace = true
 
 # Certificate parsing
 rustls-pemfile = "2"
-serde_json = "1"
 
 # HTTP types
 http.workspace = true
 bytes.workspace = true
 
-# 文件系统
-dirs.workspace = true
+# Serialization
+serde_json = "1"
+
+# Async utilities
 futures = "0.3.31"
+
+# File system
+dirs.workspace = true
 parking_lot = "0.12"
+
+# Testing
+tempfile = "3"
 
 

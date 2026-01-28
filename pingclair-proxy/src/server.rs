@@ -49,6 +49,15 @@ impl Default for RequestCtx {
     }
 }
 
+impl Drop for RequestCtx {
+    fn drop(&mut self) {
+        // Ensure active connections are decremented when context is dropped
+        if let Some(upstream) = &self.upstream {
+            upstream.dec_connections();
+        }
+    }
+}
+
 /// Mutable state for hot reloading
 #[derive(Clone)]
 pub struct ProxyState {
@@ -480,7 +489,7 @@ impl ProxyHttp for PingclairProxy {
                  
                  // Lookup token in challenge handler
                  let handler = manager.challenge_handler();
-                 if let Some(key_auth) = handler.get_token(token).await {
+                 if let Some(key_auth) = handler.get_token(token) {
                      tracing::info!("🔐 Serving ACME challenge for token: {}", token);
                      
                      let mut header = pingora_http::ResponseHeader::build(200, Some(2)).unwrap();
@@ -622,23 +631,50 @@ impl ProxyHttp for PingclairProxy {
         let state = ctx.state.as_ref().unwrap();
         if let Some(upstream) = self.select_upstream(state, route_idx, client_ip.as_deref()) {
             ctx.upstream = Some(upstream.clone());
-            
+
             // Track active connections
             upstream.inc_connections();
-            
-            // Get proxy config for headers
+
+            // Get proxy config for headers and timeouts
+            let mut read_timeout_ms = None;
+            let mut write_timeout_ms = None;
+
             if let Some(proxy_config) = self.get_proxy_config(state, route_idx) {
                 ctx.headers_up = proxy_config.headers_up.clone();
                 ctx.headers_down = proxy_config.headers_down.clone();
+                read_timeout_ms = proxy_config.read_timeout;
+                write_timeout_ms = proxy_config.write_timeout;
             }
-            
+
             // Parse and create peer
             if let Some((host, port, tls)) = Self::parse_upstream(&upstream.addr) {
-                let peer = HttpPeer::new(
+                let mut peer = HttpPeer::new(
                     (host.as_str(), port),
                     tls,
                     host.clone(),
                 );
+
+                // Apply timeouts if configured
+                if let Some(read_timeout) = read_timeout_ms {
+                    if read_timeout > 0 {
+                        peer.options.read_timeout = Some(std::time::Duration::from_millis(read_timeout as u64));
+                        tracing::debug!("⏱️ Applied read timeout: {}ms for {}", read_timeout, host);
+                    }
+                }
+
+                if let Some(write_timeout) = write_timeout_ms {
+                    if write_timeout > 0 {
+                        peer.options.write_timeout = Some(std::time::Duration::from_millis(write_timeout as u64));
+                        tracing::debug!("⏱️ Applied write timeout: {}ms for {}", write_timeout, host);
+                    }
+                }
+
+                // Set default connection timeout (10 seconds) if not configured
+                if peer.options.connection_timeout.is_none() {
+                    peer.options.connection_timeout = Some(std::time::Duration::from_secs(10));
+                    tracing::debug!("⏱️ Applied default connection timeout: 10s for {}", host);
+                }
+
                 return Ok(Box::new(peer));
             }
         }
@@ -679,11 +715,6 @@ impl ProxyHttp for PingclairProxy {
     where
         Self::CTX: Send + Sync,
     {
-        // Decrement active connections
-        if let Some(upstream) = &ctx.upstream {
-            upstream.dec_connections();
-        }
-
         // Add configured downstream headers
         for (key, value) in &ctx.headers_down {
             upstream_response.insert_header(key.clone(), value.as_str())?;
@@ -692,9 +723,36 @@ impl ProxyHttp for PingclairProxy {
         // Add server identification headers
         upstream_response.insert_header("Server", "Pingclair")?;
         
-        // Add security headers
-        upstream_response.insert_header("X-Content-Type-Options", "nosniff")?;
-        upstream_response.insert_header("X-Frame-Options", "DENY")?;
+        // Add security headers based on configuration
+        if let Some(state) = &ctx.state {
+            if state.config.security.enabled {
+                // Basic security headers
+                upstream_response.insert_header("X-Content-Type-Options", &state.config.security.x_content_type_options)?;
+                upstream_response.insert_header("X-Frame-Options", &state.config.security.x_frame_options)?;
+                upstream_response.insert_header("X-XSS-Protection", &state.config.security.x_xss_protection)?;
+                upstream_response.insert_header("X-Permitted-Cross-Domain-Policies", &state.config.security.x_permitted_cross_domain)?;
+                upstream_response.insert_header("Referrer-Policy", &state.config.security.referrer_policy)?;
+                upstream_response.insert_header("Permissions-Policy", &state.config.security.permissions_policy)?;
+                
+                // HSTS header if TLS is used and HSTS is configured
+                if state.config.tls.as_ref().map_or(false, |tls| tls.auto || tls.cert.is_some()) {
+                    if let Some(ref hsts_config) = state.config.security.hsts {
+                        let hsts_value = format!(
+                            "max-age={};{}{}",
+                            hsts_config.max_age,
+                            if hsts_config.include_subdomains { " includeSubDomains;" } else { "" },
+                            if hsts_config.preload { " preload" } else { "" }
+                        );
+                        upstream_response.insert_header("Strict-Transport-Security", &hsts_value)?;
+                    }
+                }
+                
+                // CSP header if configured
+                if let Some(ref csp) = state.config.security.csp {
+                    upstream_response.insert_header("Content-Security-Policy", csp)?;
+                }
+            }
+        }
         
         // Log request timing (only in debug or non-benchmark)
         let elapsed = ctx.start_time.elapsed();
@@ -717,11 +775,6 @@ impl ProxyHttp for PingclairProxy {
         ctx: &mut Self::CTX,
         _client_reused: bool,
     ) -> Box<pingora_core::Error> {
-        // Decrement active connections
-        if let Some(upstream) = &ctx.upstream {
-            upstream.dec_connections();
-        }
-
         let elapsed = ctx.start_time.elapsed();
         tracing::error!(
             peer = %peer,

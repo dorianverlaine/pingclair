@@ -75,6 +75,10 @@ pub struct ServerConfig {
     /// Maximum request body size in bytes (default: 1MB)
     #[serde(default = "default_body_limit")]
     pub client_max_body_size: u64,
+
+    /// Security headers configuration
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 fn default_body_limit() -> u64 {
@@ -443,6 +447,103 @@ pub struct LoggingConfig {
     pub file: Option<String>,
 }
 
+/// Security headers configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SecurityConfig {
+    /// Enable basic security headers
+    #[serde(default = "default_security_enabled")]
+    pub enabled: bool,
+
+    /// X-Frame-Options header
+    #[serde(default = "default_x_frame_options")]
+    pub x_frame_options: String,
+
+    /// X-Content-Type-Options header
+    #[serde(default = "default_x_content_type_options")]
+    pub x_content_type_options: String,
+
+    /// X-XSS-Protection header
+    #[serde(default = "default_x_xss_protection")]
+    pub x_xss_protection: String,
+
+    /// X-Permitted-Cross-Domain-Policies header
+    #[serde(default = "default_x_permitted_cross_domain")]
+    pub x_permitted_cross_domain: String,
+
+    /// Referrer-Policy header
+    #[serde(default = "default_referrer_policy")]
+    pub referrer_policy: String,
+
+    /// Permissions-Policy header
+    #[serde(default = "default_permissions_policy")]
+    pub permissions_policy: String,
+
+    /// Strict-Transport-Security header
+    #[serde(default)]
+    pub hsts: Option<HstsConfig>,
+
+    /// Content-Security-Policy header
+    #[serde(default)]
+    pub csp: Option<String>,
+}
+
+/// HSTS (HTTP Strict Transport Security) configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HstsConfig {
+    /// Max age in seconds
+    #[serde(default = "default_hsts_max_age")]
+    pub max_age: u64,
+
+    /// Include subdomains
+    #[serde(default = "default_hsts_include_subdomains")]
+    pub include_subdomains: bool,
+
+    /// Preload directive
+    #[serde(default = "default_hsts_preload")]
+    pub preload: bool,
+}
+
+fn default_security_enabled() -> bool {
+    true
+}
+
+fn default_x_frame_options() -> String {
+    "DENY".to_string()
+}
+
+fn default_x_content_type_options() -> String {
+    "nosniff".to_string()
+}
+
+fn default_x_xss_protection() -> String {
+    "1; mode=block".to_string()
+}
+
+fn default_x_permitted_cross_domain() -> String {
+    "none".to_string()
+}
+
+fn default_referrer_policy() -> String {
+    "strict-origin-when-cross-origin".to_string()
+}
+
+fn default_permissions_policy() -> String {
+    "geolocation=(), microphone=(), camera=()".to_string()
+}
+
+fn default_hsts_max_age() -> u64 {
+    31536000 // 1 year
+}
+
+fn default_hsts_include_subdomains() -> bool {
+    true
+}
+
+fn default_hsts_preload() -> bool {
+    false
+}
+
+
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -512,6 +613,7 @@ mod tests {
             routes: vec![],
             log: None,
             client_max_body_size: 1024 * 1024,
+            security: Default::default(),
         };
         assert_eq!(config.name, Some("example.com".to_string()));
     }

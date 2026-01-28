@@ -5,26 +5,75 @@
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use std::sync::Arc;
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use pingora_core::listeners::tls::TlsSettings;
 use pingora_core::listeners::TlsAccept;
 use pingora_core::protocols::tls::TlsRef;
 use pingclair_tls::manager::TlsManager;
 use openssl::ssl::NameType;
 use openssl::x509::X509;
-use openssl::pkey::PKey;
-use pingclair_tls::auto_https::AutoHttpsConfig;
+use openssl::pkey::{PKey, Private};
+use parking_lot::RwLock;
 
 #[cfg(target_os = "linux")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-/// Resolves certificates dynamically using TlsManager
-struct DynamicCertResolver(Arc<TlsManager>);
+/// Cached OpenSSL certificate with expiration tracking
+struct CachedOpenSslCert {
+    x509: X509,
+    pkey: PKey<Private>,
+    /// Unix timestamp when this cache entry expires
+    expires_at: u64,
+}
+
+/// Cache TTL for OpenSSL certificates (1 hour)
+const OPENSSL_CACHE_TTL_SECS: u64 = 3600;
+
+/// Resolves certificates dynamically using TlsManager with OpenSSL caching
+struct DynamicCertResolver {
+    tls_manager: Arc<TlsManager>,
+    /// Cache for parsed OpenSSL objects to avoid PEM parsing on every TLS handshake
+    openssl_cache: Arc<RwLock<HashMap<String, CachedOpenSslCert>>>,
+}
 
 // Manual Debug because TlsManager might not implement it
 impl std::fmt::Debug for DynamicCertResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DynamicCertResolver").finish()
+        f.debug_struct("DynamicCertResolver")
+            .field("cache_size", &self.openssl_cache.read().len())
+            .finish()
+    }
+}
+
+impl DynamicCertResolver {
+    /// Create a new resolver with caching
+    fn new(tls_manager: Arc<TlsManager>) -> Self {
+        Self {
+            tls_manager,
+            openssl_cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Get current unix timestamp
+    fn current_time() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs()
+    }
+
+    /// Clean expired cache entries
+    fn cleanup_expired(&self) {
+        let current = Self::current_time();
+        let mut cache = self.openssl_cache.write();
+        let before = cache.len();
+        cache.retain(|_, entry| entry.expires_at > current);
+        let removed = before - cache.len();
+        if removed > 0 {
+            tracing::debug!("🧹 Cleaned {} expired OpenSSL cache entries", removed);
+        }
     }
 }
 
@@ -39,12 +88,29 @@ impl TlsAccept for DynamicCertResolver {
 
         tracing::debug!("🔐 Resolving cert for SNI: {}", sni);
 
-        if let Some((cert_pem, key_pem)) = self.0.resolve_pem(&sni).await {
-            // Parse PEM
-            // Note: In real production code, caching parsed X509/PKey might be better than parsing every handshake.
-            // pingclair-tls caches rustls keys, but not openssl ones.
-            // Optimization TODO: Cache OpenSSL objects in TlsManager.
-            
+        // Step 1: Check cache first (fast path)
+        let current_time = Self::current_time();
+        {
+            let cache = self.openssl_cache.read();
+            if let Some(cached) = cache.get(&sni) {
+                if cached.expires_at > current_time {
+                    // Cache hit - use cached OpenSSL objects
+                    tracing::debug!("🚀 Using cached OpenSSL cert for {}", sni);
+                    if let Err(e) = ssl.set_certificate(&cached.x509) {
+                        tracing::error!("Failed to set cached certificate: {}", e);
+                        return;
+                    }
+                    if let Err(e) = ssl.set_private_key(&cached.pkey) {
+                        tracing::error!("Failed to set cached private key: {}", e);
+                        return;
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Step 2: Cache miss or expired - fetch and parse PEM
+        if let Some((cert_pem, key_pem)) = self.tls_manager.resolve_pem(&sni).await {
             let x509 = match X509::from_pem(cert_pem.as_bytes()) {
                 Ok(c) => c,
                 Err(e) => {
@@ -52,7 +118,7 @@ impl TlsAccept for DynamicCertResolver {
                     return;
                 }
             };
-            
+
             let pkey = match PKey::private_key_from_pem(key_pem.as_bytes()) {
                 Ok(k) => k,
                 Err(e) => {
@@ -60,15 +126,27 @@ impl TlsAccept for DynamicCertResolver {
                     return;
                 }
             };
-            
-            // Set into SSL
+
+            // Step 3: Set the certificate and key
             if let Err(e) = ssl.set_certificate(&x509) {
                 tracing::error!("Failed to set certificate: {}", e);
+                return;
             }
             if let Err(e) = ssl.set_private_key(&pkey) {
                 tracing::error!("Failed to set private key: {}", e);
+                return;
             }
 
+            // Step 4: Cache the parsed OpenSSL objects for future handshakes
+            let expires_at = current_time + OPENSSL_CACHE_TTL_SECS;
+            let cached_entry = CachedOpenSslCert {
+                x509,
+                pkey,
+                expires_at,
+            };
+
+            self.openssl_cache.write().insert(sni.clone(), cached_entry);
+            tracing::info!("🔐 Cached OpenSSL cert for {} (expires in {}s)", sni, OPENSSL_CACHE_TTL_SECS);
         }
     }
 }
@@ -168,12 +246,23 @@ fn main() -> anyhow::Result<()> {
         Commands::Run { config: config_path } => {
             tracing::info!("Starting Pingclair with config: {}", config_path);
             
-            // Load configuration
-            let config = match pingclair_config::compile_file(&config_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!("❌ Failed to load config: {}", e);
-                    std::process::exit(1);
+            // Load configuration - support both single file and directory
+            let config = if std::path::Path::new(&config_path).is_dir() {
+                tracing::info!("📁 Loading configuration from directory: {}", config_path);
+                match pingclair_config::compile_directory(&config_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("❌ Failed to load config from directory: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                match pingclair_config::compile_file(&config_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("❌ Failed to load config: {}", e);
+                        std::process::exit(1);
+                    }
                 }
             };
             
@@ -204,6 +293,7 @@ fn main() -> anyhow::Result<()> {
                 tls: None,
                 log: None,
                 client_max_body_size: 10 * 1024 * 1024, // 10MB
+                security: Default::default(),
             };
 
             let handler = HandlerConfig::ReverseProxy(ReverseProxyConfig {
@@ -251,6 +341,7 @@ fn main() -> anyhow::Result<()> {
                 tls: None,
                 log: None,
                 client_max_body_size: 10 * 1024 * 1024,
+                security: Default::default(),
             };
             
             // Resolve absolute path
@@ -272,16 +363,33 @@ fn main() -> anyhow::Result<()> {
                 matcher: None,
             });
 
-            config.servers.push(server);
+            config.servers.push(ServerConfig {
+                name: Some("_".to_string()),
+                listen: vec![listen],
+                routes: Vec::new(),
+                tls: None,
+                log: None,
+                client_max_body_size: 10 * 1024 * 1024, // 10MB
+                security: Default::default(),
+            });
             
             run_server("".to_string(), config);
         }
 
         Commands::Validate { config } => {
             tracing::info!("Validating config: {}", config);
-            match pingclair_config::compile_file(&config) {
+
+            // Support both file and directory validation
+            let result = if std::path::Path::new(&config).is_dir() {
+                tracing::info!("📁 Validating configuration directory: {}", config);
+                pingclair_config::compile_directory(&config)
+            } else {
+                pingclair_config::compile_file(&config)
+            };
+
+            match result {
                 Ok(_) => {
-                    println!("✅ Configuration file '{}' is valid!", config);
+                    println!("✅ Configuration '{}' is valid!", config);
                 },
                 Err(e) => {
                      eprintln!("❌ Configuration Error: {}", e);
@@ -365,6 +473,20 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
         });
     });
 
+    // Enhanced diagnostic logging
+    tracing::info!("🚀 Starting Pingclair v{}", env!("CARGO_PKG_VERSION"));
+    tracing::info!("📄 Loaded configuration from: {}", config_path);
+    tracing::info!("🔧 Configured {} server(s)", config.servers.len());
+
+    if config.global.auto_https != pingclair_core::config::AutoHttpsMode::Off {
+        tracing::info!("🔐 Auto HTTPS: enabled");
+        if let Some(email) = &config.global.email {
+            tracing::info!("📧 ACME email: {}", email);
+        }
+    } else {
+        tracing::info!("🔐 Auto HTTPS: disabled");
+    }
+
     if config.servers.is_empty() {
         tracing::warn!("⚠️ No servers configured!");
         return;
@@ -382,7 +504,10 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
     server.bootstrap();
     
     // Initialize TLS Manager with global settings
-    let tls_store_path = std::path::Path::new("/var/lib/pingclair/certs");
+    // Use environment variable for testing, fallback to default path
+    let tls_store_path_str = std::env::var("PINGCLAIR_TLS_STORE")
+        .unwrap_or_else(|_| "/var/lib/pingclair/certs".to_string());
+    let tls_store_path = std::path::Path::new(&tls_store_path_str);
     if !tls_store_path.exists() {
         let _ = std::fs::create_dir_all(tls_store_path);
     }
@@ -395,27 +520,51 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
         auto_https_config.enabled = false;
     }
 
-    let tls_manager = std::sync::Arc::new(pingclair_tls::manager::TlsManager::new(Some(auto_https_config), tls_store_path));
+    // Create TLS manager with persistent challenge handler
+    let tls_manager = std::sync::Arc::new(
+        tokio::runtime::Runtime::new()
+            .expect("Failed to create runtime for TLS manager initialization")
+            .block_on(async {
+                pingclair_tls::manager::TlsManager::new(Some(auto_https_config), tls_store_path)
+                    .await
+                    .expect("Failed to create TLS manager with persistent challenge handler")
+            })
+    );
 
     // Group servers by listen address
     let port_proxies = std::collections::HashMap::new();
     let port_proxies = std::sync::Arc::new(parking_lot::RwLock::new(port_proxies));
 
-    for server_config in config.servers {
-        tracing::debug!("🚀 Processing ServerConfig: name={:?}, listens={:?}", server_config.name, server_config.listen);
-        let listen_addrs = if server_config.listen.is_empty() {
-            vec!["0.0.0.0:80".to_string()]
-        } else {
-            server_config.listen.clone()
-        };
+    // Track binding information for diagnostic logging
+    let mut binding_info = std::collections::HashMap::new();
+    
+        for server_config in config.servers {
+            tracing::debug!("🚀 Processing ServerConfig: name={:?}, listens={:?}", server_config.name, server_config.listen);
+            
+            let listen_addrs = if server_config.listen.is_empty() {
+                vec!["0.0.0.0:80".to_string()]
+            } else {
+                server_config.listen.clone()
+            };
 
-        for addr in listen_addrs {
-            let mut proxies_guard = port_proxies.write();
-            let proxy = proxies_guard.entry(addr.clone()).or_insert_with(|| {
-                pingclair_proxy::server::PingclairProxy::with_tls(tls_manager.clone())
-            });
-            proxy.add_server(server_config.clone());
+            for addr in listen_addrs {
+                let mut proxies_guard = port_proxies.write();
+                let proxy = proxies_guard.entry(addr.clone()).or_insert_with(|| {
+                    pingclair_proxy::server::PingclairProxy::with_tls(tls_manager.clone())
+                });
+                
+                // Track what sites are bound to what addresses
+                let site_name = server_config.name.clone().unwrap_or_else(|| "default".to_string());
+                binding_info.entry(addr.clone()).or_insert_with(Vec::new).push(site_name);
+                
+                proxy.add_server(server_config.clone());
+            }
         }
+    
+    // Log binding information for diagnostics
+    tracing::info!("🌐 Server binding information:");
+    for (addr, sites) in &binding_info {
+        tracing::info!("   📍 {} -> [{}]", addr, sites.join(", "));
     }
 
     // Create services for each proxy
@@ -423,39 +572,55 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
     {
         let proxies_guard = port_proxies.read();
         for (addr, proxy_logic) in proxies_guard.iter() {
-            tracing::info!("   📡 Listening on {}", addr);
-            
             let proxy_service = pingora::proxy::http_proxy_service(
                 &server.configuration,
                 proxy_logic.clone(),
             );
-            
+
             let mut service = proxy_service;
-            
+
             // Determine if this is an HTTPS port
-            if addr.ends_with(":443") || addr.ends_with(":8443") {
-                 // Setup TLS with dynamic resolver (OpenSSL)
-                 // Use TlsSettings::with_callbacks
-                 let acceptor = DynamicCertResolver(tls_manager.clone());
+            let is_https = addr.ends_with(":443") || addr.ends_with(":8443");
+            let mut tls_enabled = false;
+            let mut http3_enabled = false;
+
+            if is_https {
+                 // Setup TLS with dynamic resolver (OpenSSL) and certificate caching
+                 let acceptor = DynamicCertResolver::new(tls_manager.clone());
                  match TlsSettings::with_callbacks(Box::new(acceptor)) {
                     Ok(tls_settings) => {
                          service.add_tls_with_settings(addr, None, tls_settings);
-                         tracing::info!("   🔒 HTTPS/TLS enabled on {}", addr);
+                         tls_enabled = true;
                     }
                     Err(e) => {
-                        tracing::error!("Failed to create TlsSettings: {}", e);
+                        tracing::error!("❌ Failed to create TlsSettings for {}: {}", addr, e);
                     }
                  }
             } else {
                  service.add_tcp(addr);
             }
+
+            // Enhanced diagnostic logging for each binding
+            tracing::info!(
+                "   🌐 Server listening on {} (TLS: {}, HTTP/3: {})",
+                addr,
+                if tls_enabled { "enabled" } else { "disabled" },
+                if http3_enabled { "enabled" } else { "pending" }
+            );
+
             server.add_service(service);
 
             // Check if this port should also support HTTP/3
-            if addr.ends_with(":443") || addr.ends_with(":8443") {
+            if is_https {
                 https_ports.push(addr.clone());
+                http3_enabled = true;
             }
         }
+    }
+
+    // Start HTTP/3 (QUIC) servers for HTTPS ports
+    if !https_ports.is_empty() {
+        tracing::info!("🚀 Starting HTTP/3 (QUIC) servers for {} port(s)", https_ports.len());
     }
 
     for _addr in https_ports {
@@ -523,29 +688,65 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
             
             tracing::info!("📡 SIGHUP listener active (Config: {})", config_path);
             
-            while stream.recv().await.is_some() {
-                tracing::info!("🔔 Received SIGHUP, reloading configuration...");
-                
-                match pingclair_config::compile_file(&config_path) {
+            while let Some(()) = stream.recv().await {
+                let reload_start = std::time::Instant::now();
+                tracing::info!("🔔 Received SIGHUP, reloading configuration from: {}", config_path);
+
+                // Step 1: Validate and load new configuration
+                tracing::info!("📋 Step 1/3: Validating configuration...");
+                let result = if std::path::Path::new(&config_path).is_dir() {
+                    pingclair_config::compile_directory(&config_path)
+                } else {
+                    pingclair_config::compile_file(&config_path)
+                };
+
+                match result {
                     Ok(new_config) => {
+                        tracing::info!("✅ Step 1/3: Configuration validation successful");
+                        tracing::info!("📋 Step 2/3: Preparing configuration update...");
+
                         let mut new_config_by_port = std::collections::HashMap::new();
                         for s in new_config.servers {
                             let addr = s.listen.first().cloned().unwrap_or_else(|| "0.0.0.0:80".to_string());
                             new_config_by_port.entry(addr).or_insert_with(Vec::new).push(s);
                         }
 
+                        tracing::info!("📋 Step 3/3: Applying configuration to {} port(s)...", new_config_by_port.len());
+
+                        // Use read lock to get existing proxies (safe because we only read)
                         let proxies_guard = port_proxies.read();
+                        let mut success_count = 0;
+                        let mut error_count = 0;
+
                         for (addr, servers) in new_config_by_port {
                             if let Some(proxy) = proxies_guard.get(&addr) {
                                 proxy.update_config(servers);
+                                success_count += 1;
+                                tracing::debug!("   ✓ Updated configuration for {}", addr);
                             } else {
                                 tracing::warn!("⚠️ New listen address {} found in config during reload. Restart required for new ports.", addr);
+                                error_count += 1;
                             }
                         }
-                        println!("✅ Configuration reloaded successfully");
+
+                        let reload_duration = reload_start.elapsed();
+
+                        if error_count == 0 {
+                            tracing::info!("✅ Configuration reload completed successfully in {:?}", reload_duration);
+                            tracing::info!("   📊 {} server(s) updated", success_count);
+                            println!("✅ Configuration reloaded successfully ({} servers updated in {:?})", success_count, reload_duration);
+                        } else {
+                            tracing::warn!("⚠️ Configuration reload completed with warnings in {:?}", reload_duration);
+                            tracing::warn!("   📊 {} server(s) updated, {} warning(s)", success_count, error_count);
+                            println!("⚠️ Configuration partially reloaded ({} servers updated, {} warnings in {:?})", success_count, error_count, reload_duration);
+                        }
                     }
                     Err(e) => {
-                        tracing::error!("❌ Failed to reload config: {}", e);
+                        let reload_duration = reload_start.elapsed();
+                        tracing::error!("❌ Configuration reload failed after {:?}: {}", reload_duration, e);
+                        tracing::error!("   💡 Previous configuration remains active");
+                        eprintln!("❌ Configuration reload failed: {}", e);
+                        eprintln!("   💡 Previous configuration remains active");
                     }
                 }
             }

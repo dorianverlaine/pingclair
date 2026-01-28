@@ -94,6 +94,9 @@ pub trait ChallengeHandler: Send + Sync {
     
     /// 🧹 Cleanup challenge response
     fn cleanup(&self, challenge: &ChallengeResponse) -> Result<(), AcmeError>;
+    
+    /// 🔍 Get token for validation
+    fn get_token(&self, token: &str) -> Option<String>;
 }
 
 /// 💾 HTTP-01 challenge handler that stores tokens in memory
@@ -145,6 +148,14 @@ impl ChallengeHandler for MemoryChallengeHandler {
         });
         
         Ok(())
+    }
+    
+    fn get_token(&self, token: &str) -> Option<String> {
+        // Use a blocking call to get the token synchronously
+        futures::executor::block_on(async {
+            let tokens = self.tokens.read().await;
+            tokens.get(token).cloned()
+        })
     }
 }
 

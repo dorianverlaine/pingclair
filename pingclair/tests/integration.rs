@@ -12,22 +12,28 @@ impl TestServer {
     fn new(config_body: &str) -> Self {
         let mut config_path = std::env::temp_dir();
         config_path.push(format!("pingclair-test-{}.json", uuid::Uuid::new_v4()));
-        
+
         // Write config
         let mut file = std::fs::File::create(&config_path).unwrap();
         file.write_all(config_body.as_bytes()).unwrap();
-        
+
+        // Create temporary TLS store directory for testing
+        let mut tls_store_path = std::env::temp_dir();
+        tls_store_path.push(format!("pingclair-tls-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tls_store_path).unwrap();
+
         // Start server using the compiled binary (avoids cargo lock issues)
         let bin_path = env!("CARGO_BIN_EXE_pingclair");
-        
+
         let process = Command::new(bin_path)
             .arg("run")
             .arg(config_path.to_str().unwrap())
+            .env("PINGCLAIR_TLS_STORE", tls_store_path.to_str().unwrap())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("Failed to start server");
-            
+
         Self {
             process,
             config_path,
