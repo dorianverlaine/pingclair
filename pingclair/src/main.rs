@@ -4,10 +4,73 @@
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use std::sync::Arc;
+use pingora_core::listeners::tls::TlsSettings;
+use pingora_core::listeners::TlsAccept;
+use pingora_core::protocols::tls::TlsRef;
+use pingclair_tls::manager::TlsManager;
+use openssl::ssl::NameType;
+use openssl::x509::X509;
+use openssl::pkey::PKey;
 
 #[cfg(target_os = "linux")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Resolves certificates dynamically using TlsManager
+struct DynamicCertResolver(Arc<TlsManager>);
+
+// Manual Debug because TlsManager might not implement it
+impl std::fmt::Debug for DynamicCertResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynamicCertResolver").finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl TlsAccept for DynamicCertResolver {
+    async fn certificate_callback(&self, ssl: &mut TlsRef) {
+        // Get SNI
+        let sni = ssl.servername(NameType::HOST_NAME).unwrap_or("").to_string();
+        if sni.is_empty() {
+            return;
+        }
+
+        tracing::debug!("🔐 Resolving cert for SNI: {}", sni);
+
+        if let Some((cert_pem, key_pem)) = self.0.resolve_pem(&sni).await {
+            // Parse PEM
+            // Note: In real production code, caching parsed X509/PKey might be better than parsing every handshake.
+            // pingclair-tls caches rustls keys, but not openssl ones.
+            // Optimization TODO: Cache OpenSSL objects in TlsManager.
+            
+            let x509 = match X509::from_pem(cert_pem.as_bytes()) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("Failed to parse cert PEM: {}", e);
+                    return;
+                }
+            };
+            
+            let pkey = match PKey::private_key_from_pem(key_pem.as_bytes()) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::error!("Failed to parse key PEM: {}", e);
+                    return;
+                }
+            };
+            
+            // Set into SSL
+            if let Err(e) = ssl.set_certificate(&x509) {
+                tracing::error!("Failed to set certificate: {}", e);
+            }
+            if let Err(e) = ssl.set_private_key(&pkey) {
+                tracing::error!("Failed to set private key: {}", e);
+            }
+
+        }
+    }
+}
 
 /// Pingclair - Modern web server inspired by Caddy, powered by Pingora
 #[derive(Parser)]
@@ -350,7 +413,24 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
             );
             
             let mut service = proxy_service;
-            service.add_tcp(addr);
+            
+            // Determine if this is an HTTPS port
+            if addr.ends_with(":443") || addr.ends_with(":8443") {
+                 // Setup TLS with dynamic resolver (OpenSSL)
+                 // Use TlsSettings::with_callbacks
+                 let acceptor = DynamicCertResolver(tls_manager.clone());
+                 match TlsSettings::with_callbacks(Box::new(acceptor)) {
+                    Ok(tls_settings) => {
+                         service.add_tls_with_settings(addr, None, tls_settings);
+                         tracing::info!("   🔒 HTTPS/TLS enabled on {}", addr);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to create TlsSettings: {}", e);
+                    }
+                 }
+            } else {
+                 service.add_tcp(addr);
+            }
             server.add_service(service);
 
             // Check if this port should also support HTTP/3

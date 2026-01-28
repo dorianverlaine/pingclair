@@ -21,15 +21,23 @@ pingclair-tls = { path = "../pingclair-tls" }
 pingclair-api = { path = "../pingclair-api" }
 pingclair-plugin = { path = "../pingclair-plugin" }
 
-pingora = { workspace = true, features = ["proxy"] }
+pingora = { workspace = true, features = ["proxy", "openssl"] }
+openssl = { version = "0.10", features = ["v110"] }
+
 pingora-core.workspace = true
 pingora-proxy.workspace = true
+rustls.workspace = true
+
 clap.workspace = true
+async-trait.workspace = true
+
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 parking_lot = "0.12"
+futures = "0.3"
+
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = "0.6"

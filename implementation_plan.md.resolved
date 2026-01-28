@@ -1,0 +1,59 @@
+# Pingclair 项目里程碑与优化计划 🦀
+
+> **愿景**: 打造一个像 Caddy 一样易用，且拥有 Pingora 级性能的现代化 Rust Web 服务器。
+
+---
+
+## ✅ 阶段一：核心构建与性能优化 (P0-P1) - 已完成
+
+### 🚀 性能基座
+- [x] **正则表达式预编译**: 在 `Router` 中预处理各种匹配模式，避免请求时即时解析。
+- [x] **无锁/低锁并发**: 全面从 `std::sync` 迁移到 `parking_lot`。
+- [x] **静态资源优化**: 支持预压缩检测 (`.br`, `.gz`, `.zst`) 与零拷贝大文件流。
+- [x] **内存分配器**: 在 Linux 下启用 `jemalloc` 优化长时堆分配。
+
+### 🛡️ 核心功能集
+- [x] **全功能反向代理**: 负载均衡 (RR, Hash, etc.)、健康检查、TLS 终止。
+- [x] **自动 HTTPS**: 集成 ACME (Let's Encrypt/ZeroSSL) 一键证书管理。
+- [x] **中间件生态**: Rate Limiting (令牌桶)、BasicAuth、Rewrite、Headers 过滤。
+- [x] **HTTP/3 支持**: 基于 QUIC 的高性能传输。
+
+---
+
+## ✅ 阶段二：部署自动化与 UX 飞跃 - 已完成 (当前版本)
+
+### 📦 工业级部署 (`scripts/`)
+- [x] **[install.sh](file:///Users/zhaoyikai/code/pingclair/scripts/install.sh)**: 实现 Ubuntu/Debian 自动化一键部署，脚本含架构自适应、权限加固 (`setcap`) 与 FHS 规范。
+- [x] **[uninstall.sh](file:///Users/zhaoyikai/code/pingclair/scripts/uninstall.sh)**: 安全卸载，干净清理用户与数据。
+- [x] **Systemd 深度集成**: 提供标准化服务单元，支持 CLI 快捷管理。
+
+### 🔄 平滑重载与稳定性
+- [x] **SIGHUP 动态重载**: 实现 `PingclairProxy::update_config`，支持无需停机的配置热加载。
+- [x] **隔离的异步运行时**: 解决 Pingora 与背景任务 (H3/Signals) 的运行时冲突。
+- [x] **CI 构建加固**: 修复 AArch64 交叉编译工具链，清理跨平台警告。
+
+### 🎨 极致用户体验
+- [x] **Premium 默认页**: 现代化 **Futuristic Dark Mode** 落地页，支持 **中英双语** 🌐。
+- [x] **全注释示例配置**: [Pingclairfile.example](file:///Users/zhaoyikai/code/pingclair/examples/Pingclairfile.example) 指南，让新手一眼读懂。
+- [x] **品牌透传**: 响应中全局注入 `Server: Pingclair` 标识。
+
+---
+
+## 🛠️ 阶段三：工业级特性下沉 (P2-P3) - 未来方向
+
+### ⚙️ 极致性能
+- [ ] **io_uring 事件驱动**: 进一步提升 Linux 下的网络吞吐。
+- [ ] **CPU 亲和性**: 软硬结合，减少上下文切换开销。
+
+### 🌐 协议补全
+- [ ] **gRPC 代理**: 支持现代微服务间的通信透传。
+- [ ] **On-Demand TLS**: 实现动态域名实时颁发证书。
+
+### 📊 生态建设
+- [ ] **Visual Dashboard**: 提供 Web UI 实时查看流量、QPS 与上游健康度。
+- [ ] **插件系统**: 完善 WebAssembly 插件接口，让用户编写自定义逻辑。
+
+---
+
+**最后审计**: 2026-01-27 23:15 🚀
+**状态**: 核心里程碑全部达成，进入稳定维护期。✨
