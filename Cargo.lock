@@ -2238,7 +2238,7 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "pingclair"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2270,7 +2270,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-api"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2289,7 +2289,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-config"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "ariadne",
  "criterion",
@@ -2305,7 +2305,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-core"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2329,7 +2329,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-plugin"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "pingclair-core",
@@ -2339,7 +2339,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-proxy"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -2366,7 +2366,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-static"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -2382,7 +2382,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-tls"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "bytes",
