@@ -65,6 +65,7 @@ impl DynamicCertResolver {
     }
 
     /// Clean expired cache entries
+    #[allow(dead_code)]
     fn cleanup_expired(&self) {
         let current = Self::current_time();
         let mut cache = self.openssl_cache.write();
@@ -603,6 +604,10 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
                         tracing::error!("❌ Failed to create TlsSettings for {}: {}", addr, e);
                     }
                  }
+                 
+                 // Enable HTTP/3 for HTTPS ports
+                 https_ports.push(addr.clone());
+                 http3_enabled = true;
             } else {
                  service.add_tcp(addr);
             }
@@ -616,12 +621,6 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
             );
 
             server.add_service(service);
-
-            // Check if this port should also support HTTP/3
-            if is_https {
-                https_ports.push(addr.clone());
-                http3_enabled = true;
-            }
         }
     }
 

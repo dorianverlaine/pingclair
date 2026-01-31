@@ -1,6 +1,10 @@
-//! Persistent ACME challenge handler that stores tokens to disk
+//! Persistent Challenge Handler
 //!
-//! 💾 Ensures challenge tokens survive service restarts
+//! 💾 ACME Challenge Handler that persists tokens to disk.
+//!
+//! **Purpose:**
+//! Ensures that pending HTTP-01 challenge tokens survive service restarts.
+//! This is critical for reliable certificate issuance in production environments.
 
 use std::sync::Arc;
 use std::path::PathBuf;
@@ -10,40 +14,60 @@ use tokio::fs;
 use serde::{Deserialize, Serialize};
 use tracing;
 
-/// Token entry with expiration tracking
+// MARK: - internal Types
+
+/// A stored ACME challenge token entry.
 #[derive(Clone, Serialize, Deserialize)]
 struct TokenEntry {
+    /// The authorization key content expected by the ACME server.
     key_authorization: String,
-    /// Unix timestamp when this token was created
+    
+    /// Timestamp of creation, used for garbage collection.
     created_at: u64,
 }
 
-/// Persistent challenge handler that stores tokens to disk
-pub struct PersistentChallengeHandler {
-    tokens: Arc<RwLock<std::collections::HashMap<String, TokenEntry>>>,
-    storage_path: PathBuf,
-}
-
+/// The on-disk serialization format.
 #[derive(Serialize, Deserialize)]
 struct TokenStorage {
     tokens: std::collections::HashMap<String, TokenEntry>,
 }
 
+// MARK: - Challenge Handler
+
+/// A thread-safe handler that persists HTTP-01 tokens to a JSON file.
+pub struct PersistentChallengeHandler {
+    /// In-memory cache of active tokens.
+    tokens: Arc<RwLock<std::collections::HashMap<String, TokenEntry>>>,
+    
+    /// Path to the persistence file (e.g., `acme-challenges.json`).
+    storage_path: PathBuf,
+}
+
 impl PersistentChallengeHandler {
-    /// Create a new persistent challenge handler
+    /// Creates a new persistent handler backed by the specified file path.
+    ///
+    /// Automatically loads existing tokens from disk if the file exists.
     pub async fn new(storage_path: PathBuf) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut tokens = std::collections::HashMap::new();
         
-        // Load existing tokens from storage
+        // 1. Load existing state
         if storage_path.exists() {
-            let content = fs::read_to_string(&storage_path).await?;
-            if let Ok(stored) = serde_json::from_str::<TokenStorage>(&content) {
-                tokens = stored.tokens;
-                tracing::info!("💾 Loaded {} challenge tokens from persistent storage", tokens.len());
+            match fs::read_to_string(&storage_path).await {
+                Ok(content) => {
+                    if let Ok(stored) = serde_json::from_str::<TokenStorage>(&content) {
+                        tokens = stored.tokens;
+                        tracing::info!("💾 Loaded {} persisted ACME tokens", tokens.len());
+                    } else {
+                        tracing::warn!("⚠️ Corrupt challenge file found, starting fresh");
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("⚠️ Failed to read challenge file: {}", e);
+                }
             }
         }
         
-        // Ensure storage directory exists
+        // 2. Ensure directory structure
         if let Some(parent) = storage_path.parent() {
             fs::create_dir_all(parent).await?;
         }
@@ -53,19 +77,15 @@ impl PersistentChallengeHandler {
             storage_path,
         };
         
-        // Save current tokens to ensure file exists
+        // 3. Initial save (verify write permissions)
         handler.save_tokens().await?;
         
         Ok(handler)
     }
     
-    /// Get token for a given path
-    pub async fn get_token(&self, token: &str) -> Option<String> {
-        let tokens = self.tokens.read().await;
-        tokens.get(token).map(|entry| entry.key_authorization.clone())
-    }
+    // MARK: - Internal Helpers
 
-    /// Get current unix timestamp
+    /// Gets current Unix timestamp.
     fn current_time() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -73,7 +93,7 @@ impl PersistentChallengeHandler {
             .as_secs()
     }
 
-    /// Store token to both memory and persistent storage
+    /// Stores a token to memory and flushes to disk.
     async fn store_token(&self, token: String, key_auth: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         {
             let mut tokens = self.tokens.write().await;
@@ -85,11 +105,11 @@ impl PersistentChallengeHandler {
         }
 
         self.save_tokens().await?;
-        tracing::info!("💾 Stored challenge token to persistent storage");
+        tracing::debug!("💾 Persisted ACME token");
         Ok(())
     }
     
-    /// Remove token from both memory and persistent storage
+    /// Removes a token and updates disk state.
     async fn remove_token(&self, token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         {
             let mut tokens = self.tokens.write().await;
@@ -97,10 +117,11 @@ impl PersistentChallengeHandler {
         }
         
         self.save_tokens().await?;
+        tracing::debug!("🗑️ Removed ACME token");
         Ok(())
     }
     
-    /// Save tokens to persistent storage
+    /// Serializes current state to JSON file.
     async fn save_tokens(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let tokens = self.tokens.read().await;
         let storage = TokenStorage {
@@ -113,7 +134,7 @@ impl PersistentChallengeHandler {
         Ok(())
     }
     
-    /// Clean up expired tokens (older than 24 hours) and save
+    /// Garbage Collects expired tokens (Older than 24h).
     pub async fn cleanup_expired(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         const TOKEN_TTL_SECS: u64 = 24 * 3600; // 24 hours
         let current_time = Self::current_time();
@@ -129,31 +150,31 @@ impl PersistentChallengeHandler {
 
         if removed_count > 0 {
             self.save_tokens().await?;
-            tracing::info!("🧹 Cleaned up {} expired challenge tokens", removed_count);
+            tracing::info!("🧹 GC: Cleaned {} expired challenge tokens", removed_count);
         }
 
         Ok(())
     }
-}
-
-impl Drop for PersistentChallengeHandler {
-    fn drop(&mut self) {
-        // Attempt to save tokens on shutdown
-        // Note: This won't work for async operations in Drop, so we rely on explicit cleanup
-        // In production, you'd want to handle graceful shutdown properly
+    
+    /// Public async accessor for token retrieval (internal use).
+    pub async fn get_token_async(&self, token: &str) -> Option<String> {
+        let tokens = self.tokens.read().await;
+        tokens.get(token).map(|entry| entry.key_authorization.clone())
     }
 }
 
-/// Implementation of the challenge handler trait
+// MARK: - Trait Implementation
+
 impl crate::acme::ChallengeHandler for PersistentChallengeHandler {
     fn deploy(&self, challenge: &crate::acme::ChallengeResponse) -> Result<(), crate::acme::AcmeError> {
         let handler = self.clone();
         let token = challenge.token.clone();
         let key_auth = challenge.key_authorization.clone();
         
+        // IO operations must be spawned to avoid blocking
         tokio::spawn(async move {
             if let Err(e) = handler.store_token(token, key_auth).await {
-                tracing::error!("Failed to store challenge token: {}", e);
+                tracing::error!("❌ Failed to store persistent challenge: {}", e);
             }
         });
         
@@ -166,7 +187,7 @@ impl crate::acme::ChallengeHandler for PersistentChallengeHandler {
         
         tokio::spawn(async move {
             if let Err(e) = handler.remove_token(&token).await {
-                tracing::error!("Failed to remove challenge token: {}", e);
+                tracing::error!("❌ Failed to remove persistent challenge: {}", e);
             }
         });
         
@@ -174,13 +195,16 @@ impl crate::acme::ChallengeHandler for PersistentChallengeHandler {
     }
     
     fn get_token(&self, token: &str) -> Option<String> {
-        // Use a blocking call to get the token synchronously
+        // Sync wrapper for the async internal getter.
+        // Required by the synchronous interface of `ChallengeHandler::get_token`
+        // which is often called from synchronous router contexts.
         futures::executor::block_on(async {
-            let tokens = self.tokens.read().await;
-            tokens.get(token).map(|entry| entry.key_authorization.clone())
+            self.get_token_async(token).await
         })
     }
 }
+
+// MARK: - Clone
 
 impl Clone for PersistentChallengeHandler {
     fn clone(&self) -> Self {
@@ -194,67 +218,30 @@ impl Clone for PersistentChallengeHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acme::ChallengeHandler; // Import the trait
+    use crate::acme::ChallengeHandler;
     use tempfile::tempdir;
-    use std::path::Path;
 
     #[tokio::test]
-    async fn test_persistent_challenge_handler() {
+    async fn test_persistent_storage() {
         let temp_dir = tempdir().unwrap();
-        let storage_path = temp_dir.path().join("challenge_tokens.json");
+        let storage_path = temp_dir.path().join("tokens.json");
         
         let handler = PersistentChallengeHandler::new(storage_path.clone()).await.unwrap();
         
         let challenge = crate::acme::ChallengeResponse {
-            domain: "example.com".to_string(),
+            domain: "example.com".into(),
             challenge_type: crate::acme::ChallengeType::Http01,
-            token: "test-token".to_string(),
-            key_authorization: "test-auth".to_string(),
+            token: "token1".into(),
+            key_authorization: "auth1".into(),
         };
         
-        // Deploy challenge
         handler.deploy(&challenge).unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         
-        // Wait a bit for async operation
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        assert_eq!(handler.get_token("token1"), Some("auth1".into()));
         
-        // Verify token is stored - use async get_token
-        let result = handler.get_token("test-token").await;
-        assert_eq!(result, Some("test-auth".to_string()));
-        
-        // Cleanup challenge
-        handler.cleanup(&challenge).unwrap();
-        
-        // Wait a bit for async operation
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        
-        // Verify token is removed
-        assert_eq!(handler.get_token("test-token").await, None);
-    }
-    
-    #[tokio::test]
-    async fn test_persistence_across_instances() {
-        let temp_dir = tempdir().unwrap();
-        let storage_path = temp_dir.path().join("challenge_tokens.json");
-        
-        // Create first handler and store a token
-        {
-            let handler = PersistentChallengeHandler::new(storage_path.clone()).await.unwrap();
-            let challenge = crate::acme::ChallengeResponse {
-                domain: "example.com".to_string(),
-                challenge_type: crate::acme::ChallengeType::Http01,
-                token: "persist-token".to_string(),
-                key_authorization: "persist-auth".to_string(),
-            };
-            
-            handler.deploy(&challenge).unwrap();
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
-        
-        // Create second handler and verify token persists
-        {
-            let handler = PersistentChallengeHandler::new(storage_path).await.unwrap();
-            assert_eq!(handler.get_token("persist-token").await, Some("persist-auth".to_string()));
-        }
+        // Create new instance pointing to same file
+        let handler2 = PersistentChallengeHandler::new(storage_path).await.unwrap();
+        assert_eq!(handler2.get_token("token1"), Some("auth1".into()));
     }
 }

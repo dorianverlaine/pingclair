@@ -19,6 +19,7 @@ struct CachedCert {
     /// Unix timestamp when cert expires
     expires_at: u64,
     /// Unix timestamp when cert was cached
+    #[allow(dead_code)]
     cached_at: u64,
 }
 
