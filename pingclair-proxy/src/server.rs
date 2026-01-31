@@ -10,7 +10,7 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result as PingoraResult;
 use pingora_proxy::{ProxyHttp, Session};
 use pingora_http::{RequestHeader, ResponseHeader};
-// 
+
 use std::sync::Arc;
 use std::collections::HashMap;
 use parking_lot::RwLock;
@@ -21,35 +21,38 @@ use crate::upstream::{create_upstream, Scheme, HostName};
 use crate::metrics;
 use bytes::Bytes;
 
+// MARK: - Context
+
 /// Context for each request
-pub struct RequestCtx {
+pub struct RequestContext {
     /// Matched server state
     pub state: Option<ProxyState>,
-    /// Matched route
-    pub route: Option<usize>,
+    /// Matched route index
+    pub route_index: Option<usize>,
     /// Selected upstream (kept for connection tracking)
     pub upstream: Option<Upstream>,
     /// Extra headers to add upstream
-    pub headers_up: HashMap<String, String>,
+    pub headers_upstream: HashMap<String, String>,
     /// Extra headers to add downstream
-    pub headers_down: HashMap<String, String>,
+    pub headers_downstream: HashMap<String, String>,
     /// Start time for logging
     pub start_time: std::time::Instant,
 }
 
-impl Default for RequestCtx {
+impl Default for RequestContext {
     fn default() -> Self {
         Self {
             state: None,
-            route: None,
+            route_index: None,
             upstream: None,
-            headers_up: HashMap::new(),
-            headers_down: HashMap::new(),
+            headers_upstream: HashMap::new(),
+            headers_downstream: HashMap::new(),
             start_time: std::time::Instant::now(),
         }
     }
 }
 
+// MARK: - Proxy State
 
 /// Mutable state for hot reloading
 #[derive(Clone)]
@@ -69,11 +72,17 @@ pub struct ProxyState {
 }
 
 impl ProxyState {
+    /// Creates a new `ProxyState` from a server configuration.
+    ///
+    /// Initializes all necessary components (Load Balancers, File Servers, Rate Limiters)
+    /// based on the provided configuration.
+    ///
+    /// - Parameter config: The server configuration to load.
+    /// - Returns: A fully initialized `ProxyState`.
     pub fn new(config: ServerConfig) -> Self {
         let router = Router::new(config.routes.clone());
         
-        // Initialize load balancers for each route
-        // Initialize load balancers for each route
+        // Initialize components for each route
         let mut load_balancers = Vec::new();
         let mut health_checkers = Vec::new();
         let mut file_servers = Vec::new();
@@ -102,12 +111,11 @@ impl ProxyState {
                     };
                     
                     // 3. Create Load Balancer
-                    let mut lb = Arc::new(LoadBalancer::new(upstreams, strategy));
-                    // Deferred push until configured
+                    let mut load_balancer = Arc::new(LoadBalancer::new(upstreams, strategy));
                     
                     // 4. Setup Health Checker if configured
                     if let Some(hc_config) = &proxy_config.health_check {
-                        let hc_conf = crate::health_check::HealthCheckConfig {
+                        let health_check_conf = crate::health_check::HealthCheckConfig {
                              path: hc_config.path.clone(),
                              timeout: std::time::Duration::from_secs(hc_config.timeout),
                              positive_threshold: 1,
@@ -115,21 +123,20 @@ impl ProxyState {
                              expected_status: (200, 299),
                         };
                         
-                        let hc_checker = HealthChecker::new(hc_conf);
+                        let health_checker = HealthChecker::new(health_check_conf);
                         
                         // Attach to LB (needs mutable access to LB wrapper during init)
-                        if let Some(lb_mut) = Arc::get_mut(&mut lb) {
-                            lb_mut.set_health_check(hc_checker);
-                            lb_mut.set_health_check_frequency(std::time::Duration::from_secs(hc_config.interval));
+                        if let Some(load_balancer_mut) = Arc::get_mut(&mut load_balancer) {
+                            load_balancer_mut.set_health_check(health_checker);
+                            load_balancer_mut.set_health_check_frequency(std::time::Duration::from_secs(hc_config.interval));
                         } else {
-                            tracing::warn!("Could not attach health checker to LB");
+                            tracing::warn!("Correlation ID: Init - Could not attach health checker to LB");
                         }
                     } else {
-                        health_checkers.push(None); // Stored inside LB now, keeping vector for index align if needed or removing
+                        health_checkers.push(None); // Stored inside LB now, keeping vector for index align if needed
                     }
 
-                    load_balancers.push(Some(lb));
-                    
+                    load_balancers.push(Some(load_balancer));
                     file_servers.push(None); // No file server for this route
 
                     tracing::info!(
@@ -140,7 +147,7 @@ impl ProxyState {
                 },
                 HandlerConfig::FileServer { root, index, browse, compress } => {
                     // Initialize File Server
-                    let config = pingclair_static::FileServerConfig {
+                    let fs_config = pingclair_static::FileServerConfig {
                         root: std::path::PathBuf::from(root),
                         index: if index.is_empty() { vec!["index.html".to_string()] } else { index.clone() },
                         browse: *browse,
@@ -148,11 +155,11 @@ impl ProxyState {
                         precompressed: true,  // Enable pre-compressed file detection by default
                     };
                     
-                    let fs = Arc::new(pingclair_static::FileServer::new(config));
+                    let file_server = Arc::new(pingclair_static::FileServer::new(fs_config));
                     
                     load_balancers.push(None);
                     health_checkers.push(None);
-                    file_servers.push(Some(fs));
+                    file_servers.push(Some(file_server));
                     
                     tracing::info!("📁 Initialized file server for route {}", route.path);
                 },
@@ -161,7 +168,7 @@ impl ProxyState {
                     health_checkers.push(None);
                     file_servers.push(None);
                 }
-                }
+            }
 
             // Check for rate limit config
             if let Some(rl_config) = find_rate_limit_config(&route.handler) {
@@ -183,6 +190,8 @@ impl ProxyState {
         }
     }
 }
+
+// MARK: - Server Implementation
 
 /// Pingclair reverse proxy
 #[derive(Clone)]
@@ -276,14 +285,16 @@ impl PingclairProxy {
         let protocol = "https"; 
         
         if let Some(route) = state.router.match_request(path, method, &headers.headers, host, remote_ip, protocol) {
-            let idx = route.index;
-            let handler = state.config.routes.get(idx).map(|r| r.handler.clone());
-            Some((state, Some(idx), handler))
+            let index = route.index;
+            let handler = state.config.routes.get(index).map(|r| r.handler.clone());
+            Some((state, Some(index), handler))
         } else {
             // No route matched
             Some((state, None, None))
         }
     }
+
+    // MARK: - Internal Helpers
 
     /// Get the state for a specific host
     fn get_state(&self, host: &str) -> Option<ProxyState> {
@@ -299,9 +310,9 @@ impl PingclairProxy {
     }
     
     /// Select an upstream using the load balancer
-    fn select_upstream(&self, state: &ProxyState, route_idx: usize, remote_addr: Option<&[u8]>) -> Option<Upstream> {
-        if let Some(lb) = state.load_balancers.get(route_idx).and_then(|lb| lb.as_ref()) {
-            lb.select(remote_addr)
+    fn select_upstream(&self, state: &ProxyState, route_index: usize, remote_addr: Option<&[u8]>) -> Option<Upstream> {
+        if let Some(load_balancer) = state.load_balancers.get(route_index).and_then(|lb| lb.as_ref()) {
+            load_balancer.select(remote_addr)
         } else {
             None
         }
@@ -332,8 +343,8 @@ impl PingclairProxy {
     }
     
     /// Get proxy config for a route
-    fn get_proxy_config(&self, state: &ProxyState, route_idx: usize) -> Option<ReverseProxyConfig> {
-        let route = state.config.routes.get(route_idx)?;
+    fn get_proxy_config(&self, state: &ProxyState, route_index: usize) -> Option<ReverseProxyConfig> {
+        let route = state.config.routes.get(route_index)?;
         match &route.handler {
             HandlerConfig::ReverseProxy(config) => Some(config.clone()),
             _ => None,
@@ -342,43 +353,53 @@ impl PingclairProxy {
 
     /// Handle a specific handler configuration
     #[async_recursion]
-    async fn handle_config(&self, session: &mut Session, ctx: &mut RequestCtx, handler: &HandlerConfig, path: &str, route_idx: usize) -> PingoraResult<bool> {
+    async fn handle_config(
+        &self, 
+        session: &mut Session, 
+        ctx: &mut RequestContext, 
+        handler: &HandlerConfig, 
+        path: &str, 
+        route_index: usize
+    ) -> PingoraResult<bool> {
         match handler {
             HandlerConfig::Respond { status, body, headers } => {
-                let mut resp = ResponseHeader::build(*status, Some(3)).unwrap();
+                let mut response = ResponseHeader::build(*status, Some(3)).unwrap();
                 for (k, v) in headers {
-                    let name = http::header::HeaderName::from_bytes(k.as_bytes()).unwrap();
-                    let value = http::header::HeaderValue::from_str(v.as_str()).unwrap();
-                    resp.insert_header(name, value).unwrap();
+                    if let (Ok(name), Ok(value)) = (
+                        http::header::HeaderName::from_bytes(k.as_bytes()),
+                        http::header::HeaderValue::from_str(v.as_str())
+                    ) {
+                        response.insert_header(name, value).unwrap();
+                    }
                 }
                 let body_bytes = body.as_deref().unwrap_or("").as_bytes();
-                resp.insert_header("Content-Length", body_bytes.len().to_string()).unwrap();
-                resp.insert_header("Server", "Pingclair").unwrap();
-                session.write_response_header(Box::new(resp), false).await?;
+                response.insert_header("Content-Length", body_bytes.len().to_string()).unwrap();
+                response.insert_header("Server", "Pingclair").unwrap();
+                session.write_response_header(Box::new(response), false).await?;
                 session.write_response_body(Some(Bytes::copy_from_slice(body_bytes)), true).await?;
                 Ok(true)
             }
             HandlerConfig::Redirect { to, code } => {
-                let mut resp = ResponseHeader::build(*code, Some(3)).unwrap();
-                resp.insert_header("Location", to.as_str()).unwrap();
-                resp.insert_header("Server", "Pingclair").unwrap();
-                session.write_response_header(Box::new(resp), true).await?;
+                let mut response = ResponseHeader::build(*code, Some(3)).unwrap();
+                response.insert_header("Location", to.as_str()).unwrap();
+                response.insert_header("Server", "Pingclair").unwrap();
+                session.write_response_header(Box::new(response), true).await?;
                 Ok(true)
             }
             HandlerConfig::FileServer { .. } => {
-                let maybe_fs = {
+                let maybe_file_server = {
                     ctx.state.as_ref().and_then(|state| {
-                        state.file_servers.get(route_idx).and_then(|f| f.clone())
+                        state.file_servers.get(route_index).and_then(|f| f.clone())
                     })
                 };
 
-                if let Some(fs) = maybe_fs {
+                if let Some(file_server) = maybe_file_server {
                     let range_header = session.req_header().headers.get("Range")
                         .and_then(|v| v.to_str().ok());
                     let accept_encoding = session.req_header().headers.get("Accept-Encoding")
                         .and_then(|v| v.to_str().ok());
                     
-                    if let Ok(Some(file)) = fs.serve(path, range_header, accept_encoding).await {
+                    if let Ok(Some(file)) = file_server.serve(path, range_header, accept_encoding).await {
                         let mut header = ResponseHeader::build(file.status, Some(3)).unwrap();
                         header.insert_header("Content-Type", file.mime_type.as_str()).unwrap();
                         header.insert_header("Content-Length", file.content.len().to_string()).unwrap();
@@ -407,7 +428,7 @@ impl PingclairProxy {
             }
             HandlerConfig::Pipeline(handlers) => {
                 for h in handlers {
-                    if self.handle_config(session, ctx, h, path, route_idx).await? {
+                    if self.handle_config(session, ctx, h, path, route_index).await? {
                         return Ok(true);
                     }
                 }
@@ -415,7 +436,7 @@ impl PingclairProxy {
             }
             HandlerConfig::Handle(handlers) => {
                  for h in handlers {
-                    if self.handle_config(session, ctx, h, path, route_idx).await? {
+                    if self.handle_config(session, ctx, h, path, route_index).await? {
                         return Ok(true);
                     }
                 }
@@ -439,7 +460,7 @@ impl PingclairProxy {
                 };
                 
                 for h in handlers {
-                    if self.handle_config(session, ctx, h, new_path, route_idx).await? {
+                    if self.handle_config(session, ctx, h, new_path, route_index).await? {
                         return Ok(true);
                     }
                 }
@@ -457,7 +478,7 @@ impl PingclairProxy {
             }
             HandlerConfig::Headers { set, add: _, remove: _ } => {
                 for (k, v) in set {
-                    ctx.headers_down.insert(k.clone(), v.clone());
+                    ctx.headers_downstream.insert(k.clone(), v.clone());
                 }
                 Ok(false)
             }
@@ -466,12 +487,14 @@ impl PingclairProxy {
     }
 }
 
+// MARK: - ProxyHttp Trait
+
 #[async_trait]
 impl ProxyHttp for PingclairProxy {
-    type CTX = RequestCtx;
+    type CTX = RequestContext;
     
     fn new_ctx(&self) -> Self::CTX {
-        RequestCtx::default()
+        RequestContext::default()
     }
 
     /* 
@@ -482,8 +505,8 @@ impl ProxyHttp for PingclairProxy {
     /// Request filter (Handle static files and early return)
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> pingora_core::Result<bool> {
         // Handle ACME Challenges (HTTP-01)
-        let req_header = session.req_header();
-        let path = req_header.uri.path();
+        let request_header = session.req_header();
+        let path = request_header.uri.path();
         
         if path.starts_with("/.well-known/acme-challenge/") {
             if let Some(manager) = &self.tls_manager {
@@ -508,13 +531,13 @@ impl ProxyHttp for PingclairProxy {
         }
 
         // Match route in a scope to release borrow of session
-        let (path_str, route_idx, handler, remote_ip) = {
-            let req_header = session.req_header();
-            let path = req_header.uri.path();
-            let method = req_header.method.as_str();
+        let (path_str, route_index, handler, remote_ip) = {
+            let request_header = session.req_header();
+            let path = request_header.uri.path();
+            let method = request_header.method.as_str();
             
             // Extract host and strip port
-            let host_raw = req_header.headers.get("Host")
+            let host_raw = request_header.headers.get("Host")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
             let host = host_raw.split(':').next().unwrap_or("");
@@ -537,10 +560,10 @@ impl ProxyHttp for PingclairProxy {
             // Identify protocol (scheme)
             let protocol = "http"; // TODO: Implement proper TLS detection for Pingora 0.6
                 
-            if let Some(route) = state.router.match_request(path, method, &req_header.headers, host, &remote_ip, protocol) {
-                let idx = route.index;
-                let handler = state.config.routes.get(idx).map(|r| r.handler.clone());
-                (path.to_string(), Some(idx), handler, remote_ip)
+            if let Some(route) = state.router.match_request(path, method, &request_header.headers, host, &remote_ip, protocol) {
+                let index = route.index;
+                let handler = state.config.routes.get(index).map(|r| r.handler.clone());
+                (path.to_string(), Some(index), handler, remote_ip)
             } else {
                 (path.to_string(), None, None, remote_ip)
             }
@@ -550,11 +573,11 @@ impl ProxyHttp for PingclairProxy {
         if let Some(state) = &ctx.state {
              let limit = state.config.client_max_body_size;
              if limit > 0 {
-                 if let Some(cl) = session.req_header().headers.get("content-length")
+                 if let Some(content_length) = session.req_header().headers.get("content-length")
                      .and_then(|v| v.to_str().ok())
                      .and_then(|v| v.parse::<u64>().ok()) 
                  {
-                     if cl > limit {
+                     if content_length > limit {
                          let mut header = pingora_http::ResponseHeader::build(413, Some(4)).unwrap();
                          header.insert_header("Connection", "close").unwrap();
                          header.insert_header("Server", "Pingclair").unwrap();
@@ -565,12 +588,12 @@ impl ProxyHttp for PingclairProxy {
              }
         }
 
-        if let Some(idx) = route_idx {
-            ctx.route = Some(idx);
+        if let Some(index) = route_index {
+            ctx.route_index = Some(index);
 
             // Check rate limit
             if let Some(state) = &ctx.state {
-                 if let Some(limiter) = state.rate_limiters.get(idx).and_then(|l| l.as_ref()) {
+                 if let Some(limiter) = state.rate_limiters.get(index).and_then(|l| l.as_ref()) {
                       let key = if limiter.config.by_ip {
                            Some(remote_ip.as_str())
                       } else {
@@ -594,7 +617,7 @@ impl ProxyHttp for PingclairProxy {
             }
             
             if let Some(h) = handler {
-                if self.handle_config(session, ctx, &h, &path_str, idx).await? {
+                if self.handle_config(session, ctx, &h, &path_str, index).await? {
                     return Ok(true);
                 }
             }
@@ -614,8 +637,8 @@ impl ProxyHttp for PingclairProxy {
     {
          // Route should be matched in request_filter
          
-         let route_idx = if let Some(idx) = ctx.route {
-             idx
+         let route_index = if let Some(index) = ctx.route_index {
+             index
          } else {
              return Err(pingora_core::Error::new(pingora_core::ErrorType::ConnectNoRoute));
          };
@@ -632,16 +655,16 @@ impl ProxyHttp for PingclairProxy {
 
         // Check if this is a proxy handler
         let state = ctx.state.as_ref().unwrap();
-        if let Some(upstream) = self.select_upstream(state, route_idx, client_ip.as_deref()) {
+        if let Some(upstream) = self.select_upstream(state, route_index, client_ip.as_deref()) {
             ctx.upstream = Some(upstream.clone()); // Backend is light to clone
 
             // Get proxy config for headers and timeouts
             let mut read_timeout_ms = None;
             let mut write_timeout_ms = None;
 
-            if let Some(proxy_config) = self.get_proxy_config(state, route_idx) {
-                ctx.headers_up = proxy_config.headers_up.clone();
-                ctx.headers_down = proxy_config.headers_down.clone();
+            if let Some(proxy_config) = self.get_proxy_config(state, route_index) {
+                ctx.headers_upstream = proxy_config.headers_up.clone();
+                ctx.headers_downstream = proxy_config.headers_down.clone();
                 read_timeout_ms = proxy_config.read_timeout;
                 write_timeout_ms = proxy_config.write_timeout;
             }
@@ -701,7 +724,7 @@ impl ProxyHttp for PingclairProxy {
         Self::CTX: Send + Sync,
     {
         // Add configured upstream headers
-        for (key, value) in &ctx.headers_up {
+        for (key, value) in &ctx.headers_upstream {
             upstream_request.insert_header(key.clone(), value.as_str())?;
         }
         
@@ -722,7 +745,7 @@ impl ProxyHttp for PingclairProxy {
         Self::CTX: Send + Sync,
     {
         // Add configured downstream headers
-        for (key, value) in &ctx.headers_down {
+        for (key, value) in &ctx.headers_downstream {
             upstream_response.insert_header(key.clone(), value.as_str())?;
         }
         
@@ -764,7 +787,7 @@ impl ProxyHttp for PingclairProxy {
         let elapsed = ctx.start_time.elapsed();
         tracing::debug!(
             upstream = ?ctx.upstream.as_ref().map(|u| &u.addr),
-            route = ?ctx.route,
+            route = ?ctx.route_index,
             elapsed_ms = elapsed.as_millis(),
             "✅ Request completed"
         );
@@ -798,27 +821,45 @@ impl ProxyHttp for PingclairProxy {
         _e: Option<&pingora_core::Error>,
         ctx: &mut Self::CTX,
     ) {
-        let elapsed = ctx.start_time.elapsed().as_secs_f64();
+        let response_code = session.response_written()
+            .map(|resp| resp.status.as_u16())
+            .unwrap_or(0);
         
-        let status = session.response_written()
-            .map(|r| r.status.as_u16().to_string())
-            .unwrap_or_else(|| "0".to_string());
-            
-        let method = session.req_header().method.as_str().to_string();
-        
-        // Extract host header (preferred over uri host for proxying)
-        let host = session.req_header().headers.get("host")
+        let req_header = session.req_header();
+        let method = req_header.method.as_str();
+        let host = req_header.headers.get("Host")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or_else(|| session.req_header().uri.host().unwrap_or("unknown"))
-            .split(':').next().unwrap_or("unknown")
-            .to_string();
+            .unwrap_or("-");
 
-        metrics::REQUESTS_TOTAL.with_label_values(&[&method, &status, &host]).inc();
-        metrics::REQUEST_DURATION_SECONDS.with_label_values(&[&method, &status, &host]).observe(elapsed);
+        // Update metrics
+        metrics::REQUESTS_TOTAL.with_label_values(&[
+            method, 
+            &response_code.to_string(), 
+            host
+        ]).inc();
+
+        metrics::REQUEST_DURATION_SECONDS.with_label_values(&[
+            method,
+            &response_code.to_string(),
+            host
+        ]).observe(ctx.start_time.elapsed().as_secs_f64());
+        
+        // Using info level for access logs
+        tracing::info!(
+            method = method,
+            path = req_header.uri.path(),
+            status = response_code,
+            host = host,
+            duration_ms = ctx.start_time.elapsed().as_millis(),
+            upstream = ?ctx.upstream.as_ref().map(|u| &u.addr),
+            "📝 Access"
+        );
     }
 }
 
-// Helper for finding rate limit config
+// MARK: - Helper Functions
+
+/// Recursively find a rate limit config in a handler tree
 fn find_rate_limit_config(handler: &HandlerConfig) -> Option<crate::rate_limit::RateLimitConfig> {
     match handler {
         HandlerConfig::RateLimit { requests, window_secs, by_ip, burst } => {
@@ -829,10 +870,10 @@ fn find_rate_limit_config(handler: &HandlerConfig) -> Option<crate::rate_limit::
                 burst: *burst,
             })
         },
-        HandlerConfig::Pipeline(handlers) | HandlerConfig::Handle(handlers) | HandlerConfig::HandlePath { prefix: _, handlers } => {
+        HandlerConfig::Pipeline(handlers) | HandlerConfig::Handle(handlers) | HandlerConfig::HandlePath { handlers, .. } => {
             for h in handlers {
-                if let Some(c) = find_rate_limit_config(h) {
-                     return Some(c);
+                if let Some(config) = find_rate_limit_config(h) {
+                    return Some(config);
                 }
             }
             None

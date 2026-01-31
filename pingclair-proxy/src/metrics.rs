@@ -5,8 +5,12 @@
 use prometheus::{Encoder, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder};
 use std::sync::LazyLock;
 
+// MARK: - Global Registry
+
 /// Global metrics registry
 pub static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
+
+// MARK: - Metrics Definitions
 
 /// Total requests processed
 pub static REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -35,7 +39,12 @@ pub static ACTIVE_CONNECTIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     ).expect("metric can be created")
 });
 
+// MARK: - Initialization
+
 /// Initialize metrics
+///
+/// Registers all defined metrics with the global registry.
+/// Should be called once at application startup.
 pub fn init() {
     // Register metrics
     // We ignore errors in case they are already registered (though typically init is called once)
@@ -44,7 +53,13 @@ pub fn init() {
     let _ = REGISTRY.register(Box::new(ACTIVE_CONNECTIONS.clone()));
 }
 
+// MARK: - Export
+
 /// Gather metrics in Prometheus text format
+///
+/// Use this to expose metrics via an HTTP endpoint.
+///
+/// - Returns: A string containing the Prometheus-formatted metrics.
 pub fn gather() -> String {
     let mut buffer = Vec::new();
     let encoder = TextEncoder::new();

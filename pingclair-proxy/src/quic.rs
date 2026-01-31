@@ -3,7 +3,7 @@
 //! 🚀 Provides HTTP/3 support using quinn and h3 crates.
 
 use pingclair_tls::acme::Certificate;
-use h3::server::Connection as H3Conn;
+use h3::server::Connection as H3Connection;
 use h3_quinn::Connection as QuinnConnection;
 use quinn::{Endpoint, ServerConfig as QuinnServerConfig};
 use rustls::pki_types::CertificateDer;
@@ -16,6 +16,8 @@ use http::{Request, Response};
 
 use crate::server::PingclairProxy;
 use pingclair_core::config::HandlerConfig;
+
+// MARK: - Errors
 
 /// QUIC server errors
 #[derive(Debug, Error)]
@@ -32,6 +34,8 @@ pub enum QuicError {
     #[error("🌐 HTTP/3 error: {0}")]
     H3(String),
 }
+
+// MARK: - Configuration
 
 /// ⚙️ QUIC server configuration
 #[derive(Debug, Clone)]
@@ -56,6 +60,8 @@ impl Default for QuicConfig {
         }
     }
 }
+
+// MARK: - Server
 
 /// 🚀 HTTP/3 QUIC server
 pub struct QuicServer {
@@ -82,6 +88,8 @@ impl QuicServer {
     pub fn set_proxy(&mut self, proxy: Arc<PingclairProxy>) {
         self.proxy = Some(proxy);
     }
+    
+    // MARK: - TLS Management
     
     /// 🔐 Load a certificate
     pub async fn load_certificate(&self, cert: Certificate) -> Result<(), QuicError> {
@@ -135,6 +143,8 @@ impl QuicServer {
         Ok(server_config)
     }
     
+    // MARK: - Lifecycle
+    
     /// 🚀 Start the QUIC server
     pub async fn start(mut self) -> Result<(), QuicError> {
         let cert = {
@@ -163,8 +173,8 @@ impl QuicServer {
                 let proxy_ref = proxy.clone();
                 tokio::spawn(async move {
                     match incoming.await {
-                        Ok(conn) => {
-                             if let Err(e) = Self::handle_connection(conn, proxy_ref).await {
+                        Ok(connection) => {
+                             if let Err(e) = Self::handle_connection(connection, proxy_ref).await {
                                  tracing::error!("❌ QUIC Connection error: {}", e);
                              }
                         }
@@ -179,8 +189,8 @@ impl QuicServer {
         Ok(())
     }
     
-    async fn handle_connection(conn: quinn::Connection, proxy: Option<Arc<PingclairProxy>>) -> Result<(), QuicError> {
-        let h3_conn = h3::server::Connection::new(QuinnConnection::new(conn))
+    async fn handle_connection(connection: quinn::Connection, proxy: Option<Arc<PingclairProxy>>) -> Result<(), QuicError> {
+        let h3_conn = h3::server::Connection::new(QuinnConnection::new(connection))
             .await
             .map_err(|e| QuicError::H3(e.to_string()))?;
         
@@ -188,11 +198,11 @@ impl QuicServer {
     }
     
     async fn handle_h3_connection(
-        mut conn: H3Conn<QuinnConnection, Bytes>,
+        mut connection: H3Connection<QuinnConnection, Bytes>,
         proxy: Option<Arc<PingclairProxy>>,
     ) -> Result<(), QuicError> {
         loop {
-            match conn.accept().await {
+            match connection.accept().await {
                 Ok(Some(resolver)) => {
                     let proxy = proxy.clone();
                     tokio::spawn(async move {
@@ -254,7 +264,7 @@ impl QuicServer {
         let host = host.split(':').next().unwrap_or(host);
             
         // Match route
-        if let Some((_state, _idx, handler_opt)) = proxy.match_route(host, parts.uri.path(), parts.method.as_str(), &header, "0.0.0.0") {
+        if let Some((_state, _index, handler_opt)) = proxy.match_route(host, parts.uri.path(), parts.method.as_str(), &header, "0.0.0.0") {
              if let Some(config) = handler_opt {
                  match config {
                      HandlerConfig::Respond { status, body, headers } => {

@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use pingora_core::listeners::ConnectionFilter;
 use std::net::{IpAddr, SocketAddr};
-// use std::sync::Arc; // Removed unused import
 use ipnet::IpNet;
+
+// MARK: - Connection Filter
 
 /// Connection filter that blocks requests from specific IP addresses/CIDRs
 #[derive(Debug)]
@@ -11,7 +12,10 @@ pub struct PingclairConnectionFilter {
 }
 
 impl PingclairConnectionFilter {
-    /// Create a new connection filter
+    /// Create a new connection filter with a list of blocked IP addresses/CIDRs.
+    ///
+    /// - Parameter blocked_ips: A list of strings representing IP addresses or CIDR blocks to deny.
+    /// - Returns: A configured `PingclairConnectionFilter`.
     pub fn new(blocked_ips: &[String]) -> Self {
         let mut blocked_cidrs = Vec::new();
         
@@ -37,8 +41,16 @@ impl PingclairConnectionFilter {
     }
 }
 
+// MARK: - ConnectionFilter Trait
+
 #[async_trait]
 impl ConnectionFilter for PingclairConnectionFilter {
+    /// Determines if a connection from the given address should be accepted.
+    ///
+    /// checks the source IP against the configured blocklist.
+    ///
+    /// - Parameter addr_opt: The socket address of the client connection.
+    /// - Returns: `true` if the connection is allowed, `false` if blocked.
     async fn should_accept(&self, addr_opt: Option<&SocketAddr>) -> bool {
         if self.blocked_cidrs.is_empty() {
             return true;
@@ -57,6 +69,8 @@ impl ConnectionFilter for PingclairConnectionFilter {
         true
     }
 }
+
+// MARK: - Tests
 
 #[cfg(test)]
 mod tests {

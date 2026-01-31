@@ -4,7 +4,6 @@
 //! This module acts as a bridge between Pingclair's configuration and Pingora's native backend types.
 
 pub use pingora_load_balancing::Backend as Upstream;
-// use pingora_load_balancing::Extensions; // Removed unused import
 use std::net::ToSocketAddrs;
 
 // MARK: - Types
@@ -67,9 +66,9 @@ fn parse_url_components(upstream: &str) -> Option<(std::net::SocketAddr, Scheme,
     };
     
     // Extract host and port
-    let (host, port) = if let Some(colon_inde) = minimal_url.rfind(':') {
-        let host_part = &minimal_url[..colon_inde];
-        let port_part = &minimal_url[colon_inde + 1..];
+    let (host, port) = if let Some(colon_index) = minimal_url.rfind(':') {
+        let host_part = &minimal_url[..colon_index];
+        let port_part = &minimal_url[colon_index + 1..];
         let port_number = port_part.parse::<u16>().ok()?;
         (host_part, port_number)
     } else {
