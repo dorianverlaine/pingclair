@@ -16,7 +16,8 @@ pingclair-tls = { path = "../pingclair-tls" }
 
 pingora-proxy.workspace = true
 pingora-load-balancing.workspace = true
-pingora-core.workspace = true
+pingora-limits.workspace = true
+pingora-core = { workspace = true, features = ["connection_filter"] }
 pingora-http.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
@@ -26,6 +27,7 @@ bytes.workspace = true
 parking_lot = "0.12"
 prometheus.workspace = true
 async-recursion = "1.0"
+ipnet = "2"
 
 # HTTP/3
 quinn.workspace = true

@@ -38,6 +38,10 @@ pub struct GlobalConfig {
     /// Global auto-HTTPS setting
     #[serde(default)]
     pub auto_https: AutoHttpsMode,
+
+    /// Blocked IP addresses (CIDR supported)
+    #[serde(default)]
+    pub blocked_ips: Vec<String>,
 }
 
 /// Auto-HTTPS modes

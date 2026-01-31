@@ -24,7 +24,7 @@ pingclair-plugin = { path = "../pingclair-plugin" }
 pingora = { workspace = true, features = ["proxy", "openssl"] }
 openssl = { version = "0.10", features = ["v110"] }
 
-pingora-core.workspace = true
+pingora-core = { workspace = true, features = ["connection_filter"] }
 pingora-proxy.workspace = true
 rustls.workspace = true
 

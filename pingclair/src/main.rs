@@ -578,6 +578,13 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
             );
 
             let mut service = proxy_service;
+            
+            // Add L4 Connection Filter (Global Blocked IPs)
+            let blocked_ips = &config.global.blocked_ips;
+            if !blocked_ips.is_empty() {
+                 let filter = std::sync::Arc::new(pingclair_proxy::PingclairConnectionFilter::new(blocked_ips));
+                 service.set_connection_filter(filter);
+            }
 
             // Determine if this is an HTTPS port
             let is_https = addr.ends_with(":443") || addr.ends_with(":8443");

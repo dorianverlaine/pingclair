@@ -1,88 +1,84 @@
-//! Upstream server management
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+//! Upstream Server Management
+//!
+//! Provides types and helpers for defining and creating backend servers.
+//! This module acts as a bridge between Pingclair's configuration and Pingora's native backend types.
 
-/// Represents an upstream server
-#[derive(Debug)]
-pub struct Upstream {
-    /// Server address
-    pub addr: String,
-    /// Weight for load balancing
-    pub weight: u32,
-    /// Whether the server is healthy
-    pub healthy: AtomicBool,
-    /// Active connections count
-    pub active_connections: AtomicUsize,
+pub use pingora_load_balancing::Backend as Upstream;
+// use pingora_load_balancing::Extensions; // Removed unused import
+use std::net::ToSocketAddrs;
+
+// MARK: - Types
+
+/// Metadata stored in `Backend` extensions to indicate the protocol scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scheme {
+    /// Plain text HTTP
+    Http,
+    /// Encrypted HTTPS
+    Https,
 }
 
-impl Upstream {
-    /// Create a new upstream
-    pub fn new(addr: impl Into<String>) -> Self {
-        Self {
-            addr: addr.into(),
-            weight: 1,
-            healthy: AtomicBool::new(true),
-            active_connections: AtomicUsize::new(0),
-        }
-    }
+/// A wrapper type for hostname string, stored in `Backend` extensions.
+#[derive(Debug, Clone)]
+pub struct HostName(pub String);
 
-    /// Set the weight
-    pub fn with_weight(mut self, weight: u32) -> Self {
-        self.weight = weight;
-        self
-    }
+// MARK: - Public API
+
+/// Creates a new `Upstream` (Pingora Backend) from a URL string.
+///
+/// Parses a URL-like string (e.g., "https://example.com:443") into a `SocketAddr`
+/// and associated metadata (Scheme, Hostname) required for Pingora's backend.
+///
+/// - Parameter address_string: The URL string to parse. Supports `http://` and `https://` schemes.
+/// - Returns: An `Option<Upstream>` containing the configured backend, or `None` if parsing fails.
+///
+/// **Design Check:**
+/// Uses standard library resolution which is blocking. Acceptable for startup configuration phase.
+pub fn create_upstream(address_string: &str) -> Option<Upstream> {
+    // Guard: Parse URL components
+    let (socket_address, scheme, host) = parse_url_components(address_string)?;
     
-    /// Check if healthy
-    pub fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::Relaxed)
-    }
+    // Create Backend with the resolved IP address
+    let mut backend = Upstream::new(&socket_address.to_string()).ok()?;
     
-    /// Set health status
-    pub fn set_healthy(&self, healthy: bool) {
-        self.healthy.store(healthy, Ordering::Relaxed);
-    }
+    // Enrich with metadata
+    backend.ext.insert(scheme);
+    backend.ext.insert(HostName(host));
     
-    /// Get active connection count
-    pub fn connections(&self) -> usize {
-        self.active_connections.load(Ordering::Relaxed)
-    }
-    
-    /// Increment connection count
-    pub fn inc_connections(&self) {
-        self.active_connections.fetch_add(1, Ordering::Relaxed);
-    }
-    
-    /// Decrement connection count
-    pub fn dec_connections(&self) {
-        self.active_connections.fetch_sub(1, Ordering::Relaxed);
-    }
+    Some(backend)
 }
 
-/// Pool of upstream servers
-pub struct UpstreamPool {
-    upstreams: Vec<Arc<Upstream>>,
+// MARK: - Private Helpers
+
+/// Parses a URL string into its core components.
+///
+/// - Parameter upstream: The upstream string to parse.
+/// - Returns: A tuple of `(SocketAddr, Scheme, HostString)` or `None`.
+fn parse_url_components(upstream: &str) -> Option<(std::net::SocketAddr, Scheme, String)> {
+    let trimmed_upstream = upstream.trim();
+    
+    // Determine scheme and strip prefix
+    let (scheme, minimal_url) = if trimmed_upstream.starts_with("https://") {
+        (Scheme::Https, &trimmed_upstream[8..])
+    } else if trimmed_upstream.starts_with("http://") {
+        (Scheme::Http, &trimmed_upstream[7..])
+    } else {
+        (Scheme::Http, trimmed_upstream)
+    };
+    
+    // Extract host and port
+    let (host, port) = if let Some(colon_inde) = minimal_url.rfind(':') {
+        let host_part = &minimal_url[..colon_inde];
+        let port_part = &minimal_url[colon_inde + 1..];
+        let port_number = port_part.parse::<u16>().ok()?;
+        (host_part, port_number)
+    } else {
+        let default_port = if scheme == Scheme::Https { 443 } else { 80 };
+        (minimal_url, default_port)
+    };
+    
+    // Resolve address (Blocking)
+    let socket_address = format!("{}:{}", host, port).to_socket_addrs().ok()?.next()?;
+    
+    Some((socket_address, scheme, host.to_string()))
 }
-
-impl UpstreamPool {
-    /// Create a new upstream pool
-    pub fn new(upstreams: Vec<Upstream>) -> Self {
-        Self {
-            upstreams: upstreams.into_iter().map(Arc::new).collect(),
-        }
-    }
-
-    /// Get all healthy upstreams
-    pub fn healthy(&self) -> Vec<Arc<Upstream>> {
-        self.upstreams
-            .iter()
-            .filter(|u| u.is_healthy())
-            .cloned()
-            .collect()
-    }
-
-    /// Get all upstreams
-    pub fn all(&self) -> &[Arc<Upstream>] {
-        &self.upstreams
-    }
-}
-

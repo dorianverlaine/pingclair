@@ -16,7 +16,8 @@ use std::collections::HashMap;
 use parking_lot::RwLock;
 use async_recursion::async_recursion;
 
-use crate::{LoadBalancer, Strategy, Upstream, UpstreamPool, HealthChecker};
+use crate::{LoadBalancer, Strategy, Upstream, HealthChecker};
+use crate::upstream::{create_upstream, Scheme, HostName};
 use crate::metrics;
 use bytes::Bytes;
 
@@ -27,7 +28,7 @@ pub struct RequestCtx {
     /// Matched route
     pub route: Option<usize>,
     /// Selected upstream (kept for connection tracking)
-    pub upstream: Option<std::sync::Arc<Upstream>>,
+    pub upstream: Option<Upstream>,
     /// Extra headers to add upstream
     pub headers_up: HashMap<String, String>,
     /// Extra headers to add downstream
@@ -49,14 +50,6 @@ impl Default for RequestCtx {
     }
 }
 
-impl Drop for RequestCtx {
-    fn drop(&mut self) {
-        // Ensure active connections are decremented when context is dropped
-        if let Some(upstream) = &self.upstream {
-            upstream.dec_connections();
-        }
-    }
-}
 
 /// Mutable state for hot reloading
 #[derive(Clone)]
@@ -89,43 +82,53 @@ impl ProxyState {
         for route in &config.routes {
             match &route.handler {
                 HandlerConfig::ReverseProxy(proxy_config) => {
-                    // 1. Create Upstream Pool
+                    // 1. Create Upstreams (Backends)
                     let upstreams: Vec<Upstream> = proxy_config.upstreams.iter()
-                        .map(|addr| Upstream::new(addr.clone()))
+                        .filter_map(|addr| create_upstream(addr))
                         .collect();
                     
-                    let pool = Arc::new(UpstreamPool::new(upstreams));
-                    
+                    if upstreams.is_empty() {
+                        tracing::warn!("⚠️ No valid upstreams found for route {}", route.path);
+                    }
+
                     // 2. Create Strategy
                     let strategy = match proxy_config.load_balance.strategy.as_str() {
                         "random" => Strategy::Random,
-                        "least_conn" => Strategy::LeastConn,
-                        "ip_hash" => Strategy::IpHash,
-                        "first" => Strategy::First,
+                        "least_conn" => Strategy::Random, // LeastConn not yet supported in native wrapper
+                         // TODO: implement least conn
+                        "ip_hash" => Strategy::RoundRobin, // IpHash not yet supported
+                        "first" => Strategy::RoundRobin, 
                         _ => Strategy::RoundRobin,
                     };
                     
                     // 3. Create Load Balancer
-                    let lb = Arc::new(LoadBalancer::new(pool.clone(), strategy));
-                    load_balancers.push(Some(lb));
+                    let mut lb = Arc::new(LoadBalancer::new(upstreams, strategy));
+                    // Deferred push until configured
                     
                     // 4. Setup Health Checker if configured
                     if let Some(hc_config) = &proxy_config.health_check {
                         let hc_conf = crate::health_check::HealthCheckConfig {
                              path: hc_config.path.clone(),
-                             interval: std::time::Duration::from_secs(hc_config.interval),
                              timeout: std::time::Duration::from_secs(hc_config.timeout),
-                             threshold: hc_config.threshold,
+                             positive_threshold: 1,
+                             negative_threshold: hc_config.threshold as usize,
                              expected_status: (200, 299),
-                             http_check: true,
                         };
                         
-                        let hc = Arc::new(HealthChecker::new(hc_conf));
-                        hc.start(pool);
-                        health_checkers.push(Some(hc));
+                        let hc_checker = HealthChecker::new(hc_conf);
+                        
+                        // Attach to LB (needs mutable access to LB wrapper during init)
+                        if let Some(lb_mut) = Arc::get_mut(&mut lb) {
+                            lb_mut.set_health_check(hc_checker);
+                            lb_mut.set_health_check_frequency(std::time::Duration::from_secs(hc_config.interval));
+                        } else {
+                            tracing::warn!("Could not attach health checker to LB");
+                        }
                     } else {
-                        health_checkers.push(None);
+                        health_checkers.push(None); // Stored inside LB now, keeping vector for index align if needed or removing
                     }
+
+                    load_balancers.push(Some(lb));
                     
                     file_servers.push(None); // No file server for this route
 
@@ -296,7 +299,7 @@ impl PingclairProxy {
     }
     
     /// Select an upstream using the load balancer
-    fn select_upstream(&self, state: &ProxyState, route_idx: usize, remote_addr: Option<&[u8]>) -> Option<Arc<Upstream>> {
+    fn select_upstream(&self, state: &ProxyState, route_idx: usize, remote_addr: Option<&[u8]>) -> Option<Upstream> {
         if let Some(lb) = state.load_balancers.get(route_idx).and_then(|lb| lb.as_ref()) {
             lb.select(remote_addr)
         } else {
@@ -527,7 +530,7 @@ impl ProxyHttp for PingclairProxy {
             let remote_ip = session.client_addr()
                 .map(|addr| match addr {
                     pingora_core::protocols::l4::socket::SocketAddr::Inet(inet) => inet.ip().to_string(),
-                    pingora_core::protocols::l4::socket::SocketAddr::Unix(_) => "127.0.0.1".to_string(), 
+                    pingora_core::protocols::l4::socket::SocketAddr::Unix(_) => "127.0.0.1".to_string(),
                 })
                 .unwrap_or_else(|| "0.0.0.0".to_string());
                 
@@ -630,10 +633,7 @@ impl ProxyHttp for PingclairProxy {
         // Check if this is a proxy handler
         let state = ctx.state.as_ref().unwrap();
         if let Some(upstream) = self.select_upstream(state, route_idx, client_ip.as_deref()) {
-            ctx.upstream = Some(upstream.clone());
-
-            // Track active connections
-            upstream.inc_connections();
+            ctx.upstream = Some(upstream.clone()); // Backend is light to clone
 
             // Get proxy config for headers and timeouts
             let mut read_timeout_ms = None;
@@ -647,12 +647,19 @@ impl ProxyHttp for PingclairProxy {
             }
 
             // Parse and create peer
-            if let Some((host, port, tls)) = Self::parse_upstream(&upstream.addr) {
-                let mut peer = HttpPeer::new(
-                    (host.as_str(), port),
-                    tls,
-                    host.clone(),
-                );
+            let addr = upstream.addr.clone();
+            let scheme = upstream.ext.get::<Scheme>().unwrap_or(&Scheme::Http);
+            let host = upstream.ext.get::<HostName>().map(|h| h.0.clone()).unwrap_or_else(|| match &addr {
+                 pingora_core::protocols::l4::socket::SocketAddr::Inet(inet) => inet.ip().to_string(),
+                 pingora_core::protocols::l4::socket::SocketAddr::Unix(u) => u.as_pathname().map(|p| p.to_string_lossy().to_string()).unwrap_or("unix_socket".to_string()),
+            });
+            let tls = *scheme == Scheme::Https;
+
+            let mut peer = HttpPeer::new(
+                addr,
+                tls,
+                host.clone(),
+            );
 
                 // Apply timeouts if configured
                 if let Some(read_timeout) = read_timeout_ms {
@@ -676,7 +683,6 @@ impl ProxyHttp for PingclairProxy {
                 }
 
                 return Ok(Box::new(peer));
-            }
         }
         
         // No upstream found
