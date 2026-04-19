@@ -303,6 +303,38 @@ pub enum HandlerConfig {
         handlers: Vec<HandlerConfig>,
     },
 
+    /// CORS (Cross-Origin Resource Sharing) handler
+    /// Automatically handles preflight OPTIONS requests and adds CORS headers
+    Cors {
+        /// Allowed origins (e.g., ["https://example.com", "*"])
+        #[serde(default)]
+        allowed_origins: Vec<String>,
+        /// Allowed methods (e.g., ["GET", "POST"])
+        #[serde(default = "default_cors_methods")]
+        allowed_methods: Vec<String>,
+        /// Allowed headers
+        #[serde(default = "default_cors_headers")]
+        allowed_headers: Vec<String>,
+        /// Exposed headers
+        #[serde(default)]
+        exposed_headers: Vec<String>,
+        /// Allow credentials
+        #[serde(default)]
+        allow_credentials: bool,
+        /// Max age in seconds for preflight cache
+        #[serde(default = "default_cors_max_age")]
+        max_age: u64,
+    },
+
+    /// Try files — attempt to serve from a list of paths, fall through if none match
+    /// Similar to Nginx's try_files directive
+    TryFiles {
+        /// List of file paths to try (supports {path} and {uri} variables)
+        files: Vec<String>,
+        /// Fallback handler if no file is found
+        fallback: Option<Box<HandlerConfig>>,
+    },
+
     /// Plugin invocation
     Plugin { name: String, args: Vec<String> },
 }
@@ -313,6 +345,18 @@ fn default_bool_true() -> bool {
 
 fn default_redirect_code() -> u16 {
     302
+}
+
+fn default_cors_methods() -> Vec<String> {
+    vec!["GET".into(), "POST".into(), "PUT".into(), "DELETE".into(), "OPTIONS".into()]
+}
+
+fn default_cors_headers() -> Vec<String> {
+    vec!["Content-Type".into(), "Authorization".into(), "X-Requested-With".into()]
+}
+
+fn default_cors_max_age() -> u64 {
+    86400 // 24 hours
 }
 
 fn default_status_code() -> u16 {

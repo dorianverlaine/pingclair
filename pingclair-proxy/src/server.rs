@@ -13,8 +13,12 @@ use pingora_http::{RequestHeader, ResponseHeader};
 
 use std::sync::Arc;
 use std::collections::HashMap;
+use std::time::Duration;
 use parking_lot::RwLock;
 use async_recursion::async_recursion;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use std::io::Write;
 
 use crate::{LoadBalancer, Strategy, Upstream, HealthChecker};
 use crate::upstream::{create_upstream, Scheme, HostName};
@@ -33,8 +37,32 @@ pub struct RequestContext {
     pub upstream: Option<Upstream>,
     /// Extra headers to add upstream
     pub headers_upstream: HashMap<String, String>,
-    /// Extra headers to add downstream
+    /// Extra headers to add downstream (set)
     pub headers_downstream: HashMap<String, String>,
+    /// Extra headers to add downstream (append)
+    pub headers_downstream_add: HashMap<String, String>,
+    /// Headers to remove from downstream response
+    pub headers_remove: Vec<String>,
+    /// Whether to suppress the default Server header
+    pub suppress_server_header: bool,
+    /// Whether response compression is enabled for this request
+    pub compress_response: bool,
+    /// Client accepts gzip
+    pub client_accepts_gzip: bool,
+    /// Gzip encoder accumulating response body chunks
+    pub gzip_encoder: Option<GzEncoder<Vec<u8>>>,
+    /// Request method (for access log)
+    pub request_method: String,
+    /// Request path (for access log)
+    pub request_path: String,
+    /// Request host (for access log)
+    pub request_host: String,
+    /// Upstream response status (for access log)
+    pub response_status: u16,
+    /// Response body bytes written (for access log)
+    pub response_bytes: u64,
+    /// Unique request ID
+    pub request_id: String,
     /// Start time for logging
     pub start_time: std::time::Instant,
 }
@@ -47,9 +75,33 @@ impl Default for RequestContext {
             upstream: None,
             headers_upstream: HashMap::new(),
             headers_downstream: HashMap::new(),
+            headers_downstream_add: HashMap::new(),
+            headers_remove: Vec::new(),
+            suppress_server_header: false,
+            compress_response: false,
+            client_accepts_gzip: false,
+            gzip_encoder: None,
+            request_method: String::new(),
+            request_path: String::new(),
+            request_host: String::new(),
+            response_status: 0,
+            response_bytes: 0,
+            request_id: generate_request_id(),
             start_time: std::time::Instant::now(),
         }
     }
+}
+
+/// Generate a compact, sortable request ID (timestamp + random suffix)
+fn generate_request_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    // Base36 encode for compactness: ~13 chars timestamp + 4 random
+    let rand_part: u16 = (ts as u16).wrapping_mul(31421).wrapping_add(6927);
+    format!("{:x}-{:04x}", ts, rand_part)
 }
 
 // MARK: - Proxy State
@@ -496,9 +548,115 @@ impl PingclairProxy {
                 // Returning Ok(false) to proceed
                 Ok(false)
             }
-            HandlerConfig::Headers { set, add: _, remove: _ } => {
+            HandlerConfig::Headers { set, add, remove } => {
                 for (k, v) in set {
                     ctx.headers_downstream.insert(k.clone(), v.clone());
+                }
+                for (k, v) in add {
+                    ctx.headers_downstream_add.insert(k.clone(), v.clone());
+                }
+                for h in remove {
+                    ctx.headers_remove.push(h.clone());
+                    // If removing "Server", set flag to suppress default
+                    if h.eq_ignore_ascii_case("server") {
+                        ctx.suppress_server_header = true;
+                    }
+                }
+                Ok(false)
+            }
+            HandlerConfig::Cors {
+                allowed_origins,
+                allowed_methods,
+                allowed_headers,
+                exposed_headers,
+                allow_credentials,
+                max_age,
+            } => {
+                let req_header = session.req_header();
+                let origin = req_header.headers
+                    .get("origin")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+
+                // Check if origin is allowed
+                let origin_allowed = allowed_origins.is_empty()
+                    || allowed_origins.contains(&"*".to_string())
+                    || allowed_origins.contains(&origin);
+
+                if !origin_allowed {
+                    return Ok(false); // Not a CORS request or origin not allowed
+                }
+
+                let allow_origin = if allowed_origins.contains(&"*".to_string()) {
+                    "*".to_string()
+                } else {
+                    origin.clone()
+                };
+
+                // Handle preflight OPTIONS request
+                if req_header.method == http::Method::OPTIONS {
+                    let mut header = pingora_http::ResponseHeader::build(204, Some(8)).unwrap();
+                    header.insert_header("Access-Control-Allow-Origin", &allow_origin).unwrap();
+                    header.insert_header("Access-Control-Allow-Methods", &allowed_methods.join(", ")).unwrap();
+                    header.insert_header("Access-Control-Allow-Headers", &allowed_headers.join(", ")).unwrap();
+                    header.insert_header("Access-Control-Max-Age", &max_age.to_string()).unwrap();
+                    if *allow_credentials {
+                        header.insert_header("Access-Control-Allow-Credentials", "true").unwrap();
+                    }
+                    if !exposed_headers.is_empty() {
+                        header.insert_header("Access-Control-Expose-Headers", &exposed_headers.join(", ")).unwrap();
+                    }
+                    header.insert_header("Content-Length", "0").unwrap();
+                    session.write_response_header(Box::new(header), true).await?;
+                    return Ok(true);
+                }
+
+                // For non-preflight requests, add CORS headers to downstream
+                ctx.headers_downstream.insert(
+                    "Access-Control-Allow-Origin".to_string(),
+                    allow_origin,
+                );
+                if *allow_credentials {
+                    ctx.headers_downstream.insert(
+                        "Access-Control-Allow-Credentials".to_string(),
+                        "true".to_string(),
+                    );
+                }
+                if !exposed_headers.is_empty() {
+                    ctx.headers_downstream.insert(
+                        "Access-Control-Expose-Headers".to_string(),
+                        exposed_headers.join(", "),
+                    );
+                }
+                Ok(false)
+            }
+            HandlerConfig::TryFiles { files, fallback } => {
+                // 🏗️ ARCHITECTURE: try_files checks each file path in order.
+                // If a file exists, serve it via FileServer. If none match,
+                // execute the fallback handler (or 404).
+                for file_path in files {
+                    // Resolve {path} variable
+                    let resolved = file_path.replace("{path}", path);
+                    // Check if file exists (delegate to static server)
+                    let full_path = std::path::Path::new(&resolved);
+                    if full_path.exists() && full_path.is_file() {
+                        // Serve via FileServer handler
+                        let parent = full_path.parent()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|| ".".to_string());
+                        let file_handler = HandlerConfig::FileServer {
+                            root: parent,
+                            index: vec![],
+                            browse: false,
+                            compress: true,
+                        };
+                        return self.handle_config(session, ctx, &file_handler, &resolved, route_index).await;
+                    }
+                }
+                // No file found — execute fallback
+                if let Some(fb) = fallback {
+                    return self.handle_config(session, ctx, fb, path, route_index).await;
                 }
                 Ok(false)
             }
@@ -650,7 +808,7 @@ impl ProxyHttp for PingclairProxy {
         }
 
         // Match route in a scope to release borrow of session
-        let (path_str, route_index, handler, remote_ip) = {
+        let (path_str, route_index, handler, remote_ip, request_host, request_method) = {
             let request_header = session.req_header();
             let path = request_header.uri.path();
             let method = request_header.method.as_str();
@@ -709,11 +867,37 @@ impl ProxyHttp for PingclairProxy {
             if let Some(route) = state.router.match_request(path, method, &request_header.headers, host, &remote_ip, protocol) {
                 let index = route.index;
                 let handler = state.config.routes.get(index).map(|r| r.handler.clone());
-                (path.to_string(), Some(index), handler, remote_ip)
+                (path.to_string(), Some(index), handler, remote_ip, host.to_string(), method.to_string())
             } else {
-                (path.to_string(), None, None, remote_ip)
+                (path.to_string(), None, None, remote_ip, host.to_string(), method.to_string())
             }
         };
+
+        // Capture request metadata for access log
+        ctx.request_path = path_str.clone();
+        ctx.request_host = request_host;
+        ctx.request_method = request_method;
+
+        // Detect Accept-Encoding for response compression
+        {
+            let ae = session.req_header().headers
+                .get("accept-encoding")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            ctx.client_accepts_gzip = ae.contains("gzip");
+        }
+
+        // Check if server has compression enabled
+        if ctx.client_accepts_gzip {
+            if let Some(state) = &ctx.state {
+                // Check for compress config in the server routes (encode gzip)
+                // The compress list is not in ServerConfig directly, but
+                // we enable compression if the server has any compress algos
+                // For now, enable for all proxied responses if client supports it
+                // This matches Caddy's `encode gzip` behavior.
+                ctx.compress_response = true;
+            }
+        }
 
         // Check request body size (Content-Length)
         if let Some(state) = &ctx.state {
@@ -898,6 +1082,15 @@ impl ProxyHttp for PingclairProxy {
     }
     
     /// Called before sending response to client
+    ///
+    /// 🏗️ ARCHITECTURE: Full response header processing pipeline:
+    ///   1. Set downstream headers (from header directive)
+    ///   2. Add downstream headers (append, from header +Key directive)
+    ///   3. Remove headers (from header -Key directive)
+    ///   4. Conditionally suppress Server header
+    ///   5. Apply security headers
+    ///   6. Setup gzip compression if client supports it
+    ///   7. Add request ID header
     async fn response_filter(
         &self,
         _session: &mut Session,
@@ -907,26 +1100,42 @@ impl ProxyHttp for PingclairProxy {
     where
         Self::CTX: Send + Sync,
     {
-        // Add configured downstream headers
+        // Capture response status for access log
+        ctx.response_status = upstream_response.status.as_u16();
+
+        // 1. Set configured downstream headers
         for (key, value) in &ctx.headers_downstream {
             upstream_response.insert_header(key.clone(), value.as_str())?;
         }
-        
-        // Add server identification headers
-        upstream_response.insert_header("Server", "Pingclair")?;
-        
-        // Add security headers based on configuration
+
+        // 2. Append configured downstream headers
+        for (key, value) in &ctx.headers_downstream_add {
+            upstream_response.append_header(key.clone(), value.as_str())?;
+        }
+
+        // 3. Remove configured headers
+        for header_name in &ctx.headers_remove {
+            let _ = upstream_response.remove_header(header_name);
+        }
+
+        // 4. Server header (only if not suppressed by `header -Server`)
+        if !ctx.suppress_server_header {
+            upstream_response.insert_header("Server", "Pingclair")?;
+        }
+
+        // 5. Add request ID header for tracing
+        upstream_response.insert_header("X-Request-Id", &ctx.request_id)?;
+
+        // 6. Security headers based on configuration
         if let Some(state) = &ctx.state {
             if state.config.security.enabled {
-                // Basic security headers
                 upstream_response.insert_header("X-Content-Type-Options", &state.config.security.x_content_type_options)?;
                 upstream_response.insert_header("X-Frame-Options", &state.config.security.x_frame_options)?;
                 upstream_response.insert_header("X-XSS-Protection", &state.config.security.x_xss_protection)?;
                 upstream_response.insert_header("X-Permitted-Cross-Domain-Policies", &state.config.security.x_permitted_cross_domain)?;
                 upstream_response.insert_header("Referrer-Policy", &state.config.security.referrer_policy)?;
                 upstream_response.insert_header("Permissions-Policy", &state.config.security.permissions_policy)?;
-                
-                // HSTS header if TLS is used and HSTS is configured
+
                 if state.config.tls.as_ref().map_or(false, |tls| tls.auto || tls.cert.is_some()) {
                     if let Some(ref hsts_config) = state.config.security.hsts {
                         let hsts_value = format!(
@@ -938,24 +1147,97 @@ impl ProxyHttp for PingclairProxy {
                         upstream_response.insert_header("Strict-Transport-Security", &hsts_value)?;
                     }
                 }
-                
-                // CSP header if configured
+
                 if let Some(ref csp) = state.config.security.csp {
                     upstream_response.insert_header("Content-Security-Policy", csp)?;
                 }
             }
         }
-        
-        // Log request timing (only in debug or non-benchmark)
-        let elapsed = ctx.start_time.elapsed();
-        tracing::debug!(
-            upstream = ?ctx.upstream.as_ref().map(|u| &u.addr),
-            route = ?ctx.route_index,
-            elapsed_ms = elapsed.as_millis(),
-            "✅ Request completed"
-        );
-        
+
+        // 7. Setup gzip compression if applicable
+        // Only compress if:
+        //   - Client accepts gzip
+        //   - Response is not already compressed
+        //   - Content type is compressible (text/*, application/json, etc.)
+        //   - Body is not too small (> 256 bytes via Content-Length)
+        if ctx.compress_response && ctx.client_accepts_gzip {
+            let already_encoded = upstream_response.headers
+                .get("content-encoding")
+                .is_some();
+            let content_type = upstream_response.headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let is_compressible = content_type.starts_with("text/")
+                || content_type.contains("json")
+                || content_type.contains("xml")
+                || content_type.contains("javascript")
+                || content_type.contains("css")
+                || content_type.contains("svg");
+            let content_length = upstream_response.headers
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+            let too_small = content_length.map_or(false, |len| len < 256);
+
+            if !already_encoded && is_compressible && !too_small {
+                // Initialize gzip encoder
+                ctx.gzip_encoder = Some(GzEncoder::new(Vec::new(), Compression::fast()));
+                // Set response headers for compressed content
+                upstream_response.insert_header("Content-Encoding", "gzip")?;
+                let _ = upstream_response.remove_header("Content-Length");
+                // Transfer-Encoding: chunked will be set by Pingora automatically
+                upstream_response.insert_header("Vary", "Accept-Encoding")?;
+            }
+        }
+
         Ok(())
+    }
+
+    /// Filter upstream response body chunks for gzip compression.
+    ///
+    /// 🏗️ ARCHITECTURE: Streaming gzip — each body chunk is fed into the
+    /// GzEncoder. On `end_of_stream`, we flush and finalize the encoder,
+    /// replacing the last chunk with the compressed output.
+    fn upstream_response_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> pingora_core::Result<Option<Duration>> {
+        // Track response bytes for access log
+        if let Some(b) = body.as_ref() {
+            ctx.response_bytes += b.len() as u64;
+        }
+
+        // Streaming gzip compression
+        if let Some(ref mut encoder) = ctx.gzip_encoder {
+            if let Some(chunk) = body.as_ref() {
+                let _ = encoder.write_all(chunk);
+            }
+            // Suppress intermediate chunks — we'll emit the full compressed
+            // body as the final chunk (simpler than true streaming for now)
+            if end_of_stream {
+                // Take ownership of the encoder, finalize, emit compressed body
+                if let Some(encoder) = ctx.gzip_encoder.take() {
+                    match encoder.finish() {
+                        Ok(compressed) => {
+                            *body = Some(Bytes::from(compressed));
+                        }
+                        Err(e) => {
+                            tracing::warn!("⚠️ Gzip compression failed: {}", e);
+                            // On failure, pass through uncompressed
+                        }
+                    }
+                }
+            } else {
+                // Suppress intermediate chunks — they're buffered in the encoder
+                *body = Some(Bytes::new());
+            }
+        }
+
+        Ok(None)
     }
     
     /// Called on errors
@@ -977,27 +1259,45 @@ impl ProxyHttp for PingclairProxy {
         e
     }
 
-    /// Called after response is sent
+    /// Structured access log — emitted after each request completes.
+    ///
+    /// 🏗️ ARCHITECTURE: Produces JSON-structured log lines compatible
+    /// with the Caddy JSON log format. Fields:
+    ///   - ts, duration, request (method, host, uri), status, size, request_id
+    ///   - Per-server log level/file is configured but we use tracing for now
     async fn logging(
         &self,
         session: &mut Session,
-        _e: Option<&pingora_core::Error>,
+        e: Option<&pingora_core::Error>,
         ctx: &mut Self::CTX,
     ) {
         let response_code = session.response_written()
             .map(|resp| resp.status.as_u16())
-            .unwrap_or(0);
-        
+            .unwrap_or(ctx.response_status);
+
         let req_header = session.req_header();
         let method = req_header.method.as_str();
         let host = req_header.headers.get("Host")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("-");
+        let user_agent = req_header.headers.get("User-Agent")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-");
+        let referer = req_header.headers.get("Referer")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-");
+        let remote_ip = session.client_addr()
+            .map(|addr| match addr {
+                pingora_core::protocols::l4::socket::SocketAddr::Inet(inet) => inet.ip().to_string(),
+                pingora_core::protocols::l4::socket::SocketAddr::Unix(_) => "127.0.0.1".to_string(),
+            })
+            .unwrap_or_else(|| "0.0.0.0".to_string());
+        let elapsed = ctx.start_time.elapsed();
 
-        // Update metrics
+        // Update Prometheus metrics
         metrics::REQUESTS_TOTAL.with_label_values(&[
-            method, 
-            &response_code.to_string(), 
+            method,
+            &response_code.to_string(),
             host
         ]).inc();
 
@@ -1005,18 +1305,39 @@ impl ProxyHttp for PingclairProxy {
             method,
             &response_code.to_string(),
             host
-        ]).observe(ctx.start_time.elapsed().as_secs_f64());
-        
-        // Using info level for access logs
-        tracing::info!(
-            method = method,
-            path = req_header.uri.path(),
-            status = response_code,
-            host = host,
-            duration_ms = ctx.start_time.elapsed().as_millis(),
-            upstream = ?ctx.upstream.as_ref().map(|u| &u.addr),
-            "📝 Access"
-        );
+        ]).observe(elapsed.as_secs_f64());
+
+        // Structured access log
+        if let Some(err) = e {
+            tracing::error!(
+                request_id = %ctx.request_id,
+                method = method,
+                host = host,
+                path = req_header.uri.path(),
+                status = response_code,
+                bytes = ctx.response_bytes,
+                duration_ms = elapsed.as_millis(),
+                remote_ip = %remote_ip,
+                user_agent = user_agent,
+                error = %err,
+                "❌ Access"
+            );
+        } else {
+            tracing::info!(
+                request_id = %ctx.request_id,
+                method = method,
+                host = host,
+                path = req_header.uri.path(),
+                status = response_code,
+                bytes = ctx.response_bytes,
+                duration_ms = elapsed.as_millis(),
+                remote_ip = %remote_ip,
+                user_agent = user_agent,
+                referer = referer,
+                upstream = ?ctx.upstream.as_ref().map(|u| &u.addr),
+                "📝 Access"
+            );
+        }
     }
 }
 

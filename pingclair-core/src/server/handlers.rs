@@ -239,6 +239,17 @@ pub fn execute_handler(config: &HandlerConfig) -> HandlerResult {
             Ok(response)
         }
 
+        HandlerConfig::Cors { .. } => {
+            // CORS is handled at the proxy layer where we have access to the request.
+            // Returning a passthrough here.
+            Ok(HandlerResponse::status(200))
+        }
+
+        HandlerConfig::TryFiles { .. } => {
+            // TryFiles requires filesystem access, handled at the proxy layer.
+            Ok(HandlerResponse::status(200))
+        }
+
         HandlerConfig::Plugin { name, args: _ } => {
             Err(HandlerError::Config(format!("Plugin {} is not yet implemented", name)))
         }

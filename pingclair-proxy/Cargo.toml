@@ -28,6 +28,7 @@ parking_lot = "0.12"
 prometheus.workspace = true
 async-recursion = "1.0"
 ipnet = "2"
+flate2 = "1.0"
 
 # HTTP/3
 quinn.workspace = true
