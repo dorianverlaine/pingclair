@@ -507,6 +507,105 @@ impl PingclairProxy {
     }
 }
 
+// MARK: - Caddy Placeholder Resolution
+
+/// Resolve Caddy-style `{placeholder}` variables in a header value string
+/// using the actual downstream request headers.
+///
+/// Supported placeholders:
+/// - `{http.request.header.Header-Name}` → value of the named request header
+/// - `{host}`                            → request Host header
+/// - `{remote_ip}`                       → client IP (from X-Forwarded-For or peer)
+/// - `{http.request.method}`             → HTTP method
+/// - `{http.request.uri}`                → full URI
+/// - `{http.request.uri.path}`           → URI path only
+///
+/// If a placeholder references a header that doesn't exist, it resolves to
+/// an empty string (matching Caddy's behavior).
+fn resolve_caddy_placeholders(template: &str, req: &RequestHeader) -> String {
+    if !template.contains('{') {
+        // ⚡ OPTIMIZATION: Fast path — no placeholders, return as-is.
+        return template.to_string();
+    }
+
+    let mut result = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            // Collect placeholder name until '}'
+            let mut placeholder = String::new();
+            while let Some(&pc) = chars.peek() {
+                if pc == '}' {
+                    chars.next(); // consume '}'
+                    break;
+                }
+                placeholder.push(chars.next().unwrap());
+            }
+
+            // Resolve the placeholder
+            let resolved = resolve_single_placeholder(&placeholder, req);
+            result.push_str(&resolved);
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
+/// Resolve a single Caddy placeholder name to its value.
+fn resolve_single_placeholder(name: &str, req: &RequestHeader) -> String {
+    // {http.request.header.Header-Name}
+    if let Some(header_name) = name.strip_prefix("http.request.header.") {
+        return req.headers
+            .get(header_name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+    }
+
+    // Common shortcuts
+    match name {
+        "host" => {
+            req.headers
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        }
+        "http.request.host" => {
+            req.headers
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        }
+        "remote_ip" | "http.request.remote.host" => {
+            // Best effort: try X-Forwarded-For, then X-Real-IP, then empty
+            req.headers
+                .get("x-forwarded-for")
+                .or_else(|| req.headers.get("x-real-ip"))
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        }
+        "http.request.method" => {
+            req.method.as_str().to_string()
+        }
+        "http.request.uri" => {
+            req.uri.to_string()
+        }
+        "http.request.uri.path" => {
+            req.uri.path().to_string()
+        }
+        _ => {
+            tracing::debug!("⚠️ Unresolved Caddy placeholder: {{{}}}", name);
+            String::new()
+        }
+    }
+}
+
 // MARK: - ProxyHttp Trait
 
 #[async_trait]
@@ -768,23 +867,33 @@ impl ProxyHttp for PingclairProxy {
 
     
     /// Called before sending request to upstream
+    ///
+    /// 🏗️ ARCHITECTURE: Resolve Caddy-style `{http.request.header.X}` placeholders
+    /// in `headers_up` values by reading from the actual downstream request at runtime.
+    /// This enables configs like:
+    ///   `header_up X-Forwarded-For {http.request.header.CF-Connecting-IP}`
     async fn upstream_request_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> pingora_core::Result<()>
     where
         Self::CTX: Send + Sync,
     {
-        // Add configured upstream headers
-        for (key, value) in &ctx.headers_upstream {
-            upstream_request.insert_header(key.clone(), value.as_str())?;
+        let downstream_headers = session.req_header();
+
+        // Add configured upstream headers with variable resolution
+        for (key, value_template) in &ctx.headers_upstream {
+            let resolved = resolve_caddy_placeholders(value_template, downstream_headers);
+            upstream_request.insert_header(key.clone(), resolved.as_str())?;
         }
-        
-        // Add proxy headers
-        upstream_request.insert_header("X-Forwarded-Proto", "https")?;
-        
+
+        // Add standard proxy headers (only if not already configured by user)
+        if !ctx.headers_upstream.contains_key("X-Forwarded-Proto") {
+            upstream_request.insert_header("X-Forwarded-Proto", "https")?;
+        }
+
         Ok(())
     }
     

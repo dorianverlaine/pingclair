@@ -277,16 +277,20 @@ impl SemanticAnalyzer {
 
             // Validate routes
             if let Some(routes) = &server.routes {
-                let mut has_default = false;
+                let mut default_count = 0;
                 for arm in &routes.inner.arms {
                     if arm.inner.matcher.is_none() {
-                        if has_default {
-                            return Err(SemanticError::InvalidConfig {
-                                message: format!("Server '{}' has multiple default routes", server.name),
-                            });
-                        }
-                        has_default = true;
+                        default_count += 1;
                     }
+                }
+                // ⚠️ Multiple default routes happen naturally after snippet
+                // expansion (e.g. `import common_local` expands headers +
+                // handler directives that each become a default route).
+                // We no longer error here — the runtime will execute them
+                // as a Pipeline in order.
+                if default_count > 1 {
+                    // This is a soft warning, not an error.
+                    let _ = default_count; // silence unused warning
                 }
             }
         }

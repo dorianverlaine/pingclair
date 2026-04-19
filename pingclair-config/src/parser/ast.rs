@@ -336,7 +336,7 @@ pub enum Handler {
     FileServer(FileServerConfig),
 
     /// Exclusive routing group
-    Handle(Vec<Node<Directive>>),
+    Handle(Vec<Handler>),
 
     /// Plugin invocation
     Plugin { name: String, args: Vec<Expr> },

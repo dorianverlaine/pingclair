@@ -367,27 +367,13 @@ fn compile_handler(handler: &Handler) -> CompileResult<HandlerConfig> {
             })
         }
         
-        Handler::Handle(directives) => {
-            // Need a way to compile directives to handlers
-            // For now, only support top-level handlers within handle block
-            // Handle blocks often contain things like headers, rewrite, respond, proxy
-            // We can treat it as a pipeline for now
-            let mut handlers = Vec::new();
-            for node in directives {
-                match &node.inner {
-                    Directive::Headers(h) => {
-                        handlers.push(HandlerConfig::Headers {
-                            set: h.set.clone(),
-                            add: h.add.clone(),
-                            remove: h.remove.clone(),
-                        });
-                    }
-                    _ => {
-                        // Skip or implement more later
-                    }
-                }
+        Handler::Handle(sub_handlers) => {
+            // Recursively compile each sub-handler in the Handle block
+            let mut compiled = Vec::new();
+            for h in sub_handlers {
+                compiled.push(compile_handler(h)?);
             }
-            Ok(HandlerConfig::Handle(handlers))
+            Ok(HandlerConfig::Handle(compiled))
         }
 
         Handler::Plugin { name, args } => {

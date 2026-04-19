@@ -4,6 +4,8 @@
 
 use crate::parser::caddy_ast::{Directive, Block};
 use crate::parser::lexer::{LexError, Location, Spanned, Token, tokenize};
+#[allow(unused_imports)]
+use crate::parser::lexer::LexResult;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -154,11 +156,14 @@ impl<'a> Parser<'a> {
                     self.consume();
                 },
                 Token::EnvVar(s) => {
-                    // treat env var as arg, Adapter will expand or assume it's expanded
-                    // Actually, let's keep ${VAR} syntax?
-                    // Or expand now?
-                    // Let's keep ${VAR} syntax for now.
-                    args.push(format!("${{{}}}", s)); 
+                    // Preserve ${VAR} syntax for later expansion
+                    args.push(format!("${{{}}}", s));
+                    self.consume();
+                },
+                Token::Placeholder(s) => {
+                    // Preserve Caddy placeholder syntax {http.request.header.X}
+                    // The adapter / runtime will resolve these at request time.
+                    args.push(format!("{{{}}}", s));
                     self.consume();
                 },
                 _ => {

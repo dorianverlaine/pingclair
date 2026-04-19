@@ -10,7 +10,6 @@ description = "Configuration parser for Pingclair (Pingclairfile)"
 
 [dependencies]
 pingclair-core = { path = "../pingclair-core" }
-logos.workspace = true
 ariadne.workspace = true
 serde.workspace = true
 serde_json.workspace = true
