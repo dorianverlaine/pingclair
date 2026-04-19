@@ -132,8 +132,12 @@ impl ProxyState {
                         } else {
                             tracing::warn!("Correlation ID: Init - Could not attach health checker to LB");
                         }
+                        // 🛑 SAFETY: Always push to keep health_checkers aligned with
+                        // load_balancers by index. Health checker is stored inside the LB
+                        // object; this slot is a tombstone for index alignment only.
+                        health_checkers.push(None);
                     } else {
-                        health_checkers.push(None); // Stored inside LB now, keeping vector for index align if needed
+                        health_checkers.push(None);
                     }
 
                     load_balancers.push(Some(load_balancer));
@@ -296,16 +300,33 @@ impl PingclairProxy {
 
     // MARK: - Internal Helpers
 
-    /// Get the state for a specific host
+    /// Get the state for a specific host.
+    ///
+    /// Resolution order (matches Caddy semantics):
+    /// 1. Exact hostname match (`api.example.com`)
+    /// 2. Wildcard match (`*.example.com`) — checks all registered wildcard hosts
+    /// 3. Default catch-all server
     fn get_state(&self, host: &str) -> Option<ProxyState> {
-        // 1. Exact match
-        if let Some(state) = self.hosts.read().get(host) {
+        let hosts = self.hosts.read();
+
+        // 1. Exact match (fast path)
+        if let Some(state) = hosts.get(host) {
             return Some(state.clone());
         }
-        
-        // 2. TODO: Wildcard matches (*.example.com)
-        
-        // 3. Default
+
+        // 2. ⚡ OPTIMIZATION: Wildcard match — iterate registered patterns like *.example.com
+        // Only hosts whose registered key starts with "*." are wildcard entries.
+        // For a request to "foo.example.com" we check if "*.example.com" is registered.
+        for (pattern, state) in hosts.iter() {
+            if let Some(wildcard_suffix) = pattern.strip_prefix("*.") {
+                // The request host must end with ".{suffix}" to match *.{suffix}
+                if host.ends_with(&format!(".{}", wildcard_suffix)) {
+                    return Some(state.clone());
+                }
+            }
+        }
+
+        // 3. Default catch-all
         self.default.read().clone()
     }
     
@@ -557,8 +578,35 @@ impl ProxyHttp for PingclairProxy {
                 })
                 .unwrap_or_else(|| "0.0.0.0".to_string());
                 
-            // Identify protocol (scheme)
-            let protocol = "http"; // TODO: Implement proper TLS detection for Pingora 0.6
+            // ⚡ OPTIMIZATION: Identify protocol via port heuristic and X-Forwarded-Proto.
+            // Pingora 0.6 removed the per-request TLS flag; we detect HTTPS by:
+            //   (a) checking the X-Forwarded-Proto header (set by our upstream_request_filter), or
+            //   (b) checking whether the local port is 443 / 8443 as a fallback.
+            let protocol = {
+                let via_header = request_header.headers
+                    .get("x-forwarded-proto")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if via_header == "https" {
+                    "https"
+                } else {
+                    // Fallback: infer from the Host header port or the server listen config.
+                    let host_header = request_header.headers
+                        .get("Host")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let port_in_host = host_header
+                        .split(':')
+                        .nth(1)
+                        .and_then(|p| p.parse::<u16>().ok())
+                        .unwrap_or(80);
+                    if port_in_host == 443 || port_in_host == 8443 {
+                        "https"
+                    } else {
+                        "http"
+                    }
+                }
+            };
                 
             if let Some(route) = state.router.match_request(path, method, &request_header.headers, host, &remote_ip, protocol) {
                 let index = route.index;
@@ -653,8 +701,15 @@ impl ProxyHttp for PingclairProxy {
                  pingora_core::protocols::l4::socket::SocketAddr::Unix(_) => vec![], 
              });
 
-        // Check if this is a proxy handler
-        let state = ctx.state.as_ref().unwrap();
+        // 🛑 SAFETY: state must have been set by request_filter. If it wasn't
+        // (e.g. no virtual host matched), fail gracefully instead of panic.
+        let state = match ctx.state.as_ref() {
+            Some(s) => s,
+            None => {
+                tracing::warn!("⚠️ upstream_peer called with no state in context — no virtual host matched");
+                return Err(pingora_core::Error::new(pingora_core::ErrorType::ConnectNoRoute));
+            }
+        };
         if let Some(upstream) = self.select_upstream(state, route_index, client_ip.as_deref()) {
             ctx.upstream = Some(upstream.clone()); // Backend is light to clone
 

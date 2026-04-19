@@ -364,15 +364,9 @@ fn main() -> anyhow::Result<()> {
                 matcher: None,
             });
 
-            config.servers.push(ServerConfig {
-                name: Some("_".to_string()),
-                listen: vec![listen],
-                routes: Vec::new(),
-                tls: None,
-                log: None,
-                client_max_body_size: 10 * 1024 * 1024, // 10MB
-                security: Default::default(),
-            });
+            // 🛑 SAFETY: Push the server that contains the FileServer route,
+            // not a duplicate empty ServerConfig.
+            config.servers.push(server);
             
             run_server("".to_string(), config);
         }

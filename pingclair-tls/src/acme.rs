@@ -146,28 +146,23 @@ impl Default for MemoryChallengeHandler {
 
 impl ChallengeHandler for MemoryChallengeHandler {
     fn deploy(&self, challenge: &ChallengeResponse) -> Result<(), AcmeError> {
-        let tokens = self.tokens.clone();
-        let token = challenge.token.clone();
-        let key_auth = challenge.key_authorization.clone();
-        
-        // Use blocking task or spawn, here we just spawn to avoid blocking caller
-        tokio::spawn(async move {
-            let mut tokens = tokens.write().await;
-            tokens.insert(token, key_auth);
+        // 🛑 SAFETY: We must block here and guarantee the token is written
+        // before returning Ok(()). If we used tokio::spawn, the token might
+        // not be in the map yet when the ACME server sends its HTTP-01
+        // verification request, causing the challenge to fail.
+        futures::executor::block_on(async {
+            let mut tokens = self.tokens.write().await;
+            tokens.insert(challenge.token.clone(), challenge.key_authorization.clone());
         });
-        
         Ok(())
     }
     
     fn cleanup(&self, challenge: &ChallengeResponse) -> Result<(), AcmeError> {
-        let tokens = self.tokens.clone();
-        let token = challenge.token.clone();
-        
-        tokio::spawn(async move {
-            let mut tokens = tokens.write().await;
-            tokens.remove(&token);
+        // 🛑 SAFETY: Block to guarantee removal is synchronous with cleanup call.
+        futures::executor::block_on(async {
+            let mut tokens = self.tokens.write().await;
+            tokens.remove(&challenge.token);
         });
-        
         Ok(())
     }
     
