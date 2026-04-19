@@ -102,12 +102,11 @@ impl ProxyState {
 
                     // 2. Create Strategy
                     let strategy = match proxy_config.load_balance.strategy.as_str() {
-                        "random" => Strategy::Random,
-                        "least_conn" => Strategy::Random, // LeastConn not yet supported in native wrapper
-                         // TODO: implement least conn
-                        "ip_hash" => Strategy::RoundRobin, // IpHash not yet supported
-                        "first" => Strategy::RoundRobin, 
-                        _ => Strategy::RoundRobin,
+                        "random"     => Strategy::Random,
+                        "least_conn" => Strategy::LeastConn,
+                        "ip_hash"    => Strategy::IpHash,
+                        "first"      => Strategy::RoundRobin,
+                        _            => Strategy::RoundRobin,
                     };
                     
                     // 3. Create Load Balancer
