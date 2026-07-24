@@ -38,23 +38,35 @@ Que vous ayez besoin d'un simple serveur de fichiers statiques ou d'une passerel
 
 ## ⚡ Benchmarks
 
-Nous avons comparé Pingclair, Nginx et Caddy sur un réseau bridge Docker (afin d'écarter le surcoût de la pile réseau de l'hôte) pour une comparaison équitable.
+La méthodologie complète, les résultats bruts et — surtout — les bugs mis au
+jour par ce processus (dont un encore ouvert) se trouvent dans
+[`benchmarks/README.md`](benchmarks/README.md) (en anglais). Le tableau
+ci-dessous ne montre que les chiffres pour les fichiers statiques ; lisez
+l'analyse complète avant d'en tirer des conclusions, en particulier sur le
+débit du reverse proxy et la compression gzip sous charge.
 
-**Environnement de test**
-*   Matériel : MacBook Pro (puce M2), Docker Desktop
-*   Paramètres : fichier statique de 1 Ko, 4 threads, 100 connexions, durée de 15 s
-*   Réseau : conteneur à conteneur
+**Environnement de test** : réseau bridge Docker, chaque serveur dans son
+propre conteneur limité à 2 vCPU / 512 Mo, MacBook Pro (M2), `wrk -t4 -d15s`,
+fichier statique de 1 Ko.
 
-| Serveur | RPS (req./s) | Latence moyenne | Remarques |
-|---------|--------------|-----------------|-----------|
-| **Nginx (Alpine)** | **~24 902** | **4,17 ms** | ⭐️ La référence du secteur — C/epoll extrêmement optimisé |
-| **Pingclair (Debian)** | **~19 899** | **5,44 ms** | 🚀 Juste derrière, à ~80 % de Nginx |
-| **Caddy (Alpine)** | **~6 803** | **14,86 ms** | 🐢 Priorité à la simplicité, bridé par le GC de Go |
+| Serveur | RPS @ c50 | RPS @ c500 | Remarques |
+|---------|-----------|------------|-----------|
+| **Nginx (Alpine)** | ~28 801 | ~27 853 | Le plus rapide à cette taille, à tous les niveaux de concurrence testés |
+| **Pingclair (Debian)** | ~22 942 | ~21 162 | ~75-80 % de Nginx |
+| **Caddy (Alpine)** | ~18 309 | ~18 448 | Constant, ~65 % de Nginx |
 
-> **Analyse**
-> Pingclair est un projet Rust relativement jeune, mais grâce au socle solide de Pingora il atteint 80 % des performances d'un Nginx mature, même dans un environnement Docker non optimisé — et environ **3×** celles de Caddy, son concurrent le plus proche en matière de simplicité d'usage.
->
-> *Ces benchmarks sont indicatifs ; les performances réelles dépendent de votre charge de travail.*
+> **Des réserves plus importantes que le tableau**
+> Sur le débit du reverse proxy, pingclair est passé devant nginx et caddy
+> à forte concurrence dans cet environnement limité en conteneurs — un
+> résultat réel mais non confirmé sur du matériel sans limitation, à ne
+> pas généraliser. Plus important : un test de charge avec un gros fichier
+> (20 Mo) compressé en gzip a révélé un bug réel et toujours ouvert : le
+> chemin de compression des fichiers statiques de pingclair met en
+> mémoire tampon le fichier entier à chaque requête, sans cache, et sous
+> charge concurrente soutenue, un test de 20 secondes en a pris **16
+> minutes** (sans plantage ni OOM — juste une mise en file d'attente
+> sévère). Voir [`benchmarks/README.md`](benchmarks/README.md) pour le
+> détail complet.
 
 ## 📦 Installation
 

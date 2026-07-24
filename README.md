@@ -38,23 +38,32 @@ Whether you need a simple static file server or an enterprise gateway with load 
 
 ## ⚡ Benchmarks
 
-We benchmarked Pingclair, Nginx, and Caddy over a Docker bridge network (eliminating host network stack overhead) for a fair comparison.
+Full methodology, raw results, and — importantly — the bugs this process
+found (including one still open) live in
+[`benchmarks/README.md`](benchmarks/README.md). The numbers below are the
+headline static-file results only; read the full writeup before drawing
+conclusions, especially about reverse-proxy throughput and gzip under load.
 
-**Test environment**
-*   Hardware: MacBook Pro (M2), Docker Desktop
-*   Setup: 1 KB static file, 4 threads, 100 connections, 15 s duration
-*   Network: container-to-container
+**Test environment**: Docker bridge network, each server in its own
+container capped at 2 vCPU / 512MB, MacBook Pro (M2), `wrk -t4 -d15s`,
+1 KB static file.
 
-| Server | RPS | Avg latency | Notes |
-|--------|-----|-------------|-------|
-| **Nginx (Alpine)** | **~24,902** | **4.17 ms** | ⭐️ The industry benchmark — extremely well-tuned C/epoll |
-| **Pingclair (Debian)** | **~19,899** | **5.44 ms** | 🚀 Close behind, ~80% of Nginx |
-| **Caddy (Alpine)** | **~6,803** | **14.86 ms** | 🐢 Ease-of-use first, limited by Go GC overhead |
+| Server | RPS @ c50 | RPS @ c500 | Notes |
+|--------|-----------|------------|-------|
+| **Nginx (Alpine)** | ~28,801 | ~27,853 | Fastest at this size across all concurrency levels tested |
+| **Pingclair (Debian)** | ~22,942 | ~21,162 | ~75-80% of Nginx |
+| **Caddy (Alpine)** | ~18,309 | ~18,448 | Consistent, ~65% of Nginx |
 
-> **Analysis**
-> Pingclair is a comparatively young Rust project, but thanks to Pingora's solid core it reaches 80% of a mature Nginx even in an unoptimized Docker environment — and roughly **3×** Caddy, its closest peer in terms of usability.
->
-> *Benchmarks are indicative only; real-world performance depends on your workload.*
+> **Caveats that matter more than the table**
+> Reverse-proxy throughput showed pingclair *ahead* of both nginx and
+> caddy at higher concurrency in this specific container-capped setup —
+> that result is real but unconfirmed on uncapped hardware, and shouldn't
+> be read as a general claim. More importantly, a large-file (20MB) gzip
+> load test surfaced a genuine, still-open bug: pingclair's static-file
+> compression path buffers the whole file per request with no cache, and
+> under sustained concurrent load a 20-second test took **16 minutes**
+> (no crash, no OOM — just severe queuing). See
+> [`benchmarks/README.md`](benchmarks/README.md) for the full breakdown.
 
 ## 📦 Installation
 
