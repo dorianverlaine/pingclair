@@ -39,7 +39,7 @@ Que vous ayez besoin d'un simple serveur de fichiers statiques ou d'une passerel
 ## ⚡ Benchmarks
 
 La méthodologie complète, les résultats bruts et — surtout — les bugs mis au
-jour par ce processus (dont un encore ouvert) se trouvent dans
+jour et corrigés par ce processus se trouvent dans
 [`benchmarks/README.md`](benchmarks/README.md) (en anglais). Le tableau
 ci-dessous ne montre que les chiffres pour les fichiers statiques ; lisez
 l'analyse complète avant d'en tirer des conclusions, en particulier sur le
@@ -59,14 +59,19 @@ fichier statique de 1 Ko.
 > Sur le débit du reverse proxy, pingclair est passé devant nginx et caddy
 > à forte concurrence dans cet environnement limité en conteneurs — un
 > résultat réel mais non confirmé sur du matériel sans limitation, à ne
-> pas généraliser. Plus important : un test de charge avec un gros fichier
-> (20 Mo) compressé en gzip a révélé un bug réel et toujours ouvert : le
-> chemin de compression des fichiers statiques de pingclair met en
-> mémoire tampon le fichier entier à chaque requête, sans cache, et sous
-> charge concurrente soutenue, un test de 20 secondes en a pris **16
-> minutes** (sans plantage ni OOM — juste une mise en file d'attente
-> sévère). Voir [`benchmarks/README.md`](benchmarks/README.md) pour le
-> détail complet.
+> pas généraliser. Par ailleurs, un test de charge avec un gros fichier
+> (20 Mo) compressé en gzip a révélé — et permis de corriger — un vrai
+> bug : la compression des fichiers statiques était refaite intégralement
+> à chaque requête, sans aucun cache, et sous charge concurrente soutenue
+> un test de 20 secondes en prenait 16 minutes. Une fois corrigé (ajout
+> d'un cache des corps compressés), le même test se termine désormais en
+> 20,09 s et traite **21 684 requêtes** (contre 54 avant) — plus que
+> nginx et caddy réunis sur ce même test, puisque les requêtes répétées
+> sautent entièrement la compression. Une réserve résiduelle (pic de
+> mémoire transitoire dû à un « effet de horde » sur les premiers ratés
+> concurrents) est documentée dans le détail complet. Voir
+> [`benchmarks/README.md`](benchmarks/README.md) pour la comparaison
+> avant/après intégrale.
 
 ## 📦 Installation
 
