@@ -21,13 +21,13 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # Pingora 核心
-pingora = "0.7"
-pingora-core = "0.7"
-pingora-proxy = "0.7"
-pingora-http = "0.7"
-pingora-timeout = "0.7"
-pingora-load-balancing = "0.7"
-pingora-limits = "0.7"
+pingora = "0.8"
+pingora-core = "0.8"
+pingora-proxy = "0.8"
+pingora-http = "0.8"
+pingora-timeout = "0.8"
+pingora-load-balancing = "0.8"
+pingora-limits = "0.8"
 
 # Async 运行时
 tokio = { version = "1", features = ["full"] }
