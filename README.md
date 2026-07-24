@@ -2,154 +2,155 @@
 
 # 🦀 Pingclair
 
-**基于 Pingora 构建的现代高性能 Web 服务器与反向代理**  
-*融合了 Cloudflare Pingora 的极致性能与 Caddy 的极简开发体验*
+**A modern, high-performance web server and reverse proxy built on Pingora**  
+*Cloudflare Pingora's raw performance, wrapped in Caddy's minimalist developer experience*
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 [![Status](https://img.shields.io/badge/status-active-green.svg)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/dorianverlaine/pingclair/pulls)
 
+**English** · [繁體中文](README.zh-TW.md) · [Français](README.fr.md)
+
 </div>
 
 ---
 
-## 📖 项目简介
+## 📖 Overview
 
-**Pingclair** 是一个下一代 Web 服务器和反向代理工具。它的核心理念是将 **Cloudflare Pingora**（处理过万亿级请求的 Rust 代理框架）的强大能力，封装在一个类似于 **Caddy** 的易用外壳之下。
+**Pingclair** is a next-generation web server and reverse proxy. Its core idea is to take the power of **Cloudflare Pingora** — the Rust proxy framework that serves trillions of requests — and wrap it in a shell as approachable as **Caddy**.
 
-传统的 Nginx 配置往往晦涩难懂，而 Caddy 虽然易用但通常基于 Go。Pingclair 旨在填补这一空白：提供一个 **100% Rust 编写**、**内存安全**、**高性能** 且 **配置直观** 的解决方案。
+Nginx configuration is notoriously cryptic, while Caddy is pleasant to use but built on Go. Pingclair aims to fill that gap: **100% Rust**, **memory-safe**, **fast**, and **intuitive to configure**.
 
-无论你是需要一个简单的静态文件服务器，还是一个支持复杂负载均衡、自动 HTTPS 和 HTTP/3 的企业级网关，Pingclair 都能胜任。
+Whether you need a simple static file server or an enterprise gateway with load balancing, automatic HTTPS, and HTTP/3, Pingclair handles it.
 
-## ✨ 核心特性
+## ✨ Features
 
-*   🚀 **基于 Pingora 内核**: 站在巨人的肩膀上，利用 Cloudflare 经过实战检验的基础设施，提供企业级的稳定性和吞吐量。
-*   🔒 **内存安全**: 得益于 Rust 语言特性，彻底杜绝缓冲区溢出等常见的内存安全漏洞。
-*   📝 **Caddyfile 兼容配置**: 极简的配置 DSL。支持**自动 HTTPS**、**多监听器**和**命名匹配器**，兼容主流 Caddyfile 语法。
-*   ⚡ **HTTP/3 (QUIC) 原生支持**: 拥抱未来网络协议，在不稳定的网络环境下提供更低的延迟和更好的连接迁移能力。
-*   🔄 **智能负载均衡**: 内置多种算法（轮询、最少连接等），支持健康检查和故障自动转移。
-*   🔐 **全自动 HTTPS**: 集成 ACME 协议（如 Let's Encrypt），自动申请和续期 SSL/TLS 证书，零配置开启加密传输。
-*   📁 **高性能静态文件服务**: 支持 Gzip/Brotli 压缩、Range 请求和高效的文件传输。
-*   🔌 **模块化插件系统**: (开发中) 允许通过 Rust trait 扩展自定义功能，无需修改核心代码。
-*   📊 **可观测性**: 开箱即用的 Prometheus 指标导出和 OpenTelemetry Tracing 支持。
+*   🚀 **Powered by Pingora** — Standing on the shoulders of giants, backed by Cloudflare's battle-tested infrastructure for enterprise-grade stability and throughput.
+*   🔒 **Memory safe** — Rust eliminates buffer overflows and the rest of the classic memory-safety vulnerability class.
+*   📝 **Caddyfile-compatible config** — A minimal configuration DSL with **automatic HTTPS**, **multiple listeners**, and **named matchers**, compatible with mainstream Caddyfile syntax.
+*   ⚡ **Native HTTP/3 (QUIC)** — Lower latency and better connection migration on unreliable networks.
+*   🔄 **Smart load balancing** — Several built-in algorithms (round-robin, least-connections, and more) with health checks and automatic failover.
+*   🔐 **Fully automatic HTTPS** — Built-in ACME (Let's Encrypt) support issues and renews SSL/TLS certificates with zero configuration.
+*   📁 **Fast static file serving** — Gzip/Brotli compression, range requests, and efficient file transfer.
+*   🔌 **Modular plugin system** — *(in development)* Extend functionality through Rust traits without touching the core.
+*   📊 **Observability** — Prometheus metrics export and OpenTelemetry tracing out of the box.
 
-## ⚡ 性能基准测试
+## ⚡ Benchmarks
 
-我们在 Docker Bridge 内网（消除系统网络栈开销）对 Pingclair、Nginx 和 Caddy 进行了公平的压力测试。
+We benchmarked Pingclair, Nginx, and Caddy over a Docker bridge network (eliminating host network stack overhead) for a fair comparison.
 
-**测试环境**:
-*   硬件: MacBook Pro (M2 Chip), Docker Desktop
-*   配置: 1KB 静态文件, 4 Threads, 100 Connections, 15s Duration
-*   网络: Docker 容器直连 (Container-to-Container)
+**Test environment**
+*   Hardware: MacBook Pro (M2), Docker Desktop
+*   Setup: 1 KB static file, 4 threads, 100 connections, 15 s duration
+*   Network: container-to-container
 
-| 服务器 | RPS (请求/秒) | 平均延迟 | 备注 |
-|--------|---------------|----------|------|
-| **Nginx (Alpine)** | **~24,902** | **4.17ms** | ⭐️ 行业标杆，极致的 C/Epoll 优化 |
-| **Pingclair (Debian)** | **~19,899** | **5.44ms** | 🚀 紧随其后，达到 Nginx 的 ~80% 性能 |
-| **Caddy (Alpine)** | **~6,803** | **14.86ms** | 🐢 易用性优先，受限于 Go GC 开销 |
+| Server | RPS | Avg latency | Notes |
+|--------|-----|-------------|-------|
+| **Nginx (Alpine)** | **~24,902** | **4.17 ms** | ⭐️ The industry benchmark — extremely well-tuned C/epoll |
+| **Pingclair (Debian)** | **~19,899** | **5.44 ms** | 🚀 Close behind, ~80% of Nginx |
+| **Caddy (Alpine)** | **~6,803** | **14.86 ms** | 🐢 Ease-of-use first, limited by Go GC overhead |
 
-> **分析**:
-> 虽然 Pingclair 是一个相对年轻的 Rust 项目，但得益于 Cloudflare Pingora 坚实的内核，即便在未经特定优化的 Docker 环境下，其性能也达到了成熟竞品 Nginx 的 80%，并达到了同类易用型服务器 Caddy 的 **3倍**。
+> **Analysis**
+> Pingclair is a comparatively young Rust project, but thanks to Pingora's solid core it reaches 80% of a mature Nginx even in an unoptimized Docker environment — and roughly **3×** Caddy, its closest peer in terms of usability.
 >
-> *注意：基准测试仅供参考，实际生产环境性能取决于具体业务逻辑。*
+> *Benchmarks are indicative only; real-world performance depends on your workload.*
 
-## 📦 安装指南
+## 📦 Installation
 
-### 前置要求
+### Prerequisites
 
-*   **Rust 工具链**: 需要安装 Rust 1.85 或更高版本。
+*   **Rust toolchain** — Rust 1.85 or newer.
 
-### 源码编译安装
+### Build from source
 
-推荐从源码编译以获得针对你本机 CPU 优化的二进制文件：
+Building from source is recommended, since it produces a binary tuned for your CPU:
 
 ```bash
-# 1. 克隆仓库
+# 1. Clone the repository
 git clone https://github.com/dorianverlaine/pingclair.git
 cd pingclair
 
-# 2. 编译并安装 (release 模式)
+# 2. Build and install (release mode)
 cargo install --path ./pingclair
 ```
 
-安装完成后，`pingclair` 命令将被添加到你的系统 PATH 中。
+Once installed, the `pingclair` command is available on your `PATH`.
 
-### Ubuntu/Debian 极简安装 (推荐)
+### One-line install on Ubuntu/Debian (recommended)
 
-如果你在 Ubuntu 或 Debian 系统上，可以使用一键安装脚本。该脚本会自动下载（或编译）二进制文件，配置 `systemd` 服务，并创建 `pingclair` 低权限用户（使用 `setcap` 绑定端口）。
+On Ubuntu or Debian you can use the install script. It downloads (or builds) the binary, sets up a `systemd` service, and creates an unprivileged `pingclair` user that binds low ports via `setcap`.
 
 ```bash
-# 运行安装脚本 (需要 sudo 权限)
 curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash
 ```
 
-安装完成后，你可以使用 `pc` (pingclair 的缩写) 命令来管理服务。
+After installation, manage the service with the `pc` command (short for `pingclair`).
 
-## 🏃 快速上手
+## 🏃 Quick start
 
-Pingclair 提供了两种运行模式：**CLI 命令行模式**（适用于快速测试）和 **配置文件模式**（适用于生产环境）。
+Pingclair runs in two modes: **CLI mode** for quick tests, and **config-file mode** for production.
 
-### 1. 命令行模式 (CLI)
+### 1. CLI mode
 
-**启动静态文件服务器**  
-将当前目录下的文件通过 HTTP 8080 端口对外提供服务：
+**Serve static files**  
+Serve the current directory over HTTP on port 8080:
 ```bash
 pingclair file-server --listen :8080 --root .
 ```
 
-**启动反向代理**  
-将本地 8080 端口的流量转发到后端的 3000 端口：
+**Run a reverse proxy**  
+Forward traffic from local port 8080 to a backend on port 3000:
 ```bash
 pingclair reverse-proxy --from :8080 --to localhost:3000
 ```
 
-**管理系统服务 (Linux)**
-安装后可以使用内置命令管理 `systemd` 服务：
+**Manage the system service (Linux)**  
+After installation, the built-in commands manage the `systemd` unit:
 ```bash
-pc service start    # 启动
-pc service stop     # 停止
-pc service status   # 状态查询
-pc service reload   # 平滑重载配置 (SIGHUP)
-pc service restart  # 重启
+pc service start    # start
+pc service stop     # stop
+pc service status   # status
+pc service reload   # graceful config reload (SIGHUP)
+pc service restart  # restart
 ```
 
-### 2. 配置文件模式 (推荐)
+### 2. Config-file mode (recommended)
 
-在项目根目录下创建一个名为 `Pingclairfile` 的文件，然后运行：
+Create a file named `Pingclairfile` in your project root, then run:
 
 ```bash
 pingclair run Pingclairfile
 ```
 
-## 🛠️ 配置详解 (Pingclairfile)
+## 🛠️ Configuration (Pingclairfile)
 
-Pingclairfile 是一种结构化的配置语言。它看起来很像 Rust 代码，但专门用于描述服务器行为。
+The Pingclairfile is a structured configuration language. It looks a lot like Rust, but is purpose-built for describing server behavior.
 
-### 基础结构
+### Basic structure
 
-一个最简单的配置包含一个或多个站点块：
+The simplest configuration is one or more site blocks:
 
 ```caddyfile
-# 定义一个监听 localhost 的服务器
+# A server listening on localhost
 localhost:8080 {
-    # 静态文件服务
+    # Static file serving
     file_server ./public
 }
 ```
 
-### 路由与匹配 (Routing & Matching)
+### Routing and matching
 
-Pingclair 提供了强大的路由匹配能力。你可以根据路径、域名、Header 等条件分流请求。
+Pingclair has a powerful matcher system — route requests by path, host, headers, and more.
 
 ```caddyfile
 example.com {
-    # 1. 使用命名匹配器匹配 API 路径
+    # 1. A named matcher for API paths
     @api {
         path /api/v1/*
     }
-    
-    # 针对 API 请求的逻辑
+
+    # Logic for API requests
     handle @api {
         header {
             set Content-Type "application/json"
@@ -157,7 +158,7 @@ example.com {
         reverse_proxy localhost:3000
     }
 
-    # 2. 匹配静态资源
+    # 2. Match static assets
     handle /assets/* {
         header {
             set Cache-Control "public, max-age=86400"
@@ -165,19 +166,19 @@ example.com {
         file_server ./assets
     }
 
-    # 3. 默认回退（Fallback）
+    # 3. Fallback
     handle {
         respond "Page Not Found" 404
     }
 }
 ```
 
-### 高级特性：宏 (Macros)
+### Advanced: macros
 
-这是 Pingclair 最强大的特性之一。你可以定义“宏”来封装重复的配置片段，并在多个服务器或路由中复用，保持配置文件的整洁（DRY 原则）。
+Macros are one of Pingclair's most powerful features. Define a macro to encapsulate a repeated configuration fragment, then reuse it across servers and routes to keep configuration DRY.
 
 ```rust
-// 定义一个名为 security 的宏，用于添加安全头
+// A macro that adds security headers
 macro security_headers!() {
     headers {
         remove: ["Server", "X-Powered-By"];
@@ -189,7 +190,7 @@ macro security_headers!() {
     }
 }
 
-// 定义通用的日志配置宏
+// A shared logging macro
 macro standard_log!(path) {
     log {
         output: File(path);
@@ -200,8 +201,8 @@ macro standard_log!(path) {
 
 server "blog.example.com" {
     listen: "0.0.0.0:443";
-    
-    // 使用宏
+
+    // Use the macros
     use security_headers!();
     use standard_log!("/var/log/pingclair/blog.log");
 
@@ -212,8 +213,8 @@ server "blog.example.com" {
 
 server "shop.example.com" {
     listen: "0.0.0.0:443";
-    
-    // 复用相同的安全配置
+
+    // Reuse the same security configuration
     use security_headers!();
     use standard_log!("/var/log/pingclair/shop.log");
 
@@ -223,57 +224,57 @@ server "shop.example.com" {
 }
 ```
 
-### 反向代理与负载均衡
+### Reverse proxy and load balancing
 
 ```caddyfile
 :80 :8080 {
-    # 反向代理到多个后端
+    # Proxy to multiple backends
     reverse_proxy 10.0.0.1:8080 10.0.0.2:8080 {
-        # 负载均衡策略: round_robin, random, least_conn
+        # Load balancing policy: round_robin, random, least_conn
         lb_policy least_conn
-        
-        # 失败重试
+
+        # Retry on failure
         failover true
     }
 }
 ```
 
-## 🏗️ 架构概览
+## 🏗️ Architecture
 
-Pingclair 采用模块化的 Workspace 结构管理代码：
+Pingclair is organized as a modular Cargo workspace:
 
-| Crate (模块) | 描述 |
-|--------------|------|
-| **`pingclair`** | **CLI 入口**。负责解析命令行参数，初始化日志，引导系统启动。 |
-| **`pingclair-core`** | **核心运行时**。定义了核心的数据结构、Trait 和服务器生命周期管理。 |
-| **`pingclair-config`** | **配置编译器**。负责解析 `Pingclairfile`，进行词法分析、语法分析和语义检查，生成运行时配置对象。 |
-| **`pingclair-proxy`** | **代理实现**。基于 Pingora Proxy Trait 实现的 HTTP/TCP 代理逻辑，包含负载均衡器。 |
-| **`pingclair-static`** | **静态文件服务**。实现了高效的文件读取、MIME 类型推断和流式传输。 |
-| **`pingclair-tls`** | **TLS 管理**。处理证书加载、ACME 自动申请（Let's Encrypt）以及 QUIC 握手逻辑。 |
-| **`pingclair-api`** | **Admin API**。提供 RESTful 接口，允许在运行时动态查看状态或热更新配置。 |
-| **`pingclair-plugin`** | **插件系统**。定义了插件接口，允许第三方开发者扩展功能。 |
+| Crate | Description |
+|-------|-------------|
+| **`pingclair`** | **CLI entry point.** Parses arguments, initializes logging, bootstraps the system. |
+| **`pingclair-core`** | **Core runtime.** Core data structures, traits, and server lifecycle management. |
+| **`pingclair-config`** | **Configuration compiler.** Lexes, parses, and semantically checks the `Pingclairfile`, producing runtime config objects. |
+| **`pingclair-proxy`** | **Proxy implementation.** HTTP/TCP proxy logic built on Pingora's proxy trait, including the load balancer. |
+| **`pingclair-static`** | **Static file serving.** Efficient file reads, MIME type inference, and streaming. |
+| **`pingclair-tls`** | **TLS management.** Certificate loading, automatic ACME issuance (Let's Encrypt), and QUIC handshake logic. |
+| **`pingclair-api`** | **Admin API.** A RESTful interface for inspecting state and hot-reloading configuration at runtime. |
+| **`pingclair-plugin`** | **Plugin system.** The plugin interface for third-party extensions. |
 
-## 🤝 参与贡献
+## 🤝 Contributing
 
-我们非常欢迎社区的贡献！无论你是想修复一个 Bug，增加一个新特性，还是仅仅改进文档。
+Contributions are very welcome — whether you're fixing a bug, adding a feature, or just improving the docs.
 
-### 开发流程
+### Workflow
 
-1.  **Fork** 本仓库。
-2.  **创建分支**: `git checkout -b feature/my-cool-feature`
-3.  **提交代码**: 遵循 Rust 代码风格。
-4.  **运行测试**: 确保所有测试通过。
+1.  **Fork** the repository.
+2.  **Create a branch**: `git checkout -b feature/my-cool-feature`
+3.  **Write code** following standard Rust style.
+4.  **Run the tests** and make sure they pass:
     ```bash
     cargo test --workspace
     ```
-5.  **提交 PR**: 在 Pull Request 中描述你的改动。
+5.  **Open a PR** describing your change.
 
-## 📄 许可证
+## 📄 License
 
-本项目采用 **Apache 2.0 许可证** 开源。详情请见 [LICENSE](LICENSE) 文件。
+Licensed under the **Apache License 2.0**. See [LICENSE](LICENSE) for details.
 
 ---
 
 <div align="center">
-  <sub>由 Pingclair 贡献者团队用 ❤️ 和 Rust 打造</sub>
+  <sub>Built with ❤️ and Rust</sub>
 </div>
