@@ -2274,6 +2274,7 @@ dependencies = [
  "quinn",
  "rustls",
  "rustls-pemfile 2.2.0",
+ "serde_json",
  "thiserror 2.0.19",
  "tokio",
  "tracing",

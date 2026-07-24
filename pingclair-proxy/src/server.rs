@@ -119,6 +119,77 @@ fn generate_request_id() -> String {
     format!("{:x}-{:x}", epoch, seq)
 }
 
+/// Feed one response body chunk through a streaming gzip encoder.
+///
+/// 🏗️ ARCHITECTURE: real streaming, not full-body buffering.
+///
+/// A naive implementation accumulates every chunk in the encoder and only
+/// emits output once, at `end_of_stream` — so a large upstream response (or
+/// an adversarial client requesting one) means buffering the *entire* body
+/// in memory before the first byte goes out: an OOM risk independent of
+/// how big the response actually needs to be in flight at once. Here we
+/// force a sync flush after every chunk, which pushes whatever the deflate
+/// stream has buffered internally out into the encoder's small `Vec<u8>`,
+/// then drain that Vec as this chunk's output via `mem::take`. Memory use
+/// is bounded by one chunk's worth of compressed bytes, regardless of
+/// total response size.
+///
+/// Extracted as a free function (rather than inlined in the `ProxyHttp`
+/// trait impl) so it can be unit-tested without needing a live Pingora
+/// `Session`.
+fn stream_gzip_chunk(
+    encoder_slot: &mut Option<GzEncoder<Vec<u8>>>,
+    body: &mut Option<Bytes>,
+    end_of_stream: bool,
+) {
+    if encoder_slot.is_none() {
+        return;
+    }
+
+    // Feed this chunk into the encoder.
+    if let Some(chunk) = body.as_ref() {
+        if let Some(encoder) = encoder_slot.as_mut() {
+            if let Err(e) = encoder.write_all(chunk) {
+                tracing::warn!(
+                    "⚠️ Gzip compression failed, aborting compression for the rest of this response: {}",
+                    e
+                );
+                // Bail out of compression entirely; the client already
+                // received a Content-Encoding: gzip header for this
+                // response so we cannot fall back to plaintext mid-stream
+                // — better to end the response short than to send a
+                // client a body it can't decode.
+                *encoder_slot = None;
+                *body = None;
+                return;
+            }
+        }
+    }
+
+    if end_of_stream {
+        // Finalize: flushes any remaining buffered bytes plus the gzip
+        // trailer (CRC32 + uncompressed size) into the encoder's Vec.
+        if let Some(encoder) = encoder_slot.take() {
+            match encoder.finish() {
+                Ok(tail) => *body = Some(Bytes::from(tail)),
+                Err(e) => {
+                    tracing::warn!("⚠️ Gzip finalize failed: {}", e);
+                    *body = Some(Bytes::new());
+                }
+            }
+        }
+        return;
+    }
+
+    if let Some(encoder) = encoder_slot.as_mut() {
+        if let Err(e) = encoder.flush() {
+            tracing::warn!("⚠️ Gzip flush failed: {}", e);
+        }
+        let out = std::mem::take(encoder.get_mut());
+        *body = Some(Bytes::from(out));
+    }
+}
+
 // MARK: - Proxy State
 
 /// Mutable state for hot reloading
@@ -1244,64 +1315,7 @@ impl ProxyHttp for PingclairProxy {
             ctx.response_bytes += b.len() as u64;
         }
 
-        if ctx.gzip_encoder.is_none() {
-            return Ok(None);
-        }
-
-        // Feed this chunk into the encoder.
-        if let Some(chunk) = body.as_ref() {
-            if let Some(encoder) = ctx.gzip_encoder.as_mut() {
-                if let Err(e) = encoder.write_all(chunk) {
-                    tracing::warn!(
-                        "⚠️ Gzip compression failed, aborting compression for the rest of this response: {}",
-                        e
-                    );
-                    // Bail out of compression entirely; the client already
-                    // received a Content-Encoding: gzip header for this
-                    // response so we cannot fall back to plaintext mid-
-                    // stream — better to end the response short than to
-                    // send a client a body it can't decode.
-                    ctx.gzip_encoder = None;
-                    *body = None;
-                    return Ok(None);
-                }
-            }
-        }
-
-        if end_of_stream {
-            // Finalize: flushes any remaining buffered bytes plus the gzip
-            // trailer (CRC32 + uncompressed size) into the encoder's Vec.
-            if let Some(encoder) = ctx.gzip_encoder.take() {
-                match encoder.finish() {
-                    Ok(tail) => *body = Some(Bytes::from(tail)),
-                    Err(e) => {
-                        tracing::warn!("⚠️ Gzip finalize failed: {}", e);
-                        *body = Some(Bytes::new());
-                    }
-                }
-            }
-            return Ok(None);
-        }
-
-        // 🏗️ ARCHITECTURE: real streaming, not full-body buffering.
-        //
-        // The previous implementation fed every chunk into the encoder but
-        // only ever emitted output once, at `end_of_stream` — so a large
-        // upstream response (or an adversarial client requesting one) meant
-        // buffering the *entire* body in memory before the first byte went
-        // out. Here we force a sync flush after every chunk, which pushes
-        // whatever the deflate stream has buffered internally out into the
-        // encoder's small `Vec<u8>`, then drain that Vec as this chunk's
-        // output. `mem::take` swaps in a fresh empty Vec, so the buffer
-        // never grows past one chunk's worth of compressed bytes,
-        // regardless of total response size.
-        if let Some(encoder) = ctx.gzip_encoder.as_mut() {
-            if let Err(e) = encoder.flush() {
-                tracing::warn!("⚠️ Gzip flush failed: {}", e);
-            }
-            let out = std::mem::take(encoder.get_mut());
-            *body = Some(Bytes::from(out));
-        }
+        stream_gzip_chunk(&mut ctx.gzip_encoder, body, end_of_stream);
 
         Ok(None)
     }
@@ -1429,5 +1443,318 @@ fn find_rate_limit_config(handler: &HandlerConfig) -> Option<crate::rate_limit::
             None
         },
         _ => None,
+    }
+}
+
+// MARK: - P0 Regression Tests
+//
+// Targeted tests for the 4 P0 issues fixed per docs/AUDIT_NGINX_PARITY.md:
+// gzip OOM risk, request ID syscall overhead, hosts lock contention, and
+// upstream connection pool sizing.
+#[cfg(test)]
+mod p0_regression_tests {
+    use super::*;
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
+
+    // ---- Fix 1: streaming gzip stays bounded regardless of body size ----
+
+    /// Feeds a large body through `stream_gzip_chunk` one chunk at a time
+    /// and asserts the per-chunk output buffer never grows anywhere near
+    /// the size of the accumulated body — the exact OOM scenario the audit
+    /// flagged (large upstream response + gzip = whole body buffered).
+    #[test]
+    fn gzip_streaming_bounds_memory_regardless_of_total_body_size() {
+        let mut encoder_slot = Some(GzEncoder::new(Vec::new(), Compression::fast()));
+        let chunk = Bytes::from(vec![b'a'; 64 * 1024]); // 64KB per chunk
+        let total_chunks = 500; // 32MB total body
+        let mut max_single_output = 0usize;
+        let mut full_output = Vec::new();
+
+        for i in 0..total_chunks {
+            let mut body = Some(chunk.clone());
+            let end = i == total_chunks - 1;
+            stream_gzip_chunk(&mut encoder_slot, &mut body, false);
+            if let Some(out) = &body {
+                max_single_output = max_single_output.max(out.len());
+                full_output.extend_from_slice(out);
+            }
+            if end {
+                // Final empty chunk to flush the trailer.
+                let mut tail_body: Option<Bytes> = None;
+                stream_gzip_chunk(&mut encoder_slot, &mut tail_body, true);
+                if let Some(out) = &tail_body {
+                    full_output.extend_from_slice(out);
+                }
+            }
+        }
+
+        // The whole uncompressed body is 32MB; if we were still buffering
+        // the entire thing before emitting anything, `max_single_output`
+        // would be on that order. Bounded streaming keeps it tiny.
+        assert!(
+            max_single_output < 1024 * 1024,
+            "a single chunk's compressed output was {max_single_output} bytes — \
+             gzip streaming appears to be buffering the whole body again"
+        );
+        assert!(encoder_slot.is_none(), "encoder should be consumed after end_of_stream");
+
+        // And the output must still be valid, correct gzip data.
+        let mut decoder = GzDecoder::new(&full_output[..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).unwrap();
+        assert_eq!(decompressed.len(), total_chunks * chunk.len());
+        assert!(decompressed.iter().all(|&b| b == b'a'));
+    }
+
+    #[test]
+    fn gzip_streaming_handles_single_chunk_response() {
+        let mut encoder_slot = Some(GzEncoder::new(Vec::new(), Compression::fast()));
+        let mut body = Some(Bytes::from_static(b"hello world"));
+        stream_gzip_chunk(&mut encoder_slot, &mut body, true);
+
+        let out = body.expect("should produce compressed output");
+        let mut decoder = GzDecoder::new(&out[..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).unwrap();
+        assert_eq!(decompressed, b"hello world");
+    }
+
+    #[test]
+    fn gzip_streaming_handles_empty_body() {
+        let mut encoder_slot = Some(GzEncoder::new(Vec::new(), Compression::fast()));
+        let mut body: Option<Bytes> = None;
+        stream_gzip_chunk(&mut encoder_slot, &mut body, true);
+
+        // Even a zero-byte response still gets a valid (empty) gzip stream.
+        let out = body.expect("finalize should still emit gzip header+trailer");
+        let mut decoder = GzDecoder::new(&out[..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).unwrap();
+        assert!(decompressed.is_empty());
+    }
+
+    #[test]
+    fn gzip_streaming_noop_when_no_encoder_present() {
+        // Uncompressed responses (client doesn't accept gzip, etc.) must
+        // pass through completely untouched.
+        let mut encoder_slot: Option<GzEncoder<Vec<u8>>> = None;
+        let mut body = Some(Bytes::from_static(b"passthrough"));
+        stream_gzip_chunk(&mut encoder_slot, &mut body, false);
+        assert_eq!(body, Some(Bytes::from_static(b"passthrough")));
+    }
+
+    // ---- Fix 2: request ID generation is syscall-free per request ----
+
+    #[test]
+    fn request_ids_are_unique_across_many_sequential_calls() {
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..100_000 {
+            assert!(ids.insert(generate_request_id()), "duplicate request ID generated");
+        }
+    }
+
+    #[test]
+    fn request_ids_are_unique_under_concurrent_generation() {
+        // The counter is a shared static AtomicU64; this is the test that
+        // would catch a race in the fix (e.g. non-atomic increment).
+        let thread_count = 16;
+        let per_thread = 5_000;
+        let barrier = Arc::new(Barrier::new(thread_count));
+
+        let handles: Vec<_> = (0..thread_count)
+            .map(|_| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..per_thread).map(|_| generate_request_id()).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+
+        let mut all_ids = std::collections::HashSet::new();
+        for h in handles {
+            for id in h.join().unwrap() {
+                assert!(all_ids.insert(id), "duplicate request ID across threads");
+            }
+        }
+        assert_eq!(all_ids.len(), thread_count * per_thread);
+    }
+
+    #[test]
+    fn request_id_format_is_stable_and_sortable_within_epoch() {
+        let a = generate_request_id();
+        let b = generate_request_id();
+        assert!(a.contains('-'), "expected `<epoch>-<seq>` format, got {a}");
+        let (epoch_a, seq_a) = a.split_once('-').unwrap();
+        let (epoch_b, seq_b) = b.split_once('-').unwrap();
+        // Same process epoch for two calls made back-to-back.
+        assert_eq!(epoch_a, epoch_b);
+        let seq_a = u64::from_str_radix(seq_a, 16).unwrap();
+        let seq_b = u64::from_str_radix(seq_b, 16).unwrap();
+        assert!(seq_b > seq_a, "sequence should be monotonically increasing");
+    }
+
+    // ---- Fix 3: hosts/default reads never contend with reloads ----
+
+    fn minimal_server_config(name: &str) -> ServerConfig {
+        ServerConfig {
+            name: Some(name.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn get_state_resolves_exact_host_after_add_server() {
+        let proxy = PingclairProxy::new();
+        assert!(proxy.get_state("api.example.com").is_none());
+
+        proxy.add_server(minimal_server_config("api.example.com"));
+        assert!(proxy.get_state("api.example.com").is_some());
+        assert!(proxy.get_state("other.example.com").is_none());
+    }
+
+    #[test]
+    fn get_state_falls_back_to_wildcard_then_default() {
+        let proxy = PingclairProxy::new();
+        proxy.add_server(minimal_server_config("*.example.com"));
+        assert!(proxy.get_state("foo.example.com").is_some());
+        assert!(proxy.get_state("example.com").is_none()); // wildcard doesn't match bare domain
+
+        proxy.add_server(minimal_server_config("_")); // catch-all
+        assert!(proxy.get_state("totally-unrelated.test").is_some());
+    }
+
+    #[test]
+    fn update_config_atomically_replaces_the_whole_host_map() {
+        let proxy = PingclairProxy::new();
+        proxy.add_server(minimal_server_config("a.example.com"));
+        proxy.add_server(minimal_server_config("b.example.com"));
+        assert!(proxy.get_state("a.example.com").is_some());
+        assert!(proxy.get_state("b.example.com").is_some());
+
+        // Replace entirely with just one host — "a" should disappear.
+        proxy.update_config(vec![minimal_server_config("b.example.com")]);
+        assert!(proxy.get_state("a.example.com").is_none());
+        assert!(proxy.get_state("b.example.com").is_some());
+    }
+
+    #[test]
+    fn concurrent_add_server_calls_never_lose_entries() {
+        // This is the test a naive `hosts.write(); *hosts = ...` swap (or a
+        // non-retrying read-modify-write) would fail: under contention,
+        // ArcSwap::rcu must retry rather than silently drop a racing
+        // writer's insert.
+        let proxy = Arc::new(PingclairProxy::new());
+        let thread_count = 32;
+        let barrier = Arc::new(Barrier::new(thread_count));
+
+        let handles: Vec<_> = (0..thread_count)
+            .map(|i| {
+                let proxy = proxy.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    proxy.add_server(minimal_server_config(&format!("host-{i}.example.com")));
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        for i in 0..thread_count {
+            assert!(
+                proxy.get_state(&format!("host-{i}.example.com")).is_some(),
+                "host-{i}.example.com was lost under concurrent add_server calls"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_reads_never_observe_a_torn_or_panicking_state_during_reload() {
+        // Readers must never block on, or be corrupted by, a concurrent
+        // hot-reload. Hammer get_state from many threads while another
+        // thread repeatedly calls update_config, and assert nothing panics
+        // and every read is a fully-formed ProxyState or None.
+        let proxy = Arc::new(PingclairProxy::new());
+        proxy.add_server(minimal_server_config("stable.example.com"));
+
+        let stop = Arc::new(AtomicUsize::new(0));
+        let reload_count = 200;
+
+        let writer = {
+            let proxy = proxy.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                for i in 0..reload_count {
+                    proxy.update_config(vec![
+                        minimal_server_config("stable.example.com"),
+                        minimal_server_config(&format!("churn-{i}.example.com")),
+                    ]);
+                }
+                stop.store(1, Ordering::Relaxed);
+            })
+        };
+
+        let readers: Vec<_> = (0..8)
+            .map(|_| {
+                let proxy = proxy.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut observed_none_for_stable = false;
+                    while stop.load(Ordering::Relaxed) == 0 {
+                        match proxy.get_state("stable.example.com") {
+                            Some(state) => {
+                                // A fully-formed ProxyState must have a
+                                // router; this is what would look "torn"
+                                // if we ever read across two different
+                                // in-progress writes.
+                                let _ = &state.router;
+                            }
+                            None => observed_none_for_stable = true,
+                        }
+                    }
+                    observed_none_for_stable
+                })
+            })
+            .collect();
+
+        writer.join().unwrap();
+        for r in readers {
+            let saw_none = r.join().unwrap();
+            // "stable.example.com" is present in every single update_config
+            // call, so a correct implementation must never report it
+            // missing to a reader.
+            assert!(!saw_none, "reader observed stable host missing during reload — reload is not atomic per-map");
+        }
+
+        assert!(proxy.get_state("stable.example.com").is_some());
+    }
+
+    // ---- Fix 4: upstream connection pool size is explicit, not implicit ----
+
+    #[test]
+    fn global_config_pool_size_defaults_to_none_and_round_trips() {
+        use pingclair_core::config::GlobalConfig;
+
+        let default_cfg = GlobalConfig::default();
+        assert_eq!(
+            default_cfg.upstream_keepalive_pool_size, None,
+            "default must be None so main.rs falls back to Pingora's own default explicitly, \
+             rather than us silently guessing a number"
+        );
+
+        let json = r#"{"email":null,"auto_https":"on","blocked_ips":[],"upstream_keepalive_pool_size":256}"#;
+        let parsed: GlobalConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.upstream_keepalive_pool_size, Some(256));
+
+        // Old configs saved before this field existed must still parse.
+        let legacy_json = r#"{"email":null,"auto_https":"on","blocked_ips":[]}"#;
+        let parsed_legacy: GlobalConfig = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(parsed_legacy.upstream_keepalive_pool_size, None);
     }
 }

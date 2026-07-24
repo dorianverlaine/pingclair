@@ -39,3 +39,5 @@ rustls.workspace = true
 thiserror.workspace = true
 rustls-pemfile = "2"
 
+[dev-dependencies]
+serde_json.workspace = true
