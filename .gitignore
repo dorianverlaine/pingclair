@@ -44,3 +44,6 @@ examples/*.bin
 # Benchmark artifacts
 pingclair-linux-amd64
 bench_*
+
+# Stray test output
+**/test_output.txt

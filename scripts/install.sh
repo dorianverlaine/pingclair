@@ -37,7 +37,7 @@ esac
 echo "Detected architecture: $ARCH"
 
 # 4. Download Binary
-REPO="SinclairChao/pingclair"
+REPO="dorianverlaine/pingclair"
 echo "Fetching latest release from $REPO..."
 
 LATEST_RELEASE_URL=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" | jq -r ".assets[] | select(.name | contains(\"$ASSET_KEY\") and contains(\"linux\")) | .browser_download_url" | head -n 1)
