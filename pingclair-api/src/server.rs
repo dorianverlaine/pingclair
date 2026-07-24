@@ -70,10 +70,10 @@ async fn handle_request(
             let proxies_guard = proxies.read();
             for (addr, proxy) in proxies_guard.iter() {
                 let mut host_configs = Vec::new();
-                for host_state in proxy.hosts.read().values() {
+                for host_state in proxy.hosts.load().values() {
                     host_configs.push(host_state.config.as_ref().clone());
                 }
-                if let Some(def) = proxy.default.read().as_ref() {
+                if let Some(def) = (**proxy.default.load()).as_ref() {
                     host_configs.push(def.config.as_ref().clone());
                 }
                 configs.insert(addr.clone(), host_configs);
