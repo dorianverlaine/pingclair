@@ -45,19 +45,23 @@ fix without review:
    aarch64 under this crate's release profile (`panic="abort"` + fat LTO +
    `codegen-units=1`), failing the image build partway through compiling
    `tokio`. Pinned to stable. (commit adjacent to the above)
-9. **NOT YET FIXED: static-file gzip compression has the same full-buffer
-   bug as #1, in a different crate.** `pingclair-static::FileServer::
-   compress_content` fully buffers the input file *and* the compressed
-   output per request, with no cache. Fix #1 only covers the
-   reverse-proxy response path — this is the static-file path, and it
-   wasn't touched. Under sustained concurrent load against a large file,
-   this caused a 20-second benchmark to take 16 minutes (see "Large body"
-   results below); memory peaked at 367.9 MiB of a 512 MiB cap without
-   OOM-killing, so this is a severe latency/queuing problem, not a crash.
-   Likely fix: apply the same streaming approach used for #1, and/or add
-   a compressed-response cache keyed on file path + mtime + encoding.
+9. **FIXED: static-file gzip compression had the same full-buffer bug as
+   #1, in a different crate.** `pingclair-static::FileServer::
+   compress_content` fully buffered the input file *and* the compressed
+   output on *every* request, with no cache — fix #1 only covered the
+   reverse-proxy response path, and this static-file path wasn't touched.
+   Under sustained concurrent load against a large file, this turned a
+   20-second benchmark into 16 minutes (see "Large body" results below).
+   Fixed by adding a byte-bounded LRU cache of compressed bodies keyed on
+   `(path, mtime, encoding)` — a hit skips the disk read and the
+   compression entirely; editing a file (new mtime) transparently
+   invalidates its stale entry. Verified with a repeat of the exact same
+   benchmark: 16 minutes → 20.09s, 54 requests → 21,684, 0.06 req/s →
+   1,079 req/s (~400x more requests served). See "Large body" results
+   below for the full before/after and an important residual caveat about
+   cold-start memory. (`240399c`)
 
-Workspace tests: 65 → 83, all passing, across fixes 1-8.
+Workspace tests: 65 → 91, all passing, across all 9 fixes.
 
 Also deleted a `strict-tests/` directory that had been added by another
 tool: 16 of its 26 tests failed against the real compiler because it
@@ -156,58 +160,56 @@ custom-tuned beyond the basics in `configs/*/`.
 
 ### Large body (20MB), gzip, sustained concurrent load — the important one
 
+**Before the fix (bug #9, `pingclair_static_plain_c500.txt` era, commit
+`e35e067` and earlier):**
+
 | Server | Requests completed | Wall time (nominal 20s) | Timeouts | Peak container memory | Peak CPU |
 |---|---|---|---|---|---|
-| **Pingclair** | 54 | **16m 1s** | 48 | **367.9 MiB / 512 MiB** | ~101% (1 core) |
+| **Pingclair** | 54 | **16m 1s** | 48 | 367.9 MiB / 512 MiB | ~101% (1 core) |
 | Nginx | 150 | 20.1s | 126 | 22.2 MiB / 512 MiB | ~211% (2 cores) |
 | Caddy | 374 | 20.0s | 0 | 73.0 MiB / 512 MiB | ~201% (2 cores) |
 
-The memory gap is the real story here, not just the wall-clock time.
-Nginx and Caddy both peg *both* CPU cores while actively compressing
-(~200%) yet barely touch memory (22 MiB / 73 MiB) — consistent with truly
-streaming, low-buffer compression. Pingclair uses *less* CPU (~101%, one
-core, likely serialized rather than parallel) while using **5-16x more
-memory** — consistent with the full-buffer, uncached compression
-described below, not a CPU-bound bottleneck.
+Root cause, confirmed by isolated reproduction (not speculation):
+`/large.html` is served by `pingclair-static`'s `FileServer`, **not** the
+reverse-proxy path, so P0 fix #1's streaming gzip didn't apply to it.
+`FileServer::compress_content` fully buffered the input file *and* the
+compressed output on every single request, with no cache. A single
+request was fast (0.4s); 5 concurrent requests were fine (0.7-1.75s). The
+problem was **sustained** load: `wrk -c20 -d20s` keeps 20 connections
+firing repeated requests for the full window, each one re-compressing the
+same 20MB file from scratch — under the container's 2-vCPU cap that
+backlog compounded into a 16-minute grind. Not an OOM (memory stayed
+under the cap, no crash) — an unbounded-latency/queuing problem.
 
-**Pingclair did not finish this test in anything close to the intended
-20-second window.** Root cause, confirmed by isolated reproduction (not
-speculation):
+**After the fix (`240399c`, compressed-body LRU cache), same test,
+repeated exactly:**
 
-- `/large.html` is served by `pingclair-static`'s `FileServer`, **not**
-  the reverse-proxy path — so the streaming-gzip fix from this session
-  (P0 fix #1 above) does not apply to it at all.
-- `FileServer::compress_content` (`pingclair-static/src/file_server.rs`)
-  still does the exact same class of bug that was fixed on the proxy
-  side: it fully buffers the input file *and* the compressed output in
-  memory, per request, with no cache — for every single request to the
-  same 20MB file.
-- A single request is fast and fine (0.4s). Five concurrent requests are
-  fine (0.7-1.75s). The problem is **sustained** load: `wrk -c20 -d20s`
-  keeps 20 persistent connections busy firing repeated requests for the
-  full 20 seconds, and each one re-compresses the full 20MB from scratch.
-  Under the container's 2-vCPU cap, that backlog compounds — measured
-  peak memory of 367.9 MiB (of the 512 MiB cap) lines up almost exactly
-  with several concurrent 20MB-class buffers in flight at once — and the
-  server never recovers within the test window; it just keeps grinding
-  through a growing backlog for 16 minutes.
-- This is **not an OOM** (confirmed: memory stayed under the cap and the
-  container never crashed or restarted) — it's an unbounded-latency /
-  queuing problem under sustained concurrent load against a large,
-  repeatedly-requested compressible file.
-- Nginx and Caddy both also compress on the fly with no explicit cache,
-  but neither exhibited anything close to this — see the memory/CPU table
-  above. Both stayed under 75 MiB while pegging both CPU cores; pingclair
-  used one core less aggressively while ballooning to 367.9 MiB. That
-  points specifically at a buffering/streaming difference, not raw
-  compression speed.
+| Server | Requests completed | Wall time (nominal 20s) | Timeouts | Peak container memory |
+|---|---|---|---|---|
+| **Pingclair** | **21,684** | **20.09s** | 21 | 373.6 MiB / 512 MiB (transient — settles to 17.5 MiB within ~10s) |
+| Nginx | 129 | 20.03s | 107 | — |
+| Caddy | 401 | 20.02s | 0 | — |
 
-**Recommended follow-up** (not done in this session — this needs its own
-focused pass, not a rushed fix): apply the same streaming approach used
-for the reverse-proxy gzip path to `FileServer::compress_content`, and/or
-add a compressed-response cache for static files (keyed on file path +
-mtime + encoding), which is very likely part of why Nginx/Caddy hold up
-better here.
+- **54 → 21,684 requests (~400x), 16m1s → 20.09s, 0.06 → 1,079 req/s.**
+  Error rate dropped from ~47% of attempts timing out to ~0.1%.
+- Pingclair now serves **more total requests than nginx and caddy
+  combined** on this exact test, because after the first request the file
+  is cached compressed — every subsequent hit skips compression
+  entirely, while nginx and caddy (no compressed-response cache
+  configured) pay the full compression cost on every request, every time.
+- **Important residual caveat**: peak memory during the *cold start* is
+  essentially unchanged (373.6 MiB vs. 367.9 MiB before). The cache
+  starts empty, so with `-c20` all 20 connections race in and miss
+  simultaneously — each independently compresses the full file before
+  any of them finishes and populates the cache (a classic "cache
+  stampede"). The fix eliminates the *steady-state* problem completely;
+  it does not yet coalesce concurrent first-time misses into a single
+  compression pass. That would need in-flight request deduplication
+  (have racing misses await the first compressor rather than each doing
+  their own), which is a reasonable next increment but wasn't in scope
+  here — memory does settle immediately once the cache warms (17.5 MiB
+  within ~10s), so this is a bounded, transient cost, not a repeat of
+  the original bug.
 
 ## Remote VPS run
 
