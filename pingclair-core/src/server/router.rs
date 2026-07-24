@@ -109,6 +109,26 @@ impl Router {
         for (path, routes) in path_groups {
             // Convert glob patterns to matchit format
             let matchit_path = Self::glob_to_matchit(&path);
+
+            // A glob like "/proxy/*" must also match the bare directory it
+            // was written to catch — both "/proxy/" and "/proxy" — with
+            // nothing after the prefix. That's how Caddy's own `*` glob and
+            // Nginx's prefix `location` both behave, and hitting the exact
+            // directory is an extremely common request. matchit's `{*rest}`
+            // wildcard requires at least one character after the prefix, and
+            // treats "/proxy" and "/proxy/" as distinct paths, so without
+            // these extra static registrations the bare forms fall through
+            // to the server's default route instead of matching —
+            // previously surfacing as a 500 ConnectNoRoute inside
+            // upstream_peer() when the default route had no upstream.
+            for bare in Self::bare_prefixes(&path) {
+                if let Err(e) = path_router.insert(bare.clone(), routes.clone()) {
+                    // A conflict here just means an explicit route already
+                    // owns that exact path; that route legitimately wins.
+                    tracing::debug!("Skipping bare-prefix route {}: {}", bare, e);
+                }
+            }
+
             if let Err(e) = path_router.insert(&matchit_path, routes) {
                 tracing::warn!("Failed to insert route {}: {}", path, e);
             }
@@ -283,6 +303,29 @@ impl Router {
         path.to_string()
     }
     
+    /// The bare (non-wildcard) prefixes a glob path should also match.
+    ///
+    /// `/proxy/*` → `["/proxy", "/proxy/"]` so a request to either the bare
+    /// directory or its trailing-slash form still hits the route.
+    /// `/foo*`    → `["/foo"]`.
+    /// Non-glob paths yield nothing.
+    fn bare_prefixes(path: &str) -> Vec<String> {
+        if let Some(prefix) = path.strip_suffix("/*") {
+            // "/proxy/*" -> prefix "/proxy": match both "/proxy" and "/proxy/".
+            if prefix.is_empty() {
+                // "/*" is the catch-all; leave it to default_routes.
+                Vec::new()
+            } else {
+                vec![prefix.to_string(), format!("{}/", prefix)]
+            }
+        } else if let Some(prefix) = path.strip_suffix('*') {
+            // "/foo*" -> prefix "/foo".
+            if prefix.is_empty() { Vec::new() } else { vec![prefix.to_string()] }
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Convert glob pattern to matchit format
     fn glob_to_matchit(path: &str) -> String {
         if path.ends_with("/*") {
@@ -356,8 +399,38 @@ mod tests {
             make_route("/*"),
         ];
         let router = Router::new(routes);
-        
+
         let matched = router.match_path("/unknown");
         assert!(!matched.is_empty());
+    }
+
+    /// Regression: a `/proxy/*` route must also match the bare `/proxy/`
+    /// (nothing after the slash) and `/proxy` — the exact directory the
+    /// glob was written to catch. matchit's `{*rest}` wildcard needs at
+    /// least one trailing char, so without the bare-prefix registration
+    /// these fall through to the default route (or 500 with ConnectNoRoute
+    /// when there is no default upstream), diverging from how Caddy/Nginx
+    /// treat the same pattern.
+    #[test]
+    fn test_glob_matches_bare_prefix() {
+        let routes = vec![make_route("/proxy/*")];
+        let router = Router::new(routes);
+
+        // With a trailing segment — always worked.
+        assert!(!router.match_path("/proxy/foo").is_empty(), "/proxy/foo should match /proxy/*");
+        // The bare directory with a trailing slash — the reported bug.
+        assert!(!router.match_path("/proxy/").is_empty(), "/proxy/ should match /proxy/*");
+        // The bare directory with no trailing slash.
+        assert!(!router.match_path("/proxy").is_empty(), "/proxy should match /proxy/*");
+    }
+
+    /// The bare-prefix registration must not over-match a sibling path that
+    /// merely shares a textual prefix (`/proxying` is not under `/proxy/*`).
+    #[test]
+    fn test_glob_bare_prefix_does_not_overmatch_siblings() {
+        let routes = vec![make_route("/proxy/*")];
+        let router = Router::new(routes);
+        assert!(router.match_path("/proxyfoo").is_empty(), "/proxyfoo must NOT match /proxy/*");
+        assert!(router.match_path("/other").is_empty(), "/other must NOT match /proxy/*");
     }
 }
