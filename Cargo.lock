@@ -2288,10 +2288,12 @@ dependencies = [
  "async-compression",
  "async-trait",
  "bytes",
+ "flate2",
  "http 1.4.2",
  "httpdate",
  "mime_guess",
  "pingclair-core",
+ "tempfile",
  "tokio",
  "tracing",
 ]
