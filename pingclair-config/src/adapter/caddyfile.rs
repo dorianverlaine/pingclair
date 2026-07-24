@@ -274,7 +274,7 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                     }
                 },
                 "route" | "handle" => {
-                    let (matcher, inner_block) = parse_matcher_and_block(&sub_d)?;
+                    let (matcher, inner_block) = parse_route_matcher_and_block(&sub_d)?;
                     if let Some(blk) = inner_block {
                         let mut handlers = Vec::new();
                         for inner_d in &blk.directives {
@@ -717,6 +717,32 @@ fn parse_matcher_and_block(d: &Directive) -> Result<(Option<Matcher>, Option<&Bl
     Ok((matcher, block))
 }
 
+/// Parse the matcher for a `route`/`handle` directive.
+///
+/// Unlike the generic [`parse_matcher_and_block`], the first argument of a
+/// `route`/`handle` block is *positionally* a matcher and accepts both
+/// spellings Caddy allows:
+///   - `@name`      → a named matcher defined elsewhere in the block
+///   - `/some/path` → an inline path matcher (`handle /api/*`)
+///
+/// Historically only `@name` was recognised here, so `handle /api/*` (and
+/// the equivalent `route "/api/*"`) silently dropped its path and collapsed
+/// into the server's catch-all handler — every request matched it
+/// regardless of URL. This dedicated helper keeps that leading-`/`
+/// detection out of the generic branch, where a leading `/` is a real
+/// argument (e.g. `file_server /var/www/html`), not a matcher.
+fn parse_route_matcher_and_block(d: &Directive) -> Result<(Option<Matcher>, Option<&Block>), AdapterError> {
+    let block = d.block.as_ref();
+    let matcher = match d.args.first() {
+        Some(arg) if arg.starts_with('@') => Some(Matcher::Named(arg.clone())),
+        Some(arg) if arg.starts_with('/') => {
+            Some(Matcher::Path(PathMatcher { patterns: vec![arg.clone()] }))
+        }
+        _ => None,
+    };
+    Ok((matcher, block))
+}
+
 fn parse_matcher_definition(d: &Directive) -> Result<Matcher, AdapterError> {
     if let Some(block) = &d.block {
         let mut matchers = Vec::new();
@@ -1010,5 +1036,81 @@ mod global_tests {
         let ast = adapt(directives).unwrap();
         let server = &ast.servers[0].inner;
         assert!(server.matchers.contains_key("@cf_access"));
+    }
+
+    // ---- Regression: `handle`/`route` with an inline path matcher ----
+    //
+    // `handle /api/*` and `route "/api/*"` must keep their path. The old
+    // adapter only recognised `@name` matchers, so an inline path was
+    // dropped and the block collapsed into the server's catch-all — every
+    // request matched it regardless of URL. These use the full public
+    // `compile()` pipeline so they assert the final RouteConfig.path, which
+    // is what the runtime router actually keys on.
+
+    fn compiled_routes(source: &str) -> Vec<pingclair_core::config::RouteConfig> {
+        crate::compile(source).unwrap().servers.remove(0).routes
+    }
+
+    #[test]
+    fn handle_with_inline_path_keeps_its_path() {
+        let routes = compiled_routes(r#"
+            :8080 {
+                handle /proxy/* {
+                    reverse_proxy 127.0.0.1:9000
+                }
+                file_server /var/www/html
+            }
+        "#);
+
+        // The proxy route must be keyed on /proxy/*, NOT collapsed to /*.
+        let proxy = routes.iter()
+            .find(|r| matches!(&r.handler,
+                pingclair_core::config::HandlerConfig::ReverseProxy(_)
+                | pingclair_core::config::HandlerConfig::Pipeline(_)))
+            .expect("proxy route should exist");
+        assert_eq!(proxy.path, "/proxy/*", "handle /proxy/* lost its path");
+
+        // The bare file_server is the catch-all.
+        let fs = routes.iter()
+            .find(|r| matches!(&r.handler, pingclair_core::config::HandlerConfig::FileServer { .. }))
+            .expect("file_server route should exist");
+        assert_eq!(fs.path, "/*");
+    }
+
+    #[test]
+    fn route_with_quoted_path_keeps_its_path() {
+        let routes = compiled_routes(r#"
+            example.com {
+                route "/api/*" {
+                    respond "api" 200
+                }
+                route "/health" {
+                    respond "ok" 200
+                }
+            }
+        "#);
+        let paths: Vec<_> = routes.iter().map(|r| r.path.as_str()).collect();
+        assert!(paths.contains(&"/api/*"), "route \"/api/*\" lost its path; got {paths:?}");
+        assert!(paths.contains(&"/health"), "route \"/health\" lost its path; got {paths:?}");
+    }
+
+    #[test]
+    fn bare_file_server_root_is_not_mistaken_for_a_matcher() {
+        // `file_server /var/www/html` at server level: the leading-'/' arg
+        // is the ROOT, not a path matcher. It must stay the catch-all and
+        // keep its root — the scoped fix must not leak into this branch.
+        let routes = compiled_routes(r#"
+            :8080 {
+                file_server /var/www/html
+            }
+        "#);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].path, "/*");
+        match &routes[0].handler {
+            pingclair_core::config::HandlerConfig::FileServer { root, .. } => {
+                assert_eq!(root, "/var/www/html", "file_server root was swallowed as a matcher");
+            }
+            other => panic!("expected FileServer, got {other:?}"),
+        }
     }
 }

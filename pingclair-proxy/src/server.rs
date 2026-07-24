@@ -227,88 +227,86 @@ impl ProxyState {
         let mut rate_limiters = Vec::new();
 
         for route in &config.routes {
-            match &route.handler {
-                HandlerConfig::ReverseProxy(proxy_config) => {
-                    // 1. Create Upstreams (Backends)
-                    let upstreams: Vec<Upstream> = proxy_config.upstreams.iter()
-                        .filter_map(|addr| create_upstream(addr))
-                        .collect();
-                    
-                    if upstreams.is_empty() {
-                        tracing::warn!("⚠️ No valid upstreams found for route {}", route.path);
-                    }
+            // Each per-route slot is resolved independently by walking the
+            // route's handler tree. A `reverse_proxy`/`file_server`/
+            // `rate_limit` may sit at the top level *or* be nested inside a
+            // `handle {}` / `route {}` block (which the adapter represents as
+            // a Pipeline); the finders recurse so both cases are set up
+            // identically. Previously only top-level ReverseProxy/FileServer
+            // handlers were recognised, so anything inside a `handle` block
+            // got no load balancer / no file-server instance and failed at
+            // runtime with ConnectNoRoute — even though rate limiting inside
+            // the same block already worked. Every slot is pushed exactly
+            // once per route, keeping the four vecs index-aligned.
 
-                    // 2. Create Strategy
-                    let strategy = match proxy_config.load_balance.strategy.as_str() {
-                        "random"     => Strategy::Random,
-                        "least_conn" => Strategy::LeastConn,
-                        "ip_hash"    => Strategy::IpHash,
-                        "first"      => Strategy::RoundRobin,
-                        _            => Strategy::RoundRobin,
-                    };
-                    
-                    // 3. Create Load Balancer
-                    let mut load_balancer = Arc::new(LoadBalancer::new(upstreams, strategy));
-                    
-                    // 4. Setup Health Checker if configured
-                    if let Some(hc_config) = &proxy_config.health_check {
-                        let health_check_conf = crate::health_check::HealthCheckConfig {
-                             path: hc_config.path.clone(),
-                             timeout: std::time::Duration::from_secs(hc_config.timeout),
-                             positive_threshold: 1,
-                             negative_threshold: hc_config.threshold as usize,
-                             expected_status: (200, 299),
-                        };
-                        
-                        let health_checker = HealthChecker::new(health_check_conf);
-                        
-                        // Attach to LB (needs mutable access to LB wrapper during init)
-                        if let Some(load_balancer_mut) = Arc::get_mut(&mut load_balancer) {
-                            load_balancer_mut.set_health_check(health_checker);
-                            load_balancer_mut.set_health_check_frequency(std::time::Duration::from_secs(hc_config.interval));
-                        } else {
-                            tracing::warn!("Correlation ID: Init - Could not attach health checker to LB");
-                        }
-                        // 🛑 SAFETY: Always push to keep health_checkers aligned with
-                        // load_balancers by index. Health checker is stored inside the LB
-                        // object; this slot is a tombstone for index alignment only.
-                        health_checkers.push(None);
-                    } else {
-                        health_checkers.push(None);
-                    }
+            // Load balancer (possibly nested inside a handle/route block)
+            if let Some(proxy_config) = find_reverse_proxy_config(&route.handler) {
+                let upstreams: Vec<Upstream> = proxy_config.upstreams.iter()
+                    .filter_map(|addr| create_upstream(addr))
+                    .collect();
 
-                    load_balancers.push(Some(load_balancer));
-                    file_servers.push(None); // No file server for this route
-
-                    tracing::info!(
-                        "⚖️ Initialized load balancer for route {} with strategy {:?}", 
-                        route.path, strategy
-                    );
-
-                },
-                HandlerConfig::FileServer { root, index, browse, compress } => {
-                    // Initialize File Server
-                    let fs_config = pingclair_static::FileServerConfig {
-                        root: std::path::PathBuf::from(root),
-                        index: if index.is_empty() { vec!["index.html".to_string()] } else { index.clone() },
-                        browse: *browse,
-                        compress: *compress,
-                        precompressed: true,  // Enable pre-compressed file detection by default
-                    };
-                    
-                    let file_server = Arc::new(pingclair_static::FileServer::new(fs_config));
-                    
-                    load_balancers.push(None);
-                    health_checkers.push(None);
-                    file_servers.push(Some(file_server));
-                    
-                    tracing::info!("📁 Initialized file server for route {}", route.path);
-                },
-                _ => {
-                    load_balancers.push(None);
-                    health_checkers.push(None);
-                    file_servers.push(None);
+                if upstreams.is_empty() {
+                    tracing::warn!("⚠️ No valid upstreams found for route {}", route.path);
                 }
+
+                let strategy = match proxy_config.load_balance.strategy.as_str() {
+                    "random"     => Strategy::Random,
+                    "least_conn" => Strategy::LeastConn,
+                    "ip_hash"    => Strategy::IpHash,
+                    "first"      => Strategy::RoundRobin,
+                    _            => Strategy::RoundRobin,
+                };
+
+                let mut load_balancer = Arc::new(LoadBalancer::new(upstreams, strategy));
+
+                if let Some(hc_config) = &proxy_config.health_check {
+                    let health_check_conf = crate::health_check::HealthCheckConfig {
+                         path: hc_config.path.clone(),
+                         timeout: std::time::Duration::from_secs(hc_config.timeout),
+                         positive_threshold: 1,
+                         negative_threshold: hc_config.threshold as usize,
+                         expected_status: (200, 299),
+                    };
+
+                    let health_checker = HealthChecker::new(health_check_conf);
+
+                    if let Some(load_balancer_mut) = Arc::get_mut(&mut load_balancer) {
+                        load_balancer_mut.set_health_check(health_checker);
+                        load_balancer_mut.set_health_check_frequency(std::time::Duration::from_secs(hc_config.interval));
+                    } else {
+                        tracing::warn!("Correlation ID: Init - Could not attach health checker to LB");
+                    }
+                }
+
+                load_balancers.push(Some(load_balancer));
+                tracing::info!(
+                    "⚖️ Initialized load balancer for route {} with strategy {:?}",
+                    route.path, strategy
+                );
+            } else {
+                load_balancers.push(None);
+            }
+
+            // Health checker is stored inside the LB object; this slot is a
+            // tombstone kept only for index alignment with load_balancers.
+            health_checkers.push(None);
+
+            // File server (possibly nested inside a handle/route block)
+            if let Some(HandlerConfig::FileServer { root, index, browse, compress }) =
+                find_file_server_config(&route.handler)
+            {
+                let fs_config = pingclair_static::FileServerConfig {
+                    root: std::path::PathBuf::from(root),
+                    index: if index.is_empty() { vec!["index.html".to_string()] } else { index.clone() },
+                    browse: *browse,
+                    compress: *compress,
+                    precompressed: true,  // Enable pre-compressed file detection by default
+                };
+
+                file_servers.push(Some(Arc::new(pingclair_static::FileServer::new(fs_config))));
+                tracing::info!("📁 Initialized file server for route {}", route.path);
+            } else {
+                file_servers.push(None);
             }
 
             // Check for rate limit config
@@ -519,10 +517,10 @@ impl PingclairProxy {
     /// Get proxy config for a route
     fn get_proxy_config(&self, state: &ProxyState, route_index: usize) -> Option<ReverseProxyConfig> {
         let route = state.config.routes.get(route_index)?;
-        match &route.handler {
-            HandlerConfig::ReverseProxy(config) => Some(config.clone()),
-            _ => None,
-        }
+        // Recurse into handle/route blocks so a nested reverse_proxy's
+        // headers/timeouts are picked up, matching how ProxyState::new sets
+        // up its load balancer.
+        find_reverse_proxy_config(&route.handler).cloned()
     }
 
     /// Handle a specific handler configuration
@@ -1424,6 +1422,41 @@ impl ProxyHttp for PingclairProxy {
 // MARK: - Helper Functions
 
 /// Recursively find a rate limit config in a handler tree
+/// Find the first `ReverseProxy` config in a handler tree, recursing
+/// through `Pipeline`/`Handle`/`HandlePath` wrappers.
+///
+/// A `handle /api/* { reverse_proxy ... }` block is compiled to a route
+/// whose handler is a `Pipeline([ReverseProxy])`, not a bare `ReverseProxy`.
+/// Without this recursion the reverse proxy nested in that pipeline would
+/// get no load balancer and every request to it would fail with
+/// ConnectNoRoute. Mirrors [`find_rate_limit_config`].
+fn find_reverse_proxy_config(handler: &HandlerConfig) -> Option<&ReverseProxyConfig> {
+    match handler {
+        HandlerConfig::ReverseProxy(config) => Some(config),
+        HandlerConfig::Pipeline(handlers)
+        | HandlerConfig::Handle(handlers)
+        | HandlerConfig::HandlePath { handlers, .. } => {
+            handlers.iter().find_map(|h| find_reverse_proxy_config(h))
+        }
+        _ => None,
+    }
+}
+
+/// Find the first `FileServer` config in a handler tree, recursing through
+/// `Pipeline`/`Handle`/`HandlePath` wrappers. Returns the `FileServer`
+/// handler node itself so the caller can destructure its fields.
+fn find_file_server_config(handler: &HandlerConfig) -> Option<&HandlerConfig> {
+    match handler {
+        HandlerConfig::FileServer { .. } => Some(handler),
+        HandlerConfig::Pipeline(handlers)
+        | HandlerConfig::Handle(handlers)
+        | HandlerConfig::HandlePath { handlers, .. } => {
+            handlers.iter().find_map(|h| find_file_server_config(h))
+        }
+        _ => None,
+    }
+}
+
 fn find_rate_limit_config(handler: &HandlerConfig) -> Option<crate::rate_limit::RateLimitConfig> {
     match handler {
         HandlerConfig::RateLimit { requests, window_secs, by_ip, burst } => {
