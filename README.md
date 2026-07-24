@@ -39,10 +39,10 @@ Whether you need a simple static file server or an enterprise gateway with load 
 ## ⚡ Benchmarks
 
 Full methodology, raw results, and — importantly — the bugs this process
-found (including one still open) live in
-[`benchmarks/README.md`](benchmarks/README.md). The numbers below are the
-headline static-file results only; read the full writeup before drawing
-conclusions, especially about reverse-proxy throughput and gzip under load.
+found and fixed live in [`benchmarks/README.md`](benchmarks/README.md).
+The numbers below are the headline static-file results only; read the
+full writeup before drawing conclusions, especially about reverse-proxy
+throughput and gzip under load.
 
 **Test environment**: Docker bridge network, each server in its own
 container capped at 2 vCPU / 512MB, MacBook Pro (M2), `wrk -t4 -d15s`,
@@ -58,12 +58,17 @@ container capped at 2 vCPU / 512MB, MacBook Pro (M2), `wrk -t4 -d15s`,
 > Reverse-proxy throughput showed pingclair *ahead* of both nginx and
 > caddy at higher concurrency in this specific container-capped setup —
 > that result is real but unconfirmed on uncapped hardware, and shouldn't
-> be read as a general claim. More importantly, a large-file (20MB) gzip
-> load test surfaced a genuine, still-open bug: pingclair's static-file
-> compression path buffers the whole file per request with no cache, and
-> under sustained concurrent load a 20-second test took **16 minutes**
-> (no crash, no OOM — just severe queuing). See
-> [`benchmarks/README.md`](benchmarks/README.md) for the full breakdown.
+> be read as a general claim. Separately, a large-file (20MB) gzip load
+> test found and led to fixing a real bug: static-file compression was
+> redone from scratch on every request with no cache, and under sustained
+> concurrent load a 20-second test took 16 minutes. Fixed with a
+> compressed-body cache — the same test now finishes in 20.09s serving
+> **21,684 requests (was 54)**, more than nginx and caddy combined on the
+> identical test, since repeat hits skip compression entirely. One
+> residual caveat (transient cold-start memory under a concurrent-miss
+> "stampede") is documented in the full writeup. See
+> [`benchmarks/README.md`](benchmarks/README.md) for the complete
+> before/after.
 
 ## 📦 Installation
 
