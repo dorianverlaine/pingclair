@@ -1,0 +1,61 @@
+name: pingclair-bench
+
+networks:
+  bench:
+    driver: bridge
+
+services:
+  backend:
+    image: nginx:1.27-alpine
+    networks: [bench]
+    volumes:
+      - ./configs/backend/nginx.conf:/etc/nginx/nginx.conf:ro
+    # Not published to the host — internal-only shared upstream.
+
+  pingclair:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: ["pingclair", "run", "/etc/pingclair/Pingclairfile"]
+    networks: [bench]
+    depends_on: [backend]
+    volumes:
+      - ./configs/pingclair/Pingclairfile:/etc/pingclair/Pingclairfile:ro
+      - ./configs/pingclair/html:/var/www/html:ro
+    ports:
+      - "18080:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 512M
+
+  nginx:
+    image: nginx:1.27-alpine
+    networks: [bench]
+    depends_on: [backend]
+    volumes:
+      - ./configs/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./configs/nginx/html:/var/www/html:ro
+    ports:
+      - "18081:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 512M
+
+  caddy:
+    image: caddy:2-alpine
+    networks: [bench]
+    depends_on: [backend]
+    volumes:
+      - ./configs/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./configs/caddy/html:/var/www/html:ro
+    ports:
+      - "18082:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 512M
