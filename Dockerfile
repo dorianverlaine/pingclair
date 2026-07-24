@@ -1,5 +1,11 @@
 # Build Stage
-FROM ghcr.io/rust-lang/rust:nightly-slim AS builder
+#
+# Stable, not nightly: the workspace has no nightly-only feature gates
+# (edition 2024 only needs Rust 1.85+, which stable has had since Feb
+# 2025), and nightly's codegen backend has a known internal-compiler-error
+# on aarch64 under this crate's release profile (panic="abort" + fat LTO +
+# codegen-units=1) — it ICEs partway through compiling `tokio` itself.
+FROM ghcr.io/rust-lang/rust:1-slim AS builder
 
 WORKDIR /usr/src/app
 
