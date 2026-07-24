@@ -8,7 +8,7 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 [![Status](https://img.shields.io/badge/status-active-green.svg)]()
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/dorianverlaine/pingclair/pulls)
 
 </div>
 
@@ -66,7 +66,7 @@
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/SinclairChao/pingclair.git
+git clone https://github.com/dorianverlaine/pingclair.git
 cd pingclair
 
 # 2. 编译并安装 (release 模式)
@@ -81,7 +81,7 @@ cargo install --path ./pingclair
 
 ```bash
 # 运行安装脚本 (需要 sudo 权限)
-curl -fsSL https://raw.githubusercontent.com/SinclairChao/pingclair/main/scripts/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash
 ```
 
 安装完成后，你可以使用 `pc` (pingclair 的缩写) 命令来管理服务。

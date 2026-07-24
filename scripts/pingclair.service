@@ -1,6 +1,6 @@
 [Unit]
 Description=Pingclair High-Performance Web Server
-Documentation=https://github.com/SinclairChao/pingclair
+Documentation=https://github.com/dorianverlaine/pingclair
 After=network-online.target
 Wants=network-online.target
 
