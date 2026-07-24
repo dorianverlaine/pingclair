@@ -36,16 +36,16 @@ async-trait = "0.1"
 # 序列化
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "0.9"
 
 # 配置解析
-logos = "0.15"
-ariadne = "0.5"      # 错误报告
+logos = "0.16"
+ariadne = "0.6"      # 错误报告
 
 # TLS/证书
 rustls = "0.23"
-rcgen = "0.13"
-x509-parser = "0.16"
+rcgen = "0.14"
+x509-parser = "0.18"
 
 # HTTP/3 (QUIC)
 quinn = "0.11"
@@ -60,7 +60,7 @@ mime_guess = "2"
 # 日志和监控
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-prometheus = "0.13"
+prometheus = "0.14"
 
 # 错误处理
 thiserror = "2"
@@ -70,7 +70,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 
 # 测试
-criterion = "0.5"
+criterion = "0.8"
 
 # 文件系统
 dirs = "6"
