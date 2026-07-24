@@ -1,0 +1,13 @@
+Running 15s test @ http://127.0.0.1:18081/small.txt
+  4 threads and 50 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    22.65ms   46.32ms   1.00s    90.95%
+    Req/Sec     6.09k     1.01k   11.36k    76.00%
+  Latency Distribution
+     50%    0.90ms
+     75%   28.16ms
+     90%   61.51ms
+     99%  192.55ms
+  364293 requests in 15.03s, 209.14MB read
+Requests/sec:  24229.86
+Transfer/sec:     13.91MB

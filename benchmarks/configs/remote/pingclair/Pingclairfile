@@ -1,0 +1,22 @@
+# Benchmark config for Pingclair on the bare-metal Aliyun Shenzhen VPS.
+# Same shape as benchmarks/configs/pingclair/Pingclairfile, adjusted for
+# real filesystem paths instead of container paths.
+#
+# NOTE: bare `:8080` address, not a named host — see the comment in
+# benchmarks/configs/pingclair/Pingclairfile for why a named block address
+# crashes pingclair at startup unless that literal hostname resolves to a
+# local interface.
+
+global {
+    debug false
+}
+
+:8080 {
+    compress gzip
+
+    handle /proxy/* {
+        reverse_proxy 127.0.0.1:9000
+    }
+
+    file_server /root/bench/html
+}

@@ -1,0 +1,18 @@
+{
+	auto_https off
+	admin off
+}
+
+http://bench.local:8080 {
+	root * /root/bench/html
+	encode gzip
+
+	handle /proxy/* {
+		uri strip_prefix /proxy
+		reverse_proxy 127.0.0.1:9000
+	}
+
+	handle {
+		file_server
+	}
+}
