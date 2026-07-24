@@ -14,7 +14,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use std::sync::Arc;
 use std::collections::HashMap;
 use std::time::Duration;
-use parking_lot::RwLock;
+use arc_swap::ArcSwap;
 use async_recursion::async_recursion;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -92,16 +92,31 @@ impl Default for RequestContext {
     }
 }
 
-/// Generate a compact, sortable request ID (timestamp + random suffix)
+/// Process-wide base timestamp for request IDs, captured once instead of
+/// on every request.
+static REQUEST_ID_EPOCH_US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+/// Monotonic per-process request counter.
+static REQUEST_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Generate a compact, sortable request ID (process epoch + counter).
+///
+/// The original implementation called `SystemTime::now()` — a syscall — on
+/// every single request. At high QPS that syscall overhead is pure waste:
+/// the ID only needs to be unique and roughly time-ordered, not carry a
+/// precise per-request timestamp. So the wall-clock read happens exactly
+/// once per process (lazily, on the first request), and every subsequent
+/// request just does one relaxed atomic increment.
 fn generate_request_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros();
-    // Base36 encode for compactness: ~13 chars timestamp + 4 random
-    let rand_part: u16 = (ts as u16).wrapping_mul(31421).wrapping_add(6927);
-    format!("{:x}-{:04x}", ts, rand_part)
+    use std::sync::atomic::Ordering;
+    let epoch = *REQUEST_ID_EPOCH_US.get_or_init(|| {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64
+    });
+    let seq = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:x}-{:x}", epoch, seq)
 }
 
 // MARK: - Proxy State
@@ -249,12 +264,19 @@ impl ProxyState {
 // MARK: - Server Implementation
 
 /// Pingclair reverse proxy
+///
+/// `hosts`/`default` use `ArcSwap` rather than `RwLock` because they sit on
+/// the per-request hot path (`get_state` is called for every single
+/// request) while writes only happen on hot-reload — an operation measured
+/// in reloads-per-hour, not requests-per-second. `ArcSwap::load()` is a
+/// lock-free, wait-free read, so concurrent requests never contend with
+/// each other or with a config reload.
 #[derive(Clone)]
 pub struct PingclairProxy {
     /// Map of hostname -> server state
-    pub hosts: Arc<RwLock<HashMap<String, ProxyState>>>,
+    pub hosts: Arc<ArcSwap<HashMap<String, ProxyState>>>,
     /// Default server state (catch-all)
-    pub default: Arc<RwLock<Option<ProxyState>>>,
+    pub default: Arc<ArcSwap<Option<ProxyState>>>,
     /// TLS Manager for certificate resolution
     pub tls_manager: Option<Arc<pingclair_tls::manager::TlsManager>>,
 }
@@ -262,8 +284,8 @@ pub struct PingclairProxy {
 impl Default for PingclairProxy {
     fn default() -> Self {
         Self {
-            hosts: Arc::new(RwLock::new(HashMap::new())),
-            default: Arc::new(RwLock::new(None)),
+            hosts: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            default: Arc::new(ArcSwap::from_pointee(None)),
             tls_manager: None,
         }
     }
@@ -274,12 +296,12 @@ impl PingclairProxy {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     /// Create a new proxy with TLS manager
     pub fn with_tls(tls_manager: Arc<pingclair_tls::manager::TlsManager>) -> Self {
         Self {
-            hosts: Arc::new(RwLock::new(HashMap::new())),
-            default: Arc::new(RwLock::new(None)),
+            hosts: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            default: Arc::new(ArcSwap::from_pointee(None)),
             tls_manager: Some(tls_manager),
         }
     }
@@ -287,19 +309,23 @@ impl PingclairProxy {
     /// Add a server configuration to this proxy
     pub fn add_server(&self, config: ServerConfig) {
         let state = ProxyState::new(config.clone());
-        
-        // Add to hosts map for each domain
-        let mut hosts = self.hosts.write();
-        let mut default = self.default.write();
-        
+
         if let Some(domain) = &config.name {
             if domain == "_" || domain == "*" || domain.starts_with(':') {
-                *default = Some(state.clone());
+                self.default.store(Arc::new(Some(state)));
             } else {
-                hosts.insert(domain.clone(), state.clone());
+                // Read-Copy-Update: clone the current map, insert into the
+                // copy, then publish it atomically. add_server is a rare,
+                // low-frequency admin operation, so an O(n) copy here is a
+                // fair trade for wait-free reads on the request hot path.
+                self.hosts.rcu(|current| {
+                    let mut next = (**current).clone();
+                    next.insert(domain.clone(), state.clone());
+                    next
+                });
             }
         } else {
-            *default = Some(state.clone());
+            self.default.store(Arc::new(Some(state)));
         }
     }
 
@@ -321,11 +347,12 @@ impl PingclairProxy {
             }
         }
 
-        let mut hosts = self.hosts.write();
-        let mut default = self.default.write();
-        *hosts = new_hosts;
-        *default = new_default;
-        
+        // Single atomic publish: in-flight requests keep using the Arc they
+        // already loaded; new requests see the new map. No lock is ever
+        // held, so a reload can never block or be blocked by traffic.
+        self.hosts.store(Arc::new(new_hosts));
+        self.default.store(Arc::new(new_default));
+
         tracing::info!("♻️ Configuration reloaded successfully");
     }
     
@@ -358,7 +385,7 @@ impl PingclairProxy {
     /// 2. Wildcard match (`*.example.com`) — checks all registered wildcard hosts
     /// 3. Default catch-all server
     fn get_state(&self, host: &str) -> Option<ProxyState> {
-        let hosts = self.hosts.read();
+        let hosts = self.hosts.load();
 
         // 1. Exact match (fast path)
         if let Some(state) = hosts.get(host) {
@@ -378,7 +405,11 @@ impl PingclairProxy {
         }
 
         // 3. Default catch-all
-        self.default.read().clone()
+        // Explicit double-deref: `Guard` and `Arc` both implement `Clone`
+        // themselves, so a bare `.load().clone()` would clone the guard
+        // (cheap, but the wrong type) instead of the `Option<ProxyState>`
+        // it points to.
+        (**self.default.load()).clone()
     }
     
     /// Select an upstream using the load balancer
@@ -1197,8 +1228,10 @@ impl ProxyHttp for PingclairProxy {
     /// Filter upstream response body chunks for gzip compression.
     ///
     /// 🏗️ ARCHITECTURE: Streaming gzip — each body chunk is fed into the
-    /// GzEncoder. On `end_of_stream`, we flush and finalize the encoder,
-    /// replacing the last chunk with the compressed output.
+    /// GzEncoder. Every chunk is written in, sync-flushed, and drained
+    /// immediately — memory use is bounded by one chunk's worth of
+    /// compressed output, never by the size of the whole response body.
+    /// `end_of_stream` finalizes the encoder (trailer + final flush).
     fn upstream_response_body_filter(
         &self,
         _session: &mut Session,
@@ -1211,30 +1244,63 @@ impl ProxyHttp for PingclairProxy {
             ctx.response_bytes += b.len() as u64;
         }
 
-        // Streaming gzip compression
-        if let Some(ref mut encoder) = ctx.gzip_encoder {
-            if let Some(chunk) = body.as_ref() {
-                let _ = encoder.write_all(chunk);
+        if ctx.gzip_encoder.is_none() {
+            return Ok(None);
+        }
+
+        // Feed this chunk into the encoder.
+        if let Some(chunk) = body.as_ref() {
+            if let Some(encoder) = ctx.gzip_encoder.as_mut() {
+                if let Err(e) = encoder.write_all(chunk) {
+                    tracing::warn!(
+                        "⚠️ Gzip compression failed, aborting compression for the rest of this response: {}",
+                        e
+                    );
+                    // Bail out of compression entirely; the client already
+                    // received a Content-Encoding: gzip header for this
+                    // response so we cannot fall back to plaintext mid-
+                    // stream — better to end the response short than to
+                    // send a client a body it can't decode.
+                    ctx.gzip_encoder = None;
+                    *body = None;
+                    return Ok(None);
+                }
             }
-            // Suppress intermediate chunks — we'll emit the full compressed
-            // body as the final chunk (simpler than true streaming for now)
-            if end_of_stream {
-                // Take ownership of the encoder, finalize, emit compressed body
-                if let Some(encoder) = ctx.gzip_encoder.take() {
-                    match encoder.finish() {
-                        Ok(compressed) => {
-                            *body = Some(Bytes::from(compressed));
-                        }
-                        Err(e) => {
-                            tracing::warn!("⚠️ Gzip compression failed: {}", e);
-                            // On failure, pass through uncompressed
-                        }
+        }
+
+        if end_of_stream {
+            // Finalize: flushes any remaining buffered bytes plus the gzip
+            // trailer (CRC32 + uncompressed size) into the encoder's Vec.
+            if let Some(encoder) = ctx.gzip_encoder.take() {
+                match encoder.finish() {
+                    Ok(tail) => *body = Some(Bytes::from(tail)),
+                    Err(e) => {
+                        tracing::warn!("⚠️ Gzip finalize failed: {}", e);
+                        *body = Some(Bytes::new());
                     }
                 }
-            } else {
-                // Suppress intermediate chunks — they're buffered in the encoder
-                *body = Some(Bytes::new());
             }
+            return Ok(None);
+        }
+
+        // 🏗️ ARCHITECTURE: real streaming, not full-body buffering.
+        //
+        // The previous implementation fed every chunk into the encoder but
+        // only ever emitted output once, at `end_of_stream` — so a large
+        // upstream response (or an adversarial client requesting one) meant
+        // buffering the *entire* body in memory before the first byte went
+        // out. Here we force a sync flush after every chunk, which pushes
+        // whatever the deflate stream has buffered internally out into the
+        // encoder's small `Vec<u8>`, then drain that Vec as this chunk's
+        // output. `mem::take` swaps in a fresh empty Vec, so the buffer
+        // never grows past one chunk's worth of compressed bytes,
+        // regardless of total response size.
+        if let Some(encoder) = ctx.gzip_encoder.as_mut() {
+            if let Err(e) = encoder.flush() {
+                tracing::warn!("⚠️ Gzip flush failed: {}", e);
+            }
+            let out = std::mem::take(encoder.get_mut());
+            *body = Some(Bytes::from(out));
         }
 
         Ok(None)

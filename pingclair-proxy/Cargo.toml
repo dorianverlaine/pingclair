@@ -29,6 +29,7 @@ prometheus.workspace = true
 async-recursion = "1.0"
 ipnet = "2"
 flate2 = "1.0"
+arc-swap.workspace = true
 
 # HTTP/3
 quinn.workspace = true

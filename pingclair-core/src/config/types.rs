@@ -34,7 +34,7 @@ pub struct PingclairConfig {
 pub struct GlobalConfig {
     /// Global ACME email
     pub email: Option<String>,
-    
+
     /// Global auto-HTTPS setting
     #[serde(default)]
     pub auto_https: AutoHttpsMode,
@@ -42,6 +42,14 @@ pub struct GlobalConfig {
     /// Blocked IP addresses (CIDR supported)
     #[serde(default)]
     pub blocked_ips: Vec<String>,
+
+    /// Max number of idle upstream connections Pingora keeps open per
+    /// worker thread for reuse. Explicitly configurable rather than left
+    /// as an implicit framework default, so a deployment under load has a
+    /// deliberate, known ceiling on upstream connection fan-out instead of
+    /// an invisible one. `None` uses Pingora's own default (128).
+    #[serde(default)]
+    pub upstream_keepalive_pool_size: Option<usize>,
 }
 
 /// Auto-HTTPS modes

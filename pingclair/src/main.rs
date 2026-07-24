@@ -487,15 +487,34 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
         return;
     }
 
-    // Create Pingora Server
-    let mut server = pingora::server::Server::new(Some(pingora::server::configuration::Opt {
-        upgrade: false,
-        daemon: false,
-        nocapture: false,
-        test: false,
-        conf: None, // We handle config manually
-    })).expect("Failed to create Pingora server");
-    
+    // Create Pingora Server.
+    //
+    // We build `ServerConf` explicitly (rather than passing `conf: None`
+    // and letting Pingora fall back to its own implicit default) so the
+    // upstream keepalive connection pool size is always a deliberate,
+    // known value — not an invisible one an operator only discovers when
+    // a slow upstream under load starts exhausting connections.
+    let mut server_conf = pingora::server::configuration::ServerConf::default();
+    server_conf.upstream_keepalive_pool_size = config
+        .global
+        .upstream_keepalive_pool_size
+        .unwrap_or(server_conf.upstream_keepalive_pool_size);
+    tracing::info!(
+        "🔗 Upstream keepalive pool size: {} connections/thread",
+        server_conf.upstream_keepalive_pool_size
+    );
+
+    let mut server = pingora::server::Server::new_with_opt_and_conf(
+        Some(pingora::server::configuration::Opt {
+            upgrade: false,
+            daemon: false,
+            nocapture: false,
+            test: false,
+            conf: None, // We build ServerConf ourselves above; no file to load.
+        }),
+        server_conf,
+    );
+
     server.bootstrap();
     
     // Initialize TLS Manager with global settings

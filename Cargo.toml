@@ -78,6 +78,9 @@ dirs = "6"
 # 字符串处理
 smartstring = "1"
 
+# 无锁热路径读取
+arc-swap = "1"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
