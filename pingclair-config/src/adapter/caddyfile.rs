@@ -158,6 +158,24 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                         }
                     }
                 }
+                "admin" => {
+                    match sub.args.first() {
+                        // `admin off` explicitly disables the admin API
+                        Some(arg) if arg == "off" => {
+                            global.admin = Some(AdminDirective {
+                                listen: String::new(),
+                                enabled: false,
+                            });
+                        }
+                        Some(arg) => {
+                            global.admin = Some(AdminDirective {
+                                listen: arg.clone(),
+                                enabled: true,
+                            });
+                        }
+                        None => return Err(AdapterError::ArgumentCount("admin".into(), 1, 0)),
+                    }
+                }
                 "protocols" => {
                     for arg in &sub.args {
                         match arg.to_lowercase().as_str() {
@@ -273,6 +291,9 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                         server.log = Some(Node::new(log, Location { start: 0, end: 0 }));
                     }
                 },
+                "tls" => {
+                    server.tls = Some(adapt_tls_directive(&sub_d)?);
+                },
                 "route" | "handle" => {
                     let (matcher, inner_block) = parse_route_matcher_and_block(&sub_d)?;
                     if let Some(blk) = inner_block {
@@ -377,14 +398,90 @@ fn parse_server_address(addr: &str) -> Option<ParsedAddress> {
         (rest.to_string(), p)
     };
 
+    // Caddy/nginx semantics: only an IP literal in the site address is a
+    // bind address. A *hostname* selects the virtual host via the Host
+    // header while the listener binds all interfaces. Previously the
+    // hostname was passed literally to Pingora as the bind host, so
+    // `bench.local:8080 { ... }` crashed at startup with a BindError unless
+    // the name happened to resolve to a local interface (localhost worked,
+    // real domains didn't) — see benchmarks/README.md.
+    let bind_host = if is_ip_literal(&hostname) {
+        hostname.clone()
+    } else {
+        "0.0.0.0".to_string()
+    };
+
     Some(ParsedAddress {
-        hostname: hostname.clone(),
+        hostname,
         listen: ListenAddr {
             scheme,
-            host: hostname,
+            host: bind_host,
             port,
         },
     })
+}
+
+/// Whether `host` is an IP literal (bare or bracketed IPv6 included) rather
+/// than a hostname.
+fn is_ip_literal(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>().is_ok()
+        || host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .is_some_and(|h| h.parse::<std::net::IpAddr>().is_ok())
+}
+
+// MARK: - tls Directive
+
+/// Adapt the `tls` server directive. Supported forms:
+///   tls off
+///   tls auto
+///   tls /path/cert.pem /path/key.pem
+///   tls { cert ...; key ...; acme_email ...; http3 ... }
+fn adapt_tls_directive(d: &Directive) -> Result<TlsDirective, AdapterError> {
+    let mut tls = TlsDirective::default();
+
+    if let Some(block) = &d.block {
+        for sub in &block.directives {
+            match sub.name.as_str() {
+                "cert" => tls.cert = sub.args.first().cloned(),
+                "key" => tls.key = sub.args.first().cloned(),
+                "acme_email" | "email" => tls.acme_email = sub.args.first().cloned(),
+                "auto" => tls.auto = true,
+                "http3" => {
+                    tls.http3 = Some(
+                        sub.args.first().map(|s| s != "off" && s != "false").unwrap_or(true),
+                    );
+                }
+                _ => return Err(AdapterError::UnknownDirective(format!("tls: {}", sub.name))),
+            }
+        }
+    } else {
+        match d.args.as_slice() {
+            [arg] if arg == "off" => tls.off = true,
+            [arg] if arg == "auto" => tls.auto = true,
+            [cert, key] => {
+                tls.cert = Some(cert.clone());
+                tls.key = Some(key.clone());
+            }
+            _ => {
+                return Err(AdapterError::InvalidArgument(
+                    "tls".into(),
+                    "expected 'off', 'auto', '<cert> <key>', or a block".into(),
+                ));
+            }
+        }
+    }
+
+    // A certificate without its private key (or vice versa) is unusable.
+    if tls.cert.is_some() != tls.key.is_some() {
+        return Err(AdapterError::InvalidArgument(
+            "tls".into(),
+            "cert and key must be specified together".into(),
+        ));
+    }
+
+    Ok(tls)
 }
 
 // MARK: - Log Block
@@ -960,6 +1057,42 @@ mod global_tests {
     }
 
     #[test]
+    fn test_hostname_address_binds_wildcard_not_hostname() {
+        // A named site address must not be bound literally: the listener
+        // goes on all interfaces and the hostname is used for Host-header
+        // routing (Caddy/nginx semantics). Binding the hostname itself
+        // crashed startup for any name that doesn't resolve locally.
+        let source = r#"
+            bench.local:8080 {
+                respond "OK"
+            }
+        "#;
+        let directives = parse(source).unwrap();
+        let ast = adapt(directives).unwrap();
+
+        let server = &ast.servers[0].inner;
+        assert_eq!(server.name, "bench.local");
+        assert_eq!(server.listens.len(), 1);
+        assert_eq!(server.listens[0].host, "0.0.0.0");
+        assert_eq!(server.listens[0].port, Some(8080));
+    }
+
+    #[test]
+    fn test_ip_literal_address_binds_to_that_ip() {
+        // An IP literal *is* a bind address — only hostnames get the
+        // bind-wildcard treatment.
+        for (source, expected) in [
+            ("127.0.0.1:8080 { respond \"OK\" }", "127.0.0.1"),
+            ("192.168.1.10 { respond \"OK\" }", "192.168.1.10"),
+        ] {
+            let directives = parse(source).unwrap();
+            let ast = adapt(directives).unwrap();
+            let server = &ast.servers[0].inner;
+            assert_eq!(server.listens[0].host, expected, "IP literal must stay the bind host");
+        }
+    }
+
+    #[test]
     fn test_servers_nested_global() {
         let source = r#"{
             servers {
@@ -1112,5 +1245,119 @@ mod global_tests {
             }
             other => panic!("expected FileServer, got {other:?}"),
         }
+    }
+
+    // ---- tls server directive ----
+
+    #[test]
+    fn test_tls_cert_key() {
+        let source = r#"
+            example.com {
+                listen :443
+                tls /etc/ssl/cert.pem /etc/ssl/key.pem
+            }
+        "#;
+        let directives = parse(source).unwrap();
+        let ast = adapt(directives).unwrap();
+
+        let tls = ast.servers[0].inner.tls.as_ref().expect("tls directive");
+        assert_eq!(tls.cert.as_deref(), Some("/etc/ssl/cert.pem"));
+        assert_eq!(tls.key.as_deref(), Some("/etc/ssl/key.pem"));
+        assert!(!tls.auto);
+        assert!(!tls.off);
+    }
+
+    #[test]
+    fn test_tls_auto() {
+        let source = r#"
+            example.com {
+                listen :443
+                tls auto
+            }
+        "#;
+        let directives = parse(source).unwrap();
+        let ast = adapt(directives).unwrap();
+
+        let tls = ast.servers[0].inner.tls.as_ref().expect("tls directive");
+        assert!(tls.auto);
+        assert!(tls.cert.is_none());
+    }
+
+    #[test]
+    fn test_tls_off() {
+        let source = r#"
+            example.com {
+                listen :443
+                tls off
+            }
+        "#;
+        let directives = parse(source).unwrap();
+        let ast = adapt(directives).unwrap();
+
+        let tls = ast.servers[0].inner.tls.as_ref().expect("tls directive");
+        assert!(tls.off);
+    }
+
+    #[test]
+    fn test_tls_block_form() {
+        let source = r#"
+            example.com {
+                listen :443
+                tls {
+                    cert /etc/ssl/cert.pem
+                    key /etc/ssl/key.pem
+                    acme_email admin@example.com
+                    http3
+                }
+            }
+        "#;
+        let directives = parse(source).unwrap();
+        let ast = adapt(directives).unwrap();
+
+        let tls = ast.servers[0].inner.tls.as_ref().expect("tls directive");
+        assert_eq!(tls.cert.as_deref(), Some("/etc/ssl/cert.pem"));
+        assert_eq!(tls.key.as_deref(), Some("/etc/ssl/key.pem"));
+        assert_eq!(tls.acme_email.as_deref(), Some("admin@example.com"));
+        assert_eq!(tls.http3, Some(true));
+    }
+
+    #[test]
+    fn test_tls_cert_without_key_is_an_error() {
+        let source = r#"
+            example.com {
+                listen :443
+                tls /etc/ssl/cert.pem
+            }
+        "#;
+        let directives = parse(source).unwrap();
+        let result = adapt(directives);
+        assert!(matches!(result, Err(AdapterError::InvalidArgument(..))));
+    }
+
+    // ---- Global admin directive ----
+
+    #[test]
+    fn test_admin_listen() {
+        let source = r#"{
+            admin 127.0.0.1:2019
+        }"#;
+        let directives = parse(source).unwrap();
+        let ast = adapt(directives).unwrap();
+
+        let admin = ast.global.unwrap().inner.admin.expect("admin directive");
+        assert_eq!(admin.listen, "127.0.0.1:2019");
+        assert!(admin.enabled);
+    }
+
+    #[test]
+    fn test_admin_off() {
+        let source = r#"{
+            admin off
+        }"#;
+        let directives = parse(source).unwrap();
+        let ast = adapt(directives).unwrap();
+
+        let admin = ast.global.unwrap().inner.admin.expect("admin directive");
+        assert!(!admin.enabled);
     }
 }

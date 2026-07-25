@@ -5,7 +5,7 @@
 use crate::parser::ast::*;
 use pingclair_core::config::{
     PingclairConfig, ServerConfig, RouteConfig, HandlerConfig,
-    TlsConfig, ReverseProxyConfig,
+    TlsConfig, ReverseProxyConfig, AdminConfig,
     LoadBalanceConfig, LogConfig, LogOutput as CoreLogOutput, LogFormat as CoreLogFormat,
     Matcher as CoreMatcher, MatcherCondition,
 };
@@ -67,6 +67,15 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
         };
     }
     
+    // Set admin API configuration (`admin <listen>` / `admin off`)
+    if let Some(admin) = &global.admin {
+        config.admin = Some(AdminConfig {
+            listen: admin.listen.clone(),
+            enabled: admin.enabled,
+            api_key: None,
+        });
+    }
+    
     Ok(())
 }
 
@@ -93,6 +102,30 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         // Set TLS based on scheme
         if listen.scheme == Scheme::Https {
             config.tls = Some(TlsConfig::default());
+        }
+    }
+    
+    // TLS directive (`tls cert key`, `tls auto`, `tls off`, or block form).
+    // Merged with the https-scheme default above so neither clobbers the other.
+    if let Some(tls) = &server.tls {
+        if tls.off {
+            config.tls = None;
+        } else {
+            let mut merged = config.tls.take().unwrap_or_default();
+            merged.auto = merged.auto || tls.auto;
+            if tls.cert.is_some() {
+                merged.cert = tls.cert.clone();
+            }
+            if tls.key.is_some() {
+                merged.key = tls.key.clone();
+            }
+            if tls.acme_email.is_some() {
+                merged.acme_email = tls.acme_email.clone();
+            }
+            if let Some(http3) = tls.http3 {
+                merged.http3 = http3;
+            }
+            config.tls = Some(merged);
         }
     }
     

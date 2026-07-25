@@ -43,7 +43,18 @@ pub struct GlobalBlock {
     pub logging: Option<LoggingConfig>,
     pub email: Option<String>,
     pub auto_https: Option<AutoHttpsMode>,
+    pub admin: Option<AdminDirective>,
     pub directives: Vec<Directive>,
+}
+
+/// Admin API configuration (from the global `admin` directive)
+#[derive(Debug, Clone)]
+pub struct AdminDirective {
+    /// Listen address (e.g. "127.0.0.1:2019")
+    pub listen: String,
+
+    /// Enable the admin API (`admin off` disables it)
+    pub enabled: bool,
 }
 
 /// Auto-HTTPS modes
@@ -118,6 +129,9 @@ pub struct ServerBlock {
     /// Log configuration
     pub log: Option<Node<LogBlock>>,
     
+    /// TLS configuration (from the `tls` directive)
+    pub tls: Option<TlsDirective>,
+    
     /// Route definitions
     pub routes: Option<Node<RouteBlock>>,
 
@@ -126,6 +140,28 @@ pub struct ServerBlock {
     
     /// Other directives (including macro calls)
     pub directives: Vec<Directive>,
+}
+
+/// TLS configuration for a server block (from the `tls` directive)
+#[derive(Debug, Clone, Default)]
+pub struct TlsDirective {
+    /// Explicitly disable TLS (`tls off`)
+    pub off: bool,
+
+    /// Automatic certificate management (`tls auto`)
+    pub auto: bool,
+
+    /// Certificate file path
+    pub cert: Option<String>,
+
+    /// Private key file path
+    pub key: Option<String>,
+
+    /// ACME account email
+    pub acme_email: Option<String>,
+
+    /// Enable HTTP/3
+    pub http3: Option<bool>,
 }
 
 /// Listen address
@@ -491,6 +527,7 @@ impl ServerBlock {
             bind: None,
             compress: Vec::new(),
             log: None,
+            tls: None,
             routes: None,
             matchers: HashMap::new(),
             directives: Vec::new(),

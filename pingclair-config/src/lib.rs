@@ -161,6 +161,23 @@ mod tests {
     }
 
     #[test]
+    fn test_named_site_address_compiles_to_wildcard_listen() {
+        // `bench.local:8080` must compile to a wildcard bind + hostname-based
+        // vhost, not a literal `bench.local:8080` bind (which crashed startup
+        // unless the name resolved to a local interface).
+        let source = r#"
+            bench.local:8080 {
+                respond "OK"
+            }
+        "#;
+
+        let config = compile(source).unwrap();
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers[0].name, Some("bench.local".to_string()));
+        assert_eq!(config.servers[0].listen, vec!["0.0.0.0:8080".to_string()]);
+    }
+
+    #[test]
     fn test_compile_complex() {
         let source = r#"
             global {
@@ -180,5 +197,124 @@ mod tests {
         let config = compile(source).unwrap();
         assert_eq!(config.servers.len(), 1);
         assert_eq!(config.servers[0].routes.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_tls_cert_key() {
+        let source = r#"
+            example.com {
+                listen :443
+                tls /etc/ssl/cert.pem /etc/ssl/key.pem
+                respond "OK"
+            }
+        "#;
+
+        let config = compile(source).unwrap();
+        let tls = config.servers[0].tls.as_ref().expect("tls config");
+        assert_eq!(tls.cert.as_deref(), Some("/etc/ssl/cert.pem"));
+        assert_eq!(tls.key.as_deref(), Some("/etc/ssl/key.pem"));
+        assert!(!tls.auto);
+    }
+
+    #[test]
+    fn test_compile_tls_auto() {
+        let source = r#"
+            example.com {
+                listen :443
+                tls auto
+                respond "OK"
+            }
+        "#;
+
+        let config = compile(source).unwrap();
+        let tls = config.servers[0].tls.as_ref().expect("tls config");
+        assert!(tls.auto);
+    }
+
+    #[test]
+    fn test_compile_tls_block_form() {
+        let source = r#"
+            example.com {
+                listen :443
+                tls {
+                    cert /etc/ssl/cert.pem
+                    key /etc/ssl/key.pem
+                    acme_email admin@example.com
+                    http3
+                }
+                respond "OK"
+            }
+        "#;
+
+        let config = compile(source).unwrap();
+        let tls = config.servers[0].tls.as_ref().expect("tls config");
+        assert_eq!(tls.cert.as_deref(), Some("/etc/ssl/cert.pem"));
+        assert_eq!(tls.key.as_deref(), Some("/etc/ssl/key.pem"));
+        assert_eq!(tls.acme_email.as_deref(), Some("admin@example.com"));
+        assert!(tls.http3);
+    }
+
+    #[test]
+    fn test_compile_tls_merges_with_https_scheme_default() {
+        // An https:// site address already yields a default TlsConfig; the
+        // `tls` directive must merge into it, not be overwritten by it.
+        let source = r#"
+            https://example.com {
+                tls /etc/ssl/cert.pem /etc/ssl/key.pem
+                respond "OK"
+            }
+        "#;
+
+        let config = compile(source).unwrap();
+        let tls = config.servers[0].tls.as_ref().expect("tls config");
+        assert_eq!(tls.cert.as_deref(), Some("/etc/ssl/cert.pem"));
+        assert_eq!(tls.key.as_deref(), Some("/etc/ssl/key.pem"));
+    }
+
+    #[test]
+    fn test_compile_tls_off_disables_https_scheme_default() {
+        let source = r#"
+            https://example.com {
+                tls off
+                respond "OK"
+            }
+        "#;
+
+        let config = compile(source).unwrap();
+        assert!(config.servers[0].tls.is_none(), "tls off must clear the https-scheme default");
+    }
+
+    #[test]
+    fn test_compile_admin_listen() {
+        let source = r#"{
+            admin 127.0.0.1:2019
+        }
+
+        example.com {
+            listen :80
+            respond "OK"
+        }"#;
+
+        let config = compile(source).unwrap();
+        let admin = config.admin.as_ref().expect("admin config");
+        assert_eq!(admin.listen, "127.0.0.1:2019");
+        assert!(admin.enabled);
+        assert!(admin.api_key.is_none());
+    }
+
+    #[test]
+    fn test_compile_admin_off() {
+        let source = r#"{
+            admin off
+        }
+
+        example.com {
+            listen :80
+            respond "OK"
+        }"#;
+
+        let config = compile(source).unwrap();
+        let admin = config.admin.as_ref().expect("admin config");
+        assert!(!admin.enabled);
     }
 }
