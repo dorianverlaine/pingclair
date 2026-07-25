@@ -3,23 +3,16 @@
 # config language allows: static file root + gzip on, and a /proxy/* route
 # forwarded to the shared "backend" upstream (not itself measured).
 #
-# NOTE: deliberately using a bare `:8080` block address instead of a named
-# host like `bench.local:8080`. pingclair-config's caddyfile adapter
-# (parse_server_address in adapter/caddyfile.rs) takes whatever hostname
-# appears in the block header and uses it *literally* as the bind host
-# passed to Pingora — not 0.0.0.0 with host-header routing, as Caddy/nginx
-# do. A named block crashes at startup unless that exact hostname happens
-# to resolve to a local interface (works for "localhost", breaks for any
-# real domain or container hostname without local DNS). Confirmed via
-# `docker compose logs`: BindError / "Temporary failure in name
-# resolution" on "bench.local:80". This looks like a real, previously
-# undiscovered bug — see benchmarks/README.md.
+# Uses a named site address (`bench.local:8080`) like the nginx and caddy
+# configs do. The caddyfile adapter binds hostname-based addresses on
+# 0.0.0.0 and routes by the Host header (Caddy/nginx semantics); the wrk
+# and curl invocations in scripts/ all send `Host: bench.local`.
 
 global {
     debug false
 }
 
-:8080 {
+bench.local:8080 {
     compress gzip
 
     handle /proxy/* {
