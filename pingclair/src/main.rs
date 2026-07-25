@@ -481,10 +481,19 @@ async fn refresh_h3_cert_table(
     }
 }
 
+/// Pingora requires a full `IP:port` socket address. Accept the Caddy-style
+/// shorthand `:port` by binding the wildcard address, so JSON configs behave
+/// the same as Pingclairfile ones (the DSL adapter already normalizes).
+fn normalize_listen_addr(addr: &str) -> String {
+    match addr.strip_prefix(':') {
+        Some(port) => format!("0.0.0.0:{port}"),
+        None => addr.to_string(),
+    }
+}
+
 fn run_server(config_path: String, config: pingclair_core::config::PingclairConfig) {
     #[cfg(not(target_os = "linux"))]
     let _ = config_path;
-
     // Create a background Tokio runtime for async tasks (HTTP/3, SIGHUP, etc.)
     // We do this in a separate thread to avoid conflicts with Pingora's runtime.
     let bg_runtime = tokio::runtime::Runtime::new().expect("Failed to create background runtime");
@@ -642,7 +651,7 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
             let listen_addrs = if server_config.listen.is_empty() {
                 vec!["0.0.0.0:80".to_string()]
             } else {
-                server_config.listen.clone()
+                server_config.listen.iter().map(|a| normalize_listen_addr(a)).collect()
             };
 
             for addr in listen_addrs {
@@ -851,7 +860,7 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
 
                         let mut new_config_by_port = std::collections::HashMap::new();
                         for s in new_config.servers {
-                            let addr = s.listen.first().cloned().unwrap_or_else(|| "0.0.0.0:80".to_string());
+                            let addr = s.listen.first().map(|a| normalize_listen_addr(a)).unwrap_or_else(|| "0.0.0.0:80".to_string());
                             new_config_by_port.entry(addr).or_insert_with(Vec::new).push(s);
                         }
 
@@ -950,5 +959,17 @@ mod tests {
     fn verify_cli() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn normalize_listen_addr_expands_bare_port() {
+        assert_eq!(normalize_listen_addr(":8443"), "0.0.0.0:8443");
+        assert_eq!(normalize_listen_addr(":80"), "0.0.0.0:80");
+        // Full socket addresses pass through untouched.
+        assert_eq!(normalize_listen_addr("127.0.0.1:9000"), "127.0.0.1:9000");
+        assert_eq!(normalize_listen_addr("0.0.0.0:443"), "0.0.0.0:443");
+        // The normalized form must parse as a SocketAddr (Pingora + H3 both
+        // require this).
+        assert!(normalize_listen_addr(":8443").parse::<std::net::SocketAddr>().is_ok());
     }
 }

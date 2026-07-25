@@ -116,7 +116,25 @@ fixed and verified end-to-end on the same box:
     now supported in the Caddyfile syntax, including `tls { cert/key/
     acme_email/http3 }` block form and `admin off`.
 
-Workspace tests: 65 → 129, all passing, across all 20 fixes.
+## Bugs found by the HTTP/3 (quiche) VPS run (July 2026)
+
+After the HTTP/3 stack was rewritten on quiche, the Linux smoke run
+surfaced one more startup crasher:
+
+21. **Bare `:port` listen addresses in JSON configs crashed startup.**
+    Pingora requires a full `IP:port` socket address; a JSON config with
+    `"listen": [":8443"]` died with `Name or service not known` (and the
+    QUIC socket parse failed the same way). Only DSL configs worked,
+    because the Caddyfile adapter already normalized to `0.0.0.0`. Both
+    the initial bind path and the SIGHUP reload path in `main.rs` now
+    normalize `:port` → `0.0.0.0:port` (`normalize_listen_addr`, with a
+    unit test).
+
+Workspace tests: 65 → 129, all passing, across all 20 fixes. (Later: 148
+with the HTTP/3-on-quiche rewrite and fix #21; the H3 stack was verified
+end-to-end on the same VPS — 10MB static and proxied bodies byte-identical
+over QUIC, streamed POSTs with and without Content-Length, 413 on
+oversize, and Alt-Svc advertised on H1.1 TLS responses.)
 
 Also deleted a `strict-tests/` directory that had been added by another
 tool: 16 of its 26 tests failed against the real compiler because it
