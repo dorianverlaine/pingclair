@@ -2275,6 +2275,7 @@ dependencies = [
  "boring",
  "bytes",
  "flate2",
+ "futures",
  "http 1.4.2",
  "ipnet",
  "parking_lot",

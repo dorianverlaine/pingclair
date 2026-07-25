@@ -2457,11 +2457,11 @@ fn find_reverse_proxy_config(handler: &HandlerConfig) -> Option<&ReverseProxyCon
     }
 }
 
-/// Expand weighted upstream definitions once at configuration load. Repeating
-/// a `Backend` in the selector is how Pingora's round-robin and Ketama
-/// algorithms receive a relative weight, while keeping selection allocation-
-/// free. A defensive cap prevents an untrusted JSON configuration from
-/// creating an arbitrarily large pool.
+/// ⚖️ Apply each upstream weight to Pingora's native weighted backend.
+///
+/// Repeating an identical backend is incorrect because Pingora stores its
+/// backend set by value and deduplicates those entries before selection.
+/// A defensive cap keeps every selector's internal weighted table bounded.
 fn build_weighted_upstreams(config: &ReverseProxyConfig) -> (Vec<Upstream>, Vec<Upstream>) {
     let options: Vec<_> = if config.upstream_options.is_empty() {
         config
@@ -2487,8 +2487,9 @@ fn build_weighted_upstreams(config: &ReverseProxyConfig) -> (Vec<Upstream>, Vec<
             &mut primary
         };
         match create_upstream(&option.address) {
-            Some(upstream) => {
-                target.extend(std::iter::repeat_n(upstream, weight as usize));
+            Some(mut upstream) => {
+                upstream.weight = weight as usize;
+                target.push(upstream);
             }
             None => tracing::warn!(upstream = %option.address, "Ignoring invalid upstream address"),
         }
@@ -3175,7 +3176,7 @@ mod caddy_parity_tests {
     }
 
     #[test]
-    fn weighted_upstreams_expand_primaries_and_isolate_backups() {
+    fn weighted_upstreams_set_native_weights_and_isolate_backups() {
         let config = ReverseProxyConfig {
             upstream_options: vec![
                 pingclair_core::config::ProxyUpstream {
@@ -3192,18 +3193,12 @@ mod caddy_parity_tests {
             ..Default::default()
         };
         let (primary, backup) = build_weighted_upstreams(&config);
-        assert_eq!(primary.len(), 3);
-        assert!(
-            primary
-                .iter()
-                .all(|upstream| upstream.addr.to_string() == "127.0.0.1:8301")
-        );
-        assert_eq!(backup.len(), 2);
-        assert!(
-            backup
-                .iter()
-                .all(|upstream| upstream.addr.to_string() == "127.0.0.1:8302")
-        );
+        assert_eq!(primary.len(), 1);
+        assert_eq!(primary[0].addr.to_string(), "127.0.0.1:8301");
+        assert_eq!(primary[0].weight, 3);
+        assert_eq!(backup.len(), 1);
+        assert_eq!(backup[0].addr.to_string(), "127.0.0.1:8302");
+        assert_eq!(backup[0].weight, 2);
     }
 
     #[test]
