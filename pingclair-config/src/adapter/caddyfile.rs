@@ -165,12 +165,16 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                             global.admin = Some(AdminDirective {
                                 listen: String::new(),
                                 enabled: false,
+                                api_key: None,
                             });
                         }
+                        // `admin <listen> [api_key]` — the optional second
+                        // argument is the Bearer token for the admin API.
                         Some(arg) => {
                             global.admin = Some(AdminDirective {
                                 listen: arg.clone(),
                                 enabled: true,
+                                api_key: sub.args.get(1).cloned(),
                             });
                         }
                         None => return Err(AdapterError::ArgumentCount("admin".into(), 1, 0)),
@@ -599,8 +603,71 @@ fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
             }
             Ok(Handler::Handle(handlers))
         },
+        "basic_auth" | "basicauth" => {
+            adapt_basic_auth(d)
+        },
         _ => Err(AdapterError::UnknownDirective(d.name)),
     }
+}
+
+// MARK: - basic_auth Directive Adapter
+
+/// Adapt the `basic_auth` directive. Supported forms:
+///   basic_auth <user> <password> [<user2> <password2>...]
+///   basic_auth {
+///       realm "Restricted Area"
+///       <user> <password>
+///   }
+///
+/// Passwords are stored as plain text; bcrypt-hashed credentials are not
+/// supported yet (the runtime never matches `hashed: true` entries).
+fn adapt_basic_auth(d: Directive) -> Result<Handler, AdapterError> {
+    let mut config = BasicAuthConfig {
+        realm: None,
+        credentials: Vec::new(),
+    };
+
+    let mut pairs_from = |args: &[String]| -> Result<(), AdapterError> {
+        if args.len() % 2 != 0 {
+            return Err(AdapterError::InvalidArgument(
+                "basic_auth".into(),
+                "credentials must be <user> <password> pairs".into(),
+            ));
+        }
+        for pair in args.chunks(2) {
+            config.credentials.push((pair[0].clone(), pair[1].clone()));
+        }
+        Ok(())
+    };
+
+    if let Some(block) = &d.block {
+        if !d.args.is_empty() {
+            return Err(AdapterError::InvalidArgument(
+                "basic_auth".into(),
+                "cannot mix inline credentials with a block".into(),
+            ));
+        }
+        for sub in &block.directives {
+            if sub.name == "realm" {
+                config.realm = sub.args.first().cloned();
+            } else {
+                pairs_from(&std::iter::once(sub.name.clone())
+                    .chain(sub.args.iter().cloned())
+                    .collect::<Vec<_>>())?;
+            }
+        }
+    } else {
+        pairs_from(&d.args)?;
+    }
+
+    if config.credentials.is_empty() {
+        return Err(AdapterError::InvalidArgument(
+            "basic_auth".into(),
+            "at least one credential pair is required".into(),
+        ));
+    }
+
+    Ok(Handler::BasicAuth(config))
 }
 
 // MARK: - reverse_proxy Full Block Parsing
@@ -1199,7 +1266,7 @@ mod global_tests {
         let proxy = routes.iter()
             .find(|r| matches!(&r.handler,
                 pingclair_core::config::HandlerConfig::ReverseProxy(_)
-                | pingclair_core::config::HandlerConfig::Pipeline(_)))
+                | pingclair_core::config::HandlerConfig::Pipeline { .. }))
             .expect("proxy route should exist");
         assert_eq!(proxy.path, "/proxy/*", "handle /proxy/* lost its path");
 

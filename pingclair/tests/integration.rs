@@ -217,6 +217,99 @@ async fn test_admin_api_hot_reload() {
 }
 
 #[tokio::test]
+async fn test_basic_auth_end_to_end() {
+    // A pipeline of basic_auth + respond behind a single route. Exercises the
+    // full path through the real binary: no credentials → 401 challenge,
+    // wrong password → 401, valid credentials → 200 from the next handler.
+    let config = r#"{
+        "servers": [
+            {
+                "listen": ["127.0.0.1:9095"],
+                "routes": [
+                    {
+                        "path": "/",
+                        "handler": {
+                            "type": "pipeline",
+                            "handlers": [
+                                {
+                                    "type": "basic_auth",
+                                    "realm": "Test Realm",
+                                    "credentials": [
+                                        { "username": "alice", "password": "secret1" }
+                                    ]
+                                },
+                                { "type": "respond", "status": 200, "body": "welcome" }
+                            ]
+                        }
+                    }
+                ]
+            }
+        ]
+    }"#;
+
+    let mut server = TestServer::new(config);
+    let client = no_proxy_client();
+
+    // wait_for_server needs a success response; poll the authed URL instead.
+    let authed = || async {
+        client
+            .get("http://127.0.0.1:9095/")
+            .basic_auth("alice", Some("secret1"))
+            .send()
+            .await
+    };
+    let mut up = false;
+    for _ in 0..50 {
+        if let Ok(resp) = authed().await {
+            if resp.status().is_success() {
+                up = true;
+                break;
+            }
+        }
+        if let Ok(Some(status)) = server.process.try_wait() {
+            panic!("server exited early: {}", status);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(up, "server failed to start");
+
+    // 1. No credentials → 401 with a WWW-Authenticate challenge.
+    let resp = client.get("http://127.0.0.1:9095/").send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+    let challenge = resp
+        .headers()
+        .get("WWW-Authenticate")
+        .expect("missing challenge header")
+        .to_str()
+        .unwrap();
+    assert!(challenge.contains("Basic"), "unexpected challenge: {}", challenge);
+    assert!(challenge.contains("Test Realm"), "realm missing: {}", challenge);
+
+    // 2. Wrong password → 401.
+    let resp = client
+        .get("http://127.0.0.1:9095/")
+        .basic_auth("alice", Some("wrong"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // 3. Unknown user → 401.
+    let resp = client
+        .get("http://127.0.0.1:9095/")
+        .basic_auth("mallory", Some("secret1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // 4. Valid credentials → 200 from the respond handler.
+    let resp = authed().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "welcome");
+}
+
+#[tokio::test]
 async fn test_compression() {
     let tmp_dir = tempfile::tempdir().unwrap();
     let file_path = tmp_dir.path().join("big.txt");

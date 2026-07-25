@@ -125,6 +125,23 @@ fn generate_request_id() -> String {
     format!("{:x}-{:x}", epoch, seq)
 }
 
+/// Validate a client-supplied `X-Request-Id` before adopting it.
+///
+/// The value ends up in response headers and log lines, so reject anything
+/// that could smuggle CR/LF or control characters, anything non-ASCII, and
+/// anything absurdly long (128 bytes matches common gateway practice).
+fn sanitize_request_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 {
+        return None;
+    }
+    if trimmed.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
 /// Feed one response body chunk through a streaming gzip encoder.
 ///
 /// 🏗️ ARCHITECTURE: real streaming, not full-body buffering.
@@ -651,6 +668,7 @@ impl PingclairProxy {
                 let body_bytes = body.as_deref().unwrap_or("").as_bytes();
                 response.insert_header("Content-Length", body_bytes.len().to_string()).unwrap();
                 response.insert_header("Server", "Pingclair").unwrap();
+                response.insert_header("X-Request-Id", &ctx.request_id).unwrap();
                 session.write_response_header(Box::new(response), false).await?;
                 session.write_response_body(Some(Bytes::copy_from_slice(body_bytes)), true).await?;
                 Ok(true)
@@ -659,6 +677,7 @@ impl PingclairProxy {
                 let mut response = ResponseHeader::build(*code, Some(3)).unwrap();
                 response.insert_header("Location", to.as_str()).unwrap();
                 response.insert_header("Server", "Pingclair").unwrap();
+                response.insert_header("X-Request-Id", &ctx.request_id).unwrap();
                 session.write_response_header(Box::new(response), true).await?;
                 Ok(true)
             }
@@ -692,6 +711,7 @@ impl PingclairProxy {
                             }
                             header.insert_header("Accept-Ranges", "bytes").unwrap();
                             header.insert_header("Server", "Pingclair").unwrap();
+                            header.insert_header("X-Request-Id", &ctx.request_id).unwrap();
 
                             session.write_response_header(Box::new(header), false).await?;
                             // Synchronous chunk reads (see StreamingFile):
@@ -727,6 +747,7 @@ impl PingclairProxy {
                             }
                             header.insert_header("Accept-Ranges", "bytes").unwrap();
                             header.insert_header("Server", "Pingclair").unwrap();
+                            header.insert_header("X-Request-Id", &ctx.request_id).unwrap();
 
                             session.write_response_header(Box::new(header), false).await?;
                             session.write_response_body(Some(Bytes::from(file.content)), true).await?;
@@ -744,7 +765,7 @@ impl PingclairProxy {
                 }
                 Ok(false)
             }
-            HandlerConfig::Pipeline(handlers) => {
+            HandlerConfig::Pipeline { handlers } => {
                 for h in handlers {
                     if self.handle_config(session, ctx, h, path, route_index).await? {
                         return Ok(true);
@@ -752,7 +773,7 @@ impl PingclairProxy {
                 }
                 Ok(false)
             }
-            HandlerConfig::Handle(handlers) => {
+            HandlerConfig::Handle { handlers } => {
                  for h in handlers {
                     if self.handle_config(session, ctx, h, path, route_index).await? {
                         return Ok(true);
@@ -790,8 +811,9 @@ impl PingclairProxy {
                 Ok(false)
             }
             HandlerConfig::RateLimit { .. } => {
-                // Rate limiting is handled in request_filter (TODO: verify integration)
-                // Returning Ok(false) to proceed
+                // Enforcement happens in `request_filter`, which holds one
+                // pre-built limiter per route (see `rate_limiters`); reaching
+                // this arm means the request passed, so just fall through.
                 Ok(false)
             }
             HandlerConfig::BasicAuth { realm, credentials } => {
@@ -1171,6 +1193,17 @@ impl ProxyHttp for PingclairProxy {
         ctx.request_host = request_host;
         ctx.request_method = request_method;
 
+        // Honor a client-supplied request ID so traces can be correlated
+        // across chained proxies; fall back to the generated one when the
+        // header is absent or malformed.
+        if let Some(client_id) = session.req_header().headers
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .and_then(sanitize_request_id)
+        {
+            ctx.request_id = client_id;
+        }
+
         // Detect Accept-Encoding for response compression
         {
             let ae = session.req_header().headers
@@ -1367,6 +1400,12 @@ impl ProxyHttp for PingclairProxy {
             && !upstream_request.headers.contains_key("x-real-ip")
         {
             upstream_request.insert_header("X-Real-IP", &client_ip)?;
+        }
+
+        // Forward the request ID so upstream services can correlate their
+        // logs with ours; a user-configured `header_up X-Request-Id` wins.
+        if !ctx.headers_upstream.contains_key("X-Request-Id") {
+            upstream_request.insert_header("X-Request-Id", &ctx.request_id)?;
         }
 
         Ok(())
@@ -1656,8 +1695,8 @@ impl ProxyHttp for PingclairProxy {
 fn find_reverse_proxy_config(handler: &HandlerConfig) -> Option<&ReverseProxyConfig> {
     match handler {
         HandlerConfig::ReverseProxy(config) => Some(config),
-        HandlerConfig::Pipeline(handlers)
-        | HandlerConfig::Handle(handlers)
+        HandlerConfig::Pipeline { handlers }
+        | HandlerConfig::Handle { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
             handlers.iter().find_map(|h| find_reverse_proxy_config(h))
         }
@@ -1671,8 +1710,8 @@ fn find_reverse_proxy_config(handler: &HandlerConfig) -> Option<&ReverseProxyCon
 fn find_file_server_config(handler: &HandlerConfig) -> Option<&HandlerConfig> {
     match handler {
         HandlerConfig::FileServer { .. } => Some(handler),
-        HandlerConfig::Pipeline(handlers)
-        | HandlerConfig::Handle(handlers)
+        HandlerConfig::Pipeline { handlers }
+        | HandlerConfig::Handle { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
             handlers.iter().find_map(|h| find_file_server_config(h))
         }
@@ -1690,7 +1729,7 @@ fn find_rate_limit_config(handler: &HandlerConfig) -> Option<crate::rate_limit::
                 burst: *burst,
             })
         },
-        HandlerConfig::Pipeline(handlers) | HandlerConfig::Handle(handlers) | HandlerConfig::HandlePath { handlers, .. } => {
+        HandlerConfig::Pipeline { handlers } | HandlerConfig::Handle { handlers } | HandlerConfig::HandlePath { handlers, .. } => {
             for h in handlers {
                 if let Some(config) = find_rate_limit_config(h) {
                     return Some(config);
@@ -1712,8 +1751,8 @@ pub(crate) fn find_basic_auth_config(handler: &HandlerConfig) -> Option<(&str, &
         HandlerConfig::BasicAuth { realm, credentials } => {
             Some((realm.as_str(), credentials.as_slice()))
         }
-        HandlerConfig::Pipeline(handlers)
-        | HandlerConfig::Handle(handlers)
+        HandlerConfig::Pipeline { handlers }
+        | HandlerConfig::Handle { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
             handlers.iter().find_map(find_basic_auth_config)
         }
@@ -1894,6 +1933,33 @@ mod p0_regression_tests {
         let seq_a = u64::from_str_radix(seq_a, 16).unwrap();
         let seq_b = u64::from_str_radix(seq_b, 16).unwrap();
         assert!(seq_b > seq_a, "sequence should be monotonically increasing");
+    }
+
+    #[test]
+    fn sanitize_request_id_accepts_typical_values() {
+        assert_eq!(
+            sanitize_request_id("abc-123_DEF.456"),
+            Some("abc-123_DEF.456".to_string())
+        );
+        assert_eq!(
+            sanitize_request_id("  padded  "),
+            Some("padded".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_request_id_rejects_unsafe_values() {
+        // Empty / whitespace-only
+        assert_eq!(sanitize_request_id(""), None);
+        assert_eq!(sanitize_request_id("   "), None);
+        // CR/LF header-smuggling attempts
+        assert_eq!(sanitize_request_id("ok\r\nX-Injected: evil"), None);
+        assert_eq!(sanitize_request_id("ok\nbad"), None);
+        // Non-ASCII
+        assert_eq!(sanitize_request_id("要求-123"), None);
+        // Overlong
+        assert_eq!(sanitize_request_id(&"a".repeat(129)), None);
+        assert!(sanitize_request_id(&"a".repeat(128)).is_some());
     }
 
     // ---- Fix 3: hosts/default reads never contend with reloads ----
@@ -2155,10 +2221,10 @@ mod basic_auth_tests {
     fn finds_basic_auth_nested_in_pipeline_and_handle_path() {
         let handler = HandlerConfig::HandlePath {
             prefix: "/admin".to_string(),
-            handlers: vec![HandlerConfig::Pipeline(vec![
+            handlers: vec![HandlerConfig::Pipeline { handlers: vec![
                 basic_auth_handler(),
                 respond_handler(),
-            ])],
+            ] }],
         };
         let (realm, _) = find_basic_auth_config(&handler).unwrap();
         assert_eq!(realm, "Restricted");
@@ -2166,7 +2232,7 @@ mod basic_auth_tests {
 
     #[test]
     fn returns_none_when_no_basic_auth_present() {
-        let handler = HandlerConfig::Pipeline(vec![respond_handler()]);
+        let handler = HandlerConfig::Pipeline { handlers: vec![respond_handler()] };
         assert!(find_basic_auth_config(&handler).is_none());
         assert!(find_basic_auth_config(&respond_handler()).is_none());
     }

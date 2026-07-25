@@ -67,12 +67,12 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
         };
     }
     
-    // Set admin API configuration (`admin <listen>` / `admin off`)
+    // Set admin API configuration (`admin <listen> [api_key]` / `admin off`)
     if let Some(admin) = &global.admin {
         config.admin = Some(AdminConfig {
             listen: admin.listen.clone(),
             enabled: admin.enabled,
-            api_key: None,
+            api_key: admin.api_key.clone(),
         });
     }
     
@@ -388,7 +388,7 @@ fn compile_handler(handler: &Handler) -> CompileResult<HandlerConfig> {
             let compiled: Result<Vec<_>, _> = handlers.iter()
                 .map(compile_handler)
                 .collect();
-            Ok(HandlerConfig::Pipeline(compiled?))
+            Ok(HandlerConfig::Pipeline { handlers: compiled? })
         }
         
         Handler::FileServer(fs) => {
@@ -406,7 +406,20 @@ fn compile_handler(handler: &Handler) -> CompileResult<HandlerConfig> {
             for h in sub_handlers {
                 compiled.push(compile_handler(h)?);
             }
-            Ok(HandlerConfig::Handle(compiled))
+            Ok(HandlerConfig::Handle { handlers: compiled })
+        }
+
+        Handler::BasicAuth(config) => {
+            Ok(HandlerConfig::BasicAuth {
+                realm: config.realm.clone().unwrap_or_else(|| "Restricted".to_string()),
+                credentials: config.credentials.iter()
+                    .map(|(username, password)| pingclair_core::config::BasicAuthCredential {
+                        username: username.clone(),
+                        password: password.clone(),
+                        hashed: false,
+                    })
+                    .collect(),
+            })
         }
 
         Handler::Plugin { name, args } => {

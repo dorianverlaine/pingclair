@@ -130,7 +130,7 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             Err(HandlerError::Config("ReverseProxy should use Pingora".to_string()))
         }
         
-        HandlerConfig::Pipeline(handlers) => {
+        HandlerConfig::Pipeline { handlers } => {
             // Execute handlers in order, combining results
             let mut final_response = HandlerResponse::status(200);
             
@@ -150,9 +150,9 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             Ok(final_response)
         }
 
-        HandlerConfig::Handle(handlers) => {
+        HandlerConfig::Handle { handlers } => {
             // Treat Handle as a pipeline for now
-            execute_handler(&HandlerConfig::Pipeline(handlers.clone()), headers)
+            execute_handler(&HandlerConfig::Pipeline { handlers: handlers.clone() }, headers)
         }
 
         HandlerConfig::Rewrite { strip_prefix, strip_suffix, replace, regex: _, regex_replace: _ } => {
@@ -229,7 +229,7 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
 
         HandlerConfig::HandlePath { prefix, handlers } => {
             // execute inner handlers
-            let mut response = execute_handler(&HandlerConfig::Pipeline(handlers.clone()), headers)?;
+            let mut response = execute_handler(&HandlerConfig::Pipeline { handlers: handlers.clone() }, headers)?;
             
             // Add instruction to strip prefix
             // Note: In a real execution engine, we would modify the path before inner execution,

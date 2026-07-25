@@ -283,10 +283,14 @@ pub enum HandlerConfig {
     },
 
     /// Pipeline of handlers
-    Pipeline(Vec<HandlerConfig>),
+    Pipeline {
+        handlers: Vec<HandlerConfig>,
+    },
 
     /// Exclusive routing group
-    Handle(Vec<HandlerConfig>),
+    Handle {
+        handlers: Vec<HandlerConfig>,
+    },
 
     /// HTTP Basic Authentication
     /// Requires valid credentials before allowing access

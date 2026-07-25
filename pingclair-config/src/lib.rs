@@ -140,6 +140,7 @@ pub enum FullCompileError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pingclair_core::config::HandlerConfig;
 
     #[test]
     fn test_full_compile() {
@@ -316,5 +317,91 @@ mod tests {
         let config = compile(source).unwrap();
         let admin = config.admin.as_ref().expect("admin config");
         assert!(!admin.enabled);
+    }
+
+    #[test]
+    fn test_compile_admin_with_api_key() {
+        let source = r#"{
+            admin 127.0.0.1:2019 s3cret-token
+        }
+
+        example.com {
+            listen :80
+            respond "OK"
+        }"#;
+
+        let config = compile(source).unwrap();
+        let admin = config.admin.as_ref().expect("admin config");
+        assert_eq!(admin.listen, "127.0.0.1:2019");
+        assert!(admin.enabled);
+        assert_eq!(admin.api_key.as_deref(), Some("s3cret-token"));
+    }
+
+    #[test]
+    fn test_compile_basic_auth_inline() {
+        let source = r#"
+            example.com {
+                listen :80
+                basic_auth alice secret1 bob secret2
+                respond "OK"
+            }
+        "#;
+
+        let config = compile(source).unwrap();
+        let route = &config.servers[0].routes[0];
+        let HandlerConfig::Pipeline { handlers } = &route.handler else {
+            panic!("expected pipeline, got {:?}", route.handler);
+        };
+        let auth = handlers.iter().find_map(|h| match h {
+            HandlerConfig::BasicAuth { realm, credentials } => Some((realm, credentials)),
+            _ => None,
+        }).expect("basic_auth handler");
+        assert_eq!(auth.0, "Restricted");
+        assert_eq!(auth.1.len(), 2);
+        assert_eq!(auth.1[0].username, "alice");
+        assert_eq!(auth.1[0].password, "secret1");
+        assert!(!auth.1[0].hashed);
+        assert_eq!(auth.1[1].username, "bob");
+    }
+
+    #[test]
+    fn test_compile_basic_auth_block_with_realm() {
+        let source = r#"
+            example.com {
+                listen :80
+                basic_auth {
+                    realm "Admin Area"
+                    admin hunter2
+                }
+                respond "OK"
+            }
+        "#;
+
+        let config = compile(source).unwrap();
+        let route = &config.servers[0].routes[0];
+        let HandlerConfig::Pipeline { handlers } = &route.handler else {
+            panic!("expected pipeline, got {:?}", route.handler);
+        };
+        let auth = handlers.iter().find_map(|h| match h {
+            HandlerConfig::BasicAuth { realm, credentials } => Some((realm, credentials)),
+            _ => None,
+        }).expect("basic_auth handler");
+        assert_eq!(auth.0, "Admin Area");
+        assert_eq!(auth.1.len(), 1);
+        assert_eq!(auth.1[0].username, "admin");
+        assert_eq!(auth.1[0].password, "hunter2");
+    }
+
+    #[test]
+    fn test_compile_basic_auth_rejects_odd_args() {
+        let source = r#"
+            example.com {
+                listen :80
+                basic_auth alice
+                respond "OK"
+            }
+        "#;
+
+        assert!(compile(source).is_err());
     }
 }
