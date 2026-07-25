@@ -10,10 +10,14 @@
 
 use crate::health_check::HealthChecker;
 use crate::upstream::Upstream;
+use futures::FutureExt;
+use pingora_load_balancing::Backends;
 use pingora_load_balancing::LoadBalancer as NativeLoadBalancer;
+use pingora_load_balancing::discovery::Static;
 use pingora_load_balancing::prelude::RoundRobin;
 use pingora_load_balancing::selection::consistent::KetamaHashing;
-use std::collections::HashMap;
+use pingora_load_balancing::selection::{BackendIter, BackendSelection};
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -190,6 +194,23 @@ pub struct LoadBalancer {
 
 // MARK: - Implementation
 
+fn build_native_load_balancer<S>(upstreams: Vec<Upstream>) -> NativeLoadBalancer<S>
+where
+    S: BackendSelection + 'static,
+    S::Iter: BackendIter,
+{
+    // ⚖️ Preserve Pingora's native Backend weight instead of resolving it back to weight one.
+    let discovery = Static::new(BTreeSet::from_iter(upstreams));
+    let backends = Backends::new(discovery);
+    let load_balancer = NativeLoadBalancer::from_backends(backends);
+    load_balancer
+        .update()
+        .now_or_never()
+        .expect("static backend discovery must not block")
+        .expect("static backend discovery must succeed");
+    load_balancer
+}
+
 impl LoadBalancer {
     /// Creates a new `LoadBalancer` instance with the specified upstreams and strategy.
     ///
@@ -219,8 +240,7 @@ impl LoadBalancer {
             }
             Strategy::IpHash => {
                 let native: NativeLoadBalancer<KetamaHashing> =
-                    NativeLoadBalancer::try_from_iter(upstreams)
-                        .expect("Failed to create KetamaHashing LoadBalancer");
+                    build_native_load_balancer(upstreams);
                 Self {
                     strategy,
                     native_rr: None,
@@ -234,9 +254,7 @@ impl LoadBalancer {
             // Pingora's `Random` algorithm is separate but our wrapper uses the
             // RR native LB for both — the strategy enum drives the key.
             Strategy::RoundRobin | Strategy::Random => {
-                let native: NativeLoadBalancer<RoundRobin> =
-                    NativeLoadBalancer::try_from_iter(upstreams)
-                        .expect("Failed to create RoundRobin LoadBalancer");
+                let native: NativeLoadBalancer<RoundRobin> = build_native_load_balancer(upstreams);
                 Self {
                     strategy,
                     native_rr: Some(Arc::new(native)),
@@ -359,6 +377,27 @@ mod tests {
         assert_eq!(s1.addr.to_string(), "127.0.0.1:8001");
         assert_eq!(s2.addr.to_string(), "127.0.0.1:8002");
         assert_eq!(s3.addr.to_string(), "127.0.0.1:8001");
+    }
+
+    #[test]
+    fn weighted_round_robin_honors_native_backend_weights() {
+        let mut weighted = Upstream::new("127.0.0.1:8001").unwrap();
+        weighted.weight = 3;
+        let normal = Upstream::new("127.0.0.1:8002").unwrap();
+        let lb = LoadBalancer::new(vec![weighted, normal], Strategy::RoundRobin);
+
+        let mut weighted_count = 0;
+        let mut normal_count = 0;
+        for _ in 0..40 {
+            match lb.select(None).unwrap().addr.to_string().as_str() {
+                "127.0.0.1:8001" => weighted_count += 1,
+                "127.0.0.1:8002" => normal_count += 1,
+                address => panic!("unexpected backend: {address}"),
+            }
+        }
+
+        assert_eq!(weighted_count, 30);
+        assert_eq!(normal_count, 10);
     }
 
     #[test]

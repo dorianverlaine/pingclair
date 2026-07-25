@@ -738,10 +738,11 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
             let mut http3_enabled = false;
 
             if is_https {
-                // Setup TLS with dynamic resolver (OpenSSL) and certificate caching
+                // 🔐 Enable dynamic certificates and advertise HTTP/2 plus HTTP/1.1 over ALPN.
                 let acceptor = DynamicCertResolver::new(tls_manager.clone());
                 match TlsSettings::with_callbacks(Box::new(acceptor)) {
-                    Ok(tls_settings) => {
+                    Ok(mut tls_settings) => {
+                        tls_settings.enable_h2();
                         service.add_tls_with_settings(addr, None, tls_settings);
                         tls_enabled = true;
                     }
