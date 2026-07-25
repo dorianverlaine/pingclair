@@ -231,6 +231,14 @@ enum ServiceAction {
 
 
 fn main() -> anyhow::Result<()> {
+    // Install a process-level rustls CryptoProvider before any TLS code runs.
+    // Both the `aws-lc-rs` and `ring` features end up enabled through the
+    // workspace dependency graph, so rustls cannot pick one automatically and
+    // panics on the first TLS handshake without an explicit default.
+    // `install_default` returns Err if a provider is already installed (e.g. by
+    // a library we depend on); that is fine, so the result is discarded.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     // Initialize tracing
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
@@ -473,6 +481,10 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
     tracing::info!("📄 Loaded configuration from: {}", config_path);
     tracing::info!("🔧 Configured {} server(s)", config.servers.len());
 
+    // Register Prometheus metrics with the global registry so the admin
+    // /metrics endpoint has data to expose.
+    pingclair_proxy::metrics::init();
+
     if config.global.auto_https != pingclair_core::config::AutoHttpsMode::Off {
         tracing::info!("🔐 Auto HTTPS: enabled");
         if let Some(email) = &config.global.email {
@@ -544,6 +556,40 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
                     .expect("Failed to create TLS manager with persistent challenge handler")
             })
     );
+
+    // Load manually configured TLS certificates (tls.cert + tls.key file pairs)
+    // into the TLS manager. Manual certs take precedence over ACME-issued ones.
+    for server_config in &config.servers {
+        let Some(tls) = &server_config.tls else { continue };
+        let (Some(cert_path), Some(key_path)) = (&tls.cert, &tls.key) else { continue };
+
+        let Some(name) = server_config.name.as_deref() else {
+            tracing::warn!("⚠️ TLS cert/key configured on an unnamed server, skipping manual certificate load");
+            continue;
+        };
+        if name.is_empty() || name == "_" {
+            tracing::warn!("⚠️ Skipping manual TLS certificate for wildcard/unnamed server '{}'", name);
+            continue;
+        }
+
+        let cert_pem = match std::fs::read_to_string(cert_path) {
+            Ok(pem) => pem,
+            Err(e) => {
+                tracing::error!("❌ Failed to read TLS cert file {}: {}", cert_path, e);
+                continue;
+            }
+        };
+        let key_pem = match std::fs::read_to_string(key_path) {
+            Ok(pem) => pem,
+            Err(e) => {
+                tracing::error!("❌ Failed to read TLS key file {}: {}", key_path, e);
+                continue;
+            }
+        };
+
+        tls_manager.add_manual_cert(name, cert_pem, key_pem);
+        tracing::info!("🔐 Loaded manual TLS certificate for {}", name);
+    }
 
     // Group servers by listen address
     let port_proxies = std::collections::HashMap::new();
@@ -772,6 +818,47 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
         });
     }
     
+    // ========================================
+    // 🛑 Signal Handling for Shutdown (SIGINT/SIGTERM)
+    // ========================================
+    // Pingora's `run_forever()` blocks indefinitely, so without explicit
+    // handlers the process only dies on SIGKILL. Install shutdown handlers
+    // on the background runtime before entering it.
+    bg_handle.spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("❌ Failed to create SIGTERM listener: {}", e);
+                    // Fall back to SIGINT-only handling.
+                    let _ = tokio::signal::ctrl_c().await;
+                    tracing::info!("🛑 Received SIGINT, shutting down");
+                    std::process::exit(0);
+                }
+            };
+
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("🛑 Received SIGINT, shutting down");
+                }
+                _ = sigterm.recv() => {
+                    tracing::info!("🛑 Received SIGTERM, shutting down");
+                }
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("🛑 Received Ctrl-C, shutting down");
+        }
+
+        std::process::exit(0);
+    });
+
     println!("🚀 Pingclair running...");
     server.run_forever();
 }

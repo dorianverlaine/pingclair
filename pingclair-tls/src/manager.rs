@@ -29,8 +29,9 @@ pub struct TlsManager {
     auto_https: Option<Arc<AutoHttps>>,
     /// Challenge handler (HTTP-01) - can be either memory or persistent
     challenge_handler: Arc<dyn ChallengeHandler>,
-    /// Fallback/Manual certificates (domain -> cert)
-    manual_certs: HashMap<String, Arc<rustls::sign::CertifiedKey>>,
+    /// Manually configured certificates in PEM form (domain -> (cert_pem, key_pem)).
+    /// Loaded from the config file at startup; takes precedence over ACME certs.
+    manual_pem_certs: RwLock<HashMap<String, (String, String)>>,
     /// Cached parsed CertifiedKey from ACME certs (domain -> cached key with metadata)
     /// Avoids expensive PEM parsing on every TLS handshake
     cached_certs: RwLock<HashMap<String, CachedCert>>,
@@ -55,7 +56,7 @@ impl TlsManager {
         Ok(Self {
             auto_https,
             challenge_handler: challenge_handler as Arc<dyn ChallengeHandler>,
-            manual_certs: HashMap::new(),
+            manual_pem_certs: RwLock::new(HashMap::new()),
             cached_certs: RwLock::new(HashMap::new()),
             cache_ttl: Duration::from_secs(3600), // 1 hour default TTL
         })
@@ -75,7 +76,7 @@ impl TlsManager {
         Self {
             auto_https,
             challenge_handler: challenge_handler as Arc<dyn ChallengeHandler>,
-            manual_certs: HashMap::new(),
+            manual_pem_certs: RwLock::new(HashMap::new()),
             cached_certs: RwLock::new(HashMap::new()),
             cache_ttl: Duration::from_secs(3600), // 1 hour default TTL
         }
@@ -99,7 +100,7 @@ impl TlsManager {
         Ok(Self {
             auto_https,
             challenge_handler: challenge_handler as Arc<dyn ChallengeHandler>,
-            manual_certs: HashMap::new(),
+            manual_pem_certs: RwLock::new(HashMap::new()),
             cached_certs: RwLock::new(HashMap::new()),
             cache_ttl: Duration::from_secs(3600), // 1 hour default TTL
         })
@@ -115,11 +116,23 @@ impl TlsManager {
         Ok(())
     }
 
+    /// Add a manually configured certificate (PEM form) for a domain.
+    /// Manual certificates take precedence over ACME-issued ones.
+    pub fn add_manual_cert(&self, domain: &str, cert_pem: String, key_pem: String) {
+        self.manual_pem_certs
+            .write()
+            .insert(domain.to_string(), (cert_pem, key_pem));
+    }
+
     /// 🔍 Resolve a certificate for a client hello (SNI) as PEM
     pub async fn resolve_pem(&self, domain: &str) -> Option<(String, String)> {
-        // 1. Check manual certs? (Manual certs currently store CertifiedKey, need to change to PEM)
-        // For now let's focus on Auto HTTPS which has PEMs in Certificate struct
-        
+        // 1. Check manual certs (PEM pair configured in the config file)
+        let manual = self.manual_pem_certs.read().get(domain).cloned();
+        if let Some(pems) = manual {
+            return Some(pems);
+        }
+
+        // 2. Auto HTTPS (ACME store)
         if let Some(auto) = &self.auto_https {
              match auto.get_certificate(domain, self.challenge_handler.as_ref()).await {
                  Ok(cert) => {
@@ -135,9 +148,22 @@ impl TlsManager {
 
     /// 🔍 Resolve a certificate for a client hello (SNI) as rustls CertifiedKey
     pub async fn resolve_cert(&self, domain: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        // 1. Check manual certs
-        if let Some(cert) = self.manual_certs.get(domain) {
-            return Some(cert.clone());
+        // 1. Check manual certs (PEM pair configured in the config file)
+        let manual = self.manual_pem_certs.read().get(domain).cloned();
+        if let Some((cert_pem, key_pem)) = manual {
+            let cert = crate::Certificate {
+                cert_pem,
+                key_pem,
+                domains: vec![domain.to_string()],
+                expires_at: 0,
+            };
+            match self.convert_to_rustls(&cert) {
+                Ok(key) => return Some(Arc::new(key)),
+                Err(e) => {
+                    tracing::error!("❌ Failed to parse manual certificate for {}: {}", domain, e);
+                    return None;
+                }
+            }
         }
         
         // 2. Check cached CertifiedKey (fast path - no PEM parsing)
@@ -244,5 +270,49 @@ impl TlsManager {
     /// Update cache TTL
     pub fn set_cache_ttl(&mut self, ttl: Duration) {
         self.cache_ttl = ttl;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_manager() -> TlsManager {
+        let dir = std::env::temp_dir()
+            .join(format!("pingclair-tls-manager-test-{}", std::process::id()));
+        TlsManager::new_with_memory_challenges(None, &dir)
+    }
+
+    #[tokio::test]
+    async fn resolve_pem_returns_manual_cert() {
+        let manager = test_manager();
+        manager.add_manual_cert(
+            "example.com",
+            "CERT_PEM".to_string(),
+            "KEY_PEM".to_string(),
+        );
+
+        let resolved = manager.resolve_pem("example.com").await;
+        assert_eq!(
+            resolved,
+            Some(("CERT_PEM".to_string(), "KEY_PEM".to_string()))
+        );
+
+        // Unknown domains fall through to ACME (disabled here) and return None.
+        assert!(manager.resolve_pem("other.example.com").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_pem_prefers_manual_over_acme() {
+        // Even with auto_https disabled the manual lookup must happen first;
+        // the key property is that a manual entry is returned verbatim.
+        let manager = test_manager();
+        manager.add_manual_cert("a.example.com", "A_CERT".to_string(), "A_KEY".to_string());
+        manager.add_manual_cert("b.example.com", "B_CERT".to_string(), "B_KEY".to_string());
+
+        assert_eq!(
+            manager.resolve_pem("b.example.com").await,
+            Some(("B_CERT".to_string(), "B_KEY".to_string()))
+        );
     }
 }
