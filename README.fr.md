@@ -10,7 +10,7 @@
 [![Status](https://img.shields.io/badge/status-active-green.svg)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/dorianverlaine/pingclair/pulls)
 
-[English](README.md) · [繁體中文](README.zh-TW.md) · **Français**
+[English](README.md) · [繁體中文](README.zh.md) · **Français**
 
 </div>
 
@@ -33,7 +33,6 @@ Que vous ayez besoin d'un simple serveur de fichiers statiques ou d'une passerel
 *   🔄 **Répartition de charge intelligente** — Plusieurs algorithmes intégrés (round-robin, least-connections, etc.), avec health checks et bascule automatique.
 *   🔐 **HTTPS entièrement automatique** — Le support ACME intégré (Let's Encrypt) émet et renouvelle les certificats SSL/TLS sans aucune configuration.
 *   📁 **Service de fichiers statiques performant** — Compression Gzip/Brotli, requêtes Range et transfert de fichiers efficace.
-*   🔌 **Système de plugins modulaire** — *(en développement)* Étendez les fonctionnalités via des traits Rust, sans toucher au cœur.
 *   📊 **Observabilité** — Export de métriques Prometheus et traçage OpenTelemetry prêts à l'emploi.
 
 ## ⚡ Benchmarks

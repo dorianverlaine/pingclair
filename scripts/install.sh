@@ -92,14 +92,14 @@ curl -s -L -o /etc/Pingclair/Pingclairfile.example "$BASE_RAW_URL/examples/Pingc
 if [ ! -f /etc/Pingclair/Pingclairfile ]; then
     echo "Creating default Pingclairfile..."
     cat > /etc/Pingclair/Pingclairfile <<EOF
-# 🦀 Pingclair 默认配置文件
-# 管理命令: pc service <start|stop|reload|status>
+# 🦀 Pingclair default configuration file
+# Management commands: pc service <start|stop|reload|status>
 
 server "default" {
     listen: "0.0.0.0:80";
     
     route {
-        # 欢迎页面
+        # Welcome page
         _ => {
             file_server "/var/lib/pingclair/html";
         }

@@ -20,7 +20,7 @@ repository = "https://github.com/dorianverlaine/pingclair"
 rust-version = "1.88"
 
 [workspace.dependencies]
-# Pingora 核心
+# Pingora core
 pingora = "0.8"
 pingora-core = "0.8"
 pingora-proxy = "0.8"
@@ -29,20 +29,20 @@ pingora-timeout = "0.8"
 pingora-load-balancing = "0.8"
 pingora-limits = "0.8"
 
-# Async 运行时
+# Async runtime
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 
-# 序列化
+# Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
 
-# 配置解析
+# Configuration parsing
 logos = "0.16"
-ariadne = "0.6"      # 错误报告
+ariadne = "0.6"      # error reporting
 
-# TLS/证书
+# TLS / certificates
 rustls = { version = "0.23", features = ["ring"] }
 rcgen = "0.14"
 x509-parser = "0.18"
@@ -58,28 +58,28 @@ http = "1"
 bytes = "1"
 mime_guess = "2"
 
-# 日志和监控
+# Logging and metrics
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 prometheus = "0.14"
 
-# 错误处理
+# Error handling
 thiserror = "2"
 anyhow = "1"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# 测试
+# Testing
 criterion = "0.8"
 
-# 文件系统
+# File system
 dirs = "6"
 
-# 字符串处理
+# String handling
 smartstring = "1"
 
-# 无锁热路径读取
+# Lock-free reads on hot paths
 arc-swap = "1"
 
 [profile.release]
