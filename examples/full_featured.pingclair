@@ -1,93 +1,73 @@
-// Full-featured example demonstrating all capabilities
+# Full-featured example — every directive below passes `pingclair validate`.
+# Simpler starting points: Pingclairfile.example, basic.pingclair.
 
-// Global settings
-global {
-    debug true;
-    
-    http3 {
-        enabled true;
-        alt_svc_max_age 86400;
-    }
-    
-    logging {
-        level "info";
-        format "json";
-    }
+# Global options block
+{
+    # ACME account email (Let's Encrypt)
+    email admin@example.com
+
+    # Automatic HTTPS: on | off | disable_redirects
+    auto_https off
+
+    # Admin API on 127.0.0.1:2019, protected by a Bearer token.
+    # Without a token the API only accepts loopback connections.
+    admin 127.0.0.1:2019 your-secret-key-here
 }
 
-// Admin API
-admin {
-    listen "localhost:2019";
-    auth {
-        api_key "your-secret-key-here";
-    }
-}
+# Main site. A bare hostname binds 0.0.0.0 and routes by Host header.
+example.com {
+    listen :8080
 
-// Main website
-server "example.com" {
-    tls auto;
-    http3;
-
-    // Compression middleware for all routes
-    compress ["gzip", "br", "zstd"];
-
-    // Security headers
-    headers {
-        add "X-Frame-Options" "DENY";
-        add "X-Content-Type-Options" "nosniff";
-        add "Strict-Transport-Security" "max-age=31536000; includeSubDomains";
+    # Manual certificate + HTTP/3 (QUIC). Use `tls auto` for ACME instead.
+    tls {
+        cert /etc/pingclair/certs/example.com.pem
+        key /etc/pingclair/certs/example.com.key
+        http3
     }
 
-    // Static files
-    route "/" {
-        file_server "./public" {
-            index ["index.html"];
-            browse false;
+    # Response compression for static files (gzip, brotli, zstd)
+    encode gzip br zstd
+
+    # Response headers: set, append with +, remove with -
+    header {
+        X-Frame-Options "DENY"
+        X-Content-Type-Options "nosniff"
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        -X-Powered-By
+    }
+
+    # Admin area gated by HTTP Basic auth. Inline form is also valid:
+    #   basic_auth admin hunter2
+    handle /admin/* {
+        basic_auth {
+            realm "Admin Area"
+            admin hunter2
+            ops s3cret
         }
+        respond "Welcome to the admin area"
     }
 
-    // API backend
-    route "/api/*" {
-        rate_limit {
-            requests 100;
-            window 60;
-        }
-
-        reverse_proxy ["http://localhost:3000"] {
-            load_balance least_conn;
-            
-            health_check "/health" {
-                interval 10s;
-                timeout 3s;
+    # API backend. flush_interval -1 enables per-chunk streaming, which
+    # keeps SSE / LLM-style endpoints responsive through the proxy.
+    handle /api/* {
+        reverse_proxy localhost:3000 localhost:3001 {
+            header_up X-Forwarded-Host {host}
+            flush_interval -1
+            transport http {
+                read_timeout 300s
+                write_timeout 300s
             }
         }
     }
 
-    // WebSocket support
-    route "/ws" {
-        reverse_proxy ["http://localhost:3001"];
+    # Custom response for a health-check endpoint
+    handle /healthz {
+        respond "ok"
     }
 
-    // Redirect www to non-www
-    route "/redirect-test" {
-        redirect "https://example.com/" 301;
-    }
-}
-
-// API subdomain
-server "api.example.com" {
-    tls auto;
-    http3;
-
-    route "/*" {
-        cors {
-            origins ["https://example.com", "https://app.example.com"];
-            methods ["GET", "POST", "PUT", "DELETE"];
-            headers ["Authorization", "Content-Type"];
-        }
-
-        reverse_proxy ["http://localhost:3000", "http://localhost:3001"] {
-            load_balance round_robin;
-        }
+    # Static files for everything else
+    file_server {
+        root ./public
+        index index.html
     }
 }

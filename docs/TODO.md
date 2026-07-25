@@ -5,7 +5,7 @@
 > nginx parity 的整體審計見 `docs/AUDIT_NGINX_PARITY.md`;壓測發現並已修復的
 > bug 歷史見 `benchmarks/README.md`。
 >
-> 最後更新: 2026-07-25(第二版,補充同類專案調研後的功能規劃)
+> 最後更新: 2026-07-26(第 0/1 波完成:程式碼債、DSL api_key/basic_auth、Request ID)
 
 ---
 
@@ -29,9 +29,12 @@ ACME 帳戶持久化(詳見審計文檔)。
   正則**改寫**沒有(`handlers.rs` Rewrite 僅字面替換)。
 - [ ] **bcrypt 憑據** — `BasicAuthCredential { hashed: true }` 目前**永不匹配**(直接跳過)。
   需要引入 bcrypt 依賴(刻意暫緩,是依賴決策)。明文憑據正常工作。
-- [ ] **CORS** — preflight 處理 + 回應標頭注入。目前完全沒有,反代 API 場景剛需。
-- [ ] **Request ID** — 產生或透傳 `X-Request-Id`,貫穿 access log 與上游轉發。
-  排障與分散式追蹤的基礎設施,成本很低。
+- [ ] **CORS** — 預檢處理 + 回應標頭注入。⚠️ 注意:`HandlerConfig::Cors` 結構
+  在 core 配置裡已存在(`types.rs:338`),但**沒有任何執行路徑處理它**——
+  需要核實後補實現,DSL 也沒有對應指令。
+- [x] **Request ID**(2026-07-26)— 客戶端 `X-Request-Id` 透傳(消毒後採用),
+  無則生成;轉發上游(header_up 可覆蓋)、下游回應標頭、access log 全貫穿。
+  ⚠️ H3(quic.rs)路徑尚未轉發 Request ID,見下方小項。
 - [ ] **IP / Referer / UA 存取控制** — 依 IP/CIDR、Referer host、User-Agent 正則
   做 allow/deny。現有 rate limiter 的 keyed 機制可複用。
 
@@ -86,12 +89,14 @@ ACME 帳戶持久化(詳見審計文檔)。
 
 ## 🟦 DSL 缺口(Pingclairfile 還不能配,JSON 配置可用)
 
-- [ ] **`admin.api_key`** — 編譯器硬編碼 `None`(`pingclair-config/src/compiler.rs:75`),
-  Admin API 金鑰只能 JSON 設定。
-- [ ] **`basic_auth`** — DSL 從不產生 `HandlerConfig::BasicAuth`,只有 JSON 配置能用到
-  三條路徑(H1/H2/H3)的 Basic Auth。
+- [x] **`admin.api_key`**(2026-07-26)— `admin 127.0.0.1:2019 s3cret` 第二位置參數
+  即 Bearer token。
+- [x] **`basic_auth`**(2026-07-26)— 行內 `basic_auth user pass [u2 p2...]` 與
+  block 形式(支援 `realm` 子指令)均已支援,編譯為明文憑據。
 - [ ] 其他候補:`error_page`、`gzip_types`、CORS、IP/Referer/UA 限制、LB weight、
   traffic splitting、新認證方式等實現後需一併補 DSL 語法。
+- [ ] **`redirect`** — core 有 `HandlerConfig::Redirect`、AST 有 `Handler::Redirect`,
+  但適配器從不產生它,DSL 寫 `redirect` 會報 Unknown directive。
 
 ---
 
@@ -119,18 +124,24 @@ ACME 帳戶持久化(詳見審計文檔)。
 - [ ] **H3 壓測** — QUIC 路徑只有九項冒煙測試(VPS),無效能數據。
 - [ ] **ACME `from_credentials` 還原路徑** — 單元測試不聯網,只覆蓋序列化/持久化;
   真實還原需對 LE staging 做一次手動驗證。
-- [ ] **Basic Auth 端到端** — 單元測試齊全,但沒有經真二進位 + JSON 配置的
-  整合測試(401/200 全流程)。
+- [x] **Basic Auth 端到端**(2026-07-26)— `test_basic_auth_end_to_end` 覆蓋
+  401 挑戰/錯密碼/未知用戶/通過四種情況(真二進位 + JSON pipeline 配置)。
+- [ ] **H3 Request ID 轉發** — quic.rs 走 Connector 時未帶 `X-Request-Id`,
+  H3 回應也不帶該標頭;H1/H2 已全貫穿(2026-07-26)。
 
 ---
 
 ## 🔧 程式碼債(小)
 
-- [ ] `pingclair-api/src/handlers.rs` 還有一個 `#![allow(dead_code)]`(歷史遺留,
-  與 auth 無關)。
-- [ ] `pingclair-core/src/config/loader.rs:41` 的 TODO 註釋已過時(parser 早就有了),刪掉。
-- [ ] `pingclair-proxy/src/server.rs:758` 註釋 "Rate limiting ... TODO: verify integration",
-  需確認限流在 `request_filter` 的整合是否完整。
+- [x] ~~`pingclair-api/src/handlers.rs` 的 `#![allow(dead_code)]`~~(2026-07-26)
+  — 整個模組無呼叫者,已連同 `mod handlers;` 一併刪除。
+- [x] ~~`pingclair-core/src/config/loader.rs:41` 過時 TODO~~(2026-07-26)— 註釋
+  已更正為指向 pingclair-config。
+- [x] ~~`pingclair-proxy/src/server.rs` 限流 TODO 註釋~~(2026-07-26)— 已核實
+  `request_filter` 內按路由預建 limiter 並執行 429,註釋改為描述實際行為。
+- [x] ~~`HandlerConfig::Pipeline`/`Handle` 無法 JSON 序列化~~(2026-07-26)—
+  serde 內部標籤 + newtype Vec 變體不能 round-trip(Admin API hot-reload 與
+  GET /config 遇到 pipeline 配置必炸),已改為結構體變體 `{ handlers: [...] }`。
 
 ---
 

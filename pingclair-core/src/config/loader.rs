@@ -36,10 +36,12 @@ impl ConfigLoader {
             .map_err(|e| Error::Config(format!("Invalid TOML: {}", e)))
     }
 
-    /// Parse Pingclairfile configuration
+    /// Pingclairfile sources are compiled by the `pingclair-config` crate,
+    /// which depends on this one; the core loader only handles data formats.
     pub fn from_pingclairfile(_content: &str) -> Result<PingclairConfig> {
-        // TODO: Implement Pingclairfile parser in pingclair-config crate
-        Err(Error::Config("Pingclairfile parser not yet implemented".to_string()))
+        Err(Error::Config(
+            "Pingclairfile must be compiled via pingclair-config".to_string(),
+        ))
     }
 }
 

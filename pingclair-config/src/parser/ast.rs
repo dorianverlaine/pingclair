@@ -55,6 +55,9 @@ pub struct AdminDirective {
 
     /// Enable the admin API (`admin off` disables it)
     pub enabled: bool,
+
+    /// Bearer token required for admin API requests
+    pub api_key: Option<String>,
 }
 
 /// Auto-HTTPS modes
@@ -374,8 +377,21 @@ pub enum Handler {
     /// Exclusive routing group
     Handle(Vec<Handler>),
 
+    /// HTTP Basic authentication gate
+    BasicAuth(BasicAuthConfig),
+
     /// Plugin invocation
     Plugin { name: String, args: Vec<Expr> },
+}
+
+/// Basic authentication configuration
+#[derive(Debug, Clone)]
+pub struct BasicAuthConfig {
+    /// Realm shown in the `WWW-Authenticate` challenge
+    pub realm: Option<String>,
+
+    /// `(username, password)` pairs in plain text
+    pub credentials: Vec<(String, String)>,
 }
 
 /// Proxy configuration
