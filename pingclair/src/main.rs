@@ -2,19 +2,19 @@
 //!
 //! This is the main entry point for the Pingclair CLI.
 
-use clap::{Parser, Subcommand};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use std::sync::Arc;
-use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
-use pingora_core::listeners::tls::TlsSettings;
-use pingora_core::listeners::TlsAccept;
-use pingora_core::protocols::tls::TlsRef;
-use pingclair_tls::manager::TlsManager;
+use boring::pkey::{PKey, Private};
 use boring::ssl::NameType;
 use boring::x509::X509;
-use boring::pkey::{PKey, Private};
+use clap::{Parser, Subcommand};
 use parking_lot::RwLock;
+use pingclair_tls::manager::TlsManager;
+use pingora_core::listeners::TlsAccept;
+use pingora_core::listeners::tls::TlsSettings;
+use pingora_core::protocols::tls::TlsRef;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[cfg(target_os = "linux")]
 #[global_allocator]
@@ -82,7 +82,10 @@ impl DynamicCertResolver {
 impl TlsAccept for DynamicCertResolver {
     async fn certificate_callback(&self, ssl: &mut TlsRef) {
         // Get SNI
-        let sni = ssl.servername(NameType::HOST_NAME).unwrap_or("").to_string();
+        let sni = ssl
+            .servername(NameType::HOST_NAME)
+            .unwrap_or("")
+            .to_string();
         if sni.is_empty() {
             return;
         }
@@ -147,7 +150,11 @@ impl TlsAccept for DynamicCertResolver {
             };
 
             self.ssl_cache.write().insert(sni.clone(), cached_entry);
-            tracing::info!("🔐 Cached cert for {} (expires in {}s)", sni, CERT_CACHE_TTL_SECS);
+            tracing::info!(
+                "🔐 Cached cert for {} (expires in {}s)",
+                sni,
+                CERT_CACHE_TTL_SECS
+            );
         }
     }
 }
@@ -229,7 +236,6 @@ enum ServiceAction {
     Status,
 }
 
-
 fn main() -> anyhow::Result<()> {
     // Install a process-level rustls CryptoProvider before any TLS code runs.
     // Both the `aws-lc-rs` and `ring` features end up enabled through the
@@ -252,9 +258,11 @@ fn main() -> anyhow::Result<()> {
     }
 
     match cli.command {
-        Commands::Run { config: config_path } => {
+        Commands::Run {
+            config: config_path,
+        } => {
             tracing::info!("Starting Pingclair with config: {}", config_path);
-            
+
             // Load configuration - support both single file and directory
             let config = if std::path::Path::new(&config_path).is_dir() {
                 tracing::info!("📁 Loading configuration from directory: {}", config_path);
@@ -274,25 +282,24 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             };
-            
+
             run_server(config_path.clone(), config);
         }
 
         Commands::ReverseProxy { from, to } => {
             tracing::info!("Starting reverse proxy: {} -> {}", from, to);
-             // Create dynamic config
+            // Create dynamic config
             let mut config = pingclair_core::config::PingclairConfig::default();
-            
+
             // Parse listen address
             let listen = if from.starts_with(':') {
                 format!("0.0.0.0{}", from)
             } else {
-                 from.clone()
+                from.clone()
             };
 
             use pingclair_core::config::{
-                ServerConfig, RouteConfig, HandlerConfig, 
-                ReverseProxyConfig, LoadBalanceConfig
+                HandlerConfig, LoadBalanceConfig, ReverseProxyConfig, RouteConfig, ServerConfig,
             };
 
             let mut server = ServerConfig {
@@ -303,10 +310,12 @@ fn main() -> anyhow::Result<()> {
                 log: None,
                 client_max_body_size: 10 * 1024 * 1024, // 10MB
                 security: Default::default(),
+                error_pages: Default::default(),
             };
 
             let handler = HandlerConfig::ReverseProxy(ReverseProxyConfig {
                 upstreams: vec![to.clone()],
+                upstream_options: Vec::new(),
                 load_balance: LoadBalanceConfig::default(),
                 health_check: None,
                 headers_up: std::collections::HashMap::new(),
@@ -319,29 +328,29 @@ fn main() -> anyhow::Result<()> {
             server.routes.push(RouteConfig {
                 path: "/*".to_string(),
                 handler,
-                methods: None, 
+                methods: None,
                 matcher: None,
             });
 
             config.servers.push(server);
-            
+
             run_server("".to_string(), config);
         }
 
         Commands::FileServer { listen, root } => {
             tracing::info!("Starting file server on {} serving {}", listen, root);
-            
-             // Create dynamic config
+
+            // Create dynamic config
             let mut config = pingclair_core::config::PingclairConfig::default();
-            
+
             // Parse listen address
             let listen_addr = if listen.starts_with(':') {
                 format!("0.0.0.0{}", listen)
             } else {
-                 listen.clone()
+                listen.clone()
             };
 
-            use pingclair_core::config::{ServerConfig, RouteConfig, HandlerConfig};
+            use pingclair_core::config::{HandlerConfig, RouteConfig, ServerConfig};
 
             let mut server = ServerConfig {
                 name: Some("_".to_string()),
@@ -351,8 +360,9 @@ fn main() -> anyhow::Result<()> {
                 log: None,
                 client_max_body_size: 10 * 1024 * 1024,
                 security: Default::default(),
+                error_pages: Default::default(),
             };
-            
+
             // Resolve absolute path
             let root_path = std::fs::canonicalize(&root)
                 .map(|p| p.to_string_lossy().to_string())
@@ -368,14 +378,14 @@ fn main() -> anyhow::Result<()> {
             server.routes.push(RouteConfig {
                 path: "/*".to_string(),
                 handler,
-                methods: None, 
+                methods: None,
                 matcher: None,
             });
 
             // 🛑 SAFETY: Push the server that contains the FileServer route,
             // not a duplicate empty ServerConfig.
             config.servers.push(server);
-            
+
             run_server("".to_string(), config);
         }
 
@@ -393,10 +403,10 @@ fn main() -> anyhow::Result<()> {
             match result {
                 Ok(_) => {
                     println!("✅ Configuration '{}' is valid!", config);
-                },
+                }
                 Err(e) => {
-                     eprintln!("❌ Configuration Error: {}", e);
-                     std::process::exit(1);
+                    eprintln!("❌ Configuration Error: {}", e);
+                    std::process::exit(1);
                 }
             }
         }
@@ -498,7 +508,7 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
     // We do this in a separate thread to avoid conflicts with Pingora's runtime.
     let bg_runtime = tokio::runtime::Runtime::new().expect("Failed to create background runtime");
     let bg_handle = bg_runtime.handle().clone();
-    
+
     std::thread::spawn(move || {
         bg_runtime.block_on(async {
             // Keep the runtime alive
@@ -544,22 +554,16 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
     // Pingora defaults to ONE thread per service — on a multi-core box that
     // leaves the machine idle while nginx runs one worker per core. Scale
     // with available parallelism instead (still overridable via config).
-    server_conf.threads = config
-        .global
-        .worker_threads
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        });
+    server_conf.threads = config.global.worker_threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    });
     tracing::info!(
         "🔗 Upstream keepalive pool size: {} connections/thread",
         server_conf.upstream_keepalive_pool_size
     );
-    tracing::info!(
-        "🧵 Worker threads per service: {}",
-        server_conf.threads
-    );
+    tracing::info!("🧵 Worker threads per service: {}", server_conf.threads);
 
     let mut server = pingora::server::Server::new_with_opt_and_conf(
         Some(pingora::server::configuration::Opt {
@@ -573,7 +577,7 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
     );
 
     server.bootstrap();
-    
+
     // Initialize TLS Manager with global settings
     // Use environment variable for testing, fallback to default path
     let tls_store_path_str = std::env::var("PINGCLAIR_TLS_STORE")
@@ -599,21 +603,30 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
                 pingclair_tls::manager::TlsManager::new(Some(auto_https_config), tls_store_path)
                     .await
                     .expect("Failed to create TLS manager with persistent challenge handler")
-            })
+            }),
     );
 
     // Load manually configured TLS certificates (tls.cert + tls.key file pairs)
     // into the TLS manager. Manual certs take precedence over ACME-issued ones.
     for server_config in &config.servers {
-        let Some(tls) = &server_config.tls else { continue };
-        let (Some(cert_path), Some(key_path)) = (&tls.cert, &tls.key) else { continue };
+        let Some(tls) = &server_config.tls else {
+            continue;
+        };
+        let (Some(cert_path), Some(key_path)) = (&tls.cert, &tls.key) else {
+            continue;
+        };
 
         let Some(name) = server_config.name.as_deref() else {
-            tracing::warn!("⚠️ TLS cert/key configured on an unnamed server, skipping manual certificate load");
+            tracing::warn!(
+                "⚠️ TLS cert/key configured on an unnamed server, skipping manual certificate load"
+            );
             continue;
         };
         if name.is_empty() || name == "_" {
-            tracing::warn!("⚠️ Skipping manual TLS certificate for wildcard/unnamed server '{}'", name);
+            tracing::warn!(
+                "⚠️ Skipping manual TLS certificate for wildcard/unnamed server '{}'",
+                name
+            );
             continue;
         }
 
@@ -651,38 +664,49 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
         .filter_map(|s| s.name.clone())
         .filter(|n| !n.is_empty() && n != "_" && n != "*" && !n.starts_with(':'))
         .collect();
-    let h3_pool_size = config
-        .global
-        .upstream_keepalive_pool_size
-        .unwrap_or(128);
+    let h3_pool_size = config.global.upstream_keepalive_pool_size.unwrap_or(128);
     let h3_blocked_ips = config.global.blocked_ips.clone();
 
     // Track binding information for diagnostic logging
     let mut binding_info = std::collections::HashMap::new();
-    
-        for server_config in config.servers {
-            tracing::debug!("🚀 Processing ServerConfig: name={:?}, listens={:?}", server_config.name, server_config.listen);
-            
-            let listen_addrs = if server_config.listen.is_empty() {
-                vec!["0.0.0.0:80".to_string()]
-            } else {
-                server_config.listen.iter().map(|a| normalize_listen_addr(a)).collect()
-            };
 
-            for addr in listen_addrs {
-                let mut proxies_guard = port_proxies.write();
-                let proxy = proxies_guard.entry(addr.clone()).or_insert_with(|| {
-                    pingclair_proxy::server::PingclairProxy::with_tls(tls_manager.clone())
-                });
-                
-                // Track what sites are bound to what addresses
-                let site_name = server_config.name.clone().unwrap_or_else(|| "default".to_string());
-                binding_info.entry(addr.clone()).or_insert_with(Vec::new).push(site_name);
-                
-                proxy.add_server(server_config.clone());
-            }
+    for server_config in config.servers {
+        tracing::debug!(
+            "🚀 Processing ServerConfig: name={:?}, listens={:?}",
+            server_config.name,
+            server_config.listen
+        );
+
+        let listen_addrs = if server_config.listen.is_empty() {
+            vec!["0.0.0.0:80".to_string()]
+        } else {
+            server_config
+                .listen
+                .iter()
+                .map(|a| normalize_listen_addr(a))
+                .collect()
+        };
+
+        for addr in listen_addrs {
+            let mut proxies_guard = port_proxies.write();
+            let proxy = proxies_guard.entry(addr.clone()).or_insert_with(|| {
+                pingclair_proxy::server::PingclairProxy::with_tls(tls_manager.clone())
+            });
+
+            // Track what sites are bound to what addresses
+            let site_name = server_config
+                .name
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            binding_info
+                .entry(addr.clone())
+                .or_insert_with(Vec::new)
+                .push(site_name);
+
+            proxy.add_server(server_config.clone());
         }
-    
+    }
+
     // Log binding information for diagnostics
     tracing::info!("🌐 Server binding information:");
     for (addr, sites) in &binding_info {
@@ -694,18 +718,18 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
     {
         let proxies_guard = port_proxies.read();
         for (addr, proxy_logic) in proxies_guard.iter() {
-            let proxy_service = pingora::proxy::http_proxy_service(
-                &server.configuration,
-                proxy_logic.clone(),
-            );
+            let proxy_service =
+                pingora::proxy::http_proxy_service(&server.configuration, proxy_logic.clone());
 
             let mut service = proxy_service;
-            
+
             // Add L4 Connection Filter (Global Blocked IPs)
             let blocked_ips = &config.global.blocked_ips;
             if !blocked_ips.is_empty() {
-                 let filter = std::sync::Arc::new(pingclair_proxy::PingclairConnectionFilter::new(blocked_ips));
-                 service.set_connection_filter(filter);
+                let filter = std::sync::Arc::new(pingclair_proxy::PingclairConnectionFilter::new(
+                    blocked_ips,
+                ));
+                service.set_connection_filter(filter);
             }
 
             // Determine if this is an HTTPS port
@@ -714,35 +738,32 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
             let mut http3_enabled = false;
 
             if is_https {
-                 // Setup TLS with dynamic resolver (OpenSSL) and certificate caching
-                 let acceptor = DynamicCertResolver::new(tls_manager.clone());
-                 match TlsSettings::with_callbacks(Box::new(acceptor)) {
+                // Setup TLS with dynamic resolver (OpenSSL) and certificate caching
+                let acceptor = DynamicCertResolver::new(tls_manager.clone());
+                match TlsSettings::with_callbacks(Box::new(acceptor)) {
                     Ok(tls_settings) => {
-                         service.add_tls_with_settings(addr, None, tls_settings);
-                         tls_enabled = true;
+                        service.add_tls_with_settings(addr, None, tls_settings);
+                        tls_enabled = true;
                     }
                     Err(e) => {
                         tracing::error!("❌ Failed to create TlsSettings for {}: {}", addr, e);
                     }
-                 }
+                }
 
-                 // Enable HTTP/3 for HTTPS ports when the global switch is on:
-                 // advertise Alt-Svc on this listener and queue the port for
-                 // a QUIC socket.
-                 if http3_globally_enabled {
-                     https_ports.push(addr.clone());
-                     http3_enabled = true;
+                // Enable HTTP/3 for HTTPS ports when the global switch is on:
+                // advertise Alt-Svc on this listener and queue the port for
+                // a QUIC socket.
+                if http3_globally_enabled {
+                    https_ports.push(addr.clone());
+                    http3_enabled = true;
 
-                     if let Some(port) = addr
-                         .rsplit(':')
-                         .next()
-                         .and_then(|p| p.parse::<u16>().ok())
-                     {
-                         proxy_logic.set_alt_svc(port);
-                     }
-                 }
+                    if let Some(port) = addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok())
+                    {
+                        proxy_logic.set_alt_svc(port);
+                    }
+                }
             } else {
-                 service.add_tcp(addr);
+                service.add_tcp(addr);
             }
 
             // Enhanced diagnostic logging for each binding
@@ -816,24 +837,24 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
             }
         });
     }
-    
+
     // Start Admin API if enabled
     if let Some(admin_config) = config.admin {
-            if admin_config.enabled {
-                let listen = admin_config.listen.clone();
-                let api_key = admin_config.api_key.clone();
-                let proxies = port_proxies.clone();
-                
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().expect("Failed to create admin runtime");
-                    rt.block_on(async {
-                        let addr = listen.parse().expect("Invalid admin listen address");
-                        if let Err(e) = pingclair_api::run_admin_server(addr, proxies, api_key).await {
-                            tracing::error!("Admin server error: {}", e);
-                        }
-                    });
+        if admin_config.enabled {
+            let listen = admin_config.listen.clone();
+            let api_key = admin_config.api_key.clone();
+            let proxies = port_proxies.clone();
+
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().expect("Failed to create admin runtime");
+                rt.block_on(async {
+                    let addr = listen.parse().expect("Invalid admin listen address");
+                    if let Err(e) = pingclair_api::run_admin_server(addr, proxies, api_key).await {
+                        tracing::error!("Admin server error: {}", e);
+                    }
                 });
-            }
+            });
+        }
     }
 
     // ========================================
@@ -843,10 +864,10 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
     if !config_path.is_empty() {
         let config_path = config_path.clone();
         let port_proxies = port_proxies.clone();
-        
+
         bg_handle.spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
-            
+
             let mut stream = match signal(SignalKind::hangup()) {
                 Ok(s) => s,
                 Err(e) => {
@@ -854,9 +875,9 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
                     return;
                 }
             };
-            
+
             tracing::info!("📡 SIGHUP listener active (Config: {})", config_path);
-            
+
             while let Some(()) = stream.recv().await {
                 let reload_start = std::time::Instant::now();
                 tracing::info!("🔔 Received SIGHUP, reloading configuration from: {}", config_path);
@@ -921,7 +942,7 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
             }
         });
     }
-    
+
     // ========================================
     // 🛑 Signal Handling for Shutdown (SIGINT/SIGTERM)
     // ========================================
@@ -931,7 +952,7 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
     bg_handle.spawn(async move {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{signal, SignalKind};
+            use tokio::signal::unix::{SignalKind, signal};
 
             let mut sigterm = match signal(SignalKind::terminate()) {
                 Ok(s) => s,
@@ -986,6 +1007,10 @@ mod tests {
         assert_eq!(normalize_listen_addr("0.0.0.0:443"), "0.0.0.0:443");
         // The normalized form must parse as a SocketAddr (Pingora + H3 both
         // require this).
-        assert!(normalize_listen_addr(":8443").parse::<std::net::SocketAddr>().is_ok());
+        assert!(
+            normalize_listen_addr(":8443")
+                .parse::<std::net::SocketAddr>()
+                .is_ok()
+        );
     }
 }

@@ -8,11 +8,11 @@
 //! lightweight atomic-counter wrapper that tracks active connections per backend
 //! independently from the native load balancer.
 
-use crate::upstream::Upstream;
 use crate::health_check::HealthChecker;
+use crate::upstream::Upstream;
+use pingora_load_balancing::LoadBalancer as NativeLoadBalancer;
 use pingora_load_balancing::prelude::RoundRobin;
 use pingora_load_balancing::selection::consistent::KetamaHashing;
-use pingora_load_balancing::LoadBalancer as NativeLoadBalancer;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -133,7 +133,11 @@ impl LeastConnTracker {
                 }
             })
             .collect();
-        Self { counters, upstreams, health }
+        Self {
+            counters,
+            upstreams,
+            health,
+        }
     }
 
     /// Select the upstream with the fewest active connections among the
@@ -180,6 +184,8 @@ pub struct LoadBalancer {
     /// for the native (RoundRobin/Random/IpHash) and custom (LeastConn)
     /// selection paths.
     health: Arc<BackendHealth>,
+    /// Backup pool consulted only when no primary backend is selectable.
+    backup: Option<Arc<LoadBalancer>>,
 }
 
 // MARK: - Implementation
@@ -208,6 +214,7 @@ impl LoadBalancer {
                     native_ketama: None,
                     least_conn: Some(tracker),
                     health,
+                    backup: None,
                 }
             }
             Strategy::IpHash => {
@@ -220,6 +227,7 @@ impl LoadBalancer {
                     native_ketama: Some(Arc::new(native)),
                     least_conn: None,
                     health,
+                    backup: None,
                 }
             }
             // RoundRobin and Random share the same Pingora RoundRobin backend;
@@ -235,9 +243,22 @@ impl LoadBalancer {
                     native_ketama: None,
                     least_conn: None,
                     health,
+                    backup: None,
                 }
             }
         }
+    }
+
+    /// Creates a primary pool with an optional backup pool. Backup peers are
+    /// deliberately separate from the primary selector so their weights do
+    /// not put them into normal rotation; they are tried only after all
+    /// primaries are unhealthy or unavailable.
+    pub fn with_backup(primary: Vec<Upstream>, backup: Vec<Upstream>, strategy: Strategy) -> Self {
+        let mut load_balancer = Self::new(primary, strategy);
+        if !backup.is_empty() {
+            load_balancer.backup = Some(Arc::new(Self::new(backup, strategy)));
+        }
+        load_balancer
     }
 
     /// Mark a backend as down (passive health check). Called from
@@ -245,6 +266,9 @@ impl LoadBalancer {
     /// backend fails; `select` then skips it for [`FAIL_COOLDOWN`].
     pub fn mark_unhealthy(&self, addr: &SocketAddr) {
         self.health.mark_down(addr);
+        if let Some(backup) = &self.backup {
+            backup.mark_unhealthy(addr);
+        }
     }
 
     /// Configures the health checker for this load balancer.
@@ -283,27 +307,30 @@ impl LoadBalancer {
     ///                  Ignored for other strategies.
     /// - Returns: An optional `Upstream` if a healthy backend is available.
     pub fn select(&self, key: Option<&[u8]>) -> Option<Upstream> {
-        match self.strategy {
+        let primary = match self.strategy {
             Strategy::LeastConn => {
                 // ⚡ LeastConn: pick minimum active-connection upstream.
                 // The counter slot is released immediately — for the simple
                 // select() API we count a "selection" as one request unit.
-                let tracker = self.least_conn.as_ref()?;
-                let (upstream, _guard) = tracker.select()?;
-                Some(upstream)
+                self.least_conn
+                    .as_ref()
+                    .and_then(|tracker| tracker.select().map(|(upstream, _guard)| upstream))
             }
             Strategy::IpHash => {
-                let native = self.native_ketama.as_ref()?;
                 let hash_key = key.unwrap_or(b"");
                 // select_with keeps Pingora's own health verdict (`ready`,
                 // used by active health checks) and adds our passive marks.
-                native.select_with(hash_key, 256, |b, ready| ready && self.health.is_up_backend(b))
+                self.native_ketama.as_ref().and_then(|native| {
+                    native.select_with(hash_key, 256, |b, ready| {
+                        ready && self.health.is_up_backend(b)
+                    })
+                })
             }
-            Strategy::RoundRobin | Strategy::Random => {
-                let native = self.native_rr.as_ref()?;
+            Strategy::RoundRobin | Strategy::Random => self.native_rr.as_ref().and_then(|native| {
                 native.select_with(b"", 256, |b, ready| ready && self.health.is_up_backend(b))
-            }
-        }
+            }),
+        };
+        primary.or_else(|| self.backup.as_ref().and_then(|backup| backup.select(key)))
     }
 
     /// Provides access to the underlying native Pingora load balancer (RoundRobin variant).
@@ -403,7 +430,8 @@ mod tests {
         let lb = LoadBalancer::new(vec![u1, u2], Strategy::RoundRobin);
 
         // Mark down with a short cooldown (tests can't wait out FAIL_COOLDOWN).
-        lb.health.mark_down_for(&addr("127.0.0.1:8001"), Duration::from_millis(50));
+        lb.health
+            .mark_down_for(&addr("127.0.0.1:8001"), Duration::from_millis(50));
         assert_eq!(lb.select(None).unwrap().addr.to_string(), "127.0.0.1:8002");
 
         std::thread::sleep(Duration::from_millis(60));
@@ -426,6 +454,20 @@ mod tests {
 
         lb.mark_unhealthy(&addr("127.0.0.1:8001"));
         lb.mark_unhealthy(&addr("127.0.0.1:8002"));
-        assert!(lb.select(None).is_none(), "all down → None (caller answers 502)");
+        assert!(
+            lb.select(None).is_none(),
+            "all down → None (caller answers 502)"
+        );
+    }
+
+    #[test]
+    fn backup_is_used_only_after_primaries_are_unhealthy() {
+        let primary = Upstream::new("127.0.0.1:8201").unwrap();
+        let backup = Upstream::new("127.0.0.1:8202").unwrap();
+        let lb = LoadBalancer::with_backup(vec![primary], vec![backup], Strategy::RoundRobin);
+
+        assert_eq!(lb.select(None).unwrap().addr.to_string(), "127.0.0.1:8201");
+        lb.mark_unhealthy(&addr("127.0.0.1:8201"));
+        assert_eq!(lb.select(None).unwrap().addr.to_string(), "127.0.0.1:8202");
     }
 }

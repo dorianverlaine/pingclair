@@ -5,10 +5,10 @@
 //!   Pass 2: Convert the expanded generic directives into the Typed AST
 
 use crate::parser::ast::*;
-use crate::parser::caddy_ast::{Directive, Block};
+use crate::parser::caddy_ast::{Block, Directive};
 use crate::parser::lexer::Location;
-use thiserror::Error;
 use std::collections::HashMap;
+use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum AdapterError {
@@ -48,9 +48,7 @@ fn collect_snippets(
         if d.name.starts_with('(') && d.name.ends_with(')') {
             // Snippet definition: (name) { ... }
             let snippet_name = d.name[1..d.name.len() - 1].to_string();
-            let body = d.block
-                .map(|b| b.directives)
-                .unwrap_or_default();
+            let body = d.block.map(|b| b.directives).unwrap_or_default();
             snippets.insert(snippet_name, body);
         } else {
             remaining.push(d);
@@ -77,9 +75,9 @@ fn expand_imports(
     for d in directives {
         if d.name == "import" {
             if let Some(name) = d.args.first() {
-                let body = snippets.get(name).ok_or_else(|| {
-                    AdapterError::UndefinedSnippet(name.clone())
-                })?;
+                let body = snippets
+                    .get(name)
+                    .ok_or_else(|| AdapterError::UndefinedSnippet(name.clone()))?;
                 // Recursively expand in case the snippet itself imports others
                 let expanded = expand_imports(body.clone(), snippets, depth + 1)?;
                 result.extend(expanded);
@@ -88,7 +86,9 @@ fn expand_imports(
             // Recursively expand imports inside blocks
             let expanded_block = if let Some(block) = d.block {
                 let expanded_body = expand_imports(block.directives, snippets, depth + 1)?;
-                Some(Block { directives: expanded_body })
+                Some(Block {
+                    directives: expanded_body,
+                })
             } else {
                 None
             };
@@ -124,7 +124,8 @@ pub fn adapt(directives: Vec<Directive>) -> Result<Ast, AdapterError> {
             // Caddy uses snippets (import), which we now handle above.
         } else {
             let server = adapt_server(d)?;
-            ast.servers.push(Node::new(server, Location { start: 0, end: 0 }));
+            ast.servers
+                .push(Node::new(server, Location { start: 0, end: 0 }));
         }
     }
 
@@ -153,8 +154,15 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                         match arg.as_str() {
                             "on" => global.auto_https = Some(AutoHttpsMode::On),
                             "off" => global.auto_https = Some(AutoHttpsMode::Off),
-                            "disable_redirects" => global.auto_https = Some(AutoHttpsMode::DisableRedirects),
-                            _ => return Err(AdapterError::InvalidArgument("auto_https".into(), arg.clone())),
+                            "disable_redirects" => {
+                                global.auto_https = Some(AutoHttpsMode::DisableRedirects)
+                            }
+                            _ => {
+                                return Err(AdapterError::InvalidArgument(
+                                    "auto_https".into(),
+                                    arg.clone(),
+                                ));
+                            }
                         }
                     }
                 }
@@ -262,18 +270,26 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
         for sub_d in block.directives {
             match sub_d.name.as_str() {
                 "bind" => {
-                    if sub_d.args.is_empty() { return Err(AdapterError::ArgumentCount("bind".into(), 1, 0)); }
+                    if sub_d.args.is_empty() {
+                        return Err(AdapterError::ArgumentCount("bind".into(), 1, 0));
+                    }
                     server.bind = Some(sub_d.args[0].clone());
-                },
+                }
                 "listen" => {
-                    if sub_d.args.is_empty() { return Err(AdapterError::ArgumentCount("listen".into(), 1, 0)); }
+                    if sub_d.args.is_empty() {
+                        return Err(AdapterError::ArgumentCount("listen".into(), 1, 0));
+                    }
                     let addr = &sub_d.args[0];
                     server.listens.push(ListenAddr {
-                        scheme: if addr.starts_with("https") { Scheme::Https } else { Scheme::Http },
+                        scheme: if addr.starts_with("https") {
+                            Scheme::Https
+                        } else {
+                            Scheme::Http
+                        },
                         host: "0.0.0.0".to_string(),
                         port: addr.split(':').last().and_then(|p| p.parse().ok()),
                     });
-                },
+                }
                 "compress" | "encode" => {
                     // Caddy uses `encode gzip` / `encode zstd`
                     for arg in &sub_d.args {
@@ -288,16 +304,40 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                     if sub_d.args.is_empty() {
                         server.compress.push(CompressionAlgo::Gzip);
                     }
-                },
+                }
                 "log" => {
                     if let Some(log_block) = sub_d.block {
                         let log = adapt_log_block(log_block)?;
                         server.log = Some(Node::new(log, Location { start: 0, end: 0 }));
                     }
-                },
+                }
                 "tls" => {
                     server.tls = Some(adapt_tls_directive(&sub_d)?);
-                },
+                }
+                "error_page" => {
+                    // nginx-style: error_page 404 /404.html
+                    //              error_page 500 502 503 504 /50x.html
+                    if sub_d.args.len() < 2 {
+                        return Err(AdapterError::ArgumentCount(
+                            "error_page".into(),
+                            2,
+                            sub_d.args.len(),
+                        ));
+                    }
+                    let page = sub_d.args.last().unwrap().clone();
+                    for code_str in &sub_d.args[..sub_d.args.len() - 1] {
+                        let code = code_str.parse::<u16>().map_err(|_| {
+                            AdapterError::InvalidArgument("error_page".into(), code_str.clone())
+                        })?;
+                        if !(400..=599).contains(&code) {
+                            return Err(AdapterError::InvalidArgument(
+                                "error_page".into(),
+                                format!("status {} is not an error code", code),
+                            ));
+                        }
+                        server.error_pages.push((code, page.clone()));
+                    }
+                }
                 "route" | "handle" => {
                     let (matcher, inner_block) = parse_route_matcher_and_block(&sub_d)?;
                     if let Some(blk) = inner_block {
@@ -311,12 +351,12 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                             add_route(&mut server, matcher, Handler::Pipeline(handlers));
                         }
                     }
-                },
+                }
                 name if name.starts_with('@') => {
                     // Named matcher definition
                     let matcher = parse_matcher_definition(&sub_d)?;
                     server.matchers.insert(name.to_string(), matcher);
-                },
+                }
                 "header" => {
                     // Caddy `header` directive at server level:
                     //   header @matcher Key "Value"
@@ -328,13 +368,15 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                     } else {
                         default_handlers.push(handler);
                     }
-                },
+                }
                 _ => {
                     // Try to extract matcher and adapt as handler
                     let (matcher, _) = parse_matcher_and_block(&sub_d)?;
                     let mut handler_d = sub_d.clone();
                     if matcher.is_some() {
-                        if handler_d.args.is_empty() { return Err(AdapterError::ArgumentCount(sub_d.name, 1, 0)); }
+                        if handler_d.args.is_empty() {
+                            return Err(AdapterError::ArgumentCount(sub_d.name, 1, 0));
+                        }
                         handler_d.args.remove(0);
                     }
 
@@ -454,7 +496,10 @@ fn adapt_tls_directive(d: &Directive) -> Result<TlsDirective, AdapterError> {
                 "auto" => tls.auto = true,
                 "http3" => {
                     tls.http3 = Some(
-                        sub.args.first().map(|s| s != "off" && s != "false").unwrap_or(true),
+                        sub.args
+                            .first()
+                            .map(|s| s != "off" && s != "false")
+                            .unwrap_or(true),
                     );
                 }
                 _ => return Err(AdapterError::UnknownDirective(format!("tls: {}", sub.name))),
@@ -532,7 +577,9 @@ fn adapt_log_block(block: Block) -> Result<LogBlock, AdapterError> {
                                         if let Some(fields_block) = fb_d.block {
                                             for field_d in fields_block.directives {
                                                 // field_name "delete" → exclude field
-                                                if field_d.args.first().map(|a| a.as_str()) == Some("delete") {
+                                                if field_d.args.first().map(|a| a.as_str())
+                                                    == Some("delete")
+                                                {
                                                     filter.exclude.push(field_d.name);
                                                 }
                                             }
@@ -557,12 +604,8 @@ fn adapt_log_block(block: Block) -> Result<LogBlock, AdapterError> {
 
 fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
     match d.name.as_str() {
-        "reverse_proxy" => {
-            adapt_reverse_proxy(d)
-        },
-        "respond" => {
-            adapt_respond(d)
-        },
+        "reverse_proxy" => adapt_reverse_proxy(d),
+        "respond" => adapt_respond(d),
         "file_server" => {
             let mut root = ".".to_string();
             if let Some(arg) = d.args.first() {
@@ -581,18 +624,22 @@ fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
             if let Some(block) = d.block {
                 for sub in block.directives {
                     match sub.name.as_str() {
-                        "root" => if let Some(arg) = sub.args.first() { config.root = arg.clone(); },
+                        "root" => {
+                            if let Some(arg) = sub.args.first() {
+                                config.root = arg.clone();
+                            }
+                        }
                         "index" => config.index = sub.args.clone(),
-                        "browse" => config.browse = sub.args.first().map(|s| s == "true").unwrap_or(true),
+                        "browse" => {
+                            config.browse = sub.args.first().map(|s| s == "true").unwrap_or(true)
+                        }
                         _ => {}
                     }
                 }
             }
             Ok(Handler::FileServer(config))
-        },
-        "header" => {
-            adapt_header_directive(&d)
-        },
+        }
+        "header" => adapt_header_directive(&d),
         "handle" => {
             // `handle { ... }` inside another handle — nested exclusive routing
             let mut handlers = Vec::new();
@@ -602,12 +649,116 @@ fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
                 }
             }
             Ok(Handler::Handle(handlers))
-        },
-        "basic_auth" | "basicauth" => {
-            adapt_basic_auth(d)
-        },
+        }
+        "basic_auth" | "basicauth" => adapt_basic_auth(d),
+        "rewrite" => adapt_rewrite(d),
+        "cors" => adapt_cors(d),
+        "access_control" => adapt_access_control(d),
         _ => Err(AdapterError::UnknownDirective(d.name)),
     }
+}
+
+/// Adapt `rewrite <replacement>` or `rewrite <regex> <replacement>`.
+///
+/// The two-argument form is deliberately explicit: it keeps a plain
+/// replacement from accidentally treating punctuation as a regex and maps
+/// capture groups directly to Rust-regex's `$1` replacement syntax.
+fn adapt_rewrite(d: Directive) -> Result<Handler, AdapterError> {
+    if d.block.is_some() {
+        return Err(AdapterError::BlockNotAllowed("rewrite".into()));
+    }
+    match d.args.as_slice() {
+        [replace] => Ok(Handler::Rewrite(RewriteConfig {
+            replace: Some(replace.clone()),
+            regex: None,
+            regex_replace: None,
+        })),
+        [regex, replacement] => Ok(Handler::Rewrite(RewriteConfig {
+            replace: None,
+            regex: Some(regex.clone()),
+            regex_replace: Some(replacement.clone()),
+        })),
+        _ => Err(AdapterError::InvalidArgument(
+            "rewrite".into(),
+            "expected <replacement> or <regex> <replacement>".into(),
+        )),
+    }
+}
+
+/// Adapt the CORS directive. Inline arguments are allowed origins; block
+/// subdirectives are `origins`, `methods`, `headers`, `expose_headers`,
+/// `allow_credentials`, and `max_age`.
+fn adapt_cors(d: Directive) -> Result<Handler, AdapterError> {
+    let mut config = CorsConfig {
+        allowed_origins: d.args,
+        ..Default::default()
+    };
+    if let Some(block) = d.block {
+        for sub in block.directives {
+            match sub.name.as_str() {
+                "origins" => config.allowed_origins = sub.args,
+                "methods" => config.allowed_methods = sub.args,
+                "headers" => config.allowed_headers = sub.args,
+                "expose_headers" => config.exposed_headers = sub.args,
+                "allow_credentials" => {
+                    config.allow_credentials = sub
+                        .args
+                        .first()
+                        .map(|value| value == "true" || value == "on")
+                        .unwrap_or(true);
+                }
+                "max_age" => {
+                    let value = sub
+                        .args
+                        .first()
+                        .ok_or_else(|| AdapterError::ArgumentCount("cors max_age".into(), 1, 0))?;
+                    config.max_age = Some(value.parse().map_err(|_| {
+                        AdapterError::InvalidArgument("cors max_age".into(), value.clone())
+                    })?);
+                }
+                _ => {
+                    return Err(AdapterError::UnknownDirective(format!(
+                        "cors: {}",
+                        sub.name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(Handler::Cors(config))
+}
+
+/// Adapt route access control. Each subdirective accepts one or more values:
+/// `allow_ip`, `deny_ip`, `allow_referer`, `deny_referer`, `allow_user_agent`,
+/// and `deny_user_agent`.
+fn adapt_access_control(d: Directive) -> Result<Handler, AdapterError> {
+    if !d.args.is_empty() || d.block.is_none() {
+        return Err(AdapterError::InvalidArgument(
+            "access_control".into(),
+            "expected a block of allow_/deny_ rules".into(),
+        ));
+    }
+    let mut config = AccessControlConfig::default();
+    for sub in d.block.unwrap().directives {
+        if sub.args.is_empty() {
+            return Err(AdapterError::ArgumentCount(sub.name, 1, 0));
+        }
+        match sub.name.as_str() {
+            "allow_ip" => config.allowed_ips.extend(sub.args),
+            "deny_ip" => config.denied_ips.extend(sub.args),
+            "allow_referer" => config.allowed_referers.extend(sub.args),
+            "deny_referer" => config.denied_referers.extend(sub.args),
+            "allow_user_agent" => config.allowed_user_agents.extend(sub.args),
+            "deny_user_agent" => config.denied_user_agents.extend(sub.args),
+            _ => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "access_control: {}",
+                    sub.name
+                )));
+            }
+        }
+    }
+    Ok(Handler::AccessControl(config))
 }
 
 // MARK: - basic_auth Directive Adapter
@@ -651,9 +802,11 @@ fn adapt_basic_auth(d: Directive) -> Result<Handler, AdapterError> {
             if sub.name == "realm" {
                 config.realm = sub.args.first().cloned();
             } else {
-                pairs_from(&std::iter::once(sub.name.clone())
-                    .chain(sub.args.iter().cloned())
-                    .collect::<Vec<_>>())?;
+                pairs_from(
+                    &std::iter::once(sub.name.clone())
+                        .chain(sub.args.iter().cloned())
+                        .collect::<Vec<_>>(),
+                )?;
             }
         }
     } else {
@@ -676,10 +829,13 @@ fn adapt_basic_auth(d: Directive) -> Result<Handler, AdapterError> {
 ///
 /// Handles:
 /// - `reverse_proxy host:port` (simple, args-only)
+/// - `reverse_proxy { to host:port { weight 3 }; to host:port { backup } }`
 /// - `reverse_proxy host:port { header_up K V; flush_interval -1; transport http { ... } }`
 fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
     // Collect upstreams from args (filter out matcher @names)
-    let upstreams: Vec<String> = d.args.iter()
+    let upstreams: Vec<String> = d
+        .args
+        .iter()
         .filter(|a| !a.starts_with('@'))
         .cloned()
         .collect();
@@ -696,10 +852,7 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
                     if sub.args.len() >= 2 {
                         let key = sub.args[0].clone();
                         let value = sub.args[1].clone();
-                        proxy.header_up.insert(
-                            key,
-                            Expr::String(value),
-                        );
+                        proxy.header_up.insert(key, Expr::String(value));
                     }
                 }
                 "header_down" => {
@@ -725,12 +878,12 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
                         for t_sub in transport_block.directives {
                             match t_sub.name.as_str() {
                                 "read_timeout" => {
-                                    transport.read_timeout = t_sub.args.first()
-                                        .and_then(|s| parse_duration_ms(s));
+                                    transport.read_timeout =
+                                        t_sub.args.first().and_then(|s| parse_duration_ms(s));
                                 }
                                 "write_timeout" => {
-                                    transport.write_timeout = t_sub.args.first()
-                                        .and_then(|s| parse_duration_ms(s));
+                                    transport.write_timeout =
+                                        t_sub.args.first().and_then(|s| parse_duration_ms(s));
                                 }
                                 _ => {}
                             }
@@ -739,12 +892,91 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
                     }
                 }
                 "lb_policy" => {
-                    // lb_policy round_robin / random / least_conn / ip_hash
-                    // Not in AST ProxyConfig but will be consumed by core loader
+                    let policy = sub
+                        .args
+                        .first()
+                        .ok_or_else(|| AdapterError::ArgumentCount("lb_policy".into(), 1, 0))?;
+                    match policy.as_str() {
+                        "round_robin" | "random" | "least_conn" | "ip_hash" | "first" => {
+                            proxy.lb_policy = Some(policy.clone());
+                        }
+                        _ => {
+                            return Err(AdapterError::InvalidArgument(
+                                "lb_policy".into(),
+                                policy.clone(),
+                            ));
+                        }
+                    }
+                }
+                "to" => {
+                    let address = sub
+                        .args
+                        .first()
+                        .ok_or_else(|| {
+                            AdapterError::ArgumentCount("reverse_proxy to".into(), 1, 0)
+                        })?
+                        .clone();
+                    if sub.args.len() != 1 {
+                        return Err(AdapterError::InvalidArgument(
+                            "reverse_proxy to".into(),
+                            "expected exactly one upstream address".into(),
+                        ));
+                    }
+                    let mut upstream = ProxyUpstreamConfig {
+                        address: address.clone(),
+                        weight: 1,
+                        backup: false,
+                    };
+                    if let Some(to_block) = sub.block {
+                        for option in to_block.directives {
+                            match option.name.as_str() {
+                                "weight" => {
+                                    let raw = option.args.first().ok_or_else(|| {
+                                        AdapterError::ArgumentCount(
+                                            "reverse_proxy to weight".into(),
+                                            1,
+                                            0,
+                                        )
+                                    })?;
+                                    upstream.weight = raw.parse().map_err(|_| {
+                                        AdapterError::InvalidArgument(
+                                            "reverse_proxy to weight".into(),
+                                            raw.clone(),
+                                        )
+                                    })?;
+                                    if upstream.weight == 0 {
+                                        return Err(AdapterError::InvalidArgument(
+                                            "reverse_proxy to weight".into(),
+                                            "weight must be greater than zero".into(),
+                                        ));
+                                    }
+                                }
+                                "backup" => {
+                                    upstream.backup = option
+                                        .args
+                                        .first()
+                                        .map(|value| value != "false" && value != "off")
+                                        .unwrap_or(true);
+                                }
+                                _ => {
+                                    return Err(AdapterError::UnknownDirective(format!(
+                                        "reverse_proxy to: {}",
+                                        option.name
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    proxy.upstreams.push(address);
+                    proxy.upstream_options.push(upstream);
                 }
                 _ => {}
             }
         }
+    }
+
+    if proxy.upstreams.is_empty() {
+        return Err(AdapterError::ArgumentCount("reverse_proxy".into(), 1, 0));
     }
 
     Ok(Handler::Proxy(Box::new(proxy)))
@@ -849,9 +1081,7 @@ fn adapt_header_directive(d: &Directive) -> Result<Handler, AdapterError> {
     } else {
         // Inline form: `header @matcher Key "Value"` or `header -Server`
         // Skip @matcher argument
-        let args: Vec<&String> = d.args.iter()
-            .filter(|a| !a.starts_with('@'))
-            .collect();
+        let args: Vec<&String> = d.args.iter().filter(|a| !a.starts_with('@')).collect();
 
         if let Some(key) = args.first() {
             if key.starts_with('-') {
@@ -867,7 +1097,9 @@ fn adapt_header_directive(d: &Directive) -> Result<Handler, AdapterError> {
 
 // MARK: - Matchers
 
-fn parse_matcher_and_block(d: &Directive) -> Result<(Option<Matcher>, Option<&Block>), AdapterError> {
+fn parse_matcher_and_block(
+    d: &Directive,
+) -> Result<(Option<Matcher>, Option<&Block>), AdapterError> {
     let mut matcher = None;
     let block = d.block.as_ref();
 
@@ -895,13 +1127,15 @@ fn parse_matcher_and_block(d: &Directive) -> Result<(Option<Matcher>, Option<&Bl
 /// regardless of URL. This dedicated helper keeps that leading-`/`
 /// detection out of the generic branch, where a leading `/` is a real
 /// argument (e.g. `file_server /var/www/html`), not a matcher.
-fn parse_route_matcher_and_block(d: &Directive) -> Result<(Option<Matcher>, Option<&Block>), AdapterError> {
+fn parse_route_matcher_and_block(
+    d: &Directive,
+) -> Result<(Option<Matcher>, Option<&Block>), AdapterError> {
     let block = d.block.as_ref();
     let matcher = match d.args.first() {
         Some(arg) if arg.starts_with('@') => Some(Matcher::Named(arg.clone())),
-        Some(arg) if arg.starts_with('/') => {
-            Some(Matcher::Path(PathMatcher { patterns: vec![arg.clone()] }))
-        }
+        Some(arg) if arg.starts_with('/') => Some(Matcher::Path(PathMatcher {
+            patterns: vec![arg.clone()],
+        })),
         _ => None,
     };
     Ok((matcher, block))
@@ -915,7 +1149,10 @@ fn parse_matcher_definition(d: &Directive) -> Result<Matcher, AdapterError> {
         }
 
         if matchers.is_empty() {
-            return Err(AdapterError::InvalidArgument(d.name.clone(), "Empty matcher block".into()));
+            return Err(AdapterError::InvalidArgument(
+                d.name.clone(),
+                "Empty matcher block".into(),
+            ));
         }
 
         let mut combined = matchers.remove(0);
@@ -939,28 +1176,38 @@ fn parse_matcher_definition(d: &Directive) -> Result<Matcher, AdapterError> {
 
 fn parse_single_matcher(d: &Directive) -> Result<Matcher, AdapterError> {
     match d.name.as_str() {
-        "path" => {
-            Ok(Matcher::Path(PathMatcher { patterns: d.args.clone() }))
-        }
+        "path" => Ok(Matcher::Path(PathMatcher {
+            patterns: d.args.clone(),
+        })),
         "method" => {
-            let methods = d.args.iter().filter_map(|m| match m.to_uppercase().as_str() {
-                "GET" => Some(HttpMethod::Get),
-                "POST" => Some(HttpMethod::Post),
-                "PUT" => Some(HttpMethod::Put),
-                "DELETE" => Some(HttpMethod::Delete),
-                _ => None,
-            }).collect();
+            let methods = d
+                .args
+                .iter()
+                .filter_map(|m| match m.to_uppercase().as_str() {
+                    "GET" => Some(HttpMethod::Get),
+                    "POST" => Some(HttpMethod::Post),
+                    "PUT" => Some(HttpMethod::Put),
+                    "DELETE" => Some(HttpMethod::Delete),
+                    _ => None,
+                })
+                .collect();
             Ok(Matcher::Method(methods))
         }
         "header" => {
-            if d.args.is_empty() { return Err(AdapterError::ArgumentCount("header".into(), 1, d.args.len())); }
+            if d.args.is_empty() {
+                return Err(AdapterError::ArgumentCount(
+                    "header".into(),
+                    1,
+                    d.args.len(),
+                ));
+            }
 
             let condition = if d.args.len() >= 2 {
                 let val = &d.args[1];
                 if val == "*" {
                     HeaderCondition::Exists
                 } else if val.starts_with("*") && val.ends_with("*") {
-                    HeaderCondition::Contains(val[1..val.len()-1].to_string())
+                    HeaderCondition::Contains(val[1..val.len() - 1].to_string())
                 } else {
                     HeaderCondition::Equals(val.clone())
                 }
@@ -974,7 +1221,10 @@ fn parse_single_matcher(d: &Directive) -> Result<Matcher, AdapterError> {
                 condition,
             }))
         }
-        _ => Err(AdapterError::UnknownDirective(format!("matcher: {}", d.name))),
+        _ => Err(AdapterError::UnknownDirective(format!(
+            "matcher: {}",
+            d.name
+        ))),
     }
 }
 
@@ -982,13 +1232,16 @@ fn parse_single_matcher(d: &Directive) -> Result<Matcher, AdapterError> {
 
 fn add_route(server: &mut ServerBlock, matcher: Option<Matcher>, handler: Handler) {
     if server.routes.is_none() {
-        server.routes = Some(Node::new(RouteBlock { arms: Vec::new() }, Location { start: 0, end: 0 }));
+        server.routes = Some(Node::new(
+            RouteBlock { arms: Vec::new() },
+            Location { start: 0, end: 0 },
+        ));
     }
     let routes = server.routes.as_mut().unwrap();
-    routes.inner.arms.push(Node::new(RouteArm {
-        matcher,
-        handler,
-    }, Location { start: 0, end: 0 }));
+    routes.inner.arms.push(Node::new(
+        RouteArm { matcher, handler },
+        Location { start: 0, end: 0 },
+    ));
 }
 
 // MARK: - Tests
@@ -1097,7 +1350,10 @@ mod global_tests {
             assert_eq!(proxy.upstreams, vec!["127.0.0.1:3000"]);
             assert!(proxy.header_up.contains_key("X-Forwarded-Proto"));
             assert!(proxy.header_up.contains_key("X-Real-IP"));
-            assert!(matches!(proxy.flush_interval, Some(FlushInterval::Immediate)));
+            assert!(matches!(
+                proxy.flush_interval,
+                Some(FlushInterval::Immediate)
+            ));
             assert!(proxy.transport.is_some());
             let t = proxy.transport.as_ref().unwrap();
             assert_eq!(t.read_timeout, Some(300_000));
@@ -1155,7 +1411,10 @@ mod global_tests {
             let directives = parse(source).unwrap();
             let ast = adapt(directives).unwrap();
             let server = &ast.servers[0].inner;
-            assert_eq!(server.listens[0].host, expected, "IP literal must stay the bind host");
+            assert_eq!(
+                server.listens[0].host, expected,
+                "IP literal must stay the bind host"
+            );
         }
     }
 
@@ -1253,33 +1512,47 @@ mod global_tests {
 
     #[test]
     fn handle_with_inline_path_keeps_its_path() {
-        let routes = compiled_routes(r#"
+        let routes = compiled_routes(
+            r#"
             :8080 {
                 handle /proxy/* {
                     reverse_proxy 127.0.0.1:9000
                 }
                 file_server /var/www/html
             }
-        "#);
+        "#,
+        );
 
         // The proxy route must be keyed on /proxy/*, NOT collapsed to /*.
-        let proxy = routes.iter()
-            .find(|r| matches!(&r.handler,
-                pingclair_core::config::HandlerConfig::ReverseProxy(_)
-                | pingclair_core::config::HandlerConfig::Pipeline { .. }))
+        let proxy = routes
+            .iter()
+            .find(|r| {
+                matches!(
+                    &r.handler,
+                    pingclair_core::config::HandlerConfig::ReverseProxy(_)
+                        | pingclair_core::config::HandlerConfig::Pipeline { .. }
+                )
+            })
             .expect("proxy route should exist");
         assert_eq!(proxy.path, "/proxy/*", "handle /proxy/* lost its path");
 
         // The bare file_server is the catch-all.
-        let fs = routes.iter()
-            .find(|r| matches!(&r.handler, pingclair_core::config::HandlerConfig::FileServer { .. }))
+        let fs = routes
+            .iter()
+            .find(|r| {
+                matches!(
+                    &r.handler,
+                    pingclair_core::config::HandlerConfig::FileServer { .. }
+                )
+            })
             .expect("file_server route should exist");
         assert_eq!(fs.path, "/*");
     }
 
     #[test]
     fn route_with_quoted_path_keeps_its_path() {
-        let routes = compiled_routes(r#"
+        let routes = compiled_routes(
+            r#"
             example.com {
                 route "/api/*" {
                     respond "api" 200
@@ -1288,10 +1561,17 @@ mod global_tests {
                     respond "ok" 200
                 }
             }
-        "#);
+        "#,
+        );
         let paths: Vec<_> = routes.iter().map(|r| r.path.as_str()).collect();
-        assert!(paths.contains(&"/api/*"), "route \"/api/*\" lost its path; got {paths:?}");
-        assert!(paths.contains(&"/health"), "route \"/health\" lost its path; got {paths:?}");
+        assert!(
+            paths.contains(&"/api/*"),
+            "route \"/api/*\" lost its path; got {paths:?}"
+        );
+        assert!(
+            paths.contains(&"/health"),
+            "route \"/health\" lost its path; got {paths:?}"
+        );
     }
 
     #[test]
@@ -1299,16 +1579,21 @@ mod global_tests {
         // `file_server /var/www/html` at server level: the leading-'/' arg
         // is the ROOT, not a path matcher. It must stay the catch-all and
         // keep its root — the scoped fix must not leak into this branch.
-        let routes = compiled_routes(r#"
+        let routes = compiled_routes(
+            r#"
             :8080 {
                 file_server /var/www/html
             }
-        "#);
+        "#,
+        );
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].path, "/*");
         match &routes[0].handler {
             pingclair_core::config::HandlerConfig::FileServer { root, .. } => {
-                assert_eq!(root, "/var/www/html", "file_server root was swallowed as a matcher");
+                assert_eq!(
+                    root, "/var/www/html",
+                    "file_server root was swallowed as a matcher"
+                );
             }
             other => panic!("expected FileServer, got {other:?}"),
         }

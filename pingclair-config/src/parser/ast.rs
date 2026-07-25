@@ -23,10 +23,10 @@ impl<T> Node<T> {
 pub struct Ast {
     /// Global configuration block
     pub global: Option<Node<GlobalBlock>>,
-    
+
     /// Macro definitions
     pub macros: Vec<Node<MacroDef>>,
-    
+
     /// Server definitions
     pub servers: Vec<Node<ServerBlock>>,
 }
@@ -85,10 +85,10 @@ pub enum Protocol {
 pub struct MacroDef {
     /// Macro name (without !)
     pub name: String,
-    
+
     /// Parameters: ($name: type)
     pub params: Vec<MacroParam>,
-    
+
     /// Body directives
     pub body: Vec<Directive>,
 }
@@ -97,7 +97,7 @@ pub struct MacroDef {
 #[derive(Debug, Clone)]
 pub struct MacroParam {
     pub name: String,
-    pub ty: Option<String>,  // Optional type annotation
+    pub ty: Option<String>, // Optional type annotation
 }
 
 /// Macro invocation
@@ -105,7 +105,7 @@ pub struct MacroParam {
 pub struct MacroCall {
     /// Macro name (without !)
     pub name: String,
-    
+
     /// Arguments
     pub args: Vec<Expr>,
 }
@@ -119,28 +119,31 @@ pub struct MacroCall {
 pub struct ServerBlock {
     /// Server name / hostname
     pub name: String,
-    
+
     /// Listen addresses
     pub listens: Vec<ListenAddr>,
-    
+
     /// Bind address
     pub bind: Option<String>,
-    
+
     /// Compression algorithms
     pub compress: Vec<CompressionAlgo>,
-    
+
     /// Log configuration
     pub log: Option<Node<LogBlock>>,
-    
+
     /// TLS configuration (from the `tls` directive)
     pub tls: Option<TlsDirective>,
-    
+
     /// Route definitions
     pub routes: Option<Node<RouteBlock>>,
 
     /// Named matcher definitions
     pub matchers: HashMap<String, Matcher>,
-    
+
+    /// Custom error pages: HTTP status code → file path (`error_page` directive)
+    pub error_pages: Vec<(u16, String)>,
+
     /// Other directives (including macro calls)
     pub directives: Vec<Directive>,
 }
@@ -263,7 +266,7 @@ pub struct RouteBlock {
 pub struct RouteArm {
     /// Match condition (None = default/wildcard `_`)
     pub matcher: Option<Matcher>,
-    
+
     /// Handler for this route
     pub handler: Handler,
 }
@@ -273,31 +276,31 @@ pub struct RouteArm {
 pub enum Matcher {
     /// Match by path pattern: path("/api/*")
     Path(PathMatcher),
-    
+
     /// Match by header: header("X-Foo", exists) or header("X-Foo", "value")
     Header(HeaderMatcher),
-    
+
     /// Match by method: method(GET | POST)
     Method(Vec<HttpMethod>),
-    
+
     /// Match by query parameter
     Query(QueryMatcher),
-    
+
     /// Match by host: host("example.com" | "*.example.com")
     Host(Vec<String>),
-    
+
     /// Match by remote IP: remote_ip("1.2.3.4" | "192.168.1.0/24")
     RemoteIp(Vec<String>),
-    
+
     /// Match by protocol: protocol("https" | "http")
     Protocol(Vec<String>),
-    
+
     /// Combined matchers with AND
     And(Box<Matcher>, Box<Matcher>),
-    
+
     /// Combined matchers with OR
     Or(Box<Matcher>, Box<Matcher>),
-    
+
     /// Negated matcher
     Not(Box<Matcher>),
 
@@ -334,7 +337,7 @@ pub enum HeaderCondition {
 #[derive(Debug, Clone)]
 pub struct QueryMatcher {
     pub name: String,
-    pub condition: HeaderCondition,  // Reuse same conditions
+    pub condition: HeaderCondition, // Reuse same conditions
 }
 
 /// HTTP methods
@@ -358,19 +361,19 @@ pub enum HttpMethod {
 pub enum Handler {
     /// Reverse proxy
     Proxy(Box<ProxyConfig>),
-    
+
     /// Static response
     Respond(ResponseConfig),
-    
+
     /// Redirect
     Redirect(RedirectConfig),
-    
+
     /// Headers modification only
     Headers(HeadersConfig),
-    
+
     /// Multiple handlers (pipeline)
     Pipeline(Vec<Handler>),
-    
+
     /// File server (future)
     FileServer(FileServerConfig),
 
@@ -379,6 +382,15 @@ pub enum Handler {
 
     /// HTTP Basic authentication gate
     BasicAuth(BasicAuthConfig),
+
+    /// Internal URI rewrite.
+    Rewrite(RewriteConfig),
+
+    /// Cross-origin resource sharing policy.
+    Cors(CorsConfig),
+
+    /// IP, Referer-host, and User-Agent access policy.
+    AccessControl(AccessControlConfig),
 
     /// Plugin invocation
     Plugin { name: String, args: Vec<Expr> },
@@ -399,32 +411,77 @@ pub struct BasicAuthConfig {
 pub struct ProxyConfig {
     /// Upstream URLs
     pub upstreams: Vec<String>,
-    
+
+    /// Per-upstream options, including weighted and backup peers.
+    pub upstream_options: Vec<ProxyUpstreamConfig>,
+
+    /// Load-balancing strategy selected by `lb_policy`.
+    pub lb_policy: Option<String>,
+
     /// Flush interval
     pub flush_interval: Option<FlushInterval>,
-    
+
     /// Headers to add to upstream request
     pub header_up: HashMap<String, Expr>,
-    
+
     /// Transport configuration
     pub transport: Option<TransportConfig>,
-    
+
     /// Macro calls (use xxx!())
     pub macro_calls: Vec<MacroCall>,
+}
+
+/// A reverse-proxy upstream declared with a `to` block.
+#[derive(Debug, Clone)]
+pub struct ProxyUpstreamConfig {
+    pub address: String,
+    pub weight: u32,
+    pub backup: bool,
+}
+
+/// Rewrite configuration. A two-argument `rewrite` directive is a regex
+/// rewrite; the replacement follows Rust-regex `$1` capture syntax.
+#[derive(Debug, Clone)]
+pub struct RewriteConfig {
+    pub replace: Option<String>,
+    pub regex: Option<String>,
+    pub regex_replace: Option<String>,
+}
+
+/// CORS policy declared by the `cors` directive.
+#[derive(Debug, Clone, Default)]
+pub struct CorsConfig {
+    pub allowed_origins: Vec<String>,
+    pub allowed_methods: Vec<String>,
+    pub allowed_headers: Vec<String>,
+    pub exposed_headers: Vec<String>,
+    pub allow_credentials: bool,
+    pub max_age: Option<u64>,
+}
+
+/// Route access policy declared by the `access_control` directive.
+#[derive(Debug, Clone, Default)]
+pub struct AccessControlConfig {
+    pub allowed_ips: Vec<String>,
+    pub denied_ips: Vec<String>,
+    pub allowed_referers: Vec<String>,
+    pub denied_referers: Vec<String>,
+    pub allowed_user_agents: Vec<String>,
+    pub denied_user_agents: Vec<String>,
 }
 
 /// Flush interval
 #[derive(Debug, Clone, Copy)]
 pub enum FlushInterval {
-    Immediate,  // -1 in Caddy
-    Duration(u64),  // milliseconds
+    Immediate,     // -1 in Caddy
+    Duration(u64), // milliseconds
 }
 
 /// Transport configuration
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
-    pub read_timeout: Option<u64>,   // milliseconds
-    pub write_timeout: Option<u64>,  // milliseconds
+    pub read_timeout: Option<u64>,  // milliseconds
+    pub write_timeout: Option<u64>, // milliseconds
 }
 
 /// Static response configuration
@@ -468,25 +525,25 @@ pub struct FileServerConfig {
 pub enum Expr {
     /// String literal
     String(String),
-    
+
     /// Integer literal
     Integer(i64),
-    
+
     /// Boolean literal
     Bool(bool),
-    
+
     /// Duration value (in milliseconds)
     Duration(u64),
-    
+
     /// Variable reference: ${req.header["X"]}
     Variable(Variable),
-    
+
     /// Array literal: [a, b, c]
     Array(Vec<Expr>),
-    
+
     /// Map literal: { "key": "value" }
     Map(HashMap<String, Expr>),
-    
+
     /// Identifier reference
     Ident(String),
 }
@@ -514,13 +571,13 @@ impl Variable {
 pub enum Directive {
     /// Macro call: use xxx!()
     MacroCall(MacroCall),
-    
+
     /// Headers block
     Headers(HeadersConfig),
-    
+
     /// Key-value setting
     Setting { key: String, value: Expr },
-    
+
     /// Nested block
     Block { name: String, body: Vec<Directive> },
 }
@@ -546,6 +603,7 @@ impl ServerBlock {
             tls: None,
             routes: None,
             matchers: HashMap::new(),
+            error_pages: Vec::new(),
             directives: Vec::new(),
         }
     }
@@ -554,7 +612,16 @@ impl ServerBlock {
 impl ProxyConfig {
     pub fn new(upstreams: Vec<String>) -> Self {
         Self {
+            upstream_options: upstreams
+                .iter()
+                .map(|address| ProxyUpstreamConfig {
+                    address: address.clone(),
+                    weight: 1,
+                    backup: false,
+                })
+                .collect(),
             upstreams,
+            lb_policy: None,
             flush_interval: None,
             header_up: HashMap::new(),
             transport: None,

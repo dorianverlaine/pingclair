@@ -4,8 +4,8 @@
 
 use crate::config::{BasicAuthCredential, HandlerConfig};
 use base64::Engine as _;
-use http::StatusCode;
 use bytes::Bytes;
+use http::StatusCode;
 use std::collections::HashMap;
 
 /// Handler result
@@ -24,10 +24,10 @@ pub struct HandlerResponse {
 pub enum HandlerError {
     #[error("Upstream error: {0}")]
     Upstream(String),
-    
+
     #[error("Configuration error: {0}")]
     Config(String),
-    
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -41,7 +41,7 @@ impl HandlerResponse {
             body: None,
         }
     }
-    
+
     /// Create a response with body
     pub fn with_body(code: u16, body: impl Into<Bytes>) -> Self {
         Self {
@@ -50,31 +50,31 @@ impl HandlerResponse {
             body: Some(body.into()),
         }
     }
-    
+
     /// Add a header
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.insert(name.into(), value.into());
         self
     }
-    
+
     /// Create redirect response
     pub fn redirect(to: &str, code: u16) -> Self {
         let status = StatusCode::from_u16(code).unwrap_or(StatusCode::FOUND);
         let mut headers = HashMap::new();
         headers.insert("Location".to_string(), to.to_string());
-        
+
         Self {
             status,
             headers,
             body: None,
         }
     }
-    
+
     /// Create not found response
     pub fn not_found() -> Self {
         Self::with_body(404, "Not Found")
     }
-    
+
     /// Create internal server error response
     pub fn internal_error() -> Self {
         Self::with_body(500, "Internal Server Error")
@@ -87,23 +87,29 @@ impl HandlerResponse {
 /// (currently only `BasicAuth`) read them from here.
 pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> HandlerResult {
     match config {
-        HandlerConfig::Respond { status, body, headers } => {
+        HandlerConfig::Respond {
+            status,
+            body,
+            headers,
+        } => {
             let mut response = if let Some(body_content) = body {
                 // Clone the body content to get owned data
                 HandlerResponse::with_body(*status, Bytes::from(body_content.clone()))
             } else {
                 HandlerResponse::status(*status)
             };
-            
+
             response.headers = headers.clone();
             Ok(response)
         }
-        
-        HandlerConfig::Redirect { to, code } => {
-            Ok(HandlerResponse::redirect(to, *code))
-        }
-        
-        HandlerConfig::Headers { set, add, remove: _ } => {
+
+        HandlerConfig::Redirect { to, code } => Ok(HandlerResponse::redirect(to, *code)),
+
+        HandlerConfig::Headers {
+            set,
+            add,
+            remove: _,
+        } => {
             // Headers handler modifies existing response
             // Return a passthrough response
             let mut response = HandlerResponse::status(200);
@@ -115,25 +121,32 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             }
             Ok(response)
         }
-        
-        HandlerConfig::FileServer { root, index, browse: _, compress: _ } => {
+
+        HandlerConfig::FileServer {
+            root,
+            index,
+            browse: _,
+            compress: _,
+        } => {
             // File server would need async file reading
             // Return placeholder for now
             Err(HandlerError::Config(format!(
-                "FileServer({:?}, {:?}) not yet implemented", 
+                "FileServer({:?}, {:?}) not yet implemented",
                 root, index
             )))
         }
-        
+
         HandlerConfig::ReverseProxy(_) => {
             // Reverse proxy is handled separately by Pingora
-            Err(HandlerError::Config("ReverseProxy should use Pingora".to_string()))
+            Err(HandlerError::Config(
+                "ReverseProxy should use Pingora".to_string(),
+            ))
         }
-        
+
         HandlerConfig::Pipeline { handlers } => {
             // Execute handlers in order, combining results
             let mut final_response = HandlerResponse::status(200);
-            
+
             for handler in handlers {
                 match execute_handler(handler, headers) {
                     Ok(response) => {
@@ -146,35 +159,54 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
                     Err(e) => return Err(e),
                 }
             }
-            
+
             Ok(final_response)
         }
 
         HandlerConfig::Handle { handlers } => {
             // Treat Handle as a pipeline for now
-            execute_handler(&HandlerConfig::Pipeline { handlers: handlers.clone() }, headers)
+            execute_handler(
+                &HandlerConfig::Pipeline {
+                    handlers: handlers.clone(),
+                },
+                headers,
+            )
         }
 
-        HandlerConfig::Rewrite { strip_prefix, strip_suffix, replace, regex: _, regex_replace: _ } => {
+        HandlerConfig::Rewrite {
+            strip_prefix,
+            strip_suffix,
+            replace,
+            regex: _,
+            regex_replace: _,
+        } => {
             // Rewrite handler modifies the request path
             // This is a signal to the proxy layer to modify the URI before forwarding
             // We return a special response that indicates a rewrite is needed
             let mut response = HandlerResponse::status(200);
-            
+
             // Set special headers to communicate rewrite intent to proxy layer
             if let Some(prefix) = strip_prefix {
-                response.headers.insert("X-Pingclair-Strip-Prefix".to_string(), prefix.clone());
+                response
+                    .headers
+                    .insert("X-Pingclair-Strip-Prefix".to_string(), prefix.clone());
             }
             if let Some(suffix) = strip_suffix {
-                response.headers.insert("X-Pingclair-Strip-Suffix".to_string(), suffix.clone());
+                response
+                    .headers
+                    .insert("X-Pingclair-Strip-Suffix".to_string(), suffix.clone());
             }
             if let Some(replacement) = replace {
-                response.headers.insert("X-Pingclair-Replace-Path".to_string(), replacement.clone());
+                response
+                    .headers
+                    .insert("X-Pingclair-Replace-Path".to_string(), replacement.clone());
             }
             // Note: regex support would need the regex crate here
             // For now, regex rewrites are handled separately
-            
-            response.headers.insert("X-Pingclair-Rewrite".to_string(), "true".to_string());
+
+            response
+                .headers
+                .insert("X-Pingclair-Rewrite".to_string(), "true".to_string());
             Ok(response)
         }
 
@@ -187,35 +219,35 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
                 Ok(HandlerResponse::status(200))
             } else {
                 let mut response = HandlerResponse::with_body(401, "Unauthorized");
-                response.headers.insert(
-                    "WWW-Authenticate".to_string(),
-                    basic_auth_challenge(realm)
-                );
+                response
+                    .headers
+                    .insert("WWW-Authenticate".to_string(), basic_auth_challenge(realm));
                 Ok(response)
             }
         }
 
-        HandlerConfig::RateLimit { requests, window_secs, by_ip: _, burst } => {
+        HandlerConfig::RateLimit {
+            requests,
+            window_secs,
+            by_ip: _,
+            burst,
+        } => {
             // RateLimit handler - this signals rate limiting is configured for this route
             // The actual rate limit checking is done at the proxy layer
             // Here we return headers that indicate the rate limit config
             let mut response = HandlerResponse::status(429);
-            response.headers.insert(
-                "X-RateLimit-Limit".to_string(),
-                requests.to_string()
-            );
-            response.headers.insert(
-                "X-RateLimit-Window".to_string(),
-                window_secs.to_string()
-            );
-            response.headers.insert(
-                "X-RateLimit-Burst".to_string(),
-                burst.to_string()
-            );
-            response.headers.insert(
-                "Retry-After".to_string(),
-                window_secs.to_string()
-            );
+            response
+                .headers
+                .insert("X-RateLimit-Limit".to_string(), requests.to_string());
+            response
+                .headers
+                .insert("X-RateLimit-Window".to_string(), window_secs.to_string());
+            response
+                .headers
+                .insert("X-RateLimit-Burst".to_string(), burst.to_string());
+            response
+                .headers
+                .insert("Retry-After".to_string(), window_secs.to_string());
             response.body = Some(bytes::Bytes::from("Too Many Requests"));
             Ok(response)
         }
@@ -229,17 +261,21 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
 
         HandlerConfig::HandlePath { prefix, handlers } => {
             // execute inner handlers
-            let mut response = execute_handler(&HandlerConfig::Pipeline { handlers: handlers.clone() }, headers)?;
-            
+            let mut response = execute_handler(
+                &HandlerConfig::Pipeline {
+                    handlers: handlers.clone(),
+                },
+                headers,
+            )?;
+
             // Add instruction to strip prefix
             // Note: In a real execution engine, we would modify the path before inner execution,
-            // but here we are generating instructions/response. 
+            // but here we are generating instructions/response.
             // The X-Pingclair-Strip-Prefix hopefully tells the proxy to modify the request *as it processes it*.
             // LIMITATION: This assumes the proxy sees this header and acts on it for *subsequent* or *current* processing.
-            response.headers.insert(
-                "X-Pingclair-Strip-Prefix".to_string(),
-                prefix.clone()
-            );
+            response
+                .headers
+                .insert("X-Pingclair-Strip-Prefix".to_string(), prefix.clone());
             Ok(response)
         }
 
@@ -249,14 +285,21 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             Ok(HandlerResponse::status(200))
         }
 
+        HandlerConfig::AccessControl(_) => {
+            // Access control is evaluated by the proxy before dispatch, where
+            // the peer address and request headers are available.
+            Ok(HandlerResponse::status(200))
+        }
+
         HandlerConfig::TryFiles { .. } => {
             // TryFiles requires filesystem access, handled at the proxy layer.
             Ok(HandlerResponse::status(200))
         }
 
-        HandlerConfig::Plugin { name, args: _ } => {
-            Err(HandlerError::Config(format!("Plugin {} is not yet implemented", name)))
-        }
+        HandlerConfig::Plugin { name, args: _ } => Err(HandlerError::Config(format!(
+            "Plugin {} is not yet implemented",
+            name
+        ))),
     }
 }
 
@@ -326,18 +369,21 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD as BASE64;
-    
+
     fn empty_headers() -> http::HeaderMap {
         http::HeaderMap::new()
     }
-    
+
     #[test]
     fn test_respond_handler() {
         let config = HandlerConfig::Respond {
@@ -345,39 +391,42 @@ mod tests {
             body: Some("Hello, World!".to_string()),
             headers: HashMap::new(),
         };
-        
+
         let response = execute_handler(&config, &empty_headers()).unwrap();
         assert_eq!(response.status, StatusCode::OK);
         assert!(response.body.is_some());
     }
-    
+
     #[test]
     fn test_redirect_handler() {
         let config = HandlerConfig::Redirect {
             to: "https://example.com".to_string(),
             code: 301,
         };
-        
+
         let response = execute_handler(&config, &empty_headers()).unwrap();
         assert_eq!(response.status, StatusCode::MOVED_PERMANENTLY);
-        assert_eq!(response.headers.get("Location"), Some(&"https://example.com".to_string()));
+        assert_eq!(
+            response.headers.get("Location"),
+            Some(&"https://example.com".to_string())
+        );
     }
-    
+
     #[test]
     fn test_headers_handler() {
         let mut headers = HashMap::new();
         headers.insert("X-Custom".to_string(), "value".to_string());
-        
+
         let config = HandlerConfig::Headers {
             set: headers,
             add: HashMap::new(),
             remove: Vec::new(),
         };
-        
+
         let response = execute_handler(&config, &empty_headers()).unwrap();
         assert_eq!(response.headers.get("X-Custom"), Some(&"value".to_string()));
     }
-    
+
     fn basic_auth_config() -> HandlerConfig {
         HandlerConfig::BasicAuth {
             realm: "Restricted".to_string(),
@@ -395,7 +444,7 @@ mod tests {
             ],
         }
     }
-    
+
     fn headers_with_basic_auth(user: &str, password: &str) -> http::HeaderMap {
         let mut headers = http::HeaderMap::new();
         let encoded = BASE64.encode(format!("{}:{}", user, password));
@@ -405,39 +454,39 @@ mod tests {
         );
         headers
     }
-    
+
     #[test]
     fn test_basic_auth_correct_credentials_pass() {
         let config = basic_auth_config();
         let headers = headers_with_basic_auth("alice", "s3cret");
-        
+
         let response = execute_handler(&config, &headers).unwrap();
         assert_eq!(response.status, StatusCode::OK);
         assert!(response.body.is_none());
     }
-    
+
     #[test]
     fn test_basic_auth_wrong_password_rejected() {
         let config = basic_auth_config();
         let headers = headers_with_basic_auth("alice", "wrong");
-        
+
         let response = execute_handler(&config, &headers).unwrap();
         assert_eq!(response.status, StatusCode::UNAUTHORIZED);
     }
-    
+
     #[test]
     fn test_basic_auth_unknown_user_rejected() {
         let config = basic_auth_config();
         let headers = headers_with_basic_auth("mallory", "s3cret");
-        
+
         let response = execute_handler(&config, &headers).unwrap();
         assert_eq!(response.status, StatusCode::UNAUTHORIZED);
     }
-    
+
     #[test]
     fn test_basic_auth_missing_header_challenges() {
         let config = basic_auth_config();
-        
+
         let response = execute_handler(&config, &empty_headers()).unwrap();
         assert_eq!(response.status, StatusCode::UNAUTHORIZED);
         assert_eq!(
@@ -445,7 +494,7 @@ mod tests {
             Some(&"Basic realm=\"Restricted\"".to_string())
         );
     }
-    
+
     #[test]
     fn test_basic_auth_malformed_base64_rejected() {
         let config = basic_auth_config();
@@ -454,11 +503,11 @@ mod tests {
             http::header::AUTHORIZATION,
             "Basic !!!not-base64!!!".parse().unwrap(),
         );
-        
+
         let response = execute_handler(&config, &headers).unwrap();
         assert_eq!(response.status, StatusCode::UNAUTHORIZED);
     }
-    
+
     fn plain_credentials() -> Vec<BasicAuthCredential> {
         vec![BasicAuthCredential {
             username: "alice".to_string(),
@@ -466,13 +515,13 @@ mod tests {
             hashed: false,
         }]
     }
-    
+
     #[test]
     fn test_verify_basic_auth_accepts_valid_credentials() {
         let headers = headers_with_basic_auth("alice", "s3cret");
         assert!(verify_basic_auth(&headers, &plain_credentials()));
     }
-    
+
     #[test]
     fn test_verify_basic_auth_rejects_non_basic_scheme() {
         let mut headers = http::HeaderMap::new();
@@ -482,7 +531,7 @@ mod tests {
         );
         assert!(!verify_basic_auth(&headers, &plain_credentials()));
     }
-    
+
     #[test]
     fn test_verify_basic_auth_password_may_contain_colon() {
         let credentials = vec![BasicAuthCredential {
@@ -493,7 +542,7 @@ mod tests {
         let headers = headers_with_basic_auth("alice", "pa:ss:word");
         assert!(verify_basic_auth(&headers, &credentials));
     }
-    
+
     #[test]
     fn test_verify_basic_auth_skips_hashed_credentials() {
         // Bcrypt verification is not available in this crate; a hashed
@@ -506,9 +555,12 @@ mod tests {
         let headers = headers_with_basic_auth("alice", "s3cret");
         assert!(!verify_basic_auth(&headers, &credentials));
     }
-    
+
     #[test]
     fn test_basic_auth_challenge_formats_realm() {
-        assert_eq!(basic_auth_challenge("Restricted"), "Basic realm=\"Restricted\"");
+        assert_eq!(
+            basic_auth_challenge("Restricted"),
+            "Basic realm=\"Restricted\""
+        );
     }
 }

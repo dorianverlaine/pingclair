@@ -1,6 +1,6 @@
 # 🧪 Pingclair vs Nginx 生產替代性審計
 
-> **審計時間**: 2026-07-25(第二次審計,逐項對照程式碼核實)
+> **審計時間**: 2026-07-26(第二次審計,逐項對照程式碼核實;已納入 Caddy parity 第一波)
 > **上次審計**: 2026-04-20(v0.1.6,P0 四項已全部修復,見文末)
 > **當前版本**: v0.1.7
 
@@ -71,10 +71,10 @@
 | 功能 | 現狀 | 證據 | 預計耗時 |
 |------|------|------|----------|
 | ~~SSE / 流式反代~~ | ✅ 已修復(2026-07-25) | Pingora 本就逐 chunk 轉發;真正問題是我們的 gzip filter 壓了 SSE。現 `flush_interval: -1` 路由與 `text/event-stream` 回應都跳過 gzip(`pingclair-proxy/src/server.rs`) | — |
-| `error_page` | ❌ 零實現 | 全庫無 `error_page` 匹配;502/404 只能出預設頁 | 半天 |
-| LB weight / backup | ❌ 所有後端一視同仁 | `load_balancer.rs:194`;被動健康檢查(`max_fails`/`fail_timeout`)已有(`load_balancer.rs:53-104`) | 1 天 |
+| `error_page` | ✅ 已修復(2026-07-26) | `error_page <code...> <path>`;靜態 404 與上游 500/502 套用自訂頁並安全回退 | — |
+| LB weight / backup | ✅ 已修復(2026-07-26) | `to <upstream> { weight N }` 加權主池;`backup` 僅在主池全數不可用時選取 | — |
 | 反代 Brotli | ❌ gzip only | `server.rs:1419`(flate2 `GzEncoder`);靜態路徑已有 br/zstd | 半天 |
-| 正則 rewrite | ❌ 正則**匹配**已有,正則**改寫**沒有 | `router.rs:15-53`(Regex matcher,預編譯快取)vs `handlers.rs:170-171` | 半天 |
+| 正則 rewrite | ✅ 已修復(2026-07-26) | `rewrite "<regex>" "<replacement>"`;載入時預編譯、支援 `$1` capture 並保留 query string | — |
 | RequestContext 輕量化 | 🟡 未做但影響小 | `server.rs:31-93` 每請求 3 個 `HashMap::new()`;空 HashMap 不配置堆記憶體,僅插入時才配置 | 2 小時 |
 
 ## 🟢 P2 — 進階 / 可觀測性
@@ -115,6 +115,9 @@
 - ✅ **ACME 帳戶持久化** — 見 Blocker #3
 - ✅ **SSE / 流式反代** — `flush_interval: -1` 與 `text/event-stream` 自動跳過 gzip;
   Pingora 傳輸層本就对未知長度 body 逐 chunk flush(見上方 P1 表)
+- ✅ **CORS** — `cors` DSL + 預檢驗證/一般回應標頭注入
+- ✅ **IP / Referer / UA 存取控制** — `access_control` DSL;CIDR、Referer host、預編譯 UA regex，deny 優先
+- ✅ **error_page / LB weight/backup / 正則 rewrite** — 見上方 P1 表
 
 ---
 
@@ -160,9 +163,9 @@ gzip 反超 nginx,反代 20.1k vs nginx 22.0k,20MB 流式 RSS 17.7MiB)。
 | 階段 | 內容 | 耗時 |
 |------|------|------|
 | **階段 1** | 🔴 3 個 Blocker(admin auth / auth_basic / ACME 帳戶持久化) | ✅ 已完成(2026-07-25) |
-| **階段 2** | 🟡 P1 功能(~~SSE~~ ✅ / error_page / LB weight / 反代 br / 正則 rewrite) | ~2.5 天 |
+| **階段 2** | 🟡 P1 功能(~~SSE / error_page / LB weight / 正則 rewrite~~ ✅ / 反代 br) | ~半天 |
 | **階段 3** | 🟢 P2 進階(proxy_cache / 日誌格式 / 指標 / 外掛 / H3 壓測優化) | 按週計 |
 
 **結論**: 核心(效能、流式、熱重載、H3)已到生產水位;三個安全/正確性
 口子與 SSE 流式反代已於 2026-07-25 修復,**可小規模試生產**。
-剩下的 nginx parity 功能(`error_page`、LB weight、`proxy_cache`)按優先級跟進。
+剩下的 nginx parity 功能(反代 Brotli、`proxy_cache`)按優先級跟進。

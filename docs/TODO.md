@@ -5,7 +5,7 @@
 > nginx parity 的整體審計見 `docs/AUDIT_NGINX_PARITY.md`;壓測發現並已修復的
 > bug 歷史見 `benchmarks/README.md`。
 >
-> 最後更新: 2026-07-26(第 0/1 波完成:程式碼債、DSL api_key/basic_auth、Request ID)
+> 最後更新: 2026-07-26(Caddy parity 第一波完成:error_page、CORS、存取控制、正則 rewrite、LB weight/backup)
 
 ---
 
@@ -20,23 +20,24 @@ ACME 帳戶持久化(詳見審計文檔)。
 
 ### P1 — 常用功能
 
-- [ ] **`error_page`** — 自訂錯誤頁(404/500/502/504)。全庫無實現,錯誤只能出預設頁。
-- [ ] **LB weight / backup** — 加權負載平衡 + 備用後端。`pingclair-proxy/src/load_balancer.rs:194`
-  目前所有後端一視同仁(被動健康檢查 `max_fails`/`fail_timeout` 已有)。
+- [x] **`error_page`**(2026-07-26)— 支援 `error_page 404 /path/404.html` 與多狀態碼共用頁面;
+  靜態 404 和上游失敗的 500/502 都會套用,讀取失敗時安全回退內建純文字錯誤頁。
+- [x] **LB weight / backup**(2026-07-26)— `reverse_proxy` 的 `to <upstream> { weight N }`
+  以加權主池選擇;`backup` 僅在所有主後端都被被動健康檢查標記為不可用時才接手。
 - [ ] **反代壓縮補齊** — 反代路徑只有 gzip(`pingclair-proxy/src/server.rs` `GzEncoder`);
   靜態路徑已有 br/zstd。反代至少補 br,有餘力再 zstd。
-- [ ] **正則 rewrite** — 正則**匹配**已有(`pingclair-core/src/server/router.rs`,預編譯快取),
-  正則**改寫**沒有(`handlers.rs` Rewrite 僅字面替換)。
+- [x] **正則 rewrite**(2026-07-26)— `rewrite "<regex>" "<replacement>"` 已支援 `$1` capture
+  與 query string 保留;正則在配置載入時預編譯,不落在熱路徑。
 - [ ] **bcrypt 憑據** — `BasicAuthCredential { hashed: true }` 目前**永不匹配**(直接跳過)。
   需要引入 bcrypt 依賴(刻意暫緩,是依賴決策)。明文憑據正常工作。
-- [ ] **CORS** — 預檢處理 + 回應標頭注入。⚠️ 注意:`HandlerConfig::Cors` 結構
-  在 core 配置裡已存在(`types.rs:338`),但**沒有任何執行路徑處理它**——
-  需要核實後補實現,DSL 也沒有對應指令。
+- [x] **CORS**(2026-07-26)— `cors` DSL 支援 origin/method/header/expose header、credentials
+  與 max-age;執行期處理預檢、驗證 requested method/header 並對一般回應注入 CORS 標頭。
 - [x] **Request ID**(2026-07-26)— 客戶端 `X-Request-Id` 透傳(消毒後採用),
   無則生成;轉發上游(header_up 可覆蓋)、下游回應標頭、access log 全貫穿。
   ⚠️ H3(quic.rs)路徑尚未轉發 Request ID,見下方小項。
-- [ ] **IP / Referer / UA 存取控制** — 依 IP/CIDR、Referer host、User-Agent 正則
-  做 allow/deny。現有 rate limiter 的 keyed 機制可複用。
+- [x] **IP / Referer / UA 存取控制**(2026-07-26)— `access_control` DSL 支援 allow/deny
+  IP/CIDR、Referer host(含 `*.example.com`)與 User-Agent 正則;deny 優先,allow list
+  為必須條件,規則於載入時預編譯且錯誤設定 fail closed。
 
 ### P2 — 進階 / 可觀測性
 
@@ -93,8 +94,7 @@ ACME 帳戶持久化(詳見審計文檔)。
   即 Bearer token。
 - [x] **`basic_auth`**(2026-07-26)— 行內 `basic_auth user pass [u2 p2...]` 與
   block 形式(支援 `realm` 子指令)均已支援,編譯為明文憑據。
-- [ ] 其他候補:`error_page`、`gzip_types`、CORS、IP/Referer/UA 限制、LB weight、
-  traffic splitting、新認證方式等實現後需一併補 DSL 語法。
+- [ ] 其他候補:`gzip_types`、traffic splitting、新認證方式等實現後需一併補 DSL 語法。
 - [ ] **`redirect`** — core 有 `HandlerConfig::Redirect`、AST 有 `Handler::Redirect`,
   但適配器從不產生它,DSL 寫 `redirect` 會報 Unknown directive。
 

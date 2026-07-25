@@ -22,18 +22,15 @@
 //! ```
 
 pub mod adapter;
-pub mod parser;
 pub mod compiler;
+pub mod parser;
 
 pub use parser::{
-    parse, compile as parse_and_analyze, 
-    Ast, ParseError, CompileError as AnalyzeError,
-    Token, tokenize, LexError,
-    VariableResolver, ResolvedVariable,
-    SemanticAnalyzer, SemanticError,
+    Ast, CompileError as AnalyzeError, LexError, ParseError, ResolvedVariable, SemanticAnalyzer,
+    SemanticError, Token, VariableResolver, compile as parse_and_analyze, parse, tokenize,
 };
 
-pub use compiler::{compile_ast, CompileError};
+pub use compiler::{CompileError, compile_ast};
 
 use pingclair_core::config::PingclairConfig;
 use std::path::Path;
@@ -42,19 +39,18 @@ use std::path::Path;
 pub fn compile(source: &str) -> Result<PingclairConfig, FullCompileError> {
     // Parse and analyze
     let ast = parse_and_analyze(source)?;
-    
+
     // Compile to config
     let config = compile_ast(&ast)?;
-    
+
     Ok(config)
 }
 
 /// Load and compile a Pingclairfile from a path
 pub fn compile_file(path: impl AsRef<Path>) -> Result<PingclairConfig, FullCompileError> {
     let path = path.as_ref();
-    let source = std::fs::read_to_string(path)
-        .map_err(|e| FullCompileError::Io(e.to_string()))?;
-        
+    let source = std::fs::read_to_string(path).map_err(|e| FullCompileError::Io(e.to_string()))?;
+
     if path.extension().map_or(false, |ext| ext == "json") {
         serde_json::from_str(&source)
             .map_err(|e| FullCompileError::Io(format!("JSON parse error: {}", e)))
@@ -64,21 +60,23 @@ pub fn compile_file(path: impl AsRef<Path>) -> Result<PingclairConfig, FullCompi
 }
 
 /// Load and merge multiple configuration files
-pub fn compile_multiple_files(paths: &[impl AsRef<Path>]) -> Result<PingclairConfig, FullCompileError> {
+pub fn compile_multiple_files(
+    paths: &[impl AsRef<Path>],
+) -> Result<PingclairConfig, FullCompileError> {
     let mut final_config = pingclair_core::config::PingclairConfig::default();
-    
+
     for path in paths {
         let config = compile_file(path.as_ref())?;
-        
+
         // Merge configurations
         final_config.debug = final_config.debug || config.debug;
         final_config.servers.extend(config.servers);
-        
+
         // Merge admin config (use the last one if multiple exist)
         if let Some(admin) = config.admin {
             final_config.admin = Some(admin);
         }
-        
+
         // Merge global config
         if let Some(email) = config.global.email {
             final_config.global.email = Some(email);
@@ -86,41 +84,39 @@ pub fn compile_multiple_files(paths: &[impl AsRef<Path>]) -> Result<PingclairCon
         if config.global.auto_https != pingclair_core::config::AutoHttpsMode::On {
             final_config.global.auto_https = config.global.auto_https;
         }
-        
+
         // Merge logging config (use the last one if multiple exist)
         if !config.logging.level.is_empty() {
             final_config.logging = config.logging;
         }
     }
-    
+
     Ok(final_config)
 }
 
 /// Load and merge configuration from directory (all .pingclair files)
 pub fn compile_directory(dir_path: impl AsRef<Path>) -> Result<PingclairConfig, FullCompileError> {
-    use std::fs;
     use std::ffi::OsStr;
-    
+    use std::fs;
+
     let dir_path = dir_path.as_ref();
     let mut config_paths = Vec::new();
-    
-    for entry in fs::read_dir(dir_path)
-        .map_err(|e| FullCompileError::Io(e.to_string()))?
-    {
+
+    for entry in fs::read_dir(dir_path).map_err(|e| FullCompileError::Io(e.to_string()))? {
         let entry = entry.map_err(|e| FullCompileError::Io(e.to_string()))?;
         let path = entry.path();
-        
-        if path.extension() == Some(OsStr::new("pingclair")) || 
-           path.extension() == Some(OsStr::new("json")) ||
-           path.file_stem() == Some(OsStr::new("Pingclairfile"))
+
+        if path.extension() == Some(OsStr::new("pingclair"))
+            || path.extension() == Some(OsStr::new("json"))
+            || path.file_stem() == Some(OsStr::new("Pingclairfile"))
         {
             config_paths.push(path);
         }
     }
-    
+
     // Sort paths to ensure consistent loading order
     config_paths.sort();
-    
+
     compile_multiple_files(&config_paths)
 }
 
@@ -129,10 +125,10 @@ pub fn compile_directory(dir_path: impl AsRef<Path>) -> Result<PingclairConfig, 
 pub enum FullCompileError {
     #[error("IO error: {0}")]
     Io(String),
-    
+
     #[error("Parse/analyze error: {0}")]
     Analyze(#[from] AnalyzeError),
-    
+
     #[error("Compile error: {0}")]
     Compile(#[from] CompileError),
 }
@@ -282,7 +278,10 @@ mod tests {
         "#;
 
         let config = compile(source).unwrap();
-        assert!(config.servers[0].tls.is_none(), "tls off must clear the https-scheme default");
+        assert!(
+            config.servers[0].tls.is_none(),
+            "tls off must clear the https-scheme default"
+        );
     }
 
     #[test]
@@ -352,10 +351,13 @@ mod tests {
         let HandlerConfig::Pipeline { handlers } = &route.handler else {
             panic!("expected pipeline, got {:?}", route.handler);
         };
-        let auth = handlers.iter().find_map(|h| match h {
-            HandlerConfig::BasicAuth { realm, credentials } => Some((realm, credentials)),
-            _ => None,
-        }).expect("basic_auth handler");
+        let auth = handlers
+            .iter()
+            .find_map(|h| match h {
+                HandlerConfig::BasicAuth { realm, credentials } => Some((realm, credentials)),
+                _ => None,
+            })
+            .expect("basic_auth handler");
         assert_eq!(auth.0, "Restricted");
         assert_eq!(auth.1.len(), 2);
         assert_eq!(auth.1[0].username, "alice");
@@ -382,10 +384,13 @@ mod tests {
         let HandlerConfig::Pipeline { handlers } = &route.handler else {
             panic!("expected pipeline, got {:?}", route.handler);
         };
-        let auth = handlers.iter().find_map(|h| match h {
-            HandlerConfig::BasicAuth { realm, credentials } => Some((realm, credentials)),
-            _ => None,
-        }).expect("basic_auth handler");
+        let auth = handlers
+            .iter()
+            .find_map(|h| match h {
+                HandlerConfig::BasicAuth { realm, credentials } => Some((realm, credentials)),
+                _ => None,
+            })
+            .expect("basic_auth handler");
         assert_eq!(auth.0, "Admin Area");
         assert_eq!(auth.1.len(), 1);
         assert_eq!(auth.1[0].username, "admin");
@@ -403,5 +408,121 @@ mod tests {
         "#;
 
         assert!(compile(source).is_err());
+    }
+
+    #[test]
+    fn test_compile_error_page() {
+        let source = r#"
+            example.com {
+                listen :80
+                error_page 404 /var/www/404.html
+                error_page 500 502 503 504 /var/www/50x.html
+                respond "OK"
+            }
+        "#;
+
+        let config = compile(source).unwrap();
+        let pages = &config.servers[0].error_pages;
+        assert_eq!(
+            pages.get(&404).map(|s| s.as_str()),
+            Some("/var/www/404.html")
+        );
+        assert_eq!(
+            pages.get(&500).map(|s| s.as_str()),
+            Some("/var/www/50x.html")
+        );
+        assert_eq!(
+            pages.get(&502).map(|s| s.as_str()),
+            Some("/var/www/50x.html")
+        );
+        assert_eq!(
+            pages.get(&504).map(|s| s.as_str()),
+            Some("/var/www/50x.html")
+        );
+        assert!(pages.get(&403).is_none());
+    }
+
+    #[test]
+    fn test_compile_error_page_rejects_bad_input() {
+        // Single argument (no page path)
+        assert!(
+            compile("example.com {\n listen :80\n error_page 404\n respond \"OK\"\n}").is_err()
+        );
+        // Non-error status code
+        assert!(
+            compile("example.com {\n listen :80\n error_page 200 /ok.html\n respond \"OK\"\n}")
+                .is_err()
+        );
+        // Non-numeric code
+        assert!(
+            compile("example.com {\n listen :80\n error_page abc /x.html\n respond \"OK\"\n}")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_compile_caddy_parity_directives() {
+        let source = r#"
+            example.com {
+                listen :80
+                handle /api/* {
+                    cors https://app.example.com {
+                        methods GET POST
+                        headers Content-Type Authorization
+                        expose_headers X-Request-Id
+                        allow_credentials
+                        max_age 600
+                    }
+                    access_control {
+                        allow_ip 10.0.0.0/8 2001:db8::/32
+                        deny_ip 10.1.2.3
+                        allow_referer app.example.com *.trusted.example
+                        deny_referer evil.example
+                        allow_user_agent "^PingclairClient/"
+                        deny_user_agent "(?i)bot"
+                    }
+                    rewrite "^/api/(.*)$" "/v1/$1"
+                    reverse_proxy {
+                        lb_policy least_conn
+                        to 127.0.0.1:3000 { weight 3 }
+                        to 127.0.0.1:3001 { backup }
+                    }
+                }
+            }
+        "#;
+
+        let config = compile(source).unwrap();
+        let HandlerConfig::Pipeline { handlers } = &config.servers[0].routes[0].handler else {
+            panic!("expected handler pipeline");
+        };
+        assert!(handlers.iter().any(|handler| matches!(handler, HandlerConfig::Cors {
+            allowed_origins,
+            allowed_methods,
+            allow_credentials: true,
+            max_age: 600,
+            ..
+        } if allowed_origins == &["https://app.example.com"] && allowed_methods == &["GET", "POST"])));
+        assert!(handlers.iter().any(
+            |handler| matches!(handler, HandlerConfig::AccessControl(access)
+            if access.allowed_ips.len() == 2 && access.denied_user_agents == ["(?i)bot"])
+        ));
+        assert!(
+            handlers
+                .iter()
+                .any(|handler| matches!(handler, HandlerConfig::Rewrite {
+            regex: Some(pattern), regex_replace: Some(replacement), ..
+        } if pattern == "^/api/(.*)$" && replacement == "/v1/$1"))
+        );
+        let proxy = handlers
+            .iter()
+            .find_map(|handler| match handler {
+                HandlerConfig::ReverseProxy(proxy) => Some(proxy),
+                _ => None,
+            })
+            .expect("reverse proxy handler");
+        assert_eq!(proxy.load_balance.strategy, "least_conn");
+        assert_eq!(proxy.upstream_options.len(), 2);
+        assert_eq!(proxy.upstream_options[0].weight, 3);
+        assert!(proxy.upstream_options[1].backup);
     }
 }
