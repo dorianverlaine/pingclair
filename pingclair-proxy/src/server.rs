@@ -583,46 +583,38 @@ impl PingclairProxy {
                     let accept_encoding = session.req_header().headers.get("Accept-Encoding")
                         .and_then(|v| v.to_str().ok());
 
-                    // Large-file path: stream complete (non-Range),
-                    // uncompressed responses in 64KB chunks instead of
-                    // buffering the whole body in memory. `could_stream`
-                    // gates this without any I/O (Range and
-                    // compression-negotiated requests never stream), so the
-                    // stat+open in serve_streaming is only paid when
-                    // streaming is actually possible.
-                    if file_server.could_stream(range_header, accept_encoding) {
-                        if let Ok(Some(mut stream)) = file_server.serve_streaming(path).await {
-                            if file_server.should_stream_response(stream.file_size, range_header, accept_encoding) {
-                                let mut header = ResponseHeader::build(200, Some(3)).unwrap();
-                                header.insert_header("Content-Type", stream.mime_type.as_str()).unwrap();
-                                header.insert_header("Content-Length", stream.file_size.to_string()).unwrap();
-                                if let Some(lm) = &stream.last_modified {
-                                    header.insert_header("Last-Modified", lm.as_str()).unwrap();
-                                }
-                                if let Some(etag) = &stream.etag {
-                                    header.insert_header("ETag", etag.as_str()).unwrap();
-                                }
-                                header.insert_header("Accept-Ranges", "bytes").unwrap();
-                                header.insert_header("Server", "Pingclair").unwrap();
-
-                                session.write_response_header(Box::new(header), false).await?;
-                                while let Some(chunk) = stream.read_chunk().await.map_err(|e| {
-                                    pingora_core::Error::because(
-                                        pingora_core::ErrorType::ReadError,
-                                        "streaming file body",
-                                        e,
-                                    )
-                                })? {
-                                    let last = stream.is_complete();
-                                    session.write_response_body(Some(Bytes::from(chunk)), last).await?;
-                                }
-                                return Ok(true);
+                    // serve_auto makes the buffered-vs-streaming call in one
+                    // pass (single resolve + stat per request): large,
+                    // complete, uncompressed responses stream in 64KB chunks
+                    // instead of being buffered whole in memory.
+                    match file_server.serve_auto(path, range_header, accept_encoding).await {
+                        Ok(Some(pingclair_static::ServedResponse::Stream(mut stream))) => {
+                            let mut header = ResponseHeader::build(200, Some(3)).unwrap();
+                            header.insert_header("Content-Type", stream.mime_type.as_str()).unwrap();
+                            header.insert_header("Content-Length", stream.file_size.to_string()).unwrap();
+                            if let Some(lm) = &stream.last_modified {
+                                header.insert_header("Last-Modified", lm.as_str()).unwrap();
                             }
-                        }
-                    }
+                            if let Some(etag) = &stream.etag {
+                                header.insert_header("ETag", etag.as_str()).unwrap();
+                            }
+                            header.insert_header("Accept-Ranges", "bytes").unwrap();
+                            header.insert_header("Server", "Pingclair").unwrap();
 
-                    match file_server.serve(path, range_header, accept_encoding).await {
-                        Ok(Some(file)) => {
+                            session.write_response_header(Box::new(header), false).await?;
+                            while let Some(chunk) = stream.read_chunk().await.map_err(|e| {
+                                pingora_core::Error::because(
+                                    pingora_core::ErrorType::ReadError,
+                                    "streaming file body",
+                                    e,
+                                )
+                            })? {
+                                let last = stream.is_complete();
+                                session.write_response_body(Some(Bytes::from(chunk)), last).await?;
+                            }
+                            return Ok(true);
+                        }
+                        Ok(Some(pingclair_static::ServedResponse::Buffered(file))) => {
                             let mut header = ResponseHeader::build(file.status, Some(3)).unwrap();
                             header.insert_header("Content-Type", file.mime_type.as_str()).unwrap();
                             header.insert_header("Content-Length", file.content.len().to_string()).unwrap();

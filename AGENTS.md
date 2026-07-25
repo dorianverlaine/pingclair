@@ -136,9 +136,14 @@ deserialized directly into `PingclairConfig` (used by the integration tests).
 - The admin API (`pingclair-api`) can hot-reload configuration — treat its
   auth layer (`src/auth.rs`) as security-critical; do not weaken it.
 - Path traversal and streaming correctness matter: `pingclair-static` serves
-  arbitrary files from a configured root (validate paths stay under root),
-  and both the proxy and static server must stream large bodies rather than
-  buffer them fully (past OOM bugs — see `benchmarks/README.md` and
+  arbitrary files from a configured root. Confinement is **lexical**
+  (`resolve_path` rejects `..` escaping the root with no syscalls — the
+  nginx/Caddy model); symlinks inside the docroot are followed, like both of
+  those servers by default, so do not treat the docroot as a security
+  boundary against someone who can plant symlinks in it. Do not reintroduce
+  per-request `canonicalize` — it measurably hurt static throughput. Both
+  the proxy and static server must stream large bodies rather than buffer
+  them fully (past OOM bugs — see `benchmarks/README.md` and
   `docs/AUDIT_NGINX_PARITY.md` for the history).
 - The install script runs a root shell script and creates a system user +
   systemd unit + `setcap` on the binary; review any change to

@@ -114,12 +114,6 @@ impl Default for FileServerConfig {
 /// Static file server
 pub struct FileServer {
     config: FileServerConfig,
-    /// Canonicalized (symlinks/`..` resolved, absolute) form of
-    /// `config.root`, captured once at construction. Every served path is
-    /// canonicalized and checked against this prefix — a lexical
-    /// `starts_with` on the *joined* path is not a traversal guard, because
-    /// `root.join("../x")` still lexically starts with `root`.
-    canonical_root: PathBuf,
     /// Cache of already-compressed file bodies (see [`CompressCache`]).
     /// Behind a `Mutex` because `FileServer` is shared (`Arc`) across all
     /// worker threads; the lock is only ever held for a tiny map operation,
@@ -145,6 +139,16 @@ pub struct ServedFile {
     pub last_modified: Option<String>,
     pub etag: Option<String>,
     pub content_encoding: Option<String>,
+}
+
+/// Result of [`FileServer::serve_auto`]: either a fully buffered body
+/// (small, ranged, or compressed responses) or an open streaming handle
+/// (large, complete, uncompressed responses). Splitting the decision at
+/// this level means one path resolution + one stat per request — the
+/// caller never has to probe-then-fall-back.
+pub enum ServedResponse {
+    Buffered(ServedFile),
+    Stream(StreamingFile),
 }
 
 /// Streaming file response for zero-copy large file transfer
@@ -218,14 +222,8 @@ impl FileServer {
 
     /// Create a new file server
     pub fn new(config: FileServerConfig) -> Self {
-        // Canonicalize the root once. If the root doesn't exist yet this
-        // fails; fall back to the configured path so the server still
-        // starts (every request will then simply 404, as before).
-        let canonical_root = std::fs::canonicalize(&config.root)
-            .unwrap_or_else(|_| config.root.clone());
         Self {
             config,
-            canonical_root,
             compress_cache: Mutex::new(CompressCache::new(Self::COMPRESS_CACHE_BUDGET)),
             in_flight: Mutex::new(HashMap::new()),
         }
@@ -270,23 +268,39 @@ impl FileServer {
     const STREAMING_THRESHOLD: u64 = 5 * 1024 * 1024;
 
     /// Resolve a request path to an on-disk path that is verifiably inside
-    /// the document root.
+    /// the document root — purely lexically, with no filesystem syscalls
+    /// (this runs on the per-request hot path).
     ///
-    /// The joined path is canonicalized (resolving `..`, `.` and symlinks)
-    /// and must remain under the canonical root captured at construction.
-    /// Returns `None` — i.e. "not found", answered with a 404 — when the
-    /// file doesn't exist (canonicalize fails) or when the resolved path
-    /// escapes the root. The latter deliberately also rejects in-root
-    /// symlinks that point outside the root.
-    async fn resolve_path(&self, path: &str) -> Option<PathBuf> {
-        let joined = self.config.root.join(path.trim_start_matches('/'));
-        let canonical = tokio::fs::canonicalize(&joined).await.ok()?;
-        if canonical.starts_with(&self.canonical_root) {
-            Some(canonical)
-        } else {
-            tracing::warn!("🚫 Rejected path escaping docroot: {} -> {:?}", path, canonical);
-            None
+    /// Dot segments are processed component by component while tracking the
+    /// depth below the root: `..` at depth 0 would escape the root and is
+    /// rejected (`None` → answered 404), anything else is applied to the
+    /// joined path. This is the same confinement model as nginx's URI
+    /// normalization and Caddy's `path.Clean` prefix check — like both of
+    /// them, symlinks inside the docroot are *followed* (an attacker who
+    /// can plant symlinks in the docroot already has filesystem access, so
+    /// canonicalizing per request would only cost syscalls, not buy safety).
+    fn resolve_path(&self, path: &str) -> Option<PathBuf> {
+        let mut out = self.config.root.clone();
+        // Components below the root; reaching for `..` at 0 escapes it.
+        let mut depth: usize = 0;
+        for comp in path.split('/') {
+            match comp {
+                "" | "." => {}
+                ".." => {
+                    if depth == 0 {
+                        tracing::warn!("🚫 Rejected path escaping docroot: {}", path);
+                        return None;
+                    }
+                    out.pop();
+                    depth -= 1;
+                }
+                c => {
+                    out.push(c);
+                    depth += 1;
+                }
+            }
         }
+        Some(out)
     }
 
     /// Cheap pre-check for the streaming path, without any I/O: streaming
@@ -314,36 +328,42 @@ impl FileServer {
     /// Returns a StreamingFile that can be used for chunked transfer
     /// Use this for files larger than 5MB to avoid memory pressure
     pub async fn serve_streaming(&self, path: &str) -> Result<Option<StreamingFile>> {
-        // Canonicalize + docroot check (rejects traversal and escaping symlinks)
-        let file_path = match self.resolve_path(path).await {
+        // Lexical docroot check (rejects `..` traversal; no syscalls)
+        let file_path = match self.resolve_path(path) {
             Some(p) => p,
             None => return Ok(None),
         };
-        
+
         // Check if file exists
         let metadata = match tokio::fs::metadata(&file_path).await {
             Ok(m) if m.is_file() => m,
             _ => return Ok(None),
         };
-        
+
+        Ok(Some(Self::open_stream(file_path, &metadata).await?))
+    }
+
+    /// Open `file_path` for chunked streaming, computing the response
+    /// metadata (MIME, Last-Modified, ETag) from the already-fetched stat.
+    async fn open_stream(file_path: PathBuf, metadata: &std::fs::Metadata) -> Result<StreamingFile> {
         let file_size = metadata.len();
-        
+
         // Open file handle (no reading yet - zero-copy preparation)
         let file = tokio::fs::File::open(&file_path).await?;
-        
+
         // Guess MIME type
         let mime_type = mime_guess::from_path(&file_path)
             .first_or_octet_stream()
             .to_string();
-        
+
         // Calculate Last-Modified and ETag
         let last_modified = metadata.modified().ok()
             .map(|t| httpdate::fmt_http_date(t));
-            
-        let etag = format!("\"{:x}-{:x}\"", file_size, 
+
+        let etag = format!("\"{:x}-{:x}\"", file_size,
             metadata.modified().map(|t| t.elapsed().unwrap_or_default().as_secs()).unwrap_or(0));
-        
-        Ok(Some(StreamingFile {
+
+        Ok(StreamingFile {
             file,
             file_size,
             chunk_size: 64 * 1024,  // 64KB chunks
@@ -352,7 +372,7 @@ impl FileServer {
             last_modified,
             etag: Some(etag),
             bytes_read: 0,
-        }))
+        })
     }
     
     /// Check if a file should be served with streaming (based on size)
@@ -365,10 +385,15 @@ impl FileServer {
     }
 
 
-    /// Serve a file request
-    pub async fn serve(&self, path: &str, range_header: Option<&str>, accept_encoding: Option<&str>) -> Result<Option<ServedFile>> {
-        // Canonicalize + docroot check (rejects traversal and escaping symlinks)
-        let mut file_path = match self.resolve_path(path).await {
+    /// Serve a file request, choosing between a buffered body and a
+    /// streaming handle: large, complete (non-Range), uncompressed
+    /// responses come back as [`ServedResponse::Stream`] so the caller can
+    /// write them out in chunks; everything else is
+    /// [`ServedResponse::Buffered`]. One path resolution + one stat per
+    /// request either way — no probe-then-fall-back double work.
+    pub async fn serve_auto(&self, path: &str, range_header: Option<&str>, accept_encoding: Option<&str>) -> Result<Option<ServedResponse>> {
+        // Lexical docroot check (rejects `..` traversal; no syscalls)
+        let mut file_path = match self.resolve_path(path) {
             Some(p) => p,
             None => return Ok(None),
         };
@@ -405,7 +430,7 @@ impl FileServer {
                         (listing.into_bytes(), None)
                     };
 
-                    return Ok(Some(ServedFile {
+                    return Ok(Some(ServedResponse::Buffered(ServedFile {
                         content,
                         mime_type: "text/html; charset=utf-8".to_string(),
                         path: file_path,
@@ -414,7 +439,7 @@ impl FileServer {
                         last_modified: None,
                         etag: None,
                         content_encoding: encoding,
-                    }));
+                    })));
                 } else {
                     return Ok(None);
                 }
@@ -456,6 +481,14 @@ impl FileServer {
             .first_or_octet_stream()
             .to_string();
 
+        // Streaming branch: large, complete, uncompressed responses are
+        // handed back as an open file for chunked writing — the body is
+        // never held in memory. Checked before the compression cache path,
+        // which only ever applies to buffered responses.
+        if self.should_stream_response(file_size, range_header, accept_encoding) {
+            return Ok(Some(ServedResponse::Stream(Self::open_stream(file_path, &metadata).await?)));
+        }
+
         // Cache-key ingredients. Only full-file (200, non-range) responses
         // with compression enabled are cacheable; the negotiated encoding and
         // the file mtime (so an edit invalidates the stale entry) form the key.
@@ -476,7 +509,7 @@ impl FileServer {
             let key = CompressKey { path: file_path.clone(), mtime_ns, encoding: enc };
             if let Some(cached) = self.compress_cache.lock().unwrap().get(&key) {
                 tracing::debug!("✅ Serving cached {} compression: {}", enc, file_path.display());
-                return Ok(Some(ServedFile {
+                return Ok(Some(ServedResponse::Buffered(ServedFile {
                     content: (*cached).clone(),
                     mime_type,
                     path: file_path,
@@ -485,7 +518,7 @@ impl FileServer {
                     last_modified,
                     etag: Some(etag),
                     content_encoding: Some(enc.to_string()),
-                }));
+                })));
             }
         }
 
@@ -497,7 +530,7 @@ impl FileServer {
         if self.config.precompressed && status == 200 {
             if let Some((precompressed_content, encoding)) = self.try_precompressed(&file_path, accept_encoding).await {
                 tracing::debug!("✅ Using pre-compressed file: {} ({})", file_path.display(), encoding);
-                return Ok(Some(ServedFile {
+                return Ok(Some(ServedResponse::Buffered(ServedFile {
                     content: precompressed_content,
                     mime_type,
                     path: file_path,
@@ -506,7 +539,7 @@ impl FileServer {
                     last_modified,
                     etag: Some(etag),
                     content_encoding: Some(encoding.to_string()),
-                }));
+                })));
             }
         }
 
@@ -534,7 +567,7 @@ impl FileServer {
                 drop(guard);
                 Self::release_inflight(&self.in_flight, &key, &lock);
                 tracing::debug!("✅ Serving coalesced {} compression: {}", enc, file_path.display());
-                return Ok(Some(ServedFile {
+                return Ok(Some(ServedResponse::Buffered(ServedFile {
                     content: (*cached).clone(),
                     mime_type,
                     path: file_path,
@@ -543,7 +576,7 @@ impl FileServer {
                     last_modified,
                     etag: Some(etag),
                     content_encoding: Some(enc.to_string()),
-                }));
+                })));
             }
             Some((key, lock, guard))
         } else {
@@ -569,7 +602,7 @@ impl FileServer {
 
         let (content, content_encoding) = result?;
 
-        Ok(Some(ServedFile {
+        Ok(Some(ServedResponse::Buffered(ServedFile {
             content,
             mime_type,
             path: file_path,
@@ -578,7 +611,37 @@ impl FileServer {
             last_modified,
             etag: Some(etag),
             content_encoding,
-        }))
+        })))
+    }
+
+    /// Serve a file request, always buffered.
+    ///
+    /// Compatibility wrapper around [`Self::serve_auto`] for callers that
+    /// cannot write a chunked body (QUIC path, `try_files`): a streaming
+    /// result is read into memory here, so this shares the old
+    /// whole-body-in-memory behavior for large files. The main HTTP path
+    /// uses `serve_auto` directly.
+    pub async fn serve(&self, path: &str, range_header: Option<&str>, accept_encoding: Option<&str>) -> Result<Option<ServedFile>> {
+        match self.serve_auto(path, range_header, accept_encoding).await? {
+            Some(ServedResponse::Buffered(file)) => Ok(Some(file)),
+            Some(ServedResponse::Stream(mut stream)) => {
+                let mut content = Vec::with_capacity(stream.file_size as usize);
+                while let Some(chunk) = stream.read_chunk().await? {
+                    content.extend_from_slice(&chunk);
+                }
+                Ok(Some(ServedFile {
+                    content,
+                    mime_type: stream.mime_type,
+                    path: stream.path,
+                    status: 200,
+                    content_range: None,
+                    last_modified: stream.last_modified,
+                    etag: stream.etag,
+                    content_encoding: None,
+                }))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Read `length` bytes of `file_path` starting at `start`, then compress
@@ -898,12 +961,15 @@ mod traversal_tests {
     }
 
     #[tokio::test]
-    async fn symlink_escaping_root_is_rejected() {
+    async fn symlink_escaping_root_is_followed_like_nginx_and_caddy() {
+        // Docroot confinement is lexical (see resolve_path): like nginx and
+        // Caddy by default, symlinks are followed — docroot is not a
+        // security boundary against someone who can plant symlinks in it.
         let f = fixture().await;
         std::os::unix::fs::symlink(f.base.path().join("secret.txt"), f.root.join("link.txt")).unwrap();
         let fs = server(&f.root);
-        assert!(fs.serve("/link.txt", None, None).await.unwrap().is_none());
-        assert!(fs.serve_streaming("/link.txt").await.unwrap().is_none());
+        let served = fs.serve("/link.txt", None, None).await.unwrap().unwrap();
+        assert_eq!(served.content, b"top secret");
     }
 
     #[tokio::test]
@@ -925,6 +991,68 @@ mod traversal_tests {
         assert_eq!(nested.content, b"nested");
         let streamed = fs.serve_streaming("/sub/page.txt").await.unwrap().unwrap();
         assert_eq!(streamed.file_size, 6);
+    }
+}
+
+#[cfg(test)]
+mod serve_auto_tests {
+    use super::*;
+
+    fn server(root: &std::path::Path, compress: bool) -> FileServer {
+        FileServer::new(FileServerConfig {
+            root: root.to_path_buf(),
+            index: vec![],
+            browse: false,
+            compress,
+            precompressed: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn large_uncompressed_file_streams_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        // 6MB, over the 5MB streaming threshold; non-repeating so gzip
+        // wouldn't trivially shrink it (not used here anyway).
+        let body: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        tokio::fs::write(dir.path().join("big.bin"), &body).await.unwrap();
+
+        let fs = server(dir.path(), false);
+        match fs.serve_auto("/big.bin", None, None).await.unwrap().unwrap() {
+            ServedResponse::Stream(mut stream) => {
+                assert_eq!(stream.file_size, body.len() as u64);
+                let mut got = Vec::new();
+                while let Some(chunk) = stream.read_chunk().await.unwrap() {
+                    got.extend_from_slice(&chunk);
+                }
+                assert_eq!(got, body, "streamed bytes must equal the file");
+            }
+            ServedResponse::Buffered(_) => panic!("6MB uncompressed response must stream"),
+        }
+    }
+
+    #[tokio::test]
+    async fn large_file_stays_buffered_when_compression_is_negotiated() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("big.txt"), &vec![b'a'; 6 * 1024 * 1024]).await.unwrap();
+
+        let fs = server(dir.path(), true);
+        match fs.serve_auto("/big.txt", None, Some("gzip")).await.unwrap().unwrap() {
+            ServedResponse::Buffered(file) => {
+                assert_eq!(file.content_encoding.as_deref(), Some("gzip"));
+            }
+            ServedResponse::Stream(_) => panic!("compressed responses must stay buffered for the cache"),
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_wrapper_buffers_a_stream_for_compat_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = vec![b'x'; 6 * 1024 * 1024];
+        tokio::fs::write(dir.path().join("big.bin"), &body).await.unwrap();
+
+        let fs = server(dir.path(), false);
+        let served = fs.serve("/big.bin", None, None).await.unwrap().unwrap();
+        assert_eq!(served.content, body, "serve() must return the full body even for streamed files");
     }
 }
 
@@ -1064,13 +1192,12 @@ mod serve_cache_tests {
             precompressed: false,
         }));
 
-        // The key serve() will compute for this file. serve() works on the
-        // canonicalized path (see resolve_path), and tempdir lives under a
-        // symlinked /var on macOS, so canonicalize here too.
-        let canonical_path = std::fs::canonicalize(&path).unwrap();
+        // The key serve() will compute for this file: the lexically
+        // resolved docroot-joined path (see resolve_path).
+        let resolved_path = dir.path().join("big.txt");
         let mtime_ns = std::fs::metadata(&path).unwrap().modified().unwrap()
             .duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let key = CompressKey { path: canonical_path, mtime_ns, encoding: "gzip" };
+        let key = CompressKey { path: resolved_path, mtime_ns, encoding: "gzip" };
 
         // Simulate an in-flight compression: hold the per-key lock the way
         // the first requester would.
