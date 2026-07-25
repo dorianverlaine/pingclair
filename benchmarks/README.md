@@ -150,17 +150,74 @@ uses its own default/fastest setting — see `configs/*/nginx.conf`'s
 comment on `gzip_comp_level`), so gzip numbers are informative but not a
 precise apples-to-apples compression-speed comparison.
 
-**Remote (bare-metal VPS)**: a 2 vCPU / 1.6GB Aliyun Shenzhen box, with
-`wrk` run from a separate Mac over an existing Shadowrocket tunnel. Only
-one candidate binds `:8080` at a time (the box is too small to host all
-three concurrently without skewing results). This run was interrupted by
-VPS resource constraints during the release build (`lto = "fat"` +
-`codegen-units = 1` is memory-hungry to link on a 1.6GB box) and not
-completed in this session — configs and scripts are in place
-(`configs/remote/`, `scripts/provision_remote.sh`,
-`scripts/run_remote_matrix.sh`) for a follow-up run.
+**Remote (bare-metal VPS)**: a 2 vCPU / 1.6GB Aliyun Shenzhen box. An
+earlier attempt (wrk driven from a laptop over a tunnel) was abandoned —
+both network-bound and blocked by the release build thrashing on 1.6GB.
+The completed run instead uses `scripts/run_onbox_matrix.sh`: everything
+on the box itself, each candidate on `127.0.0.1:8080` in turn, wrk over
+loopback (`-t2 -d15s`; the 2 vCPU are shared with the server under test).
+Raw output: `results/20260725_vps_onbox/`. The release build links fine
+with the box's 2GB of swap added.
 
-## Results
+### VPS on-box results (July 2026, all fixes in)
+
+Static file (1KB), plain:
+
+| Concurrency | Pingclair | Nginx | Caddy |
+|---|---|---|---|
+| 50  | 20,022 req/s | 51,904 req/s | 17,772 req/s |
+| 200 | 18,795 req/s | 55,236 req/s | 17,413 req/s |
+| 500 | 17,797 req/s | 53,508 req/s | 16,229 req/s |
+
+Static file (1KB), gzip requested:
+
+| Concurrency | Pingclair | Nginx | Caddy |
+|---|---|---|---|
+| 50  | 29,606 req/s | 44,050 req/s | 14,922 req/s |
+| 200 | 27,459 req/s | 44,268 req/s | 15,412 req/s |
+| 500 | 25,642 req/s | 42,913 req/s | 13,984 req/s |
+
+Reverse proxy passthrough (shared nginx backend on :9000):
+
+| Concurrency | Pingclair | Nginx | Caddy |
+|---|---|---|---|
+| 50  | 20,507 req/s | 20,713 req/s | 11,189 req/s |
+| 200 | 17,716 req/s | 20,778 req/s | 9,168 req/s |
+| 500 | 15,861 req/s | 18,823 req/s | 8,041 req/s |
+
+Large body (20MB), gzip, `-c20 -d20s`, memory sampled:
+
+| Server | Requests completed | Throughput | Timeouts | Peak RSS |
+|---|---|---|---|---|
+| **Pingclair** | **14,070 (703 req/s)** | **2.17 GB/s** | **0** | 74 MiB |
+| Nginx | 183 (9.1 req/s) | 41 MB/s | 110 | 21 MiB |
+| Caddy | 204 (10.1 req/s) | 39 MB/s | 65 | 117 MiB |
+
+Readings:
+
+- **Nginx is ~2.6-2.9x pingclair on plain 1KB static** (sendfile +
+  decades of hot-path tuning); caddy and pingclair are close, pingclair
+  slightly ahead. This is the workload where pingclair has the most head
+  room left.
+- **gzip static narrows the gap** (pingclair ~60-67% of nginx, ~1.8x
+  caddy) — and note gzip here means on-the-fly per request for nginx/
+  caddy vs pingclair's compressed-body cache, so the gap shrinks as the
+  file gets bigger and more compressible (see large body).
+- **Proxying is essentially tied with nginx** (~84-99%) and ~1.8-2x
+  caddy — the container-run anomaly (pingclair "winning" at c500) did
+  not reproduce on bare metal, as expected; see the caveat below the
+  container proxy table.
+- **Large compressible bodies are the compressed-body cache's home
+  turf**: ~70x nginx/caddy throughput, 0 timeouts, because repeat hits
+  skip compression entirely while nginx/caddy re-compress on every
+  request (their per-request CPU cost at gzip on a 20MB file on 2 shared
+  vCPU is brutal). The price of the cache is the 64MB compressed-body
+  budget, visible in the 74 MiB peak RSS vs nginx's 21 MiB.
+- Compression levels are not perfectly matched (nginx
+  `gzip_comp_level 1` vs each engine's own default), so treat gzip
+  numbers as informative, not exact.
+
+## Results (Docker bridge, July 2026)
 
 Full run: `results/20260724_203009/` (33 files, one per server × test ×
 concurrency, plus memory timelines for the large-body test). All numbers
@@ -266,14 +323,10 @@ repeated exactly:**
 
 ## Remote VPS run
 
-Not completed this session — the box (2 vCPU / 1.6GB Aliyun Shenzhen) is
-memory-constrained enough that the release build itself (`lto = "fat"` +
-`codegen-units = 1`) struggled to link, thrashing badly enough that SSH
-sessions timed out during the banner exchange. Configs and scripts are
-staged and ready (`configs/remote/`, `scripts/provision_remote.sh`,
-`scripts/run_remote_matrix.sh`); worth trying a non-LTO release profile
-for that specific build, or building elsewhere and shipping the binary
-over, next time.
+Completed July 2026 — see "VPS on-box results" above. The earlier failure
+mode (release link thrashing on 1.6GB) went away once the box had 2GB of
+swap; the full release profile (`lto = "fat"`, `codegen-units = 1`) now
+builds in ~2.5 minutes on the box.
 
 ## Reproducing
 
@@ -281,5 +334,8 @@ over, next time.
 cd benchmarks
 ./scripts/run_local_matrix.sh          # local, Docker bridge
 ./scripts/provision_remote.sh          # remote, one-time setup (VPS)
-./scripts/run_remote_matrix.sh         # remote, the actual run
+./scripts/run_remote_matrix.sh         # remote, wrk driven from your laptop
+./scripts/run_onbox_matrix.sh          # remote, everything on the VPS itself
+                                       # (the methodology used for the VPS
+                                       # results above — no network in the way)
 ```
