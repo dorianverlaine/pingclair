@@ -259,6 +259,9 @@ server "shop.example.com" {
 example.com {
     error_page 404 /srv/errors/404.html
 
+    @legacy path /legacy/*
+    redir @legacy https://example.com/new permanent
+
     handle /api/* {
         cors https://app.example.com {
             methods GET POST

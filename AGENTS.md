@@ -173,6 +173,24 @@ and have previously crashed the binary at startup.
 The H3 event pump must also run during maintenance, not only after packet
 receipt. A body drain can queue a `Finished` event without another packet.
 
+The listener intentionally uses raw Tokio UDP plus quiche because
+tokio-quiche's server accept path was not public when this implementation was
+built. Each HTTPS port owns one task and one lock-free connection map. Request
+tasks return response events through bounded channels; preserve that
+backpressure and never buffer complete bodies to simplify middleware.
+
+H3 certificates are published through an `ArcSwap` table. The refresh path
+uses `TlsManager::peek_pem`, which may read only certificates that already
+exist and must never trigger ACME issuance. Ports and the certificate-domain
+set are largely captured at startup, even though routes and certificate
+contents can be refreshed.
+
+Early data is enabled in quiche. Audit 0-RTT replay safety before adding
+non-idempotent behavior. Any H3 or TLS dependency change requires a Linux
+release build and quiche-client smoke coverage for SNI, Alt-Svc, streamed
+static/proxy bodies, POST bodies with and without Content-Length, 413, and
+upstream keepalive.
+
 ### Hot paths
 
 Performance is a correctness requirement:
