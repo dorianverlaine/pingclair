@@ -19,6 +19,131 @@
 
 ---
 
+## 🎯 v0.2.0 發布目標：可信的單機生產反向代理
+
+目前 workspace 版本是 `0.1.7`。下一個正式版本直接定為 `0.2.0`，定位不是
+「加入最多功能」，而是把 Pingclair 已公開的 HTTP reverse proxy、靜態服務、
+自動 TLS、H3、熱更新與 Caddy-like DSL 做成可重現、可觀測、可安全升級的
+**single-node production baseline**。
+
+以下是 release blocker；下方 P0／P1 保留更完整的實作細節。只有全部勾選，
+才可以改 workspace version、建立 `v0.2.0` tag。已在舊 commit 驗證過的能力，
+仍須使用同一個 release-candidate commit 重新跑乾淨 Linux 驗證。
+
+### R0：先讓測試結果可信
+
+- [ ] **整合測試隔離完成** — 全部真 binary 測試使用動態 port／唯一 readiness
+  token；child 與 process group 在成功、panic、timeout、Ctrl-C 後都會 reap，
+  連續跑 20 次不得殘留 listener 或幽靈 Pingclair。
+- [ ] **乾淨 Linux 驗證腳本完成** — 由指定 commit 建立暫存 checkout，建置 release
+  binary、啟動測試、收集 config/log/metrics/result，最後只清理自己建立的程序與目錄。
+- [ ] **協議安全回歸集完成** — H1/H2/H3 的 URI/header 正規化、hop-by-hop headers、
+  request smuggling、oversized headers、malformed input 與 body limit 都有負向測試。
+
+### R1：既有功能成為真正的 shipped behavior
+
+- [ ] **Caddy parity 第一波完成驗收** — `error_page`、CORS、IP/Referer/UA access
+  control、regex rewrite、LB weight/backup 與 `redir` 在同一 RC commit 上通過
+  H1/H2 真 binary 測試與乾淨 VPS smoke。
+- [ ] **安全與配置完成驗收** — Admin API auth、Basic Auth、ACME account
+  persistence、`tls`／`admin`／`basic_auth`／`redir` DSL、JSON round-trip 與 hot
+  reload 都通過成功／拒絕／錯誤配置案例；`0.1.7` 的有效配置保持相容。
+- [ ] **串流與壓縮完成驗收** — request/response 大 body、range、SSE、gzip/br/zstd、
+  可配置 `gzip_types`、client disconnect cancellation 均保持 bounded memory；
+  不得因 retry、middleware 或觀測功能重新引入全量 body buffering。
+
+### R2：補齊單機生產可靠性護欄
+
+- [ ] **可信 client identity** — `trusted_proxies` 與 PROXY protocol v1/v2 完成；
+  access control、rate limit、IP hash、forwarded headers 與 access log 使用同一個
+  經驗證 client IP，未受信 client 不可偽造代理鏈。
+- [ ] **安全 retry／redispatch** — 可配置 tries、總時限、backoff 與狀態碼；
+  v0.2 預設且只保證尚未送出 body 或可安全重放的冪等請求。非冪等 body replay
+  與 AI POST fallback 明確延後，不以隱式 buffering 假裝支援。
+- [ ] **Circuit breaker／overload protection** — route/upstream 的 connection、
+  in-flight request、pending queue 與連續失敗上限可配置；有 open/half-open
+  recovery、503/429、metrics，以及 hot reload 狀態轉換測試。
+- [ ] **上游 TLS／mTLS** — CA 驗證、SNI/Host、ALPN、client certificate、憑證
+  rotation 與錯誤診斷完成；預設驗證憑證，insecure 模式必須明確 opt-in。
+- [ ] **Basic Auth 雜湊憑據可用** — `hashed: true` 的 bcrypt 憑據真正完成校驗，
+  成功、失敗、錯誤 hash 與成本上限都有測試；文件不再引導使用明文密碼。
+- [ ] **健康檢查與 rate limit 可相信** — active/passive health 支援 Host、method、
+  headers、status/body、positive/negative threshold 與 slow start；單機 rate limit
+  的 GCRA/token-bucket、burst、key scope、`RateLimit-*`／`Retry-After` 語意正確。
+  Redis distributed limit 不列入 v0.2。
+- [ ] **資源邊界完整** — client header/body/idle、整體 request、upstream connect/
+  first-byte/between-reads timeout，以及 header bytes/count、connection、bandwidth
+  上限可配置；SSE/WebSocket 有獨立長連線策略。
+
+### R3：協議與 H3 不再是兩套產品
+
+- [ ] **H3 middleware parity** — Request ID、access control、rewrite、CORS、
+  `error_page`、redirect 與必要 pipeline 語意和 H1/H2 一致；抽出
+  transport-neutral policy，不把 Pingora `Session` 硬塞進 quiche 路徑。
+- [ ] **協議矩陣通過** — WebSocket upgrade、gRPC/h2c＋trailers、SSE、
+  `Expect: 100-continue`、HTTP trailers、103 Early Hints 與 downstream cancellation
+  在支援的 H1/H2/H3 組合有明確測試；不支援的組合必須 fail clearly 並寫入文件。
+- [ ] **H3 Linux release smoke 通過** — SNI、Alt-Svc、靜態/代理大 body、
+  Content-Length/chunked POST、413、keepalive、middleware parity 與 0-RTT
+  非冪等拒絕策略均使用 quiche client 驗證。
+
+### R4：操作與可觀測性達到可值班程度
+
+- [ ] **Access log 真正由配置驅動** — text/JSON、stdout/stderr/file、rotation、
+  request ID、verified client IP、route/upstream、tries、TTFB/duration、status/bytes
+  完整；Authorization、Cookie、API key 與其他 secret 預設 redaction。
+- [ ] **Metrics 與健康端點完整** — `/live`、`/ready`、config version、route/status、
+  upstream latency/error、retry、circuit/queue、pool、TLS 與 H3 指標可用；所有
+  label 有 cardinality 上限。
+- [ ] **Reload／shutdown 可操作** — 配置更新原子套用，錯誤配置保留
+  last-known-good；SIGHUP、SIGTERM、systemd restart 與 upstream drain 有真 binary
+  測試。v0.2 可明示 listener topology 變更需要 restart，不假裝已經 zero-downtime。
+
+### R5：發布閘門
+
+- [ ] **品質閘門全綠** — Linux/macOS 的 `cargo build --workspace`、
+  `cargo test --workspace`、`cargo fmt --all --check`、clippy `-D warnings` 通過；
+  dependency audit 沒有未處理的 high/critical advisory，例外需有書面風險接受。
+- [ ] **RC soak／chaos 通過** — 同一 release binary 至少 1 小時混合 static、
+  proxy、SSE、reload、backend failure/recovery 與 TLS/H3 流量；零 crash、零卡死、
+  零幽靈程序、無單調 RSS 成長，結果保存在 `benchmarks/results/`。
+- [ ] **效能沒有不可解釋回退** — 同一 VPS／同一 harness 的 static plain/gzip、
+  reverse proxy 與 20MB streaming 對比 2026-07-25 baseline；吞吐或 p99 回退超過
+  10% 必須修復或在 release notes 以數據解釋，streaming RSS 必須維持 bounded。
+- [ ] **發布產物可驗證** — Linux x86_64/aarch64、macOS x86_64/arm64 binary，
+  GHCR image、SHA-256 checksums、SBOM 與 provenance/signature 自動產生；每個 binary
+  的 `pingclair --version` 必須等於 tag。
+- [ ] **安裝與升級 smoke 通過** — 全新安裝、`0.1.7 → 0.2.0` 升級、systemd
+  start/reload/stop、uninstall、Docker 啟動及最小 Pingclairfile 都在乾淨環境驗證。
+- [ ] **發布文件完成** — `CHANGELOG.md`、三語 README、所有 examples、配置參考、
+  安全限制、H3 支援矩陣、已知問題與 migration notes 同步；所有範例可由
+  `pingclair validate` 驗證。
+- [ ] **最後發布動作** — 只在上述項目全綠後將 workspace version 改為 `0.2.0`，
+  建立帶 emoji 的 release commit、signed `v0.2.0` tag，確認 GitHub Release／GHCR
+  完成後再把本目標移入完成區。
+
+### v0.2 明確不做
+
+以下不是 v0.2 blocker，保留在 P2/P3 或排入 v0.3+：
+
+- AI Gateway、provider translation、token/cost quota、semantic routing/cache、MCP。
+- `proxy_cache`、DNS/Kubernetes discovery、reload-free dynamic backend control plane。
+- L4 TCP/TLS passthrough、通用 UDP、Gateway API/xDS、正式 plugin runtime。
+- Redis distributed rate limit、非冪等 request body retry、traffic mirror/canary。
+- OpenTelemetry/OpenInference、Web UI、ACME DNS-01、ECH、zero-downtime listener handoff。
+
+### 建議執行順序
+
+1. R0 測試隔離與乾淨遠端腳本。
+2. R1 把已實作項目在同一 RC 基線上驗完，先清掉「有程式碼但未驗證」。
+3. R2 trusted proxies／timeouts／bcrypt，再做 retry、circuit、TLS、health/rate
+   limit。
+4. R3 先建立協議矩陣，再逐步做 H3 transport-neutral parity。
+5. R4 logs／metrics／readiness／reload 操作面。
+6. R5 soak、效能回歸、release workflow、文件、版本與 tag。
+
+---
+
 ## ✅ 完成：已通過遠端伺服器驗證
 
 ### 2026-07-25 VPS 生產情境測試
@@ -78,9 +203,9 @@
 
 ### 2026-07-26 Caddy parity 第一波
 
-目前 commit：`dd1ed57`。`cargo build --workspace`、`cargo test --workspace`
-與 7 項真 binary 整合測試均在本機通過，但下列項目尚未在乾淨 Linux/VPS
-上跑過：
+第一波功能基線為 `dd1ed57`，`redir` DSL 與 H3 護欄追加於 `b624b0c`。
+`cargo build --workspace`、`cargo test --workspace` 與 7 項真 binary 整合測試
+均在本機通過，但下列項目尚未在乾淨 Linux/VPS 上跑過：
 
 - [x] **`error_page`** — 多狀態碼共用頁；靜態 404 與上游 500/502 使用自訂頁，
   檔案讀取失敗時回退內建文字頁。
@@ -296,8 +421,8 @@
   BoringSSL／rustls 分工。
 - [ ] **ACME `from_credentials` staging 實測**。
 - [ ] **musl 靜態二進位**。
-- [ ] **macOS x86_64／arm64 release artifact**。
-- [ ] **官方 Docker image 發佈** — tag 時推 GHCR／Docker Hub。
+- [ ] **v0.2 R5：macOS x86_64／arm64 release artifact**。
+- [ ] **v0.2 R5：官方 Docker image 發佈** — tag 時至少推 GHCR；Docker Hub 可延後。
 - [ ] **免 root 安裝路徑** — `/usr/local/bin` 或 `~/.local/bin`，不依賴 systemd。
 
 ---
