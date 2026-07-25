@@ -1,0 +1,9 @@
+   Compiling pingclair-tls v0.1.7 (/root/pingclair-v02-production-57e10f9/repo/pingclair-tls)
+   Compiling pingclair-core v0.1.7 (/root/pingclair-v02-production-57e10f9/repo/pingclair-core)
+   Compiling pingclair-static v0.1.7 (/root/pingclair-v02-production-57e10f9/repo/pingclair-static)
+   Compiling pingclair-proxy v0.1.7 (/root/pingclair-v02-production-57e10f9/repo/pingclair-proxy)
+   Compiling pingclair-api v0.1.7 (/root/pingclair-v02-production-57e10f9/repo/pingclair-api)
+   Compiling pingclair-config v0.1.7 (/root/pingclair-v02-production-57e10f9/repo/pingclair-config)
+   Compiling pingclair-plugin v0.1.7 (/root/pingclair-v02-production-57e10f9/repo/pingclair-plugin)
+   Compiling pingclair v0.1.7 (/root/pingclair-v02-production-57e10f9/repo/pingclair)
+    Finished `release` profile [optimized] target(s) in 2m 34s
