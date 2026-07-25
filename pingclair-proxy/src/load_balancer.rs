@@ -16,7 +16,23 @@ use pingora_load_balancing::LoadBalancer as NativeLoadBalancer;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// MARK: - Types
+
+/// How long a backend that failed to connect stays out of rotation before
+/// it becomes selectable again (nginx `fail_timeout` semantics). The first
+/// selection after the cooldown acts as the half-open probe: if it fails
+/// too, the backend is marked down for another cooldown.
+pub const FAIL_COOLDOWN: Duration = Duration::from_secs(10);
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 // MARK: - Types
 
@@ -34,6 +50,59 @@ pub enum Strategy {
     IpHash,
 }
 
+// MARK: - Passive Backend Health
+
+/// Passive (in-band) health marks, nginx `max_fails`/`fail_timeout` style.
+///
+/// When a connection to a backend fails, `ProxyHttp::fail_to_connect` calls
+/// [`BackendHealth::mark_down`], which records the instant until which the
+/// backend is considered down. `select` skips down backends; once the
+/// cooldown expires the backend automatically becomes selectable again, so
+/// no background re-enable task is needed — the next request through is the
+/// half-open probe. Values are unix milliseconds; 0 means healthy.
+struct BackendHealth {
+    down_until: HashMap<SocketAddr, Arc<AtomicU64>>,
+}
+
+impl BackendHealth {
+    fn new(addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
+        let down_until = addrs
+            .into_iter()
+            .map(|addr| (addr, Arc::new(AtomicU64::new(0))))
+            .collect();
+        Self { down_until }
+    }
+
+    /// Mark a backend down for `cooldown`. `fetch_max` so a later failure
+    /// can only extend, never shorten, an ongoing cooldown.
+    fn mark_down_for(&self, addr: &SocketAddr, cooldown: Duration) {
+        if let Some(slot) = self.down_until.get(addr) {
+            let until = now_millis() + cooldown.as_millis() as u64;
+            slot.fetch_max(until, Ordering::Relaxed);
+        }
+    }
+
+    fn mark_down(&self, addr: &SocketAddr) {
+        self.mark_down_for(addr, FAIL_COOLDOWN);
+    }
+
+    /// A backend is up when its down-until mark is absent or in the past.
+    fn is_up(&self, addr: &SocketAddr) -> bool {
+        match self.down_until.get(addr) {
+            Some(slot) => slot.load(Ordering::Relaxed) <= now_millis(),
+            None => true,
+        }
+    }
+
+    fn is_up_backend(&self, backend: &Upstream) -> bool {
+        match &backend.addr {
+            pingora_core::protocols::l4::socket::SocketAddr::Inet(inet) => self.is_up(inet),
+            // Unix-socket backends: no passive marking, always selectable.
+            _ => true,
+        }
+    }
+}
+
 // MARK: - Least Connection Tracker
 
 /// Tracks active-connection counts per upstream address for LeastConn strategy.
@@ -48,10 +117,12 @@ struct LeastConnTracker {
     counters: Vec<(SocketAddr, Arc<AtomicUsize>)>,
     /// The raw upstream list for returning the selected `Upstream` value.
     upstreams: Vec<Upstream>,
+    /// Passive health marks — down backends are skipped by `select`.
+    health: Arc<BackendHealth>,
 }
 
 impl LeastConnTracker {
-    fn new(upstreams: Vec<Upstream>) -> Self {
+    fn new(upstreams: Vec<Upstream>, health: Arc<BackendHealth>) -> Self {
         let counters = upstreams
             .iter()
             .filter_map(|u| {
@@ -62,20 +133,20 @@ impl LeastConnTracker {
                 }
             })
             .collect();
-        Self { counters, upstreams }
+        Self { counters, upstreams, health }
     }
 
-    /// Select the upstream with the fewest active connections.
+    /// Select the upstream with the fewest active connections among the
+    /// backends that are not currently marked down. Returns `None` when all
+    /// backends are down (the caller then answers 502, nginx-style).
     fn select(&self) -> Option<(Upstream, Arc<AtomicUsize>)> {
-        if self.counters.is_empty() {
-            return None;
-        }
         // ⚡ OPTIMIZATION: Linear scan is acceptable — backend counts are typically
         // in the tens, making a full sort unnecessary overhead.
         let (min_idx, _) = self
             .counters
             .iter()
             .enumerate()
+            .filter(|(_, (addr, _))| self.health.is_up(addr))
             .min_by_key(|(_, (_, ctr))| ctr.load(Ordering::Relaxed))?;
 
         let upstream = self.upstreams.get(min_idx)?.clone();
@@ -83,22 +154,6 @@ impl LeastConnTracker {
         // Increment before returning — decremented by the caller via release()
         counter.fetch_add(1, Ordering::Relaxed);
         Some((upstream, counter))
-    }
-}
-
-// MARK: - Active Connection Guard
-
-/// RAII guard that automatically releases an active-connection slot when dropped.
-///
-/// Callers receive this alongside the selected `Upstream`. It is intentionally
-/// dropped at end of request scope to keep counters accurate.
-pub struct ConnGuard(Arc<AtomicUsize>);
-
-impl Drop for ConnGuard {
-    fn drop(&mut self) {
-        // 🛑 SAFETY: Never underflow — we only create a guard after a successful
-        // fetch_add, so there is always at least 1 to subtract.
-        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -119,6 +174,12 @@ pub struct LoadBalancer {
     native_ketama: Option<Arc<NativeLoadBalancer<KetamaHashing>>>,
     /// Least-connection tracker (LeastConn only).
     least_conn: Option<Arc<LeastConnTracker>>,
+    /// Passive health marks shared by every strategy: `fail_to_connect`
+    /// marks a backend down here and `select` skips it until the cooldown
+    /// expires. Implemented outside the native LB so it works uniformly
+    /// for the native (RoundRobin/Random/IpHash) and custom (LeastConn)
+    /// selection paths.
+    health: Arc<BackendHealth>,
 }
 
 // MARK: - Implementation
@@ -131,14 +192,22 @@ impl LoadBalancer {
     ///   - strategy: The selection strategy to use.
     /// - Returns: A configured `LoadBalancer` instance.
     pub fn new(upstreams: Vec<Upstream>, strategy: Strategy) -> Self {
+        let health = Arc::new(BackendHealth::new(upstreams.iter().filter_map(|u| {
+            if let pingora_core::protocols::l4::socket::SocketAddr::Inet(inet) = &u.addr {
+                Some(*inet)
+            } else {
+                None
+            }
+        })));
         match strategy {
             Strategy::LeastConn => {
-                let tracker = Arc::new(LeastConnTracker::new(upstreams));
+                let tracker = Arc::new(LeastConnTracker::new(upstreams, health.clone()));
                 Self {
                     strategy,
                     native_rr: None,
                     native_ketama: None,
                     least_conn: Some(tracker),
+                    health,
                 }
             }
             Strategy::IpHash => {
@@ -150,6 +219,7 @@ impl LoadBalancer {
                     native_rr: None,
                     native_ketama: Some(Arc::new(native)),
                     least_conn: None,
+                    health,
                 }
             }
             // RoundRobin and Random share the same Pingora RoundRobin backend;
@@ -164,9 +234,17 @@ impl LoadBalancer {
                     native_rr: Some(Arc::new(native)),
                     native_ketama: None,
                     least_conn: None,
+                    health,
                 }
             }
         }
+    }
+
+    /// Mark a backend as down (passive health check). Called from
+    /// `ProxyHttp::fail_to_connect` when a connection attempt to the
+    /// backend fails; `select` then skips it for [`FAIL_COOLDOWN`].
+    pub fn mark_unhealthy(&self, addr: &SocketAddr) {
+        self.health.mark_down(addr);
     }
 
     /// Configures the health checker for this load balancer.
@@ -180,8 +258,10 @@ impl LoadBalancer {
                 tracing::warn!("⚠️ Failed to set health check: LoadBalancer already shared");
             }
         }
-        // Note: LeastConn health checking is not yet integrated — upstreams are
-        // always assumed healthy. This is a known P3 follow-up item.
+        // Note: LeastConn active health checking is not integrated — the
+        // native background health-check service only drives `native_rr`.
+        // LeastConn (and every other strategy) is still covered by the
+        // passive fail_to_connect marking in `select`.
     }
 
     /// Sets the frequency of health checks.
@@ -206,9 +286,8 @@ impl LoadBalancer {
         match self.strategy {
             Strategy::LeastConn => {
                 // ⚡ LeastConn: pick minimum active-connection upstream.
-                // The ConnGuard is intentionally dropped here — for the simple
+                // The counter slot is released immediately — for the simple
                 // select() API we count a "selection" as one request unit.
-                // Callers that need precise tracking can use select_with_guard().
                 let tracker = self.least_conn.as_ref()?;
                 let (upstream, _guard) = tracker.select()?;
                 Some(upstream)
@@ -216,11 +295,13 @@ impl LoadBalancer {
             Strategy::IpHash => {
                 let native = self.native_ketama.as_ref()?;
                 let hash_key = key.unwrap_or(b"");
-                native.select(hash_key, 256)
+                // select_with keeps Pingora's own health verdict (`ready`,
+                // used by active health checks) and adds our passive marks.
+                native.select_with(hash_key, 256, |b, ready| ready && self.health.is_up_backend(b))
             }
             Strategy::RoundRobin | Strategy::Random => {
                 let native = self.native_rr.as_ref()?;
-                native.select(b"", 256)
+                native.select_with(b"", 256, |b, ready| ready && self.health.is_up_backend(b))
             }
         }
     }
@@ -268,5 +349,83 @@ mod tests {
         } else {
             panic!("Expected LeastConn tracker");
         }
+    }
+
+    // ---- Passive health marking (fail_to_connect failover) ----
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn unhealthy_backend_is_skipped_round_robin() {
+        let u1 = Upstream::new("127.0.0.1:8001").unwrap();
+        let u2 = Upstream::new("127.0.0.1:8002").unwrap();
+        let lb = LoadBalancer::new(vec![u1, u2], Strategy::RoundRobin);
+
+        lb.mark_unhealthy(&addr("127.0.0.1:8001"));
+        for _ in 0..4 {
+            assert_eq!(lb.select(None).unwrap().addr.to_string(), "127.0.0.1:8002");
+        }
+    }
+
+    #[test]
+    fn unhealthy_backend_is_skipped_least_conn() {
+        let u1 = Upstream::new("127.0.0.1:9001").unwrap();
+        let u2 = Upstream::new("127.0.0.1:9002").unwrap();
+        let lb = LoadBalancer::new(vec![u1, u2], Strategy::LeastConn);
+
+        lb.mark_unhealthy(&addr("127.0.0.1:9001"));
+        for _ in 0..4 {
+            assert_eq!(lb.select(None).unwrap().addr.to_string(), "127.0.0.1:9002");
+        }
+    }
+
+    #[test]
+    fn unhealthy_backend_is_skipped_ip_hash() {
+        let u1 = Upstream::new("127.0.0.1:8101").unwrap();
+        let u2 = Upstream::new("127.0.0.1:8102").unwrap();
+        let lb = LoadBalancer::new(vec![u1, u2], Strategy::IpHash);
+
+        // Find a key that would normally land on 8101, then mark 8101 down:
+        // the same key must be rerouted to the surviving backend.
+        let key = b"client-a";
+        let first = lb.select(Some(key)).unwrap();
+        lb.mark_unhealthy(&addr(&first.addr.to_string()));
+        let after = lb.select(Some(key)).unwrap();
+        assert_ne!(after.addr.to_string(), first.addr.to_string());
+    }
+
+    #[test]
+    fn backend_recovers_after_cooldown() {
+        let u1 = Upstream::new("127.0.0.1:8001").unwrap();
+        let u2 = Upstream::new("127.0.0.1:8002").unwrap();
+        let lb = LoadBalancer::new(vec![u1, u2], Strategy::RoundRobin);
+
+        // Mark down with a short cooldown (tests can't wait out FAIL_COOLDOWN).
+        lb.health.mark_down_for(&addr("127.0.0.1:8001"), Duration::from_millis(50));
+        assert_eq!(lb.select(None).unwrap().addr.to_string(), "127.0.0.1:8002");
+
+        std::thread::sleep(Duration::from_millis(60));
+        // Cooldown expired: 8001 is selectable again (half-open probe).
+        let mut saw_8001 = false;
+        for _ in 0..4 {
+            if lb.select(None).unwrap().addr.to_string() == "127.0.0.1:8001" {
+                saw_8001 = true;
+                break;
+            }
+        }
+        assert!(saw_8001, "backend must rejoin rotation after the cooldown");
+    }
+
+    #[test]
+    fn all_backends_down_returns_none() {
+        let u1 = Upstream::new("127.0.0.1:8001").unwrap();
+        let u2 = Upstream::new("127.0.0.1:8002").unwrap();
+        let lb = LoadBalancer::new(vec![u1, u2], Strategy::RoundRobin);
+
+        lb.mark_unhealthy(&addr("127.0.0.1:8001"));
+        lb.mark_unhealthy(&addr("127.0.0.1:8002"));
+        assert!(lb.select(None).is_none(), "all down → None (caller answers 502)");
     }
 }
