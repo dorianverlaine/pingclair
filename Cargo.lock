@@ -2233,6 +2233,7 @@ name = "pingclair-core"
 version = "0.1.7"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "criterion",
  "http 1.4.2",

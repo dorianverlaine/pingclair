@@ -39,7 +39,7 @@ use pingora_http::RequestHeader;
 use quiche::h3::NameValue;
 
 use crate::connection_filter::PingclairConnectionFilter;
-use crate::server::{append_forwarded_for, resolve_caddy_placeholders, PingclairProxy};
+use crate::server::{append_forwarded_for, find_basic_auth_config, resolve_caddy_placeholders, PingclairProxy};
 
 /// Maximum UDP payload we ask quiche to send (standard Ethernet MTU-safe).
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -1147,6 +1147,22 @@ async fn handle_request_inner(
                 ));
             }
             send_headers(resp_tx, cid, stream_id, headers, true).await;
+            return Ok(());
+        }
+    }
+
+    // Basic auth gate, same semantics as the H1/H2 `handle_config` arm: a
+    // BasicAuth config anywhere in the handler tree must pass before the
+    // request is dispatched.
+    if let Some((realm, credentials)) = find_basic_auth_config(&handler) {
+        if !pingclair_core::server::verify_basic_auth(&header.headers, credentials) {
+            let challenge = pingclair_core::server::basic_auth_challenge(realm);
+            let hdrs = vec![
+                quiche::h3::Header::new(b":status", b"401"),
+                quiche::h3::Header::new(b"www-authenticate", challenge.as_bytes()),
+                quiche::h3::Header::new(b"server", b"Pingclair"),
+            ];
+            send_headers(resp_tx, cid, stream_id, hdrs, true).await;
             return Ok(());
         }
     }

@@ -26,6 +26,7 @@ http.workspace = true
 
 # Router
 regex = "1"
+base64 = "0.22"  # Decoding Basic auth credentials
 matchit = "0.8"  # Radix tree router
 pingclair-tls = { version = "0.1.0", path = "../pingclair-tls" }
 

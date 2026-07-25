@@ -15,19 +15,30 @@ use parking_lot::RwLock;
 
 use pingclair_core::config::ServerConfig;
 
+use crate::auth::{authorize, ApiKeyAuth, AuthDecision};
+
 
 /// Run the admin server
 pub async fn run_admin_server(
     addr: SocketAddr,
     proxies: Arc<RwLock<std::collections::HashMap<String, pingclair_proxy::server::PingclairProxy>>>,
+    api_key: Option<String>,
 ) -> pingclair_core::Result<()> {
     let listener = TcpListener::bind(addr).await
         .map_err(|e| pingclair_core::Error::Server(format!("Failed to bind admin API: {}", e)))?;
-    
+
+    let auth = api_key.map(|key| Arc::new(ApiKeyAuth::new(key)));
+    if auth.is_none() {
+        tracing::warn!(
+            "⚠️  Admin API is running WITHOUT authentication: no `api_key` configured. \
+             Only loopback clients are allowed; set `admin.api_key` to enable remote access."
+        );
+    }
+
     tracing::info!("🔧 Admin API listening on http://{}", addr);
-    
+
     loop {
-        let (stream, _) = match listener.accept().await {
+        let (stream, peer_addr) = match listener.accept().await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("Admin accept error: {}", e);
@@ -37,10 +48,13 @@ pub async fn run_admin_server(
 
         let io = TokioIo::new(stream);
         let proxies = proxies.clone();
+        let auth = auth.clone();
 
         tokio::task::spawn(async move {
             if let Err(err) = http1::Builder::new()
-                .serve_connection(io, service_fn(move |req| handle_request(req, proxies.clone())))
+                .serve_connection(io, service_fn(move |req| {
+                    handle_request(req, proxies.clone(), auth.clone(), peer_addr)
+                }))
                 .await
             {
                 tracing::error!("Error serving connection: {:?}", err);
@@ -52,7 +66,24 @@ pub async fn run_admin_server(
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
     proxies: Arc<RwLock<std::collections::HashMap<String, pingclair_proxy::server::PingclairProxy>>>,
+    auth: Option<Arc<ApiKeyAuth>>,
+    peer_addr: SocketAddr,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    let authorization = req
+        .headers()
+        .get(hyper::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    match authorize(auth.as_deref(), authorization, peer_addr.ip()) {
+        AuthDecision::Allowed => {},
+        AuthDecision::Unauthorized => {
+            return Ok(response(StatusCode::UNAUTHORIZED, r#"{"error":"unauthorized"}"#));
+        },
+        AuthDecision::Forbidden => {
+            return Ok(response(StatusCode::FORBIDDEN, r#"{"error":"forbidden"}"#));
+        },
+    }
+
     match (req.method(), req.uri().path()) {
         (&Method::GET, "/health") => {
             Ok(Response::new(Full::new(Bytes::from(r#"{"status":"healthy"}"#))))

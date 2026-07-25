@@ -60,6 +60,11 @@ impl CertStore {
         }
     }
     
+    /// Returns the root directory backing this store.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    
     /// Resolves the default system path for certificate storage.
     /// Typically `~/.local/share/pingclair/certs` on Linux/macOS.
     pub fn default_path() -> PathBuf {

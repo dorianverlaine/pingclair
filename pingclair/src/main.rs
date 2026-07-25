@@ -821,13 +821,14 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
     if let Some(admin_config) = config.admin {
             if admin_config.enabled {
                 let listen = admin_config.listen.clone();
+                let api_key = admin_config.api_key.clone();
                 let proxies = port_proxies.clone();
                 
                 std::thread::spawn(move || {
                     let rt = tokio::runtime::Runtime::new().expect("Failed to create admin runtime");
                     rt.block_on(async {
                         let addr = listen.parse().expect("Invalid admin listen address");
-                        if let Err(e) = pingclair_api::run_admin_server(addr, proxies).await {
+                        if let Err(e) = pingclair_api::run_admin_server(addr, proxies, api_key).await {
                             tracing::error!("Admin server error: {}", e);
                         }
                     });
