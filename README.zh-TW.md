@@ -29,7 +29,7 @@
 *   🚀 **以 Pingora 為核心** — 站在巨人的肩膀上，倚靠 Cloudflare 歷經實戰驗證的基礎設施，提供企業級的穩定度與吞吐量。
 *   🔒 **記憶體安全** — 受惠於 Rust 的語言特性，徹底杜絕緩衝區溢位這類常見的記憶體安全漏洞。
 *   📝 **相容 Caddyfile 的設定** — 極簡的設定 DSL，支援**自動 HTTPS**、**多重監聽器**與**具名匹配器**，相容主流 Caddyfile 語法。
-*   ⚡ **原生支援 HTTP/3 (QUIC)** — 擁抱新一代網路協定，在不穩定的網路環境下提供更低的延遲與更好的連線遷移能力。
+*   ⚡ **原生支援 HTTP/3 (QUIC)** — 基於 Cloudflare 的 [quiche](https://github.com/cloudflare/quiche)（支撐 Cloudflare 邊緣網路的生產級 QUIC 協定棧）打造，在不穩定的網路環境下提供更低的延遲與更好的連線遷移能力。
 *   🔄 **智慧負載平衡** — 內建多種演算法（輪詢、最少連線等），支援健康檢查與故障自動轉移。
 *   🔐 **全自動 HTTPS** — 整合 ACME 協定（如 Let's Encrypt），自動申請與續期 SSL/TLS 憑證，零設定即可啟用加密傳輸。
 *   📁 **高效能靜態檔案服務** — 支援 Gzip/Brotli 壓縮、Range 請求與高效率的檔案傳輸。
@@ -260,9 +260,9 @@ Pingclair 採用模組化的 Cargo Workspace 結構管理程式碼：
 | **`pingclair`** | **CLI 進入點**。負責解析命令列參數、初始化日誌，並引導系統啟動。 |
 | **`pingclair-core`** | **核心執行期**。定義核心資料結構、Trait 與伺服器生命週期管理。 |
 | **`pingclair-config`** | **設定編譯器**。負責解析 `Pingclairfile`，進行詞法分析、語法分析與語意檢查，產生執行期設定物件。 |
-| **`pingclair-proxy`** | **代理實作**。基於 Pingora Proxy Trait 實作的 HTTP／TCP 代理邏輯，包含負載平衡器。 |
+| **`pingclair-proxy`** | **代理實作**。基於 Pingora Proxy Trait 實作的 HTTP／TCP 代理邏輯，包含負載平衡器，以及基於 Cloudflare quiche 打造的 HTTP/3（QUIC）監聽器。 |
 | **`pingclair-static`** | **靜態檔案服務**。實作高效率的檔案讀取、MIME 類型推斷與串流傳輸。 |
-| **`pingclair-tls`** | **TLS 管理**。處理憑證載入、ACME 自動申請（Let's Encrypt）以及 QUIC 交握邏輯。 |
+| **`pingclair-tls`** | **TLS 管理**。處理憑證載入與 ACME 自動申請（Let's Encrypt）。 |
 | **`pingclair-api`** | **Admin API**。提供 RESTful 介面，可在執行期動態檢視狀態或熱更新設定。 |
 | **`pingclair-plugin`** | **外掛系統**。定義外掛介面，讓第三方開發者得以擴充功能。 |
 
