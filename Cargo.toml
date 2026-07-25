@@ -17,7 +17,7 @@ edition = "2024"
 authors = ["Dorian Verlaine <dorianverlaine@icloud.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/dorianverlaine/pingclair"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 # Pingora 核心
@@ -43,14 +43,15 @@ logos = "0.16"
 ariadne = "0.6"      # 错误报告
 
 # TLS/证书
-rustls = "0.23"
+rustls = { version = "0.23", features = ["ring"] }
 rcgen = "0.14"
 x509-parser = "0.18"
 
-# HTTP/3 (QUIC)
-quinn = "0.11"
-h3 = "0.0.8"
-h3-quinn = "0.0.10"
+# HTTP/3 (QUIC) — Cloudflare quiche on BoringSSL
+# (tokio-quiche was evaluated and rejected: its server-side accept API is
+# pub(crate); the raw quiche event loop is implemented in pingclair-proxy.)
+quiche = "0.29"
+boring = "4.22"   # must stay on the same release quiche 0.29 links against
 
 # HTTP
 http = "1"

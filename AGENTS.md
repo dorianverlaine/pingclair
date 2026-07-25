@@ -14,7 +14,7 @@ gzip/Brotli compression, load balancing, Prometheus metrics, and an admin
 REST API for runtime inspection and hot-reload.
 
 - Workspace version: `0.1.6` (see `[workspace.package]` in the root `Cargo.toml`)
-- Rust edition 2024, minimum toolchain **Rust 1.85**
+- Rust edition 2024, minimum toolchain **Rust 1.88** (quiche requires it)
 - License: Apache-2.0
 - Repository: https://github.com/dorianverlaine/pingclair
 
@@ -24,10 +24,10 @@ Cargo workspace with 8 member crates (all declared in the root `Cargo.toml`):
 
 | Crate | Role |
 |-------|------|
-| `pingclair` | CLI binary (`pingclair`, `[[bin]]` in `pingclair/Cargo.toml`). Entry point `pingclair/src/main.rs`. Wires all other crates together; also contains the OpenSSL SNI certificate resolver with caching. |
+| `pingclair` | CLI binary (`pingclair`, `[[bin]]` in `pingclair/Cargo.toml`). Entry point `pingclair/src/main.rs`. Wires all other crates together; also contains the BoringSSL SNI certificate resolver with caching. |
 | `pingclair-core` | Core runtime: config types (`src/config/`), error types (`src/error.rs`), HTTP server + router + handlers + redirects (`src/server/`). Other crates depend on this for shared types. |
 | `pingclair-config` | Configuration compiler for the Pingclairfile DSL: lexer (logos), parser, AST, semantic analysis, variables (`src/parser/`), compilation to `PingclairConfig` (`src/compiler.rs`), and format adapters (`src/adapter/`, incl. a Caddyfile adapter and JSON passthrough). Public entry points: `compile()`, `compile_file()`, `compile_multiple_files()`, `compile_directory()`. |
-| `pingclair-proxy` | Reverse-proxy implementation on Pingora's proxy trait: load balancer, health checks, upstreams, rate limiting, connection filter, QUIC/HTTP/3 listener, Prometheus metrics. |
+| `pingclair-proxy` | Reverse-proxy implementation on Pingora's proxy trait: load balancer, health checks, upstreams, rate limiting, connection filter, HTTP/3 listener, Prometheus metrics. |
 | `pingclair-static` | Static file serving: file server with range requests, compression (with a byte-bounded LRU cache of compressed bodies keyed on `(path, mtime, encoding)`), MIME inference. |
 | `pingclair-tls` | TLS management: certificate store, ACME issuance/renewal, auto-HTTPS redirect logic, persistent ACME challenge handler. |
 | `pingclair-api` | Admin REST API (`run_admin_server`): auth, routes, handlers for state inspection and config hot-reload. |
@@ -53,9 +53,10 @@ Other top-level directories:
 
 ## Build and test commands
 
-Prerequisites on Linux: `cmake pkg-config libssl-dev` (Pingora/OpenSSL need
-them; see `.github/workflows/rust.yml`). On macOS these generally come from
-the system/Homebrew.
+Prerequisites on Linux: `cmake pkg-config` and a C++ toolchain (BoringSSL is
+built from source via the `boring-sys` crate; see `.github/workflows/rust.yml`,
+which also installs the now-unneeded `libssl-dev`). On macOS these generally
+come from the system/Homebrew.
 
 ```bash
 cargo build --workspace           # debug build
@@ -92,6 +93,59 @@ pingclair service start|stop|restart|reload|status       # manage systemd unit (
 Config file formats: `Pingclairfile` (DSL), `*.pingclair`, `*.json`, or a
 directory containing any mix (merged in sorted order). JSON files are
 deserialized directly into `PingclairConfig` (used by the integration tests).
+
+## HTTP/3 (QUIC) stack
+
+HTTP/3 is built on **quiche 0.29** (Cloudflare's QUIC implementation, on
+BoringSSL via the `boring` crate) — the earlier quinn + h3 stack was
+removed, and tokio-quiche was evaluated and rejected because its
+server-side accept API is `pub(crate)` (only the client API is public).
+
+`pingclair-proxy/src/quic.rs` runs one UDP socket + one tokio task per
+HTTPS listen port, single-threading a `HashMap<ConnectionId, ConnState>`
+(no locks on the QUIC path). Key design points:
+
+- **SNI multi-certificate**: BoringSSL's `select_certificate_callback`
+  resolves against a `CertTable` (an `ArcSwap`-published map) fed from
+  `TlsManager::peek_pem` — manual certs plus already-issued ACME certs.
+  `peek_pem` never triggers issuance; issuance stays on the lazy H1
+  handshake path. A background task in `main.rs` refreshes the table
+  every 60s so renewals reach new handshakes without a restart.
+- **Request handling** reuses `PingclairProxy::match_route` (same entry
+  point as H1/H2). Each request runs in a tokio task; response bytes flow
+  back to the event loop over a channel and are written through quiche
+  with real flow control — static files (`serve_auto` Stream branch) and
+  upstream responses are streamed in chunks, never buffered whole.
+  **The h3 event pump must run from the maintenance pass too, not only on
+  packet receipt**: `recv_body` queues the `Finished` event internally once
+  the last body bytes are consumed, so a backpressure-deferred drain can
+  produce events without any new packet arriving — polling only on packet
+  receipt deadlocks large request bodies.
+- **Reverse proxying** goes through Pingora's `Connector` (same keepalive
+  pool, HTTPS-upstream support, and route timeouts as H1/H2). The request
+  body is streamed: headers are sent upstream first, body chunks are
+  forwarded as they arrive, bounded by a small channel with QUIC flow
+  control as backpressure. HTTP/3 carries no framing headers, but the
+  HTTP/1 upstream body writer derives its mode from the forwarded headers,
+  so the client's `content-length` is forwarded (and verified against the
+  streamed byte count) or `Transfer-Encoding: chunked` is synthesized for
+  body-capable methods without one.
+- **Alt-Svc** advertisement is a Pingora downstream module
+  (`pingclair-proxy/src/alt_svc.rs`) registered in
+  `init_downstream_modules`, so it covers locally generated responses as
+  well as proxied ones. It is only armed on HTTPS listeners where HTTP/3
+  is enabled (`PingclairProxy::set_alt_svc`).
+- **Switch**: `global.http3` (JSON config, serde default `true`) gates
+  whether HTTPS ports start QUIC listeners. The Pingclairfile DSL has no
+  directive for it yet.
+- **Single TLS stack**: the whole workspace uses BoringSSL (Pingora via its
+  `boringssl` feature on the `pingora` crate, quiche via the `boring` crate —
+  both unify on the same `boring` 4.x build). This is load-bearing: an
+  OpenSSL stack statically linked next to quiche's BoringSSL collides on
+  libcrypto symbol names (`X509_STORE_free`, `OBJ_nid2sn`, …) and the binary
+  SIGBUSed at startup. Do not reintroduce Pingora's `openssl` feature; note
+  that `pingora-openssl` force-enables `openssl/vendored`. rustls (ACME) is
+  unaffected — it has no C symbols.
 
 ## Code style guidelines
 

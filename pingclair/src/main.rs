@@ -11,38 +11,38 @@ use pingora_core::listeners::tls::TlsSettings;
 use pingora_core::listeners::TlsAccept;
 use pingora_core::protocols::tls::TlsRef;
 use pingclair_tls::manager::TlsManager;
-use openssl::ssl::NameType;
-use openssl::x509::X509;
-use openssl::pkey::{PKey, Private};
+use boring::ssl::NameType;
+use boring::x509::X509;
+use boring::pkey::{PKey, Private};
 use parking_lot::RwLock;
 
 #[cfg(target_os = "linux")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-/// Cached OpenSSL certificate with expiration tracking
-struct CachedOpenSslCert {
+/// Cached BoringSSL certificate with expiration tracking
+struct CachedSslCert {
     x509: X509,
     pkey: PKey<Private>,
     /// Unix timestamp when this cache entry expires
     expires_at: u64,
 }
 
-/// Cache TTL for OpenSSL certificates (1 hour)
-const OPENSSL_CACHE_TTL_SECS: u64 = 3600;
+/// Cache TTL for parsed certificates (1 hour)
+const CERT_CACHE_TTL_SECS: u64 = 3600;
 
-/// Resolves certificates dynamically using TlsManager with OpenSSL caching
+/// Resolves certificates dynamically using TlsManager with BoringSSL caching
 struct DynamicCertResolver {
     tls_manager: Arc<TlsManager>,
-    /// Cache for parsed OpenSSL objects to avoid PEM parsing on every TLS handshake
-    openssl_cache: Arc<RwLock<HashMap<String, CachedOpenSslCert>>>,
+    /// Cache for parsed BoringSSL objects to avoid PEM parsing on every TLS handshake
+    ssl_cache: Arc<RwLock<HashMap<String, CachedSslCert>>>,
 }
 
 // Manual Debug because TlsManager might not implement it
 impl std::fmt::Debug for DynamicCertResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DynamicCertResolver")
-            .field("cache_size", &self.openssl_cache.read().len())
+            .field("cache_size", &self.ssl_cache.read().len())
             .finish()
     }
 }
@@ -52,7 +52,7 @@ impl DynamicCertResolver {
     fn new(tls_manager: Arc<TlsManager>) -> Self {
         Self {
             tls_manager,
-            openssl_cache: Arc::new(RwLock::new(HashMap::new())),
+            ssl_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -68,12 +68,12 @@ impl DynamicCertResolver {
     #[allow(dead_code)]
     fn cleanup_expired(&self) {
         let current = Self::current_time();
-        let mut cache = self.openssl_cache.write();
+        let mut cache = self.ssl_cache.write();
         let before = cache.len();
         cache.retain(|_, entry| entry.expires_at > current);
         let removed = before - cache.len();
         if removed > 0 {
-            tracing::debug!("🧹 Cleaned {} expired OpenSSL cache entries", removed);
+            tracing::debug!("🧹 Cleaned {} expired certificate cache entries", removed);
         }
     }
 }
@@ -92,11 +92,11 @@ impl TlsAccept for DynamicCertResolver {
         // Step 1: Check cache first (fast path)
         let current_time = Self::current_time();
         {
-            let cache = self.openssl_cache.read();
+            let cache = self.ssl_cache.read();
             if let Some(cached) = cache.get(&sni) {
                 if cached.expires_at > current_time {
-                    // Cache hit - use cached OpenSSL objects
-                    tracing::debug!("🚀 Using cached OpenSSL cert for {}", sni);
+                    // Cache hit - use cached BoringSSL objects
+                    tracing::debug!("🚀 Using cached cert for {}", sni);
                     if let Err(e) = ssl.set_certificate(&cached.x509) {
                         tracing::error!("Failed to set cached certificate: {}", e);
                         return;
@@ -138,16 +138,16 @@ impl TlsAccept for DynamicCertResolver {
                 return;
             }
 
-            // Step 4: Cache the parsed OpenSSL objects for future handshakes
-            let expires_at = current_time + OPENSSL_CACHE_TTL_SECS;
-            let cached_entry = CachedOpenSslCert {
+            // Step 4: Cache the parsed BoringSSL objects for future handshakes
+            let expires_at = current_time + CERT_CACHE_TTL_SECS;
+            let cached_entry = CachedSslCert {
                 x509,
                 pkey,
                 expires_at,
             };
 
-            self.openssl_cache.write().insert(sni.clone(), cached_entry);
-            tracing::info!("🔐 Cached OpenSSL cert for {} (expires in {}s)", sni, OPENSSL_CACHE_TTL_SECS);
+            self.ssl_cache.write().insert(sni.clone(), cached_entry);
+            tracing::info!("🔐 Cached cert for {} (expires in {}s)", sni, CERT_CACHE_TTL_SECS);
         }
     }
 }
@@ -460,6 +460,27 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Populate the HTTP/3 SNI certificate table from the TLS manager.
+///
+/// Uses `peek_pem`, which only returns certificates that already exist
+/// (manual certs and previously issued ACME certs) and never triggers an
+/// ACME issuance — issuance stays on the lazy HTTP/1.1 handshake path.
+/// Called once at startup and then periodically, so renewed certificates
+/// reach new QUIC handshakes without a restart.
+async fn refresh_h3_cert_table(
+    table: &pingclair_proxy::quic::CertTable,
+    tls_manager: &TlsManager,
+    domains: &[String],
+) {
+    for domain in domains {
+        if let Some((cert_pem, key_pem)) = tls_manager.peek_pem(domain).await {
+            if let Err(e) = table.upsert_pem(domain, &cert_pem, &key_pem) {
+                tracing::warn!("⚠️ H3: skipping certificate for {}: {}", domain, e);
+            }
+        }
+    }
+}
+
 fn run_server(config_path: String, config: pingclair_core::config::PingclairConfig) {
     #[cfg(not(target_os = "linux"))]
     let _ = config_path;
@@ -595,6 +616,23 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
     let port_proxies = std::collections::HashMap::new();
     let port_proxies = std::sync::Arc::new(parking_lot::RwLock::new(port_proxies));
 
+    // HTTP/3 startup inputs, captured before `config.servers` is consumed:
+    // - the global on/off switch (HTTPS ports only ever start H3),
+    // - the domains whose certificates seed the SNI cert table,
+    // - the upstream pool size + L4 blocklist kept consistent with H1/H2.
+    let http3_globally_enabled = config.global.http3;
+    let h3_domains: Vec<String> = config
+        .servers
+        .iter()
+        .filter_map(|s| s.name.clone())
+        .filter(|n| !n.is_empty() && n != "_" && n != "*" && !n.starts_with(':'))
+        .collect();
+    let h3_pool_size = config
+        .global
+        .upstream_keepalive_pool_size
+        .unwrap_or(128);
+    let h3_blocked_ips = config.global.blocked_ips.clone();
+
     // Track binding information for diagnostic logging
     let mut binding_info = std::collections::HashMap::new();
     
@@ -663,10 +701,22 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
                         tracing::error!("❌ Failed to create TlsSettings for {}: {}", addr, e);
                     }
                  }
-                 
-                 // Enable HTTP/3 for HTTPS ports
-                 https_ports.push(addr.clone());
-                 http3_enabled = true;
+
+                 // Enable HTTP/3 for HTTPS ports when the global switch is on:
+                 // advertise Alt-Svc on this listener and queue the port for
+                 // a QUIC socket.
+                 if http3_globally_enabled {
+                     https_ports.push(addr.clone());
+                     http3_enabled = true;
+
+                     if let Some(port) = addr
+                         .rsplit(':')
+                         .next()
+                         .and_then(|p| p.parse::<u16>().ok())
+                     {
+                         proxy_logic.set_alt_svc(port);
+                     }
+                 }
             } else {
                  service.add_tcp(addr);
             }
@@ -676,7 +726,7 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
                 "   🌐 Server listening on {} (TLS: {}, HTTP/3: {})",
                 addr,
                 if tls_enabled { "enabled" } else { "disabled" },
-                if http3_enabled { "enabled" } else { "pending" }
+                if http3_enabled { "enabled" } else { "disabled" }
             );
 
             server.add_service(service);
@@ -685,33 +735,62 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
 
     // Start HTTP/3 (QUIC) servers for HTTPS ports
     if !https_ports.is_empty() {
-        tracing::info!("🚀 Starting HTTP/3 (QUIC) servers for {} port(s)", https_ports.len());
-    }
+        tracing::info!(
+            "🚀 Starting HTTP/3 (quiche) servers for {} port(s)",
+            https_ports.len()
+        );
 
-    for _addr in https_ports {
-        if let Ok(socket_addr) = _addr.parse::<std::net::SocketAddr>() {
-            let _tls_m = tls_manager.clone();
-            let port_proxies = port_proxies.clone();
-            let addr_str = _addr.clone();
-            
-            bg_handle.spawn(async move {
-                let mut quic_config = pingclair_proxy::quic::QuicConfig::default();
-                quic_config.listen = socket_addr;
-                
-                let mut quic_server = pingclair_proxy::quic::QuicServer::new(quic_config);
-                
-                // Inject proxy logic
-                if let Some(proxy) = port_proxies.read().get(&addr_str) {
-                    quic_server.set_proxy(std::sync::Arc::new(proxy.clone()));
-                }
+        // Shared SNI certificate table: populated from the TLS manager
+        // (manual certs + already-issued ACME certs), then refreshed
+        // periodically so renewals reach new handshakes without a restart.
+        let cert_table = std::sync::Arc::new(pingclair_proxy::quic::CertTable::new());
+        let table_for_task = cert_table.clone();
+        let tls_for_task = tls_manager.clone();
+        let proxies_for_task = port_proxies.clone();
+        let domains_for_task = h3_domains.clone();
+        let blocked_for_task = h3_blocked_ips.clone();
 
-                tracing::info!("🚀 Starting HTTP/3 server on {}", socket_addr);
-                
-                if let Err(e) = quic_server.start().await {
-                    tracing::error!("HTTP/3 server failed: {}", e);
-                }
-            });
-        }
+        bg_handle.spawn(async move {
+            // Populate the table before serving so the first handshake can
+            // already find its certificate.
+            refresh_h3_cert_table(&table_for_task, &tls_for_task, &domains_for_task).await;
+
+            for addr_str in &https_ports {
+                let Ok(socket_addr) = addr_str.parse::<std::net::SocketAddr>() else {
+                    tracing::error!("❌ Invalid HTTP/3 listen address: {}", addr_str);
+                    continue;
+                };
+
+                let proxy = {
+                    let guard = proxies_for_task.read();
+                    guard.get(addr_str).map(|p| std::sync::Arc::new(p.clone()))
+                };
+                let Some(proxy) = proxy else {
+                    tracing::error!("❌ No proxy found for HTTP/3 address {}", addr_str);
+                    continue;
+                };
+
+                let server = pingclair_proxy::quic::QuicServer::new(
+                    socket_addr,
+                    proxy,
+                    table_for_task.clone(),
+                    h3_pool_size,
+                    blocked_for_task.clone(),
+                );
+
+                tokio::spawn(async move {
+                    if let Err(e) = server.run().await {
+                        tracing::error!("HTTP/3 server on {} failed: {}", socket_addr, e);
+                    }
+                });
+            }
+
+            // Periodic refresh: picks up ACME issuances and renewals.
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                refresh_h3_cert_table(&table_for_task, &tls_for_task, &domains_for_task).await;
+            }
+        });
     }
     
     // Start Admin API if enabled

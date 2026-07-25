@@ -39,6 +39,24 @@ impl PingclairConnectionFilter {
 
         Self { blocked_cidrs }
     }
+    /// Synchronous blocklist check for a peer socket address.
+    ///
+    /// The QUIC (UDP) path has no async `ConnectionFilter` hook, so it
+    /// consults this directly from the datagram loop.
+    pub fn allows(&self, addr: &SocketAddr) -> bool {
+        if self.blocked_cidrs.is_empty() {
+            return true;
+        }
+
+        let ip = addr.ip();
+        for cidr in &self.blocked_cidrs {
+            if cidr.contains(&ip) {
+                tracing::debug!("🚫 Blocked connection from {} (matched {})", ip, cidr);
+                return false;
+            }
+        }
+        true
+    }
 }
 
 // MARK: - ConnectionFilter Trait
@@ -52,21 +70,10 @@ impl ConnectionFilter for PingclairConnectionFilter {
     /// - Parameter addr_opt: The socket address of the client connection.
     /// - Returns: `true` if the connection is allowed, `false` if blocked.
     async fn should_accept(&self, addr_opt: Option<&SocketAddr>) -> bool {
-        if self.blocked_cidrs.is_empty() {
-            return true;
+        match addr_opt {
+            Some(addr) => self.allows(addr),
+            None => true,
         }
-
-        if let Some(addr) = addr_opt {
-            let ip = addr.ip();
-            for cidr in &self.blocked_cidrs {
-                if cidr.contains(&ip) {
-                    tracing::debug!("🚫 Blocked connection from {} (matched {})", ip, cidr);
-                    return false;
-                }
-            }
-        }
-        
-        true
     }
 }
 

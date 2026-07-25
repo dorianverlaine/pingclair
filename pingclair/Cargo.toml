@@ -21,8 +21,11 @@ pingclair-tls = { path = "../pingclair-tls" }
 pingclair-api = { path = "../pingclair-api" }
 pingclair-plugin = { path = "../pingclair-plugin" }
 
-pingora = { workspace = true, features = ["proxy", "openssl"] }
-openssl = { version = "0.10", features = ["v110"] }
+# Single TLS stack: BoringSSL everywhere. quiche (HTTP/3) links BoringSSL
+# statically, so Pingora must use its boringssl backend — a second, OpenSSL
+# TLS stack in the same binary collides on libcrypto symbols (SIGBUS).
+pingora = { workspace = true, features = ["proxy", "boringssl"] }
+boring.workspace = true
 
 pingora-core = { workspace = true, features = ["connection_filter"] }
 pingora-proxy.workspace = true
