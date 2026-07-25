@@ -70,10 +70,10 @@ cargo install --path ./pingclair  # install the CLI binary
 CI (`.github/workflows/rust.yml`) runs exactly `cargo build --verbose` and
 `cargo test --verbose` on every push/PR to `main` — keep both green.
 `.github/workflows/release.yml` builds release tarballs for Linux x86_64 and
-aarch64 on `v*` tags. Note: the release workflow uses a nightly toolchain step
-but the code itself needs only stable; the Dockerfile deliberately pins
-**stable** Rust because nightly ICEs on aarch64 under this workspace's release
-profile — do not reintroduce a nightly pin without checking that.
+aarch64 on `v*` tags. Both it and the Dockerfile pin **stable** Rust: the code
+needs only stable, and nightly ICEs (rustc_codegen_ssa "not immediate" while
+compiling tokio) under this workspace's release profile — do not reintroduce
+a nightly pin without checking that.
 
 Important test detail: `pingclair/tests/integration.rs` spawns the compiled
 `pingclair` binary (`env!("CARGO_BIN_EXE_pingclair")`) with a JSON config and
