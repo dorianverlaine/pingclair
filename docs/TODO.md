@@ -32,11 +32,12 @@
 
 ### R0：先讓測試結果可信
 
-- [ ] **整合測試隔離完成（本機已過，待 Linux）** — 全部真 binary 測試使用
+- [ ] **整合測試隔離完成（本機已過，Linux 20 輪執行中）** — 全部真 binary 測試使用
   動態 port／唯一 readiness token；child 與 process group 在成功、panic、
   timeout、Ctrl-C 後都會 reap，連續跑 20 次不得殘留 listener 或幽靈 Pingclair。
-- [ ] **乾淨 Linux 驗證腳本完成** — 由指定 commit 建立暫存 checkout，建置 release
-  binary、啟動測試、收集 config/log/metrics/result，最後只清理自己建立的程序與目錄。
+- [ ] **乾淨 Linux 驗證腳本完成（已實作，待新 commit 自我驗證）** — 由指定 commit
+  建立暫存 checkout，建置 release binary、啟動測試、收集
+  config/log/metrics/result，最後只清理自己建立的程序與目錄。
 - [ ] **協議安全回歸集完成** — H1/H2/H3 的 URI/header 正規化、hop-by-hop headers、
   request smuggling、oversized headers、malformed input 與 body limit 都有負向測試。
 
@@ -205,6 +206,14 @@
 - [x] **本機重複驗證** — `scripts/test-integration-isolation.sh` 可重現隔離測試；
   macOS 最終版本連跑 20 輪、每輪 10 項並行測試全過，結束後沒有新增 Pingclair、
   listener 或 watchdog。仍須在乾淨 Linux 以同一 commit 重跑，才可勾選 R0。
+- [x] **乾淨 Linux 內層驗證腳本** — `scripts/validate-linux-commit.sh` 僅接受完整
+  commit SHA，建立唯一暫存 checkout，依序執行 release build、workspace tests、
+  20 輪隔離測試與 release binary loopback smoke，保存 metadata、config、log、
+  metrics、listener 與 SHA-256；清理時只終止自己記錄的 process group。
+- [x] **公網生產 fixture** — `scripts/remote-production-fixture.sh` 在確認
+  80/443/2019/9001–9003 無占用後啟動真實 release binary、三個 upstream 與
+  80 TCP／443 TCP+UDP listener；stop 前逐一核對 PID cmdline 的專屬 run directory，
+  拒絕對不屬於本次 fixture 的程序送 signal。
 
 ### 安全與正確性
 
@@ -230,14 +239,42 @@
 - [x] **正則 rewrite 執行與 DSL** — 支援 `$1` capture 與 query string 保留；
   regex 於配置載入時預編譯。
 - [x] **LB weight／backup** — 加權主池；僅在所有主節點不可選時使用 backup。
+  公網測試發現舊實作把同一 backend 重複插入 set，實際仍為 1:1；目前已改用
+  Pingora 原生 `Backend.weight`，本機 selector 40 次精準通過 30:10，待新 commit
+  公網重測。
+- [x] **H2 ALPN 修正** — 公網測試發現 `TlsSettings::with_callbacks` 預設未開 H2，
+  TLS handshake 沒有協商 ALPN；目前已顯式 `enable_h2()`，待新 commit 以
+  curl HTTP/2 與 OpenSSL ALPN 重測。
 
 移入「完成」前需在乾淨遠端 commit 上跑一套 parity smoke：
 
-- [ ] 靜態 404 與死亡 upstream 502 的自訂錯誤頁。
-- [ ] CORS simple request、合法／非法 preflight。
+- [x] 靜態 404 自訂錯誤頁已在 `0d2e052` 公網通過；死亡 upstream 502 尚未跑。
+- [x] CORS simple request、合法 preflight 已在 `0d2e052` 公網通過；非法
+  preflight 尚未跑。
 - [ ] IP、Referer、UA 的 allow／deny 與 deny precedence。
-- [ ] rewrite capture、query 保留、代理 upstream 實際收到的 URI。
-- [ ] weight 分布，以及 primary 全掛時 backup 接手／primary 恢復。
+- [x] UA deny 已在 `0d2e052` 公網通過；IP、Referer 與 deny precedence 尚未跑。
+- [x] rewrite capture、query 保留已在 `0d2e052` 公網靜態路徑通過；代理
+  upstream 實際收到的 URI 尚未跑。
+- [x] primary 全掛時 backup 在 `0d2e052` 公網 8/8 接手；weight 當時實測為錯誤的
+  20:20，修正後待重測，primary 恢復尚未跑。
+
+### 2026-07-26 公網 80／443 生產情境（部分通過）
+
+精確 commit：`0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。阿里雲深圳 VPS
+實際執行 release Pingclair，綁定 80 TCP、443 TCP+UDP；本機以公網 IP 發送
+HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
+`benchmarks/results/20260726_v02_remote_0d2e0524/`。
+
+- [x] **公網 H1 與 H3 基線** — HTTP 80、HTTPS H1、真實 QUIC/H3 均回 200；
+  H3 連續 10 次成功，VPS tcpdump 亦看到外網 UDP exchange。
+- [x] **Admin 未暴露公網** — 2019 僅綁 loopback，從本機對 VPS 公網連線失敗。
+- [x] **Caddy parity 部分路徑** — H1 的自訂 404、CORS simple/preflight、
+  UA deny、regex rewrite＋query 與 LB backup 通過。
+- [ ] **本次發現並待新 commit 重測** — H2 未協商 ALPN；LB 3:1 實測 20:20。
+  兩者已在本機修正並完成回歸測試。
+- [ ] **H3 middleware parity 仍未完成** — CORS、access control 與 rewrite 路徑
+  回 501；404 使用內建頁而非 `error_page`。這是 R3 的真實缺口，不得把 H3
+  baseline 200 誤寫成 parity 完成。
 
 ### 其他已實作項目
 
