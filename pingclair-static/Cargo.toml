@@ -21,6 +21,6 @@ anyhow.workspace = true
 async-compression = { version = "0.4", features = ["gzip", "brotli", "zstd", "tokio"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["fs", "rt-multi-thread", "macros", "io-util"] }
+tokio = { workspace = true, features = ["fs", "rt-multi-thread", "macros", "io-util", "time"] }
 tempfile = "3"
 flate2 = "1"
