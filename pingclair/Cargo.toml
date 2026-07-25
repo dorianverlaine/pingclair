@@ -47,7 +47,11 @@ tikv-jemallocator = "0.6"
 
 [dev-dependencies]
 serde_json.workspace = true
-reqwest = { version = "0.11", features = ["json", "blocking"] }
+# default-features = false: reqwest's default-tls (native-tls) pulls in
+# openssl-sys on Linux, whose OpenSSL symbols collide with quiche's statically
+# linked BoringSSL at link time (undefined SSL_CTX_ctrl etc. in CI). rustls is
+# pure Rust and has no C symbols, so it coexists with BoringSSL.
+reqwest = { version = "0.11", default-features = false, features = ["json", "blocking", "rustls-tls"] }
 tokio = { workspace = true, features = ["full"] }
 tempfile = "3.8"
 uuid = { version = "1.0", features = ["v4"] }
