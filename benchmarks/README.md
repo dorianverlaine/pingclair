@@ -10,9 +10,9 @@ a load test, so the old numbers should not be trusted.
 Preparing to load-test surfaced 8 real bugs, none of which were about the
 benchmark itself — they were pre-existing defects the benchmark happened to
 exercise. All 8 are fixed and covered by regression tests on `main`. A 9th
-was found by the benchmark *run itself* and is **not yet fixed** (see
-"Large body" results below) — documenting it here rather than rushing a
-fix without review:
+was found by the benchmark *run itself* and has since been fixed too (see
+"Large body" results below); #10 and #11 were found during that re-run and
+its follow-up analysis, and are fixed as well:
 
 1. **Gzip full-body buffering (OOM risk)** — `upstream_response_body_filter`
    buffered an entire proxied response before emitting anything. Fixed to
@@ -60,8 +60,25 @@ fix without review:
    1,079 req/s (~400x more requests served). See "Large body" results
    below for the full before/after and an important residual caveat about
    cold-start memory. (`240399c`)
+10. **Named site addresses were bound literally.** `bench.local:8080 { }`
+    passed `bench.local` straight to Pingora as the bind host instead of
+    binding `0.0.0.0` and routing by the Host header (Caddy/nginx
+    semantics), so startup crashed with a BindError unless the hostname
+    happened to resolve to a local interface — this is why both benchmark
+    Pingclairfiles were originally forced to use a bare `:8080` block.
+    Fixed in `parse_server_address` (pingclair-config): IP literals still
+    bind to that address; hostnames now bind the wildcard and match via
+    the Host header, and the benchmark configs use `bench.local:8080`
+    like the nginx/caddy configs.
+11. **Cold-cache compression stampede.** A follow-up to #9: the compressed
+    body cache fixed steady-state, but on a cold cache N concurrent
+    requests for the same file each read and compressed it independently
+    before the first one populated the cache (the cold-start memory spike
+    in the "Large body" re-run). Fixed with in-flight request coalescing:
+    the first request per (path, mtime, encoding) compresses under a
+    per-key async lock and the rest wait, then serve the shared result.
 
-Workspace tests: 65 → 91, all passing, across all 9 fixes.
+Workspace tests: 65 → 95, all passing, across all 11 fixes.
 
 Also deleted a `strict-tests/` directory that had been added by another
 tool: 16 of its 26 tests failed against the real compiler because it
@@ -197,19 +214,17 @@ repeated exactly:**
   is cached compressed — every subsequent hit skips compression
   entirely, while nginx and caddy (no compressed-response cache
   configured) pay the full compression cost on every request, every time.
-- **Important residual caveat**: peak memory during the *cold start* is
-  essentially unchanged (373.6 MiB vs. 367.9 MiB before). The cache
-  starts empty, so with `-c20` all 20 connections race in and miss
-  simultaneously — each independently compresses the full file before
-  any of them finishes and populates the cache (a classic "cache
-  stampede"). The fix eliminates the *steady-state* problem completely;
-  it does not yet coalesce concurrent first-time misses into a single
-  compression pass. That would need in-flight request deduplication
-  (have racing misses await the first compressor rather than each doing
-  their own), which is a reasonable next increment but wasn't in scope
-  here — memory does settle immediately once the cache warms (17.5 MiB
-  within ~10s), so this is a bounded, transient cost, not a repeat of
-  the original bug.
+- **Cold-start caveat — since fixed**: peak memory during the *cold start*
+  was essentially unchanged in that run (373.6 MiB vs. 367.9 MiB before).
+  The cache started empty, so with `-c20` all 20 connections raced in and
+  missed simultaneously — each independently compressed the full file
+  before any of them finished and populated the cache (a classic "cache
+  stampede"). This was later fixed with **in-flight request coalescing**
+  (`pingclair-static/src/file_server.rs`): the first request for a given
+  (path, mtime, encoding) takes a per-key async lock and does the read +
+  compression, and concurrent requests for the same key wait on that lock
+  and then serve the shared cached result — one compression pass total.
+  See the `concurrent_cold_cache_requests_are_coalesced` test.
 
 ## Remote VPS run
 

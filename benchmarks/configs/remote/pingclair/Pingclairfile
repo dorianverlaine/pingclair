@@ -2,16 +2,15 @@
 # Same shape as benchmarks/configs/pingclair/Pingclairfile, adjusted for
 # real filesystem paths instead of container paths.
 #
-# NOTE: bare `:8080` address, not a named host — see the comment in
-# benchmarks/configs/pingclair/Pingclairfile for why a named block address
-# crashes pingclair at startup unless that literal hostname resolves to a
-# local interface.
+# Named site address (`bench.local:8080`): the adapter binds hostname-based
+# addresses on 0.0.0.0 and routes by the Host header; the benchmark scripts
+# all send `Host: bench.local`.
 
 global {
     debug false
 }
 
-:8080 {
+bench.local:8080 {
     compress gzip
 
     handle /proxy/* {
