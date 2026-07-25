@@ -49,7 +49,10 @@ Other top-level directories:
   binary + systemd service + unprivileged `pingclair` user with `setcap`),
   `pingclair.service`.
 - `docs/` — `AUDIT_NGINX_PARITY.md`, an nginx-parity/stability audit written
-  in Traditional Chinese.
+  in Traditional Chinese; `TODO.md`, the running list of known issues, feature
+  gaps, DSL gaps, and test gaps (Traditional Chinese). **Read `docs/TODO.md`
+  before planning new work and update it whenever you fix or discover an
+  issue** — it is the project's durable memory across sessions.
 
 ## Build and test commands
 
@@ -226,3 +229,6 @@ HTTPS listen port, single-threading a `HashMap<ConnectionId, ConnState>`
   performance-relevant bugs.
 - `docs/AUDIT_NGINX_PARITY.md` (Traditional Chinese) tracks nginx-parity gaps
   and P0 issues; check it before touching proxy/static hot paths.
+- `docs/TODO.md` (Traditional Chinese) is the canonical list of known issues,
+  unshipped features, DSL gaps, and test gaps. Keep it current: mark items
+  done (with the date) when fixed, add new ones when found.
