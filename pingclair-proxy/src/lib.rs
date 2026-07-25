@@ -21,7 +21,7 @@ pub mod server;
 
 pub use health_check::HealthChecker;
 pub use rate_limit::{RateLimiter, RateLimitConfig, RateLimitInfo};
-pub use load_balancer::{LoadBalancer, Strategy};
+pub use load_balancer::{LoadBalancer, Strategy, FAIL_COOLDOWN};
 pub use upstream::Upstream;
 pub use server::PingclairProxy;
 pub use connection_filter::PingclairConnectionFilter;

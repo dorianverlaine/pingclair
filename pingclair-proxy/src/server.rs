@@ -6,7 +6,7 @@ use pingclair_core::config::{ServerConfig, HandlerConfig, ReverseProxyConfig};
 use pingclair_core::server::Router;
 
 use async_trait::async_trait;
-use pingora_core::upstreams::peer::HttpPeer;
+use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_core::Result as PingoraResult;
 use pingora_proxy::{ProxyHttp, Session};
 use pingora_http::{RequestHeader, ResponseHeader};
@@ -523,6 +523,18 @@ impl PingclairProxy {
         find_reverse_proxy_config(&route.handler).cloned()
     }
 
+    /// Write a minimal plain-text response and end the request.
+    /// Used for early, handler-less answers such as 404s.
+    async fn write_simple_response(session: &mut Session, status: u16, body: &str) -> PingoraResult<()> {
+        let mut response = ResponseHeader::build(status, Some(3)).unwrap();
+        response.insert_header("Content-Type", "text/plain").unwrap();
+        response.insert_header("Content-Length", body.len().to_string()).unwrap();
+        response.insert_header("Server", "Pingclair").unwrap();
+        session.write_response_header(Box::new(response), false).await?;
+        session.write_response_body(Some(Bytes::copy_from_slice(body.as_bytes())), true).await?;
+        Ok(())
+    }
+
     /// Handle a specific handler configuration
     #[async_recursion]
     async fn handle_config(
@@ -570,30 +582,78 @@ impl PingclairProxy {
                         .and_then(|v| v.to_str().ok());
                     let accept_encoding = session.req_header().headers.get("Accept-Encoding")
                         .and_then(|v| v.to_str().ok());
-                    
-                    if let Ok(Some(file)) = file_server.serve(path, range_header, accept_encoding).await {
-                        let mut header = ResponseHeader::build(file.status, Some(3)).unwrap();
-                        header.insert_header("Content-Type", file.mime_type.as_str()).unwrap();
-                        header.insert_header("Content-Length", file.content.len().to_string()).unwrap();
-                        
-                        if let Some(range) = file.content_range {
-                            header.insert_header("Content-Range", range.as_str()).unwrap();
+
+                    // Large-file path: stream complete (non-Range),
+                    // uncompressed responses in 64KB chunks instead of
+                    // buffering the whole body in memory. `could_stream`
+                    // gates this without any I/O (Range and
+                    // compression-negotiated requests never stream), so the
+                    // stat+open in serve_streaming is only paid when
+                    // streaming is actually possible.
+                    if file_server.could_stream(range_header, accept_encoding) {
+                        if let Ok(Some(mut stream)) = file_server.serve_streaming(path).await {
+                            if file_server.should_stream_response(stream.file_size, range_header, accept_encoding) {
+                                let mut header = ResponseHeader::build(200, Some(3)).unwrap();
+                                header.insert_header("Content-Type", stream.mime_type.as_str()).unwrap();
+                                header.insert_header("Content-Length", stream.file_size.to_string()).unwrap();
+                                if let Some(lm) = &stream.last_modified {
+                                    header.insert_header("Last-Modified", lm.as_str()).unwrap();
+                                }
+                                if let Some(etag) = &stream.etag {
+                                    header.insert_header("ETag", etag.as_str()).unwrap();
+                                }
+                                header.insert_header("Accept-Ranges", "bytes").unwrap();
+                                header.insert_header("Server", "Pingclair").unwrap();
+
+                                session.write_response_header(Box::new(header), false).await?;
+                                while let Some(chunk) = stream.read_chunk().await.map_err(|e| {
+                                    pingora_core::Error::because(
+                                        pingora_core::ErrorType::ReadError,
+                                        "streaming file body",
+                                        e,
+                                    )
+                                })? {
+                                    let last = stream.is_complete();
+                                    session.write_response_body(Some(Bytes::from(chunk)), last).await?;
+                                }
+                                return Ok(true);
+                            }
                         }
-                        if let Some(lm) = file.last_modified {
-                            header.insert_header("Last-Modified", lm.as_str()).unwrap();
+                    }
+
+                    match file_server.serve(path, range_header, accept_encoding).await {
+                        Ok(Some(file)) => {
+                            let mut header = ResponseHeader::build(file.status, Some(3)).unwrap();
+                            header.insert_header("Content-Type", file.mime_type.as_str()).unwrap();
+                            header.insert_header("Content-Length", file.content.len().to_string()).unwrap();
+
+                            if let Some(range) = file.content_range {
+                                header.insert_header("Content-Range", range.as_str()).unwrap();
+                            }
+                            if let Some(lm) = file.last_modified {
+                                header.insert_header("Last-Modified", lm.as_str()).unwrap();
+                            }
+                            if let Some(etag) = file.etag {
+                                header.insert_header("ETag", etag.as_str()).unwrap();
+                            }
+                            if let Some(encoding) = file.content_encoding {
+                                header.insert_header("Content-Encoding", encoding.as_str()).unwrap();
+                            }
+                            header.insert_header("Accept-Ranges", "bytes").unwrap();
+                            header.insert_header("Server", "Pingclair").unwrap();
+
+                            session.write_response_header(Box::new(header), false).await?;
+                            session.write_response_body(Some(Bytes::from(file.content)), true).await?;
+                            return Ok(true);
                         }
-                        if let Some(etag) = file.etag {
-                            header.insert_header("ETag", etag.as_str()).unwrap();
+                        // Missing file (or read error): a file_server route
+                        // has no upstream to fall back to, so answer 404
+                        // here instead of falling through to upstream_peer,
+                        // which would surface a 500 (ConnectNoRoute).
+                        _ => {
+                            Self::write_simple_response(session, 404, "404 Not Found").await?;
+                            return Ok(true);
                         }
-                        if let Some(encoding) = file.content_encoding {
-                            header.insert_header("Content-Encoding", encoding.as_str()).unwrap();
-                        }
-                        header.insert_header("Accept-Ranges", "bytes").unwrap();
-                        header.insert_header("Server", "Pingclair").unwrap();
-                        
-                        session.write_response_header(Box::new(header), false).await?;
-                        session.write_response_body(Some(Bytes::from(file.content)), true).await?;
-                        return Ok(true);
                     }
                 }
                 Ok(false)
@@ -767,6 +827,16 @@ impl PingclairProxy {
 
 // MARK: - Caddy Placeholder Resolution
 
+/// Compute the outgoing `X-Forwarded-For` value: the client IP appended to
+/// any existing proxy chain (`"a, b"` → `"a, b, client"`). An absent or
+/// blank incoming value starts a fresh chain.
+fn append_forwarded_for(existing: Option<&str>, client_ip: &str) -> String {
+    match existing {
+        Some(chain) if !chain.trim().is_empty() => format!("{}, {}", chain.trim(), client_ip),
+        _ => client_ip.to_string(),
+    }
+}
+
 /// Resolve Caddy-style `{placeholder}` variables in a header value string
 /// using the actual downstream request headers.
 ///
@@ -922,7 +992,14 @@ impl ProxyHttp for PingclairProxy {
             // Get state for this host
             let state = match self.get_state(host) {
                 Some(s) => s,
-                None => return Ok(false), // No virtual host found
+                None => {
+                    // Unknown virtual host: nothing could ever proxy this
+                    // request, so answer 404 now. Returning Ok(false) here
+                    // would land in upstream_peer with no state and surface
+                    // as a 500 (ConnectNoRoute).
+                    Self::write_simple_response(session, 404, "404 Not Found").await?;
+                    return Ok(true);
+                }
             };
             ctx.state = Some(state.clone());
 
@@ -987,16 +1064,11 @@ impl ProxyHttp for PingclairProxy {
             ctx.client_accepts_gzip = ae.contains("gzip");
         }
 
-        // Check if server has compression enabled
-        if ctx.client_accepts_gzip {
-            if let Some(state) = &ctx.state {
-                // Check for compress config in the server routes (encode gzip)
-                // The compress list is not in ServerConfig directly, but
-                // we enable compression if the server has any compress algos
-                // For now, enable for all proxied responses if client supports it
-                // This matches Caddy's `encode gzip` behavior.
-                ctx.compress_response = true;
-            }
+        // Check if server has compression enabled.
+        // For now, enable for all proxied responses if the client supports
+        // gzip. This matches Caddy's `encode gzip` behavior.
+        if ctx.client_accepts_gzip && ctx.state.is_some() {
+            ctx.compress_response = true;
         }
 
         // Check request body size (Content-Length)
@@ -1052,7 +1124,17 @@ impl ProxyHttp for PingclairProxy {
                 }
             }
         }
-        
+
+        // A vhost matched but no route did: there is no handler and no
+        // upstream for this request, so answer 404. (Ok(false) would reach
+        // upstream_peer, which has nothing to proxy to and fails with a
+        // 500 ConnectNoRoute.) When a route *did* match, Ok(false) remains
+        // the normal "proxy this to the route's upstream" signal.
+        if route_index.is_none() {
+            Self::write_simple_response(session, 404, "404 Not Found").await?;
+            return Ok(true);
+        }
+
         Ok(false)
     }
     
@@ -1176,6 +1258,28 @@ impl ProxyHttp for PingclairProxy {
         // Add standard proxy headers (only if not already configured by user)
         if !ctx.headers_upstream.contains_key("X-Forwarded-Proto") {
             upstream_request.insert_header("X-Forwarded-Proto", "https")?;
+        }
+
+        // Client IP forwarding (de-facto proxy standard): append the client
+        // IP to any incoming X-Forwarded-For chain and set X-Real-IP when
+        // absent. User-configured `header_up` values for these headers win.
+        let client_ip = session.client_addr()
+            .map(|addr| match addr {
+                pingora_core::protocols::l4::socket::SocketAddr::Inet(inet) => inet.ip().to_string(),
+                pingora_core::protocols::l4::socket::SocketAddr::Unix(_) => "127.0.0.1".to_string(),
+            })
+            .unwrap_or_else(|| "0.0.0.0".to_string());
+
+        if !ctx.headers_upstream.contains_key("X-Forwarded-For") {
+            let existing = upstream_request.headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok());
+            upstream_request.insert_header("X-Forwarded-For", append_forwarded_for(existing, &client_ip))?;
+        }
+        if !ctx.headers_upstream.contains_key("X-Real-IP")
+            && !upstream_request.headers.contains_key("x-real-ip")
+        {
+            upstream_request.insert_header("X-Real-IP", &client_ip)?;
         }
 
         Ok(())
@@ -1318,6 +1422,36 @@ impl ProxyHttp for PingclairProxy {
         Ok(None)
     }
     
+    /// Called when establishing the connection to the selected upstream fails.
+    ///
+    /// Passive health check with nginx `max_fails`/`fail_timeout` semantics:
+    /// the failed backend is marked down on the route's load balancer (see
+    /// [`LoadBalancer::mark_unhealthy`]) so `select` skips it for
+    /// [`crate::FAIL_COOLDOWN`], and the error is marked retryable so
+    /// Pingora's retry loop calls `upstream_peer` again *within the same
+    /// request* — the client sees a single slightly-slower request instead
+    /// of a 502, as long as another backend is up. Retrying is safe here
+    /// because the connection never came up: no part of the request was
+    /// sent to the failed peer.
+    fn fail_to_connect(
+        &self,
+        _session: &mut Session,
+        peer: &HttpPeer,
+        ctx: &mut Self::CTX,
+        mut e: Box<pingora_core::Error>,
+    ) -> Box<pingora_core::Error> {
+        if let (Some(state), Some(route_index)) = (ctx.state.as_ref(), ctx.route_index) {
+            if let Some(lb) = state.load_balancers.get(route_index).and_then(|l| l.as_ref()) {
+                if let pingora_core::protocols::l4::socket::SocketAddr::Inet(addr) = peer.address() {
+                    tracing::warn!("🔻 Marking upstream {} down after connect failure (cooldown {:?})", addr, crate::FAIL_COOLDOWN);
+                    lb.mark_unhealthy(addr);
+                }
+            }
+        }
+        e.retry = true.into();
+        e
+    }
+
     /// Called on errors
     fn error_while_proxy(
         &self,
@@ -1484,6 +1618,30 @@ fn find_rate_limit_config(handler: &HandlerConfig) -> Option<crate::rate_limit::
 // Targeted tests for the 4 P0 issues fixed per docs/AUDIT_NGINX_PARITY.md:
 // gzip OOM risk, request ID syscall overhead, hosts lock contention, and
 // upstream connection pool sizing.
+#[cfg(test)]
+mod forwarded_headers_tests {
+    use super::append_forwarded_for;
+
+    #[test]
+    fn starts_a_fresh_chain_when_absent_or_blank() {
+        assert_eq!(append_forwarded_for(None, "1.2.3.4"), "1.2.3.4");
+        assert_eq!(append_forwarded_for(Some(""), "1.2.3.4"), "1.2.3.4");
+        assert_eq!(append_forwarded_for(Some("  "), "1.2.3.4"), "1.2.3.4");
+    }
+
+    #[test]
+    fn appends_to_an_existing_chain() {
+        assert_eq!(
+            append_forwarded_for(Some("203.0.113.1"), "1.2.3.4"),
+            "203.0.113.1, 1.2.3.4"
+        );
+        assert_eq!(
+            append_forwarded_for(Some("203.0.113.1, 203.0.113.2"), "1.2.3.4"),
+            "203.0.113.1, 203.0.113.2, 1.2.3.4"
+        );
+    }
+}
+
 #[cfg(test)]
 mod p0_regression_tests {
     use super::*;
