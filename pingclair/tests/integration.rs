@@ -1,7 +1,7 @@
-use std::process::{Command, Child};
-use std::time::Duration;
-use std::path::PathBuf;
 use std::io::Write;
+use std::path::PathBuf;
+use std::process::{Child, Command};
+use std::time::Duration;
 
 struct TestServer {
     process: Child,
@@ -53,10 +53,7 @@ impl Drop for TestServer {
 /// it up from the system settings and the proxy — not pingclair — would be
 /// answering (or refusing) these requests.
 fn no_proxy_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .unwrap()
+    reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
 async fn wait_for_server(url: &str, server: &mut TestServer) -> bool {
@@ -64,22 +61,22 @@ async fn wait_for_server(url: &str, server: &mut TestServer) -> bool {
     for _ in 0..50 {
         // Check if process is still alive
         if let Ok(Some(status)) = server.process.try_wait() {
-             // Process exited prematurely
-             eprintln!("Server exited unexpectedly with status: {}", status);
-             // Dump stderr
-             if let Some(mut stderr) = server.process.stderr.take() {
-                 use std::io::Read;
-                 let mut s = String::new();
-                 stderr.read_to_string(&mut s).unwrap();
-                 eprintln!("STDERR:\n{}", s);
-             }
-             if let Some(mut stdout) = server.process.stdout.take() {
-                 use std::io::Read;
-                 let mut s = String::new();
-                 stdout.read_to_string(&mut s).unwrap();
-                 eprintln!("STDOUT:\n{}", s);
-             }
-             return false;
+            // Process exited prematurely
+            eprintln!("Server exited unexpectedly with status: {}", status);
+            // Dump stderr
+            if let Some(mut stderr) = server.process.stderr.take() {
+                use std::io::Read;
+                let mut s = String::new();
+                stderr.read_to_string(&mut s).unwrap();
+                eprintln!("STDERR:\n{}", s);
+            }
+            if let Some(mut stdout) = server.process.stdout.take() {
+                use std::io::Read;
+                let mut s = String::new();
+                stdout.read_to_string(&mut s).unwrap();
+                eprintln!("STDOUT:\n{}", s);
+            }
+            return false;
         }
 
         // Any HTTP response (even a proxy's error page) counts as "answered",
@@ -93,15 +90,20 @@ async fn wait_for_server(url: &str, server: &mut TestServer) -> bool {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    
+
     // Timeout
     eprintln!("Timeout waiting for server!");
-     if let Some(mut stderr) = server.process.stderr.take() {
-                 use std::io::Read;
-                 let mut s = String::new();
-                 stderr.read_to_string(&mut s).unwrap();
-                 eprintln!("STDERR:\n{}", s);
-     }
+    // Close the producer before draining its pipes. Reading to EOF while the
+    // server is still alive blocks forever and can leave a stale listener
+    // behind after the test harness is interrupted.
+    let _ = server.process.kill();
+    let _ = server.process.wait();
+    if let Some(mut stderr) = server.process.stderr.take() {
+        use std::io::Read;
+        let mut s = String::new();
+        stderr.read_to_string(&mut s).unwrap();
+        eprintln!("STDERR:\n{}", s);
+    }
     false
 }
 
@@ -114,7 +116,8 @@ async fn test_static_file_server() {
     let root_path = tmp_dir.path().to_str().unwrap().replace("\\", "/");
 
     // 2. Create config (JSON format)
-    let config = format!(r#"{{
+    let config = format!(
+        r#"{{
         "servers": [
             {{
                 "listen": ["127.0.0.1:9091"],
@@ -129,16 +132,25 @@ async fn test_static_file_server() {
                 ]
             }}
         ]
-    }}"#, root_path);
+    }}"#,
+        root_path
+    );
 
     // 3. Start Server
     let mut server = TestServer::new(&config);
-    
+
     // 4. Wait
-    assert!(wait_for_server("http://127.0.0.1:9091/index.html", &mut server).await, "Server failed to start");
-    
+    assert!(
+        wait_for_server("http://127.0.0.1:9091/index.html", &mut server).await,
+        "Server failed to start"
+    );
+
     // 5. Assert
-    let resp = no_proxy_client().get("http://127.0.0.1:9091/index.html").send().await.unwrap();
+    let resp = no_proxy_client()
+        .get("http://127.0.0.1:9091/index.html")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let text = resp.text().await.unwrap();
     assert_eq!(text, "<h1>Hello World</h1>");
@@ -155,7 +167,8 @@ async fn test_admin_api_hot_reload() {
     let root_path = tmp_dir.path().to_str().unwrap().replace("\\", "/");
 
     // 1. Start with initial config (JSON)
-    let init_config = format!(r#"{{
+    let init_config = format!(
+        r#"{{
         "admin": {{
             "enabled": true,
             "listen": "127.0.0.1:9092"
@@ -175,15 +188,24 @@ async fn test_admin_api_hot_reload() {
                 ]
             }}
         ]
-    }}"#, root_path);
+    }}"#,
+        root_path
+    );
 
     let mut server = TestServer::new(&init_config);
-    assert!(wait_for_server("http://127.0.0.1:9093/", &mut server).await, "Server V1 failed to start");
-    
+    assert!(
+        wait_for_server("http://127.0.0.1:9093/", &mut server).await,
+        "Server V1 failed to start"
+    );
+
     // Check V1 (matches index v1.txt)
-    let resp = no_proxy_client().get("http://127.0.0.1:9093/").send().await.unwrap();
+    let resp = no_proxy_client()
+        .get("http://127.0.0.1:9093/")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.text().await.unwrap(), "Version 1");
-    
+
     // 2. Perform Hot Reload (JSON Payload)
     let new_config_obj = serde_json::json!({
         "listen": ["127.0.0.1:9093"],
@@ -199,19 +221,20 @@ async fn test_admin_api_hot_reload() {
             }
         ]
     });
-    
+
     let client = no_proxy_client();
-    let reload_resp = client.post("http://127.0.0.1:9092/config/0")
+    let reload_resp = client
+        .post("http://127.0.0.1:9092/config/0")
         .json(&new_config_obj)
         .send()
         .await
         .unwrap();
-        
+
     assert_eq!(reload_resp.status(), 200);
-    
+
     // 3. Check V2
     tokio::time::sleep(Duration::from_millis(200)).await;
-    
+
     let resp_v2 = client.get("http://127.0.0.1:9093/").send().await.unwrap();
     assert_eq!(resp_v2.text().await.unwrap(), "Version 2");
 }
@@ -282,8 +305,16 @@ async fn test_basic_auth_end_to_end() {
         .expect("missing challenge header")
         .to_str()
         .unwrap();
-    assert!(challenge.contains("Basic"), "unexpected challenge: {}", challenge);
-    assert!(challenge.contains("Test Realm"), "realm missing: {}", challenge);
+    assert!(
+        challenge.contains("Basic"),
+        "unexpected challenge: {}",
+        challenge
+    );
+    assert!(
+        challenge.contains("Test Realm"),
+        "realm missing: {}",
+        challenge
+    );
 
     // 2. Wrong password → 401.
     let resp = client
@@ -310,6 +341,235 @@ async fn test_basic_auth_end_to_end() {
 }
 
 #[tokio::test]
+async fn test_custom_error_pages() {
+    // Custom error pages: a 404 from a static miss and a 502 from a dead
+    // upstream must both serve the configured files instead of the
+    // built-in plain-text error.
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let page_404 = tmp_dir.path().join("404.html");
+    let page_502 = tmp_dir.path().join("502.html");
+    std::fs::write(&page_404, "<h1>custom not found</h1>").unwrap();
+    std::fs::write(&page_502, "<h1>custom bad gateway</h1>").unwrap();
+    // Empty docroot so every static request misses.
+    let root = tmp_dir.path().join("www");
+    std::fs::create_dir(&root).unwrap();
+
+    let config = format!(
+        r#"{{
+        "servers": [
+            {{
+                "listen": ["127.0.0.1:9096"],
+                "error_pages": {{
+                    "404": "{}",
+                    "500": "{}",
+                    "502": "{}"
+                }},
+                "routes": [
+                    {{
+                        "path": "/static/*",
+                        "handler": {{
+                            "type": "file_server",
+                            "root": "{}"
+                        }}
+                    }},
+                    {{
+                        "path": "/api/*",
+                        "handler": {{
+                            "type": "reverse_proxy",
+                            "upstreams": ["http://127.0.0.1:1"],
+                            "load_balance": {{ "strategy": "round_robin" }},
+                            "headers_up": {{}},
+                            "headers_down": {{}}
+                        }}
+                    }}
+                ]
+            }}
+        ]
+    }}"#,
+        page_404.display(),
+        page_502.display(),
+        page_502.display(),
+        root.display()
+    );
+
+    let mut server = TestServer::new(&config);
+    let client = no_proxy_client();
+    let mut up = false;
+    for _ in 0..50 {
+        // Any answered HTTP response means the listener is up; the static
+        // route 404s by design here.
+        if client
+            .get("http://127.0.0.1:9096/static/missing.txt")
+            .send()
+            .await
+            .is_ok()
+        {
+            up = true;
+            break;
+        }
+        if let Ok(Some(status)) = server.process.try_wait() {
+            panic!("server exited early: {}", status);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(up, "server failed to start");
+
+    // Static miss → custom 404 page.
+    let resp = client
+        .get("http://127.0.0.1:9096/static/missing.txt")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    assert_eq!(resp.headers().get("Content-Type").unwrap(), "text/html");
+    assert_eq!(resp.text().await.unwrap(), "<h1>custom not found</h1>");
+
+    // Dead upstream → custom gateway-error page. Pingora classifies a
+    // refused connection as either 500 or 502 depending on where the
+    // failure surfaces; both map to the same custom page here.
+    let resp = client
+        .get("http://127.0.0.1:9096/api/thing")
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    assert!(
+        status == 500 || status == 502,
+        "unexpected status {}",
+        status
+    );
+    assert_eq!(resp.text().await.unwrap(), "<h1>custom bad gateway</h1>");
+}
+
+#[tokio::test]
+async fn test_cors_and_access_control_end_to_end() {
+    let config = r#"{
+        "servers": [
+            {
+                "listen": ["127.0.0.1:9097"],
+                "routes": [
+                    {
+                        "path": "/",
+                        "handler": {
+                            "type": "pipeline",
+                            "handlers": [
+                                {
+                                    "type": "cors",
+                                    "allowed_origins": ["https://app.example"],
+                                    "allowed_methods": ["GET", "POST"],
+                                    "allowed_headers": ["Content-Type"],
+                                    "exposed_headers": ["X-Request-Id"],
+                                    "allow_credentials": true,
+                                    "max_age": 600
+                                },
+                                {
+                                    "type": "access_control",
+                                    "allowed_ips": ["0.0.0.0/0"],
+                                    "denied_user_agents": ["(?i)blockedbot"]
+                                },
+                                { "type": "respond", "status": 200, "body": "welcome" }
+                            ]
+                        }
+                    }
+                ]
+            }
+        ]
+    }"#;
+    let mut server = TestServer::new(config);
+    let client = no_proxy_client();
+    let mut up = false;
+    for _ in 0..50 {
+        if client.get("http://127.0.0.1:9097/").send().await.is_ok() {
+            up = true;
+            break;
+        }
+        if let Ok(Some(status)) = server.process.try_wait() {
+            panic!("server exited early: {status}");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(up, "server failed to start");
+
+    let response = client
+        .get("http://127.0.0.1:9097/")
+        .header("Origin", "https://app.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers()["access-control-allow-origin"],
+        "https://app.example"
+    );
+    assert_eq!(
+        response.headers()["access-control-allow-credentials"],
+        "true"
+    );
+    assert_eq!(response.text().await.unwrap(), "welcome");
+
+    let response = client
+        .request(reqwest::Method::OPTIONS, "http://127.0.0.1:9097/")
+        .header("Origin", "https://app.example")
+        .header("Access-Control-Request-Method", "POST")
+        .header("Access-Control-Request-Headers", "Content-Type")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    assert_eq!(response.headers()["access-control-max-age"], "600");
+
+    let response = client
+        .get("http://127.0.0.1:9097/")
+        .header("User-Agent", "BlockedBot/1.0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+}
+
+#[tokio::test]
+async fn test_regex_rewrite_reaches_the_rewritten_static_path() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    std::fs::write(temp_dir.path().join("hello.txt"), "rewritten").unwrap();
+    let root = temp_dir.path().to_str().unwrap().replace("\\", "/");
+    let config = format!(
+        r#"{{
+        "servers": [{{
+            "listen": ["127.0.0.1:9098"],
+            "routes": [{{
+                "path": "/*",
+                "handler": {{
+                    "type": "pipeline",
+                    "handlers": [
+                        {{
+                            "type": "rewrite",
+                            "regex": "^/api/(.*)$",
+                            "regex_replace": "/$1"
+                        }},
+                        {{ "type": "file_server", "root": "{}" }}
+                    ]
+                }}
+            }}]
+        }}]
+    }}"#,
+        root
+    );
+    let mut server = TestServer::new(&config);
+    assert!(
+        wait_for_server("http://127.0.0.1:9098/api/hello.txt", &mut server).await,
+        "Server failed to start"
+    );
+
+    let response = no_proxy_client()
+        .get("http://127.0.0.1:9098/api/hello.txt?cache=1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "rewritten");
+}
+
+#[tokio::test]
 async fn test_compression() {
     let tmp_dir = tempfile::tempdir().unwrap();
     let file_path = tmp_dir.path().join("big.txt");
@@ -318,7 +578,8 @@ async fn test_compression() {
     std::fs::write(&file_path, &content).unwrap();
     let root_path = tmp_dir.path().to_str().unwrap().replace("\\", "/");
 
-    let config = format!(r#"{{
+    let config = format!(
+        r#"{{
         "servers": [
             {{
                 "listen": ["127.0.0.1:9094"],
@@ -334,15 +595,21 @@ async fn test_compression() {
                 ]
             }}
         ]
-    }}"#, root_path);
+    }}"#,
+        root_path
+    );
 
     let mut server = TestServer::new(&config);
-    assert!(wait_for_server("http://127.0.0.1:9094/big.txt", &mut server).await, "Server failed to start");
+    assert!(
+        wait_for_server("http://127.0.0.1:9094/big.txt", &mut server).await,
+        "Server failed to start"
+    );
 
     let client = no_proxy_client();
 
     // Request with gzip
-    let resp: reqwest::Response = client.get("http://127.0.0.1:9094/big.txt")
+    let resp: reqwest::Response = client
+        .get("http://127.0.0.1:9094/big.txt")
         .header("Accept-Encoding", "gzip")
         .send()
         .await
@@ -350,28 +617,36 @@ async fn test_compression() {
 
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers().get("Content-Encoding").unwrap(), "gzip");
-    
+
     let compressed_bytes = resp.bytes().await.expect("Failed to get bytes");
-    
+
     // Decompress manually
     use flate2::read::GzDecoder;
     use std::io::Read;
     let mut decoder = GzDecoder::new(&compressed_bytes[..]);
     let mut decompressed = String::new();
-    decoder.read_to_string(&mut decompressed).expect("Failed to decompress");
-    
+    decoder
+        .read_to_string(&mut decompressed)
+        .expect("Failed to decompress");
+
     assert_eq!(decompressed, content);
 
     // Request with brotli if supported
-    let resp_br: reqwest::Response = client.get("http://127.0.0.1:9094/big.txt")
+    let resp_br: reqwest::Response = client
+        .get("http://127.0.0.1:9094/big.txt")
         .header("Accept-Encoding", "br")
         .send()
         .await
         .expect("Failed to send br request");
-    
+
     // reqwest might not support br by default without features, but we can check the header if we manually set it
     // Our server implementation prioritize br > zstd > gzip
-    if resp_br.headers().get("Content-Encoding").map(|v| v == "br").unwrap_or(false) {
+    if resp_br
+        .headers()
+        .get("Content-Encoding")
+        .map(|v| v == "br")
+        .unwrap_or(false)
+    {
         println!("Brotli verified");
     }
 }

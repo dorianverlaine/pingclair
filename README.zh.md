@@ -6,7 +6,7 @@
 *結合 Cloudflare Pingora 的極致效能與 Caddy 的極簡開發體驗*
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 [![Status](https://img.shields.io/badge/status-active-green.svg)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/dorianverlaine/pingclair/pulls)
 
@@ -74,7 +74,7 @@
 
 ### 前置需求
 
-*   **Rust 工具鏈** — 需要 Rust 1.85 或更新的版本。
+*   **Rust 工具鏈** — 需要 Rust 1.88 或更新的版本。
 
 ### 從原始碼編譯安裝
 
@@ -243,13 +243,34 @@ server "shop.example.com" {
 
 ```caddyfile
 :80 :8080 {
-    # 反向代理到多個後端
-    reverse_proxy 10.0.0.1:8080 10.0.0.2:8080 {
-        # 負載平衡策略：round_robin、random、least_conn
+    reverse_proxy {
         lb_policy least_conn
+        to 10.0.0.1:8080 { weight 3 }
+        to 10.0.0.2:8080
+        # 僅在所有主要後端皆不可用時使用。
+        to 10.0.0.3:8080 { backup }
+    }
+}
+```
 
-        # 失敗重試
-        failover true
+### Caddy parity 控制項
+
+```caddyfile
+example.com {
+    error_page 404 /srv/errors/404.html
+
+    handle /api/* {
+        cors https://app.example.com {
+            methods GET POST
+            allow_credentials
+        }
+        access_control {
+            allow_ip 10.0.0.0/8
+            deny_user_agent "(?i)bot"
+        }
+        # 正則 capture 使用 $1、$2……，並會保留 query string。
+        rewrite "^/api/(.*)$" "/v1/$1"
+        reverse_proxy 127.0.0.1:3000
     }
 }
 ```

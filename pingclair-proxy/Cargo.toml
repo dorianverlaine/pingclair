@@ -30,6 +30,7 @@ async-recursion = "1.0"
 ipnet = "2"
 flate2 = "1.0"
 arc-swap.workspace = true
+regex = "1"
 
 # HTTP/3 (QUIC) — quiche + BoringSSL
 quiche.workspace = true

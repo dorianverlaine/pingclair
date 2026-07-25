@@ -6,7 +6,7 @@
 *Cloudflare Pingora's raw performance, wrapped in Caddy's minimalist developer experience*
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 [![Status](https://img.shields.io/badge/status-active-green.svg)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/dorianverlaine/pingclair/pulls)
 
@@ -83,7 +83,7 @@ a 20-second test into 16 minutes — is documented in
 
 ### Prerequisites
 
-*   **Rust toolchain** — Rust 1.85 or newer.
+*   **Rust toolchain** — Rust 1.88 or newer.
 
 ### Build from source
 
@@ -251,13 +251,34 @@ server "shop.example.com" {
 
 ```caddyfile
 :80 :8080 {
-    # Proxy to multiple backends
-    reverse_proxy 10.0.0.1:8080 10.0.0.2:8080 {
-        # Load balancing policy: round_robin, random, least_conn
+    reverse_proxy {
         lb_policy least_conn
+        to 10.0.0.1:8080 { weight 3 }
+        to 10.0.0.2:8080
+        # Used only when every primary is unavailable.
+        to 10.0.0.3:8080 { backup }
+    }
+}
+```
 
-        # Retry on failure
-        failover true
+### Caddy parity controls
+
+```caddyfile
+example.com {
+    error_page 404 /srv/errors/404.html
+
+    handle /api/* {
+        cors https://app.example.com {
+            methods GET POST
+            allow_credentials
+        }
+        access_control {
+            allow_ip 10.0.0.0/8
+            deny_user_agent "(?i)bot"
+        }
+        # Regex captures use $1, $2, ... and preserve query strings.
+        rewrite "^/api/(.*)$" "/v1/$1"
+        reverse_proxy 127.0.0.1:3000
     }
 }
 ```

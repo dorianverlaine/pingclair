@@ -17,6 +17,7 @@ toml.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 smartstring.workspace = true
+regex = "1"
 
 [dev-dependencies]
 criterion.workspace = true

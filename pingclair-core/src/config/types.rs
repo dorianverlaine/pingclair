@@ -115,6 +115,12 @@ pub struct ServerConfig {
     /// Security headers configuration
     #[serde(default)]
     pub security: SecurityConfig,
+
+    /// Custom error pages: HTTP status code → file path served for that
+    /// error (404/500/502/504, ...). Falls back to the built-in plain-text
+    /// response when unset or unreadable.
+    #[serde(default)]
+    pub error_pages: HashMap<u16, String>,
 }
 
 fn default_body_limit() -> u64 {
@@ -165,21 +171,17 @@ pub struct RouteConfig {
 #[serde(untagged)]
 pub enum Matcher {
     /// Match by path
-    Path {
-        patterns: Vec<String>,
-    },
-    
+    Path { patterns: Vec<String> },
+
     /// Match by header
     Header {
         name: String,
         condition: MatcherCondition,
     },
-    
+
     /// Match by HTTP method
-    Method {
-        methods: Vec<String>,
-    },
-    
+    Method { methods: Vec<String> },
+
     /// Match by query parameter
     Query {
         name: String,
@@ -188,20 +190,19 @@ pub enum Matcher {
 
     /// Match by host
     Host(Vec<String>),
-    
+
     /// Match by remote IP
     RemoteIp(Vec<String>),
-    
+
     /// Match by protocol
     Protocol(Vec<String>),
-    
-    
+
     /// AND combination
     And(Box<Matcher>, Box<Matcher>),
-    
+
     /// OR combination
     Or(Box<Matcher>, Box<Matcher>),
-    
+
     /// NOT
     Not(Box<Matcher>),
 }
@@ -283,14 +284,10 @@ pub enum HandlerConfig {
     },
 
     /// Pipeline of handlers
-    Pipeline {
-        handlers: Vec<HandlerConfig>,
-    },
+    Pipeline { handlers: Vec<HandlerConfig> },
 
     /// Exclusive routing group
-    Handle {
-        handlers: Vec<HandlerConfig>,
-    },
+    Handle { handlers: Vec<HandlerConfig> },
 
     /// HTTP Basic Authentication
     /// Requires valid credentials before allowing access
@@ -362,6 +359,10 @@ pub enum HandlerConfig {
         max_age: u64,
     },
 
+    /// Request access control evaluated before the route's terminal handler.
+    /// Deny rules take precedence; populated allow lists are mandatory.
+    AccessControl(AccessControlConfig),
+
     /// Try files — attempt to serve from a list of paths, fall through if none match
     /// Similar to Nginx's try_files directive
     TryFiles {
@@ -384,11 +385,21 @@ fn default_redirect_code() -> u16 {
 }
 
 fn default_cors_methods() -> Vec<String> {
-    vec!["GET".into(), "POST".into(), "PUT".into(), "DELETE".into(), "OPTIONS".into()]
+    vec![
+        "GET".into(),
+        "POST".into(),
+        "PUT".into(),
+        "DELETE".into(),
+        "OPTIONS".into(),
+    ]
 }
 
 fn default_cors_headers() -> Vec<String> {
-    vec!["Content-Type".into(), "Authorization".into(), "X-Requested-With".into()]
+    vec![
+        "Content-Type".into(),
+        "Authorization".into(),
+        "X-Requested-With".into(),
+    ]
 }
 
 fn default_cors_max_age() -> u64 {
@@ -429,6 +440,11 @@ pub struct ReverseProxyConfig {
     /// Upstream URLs
     pub upstreams: Vec<String>,
 
+    /// Per-upstream weight and backup role. When empty, every address in
+    /// `upstreams` is a primary with weight one (the legacy JSON form).
+    #[serde(default)]
+    pub upstream_options: Vec<ProxyUpstream>,
+
     /// Load balancing configuration
     #[serde(default)]
     pub load_balance: LoadBalanceConfig,
@@ -461,6 +477,47 @@ pub struct LoadBalanceConfig {
     /// Strategy: round_robin, random, least_conn, ip_hash, first
     #[serde(default = "default_lb_strategy")]
     pub strategy: String,
+}
+
+/// An upstream's selection properties.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyUpstream {
+    /// Dial address, including an optional http/https scheme.
+    pub address: String,
+    /// Relative selection weight among primary (or backup) peers.
+    #[serde(default = "default_upstream_weight")]
+    pub weight: u32,
+    /// Backup peers are only selected after every primary is unavailable.
+    #[serde(default)]
+    pub backup: bool,
+}
+
+fn default_upstream_weight() -> u32 {
+    1
+}
+
+/// Route-level IP, Referer-host, and User-Agent access policy.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AccessControlConfig {
+    /// CIDR or literal IP ranges that may access the route.
+    #[serde(default)]
+    pub allowed_ips: Vec<String>,
+    /// CIDR or literal IP ranges that are always rejected.
+    #[serde(default)]
+    pub denied_ips: Vec<String>,
+    /// Referer hosts that may access the route. `*.example.com` matches
+    /// subdomains; an empty Referer does not satisfy a populated allow list.
+    #[serde(default)]
+    pub allowed_referers: Vec<String>,
+    /// Referer hosts that are always rejected.
+    #[serde(default)]
+    pub denied_referers: Vec<String>,
+    /// Regular expressions that may match the User-Agent header.
+    #[serde(default)]
+    pub allowed_user_agents: Vec<String>,
+    /// Regular expressions that always reject the User-Agent header.
+    #[serde(default)]
+    pub denied_user_agents: Vec<String>,
 }
 
 fn default_lb_strategy() -> String {
@@ -627,7 +684,6 @@ fn default_hsts_preload() -> bool {
     false
 }
 
-
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -698,6 +754,7 @@ mod tests {
             log: None,
             client_max_body_size: 1024 * 1024,
             security: Default::default(),
+            error_pages: Default::default(),
         };
         assert_eq!(config.name, Some("example.com".to_string()));
     }
