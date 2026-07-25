@@ -104,6 +104,9 @@
   上游、下游與 access log 貫穿。H3 尚未支援。
 - [x] **`admin.api_key` DSL**（2026-07-26）— `admin <listen> <token>`。
 - [x] **`basic_auth` DSL**（2026-07-26）— 行內與 block＋realm 形式均可編譯。
+- [x] **`redir`／`redirect` DSL**（2026-07-26）— 支援預設 302、數字 3xx、
+  `temporary`／`permanent` 與 named matcher；配置 crate 的 66 項測試通過，
+  尚未以真 binary 驗證。
 
 ---
 
@@ -128,7 +131,6 @@
   Request ID 與 H1/H2 pipeline 尚未完整套用。
 - [ ] **SSE 真 binary 端到端測試** — 慢速 upstream 逐 chunk 發送，斷言客戶端
   增量收到資料而非等待完整 body。
-- [ ] **`redirect` DSL** — core 與 AST 有型別，Caddyfile adapter 尚未產生它。
 - [ ] **健康檢查 Host 標頭** — 虛擬主機 upstream 需要可配置 Host。
 - [ ] **`gzip_types` 可設定** — 目前 MIME 清單硬編碼。
 
@@ -193,3 +195,26 @@
 - reqwest dev dependency 必須維持 rustls；native-tls／OpenSSL 會與 quiche 的
   BoringSSL 產生連結衝突。
 - 遠端 `/root/pingclair` 有歷史未提交變更；禁止盲目 pull/reset/clean。
+
+### HTTP/3 實作護欄
+
+- `quiche 0.29`、`boring 4.22` 與 Pingora `boringssl` feature 是同一套
+  BoringSSL 鏈結設計。禁止引入 `pingora-openssl`、`openssl-sys` 或 reqwest
+  `native-tls`；過去曾因 OpenSSL／BoringSSL 符號衝突造成啟動 SIGBUS 與 Linux
+  link error。
+- H3 是 `pingclair-proxy/src/quic.rs` 的 raw Tokio UDP／quiche 路徑，每個 HTTPS
+  port 一個 task 與一個無鎖 connection map；不是 Pingora `ProxyHttp Session`
+  的延伸。middleware parity 應抽出 transport-neutral 邏輯，不可硬把 H1/H2
+  Session 塞進 H3。
+- `pump_h3_events` 必須同時由收包與 maintenance pass 驅動。request body drain
+  可能在沒有新 UDP packet 時產生 `Finished`；只在收包時 pump 會讓大型 POST
+  永久卡住。
+- H3 憑證表以 `ArcSwap` 發佈，透過 `TlsManager::peek_pem` 讀取既有憑證並每
+  60 秒刷新；`peek_pem` 不可觸發 ACME 簽發。listener port、憑證 domain 清單
+  等 topology 仍主要在啟動時擷取，新增項目不得假設 hot reload 已完整生效。
+- H3 request／response body 必須維持 bounded channel、QUIC flow control 與串流；
+  不可為了 middleware parity 改成全量緩衝。`enable_early_data()` 已開啟，擴充
+  非冪等請求行為前須先審核 0-RTT replay 風險。
+- 修改 H3 或 TLS dependency 後，至少以 Linux release binary＋quiche client
+  重跑 Alt-Svc、SNI、多大小靜態／代理 body、含／不含 Content-Length 的 POST、
+  413 與 upstream keepalive；macOS 單元測試不足以驗證鏈結與 QUIC 行為。

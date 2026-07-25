@@ -525,4 +525,57 @@ mod tests {
         assert_eq!(proxy.upstream_options[0].weight, 3);
         assert!(proxy.upstream_options[1].backup);
     }
+
+    #[test]
+    fn test_compile_redirect_directive() {
+        let config = compile(
+            r#"
+            example.com {
+                redir /new-home
+            }
+        "#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            &config.servers[0].routes[0].handler,
+            HandlerConfig::Redirect { to, code }
+                if to == "/new-home" && *code == 302
+        ));
+    }
+
+    #[test]
+    fn test_compile_redirect_codes_and_named_matcher() {
+        let config = compile(
+            r#"
+            example.com {
+                @legacy path /old/*
+                redir @legacy https://example.com/new permanent
+                redirect /temporary 307
+            }
+        "#,
+        )
+        .unwrap();
+
+        let routes = &config.servers[0].routes;
+        assert!(matches!(
+            &routes[0].handler,
+            HandlerConfig::Redirect { to, code }
+                if to == "https://example.com/new" && *code == 301
+        ));
+        assert!(routes[0].matcher.is_some());
+        assert!(matches!(
+            &routes[1].handler,
+            HandlerConfig::Redirect { to, code }
+                if to == "/temporary" && *code == 307
+        ));
+    }
+
+    #[test]
+    fn test_reject_invalid_redirect_directive() {
+        assert!(compile("example.com { redir }").is_err());
+        assert!(compile("example.com { redir /target 200 }").is_err());
+        assert!(compile("example.com { redir /target forever }").is_err());
+        assert!(compile("example.com { redir /target { respond 200 } }").is_err());
+    }
 }

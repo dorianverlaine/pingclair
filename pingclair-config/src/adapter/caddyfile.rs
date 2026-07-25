@@ -606,6 +606,7 @@ fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
     match d.name.as_str() {
         "reverse_proxy" => adapt_reverse_proxy(d),
         "respond" => adapt_respond(d),
+        "redir" | "redirect" => adapt_redirect(d),
         "file_server" => {
             let mut root = ".".to_string();
             if let Some(arg) = d.args.first() {
@@ -656,6 +657,41 @@ fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
         "access_control" => adapt_access_control(d),
         _ => Err(AdapterError::UnknownDirective(d.name)),
     }
+}
+
+fn adapt_redirect(d: Directive) -> Result<Handler, AdapterError> {
+    if d.block.is_some() {
+        return Err(AdapterError::BlockNotAllowed(d.name));
+    }
+
+    let (to, code) = match d.args.as_slice() {
+        [to] => (to.clone(), 302),
+        [to, code] => {
+            let code = match code.as_str() {
+                "temporary" => 302,
+                "permanent" => 301,
+                value => value.parse::<u16>().map_err(|_| {
+                    AdapterError::InvalidArgument(d.name.clone(), value.to_string())
+                })?,
+            };
+            (to.clone(), code)
+        }
+        _ => {
+            return Err(AdapterError::InvalidArgument(
+                d.name,
+                "expected <location> [3xx|temporary|permanent]".into(),
+            ));
+        }
+    };
+
+    if !(300..=399).contains(&code) {
+        return Err(AdapterError::InvalidArgument(
+            d.name,
+            format!("status {code} is not a redirect code"),
+        ));
+    }
+
+    Ok(Handler::Redirect(RedirectConfig { to, code }))
 }
 
 /// Adapt `rewrite <replacement>` or `rewrite <regex> <replacement>`.
