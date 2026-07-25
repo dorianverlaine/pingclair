@@ -11,6 +11,7 @@
 pub mod health_check;
 pub mod rate_limit;
 pub mod metrics;
+pub mod alt_svc;
 pub mod quic;
 mod load_balancer;
 mod upstream;

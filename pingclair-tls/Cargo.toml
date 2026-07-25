@@ -24,11 +24,6 @@ instant-acme = "0.8"
 tokio-rustls = "0.26"
 webpki-roots = "0.26"
 
-# HTTP/3 (QUIC)
-quinn.workspace = true
-h3.workspace = true
-h3-quinn.workspace = true
-
 # Certificate parsing
 rustls-pemfile = "2"
 

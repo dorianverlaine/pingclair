@@ -30,7 +30,7 @@ pub struct PingclairConfig {
 }
 
 /// Global configuration options
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalConfig {
     /// Global ACME email
     pub email: Option<String>,
@@ -50,6 +50,23 @@ pub struct GlobalConfig {
     /// an invisible one. `None` uses Pingora's own default (128).
     #[serde(default)]
     pub upstream_keepalive_pool_size: Option<usize>,
+
+    /// Enable HTTP/3 (QUIC) listeners on HTTPS ports. Defaults to true;
+    /// set to false to serve HTTPS over TCP (HTTP/1.1 + HTTP/2) only.
+    #[serde(default = "default_bool_true")]
+    pub http3: bool,
+}
+
+impl Default for GlobalConfig {
+    fn default() -> Self {
+        Self {
+            email: None,
+            auto_https: AutoHttpsMode::default(),
+            blocked_ips: Vec::new(),
+            upstream_keepalive_pool_size: None,
+            http3: true,
+        }
+    }
 }
 
 /// Auto-HTTPS modes
@@ -682,5 +699,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.flush_interval, Some(-1));
+    }
+
+    #[test]
+    fn test_global_http3_defaults_to_true() {
+        assert!(GlobalConfig::default().http3);
+
+        // Configs written before the switch existed must keep H3 enabled.
+        let legacy: GlobalConfig = serde_json::from_str(r#"{"email":null}"#).unwrap();
+        assert!(legacy.http3);
+
+        let disabled: GlobalConfig = serde_json::from_str(r#"{"http3":false}"#).unwrap();
+        assert!(!disabled.http3);
     }
 }

@@ -1,7 +1,7 @@
 # Build Stage
 #
 # Stable, not nightly: the workspace has no nightly-only feature gates
-# (edition 2024 only needs Rust 1.85+, which stable has had since Feb
+# (edition 2024 plus quiche needs Rust 1.88+, which stable has had for a
 # 2025), and nightly's codegen backend has a known internal-compiler-error
 # on aarch64 under this crate's release profile (panic="abort" + fat LTO +
 # codegen-units=1) — it ICEs partway through compiling `tokio` itself.
@@ -9,10 +9,11 @@ FROM ghcr.io/rust-lang/rust:1-slim AS builder
 
 WORKDIR /usr/src/app
 
-# Install build dependencies (needed for Pingora/OpenSSL/etc)
+# Install build dependencies (cmake + a C/C++ toolchain are needed to
+# build the vendored BoringSSL used by quiche / pingora-boringssl; no
+# system OpenSSL is required anymore)
 RUN apt-get update && apt-get install -y \
     pkg-config \
-    libssl-dev \
     build-essential \
     cmake \
     git \
@@ -39,7 +40,6 @@ FROM debian:sid-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
-    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

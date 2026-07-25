@@ -124,6 +124,29 @@ impl TlsManager {
             .insert(domain.to_string(), (cert_pem, key_pem));
     }
 
+    /// 🔍 Resolve a certificate PEM pair WITHOUT triggering ACME issuance.
+    ///
+    /// Checks manual certificates first, then certificates already present in
+    /// the ACME store cache. Unlike [`TlsManager::resolve_pem`] this never
+    /// starts an issuance flow — it only surfaces material that already
+    /// exists. Used to populate the HTTP/3 SNI certificate table, where new
+    /// issuance must stay on the lazy HTTP/1.1 handshake path.
+    pub async fn peek_pem(&self, domain: &str) -> Option<(String, String)> {
+        // 1. Manual certs (PEM pair configured in the config file)
+        let manual = self.manual_pem_certs.read().get(domain).cloned();
+        if let Some(pems) = manual {
+            return Some(pems);
+        }
+
+        // 2. Already-issued ACME certs (store cache only — no issuance)
+        if let Some(auto) = &self.auto_https {
+            if let Some(cert) = auto.cached_certificate(domain).await {
+                return Some((cert.cert_pem, cert.key_pem));
+            }
+        }
+        None
+    }
+
     /// 🔍 Resolve a certificate for a client hello (SNI) as PEM
     pub async fn resolve_pem(&self, domain: &str) -> Option<(String, String)> {
         // 1. Check manual certs (PEM pair configured in the config file)
@@ -314,5 +337,23 @@ mod tests {
             manager.resolve_pem("b.example.com").await,
             Some(("B_CERT".to_string(), "B_KEY".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn peek_pem_returns_manual_cert_without_issuance() {
+        let manager = test_manager();
+        manager.add_manual_cert(
+            "example.com",
+            "CERT_PEM".to_string(),
+            "KEY_PEM".to_string(),
+        );
+
+        assert_eq!(
+            manager.peek_pem("example.com").await,
+            Some(("CERT_PEM".to_string(), "KEY_PEM".to_string()))
+        );
+
+        // Unknown domains return None without triggering any issuance flow.
+        assert!(manager.peek_pem("other.example.com").await.is_none());
     }
 }

@@ -254,6 +254,16 @@ impl AutoHttps {
     pub async fn has_certificate(&self, domain: &str) -> bool {
         self.store.has_valid(domain).await
     }
+
+    /// Returns an already-issued certificate from the store's cache, if any.
+    ///
+    /// Unlike [`AutoHttps::get_certificate`] this never triggers an ACME
+    /// issuance flow — it only surfaces certificates that already exist.
+    /// Used by the HTTP/3 SNI certificate table, which cannot await an
+    /// issuance inside a handshake callback.
+    pub async fn cached_certificate(&self, domain: &str) -> Option<Certificate> {
+        self.store.get(domain).await
+    }
 }
 
 #[cfg(test)]

@@ -348,6 +348,11 @@ pub struct PingclairProxy {
     pub default: Arc<ArcSwap<Option<ProxyState>>>,
     /// TLS Manager for certificate resolution
     pub tls_manager: Option<Arc<pingclair_tls::manager::TlsManager>>,
+    /// Alt-Svc value advertised on this listener's responses when HTTP/3 is
+    /// enabled (`None` = do not advertise, e.g. plain-HTTP listeners).
+    /// Stored behind `ArcSwap` so it can be flipped without restarting the
+    /// Pingora service.
+    pub alt_svc: Arc<ArcSwap<Option<String>>>,
 }
 
 impl Default for PingclairProxy {
@@ -356,6 +361,7 @@ impl Default for PingclairProxy {
             hosts: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             default: Arc::new(ArcSwap::from_pointee(None)),
             tls_manager: None,
+            alt_svc: Arc::new(ArcSwap::from_pointee(None)),
         }
     }
 }
@@ -372,7 +378,16 @@ impl PingclairProxy {
             hosts: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             default: Arc::new(ArcSwap::from_pointee(None)),
             tls_manager: Some(tls_manager),
+            alt_svc: Arc::new(ArcSwap::from_pointee(None)),
         }
+    }
+
+    /// Advertise HTTP/3 availability for this listener via the `Alt-Svc`
+    /// response header (added by the downstream module registered in
+    /// `init_downstream_modules`).
+    pub fn set_alt_svc(&self, port: u16) {
+        self.alt_svc
+            .store(Arc::new(Some(crate::alt_svc::alt_svc_value(port))));
     }
 
     /// Add a server configuration to this proxy
@@ -482,7 +497,7 @@ impl PingclairProxy {
     }
     
     /// Select an upstream using the load balancer
-    fn select_upstream(&self, state: &ProxyState, route_index: usize, remote_addr: Option<&[u8]>) -> Option<Upstream> {
+    pub(crate) fn select_upstream(&self, state: &ProxyState, route_index: usize, remote_addr: Option<&[u8]>) -> Option<Upstream> {
         if let Some(load_balancer) = state.load_balancers.get(route_index).and_then(|lb| lb.as_ref()) {
             load_balancer.select(remote_addr)
         } else {
@@ -515,12 +530,54 @@ impl PingclairProxy {
     }
     
     /// Get proxy config for a route
-    fn get_proxy_config(&self, state: &ProxyState, route_index: usize) -> Option<ReverseProxyConfig> {
+    pub(crate) fn get_proxy_config(&self, state: &ProxyState, route_index: usize) -> Option<ReverseProxyConfig> {
         let route = state.config.routes.get(route_index)?;
         // Recurse into handle/route blocks so a nested reverse_proxy's
         // headers/timeouts are picked up, matching how ProxyState::new sets
         // up its load balancer.
         find_reverse_proxy_config(&route.handler).cloned()
+    }
+
+    /// Build an [`HttpPeer`] for a selected upstream, applying the route's
+    /// configured read/write timeouts plus a default 10s connect timeout.
+    ///
+    /// Shared by the Pingora proxy path (`upstream_peer`) and the HTTP/3
+    /// reverse-proxy path (`crate::quic`) so both honor identical timeout
+    /// and SNI semantics.
+    pub(crate) fn build_http_peer(
+        upstream: &Upstream,
+        read_timeout_ms: Option<i64>,
+        write_timeout_ms: Option<i64>,
+    ) -> HttpPeer {
+        let addr = upstream.addr.clone();
+        let scheme = upstream.ext.get::<Scheme>().unwrap_or(&Scheme::Http);
+        let host = upstream.ext.get::<HostName>().map(|h| h.0.clone()).unwrap_or_else(|| match &addr {
+             pingora_core::protocols::l4::socket::SocketAddr::Inet(inet) => inet.ip().to_string(),
+             pingora_core::protocols::l4::socket::SocketAddr::Unix(u) => u.as_pathname().map(|p| p.to_string_lossy().to_string()).unwrap_or("unix_socket".to_string()),
+        });
+        let tls = *scheme == Scheme::Https;
+
+        let mut peer = HttpPeer::new(addr, tls, host);
+
+        // Apply timeouts if configured
+        if let Some(read_timeout) = read_timeout_ms {
+            if read_timeout > 0 {
+                peer.options.read_timeout = Some(std::time::Duration::from_millis(read_timeout as u64));
+            }
+        }
+
+        if let Some(write_timeout) = write_timeout_ms {
+            if write_timeout > 0 {
+                peer.options.write_timeout = Some(std::time::Duration::from_millis(write_timeout as u64));
+            }
+        }
+
+        // Set default connection timeout (10 seconds) if not configured
+        if peer.options.connection_timeout.is_none() {
+            peer.options.connection_timeout = Some(std::time::Duration::from_secs(10));
+        }
+
+        peer
     }
 
     /// Write a minimal plain-text response and end the request.
@@ -822,7 +879,7 @@ impl PingclairProxy {
 /// Compute the outgoing `X-Forwarded-For` value: the client IP appended to
 /// any existing proxy chain (`"a, b"` → `"a, b, client"`). An absent or
 /// blank incoming value starts a fresh chain.
-fn append_forwarded_for(existing: Option<&str>, client_ip: &str) -> String {
+pub(crate) fn append_forwarded_for(existing: Option<&str>, client_ip: &str) -> String {
     match existing {
         Some(chain) if !chain.trim().is_empty() => format!("{}, {}", chain.trim(), client_ip),
         _ => client_ip.to_string(),
@@ -842,7 +899,7 @@ fn append_forwarded_for(existing: Option<&str>, client_ip: &str) -> String {
 ///
 /// If a placeholder references a header that doesn't exist, it resolves to
 /// an empty string (matching Caddy's behavior).
-fn resolve_caddy_placeholders(template: &str, req: &RequestHeader) -> String {
+pub(crate) fn resolve_caddy_placeholders(template: &str, req: &RequestHeader) -> String {
     if !template.contains('{') {
         // ⚡ OPTIMIZATION: Fast path — no placeholders, return as-is.
         return template.to_string();
@@ -931,9 +988,18 @@ fn resolve_single_placeholder(name: &str, req: &RequestHeader) -> String {
 #[async_trait]
 impl ProxyHttp for PingclairProxy {
     type CTX = RequestContext;
-    
+
     fn new_ctx(&self) -> Self::CTX {
         RequestContext::default()
+    }
+
+    /// Register downstream modules that run on every response written
+    /// through this proxy (both locally generated and upstream-proxied),
+    /// which is exactly the property Alt-Svc advertisement needs.
+    fn init_downstream_modules(&self, modules: &mut pingora_core::modules::http::HttpModules) {
+        modules.add_module(Box::new(crate::alt_svc::AltSvcModuleBuilder::new(
+            self.alt_svc.clone(),
+        )));
     }
 
     /* 
@@ -1180,43 +1246,13 @@ impl ProxyHttp for PingclairProxy {
                 write_timeout_ms = proxy_config.write_timeout;
             }
 
-            // Parse and create peer
-            let addr = upstream.addr.clone();
-            let scheme = upstream.ext.get::<Scheme>().unwrap_or(&Scheme::Http);
-            let host = upstream.ext.get::<HostName>().map(|h| h.0.clone()).unwrap_or_else(|| match &addr {
-                 pingora_core::protocols::l4::socket::SocketAddr::Inet(inet) => inet.ip().to_string(),
-                 pingora_core::protocols::l4::socket::SocketAddr::Unix(u) => u.as_pathname().map(|p| p.to_string_lossy().to_string()).unwrap_or("unix_socket".to_string()),
-            });
-            let tls = *scheme == Scheme::Https;
-
-            let mut peer = HttpPeer::new(
-                addr,
-                tls,
-                host.clone(),
-            );
-
-                // Apply timeouts if configured
-                if let Some(read_timeout) = read_timeout_ms {
-                    if read_timeout > 0 {
-                        peer.options.read_timeout = Some(std::time::Duration::from_millis(read_timeout as u64));
-                        tracing::debug!("⏱️ Applied read timeout: {}ms for {}", read_timeout, host);
-                    }
-                }
-
-                if let Some(write_timeout) = write_timeout_ms {
-                    if write_timeout > 0 {
-                        peer.options.write_timeout = Some(std::time::Duration::from_millis(write_timeout as u64));
-                        tracing::debug!("⏱️ Applied write timeout: {}ms for {}", write_timeout, host);
-                    }
-                }
-
-                // Set default connection timeout (10 seconds) if not configured
-                if peer.options.connection_timeout.is_none() {
-                    peer.options.connection_timeout = Some(std::time::Duration::from_secs(10));
-                    tracing::debug!("⏱️ Applied default connection timeout: 10s for {}", host);
-                }
-
-                return Ok(Box::new(peer));
+            // Parse and create peer (shared with the HTTP/3 path so both
+            // honor identical timeout semantics).
+            return Ok(Box::new(Self::build_http_peer(
+                &upstream,
+                read_timeout_ms,
+                write_timeout_ms,
+            )));
         }
         
         // No upstream found
