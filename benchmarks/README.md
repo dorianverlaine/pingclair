@@ -78,7 +78,45 @@ its follow-up analysis, and are fixed as well:
     the first request per (path, mtime, encoding) compresses under a
     per-key async lock and the rest wait, then serve the shared result.
 
-Workspace tests: 65 → 95, all passing, across all 11 fixes.
+## Bugs found by the VPS production test (July 2026)
+
+A dedicated production-readiness run on the Aliyun Shenzhen VPS (2 vCPU /
+1.6GB) — named vhosts, static + compression + range, reverse proxy with
+two upstreams, admin API, TLS, wrk load — surfaced another batch. All
+fixed and verified end-to-end on the same box:
+
+12. **Path traversal read files outside the docroot.** `GET /../x` passed a
+    lexical `starts_with(root)` check. Confinement is now lexical
+    dot-segment normalization (zero syscalls, nginx/Caddy model).
+13. **Any TLS handshake panicked the whole process** (`panic=abort`):
+    rustls could not auto-select a CryptoProvider (both `aws-lc-rs` and
+    `ring` enabled). An explicit provider is installed at startup.
+14. **Manual TLS certificates were silently ignored** — `tls cert key` in
+    config was never loaded; manual certs now take precedence over ACME in
+    SNI resolution.
+15. **Missing files / unknown vhosts / unmatched routes returned 500**
+    (fell through to `upstream_peer`'s ConnectNoRoute) instead of 404.
+16. **No upstream failover**: with two upstreams and one dead, ~50% of
+    requests 502'd. Passive health marks (nginx max_fails/fail_timeout
+    semantics) plus a same-request retry fixed this — 20/20 requests
+    succeed with one upstream down, and the dead one rejoins after its
+    cooldown.
+17. **Large uncompressed static files were fully buffered in memory** (the
+    `StreamingFile` path was dead code): 20MB × 20 conns drove RSS 24→236
+    MiB. `FileServer::serve_auto` now returns Buffered/Stream after one
+    resolve + stat; streaming RSS stays ~35 MiB with no throughput
+    regression (plain static 17.1k rps vs 17.5k baseline, gzip 25.2k vs
+    23.9k).
+18. **SIGTERM/SIGINT never stopped the process** (systemd stop hung until
+    SIGKILL). Explicit shutdown handlers added.
+19. **Admin `/metrics` returned an empty body** — `metrics::init()` was
+    never called. **X-Forwarded-For/X-Real-IP were not set** on proxied
+    requests. Both fixed.
+20. **The DSL had no `tls` or `admin` directives** (JSON-only). Both are
+    now supported in the Caddyfile syntax, including `tls { cert/key/
+    acme_email/http3 }` block form and `admin off`.
+
+Workspace tests: 65 → 129, all passing, across all 20 fixes.
 
 Also deleted a `strict-tests/` directory that had been added by another
 tool: 16 of its 26 tests failed against the real compiler because it
