@@ -32,9 +32,9 @@
 
 ### R0：先讓測試結果可信
 
-- [ ] **整合測試隔離完成** — 全部真 binary 測試使用動態 port／唯一 readiness
-  token；child 與 process group 在成功、panic、timeout、Ctrl-C 後都會 reap，
-  連續跑 20 次不得殘留 listener 或幽靈 Pingclair。
+- [ ] **整合測試隔離完成（本機已過，待 Linux）** — 全部真 binary 測試使用
+  動態 port／唯一 readiness token；child 與 process group 在成功、panic、
+  timeout、Ctrl-C 後都會 reap，連續跑 20 次不得殘留 listener 或幽靈 Pingclair。
 - [ ] **乾淨 Linux 驗證腳本完成** — 由指定 commit 建立暫存 checkout，建置 release
   binary、啟動測試、收集 config/log/metrics/result，最後只清理自己建立的程序與目錄。
 - [ ] **協議安全回歸集完成** — H1/H2/H3 的 URI/header 正規化、hop-by-hop headers、
@@ -192,6 +192,20 @@
 
 ## 🧪 已實作：本機通過，尚待乾淨遠端驗證
 
+### 2026-07-26 整合測試隔離
+
+- [x] **動態 listener 與可信 readiness** — 10 項真 binary 測試不再使用
+  9091–9098；每個 server/admin port 先由 OS 保留，啟動前才釋放。每個 child
+  都注入唯一 readiness path/token，Admin 測試也會等待 `/health`，不再把舊程序
+  或尚未完成 bind 的 listener 誤判為 ready。
+- [x] **程序群組與中止清理** — Pingclair、watchdog 各自使用獨立 process group；
+  正常完成、失敗啟動、panic/timeout Drop 都會 kill＋wait。harness 因 Ctrl-C
+  或外部中止消失時，獨立 watchdog 會清理 Pingclair group；stdout/stderr 改寫入
+  per-test 暫存目錄，避免 pipe 塞滿後互相等待。
+- [x] **本機重複驗證** — `scripts/test-integration-isolation.sh` 可重現隔離測試；
+  macOS 最終版本連跑 20 輪、每輪 10 項並行測試全過，結束後沒有新增 Pingclair、
+  listener 或 watchdog。仍須在乾淨 Linux 以同一 commit 重跑，才可勾選 R0。
+
 ### 安全與正確性
 
 - [x] **Admin API 認證**（2026-07-25）— Bearer key 已接入；未配置 key 時僅允許
@@ -243,11 +257,10 @@
 
 ### P0：測試可靠性
 
-- [ ] **整合測試動態 port／程序隔離** — 現有測試使用 9091–9098 固定埠；
-  測試被中止時仍可能留下幽靈 Pingclair。新測試應使用動態埠或唯一 readiness
-  token，並加入 PID／port owner 檢查。
-- [ ] **測試程序群組清理** — `Drop` 只處理直接 child；需評估 process group 或
-  kill-on-drop guard，確保子程序與被中止測試不殘留。
+- [ ] **Workspace lint baseline** — `cargo fmt --all --check` 目前仍有大量歷史格式差異；
+  `cargo clippy --workspace --all-targets -- -D warnings` 首先卡在
+  `pingclair-tls/src/cert_store.rs` 與 `manager.rs` 的 `collapsible_if`。需以獨立、
+  可審查的格式／lint commit 清乾淨並加入 CI，不能把 R5 的品質閘門寫成假綠。
 - [ ] **乾淨遠端驗證工作流** — 不可再直接使用髒的 `/root/pingclair`。
   補一個以指定 commit 建立暫存 clone/worktree、測試、收集結果、清理程序的腳本。
 - [ ] **協議與解析安全回歸集** — 對 H1/H2/H3 建立 URI／header 正規化、
