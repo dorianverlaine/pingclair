@@ -1,0 +1,13 @@
+Running 15s test @ http://127.0.0.1:8080/proxy/
+  2 threads and 200 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    11.40ms    3.14ms  78.41ms   95.60%
+    Req/Sec     8.90k   634.15     9.84k    93.67%
+  Latency Distribution
+     50%   11.36ms
+     75%   11.79ms
+     90%   12.19ms
+     99%   14.94ms
+  265794 requests in 15.00s, 57.29MB read
+Requests/sec:  17715.52
+Transfer/sec:      3.82MB

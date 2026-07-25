@@ -40,38 +40,43 @@ Que vous ayez besoin d'un simple serveur de fichiers statiques ou d'une passerel
 
 La méthodologie complète, les résultats bruts et — surtout — les bugs mis au
 jour et corrigés par ce processus se trouvent dans
-[`benchmarks/README.md`](benchmarks/README.md) (en anglais). Le tableau
-ci-dessous ne montre que les chiffres pour les fichiers statiques ; lisez
-l'analyse complète avant d'en tirer des conclusions, en particulier sur le
-débit du reverse proxy et la compression gzip sous charge.
+[`benchmarks/README.md`](benchmarks/README.md) (en anglais). Lisez l'analyse
+complète avant d'en tirer des conclusions.
 
-**Environnement de test** : réseau bridge Docker, chaque serveur dans son
-propre conteneur limité à 2 vCPU / 512 Mo, MacBook Pro (M2), `wrk -t4 -d15s`,
-fichier statique de 1 Ko.
+**Environnement de test** : VPS bare-metal (Aliyun, 2 vCPU / 1,6 Go,
+Ubuntu 24.04), chaque serveur à tour de rôle sur `127.0.0.1:8080`,
+`wrk -t2 -d15s` en loopback (`results/20260725_vps_onbox/`).
 
-| Serveur | RPS @ c50 | RPS @ c500 | Remarques |
-|---------|-----------|------------|-----------|
-| **Nginx (Alpine)** | ~28 801 | ~27 853 | Le plus rapide à cette taille, à tous les niveaux de concurrence testés |
-| **Pingclair (Debian)** | ~22 942 | ~21 162 | ~75-80 % de Nginx |
-| **Caddy (Alpine)** | ~18 309 | ~18 448 | Constant, ~65 % de Nginx |
+| Scénario | Pingclair | Nginx | Caddy |
+|----------|-----------|-------|-------|
+| Statique 1 Ko, brut (c200) | 18 795 req/s | **55 236 req/s** | 17 413 req/s |
+| Statique 1 Ko, gzip (c200) | 27 459 req/s | **44 268 req/s** | 15 412 req/s |
+| Reverse proxy (c200) | 17 716 req/s | **20 778 req/s** | 9 168 req/s |
+| Gros fichier 20 Mo, gzip (c20) | **703 req/s, 0 timeout** | 9,1 req/s, 110 timeouts | 10,1 req/s, 65 timeouts |
 
-> **Des réserves plus importantes que le tableau**
-> Sur le débit du reverse proxy, pingclair est passé devant nginx et caddy
-> à forte concurrence dans cet environnement limité en conteneurs — un
-> résultat réel mais non confirmé sur du matériel sans limitation, à ne
-> pas généraliser. Par ailleurs, un test de charge avec un gros fichier
-> (20 Mo) compressé en gzip a révélé — et permis de corriger — un vrai
-> bug : la compression des fichiers statiques était refaite intégralement
-> à chaque requête, sans aucun cache, et sous charge concurrente soutenue
-> un test de 20 secondes en prenait 16 minutes. Une fois corrigé (ajout
-> d'un cache des corps compressés), le même test se termine désormais en
-> 20,09 s et traite **21 684 requêtes** (contre 54 avant) — plus que
-> nginx et caddy réunis sur ce même test, puisque les requêtes répétées
-> sautent entièrement la compression. Une réserve résiduelle (pic de
-> mémoire transitoire dû à un « effet de horde » sur les premiers ratés
-> concurrents) est documentée dans le détail complet. Voir
-> [`benchmarks/README.md`](benchmarks/README.md) pour la comparaison
-> avant/après intégrale.
+**Comment lire ces chiffres**
+
+- Nginx mène de ~2,6-2,9x sur le petit fichier statique brut (sendfile +
+  un chemin de code très optimisé) — l'écart est réel et c'est là que
+  pingclair a le plus de marge de progression. Pingclair devance
+  légèrement Caddy sur la même charge.
+- Le reverse proxy est quasiment à égalité avec nginx (~84-99 %) et
+  ~1,8-2x devant Caddy, sans aucune erreur pour les trois.
+- Les gros fichiers compressibles sont le terrain de prédilection du
+  cache de corps compressés : ~70x le débit de nginx/caddy avec **0
+  timeout**, car les accès répétés sautent entièrement la compression
+  alors que nginx et caddy recompressent le fichier de 20 Mo à chaque
+  requête. Ce cache coûte de la mémoire par conception (pic RSS de 74
+  Mio contre 21 Mio pour nginx — budget borné à 64 Mo).
+- Les niveaux de compression ne sont pas parfaitement alignés entre
+  moteurs (`gzip_comp_level 1` pour nginx, défauts ailleurs) : les
+  comparaisons gzip sont indicatives, pas exactes.
+
+Un run Docker bridge plus ancien (conteneurs 2 vCPU / 512 Mo, Apple M2),
+avec la matrice complète et la liste des **20 bugs trouvés et corrigés
+grâce aux benchmarks** — dont un bug de compression statique qui
+transformait un test de 20 secondes en 16 minutes — est documenté dans
+[`benchmarks/README.md`](benchmarks/README.md).
 
 ## 📦 Installation
 
