@@ -21,7 +21,7 @@ services:
     depends_on: [backend]
     volumes:
       - ./configs/pingclair/Pingclairfile:/etc/pingclair/Pingclairfile:ro
-      - ./configs/pingclair/html:/var/www/html:ro
+      - ./payloads:/var/www/html:ro
     ports:
       - "18080:8080"
     deploy:
@@ -36,7 +36,7 @@ services:
     depends_on: [backend]
     volumes:
       - ./configs/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./configs/nginx/html:/var/www/html:ro
+      - ./payloads:/var/www/html:ro
     ports:
       - "18081:8080"
     deploy:
@@ -51,7 +51,7 @@ services:
     depends_on: [backend]
     volumes:
       - ./configs/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./configs/caddy/html:/var/www/html:ro
+      - ./payloads:/var/www/html:ro
     ports:
       - "18082:8080"
     deploy:

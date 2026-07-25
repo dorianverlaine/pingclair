@@ -1,0 +1,3 @@
+# Benchmark payload fixtures are multi-MB test data, not project source.
+# Mark them vendored so GitHub's language stats reflect the actual code.
+benchmarks/payloads/** linguist-vendored
