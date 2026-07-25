@@ -31,7 +31,7 @@ Cargo workspace with 8 member crates (all declared in the root `Cargo.toml`):
 | `pingclair-static` | Static file serving: file server with range requests, compression (with a byte-bounded LRU cache of compressed bodies keyed on `(path, mtime, encoding)`), MIME inference. |
 | `pingclair-tls` | TLS management: certificate store, ACME issuance/renewal, auto-HTTPS redirect logic, persistent ACME challenge handler. |
 | `pingclair-api` | Admin REST API (`run_admin_server`): auth, routes, handlers for state inspection and config hot-reload. |
-| `pingclair-plugin` | Plugin system (traits, registry, loader). Exposes `Plugin`, `PluginContext`, `PluginInfo`, `PluginRegistry`, `PluginLoader`. Per the README this is still in development. |
+| `pingclair-plugin` | Plugin system (traits, registry, loader). Exposes `Plugin`, `PluginContext`, `PluginInfo`, `PluginRegistry`, `PluginLoader`. Currently a stub: the loader is unimplemented and nothing is wired into the runtime; it is not advertised as a user-facing feature. |
 
 Other top-level directories:
 
@@ -49,7 +49,7 @@ Other top-level directories:
   binary + systemd service + unprivileged `pingclair` user with `setcap`),
   `pingclair.service`.
 - `docs/` — `AUDIT_NGINX_PARITY.md`, an nginx-parity/stability audit written
-  in Chinese.
+  in Traditional Chinese.
 
 ## Build and test commands
 
@@ -150,9 +150,11 @@ HTTPS listen port, single-threading a `HashMap<ConnectionId, ConnState>`
 ## Code style guidelines
 
 - Standard Rust style (`cargo fmt`-compatible), standard naming; comments and
-  doc comments in the source are in **English**. Some workspace-level
-  `Cargo.toml` dependency-section comments are in Chinese — match the file
-  you're editing rather than imposing one language globally.
+  doc comments in the source are in **English only** (Apple-style: complete
+  sentences, proper punctuation). No Chinese in code comments, `Cargo.toml`
+  comments, or shell scripts. Any Chinese prose in the repository (user docs
+  such as `README.zh.md` and `docs/AUDIT_NGINX_PARITY.md`) must be written in
+  **Traditional Chinese (Taiwan usage)**.
 - Async code is Tokio-based; Pingora traits are implemented with
   `async-trait`. Errors use `thiserror` in libraries and `anyhow` at the CLI
   boundary.
@@ -216,11 +218,11 @@ HTTPS listen port, single-threading a `HashMap<ConnectionId, ConnState>`
 
 ## Documentation conventions
 
-- Main user docs: `README.md` (English; translations in `README.zh-TW.md`,
+- Main user docs: `README.md` (English; translations in `README.zh.md`,
   `README.fr.md` — update all three if you change user-facing behavior
   documented there).
 - `benchmarks/README.md` is the source of truth for performance claims and
   for the list of load-test-discovered bugs; update it when fixing
   performance-relevant bugs.
-- `docs/AUDIT_NGINX_PARITY.md` (Chinese) tracks nginx-parity gaps and P0
-  issues; check it before touching proxy/static hot paths.
+- `docs/AUDIT_NGINX_PARITY.md` (Traditional Chinese) tracks nginx-parity gaps
+  and P0 issues; check it before touching proxy/static hot paths.

@@ -10,7 +10,7 @@
 [![Status](https://img.shields.io/badge/status-active-green.svg)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/dorianverlaine/pingclair/pulls)
 
-**English** · [繁體中文](README.zh-TW.md) · [Français](README.fr.md)
+**English** · [中文](README.zh.md) · [Français](README.fr.md)
 
 </div>
 
@@ -33,7 +33,6 @@ Whether you need a simple static file server or an enterprise gateway with load 
 *   🔄 **Smart load balancing** — Several built-in algorithms (round-robin, least-connections, and more) with health checks and automatic failover.
 *   🔐 **Fully automatic HTTPS** — Built-in ACME (Let's Encrypt) support issues and renews SSL/TLS certificates with zero configuration.
 *   📁 **Fast static file serving** — Gzip/Brotli compression, range requests, and efficient file transfer.
-*   🔌 **Modular plugin system** — *(in development)* Extend functionality through Rust traits without touching the core.
 *   📊 **Observability** — Prometheus metrics export and OpenTelemetry tracing out of the box.
 
 ## ⚡ Benchmarks
