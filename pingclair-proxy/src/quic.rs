@@ -1220,7 +1220,7 @@ async fn handle_request_inner(
                     // Stream the file in chunks — never buffered whole.
                     let mut fin_sent = false;
                     loop {
-                        match stream.read_chunk().await {
+                        match stream.read_chunk() {
                             Ok(Some(chunk)) => {
                                 let last = stream.is_complete();
                                 send_body(resp_tx, cid, stream_id, chunk, last).await;

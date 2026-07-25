@@ -541,9 +541,24 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
         .global
         .upstream_keepalive_pool_size
         .unwrap_or(server_conf.upstream_keepalive_pool_size);
+    // Pingora defaults to ONE thread per service — on a multi-core box that
+    // leaves the machine idle while nginx runs one worker per core. Scale
+    // with available parallelism instead (still overridable via config).
+    server_conf.threads = config
+        .global
+        .worker_threads
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        });
     tracing::info!(
         "🔗 Upstream keepalive pool size: {} connections/thread",
         server_conf.upstream_keepalive_pool_size
+    );
+    tracing::info!(
+        "🧵 Worker threads per service: {}",
+        server_conf.threads
     );
 
     let mut server = pingora::server::Server::new_with_opt_and_conf(

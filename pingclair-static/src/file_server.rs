@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 use pingclair_core::error::Result;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use std::io::{Read as _, Seek as _, SeekFrom};
 
 /// Key for a cached compressed response: a file identity (path + mtime) plus
 /// the content encoding. mtime is part of the key so editing a file naturally
@@ -154,8 +154,13 @@ pub enum ServedResponse {
 /// Streaming file response for zero-copy large file transfer
 /// Use this for files larger than 5MB to avoid memory pressure
 pub struct StreamingFile {
-    /// Tokio file handle for async reading
-    pub file: tokio::fs::File,
+    /// Synchronous file handle. Synchronous I/O is intentional: reads of
+    /// local regular files effectively never block (a page-cache hit is
+    /// microseconds), which is why nginx reads/sends files directly on its
+    /// event-loop threads. Routing every read through `tokio::fs` costs a
+    /// `spawn_blocking` cross-thread round trip per chunk — several per
+    /// request on this hot path.
+    pub file: std::fs::File,
     /// Total file size in bytes
     pub file_size: u64,
     /// Chunk size for streaming (default 64KB)
@@ -173,9 +178,10 @@ pub struct StreamingFile {
 }
 
 impl StreamingFile {
-    /// Read the next chunk of data
+    /// Read the next chunk of data (synchronous — see the `file` field for
+    /// why blocking I/O is deliberate here).
     /// Returns None when EOF is reached
-    pub async fn read_chunk(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+    pub fn read_chunk(&mut self) -> std::io::Result<Option<Vec<u8>>> {
         if self.bytes_read >= self.file_size {
             return Ok(None);
         }
@@ -184,7 +190,7 @@ impl StreamingFile {
         let to_read = remaining.min(self.chunk_size);
         
         let mut buf = vec![0u8; to_read];
-        let n = self.file.read(&mut buf).await?;
+        let n = self.file.read(&mut buf)?;
         
         if n == 0 {
             return Ok(None);
@@ -334,22 +340,24 @@ impl FileServer {
             None => return Ok(None),
         };
 
-        // Check if file exists
-        let metadata = match tokio::fs::metadata(&file_path).await {
+        // Check if file exists. `std::fs` on purpose: stat of a local file
+        // is a cheap syscall, while `tokio::fs::metadata` would dispatch a
+        // `spawn_blocking` cross-thread round trip per request.
+        let metadata = match std::fs::metadata(&file_path) {
             Ok(m) if m.is_file() => m,
             _ => return Ok(None),
         };
 
-        Ok(Some(Self::open_stream(file_path, &metadata).await?))
+        Ok(Some(Self::open_stream(file_path, &metadata)?))
     }
 
     /// Open `file_path` for chunked streaming, computing the response
     /// metadata (MIME, Last-Modified, ETag) from the already-fetched stat.
-    async fn open_stream(file_path: PathBuf, metadata: &std::fs::Metadata) -> Result<StreamingFile> {
+    fn open_stream(file_path: PathBuf, metadata: &std::fs::Metadata) -> Result<StreamingFile> {
         let file_size = metadata.len();
 
         // Open file handle (no reading yet - zero-copy preparation)
-        let file = tokio::fs::File::open(&file_path).await?;
+        let file = std::fs::File::open(&file_path)?;
 
         // Guess MIME type
         let mime_type = mime_guess::from_path(&file_path)
@@ -378,7 +386,7 @@ impl FileServer {
     /// Check if a file should be served with streaming (based on size)
     pub async fn should_stream(&self, path: &str) -> Result<bool> {
         let file_path = self.config.root.join(path.trim_start_matches('/'));
-        match tokio::fs::metadata(&file_path).await {
+        match std::fs::metadata(&file_path) {
             Ok(m) => Ok(m.len() > Self::STREAMING_THRESHOLD),
             Err(_) => Ok(false),
         }
@@ -400,8 +408,9 @@ impl FileServer {
 
         tracing::debug!("📁 Serving request: {} -> {:?}", path, file_path);
         
-        // Check if metadata exists
-        let metadata = match tokio::fs::metadata(&file_path).await {
+        // Check if metadata exists (synchronous by design — see
+        // serve_streaming for why tokio::fs is avoided on this hot path)
+        let metadata = match std::fs::metadata(&file_path) {
             Ok(m) => m,
             Err(_) => return Ok(None),
         };
@@ -412,7 +421,7 @@ impl FileServer {
             let mut index_found = false;
             for index in &self.config.index {
                 let index_path = file_path.join(index);
-                if tokio::fs::try_exists(&index_path).await.unwrap_or(false) {
+                if index_path.exists() {
                     file_path = index_path;
                     index_found = true;
                     break;
@@ -447,7 +456,7 @@ impl FileServer {
         }
 
         // Get updated metadata for file (size, modified)
-        let metadata = match tokio::fs::metadata(&file_path).await {
+        let metadata = match std::fs::metadata(&file_path) {
             Ok(m) => m,
             Err(_) => return Ok(None),
         };
@@ -486,7 +495,7 @@ impl FileServer {
         // never held in memory. Checked before the compression cache path,
         // which only ever applies to buffered responses.
         if self.should_stream_response(file_size, range_header, accept_encoding) {
-            return Ok(Some(ServedResponse::Stream(Self::open_stream(file_path, &metadata).await?)));
+            return Ok(Some(ServedResponse::Stream(Self::open_stream(file_path, &metadata)?)));
         }
 
         // Cache-key ingredients. Only full-file (200, non-range) responses
@@ -626,7 +635,7 @@ impl FileServer {
             Some(ServedResponse::Buffered(file)) => Ok(Some(file)),
             Some(ServedResponse::Stream(mut stream)) => {
                 let mut content = Vec::with_capacity(stream.file_size as usize);
-                while let Some(chunk) = stream.read_chunk().await? {
+                while let Some(chunk) = stream.read_chunk()? {
                     content.extend_from_slice(&chunk);
                 }
                 Ok(Some(ServedFile {
@@ -656,14 +665,18 @@ impl FileServer {
         encoding: Option<&'static str>,
         mtime_ns: Option<u128>,
     ) -> Result<(Vec<u8>, Option<String>)> {
-        let mut file = tokio::fs::File::open(file_path).await?;
+        // Synchronous read, intentionally: a local regular-file read served
+        // from the page cache effectively never blocks (the nginx model), so
+        // paying a spawn_blocking round trip per request via tokio::fs only
+        // adds cross-thread wakeups on this hot path.
+        let mut file = std::fs::File::open(file_path)?;
 
         if start > 0 {
-            file.seek(std::io::SeekFrom::Start(start)).await?;
+            file.seek(SeekFrom::Start(start))?;
         }
 
         let mut content = vec![0u8; length as usize];
-        file.read_exact(&mut content).await?;
+        file.read_exact(&mut content)?;
 
         match encoding {
             Some(enc) => {
@@ -718,7 +731,8 @@ impl FileServer {
             let precompressed_path = std::path::PathBuf::from(precompressed_path);
             
             // Check if pre-compressed file exists and is readable
-            if let Ok(content) = tokio::fs::read(&precompressed_path).await {
+            // (synchronous read — same rationale as read_and_maybe_compress)
+            if let Ok(content) = std::fs::read(&precompressed_path) {
                 return Some((content, encoding));
             }
         }
@@ -782,7 +796,9 @@ impl FileServer {
     
     /// Generate HTML directory listing
     async fn generate_listing(&self, dir_path: &std::path::Path, req_path: &str) -> Result<String> {
-        let mut entries = tokio::fs::read_dir(dir_path).await?;
+        // Synchronous directory read — a readdir on a local filesystem is a
+        // cheap syscall, not worth a spawn_blocking round trip.
+        let entries = std::fs::read_dir(dir_path)?;
         let mut html = format!(
             "<html><head><title>Index of {}</title></head><body><h1>Index of {}</h1><hr><pre>",
             req_path, req_path
@@ -793,10 +809,11 @@ impl FileServer {
              html.push_str("<a href=\"..\">../</a>\n");
         }
         
-        while let Some(entry) = entries.next_entry().await? {
+        for entry in entries {
+            let entry = entry?;
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            let is_dir = entry.file_type().await?.is_dir();
+            let is_dir = entry.file_type()?.is_dir();
             let display_name = if is_dir { format!("{}/", name_str) } else { name_str.to_string() };
             
             html.push_str(&format!("<a href=\"{}\">{}</a>\n", display_name, display_name));
@@ -1021,7 +1038,7 @@ mod serve_auto_tests {
             ServedResponse::Stream(mut stream) => {
                 assert_eq!(stream.file_size, body.len() as u64);
                 let mut got = Vec::new();
-                while let Some(chunk) = stream.read_chunk().await.unwrap() {
+                while let Some(chunk) = stream.read_chunk().unwrap() {
                     got.extend_from_slice(&chunk);
                 }
                 assert_eq!(got, body, "streamed bytes must equal the file");

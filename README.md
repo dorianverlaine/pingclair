@@ -48,18 +48,23 @@ loopback (`results/20260725_vps_onbox/`).
 
 | Scenario | Pingclair | Nginx | Caddy |
 |----------|-----------|-------|-------|
-| Static 1KB, plain (c200) | 18,795 req/s | **55,236 req/s** | 17,413 req/s |
-| Static 1KB, gzip (c200) | 27,459 req/s | **44,268 req/s** | 15,412 req/s |
-| Reverse proxy (c200) | 17,716 req/s | **20,778 req/s** | 9,168 req/s |
+| Static 1KB, plain (c100) | 50,145 req/s | **53,579 req/s** | 17,337 req/s |
+| Static 1KB, gzip (c100) | **42,982 req/s** | 42,510 req/s | 15,302 req/s |
+| Reverse proxy (c100) | 20,154 req/s | **21,961 req/s** | 9,870 req/s |
 | Large 20MB, gzip (c20) | **703 req/s, 0 timeouts** | 9.1 req/s, 110 timeouts | 10.1 req/s, 65 timeouts |
 
 **How to read this**
 
-- Nginx is ~2.6-2.9x ahead on plain small-file static (sendfile + a very
-  mature hot path) — that gap is real and is where pingclair has the
-  most headroom left. Pingclair edges out Caddy on the same workload.
-- Reverse proxying is essentially tied with nginx (~84-99%) and ~1.8-2x
-  Caddy, with zero errors on all three.
+- Small-file static is now essentially tied with nginx (94% plain, 101%
+  gzip) and ~2.9x Caddy. This was not always so: earlier runs showed a
+  ~2.9x gap to nginx, root-caused to `tokio::fs` — every `tokio::fs`
+  call is a `spawn_blocking` cross-thread round-trip, so each request
+  paid ~8 futex wake/waits. The static hot path now uses synchronous
+  `std::fs` (the nginx model: local file reads don't meaningfully
+  block), which took futex from 8/request to ~0 and throughput from
+  18.7k to 50k req/s. Full story in `benchmarks/README.md`.
+- Reverse proxying is ~92% of nginx and ~2x Caddy, with zero errors on
+  all three.
 - Large compressible bodies are the compressed-body cache's home turf:
   pingclair serves ~70x nginx/caddy's throughput with **0 timeouts**
   because repeat hits skip compression entirely, while nginx and caddy
