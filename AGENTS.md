@@ -13,7 +13,7 @@ a Caddyfile-compatible DSL ("Pingclairfile"), automatic HTTPS via ACME
 gzip/Brotli compression, load balancing, Prometheus metrics, and an admin
 REST API for runtime inspection and hot-reload.
 
-- Workspace version: `0.1.6` (see `[workspace.package]` in the root `Cargo.toml`)
+- Workspace version: `0.1.7` (see `[workspace.package]` in the root `Cargo.toml`)
 - Rust edition 2024, minimum toolchain **Rust 1.88** (quiche requires it)
 - License: Apache-2.0
 - Repository: https://github.com/dorianverlaine/pingclair
