@@ -30,7 +30,11 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@nightly
+        # Pin stable: nightly ICEs (rustc_codegen_ssa operand.rs "not immediate")
+        # when compiling tokio under this workspace's release profile (fat LTO,
+        # codegen-units=1) — hit on both x86_64 and aarch64. The code needs
+        # only stable (CI builds on it); do not reintroduce a nightly pin.
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.platform.target }}
 
