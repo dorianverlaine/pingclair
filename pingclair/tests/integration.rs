@@ -48,8 +48,19 @@ impl Drop for TestServer {
     }
 }
 
+/// Tests must talk to the server directly: on machines with a system HTTP
+/// proxy (e.g. macOS with a proxy configured for 127.0.0.1), reqwest picks
+/// it up from the system settings and the proxy — not pingclair — would be
+/// answering (or refusing) these requests.
+fn no_proxy_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+}
+
 async fn wait_for_server(url: &str, server: &mut TestServer) -> bool {
-    let client = reqwest::Client::new();
+    let client = no_proxy_client();
     for _ in 0..50 {
         // Check if process is still alive
         if let Ok(Some(status)) = server.process.try_wait() {
@@ -71,8 +82,14 @@ async fn wait_for_server(url: &str, server: &mut TestServer) -> bool {
              return false;
         }
 
-        if client.get(url).send().await.is_ok() {
-            return true;
+        // Any HTTP response (even a proxy's error page) counts as "answered",
+        // so require a success status — otherwise a local HTTP proxy
+        // answering instantly with its own 503 would mark the server "up"
+        // before it has even bound its socket.
+        if let Ok(resp) = client.get(url).send().await {
+            if resp.status().is_success() {
+                return true;
+            }
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -121,7 +138,7 @@ async fn test_static_file_server() {
     assert!(wait_for_server("http://127.0.0.1:9091/index.html", &mut server).await, "Server failed to start");
     
     // 5. Assert
-    let resp = reqwest::get("http://127.0.0.1:9091/index.html").await.unwrap();
+    let resp = no_proxy_client().get("http://127.0.0.1:9091/index.html").send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let text = resp.text().await.unwrap();
     assert_eq!(text, "<h1>Hello World</h1>");
@@ -164,7 +181,7 @@ async fn test_admin_api_hot_reload() {
     assert!(wait_for_server("http://127.0.0.1:9093/", &mut server).await, "Server V1 failed to start");
     
     // Check V1 (matches index v1.txt)
-    let resp = reqwest::get("http://127.0.0.1:9093/").await.unwrap();
+    let resp = no_proxy_client().get("http://127.0.0.1:9093/").send().await.unwrap();
     assert_eq!(resp.text().await.unwrap(), "Version 1");
     
     // 2. Perform Hot Reload (JSON Payload)
@@ -183,7 +200,7 @@ async fn test_admin_api_hot_reload() {
         ]
     });
     
-    let client = reqwest::Client::new();
+    let client = no_proxy_client();
     let reload_resp = client.post("http://127.0.0.1:9092/config/0")
         .json(&new_config_obj)
         .send()
@@ -195,7 +212,7 @@ async fn test_admin_api_hot_reload() {
     // 3. Check V2
     tokio::time::sleep(Duration::from_millis(200)).await;
     
-    let resp_v2 = reqwest::get("http://127.0.0.1:9093/").await.unwrap();
+    let resp_v2 = client.get("http://127.0.0.1:9093/").send().await.unwrap();
     assert_eq!(resp_v2.text().await.unwrap(), "Version 2");
 }
 
@@ -229,9 +246,7 @@ async fn test_compression() {
     let mut server = TestServer::new(&config);
     assert!(wait_for_server("http://127.0.0.1:9094/big.txt", &mut server).await, "Server failed to start");
 
-    let client = reqwest::Client::builder()
-        .build()
-        .unwrap();
+    let client = no_proxy_client();
 
     // Request with gzip
     let resp: reqwest::Response = client.get("http://127.0.0.1:9094/big.txt")
