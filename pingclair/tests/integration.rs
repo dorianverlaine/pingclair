@@ -1,126 +1,437 @@
 use std::io::Write;
+use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::Duration;
 
 struct TestServer {
     process: Child,
-    config_path: PathBuf,
+    watchdog: Option<Child>,
+    server_addresses: Vec<Vec<SocketAddr>>,
+    admin_address: Option<SocketAddr>,
+    readiness_path: String,
+    readiness_token: String,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    stopped: bool,
+    _temp_dir: tempfile::TempDir,
 }
 
 impl TestServer {
     fn new(config_body: &str) -> Self {
-        let mut config_path = std::env::temp_dir();
-        config_path.push(format!("pingclair-test-{}.json", uuid::Uuid::new_v4()));
+        let temp_dir = tempfile::tempdir().expect("failed to create the test directory");
+        let config_path = temp_dir.path().join("config.json");
+        let tls_store_path = temp_dir.path().join("tls");
+        let stdout_path = temp_dir.path().join("stdout.log");
+        let stderr_path = temp_dir.path().join("stderr.log");
+        std::fs::create_dir(&tls_store_path).expect("failed to create the test TLS store");
 
-        // Write config
+        let readiness_id = uuid::Uuid::new_v4();
+        let readiness_path = format!("/__pingclair_test_ready_{readiness_id}");
+        let readiness_token = format!("pingclair-ready-{readiness_id}");
+        let mut config: serde_json::Value =
+            serde_json::from_str(config_body).expect("invalid integration-test JSON");
+        let mut reservations = Vec::new();
+        let server_addresses = prepare_server_listeners(
+            &mut config,
+            &readiness_path,
+            &readiness_token,
+            &mut reservations,
+        );
+        let admin_address = prepare_admin_listener(&mut config, &mut reservations);
+
+        // 🧪 Keep every test artifact together so cleanup is atomic and inspectable.
         let mut file = std::fs::File::create(&config_path).unwrap();
-        file.write_all(config_body.as_bytes()).unwrap();
+        file.write_all(serde_json::to_string_pretty(&config).unwrap().as_bytes())
+            .unwrap();
 
-        // Create temporary TLS store directory for testing
-        let mut tls_store_path = std::env::temp_dir();
-        tls_store_path.push(format!("pingclair-tls-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tls_store_path).unwrap();
-
-        // Start server using the compiled binary (avoids cargo lock issues)
+        // 🧾 Use files instead of pipes so verbose logs can never block the child.
+        let stdout = std::fs::File::create(&stdout_path).unwrap();
+        let stderr = std::fs::File::create(&stderr_path).unwrap();
         let bin_path = env!("CARGO_BIN_EXE_pingclair");
-
-        let process = Command::new(bin_path)
+        let mut command = Command::new(bin_path);
+        command
             .arg("run")
-            .arg(config_path.to_str().unwrap())
-            .env("PINGCLAIR_TLS_STORE", tls_store_path.to_str().unwrap())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("Failed to start server");
+            .arg(&config_path)
+            .env("PINGCLAIR_TLS_STORE", &tls_store_path)
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+
+        // 🧹 Isolate the server so panic and timeout cleanup can reap its descendants.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+
+        // 🔓 Release reservations only when the child is ready to bind the ports.
+        drop(reservations);
+        let mut process = command.spawn().expect("failed to start the test server");
+        let watchdog = match spawn_parent_watchdog(process.id()) {
+            Ok(watchdog) => watchdog,
+            Err(error) => {
+                terminate_process_group(&mut process, "test server");
+                panic!("failed to start the test parent watchdog: {error}");
+            }
+        };
 
         Self {
             process,
-            config_path,
+            watchdog,
+            server_addresses,
+            admin_address,
+            readiness_path,
+            readiness_token,
+            stdout_path,
+            stderr_path,
+            stopped: false,
+            _temp_dir: temp_dir,
         }
+    }
+
+    fn url(&self, server_index: usize, path: &str) -> String {
+        format!("http://{}{}", self.server_addresses[server_index][0], path)
+    }
+
+    fn address(&self, server_index: usize) -> SocketAddr {
+        self.server_addresses[server_index][0]
+    }
+
+    fn admin_url(&self, path: &str) -> String {
+        format!(
+            "http://{}{}",
+            self.admin_address
+                .expect("admin listener is not configured"),
+            path
+        )
+    }
+
+    fn exit_status(&mut self) -> Option<ExitStatus> {
+        match self.process.try_wait() {
+            Ok(status) => status,
+            Err(error) => panic!("failed to inspect the test server: {error}"),
+        }
+    }
+
+    fn print_diagnostics(&self) {
+        for (label, path) in [("STDERR", &self.stderr_path), ("STDOUT", &self.stdout_path)] {
+            match std::fs::read_to_string(path) {
+                Ok(output) if !output.is_empty() => eprintln!("📋 {label}:\n{output}"),
+                Ok(_) => {}
+                Err(error) => eprintln!("❌ Failed to read {label}: {error}"),
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        if self.stopped {
+            return;
+        }
+
+        terminate_process_group(&mut self.process, "test server");
+        if let Some(watchdog) = &mut self.watchdog {
+            terminate_process_group(watchdog, "test parent watchdog");
+        }
+        self.stopped = true;
+    }
+
+    async fn wait_until_ready(&mut self) -> bool {
+        let client = no_proxy_client();
+        let url = self.url(0, &self.readiness_path);
+        let admin_url = self
+            .admin_address
+            .map(|address| format!("http://{address}/health"));
+        let mut server_ready = false;
+        let mut admin_ready = admin_url.is_none();
+        for _ in 0..50 {
+            if let Some(status) = self.exit_status() {
+                eprintln!("❌ Server exited unexpectedly with status: {status}");
+                self.stop();
+                self.print_diagnostics();
+                return false;
+            }
+
+            if !server_ready
+                && let Ok(response) = client.get(&url).send().await
+                && response.status().is_success()
+                && let Ok(body) = response.text().await
+            {
+                server_ready = body == self.readiness_token;
+            }
+            if !admin_ready && let Some(url) = &admin_url {
+                admin_ready = client.get(url).send().await.is_ok();
+            }
+            if server_ready && admin_ready {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        eprintln!(
+            "⏳ Timed out waiting for test readiness (server={server_ready}, admin={admin_ready})."
+        );
+        self.stop();
+        self.print_diagnostics();
+        false
     }
 }
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        let _ = self.process.kill();
-        let _ = std::fs::remove_file(&self.config_path);
+        self.stop();
     }
 }
 
-/// Tests must talk to the server directly: on machines with a system HTTP
-/// proxy (e.g. macOS with a proxy configured for 127.0.0.1), reqwest picks
-/// it up from the system settings and the proxy — not pingclair — would be
-/// answering (or refusing) these requests.
+fn terminate_process_group(process: &mut Child, label: &str) {
+    #[cfg(unix)]
+    let leader_exited = matches!(process.try_wait(), Ok(Some(_)));
+    #[cfg(unix)]
+    // SAFETY: 🧯 Every child passed here owns the process group matching its PID.
+    unsafe {
+        let result = libc::kill(-(process.id() as i32), libc::SIGKILL);
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            let process_is_gone = error.raw_os_error() == Some(libc::ESRCH)
+                || (leader_exited && error.raw_os_error() == Some(libc::EPERM));
+            if !process_is_gone {
+                eprintln!("❌ Failed to kill the {label} process group: {error}");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = label;
+        let _ = process.kill();
+    }
+
+    let _ = process.wait();
+}
+
+fn spawn_parent_watchdog(process_group_id: u32) -> std::io::Result<Option<Child>> {
+    spawn_watchdog(std::process::id(), process_group_id)
+}
+
+fn spawn_watchdog(parent_process_id: u32, process_group_id: u32) -> std::io::Result<Option<Child>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        // 🐕 Keep the watchdog outside the harness group so it survives an interrupted test.
+        let script = r#"
+parent_pid=$1
+group_id=$2
+while /bin/kill -0 "-$group_id" 2>/dev/null; do
+    if ! /bin/kill -0 "$parent_pid" 2>/dev/null; then
+        /bin/kill -KILL "-$group_id" 2>/dev/null
+        exit 0
+    fi
+    sleep 0.1
+done
+"#;
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .arg("pingclair-test-watchdog")
+            .arg(parent_process_id.to_string())
+            .arg(process_group_id.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        command.spawn().map(Some)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent_process_id;
+        let _ = process_group_id;
+        Ok(None)
+    }
+}
+
+fn reserve_loopback_listener(reservations: &mut Vec<TcpListener>) -> SocketAddr {
+    let listener =
+        TcpListener::bind(("127.0.0.1", 0)).expect("failed to reserve a loopback test port");
+    let address = listener
+        .local_addr()
+        .expect("failed to read the reserved test address");
+    reservations.push(listener);
+    address
+}
+
+fn prepare_server_listeners(
+    config: &mut serde_json::Value,
+    readiness_path: &str,
+    readiness_token: &str,
+    reservations: &mut Vec<TcpListener>,
+) -> Vec<Vec<SocketAddr>> {
+    let servers = config
+        .get_mut("servers")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("integration-test config must contain servers");
+
+    servers
+        .iter_mut()
+        .map(|server| {
+            let listen = server
+                .get_mut("listen")
+                .and_then(serde_json::Value::as_array_mut)
+                .expect("integration-test server must contain a listen array");
+            let addresses: Vec<_> = (0..listen.len())
+                .map(|_| reserve_loopback_listener(reservations))
+                .collect();
+            *listen = addresses
+                .iter()
+                .map(|address| serde_json::Value::String(address.to_string()))
+                .collect();
+
+            // 🪪 A per-process token proves that readiness came from this child.
+            let routes = server
+                .get_mut("routes")
+                .and_then(serde_json::Value::as_array_mut)
+                .expect("integration-test server must contain routes");
+            routes.insert(
+                0,
+                serde_json::json!({
+                    "path": readiness_path,
+                    "handler": {
+                        "type": "respond",
+                        "status": 200,
+                        "body": readiness_token
+                    }
+                }),
+            );
+            addresses
+        })
+        .collect()
+}
+
+fn prepare_admin_listener(
+    config: &mut serde_json::Value,
+    reservations: &mut Vec<TcpListener>,
+) -> Option<SocketAddr> {
+    let admin = config.get_mut("admin")?.as_object_mut()?;
+    if !admin
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let address = reserve_loopback_listener(reservations);
+    admin.insert(
+        "listen".to_string(),
+        serde_json::Value::String(address.to_string()),
+    );
+    Some(address)
+}
+
+/// 🧭 Tests must talk directly to Pingclair, even when macOS has a loopback proxy.
 fn no_proxy_client() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
-async fn wait_for_server(url: &str, server: &mut TestServer) -> bool {
-    let client = no_proxy_client();
+#[tokio::test]
+async fn test_drop_reaps_server_and_releases_listener() {
+    let config = r#"{
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "routes": [{
+                "path": "/",
+                "handler": { "type": "respond", "status": 200, "body": "ok" }
+            }]
+        }]
+    }"#;
+    let address = {
+        let mut server = TestServer::new(config);
+        assert!(server.wait_until_ready().await, "server failed to start");
+        server.address(0)
+    };
+
+    // 🧹 Rebinding proves that Drop waited until the listener was released.
+    let rebound = TcpListener::bind(address).expect("test server left its listener behind");
+    assert_eq!(rebound.local_addr().unwrap(), address);
+}
+
+#[tokio::test]
+async fn test_failed_start_reaps_server_and_releases_listener() {
+    let config = r#"{
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "routes": [{
+                "path": "/",
+                "handler": { "type": "intentionally_invalid" }
+            }]
+        }]
+    }"#;
+    let mut server = TestServer::new(config);
+    let address = server.address(0);
+
+    assert!(
+        !server.wait_until_ready().await,
+        "invalid configuration unexpectedly started"
+    );
+    let rebound = TcpListener::bind(address).expect("failed startup left its listener behind");
+    assert_eq!(rebound.local_addr().unwrap(), address);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_watchdog_kills_group_after_parent_disappears() {
+    use std::os::unix::process::CommandExt;
+
+    let mut watched = Command::new("sleep")
+        .arg("30")
+        .process_group(0)
+        .spawn()
+        .expect("failed to start the watched process");
+    let mut surrogate_parent = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("failed to start the surrogate parent");
+    let mut watchdog = spawn_watchdog(surrogate_parent.id(), watched.id())
+        .expect("failed to start the watchdog")
+        .expect("watchdog is required on Unix");
+
+    surrogate_parent
+        .kill()
+        .expect("failed to stop the surrogate parent");
+    surrogate_parent
+        .wait()
+        .expect("failed to reap the surrogate parent");
+
     for _ in 0..50 {
-        // Check if process is still alive
-        if let Ok(Some(status)) = server.process.try_wait() {
-            // Process exited prematurely
-            eprintln!("Server exited unexpectedly with status: {}", status);
-            // Dump stderr
-            if let Some(mut stderr) = server.process.stderr.take() {
-                use std::io::Read;
-                let mut s = String::new();
-                stderr.read_to_string(&mut s).unwrap();
-                eprintln!("STDERR:\n{}", s);
-            }
-            if let Some(mut stdout) = server.process.stdout.take() {
-                use std::io::Read;
-                let mut s = String::new();
-                stdout.read_to_string(&mut s).unwrap();
-                eprintln!("STDOUT:\n{}", s);
-            }
-            return false;
+        if watched
+            .try_wait()
+            .expect("failed to inspect the watched process")
+            .is_some()
+        {
+            watchdog.wait().expect("failed to reap the watchdog");
+            return;
         }
-
-        // Any HTTP response (even a proxy's error page) counts as "answered",
-        // so require a success status — otherwise a local HTTP proxy
-        // answering instantly with its own 503 would mark the server "up"
-        // before it has even bound its socket.
-        if let Ok(resp) = client.get(url).send().await {
-            if resp.status().is_success() {
-                return true;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // Timeout
-    eprintln!("Timeout waiting for server!");
-    // Close the producer before draining its pipes. Reading to EOF while the
-    // server is still alive blocks forever and can leave a stale listener
-    // behind after the test harness is interrupted.
-    let _ = server.process.kill();
-    let _ = server.process.wait();
-    if let Some(mut stderr) = server.process.stderr.take() {
-        use std::io::Read;
-        let mut s = String::new();
-        stderr.read_to_string(&mut s).unwrap();
-        eprintln!("STDERR:\n{}", s);
-    }
-    false
+    terminate_process_group(&mut watched, "watchdog test process");
+    terminate_process_group(&mut watchdog, "watchdog test helper");
+    panic!("watchdog left the watched process running");
 }
 
 #[tokio::test]
 async fn test_static_file_server() {
-    // 1. Setup static file content
+    // 📄 Create the static file fixture.
     let tmp_dir = tempfile::tempdir().unwrap();
     let file_path = tmp_dir.path().join("index.html");
     std::fs::write(&file_path, "<h1>Hello World</h1>").unwrap();
     let root_path = tmp_dir.path().to_str().unwrap().replace("\\", "/");
 
-    // 2. Create config (JSON format)
+    // ⚙️ Build the JSON configuration.
     let config = format!(
         r#"{{
         "servers": [
             {{
-                "listen": ["127.0.0.1:9091"],
+                "listen": ["127.0.0.1:0"],
                 "routes": [
                     {{
                         "path": "/",
@@ -136,21 +447,15 @@ async fn test_static_file_server() {
         root_path
     );
 
-    // 3. Start Server
+    // 🚀 Start the real server binary.
     let mut server = TestServer::new(&config);
 
-    // 4. Wait
-    assert!(
-        wait_for_server("http://127.0.0.1:9091/index.html", &mut server).await,
-        "Server failed to start"
-    );
+    // ⏳ Wait for the unique readiness response.
+    assert!(server.wait_until_ready().await, "Server failed to start");
 
-    // 5. Assert
-    let resp = no_proxy_client()
-        .get("http://127.0.0.1:9091/index.html")
-        .send()
-        .await
-        .unwrap();
+    // ✅ Verify the static response.
+    let url = server.url(0, "/index.html");
+    let resp = no_proxy_client().get(url).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let text = resp.text().await.unwrap();
     assert_eq!(text, "<h1>Hello World</h1>");
@@ -158,7 +463,7 @@ async fn test_static_file_server() {
 
 #[tokio::test]
 async fn test_admin_api_hot_reload() {
-    // Setup content for v1 and v2
+    // 📄 Create distinct fixtures for both configuration versions.
     let tmp_dir = tempfile::tempdir().unwrap();
     let v1_path = tmp_dir.path().join("v1.txt");
     let v2_path = tmp_dir.path().join("v2.txt");
@@ -166,16 +471,16 @@ async fn test_admin_api_hot_reload() {
     std::fs::write(&v2_path, "Version 2").unwrap();
     let root_path = tmp_dir.path().to_str().unwrap().replace("\\", "/");
 
-    // 1. Start with initial config (JSON)
+    // 🚀 Start with the initial JSON configuration.
     let init_config = format!(
         r#"{{
         "admin": {{
             "enabled": true,
-            "listen": "127.0.0.1:9092"
+            "listen": "127.0.0.1:0"
         }},
         "servers": [
             {{
-                "listen": ["127.0.0.1:9093"],
+                "listen": ["127.0.0.1:0"],
                 "routes": [
                     {{
                         "path": "/",
@@ -193,22 +498,17 @@ async fn test_admin_api_hot_reload() {
     );
 
     let mut server = TestServer::new(&init_config);
-    assert!(
-        wait_for_server("http://127.0.0.1:9093/", &mut server).await,
-        "Server V1 failed to start"
-    );
+    assert!(server.wait_until_ready().await, "Server V1 failed to start");
 
-    // Check V1 (matches index v1.txt)
-    let resp = no_proxy_client()
-        .get("http://127.0.0.1:9093/")
-        .send()
-        .await
-        .unwrap();
+    // ✅ Verify that the first index file is active.
+    let server_url = server.url(0, "/");
+    let resp = no_proxy_client().get(&server_url).send().await.unwrap();
     assert_eq!(resp.text().await.unwrap(), "Version 1");
 
-    // 2. Perform Hot Reload (JSON Payload)
+    // 🔄 Apply the replacement configuration through the Admin API.
+    let listen_address = server.address(0).to_string();
     let new_config_obj = serde_json::json!({
-        "listen": ["127.0.0.1:9093"],
+        "listen": [listen_address],
         "routes": [
             {
                 "path": "/",
@@ -224,7 +524,7 @@ async fn test_admin_api_hot_reload() {
 
     let client = no_proxy_client();
     let reload_resp = client
-        .post("http://127.0.0.1:9092/config/0")
+        .post(server.admin_url("/config/0"))
         .json(&new_config_obj)
         .send()
         .await
@@ -232,22 +532,20 @@ async fn test_admin_api_hot_reload() {
 
     assert_eq!(reload_resp.status(), 200);
 
-    // 3. Check V2
+    // ✅ Verify that the replacement index file is active.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let resp_v2 = client.get("http://127.0.0.1:9093/").send().await.unwrap();
+    let resp_v2 = client.get(&server_url).send().await.unwrap();
     assert_eq!(resp_v2.text().await.unwrap(), "Version 2");
 }
 
 #[tokio::test]
 async fn test_basic_auth_end_to_end() {
-    // A pipeline of basic_auth + respond behind a single route. Exercises the
-    // full path through the real binary: no credentials → 401 challenge,
-    // wrong password → 401, valid credentials → 200 from the next handler.
+    // 🔐 Exercise the complete Basic Auth pipeline through the real binary.
     let config = r#"{
         "servers": [
             {
-                "listen": ["127.0.0.1:9095"],
+                "listen": ["127.0.0.1:0"],
                 "routes": [
                     {
                         "path": "/",
@@ -272,32 +570,19 @@ async fn test_basic_auth_end_to_end() {
 
     let mut server = TestServer::new(config);
     let client = no_proxy_client();
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let url = server.url(0, "/");
 
-    // wait_for_server needs a success response; poll the authed URL instead.
     let authed = || async {
         client
-            .get("http://127.0.0.1:9095/")
+            .get(&url)
             .basic_auth("alice", Some("secret1"))
             .send()
             .await
     };
-    let mut up = false;
-    for _ in 0..50 {
-        if let Ok(resp) = authed().await {
-            if resp.status().is_success() {
-                up = true;
-                break;
-            }
-        }
-        if let Ok(Some(status)) = server.process.try_wait() {
-            panic!("server exited early: {}", status);
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    assert!(up, "server failed to start");
 
-    // 1. No credentials → 401 with a WWW-Authenticate challenge.
-    let resp = client.get("http://127.0.0.1:9095/").send().await.unwrap();
+    // 🚫 Missing credentials must return a Basic Auth challenge.
+    let resp = client.get(&url).send().await.unwrap();
     assert_eq!(resp.status(), 401);
     let challenge = resp
         .headers()
@@ -316,25 +601,25 @@ async fn test_basic_auth_end_to_end() {
         challenge
     );
 
-    // 2. Wrong password → 401.
+    // 🚫 An incorrect password must be rejected.
     let resp = client
-        .get("http://127.0.0.1:9095/")
+        .get(&url)
         .basic_auth("alice", Some("wrong"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 401);
 
-    // 3. Unknown user → 401.
+    // 🚫 An unknown user must be rejected.
     let resp = client
-        .get("http://127.0.0.1:9095/")
+        .get(&url)
         .basic_auth("mallory", Some("secret1"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 401);
 
-    // 4. Valid credentials → 200 from the respond handler.
+    // ✅ Valid credentials must reach the response handler.
     let resp = authed().await.unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.unwrap(), "welcome");
@@ -342,15 +627,13 @@ async fn test_basic_auth_end_to_end() {
 
 #[tokio::test]
 async fn test_custom_error_pages() {
-    // Custom error pages: a 404 from a static miss and a 502 from a dead
-    // upstream must both serve the configured files instead of the
-    // built-in plain-text error.
+    // 🎨 Verify custom pages for both static and upstream failures.
     let tmp_dir = tempfile::tempdir().unwrap();
     let page_404 = tmp_dir.path().join("404.html");
     let page_502 = tmp_dir.path().join("502.html");
     std::fs::write(&page_404, "<h1>custom not found</h1>").unwrap();
     std::fs::write(&page_502, "<h1>custom bad gateway</h1>").unwrap();
-    // Empty docroot so every static request misses.
+    // 📁 Keep the document root empty so every static request misses.
     let root = tmp_dir.path().join("www");
     std::fs::create_dir(&root).unwrap();
 
@@ -358,7 +641,7 @@ async fn test_custom_error_pages() {
         r#"{{
         "servers": [
             {{
-                "listen": ["127.0.0.1:9096"],
+                "listen": ["127.0.0.1:0"],
                 "error_pages": {{
                     "404": "{}",
                     "500": "{}",
@@ -394,29 +677,11 @@ async fn test_custom_error_pages() {
 
     let mut server = TestServer::new(&config);
     let client = no_proxy_client();
-    let mut up = false;
-    for _ in 0..50 {
-        // Any answered HTTP response means the listener is up; the static
-        // route 404s by design here.
-        if client
-            .get("http://127.0.0.1:9096/static/missing.txt")
-            .send()
-            .await
-            .is_ok()
-        {
-            up = true;
-            break;
-        }
-        if let Ok(Some(status)) = server.process.try_wait() {
-            panic!("server exited early: {}", status);
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    assert!(up, "server failed to start");
+    assert!(server.wait_until_ready().await, "server failed to start");
 
-    // Static miss → custom 404 page.
+    // ✅ A static miss must use the custom 404 page.
     let resp = client
-        .get("http://127.0.0.1:9096/static/missing.txt")
+        .get(server.url(0, "/static/missing.txt"))
         .send()
         .await
         .unwrap();
@@ -424,11 +689,10 @@ async fn test_custom_error_pages() {
     assert_eq!(resp.headers().get("Content-Type").unwrap(), "text/html");
     assert_eq!(resp.text().await.unwrap(), "<h1>custom not found</h1>");
 
-    // Dead upstream → custom gateway-error page. Pingora classifies a
-    // refused connection as either 500 or 502 depending on where the
-    // failure surfaces; both map to the same custom page here.
+    // ✅ A dead upstream must use the configured gateway-error page.
+    // ℹ️ Pingora may classify connection refusal as either 500 or 502.
     let resp = client
-        .get("http://127.0.0.1:9096/api/thing")
+        .get(server.url(0, "/api/thing"))
         .send()
         .await
         .unwrap();
@@ -446,7 +710,7 @@ async fn test_cors_and_access_control_end_to_end() {
     let config = r#"{
         "servers": [
             {
-                "listen": ["127.0.0.1:9097"],
+                "listen": ["127.0.0.1:0"],
                 "routes": [
                     {
                         "path": "/",
@@ -477,21 +741,11 @@ async fn test_cors_and_access_control_end_to_end() {
     }"#;
     let mut server = TestServer::new(config);
     let client = no_proxy_client();
-    let mut up = false;
-    for _ in 0..50 {
-        if client.get("http://127.0.0.1:9097/").send().await.is_ok() {
-            up = true;
-            break;
-        }
-        if let Ok(Some(status)) = server.process.try_wait() {
-            panic!("server exited early: {status}");
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    assert!(up, "server failed to start");
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let url = server.url(0, "/");
 
     let response = client
-        .get("http://127.0.0.1:9097/")
+        .get(&url)
         .header("Origin", "https://app.example")
         .send()
         .await
@@ -508,7 +762,7 @@ async fn test_cors_and_access_control_end_to_end() {
     assert_eq!(response.text().await.unwrap(), "welcome");
 
     let response = client
-        .request(reqwest::Method::OPTIONS, "http://127.0.0.1:9097/")
+        .request(reqwest::Method::OPTIONS, &url)
         .header("Origin", "https://app.example")
         .header("Access-Control-Request-Method", "POST")
         .header("Access-Control-Request-Headers", "Content-Type")
@@ -519,7 +773,7 @@ async fn test_cors_and_access_control_end_to_end() {
     assert_eq!(response.headers()["access-control-max-age"], "600");
 
     let response = client
-        .get("http://127.0.0.1:9097/")
+        .get(&url)
         .header("User-Agent", "BlockedBot/1.0")
         .send()
         .await
@@ -535,7 +789,7 @@ async fn test_regex_rewrite_reaches_the_rewritten_static_path() {
     let config = format!(
         r#"{{
         "servers": [{{
-            "listen": ["127.0.0.1:9098"],
+            "listen": ["127.0.0.1:0"],
             "routes": [{{
                 "path": "/*",
                 "handler": {{
@@ -555,13 +809,10 @@ async fn test_regex_rewrite_reaches_the_rewritten_static_path() {
         root
     );
     let mut server = TestServer::new(&config);
-    assert!(
-        wait_for_server("http://127.0.0.1:9098/api/hello.txt", &mut server).await,
-        "Server failed to start"
-    );
+    assert!(server.wait_until_ready().await, "Server failed to start");
 
     let response = no_proxy_client()
-        .get("http://127.0.0.1:9098/api/hello.txt?cache=1")
+        .get(server.url(0, "/api/hello.txt?cache=1"))
         .send()
         .await
         .unwrap();
@@ -573,7 +824,7 @@ async fn test_regex_rewrite_reaches_the_rewritten_static_path() {
 async fn test_compression() {
     let tmp_dir = tempfile::tempdir().unwrap();
     let file_path = tmp_dir.path().join("big.txt");
-    // Create a large enough file to benefit from compression
+    // 📦 Create a fixture large enough to benefit from compression.
     let content = "Pingclair Compression Test ".repeat(100);
     std::fs::write(&file_path, &content).unwrap();
     let root_path = tmp_dir.path().to_str().unwrap().replace("\\", "/");
@@ -582,7 +833,7 @@ async fn test_compression() {
         r#"{{
         "servers": [
             {{
-                "listen": ["127.0.0.1:9094"],
+                "listen": ["127.0.0.1:0"],
                 "routes": [
                     {{
                         "path": "/",
@@ -600,16 +851,14 @@ async fn test_compression() {
     );
 
     let mut server = TestServer::new(&config);
-    assert!(
-        wait_for_server("http://127.0.0.1:9094/big.txt", &mut server).await,
-        "Server failed to start"
-    );
+    assert!(server.wait_until_ready().await, "Server failed to start");
 
     let client = no_proxy_client();
+    let url = server.url(0, "/big.txt");
 
-    // Request with gzip
+    // 🗜️ Request and verify gzip compression.
     let resp: reqwest::Response = client
-        .get("http://127.0.0.1:9094/big.txt")
+        .get(&url)
         .header("Accept-Encoding", "gzip")
         .send()
         .await
@@ -620,7 +869,7 @@ async fn test_compression() {
 
     let compressed_bytes = resp.bytes().await.expect("Failed to get bytes");
 
-    // Decompress manually
+    // 🔍 Decompress the response explicitly for byte-level verification.
     use flate2::read::GzDecoder;
     use std::io::Read;
     let mut decoder = GzDecoder::new(&compressed_bytes[..]);
@@ -631,22 +880,22 @@ async fn test_compression() {
 
     assert_eq!(decompressed, content);
 
-    // Request with brotli if supported
+    // 🗜️ Request Brotli compression when the build supports it.
     let resp_br: reqwest::Response = client
-        .get("http://127.0.0.1:9094/big.txt")
+        .get(&url)
         .header("Accept-Encoding", "br")
         .send()
         .await
         .expect("Failed to send br request");
 
-    // reqwest might not support br by default without features, but we can check the header if we manually set it
-    // Our server implementation prioritize br > zstd > gzip
+    // ℹ️ A manually supplied header still lets the test inspect Brotli negotiation.
+    // 📊 Pingclair prioritizes Brotli, then Zstandard, then gzip.
     if resp_br
         .headers()
         .get("Content-Encoding")
         .map(|v| v == "br")
         .unwrap_or(false)
     {
-        println!("Brotli verified");
+        println!("✅ Brotli verified.");
     }
 }

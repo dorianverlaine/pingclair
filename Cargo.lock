@@ -2172,6 +2172,7 @@ dependencies = [
  "clap",
  "flate2",
  "futures",
+ "libc",
  "parking_lot",
  "pingclair-api",
  "pingclair-config",
