@@ -1,173 +1,152 @@
 # 🧪 Pingclair vs Nginx 生产替代性审计
 
-> **审计时间**: 2026-04-20
-> **审计范围**: 压测稳定性 + Nginx 功能覆盖度
-> **当前版本**: v0.1.6
+> **审计时间**: 2026-07-25(第二次审计,逐项对照代码核实)
+> **上次审计**: 2026-04-20(v0.1.6,P0 四项已全部修复,见文末)
+> **当前版本**: v0.1.7
 
 ---
 
-## 🔴 压测会翻车的问题（P0 — 先修这些再压）
+## 🔴 上生产前必须修复(Blocker)
 
-### 1. Gzip 压缩全量缓冲 — 🚨 OOM 风险
+### 1. Admin API 完全无认证,且默认启用 🚨
 
-**文件**: `pingclair-proxy/src/server.rs` (`upstream_response_body_filter`)
+**文件**: `pingclair-api/src/server.rs:52-113`(`handle_request`)
 
-**问题**: `upstream_response_body_filter` 把所有 body chunk 写入 `GzEncoder<Vec<u8>>`，
-在 `end_of_stream` 一次性 flush。如果上游返回 100MB 大文件 + `Content-Type: text/plain`，
-整个响应被缓存在内存。
+**问题**: 配置里有 `AdminConfig.api_key`(`pingclair-core/src/config/types.rs:507`),
+`ApiKeyAuth` 结构也写好了(`pingclair-api/src/auth.rs`,还标着 `#![allow(dead_code)]`),
+但 `handle_request` **从未调用它**。`/config` GET/POST(热重载)和 `/metrics`
+零认证暴露,且 `enabled` 默认为 `true`(`types.rs:511`)。任何能访问 admin
+端口的人都可以读取并改写运行时配置。
 
 **修复方案**:
-- 增加 **最大压缩体积限制** (e.g. 10MB)，超过阈值直接 pass-through
-- 或实现 **真正的流式压缩** — 每个 chunk 独立 flush 出去
+- `handle_request` 入口统一校验 `Authorization: Bearer <api_key>`
+- 未配置 `api_key` 时默认只绑 `127.0.0.1`,并在启动日志里大字警告
+- 移除 `#![allow(dead_code)]`
 
-**预计耗时**: 1-2 小时
-
-- [ ] 修复
-
----
-
-### 2. RequestContext 分配开销
-
-**文件**: `pingclair-proxy/src/server.rs` (`RequestContext::default()`)
-
-**问题**: 每个请求创建 5 个 `HashMap::new()` + 1 个 `Vec::new()` + 2 个 `String::new()`
-+ 1 个 `generate_request_id()` (涉及 syscall `SystemTime::now()`)。
-在 10k QPS 下每秒 5 万次堆分配。
-
-**修复方案**:
-- 使用 `SmallVec<[(String, String); 4]>` 代替 HashMap（大多数请求 header 数量 < 4）
-- 用 `AtomicU64` 计数器代替 `SystemTime` 生成 request ID
-- 或者用对象池回收 `RequestContext`
-
-**预计耗时**: 2-3 小时
+**预计耗时**: 2 小时
 
 - [ ] 修复
 
 ---
 
-### 3. `hosts` RwLock 竞争
+### 2. auth_basic 是坏的 — 比没有更糟 🚨
 
-**文件**: `pingclair-proxy/src/server.rs` (`PingclairProxy.hosts`)
+**文件**: `pingclair-core/src/server/handlers.rs:177-192`(`BasicAuth` handler)
 
-**问题**: `get_state(host)` 在每个请求的热路径上 `.read()` 这个 `RwLock<HashMap>`。
-虽然 `parking_lot::RwLock` 性能不错，但高并发下仍是共享状态。
+**问题**: handler 拿到 `credentials` 后直接忽略(`credentials: _`),
+**无条件返回 401** + `WWW-Authenticate`。配了 Basic Auth 的站点会把
+**所有人**(包括合法用户)挡在门外。整个代码库里没有任何地方校验
+`Authorization` 头。
 
-**修复方案**: 采用 `ArcSwap<HashMap>` 或 `crossbeam-epoch` 做无锁读。
-写操作（热更新）频率极低，可以接受 Copy-on-Write。
+**修复方案**: 解析 `Authorization: Basic <base64>`,与配置的 credentials
+比对(常量时间比较);不匹配才 401。补单元测试(正确密码放行 / 错误密码 401 /
+缺 header 401)。
 
-**预计耗时**: 1 小时
-
-- [ ] 修复
-
----
-
-### 4. 无 upstream 连接池上限
-
-**问题**: Pingora 默认连接池无上限。如果 upstream 慢（300ms），10k QPS 意味着
-3000 个并发连接到后端。后端可能被打满。
-
-**修复方案**: 在 `HttpPeer` 设置 `max_keepalive_connections` 和 `connection_timeout`
-(已部分实现，需确认 Pingora level 的 pool size 配置)
-
-**预计耗时**: 30 分钟
+**预计耗时**: 半天
 
 - [ ] 修复
 
 ---
 
-## 🟡 Nginx 常用功能差距
+### 3. ACME 每次签发都注册新账户
 
-### 功能对照表
+**文件**: `pingclair-tls/src/acme.rs:350-371`(`ensure_account`)
 
-| Nginx 功能 | Pingclair | 差距 | 优先级 |
-|------------|-----------|------|--------|
-| `proxy_pass` | ✅ `ReverseProxy` | 完整 | — |
-| `upstream { }` 组 + weight | 🟡 有 LB 但无 weight | 缺 weight/backup | P1 |
-| `location /path { }` | ✅ path matcher | 完整 | — |
-| `location ~ regex { }` | 🟡 `Matcher::Path` 只有 glob | 缺正则 | P1 |
-| `proxy_set_header` | ✅ `header_up` | 完整 | — |
-| `add_header` / `more_set_headers` | ✅ `Headers` handler | 完整 | — |
-| `gzip on` | ✅ 已实现 | 完整（需 OOM 修复） | — |
-| `gzip_types` | ✅ 硬编码常见类型 | 可配置化 | P2 |
-| `try_files` | ✅ 已实现 | 完整 | — |
-| `error_page 404 /404.html` | ❌ | 缺 | P1 |
-| `return 301 https://...` | ✅ `Redirect` | 完整 | — |
-| `rewrite ^(.*)$ /index.html break` | 🟡 有 Rewrite 但无 regex | 缺正则 | P2 |
-| `proxy_read_timeout` | ✅ `read_timeout` | 完整 | — |
-| `proxy_connect_timeout` | ✅ `connection_timeout` | 完整 | — |
-| `client_max_body_size` | ✅ 已实现 | 完整 | — |
-| `keepalive` | ✅ Pingora 内置 | 完整 | — |
-| `ssl_certificate` / ACME | ✅ AutoHTTPS + TlsManager | 完整 | — |
-| `limit_req` | ✅ RateLimiter | 完整 | — |
-| `auth_basic` | 🟡 配置类型有但运行时缺 | 缺 | P1 |
-| `proxy_cache` | ❌ | 缺 | P2 |
-| `access_log` JSON | ✅ 已实现 | 完整（结构化 tracing） | — |
-| `log_format` | 🟡 字段固定 | 可配置化 | P3 |
-| WebSocket proxying | 🟢 Pingora 透传 | 基本完整 | — |
-| `proxy_buffering off` (SSE/streaming) | 🟡 `flush_interval -1` 已解析 | 运行时未设置 | P1 |
-| Graceful shutdown | ✅ Pingora 内置 | 完整 | — |
-| Graceful reload (SIGHUP) | ✅ 已实现 | 完整 | — |
-| IP whitelist / deny | ✅ ConnectionFilter | 完整 | — |
+**问题**: ACME 账户私钥不持久化,每次签发都 `create` 一个新账户。
+会撞 Let's Encrypt 的注册频率限制(每 IP 3 小时 10 个账户),多域名 +
+频繁重启的场景下签发会直接失败。已签发的证书有持久化(`cert_store.rs`),
+唯独账户没有。
+
+**修复方案**: 账户私钥(pem/jwk)落盘到 TLS store 目录,启动时优先加载;
+同时记录 account URL 供后续复用。
+
+**预计耗时**: 半天
+
+- [ ] 修复
 
 ---
 
-## 📋 按优先级排列的 TODO
+## 🟡 Nginx 功能差距(P1,替代 90% 场景需要)
 
-### 🔴 P0 — 压测前必须修复（~4h）
+| 功能 | 现状 | 证据 | 预计耗时 |
+|------|------|------|----------|
+| SSE / 流式反代 | ❌ `flush_interval` 只解析不生效 | DSL→`types.rs:445` 有管道,但 `pingclair-proxy` 里零读取;反代 LLM/SSE 场景不可用 | 半天 |
+| `error_page` | ❌ 零实现 | 全库无 `error_page` 匹配;502/404 只能出默认页 | 半天 |
+| LB weight / backup | ❌ 所有后端一视同仁 | `load_balancer.rs:194`;被动健康检查(`max_fails`/`fail_timeout`)已有(`load_balancer.rs:53-104`) | 1 天 |
+| 反代 Brotli | ❌ gzip only | `server.rs:1419`(flate2 `GzEncoder`);静态路径已有 br/zstd | 半天 |
+| 正则 rewrite | ❌ 正则**匹配**已有,正则**改写**没有 | `router.rs:15-53`(Regex matcher,预编译缓存)vs `handlers.rs:170-171` | 半天 |
+| RequestContext 轻量化 | 🟡 未做但影响小 | `server.rs:31-93` 每请求 3 个 `HashMap::new()`;空 HashMap 不分配堆内存,仅插入时才分配 | 2 小时 |
 
-- [ ] **Gzip 最大体积限制** — 超过 10MB 直接 pass-through，避免 OOM
-- [ ] **upstream 连接池上限** — 设置 `pool_size` 防止打满后端
-- [ ] **`hosts` RwLock → ArcSwap** — 消除热路径上的锁竞争
-- [ ] **RequestContext 轻量化** — SmallVec 代替 HashMap
+## 🟢 P2 — 进阶 / 可观测性
 
-### 🟡 P1 — Nginx 功能追平（~8h）
-
-- [ ] **`error_page`** — 自定义错误页面（404/500/502/504）
-- [ ] **`auth_basic`** — Basic Auth 运行时校验（header 解析 + bcrypt 比对）
-- [ ] **`flush_interval -1` 运行时** — 禁用 response buffering 支持 SSE/EventStream
-- [ ] **`location ~ regex`** — 路径匹配支持正则表达式
-- [ ] **`upstream weight/backup`** — 加权负载均衡 + 备用后端
-
-### 🟢 P2 — 进阶功能（~12h）
-
-- [ ] **`proxy_cache`** — HTTP 缓存层（ETag/Last-Modified/Cache-Control）
-- [ ] **`rewrite` 正则支持** — `regex` crate 集成
-- [ ] **Brotli 压缩** — 除 gzip 外支持 br
-- [ ] **`gzip_types` 可配置** — 通过配置控制可压缩的 MIME 类型
-- [ ] **请求/响应 body size 限制** — 流式检查不缓存
+| 功能 | 现状 | 说明 |
+|------|------|------|
+| `proxy_cache` | ❌ | HTTP 响应缓存层,大功能(1 周+) |
+| 访问日志格式 | ❌ 固定 tracing JSON | `server.rs:1509` 自述 "we use tracing for now";`LogConfig` 是摆设 |
+| Prometheus 指标 | 🟡 仅 3 个 series | `pingclair-proxy/src/metrics.rs:16-40`:requests_total / duration / active_connections |
+| 插件系统 | ❌ stub | `pingclair-plugin/src/loader.rs:10-13` 是 `// TODO`,`main.rs` 未接线;README 不应再当卖点 |
+| QUIC 事件循环 | 🟡 单 task/端口 | `pingclair-proxy/src/quic.rs` 简单模型,高并发 H3 下可能是瓶颈,**未压测过** |
+| 健康检查 Host 头 | ❌ | `health_check.rs:106` TODO:虚拟主机场景需要自定义 Host |
+| gzip_types 可配置 | ❌ 硬编码 | 低优先 |
 
 ---
 
-## 🧠 Pingora 已经帮我们做好的事（不需要自己实现）
+## ✅ 已修复确认(2026-07-25 代码核实)
 
-- ✅ **HTTP keep-alive 连接复用** — 上下游都自动管理
-- ✅ **Chunked Transfer-Encoding** — 自动处理
-- ✅ **100-continue** — 自动处理
-- ✅ **WebSocket 升级** — Pingora 透传 Connection: Upgrade + Upgrade: websocket
-- ✅ **HTTP/2 多路复用** — 上游自动支持
-- ✅ **连接池** — 内置 upstream 连接复用
-- ✅ **Backpressure** — 流式 body 传输不会无限缓冲（除了我们自己的 gzip）
-- ✅ **Graceful shutdown** — SIGTERM 时等待在途请求完成
-- ✅ **Worker 线程模型** — 多线程 epoll/kqueue
+上次审计 P0 四项 + 后续发现的问题,均已修复:
+
+- ✅ **Gzip 全量缓冲 OOM** — `server.rs:1431-1452` 流式压缩,逐 chunk sync-flush,
+  内存以单个 chunk 为界;<256B 小 body 跳过(`server.rs:1415`)
+- ✅ **`hosts` RwLock 竞争** — 已换 `ArcSwap<HashMap>`(`server.rs:337-348`),热路径无锁
+- ✅ **upstream 连接池上限** — `global.upstream_keepalive_pool_size`(`types.rs:48`),
+  `main.rs:540-543` 应用并在启动时打日志(`main.rs:556-562`)
+- ✅ **静态压缩缓存惊群** — per-key `tokio::sync::Mutex` single-flight 去重
+  (`file_server.rs:122-129, 555-609`),有并发冷缓存测试覆盖
+- ✅ **静态热路径 tokio::fs** — 已全改同步 `std::fs`(2.6x 吞吐,见 `benchmarks/README.md` #22/#23)
+- ✅ **worker_threads 默认 1** — 改 `available_parallelism()`,可配置,启动打日志
+- ✅ **正则 location 匹配** — `router.rs` Regex matcher,预编译缓存
+- ✅ **DSL http3 开关** — `compiler.rs:180-182` + Caddyfile adapter 支持
+- ✅ **优雅重载** — SIGHUP(`main.rs:839-918`)+ admin API 双通道;SIGTERM 优雅关闭
+- ✅ **静态 Brotli/Zstd** — 预压缩 `.br`/`.gz`/`.zst` + 实时压缩(`file_server.rs:714-766`)
+- ✅ **具名 server 块绑定** — `bench.local:8080` 绑 `0.0.0.0` 按 Host 路由(benchmarks #14)
+- ✅ **HTTP/3** — quiche 0.29 重写上线,九项 VPS 冒烟测试全过
+
+---
+
+## 🧠 Pingora 已经帮我们做好的事(不需要自己实现)
+
+- ✅ HTTP keep-alive 连接复用(上下游)
+- ✅ Chunked Transfer-Encoding / 100-continue
+- ✅ WebSocket 升级透传
+- ✅ HTTP/2 多路复用(上游自动)
+- ✅ 连接池(内置 upstream 复用)
+- ✅ Backpressure(流式 body,除了我们自己的 gzip 已修)
+- ✅ Graceful shutdown(SIGTERM 等待在途请求)
+- ✅ Worker 线程模型(多线程 epoll/kqueue)
 
 ---
 
 ## 🎯 建议的压测策略
 
 ```bash
-# 第一步：不开 gzip，纯代理性能
+# 第一步:不开 gzip,纯代理性能
 wrk -t4 -c100 -d30s http://localhost:8080/api/test
 
-# 第二步：开 gzip，检测内存
+# 第二步:开 gzip,检测内存
 wrk -t4 -c100 -d30s -H "Accept-Encoding: gzip" http://localhost:8080/api/test
 watch -n1 "ps aux | grep pingclair"
 
-# 第三步：长连接 + 高并发
+# 第三步:长连接 + 高并发
 wrk -t8 -c1000 -d60s --latency http://localhost:8080/
 
-# 第四步：大 body（OOM 测试）
+# 第四步:大 body(流式验证)
 curl -s http://localhost:8080/large-file.json -H "Accept-Encoding: gzip" > /dev/null
+
+# 第五步:H3 压测(QUIC 单 task 模型未压过,重点观察)
 ```
+
+最新实测数据见 `benchmarks/README.md`(VPS 2 vCPU:静态 50k rps ≈ nginx 94%,
+gzip 反超 nginx,反代 20.1k vs nginx 22.0k,20MB 流式 RSS 17.7MiB)。
 
 ---
 
@@ -175,7 +154,9 @@ curl -s http://localhost:8080/large-file.json -H "Accept-Encoding: gzip" > /dev/
 
 | 阶段 | 内容 | 耗时 |
 |------|------|------|
-| **阶段 1** | P0 性能修复（可以安心压测） | 4h |
-| **阶段 2** | P1 功能追平（可以替代 90% 的 Nginx 场景） | 8h |
-| **阶段 3** | P2 进阶功能（可以替代 99% 的 Nginx 场景） | 12h |
-| **总计** | | **~24h 工作量** |
+| **阶段 1** | 🔴 3 个 Blocker(admin auth / auth_basic / ACME 账户持久化) | ~1.5 天 |
+| **阶段 2** | 🟡 P1 功能(SSE / error_page / LB weight / 反代 br / 正则 rewrite) | ~3 天 |
+| **阶段 3** | 🟢 P2 进阶(proxy_cache / 日志格式 / 指标 / 插件 / H3 压测优化) | 按周计 |
+
+**结论**: 内核(性能、流式、热重载、H3)已到生产水位;差的是 3 个安全/正确性
+口子(约 1.5 天)和一批 nginx  parity 功能。堵完 Blocker 即可小规模试生产。
