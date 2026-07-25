@@ -220,9 +220,9 @@ fn spawn_watchdog(parent_process_id: u32, process_group_id: u32) -> std::io::Res
         let script = r#"
 parent_pid=$1
 group_id=$2
-while /bin/kill -0 "-$group_id" 2>/dev/null; do
+while /bin/kill -0 -- "-$group_id" 2>/dev/null; do
     if ! /bin/kill -0 "$parent_pid" 2>/dev/null; then
-        /bin/kill -KILL "-$group_id" 2>/dev/null
+        /bin/kill -KILL -- "-$group_id" 2>/dev/null
         exit 0
     fi
     sleep 0.1
