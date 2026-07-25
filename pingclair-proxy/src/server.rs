@@ -418,6 +418,39 @@ fn referer_host(referer: &str) -> Option<&str> {
     Some(host.split(':').next().unwrap_or(host))
 }
 
+fn request_authority(request: &RequestHeader) -> &str {
+    // 🌐 HTTP/2 carries the virtual host in `:authority`, which Pingora stores in the URI.
+    request
+        .uri
+        .authority()
+        .map(|authority| authority.as_str())
+        .or_else(|| {
+            request
+                .headers
+                .get(http::header::HOST)
+                .and_then(|value| value.to_str().ok())
+        })
+        .unwrap_or("")
+}
+
+fn authority_host(authority: &str) -> &str {
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        return bracketed
+            .split_once(']')
+            .map_or(authority, |(host, _)| host);
+    }
+    authority
+        .rsplit_once(':')
+        .filter(|(_, port)| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
+        .map_or(authority, |(host, _)| host)
+}
+
+fn authority_port(authority: &str) -> Option<u16> {
+    authority
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+}
+
 fn host_matches_rule(host: &str, rule: &str) -> bool {
     let host = host.to_ascii_lowercase();
     if let Some(suffix) = rule.strip_prefix("*.") {
@@ -1726,13 +1759,9 @@ impl ProxyHttp for PingclairProxy {
             let path = request_header.uri.path();
             let method = request_header.method.as_str();
 
-            // Extract host and strip port
-            let host_raw = request_header
-                .headers
-                .get("Host")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            let host = host_raw.split(':').next().unwrap_or("");
+            // 🌐 Prefer URI authority so HTTP/2 virtual hosts match the HTTP/1.1 Host path.
+            let authority = request_authority(request_header);
+            let host = authority_host(authority);
 
             // Get state for this host
             let state = match self.get_state(host) {
@@ -1761,30 +1790,21 @@ impl ProxyHttp for PingclairProxy {
                 })
                 .unwrap_or_else(|| "0.0.0.0".to_string());
 
-            // ⚡ OPTIMIZATION: Identify protocol via port heuristic and X-Forwarded-Proto.
+            // ⚡ OPTIMIZATION: Identify protocol via URI scheme, forwarding header, or port.
             // Pingora 0.6 removed the per-request TLS flag; we detect HTTPS by:
-            //   (a) checking the X-Forwarded-Proto header (set by our upstream_request_filter), or
-            //   (b) checking whether the local port is 443 / 8443 as a fallback.
+            //   (a) checking the HTTP/2 `:scheme` mapped into the URI,
+            //   (b) checking X-Forwarded-Proto, or
+            //   (c) checking whether the authority uses port 443 / 8443.
             let protocol = {
                 let via_header = request_header
                     .headers
                     .get("x-forwarded-proto")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
-                if via_header == "https" {
+                if request_header.uri.scheme_str() == Some("https") || via_header == "https" {
                     "https"
                 } else {
-                    // Fallback: infer from the Host header port or the server listen config.
-                    let host_header = request_header
-                        .headers
-                        .get("Host")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-                    let port_in_host = host_header
-                        .split(':')
-                        .nth(1)
-                        .and_then(|p| p.parse::<u16>().ok())
-                        .unwrap_or(80);
+                    let port_in_host = authority_port(authority).unwrap_or(80);
                     if port_in_host == 443 || port_in_host == 8443 {
                         "https"
                     } else {
@@ -2365,11 +2385,10 @@ impl ProxyHttp for PingclairProxy {
 
         let req_header = session.req_header();
         let method = req_header.method.as_str();
-        let host = req_header
-            .headers
-            .get("Host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("-");
+        let host = match request_authority(req_header) {
+            "" => "-",
+            authority => authority,
+        };
         let user_agent = req_header
             .headers
             .get("User-Agent")
@@ -2630,6 +2649,30 @@ mod p0_regression_tests {
     use std::io::Read;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn request_authority_supports_http1_host_and_http2_authority() {
+        let mut h1 = RequestHeader::build("GET", b"/ready", None).unwrap();
+        h1.insert_header(http::header::HOST, "api.example.com:8443")
+            .unwrap();
+        assert_eq!(request_authority(&h1), "api.example.com:8443");
+        assert_eq!(authority_host(request_authority(&h1)), "api.example.com");
+        assert_eq!(authority_port(request_authority(&h1)), Some(8443));
+
+        let mut h2 = RequestHeader::build_no_case("GET", b"/ready", None).unwrap();
+        h2.uri = "https://h2.example.com:443/ready".parse().unwrap();
+        h2.insert_header(http::header::HOST, "conflicting.example.com")
+            .unwrap();
+        assert_eq!(request_authority(&h2), "h2.example.com:443");
+        assert_eq!(authority_host(request_authority(&h2)), "h2.example.com");
+        assert_eq!(authority_port(request_authority(&h2)), Some(443));
+    }
+
+    #[test]
+    fn authority_host_supports_bracketed_ipv6() {
+        assert_eq!(authority_host("[2001:db8::1]:443"), "2001:db8::1");
+        assert_eq!(authority_port("[2001:db8::1]:443"), Some(443));
+    }
 
     // ---- Fix 1: streaming gzip stays bounded regardless of body size ----
 
