@@ -130,6 +130,41 @@ surfaced one more startup crasher:
     normalize `:port` → `0.0.0.0:port` (`normalize_listen_addr`, with a
     unit test).
 
+## The static-throughput root cause (July 2026, same-day follow-up)
+
+The 18.8k vs 55.2k req/s static gap to nginx above turned out to be two
+stacked configuration/code defects, not a fundamental runtime tax:
+
+22. **Pingora's `ServerConf.threads` defaults to 1** — every benchmark
+    in this document before this fix ran pingclair on a *single* worker
+    thread while nginx ran `worker_processes auto` (2 on this box).
+    `main.rs` now scales `threads` to `available_parallelism()`
+    (overridable via `global.worker_threads`).
+23. **`tokio::fs` in the static hot path was the real killer.** Every
+    `tokio::fs` call (metadata/open/read) is a `spawn_blocking`
+    cross-thread round-trip: strace showed **8 futex wake/waits per
+    request** (nginx: 0) and pidstat showed 89% of CPU in kernel time.
+    Fixing threads alone changed nothing (18.7k req/s, 154% CPU).
+    Converting the static request path to synchronous `std::fs` — the
+    nginx model, local file reads from page cache don't meaningfully
+    block — took futex to ~50 calls total per 17.7k requests and roughly
+    **2.6x'd throughput**.
+
+Same-box numbers after the fix (wrk -t2 -c100 -d10s, loopback):
+
+| Scenario | Pingclair (before) | Pingclair (after) | Nginx | Caddy |
+|----------|--------------------|-------------------|-------|-------|
+| Static 1KB, plain | ~18,700 req/s | 50,145 req/s | 53,579 req/s | 17,337 req/s |
+| Static 1KB, gzip | ~27,500 req/s | 42,982 req/s | 42,510 req/s | 15,302 req/s |
+| Reverse proxy | ~17,700 req/s | 20,154 req/s | 21,961 req/s | 9,870 req/s |
+
+20MB uncompressed streaming stays healthy: 1.42 GB/s with 17.7 MiB RSS.
+
+Lesson, now recorded in AGENTS.md: never use `tokio::fs` on a per-request
+hot path — its spawn_blocking tax dominates at small response sizes;
+and any framework default that decides runtime topology (threads, pool
+sizes, timeouts) must be set explicitly and logged at startup.
+
 Workspace tests: 65 → 129, all passing, across all 20 fixes. (Later: 148
 with the HTTP/3-on-quiche rewrite and fix #21; the H3 stack was verified
 end-to-end on the same VPS — 10MB static and proxied bodies byte-identical

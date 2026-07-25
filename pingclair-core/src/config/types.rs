@@ -55,6 +55,12 @@ pub struct GlobalConfig {
     /// set to false to serve HTTPS over TCP (HTTP/1.1 + HTTP/2) only.
     #[serde(default = "default_bool_true")]
     pub http3: bool,
+
+    /// Worker threads **per listen service**. Pingora's default is 1, which
+    /// single-threads the entire server; `None` scales to the machine's
+    /// available parallelism (nginx `worker_processes auto` semantics).
+    #[serde(default)]
+    pub worker_threads: Option<usize>,
 }
 
 impl Default for GlobalConfig {
@@ -65,6 +71,7 @@ impl Default for GlobalConfig {
             blocked_ips: Vec::new(),
             upstream_keepalive_pool_size: None,
             http3: true,
+            worker_threads: None,
         }
     }
 }

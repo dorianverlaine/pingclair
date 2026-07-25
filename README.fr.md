@@ -49,19 +49,25 @@ Ubuntu 24.04), chaque serveur à tour de rôle sur `127.0.0.1:8080`,
 
 | Scénario | Pingclair | Nginx | Caddy |
 |----------|-----------|-------|-------|
-| Statique 1 Ko, brut (c200) | 18 795 req/s | **55 236 req/s** | 17 413 req/s |
-| Statique 1 Ko, gzip (c200) | 27 459 req/s | **44 268 req/s** | 15 412 req/s |
-| Reverse proxy (c200) | 17 716 req/s | **20 778 req/s** | 9 168 req/s |
+| Statique 1 Ko, brut (c100) | 50 145 req/s | **53 579 req/s** | 17 337 req/s |
+| Statique 1 Ko, gzip (c100) | **42 982 req/s** | 42 510 req/s | 15 302 req/s |
+| Reverse proxy (c100) | 20 154 req/s | **21 961 req/s** | 9 870 req/s |
 | Gros fichier 20 Mo, gzip (c20) | **703 req/s, 0 timeout** | 9,1 req/s, 110 timeouts | 10,1 req/s, 65 timeouts |
 
 **Comment lire ces chiffres**
 
-- Nginx mène de ~2,6-2,9x sur le petit fichier statique brut (sendfile +
-  un chemin de code très optimisé) — l'écart est réel et c'est là que
-  pingclair a le plus de marge de progression. Pingclair devance
-  légèrement Caddy sur la même charge.
-- Le reverse proxy est quasiment à égalité avec nginx (~84-99 %) et
-  ~1,8-2x devant Caddy, sans aucune erreur pour les trois.
+- Le petit fichier statique est désormais quasiment à égalité avec nginx
+  (94 % en brut, 101 % en gzip) et ~2,9x devant Caddy. Il n'en a pas
+  toujours été ainsi : les mesures précédentes montraient un écart de
+  ~2,9x avec nginx, dont la cause était `tokio::fs` — chaque appel est
+  un aller-retour inter-threads `spawn_blocking`, soit ~8 futex par
+  requête. Le chemin chaud statique utilise maintenant `std::fs`
+  synchrone (le modèle nginx : les lectures de fichiers locaux ne
+  bloquent pas vraiment), ce qui a fait passer les futex de 8/requête à
+  ~0 et le débit de 18,7k à 50k req/s. Détails dans
+  `benchmarks/README.md`.
+- Le reverse proxy atteint ~92 % de nginx et ~2x Caddy, sans aucune
+  erreur pour les trois.
 - Les gros fichiers compressibles sont le terrain de prédilection du
   cache de corps compressés : ~70x le débit de nginx/caddy avec **0
   timeout**, car les accès répétés sautent entièrement la compression

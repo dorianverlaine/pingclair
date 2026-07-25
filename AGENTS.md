@@ -161,6 +161,17 @@ HTTPS listen port, single-threading a `HashMap<ConnectionId, ConnState>`
   allocations, and streams bodies instead of buffering them (see "Security
   and correctness notes" below). Preserve those properties when editing
   `pingclair-proxy` and `pingclair-static`.
+- **Never use `tokio::fs` on a per-request hot path.** Every `tokio::fs`
+  call is a `spawn_blocking` cross-thread round-trip (~futex wake+wait
+  each way); on the static path that cost ~8 futexes/request and halved
+  throughput. Use synchronous `std::fs` for local regular files — page-
+  cache reads don't meaningfully block, same model as nginx (measured:
+  18.7k → 50k req/s on 2 vCPU; see `benchmarks/README.md`).
+- **Any framework default that decides runtime topology must be set
+  explicitly and logged at startup.** Pingora's `ServerConf.threads`
+  defaults to 1 (single-threaded server!); we set it to
+  `available_parallelism()`, overridable via `global.worker_threads`.
+  Same principle behind the explicit `upstream_keepalive_pool_size`.
 - On Linux, the binary uses jemalloc (`tikv-jemallocator`); on other platforms
   the system allocator. Keep the `cfg(target_os = "linux")` guard intact.
 - Make minimal, scoped changes; match the surrounding module's structure

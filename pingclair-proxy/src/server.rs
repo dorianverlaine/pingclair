@@ -659,7 +659,9 @@ impl PingclairProxy {
                             header.insert_header("Server", "Pingclair").unwrap();
 
                             session.write_response_header(Box::new(header), false).await?;
-                            while let Some(chunk) = stream.read_chunk().await.map_err(|e| {
+                            // Synchronous chunk reads (see StreamingFile):
+                            // only the socket writes are async here.
+                            while let Some(chunk) = stream.read_chunk().map_err(|e| {
                                 pingora_core::Error::because(
                                     pingora_core::ErrorType::ReadError,
                                     "streaming file body",
