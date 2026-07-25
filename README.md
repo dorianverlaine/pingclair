@@ -29,7 +29,7 @@ Whether you need a simple static file server or an enterprise gateway with load 
 *   🚀 **Powered by Pingora** — Standing on the shoulders of giants, backed by Cloudflare's battle-tested infrastructure for enterprise-grade stability and throughput.
 *   🔒 **Memory safe** — Rust eliminates buffer overflows and the rest of the classic memory-safety vulnerability class.
 *   📝 **Caddyfile-compatible config** — A minimal configuration DSL with **automatic HTTPS**, **multiple listeners**, and **named matchers**, compatible with mainstream Caddyfile syntax.
-*   ⚡ **Native HTTP/3 (QUIC)** — Lower latency and better connection migration on unreliable networks.
+*   ⚡ **Native HTTP/3 (QUIC)** — Built on [quiche](https://github.com/cloudflare/quiche), the production QUIC stack that powers Cloudflare's edge. Lower latency and better connection migration on unreliable networks.
 *   🔄 **Smart load balancing** — Several built-in algorithms (round-robin, least-connections, and more) with health checks and automatic failover.
 *   🔐 **Fully automatic HTTPS** — Built-in ACME (Let's Encrypt) support issues and renews SSL/TLS certificates with zero configuration.
 *   📁 **Fast static file serving** — Gzip/Brotli compression, range requests, and efficient file transfer.
@@ -267,9 +267,9 @@ Pingclair is organized as a modular Cargo workspace:
 | **`pingclair`** | **CLI entry point.** Parses arguments, initializes logging, bootstraps the system. |
 | **`pingclair-core`** | **Core runtime.** Core data structures, traits, and server lifecycle management. |
 | **`pingclair-config`** | **Configuration compiler.** Lexes, parses, and semantically checks the `Pingclairfile`, producing runtime config objects. |
-| **`pingclair-proxy`** | **Proxy implementation.** HTTP/TCP proxy logic built on Pingora's proxy trait, including the load balancer. |
+| **`pingclair-proxy`** | **Proxy implementation.** HTTP/TCP proxy logic built on Pingora's proxy trait, including the load balancer, plus the HTTP/3 (QUIC) listener built on Cloudflare's quiche. |
 | **`pingclair-static`** | **Static file serving.** Efficient file reads, MIME type inference, and streaming. |
-| **`pingclair-tls`** | **TLS management.** Certificate loading, automatic ACME issuance (Let's Encrypt), and QUIC handshake logic. |
+| **`pingclair-tls`** | **TLS management.** Certificate loading and automatic ACME issuance (Let's Encrypt). |
 | **`pingclair-api`** | **Admin API.** A RESTful interface for inspecting state and hot-reloading configuration at runtime. |
 | **`pingclair-plugin`** | **Plugin system.** The plugin interface for third-party extensions. |
 
