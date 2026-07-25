@@ -134,6 +134,10 @@ impl AutoHttps {
             acme
         };
         
+        // Persist the ACME account next to the certificates so it is reused
+        // across restarts instead of re-registering on every issuance.
+        let acme = acme.with_account_store(store.path().to_path_buf());
+        
         Self {
             config,
             acme,

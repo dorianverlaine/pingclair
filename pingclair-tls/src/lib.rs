@@ -6,6 +6,7 @@
 //! - Automatic HTTPS
 //! - HTTP/3 (QUIC) support
 
+pub mod account_store;
 pub mod acme;
 pub mod auto_https;
 pub mod cert_store;

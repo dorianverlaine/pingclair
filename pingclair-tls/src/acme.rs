@@ -8,9 +8,10 @@
 //! - Certificate finalization and download.
 
 use instant_acme::{
-    Account, AuthorizationStatus, ChallengeType as AcmeChallengeType,
+    Account, AccountCredentials, AuthorizationStatus, ChallengeType as AcmeChallengeType,
     Identifier, NewAccount, NewOrder, OrderStatus,
 };
+use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -187,6 +188,10 @@ pub struct AcmeClient {
     
     /// Preferred challenge type for validation.
     challenge_type: ChallengeType,
+    
+    /// Root directory of the TLS store where the ACME account credentials
+    /// are persisted. When `None`, the account is not persisted.
+    account_store_root: Option<PathBuf>,
 }
 
 impl AcmeClient {
@@ -196,6 +201,7 @@ impl AcmeClient {
             staging: false,
             email: None,
             challenge_type: ChallengeType::Http01,
+            account_store_root: None,
         }
     }
     
@@ -205,12 +211,20 @@ impl AcmeClient {
             staging: true,
             email: None,
             challenge_type: ChallengeType::Http01,
+            account_store_root: None,
         }
     }
     
     /// Sets the contact email.
     pub fn with_email(mut self, email: impl Into<String>) -> Self {
         self.email = Some(email.into());
+        self
+    }
+    
+    /// Sets the root directory of the TLS store so the ACME account
+    /// credentials are persisted and reused across restarts.
+    pub fn with_account_store(mut self, store_root: impl Into<PathBuf>) -> Self {
+        self.account_store_root = Some(store_root.into());
         self
     }
     
@@ -348,7 +362,47 @@ impl AcmeClient {
     }
 
     /// Internal helper to ensure an account exists.
+    ///
+    /// Reuses the persisted account credentials when available so the same
+    /// ACME account survives restarts. Falls back to registering a new
+    /// account when the credentials file is missing, unreadable, or rejected
+    /// by the ACME provider, and persists the new credentials afterwards.
     async fn ensure_account(&self, directory_url: &str) -> Result<Account, AcmeError> {
+        let credentials_path = self.account_store_root.as_ref()
+            .map(|root| crate::account_store::credentials_path(root, self.staging));
+
+        // 1. Try to restore the account from persisted credentials.
+        if let Some(path) = &credentials_path {
+            match Self::load_account_credentials(path) {
+                Ok(Some(credentials)) => {
+                    let builder = Account::builder()
+                        .map_err(|e| AcmeError::Account(format!("Builder init failed: {}", e)))?;
+                    match builder.from_credentials(credentials).await {
+                        Ok(account) => {
+                            tracing::info!("🔑 Reusing persisted ACME account from {:?}", path);
+                            return Ok(account);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "⚠️ Stored ACME account rejected ({}); registering a new account",
+                                e
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {
+                    tracing::debug!("No persisted ACME account at {:?}; registering a new one", path);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "⚠️ Failed to load ACME account credentials from {:?}: {}; registering a new account",
+                        path, e
+                    );
+                }
+            }
+        }
+
+        // 2. Register a new account.
         let contact: Vec<String> = self.email.as_ref()
             .map(|e| vec![format!("mailto:{}", e)])
             .unwrap_or_default();
@@ -364,10 +418,52 @@ impl AcmeClient {
         let builder = Account::builder()
             .map_err(|e| AcmeError::Account(format!("Builder init failed: {}", e)))?;
             
-        let (account, _) = builder.create(&new_account, directory_url.to_string(), None).await
+        let (account, credentials) = builder.create(&new_account, directory_url.to_string(), None).await
             .map_err(|e| AcmeError::Account(format!("Registration failed: {}", e)))?;
+
+        // 3. Persist the credentials for future restarts. A failure here is
+        //    non-fatal: issuance can proceed with the in-memory account.
+        if let Some(path) = &credentials_path {
+            if let Err(e) = Self::store_account_credentials(path, &credentials) {
+                tracing::warn!(
+                    "⚠️ Failed to persist ACME account credentials to {:?}: {}",
+                    path, e
+                );
+            } else {
+                tracing::info!("💾 Persisted ACME account credentials to {:?}", path);
+            }
+        }
             
         Ok(account)
+    }
+
+    /// Loads and deserializes persisted account credentials.
+    ///
+    /// - Returns: `Ok(Some(_))` when valid credentials exist, `Ok(None)` when
+    ///   the file is missing, or an `Err` when the file is unreadable or
+    ///   corrupt.
+    fn load_account_credentials(path: &std::path::Path) -> Result<Option<AccountCredentials>, AcmeError> {
+        match crate::account_store::load(path)
+            .map_err(|e| AcmeError::Account(format!("Read failed: {}", e)))?
+        {
+            Some(json) => {
+                let credentials = serde_json::from_str(&json)
+                    .map_err(|e| AcmeError::Account(format!("Corrupt credentials: {}", e)))?;
+                Ok(Some(credentials))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Serializes and persists account credentials to disk.
+    fn store_account_credentials(
+        path: &std::path::Path,
+        credentials: &AccountCredentials,
+    ) -> Result<(), AcmeError> {
+        let json = serde_json::to_string_pretty(credentials)
+            .map_err(|e| AcmeError::Account(format!("Serialization failed: {}", e)))?;
+        crate::account_store::save(path, &json)
+            .map_err(|e| AcmeError::Account(format!("Write failed: {}", e)))
     }
 }
 
@@ -408,5 +504,70 @@ mod tests {
             expires_at: now + 29 * 86400,
         };
         assert!(near.needs_renewal());
+    }
+
+    /// A serialized credentials payload with a syntactically valid
+    /// (base64url-encoded) key, matching the `AccountCredentials` JSON shape.
+    const TEST_CREDENTIALS_JSON: &str = r#"{
+        "id": "https://acme.example/acct/1",
+        "key_pkcs8": "QUJD",
+        "directory": "https://acme-v02.api.letsencrypt.org/directory"
+    }"#;
+
+    #[test]
+    fn load_account_credentials_returns_none_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::account_store::credentials_path(dir.path(), false);
+        assert!(AcmeClient::load_account_credentials(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn load_account_credentials_rejects_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::account_store::credentials_path(dir.path(), false);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ not valid json").unwrap();
+        assert!(AcmeClient::load_account_credentials(&path).is_err());
+    }
+
+    #[test]
+    fn stored_account_credentials_survive_a_second_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::account_store::credentials_path(dir.path(), false);
+
+        // First run: no file yet.
+        assert!(AcmeClient::load_account_credentials(&path).unwrap().is_none());
+
+        // Simulate a first issuance persisting the freshly created account.
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, TEST_CREDENTIALS_JSON).unwrap();
+
+        // Second run: the same credentials are loaded back.
+        let credentials = AcmeClient::load_account_credentials(&path)
+            .unwrap()
+            .expect("credentials should load");
+
+        // Re-persisting through the store helper must not change the identity
+        // of the account: the serialized form stays identical.
+        AcmeClient::store_account_credentials(&path, &credentials).unwrap();
+        let reloaded = AcmeClient::load_account_credentials(&path)
+            .unwrap()
+            .expect("credentials should reload");
+        let first = serde_json::to_string(&credentials).unwrap();
+        let second = serde_json::to_string(&reloaded).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn staging_and_production_use_separate_credential_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let prod = crate::account_store::credentials_path(dir.path(), false);
+        let staging = crate::account_store::credentials_path(dir.path(), true);
+        assert_ne!(prod, staging);
+
+        // Writing staging credentials must not make them visible to production.
+        crate::account_store::save(&staging, TEST_CREDENTIALS_JSON).unwrap();
+        assert!(AcmeClient::load_account_credentials(&prod).unwrap().is_none());
+        assert!(AcmeClient::load_account_credentials(&staging).unwrap().is_some());
     }
 }

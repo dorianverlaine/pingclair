@@ -2,7 +2,7 @@
 //!
 //! 🌐 This module implements the core reverse proxy using Pingora's ProxyHttp trait.
 
-use pingclair_core::config::{ServerConfig, HandlerConfig, ReverseProxyConfig};
+use pingclair_core::config::{ServerConfig, HandlerConfig, ReverseProxyConfig, BasicAuthCredential};
 use pingclair_core::server::Router;
 
 use async_trait::async_trait;
@@ -49,6 +49,11 @@ pub struct RequestContext {
     pub compress_response: bool,
     /// Client accepts gzip
     pub client_accepts_gzip: bool,
+    /// Whether the matched route requested immediate per-chunk flushing
+    /// (`flush_interval: -1`). When true, body chunks flow downstream as
+    /// they arrive from upstream and response compression is disabled so
+    /// SSE / LLM-style streaming endpoints work through the proxy.
+    pub streaming_response: bool,
     /// Gzip encoder accumulating response body chunks
     pub gzip_encoder: Option<GzEncoder<Vec<u8>>>,
     /// Request method (for access log)
@@ -80,6 +85,7 @@ impl Default for RequestContext {
             suppress_server_header: false,
             compress_response: false,
             client_accepts_gzip: false,
+            streaming_response: false,
             gzip_encoder: None,
             request_method: String::new(),
             request_path: String::new(),
@@ -191,6 +197,35 @@ fn stream_gzip_chunk(
 }
 
 // MARK: - Proxy State
+
+/// Whether a route's `flush_interval` means "forward each chunk downstream
+/// as soon as it arrives from upstream" (configured as `-1`).
+///
+/// Positive `flush_interval` values are deliberately not implemented as a
+/// timer: Pingora 0.8 has no timed downstream flush mechanism (the
+/// `Option<Duration>` returned by its body filters is a *delay* before
+/// forwarding, not a flush schedule), and its transport layer already
+/// flushes every chunk for unknown-length bodies (see the buffering note in
+/// pingora-core `v1/body.rs`: buffering is only allowed when the body size
+/// is known ahead). Immediate mode therefore only needs to disable anything
+/// on our side that would hold chunks back — today that is response gzip.
+pub fn wants_immediate_flush(flush_interval: Option<i64>) -> bool {
+    flush_interval == Some(-1)
+}
+
+/// Whether the response content type is a real-time streaming format that
+/// must never be compressed, regardless of route configuration.
+///
+/// Server-Sent Events (`text/event-stream`) clients expect an identity
+/// body delivered incrementally; wrapping it in `Content-Encoding: gzip`
+/// breaks event delivery for clients that do not decode gzip.
+pub fn is_streaming_content_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .map(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+        .unwrap_or(false)
+}
 
 /// Mutable state for hot reloading
 #[derive(Clone)]
@@ -759,6 +794,27 @@ impl PingclairProxy {
                 // Returning Ok(false) to proceed
                 Ok(false)
             }
+            HandlerConfig::BasicAuth { realm, credentials } => {
+                // Verify the request's credentials before any later handler
+                // in the chain runs. Success falls through (Ok(false)) like
+                // the Headers handler; failure answers a 401 challenge.
+                if pingclair_core::server::verify_basic_auth(
+                    &session.req_header().headers,
+                    credentials,
+                ) {
+                    Ok(false)
+                } else {
+                    let body = "Unauthorized";
+                    let challenge = pingclair_core::server::basic_auth_challenge(realm);
+                    let mut response = ResponseHeader::build(401, Some(3)).unwrap();
+                    response.insert_header("WWW-Authenticate", challenge.as_str()).unwrap();
+                    response.insert_header("Content-Length", body.len().to_string()).unwrap();
+                    response.insert_header("Server", "Pingclair").unwrap();
+                    session.write_response_header(Box::new(response), false).await?;
+                    session.write_response_body(Some(Bytes::copy_from_slice(body.as_bytes())), true).await?;
+                    Ok(true)
+                }
+            }
             HandlerConfig::Headers { set, add, remove } => {
                 for (k, v) in set {
                     ctx.headers_downstream.insert(k.clone(), v.clone());
@@ -1246,6 +1302,7 @@ impl ProxyHttp for PingclairProxy {
                 ctx.headers_downstream = proxy_config.headers_down.clone();
                 read_timeout_ms = proxy_config.read_timeout;
                 write_timeout_ms = proxy_config.write_timeout;
+                ctx.streaming_response = wants_immediate_flush(proxy_config.flush_interval);
             }
 
             // Parse and create peer (shared with the HTTP/3 path so both
@@ -1391,10 +1448,12 @@ impl ProxyHttp for PingclairProxy {
         // 7. Setup gzip compression if applicable
         // Only compress if:
         //   - Client accepts gzip
+        //   - Route did not request immediate flushing (`flush_interval: -1`)
+        //   - Response is not a real-time stream (e.g. text/event-stream)
         //   - Response is not already compressed
         //   - Content type is compressible (text/*, application/json, etc.)
         //   - Body is not too small (> 256 bytes via Content-Length)
-        if ctx.compress_response && ctx.client_accepts_gzip {
+        if ctx.compress_response && ctx.client_accepts_gzip && !ctx.streaming_response {
             let already_encoded = upstream_response.headers
                 .get("content-encoding")
                 .is_some();
@@ -1414,7 +1473,7 @@ impl ProxyHttp for PingclairProxy {
                 .and_then(|v| v.parse::<u64>().ok());
             let too_small = content_length.map_or(false, |len| len < 256);
 
-            if !already_encoded && is_compressible && !too_small {
+            if !already_encoded && is_compressible && !is_streaming_content_type(content_type) && !too_small {
                 // Initialize gzip encoder
                 ctx.gzip_encoder = Some(GzEncoder::new(Vec::new(), Compression::fast()));
                 // Set response headers for compressed content
@@ -1639,6 +1698,25 @@ fn find_rate_limit_config(handler: &HandlerConfig) -> Option<crate::rate_limit::
             }
             None
         },
+        _ => None,
+    }
+}
+
+/// Find the first `BasicAuth` config in a handler tree, recursing through
+/// `Pipeline`/`Handle`/`HandlePath` wrappers. Mirrors
+/// [`find_rate_limit_config`]. Used by the HTTP/3 dispatch, which matches
+/// only on the top-level handler and therefore cannot rely on the
+/// `handle_config` arm the H1/H2 path uses.
+pub(crate) fn find_basic_auth_config(handler: &HandlerConfig) -> Option<(&str, &[BasicAuthCredential])> {
+    match handler {
+        HandlerConfig::BasicAuth { realm, credentials } => {
+            Some((realm.as_str(), credentials.as_slice()))
+        }
+        HandlerConfig::Pipeline(handlers)
+        | HandlerConfig::Handle(handlers)
+        | HandlerConfig::HandlePath { handlers, .. } => {
+            handlers.iter().find_map(find_basic_auth_config)
+        }
         _ => None,
     }
 }
@@ -1977,5 +2055,119 @@ mod p0_regression_tests {
         let legacy_json = r#"{"email":null,"auto_https":"on","blocked_ips":[]}"#;
         let parsed_legacy: GlobalConfig = serde_json::from_str(legacy_json).unwrap();
         assert_eq!(parsed_legacy.upstream_keepalive_pool_size, None);
+    }
+}
+
+#[cfg(test)]
+mod streaming_flush_tests {
+    use super::*;
+
+    #[test]
+    fn immediate_flush_only_for_negative_one() {
+        assert!(wants_immediate_flush(Some(-1)));
+        assert!(!wants_immediate_flush(None));
+        assert!(!wants_immediate_flush(Some(0)));
+        assert!(!wants_immediate_flush(Some(1)));
+        assert!(!wants_immediate_flush(Some(100)));
+        assert!(!wants_immediate_flush(Some(-2)));
+    }
+
+    #[test]
+    fn event_stream_content_type_is_detected_as_streaming() {
+        assert!(is_streaming_content_type("text/event-stream"));
+        assert!(is_streaming_content_type("text/event-stream; charset=utf-8"));
+        assert!(is_streaming_content_type("Text/Event-Stream"));
+        assert!(is_streaming_content_type(" text/event-stream ; charset=utf-8"));
+    }
+
+    #[test]
+    fn non_streaming_content_types_are_not_flagged() {
+        assert!(!is_streaming_content_type("text/plain"));
+        assert!(!is_streaming_content_type("text/html; charset=utf-8"));
+        assert!(!is_streaming_content_type("application/json"));
+        assert!(!is_streaming_content_type("application/x-ndjson"));
+        assert!(!is_streaming_content_type(""));
+    }
+
+    #[test]
+    fn streaming_response_defaults_to_off() {
+        let ctx = RequestContext::default();
+        assert!(!ctx.streaming_response);
+    }
+
+    #[test]
+    fn streaming_route_disables_gzip_gate() {
+        // The gzip branch in `response_filter` requires
+        // `ctx.compress_response && ctx.client_accepts_gzip && !ctx.streaming_response`.
+        // A route with `flush_interval: -1` sets streaming_response, which
+        // must keep the gate closed even when the client accepts gzip.
+        let mut ctx = RequestContext {
+            compress_response: true,
+            client_accepts_gzip: true,
+            ..Default::default()
+        };
+        ctx.streaming_response = wants_immediate_flush(Some(-1));
+        let gzip_gate_opens =
+            ctx.compress_response && ctx.client_accepts_gzip && !ctx.streaming_response;
+        assert!(!gzip_gate_opens, "flush_interval: -1 must disable the gzip filter");
+
+        // Sanity: without the streaming flag the same request would compress.
+        ctx.streaming_response = wants_immediate_flush(None);
+        let gzip_gate_opens =
+            ctx.compress_response && ctx.client_accepts_gzip && !ctx.streaming_response;
+        assert!(gzip_gate_opens);
+    }
+}
+
+#[cfg(test)]
+mod basic_auth_tests {
+    use super::*;
+
+    fn basic_auth_handler() -> HandlerConfig {
+        HandlerConfig::BasicAuth {
+            realm: "Restricted".to_string(),
+            credentials: vec![BasicAuthCredential {
+                username: "alice".to_string(),
+                password: "s3cret".to_string(),
+                hashed: false,
+            }],
+        }
+    }
+
+    fn respond_handler() -> HandlerConfig {
+        HandlerConfig::Respond {
+            status: 200,
+            body: None,
+            headers: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn finds_bare_basic_auth_config() {
+        let handler = basic_auth_handler();
+        let (realm, credentials) = find_basic_auth_config(&handler).unwrap();
+        assert_eq!(realm, "Restricted");
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(credentials[0].username, "alice");
+    }
+
+    #[test]
+    fn finds_basic_auth_nested_in_pipeline_and_handle_path() {
+        let handler = HandlerConfig::HandlePath {
+            prefix: "/admin".to_string(),
+            handlers: vec![HandlerConfig::Pipeline(vec![
+                basic_auth_handler(),
+                respond_handler(),
+            ])],
+        };
+        let (realm, _) = find_basic_auth_config(&handler).unwrap();
+        assert_eq!(realm, "Restricted");
+    }
+
+    #[test]
+    fn returns_none_when_no_basic_auth_present() {
+        let handler = HandlerConfig::Pipeline(vec![respond_handler()]);
+        assert!(find_basic_auth_config(&handler).is_none());
+        assert!(find_basic_auth_config(&respond_handler()).is_none());
     }
 }
