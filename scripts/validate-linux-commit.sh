@@ -25,6 +25,11 @@ mkdir -p "${requested_results}"
 readonly results_dir="$(cd "${requested_results}" && pwd)"
 readonly work_dir="$(mktemp -d "${TMPDIR:-/tmp}/pingclair-linux-validation.XXXXXXXX")"
 readonly checkout_dir="${work_dir}/checkout"
+
+# 🧰 Keep test linking reproducible on small validation hosts without changing runtime behavior.
+export CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG:-0}"
+export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
+
 active_pid=""
 server_pid=""
 validation_finished=false
@@ -119,6 +124,8 @@ git -C "${checkout_dir}" checkout -q --detach "${resolved_commit}"
     printf 'kernel=%s\n' "$(uname -a)"
     printf 'rustc=%s\n' "$(rustc --version)"
     printf 'cargo=%s\n' "$(cargo --version)"
+    printf 'cargo_profile_test_debug=%s\n' "${CARGO_PROFILE_TEST_DEBUG}"
+    printf 'cargo_incremental=%s\n' "${CARGO_INCREMENTAL}"
     if command -v lsb_release >/dev/null 2>&1; then
         lsb_release -a 2>/dev/null || true
     fi
