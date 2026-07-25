@@ -1,0 +1,12 @@
+HTTP/1.1 200 OK
+Content-Length: 14
+Server: Pingclair
+X-Request-Id: 6577763e7d087-9
+Access-Control-Expose-Headers: X-Request-Id
+Access-Control-Allow-Origin: https://app.example
+Access-Control-Allow-Credentials: true
+Vary: Origin
+Alt-Svc: h3=":443"; ma=86400
+Date: Sat, 25 Jul 2026 22:57:24 GMT
+Connection: keep-alive
+

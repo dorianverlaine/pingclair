@@ -1,0 +1,2 @@
+  20 primary-a /proxy/sample
+  20 primary-b /proxy/sample

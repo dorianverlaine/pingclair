@@ -1,0 +1,11 @@
+HTTP/2 200 
+content-length: 14
+server: Pingclair
+x-request-id: 6577834e79037-e
+access-control-expose-headers: X-Request-Id
+access-control-allow-origin: https://app.example
+access-control-allow-credentials: true
+vary: Origin
+alt-svc: h3=":443"; ma=86400
+date: Sat, 25 Jul 2026 23:55:55 GMT
+

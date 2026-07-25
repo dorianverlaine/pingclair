@@ -1,0 +1,7 @@
+HTTP/2 403 
+content-type: text/plain
+content-length: 9
+server: Pingclair
+alt-svc: h3=":443"; ma=86400
+date: Sat, 25 Jul 2026 23:55:56 GMT
+

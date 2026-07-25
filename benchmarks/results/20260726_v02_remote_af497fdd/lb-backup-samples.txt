@@ -1,0 +1,8 @@
+backup /proxy/backup?i=1
+backup /proxy/backup?i=2
+backup /proxy/backup?i=3
+backup /proxy/backup?i=4
+backup /proxy/backup?i=5
+backup /proxy/backup?i=6
+backup /proxy/backup?i=7
+backup /proxy/backup?i=8

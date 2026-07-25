@@ -1,0 +1,7 @@
+HTTP/2 200 
+content-length: 52
+server: Pingclair
+x-request-id: 6577834e79037-c
+alt-svc: h3=":443"; ma=86400
+date: Sat, 25 Jul 2026 23:55:51 GMT
+

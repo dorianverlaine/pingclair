@@ -1,0 +1,1 @@
+PASS: exact commit af497fdd, public H1/H2/H3, H2 parity, LB 3:1, and backup 8/8.

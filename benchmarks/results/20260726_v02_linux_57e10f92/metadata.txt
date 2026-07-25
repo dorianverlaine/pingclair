@@ -1,0 +1,12 @@
+validated_at_utc=2026-07-25T23:27:59Z
+repository=https://github.com/dorianverlaine/pingclair.git
+commit=57e10f9226bf39ef190ad8007ff2c936a8d385e8
+kernel=Linux iZwz966y2amwb6xum5kuiiZ 6.8.0-63-generic #66-Ubuntu SMP PREEMPT_DYNAMIC Fri Jun 13 20:25:30 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux
+rustc=rustc 1.97.1 (8bab26f4f 2026-07-14)
+cargo=cargo 1.97.1 (c980f4866 2026-06-30)
+cargo_profile_test_debug=0
+cargo_incremental=0
+Distributor ID:	Ubuntu
+Description:	Ubuntu 24.04.4 LTS
+Release:	24.04
+Codename:	noble

@@ -32,12 +32,12 @@
 
 ### R0：先讓測試結果可信
 
-- [ ] **整合測試隔離完成（本機已過，Linux 20 輪執行中）** — 全部真 binary 測試使用
+- [x] **整合測試隔離完成（`57e10f9`）** — 全部真 binary 測試使用
   動態 port／唯一 readiness token；child 與 process group 在成功、panic、
   timeout、Ctrl-C 後都會 reap，連續跑 20 次不得殘留 listener 或幽靈 Pingclair。
-- [ ] **乾淨 Linux 驗證腳本完成（已實作，待新 commit 自我驗證）** — 由指定 commit
-  建立暫存 checkout，建置 release binary、啟動測試、收集
-  config/log/metrics/result，最後只清理自己建立的程序與目錄。
+- [x] **乾淨 Linux 驗證腳本完成（`57e10f9`）** — 由指定 commit 建立暫存
+  checkout，建置 release binary、啟動測試、收集 config/log/metrics/result，
+  最後只清理自己建立的程序與目錄。
 - [ ] **協議安全回歸集完成** — H1/H2/H3 的 URI/header 正規化、hop-by-hop headers、
   request smuggling、oversized headers、malformed input 與 body limit 都有負向測試。
 
@@ -205,7 +205,11 @@
   per-test 暫存目錄，避免 pipe 塞滿後互相等待。
 - [x] **本機重複驗證** — `scripts/test-integration-isolation.sh` 可重現隔離測試；
   macOS 最終版本連跑 20 輪、每輪 10 項並行測試全過，結束後沒有新增 Pingclair、
-  listener 或 watchdog。仍須在乾淨 Linux 以同一 commit 重跑，才可勾選 R0。
+  listener 或 watchdog。
+- [x] **Linux 20 輪驗證** — `57e10f9226bf39ef190ad8007ff2c936a8d385e8`
+  在 Ubuntu 24.04 完成 20 輪、每輪 10 項並行真 binary 測試；watchdog 的 Linux
+  `/bin/kill` 負 PGID 解析差異已加 `--` 修正，GitHub Rust workflow 與 VPS
+  均通過，結束後沒有殘留 listener 或程序。
 - [x] **乾淨 Linux 內層驗證腳本** — `scripts/validate-linux-commit.sh` 僅接受完整
   commit SHA，建立唯一暫存 checkout，依序執行 release build、workspace tests、
   20 輪隔離測試與 release binary loopback smoke，保存 metadata、config、log、
@@ -240,11 +244,12 @@
   regex 於配置載入時預編譯。
 - [x] **LB weight／backup** — 加權主池；僅在所有主節點不可選時使用 backup。
   公網測試發現舊實作把同一 backend 重複插入 set，實際仍為 1:1；目前已改用
-  Pingora 原生 `Backend.weight`，本機 selector 40 次精準通過 30:10，待新 commit
-  公網重測。
+  Pingora 原生 `Backend.weight`；`af497fd` 公網 40 次精準通過 30:10，兩個
+  primary 停止後 backup 8/8 接手。
 - [x] **H2 ALPN 修正** — 公網測試發現 `TlsSettings::with_callbacks` 預設未開 H2，
-  TLS handshake 沒有協商 ALPN；目前已顯式 `enable_h2()`，待新 commit 以
-  curl HTTP/2 與 OpenSSL ALPN 重測。
+  TLS handshake 沒有協商 ALPN；顯式 `enable_h2()` 後又揭露 vhost 只讀
+  HTTP/1.1 `Host`、忽略 H2 `:authority` 的 404。`af497fd` 已統一 authority
+  解析，公網 curl version 2／200 與 OpenSSL ALPN `h2` 均通過。
 
 移入「完成」前需在乾淨遠端 commit 上跑一套 parity smoke：
 
@@ -255,8 +260,8 @@
 - [x] UA deny 已在 `0d2e052` 公網通過；IP、Referer 與 deny precedence 尚未跑。
 - [x] rewrite capture、query 保留已在 `0d2e052` 公網靜態路徑通過；代理
   upstream 實際收到的 URI 尚未跑。
-- [x] primary 全掛時 backup 在 `0d2e052` 公網 8/8 接手；weight 當時實測為錯誤的
-  20:20，修正後待重測，primary 恢復尚未跑。
+- [x] weight 3:1 與 primary 全掛時 backup 已在 `af497fd` 公網通過；primary
+  恢復尚未跑。
 
 ### 2026-07-26 公網 80／443 生產情境（部分通過）
 
@@ -270,11 +275,29 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
 - [x] **Admin 未暴露公網** — 2019 僅綁 loopback，從本機對 VPS 公網連線失敗。
 - [x] **Caddy parity 部分路徑** — H1 的自訂 404、CORS simple/preflight、
   UA deny、regex rewrite＋query 與 LB backup 通過。
-- [ ] **本次發現並待新 commit 重測** — H2 未協商 ALPN；LB 3:1 實測 20:20。
-  兩者已在本機修正並完成回歸測試。
+- [x] **本次發現並已於新 commit 修正** — H2 未協商 ALPN；LB 3:1 實測 20:20。
+  兩者已在 `af497fd` 修正並通過新一輪公網驗收，舊目錄保留失敗證據。
 - [ ] **H3 middleware parity 仍未完成** — CORS、access control 與 rewrite 路徑
   回 501；404 使用內建頁而非 `error_page`。這是 R3 的真實缺口，不得把 H3
   baseline 200 誤寫成 parity 完成。
+
+### 2026-07-26 乾淨 Linux 與公網修正驗收
+
+- [x] **乾淨 Linux 全流程（`57e10f9`）** — release workspace build、全 workspace
+  tests、20 輪 integration isolation、release binary／Admin loopback smoke
+  全過。結果保存在 `benchmarks/results/20260726_v02_linux_57e10f92/`。
+- [x] **H1／H2／H3 公網基線（`af497fd`）** — H1、H2、H3 均為 200；H2
+  authority vhost 與 ALPN 通過，H3 連續 10 次 version 3／200。GitHub Rust
+  workflow 同 commit 全綠。
+- [x] **H2 parity 與 LB 修正（`af497fd`）** — 自訂 404、CORS simple／preflight、
+  非法 origin 不輸出允許標頭、UA deny、regex rewrite＋query、LB 30:10 與
+  backup 8/8 均由本機透過公網請求 VPS 通過。結果保存在
+  `benchmarks/results/20260726_v02_remote_af497fdd/`。
+- [x] **fixture 清理** — 驗收後 80/443/2019/9001–9003 與 21209 均無本次
+  listener，沒有 Pingclair、upstream 或 watchdog 幽靈程序。
+- [ ] **尚未覆蓋** — IP／Referer 完整 allow／deny 與 precedence、死亡
+  upstream 502 自訂頁、代理 rewrite URI、primary recovery，以及 R3 的 H3
+  middleware parity。
 
 ### 其他已實作項目
 

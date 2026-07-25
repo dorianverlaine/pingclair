@@ -1,0 +1,11 @@
+HTTP/2 200 
+content-type: text/plain
+content-length: 30
+last-modified: Sat, 25 Jul 2026 23:54:15 GMT
+etag: "1e-65"
+accept-ranges: bytes
+server: Pingclair
+x-request-id: 6577834e79037-12
+alt-svc: h3=":443"; ma=86400
+date: Sat, 25 Jul 2026 23:55:56 GMT
+

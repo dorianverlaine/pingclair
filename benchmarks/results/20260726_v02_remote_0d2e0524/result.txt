@@ -1,0 +1,1 @@
+PARTIAL: H1/H3 baseline and Caddy parity passed; H2 ALPN, LB weight, and H3 middleware parity failed.

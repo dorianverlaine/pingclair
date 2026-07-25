@@ -1,0 +1,5 @@
+commit=af497fdd2dee46a97a06c98f7add119982c102f8
+binary_sha256=11db2872500a3d4398018a598e336e84faa4373618b4fbdea3e8a82d3af65d60
+public_host=pingclair-v02.test
+validated_at_utc=2026-07-25T23:55:50Z
+curl=curl 8.21.0 (aarch64-apple-darwin25.4.0) libcurl/8.21.0 OpenSSL/3.6.3 zlib/1.2.12 brotli/1.2.0 zstd/1.5.7 AppleIDN libpsl/0.23.0 libssh2/1.11.1 nghttp2/1.69.0 ngtcp2/1.24.0 nghttp3/1.17.0 mit-krb5/1.7-prerelease OpenLDAP/2.4.28/Apple

@@ -1,0 +1,57 @@
+Connecting to 47.106.89.225
+depth=0 CN=pingclair-v02.test
+verify error:num=18:self-signed certificate
+verify return:1
+depth=0 CN=pingclair-v02.test
+verify return:1
+CONNECTED(00000003)
+---
+Certificate chain
+ 0 s:CN=pingclair-v02.test
+   i:CN=pingclair-v02.test
+   a:PKEY: RSA, 2048 (bit); sigalg: sha256WithRSAEncryption
+   v:NotBefore: Jul 25 23:54:15 2026 GMT; NotAfter: Jul 27 23:54:15 2026 GMT
+---
+Server certificate
+-----BEGIN CERTIFICATE-----
+MIIDOjCCAiKgAwIBAgIUEnir9qX+rtnrYPmzUZvvRWU0hS0wDQYJKoZIhvcNAQEL
+BQAwHTEbMBkGA1UEAwwScGluZ2NsYWlyLXYwMi50ZXN0MB4XDTI2MDcyNTIzNTQx
+NVoXDTI2MDcyNzIzNTQxNVowHTEbMBkGA1UEAwwScGluZ2NsYWlyLXYwMi50ZXN0
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuJ+DTz6FxoUV5rL5DXtQ
+V8hQI4RXYJQcl+EWR/oeMpxPq0mwOB8/HO3jU8ALgAbiTfPqDux0eHfH7bMq/gok
+VWQ3cEs/OIwbsmB4arejJfkaAtlEwStKyqQwrg9JPU7BntjcyjPftzFa2xEiT1EE
+ZwpfFwS+m8aeqHo0jhKiEWCcYEbkilLXZ7soeyXVEMXxDhp7cJTT9xzpiKMuVdhT
+TP12lcvJtWSiT99jIfydxwZrlNcyLdx7cfU4Z9mIk4YBP2lZX93BMUO8P0i7LWKN
+RUZdKjLobYNy0Idcpezm9pKLehZ37EqRFYMsMsFx08qS7kgkktv80/Yfqj6eYQ/i
+0QIDAQABo3IwcDAdBgNVHQ4EFgQUrAzfUm67XM5zDksEnoMIzTqiYwIwHwYDVR0j
+BBgwFoAUrAzfUm67XM5zDksEnoMIzTqiYwIwDwYDVR0TAQH/BAUwAwEB/zAdBgNV
+HREEFjAUghJwaW5nY2xhaXItdjAyLnRlc3QwDQYJKoZIhvcNAQELBQADggEBAIMA
+ixn0mmnfBMwYJbt4LG1kjnFbqi1mJcClEY3M4jPUOA258COWTiR+XpVGTLggtbs4
+ImEMrvrmuN2l3JO0DcmekvVdcxXp+79/ZPVa+Zdn13teA/tiwQ+ysCb6DlqVj4lg
+8L8BlYEORCt9HXX3aalmo3Wc4t8fdgQuPZXyMwumJvKPeWgtXqYhAMCQiggQiwRi
+0F0n2hhP60IZxD5zmfYoSEE7zBLgxhnRxaUB3qGzhKRzxiWQDeWNJuONlsZYXF4d
+5o92rfvcqYU3tctB9KzS3y++84wDQ9XgAGMZg8SuYRSM6RYZJmLU39XfNCrAqwFa
+PjUOlAHkPTAyhVOppkU=
+-----END CERTIFICATE-----
+subject=CN=pingclair-v02.test
+issuer=CN=pingclair-v02.test
+---
+No client certificate CA names sent
+Peer signing digest: SHA256
+Peer signature type: rsa_pss_rsae_sha256
+Peer Temp Key: X25519, 253 bits
+---
+SSL handshake has read 1329 bytes and written 1638 bytes
+Verification error: self-signed certificate
+---
+New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+Protocol: TLSv1.3
+Server public key is 2048 bit
+This TLS version forbids renegotiation.
+Compression: NONE
+Expansion: NONE
+ALPN protocol: h2
+Early data was not sent
+Verify return code: 18 (self-signed certificate)
+---
+DONE
