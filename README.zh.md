@@ -154,6 +154,19 @@ localhost:8080 {
 }
 ```
 
+若 Pingclair 位於你所管理的負載平衡器或 CDN 後方，只能在全域區塊列出可信
+代理網段。未受信任的上一跳不能透過 `X-Forwarded-For`、`X-Real-IP` 或
+`X-Forwarded-Proto` 偽造 client identity：
+
+```caddyfile
+{
+    trusted_proxies 10.0.0.0/8 2001:db8::/32
+}
+```
+
+存取控制、rate limit、IP-hash 負載平衡、上游轉送、placeholder 與 access log
+會共用同一個已驗證 client IP。目前變更 `trusted_proxies` 後需要重新啟動。
+
 ### 路由與匹配
 
 Pingclair 提供強大的路由匹配能力，你可以依照路徑、網域、標頭等條件分流請求。

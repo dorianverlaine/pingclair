@@ -43,6 +43,10 @@ pub struct GlobalConfig {
     #[serde(default)]
     pub blocked_ips: Vec<String>,
 
+    /// 🛡️ Proxy IP or CIDR ranges allowed to supply client identity headers.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+
     /// Max number of idle upstream connections Pingora keeps open per
     /// worker thread for reuse. Explicitly configurable rather than left
     /// as an implicit framework default, so a deployment under load has a
@@ -69,6 +73,7 @@ impl Default for GlobalConfig {
             email: None,
             auto_https: AutoHttpsMode::default(),
             blocked_ips: Vec::new(),
+            trusted_proxies: Vec::new(),
             upstream_keepalive_pool_size: None,
             http3: true,
             worker_threads: None,
@@ -806,6 +811,7 @@ mod tests {
     #[test]
     fn test_global_http3_defaults_to_true() {
         assert!(GlobalConfig::default().http3);
+        assert!(GlobalConfig::default().trusted_proxies.is_empty());
 
         // Configs written before the switch existed must keep H3 enabled.
         let legacy: GlobalConfig = serde_json::from_str(r#"{"email":null}"#).unwrap();

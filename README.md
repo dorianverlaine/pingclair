@@ -162,6 +162,20 @@ localhost:8080 {
 }
 ```
 
+When Pingclair is behind a load balancer or CDN that you operate, list only
+those proxy networks in the global block. Untrusted peers cannot supply
+`X-Forwarded-For`, `X-Real-IP`, or `X-Forwarded-Proto` identity:
+
+```caddyfile
+{
+    trusted_proxies 10.0.0.0/8 2001:db8::/32
+}
+```
+
+The verified client IP is shared by access control, rate limiting, IP-hash
+load balancing, upstream forwarding, placeholders, and access logs. Changes
+to `trusted_proxies` currently require a restart.
+
 ### Routing and matching
 
 Pingclair has a powerful matcher system — route requests by path, host, headers, and more.

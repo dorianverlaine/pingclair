@@ -968,3 +968,145 @@ async fn test_reverse_proxy_custom_gzip_types() {
     assert_eq!(decompressed, body);
     upstream_task.await.unwrap();
 }
+
+#[tokio::test]
+async fn test_trusted_proxies_control_verified_client_identity() {
+    let server_config = |trusted_proxies: Vec<&str>| {
+        serde_json::json!({
+            "global": {
+                "http3": false,
+                "trusted_proxies": trusted_proxies
+            },
+            "servers": [{
+                "listen": ["127.0.0.1:0"],
+                "routes": [{
+                    "path": "/",
+                    "handler": {
+                        "type": "pipeline",
+                        "handlers": [
+                            {
+                                "type": "access_control",
+                                "allowed_ips": ["203.0.113.7/32"]
+                            },
+                            { "type": "respond", "status": 200, "body": "verified" }
+                        ]
+                    }
+                }]
+            }]
+        })
+        .to_string()
+    };
+    let client = no_proxy_client();
+
+    {
+        // ✅ A configured loopback proxy may assert the downstream client IP.
+        let config = server_config(vec!["127.0.0.1/32"]);
+        let mut server = TestServer::new(&config);
+        assert!(server.wait_until_ready().await, "server failed to start");
+        let url = server.url(0, "/");
+
+        let allowed = client
+            .get(&url)
+            .header("X-Forwarded-For", "203.0.113.7")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), 200);
+
+        // 🚫 Missing or malformed proxy identity fails closed to the loopback peer.
+        assert_eq!(client.get(&url).send().await.unwrap().status(), 403);
+        assert_eq!(
+            client
+                .get(&url)
+                .header("X-Forwarded-For", "203.0.113.7, invalid")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+
+    {
+        // 🚫 Without trusted_proxies, the same spoofed header cannot bypass policy.
+        let config = server_config(Vec::new());
+        let mut server = TestServer::new(&config);
+        assert!(server.wait_until_ready().await, "server failed to start");
+        let denied = client
+            .get(server.url(0, "/"))
+            .header("X-Forwarded-For", "203.0.113.7")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), 403);
+    }
+}
+
+#[tokio::test]
+async fn test_untrusted_forwarding_headers_are_sanitized_upstream() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let mut request = vec![0u8; 8192];
+        let read = stream.read(&mut request).await.unwrap();
+        request.truncate(read);
+        request_tx
+            .send(String::from_utf8(request).unwrap())
+            .unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+    });
+
+    let config = serde_json::json!({
+        "global": { "http3": false },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "routes": [{
+                "path": "/",
+                "handler": {
+                    "type": "reverse_proxy",
+                    "upstreams": [format!("http://{upstream_address}")],
+                    "load_balance": { "strategy": "round_robin" },
+                    "headers_up": {
+                        "X-Verified-Placeholder": "{remote_ip}"
+                    },
+                    "headers_down": {}
+                }
+            }]
+        }]
+    })
+    .to_string();
+
+    let mut server = TestServer::new(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let response = no_proxy_client()
+        .get(server.url(0, "/"))
+        .header("X-Forwarded-For", "203.0.113.7")
+        .header("X-Real-IP", "203.0.113.8")
+        .header("X-Forwarded-Proto", "https")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "ok");
+
+    // 🛡️ The upstream sees socket-derived identity, not attacker headers.
+    let upstream_request = request_rx.await.unwrap().to_ascii_lowercase();
+    assert!(upstream_request.contains("\r\nx-forwarded-for: 127.0.0.1\r\n"));
+    assert!(upstream_request.contains("\r\nx-real-ip: 127.0.0.1\r\n"));
+    assert!(upstream_request.contains("\r\nx-forwarded-proto: http\r\n"));
+    assert!(
+        upstream_request.contains("\r\nx-forwarded-host: 127.0.0.1:"),
+        "unexpected upstream request:\n{upstream_request}"
+    );
+    assert!(upstream_request.contains("\r\nx-verified-placeholder: 127.0.0.1\r\n"));
+    upstream_task.await.unwrap();
+}

@@ -12,6 +12,10 @@
     # Admin API on 127.0.0.1:2019, protected by a Bearer token.
     # Without a token the API only accepts loopback connections.
     admin 127.0.0.1:2019 your-secret-key-here
+
+    # 🛡️ Only proxies you operate may supply client identity headers.
+    # Changes to this global policy currently require a restart.
+    # trusted_proxies 10.0.0.0/8 2001:db8::/32
 }
 
 # Main site. A bare hostname binds 0.0.0.0 and routes by Host header.

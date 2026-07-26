@@ -77,6 +77,8 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
         });
     }
 
+    config.global.trusted_proxies = global.trusted_proxies.clone();
+
     Ok(())
 }
 

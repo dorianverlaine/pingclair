@@ -39,7 +39,7 @@ use pingora_http::RequestHeader;
 use quiche::h3::NameValue;
 
 use crate::connection_filter::PingclairConnectionFilter;
-use crate::server::{append_forwarded_for, find_basic_auth_config, resolve_caddy_placeholders, PingclairProxy};
+use crate::server::{find_basic_auth_config, resolve_caddy_placeholders, PingclairProxy};
 
 /// Maximum UDP payload we ask quiche to send (standard Ethernet MTU-safe).
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -1075,7 +1075,7 @@ async fn handle_request_inner(
     proxy: &PingclairProxy,
     connector: &pingora_core::connectors::http::Connector,
     req: &H3Request,
-    remote_ip: &str,
+    peer_ip: &str,
     cid: &quiche::ConnectionId<'static>,
     stream_id: u64,
     mut body_rx: mpsc::Receiver<Vec<u8>>,
@@ -1096,6 +1096,13 @@ async fn handle_request_inner(
         header.insert_header("host", &req.authority).ok();
     }
 
+    // 🛡️ QUIC uses the same trusted-proxy identity policy as H1 and H2.
+    let peer_address = peer_ip
+        .parse::<IpAddr>()
+        .map_err(|_| (400, "Invalid Peer Address"))?;
+    let verified_client_ip = proxy.verified_client_ip(peer_address, &header.headers);
+    let verified_client_ip_text = verified_client_ip.to_string();
+
     let host_bare = req.authority.split(':').next().unwrap_or("").to_string();
 
     // Route via the shared logic (same entry point as the H1/H2 path).
@@ -1104,7 +1111,7 @@ async fn handle_request_inner(
         path_only,
         req.method.as_str(),
         &header,
-        remote_ip,
+        &verified_client_ip_text,
     ) {
         Some((s, Some(idx), Some(h))) => (s, idx, h),
         Some(_) => return Err((404, "No Matching Route")),
@@ -1127,11 +1134,10 @@ async fn handle_request_inner(
         }
     }
 
-    // Rate limiting, same semantics as the Pingora request_filter path —
-    // keyed by the real QUIC peer address.
+    // 🛡️ Rate limiting uses the same verified client identity as H1 and H2.
     if let Some(limiter) = state.rate_limiters.get(route_index).and_then(|l| l.as_ref()) {
         let key = if limiter.config.by_ip {
-            Some(remote_ip)
+            Some(verified_client_ip_text.as_str())
         } else {
             None
         };
@@ -1297,7 +1303,8 @@ async fn handle_request_inner(
                 route_index,
                 req,
                 &header,
-                remote_ip,
+                peer_ip,
+                &verified_client_ip_text,
                 body_limit,
                 cid,
                 stream_id,
@@ -1323,7 +1330,8 @@ async fn reverse_proxy_upstream(
     route_index: usize,
     req: &H3Request,
     client_header: &RequestHeader,
-    remote_ip: &str,
+    peer_ip: &str,
+    verified_client_ip: &str,
     body_limit: u64,
     cid: &quiche::ConnectionId<'static>,
     stream_id: u64,
@@ -1331,8 +1339,8 @@ async fn reverse_proxy_upstream(
     resp_tx: &RespSender,
     body_notify: &Arc<Notify>,
 ) -> Result<(), HandlerError> {
-    // Select upstream with the real client IP so ip_hash works.
-    let ip_bytes: Vec<u8> = match remote_ip.parse::<IpAddr>() {
+    // ⚖️ Selects the upstream with the verified client IP for IP-hash routing.
+    let ip_bytes: Vec<u8> = match verified_client_ip.parse::<IpAddr>() {
         Ok(IpAddr::V4(v4)) => v4.octets().to_vec(),
         Ok(IpAddr::V6(v6)) => v6.octets().to_vec(),
         Err(_) => Vec::new(),
@@ -1405,7 +1413,8 @@ async fn reverse_proxy_upstream(
     // Configured headers_up with Caddy placeholder resolution.
     if let Some(cfg) = &proxy_config {
         for (key, template) in &cfg.headers_up {
-            let resolved = resolve_caddy_placeholders(template, client_header);
+            let resolved =
+                resolve_caddy_placeholders(template, client_header, Some(verified_client_ip));
             up_req.insert_header(key.clone(), resolved.as_str()).ok();
         }
     }
@@ -1420,21 +1429,27 @@ async fn reverse_proxy_upstream(
     if !has_header_up("X-Forwarded-Proto") {
         up_req.insert_header("X-Forwarded-Proto", "https").ok();
     }
-    if !has_header_up("X-Forwarded-For") {
-        let existing = req
-            .headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"))
-            .map(|(_, v)| v.as_str());
+    if !has_header_up("X-Forwarded-Host") {
         up_req
-            .insert_header(
-                "X-Forwarded-For",
-                append_forwarded_for(existing, remote_ip).as_str(),
-            )
+            .insert_header("X-Forwarded-Host", req.authority.as_str())
             .ok();
     }
-    if !has_header_up("X-Real-IP") && !req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-real-ip")) {
-        up_req.insert_header("X-Real-IP", remote_ip).ok();
+    if !has_header_up("X-Forwarded-For") {
+        if let Ok(peer_address) = peer_ip.parse::<IpAddr>() {
+            up_req
+                .insert_header(
+                    "X-Forwarded-For",
+                    proxy
+                        .forwarded_for(peer_address, &client_header.headers)
+                        .as_str(),
+                )
+                .ok();
+        }
+    }
+    if !has_header_up("X-Real-IP") {
+        up_req
+            .insert_header("X-Real-IP", verified_client_ip)
+            .ok();
     }
 
     session

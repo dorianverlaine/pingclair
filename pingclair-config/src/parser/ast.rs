@@ -44,6 +44,8 @@ pub struct GlobalBlock {
     pub email: Option<String>,
     pub auto_https: Option<AutoHttpsMode>,
     pub admin: Option<AdminDirective>,
+    /// 🛡️ Proxy IP or CIDR ranges allowed to supply client identity headers.
+    pub trusted_proxies: Vec<String>,
     pub directives: Vec<Directive>,
 }
 
