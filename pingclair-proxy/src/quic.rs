@@ -362,6 +362,8 @@ fn validate_token<'a>(
 /// One parsed HTTP/3 request, handed to a handler task.
 struct H3Request {
     method: String,
+    /// 🔌 Preserves extended CONNECT protocols so unsupported tunnels fail clearly.
+    protocol: Option<String>,
     /// Path including the query string.
     path: String,
     /// `:authority` (or `host` header) value, may include a port.
@@ -373,6 +375,7 @@ struct H3Request {
 /// Parse the pseudo-headers of an HTTP/3 request into an [`H3Request`].
 fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
     let mut method = None;
+    let mut protocol = None;
     let mut path = None;
     let mut authority = None;
     let mut headers = Vec::new();
@@ -383,7 +386,8 @@ fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
             b":method" => method = Some(value),
             b":path" => path = Some(value),
             b":authority" => authority = Some(value),
-            b":scheme" | b":protocol" => {}
+            b":protocol" => protocol = Some(value),
+            b":scheme" => {}
             name if name.starts_with(b":") => return None, // unknown pseudo-header
             name => headers.push((String::from_utf8_lossy(name).into_owned(), value)),
         }
@@ -398,6 +402,7 @@ fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
 
     Some(H3Request {
         method: method?,
+        protocol,
         path: path?,
         authority: authority?,
         headers,
@@ -1490,6 +1495,16 @@ async fn handle_request_inner(
         .ok_or((500, "Missing Route Handler"))?
         .handler;
 
+    // 🔌 Rejects CONNECT tunnels because the current H3 path is request-response only.
+    if method == http::Method::CONNECT || req.protocol.is_some() {
+        return Err((501, "CONNECT Not Supported Over HTTP/3"));
+    }
+
+    // 🚫 Rejects advertised request trailers before a handler can consume an incomplete message.
+    if header.headers.contains_key("trailer") {
+        return Err((501, "Request Trailers Not Supported"));
+    }
+
     // 📦 Rejects declared oversized bodies before opening an upstream connection.
     let body_limit = state.config.client_max_body_size;
     if body_limit > 0
@@ -1914,6 +1929,17 @@ async fn reverse_proxy_upstream(
         return Err((upstream_status, error_reason(upstream_status)));
     }
 
+    if session
+        .response_header()
+        .is_some_and(|response| response.headers.contains_key("trailer"))
+    {
+        tracing::warn!(
+            "🚫 Rejecting an H3 upstream response that requires unsupported trailer forwarding"
+        );
+        session.shutdown().await;
+        return Err((502, "Upstream Response Trailers Not Supported"));
+    }
+
     let mut hdrs = Vec::new();
     if let Some(resp) = session.response_header() {
         hdrs.push(quiche::h3::Header::new(
@@ -2312,6 +2338,21 @@ mod tests {
         ];
         let req = parse_h3_request(&list).unwrap();
         assert_eq!(req.authority, "fallback.example.com");
+    }
+
+    #[test]
+    fn parse_h3_request_preserves_extended_connect_protocol() {
+        let list = vec![
+            quiche::h3::Header::new(b":method", b"CONNECT"),
+            quiche::h3::Header::new(b":protocol", b"websocket"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"example.com"),
+            quiche::h3::Header::new(b":path", b"/socket"),
+        ];
+
+        let req = parse_h3_request(&list).unwrap();
+
+        assert_eq!(req.protocol.as_deref(), Some("websocket"));
     }
 
     #[test]

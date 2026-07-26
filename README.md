@@ -26,10 +26,10 @@ Whether you need a simple static file server or an enterprise gateway with load 
 
 ## ✨ Features
 
-*   🚀 **Powered by Pingora** — Standing on the shoulders of giants, backed by Cloudflare's battle-tested infrastructure for enterprise-grade stability and throughput.
+*   🚀 **Powered by Pingora** — Standing on the shoulders of giants, backed by Cloudflare's battle-tested infrastructure for enterprise-grade stability and throughput. Plaintext listeners accept HTTP/1.1 and prior-knowledge h2c; TLS listeners negotiate HTTP/2 through ALPN.
 *   🔒 **Memory safe** — Rust eliminates buffer overflows and the rest of the classic memory-safety vulnerability class.
 *   📝 **Caddyfile-compatible config** — A minimal configuration DSL with **automatic HTTPS**, **multiple listeners**, and **named matchers**, compatible with mainstream Caddyfile syntax.
-*   ⚡ **Native HTTP/3 (QUIC)** — Built on [quiche](https://github.com/cloudflare/quiche), the production QUIC stack that powers Cloudflare's edge. Lower latency and better connection migration on unreliable networks. Explicit `tls` configuration enables HTTPS and H3 on any listen port; 443 and 8443 remain automatic conventions. H3 request trailers are not forwarded: Pingclair returns `501` before response commitment or resets an already committed stream instead of silently dropping trailer metadata.
+*   ⚡ **Native HTTP/3 (QUIC)** — Built on [quiche](https://github.com/cloudflare/quiche), the production QUIC stack that powers Cloudflare's edge. Lower latency and better connection migration on unreliable networks. Explicit `tls` configuration enables HTTPS and H3 on any listen port; 443 and 8443 remain automatic conventions. Declared request trailers are not forwarded on any downstream protocol: Pingclair returns `501` before response commitment or resets an already committed H3 stream. Upstream responses advertising trailers return `502` until end-to-end trailer forwarding is supported. H3 CONNECT and extended CONNECT return `501` until tunnel support is implemented.
 *   🔄 **Smart load balancing** — Several built-in algorithms (round-robin, least-connections, and more) with health checks and automatic failover.
 *   🔐 **Fully automatic HTTPS** — Built-in ACME (Let's Encrypt) support issues and renews SSL/TLS certificates with zero configuration.
 *   📁 **Fast static file serving** — Gzip/Brotli compression, range requests, and efficient file transfer.

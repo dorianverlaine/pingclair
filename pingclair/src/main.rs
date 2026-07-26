@@ -742,8 +742,14 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
     {
         let proxies_guard = port_proxies.read();
         for (addr, proxy_logic) in proxies_guard.iter() {
+            let is_https = tls_listeners.contains(addr);
+            // 🌐 Enables prior-knowledge h2c only on plaintext listeners while TLS uses ALPN.
+            let mut server_options = pingora_core::apps::HttpServerOptions::default();
+            server_options.h2c = !is_https;
             let proxy_service =
-                pingora::proxy::http_proxy_service(&server.configuration, proxy_logic.clone());
+                pingora_proxy::ProxyServiceBuilder::new(&server.configuration, proxy_logic.clone())
+                    .server_options(server_options)
+                    .build();
 
             let mut service = proxy_service;
 
@@ -757,7 +763,6 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
             }
 
             // 🔐 Explicit TLS configuration supports HTTPS and H3 on non-standard ports.
-            let is_https = tls_listeners.contains(addr);
             let mut tls_enabled = false;
             let mut http3_enabled = false;
 

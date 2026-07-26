@@ -122,6 +122,9 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self):
+        if self.path == "/response-trailers":
+            self._write_trailer_response()
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Transfer-Encoding", "chunked")
@@ -140,6 +143,21 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             # 🛑 Records when Pingclair closes the abandoned upstream exchange.
             cancelled_path.write_text("cancelled\n")
+
+    def _write_trailer_response(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Trailer", "X-Checksum")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            # 🚫 Exercises fail-closed handling before trailer metadata can disappear.
+            self._write_chunk(b"ok")
+            self.wfile.write(b"0\r\nX-Checksum: abc\r\n\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _write_chunk(self, body):
         self.wfile.write(f"{len(body):X}\r\n".encode())
@@ -192,6 +210,16 @@ cat >"${run_dir}/config.json" <<JSON
           "headers_down": {},
           "flush_interval": -1
         }
+      },
+      {
+        "path": "/response-trailers",
+        "handler": {
+          "type": "reverse_proxy",
+          "upstreams": ["http://127.0.0.1:${upstream_port}"],
+          "load_balance": { "strategy": "round_robin" },
+          "headers_up": {},
+          "headers_down": {}
+        }
       }
     ]
   }]
@@ -220,6 +248,30 @@ for _ in {1..100}; do
 done
 if [[ "${ready}" != "true" ]]; then
     log "❌ Pingclair did not become ready over local HTTP/3."
+    exit 1
+fi
+
+request_trailer_status="$("${curl_bin}" --noproxy '*' --http3-only -ksS \
+    --resolve "${host_name}:${h3_port}:127.0.0.1" \
+    -H 'Trailer: X-Checksum' \
+    -o "${run_dir}/request-trailer.out" \
+    -w '%{http_code}' \
+    "https://${host_name}:${h3_port}/ready")"
+if [[ "${request_trailer_status}" != "501" ]] \
+    || ! grep -Fq 'Request Trailers Not Supported' "${run_dir}/request-trailer.out"; then
+    log "❌ Declared H3 request trailers did not fail clearly with 501."
+    exit 1
+fi
+
+response_trailer_status="$("${curl_bin}" --noproxy '*' --http3-only -ksS \
+    --resolve "${host_name}:${h3_port}:127.0.0.1" \
+    -o "${run_dir}/response-trailer.out" \
+    -w '%{http_code}' \
+    "https://${host_name}:${h3_port}/response-trailers")"
+if [[ "${response_trailer_status}" != "502" ]] \
+    || ! grep -Fq 'Upstream Response Trailers Not Supported' \
+        "${run_dir}/response-trailer.out"; then
+    log "❌ H3 upstream response trailers did not fail clearly with 502."
     exit 1
 fi
 
@@ -276,4 +328,4 @@ if [[ "$("${curl_bin}" --noproxy '*' --http3-only -kfsS \
     exit 1
 fi
 
-log "✅ Local HTTP/3 SSE streaming and downstream cancellation passed."
+log "✅ Local HTTP/3 SSE, cancellation, and trailer rejection passed."
