@@ -80,9 +80,11 @@
 
 ### R3：協議與 H3 不再是兩套產品
 
-- [ ] **H3 middleware parity** — Request ID、access control、rewrite、CORS、
-  `error_page`、redirect 與必要 pipeline 語意和 H1/H2 一致；抽出
-  transport-neutral policy，不把 Pingora `Session` 硬塞進 quiche 路徑。
+- [ ] **H3 middleware parity** — 🧪 Request ID、access control、rewrite、CORS、
+  `error_page`、redirect、header mutation、Basic Auth 與必要 pipeline 語意已接入
+  transport-neutral policy；`pingclair-proxy` 73 項單元測試、14 項真 binary
+  integration 與本機真實 HTTP/3 smoke 通過。仍須完成 Linux release／公網 QUIC
+  驗證，通過前不得勾選。
 - [ ] **協議矩陣通過** — WebSocket upgrade、gRPC/h2c＋trailers、SSE、
   `Expect: 100-continue`、HTTP trailers、103 Early Hints 與 downstream cancellation
   在支援的 H1/H2/H3 組合有明確測試；不支援的組合必須 fail clearly 並寫入文件。
@@ -150,6 +152,38 @@
 4. R3 先建立協議矩陣，再逐步做 H3 transport-neutral parity。
 5. R4 logs／metrics／readiness／reload 操作面。
 6. R5 soak、效能回歸、release workflow、文件、版本與 tag。
+
+### 🚧 當前接手點（2026-07-26）
+
+- H3 parity 重構已完成本機實作：新增
+  `pingclair-proxy/src/http_policy.rs`，H1/H2 與 H3 共用 Request ID、CORS、
+  downstream header policy 與 URI rewrite；H3 pipeline／handle／handle_path、
+  Basic Auth、redirect、靜態、代理與自訂錯誤頁已接線。
+- 已修正兩個順帶發現的 H1/H2 問題：`handle_path` 現在真的改寫 upstream URI；
+  route middleware headers 不會再被 `reverse_proxy.headers_down` 整份覆寫；
+  local response 也套用 security headers。
+- H3 body 仍使用 bounded channel 與 QUIC flow control，static/proxy response
+  仍逐 chunk 串流；沒有為 middleware parity 引入全量 buffering。
+- H3 route planner 直接借用已發佈的 immutable handler tree，不再於每個請求
+  clone 整棵 pipeline／proxy config；response header append policy 亦保留跨多個
+  middleware 的所有值。
+- 因 reverse proxy 可接受非冪等方法且尚無 replay protection，quiche 0-RTT
+  early data 已預設停用；正常 1-RTT H3 不受影響。
+- 本機以明確 TLS 的 `127.0.0.1:21209` 啟動 TCP＋UDP listener，Homebrew curl
+  8.21.0 強制 `--http3-only` 驗證：CORS simple 200、合法 preflight 204、非法
+  method 403、header set/add/remove、client Request ID、UA deny 403、regex
+  rewrite＋query、custom 404、proxy rewrite、300KB 有／無 Content-Length POST、
+  2MB body limit 413、10/10 baseline 與 5 次 upstream keepalive 共用連線皆通過。
+- 本機 smoke 另發現並修正兩項 H3 問題：TLS/H3 啟動不再硬編碼只辨識 443/8443，
+  明確 TLS 配置可使用非標準埠；提前回 413 時 stream state 會保留到 request
+  drain 與 response FIN 都完成，避免 client 收完 body 後永久等待。
+- 本輪 local gate：`cargo fmt --all -- --check`、workspace clippy
+  `--all-targets -D warnings`、`cargo build --locked --workspace`、
+  `cargo test --locked --workspace` 與新增 handle_path/header 真 binary regression
+  已於提交前最後一次完整重跑通過。
+- 下一步（下次執行）：不再重做本機實作，直接以本次精確 commit 做乾淨 Linux
+  release build，啟動 80 TCP／443 TCP+UDP fixture，從本機公網重跑上述 HTTP/3
+  矩陣並保存結果；通過後才把 R3 parity 移入完成區。
 
 ---
 
@@ -314,11 +348,12 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
   UA deny、regex rewrite＋query 與 LB backup 通過。
 - [x] **本次發現並已於新 commit 修正** — H2 未協商 ALPN；LB 3:1 實測 20:20。
   兩者已在 `af497fd` 修正並通過新一輪公網驗收，舊目錄保留失敗證據。
-- [ ] **H3 middleware parity 仍未完成** — `40f78e9` 已讓 H3 access control
-  與 H1/H2 共用預編譯 policy；公網 UA deny 連續 10 次均回 `403`。允許的 H3
-  請求可通過 access gate，但 CORS／pipeline 與 rewrite dispatch 仍回 `501`，
-  404 亦使用內建頁而非 `error_page`。這是 R3 的真實缺口，不得把 access gate
-  或 baseline 200 誤寫成完整 parity。
+- [ ] **H3 middleware parity 待新 commit 公網驗證** — 舊 `40f78e9` 只完成
+  access control，公網 UA deny 連續 10 次均回 `403`；當時允許請求仍會因
+  CORS／pipeline／rewrite 缺口回 `501`。目前程式碼已補齊這些 dispatch、
+  Request ID、header mutation、Basic Auth 與 `error_page`，並通過 73 項 proxy
+  單元測試及本機真實 H3 矩陣；舊失敗證據不可覆寫，新程式碼也不可在公網驗證前
+  宣稱完成。
 
 ### 2026-07-26 乾淨 Linux 與公網修正驗收
 
@@ -347,8 +382,10 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
 
 - [x] **SSE／流式反代 gzip gate**（2026-07-25）— `flush_interval: -1` 與
   `text/event-stream` 會跳過 gzip；目前只有決策邏輯單元測試。
-- [x] **Request ID（H1/H2）**（2026-07-26）— 消毒後接受客戶端 ID，否則生成；
-  上游、下游與 access log 貫穿。H3 尚未支援。
+- [x] **Request ID（H1/H2；H3 待遠端驗證）**（2026-07-26）— 消毒後接受
+  客戶端 ID，否則生成；上游與下游貫穿，H1/H2 另有 access log。H3 已在
+  本機真實 HTTP/3 驗證相同生成／消毒 policy 與 upstream/downstream
+  propagation，尚待公網 QUIC 驗證。
 - [x] **`admin.api_key` DSL**（2026-07-26）— `admin <listen> <token>`。
 - [x] **`basic_auth` DSL**（2026-07-26）— 行內與 block＋realm 形式均可編譯。
 - [x] **`redir`／`redirect` DSL**（2026-07-26）— 支援預設 302、數字 3xx、
@@ -410,9 +447,10 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
   upstream connect／first-byte／between-reads timeout，以及 header count／bytes、
   connection／bandwidth 限制；SSE/WebSocket 需可另外配置長連線策略。
 - [ ] **反代 Brotli／Zstd** — 反代回應目前只有 gzip；靜態路徑已有 br/zstd。
-- [ ] **H3 middleware parity** — quiche 路徑目前只直接處理 terminal
-  `FileServer`／`ReverseProxy` 等；CORS、存取控制、rewrite、`error_page`、
-  Request ID 與 H1/H2 pipeline 尚未完整套用。
+- [ ] **H3 middleware parity** — 🧪 本機實作已讓 quiche 路徑執行共用
+  Request ID、CORS、存取控制、rewrite、header policy、Basic Auth、
+  `error_page` 與 H1/H2 pipeline/handle_path 語意；proxy 單元測試與本機真實
+  HTTP/3 矩陣通過。Linux release 與公網 QUIC 完整矩陣未通過前仍屬待驗證。
 - [ ] **SSE 真 binary 端到端測試** — 慢速 upstream 逐 chunk 發送，斷言客戶端
   增量收到資料而非等待完整 body。
 
@@ -639,8 +677,9 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
   60 秒刷新；`peek_pem` 不可觸發 ACME 簽發。listener port、憑證 domain 清單
   等 topology 仍主要在啟動時擷取，新增項目不得假設 hot reload 已完整生效。
 - H3 request／response body 必須維持 bounded channel、QUIC flow control 與串流；
-  不可為了 middleware parity 改成全量緩衝。`enable_early_data()` 已開啟，擴充
-  非冪等請求行為前須先審核 0-RTT replay 風險。
+  不可為了 middleware parity 改成全量緩衝。0-RTT early data 已預設停用，因為
+  reverse proxy 支援非冪等方法且尚無 replay protection；在 route/method policy、
+  replay 語意與負向測試完成前不得重新開啟。
 - 修改 H3 或 TLS dependency 後，至少以 Linux release binary＋quiche client
   重跑 Alt-Svc、SNI、多大小靜態／代理 body、含／不含 Content-Length 的 POST、
   413 與 upstream keepalive；macOS 單元測試不足以驗證鏈結與 QUIC 行為。

@@ -1096,3 +1096,91 @@ async fn test_untrusted_forwarding_headers_are_sanitized_upstream() {
     assert!(upstream_request.contains("\r\nx-verified-placeholder: 127.0.0.1\r\n"));
     upstream_task.await.unwrap();
 }
+
+#[tokio::test]
+async fn test_handle_path_and_outer_headers_reach_the_proxy_exchange() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let mut request = vec![0u8; 8192];
+        let read = stream.read(&mut request).await.unwrap();
+        request.truncate(read);
+        request_tx
+            .send(String::from_utf8(request).unwrap())
+            .unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nServer: upstream\r\nVary: Accept-Encoding\r\nConnection: close\r\n\r\nok",
+            )
+            .await
+            .unwrap();
+    });
+
+    let config = serde_json::json!({
+        "global": { "http3": false },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "routes": [{
+                "path": "/api/*",
+                "handler": {
+                    "type": "pipeline",
+                    "handlers": [
+                        {
+                            "type": "headers",
+                            "set": { "X-Outer": "outer" },
+                            "add": { "Vary": "Origin" },
+                            "remove": ["Server"]
+                        },
+                        {
+                            "type": "handle_path",
+                            "prefix": "/api",
+                            "handlers": [{
+                                "type": "reverse_proxy",
+                                "upstreams": [format!("http://{upstream_address}")],
+                                "load_balance": { "strategy": "round_robin" },
+                                "headers_up": {},
+                                "headers_down": {
+                                    "X-Outer": "proxy-must-not-overwrite",
+                                    "X-Proxy": "proxy"
+                                }
+                            }]
+                        }
+                    ]
+                }
+            }]
+        }]
+    })
+    .to_string();
+
+    let mut server = TestServer::new(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let response = no_proxy_client()
+        .get(server.url(0, "/api/users?q=1"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-outer"], "outer");
+    assert_eq!(response.headers()["x-proxy"], "proxy");
+    assert!(response.headers().get("server").is_none());
+    assert!(response.headers().contains_key("x-request-id"));
+    assert!(
+        response
+            .headers()
+            .get_all("vary")
+            .iter()
+            .any(|value| value == "Origin")
+    );
+    assert_eq!(response.text().await.unwrap(), "ok");
+
+    // 🧭 The stripped path and shared request ID must reach the actual upstream request.
+    let upstream_request = request_rx.await.unwrap().to_ascii_lowercase();
+    assert!(upstream_request.starts_with("get /users?q=1 http/1.1\r\n"));
+    assert!(upstream_request.contains("\r\nx-request-id: "));
+    upstream_task.await.unwrap();
+}

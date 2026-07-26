@@ -12,8 +12,8 @@
 //!   `select_certificate_callback` backed by an [`ArcSwap`]-published
 //!   [`CertTable`], so ACME renewals are picked up by new handshakes
 //!   without restarting the listener.
-//! - Every HTTP/3 request is dispatched to a tokio task that reuses
-//!   [`PingclairProxy::match_route`] (the same routing entry point as the
+//! - 🧭 Every HTTP/3 request is dispatched to a tokio task that reuses
+//!   [`PingclairProxy::match_route_index`] (the same route matcher as the
 //!   H1/H2 path). Response bytes flow back to the event loop over a
 //!   channel and are written through quiche with real flow control
 //!   (pending buffers + writable-stream events), so large static files
@@ -39,7 +39,11 @@ use pingora_http::RequestHeader;
 use quiche::h3::NameValue;
 
 use crate::connection_filter::PingclairConnectionFilter;
-use crate::server::{PingclairProxy, find_basic_auth_config, resolve_caddy_placeholders};
+use crate::http_policy::{
+    CorsDecision, ResponseHeaderPolicy, authority_host, evaluate_cors, resolve_request_id,
+    rewrite_uri,
+};
+use crate::server::{PingclairProxy, ProxyState, error_reason, resolve_caddy_placeholders};
 
 /// Maximum UDP payload we ask quiche to send (standard Ethernet MTU-safe).
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -269,7 +273,7 @@ fn build_quiche_config(certs: Arc<CertTable>) -> Result<quiche::Config, QuicErro
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(100);
     config.set_disable_active_migration(true);
-    config.enable_early_data();
+    // 🛡️ Keeps 0-RTT disabled until replay-safe route and method policies are explicit.
 
     Ok(config)
 }
@@ -747,9 +751,8 @@ impl QuicServer {
             return;
         }
 
-        // Create the HTTP/3 connection as soon as the QUIC handshake is
-        // complete (or early data is available).
-        if (cs.conn.is_established() || cs.conn.is_in_early_data()) && cs.h3.is_none() {
+        // 🤝 Creates HTTP/3 state only after the replay-safe handshake completes.
+        if cs.conn.is_established() && cs.h3.is_none() {
             match quiche::h3::Connection::with_transport(&mut cs.conn, h3_config) {
                 Ok(h3) => cs.h3 = Some(h3),
                 Err(e) => {
@@ -951,11 +954,12 @@ impl QuicServer {
             }
         }
 
-        // The request stream finished and everything it carried is now in
-        // the handler's channel: close the channel so the handler's receive
-        // loop terminates.
+        // 🧹 Closes the request channel only after every received body byte is drained.
         if ss.req_stream_finished {
             ss.req_body_tx = None;
+            if ss.fin_sent {
+                ss.dead = true;
+            }
         }
     }
 
@@ -1057,13 +1061,210 @@ impl QuicServer {
             }
         }
 
-        if ss.fin_sent {
+        // 🌊 Keeps early-response streams alive until the request body is fully drained.
+        if ss.fin_sent && ss.req_stream_finished {
             ss.dead = true;
         }
     }
 }
 
 // MARK: - Handler task
+
+/// 🧭 Represents the next transport-neutral action produced by middleware.
+enum H3Plan {
+    Continue,
+    Terminal(H3Terminal),
+    Respond(H3ImmediateResponse),
+}
+
+/// 🎯 Retains only transport-relevant data after middleware planning completes.
+enum H3Terminal {
+    Respond {
+        status: u16,
+        body: Option<String>,
+        headers: HashMap<String, String>,
+    },
+    Redirect {
+        to: String,
+        code: u16,
+    },
+    FileServer,
+    ReverseProxy,
+}
+
+/// ✉️ Describes a local response without coupling policy to a QUIC stream.
+struct H3ImmediateResponse {
+    status: u16,
+    body: String,
+    headers: Vec<(String, String)>,
+}
+
+/// 🧩 Executes non-terminal middleware before selecting an H3 terminal handler.
+#[async_recursion::async_recursion]
+async fn plan_h3_handler(
+    handler: &HandlerConfig,
+    state: &ProxyState,
+    route_index: usize,
+    request_header: &mut RequestHeader,
+    effective_uri: &mut String,
+    response_policy: &mut ResponseHeaderPolicy,
+) -> Result<H3Plan, HandlerError> {
+    match handler {
+        HandlerConfig::Pipeline { handlers } | HandlerConfig::Handle { handlers } => {
+            for handler in handlers {
+                match plan_h3_handler(
+                    handler,
+                    state,
+                    route_index,
+                    request_header,
+                    effective_uri,
+                    response_policy,
+                )
+                .await?
+                {
+                    H3Plan::Continue => {}
+                    completed => return Ok(completed),
+                }
+            }
+            Ok(H3Plan::Continue)
+        }
+        HandlerConfig::HandlePath { prefix, handlers } => {
+            if effective_uri
+                .split_once('?')
+                .map_or(effective_uri.as_str(), |(path, _)| path)
+                .starts_with(prefix.as_str())
+            {
+                *effective_uri =
+                    rewrite_uri(effective_uri, Some(prefix.as_str()), None, None, None, None);
+                request_header
+                    .set_raw_path(effective_uri.as_bytes())
+                    .map_err(|_| (500, "Rewrite Failed"))?;
+            }
+            for handler in handlers {
+                match plan_h3_handler(
+                    handler,
+                    state,
+                    route_index,
+                    request_header,
+                    effective_uri,
+                    response_policy,
+                )
+                .await?
+                {
+                    H3Plan::Continue => {}
+                    completed => return Ok(completed),
+                }
+            }
+            Ok(H3Plan::Continue)
+        }
+        HandlerConfig::Headers { set, add, remove } => {
+            for (name, value) in set {
+                response_policy.set(name, value.clone());
+            }
+            for (name, value) in add {
+                response_policy.add(name, value.clone());
+            }
+            for name in remove {
+                response_policy.remove(name);
+            }
+            Ok(H3Plan::Continue)
+        }
+        HandlerConfig::Rewrite {
+            strip_prefix,
+            strip_suffix,
+            replace,
+            regex,
+            regex_replace,
+        } => {
+            *effective_uri = state
+                .rewrite_request_uri(
+                    route_index,
+                    effective_uri,
+                    strip_prefix.as_deref(),
+                    strip_suffix.as_deref(),
+                    replace.as_deref(),
+                    regex.as_deref(),
+                    regex_replace.as_deref(),
+                )
+                .map_err(|_| (500, "Rewrite Failed"))?;
+            request_header
+                .set_raw_path(effective_uri.as_bytes())
+                .map_err(|_| (500, "Rewrite Failed"))?;
+            Ok(H3Plan::Continue)
+        }
+        HandlerConfig::Cors {
+            allowed_origins,
+            allowed_methods,
+            allowed_headers,
+            exposed_headers,
+            allow_credentials,
+            max_age,
+        } => match evaluate_cors(
+            &request_header.method,
+            &request_header.headers,
+            allowed_origins,
+            allowed_methods,
+            allowed_headers,
+            exposed_headers,
+            *allow_credentials,
+            *max_age,
+        ) {
+            CorsDecision::PassThrough => Ok(H3Plan::Continue),
+            CorsDecision::Continue(policy) => {
+                response_policy.merge(policy);
+                Ok(H3Plan::Continue)
+            }
+            CorsDecision::Respond {
+                status,
+                body,
+                headers,
+            } => {
+                response_policy.merge(headers);
+                Ok(H3Plan::Respond(H3ImmediateResponse {
+                    status,
+                    body: body.to_string(),
+                    headers: Vec::new(),
+                }))
+            }
+        },
+        HandlerConfig::BasicAuth { realm, credentials } => {
+            if pingclair_core::server::verify_basic_auth_async(&request_header.headers, credentials)
+                .await
+            {
+                Ok(H3Plan::Continue)
+            } else {
+                Ok(H3Plan::Respond(H3ImmediateResponse {
+                    status: 401,
+                    body: "Unauthorized".to_string(),
+                    headers: vec![(
+                        "www-authenticate".to_string(),
+                        pingclair_core::server::basic_auth_challenge(realm),
+                    )],
+                }))
+            }
+        }
+        HandlerConfig::AccessControl(_)
+        | HandlerConfig::RateLimit { .. }
+        | HandlerConfig::HandleErrors { .. } => Ok(H3Plan::Continue),
+        HandlerConfig::Respond {
+            status,
+            body,
+            headers,
+        } => Ok(H3Plan::Terminal(H3Terminal::Respond {
+            status: *status,
+            body: body.clone(),
+            headers: headers.clone(),
+        })),
+        HandlerConfig::Redirect { to, code } => Ok(H3Plan::Terminal(H3Terminal::Redirect {
+            to: to.clone(),
+            code: *code,
+        })),
+        HandlerConfig::FileServer { .. } => Ok(H3Plan::Terminal(H3Terminal::FileServer)),
+        HandlerConfig::ReverseProxy(_) => Ok(H3Plan::Terminal(H3Terminal::ReverseProxy)),
+        HandlerConfig::TryFiles { .. } => Err((501, "Try Files Not Supported Over HTTP/3")),
+        HandlerConfig::Plugin { .. } => Err((501, "Plugin Not Supported Over HTTP/3")),
+    }
+}
 
 /// Per-request handler task: routes via the shared proxy logic and streams
 /// the response back to the event loop.
@@ -1079,6 +1280,14 @@ async fn handle_request(
     resp_tx: RespSender,
     body_notify: Arc<Notify>,
 ) {
+    let request_id = resolve_request_id(
+        req.headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-request-id"))
+            .map(|(_, value)| value.as_str()),
+    );
+    let mut error_state = None;
+    let mut response_policy = ResponseHeaderPolicy::default();
     if let Err(e) = handle_request_inner(
         &proxy,
         &connector,
@@ -1089,18 +1298,29 @@ async fn handle_request(
         body_rx,
         &resp_tx,
         &body_notify,
+        &request_id,
+        &mut error_state,
+        &mut response_policy,
     )
     .await
     {
-        // No response has been sent yet — answer with a plain-text error.
+        // 🧯 No response has been queued yet, so the wrapper can apply the vhost error policy.
         let (status, msg) = e;
-        send_simple(&resp_tx, &cid, stream_id, status, msg).await;
+        send_error_response(
+            &resp_tx,
+            &cid,
+            stream_id,
+            status,
+            msg,
+            error_state.as_ref(),
+            &response_policy,
+            &request_id,
+        )
+        .await;
     }
 }
 
-/// Error shorthand: (HTTP status, message). Returning `Err` before any
-/// response bytes were queued lets `handle_request` emit a plain-text
-/// error response.
+/// 🧯 Carries an HTTP failure to the wrapper before response bytes are queued.
 type HandlerError = (u16, &'static str);
 
 #[allow(clippy::too_many_arguments)]
@@ -1114,8 +1334,11 @@ async fn handle_request_inner(
     mut body_rx: mpsc::Receiver<Vec<u8>>,
     resp_tx: &RespSender,
     body_notify: &Arc<Notify>,
+    request_id: &str,
+    error_state: &mut Option<ProxyState>,
+    response_policy: &mut ResponseHeaderPolicy,
 ) -> Result<(), HandlerError> {
-    // Build a pingora RequestHeader for routing and placeholder resolution.
+    // 🧭 Builds one Pingora header map for routing and placeholder resolution.
     let method =
         http::Method::from_bytes(req.method.as_bytes()).map_err(|_| (400, "Bad Request"))?;
     let path_only = req.path.split('?').next().unwrap_or("/");
@@ -1136,23 +1359,34 @@ async fn handle_request_inner(
     let verified_client_ip = proxy.verified_client_ip(peer_address, &header.headers);
     let verified_client_ip_text = verified_client_ip.to_string();
 
-    let host_bare = req.authority.split(':').next().unwrap_or("").to_string();
+    let host_bare = authority_host(&req.authority).to_string();
 
-    // Route via the shared logic (same entry point as the H1/H2 path).
-    let (state, route_index, handler) = match proxy.match_route(
+    // 🧭 Routes through the shared matcher used by the H1 and H2 path.
+    let (state, route_index) = match proxy.match_route_index(
         &host_bare,
         path_only,
         req.method.as_str(),
         &header,
         &verified_client_ip_text,
     ) {
-        Some((s, Some(idx), Some(h))) => (s, idx, h),
-        Some(_) => return Err((404, "No Matching Route")),
+        Some((state, Some(index))) => {
+            *error_state = Some(state.clone());
+            (state, index)
+        }
+        Some((state, None)) => {
+            *error_state = Some(state);
+            return Err((404, "No Matching Route"));
+        }
         None => return Err((404, "No Matching Virtual Host")),
     };
+    let handler = &state
+        .config
+        .routes
+        .get(route_index)
+        .ok_or((500, "Missing Route Handler"))?
+        .handler;
 
-    // Request body size limit (Content-Length precheck; the streaming
-    // counter in the reverse-proxy path enforces it for chunked bodies).
+    // 📦 Rejects declared oversized bodies before opening an upstream connection.
     let body_limit = state.config.client_max_body_size;
     if body_limit > 0
         && let Some(content_length) = header
@@ -1182,34 +1416,47 @@ async fn handle_request_inner(
             None
         };
         if let Err(info) = limiter.check(key) {
-            let mut headers = vec![
-                quiche::h3::Header::new(b":status", b"429"),
-                quiche::h3::Header::new(b"server", b"Pingclair"),
-            ];
+            let mut headers = vec![quiche::h3::Header::new(b":status", b"429")];
             for (k, v) in info.to_headers() {
                 headers.push(quiche::h3::Header::new(k.as_bytes(), v.as_bytes()));
             }
+            apply_h3_response_policy(&mut headers, response_policy, request_id, Some(&state));
             send_headers(resp_tx, cid, stream_id, headers, true).await;
             return Ok(());
         }
     }
 
-    // 🔐 The HTTP/3 gate shares the asynchronous verifier with H1 and H2.
-    if let Some((realm, credentials)) = find_basic_auth_config(&handler)
-        && !pingclair_core::server::verify_basic_auth_async(&header.headers, credentials).await
-    {
-        let challenge = pingclair_core::server::basic_auth_challenge(realm);
-        let hdrs = vec![
-            quiche::h3::Header::new(b":status", b"401"),
-            quiche::h3::Header::new(b"www-authenticate", challenge.as_bytes()),
-            quiche::h3::Header::new(b"server", b"Pingclair"),
-        ];
-        send_headers(resp_tx, cid, stream_id, hdrs, true).await;
-        return Ok(());
-    }
+    let mut effective_uri = req.path.clone();
+    let plan = plan_h3_handler(
+        handler,
+        &state,
+        route_index,
+        &mut header,
+        &mut effective_uri,
+        response_policy,
+    )
+    .await?;
+
+    let handler = match plan {
+        H3Plan::Terminal(handler) => handler,
+        H3Plan::Respond(response) => {
+            send_immediate_response(
+                resp_tx,
+                cid,
+                stream_id,
+                response,
+                response_policy,
+                request_id,
+                Some(&state),
+            )
+            .await;
+            return Ok(());
+        }
+        H3Plan::Continue => return Err((501, "Handler Pipeline Produced No Response")),
+    };
 
     match handler {
-        HandlerConfig::Respond {
+        H3Terminal::Respond {
             status,
             body,
             headers,
@@ -1218,11 +1465,11 @@ async fn handle_request_inner(
             let mut hdrs = vec![
                 quiche::h3::Header::new(b":status", status.to_string().as_bytes()),
                 quiche::h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
-                quiche::h3::Header::new(b"server", b"Pingclair"),
             ];
             for (k, v) in &headers {
                 hdrs.push(quiche::h3::Header::new(k.as_bytes(), v.as_bytes()));
             }
+            apply_h3_response_policy(&mut hdrs, response_policy, request_id, Some(&state));
             send_headers(resp_tx, cid, stream_id, hdrs, body.is_empty()).await;
             if !body.is_empty() {
                 send_body(resp_tx, cid, stream_id, body.into_bytes(), true).await;
@@ -1230,17 +1477,17 @@ async fn handle_request_inner(
             Ok(())
         }
 
-        HandlerConfig::Redirect { to, code } => {
-            let hdrs = vec![
+        H3Terminal::Redirect { to, code } => {
+            let mut hdrs = vec![
                 quiche::h3::Header::new(b":status", code.to_string().as_bytes()),
                 quiche::h3::Header::new(b"location", to.as_bytes()),
-                quiche::h3::Header::new(b"server", b"Pingclair"),
             ];
+            apply_h3_response_policy(&mut hdrs, response_policy, request_id, Some(&state));
             send_headers(resp_tx, cid, stream_id, hdrs, true).await;
             Ok(())
         }
 
-        HandlerConfig::FileServer { .. } => {
+        H3Terminal::FileServer => {
             let maybe_fs = state.file_servers.get(route_index).and_then(|f| f.clone());
             let Some(fs) = maybe_fs else {
                 return Err((503, "File Server Unavailable"));
@@ -1252,8 +1499,9 @@ async fn handle_request_inner(
                 .get("accept-encoding")
                 .and_then(|v| v.to_str().ok());
 
+            let effective_path = effective_uri.split('?').next().unwrap_or("/");
             match fs
-                .serve_auto(path_only, range_header, accept_encoding)
+                .serve_auto(effective_path, range_header, accept_encoding)
                 .await
             {
                 Ok(Some(ServedResponse::Stream(mut stream))) => {
@@ -1265,7 +1513,6 @@ async fn handle_request_inner(
                             stream.file_size.to_string().as_bytes(),
                         ),
                         quiche::h3::Header::new(b"accept-ranges", b"bytes"),
-                        quiche::h3::Header::new(b"server", b"Pingclair"),
                     ];
                     if let Some(lm) = &stream.last_modified {
                         hdrs.push(quiche::h3::Header::new(b"last-modified", lm.as_bytes()));
@@ -1273,9 +1520,10 @@ async fn handle_request_inner(
                     if let Some(etag) = &stream.etag {
                         hdrs.push(quiche::h3::Header::new(b"etag", etag.as_bytes()));
                     }
+                    apply_h3_response_policy(&mut hdrs, response_policy, request_id, Some(&state));
                     send_headers(resp_tx, cid, stream_id, hdrs, false).await;
 
-                    // Stream the file in chunks — never buffered whole.
+                    // 🌊 Streams file chunks without buffering the complete representation.
                     let mut fin_sent = false;
                     loop {
                         match stream.read_chunk() {
@@ -1305,7 +1553,6 @@ async fn handle_request_inner(
                             file.content.len().to_string().as_bytes(),
                         ),
                         quiche::h3::Header::new(b"accept-ranges", b"bytes"),
-                        quiche::h3::Header::new(b"server", b"Pingclair"),
                     ];
                     if let Some(range) = &file.content_range {
                         hdrs.push(quiche::h3::Header::new(b"content-range", range.as_bytes()));
@@ -1319,6 +1566,7 @@ async fn handle_request_inner(
                     if let Some(enc) = &file.content_encoding {
                         hdrs.push(quiche::h3::Header::new(b"content-encoding", enc.as_bytes()));
                     }
+                    apply_h3_response_policy(&mut hdrs, response_policy, request_id, Some(&state));
                     send_headers(resp_tx, cid, stream_id, hdrs, file.content.is_empty()).await;
                     if !file.content.is_empty() {
                         send_body(resp_tx, cid, stream_id, file.content, true).await;
@@ -1333,7 +1581,7 @@ async fn handle_request_inner(
             }
         }
 
-        HandlerConfig::ReverseProxy(_) => {
+        H3Terminal::ReverseProxy => {
             reverse_proxy_upstream(
                 proxy,
                 connector,
@@ -1341,8 +1589,11 @@ async fn handle_request_inner(
                 route_index,
                 req,
                 &header,
+                &effective_uri,
                 peer_ip,
                 &verified_client_ip_text,
+                request_id,
+                response_policy,
                 body_limit,
                 cid,
                 stream_id,
@@ -1352,9 +1603,6 @@ async fn handle_request_inner(
             )
             .await
         }
-
-        // All other handlers are not applicable over the H3 in-process path.
-        _ => Err((501, "Handler Not Supported Over HTTP/3")),
     }
 }
 
@@ -1368,8 +1616,11 @@ async fn reverse_proxy_upstream(
     route_index: usize,
     req: &H3Request,
     client_header: &RequestHeader,
+    effective_uri: &str,
     peer_ip: &str,
     verified_client_ip: &str,
+    request_id: &str,
+    response_policy: &ResponseHeaderPolicy,
     body_limit: u64,
     cid: &quiche::ConnectionId<'static>,
     stream_id: u64,
@@ -1400,10 +1651,10 @@ async fn reverse_proxy_upstream(
         (502, "Upstream Connect Failed")
     })?;
 
-    // Build the upstream request.
+    // 📤 Builds the upstream request with every middleware rewrite already applied.
     let method =
         http::Method::from_bytes(req.method.as_bytes()).map_err(|_| (400, "Bad Request"))?;
-    let mut up_req = RequestHeader::build(method, req.path.as_bytes(), None)
+    let mut up_req = RequestHeader::build(method, effective_uri.as_bytes(), None)
         .map_err(|_| (400, "Bad Request"))?;
 
     // Host: the upstream's, not the downstream client's.
@@ -1490,6 +1741,9 @@ async fn reverse_proxy_upstream(
     if !has_header_up("X-Real-IP") {
         up_req.insert_header("X-Real-IP", verified_client_ip).ok();
     }
+    if !has_header_up("X-Request-Id") {
+        up_req.insert_header("X-Request-Id", request_id).ok();
+    }
 
     session
         .write_request_header(Box::new(up_req))
@@ -1540,11 +1794,20 @@ async fn reverse_proxy_upstream(
         return Err((502, "Upstream Write Failed"));
     }
 
-    // Read the upstream response headers.
+    // 📥 Reads upstream response metadata before committing an H3 response.
     if let Err(e) = session.read_response_header().await {
         tracing::error!("❌ H3 upstream read response header failed: {}", e);
         session.shutdown().await;
         return Err((502, "Upstream Read Failed"));
+    }
+
+    let upstream_status = session
+        .response_header()
+        .map(|response| response.status.as_u16())
+        .unwrap_or(502);
+    if state.intercepts_error_status(upstream_status) {
+        session.shutdown().await;
+        return Err((upstream_status, error_reason(upstream_status)));
     }
 
     let mut hdrs = Vec::new();
@@ -1567,16 +1830,12 @@ async fn reverse_proxy_upstream(
         hdrs.push(quiche::h3::Header::new(b":status", b"502"));
     }
 
-    // Configured headers_down (set semantics, like the Pingora path).
+    // 🧩 Proxy-owned replacements fill gaps without overriding outer middleware.
+    let mut effective_policy = response_policy.clone();
     if let Some(cfg) = &proxy_config {
-        for (k, v) in &cfg.headers_down {
-            let lower = k.to_ascii_lowercase();
-            hdrs.retain(|h| h.name() != lower.as_bytes());
-            hdrs.push(quiche::h3::Header::new(lower.as_bytes(), v.as_bytes()));
-        }
+        effective_policy.merge_proxy_set(&cfg.headers_down);
     }
-    hdrs.retain(|h| h.name() != b"server");
-    hdrs.push(quiche::h3::Header::new(b"server", b"Pingclair"));
+    apply_h3_response_policy(&mut hdrs, &effective_policy, request_id, Some(state));
 
     send_headers(resp_tx, cid, stream_id, hdrs, false).await;
 
@@ -1608,6 +1867,113 @@ async fn reverse_proxy_upstream(
 }
 
 // MARK: - Response channel helpers
+
+/// 🧩 Replaces one H3 response header while preserving unrelated values.
+fn set_h3_header(headers: &mut Vec<quiche::h3::Header>, name: &str, value: &str) {
+    let normalized = name.to_ascii_lowercase();
+    headers.retain(|header| !header.name().eq_ignore_ascii_case(normalized.as_bytes()));
+    headers.push(quiche::h3::Header::new(
+        normalized.as_bytes(),
+        value.as_bytes(),
+    ));
+}
+
+/// 🛡️ Applies transport-neutral middleware and vhost security headers to H3.
+fn apply_h3_response_policy(
+    headers: &mut Vec<quiche::h3::Header>,
+    policy: &ResponseHeaderPolicy,
+    request_id: &str,
+    state: Option<&ProxyState>,
+) {
+    for (name, value) in policy.set_headers() {
+        set_h3_header(headers, name, value);
+    }
+    for (name, value) in policy.add_headers() {
+        headers.push(quiche::h3::Header::new(name.as_bytes(), value.as_bytes()));
+    }
+    for name in policy.removed_headers() {
+        headers.retain(|header| !header.name().eq_ignore_ascii_case(name.as_bytes()));
+    }
+    if policy.suppresses_server() {
+        headers.retain(|header| !header.name().eq_ignore_ascii_case(b"server"));
+    } else {
+        set_h3_header(headers, "server", "Pingclair");
+    }
+    set_h3_header(headers, "x-request-id", request_id);
+
+    let Some(state) = state.filter(|state| state.config.security.enabled) else {
+        return;
+    };
+    let security = &state.config.security;
+    set_h3_header(
+        headers,
+        "x-content-type-options",
+        &security.x_content_type_options,
+    );
+    set_h3_header(headers, "x-frame-options", &security.x_frame_options);
+    set_h3_header(headers, "x-xss-protection", &security.x_xss_protection);
+    set_h3_header(
+        headers,
+        "x-permitted-cross-domain-policies",
+        &security.x_permitted_cross_domain,
+    );
+    set_h3_header(headers, "referrer-policy", &security.referrer_policy);
+    set_h3_header(headers, "permissions-policy", &security.permissions_policy);
+    if state
+        .config
+        .tls
+        .as_ref()
+        .is_some_and(|tls| tls.auto || tls.cert.is_some())
+        && let Some(hsts) = &security.hsts
+    {
+        let value = format!(
+            "max-age={};{}{}",
+            hsts.max_age,
+            if hsts.include_subdomains {
+                " includeSubDomains;"
+            } else {
+                ""
+            },
+            if hsts.preload { " preload" } else { "" }
+        );
+        set_h3_header(headers, "strict-transport-security", &value);
+    }
+    if let Some(csp) = &security.csp {
+        set_h3_header(headers, "content-security-policy", csp);
+    }
+}
+
+/// 📤 Sends one middleware-generated H3 response with the shared header policy.
+async fn send_immediate_response(
+    resp_tx: &RespSender,
+    cid: &quiche::ConnectionId<'static>,
+    stream_id: u64,
+    response: H3ImmediateResponse,
+    policy: &ResponseHeaderPolicy,
+    request_id: &str,
+    state: Option<&ProxyState>,
+) {
+    let body = response.body.into_bytes();
+    let has_content_type = response
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
+    let mut headers = vec![
+        quiche::h3::Header::new(b":status", response.status.to_string().as_bytes()),
+        quiche::h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
+    ];
+    if !body.is_empty() && !has_content_type {
+        headers.push(quiche::h3::Header::new(b"content-type", b"text/plain"));
+    }
+    for (name, value) in response.headers {
+        headers.push(quiche::h3::Header::new(name.as_bytes(), value.as_bytes()));
+    }
+    apply_h3_response_policy(&mut headers, policy, request_id, state);
+    send_headers(resp_tx, cid, stream_id, headers, body.is_empty()).await;
+    if !body.is_empty() {
+        send_body(resp_tx, cid, stream_id, body, true).await;
+    }
+}
 
 async fn send_headers(
     resp_tx: &RespSender,
@@ -1641,23 +2007,30 @@ async fn send_body(
         .await;
 }
 
-/// Send a plain-text error response from a handler task.
-async fn send_simple(
+/// 🧯 Sends a custom or built-in error response before an H3 stream is committed.
+#[allow(clippy::too_many_arguments)]
+async fn send_error_response(
     resp_tx: &RespSender,
     cid: &quiche::ConnectionId<'static>,
     stream_id: u64,
     status: u16,
     msg: &str,
+    state: Option<&ProxyState>,
+    policy: &ResponseHeaderPolicy,
+    request_id: &str,
 ) {
-    let headers = vec![
+    let (body, content_type) = state
+        .and_then(|state| state.read_error_page(status))
+        .unwrap_or_else(|| (msg.as_bytes().to_vec(), "text/plain"));
+    let mut headers = vec![
         quiche::h3::Header::new(b":status", status.to_string().as_bytes()),
-        quiche::h3::Header::new(b"content-type", b"text/plain"),
-        quiche::h3::Header::new(b"content-length", msg.len().to_string().as_bytes()),
-        quiche::h3::Header::new(b"server", b"Pingclair"),
+        quiche::h3::Header::new(b"content-type", content_type.as_bytes()),
+        quiche::h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
     ];
-    send_headers(resp_tx, cid, stream_id, headers, msg.is_empty()).await;
-    if !msg.is_empty() {
-        send_body(resp_tx, cid, stream_id, msg.as_bytes().to_vec(), true).await;
+    apply_h3_response_policy(&mut headers, policy, request_id, state);
+    send_headers(resp_tx, cid, stream_id, headers, body.is_empty()).await;
+    if !body.is_empty() {
+        send_body(resp_tx, cid, stream_id, body, true).await;
     }
 }
 
@@ -1666,6 +2039,19 @@ async fn send_simple(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pingclair_core::config::{BasicAuthCredential, RouteConfig, ServerConfig};
+
+    fn proxy_state(handler: HandlerConfig) -> ProxyState {
+        ProxyState::new(ServerConfig {
+            routes: vec![RouteConfig {
+                path: "/*".to_string(),
+                handler,
+                methods: None,
+                matcher: None,
+            }],
+            ..Default::default()
+        })
+    }
 
     /// Generate a self-signed PEM cert+key for the given names.
     fn self_signed_pem(names: &[&str]) -> (String, String) {
@@ -1828,5 +2214,184 @@ mod tests {
     fn parse_h3_request_rejects_missing_pseudo_headers() {
         let list = vec![quiche::h3::Header::new(b":method", b"GET")];
         assert!(parse_h3_request(&list).is_none());
+    }
+
+    #[tokio::test]
+    async fn h3_pipeline_applies_cors_regex_rewrite_and_terminal_response() {
+        let handler = HandlerConfig::Pipeline {
+            handlers: vec![
+                HandlerConfig::Cors {
+                    allowed_origins: vec!["https://app.example".to_string()],
+                    allowed_methods: vec!["GET".to_string()],
+                    allowed_headers: vec!["content-type".to_string()],
+                    exposed_headers: vec!["x-request-id".to_string()],
+                    allow_credentials: true,
+                    max_age: 600,
+                },
+                HandlerConfig::Rewrite {
+                    strip_prefix: None,
+                    strip_suffix: None,
+                    replace: None,
+                    regex: Some(r"^/old/(.*)$".to_string()),
+                    regex_replace: Some("/new/$1".to_string()),
+                },
+                HandlerConfig::Respond {
+                    status: 200,
+                    body: Some("ok".to_string()),
+                    headers: HashMap::new(),
+                },
+            ],
+        };
+        let state = proxy_state(handler.clone());
+        let mut request = RequestHeader::build(http::Method::GET, b"/old/item?q=1", None).unwrap();
+        request
+            .insert_header("origin", "https://app.example")
+            .unwrap();
+        let mut uri = "/old/item?q=1".to_string();
+        let mut policy = ResponseHeaderPolicy::default();
+
+        let plan = plan_h3_handler(&handler, &state, 0, &mut request, &mut uri, &mut policy)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            plan,
+            H3Plan::Terminal(H3Terminal::Respond { status: 200, .. })
+        ));
+        assert_eq!(uri, "/new/item?q=1");
+        assert_eq!(
+            request.uri.path_and_query().unwrap().as_str(),
+            "/new/item?q=1"
+        );
+        assert!(policy.set_headers().any(|(name, value)| {
+            name == "access-control-allow-origin" && value == "https://app.example"
+        }));
+    }
+
+    #[tokio::test]
+    async fn h3_preflight_rejects_before_terminal_handler() {
+        let handler = HandlerConfig::Pipeline {
+            handlers: vec![
+                HandlerConfig::Cors {
+                    allowed_origins: vec!["https://app.example".to_string()],
+                    allowed_methods: vec!["GET".to_string()],
+                    allowed_headers: vec!["content-type".to_string()],
+                    exposed_headers: Vec::new(),
+                    allow_credentials: false,
+                    max_age: 600,
+                },
+                HandlerConfig::Respond {
+                    status: 200,
+                    body: Some("must not run".to_string()),
+                    headers: HashMap::new(),
+                },
+            ],
+        };
+        let state = proxy_state(handler.clone());
+        let mut request = RequestHeader::build(http::Method::OPTIONS, b"/resource", None).unwrap();
+        request
+            .insert_header("origin", "https://app.example")
+            .unwrap();
+        request
+            .insert_header("access-control-request-method", "DELETE")
+            .unwrap();
+        let mut uri = "/resource".to_string();
+        let mut policy = ResponseHeaderPolicy::default();
+
+        let plan = plan_h3_handler(&handler, &state, 0, &mut request, &mut uri, &mut policy)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            plan,
+            H3Plan::Respond(H3ImmediateResponse { status: 403, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn h3_header_policy_survives_basic_auth_rejection() {
+        let handler = HandlerConfig::Pipeline {
+            handlers: vec![
+                HandlerConfig::Headers {
+                    set: HashMap::from([("x-policy".to_string(), "active".to_string())]),
+                    add: HashMap::new(),
+                    remove: Vec::new(),
+                },
+                HandlerConfig::BasicAuth {
+                    realm: "Restricted".to_string(),
+                    credentials: vec![BasicAuthCredential {
+                        username: "alice".to_string(),
+                        password: "secret".to_string(),
+                        hashed: false,
+                    }],
+                },
+            ],
+        };
+        let state = proxy_state(handler.clone());
+        let mut request = RequestHeader::build(http::Method::GET, b"/private", None).unwrap();
+        let mut uri = "/private".to_string();
+        let mut policy = ResponseHeaderPolicy::default();
+
+        let plan = plan_h3_handler(&handler, &state, 0, &mut request, &mut uri, &mut policy)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            plan,
+            H3Plan::Respond(H3ImmediateResponse { status: 401, .. })
+        ));
+        assert!(
+            policy
+                .set_headers()
+                .any(|(name, value)| name == "x-policy" && value == "active")
+        );
+    }
+
+    #[tokio::test]
+    async fn h3_handle_path_rewrites_the_terminal_uri() {
+        let handler = HandlerConfig::HandlePath {
+            prefix: "/api".to_string(),
+            handlers: vec![HandlerConfig::ReverseProxy(Default::default())],
+        };
+        let state = proxy_state(handler.clone());
+        let mut request = RequestHeader::build(http::Method::GET, b"/api/users?q=1", None).unwrap();
+        let mut uri = "/api/users?q=1".to_string();
+        let mut policy = ResponseHeaderPolicy::default();
+
+        let plan = plan_h3_handler(&handler, &state, 0, &mut request, &mut uri, &mut policy)
+            .await
+            .unwrap();
+
+        assert!(matches!(plan, H3Plan::Terminal(H3Terminal::ReverseProxy)));
+        assert_eq!(uri, "/users?q=1");
+    }
+
+    #[test]
+    fn h3_response_policy_replaces_removes_and_appends_headers() {
+        let mut headers = vec![
+            quiche::h3::Header::new(b":status", b"200"),
+            quiche::h3::Header::new(b"x-old", b"remove-me"),
+            quiche::h3::Header::new(b"x-set", b"old"),
+        ];
+        let mut policy = ResponseHeaderPolicy::default();
+        policy.set("x-set", "new");
+        policy.add("vary", "Origin");
+        policy.remove("x-old");
+        apply_h3_response_policy(&mut headers, &policy, "request-123", None);
+
+        assert!(!headers.iter().any(|header| header.name() == b"x-old"));
+        assert!(
+            headers
+                .iter()
+                .any(|header| header.name() == b"x-set" && header.value() == b"new")
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|header| header.name() == b"vary" && header.value() == b"Origin")
+        );
+        assert!(headers.iter().any(|header| {
+            header.name() == b"x-request-id" && header.value() == b"request-123"
+        }));
     }
 }

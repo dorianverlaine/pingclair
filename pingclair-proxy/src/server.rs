@@ -3,7 +3,7 @@
 //! 🌐 This module implements the core reverse proxy using Pingora's ProxyHttp trait.
 
 use pingclair_core::config::{
-    AccessControlConfig, BasicAuthCredential, HandlerConfig, ReverseProxyConfig, ServerConfig,
+    AccessControlConfig, HandlerConfig, ReverseProxyConfig, ServerConfig,
 };
 use pingclair_core::server::Router;
 
@@ -23,6 +23,10 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::http_policy::{
+    CorsDecision, ResponseHeaderPolicy, authority_host, evaluate_cors, generate_request_id,
+    rewrite_uri, sanitize_request_id,
+};
 use crate::metrics;
 use crate::upstream::{HostName, Scheme, create_upstream};
 use crate::{HealthChecker, LoadBalancer, Strategy, Upstream};
@@ -42,14 +46,8 @@ pub struct RequestContext {
     pub upstream: Option<Upstream>,
     /// Extra headers to add upstream
     pub headers_upstream: HashMap<String, String>,
-    /// Extra headers to add downstream (set)
-    pub headers_downstream: HashMap<String, String>,
-    /// Extra headers to add downstream (append)
-    pub headers_downstream_add: HashMap<String, String>,
-    /// Headers to remove from downstream response
-    pub headers_remove: Vec<String>,
-    /// Whether to suppress the default Server header
-    pub suppress_server_header: bool,
+    /// 🧭 Transport-neutral downstream response header mutations.
+    pub(crate) response_headers: ResponseHeaderPolicy,
     /// Whether response compression is enabled for this request
     pub compress_response: bool,
     /// Client accepts gzip
@@ -91,10 +89,7 @@ impl Default for RequestContext {
             route_index: None,
             upstream: None,
             headers_upstream: HashMap::new(),
-            headers_downstream: HashMap::new(),
-            headers_downstream_add: HashMap::new(),
-            headers_remove: Vec::new(),
-            suppress_server_header: false,
+            response_headers: ResponseHeaderPolicy::default(),
             compress_response: false,
             client_accepts_gzip: false,
             streaming_response: false,
@@ -112,12 +107,6 @@ impl Default for RequestContext {
         }
     }
 }
-
-/// Process-wide base timestamp for request IDs, captured once instead of
-/// on every request.
-static REQUEST_ID_EPOCH_US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-/// Monotonic per-process request counter.
-static REQUEST_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 🧱 Maximum accepted hops in an inbound `X-Forwarded-For` chain.
 const MAX_FORWARDED_HOPS: usize = 32;
@@ -245,44 +234,6 @@ fn parse_forwarded_ip(value: &str) -> Option<IpAddr> {
                 .and_then(|bracketed| bracketed.strip_suffix(']'))
                 .and_then(|ip| ip.parse::<IpAddr>().ok())
         })
-}
-
-/// Generate a compact, sortable request ID (process epoch + counter).
-///
-/// The original implementation called `SystemTime::now()` — a syscall — on
-/// every single request. At high QPS that syscall overhead is pure waste:
-/// the ID only needs to be unique and roughly time-ordered, not carry a
-/// precise per-request timestamp. So the wall-clock read happens exactly
-/// once per process (lazily, on the first request), and every subsequent
-/// request just does one relaxed atomic increment.
-fn generate_request_id() -> String {
-    use std::sync::atomic::Ordering;
-    let epoch = *REQUEST_ID_EPOCH_US.get_or_init(|| {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64
-    });
-    let seq = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{epoch:x}-{seq:x}")
-}
-
-/// Validate a client-supplied `X-Request-Id` before adopting it.
-///
-/// The value ends up in response headers and log lines, so reject anything
-/// that could smuggle CR/LF or control characters, anything non-ASCII, and
-/// anything absurdly long (128 bytes matches common gateway practice).
-fn sanitize_request_id(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.len() > 128 {
-        return None;
-    }
-    if trimmed.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
-        Some(trimmed.to_string())
-    } else {
-        None
-    }
 }
 
 /// Feed one response body chunk through a streaming gzip encoder.
@@ -619,18 +570,6 @@ fn session_peer_ip(session: &Session) -> IpAddr {
         .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
 }
 
-fn authority_host(authority: &str) -> &str {
-    if let Some(bracketed) = authority.strip_prefix('[') {
-        return bracketed
-            .split_once(']')
-            .map_or(authority, |(host, _)| host);
-    }
-    authority
-        .rsplit_once(':')
-        .filter(|(_, port)| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
-        .map_or(authority, |(host, _)| host)
-}
-
 fn authority_port(authority: &str) -> Option<u16> {
     authority
         .rsplit_once(':')
@@ -653,55 +592,6 @@ struct RewriteRule<'a> {
     replace: Option<&'a str>,
     regex: Option<&'a str>,
     regex_replace: Option<&'a str>,
-}
-
-fn rewrite_uri(
-    current: &str,
-    strip_prefix: Option<&str>,
-    strip_suffix: Option<&str>,
-    replace: Option<&str>,
-    regex: Option<&Regex>,
-    regex_replace: Option<&str>,
-) -> Option<String> {
-    let (path, query) = current.split_once('?').unwrap_or((current, ""));
-    let mut rewritten = path.to_string();
-
-    if let Some(prefix) = strip_prefix
-        && let Some(rest) = rewritten.strip_prefix(prefix)
-    {
-        rewritten = if rest.is_empty() {
-            "/".to_string()
-        } else if rest.starts_with('/') {
-            rest.to_string()
-        } else {
-            format!("/{rest}")
-        };
-    }
-    if let Some(suffix) = strip_suffix
-        && let Some(rest) = rewritten.strip_suffix(suffix)
-    {
-        rewritten = if rest.is_empty() {
-            "/".to_string()
-        } else {
-            rest.to_string()
-        };
-    }
-    if let Some(replacement) = replace {
-        rewritten = replacement.to_string();
-    }
-    if let Some(regex) = regex {
-        rewritten = regex
-            .replace_all(&rewritten, regex_replace.unwrap_or(""))
-            .into_owned();
-    }
-    if !rewritten.starts_with('/') {
-        rewritten.insert(0, '/');
-    }
-    Some(if rewritten.contains('?') || query.is_empty() {
-        rewritten
-    } else {
-        format!("{rewritten}?{query}")
-    })
 }
 
 impl ProxyState {
@@ -867,6 +757,73 @@ impl ProxyState {
             .and_then(|policy| policy.as_ref())
             .is_none_or(|policy| policy.allows(remote_ip, headers))
     }
+
+    /// 🧭 Applies one precompiled route rewrite without transport-specific state.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn rewrite_request_uri(
+        &self,
+        route_index: usize,
+        current: &str,
+        strip_prefix: Option<&str>,
+        strip_suffix: Option<&str>,
+        replace: Option<&str>,
+        regex_pattern: Option<&str>,
+        regex_replace: Option<&str>,
+    ) -> Result<String, &'static str> {
+        let compiled = if let Some(pattern) = regex_pattern {
+            Some(
+                self.rewrite_regexes
+                    .get(route_index)
+                    .and_then(|regexes| regexes.get(pattern).map(AsRef::as_ref))
+                    .ok_or("invalid rewrite regex in active configuration")?,
+            )
+        } else {
+            None
+        };
+        Ok(rewrite_uri(
+            current,
+            strip_prefix,
+            strip_suffix,
+            replace,
+            compiled,
+            regex_replace,
+        ))
+    }
+
+    /// 🧯 Reads one configured custom error page on the cold error path.
+    pub(crate) fn read_error_page(&self, status: u16) -> Option<(Vec<u8>, &'static str)> {
+        let path = self.config.error_pages.get(&status)?;
+        let content = std::fs::read(path).ok()?;
+        let content_type = if path.ends_with(".htm") || path.ends_with(".html") {
+            "text/html"
+        } else {
+            "text/plain"
+        };
+        Some((content, content_type))
+    }
+
+    /// 🧯 Reports whether an upstream status is configured for interception.
+    pub(crate) fn intercepts_error_status(&self, status: u16) -> bool {
+        self.config.error_pages.contains_key(&status)
+    }
+}
+
+/// 🧯 Maps common HTTP failures to stable built-in reason phrases.
+pub(crate) fn error_reason(status: u16) -> &'static str {
+    match status {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        413 => "Request Entity Too Large",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "Error",
+    }
 }
 
 // MARK: - Server Implementation
@@ -1031,25 +988,35 @@ impl PingclairProxy {
         headers: &pingora_http::RequestHeader,
         remote_ip: &str,
     ) -> Option<(ProxyState, Option<usize>, Option<HandlerConfig>)> {
-        // 1. Get state for this host
+        self.match_route_index(host, path, method, headers, remote_ip)
+            .map(|(state, route_index)| {
+                let handler = route_index
+                    .and_then(|index| state.config.routes.get(index))
+                    .map(|route| route.handler.clone());
+                (state, route_index, handler)
+            })
+    }
+
+    /// 🧭 Resolves a route without cloning its complete handler tree.
+    pub(crate) fn match_route_index(
+        &self,
+        host: &str,
+        path: &str,
+        method: &str,
+        headers: &pingora_http::RequestHeader,
+        remote_ip: &str,
+    ) -> Option<(ProxyState, Option<usize>)> {
+        // 🏠 Resolves the immutable state published for this virtual host.
         let state = self.get_state(host)?;
 
-        // 2. Match route
-        // Identify protocol (stub)
+        // 🔐 Matches the HTTPS transport used by the in-process H3 adapter.
         let protocol = "https";
 
-        if let Some(route) =
-            state
-                .router
-                .match_request(path, method, &headers.headers, host, remote_ip, protocol)
-        {
-            let index = route.index;
-            let handler = state.config.routes.get(index).map(|r| r.handler.clone());
-            Some((state, Some(index), handler))
-        } else {
-            // No route matched
-            Some((state, None, None))
-        }
+        let route_index = state
+            .router
+            .match_request(path, method, &headers.headers, host, remote_ip, protocol)
+            .map(|route| route.index);
+        Some((state, route_index))
     }
 
     // MARK: - Internal Helpers
@@ -1199,6 +1166,7 @@ impl PingclairProxy {
     /// Used for early, handler-less answers such as 404s.
     async fn write_simple_response(
         session: &mut Session,
+        ctx: &RequestContext,
         status: u16,
         body: &str,
     ) -> PingoraResult<()> {
@@ -1209,7 +1177,7 @@ impl PingclairProxy {
         response
             .insert_header("Content-Length", body.len().to_string())
             .unwrap();
-        response.insert_header("Server", "Pingclair").unwrap();
+        Self::apply_local_response_headers(&mut response, ctx)?;
         session
             .write_response_header(Box::new(response), false)
             .await?;
@@ -1226,21 +1194,59 @@ impl PingclairProxy {
         response: &mut ResponseHeader,
         ctx: &RequestContext,
     ) -> PingoraResult<()> {
-        for (key, value) in &ctx.headers_downstream {
-            response.insert_header(key.clone(), value.as_str())?;
+        ctx.response_headers
+            .apply_pingora(response, &ctx.request_id)?;
+        if let Some(state) = &ctx.state {
+            Self::apply_security_response_headers(response, state)?;
         }
-        for (key, value) in &ctx.headers_downstream_add {
-            response.append_header(key.clone(), value.as_str())?;
+        Ok(())
+    }
+
+    /// 🛡️ Applies the vhost security policy consistently to local and upstream responses.
+    fn apply_security_response_headers(
+        response: &mut ResponseHeader,
+        state: &ProxyState,
+    ) -> PingoraResult<()> {
+        if !state.config.security.enabled {
+            return Ok(());
         }
-        for header in &ctx.headers_remove {
-            let _ = response.remove_header(header);
+        response.insert_header(
+            "X-Content-Type-Options",
+            &state.config.security.x_content_type_options,
+        )?;
+        response.insert_header("X-Frame-Options", &state.config.security.x_frame_options)?;
+        response.insert_header("X-XSS-Protection", &state.config.security.x_xss_protection)?;
+        response.insert_header(
+            "X-Permitted-Cross-Domain-Policies",
+            &state.config.security.x_permitted_cross_domain,
+        )?;
+        response.insert_header("Referrer-Policy", &state.config.security.referrer_policy)?;
+        response.insert_header(
+            "Permissions-Policy",
+            &state.config.security.permissions_policy,
+        )?;
+        if state
+            .config
+            .tls
+            .as_ref()
+            .is_some_and(|tls| tls.auto || tls.cert.is_some())
+            && let Some(hsts_config) = &state.config.security.hsts
+        {
+            let hsts_value = format!(
+                "max-age={};{}{}",
+                hsts_config.max_age,
+                if hsts_config.include_subdomains {
+                    " includeSubDomains;"
+                } else {
+                    ""
+                },
+                if hsts_config.preload { " preload" } else { "" }
+            );
+            response.insert_header("Strict-Transport-Security", &hsts_value)?;
         }
-        if ctx.suppress_server_header {
-            let _ = response.remove_header("Server");
-        } else {
-            response.insert_header("Server", "Pingclair")?;
+        if let Some(csp) = &state.config.security.csp {
+            response.insert_header("Content-Security-Policy", csp)?;
         }
-        response.insert_header("X-Request-Id", &ctx.request_id)?;
         Ok(())
     }
 
@@ -1260,29 +1266,27 @@ impl PingclairProxy {
             .path_and_query()
             .map(|value| value.as_str())
             .unwrap_or("/");
-        let compiled = if let Some(pattern) = rule.regex {
-            ctx.state
-                .as_ref()
-                .and_then(|state| state.rewrite_regexes.get(route_index))
-                .and_then(|regexes| regexes.get(pattern).map(AsRef::as_ref))
-        } else {
-            None
-        };
-        if rule.regex.is_some() && compiled.is_none() {
-            return Err(pingora_core::Error::explain(
-                pingora_core::ErrorType::InternalError,
-                "invalid rewrite regex in active configuration",
-            ));
-        }
-        let new_uri = rewrite_uri(
-            current,
-            rule.strip_prefix,
-            rule.strip_suffix,
-            rule.replace,
-            compiled,
-            rule.regex_replace,
-        )
-        .expect("rewrite_uri always constructs a URI");
+        let new_uri = ctx
+            .state
+            .as_ref()
+            .ok_or_else(|| {
+                pingora_core::Error::explain(
+                    pingora_core::ErrorType::InternalError,
+                    "missing route state for rewrite",
+                )
+            })?
+            .rewrite_request_uri(
+                route_index,
+                current,
+                rule.strip_prefix,
+                rule.strip_suffix,
+                rule.replace,
+                rule.regex,
+                rule.regex_replace,
+            )
+            .map_err(|message| {
+                pingora_core::Error::explain(pingora_core::ErrorType::InternalError, message)
+            })?;
         session.req_header_mut().set_raw_path(new_uri.as_bytes())?;
         ctx.rewritten_path = Some(
             new_uri
@@ -1302,26 +1306,17 @@ impl PingclairProxy {
         ctx: &RequestContext,
         status: u16,
     ) -> PingoraResult<()> {
-        let page = ctx
+        if let Some((content, content_type)) = ctx
             .state
             .as_ref()
-            .and_then(|s| s.config.error_pages.get(&status));
-        if let Some(path) = page
-            && let Ok(content) = std::fs::read(path)
+            .and_then(|state| state.read_error_page(status))
         {
-            let mime = if path.ends_with(".htm") || path.ends_with(".html") {
-                "text/html"
-            } else {
-                "text/plain"
-            };
             let mut response = ResponseHeader::build(status, Some(4)).unwrap();
-            response.insert_header("Content-Type", mime).unwrap();
+            response
+                .insert_header("Content-Type", content_type)
+                .unwrap();
             response
                 .insert_header("Content-Length", content.len().to_string())
-                .unwrap();
-            response.insert_header("Server", "Pingclair").unwrap();
-            response
-                .insert_header("X-Request-Id", &ctx.request_id)
                 .unwrap();
             Self::apply_local_response_headers(&mut response, ctx)?;
             session
@@ -1332,16 +1327,8 @@ impl PingclairProxy {
                 .await?;
             return Ok(());
         }
-        let reason = match status {
-            400 => "Bad Request",
-            404 => "Not Found",
-            500 => "Internal Server Error",
-            502 => "Bad Gateway",
-            503 => "Service Unavailable",
-            504 => "Gateway Timeout",
-            _ => "Error",
-        };
-        Self::write_simple_response(session, status, &format!("{status} {reason}")).await
+        let reason = error_reason(status);
+        Self::write_simple_response(session, ctx, status, &format!("{status} {reason}")).await
     }
 
     /// Handle a specific handler configuration
@@ -1373,10 +1360,6 @@ impl PingclairProxy {
                 response
                     .insert_header("Content-Length", body_bytes.len().to_string())
                     .unwrap();
-                response.insert_header("Server", "Pingclair").unwrap();
-                response
-                    .insert_header("X-Request-Id", &ctx.request_id)
-                    .unwrap();
                 Self::apply_local_response_headers(&mut response, ctx)?;
                 session
                     .write_response_header(Box::new(response), false)
@@ -1389,10 +1372,6 @@ impl PingclairProxy {
             HandlerConfig::Redirect { to, code } => {
                 let mut response = ResponseHeader::build(*code, Some(3)).unwrap();
                 response.insert_header("Location", to.as_str()).unwrap();
-                response.insert_header("Server", "Pingclair").unwrap();
-                response
-                    .insert_header("X-Request-Id", &ctx.request_id)
-                    .unwrap();
                 Self::apply_local_response_headers(&mut response, ctx)?;
                 session
                     .write_response_header(Box::new(response), true)
@@ -1441,10 +1420,6 @@ impl PingclairProxy {
                                 header.insert_header("ETag", etag.as_str()).unwrap();
                             }
                             header.insert_header("Accept-Ranges", "bytes").unwrap();
-                            header.insert_header("Server", "Pingclair").unwrap();
-                            header
-                                .insert_header("X-Request-Id", &ctx.request_id)
-                                .unwrap();
                             Self::apply_local_response_headers(&mut header, ctx)?;
 
                             session
@@ -1492,10 +1467,6 @@ impl PingclairProxy {
                                     .unwrap();
                             }
                             header.insert_header("Accept-Ranges", "bytes").unwrap();
-                            header.insert_header("Server", "Pingclair").unwrap();
-                            header
-                                .insert_header("X-Request-Id", &ctx.request_id)
-                                .unwrap();
                             Self::apply_local_response_headers(&mut header, ctx)?;
 
                             session
@@ -1551,25 +1522,28 @@ impl PingclairProxy {
                 Ok(false)
             }
             HandlerConfig::HandlePath { prefix, handlers } => {
-                let new_path = if path.starts_with(prefix) {
-                    let p = &path[prefix.len()..];
-                    if p.is_empty() {
-                        "/"
-                    } else if !p.starts_with('/') {
-                        // Should ensure leading slash if we want strict path compliance,
-                        // but Caddy handle_path strips exact prefix.
-                        // Let's assume absolute paths are preferred.
-                        p // Simple strip
-                    } else {
-                        p
-                    }
+                let current = session
+                    .req_header()
+                    .uri
+                    .path_and_query()
+                    .map(|value| value.as_str())
+                    .unwrap_or(path);
+                let rewritten = if path.starts_with(prefix) {
+                    rewrite_uri(current, Some(prefix), None, None, None, None)
                 } else {
-                    path
+                    current.to_string()
                 };
+                session
+                    .req_header_mut()
+                    .set_raw_path(rewritten.as_bytes())?;
+                let new_path = rewritten
+                    .split_once('?')
+                    .map_or(rewritten.as_str(), |(rewritten_path, _)| rewritten_path);
+                ctx.rewritten_path = Some(new_path.to_string());
 
-                for h in handlers {
+                for handler in handlers {
                     if self
-                        .handle_config(session, ctx, h, new_path, route_index)
+                        .handle_config(session, ctx, handler, new_path, route_index)
                         .await?
                     {
                         return Ok(true);
@@ -1607,7 +1581,7 @@ impl PingclairProxy {
                     response
                         .insert_header("Content-Length", body.len().to_string())
                         .unwrap();
-                    response.insert_header("Server", "Pingclair").unwrap();
+                    Self::apply_local_response_headers(&mut response, ctx)?;
                     session
                         .write_response_header(Box::new(response), false)
                         .await?;
@@ -1619,17 +1593,13 @@ impl PingclairProxy {
             }
             HandlerConfig::Headers { set, add, remove } => {
                 for (k, v) in set {
-                    ctx.headers_downstream.insert(k.clone(), v.clone());
+                    ctx.response_headers.set(k, v.clone());
                 }
                 for (k, v) in add {
-                    ctx.headers_downstream_add.insert(k.clone(), v.clone());
+                    ctx.response_headers.add(k, v.clone());
                 }
-                for h in remove {
-                    ctx.headers_remove.push(h.clone());
-                    // If removing "Server", set flag to suppress default
-                    if h.eq_ignore_ascii_case("server") {
-                        ctx.suppress_server_header = true;
-                    }
+                for name in remove {
+                    ctx.response_headers.remove(name);
                 }
                 Ok(false)
             }
@@ -1668,132 +1638,52 @@ impl PingclairProxy {
                 allow_credentials,
                 max_age,
             } => {
-                let req_header = session.req_header();
-                let origin = req_header
-                    .headers
-                    .get("origin")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
-
-                // No Origin means this is an ordinary request, not CORS.
-                if origin.is_empty() {
-                    return Ok(false);
-                }
-
-                // Check if origin is allowed. A wildcard cannot be used with
-                // credentials, so reflect the validated origin in that case.
-                let wildcard_origin = allowed_origins.iter().any(|value| value == "*");
-                let origin_allowed = allowed_origins.is_empty()
-                    || wildcard_origin
-                    || allowed_origins.iter().any(|value| value == &origin);
-
-                if !origin_allowed {
-                    return Ok(false); // Not a CORS request or origin not allowed
-                }
-
-                let allow_origin = if wildcard_origin && !allow_credentials {
-                    "*".to_string()
-                } else {
-                    origin.clone()
-                };
-
-                // Handle preflight OPTIONS request
-                if req_header.method == http::Method::OPTIONS
-                    && req_header
-                        .headers
-                        .contains_key("access-control-request-method")
-                {
-                    let requested_method = req_header
-                        .headers
-                        .get("access-control-request-method")
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or("");
-                    if !allowed_methods.is_empty()
-                        && !allowed_methods
-                            .iter()
-                            .any(|method| method.eq_ignore_ascii_case(requested_method))
-                    {
-                        Self::write_simple_response(session, 403, "CORS method not allowed")
-                            .await?;
-                        return Ok(true);
+                let decision = evaluate_cors(
+                    &session.req_header().method,
+                    &session.req_header().headers,
+                    allowed_origins,
+                    allowed_methods,
+                    allowed_headers,
+                    exposed_headers,
+                    *allow_credentials,
+                    *max_age,
+                );
+                match decision {
+                    CorsDecision::PassThrough => Ok(false),
+                    CorsDecision::Continue(policy) => {
+                        ctx.response_headers.merge(policy);
+                        Ok(false)
                     }
-                    let requested_headers = req_header
-                        .headers
-                        .get("access-control-request-headers")
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or("");
-                    let headers_allowed = allowed_headers.iter().any(|header| header == "*")
-                        || requested_headers
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|header| !header.is_empty())
-                            .all(|requested| {
-                                allowed_headers
-                                    .iter()
-                                    .any(|allowed| allowed.eq_ignore_ascii_case(requested))
-                            });
-                    if !headers_allowed {
-                        Self::write_simple_response(session, 403, "CORS header not allowed")
-                            .await?;
-                        return Ok(true);
-                    }
-                    let mut header = pingora_http::ResponseHeader::build(204, Some(8)).unwrap();
-                    header
-                        .insert_header("Access-Control-Allow-Origin", &allow_origin)
-                        .unwrap();
-                    header
-                        .insert_header("Access-Control-Allow-Methods", allowed_methods.join(", "))
-                        .unwrap();
-                    header
-                        .insert_header("Access-Control-Allow-Headers", allowed_headers.join(", "))
-                        .unwrap();
-                    header
-                        .insert_header("Access-Control-Max-Age", max_age.to_string())
-                        .unwrap();
-                    if *allow_credentials {
-                        header
-                            .insert_header("Access-Control-Allow-Credentials", "true")
+                    CorsDecision::Respond {
+                        status,
+                        body,
+                        headers,
+                    } => {
+                        ctx.response_headers.merge(headers);
+                        let mut response = ResponseHeader::build(status, Some(8)).unwrap();
+                        if !body.is_empty() {
+                            response
+                                .insert_header("content-type", "text/plain")
+                                .unwrap();
+                        }
+                        response
+                            .insert_header("content-length", body.len().to_string())
                             .unwrap();
+                        Self::apply_local_response_headers(&mut response, ctx)?;
+                        session
+                            .write_response_header(Box::new(response), body.is_empty())
+                            .await?;
+                        if !body.is_empty() {
+                            session
+                                .write_response_body(
+                                    Some(Bytes::copy_from_slice(body.as_bytes())),
+                                    true,
+                                )
+                                .await?;
+                        }
+                        Ok(true)
                     }
-                    if !exposed_headers.is_empty() {
-                        header
-                            .insert_header(
-                                "Access-Control-Expose-Headers",
-                                exposed_headers.join(", "),
-                            )
-                            .unwrap();
-                    }
-                    header.insert_header("Vary", "Origin").unwrap();
-                    header.insert_header("Content-Length", "0").unwrap();
-                    header.insert_header("Server", "Pingclair").unwrap();
-                    header
-                        .insert_header("X-Request-Id", &ctx.request_id)
-                        .unwrap();
-                    session
-                        .write_response_header(Box::new(header), true)
-                        .await?;
-                    return Ok(true);
                 }
-
-                // For non-preflight requests, add CORS headers to downstream
-                ctx.headers_downstream
-                    .insert("Access-Control-Allow-Origin".to_string(), allow_origin);
-                ctx.headers_downstream_add
-                    .insert("Vary".to_string(), "Origin".to_string());
-                if *allow_credentials {
-                    ctx.headers_downstream.insert(
-                        "Access-Control-Allow-Credentials".to_string(),
-                        "true".to_string(),
-                    );
-                }
-                if !exposed_headers.is_empty() {
-                    ctx.headers_downstream.insert(
-                        "Access-Control-Expose-Headers".to_string(),
-                        exposed_headers.join(", "),
-                    );
-                }
-                Ok(false)
             }
             HandlerConfig::TryFiles { files, fallback } => {
                 // 🏗️ ARCHITECTURE: try_files checks each file path in order.
@@ -2016,7 +1906,7 @@ impl ProxyHttp for PingclairProxy {
                     // request, so answer 404 now. Returning Ok(false) here
                     // would land in upstream_peer with no state and surface
                     // as a 500 (ConnectNoRoute).
-                    Self::write_simple_response(session, 404, "404 Not Found").await?;
+                    Self::write_simple_response(session, ctx, 404, "404 Not Found").await?;
                     return Ok(true);
                 }
             };
@@ -2139,7 +2029,7 @@ impl ProxyHttp for PingclairProxy {
             {
                 let mut header = pingora_http::ResponseHeader::build(413, Some(4)).unwrap();
                 header.insert_header("Connection", "close").unwrap();
-                header.insert_header("Server", "Pingclair").unwrap();
+                Self::apply_local_response_headers(&mut header, ctx)?;
                 session
                     .write_response_header(Box::new(header), true)
                     .await?;
@@ -2157,7 +2047,7 @@ impl ProxyHttp for PingclairProxy {
             if let Some(state) = &ctx.state
                 && !state.allows_access(index, &remote_ip, &session.req_header().headers)
             {
-                Self::write_simple_response(session, 403, "Forbidden").await?;
+                Self::write_simple_response(session, ctx, 403, "Forbidden").await?;
                 return Ok(true);
             }
 
@@ -2180,7 +2070,7 @@ impl ProxyHttp for PingclairProxy {
                             header.insert_header(name, val).unwrap();
                         }
                     }
-                    header.insert_header("Server", "Pingclair").unwrap();
+                    Self::apply_local_response_headers(&mut header, ctx)?;
                     session
                         .write_response_header(Box::new(header), true)
                         .await?;
@@ -2260,7 +2150,8 @@ impl ProxyHttp for PingclairProxy {
 
             if let Some(proxy_config) = self.get_proxy_config(state, route_index) {
                 ctx.headers_upstream = proxy_config.headers_up.clone();
-                ctx.headers_downstream = proxy_config.headers_down.clone();
+                ctx.response_headers
+                    .merge_proxy_set(&proxy_config.headers_down);
                 read_timeout_ms = proxy_config.read_timeout;
                 write_timeout_ms = proxy_config.write_timeout;
                 ctx.streaming_response = wants_immediate_flush(proxy_config.flush_interval);
@@ -2369,75 +2260,12 @@ impl ProxyHttp for PingclairProxy {
         // Capture response status for access log
         ctx.response_status = upstream_response.status.as_u16();
 
-        // 1. Set configured downstream headers
-        for (key, value) in &ctx.headers_downstream {
-            upstream_response.insert_header(key.clone(), value.as_str())?;
-        }
+        ctx.response_headers
+            .apply_pingora(upstream_response, &ctx.request_id)?;
 
-        // 2. Append configured downstream headers
-        for (key, value) in &ctx.headers_downstream_add {
-            upstream_response.append_header(key.clone(), value.as_str())?;
-        }
-
-        // 3. Remove configured headers
-        for header_name in &ctx.headers_remove {
-            let _ = upstream_response.remove_header(header_name);
-        }
-
-        // 4. Server header (only if not suppressed by `header -Server`)
-        if !ctx.suppress_server_header {
-            upstream_response.insert_header("Server", "Pingclair")?;
-        }
-
-        // 5. Add request ID header for tracing
-        upstream_response.insert_header("X-Request-Id", &ctx.request_id)?;
-
-        // 6. Security headers based on configuration
-        if let Some(state) = &ctx.state
-            && state.config.security.enabled
-        {
-            upstream_response.insert_header(
-                "X-Content-Type-Options",
-                &state.config.security.x_content_type_options,
-            )?;
-            upstream_response
-                .insert_header("X-Frame-Options", &state.config.security.x_frame_options)?;
-            upstream_response
-                .insert_header("X-XSS-Protection", &state.config.security.x_xss_protection)?;
-            upstream_response.insert_header(
-                "X-Permitted-Cross-Domain-Policies",
-                &state.config.security.x_permitted_cross_domain,
-            )?;
-            upstream_response
-                .insert_header("Referrer-Policy", &state.config.security.referrer_policy)?;
-            upstream_response.insert_header(
-                "Permissions-Policy",
-                &state.config.security.permissions_policy,
-            )?;
-
-            if state
-                .config
-                .tls
-                .as_ref()
-                .is_some_and(|tls| tls.auto || tls.cert.is_some())
-                && let Some(ref hsts_config) = state.config.security.hsts
-            {
-                let hsts_value = format!(
-                    "max-age={};{}{}",
-                    hsts_config.max_age,
-                    if hsts_config.include_subdomains {
-                        " includeSubDomains;"
-                    } else {
-                        ""
-                    },
-                    if hsts_config.preload { " preload" } else { "" }
-                );
-                upstream_response.insert_header("Strict-Transport-Security", &hsts_value)?;
-            }
-
-            if let Some(ref csp) = state.config.security.csp {
-                upstream_response.insert_header("Content-Security-Policy", csp)?;
-            }
+        // 🛡️ Applies the same security policy used by locally generated responses.
+        if let Some(state) = &ctx.state {
+            Self::apply_security_response_headers(upstream_response, state)?;
         }
 
         // 7. Setup gzip compression if applicable
@@ -2813,27 +2641,6 @@ fn find_rate_limit_config(handler: &HandlerConfig) -> Option<crate::rate_limit::
                 }
             }
             None
-        }
-        _ => None,
-    }
-}
-
-/// Find the first `BasicAuth` config in a handler tree, recursing through
-/// `Pipeline`/`Handle`/`HandlePath` wrappers. Mirrors
-/// [`find_rate_limit_config`]. Used by the HTTP/3 dispatch, which matches
-/// only on the top-level handler and therefore cannot rely on the
-/// `handle_config` arm the H1/H2 path uses.
-pub(crate) fn find_basic_auth_config(
-    handler: &HandlerConfig,
-) -> Option<(&str, &[BasicAuthCredential])> {
-    match handler {
-        HandlerConfig::BasicAuth { realm, credentials } => {
-            Some((realm.as_str(), credentials.as_slice()))
-        }
-        HandlerConfig::Pipeline { handlers }
-        | HandlerConfig::Handle { handlers }
-        | HandlerConfig::HandlePath { handlers, .. } => {
-            handlers.iter().find_map(find_basic_auth_config)
         }
         _ => None,
     }
@@ -3404,60 +3211,6 @@ mod gzip_type_tests {
 }
 
 #[cfg(test)]
-mod basic_auth_tests {
-    use super::*;
-
-    fn basic_auth_handler() -> HandlerConfig {
-        HandlerConfig::BasicAuth {
-            realm: "Restricted".to_string(),
-            credentials: vec![BasicAuthCredential {
-                username: "alice".to_string(),
-                password: "s3cret".to_string(),
-                hashed: false,
-            }],
-        }
-    }
-
-    fn respond_handler() -> HandlerConfig {
-        HandlerConfig::Respond {
-            status: 200,
-            body: None,
-            headers: HashMap::new(),
-        }
-    }
-
-    #[test]
-    fn finds_bare_basic_auth_config() {
-        let handler = basic_auth_handler();
-        let (realm, credentials) = find_basic_auth_config(&handler).unwrap();
-        assert_eq!(realm, "Restricted");
-        assert_eq!(credentials.len(), 1);
-        assert_eq!(credentials[0].username, "alice");
-    }
-
-    #[test]
-    fn finds_basic_auth_nested_in_pipeline_and_handle_path() {
-        let handler = HandlerConfig::HandlePath {
-            prefix: "/admin".to_string(),
-            handlers: vec![HandlerConfig::Pipeline {
-                handlers: vec![basic_auth_handler(), respond_handler()],
-            }],
-        };
-        let (realm, _) = find_basic_auth_config(&handler).unwrap();
-        assert_eq!(realm, "Restricted");
-    }
-
-    #[test]
-    fn returns_none_when_no_basic_auth_present() {
-        let handler = HandlerConfig::Pipeline {
-            handlers: vec![respond_handler()],
-        };
-        assert!(find_basic_auth_config(&handler).is_none());
-        assert!(find_basic_auth_config(&respond_handler()).is_none());
-    }
-}
-
-#[cfg(test)]
 mod caddy_parity_tests {
     use super::*;
 
@@ -3617,7 +3370,7 @@ mod caddy_parity_tests {
                 Some(&regex),
                 Some("/v1/$1"),
             ),
-            Some("/v1/users/42?verbose=1".to_string()),
+            "/v1/users/42?verbose=1",
         );
     }
 }
