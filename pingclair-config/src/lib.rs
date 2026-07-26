@@ -51,7 +51,7 @@ pub fn compile_file(path: impl AsRef<Path>) -> Result<PingclairConfig, FullCompi
     let path = path.as_ref();
     let source = std::fs::read_to_string(path).map_err(|e| FullCompileError::Io(e.to_string()))?;
 
-    if path.extension().map_or(false, |ext| ext == "json") {
+    if path.extension().is_some_and(|ext| ext == "json") {
         serde_json::from_str(&source)
             .map_err(|e| FullCompileError::Io(format!("JSON parse error: {}", e)))
     } else {

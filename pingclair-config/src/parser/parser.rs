@@ -70,13 +70,12 @@ impl<'a> Parser<'a> {
         
         while !self.is_eof() {
             // Skip top-level newlines
-            if let Some(token) = self.peek() {
-                if matches!(token.value, Token::Newline) {
-                    self.consume();
-                    continue;
-                }
-            } else {
-                break; 
+            let Some(token) = self.peek() else {
+                break;
+            };
+            if matches!(token.value, Token::Newline) {
+                self.consume();
+                continue;
             }
             
             directives.push(self.parse_directive()?);
@@ -88,14 +87,14 @@ impl<'a> Parser<'a> {
     /// Parse a single directive: Name [Args...] [Block]
     fn parse_directive(&mut self) -> Result<Directive, ParseError> {
         // 1. Check for global block start {
-        if let Some(token) = self.peek() {
-            if matches!(token.value, Token::BlockOpen) {
-                return Ok(Directive {
-                    name: "".to_string(),
-                    args: Vec::new(),
-                    block: Some(self.parse_block()?),
-                });
-            }
+        if let Some(token) = self.peek()
+            && matches!(token.value, Token::BlockOpen)
+        {
+            return Ok(Directive {
+                name: "".to_string(),
+                args: Vec::new(),
+                block: Some(self.parse_block()?),
+            });
         }
 
         // 2. Normal directive name
@@ -114,12 +113,7 @@ impl<'a> Parser<'a> {
         let mut block = None;
 
         // 2. Loop args
-        loop {
-            let token = match self.peek() {
-                Some(t) => t,
-                None => break, // EOF ends directive
-            };
-
+        while let Some(token) = self.peek() {
             match &token.value {
                 Token::Newline => {
                     self.consume();
@@ -134,10 +128,10 @@ impl<'a> Parser<'a> {
                     // Usually: directive { ... } \n directive2
                     // block consumes closing }. Peek next.
                     // If next is Newline, consume it.
-                    if let Some(next) = self.peek() {
-                        if matches!(next.value, Token::Newline) {
-                            self.consume();
-                        }
+                    if let Some(next) = self.peek()
+                        && matches!(next.value, Token::Newline)
+                    {
+                        self.consume();
                     }
                     break;
                 },
@@ -206,10 +200,10 @@ impl<'a> Parser<'a> {
         }
         
         // Skip potential newline after {
-        if let Some(t) = self.peek() {
-            if matches!(t.value, Token::Newline) {
-                self.consume();
-            }
+        if let Some(t) = self.peek()
+            && matches!(t.value, Token::Newline)
+        {
+            self.consume();
         }
 
         let mut directives = Vec::new();

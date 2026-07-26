@@ -226,10 +226,10 @@ impl SemanticAnalyzer {
             Expr::Variable(var) => {
                 // Check if variable references a macro param
                 let parts: Vec<&str> = var.path.split('.').collect();
-                if let Some(first) = parts.first() {
-                    if let Some(replacement) = subs.get(*first) {
-                        return replacement.clone();
-                    }
+                if let Some(first) = parts.first()
+                    && let Some(replacement) = subs.get(*first)
+                {
+                    return replacement.clone();
                 }
                 expr.clone()
             }

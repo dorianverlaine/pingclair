@@ -322,7 +322,7 @@ impl LoadBalancer {
     /// Selects an upstream backend for a request.
     ///
     /// - Parameter key: Client IP bytes for hash-based selection (`IpHash`).
-    ///                  Ignored for other strategies.
+    ///   Ignored for other strategies.
     /// - Returns: An optional `Upstream` if a healthy backend is available.
     pub fn select(&self, key: Option<&[u8]>) -> Option<Upstream> {
         let primary = match self.strategy {

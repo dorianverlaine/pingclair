@@ -57,10 +57,10 @@ fn parse_url_components(upstream: &str) -> Option<(std::net::SocketAddr, Scheme,
     let trimmed_upstream = upstream.trim();
     
     // Determine scheme and strip prefix
-    let (scheme, minimal_url) = if trimmed_upstream.starts_with("https://") {
-        (Scheme::Https, &trimmed_upstream[8..])
-    } else if trimmed_upstream.starts_with("http://") {
-        (Scheme::Http, &trimmed_upstream[7..])
+    let (scheme, minimal_url) = if let Some(stripped) = trimmed_upstream.strip_prefix("https://") {
+        (Scheme::Https, stripped)
+    } else if let Some(stripped) = trimmed_upstream.strip_prefix("http://") {
+        (Scheme::Http, stripped)
     } else {
         (Scheme::Http, trimmed_upstream)
     };

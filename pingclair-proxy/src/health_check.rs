@@ -138,14 +138,13 @@ impl HealthCheck for HealthChecker {
         // Step 4: Parse Status Code
         // Format: "HTTP/1.1 200 OK"
         let response_text = String::from_utf8_lossy(&response_buffer[..bytes_read]);
-        if let Some(status_line) = response_text.lines().next() {
-            if let Some(status_code_str) = status_line.split_whitespace().nth(1) {
-                if let Ok(status_code) = status_code_str.parse::<u16>() {
-                    let (min, max) = self.config.expected_status;
-                    if status_code >= min && status_code <= max {
-                        return Ok(());
-                    }
-                }
+        if let Some(status_line) = response_text.lines().next()
+            && let Some(status_code_str) = status_line.split_whitespace().nth(1)
+            && let Ok(status_code) = status_code_str.parse::<u16>()
+        {
+            let (min, max) = self.config.expected_status;
+            if status_code >= min && status_code <= max {
+                return Ok(());
             }
         }
 

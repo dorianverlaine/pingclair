@@ -36,12 +36,15 @@ pub enum AdapterError {
 
 // MARK: - Snippet Expansion (Pass 1)
 
+type SnippetMap = HashMap<String, Vec<Directive>>;
+type SnippetCollection = (SnippetMap, Vec<Directive>);
+
 /// Collect snippet `(name) { ... }` definitions from top-level directives
 /// and return (snippets_map, remaining_directives).
 fn collect_snippets(
     directives: Vec<Directive>,
-) -> Result<(HashMap<String, Vec<Directive>>, Vec<Directive>), AdapterError> {
-    let mut snippets: HashMap<String, Vec<Directive>> = HashMap::new();
+) -> Result<SnippetCollection, AdapterError> {
+    let mut snippets = SnippetMap::new();
     let mut remaining = Vec::new();
 
     for d in directives {
@@ -291,10 +294,10 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
     }
 
     // Fallback: if server name is still a full URL, strip it
-    if server.name.contains("://") {
-        if let Some(parsed) = parse_server_address(&server.name) {
-            server.name = parsed.hostname;
-        }
+    if server.name.contains("://")
+        && let Some(parsed) = parse_server_address(&server.name)
+    {
+        server.name = parsed.hostname;
     }
 
     if server.listens.len() > 1 || server.name.starts_with(':') {
@@ -324,7 +327,7 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                             Scheme::Http
                         },
                         host: "0.0.0.0".to_string(),
-                        port: addr.split(':').last().and_then(|p| p.parse().ok()),
+                        port: addr.split(':').next_back().and_then(|p| p.parse().ok()),
                     });
                 }
                 "compress" | "encode" => {
@@ -482,9 +485,9 @@ fn parse_server_address(addr: &str) -> Option<ParsedAddress> {
         return None;
     }
 
-    let (hostname, port) = if rest.starts_with(':') {
+    let (hostname, port) = if let Some(port) = rest.strip_prefix(':') {
         // :port
-        let p = rest[1..].parse::<u16>().ok();
+        let p = port.parse::<u16>().ok();
         ("0.0.0.0".to_string(), p)
     } else if let Some(colon_pos) = rest.rfind(':') {
         // host:port
@@ -621,23 +624,23 @@ fn adapt_log_block(block: Block) -> Result<LogBlock, AdapterError> {
                             if let Some(filter_block) = d.block {
                                 let mut filter = LogFilter::default();
                                 for fb_d in filter_block.directives {
-                                    if fb_d.name == "wrap" {
-                                        if let Some(wrap_type) = fb_d.args.first() {
-                                            match wrap_type.as_str() {
-                                                "json" => format.format_type = LogFormatType::Json,
-                                                _ => {}
-                                            }
-                                        }
+                                    if fb_d.name == "wrap"
+                                        && fb_d
+                                            .args
+                                            .first()
+                                            .is_some_and(|wrap_type| wrap_type == "json")
+                                    {
+                                        format.format_type = LogFormatType::Json;
                                     }
-                                    if fb_d.name == "fields" {
-                                        if let Some(fields_block) = fb_d.block {
-                                            for field_d in fields_block.directives {
-                                                // field_name "delete" → exclude field
-                                                if field_d.args.first().map(|a| a.as_str())
-                                                    == Some("delete")
-                                                {
-                                                    filter.exclude.push(field_d.name);
-                                                }
+                                    if fb_d.name == "fields"
+                                        && let Some(fields_block) = fb_d.block
+                                    {
+                                        for field_d in fields_block.directives {
+                                            // field_name "delete" → exclude field
+                                            if field_d.args.first().map(|a| a.as_str())
+                                                == Some("delete")
+                                            {
+                                                filter.exclude.push(field_d.name);
                                             }
                                         }
                                     }
@@ -665,10 +668,10 @@ fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
         "redir" | "redirect" => adapt_redirect(d),
         "file_server" => {
             let mut root = ".".to_string();
-            if let Some(arg) = d.args.first() {
-                if !arg.starts_with('@') {
-                    root = arg.clone();
-                }
+            if let Some(arg) = d.args.first()
+                && !arg.starts_with('@')
+            {
+                root = arg.clone();
             }
 
             let mut config = FileServerConfig {
@@ -873,7 +876,7 @@ fn adapt_basic_auth(d: Directive) -> Result<Handler, AdapterError> {
     };
 
     let mut pairs_from = |args: &[String]| -> Result<(), AdapterError> {
-        if args.len() % 2 != 0 {
+        if !args.len().is_multiple_of(2) {
             return Err(AdapterError::InvalidArgument(
                 "basic_auth".into(),
                 "credentials must be <user> <password> pairs".into(),
@@ -1131,10 +1134,10 @@ fn adapt_respond(d: Directive) -> Result<Handler, AdapterError> {
         _ => {
             // First arg is body, last arg might be status
             body = Some(Expr::String(d.args[0].clone()));
-            if let Some(last) = d.args.last() {
-                if let Ok(code) = last.parse::<u16>() {
-                    status = code;
-                }
+            if let Some(last) = d.args.last()
+                && let Ok(code) = last.parse::<u16>()
+            {
+                status = code;
             }
         }
     }
@@ -1178,8 +1181,8 @@ fn adapt_header_directive(d: &Directive) -> Result<Handler, AdapterError> {
         let args: Vec<&String> = d.args.iter().filter(|a| !a.starts_with('@')).collect();
 
         if let Some(key) = args.first() {
-            if key.starts_with('-') {
-                config.remove.push(key[1..].to_string());
+            if let Some(stripped) = key.strip_prefix('-') {
+                config.remove.push(stripped.to_string());
             } else if let Some(val) = args.get(1) {
                 config.set.insert((*key).clone(), (*val).clone());
             }
@@ -1198,10 +1201,10 @@ fn parse_matcher_and_block(
     let block = d.block.as_ref();
 
     // Check first arg for @name
-    if let Some(arg) = d.args.first() {
-        if arg.starts_with('@') {
-            matcher = Some(Matcher::Named(arg.clone()));
-        }
+    if let Some(arg) = d.args.first()
+        && arg.starts_with('@')
+    {
+        matcher = Some(Matcher::Named(arg.clone()));
     }
 
     Ok((matcher, block))

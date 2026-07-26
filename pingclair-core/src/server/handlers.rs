@@ -163,15 +163,11 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             let mut final_response = HandlerResponse::status(200);
 
             for handler in handlers {
-                match execute_handler(handler, headers) {
-                    Ok(response) => {
-                        final_response.status = response.status;
-                        final_response.headers.extend(response.headers);
-                        if response.body.is_some() {
-                            final_response.body = response.body;
-                        }
-                    }
-                    Err(e) => return Err(e),
+                let response = execute_handler(handler, headers)?;
+                final_response.status = response.status;
+                final_response.headers.extend(response.headers);
+                if response.body.is_some() {
+                    final_response.body = response.body;
                 }
             }
 
