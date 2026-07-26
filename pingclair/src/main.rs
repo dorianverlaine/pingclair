@@ -435,7 +435,7 @@ fn main() -> anyhow::Result<()> {
                     ServiceAction::Status => "status",
                 };
 
-                tracing::info!("Managing service: {}", cmd);
+                tracing::info!("🛠️ Managing service: {}", cmd);
                 let status = std::process::Command::new("systemctl")
                     .arg(cmd)
                     .arg("pingclair")
@@ -450,13 +450,13 @@ fn main() -> anyhow::Result<()> {
                             ServiceAction::Reload => "reloaded",
                             ServiceAction::Status => "queried",
                         };
-                        println!("✅ Service {} successfully", past_tense);
+                        println!("✅ Service {past_tense} successfully");
                     }
                     Ok(s) => {
-                        eprintln!("❌ Failed to {} service (exit code: {})", cmd, s);
+                        eprintln!("❌ Failed to {cmd} service (exit code: {s})");
                     }
                     Err(e) => {
-                        eprintln!("❌ Failed to execute systemctl: {}", e);
+                        eprintln!("❌ Failed to execute systemctl: {e}");
                     }
                 }
             }
@@ -936,18 +936,18 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
                         if error_count == 0 {
                             tracing::info!("✅ Configuration reload completed successfully in {:?}", reload_duration);
                             tracing::info!("   📊 {} server(s) updated", success_count);
-                            println!("✅ Configuration reloaded successfully ({} servers updated in {:?})", success_count, reload_duration);
+                            println!("✅ Configuration reloaded successfully ({success_count} servers updated in {reload_duration:?})");
                         } else {
                             tracing::warn!("⚠️ Configuration reload completed with warnings in {:?}", reload_duration);
                             tracing::warn!("   📊 {} server(s) updated, {} warning(s)", success_count, error_count);
-                            println!("⚠️ Configuration partially reloaded ({} servers updated, {} warnings in {:?})", success_count, error_count, reload_duration);
+                            println!("⚠️ Configuration partially reloaded ({success_count} servers updated, {error_count} warnings in {reload_duration:?})");
                         }
                     }
                     Err(e) => {
                         let reload_duration = reload_start.elapsed();
                         tracing::error!("❌ Configuration reload failed after {:?}: {}", reload_duration, e);
                         tracing::error!("   💡 Previous configuration remains active");
-                        eprintln!("❌ Configuration reload failed: {}", e);
+                        eprintln!("❌ Configuration reload failed: {e}");
                         eprintln!("   💡 Previous configuration remains active");
                     }
                 }
