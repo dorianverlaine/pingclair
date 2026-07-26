@@ -17,7 +17,7 @@ pingclair-tls = { path = "../pingclair-tls" }
 pingora-proxy.workspace = true
 pingora-load-balancing.workspace = true
 pingora-limits.workspace = true
-pingora-core = { workspace = true, features = ["connection_filter"] }
+pingora-core = { workspace = true, features = ["boringssl", "connection_filter"] }
 pingora-http.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
@@ -41,3 +41,4 @@ thiserror.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 rcgen.workspace = true
+h2.workspace = true

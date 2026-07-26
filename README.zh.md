@@ -266,6 +266,11 @@ server "shop.example.com" {
 }
 ```
 
+上游 scheme 會決定連線協議：裸位址或 `http://` 使用 HTTP/1.1；`https://`
+透過 ALPN 協商 HTTP/2，並可回退至 HTTP/1.1；`h2c://` 強制使用明文
+prior-knowledge HTTP/2；`h2://` 則強制使用 TLS HTTP/2。原生 gRPC 應使用
+`h2c://` 或 `h2://`，確保 response trailers 以端到端 metadata 傳遞。
+
 ### Caddy parity 控制項
 
 ```caddyfile

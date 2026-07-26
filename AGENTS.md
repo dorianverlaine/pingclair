@@ -243,6 +243,10 @@ extensionless filename is `Pingclairfile`, like Caddy's `Caddyfile`. Pingclair
 also accepts `*.pingclair`, JSON, and directories of mixed config files. JSON
 deserializes directly into `PingclairConfig`.
 
+Upstream address schemes are transport policy: bare addresses and `http://`
+select H1, `https://` negotiates H2/H1 with ALPN, `h2c://` selects plaintext
+H2-only, and `h2://` selects TLS H2-only. Keep their connection pools isolated.
+
 For every user-facing directive, test all applicable layers:
 
 1. lexer/parser/adapter;

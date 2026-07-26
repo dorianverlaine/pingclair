@@ -111,6 +111,10 @@ impl Default for RequestContext {
 /// 🧱 Maximum accepted hops in an inbound `X-Forwarded-For` chain.
 const MAX_FORWARDED_HOPS: usize = 32;
 
+/// 🔐 Records the protocol selected by an upstream TLS handshake.
+#[derive(Debug)]
+struct NegotiatedUpstreamAlpn(Vec<u8>);
+
 /// 🛡️ Pre-parsed proxy networks allowed to assert downstream client identity.
 #[derive(Debug)]
 struct TrustedProxyPolicy {
@@ -1073,11 +1077,15 @@ impl PingclairProxy {
         }
     }
 
-    /// Parse upstream URL into (host, port, tls)
+    /// 🌐 Parses an upstream URL into its host, port, and TLS requirement.
     pub fn parse_upstream(upstream: &str) -> Option<(String, u16, bool)> {
         let upstream = upstream.trim();
 
-        let (scheme, rest) = if let Some(stripped) = upstream.strip_prefix("https://") {
+        let (scheme, rest) = if let Some(stripped) = upstream.strip_prefix("h2c://") {
+            (false, stripped)
+        } else if let Some(stripped) = upstream.strip_prefix("h2://") {
+            (true, stripped)
+        } else if let Some(stripped) = upstream.strip_prefix("https://") {
             (true, stripped)
         } else if let Some(stripped) = upstream.strip_prefix("http://") {
             (false, stripped)
@@ -1110,12 +1118,10 @@ impl PingclairProxy {
         find_reverse_proxy_config(&route.handler).cloned()
     }
 
-    /// Build an [`HttpPeer`] for a selected upstream, applying the route's
-    /// configured read/write timeouts plus a default 10s connect timeout.
+    /// 🌐 Builds an [`HttpPeer`] with the selected upstream protocol and timeouts.
     ///
-    /// Shared by the Pingora proxy path (`upstream_peer`) and the HTTP/3
-    /// reverse-proxy path (`crate::quic`) so both honor identical timeout
-    /// and SNI semantics.
+    /// 🤝 This shared builder keeps protocol, timeout, and SNI semantics identical
+    /// between the Pingora and HTTP/3 paths.
     pub(crate) fn build_http_peer(
         upstream: &Upstream,
         read_timeout_ms: Option<i64>,
@@ -1136,11 +1142,33 @@ impl PingclairProxy {
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or("unix_socket".to_string()),
             });
-        let tls = *scheme == Scheme::Https;
+        let (tls, max_http_version, min_http_version, protocol_group) = match scheme {
+            Scheme::Http => (false, 1, 1, 1),
+            Scheme::Https => (true, 2, 1, 2),
+            Scheme::H2c => (false, 2, 2, 3),
+            Scheme::H2 => (true, 2, 2, 4),
+        };
 
         let mut peer = HttpPeer::new(addr, tls, host);
+        peer.options
+            .set_http_version(max_http_version, min_http_version);
+        if max_http_version == 2 {
+            // 🚀 Allows one pooled H2 connection to multiplex independent request streams.
+            peer.options.max_h2_streams = 100;
+        }
+        if matches!(scheme, Scheme::H2) {
+            // 🔐 Captures ALPN so the proxy can reject a silent HTTP/1.1 fallback.
+            peer.options.upstream_tls_handshake_complete_hook = Some(Arc::new(|tls| {
+                Some(Arc::new(NegotiatedUpstreamAlpn(
+                    tls.selected_alpn_protocol()
+                        .map_or_else(Vec::new, ToOwned::to_owned),
+                )))
+            }));
+        }
+        // 🧩 Prevents differently negotiated protocols from sharing a connection pool.
+        peer.group_key = protocol_group;
 
-        // Apply timeouts if configured
+        // ⏱️ Applies route-specific read and write timeouts when configured.
         if let Some(read_timeout) = read_timeout_ms
             && read_timeout > 0
         {
@@ -1154,7 +1182,7 @@ impl PingclairProxy {
                 Some(std::time::Duration::from_millis(write_timeout as u64));
         }
 
-        // Set default connection timeout (10 seconds) if not configured
+        // ⏱️ Bounds upstream connection establishment when no override exists.
         if peer.options.connection_timeout.is_none() {
             peer.options.connection_timeout = Some(std::time::Duration::from_secs(10));
         }
@@ -2178,6 +2206,42 @@ impl ProxyHttp for PingclairProxy {
         Err(pingora_core::Error::new(
             pingora_core::ErrorType::ConnectNoRoute,
         ))
+    }
+
+    /// 🔒 Rejects `h2://` peers that did not negotiate HTTP/2 over TLS.
+    async fn connected_to_upstream(
+        &self,
+        _session: &mut Session,
+        _reused: bool,
+        peer: &HttpPeer,
+        #[cfg(unix)] _fd: std::os::unix::io::RawFd,
+        #[cfg(windows)] _sock: std::os::windows::io::RawSocket,
+        digest: Option<&pingora_core::protocols::Digest>,
+        _ctx: &mut Self::CTX,
+    ) -> PingoraResult<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if peer.group_key != 4 {
+            return Ok(());
+        }
+
+        let negotiated_h2 = digest
+            .and_then(|digest| digest.ssl_digest.as_deref())
+            .and_then(|digest| digest.extension.get::<NegotiatedUpstreamAlpn>())
+            .is_some_and(|alpn| alpn.0.as_slice() == b"h2");
+        if negotiated_h2 {
+            return Ok(());
+        }
+
+        tracing::error!(
+            peer = %peer,
+            "🔒 TLS H2 upstream did not negotiate the required h2 ALPN"
+        );
+        pingora_core::Error::e_explain(
+            pingora_core::ErrorType::HTTPStatus(502),
+            "TLS H2 upstream did not negotiate h2",
+        )
     }
 
     /// Called before sending request to upstream
@@ -3386,6 +3450,37 @@ mod caddy_parity_tests {
         assert_eq!(backup.len(), 1);
         assert_eq!(backup[0].addr.to_string(), "127.0.0.1:8302");
         assert_eq!(backup[0].weight, 2);
+    }
+
+    #[test]
+    fn upstream_schemes_select_tls_and_http_versions() {
+        for (address, tls, min_version, max_version, group_key) in [
+            ("http://127.0.0.1:8301", false, 1, 1, 1),
+            ("https://127.0.0.1:8302", true, 1, 2, 2),
+            ("h2c://127.0.0.1:8303", false, 2, 2, 3),
+            ("h2://127.0.0.1:8304", true, 2, 2, 4),
+        ] {
+            let upstream = create_upstream(address).unwrap();
+            let peer = PingclairProxy::build_http_peer(&upstream, None, None);
+
+            assert_eq!(peer.is_tls(), tls);
+            assert_eq!(
+                peer.options.alpn.get_min_http_version(),
+                min_version,
+                "{address}"
+            );
+            assert_eq!(
+                peer.options.alpn.get_max_http_version(),
+                max_version,
+                "{address}"
+            );
+            assert_eq!(peer.group_key, group_key);
+            assert_eq!(
+                peer.options.upstream_tls_handshake_complete_hook.is_some(),
+                group_key == 4,
+                "{address}"
+            );
+        }
     }
 
     #[test]
