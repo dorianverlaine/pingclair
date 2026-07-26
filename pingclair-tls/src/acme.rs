@@ -11,10 +11,11 @@ use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType as AcmeChallengeType,
     Identifier, NewAccount, NewOrder, OrderStatus,
 };
+use parking_lot::RwLock;
 use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::RwLock;
+use x509_parser::prelude::*;
 
 // MARK: - Constants
 
@@ -112,12 +113,13 @@ impl Certificate {
 
 /// Interface for handling ACME challenges.
 /// Implementations must solve the challenge (e.g., Serve file, Set DNS record).
+#[async_trait::async_trait]
 pub trait ChallengeHandler: Send + Sync {
-    /// Deploy the solution for a challenge (e.g., Write file).
-    fn deploy(&self, challenge: &ChallengeResponse) -> Result<(), AcmeError>;
+    /// 🚦 Deploys and durably publishes the solution before returning.
+    async fn deploy(&self, challenge: &ChallengeResponse) -> Result<(), AcmeError>;
     
-    /// Clean up resources after validation (e.g., Delete file).
-    fn cleanup(&self, challenge: &ChallengeResponse) -> Result<(), AcmeError>;
+    /// 🧹 Cleans up resources after validation.
+    async fn cleanup(&self, challenge: &ChallengeResponse) -> Result<(), AcmeError>;
     
     /// Retrieve a deployed token (Used by HTTP server router).
     fn get_token(&self, token: &str) -> Option<String>;
@@ -145,35 +147,49 @@ impl Default for MemoryChallengeHandler {
     }
 }
 
+#[async_trait::async_trait]
 impl ChallengeHandler for MemoryChallengeHandler {
-    fn deploy(&self, challenge: &ChallengeResponse) -> Result<(), AcmeError> {
-        // 🛑 SAFETY: We must block here and guarantee the token is written
-        // before returning Ok(()). If we used tokio::spawn, the token might
-        // not be in the map yet when the ACME server sends its HTTP-01
-        // verification request, causing the challenge to fail.
-        futures::executor::block_on(async {
-            let mut tokens = self.tokens.write().await;
-            tokens.insert(challenge.token.clone(), challenge.key_authorization.clone());
-        });
+    async fn deploy(&self, challenge: &ChallengeResponse) -> Result<(), AcmeError> {
+        // 🛡️ The token is visible before ACME validation can be triggered.
+        self.tokens
+            .write()
+            .insert(challenge.token.clone(), challenge.key_authorization.clone());
         Ok(())
     }
     
-    fn cleanup(&self, challenge: &ChallengeResponse) -> Result<(), AcmeError> {
-        // 🛑 SAFETY: Block to guarantee removal is synchronous with cleanup call.
-        futures::executor::block_on(async {
-            let mut tokens = self.tokens.write().await;
-            tokens.remove(&challenge.token);
-        });
+    async fn cleanup(&self, challenge: &ChallengeResponse) -> Result<(), AcmeError> {
+        self.tokens.write().remove(&challenge.token);
         Ok(())
     }
     
     fn get_token(&self, token: &str) -> Option<String> {
-        // Must block since interface is synchronous for the caller (usually server router)
-        futures::executor::block_on(async {
-            let tokens = self.tokens.read().await;
-            tokens.get(token).cloned()
-        })
+        self.tokens.read().get(token).cloned()
     }
+}
+
+/// 🧹 Removes every deployed challenge and records cleanup failures.
+async fn cleanup_challenges<H: ChallengeHandler + ?Sized>(
+    handler: &H,
+    challenges: &[ChallengeResponse],
+) {
+    for challenge in challenges {
+        if let Err(error) = handler.cleanup(challenge).await {
+            tracing::warn!(
+                domain = %challenge.domain,
+                %error,
+                "⚠️ Failed to clean up an ACME challenge"
+            );
+        }
+    }
+}
+
+/// 📅 Reads the leaf certificate's authoritative X.509 expiration timestamp.
+fn certificate_expiry(cert_pem: &str) -> Result<i64, AcmeError> {
+    let (_, pem) = parse_x509_pem(cert_pem.as_bytes())
+        .map_err(|error| AcmeError::CertGeneration(format!("Invalid certificate PEM: {error}")))?;
+    let (_, certificate) = parse_x509_certificate(&pem.contents)
+        .map_err(|error| AcmeError::CertGeneration(format!("Invalid X.509 certificate: {error}")))?;
+    Ok(certificate.validity().not_after.timestamp())
 }
 
 // MARK: - ACME Client
@@ -310,12 +326,19 @@ impl AcmeClient {
                 key_authorization: challenge.key_authorization().as_str().to_string(),
             };
             
-            handler.deploy(&response)?;
+            if let Err(error) = handler.deploy(&response).await {
+                cleanup_challenges(handler, &active_challenges).await;
+                return Err(error);
+            }
             active_challenges.push(response);
             
             // 4c. Notify Server
-            challenge.set_ready().await
-                .map_err(|e| AcmeError::ChallengeFailed(format!("Failed to set ready: {}", e)))?;
+            if let Err(error) = challenge.set_ready().await {
+                cleanup_challenges(handler, &active_challenges).await;
+                return Err(AcmeError::ChallengeFailed(format!(
+                    "Failed to set ready: {error}"
+                )));
+            }
                 
             tracing::info!("🚀 Verification triggered for {}", domain);
         }
@@ -323,13 +346,14 @@ impl AcmeClient {
         // 5. Poll for Status
         tracing::info!("⏳ Polling order status...");
         let retry_policy = instant_acme::RetryPolicy::default(); // reasonable defaults
-        let state = order.poll_ready(&retry_policy).await
-             .map_err(|e| AcmeError::OrderFailed(format!("Polling failed: {}", e)))?;
-             
-        // Cleanup challenges regardless of outcome
-        for challenge in &active_challenges {
-            let _ = handler.cleanup(challenge);
-        }
+        let state = order
+            .poll_ready(&retry_policy)
+            .await
+            .map_err(|error| AcmeError::OrderFailed(format!("Polling failed: {error}")));
+
+        // 🧹 Challenge tokens are removed even when polling fails.
+        cleanup_challenges(handler, &active_challenges).await;
+        let state = state?;
         
         if state != OrderStatus::Ready && state != OrderStatus::Valid {
              return Err(AcmeError::OrderFailed(format!("Order ended in state: {:?}", state)));
@@ -345,13 +369,8 @@ impl AcmeClient {
             
         tracing::info!("🎉 Certificate acquired for {:?}", domains);
         
-        // 7. Calculate Expiry (approximate 90 days)
-        // Note: Ideally we parse x509 here, but ACME doesn't return that metadata directly in the result struct.
-        // We assume 90 days for Let's Encrypt.
-        let expires_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64 + 89 * 24 * 60 * 60;
+        // 📅 Renewal decisions use the CA-signed leaf certificate's real expiry.
+        let expires_at = certificate_expiry(&cert_pem)?;
 
         Ok(Certificate {
             cert_pem,
@@ -504,6 +523,26 @@ mod tests {
             expires_at: now + 29 * 86400,
         };
         assert!(near.needs_renewal());
+    }
+
+    #[test]
+    fn certificate_expiry_uses_the_leaf_not_after_timestamp() {
+        let mut parameters =
+            rcgen::CertificateParams::new(vec!["example.com".to_string()]).unwrap();
+        parameters.not_after = rcgen::date_time_ymd(2035, 1, 2);
+        let expected_expiry = parameters.not_after.unix_timestamp();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let certificate = parameters.self_signed(&key_pair).unwrap();
+
+        assert_eq!(
+            certificate_expiry(&certificate.pem()).unwrap(),
+            expected_expiry
+        );
+    }
+
+    #[test]
+    fn certificate_expiry_rejects_malformed_pem() {
+        assert!(certificate_expiry("not a certificate").is_err());
     }
 
     /// A serialized credentials payload with a syntactically valid

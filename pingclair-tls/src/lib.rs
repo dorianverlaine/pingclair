@@ -12,6 +12,7 @@ pub mod auto_https;
 pub mod cert_store;
 pub mod manager;
 pub mod persistent_challenge_handler;
+mod secure_file;
 
 pub use acme::{AcmeClient, AcmeError, Certificate, ChallengeHandler, ChallengeType, ChallengeResponse};
 pub use auto_https::{AutoHttps, AutoHttpsConfig, AutoHttpsError};

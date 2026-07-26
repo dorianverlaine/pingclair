@@ -47,18 +47,7 @@ pub fn load(path: &Path) -> std::io::Result<Option<String>> {
 /// Creates the parent directory when needed. On Unix the file is written with
 /// mode 0600 because it contains the account private key.
 pub fn save(path: &Path, json: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, json)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-
-    Ok(())
+    crate::secure_file::write_private_file(path, json.as_bytes())
 }
 
 #[cfg(test)]

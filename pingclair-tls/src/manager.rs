@@ -139,10 +139,10 @@ impl TlsManager {
         }
 
         // 2. Already-issued ACME certs (store cache only — no issuance)
-        if let Some(auto) = &self.auto_https {
-            if let Some(cert) = auto.cached_certificate(domain).await {
-                return Some((cert.cert_pem, cert.key_pem));
-            }
+        if let Some(auto) = &self.auto_https
+            && let Some(cert) = auto.cached_certificate(domain).await
+        {
+            return Some((cert.cert_pem, cert.key_pem));
         }
         None
     }

@@ -157,7 +157,16 @@ impl CertStore {
         let safe_filename = primary_domain.replace('.', "_");
         let file_path = self.path.join(format!("{}.json", safe_filename));
         
-        tokio::fs::write(&file_path, json).await?;
+        let private_file_path = file_path.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::secure_file::write_private_file(&private_file_path, json.as_bytes())
+        })
+        .await
+        .map_err(|error| {
+            CertStoreError::Io(std::io::Error::other(format!(
+                "certificate writer failed: {error}"
+            )))
+        })??;
         
         // 3. Update Cache
         let mut cache = self.cache.write().await;
@@ -196,11 +205,12 @@ impl CertStore {
             // Use the primary domain as a unique key for the certificate bundle
             let primary_key = cert.domains.first().cloned().unwrap_or_default();
             
-            if !primary_key.is_empty() && !seen_primary_keys.contains(&primary_key) {
-                if cert.needs_renewal() {
-                    seen_primary_keys.insert(primary_key);
-                    candidates.push(cert.clone());
-                }
+            if !primary_key.is_empty()
+                && !seen_primary_keys.contains(&primary_key)
+                && cert.needs_renewal()
+            {
+                seen_primary_keys.insert(primary_key);
+                candidates.push(cert.clone());
             }
         }
         
@@ -244,10 +254,9 @@ mod tests {
     
     #[tokio::test]
     async fn test_store_lifecycle() {
-        let temp_dir = std::env::temp_dir().join("pingclair_test_certs_lifecycle");
-        let _ = tokio::fs::remove_dir_all(&temp_dir).await; // clean start
+        let temp_dir = tempfile::tempdir().unwrap();
         
-        let store = CertStore::new(&temp_dir);
+        let store = CertStore::new(temp_dir.path());
         store.init().await.expect("Init failed");
         
         let cert = Certificate {
@@ -261,13 +270,23 @@ mod tests {
         store.store(&cert).await.expect("Store failed");
         
         // Verify Persistence
-        let store2 = CertStore::new(&temp_dir);
+        let store2 = CertStore::new(temp_dir.path());
         store2.init().await.expect("Re-init failed");
         
         assert!(store2.get("a.com").await.is_some());
         assert!(store2.get("b.com").await.is_some());
-        
-        // Cleanup
-        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let certificate_path = temp_dir.path().join("a_com.json");
+            let mode = std::fs::metadata(certificate_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 }

@@ -34,14 +34,10 @@ bytes.workspace = true
 # Serialization
 serde_json = "1"
 
-# Async utilities
-futures = "0.3.31"
-
 # File system
 dirs.workspace = true
 parking_lot = "0.12"
 
 # Testing
 tempfile = "3"
-
 

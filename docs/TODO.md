@@ -94,13 +94,18 @@
 
 - [ ] **Access log 真正由配置驅動** — text/JSON、stdout/stderr/file、rotation、
   request ID、verified client IP、route/upstream、tries、TTFB/duration、status/bytes
-  完整；Authorization、Cookie、API key 與其他 secret 預設 redaction。
+  完整；Authorization、Cookie、API key 與其他 secret 預設 redaction。file output
+  支援依大小／時間 rotation、retention、壓縮及 access/error 分流；非同步寫入必須
+  有 bounded queue、明確 backpressure/drop 策略與 dropped-log metric。
 - [ ] **Metrics 與健康端點完整** — `/live`、`/ready`、config version、route/status、
   upstream latency/error、retry、circuit/queue、pool、TLS 與 H3 指標可用；所有
-  label 有 cardinality 上限。
+  label 有 cardinality 上限。systemd service 使用 `Type=notify`，只在 listener、
+  初始配置與必要依賴真正可用後送出 `READY=1`，並支援 watchdog。
 - [ ] **Reload／shutdown 可操作** — 配置更新原子套用，錯誤配置保留
   last-known-good；SIGHUP、SIGTERM、systemd restart 與 upstream drain 有真 binary
-  測試。v0.2 可明示 listener topology 變更需要 restart，不假裝已經 zero-downtime。
+  測試。手動憑證目錄的新增／更新／刪除需原子刷新 H1/H2/H3 certificate table，
+  畸形或半寫入檔案保留 last-known-good 並輸出可操作診斷。v0.2 可明示 listener
+  topology 變更需要 restart，不假裝已經 zero-downtime。
 
 ### R5：發布閘門
 
@@ -113,9 +118,10 @@
 - [ ] **效能沒有不可解釋回退** — 同一 VPS／同一 harness 的 static plain/gzip、
   reverse proxy 與 20MB streaming 對比 2026-07-25 baseline；吞吐或 p99 回退超過
   10% 必須修復或在 release notes 以數據解釋，streaming RSS 必須維持 bounded。
-- [ ] **發布產物可驗證** — Linux x86_64/aarch64、macOS x86_64/arm64 binary，
-  GHCR image、SHA-256 checksums、SBOM 與 provenance/signature 自動產生；每個 binary
-  的 `pingclair --version` 必須等於 tag。
+- [ ] **發布產物可驗證** — Linux glibc x86_64/aarch64、macOS x86_64/arm64 binary，
+  GHCR image、SHA-256 checksums、SBOM 與 provenance/signature 自動產生；x86_64
+  通用產物不得依賴建置機的 native CPU features，每個 binary 都需在乾淨 runner
+  啟動 smoke，且 `pingclair --version` 必須等於 tag。
 - [ ] **安裝與升級 smoke 通過** — 全新安裝、`0.1.7 → 0.2.0` 升級、systemd
   start/reload/stop、uninstall、Docker 啟動及最小 Pingclairfile 都在乾淨環境驗證。
 - [ ] **發布文件完成** — `CHANGELOG.md`、三語 README、所有 examples、配置參考、
@@ -231,6 +237,13 @@
   forwarding 共用 verified client IP，H1/H2 另已接入 access control／access
   log。單元、DSL 與兩項真 binary 整合測試通過；H3 access-control middleware、
   RFC 7239 `Forwarded`、PROXY protocol v1/v2 與 Linux/VPS 驗證仍待完成。
+- [x] **TLS／ACME 私密狀態強化（本機，2026-07-26）** — HTTP-01 challenge
+  deploy 改為 async durable contract，token 完成原子落盤並可由 handler 讀取後才
+  通知 ACME ready；失敗會回滾，polling 失敗也會 cleanup。憑證續期改讀 CA
+  簽發 leaf 的真實 X.509 `notAfter`，account、certificate/private key 與 challenge
+  snapshot 統一採同目錄 temporary file＋fsync＋atomic rename，Unix 從建立起即為
+  `0600`。TLS crate 20 項測試及 clippy `-D warnings` 通過；尚待 Let's Encrypt
+  staging 與 Linux/VPS 故障注入驗證。
 - [x] **Admin API 認證**（2026-07-25）— Bearer key 已接入；未配置 key 時僅允許
   loopback。本機 auth 單元測試通過，尚未以目前 commit 做遠端拒絕／放行測試。
 - [x] **Basic Auth 執行時校驗**（2026-07-25）— 正確憑據放行，缺少／錯誤憑據
@@ -336,9 +349,10 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
 ### P0：測試可靠性
 
 - [ ] **Workspace lint baseline** — `cargo fmt --all --check` 目前仍有大量歷史格式差異；
-  `cargo clippy --workspace --all-targets -- -D warnings` 首先卡在
-  `pingclair-tls/src/cert_store.rs` 與 `manager.rs` 的 `collapsible_if`。需以獨立、
-  可審查的格式／lint commit 清乾淨並加入 CI，不能把 R5 的品質閘門寫成假綠。
+  `pingclair-tls` 已可通過 clippy `-D warnings`，workspace 下一批 blocker 位於
+  `pingclair-core/src/server/router.rs` 與 `handlers.rs` 的 nested-if、manual-strip、
+  argument count 與 question-mark lint。需以獨立、可審查的格式／lint commit
+  清乾淨並加入 CI，不能把 R5 的品質閘門寫成假綠。
 - [ ] **乾淨遠端驗證工作流** — 不可再直接使用髒的 `/root/pingclair`。
   補一個以指定 commit 建立暫存 clone/worktree、測試、收集結果、清理程序的腳本。
 - [ ] **協議與解析安全回歸集** — 對 H1/H2/H3 建立 URI／header 正規化、
@@ -373,8 +387,9 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
   distributed backend，避免多 instance 各算各的。
 - [ ] **健康檢查能力補齊** — 在 Host 之外加入 method、headers、request body、
   預期 status class、response body regex、follow redirect、不同 health port、
-  positive／negative threshold、TLS probe 與 slow-start recovery；限制讀取 body
-  大小，避免 health check 自己成為資源風險。
+  positive／negative threshold、TLS probe、標準 gRPC Health Checking Protocol
+  與 slow-start recovery；限制讀取 body 大小，為 discovery 與 probe 加 jitter/
+  backoff，避免 health check 自己成為資源或同步尖峰風險。
 - [ ] **Client／upstream 資源時限** — header read、request body、idle、整體 request、
   upstream connect／first-byte／between-reads timeout，以及 header count／bytes、
   connection／bandwidth 限制；SSE/WebSocket 需可另外配置長連線策略。
@@ -389,20 +404,27 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
 
 - [ ] **`proxy_cache`** — 需定義 host＋path＋vary cache key、ETag／Cache-Control
   語意、negative cache、cache lock／single-flight、stale-while-revalidate、
-  stale-if-error、background update、range 與 PURGE；memory/disk tier 都要有硬上限。
+  stale-if-error、background update、range 與 PURGE；Authorization／Cookie 預設
+  bypass，SSE／upgrade／不可安全快取的 streaming response 必須排除。memory/disk
+  tier 都要有硬上限，並提供 hit/miss/stale/bypass/eviction 指標及受權限保護的
+  inspect／purge API。
 - [ ] **Response interception pipeline** — 依 upstream status／header 執行
   replace status、copy／drop headers、redirect、fallback handler 或自訂 error body；
   將現有 `error_page` 擴成 Caddy `handle_response`／nginx
   `proxy_intercept_errors` 等級，仍須保持串流。
 - [ ] **動態 upstream 與服務發現** — A/AAAA/SRV 定期重解析、TTL／jitter、
-  resolver override、last-known-good、靜態 fallback；再接 Docker、Kubernetes
-  EndpointSlice／Gateway API。更新 backend pool 不得重建全部 listener。
+  resolver override、last-known-good、靜態 fallback；再接 Consul health service、
+  Docker、Kubernetes EndpointSlice／Gateway API。provider 請求需有 TLS 驗證、
+  token rotation、timeout/backoff 與 stale snapshot，更新 backend pool 不得重建
+  全部 listener。
 - [ ] **Reload-free backend topology** — 參考 HAProxy 3.4 dynamic backends，
   Admin API 可新增／下線／drain upstream，顯示健康、連線、權重與最後錯誤；
   配置 reload 與 runtime override 的優先權必須明確。
 - [ ] **進階 LB／session persistence** — header／cookie／query consistent hash、
   sticky cookie、EWMA／least-latency、P2C、slow start、outlier ejection、zone-aware
-  與 backend utilization；保留目前 weight／backup 語意。
+  與 backend utilization；sticky cookie 必須簽章、可 rotation，具 Secure/
+  HttpOnly/SameSite/TTL 設定，backend drain 或消失時可安全重映射。保留目前
+  weight／backup 語意。
 - [ ] **Traffic shadow／mirror** — 非阻塞複製請求到 shadow backend，response 不回客戶；
   body replay 必須有大小上限、採樣率、敏感 header 遮罩與獨立 timeout。
 - [ ] **流量拆分** — 金絲雀／灰度比例路由，支援 header／cookie audience、
@@ -413,7 +435,8 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
 - [ ] **自訂 access log 格式** — `LogConfig` 尚未真正驅動輸出；需補
   request ID、已驗證 client IP、upstream 位址／重試次數／連線／TTFB／回應耗時、
   status、bytes、cache／circuit 狀態；Authorization、Cookie、API key 與 AI prompt
-  預設遮罩，並支援採樣與 log rotation。
+  預設遮罩，並支援採樣、access/error 分流、依大小／時間 rotation、retention、
+  壓縮及 bounded async writer；磁碟寫滿或 writer 落後不得拖死 request hot path。
 - [ ] **Prometheus 指標擴充** — 上游連線／回應時間、route/status、TLS handshake、
   retry、circuit、queue、cache、H3 connections；定義 label cardinality 預算，
   禁止把原始 path、user ID 或模型 request ID 直接當無界 label。
@@ -421,10 +444,13 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
   route/upstream spans、重試事件與可配置採樣；不得把敏感 body 當 span attribute。
 - [ ] **運行診斷與 readiness** — `/live`、`/ready`、配置版本、upstream 狀態、
   connection pool／queue／circuit 統計、有限期 debug trace 與 profile；Admin API
-  輸出需有權限分級。
+  輸出需有權限分級。systemd `sd_notify`／watchdog、容器 healthcheck 與 readiness
+  probe 必須共用同一套狀態判定，避免程序存活卻尚未可接流量。
 - [ ] **外掛系統** — loader 仍是 stub；先寫生命週期、掛載、配置雜湊與熱更新 RFC。
 - [ ] **更多認證方式** — JWT/JWKS、OIDC、API key、forward auth、client mTLS、
-  RBAC 與 CSRF；外掛系統完成後優先以外掛實作。
+  RBAC 與 CSRF；token 預設只接受 Authorization/header/cookie，不鼓勵放 query
+  string，所有驗證 cache 都需 bounded 並依 expiry/revocation 失效。外掛系統完成後
+  優先以外掛實作。
 - [ ] **External auth／policy／processing hooks** — HTTP/gRPC ext-auth 與 bounded
   ext-process 介面，供 OPA、WAF、企業 DLP 與自訂轉換使用；定義 fail-open/closed、
   timeout、body 上限、circuit breaker 與敏感資料規則，避免每種治理都硬寫進核心。
@@ -509,7 +535,9 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
   internal CA 與 cluster-wide certificate storage/locking；不得破壞既有
   BoringSSL／rustls 分工。
 - [ ] **ACME `from_credentials` staging 實測**。
-- [ ] **musl 靜態二進位**。
+- [ ] **Linux 發行相容矩陣** — x86_64/aarch64 的 musl 靜態二進位；如需提供
+  CPU optimized variant，必須與不依賴 AVX2/新指令集的通用相容版分開命名，
+  並在乾淨、較舊 CPU baseline runner 做啟動與 TLS/H1 smoke。
 - [ ] **v0.2 R5：macOS x86_64／arm64 release artifact**。
 - [ ] **v0.2 R5：官方 Docker image 發佈** — tag 時至少推 GHCR；Docker Hub 可延後。
 - [ ] **免 root 安裝路徑** — `/usr/local/bin` 或 `~/.local/bin`，不依賴 systemd。
