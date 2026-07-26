@@ -374,6 +374,27 @@ async fn write_http_chunk(
     stream.flush().await
 }
 
+/// 🧭 Builds a minimal real-proxy fixture for protocol behavior tests.
+fn protocol_proxy_config(upstream_address: SocketAddr) -> String {
+    serde_json::json!({
+        "global": { "http3": false },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "routes": [{
+                "path": "/*",
+                "handler": {
+                    "type": "reverse_proxy",
+                    "upstreams": [format!("http://{upstream_address}")],
+                    "load_balance": { "strategy": "round_robin" },
+                    "headers_up": {},
+                    "headers_down": {}
+                }
+            }]
+        }]
+    })
+    .to_string()
+}
+
 #[tokio::test]
 async fn test_drop_reaps_server_and_releases_listener() {
     let config = r#"{
@@ -1395,6 +1416,281 @@ async fn test_sse_client_disconnect_cancels_the_upstream_exchange() {
     assert!(
         cancelled.is_ok(),
         "the upstream exchange survived the downstream disconnect"
+    );
+    upstream_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_expect_continue_round_trips_before_the_request_body() {
+    use tokio::io::AsyncWriteExt;
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let headers = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+        assert!(
+            String::from_utf8_lossy(&headers)
+                .to_ascii_lowercase()
+                .contains("\r\nexpect: 100-continue\r\n")
+        );
+        stream
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .await
+            .unwrap();
+        let body = read_until_marker(&mut stream, b"hello world", Duration::from_secs(2)).await;
+        request_tx.send(body).unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+    });
+
+    let mut server = TestServer::new(&protocol_proxy_config(upstream_address));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let mut client = tokio::net::TcpStream::connect(server.address(0))
+        .await
+        .unwrap();
+    client
+        .write_all(
+            format!(
+                "POST /upload HTTP/1.1\r\nHost: {}\r\nContent-Length: 11\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+                server.address(0)
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let interim = read_until_marker(&mut client, b"\r\n\r\n", Duration::from_secs(2)).await;
+    assert!(
+        String::from_utf8_lossy(&interim).starts_with("HTTP/1.1 100"),
+        "unexpected interim response: {}",
+        String::from_utf8_lossy(&interim)
+    );
+    client.write_all(b"hello world").await.unwrap();
+    let final_response =
+        read_until_marker(&mut client, b"\r\n\r\nok", Duration::from_secs(2)).await;
+    assert!(
+        String::from_utf8_lossy(&final_response).contains("HTTP/1.1 200"),
+        "unexpected final response: {}",
+        String::from_utf8_lossy(&final_response)
+    );
+    assert!(
+        request_rx
+            .await
+            .unwrap()
+            .windows(b"hello world".len())
+            .any(|window| window == b"hello world")
+    );
+    upstream_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_early_hints_reach_the_client_before_the_final_response() {
+    use tokio::io::AsyncWriteExt;
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let (hints_written_tx, hints_written_rx) = tokio::sync::oneshot::channel();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let _ = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+        stream
+            .write_all(
+                b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload; as=style\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        hints_written_tx.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+    });
+
+    let mut server = TestServer::new(&protocol_proxy_config(upstream_address));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let mut client = tokio::net::TcpStream::connect(server.address(0))
+        .await
+        .unwrap();
+    client
+        .write_all(
+            format!(
+                "GET /hints HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                server.address(0)
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    hints_written_rx.await.unwrap();
+    let hints = read_until_marker(&mut client, b"\r\n\r\n", Duration::from_millis(500)).await;
+    let hints_text = String::from_utf8_lossy(&hints);
+    assert!(
+        hints_text.starts_with("HTTP/1.1 103"),
+        "unexpected informational response: {hints_text}"
+    );
+    assert!(
+        hints_text
+            .to_ascii_lowercase()
+            .contains("link: </style.css>")
+    );
+    assert!(!hints_text.contains("HTTP/1.1 200"));
+
+    let final_response =
+        read_until_marker(&mut client, b"\r\n\r\nok", Duration::from_secs(2)).await;
+    assert!(String::from_utf8_lossy(&final_response).contains("HTTP/1.1 200"));
+    upstream_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_declared_request_trailers_fail_clearly_without_an_upstream_exchange() {
+    use tokio::io::AsyncWriteExt;
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let mut server = TestServer::new(&protocol_proxy_config(upstream_address));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let mut client = tokio::net::TcpStream::connect(server.address(0))
+        .await
+        .unwrap();
+    client
+        .write_all(
+            format!(
+                "POST /upload HTTP/1.1\r\nHost: {}\r\nTransfer-Encoding: chunked\r\nTrailer: X-Checksum\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n",
+                server.address(0)
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let response =
+        read_until_marker(&mut client, b"501 Not Implemented", Duration::from_secs(2)).await;
+    assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 501"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), upstream.accept())
+            .await
+            .is_err(),
+        "request trailers unexpectedly reached an upstream connection"
+    );
+}
+
+#[tokio::test]
+async fn test_upstream_response_trailers_fail_before_response_commit() {
+    use tokio::io::AsyncWriteExt;
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let _ = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+        let _ = stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Checksum\r\nConnection: close\r\n\r\n2\r\nok\r\n0\r\nX-Checksum: abc\r\n\r\n",
+            )
+            .await;
+    });
+
+    let mut server = TestServer::new(&protocol_proxy_config(upstream_address));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let response = no_proxy_client()
+        .get(server.url(0, "/trailers"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 502);
+    assert_eq!(response.text().await.unwrap(), "502 Bad Gateway");
+    upstream_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_h2c_prior_knowledge_reaches_the_real_proxy_path() {
+    use tokio::io::AsyncWriteExt;
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let request = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+        assert!(String::from_utf8_lossy(&request).starts_with("GET /h2c HTTP/1.1\r\n"));
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nh2c-ok")
+            .await
+            .unwrap();
+    });
+
+    let mut server = TestServer::new(&protocol_proxy_config(upstream_address));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    let response = client.get(server.url(0, "/h2c")).send().await.unwrap();
+
+    assert_eq!(response.version(), reqwest::Version::HTTP_2);
+    assert_eq!(response.text().await.unwrap(), "h2c-ok");
+    upstream_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_websocket_upgrade_tunnels_bytes_in_both_directions() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let request = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+        let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+        assert!(request.contains("\r\nconnection: upgrade\r\n"));
+        assert!(request.contains("\r\nupgrade: websocket\r\n"));
+        stream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let mut client_payload = [0u8; 11];
+        stream.read_exact(&mut client_payload).await.unwrap();
+        assert_eq!(&client_payload, b"client-ping");
+        stream.write_all(b"upstream-pong").await.unwrap();
+    });
+
+    let mut server = TestServer::new(&protocol_proxy_config(upstream_address));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let mut client = tokio::net::TcpStream::connect(server.address(0))
+        .await
+        .unwrap();
+    client
+        .write_all(
+            format!(
+                "GET /socket HTTP/1.1\r\nHost: {}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+                server.address(0)
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let response = read_until_marker(&mut client, b"\r\n\r\n", Duration::from_secs(2)).await;
+    assert!(
+        String::from_utf8_lossy(&response).starts_with("HTTP/1.1 101"),
+        "unexpected upgrade response: {}",
+        String::from_utf8_lossy(&response)
+    );
+    client.write_all(b"client-ping").await.unwrap();
+    let downstream = read_until_marker(&mut client, b"upstream-pong", Duration::from_secs(2)).await;
+    assert!(
+        downstream
+            .windows(b"upstream-pong".len())
+            .any(|window| window == b"upstream-pong")
     );
     upstream_task.await.unwrap();
 }

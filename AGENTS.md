@@ -67,8 +67,8 @@ also run `cargo build --workspace`.
 
 `scripts/test-h3-cancellation-local.sh` requires a curl build with HTTP/3
 support. It uses dynamic TCP/UDP ports and a temporary certificate to verify
-real H3 SSE delivery, downstream cancellation, upstream teardown, and listener
-survival without touching the remote VPS.
+real H3 SSE delivery, downstream cancellation, upstream teardown, explicit
+trailer rejection, and listener survival without touching the remote VPS.
 
 `pingclair/tests/integration.rs` launches the real compiled binary and makes
 real localhost HTTP requests. It is the main end-to-end gate, not a mocked

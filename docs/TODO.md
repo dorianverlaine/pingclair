@@ -82,7 +82,7 @@
 
 - [ ] **H3 middleware parity** — 🧪 Request ID、access control、rewrite、CORS、
   `error_page`、redirect、header mutation、Basic Auth 與必要 pipeline 語意已接入
-  transport-neutral policy；`pingclair-proxy` 77 項單元測試、16 項真 binary
+  transport-neutral policy；`pingclair-proxy` 78 項單元測試、22 項真 binary
   integration 與本機真實 HTTP/3 smoke 通過。仍須完成 Linux release／公網 QUIC
   驗證，通過前不得勾選。
 - [ ] **協議矩陣通過** — WebSocket upgrade、gRPC/h2c＋trailers、SSE、
@@ -90,8 +90,11 @@
   在支援的 H1/H2/H3 組合有明確測試；不支援的組合必須 fail clearly 並寫入文件。
   🧪 H3 downstream reset／連線關閉已接入 handler cancellation；H3 request trailers
   在 response commit 前回 `501`，commit 後以 request-cancelled reset 結束，並有
-  stream-state 單元測試。本機真 H3 SSE／client disconnect 已通過；trailers 與
-  其餘協議組合仍待真 client 測試。
+  stream-state 單元測試。本機真 H3 SSE／client disconnect、宣告 request
+  trailers 的 `501` 與 upstream response trailers 的 `502` 已通過；H1 WebSocket
+  雙向 tunnel 與 prior-knowledge h2c 亦通過真 binary 測試。H3 CONNECT／extended
+  CONNECT 明確回 `501`；仍缺未宣告 trailing HEADERS 的真 client、H2/gRPC
+  trailers 與其餘協議組合。
 - [ ] **H3 Linux release smoke 通過** — SNI、Alt-Svc、靜態/代理大 body、
   Content-Length/chunked POST、413、keepalive、middleware parity 與 0-RTT
   非冪等拒絕策略均使用 quiche client 驗證。
@@ -176,9 +179,15 @@
 - 新增 `scripts/test-h3-cancellation-local.sh`：以動態 TCP／UDP 埠、暫存自簽
   憑證、真 Pingclair binary 與 Homebrew curl `--http3-only --no-buffer` 驗證
   SSE 首個 event 增量抵達、client timeout 後 upstream 在 3 秒內關閉，以及
-  listener 取消單一 stream 後仍可服務；腳本通過且未殘留程序。
+  listener 取消單一 stream 後仍可服務，以及 request／response trailer 的
+  fail-closed 狀態；腳本重跑通過且未殘留程序。
 - 真 binary integration 新增 H1 SSE 增量傳輸與 downstream disconnect 取消兩項
-  測試，兩項單獨重跑通過；整合測試總數由 14 增至 16。
+  測試，以及 `Expect: 100-continue`、103 Early Hints、request／response trailer
+  fail-closed、prior-knowledge h2c 與 WebSocket 雙向 tunnel 六項 protocol tests；
+  整合測試總數由 14 增至 22 且全數通過。
+- 明文 proxy listener 已透過 Pingora 原生 `HttpServerOptions` 啟用 h2c preface
+  辨識；TLS listener 保持 ALPN 協商。H3 CONNECT／extended CONNECT 在目前的
+  request-response transport 上會明確回 `501`，避免誤當一般代理請求。
 - H3 route planner 直接借用已發佈的 immutable handler tree，不再於每個請求
   clone 整棵 pipeline／proxy config；response header append policy 亦保留跨多個
   middleware 的所有值。
@@ -194,13 +203,12 @@
   drain 與 response FIN 都完成，避免 client 收完 body 後永久等待。
 - 本輪 local gate：`cargo fmt --all -- --check`、workspace clippy
   `--all-targets -D warnings`、`cargo build --locked --workspace`、
-  `cargo test --locked --workspace`、77 項 proxy 單元測試、16 項真 binary
+  `cargo test --locked --workspace`、78 項 proxy 單元測試、22 項真 binary
   integration 與本機真 H3 cancellation smoke，已於提交前最後一次完整重跑通過。
-- 今日下一步只做本機程式碼／測試：整理 H1/H2/H3 protocol matrix，優先測
-  `Expect: 100-continue`、informational response 與 trailers 的實際 Pingora 行為。
-  下次才以精確 commit 做乾淨 Linux release build，啟動 80 TCP／443 TCP+UDP
-  fixture，從本機公網重跑 HTTP/3 矩陣並保存結果；通過後才把 R3 parity 移入
-  完成區。
+- 今日下一步只做本機程式碼／測試：補 H2/gRPC trailers、上游協議選擇與未宣告
+  H3 trailing HEADERS 的 protocol matrix。下次才以精確 commit 做乾淨 Linux
+  release build，啟動 80 TCP／443 TCP+UDP fixture，從本機公網重跑 HTTP/3
+  矩陣並保存結果；通過後才把 R3 parity 移入完成區。
 
 ---
 
@@ -398,7 +406,8 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
 ### 其他已實作項目
 
 - [x] **SSE／流式反代 gzip gate**（2026-07-25）— `flush_interval: -1` 與
-  `text/event-stream` 會跳過 gzip；目前只有決策邏輯單元測試。
+  `text/event-stream` 會跳過 gzip；H1 真 binary 已驗證逐 event 增量抵達與
+  client disconnect cancellation，本機真 HTTP/3 亦通過相同情境。
 - [x] **Request ID（H1/H2；H3 待遠端驗證）**（2026-07-26）— 消毒後接受
   客戶端 ID，否則生成；上游與下游貫穿，H1/H2 另有 access log。H3 已在
   本機真實 HTTP/3 驗證相同生成／消毒 policy 與 upstream/downstream
@@ -434,8 +443,11 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
   trailers、SSE 斷線取消、HTTP trailers、`Expect: 100-continue`、103 Early
   Hints 與大 body backpressure；先用測試確認 Pingora 預設行為，再決定 DSL。
   🧪 H1 真 binary SSE 增量傳輸／斷線取消，以及本機真 QUIC SSE／斷線取消已通過；
-  H3 request-trailer 明確拒絕已有 state-level tests，尚缺真 trailer client 與其餘
-  跨協議端到端覆蓋。
+  H1 `Expect: 100-continue`／103 Early Hints 已通過；H1/H3 宣告 request trailers
+  回 `501`、upstream response trailers 回 `502` 的 fail-closed 真 binary 測試亦
+  通過。prior-knowledge h2c 與 H1 WebSocket 雙向 tunnel 亦通過；H3 CONNECT／
+  extended CONNECT 明確回 `501`。尚缺未宣告 H3 trailing HEADERS、H2/gRPC
+  trailers 與更多協議組合。
 
 ### P1：常用功能與協議缺口
 
@@ -471,8 +483,6 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
   Request ID、CORS、存取控制、rewrite、header policy、Basic Auth、
   `error_page` 與 H1/H2 pipeline/handle_path 語意；proxy 單元測試與本機真實
   HTTP/3 矩陣通過。Linux release 與公網 QUIC 完整矩陣未通過前仍屬待驗證。
-- [ ] **SSE 真 binary 端到端測試** — 慢速 upstream 逐 chunk 發送，斷言客戶端
-  增量收到資料而非等待完整 body。
 
 ### P2：進階功能與可觀測性
 

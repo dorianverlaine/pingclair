@@ -2051,6 +2051,14 @@ impl ProxyHttp for PingclairProxy {
                 return Ok(true);
             }
 
+            // 🚫 Rejects declared request trailers because Pingora currently discards H1 trailers.
+            if session.req_header().headers.contains_key("trailer") {
+                tracing::debug!("🚫 Rejecting request trailers before handler dispatch");
+                session.as_mut().set_keepalive(None);
+                self.serve_error_page(session, ctx, 501).await?;
+                return Ok(true);
+            }
+
             // Check rate limit
             if let Some(state) = &ctx.state
                 && let Some(limiter) = state.rate_limiters.get(index).and_then(|l| l.as_ref())
@@ -2235,6 +2243,28 @@ impl ProxyHttp for PingclairProxy {
             upstream_request.insert_header("X-Request-Id", &ctx.request_id)?;
         }
 
+        Ok(())
+    }
+
+    /// 🚫 Rejects upstream trailers before a response can lose integrity metadata.
+    async fn upstream_response_filter(
+        &self,
+        _session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        _ctx: &mut Self::CTX,
+    ) -> pingora_core::Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if upstream_response.headers.contains_key("trailer") {
+            tracing::warn!(
+                "🚫 Rejecting an upstream response that requires unsupported trailer forwarding"
+            );
+            return pingora_core::Error::e_explain(
+                pingora_core::ErrorType::HTTPStatus(502),
+                "Upstream response trailers are unsupported",
+            );
+        }
         Ok(())
     }
 

@@ -26,10 +26,10 @@
 
 ## ✨ 核心特性
 
-*   🚀 **以 Pingora 為核心** — 站在巨人的肩膀上，倚靠 Cloudflare 歷經實戰驗證的基礎設施，提供企業級的穩定度與吞吐量。
+*   🚀 **以 Pingora 為核心** — 站在巨人的肩膀上，倚靠 Cloudflare 歷經實戰驗證的基礎設施，提供企業級的穩定度與吞吐量。明文監聽器支援 HTTP/1.1 與 prior-knowledge h2c；TLS 監聽器則透過 ALPN 協商 HTTP/2。
 *   🔒 **記憶體安全** — 受惠於 Rust 的語言特性，徹底杜絕緩衝區溢位這類常見的記憶體安全漏洞。
 *   📝 **相容 Caddyfile 的設定** — 極簡的設定 DSL，支援**自動 HTTPS**、**多重監聽器**與**具名匹配器**，相容主流 Caddyfile 語法。
-*   ⚡ **原生支援 HTTP/3 (QUIC)** — 基於 Cloudflare 的 [quiche](https://github.com/cloudflare/quiche)（支撐 Cloudflare 邊緣網路的生產級 QUIC 協定棧）打造，在不穩定的網路環境下提供更低的延遲與更好的連線遷移能力。明確設定 `tls` 後，任何監聽埠都可提供 HTTPS 與 H3；443 與 8443 仍保留自動辨識。H3 目前不轉送 request trailers：回應尚未送出時會明確回傳 `501`，已送出時則重設 stream，避免默默丟棄 trailer 中繼資料。
+*   ⚡ **原生支援 HTTP/3 (QUIC)** — 基於 Cloudflare 的 [quiche](https://github.com/cloudflare/quiche)（支撐 Cloudflare 邊緣網路的生產級 QUIC 協定棧）打造，在不穩定的網路環境下提供更低的延遲與更好的連線遷移能力。明確設定 `tls` 後，任何監聽埠都可提供 HTTPS 與 H3；443 與 8443 仍保留自動辨識。目前所有下游協議都不轉送已宣告的 request trailers：回應尚未送出時會明確回傳 `501`，H3 已送出時則重設 stream。上游回應若宣告 trailers，會在完整的端到端轉送完成前明確回傳 `502`。H3 CONNECT 與 extended CONNECT 在 tunnel 支援完成前會回傳 `501`。
 *   🔄 **智慧負載平衡** — 內建多種演算法（輪詢、最少連線等），支援健康檢查與故障自動轉移。
 *   🔐 **全自動 HTTPS** — 整合 ACME 協定（如 Let's Encrypt），自動申請與續期 SSL/TLS 憑證，零設定即可啟用加密傳輸。
 *   📁 **高效能靜態檔案服務** — 支援 Gzip/Brotli 壓縮、Range 請求與高效率的檔案傳輸。
