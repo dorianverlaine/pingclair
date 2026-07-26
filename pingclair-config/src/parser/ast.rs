@@ -129,6 +129,9 @@ pub struct ServerBlock {
     /// Compression algorithms
     pub compress: Vec<CompressionAlgo>,
 
+    /// 🗜️ MIME patterns eligible for reverse-proxy gzip compression.
+    pub gzip_types: Vec<String>,
+
     /// Log configuration
     pub log: Option<Node<LogBlock>>,
 
@@ -599,6 +602,7 @@ impl ServerBlock {
             listens: Vec::new(),
             bind: None,
             compress: Vec::new(),
+            gzip_types: Vec::new(),
             log: None,
             tls: None,
             routes: None,

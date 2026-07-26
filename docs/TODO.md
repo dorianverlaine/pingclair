@@ -230,6 +230,10 @@
   hash 自動設定 `hashed: true`；JSON 亦可明確設定。bcrypt 工作移到 blocking
   pool，cost 上限 14，畸形／過高成本 hash 一律拒絕；正確、錯誤、畸形、
   成本上限、DSL 與真 binary 測試均在本機通過，尚待 VPS 驗證。
+- [x] **反代 `gzip_types`**（2026-07-26）— JSON 與 Pingclair DSL 可設定精確
+  MIME、`text/*`、`application/*+json` 與 `*/*`；未設定時保留相容的預設清單，
+  自訂 `application/wasm` 已以真 binary＋臨時 upstream 驗證壓縮與解壓內容，
+  尚待 Linux／VPS 驗證。
 - [x] **ACME 帳戶持久化**（2026-07-25）— staging／production 分開，0600 落盤；
   本機序列化與還原測試通過，尚待 Let's Encrypt staging 真實還原。
 
@@ -371,7 +375,6 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
   Request ID 與 H1/H2 pipeline 尚未完整套用。
 - [ ] **SSE 真 binary 端到端測試** — 慢速 upstream 逐 chunk 發送，斷言客戶端
   增量收到資料而非等待完整 body。
-- [ ] **`gzip_types` 可設定** — 目前 MIME 清單硬編碼。
 
 ### P2：進階功能與可觀測性
 

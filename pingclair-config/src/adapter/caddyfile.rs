@@ -232,6 +232,27 @@ fn expand_servers_block(directives: Vec<Directive>) -> Vec<Directive> {
 
 // MARK: - Server Block
 
+/// 🧾 Validates exact, subtype-wildcard, and structured-suffix MIME patterns.
+fn is_valid_mime_pattern(pattern: &str) -> bool {
+    let Some((media_type, subtype)) = pattern.split_once('/') else {
+        return false;
+    };
+    if media_type.is_empty() || subtype.is_empty() || subtype.contains('/') {
+        return false;
+    }
+    if media_type == "*" {
+        return subtype == "*";
+    }
+    if media_type.contains('*') {
+        return false;
+    }
+    match subtype.find('*') {
+        None => true,
+        Some(0) => subtype[1..].find('*').is_none(),
+        Some(_) => false,
+    }
+}
+
 fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
     let mut server = ServerBlock::new(d.name.clone());
 
@@ -304,6 +325,25 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                     if sub_d.args.is_empty() {
                         server.compress.push(CompressionAlgo::Gzip);
                     }
+                }
+                "gzip_types" => {
+                    if sub_d.args.is_empty() {
+                        return Err(AdapterError::InvalidArgument(
+                            "gzip_types".into(),
+                            "at least one MIME pattern is required".into(),
+                        ));
+                    }
+                    if let Some(pattern) = sub_d
+                        .args
+                        .iter()
+                        .find(|pattern| !is_valid_mime_pattern(pattern))
+                    {
+                        return Err(AdapterError::InvalidArgument(
+                            "gzip_types".into(),
+                            format!("invalid MIME pattern `{pattern}`"),
+                        ));
+                    }
+                    server.gzip_types = sub_d.args;
                 }
                 "log" => {
                     if let Some(log_block) = sub_d.block {

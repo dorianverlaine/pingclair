@@ -27,6 +27,8 @@ example.com {
 
     # Response compression for static files (gzip, brotli, zstd)
     encode gzip br zstd
+    # 🗜️ Reverse-proxy gzip uses these exact or wildcard MIME patterns.
+    gzip_types text/* application/json application/*+json application/x-ndjson
 
     # Response headers: set, append with +, remove with -
     header {

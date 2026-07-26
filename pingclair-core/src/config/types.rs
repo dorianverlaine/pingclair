@@ -86,6 +86,28 @@ pub enum AutoHttpsMode {
     DisableRedirects,
 }
 
+/// 🗜️ Default MIME patterns eligible for reverse-proxy gzip compression.
+pub const DEFAULT_GZIP_TYPES: &[&str] = &[
+    "text/*",
+    "application/json",
+    "application/*+json",
+    "application/x-ndjson",
+    "application/json-seq",
+    "application/xml",
+    "application/*+xml",
+    "application/javascript",
+    "application/x-javascript",
+    "image/svg+xml",
+];
+
+/// 🗜️ Builds the default reverse-proxy gzip MIME pattern list.
+pub fn default_gzip_types() -> Vec<String> {
+    DEFAULT_GZIP_TYPES
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect()
+}
+
 /// Server (virtual host) configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServerConfig {
@@ -115,6 +137,10 @@ pub struct ServerConfig {
     /// Security headers configuration
     #[serde(default)]
     pub security: SecurityConfig,
+
+    /// 🗜️ MIME patterns eligible for reverse-proxy gzip compression.
+    #[serde(default = "default_gzip_types")]
+    pub gzip_types: Vec<String>,
 
     /// Custom error pages: HTTP status code → file path served for that
     /// error (404/500/502/504, ...). Falls back to the built-in plain-text
@@ -754,9 +780,17 @@ mod tests {
             log: None,
             client_max_body_size: 1024 * 1024,
             security: Default::default(),
+            gzip_types: default_gzip_types(),
             error_pages: Default::default(),
         };
         assert_eq!(config.name, Some("example.com".to_string()));
+    }
+
+    #[test]
+    fn test_legacy_server_config_receives_default_gzip_types() {
+        let config: ServerConfig = serde_json::from_str(r#"{"name":"example.com"}"#).unwrap();
+        assert_eq!(config.gzip_types, default_gzip_types());
+        assert!(config.gzip_types.contains(&"text/*".to_string()));
     }
 
     #[test]

@@ -253,6 +253,50 @@ pub fn is_streaming_content_type(content_type: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 🗜️ Matches a response MIME type against configured gzip patterns.
+pub fn is_compressible_content_type(content_type: &str, configured_types: &[String]) -> bool {
+    let mime = content_type
+        .split(';')
+        .next()
+        .map(str::trim)
+        .unwrap_or("");
+    if mime.is_empty() {
+        return false;
+    }
+
+    if configured_types.is_empty() {
+        return pingclair_core::config::DEFAULT_GZIP_TYPES
+            .iter()
+            .any(|pattern| gzip_type_matches(mime, pattern));
+    }
+    configured_types
+        .iter()
+        .any(|pattern| gzip_type_matches(mime, pattern))
+}
+
+/// 🎯 Matches exact, subtype-wildcard, and structured-suffix MIME patterns.
+fn gzip_type_matches(mime: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern == "*/*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix("/*") {
+        return mime
+            .get(..prefix.len())
+            .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
+            && mime.as_bytes().get(prefix.len()) == Some(&b'/');
+    }
+    if let Some((prefix, suffix)) = pattern.split_once('*') {
+        return mime
+            .get(..prefix.len())
+            .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
+            && mime
+                .get(mime.len().saturating_sub(suffix.len())..)
+                .is_some_and(|value| value.eq_ignore_ascii_case(suffix));
+    }
+    mime.eq_ignore_ascii_case(pattern)
+}
+
 /// Mutable state for hot reloading
 #[derive(Clone)]
 pub struct ProxyState {
@@ -2221,12 +2265,12 @@ impl ProxyHttp for PingclairProxy {
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
-            let is_compressible = content_type.starts_with("text/")
-                || content_type.contains("json")
-                || content_type.contains("xml")
-                || content_type.contains("javascript")
-                || content_type.contains("css")
-                || content_type.contains("svg");
+            let gzip_types = ctx
+                .state
+                .as_ref()
+                .map(|state| state.config.gzip_types.as_slice())
+                .unwrap_or_default();
+            let is_compressible = is_compressible_content_type(content_type, gzip_types);
             let content_length = upstream_response
                 .headers
                 .get("content-length")
@@ -3077,6 +3121,55 @@ mod streaming_flush_tests {
         let gzip_gate_opens =
             ctx.compress_response && ctx.client_accepts_gzip && !ctx.streaming_response;
         assert!(gzip_gate_opens);
+    }
+}
+
+#[cfg(test)]
+mod gzip_type_tests {
+    use super::*;
+
+    #[test]
+    fn default_types_cover_text_json_xml_javascript_and_svg() {
+        assert!(is_compressible_content_type(
+            "text/html; charset=utf-8",
+            &[]
+        ));
+        assert!(is_compressible_content_type("application/json", &[]));
+        assert!(is_compressible_content_type(
+            "application/problem+json",
+            &[]
+        ));
+        assert!(is_compressible_content_type("application/rss+xml", &[]));
+        assert!(is_compressible_content_type(
+            "application/javascript",
+            &[]
+        ));
+        assert!(is_compressible_content_type("image/svg+xml", &[]));
+        assert!(!is_compressible_content_type("image/png", &[]));
+    }
+
+    #[test]
+    fn configured_types_replace_defaults_and_ignore_case() {
+        let configured = vec!["application/wasm".to_string(), "FONT/*".to_string()];
+        assert!(is_compressible_content_type(
+            "application/wasm",
+            &configured
+        ));
+        assert!(is_compressible_content_type(
+            "font/ttf; charset=binary",
+            &configured
+        ));
+        assert!(!is_compressible_content_type("text/plain", &configured));
+    }
+
+    #[test]
+    fn all_types_wildcard_matches_any_nonempty_mime() {
+        let configured = vec!["*/*".to_string()];
+        assert!(is_compressible_content_type(
+            "application/octet-stream",
+            &configured
+        ));
+        assert!(!is_compressible_content_type("", &configured));
     }
 }
 
