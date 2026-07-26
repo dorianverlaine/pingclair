@@ -332,6 +332,48 @@ fn no_proxy_client() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
+/// 🌊 Reads incrementally until the expected protocol marker arrives.
+async fn read_until_marker(
+    stream: &mut tokio::net::TcpStream,
+    marker: &[u8],
+    timeout: Duration,
+) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+
+    tokio::time::timeout(timeout, async {
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).await.expect("stream read failed");
+            assert!(read > 0, "stream closed before the expected marker");
+            received.extend_from_slice(&chunk[..read]);
+            if received
+                .windows(marker.len())
+                .any(|window| window == marker)
+            {
+                return received;
+            }
+        }
+    })
+    .await
+    .expect("timed out before the expected marker arrived")
+}
+
+/// 📤 Writes one HTTP/1.1 chunk without buffering the event stream.
+async fn write_http_chunk(
+    stream: &mut tokio::net::tcp::OwnedWriteHalf,
+    body: &[u8],
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    stream
+        .write_all(format!("{:X}\r\n", body.len()).as_bytes())
+        .await?;
+    stream.write_all(body).await?;
+    stream.write_all(b"\r\n").await?;
+    stream.flush().await
+}
+
 #[tokio::test]
 async fn test_drop_reaps_server_and_releases_listener() {
     let config = r#"{
@@ -1182,5 +1224,177 @@ async fn test_handle_path_and_outer_headers_reach_the_proxy_exchange() {
     let upstream_request = request_rx.await.unwrap().to_ascii_lowercase();
     assert!(upstream_request.starts_with("get /users?q=1 http/1.1\r\n"));
     assert!(upstream_request.contains("\r\nx-request-id: "));
+    upstream_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_sse_proxy_flushes_each_event_incrementally() {
+    use tokio::io::AsyncWriteExt;
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let (first_written_tx, first_written_rx) = tokio::sync::oneshot::channel();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let _ = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+        let (_, mut writer) = stream.into_split();
+        writer
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        write_http_chunk(&mut writer, b"data: first\n\n")
+            .await
+            .unwrap();
+        first_written_tx.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        write_http_chunk(&mut writer, b"data: second\n\n")
+            .await
+            .unwrap();
+        writer.write_all(b"0\r\n\r\n").await.unwrap();
+    });
+
+    let config = serde_json::json!({
+        "global": { "http3": false },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "routes": [{
+                "path": "/events",
+                "handler": {
+                    "type": "reverse_proxy",
+                    "upstreams": [format!("http://{upstream_address}")],
+                    "load_balance": { "strategy": "round_robin" },
+                    "headers_up": {},
+                    "headers_down": {},
+                    "flush_interval": -1
+                }
+            }]
+        }]
+    })
+    .to_string();
+
+    let mut server = TestServer::new(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let mut client = tokio::net::TcpStream::connect(server.address(0))
+        .await
+        .unwrap();
+    client.set_nodelay(true).unwrap();
+    client
+        .write_all(
+            format!(
+                "GET /events HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                server.address(0)
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    first_written_rx.await.unwrap();
+    let first =
+        read_until_marker(&mut client, b"data: first\n\n", Duration::from_millis(500)).await;
+    assert!(
+        !first
+            .windows(b"data: second\n\n".len())
+            .any(|window| window == b"data: second\n\n"),
+        "the second event arrived before its upstream delay"
+    );
+    let _ = read_until_marker(&mut client, b"data: second\n\n", Duration::from_secs(2)).await;
+    upstream_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_sse_client_disconnect_cancels_the_upstream_exchange() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let (first_written_tx, first_written_rx) = tokio::sync::oneshot::channel();
+    let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let _ = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+        let (mut reader, mut writer) = stream.into_split();
+        writer
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        write_http_chunk(&mut writer, b"data: first\n\n")
+            .await
+            .unwrap();
+        first_written_tx.send(()).unwrap();
+
+        let payload = vec![b'x'; 16 * 1024];
+        let mut probe = [0u8; 1];
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            tokio::select! {
+                read = reader.read(&mut probe) => {
+                    if !matches!(read, Ok(n) if n > 0) {
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    if write_http_chunk(&mut writer, &payload).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = cancelled_tx.send(());
+    });
+
+    let config = serde_json::json!({
+        "global": { "http3": false },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "routes": [{
+                "path": "/events",
+                "handler": {
+                    "type": "reverse_proxy",
+                    "upstreams": [format!("http://{upstream_address}")],
+                    "load_balance": { "strategy": "round_robin" },
+                    "headers_up": {},
+                    "headers_down": {},
+                    "flush_interval": -1
+                }
+            }]
+        }]
+    })
+    .to_string();
+
+    let mut server = TestServer::new(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let mut client = tokio::net::TcpStream::connect(server.address(0))
+        .await
+        .unwrap();
+    client.set_nodelay(true).unwrap();
+    client
+        .write_all(
+            format!(
+                "GET /events HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                server.address(0)
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    first_written_rx.await.unwrap();
+    let _ = read_until_marker(&mut client, b"data: first\n\n", Duration::from_secs(2)).await;
+    drop(client);
+
+    let cancelled = tokio::time::timeout(Duration::from_secs(3), cancelled_rx).await;
+    if cancelled.is_err() {
+        upstream_task.abort();
+        server.print_diagnostics();
+    }
+    assert!(
+        cancelled.is_ok(),
+        "the upstream exchange survived the downstream disconnect"
+    );
     upstream_task.await.unwrap();
 }

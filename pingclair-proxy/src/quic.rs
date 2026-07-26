@@ -23,6 +23,7 @@
 //!   semantics as the H1/H2 path.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +32,7 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use thiserror::Error;
 use tokio::net::UdpSocket;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 
 use pingclair_core::config::HandlerConfig;
 use pingclair_static::ServedResponse;
@@ -426,30 +427,26 @@ type ConnMap = HashMap<quiche::ConnectionId<'static>, ConnState>;
 /// Per-stream state owned by the event loop.
 #[derive(Default)]
 struct StreamState {
-    /// Response headers not yet written (e.g. stream was blocked).
+    /// 📤 Holds response headers until QUIC flow control accepts them.
     pending_headers: Option<(Vec<quiche::h3::Header>, bool)>,
     headers_sent: bool,
-    /// Response body bytes accepted from the handler but not yet by quiche.
+    /// 🌊 Holds bounded response bytes that quiche has not accepted yet.
     pending_body: VecDeque<u8>,
-    /// The handler signaled end-of-body.
+    /// 🏁 Records that the handler signaled the end of the response body.
     body_fin: bool,
-    /// FIN was successfully written to the QUIC stream.
+    /// 🏁 Records that the response FIN reached the QUIC stream.
     fin_sent: bool,
-    /// Channel feeding request-body chunks to the handler task. Dropped
-    /// once the request stream finished AND all buffered body bytes were
-    /// drained out of quiche, which ends the handler's receive loop.
+    /// 📥 Feeds bounded request-body chunks to the handler task.
     req_body_tx: Option<mpsc::Sender<Vec<u8>>>,
-    /// quiche reported `Event::Finished` for the request stream. Body bytes
-    /// may still be buffered inside quiche at this point, so the handler
-    /// channel is only closed after [`QuicServer::drain_request_body`] has
-    /// pumped them all out (otherwise a large POST would be truncated and
-    /// the upstream exchange would deadlock on Content-Length).
+    /// 🧹 Records that quiche reported the request stream as finished.
     req_stream_finished: bool,
-    /// Set when the handler's channel was full at the last drain attempt;
-    /// the drain is retried on later loop iterations (woken early by the
-    /// shared `Notify` once the handler frees capacity).
+    /// ⏳ Records that request-body draining is waiting for channel capacity.
     body_read_pending: bool,
-    /// Response terminated (reset or fully sent); ignore further messages.
+    /// 🛑 Cancels the handler when the client or transport abandons the stream.
+    cancel_tx: Option<watch::Sender<bool>>,
+    /// 🚫 Prevents a rejected request from accepting late handler responses.
+    handler_cancelled: bool,
+    /// 🧹 Marks a terminated stream so later response messages are ignored.
     dead: bool,
 }
 
@@ -458,6 +455,58 @@ struct ConnState {
     h3: Option<quiche::h3::Connection>,
     remote_addr: SocketAddr,
     streams: HashMap<u64, StreamState>,
+}
+
+impl Drop for ConnState {
+    fn drop(&mut self) {
+        // 🛑 Cancels every handler before a closed QUIC connection releases its stream state.
+        for stream in self.streams.values_mut() {
+            cancel_stream_handler(stream);
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TrailerRejection {
+    ResponseQueued,
+    ResetRequired,
+}
+
+/// 🛑 Signals structured cancellation without treating normal stream cleanup as an abort.
+fn cancel_stream_handler(stream: &mut StreamState) {
+    if let Some(cancel_tx) = stream.cancel_tx.as_ref() {
+        let _ = cancel_tx.send(true);
+    }
+    stream.req_body_tx = None;
+    stream.body_read_pending = false;
+}
+
+/// 🚫 Replaces an uncommitted handler response or requests a reset after commitment.
+fn reject_request_trailers(stream: &mut StreamState) -> TrailerRejection {
+    cancel_stream_handler(stream);
+    stream.handler_cancelled = true;
+    stream.req_stream_finished = true;
+
+    if stream.headers_sent {
+        stream.dead = true;
+        return TrailerRejection::ResetRequired;
+    }
+
+    let body = b"Request Trailers Not Supported";
+    stream.pending_headers = Some((
+        vec![
+            quiche::h3::Header::new(b":status", b"501"),
+            quiche::h3::Header::new(b"content-type", b"text/plain"),
+            quiche::h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
+            quiche::h3::Header::new(b"server", b"Pingclair"),
+        ],
+        false,
+    ));
+    stream.pending_body = body.iter().copied().collect();
+    stream.body_fin = true;
+    stream.fin_sent = false;
+    stream.dead = false;
+    TrailerRejection::ResponseQueued
 }
 
 // MARK: - Server
@@ -797,10 +846,7 @@ impl QuicServer {
                     Self::drain_request_body(cs, stream_id);
                 }
                 Ok((stream_id, quiche::h3::Event::Finished)) => {
-                    // Request stream ended. Body bytes may still be
-                    // buffered in quiche, so drain first; the handler's
-                    // body channel is closed by drain_request_body once
-                    // nothing is left to read.
+                    // 🧹 Drains buffered bytes before closing the handler's request channel.
                     if let Some(ss) = cs.streams.get_mut(&stream_id) {
                         ss.req_stream_finished = true;
                     }
@@ -808,7 +854,7 @@ impl QuicServer {
                 }
                 Ok((stream_id, quiche::h3::Event::Reset(_))) => {
                     if let Some(ss) = cs.streams.get_mut(&stream_id) {
-                        ss.req_body_tx = None;
+                        cancel_stream_handler(ss);
                         ss.dead = true;
                     }
                 }
@@ -834,14 +880,27 @@ impl QuicServer {
         resp_tx: &RespSender,
         body_notify: &Arc<Notify>,
     ) {
-        // Only client-initiated bidirectional streams carry requests.
+        // 🧭 Accepts requests only on client-initiated bidirectional streams.
         if !stream_id.is_multiple_of(4) {
             return;
         }
 
-        // A second HEADERS frame on a tracked stream is a trailers block;
-        // we don't use trailers, so ignore it.
-        if cs.streams.contains_key(&stream_id) {
+        // 🚫 Rejects request trailers explicitly because upstream forwarding is unsupported.
+        if let Some(stream) = cs.streams.get_mut(&stream_id) {
+            tracing::debug!(
+                "🚫 H3 request trailers are unsupported on stream {}; rejecting request",
+                stream_id
+            );
+            match reject_request_trailers(stream) {
+                TrailerRejection::ResponseQueued => Self::flush_stream(cs, stream_id),
+                TrailerRejection::ResetRequired => {
+                    let _ = cs.conn.stream_shutdown(
+                        stream_id,
+                        quiche::Shutdown::Write,
+                        quiche::h3::WireErrorCode::RequestCancelled as u64,
+                    );
+                }
+            }
             return;
         }
 
@@ -851,10 +910,12 @@ impl QuicServer {
         };
 
         let (req_body_tx, req_body_rx) = mpsc::channel::<Vec<u8>>(REQ_BODY_CHANNEL_CAPACITY);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
         cs.streams.insert(
             stream_id,
             StreamState {
                 req_body_tx: Some(req_body_tx),
+                cancel_tx: Some(cancel_tx),
                 ..Default::default()
             },
         );
@@ -877,13 +938,13 @@ impl QuicServer {
                 req_body_rx,
                 resp_tx,
                 notify,
+                cancel_rx,
             )
             .await;
         });
     }
 
-    /// Queue a plain-text response without spawning a handler task
-    /// (used for early errors like malformed requests).
+    /// 🚫 Queues a plain-text response without spawning a handler task.
     fn queue_simple_response(cs: &mut ConnState, stream_id: u64, status: u16, body: &str) {
         let headers = vec![
             quiche::h3::Header::new(b":status", status.to_string().as_bytes()),
@@ -972,7 +1033,7 @@ impl QuicServer {
             let Some(ss) = cs.streams.get_mut(&ev.stream_id) else {
                 return;
             };
-            if ss.dead {
+            if ss.dead || ss.handler_cancelled {
                 return;
             }
             match ev.msg {
@@ -1026,7 +1087,12 @@ impl QuicServer {
                     return;
                 }
                 Err(e) => {
-                    tracing::debug!("H3: send_response failed on stream {}: {:?}", stream_id, e);
+                    tracing::debug!(
+                        "📤 H3 response headers failed on stream {}: {:?}",
+                        stream_id,
+                        e
+                    );
+                    cancel_stream_handler(ss);
                     ss.dead = true;
                     return;
                 }
@@ -1042,7 +1108,12 @@ impl QuicServer {
                 }
                 Err(quiche::h3::Error::Done) => break,
                 Err(e) => {
-                    tracing::debug!("H3: send_body failed on stream {}: {:?}", stream_id, e);
+                    tracing::debug!(
+                        "🌊 H3 response body failed on stream {}: {:?}",
+                        stream_id,
+                        e
+                    );
+                    cancel_stream_handler(ss);
                     ss.dead = true;
                     return;
                 }
@@ -1054,7 +1125,8 @@ impl QuicServer {
                 Ok(_) => ss.fin_sent = true,
                 Err(quiche::h3::Error::Done) => {}
                 Err(e) => {
-                    tracing::debug!("H3: fin write failed on stream {}: {:?}", stream_id, e);
+                    tracing::debug!("🏁 H3 response FIN failed on stream {}: {:?}", stream_id, e);
+                    cancel_stream_handler(ss);
                     ss.dead = true;
                     return;
                 }
@@ -1266,8 +1338,31 @@ async fn plan_h3_handler(
     }
 }
 
-/// Per-request handler task: routes via the shared proxy logic and streams
-/// the response back to the event loop.
+/// 🛑 Waits for an explicit abort while allowing normal sender cleanup to finish.
+async fn wait_for_request_cancellation(cancel_rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *cancel_rx.borrow() {
+            return;
+        }
+        if cancel_rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// 🧩 Runs one handler future until it finishes or its QUIC stream is abandoned.
+async fn run_until_request_cancelled<T>(
+    cancel_rx: &mut watch::Receiver<bool>,
+    future: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = wait_for_request_cancellation(cancel_rx) => None,
+        result = future => Some(result),
+    }
+}
+
+/// 🌊 Routes one request and streams its response back to the event loop.
 #[allow(clippy::too_many_arguments)]
 async fn handle_request(
     proxy: Arc<PingclairProxy>,
@@ -1279,6 +1374,7 @@ async fn handle_request(
     body_rx: mpsc::Receiver<Vec<u8>>,
     resp_tx: RespSender,
     body_notify: Arc<Notify>,
+    mut cancel_rx: watch::Receiver<bool>,
 ) {
     let request_id = resolve_request_id(
         req.headers
@@ -1288,24 +1384,32 @@ async fn handle_request(
     );
     let mut error_state = None;
     let mut response_policy = ResponseHeaderPolicy::default();
-    if let Err(e) = handle_request_inner(
-        &proxy,
-        &connector,
-        &req,
-        &remote_ip,
-        &cid,
-        stream_id,
-        body_rx,
-        &resp_tx,
-        &body_notify,
-        &request_id,
-        &mut error_state,
-        &mut response_policy,
+    let result = run_until_request_cancelled(
+        &mut cancel_rx,
+        handle_request_inner(
+            &proxy,
+            &connector,
+            &req,
+            &remote_ip,
+            &cid,
+            stream_id,
+            body_rx,
+            &resp_tx,
+            &body_notify,
+            &request_id,
+            &mut error_state,
+            &mut response_policy,
+        ),
     )
-    .await
-    {
-        // 🧯 No response has been queued yet, so the wrapper can apply the vhost error policy.
-        let (status, msg) = e;
+    .await;
+    let Some(Err(e)) = result else {
+        return;
+    };
+
+    let (status, msg) = e;
+    // 🧯 Applies the virtual host error policy only while the client still owns the stream.
+    let _ = run_until_request_cancelled(
+        &mut cancel_rx,
         send_error_response(
             &resp_tx,
             &cid,
@@ -1315,9 +1419,9 @@ async fn handle_request(
             error_state.as_ref(),
             &response_policy,
             &request_id,
-        )
-        .await;
-    }
+        ),
+    )
+    .await;
 }
 
 /// 🧯 Carries an HTTP failure to the wrapper before response bytes are queued.
@@ -2214,6 +2318,74 @@ mod tests {
     fn parse_h3_request_rejects_missing_pseudo_headers() {
         let list = vec![quiche::h3::Header::new(b":method", b"GET")];
         assert!(parse_h3_request(&list).is_none());
+    }
+
+    #[test]
+    fn h3_request_trailers_cancel_handler_and_queue_clear_error() {
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let mut stream = StreamState {
+            cancel_tx: Some(cancel_tx),
+            req_body_tx: Some(mpsc::channel(1).0),
+            pending_body: VecDeque::from(b"stale".to_vec()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            reject_request_trailers(&mut stream),
+            TrailerRejection::ResponseQueued
+        );
+        assert!(*cancel_rx.borrow());
+        assert!(stream.handler_cancelled);
+        assert!(stream.req_stream_finished);
+        assert!(stream.req_body_tx.is_none());
+        assert_eq!(
+            stream.pending_body.iter().copied().collect::<Vec<_>>(),
+            b"Request Trailers Not Supported"
+        );
+        let (headers, fin) = stream.pending_headers.as_ref().unwrap();
+        assert!(!fin);
+        assert!(
+            headers
+                .iter()
+                .any(|header| header.name() == b":status" && header.value() == b"501")
+        );
+    }
+
+    #[test]
+    fn h3_request_trailers_reset_a_committed_response() {
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let mut stream = StreamState {
+            headers_sent: true,
+            cancel_tx: Some(cancel_tx),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            reject_request_trailers(&mut stream),
+            TrailerRejection::ResetRequired
+        );
+        assert!(*cancel_rx.borrow());
+        assert!(stream.dead);
+    }
+
+    #[tokio::test]
+    async fn h3_request_cancellation_preempts_handler_work() {
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        cancel_tx.send(true).unwrap();
+
+        let result = run_until_request_cancelled(&mut cancel_rx, async { 7 }).await;
+
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn h3_normal_stream_cleanup_does_not_cancel_completed_work() {
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        drop(cancel_tx);
+
+        let result = run_until_request_cancelled(&mut cancel_rx, async { 7 }).await;
+
+        assert_eq!(result, Some(7));
     }
 
     #[tokio::test]

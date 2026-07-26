@@ -54,6 +54,7 @@ cargo test --workspace
 cargo test -p pingclair-config
 cargo test -p pingclair-proxy
 cargo test -p pingclair --test integration -- --nocapture
+scripts/test-h3-cancellation-local.sh
 ```
 
 CI pins Rust 1.88 and runs `cargo fmt --all -- --check`,
@@ -63,6 +64,11 @@ CI pins Rust 1.88 and runs `cargo fmt --all -- --check`,
 Before handing off a code change, run at least `cargo test --workspace`; for
 changes to startup, listeners, proxying, static files, TLS, or middleware,
 also run `cargo build --workspace`.
+
+`scripts/test-h3-cancellation-local.sh` requires a curl build with HTTP/3
+support. It uses dynamic TCP/UDP ports and a temporary certificate to verify
+real H3 SSE delivery, downstream cancellation, upstream teardown, and listener
+survival without touching the remote VPS.
 
 `pingclair/tests/integration.rs` launches the real compiled binary and makes
 real localhost HTTP requests. It is the main end-to-end gate, not a mocked
