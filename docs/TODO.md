@@ -234,9 +234,10 @@
   `X-Forwarded-For`／`X-Real-IP`／`X-Forwarded-Proto`。XFF 最多 32 hops，
   由右向左跳過可信代理，畸形或過長鏈 fail closed；未受信來源會以 socket peer
   覆寫。H1/H2/H3 的 route matcher、rate limit、IP hash、placeholder 與上游
-  forwarding 共用 verified client IP，H1/H2 另已接入 access control／access
-  log。單元、DSL 與兩項真 binary 整合測試通過；H3 access-control middleware、
-  RFC 7239 `Forwarded`、PROXY protocol v1/v2 與 Linux/VPS 驗證仍待完成。
+  forwarding 共用 verified client IP，H1/H2/H3 均已接入同一份預編譯 access
+  control policy，H1/H2 另有 access log。單元、DSL 與兩項真 binary 整合測試
+  通過；H3 access control 尚待公網驗證，RFC 7239 `Forwarded`、PROXY protocol
+  v1/v2 與 Linux/VPS 完整驗證仍待完成。
 - [x] **TLS／ACME 私密狀態強化（本機，2026-07-26）** — HTTP-01 challenge
   deploy 改為 async durable contract，token 完成原子落盤並可由 handler 讀取後才
   通知 ACME ready；失敗會回滾，polling 失敗也會 cleanup。憑證續期改讀 CA
@@ -353,8 +354,10 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
   `cargo clippy --locked --workspace --all-targets -- -D warnings`；GitHub Actions
   固定 Rust 1.88 並在 build/test 前執行兩項 gate。完整 workspace 測試亦通過；
   尚待本 commit 的 GitHub runner 結果確認 Linux gate。
-- [ ] **乾淨遠端驗證工作流** — 不可再直接使用髒的 `/root/pingclair`。
-  補一個以指定 commit 建立暫存 clone/worktree、測試、收集結果、清理程序的腳本。
+- [x] **乾淨遠端驗證工作流（2026-07-26）** —
+  `scripts/validate-linux-commit.sh` 已依指定完整 SHA 建立唯一暫存 checkout，
+  保存 metadata／logs／metrics／listener／checksums，並只清理本次記錄的 process
+  group；`57e10f9` 已在乾淨 Ubuntu 24.04 全流程通過。
 - [ ] **協議與解析安全回歸集** — 對 H1/H2/H3 建立 URI／header 正規化、
   hop-by-hop header、重複 `Content-Length`／`Transfer-Encoding`、oversized
   header、request smuggling 與 malformed frame 測試；可用 proptest／fuzzing，
