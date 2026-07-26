@@ -491,9 +491,10 @@ async fn refresh_h3_cert_table(
     }
 }
 
-/// Pingora requires a full `IP:port` socket address. Accept the Caddy-style
-/// shorthand `:port` by binding the wildcard address, so JSON configs behave
-/// the same as Pingclairfile ones (the DSL adapter already normalizes).
+/// 🌐 Pingora requires a full `IP:port` socket address.
+///
+/// This helper accepts Caddy-style `:port` shorthand by binding the wildcard
+/// address, so JSON configurations match the Pingclair DSL adapter's behavior.
 fn normalize_listen_addr(addr: &str) -> String {
     match addr.strip_prefix(':') {
         Some(port) => format!("0.0.0.0:{port}"),

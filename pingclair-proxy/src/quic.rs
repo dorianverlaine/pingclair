@@ -1151,11 +1151,9 @@ async fn handle_request_inner(
         }
     }
 
-    // Basic auth gate, same semantics as the H1/H2 `handle_config` arm: a
-    // BasicAuth config anywhere in the handler tree must pass before the
-    // request is dispatched.
+    // 🔐 The HTTP/3 gate shares the asynchronous verifier with H1 and H2.
     if let Some((realm, credentials)) = find_basic_auth_config(&handler) {
-        if !pingclair_core::server::verify_basic_auth(&header.headers, credentials) {
+        if !pingclair_core::server::verify_basic_auth_async(&header.headers, credentials).await {
             let challenge = pingclair_core::server::basic_auth_challenge(realm);
             let hdrs = vec![
                 quiche::h3::Header::new(b":status", b"401"),

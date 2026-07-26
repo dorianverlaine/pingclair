@@ -66,8 +66,9 @@
   recovery、503/429、metrics，以及 hot reload 狀態轉換測試。
 - [ ] **上游 TLS／mTLS** — CA 驗證、SNI/Host、ALPN、client certificate、憑證
   rotation 與錯誤診斷完成；預設驗證憑證，insecure 模式必須明確 opt-in。
-- [ ] **Basic Auth 雜湊憑據可用** — `hashed: true` 的 bcrypt 憑據真正完成校驗，
-  成功、失敗、錯誤 hash 與成本上限都有測試；文件不再引導使用明文密碼。
+- [ ] **Basic Auth 雜湊憑據可用** — 🧪 本機已完成 `hashed: true` bcrypt 校驗、
+  async blocking 隔離、錯誤 hash fail-closed、cost ≤ 14 與 DSL 自動辨識；單元、
+  DSL 與真 binary 整合測試已通過，尚待目前 commit 的 Linux／VPS 驗證。
 - [ ] **健康檢查與 rate limit 可相信** — active/passive health 支援 Host、method、
   headers、status/body、positive/negative threshold 與 slow start；單機 rate limit
   的 GCRA/token-bucket、burst、key scope、`RateLimit-*`／`Retry-After` 語意正確。
@@ -225,6 +226,10 @@
   loopback。本機 auth 單元測試通過，尚未以目前 commit 做遠端拒絕／放行測試。
 - [x] **Basic Auth 執行時校驗**（2026-07-25）— 正確憑據放行，缺少／錯誤憑據
   回 401；`test_basic_auth_end_to_end` 已通過。
+- [x] **Basic Auth bcrypt 憑據**（2026-07-26）— Pingclair DSL 對合法 `$2*`
+  hash 自動設定 `hashed: true`；JSON 亦可明確設定。bcrypt 工作移到 blocking
+  pool，cost 上限 14，畸形／過高成本 hash 一律拒絕；正確、錯誤、畸形、
+  成本上限、DSL 與真 binary 測試均在本機通過，尚待 VPS 驗證。
 - [x] **ACME 帳戶持久化**（2026-07-25）— staging／production 分開，0600 落盤；
   本機序列化與還原測試通過，尚待 Let's Encrypt staging 真實還原。
 
@@ -361,7 +366,6 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
   upstream connect／first-byte／between-reads timeout，以及 header count／bytes、
   connection／bandwidth 限制；SSE/WebSocket 需可另外配置長連線策略。
 - [ ] **反代 Brotli／Zstd** — 反代回應目前只有 gzip；靜態路徑已有 br/zstd。
-- [ ] **bcrypt 憑據** — `BasicAuthCredential { hashed: true }` 目前永不匹配。
 - [ ] **H3 middleware parity** — quiche 路徑目前只直接處理 terminal
   `FileServer`／`ReverseProxy` 等；CORS、存取控制、rewrite、`error_page`、
   Request ID 與 H1/H2 pipeline 尚未完整套用。

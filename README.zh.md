@@ -140,7 +140,7 @@ pingclair run Pingclairfile
 
 ## 🛠️ 設定詳解（Pingclairfile）
 
-Pingclairfile 是一種結構化的設定語言。它看起來很像 Rust 程式碼，但專門用於描述伺服器的行為。
+Pingclair DSL 是專門用於描述伺服器行為的結構化設定語言；如同 Caddy 的 `Caddyfile`，其慣用檔名為 `Pingclairfile`。
 
 ### 基礎結構
 

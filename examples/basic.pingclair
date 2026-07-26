@@ -1,4 +1,4 @@
-# Basic Pingclairfile example
+# 🧭 Basic Pingclair DSL example.
 # A simple static file server
 
 localhost {

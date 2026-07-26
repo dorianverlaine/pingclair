@@ -36,13 +36,12 @@ example.com {
         -X-Powered-By
     }
 
-    # Admin area gated by HTTP Basic auth. Inline form is also valid:
-    #   basic_auth admin hunter2
+    # 🔐 The admin area uses a bcrypt hash; replace this demonstration hash.
+    # Its example plaintext is "change-me", and inline form is also valid.
     handle /admin/* {
         basic_auth {
             realm "Admin Area"
-            admin hunter2
-            ops s3cret
+            admin "$2y$12$iKzVHkDoCr2oz1DAOzX9wec0yf3A.FZM3SmsP9dYHmhE2O.3TSpSW"
         }
         respond "Welcome to the admin area"
     }

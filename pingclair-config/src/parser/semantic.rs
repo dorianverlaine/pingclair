@@ -1,4 +1,4 @@
-//! Semantic analysis for Pingclairfile
+//! 🔬 Semantic analysis for the Pingclair configuration DSL.
 //!
 //! Performs macro expansion, validation, and reference resolution.
 
