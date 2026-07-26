@@ -29,7 +29,7 @@ Que vous ayez besoin d'un simple serveur de fichiers statiques ou d'une passerel
 *   🚀 **Propulsé par Pingora** — Sur les épaules d'un géant : l'infrastructure éprouvée de Cloudflare, pour une stabilité et un débit de niveau entreprise.
 *   🔒 **Sûreté mémoire** — Rust élimine les débordements de tampon et, plus largement, toute la classe des vulnérabilités mémoire classiques.
 *   📝 **Configuration compatible Caddyfile** — Un DSL de configuration minimaliste, avec **HTTPS automatique**, **écouteurs multiples** et **matchers nommés**, compatible avec la syntaxe Caddyfile courante.
-*   ⚡ **HTTP/3 (QUIC) natif** — Bâti sur [quiche](https://github.com/cloudflare/quiche), la pile QUIC de production qui fait tourner l'edge de Cloudflare. Une latence réduite et une meilleure migration de connexion sur les réseaux instables.
+*   ⚡ **HTTP/3 (QUIC) natif** — Bâti sur [quiche](https://github.com/cloudflare/quiche), la pile QUIC de production qui fait tourner l'edge de Cloudflare. Une latence réduite et une meilleure migration de connexion sur les réseaux instables. Une configuration `tls` explicite active HTTPS et H3 sur n'importe quel port d'écoute ; 443 et 8443 restent reconnus automatiquement.
 *   🔄 **Répartition de charge intelligente** — Plusieurs algorithmes intégrés (round-robin, least-connections, etc.), avec health checks et bascule automatique.
 *   🔐 **HTTPS entièrement automatique** — Le support ACME intégré (Let's Encrypt) émet et renouvelle les certificats SSL/TLS sans aucune configuration.
 *   📁 **Service de fichiers statiques performant** — Compression Gzip/Brotli, requêtes Range et transfert de fichiers efficace.

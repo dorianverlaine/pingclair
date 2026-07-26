@@ -11,6 +11,7 @@
 pub mod alt_svc;
 pub mod connection_filter;
 pub mod health_check;
+mod http_policy;
 mod load_balancer;
 pub mod metrics;
 pub mod quic;

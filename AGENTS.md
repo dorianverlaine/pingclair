@@ -194,11 +194,12 @@ exist and must never trigger ACME issuance. Ports and the certificate-domain
 set are largely captured at startup, even though routes and certificate
 contents can be refreshed.
 
-Early data is enabled in quiche. Audit 0-RTT replay safety before adding
-non-idempotent behavior. Any H3 or TLS dependency change requires a Linux
-release build and quiche-client smoke coverage for SNI, Alt-Svc, streamed
-static/proxy bodies, POST bodies with and without Content-Length, 413, and
-upstream keepalive.
+Early data is deliberately disabled because the reverse-proxy path accepts
+non-idempotent methods and has no replay protection. Do not enable 0-RTT until
+route and method safety policy, replay behavior, and negative tests are
+explicit. Any H3 or TLS dependency change requires a Linux release build and
+quiche-client smoke coverage for SNI, Alt-Svc, streamed static/proxy bodies,
+POST bodies with and without Content-Length, 413, and upstream keepalive.
 
 ### Hot paths
 

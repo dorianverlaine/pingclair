@@ -11,7 +11,7 @@ use pingclair_tls::manager::TlsManager;
 use pingora_core::listeners::TlsAccept;
 use pingora_core::listeners::tls::TlsSettings;
 use pingora_core::protocols::tls::TlsRef;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -504,6 +504,15 @@ fn normalize_listen_addr(addr: &str) -> String {
     }
 }
 
+/// 🔐 Treats explicit TLS configuration as authoritative on every listen port.
+fn server_requires_tls(config: &pingclair_core::config::ServerConfig, addr: &str) -> bool {
+    config.tls.is_some()
+        || addr
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .is_some_and(|port| matches!(port, 443 | 8443))
+}
+
 fn run_server(config_path: String, config: pingclair_core::config::PingclairConfig) {
     #[cfg(not(target_os = "linux"))]
     let _ = config_path;
@@ -677,6 +686,7 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
 
     // Track binding information for diagnostic logging
     let mut binding_info = std::collections::HashMap::new();
+    let mut tls_listeners = HashSet::new();
 
     for server_config in config.servers {
         tracing::debug!(
@@ -696,6 +706,9 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
         };
 
         for addr in listen_addrs {
+            if server_requires_tls(&server_config, &addr) {
+                tls_listeners.insert(addr.clone());
+            }
             let mut proxies_guard = port_proxies.write();
             let proxy = proxies_guard.entry(addr.clone()).or_insert_with(|| {
                 pingclair_proxy::server::PingclairProxy::with_tls_and_trusted_proxies(
@@ -743,8 +756,8 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
                 service.set_connection_filter(filter);
             }
 
-            // Determine if this is an HTTPS port
-            let is_https = addr.ends_with(":443") || addr.ends_with(":8443");
+            // 🔐 Explicit TLS configuration supports HTTPS and H3 on non-standard ports.
+            let is_https = tls_listeners.contains(addr);
             let mut tls_enabled = false;
             let mut http3_enabled = false;
 
@@ -1024,5 +1037,20 @@ mod tests {
                 .parse::<std::net::SocketAddr>()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn explicit_tls_enables_nonstandard_https_listener() {
+        let config = pingclair_core::config::ServerConfig {
+            listen: vec!["127.0.0.1:21209".to_string()],
+            tls: Some(Default::default()),
+            ..Default::default()
+        };
+        assert!(server_requires_tls(&config, "127.0.0.1:21209"));
+
+        let plain = pingclair_core::config::ServerConfig::default();
+        assert!(!server_requires_tls(&plain, "127.0.0.1:21209"));
+        assert!(server_requires_tls(&plain, "0.0.0.0:443"));
+        assert!(server_requires_tls(&plain, "[::]:8443"));
     }
 }
