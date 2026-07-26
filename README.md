@@ -275,6 +275,12 @@ server "shop.example.com" {
 }
 ```
 
+The upstream scheme selects the connection protocol: a bare address or `http://`
+uses HTTP/1.1, `https://` negotiates HTTP/2 with HTTP/1.1 fallback through ALPN,
+`h2c://` requires prior-knowledge plaintext HTTP/2, and `h2://` requires HTTP/2
+over TLS. Use `h2c://` or `h2://` for native gRPC so response trailers remain
+end-to-end metadata.
+
 ### Caddy parity controls
 
 ```caddyfile

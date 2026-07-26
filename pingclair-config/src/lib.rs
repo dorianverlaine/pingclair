@@ -136,7 +136,7 @@ pub enum FullCompileError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pingclair_core::config::HandlerConfig;
+    use pingclair_core::config::{HandlerConfig, LogFormat, LogOutput, Matcher};
 
     #[test]
     fn test_full_compile() {
@@ -641,6 +641,170 @@ mod tests {
         assert_eq!(proxy.upstream_options.len(), 2);
         assert_eq!(proxy.upstream_options[0].weight, 3);
         assert!(proxy.upstream_options[1].backup);
+    }
+
+    #[test]
+    fn test_production_cache_matchers_compose_with_default_proxy() {
+        let config = compile(
+            r#"
+            {
+                admin off
+            }
+
+            https://portfolio.example.com:6688 {
+                tls /run/secrets/origin.crt /run/secrets/origin.key
+
+                log {
+                    output stdout
+                    format json
+                }
+
+                encode zstd gzip
+
+                header {
+                    Strict-Transport-Security "max-age=31536000; includeSubDomains"
+                    X-Content-Type-Options "nosniff"
+                    X-Frame-Options "DENY"
+                    Referrer-Policy "strict-origin-when-cross-origin"
+                    Content-Security-Policy "default-src 'self'; object-src 'none'"
+                    -Server
+                }
+
+                @api path /api/*
+                header @api Cache-Control "no-store"
+
+                @hashed path /assets/*
+                header @hashed Cache-Control "public, max-age=31536000, immutable"
+
+                @rest {
+                    not path /assets/*
+                    not path /api/*
+                }
+                header @rest Cache-Control "no-cache"
+
+                reverse_proxy app:8080
+            }
+        "#,
+        )
+        .unwrap();
+
+        fn inspect_policy(handler: &HandlerConfig) -> (Option<String>, bool, bool, bool) {
+            fn visit(
+                handler: &HandlerConfig,
+                cache_control: &mut Option<String>,
+                has_security_header: &mut bool,
+                removes_server: &mut bool,
+                has_proxy: &mut bool,
+            ) {
+                match handler {
+                    HandlerConfig::Pipeline { handlers }
+                    | HandlerConfig::Handle { handlers }
+                    | HandlerConfig::HandlePath { handlers, .. } => {
+                        for handler in handlers {
+                            visit(
+                                handler,
+                                cache_control,
+                                has_security_header,
+                                removes_server,
+                                has_proxy,
+                            );
+                        }
+                    }
+                    HandlerConfig::Headers { set, remove, .. } => {
+                        if let Some(value) = set.get("Cache-Control") {
+                            *cache_control = Some(value.clone());
+                        }
+                        *has_security_header |=
+                            set.get("X-Frame-Options").map(String::as_str) == Some("DENY");
+                        *removes_server |= remove.iter().any(|name| name == "Server");
+                    }
+                    HandlerConfig::ReverseProxy(_) => *has_proxy = true,
+                    _ => {}
+                }
+            }
+
+            let mut cache_control = None;
+            let mut has_security_header = false;
+            let mut removes_server = false;
+            let mut has_proxy = false;
+            visit(
+                handler,
+                &mut cache_control,
+                &mut has_security_header,
+                &mut removes_server,
+                &mut has_proxy,
+            );
+            (
+                cache_control,
+                has_security_header,
+                removes_server,
+                has_proxy,
+            )
+        }
+
+        let server = &config.servers[0];
+        assert_eq!(server.listen, ["0.0.0.0:6688"]);
+        assert!(matches!(
+            server.log.as_ref(),
+            Some(log)
+                if matches!(&log.output, LogOutput::Stdout)
+                    && matches!(&log.format, LogFormat::Json)
+        ));
+
+        for (path, expected_cache) in [
+            ("/api/*", "no-store"),
+            ("/assets/*", "public, max-age=31536000, immutable"),
+        ] {
+            let route = server
+                .routes
+                .iter()
+                .find(|route| route.path == path)
+                .unwrap();
+            assert_eq!(
+                inspect_policy(&route.handler),
+                (Some(expected_cache.to_string()), true, true, true)
+            );
+        }
+
+        let rest = server
+            .routes
+            .iter()
+            .find(|route| route.path == "/*" && route.matcher.is_some())
+            .unwrap();
+        assert!(matches!(
+            rest.matcher.as_ref(),
+            Some(Matcher::And(left, right))
+                if matches!(left.as_ref(), Matcher::Not(_))
+                    && matches!(right.as_ref(), Matcher::Not(_))
+        ));
+        assert_eq!(
+            inspect_policy(&rest.handler),
+            (Some("no-cache".to_string()), true, true, true)
+        );
+    }
+
+    #[test]
+    fn test_compile_upstream_protocol_schemes() {
+        let config = compile(
+            r#"
+            example.com {
+                reverse_proxy h2c://127.0.0.1:50051 h2://grpc.example.com:443 https://api.example.com
+            }
+        "#,
+        )
+        .unwrap();
+
+        let HandlerConfig::ReverseProxy(proxy) = &config.servers[0].routes[0].handler else {
+            panic!("expected reverse proxy handler");
+        };
+        assert_eq!(
+            proxy.upstreams,
+            [
+                "h2c://127.0.0.1:50051",
+                "h2://grpc.example.com:443",
+                "https://api.example.com",
+            ]
+        );
     }
 
     #[test]

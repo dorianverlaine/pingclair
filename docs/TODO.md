@@ -30,6 +30,57 @@
 才可以改 workspace version、建立 `v0.2.0` tag。已在舊 commit 驗證過的能力，
 仍須使用同一個 release-candidate commit 重新跑乾淨 Linux 驗證。
 
+### v0.2 真實生產替換驗收：Cloudflare Tunnel／Docker 單站
+
+使用者目前唯一的個人生產站是 `Cloudflare Tunnel → HTTPS caddy:6688 →
+app:8080`；三個容器只加入同一個 Docker network，源站不發布任何 host port。
+v0.2 必須能以 Pingclair 安全替換該站的 Caddy，而不是只讓相似 DSL 通過 parser。
+驗收配置需覆蓋：
+
+2026-07-26 已在 `aqeonet-aws-tw-xray` 純讀取確認現況：Amazon Linux 2023
+ARM64；cloudflared 的 origin service 是 `https://caddy:6688`，設定
+`noTLSVerify: true` 與正確 `originServerName`；Caddyfile 與 cloudflared config
+均唯讀掛載，Caddy `/data` 持久化。盤點過程未修改、重啟或新增任何遠端資源。
+
+- `admin off`，只啟動站點 listener，不意外暴露 Admin API。
+- `https://<domain>:6688` 搭配持久化 internal CA／自簽 leaf；不依賴公開
+  ACME challenge，重啟、續期與 H1/H2/H3 certificate table 行為一致。亦保留
+  掛載手動 cert/key 的 migration 路徑。
+- 每站 JSON access log 輸出 stdout，讓容器 runtime 負責 rotation；預設遮罩
+  Authorization、Cookie、API key 等敏感欄位，並能將受信 cloudflared 注入的
+  `CF-Connecting-IP` 映射為 verified client IP。
+- 反代回應依 `Accept-Encoding` 正確協商 zstd／gzip；不得因壓縮 SSE 或大 body
+  破壞串流與 bounded-memory 保證。
+- 全站安全標頭 set/remove 與依具名 path matcher 設定的 Cache-Control 能在同一
+  request pipeline 疊加；`not path` 的 AND 語意與 Caddy 相同，命中 middleware
+  後仍須繼續到 `reverse_proxy`。
+- `reverse_proxy app:8080` 可使用 Docker DNS；app 容器換 IP 後依 TTL／受控
+  重解析更新 backend，解析暫時失敗時保留 last-known-good。
+- 以 production-like Docker network 啟動真 release binary，經 Cloudflare
+  Tunnel 路徑驗證 TLS、H1/H2、headers、三類 cache policy、壓縮、真實 client
+  IP、JSON/redaction、app restart/DNS recovery、reload、shutdown 與回滾，再
+  允許切換唯一生產站。
+
+2026-07-26 逐項追蹤目前程式碼後，這份 Caddyfile **尚不能原樣替換**：
+
+- `admin off`、自訂 HTTPS port、全站 response header set/remove 與基本
+  `reverse_proxy app:8080` 已有執行路徑；手動 cert/key 可作暫時遷移方案。
+- `tls internal` 尚未進入 AST／TLS manager，會在 adapter 拒絕。
+- `log { output stdout; format json }` 只編譯成 `LogConfig`，runtime 仍使用
+  process-wide tracing，未依 per-server format/output 輸出，也沒有完整 secret
+  redaction 或 `CF-Connecting-IP` client identity。
+- `encode zstd gzip` 可被 parser 接受，但 algorithm list 未編譯進 runtime；
+  反代目前只有 gzip，且是否壓縮並未真正由該 directive 控制。
+- 🧪 行內 `@api path`／`@hashed path`、`@rest { not path ... }` 與條件式
+  `header @matcher` 的 middleware composition 已在本機修正；extensionless
+  `Pingclairfile` 經真 binary 對 `/api/*`、`/assets/*`、其餘路徑驗證三種
+  Cache-Control、安全標頭、`-Server` 與最終 reverse proxy 均正確。
+- 遞迴 `Not` matcher 目前無法安全通過 core config 的 untagged JSON round-trip；
+  直接讀 Pingclairfile 不受影響，但 JSON 配置與 Admin hot reload 仍須先定義
+  可辨識且向後相容的 matcher 表示。
+- Docker hostname 只在配置載入／reload 時以 blocking resolver 取第一個 IP；
+  沒有 TTL 重解析或 last-known-good backend 更新。
+
 ### R0：先讓測試結果可信
 
 - [x] **整合測試隔離完成（`57e10f9`）** — 全部真 binary 測試使用
@@ -43,6 +94,10 @@
 
 ### R1：既有功能成為真正的 shipped behavior
 
+- [ ] **唯一生產站替換驗收** — 🧪 `not path`、條件式 header composition 與
+  extensionless Pingclairfile 真 binary 路徑已在本機通過；其餘上述 Cloudflare
+  Tunnel／Docker 案例的 parser、compiler、H1/H2 runtime 與 production-like
+  migration/rollback 全數通過；在此之前不得宣稱 Pingclair 可以替換該 Caddy。
 - [ ] **Caddy parity 第一波完成驗收** — `error_page`、CORS、IP/Referer/UA access
   control、regex rewrite、LB weight/backup 與 `redir` 在同一 RC commit 上通過
   H1/H2 真 binary 測試與乾淨 VPS smoke。
@@ -82,7 +137,7 @@
 
 - [ ] **H3 middleware parity** — 🧪 Request ID、access control、rewrite、CORS、
   `error_page`、redirect、header mutation、Basic Auth 與必要 pipeline 語意已接入
-  transport-neutral policy；`pingclair-proxy` 78 項單元測試、22 項真 binary
+  transport-neutral policy；`pingclair-proxy` 81 項單元測試、24 項真 binary
   integration 與本機真實 HTTP/3 smoke 通過。仍須完成 Linux release／公網 QUIC
   驗證，通過前不得勾選。
 - [ ] **協議矩陣通過** — WebSocket upgrade、gRPC/h2c＋trailers、SSE、
@@ -92,9 +147,10 @@
   在 response commit 前回 `501`，commit 後以 request-cancelled reset 結束，並有
   stream-state 單元測試。本機真 H3 SSE／client disconnect、宣告 request
   trailers 的 `501` 與 upstream response trailers 的 `502` 已通過；H1 WebSocket
-  雙向 tunnel 與 prior-knowledge h2c 亦通過真 binary 測試。H3 CONNECT／extended
-  CONNECT 明確回 `501`；仍缺未宣告 trailing HEADERS 的真 client、H2/gRPC
-  trailers 與其餘協議組合。
+  雙向 tunnel、prior-knowledge h2c，以及 H2 downstream → h2c upstream 的 gRPC
+  response DATA／trailers 均通過真 binary 測試。H3 bridge 已能把 H2 upstream
+  trailers 轉成 trailing HEADERS，且 H3 CONNECT／extended CONNECT 明確回 `501`；
+  仍缺未宣告 request trailing HEADERS、TLS H2 upstream 與真 H3 gRPC client 矩陣。
 - [ ] **H3 Linux release smoke 通過** — SNI、Alt-Svc、靜態/代理大 body、
   Content-Length/chunked POST、413、keepalive、middleware parity 與 0-RTT
   非冪等拒絕策略均使用 quiche client 驗證。
@@ -184,10 +240,15 @@
 - 真 binary integration 新增 H1 SSE 增量傳輸與 downstream disconnect 取消兩項
   測試，以及 `Expect: 100-continue`、103 Early Hints、request／response trailer
   fail-closed、prior-knowledge h2c 與 WebSocket 雙向 tunnel 六項 protocol tests；
-  整合測試總數由 14 增至 22 且全數通過。
+  再加入 H2 downstream → h2c upstream 的 gRPC DATA／response trailers 測試；
+  整合測試總數由 14 增至 23 且全數通過。
 - 明文 proxy listener 已透過 Pingora 原生 `HttpServerOptions` 啟用 h2c preface
   辨識；TLS listener 保持 ALPN 協商。H3 CONNECT／extended CONNECT 在目前的
   request-response transport 上會明確回 `501`，避免誤當一般代理請求。
+- upstream scheme 現在明確選擇協議：裸位址／`http://` 為 H1、`https://` 以
+  ALPN 協商 H2/H1、`h2c://` 為明文 H2-only、`h2://` 為 TLS H2-only；不同協議
+  隔離 connection pool，H2 pool 可 multiplex。H3 bridge 亦會保留 `te: trailers`、
+  使用 H2 framing 並把 response trailers 轉成 H3 trailing HEADERS。
 - H3 route planner 直接借用已發佈的 immutable handler tree，不再於每個請求
   clone 整棵 pipeline／proxy config；response header append policy 亦保留跨多個
   middleware 的所有值。
@@ -203,12 +264,17 @@
   drain 與 response FIN 都完成，避免 client 收完 body 後永久等待。
 - 本輪 local gate：`cargo fmt --all -- --check`、workspace clippy
   `--all-targets -D warnings`、`cargo build --locked --workspace`、
-  `cargo test --locked --workspace`、78 項 proxy 單元測試、22 項真 binary
-  integration 與本機真 H3 cancellation smoke，已於提交前最後一次完整重跑通過。
-- 今日下一步只做本機程式碼／測試：補 H2/gRPC trailers、上游協議選擇與未宣告
-  H3 trailing HEADERS 的 protocol matrix。下次才以精確 commit 做乾淨 Linux
-  release build，啟動 80 TCP／443 TCP+UDP fixture，從本機公網重跑 HTTP/3
-  矩陣並保存結果；通過後才把 R3 parity 移入完成區。
+  `cargo test --locked --workspace`、75 項 config、81 項 proxy 單元測試、24 項
+  真 binary integration 與本機真 H3 cancellation smoke，已於提交前最後一次
+  完整重跑通過。
+- 今日下一步只做本機程式碼／測試：upstream scheme、h2c response trailers 與
+  真實 Pingclairfile 的 `not path`／條件式 header composition 已完成；`h2://`
+  亦會拒絕沒有協商 h2 ALPN 的 TLS 連線，但仍缺真 TLS H2 fixture。接著依序處理
+  internal CA、per-server JSON/redaction、Cloudflare client identity、反代 zstd、
+  Docker DNS 重解析與 matcher JSON round-trip。完成替換硬阻塞後才回到一般 R2
+  的 RFC 7239 `Forwarded`／PROXY protocol。下次才以精確 commit 做乾淨 Linux
+  release build 與 production-like Docker／公網驗收；通過後才把對應的 R1／R3
+  項目移入完成區。
 
 ---
 
@@ -321,6 +387,13 @@
   MIME、`text/*`、`application/*+json` 與 `*/*`；未設定時保留相容的預設清單，
   自訂 `application/wasm` 已以真 binary＋臨時 upstream 驗證壓縮與解壓內容，
   尚待 Linux／VPS 驗證。
+- [x] **上游 HTTP 協議選擇（本機，2026-07-26）** — Pingclairfile／JSON 的
+  upstream address 支援裸位址／`http://` H1、`https://` ALPN H2/H1、
+  `h2c://` 明文 H2-only 與 `h2://` TLS H2-only；不同協議隔離 pool，H2 預設
+  可 multiplex；`h2://` 在 Pingora callback 與 H3 bridge 都會拒絕未協商 h2
+  ALPN 的連線。H2 downstream → h2c upstream 的 gRPC response DATA／trailers
+  真 binary 測試與 H3 bridge trailer 測試通過；真 TLS H2 fixture、mTLS、
+  Linux／VPS 尚待驗證。
 - [x] **ACME 帳戶持久化**（2026-07-25）— staging／production 分開，0600 落盤；
   本機序列化與還原測試通過，尚待 Let's Encrypt staging 真實還原。
 
@@ -446,8 +519,10 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
   H1 `Expect: 100-continue`／103 Early Hints 已通過；H1/H3 宣告 request trailers
   回 `501`、upstream response trailers 回 `502` 的 fail-closed 真 binary 測試亦
   通過。prior-knowledge h2c 與 H1 WebSocket 雙向 tunnel 亦通過；H3 CONNECT／
-  extended CONNECT 明確回 `501`。尚缺未宣告 H3 trailing HEADERS、H2/gRPC
-  trailers 與更多協議組合。
+  extended CONNECT 明確回 `501`。H2 downstream → h2c upstream 的 gRPC DATA
+  與 response trailers 已通過真 binary，H3 bridge 的 H2 trailer 轉換亦有單元
+  測試。尚缺未宣告 request trailing HEADERS、TLS H2 upstream、真 H3 gRPC client
+  與更多協議組合。
 
 ### P1：常用功能與協議缺口
 
@@ -548,8 +623,9 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
 - [ ] **配置歷史與一鍵回滾**。
 - [ ] **零停機 graceful restart** — 目前有 graceful shutdown／reload，但 listener
   變更仍需重啟；需 SO_REUSEPORT 或 fd 交接。
-- [ ] **上游協議選擇** — HTTP/1.1、HTTPS、h2c、HTTP/2 TLS 與未來 H3 upstream
-  的顯式 ALPN／pool；先完成 gRPC／trailers 相容性，再考慮 gRPC-web transcoding。
+- [ ] **上游 HTTP/3** — v0.2 的 H1、HTTPS ALPN、h2c 與 TLS H2 選擇已實作；
+  未來 H3 upstream 需獨立 QUIC pool、0-RTT policy 與 gRPC／trailers 相容性，
+  不可與 downstream H3 connection state 混用。
 - [ ] **gRPC-web 轉發／transcoding**。
 - [ ] **目錄 autoindex**。
 - [ ] **Web 管理介面** — 內嵌單頁 UI，避免引入前端建置鏈。
@@ -615,9 +691,9 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
   passthrough，防 SSRF／DNS rebinding／tool poisoning。
 - [ ] **OpenInference／AI tracing** — 在 OpenTelemetry 上增加標準 AI span attributes，
   預設只記 token/cost/latency metadata，不記 prompt；需 cardinality 與資料保留政策。
-- [ ] **多 issuer／現代 TLS** — ACME issuer fallback、ARI、OCSP stapling、ECH、
-  internal CA 與 cluster-wide certificate storage/locking；不得破壞既有
-  BoringSSL／rustls 分工。
+- [ ] **多 issuer／現代 TLS** — v0.2 先完成上述單機 internal CA；後續再加入
+  ACME issuer fallback、ARI、OCSP stapling、ECH 與 cluster-wide certificate
+  storage/locking，不得破壞既有 BoringSSL／rustls 分工。
 - [ ] **ACME `from_credentials` staging 實測**。
 - [ ] **Linux 發行相容矩陣** — x86_64/aarch64 的 musl 靜態二進位；如需提供
   CPU optimized variant，必須與不依賴 AVX2/新指令集的通用相容版分開命名，

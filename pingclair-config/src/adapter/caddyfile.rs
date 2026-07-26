@@ -449,10 +449,22 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
 
         if !default_handlers.is_empty() {
             let final_handler = if default_handlers.len() == 1 {
-                default_handlers.remove(0)
+                default_handlers[0].clone()
             } else {
-                Handler::Pipeline(default_handlers)
+                Handler::Pipeline(default_handlers.clone())
             };
+
+            if let Some(routes) = server.routes.as_mut() {
+                for arm in &mut routes.inner.arms {
+                    if !handler_has_terminal(&arm.inner.handler) {
+                        arm.inner.handler = compose_with_default_handlers(
+                            arm.inner.handler.clone(),
+                            &default_handlers,
+                        );
+                    }
+                }
+            }
+
             add_route(&mut server, None, final_handler);
         }
     }
@@ -1274,6 +1286,37 @@ fn parse_single_matcher(d: &Directive) -> Result<Matcher, AdapterError> {
         "path" => Ok(Matcher::Path(PathMatcher {
             patterns: d.args.clone(),
         })),
+        "not" => {
+            let inner = if let Some(block) = &d.block {
+                let mut matchers = block
+                    .directives
+                    .iter()
+                    .map(parse_single_matcher)
+                    .collect::<Result<Vec<_>, _>>()?;
+                if matchers.is_empty() {
+                    return Err(AdapterError::InvalidArgument(
+                        "not".into(),
+                        "empty matcher block".into(),
+                    ));
+                }
+                let mut combined = matchers.remove(0);
+                for matcher in matchers {
+                    combined = Matcher::And(Box::new(combined), Box::new(matcher));
+                }
+                combined
+            } else {
+                let Some(name) = d.args.first() else {
+                    return Err(AdapterError::ArgumentCount("not".into(), 1, 0));
+                };
+                let nested = Directive {
+                    name: name.clone(),
+                    args: d.args[1..].to_vec(),
+                    block: None,
+                };
+                parse_single_matcher(&nested)?
+            };
+            Ok(Matcher::Not(Box::new(inner)))
+        }
         "method" => {
             let methods = d
                 .args
@@ -1324,6 +1367,37 @@ fn parse_single_matcher(d: &Directive) -> Result<Matcher, AdapterError> {
 }
 
 // MARK: - Helpers
+
+/// 🧭 Reports whether a handler tree already owns the terminal response path.
+fn handler_has_terminal(handler: &Handler) -> bool {
+    match handler {
+        Handler::Proxy(_) | Handler::Respond(_) | Handler::Redirect(_) | Handler::FileServer(_) => {
+            true
+        }
+        Handler::Pipeline(handlers) | Handler::Handle(handlers) => {
+            handlers.iter().any(handler_has_terminal)
+        }
+        Handler::Headers(_)
+        | Handler::BasicAuth(_)
+        | Handler::Rewrite(_)
+        | Handler::Cors(_)
+        | Handler::AccessControl(_)
+        | Handler::Plugin { .. } => false,
+    }
+}
+
+/// 🧩 Inserts matched middleware before the default terminal handler.
+fn compose_with_default_handlers(matched: Handler, defaults: &[Handler]) -> Handler {
+    let terminal_index = defaults
+        .iter()
+        .position(handler_has_terminal)
+        .unwrap_or(defaults.len());
+    let mut handlers = Vec::with_capacity(defaults.len() + 1);
+    handlers.extend_from_slice(&defaults[..terminal_index]);
+    handlers.push(matched);
+    handlers.extend_from_slice(&defaults[terminal_index..]);
+    Handler::Pipeline(handlers)
+}
 
 fn add_route(server: &mut ServerBlock, matcher: Option<Matcher>, handler: Handler) {
     if server.routes.is_none() {

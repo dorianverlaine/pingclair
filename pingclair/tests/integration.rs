@@ -21,10 +21,6 @@ impl TestServer {
     fn new(config_body: &str) -> Self {
         let temp_dir = tempfile::tempdir().expect("failed to create the test directory");
         let config_path = temp_dir.path().join("config.json");
-        let tls_store_path = temp_dir.path().join("tls");
-        let stdout_path = temp_dir.path().join("stdout.log");
-        let stderr_path = temp_dir.path().join("stderr.log");
-        std::fs::create_dir(&tls_store_path).expect("failed to create the test TLS store");
 
         let readiness_id = uuid::Uuid::new_v4();
         let readiness_path = format!("/__pingclair_test_ready_{readiness_id}");
@@ -44,6 +40,65 @@ impl TestServer {
         let mut file = std::fs::File::create(&config_path).unwrap();
         file.write_all(serde_json::to_string_pretty(&config).unwrap().as_bytes())
             .unwrap();
+
+        Self::start(
+            temp_dir,
+            config_path,
+            server_addresses,
+            admin_address,
+            readiness_path,
+            readiness_token,
+            reservations,
+        )
+    }
+
+    /// 📄 Starts the real binary from the extensionless production configuration path.
+    fn new_pingclairfile(config_template: &str) -> Self {
+        let temp_dir = tempfile::tempdir().expect("failed to create the test directory");
+        let config_path = temp_dir.path().join("Pingclairfile");
+        let readiness_id = uuid::Uuid::new_v4();
+        let readiness_path = format!("/__pingclair_test_ready_{readiness_id}");
+        let readiness_token = format!("pingclair-ready-{readiness_id}");
+        let mut reservations = Vec::new();
+        let address = reserve_loopback_listener(&mut reservations);
+        let config = config_template
+            .replace("__PINGCLAIR_TEST_LISTEN__", &address.to_string())
+            .replace("__PINGCLAIR_TEST_READINESS_PATH__", &readiness_path)
+            .replace("__PINGCLAIR_TEST_READINESS_TOKEN__", &readiness_token);
+        assert!(
+            !config.contains("__PINGCLAIR_TEST_"),
+            "Pingclairfile test fixture contains an unresolved placeholder"
+        );
+
+        let mut file = std::fs::File::create(&config_path).unwrap();
+        file.write_all(config.as_bytes()).unwrap();
+
+        Self::start(
+            temp_dir,
+            config_path,
+            vec![vec![address]],
+            None,
+            readiness_path,
+            readiness_token,
+            reservations,
+        )
+    }
+
+    /// 🚀 Spawns one isolated Pingclair process after its listener ports are reserved.
+    #[allow(clippy::too_many_arguments)]
+    fn start(
+        temp_dir: tempfile::TempDir,
+        config_path: PathBuf,
+        server_addresses: Vec<Vec<SocketAddr>>,
+        admin_address: Option<SocketAddr>,
+        readiness_path: String,
+        readiness_token: String,
+        reservations: Vec<TcpListener>,
+    ) -> Self {
+        let tls_store_path = temp_dir.path().join("tls");
+        let stdout_path = temp_dir.path().join("stdout.log");
+        let stderr_path = temp_dir.path().join("stderr.log");
+        std::fs::create_dir(&tls_store_path).expect("failed to create the test TLS store");
 
         // 🧾 Use files instead of pipes so verbose logs can never block the child.
         let stdout = std::fs::File::create(&stdout_path).unwrap();
@@ -376,6 +431,11 @@ async fn write_http_chunk(
 
 /// 🧭 Builds a minimal real-proxy fixture for protocol behavior tests.
 fn protocol_proxy_config(upstream_address: SocketAddr) -> String {
+    protocol_proxy_config_url(format!("http://{upstream_address}"))
+}
+
+/// 🌐 Builds a minimal real-proxy fixture with an explicit upstream scheme.
+fn protocol_proxy_config_url(upstream_address: String) -> String {
     serde_json::json!({
         "global": { "http3": false },
         "servers": [{
@@ -384,7 +444,7 @@ fn protocol_proxy_config(upstream_address: SocketAddr) -> String {
                 "path": "/*",
                 "handler": {
                     "type": "reverse_proxy",
-                    "upstreams": [format!("http://{upstream_address}")],
+                    "upstreams": [upstream_address],
                     "load_balance": { "strategy": "round_robin" },
                     "headers_up": {},
                     "headers_down": {}
@@ -1249,6 +1309,93 @@ async fn test_handle_path_and_outer_headers_reach_the_proxy_exchange() {
 }
 
 #[tokio::test]
+async fn test_production_cache_headers_compose_with_reverse_proxy() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        for _ in 0..3 {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut request = vec![0u8; 8192];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nServer: upstream\r\nConnection: close\r\n\r\nok",
+                )
+                .await
+                .unwrap();
+        }
+    });
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            header {{
+                Strict-Transport-Security "max-age=31536000; includeSubDomains"
+                X-Frame-Options "DENY"
+                -Server
+            }}
+
+            @api path /api/*
+            header @api Cache-Control "no-store"
+
+            @hashed path /assets/*
+            header @hashed Cache-Control "public, max-age=31536000, immutable"
+
+            @rest {{
+                not path /assets/*
+                not path /api/*
+            }}
+            header @rest Cache-Control "no-cache"
+
+            reverse_proxy http://{upstream_address}
+        }}
+        "#
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    for (path, expected_cache) in [
+        ("/api/session", "no-store"),
+        (
+            "/assets/app.abc123.js",
+            "public, max-age=31536000, immutable",
+        ),
+        ("/index.html", "no-cache"),
+    ] {
+        let response = client.get(server.url(0, path)).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_cache),
+            "unexpected headers for {path}: {:?}",
+            response.headers()
+        );
+        assert_eq!(response.headers()["x-frame-options"], "DENY");
+        assert_eq!(
+            response.headers()["strict-transport-security"],
+            "max-age=31536000; includeSubDomains"
+        );
+        assert!(response.headers().get("server").is_none());
+        assert_eq!(response.text().await.unwrap(), "ok");
+    }
+
+    upstream_task.await.unwrap();
+}
+
+#[tokio::test]
 async fn test_sse_proxy_flushes_each_event_incrementally() {
     use tokio::io::AsyncWriteExt;
 
@@ -1635,6 +1782,91 @@ async fn test_h2c_prior_knowledge_reaches_the_real_proxy_path() {
 
     assert_eq!(response.version(), reqwest::Version::HTTP_2);
     assert_eq!(response.text().await.unwrap(), "h2c-ok");
+    upstream_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_grpc_h2c_upstream_preserves_response_trailers() {
+    use bytes::Bytes;
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let (response_read_tx, response_read_rx) = tokio::sync::oneshot::channel();
+    let upstream_task = tokio::spawn(async move {
+        let (stream, _) = upstream.accept().await.unwrap();
+        let mut connection = h2::server::handshake(stream).await.unwrap();
+        let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+        assert_eq!(request.method(), http::Method::POST);
+        assert_eq!(request.uri().path(), "/grpc.health.v1.Health/Check");
+        assert_eq!(
+            request.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "application/grpc"
+        );
+
+        let response = http::Response::builder()
+            .status(200)
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .body(())
+            .unwrap();
+        let mut body = respond.send_response(response, false).unwrap();
+        body.send_data(Bytes::from_static(b"\0\0\0\0\0"), false)
+            .unwrap();
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+        trailers.insert("grpc-message", http::HeaderValue::from_static("healthy"));
+        body.send_trailers(trailers).unwrap();
+
+        // 🌊 Keeps driving the H2 connection until the queued trailers are delivered.
+        tokio::select! {
+            _ = async {
+                while connection.accept().await.is_some() {}
+            } => {}
+            _ = response_read_rx => {}
+        }
+    });
+
+    let config = protocol_proxy_config_url(format!("h2c://{upstream_address}"));
+    let mut server = TestServer::new(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let downstream = tokio::net::TcpStream::connect(server.address(0))
+        .await
+        .unwrap();
+    let (mut client, connection) = h2::client::handshake(downstream).await.unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = http::Request::builder()
+        .method(http::Method::POST)
+        .uri(format!(
+            "http://{}/grpc.health.v1.Health/Check",
+            server.address(0)
+        ))
+        .header(http::header::CONTENT_TYPE, "application/grpc")
+        .header("te", "trailers")
+        .body(())
+        .unwrap();
+    let (response, _) = client.send_request(request, true).unwrap();
+    let response = response.await.unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(
+        response.headers().get(http::header::CONTENT_TYPE).unwrap(),
+        "application/grpc"
+    );
+    let mut body = response.into_body();
+    assert_eq!(
+        body.data().await.unwrap().unwrap(),
+        Bytes::from_static(b"\0\0\0\0\0")
+    );
+    assert!(body.data().await.is_none());
+    let trailers = body.trailers().await.unwrap().unwrap();
+    assert_eq!(trailers.get("grpc-status").unwrap(), "0");
+    assert_eq!(trailers.get("grpc-message").unwrap(), "healthy");
+
+    response_read_tx.send(()).unwrap();
+    connection_task.abort();
+    let _ = connection_task.await;
     upstream_task.await.unwrap();
 }
 

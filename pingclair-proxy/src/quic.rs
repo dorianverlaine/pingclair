@@ -36,6 +36,7 @@ use tokio::sync::{Notify, mpsc, watch};
 
 use pingclair_core::config::HandlerConfig;
 use pingclair_static::ServedResponse;
+use pingora_core::protocols::http::client::HttpSession;
 use pingora_http::RequestHeader;
 use quiche::h3::NameValue;
 
@@ -411,10 +412,12 @@ fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
 
 /// Messages from handler tasks back to the event loop.
 enum RespMsg {
-    /// Response headers; bool = fin (no body follows).
+    /// 📋 Carries response headers and whether they end the stream.
     Headers(Vec<quiche::h3::Header>, bool),
-    /// Body chunk; bool = fin.
+    /// 🌊 Carries one body chunk and whether it ends the stream.
     Body(Vec<u8>, bool),
+    /// 🧾 Carries response trailers that end the stream.
+    Trailers(Vec<quiche::h3::Header>),
 }
 
 struct RespEvent {
@@ -437,6 +440,8 @@ struct StreamState {
     headers_sent: bool,
     /// 🌊 Holds bounded response bytes that quiche has not accepted yet.
     pending_body: VecDeque<u8>,
+    /// 🧾 Holds response trailers until body bytes and QUIC capacity are ready.
+    pending_trailers: Option<Vec<quiche::h3::Header>>,
     /// 🏁 Records that the handler signaled the end of the response body.
     body_fin: bool,
     /// 🏁 Records that the response FIN reached the QUIC stream.
@@ -645,6 +650,7 @@ impl QuicServer {
                         !s.dead
                             && (s.pending_headers.is_some()
                                 || !s.pending_body.is_empty()
+                                || s.pending_trailers.is_some()
                                 || (s.body_fin && !s.fin_sent))
                     })
                     .map(|(id, _)| *id)
@@ -1054,6 +1060,9 @@ impl QuicServer {
                         ss.body_fin = true;
                     }
                 }
+                RespMsg::Trailers(headers) => {
+                    ss.pending_trailers = Some(headers);
+                }
             }
         }
         Self::flush_stream(cs, ev.stream_id);
@@ -1115,6 +1124,29 @@ impl QuicServer {
                 Err(e) => {
                     tracing::debug!(
                         "🌊 H3 response body failed on stream {}: {:?}",
+                        stream_id,
+                        e
+                    );
+                    cancel_stream_handler(ss);
+                    ss.dead = true;
+                    return;
+                }
+            }
+        }
+
+        if ss.pending_body.is_empty()
+            && !ss.fin_sent
+            && let Some(trailers) = ss.pending_trailers.take()
+        {
+            match h3.send_additional_headers(conn, stream_id, &trailers, true, true) {
+                Ok(()) => ss.fin_sent = true,
+                Err(quiche::h3::Error::StreamBlocked) => {
+                    ss.pending_trailers = Some(trailers);
+                    return;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "🧾 H3 response trailers failed on stream {}: {:?}",
                         stream_id,
                         e
                     );
@@ -1769,6 +1801,12 @@ async fn reverse_proxy_upstream(
         tracing::error!("❌ H3 upstream connect failed: {}", e);
         (502, "Upstream Connect Failed")
     })?;
+    let upstream_is_h2 = matches!(&session, HttpSession::H2(_));
+    if peer.group_key == 4 && !upstream_is_h2 {
+        tracing::error!("🔒 H3 bridge rejected a TLS upstream without h2 ALPN");
+        session.shutdown().await;
+        return Err((502, "TLS H2 Upstream Negotiation Failed"));
+    }
 
     // 📤 Builds the upstream request with every middleware rewrite already applied.
     let method =
@@ -1781,27 +1819,31 @@ async fn reverse_proxy_upstream(
         .insert_header("Host", peer.sni.clone())
         .map_err(|_| (502, "Upstream Request Error"))?;
 
-    // The request body framing for the upstream. HTTP/3 carries no framing
-    // headers, but Pingora's HTTP/1 upstream session picks its body-writer
-    // mode (content-length vs chunked) from the request headers, so we must
-    // supply one: the client's content-length when it sent one, chunked
-    // otherwise for methods that may carry a body.
+    // 📦 Preserves a trusted content length while selecting framing for the upstream protocol.
     let client_content_length: Option<u64> = req
         .headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
         .and_then(|(_, v)| v.parse::<u64>().ok());
 
-    // Forward client headers, skipping hop-by-hop and framing headers.
+    // 🧹 Forwards end-to-end headers while stripping hop-by-hop framing metadata.
     for (k, v) in &req.headers {
         let name = k.to_ascii_lowercase();
+        if name == "te" {
+            if upstream_is_h2
+                && v.split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("trailers"))
+            {
+                up_req.insert_header("te", "trailers").ok();
+            }
+            continue;
+        }
         if matches!(
             name.as_str(),
             "host"
                 | "connection"
                 | "keep-alive"
                 | "transfer-encoding"
-                | "te"
                 | "trailer"
                 | "upgrade"
                 | "content-length"
@@ -1815,7 +1857,9 @@ async fn reverse_proxy_upstream(
         Some(cl) => {
             up_req.insert_header("Content-Length", cl.to_string()).ok();
         }
-        None if matches!(req.method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") => {
+        None if !upstream_is_h2
+            && matches!(req.method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") =>
+        {
             up_req.insert_header("Transfer-Encoding", "chunked").ok();
         }
         None => {}
@@ -1872,17 +1916,15 @@ async fn reverse_proxy_upstream(
             (502, "Upstream Write Failed")
         })?;
 
-    // Stream the request body: headers went out first, body follows
-    // chunk-by-chunk as it arrives from the client.
+    // 🌊 Streams request chunks after the upstream has accepted the headers.
     let mut counted = 0u64;
     while let Some(chunk) = body_rx.recv().await {
-        // A slot in the channel just freed up — wake the event loop so it
-        // retries deferred drains.
+        // 🔔 Wakes the event loop after freeing request-channel capacity.
         body_notify.notify_one();
 
         counted += chunk.len() as u64;
         if body_limit > 0 && counted > body_limit {
-            // Abort the upstream exchange; the client gets a 413.
+            // 🛑 Aborts the upstream exchange before returning the body-limit response.
             session.shutdown().await;
             return Err((413, "Request Entity Too Large"));
         }
@@ -1892,14 +1934,12 @@ async fn reverse_proxy_upstream(
             return Err((502, "Upstream Write Failed"));
         }
     }
-    // A declared content-length must match what was actually streamed;
-    // otherwise the upstream would wait for bytes that never come (or the
-    // extra bytes would poison the reused connection).
+    // 📏 Rejects a body length mismatch before it can poison a reused connection.
     if let Some(cl) = client_content_length
         && counted != cl
     {
         tracing::warn!(
-            "H3: request body length mismatch (content-length {}, streamed {})",
+            "⚠️ H3 request body length mismatch (content-length {}, streamed {})",
             cl,
             counted
         );
@@ -1969,7 +2009,7 @@ async fn reverse_proxy_upstream(
 
     send_headers(resp_tx, cid, stream_id, hdrs, false).await;
 
-    // Stream the response body back to the client.
+    // 🌊 Streams the upstream response without committing the final H3 frame early.
     let mut clean = true;
     loop {
         match session.read_response_body().await {
@@ -1984,10 +2024,45 @@ async fn reverse_proxy_upstream(
             }
         }
     }
-    send_body(resp_tx, cid, stream_id, Vec::new(), true).await;
+
+    let mut response_trailers = None;
+    if clean && let HttpSession::H2(h2) = &mut session {
+        match h2.read_trailers().await {
+            Ok(Some(headers)) => {
+                let mut trailers = Vec::with_capacity(headers.len());
+                for (name, value) in headers.iter() {
+                    let lower = name.as_str().to_ascii_lowercase();
+                    if matches!(
+                        lower.as_str(),
+                        "connection"
+                            | "keep-alive"
+                            | "transfer-encoding"
+                            | "te"
+                            | "trailer"
+                            | "upgrade"
+                    ) {
+                        continue;
+                    }
+                    trailers.push(quiche::h3::Header::new(lower.as_bytes(), value.as_bytes()));
+                }
+                response_trailers = Some(trailers);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!("❌ H3 upstream response trailer read failed: {}", e);
+                clean = false;
+            }
+        }
+    }
+
+    if let Some(trailers) = response_trailers.filter(|trailers| !trailers.is_empty()) {
+        send_trailers(resp_tx, cid, stream_id, trailers).await;
+    } else {
+        send_body(resp_tx, cid, stream_id, Vec::new(), true).await;
+    }
 
     if clean {
-        // Return the session to the keepalive pool.
+        // ♻️ Returns a fully consumed session to the keepalive pool.
         connector.release_http_session(session, &peer, None).await;
     } else {
         session.shutdown().await;
@@ -2137,6 +2212,22 @@ async fn send_body(
         .await;
 }
 
+/// 🧾 Queues H3 response trailers after every response body chunk.
+async fn send_trailers(
+    resp_tx: &RespSender,
+    cid: &quiche::ConnectionId<'static>,
+    stream_id: u64,
+    headers: Vec<quiche::h3::Header>,
+) {
+    let _ = resp_tx
+        .send(RespEvent {
+            cid: cid.clone(),
+            stream_id,
+            msg: RespMsg::Trailers(headers),
+        })
+        .await;
+}
+
 /// 🧯 Sends a custom or built-in error response before an H3 stream is committed.
 #[allow(clippy::too_many_arguments)]
 async fn send_error_response(
@@ -2169,7 +2260,9 @@ async fn send_error_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pingclair_core::config::{BasicAuthCredential, RouteConfig, ServerConfig};
+    use pingclair_core::config::{
+        BasicAuthCredential, ReverseProxyConfig, RouteConfig, ServerConfig,
+    };
 
     fn proxy_state(handler: HandlerConfig) -> ProxyState {
         ProxyState::new(ServerConfig {
@@ -2427,6 +2520,120 @@ mod tests {
         let result = run_until_request_cancelled(&mut cancel_rx, async { 7 }).await;
 
         assert_eq!(result, Some(7));
+    }
+
+    #[tokio::test]
+    async fn h3_bridge_preserves_h2c_grpc_response_trailers() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let (response_read_tx, response_read_rx) = tokio::sync::oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream.accept().await.unwrap();
+            let mut connection = h2::server::handshake(stream).await.unwrap();
+            let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+            assert_eq!(request.method(), http::Method::POST);
+            assert_eq!(
+                request.headers().get("te").unwrap(),
+                http::HeaderValue::from_static("trailers")
+            );
+
+            let response = http::Response::builder()
+                .status(200)
+                .header(http::header::CONTENT_TYPE, "application/grpc")
+                .body(())
+                .unwrap();
+            let mut body = respond.send_response(response, false).unwrap();
+            body.send_data(Bytes::from_static(b"\0\0\0\0\0"), false)
+                .unwrap();
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+            trailers.insert("grpc-message", http::HeaderValue::from_static("healthy"));
+            body.send_trailers(trailers).unwrap();
+
+            tokio::select! {
+                _ = async {
+                    while connection.accept().await.is_some() {}
+                } => {}
+                _ = response_read_rx => {}
+            }
+        });
+
+        let state = proxy_state(HandlerConfig::ReverseProxy(ReverseProxyConfig {
+            upstreams: vec![format!("h2c://{upstream_address}")],
+            ..Default::default()
+        }));
+        let proxy = PingclairProxy::new();
+        let connector = pingora_core::connectors::http::Connector::new(Some(
+            pingora_core::connectors::ConnectorOptions::new(16),
+        ));
+        let request = H3Request {
+            method: "POST".to_string(),
+            protocol: None,
+            path: "/grpc.health.v1.Health/Check".to_string(),
+            authority: "example.test".to_string(),
+            headers: vec![
+                ("content-type".to_string(), "application/grpc".to_string()),
+                ("te".to_string(), "trailers".to_string()),
+            ],
+        };
+        let mut client_header =
+            RequestHeader::build(http::Method::POST, b"/grpc.health.v1.Health/Check", None)
+                .unwrap();
+        client_header
+            .insert_header(http::header::CONTENT_TYPE, "application/grpc")
+            .unwrap();
+        let (body_tx, mut body_rx) = mpsc::channel(1);
+        drop(body_tx);
+        let (resp_tx, mut resp_rx) = mpsc::channel(8);
+        let body_notify = Arc::new(Notify::new());
+        let cid = quiche::ConnectionId::from_vec(vec![1, 2, 3, 4]);
+
+        reverse_proxy_upstream(
+            &proxy,
+            &connector,
+            &state,
+            0,
+            &request,
+            &client_header,
+            &request.path,
+            "127.0.0.1",
+            "127.0.0.1",
+            "test-request-id",
+            &ResponseHeaderPolicy::default(),
+            0,
+            &cid,
+            0,
+            &mut body_rx,
+            &resp_tx,
+            &body_notify,
+        )
+        .await
+        .unwrap();
+
+        let headers = resp_rx.recv().await.unwrap();
+        assert!(matches!(headers.msg, RespMsg::Headers(_, false)));
+        let body = resp_rx.recv().await.unwrap();
+        assert!(matches!(
+            body.msg,
+            RespMsg::Body(ref bytes, false) if bytes == b"\0\0\0\0\0"
+        ));
+        let trailers = resp_rx.recv().await.unwrap();
+        let RespMsg::Trailers(trailers) = trailers.msg else {
+            panic!("expected H3 response trailers");
+        };
+        assert!(
+            trailers
+                .iter()
+                .any(|header| header.name() == b"grpc-status" && header.value() == b"0")
+        );
+        assert!(
+            trailers
+                .iter()
+                .any(|header| header.name() == b"grpc-message" && header.value() == b"healthy")
+        );
+
+        response_read_tx.send(()).unwrap();
+        upstream_task.await.unwrap();
     }
 
     #[tokio::test]

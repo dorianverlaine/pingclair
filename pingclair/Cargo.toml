@@ -57,3 +57,6 @@ tempfile = "3.8"
 uuid = { version = "1.0", features = ["v4"] }
 flate2 = "1.0"
 libc = "0.2"
+h2.workspace = true
+bytes.workspace = true
+http.workspace = true

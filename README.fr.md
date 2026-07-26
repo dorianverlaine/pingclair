@@ -282,6 +282,12 @@ server "shop.example.com" {
 }
 ```
 
+Le schéma de l'amont sélectionne le protocole de connexion : une adresse nue ou
+`http://` utilise HTTP/1.1, `https://` négocie HTTP/2 avec repli HTTP/1.1 par
+ALPN, `h2c://` impose HTTP/2 en clair avec connaissance préalable, et `h2://`
+impose HTTP/2 sur TLS. Utilisez `h2c://` ou `h2://` pour gRPC natif afin de
+préserver les trailers de réponse comme métadonnées de bout en bout.
+
 ### Contrôles de parité Caddy
 
 ```caddyfile

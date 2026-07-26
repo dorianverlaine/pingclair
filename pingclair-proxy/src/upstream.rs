@@ -8,13 +8,17 @@ use std::net::ToSocketAddrs;
 
 // MARK: - Types
 
-/// Metadata stored in `Backend` extensions to indicate the protocol scheme.
+/// 🌐 Metadata stored in `Backend` extensions to select the upstream protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scheme {
-    /// Plain text HTTP
+    /// 📜 Uses plaintext HTTP/1.1.
     Http,
-    /// Encrypted HTTPS
+    /// 🔐 Negotiates HTTP/2 or HTTP/1.1 over TLS.
     Https,
+    /// 🚀 Uses prior-knowledge HTTP/2 over plaintext.
+    H2c,
+    /// 🔒 Requires HTTP/2 over TLS.
+    H2,
 }
 
 /// A wrapper type for hostname string, stored in `Backend` extensions.
@@ -57,7 +61,11 @@ fn parse_url_components(upstream: &str) -> Option<(std::net::SocketAddr, Scheme,
     let trimmed_upstream = upstream.trim();
 
     // Determine scheme and strip prefix
-    let (scheme, minimal_url) = if let Some(stripped) = trimmed_upstream.strip_prefix("https://") {
+    let (scheme, minimal_url) = if let Some(stripped) = trimmed_upstream.strip_prefix("h2c://") {
+        (Scheme::H2c, stripped)
+    } else if let Some(stripped) = trimmed_upstream.strip_prefix("h2://") {
+        (Scheme::H2, stripped)
+    } else if let Some(stripped) = trimmed_upstream.strip_prefix("https://") {
         (Scheme::Https, stripped)
     } else if let Some(stripped) = trimmed_upstream.strip_prefix("http://") {
         (Scheme::Http, stripped)
@@ -72,7 +80,11 @@ fn parse_url_components(upstream: &str) -> Option<(std::net::SocketAddr, Scheme,
         let port_number = port_part.parse::<u16>().ok()?;
         (host_part, port_number)
     } else {
-        let default_port = if scheme == Scheme::Https { 443 } else { 80 };
+        let default_port = if matches!(scheme, Scheme::Https | Scheme::H2) {
+            443
+        } else {
+            80
+        };
         (minimal_url, default_port)
     };
 
@@ -80,4 +92,22 @@ fn parse_url_components(upstream: &str) -> Option<(std::net::SocketAddr, Scheme,
     let socket_address = format!("{host}:{port}").to_socket_addrs().ok()?.next()?;
 
     Some((socket_address, scheme, host.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_schemes_preserve_protocol_metadata() {
+        for (address, expected) in [
+            ("http://127.0.0.1:8001", Scheme::Http),
+            ("https://127.0.0.1:8002", Scheme::Https),
+            ("h2c://127.0.0.1:8003", Scheme::H2c),
+            ("h2://127.0.0.1:8004", Scheme::H2),
+        ] {
+            let upstream = create_upstream(address).unwrap();
+            assert_eq!(*upstream.ext.get::<Scheme>().unwrap(), expected);
+        }
+    }
 }
