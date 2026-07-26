@@ -82,12 +82,16 @@
 
 - [ ] **H3 middleware parity** — 🧪 Request ID、access control、rewrite、CORS、
   `error_page`、redirect、header mutation、Basic Auth 與必要 pipeline 語意已接入
-  transport-neutral policy；`pingclair-proxy` 73 項單元測試、14 項真 binary
+  transport-neutral policy；`pingclair-proxy` 77 項單元測試、16 項真 binary
   integration 與本機真實 HTTP/3 smoke 通過。仍須完成 Linux release／公網 QUIC
   驗證，通過前不得勾選。
 - [ ] **協議矩陣通過** — WebSocket upgrade、gRPC/h2c＋trailers、SSE、
   `Expect: 100-continue`、HTTP trailers、103 Early Hints 與 downstream cancellation
   在支援的 H1/H2/H3 組合有明確測試；不支援的組合必須 fail clearly 並寫入文件。
+  🧪 H3 downstream reset／連線關閉已接入 handler cancellation；H3 request trailers
+  在 response commit 前回 `501`，commit 後以 request-cancelled reset 結束，並有
+  stream-state 單元測試。本機真 H3 SSE／client disconnect 已通過；trailers 與
+  其餘協議組合仍待真 client 測試。
 - [ ] **H3 Linux release smoke 通過** — SNI、Alt-Svc、靜態/代理大 body、
   Content-Length/chunked POST、413、keepalive、middleware parity 與 0-RTT
   非冪等拒絕策略均使用 quiche client 驗證。
@@ -164,6 +168,17 @@
   local response 也套用 security headers。
 - H3 body 仍使用 bounded channel 與 QUIC flow control，static/proxy response
   仍逐 chunk 串流；沒有為 middleware parity 引入全量 buffering。
+- H3 每個 request stream 已加入獨立 structured-cancellation 訊號；client reset、
+  QUIC connection drop 或 response write failure 都會丟棄對應 handler future 與
+  upstream session，不會讓慢 upstream／靜態串流在 client 離線後繼續耗用資源。
+- H3 request trailers 不再被靜默忽略：response 尚未 commit 時回明確 `501`，
+  已 commit 時送 request-cancelled stream reset；三語 README 已記錄限制。
+- 新增 `scripts/test-h3-cancellation-local.sh`：以動態 TCP／UDP 埠、暫存自簽
+  憑證、真 Pingclair binary 與 Homebrew curl `--http3-only --no-buffer` 驗證
+  SSE 首個 event 增量抵達、client timeout 後 upstream 在 3 秒內關閉，以及
+  listener 取消單一 stream 後仍可服務；腳本通過且未殘留程序。
+- 真 binary integration 新增 H1 SSE 增量傳輸與 downstream disconnect 取消兩項
+  測試，兩項單獨重跑通過；整合測試總數由 14 增至 16。
 - H3 route planner 直接借用已發佈的 immutable handler tree，不再於每個請求
   clone 整棵 pipeline／proxy config；response header append policy 亦保留跨多個
   middleware 的所有值。
@@ -179,11 +194,13 @@
   drain 與 response FIN 都完成，避免 client 收完 body 後永久等待。
 - 本輪 local gate：`cargo fmt --all -- --check`、workspace clippy
   `--all-targets -D warnings`、`cargo build --locked --workspace`、
-  `cargo test --locked --workspace` 與新增 handle_path/header 真 binary regression
-  已於提交前最後一次完整重跑通過。
-- 下一步（下次執行）：不再重做本機實作，直接以本次精確 commit 做乾淨 Linux
-  release build，啟動 80 TCP／443 TCP+UDP fixture，從本機公網重跑上述 HTTP/3
-  矩陣並保存結果；通過後才把 R3 parity 移入完成區。
+  `cargo test --locked --workspace`、77 項 proxy 單元測試、16 項真 binary
+  integration 與本機真 H3 cancellation smoke，已於提交前最後一次完整重跑通過。
+- 今日下一步只做本機程式碼／測試：整理 H1/H2/H3 protocol matrix，優先測
+  `Expect: 100-continue`、informational response 與 trailers 的實際 Pingora 行為。
+  下次才以精確 commit 做乾淨 Linux release build，啟動 80 TCP／443 TCP+UDP
+  fixture，從本機公網重跑 HTTP/3 矩陣並保存結果；通過後才把 R3 parity 移入
+  完成區。
 
 ---
 
@@ -416,6 +433,9 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
 - [ ] **真 binary 協議矩陣** — 動態 port 下覆蓋 WebSocket upgrade、gRPC/h2c
   trailers、SSE 斷線取消、HTTP trailers、`Expect: 100-continue`、103 Early
   Hints 與大 body backpressure；先用測試確認 Pingora 預設行為，再決定 DSL。
+  🧪 H1 真 binary SSE 增量傳輸／斷線取消，以及本機真 QUIC SSE／斷線取消已通過；
+  H3 request-trailer 明確拒絕已有 state-level tests，尚缺真 trailer client 與其餘
+  跨協議端到端覆蓋。
 
 ### P1：常用功能與協議缺口
 
