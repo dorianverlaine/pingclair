@@ -6,8 +6,8 @@ use crate::parser::ast::*;
 use pingclair_core::config::{
     AccessControlConfig as CoreAccessControlConfig, AdminConfig, HandlerConfig, LoadBalanceConfig,
     LogConfig, LogFormat as CoreLogFormat, LogOutput as CoreLogOutput, Matcher as CoreMatcher,
-    MatcherCondition, PingclairConfig, ProxyUpstream, ReverseProxyConfig, RouteConfig,
-    ServerConfig, TlsConfig,
+    MatcherCondition, PingclairConfig, ProxyUpstream, ReverseProxyConfig, RouteConfig, ServerConfig,
+    TlsConfig, default_gzip_types,
 };
 use pingclair_core::server::{MAX_BCRYPT_COST, bcrypt_hash_cost};
 use std::collections::HashMap;
@@ -89,6 +89,11 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         log: None,
         client_max_body_size: 1024 * 1024, // 1MB default
         security: Default::default(),
+        gzip_types: if server.gzip_types.is_empty() {
+            default_gzip_types()
+        } else {
+            server.gzip_types.clone()
+        },
         error_pages: server.error_pages.iter().cloned().collect(),
     };
 

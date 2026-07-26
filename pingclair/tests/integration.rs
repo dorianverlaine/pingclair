@@ -905,3 +905,66 @@ async fn test_compression() {
         println!("✅ Brotli verified.");
     }
 }
+
+#[tokio::test]
+async fn test_reverse_proxy_custom_gzip_types() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // 🧪 Serve a MIME type excluded from the default gzip list.
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let body = "custom gzip type ".repeat(200);
+    let upstream_body = body.clone();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let mut request = [0u8; 2048];
+        let _ = stream.read(&mut request).await.unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/wasm\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            upstream_body.len(),
+            upstream_body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+
+    let config = serde_json::json!({
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "gzip_types": ["application/wasm"],
+            "routes": [{
+                "path": "/",
+                "handler": {
+                    "type": "reverse_proxy",
+                    "upstreams": [format!("http://{upstream_address}")],
+                    "load_balance": { "strategy": "round_robin" },
+                    "headers_up": {},
+                    "headers_down": {}
+                }
+            }]
+        }]
+    })
+    .to_string();
+
+    let mut server = TestServer::new(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let response = no_proxy_client()
+        .get(server.url(0, "/module.wasm"))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers().get("Content-Encoding").unwrap(), "gzip");
+
+    // 🔍 The compressed proxy response must round-trip to the upstream body.
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let compressed = response.bytes().await.unwrap();
+    let mut decoder = GzDecoder::new(&compressed[..]);
+    let mut decompressed = String::new();
+    decoder.read_to_string(&mut decompressed).unwrap();
+    assert_eq!(decompressed, body);
+    upstream_task.await.unwrap();
+}

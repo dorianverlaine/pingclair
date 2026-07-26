@@ -461,6 +461,42 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_gzip_types() {
+        let source = r#"
+            example.com {
+                listen :80
+                gzip_types text/* application/problem+json
+                respond "OK"
+            }
+        "#;
+
+        let config = compile(source).unwrap();
+        assert_eq!(
+            config.servers[0].gzip_types,
+            vec!["text/*", "application/problem+json"]
+        );
+    }
+
+    #[test]
+    fn test_compile_gzip_types_rejects_invalid_patterns() {
+        let missing_type = r#"
+            example.com {
+                gzip_types json
+                respond "OK"
+            }
+        "#;
+        let misplaced_wildcard = r#"
+            example.com {
+                gzip_types application/json*
+                respond "OK"
+            }
+        "#;
+
+        assert!(compile(missing_type).is_err());
+        assert!(compile(misplaced_wildcard).is_err());
+    }
+
+    #[test]
     fn test_compile_error_page() {
         let source = r#"
             example.com {
