@@ -55,9 +55,10 @@
 
 ### R2：補齊單機生產可靠性護欄
 
-- [ ] **可信 client identity** — `trusted_proxies` 與 PROXY protocol v1/v2 完成；
-  access control、rate limit、IP hash、forwarded headers 與 access log 使用同一個
-  經驗證 client IP，未受信 client 不可偽造代理鏈。
+- [ ] **可信 client identity** — 🧪 全域 `trusted_proxies`、受限代理鏈解析與
+  H1/H2/H3 共用 verified client IP 已在本機完成；未受信 client 無法偽造
+  `X-Forwarded-*`／`X-Real-IP`。PROXY protocol v1/v2、RFC 7239 `Forwarded`
+  與 Linux/VPS 驗證仍缺，因此 R2 尚未完成。
 - [ ] **安全 retry／redispatch** — 可配置 tries、總時限、backoff 與狀態碼；
   v0.2 預設且只保證尚未送出 body 或可安全重放的冪等請求。非冪等 body replay
   與 AI POST fallback 明確延後，不以隱式 buffering 假裝支援。
@@ -222,6 +223,14 @@
 
 ### 安全與正確性
 
+- [x] **可信代理 client identity（本機，2026-07-26）** — JSON 與 Pingclair DSL
+  已支援全域 `trusted_proxies` IP/CIDR；只有受信任的直接上一跳可提供
+  `X-Forwarded-For`／`X-Real-IP`／`X-Forwarded-Proto`。XFF 最多 32 hops，
+  由右向左跳過可信代理，畸形或過長鏈 fail closed；未受信來源會以 socket peer
+  覆寫。H1/H2/H3 的 route matcher、rate limit、IP hash、placeholder 與上游
+  forwarding 共用 verified client IP，H1/H2 另已接入 access control／access
+  log。單元、DSL 與兩項真 binary 整合測試通過；H3 access-control middleware、
+  RFC 7239 `Forwarded`、PROXY protocol v1/v2 與 Linux/VPS 驗證仍待完成。
 - [x] **Admin API 認證**（2026-07-25）— Bearer key 已接入；未配置 key 時僅允許
   loopback。本機 auth 單元測試通過，尚未以目前 commit 做遠端拒絕／放行測試。
 - [x] **Basic Auth 執行時校驗**（2026-07-25）— 正確憑據放行，缺少／錯誤憑據
@@ -351,10 +360,10 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
   max connections、in-flight requests、pending queue、連續失敗／錯誤比例與
   half-open recovery；超限快速回 503/429，並提供指標。這是 Envoy、Traefik、
   HAProxy 的標準生產護欄。
-- [ ] **可信代理鏈與真實 client IP** — 配置 `trusted_proxies` CIDR，
-  只信任指定上一跳的 `Forwarded`／`X-Forwarded-*`；未受信來源必須覆寫而非沿用。
-  補 PROXY protocol v1/v2 listener，並讓 access control、rate limit、IP hash、
-  log 共用同一個已驗證 client identity。
+- [ ] **可信代理鏈與真實 client IP** — 🧪 全域 `trusted_proxies`、受限 XFF
+  解析、未受信 forwarding header 覆寫，以及跨 H1/H2/H3 的 verified identity
+  已在本機完成。剩餘工作是 RFC 7239 `Forwarded`、PROXY protocol v1/v2
+  listener、H3 access-control middleware 與乾淨 Linux/VPS 驗證。
 - [ ] **上游 TLS 完整化** — 明確的 CA 驗證、SNI／Host、ALPN、client certificate
   mTLS、憑證熱更新與可選 pinning；`insecure_skip_verify` 必須顯眼且預設關閉。
   HTTPS upstream 不應只以「能連上」作為完成標準。

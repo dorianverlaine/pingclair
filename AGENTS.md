@@ -23,7 +23,7 @@ The workspace has eight crates:
 | --- | --- |
 | `pingclair` | CLI, process lifecycle, listeners, runtime wiring |
 | `pingclair-core` | Shared configuration types, router, basic handlers |
-| `pingclair-config` | Pingclairfile lexer/parser/adapter/compiler |
+| `pingclair-config` | Pingclair DSL lexer/parser/adapter/compiler |
 | `pingclair-proxy` | Pingora proxy, middleware, LB, HTTP/3, metrics |
 | `pingclair-static` | Static serving, ranges, compression, streaming |
 | `pingclair-tls` | Certificate store, ACME, auto-HTTPS |

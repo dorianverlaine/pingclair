@@ -188,6 +188,22 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                         None => return Err(AdapterError::ArgumentCount("admin".into(), 1, 0)),
                     }
                 }
+                "trusted_proxies" => {
+                    if sub.args.is_empty() {
+                        return Err(AdapterError::ArgumentCount("trusted_proxies".into(), 1, 0));
+                    }
+                    for rule in sub.args {
+                        let valid = rule.parse::<ipnet::IpNet>().is_ok()
+                            || rule.parse::<std::net::IpAddr>().is_ok();
+                        if !valid {
+                            return Err(AdapterError::InvalidArgument(
+                                "trusted_proxies".into(),
+                                format!("invalid IP or CIDR `{rule}`"),
+                            ));
+                        }
+                        global.trusted_proxies.push(rule);
+                    }
+                }
                 "protocols" => {
                     for arg in &sub.args {
                         match arg.to_lowercase().as_str() {

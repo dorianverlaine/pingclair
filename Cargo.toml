@@ -57,6 +57,7 @@ boring = "4.22"   # must stay on the same release quiche 0.29 links against
 http = "1"
 bytes = "1"
 mime_guess = "2"
+ipnet = "2"
 
 # Logging and metrics
 tracing = "0.1"

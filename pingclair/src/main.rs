@@ -567,6 +567,10 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
         server_conf.upstream_keepalive_pool_size
     );
     tracing::info!("🧵 Worker threads per service: {}", server_conf.threads);
+    tracing::info!(
+        "🛡️ Trusted proxy networks: {}",
+        config.global.trusted_proxies.len()
+    );
 
     let mut server = pingora::server::Server::new_with_opt_and_conf(
         Some(pingora::server::configuration::Opt {
@@ -669,6 +673,7 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
         .collect();
     let h3_pool_size = config.global.upstream_keepalive_pool_size.unwrap_or(128);
     let h3_blocked_ips = config.global.blocked_ips.clone();
+    let trusted_proxies = config.global.trusted_proxies.clone();
 
     // Track binding information for diagnostic logging
     let mut binding_info = std::collections::HashMap::new();
@@ -693,7 +698,10 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
         for addr in listen_addrs {
             let mut proxies_guard = port_proxies.write();
             let proxy = proxies_guard.entry(addr.clone()).or_insert_with(|| {
-                pingclair_proxy::server::PingclairProxy::with_tls(tls_manager.clone())
+                pingclair_proxy::server::PingclairProxy::with_tls_and_trusted_proxies(
+                    tls_manager.clone(),
+                    &trusted_proxies,
+                )
             });
 
             // Track what sites are bound to what addresses

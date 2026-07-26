@@ -337,6 +337,37 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_trusted_proxies() {
+        let source = r#"{
+            trusted_proxies 127.0.0.1 10.0.0.0/8 2001:db8::/32
+        }
+
+        example.com {
+            listen :80
+            respond "OK"
+        }"#;
+
+        let config = compile(source).unwrap();
+        assert_eq!(
+            config.global.trusted_proxies,
+            ["127.0.0.1", "10.0.0.0/8", "2001:db8::/32"]
+        );
+    }
+
+    #[test]
+    fn test_compile_trusted_proxies_rejects_invalid_rule() {
+        let source = r#"{
+            trusted_proxies definitely-not-a-network
+        }
+
+        example.com {
+            respond "OK"
+        }"#;
+
+        assert!(compile(source).is_err());
+    }
+
+    #[test]
     fn test_compile_basic_auth_inline() {
         let source = r#"
             example.com {

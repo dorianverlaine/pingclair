@@ -167,6 +167,22 @@ localhost:8080 {
 }
 ```
 
+Lorsque Pingclair se trouve derrière un load balancer ou un CDN que vous
+administrez, déclarez uniquement ces réseaux mandataires dans le bloc global.
+Un pair non approuvé ne peut pas fournir l'identité via `X-Forwarded-For`,
+`X-Real-IP` ou `X-Forwarded-Proto` :
+
+```caddyfile
+{
+    trusted_proxies 10.0.0.0/8 2001:db8::/32
+}
+```
+
+Le contrôle d'accès, le rate limiting, l'IP-hash, les en-têtes transmis, les
+placeholders et les journaux d'accès partagent la même adresse client
+vérifiée. La modification de `trusted_proxies` nécessite actuellement un
+redémarrage.
+
 ### Routage et matchers
 
 Pingclair dispose d'un système de matchers puissant : routez les requêtes selon le chemin, le domaine, les en-têtes, etc.
