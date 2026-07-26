@@ -1,11 +1,11 @@
 //! File server implementation
 
+use pingclair_core::error::Result;
 use std::collections::{HashMap, VecDeque};
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
-use pingclair_core::error::Result;
-use std::io::{Read as _, Seek as _, SeekFrom};
 
 /// Key for a cached compressed response: a file identity (path + mtime) plus
 /// the content encoding. mtime is part of the key so editing a file naturally
@@ -36,7 +36,12 @@ struct CompressCache {
 
 impl CompressCache {
     fn new(budget: usize) -> Self {
-        Self { entries: HashMap::new(), lru: VecDeque::new(), bytes: 0, budget }
+        Self {
+            entries: HashMap::new(),
+            lru: VecDeque::new(),
+            bytes: 0,
+            budget,
+        }
     }
 
     fn touch(&mut self, key: &CompressKey) {
@@ -106,7 +111,7 @@ impl Default for FileServerConfig {
             index: vec!["index.html".to_string(), "index.htm".to_string()],
             browse: false,
             compress: true,
-            precompressed: true,  // Default to checking for pre-compressed files
+            precompressed: true, // Default to checking for pre-compressed files
         }
     }
 }
@@ -185,23 +190,23 @@ impl StreamingFile {
         if self.bytes_read >= self.file_size {
             return Ok(None);
         }
-        
+
         let remaining = (self.file_size - self.bytes_read) as usize;
         let to_read = remaining.min(self.chunk_size);
-        
+
         let mut buf = vec![0u8; to_read];
         let n = self.file.read(&mut buf)?;
-        
+
         if n == 0 {
             return Ok(None);
         }
-        
+
         buf.truncate(n);
         self.bytes_read += n as u64;
-        
+
         Ok(Some(buf))
     }
-    
+
     /// Get progress as a fraction (0.0 - 1.0)
     pub fn progress(&self) -> f64 {
         if self.file_size == 0 {
@@ -210,12 +215,12 @@ impl StreamingFile {
             self.bytes_read as f64 / self.file_size as f64
         }
     }
-    
+
     /// Check if streaming is complete
     pub fn is_complete(&self) -> bool {
         self.bytes_read >= self.file_size
     }
-    
+
     /// Get Content-Length header value
     pub fn content_length(&self) -> u64 {
         self.file_size
@@ -248,20 +253,20 @@ impl FileServer {
         self.config.browse = enable;
         self
     }
-    
+
     /// Try multiple file paths and return the first one that exists
     /// This is commonly used for SPA (Single Page Application) fallback
     /// Example: try_files(["{path}", "{path}/index.html", "/index.html"])
     pub async fn try_files(
-        &self, 
-        request_path: &str, 
-        patterns: &[String], 
+        &self,
+        request_path: &str,
+        patterns: &[String],
         accept_encoding: Option<&str>,
     ) -> Result<Option<ServedFile>> {
         for pattern in patterns {
             // Replace {path} placeholder with actual request path
             let path = pattern.replace("{path}", request_path.trim_start_matches('/'));
-            
+
             // Try to serve this path
             if let Ok(Some(file)) = self.serve(&path, None, accept_encoding).await {
                 return Ok(Some(file));
@@ -269,7 +274,7 @@ impl FileServer {
         }
         Ok(None)
     }
-    
+
     /// THRESHOLD for using streaming vs in-memory (5MB)
     const STREAMING_THRESHOLD: u64 = 5 * 1024 * 1024;
 
@@ -325,9 +330,13 @@ impl FileServer {
     /// complete (non-Range), uncompressed responses above
     /// [`Self::STREAMING_THRESHOLD`]. Compressed responses stay buffered so
     /// the compression cache keeps working.
-    pub fn should_stream_response(&self, file_size: u64, range: Option<&str>, accept_encoding: Option<&str>) -> bool {
-        self.could_stream(range, accept_encoding)
-            && file_size > Self::STREAMING_THRESHOLD
+    pub fn should_stream_response(
+        &self,
+        file_size: u64,
+        range: Option<&str>,
+        accept_encoding: Option<&str>,
+    ) -> bool {
+        self.could_stream(range, accept_encoding) && file_size > Self::STREAMING_THRESHOLD
     }
 
     /// Serve a large file using zero-copy streaming
@@ -367,13 +376,19 @@ impl FileServer {
         // Calculate Last-Modified and ETag
         let last_modified = metadata.modified().ok().map(httpdate::fmt_http_date);
 
-        let etag = format!("\"{:x}-{:x}\"", file_size,
-            metadata.modified().map(|t| t.elapsed().unwrap_or_default().as_secs()).unwrap_or(0));
+        let etag = format!(
+            "\"{:x}-{:x}\"",
+            file_size,
+            metadata
+                .modified()
+                .map(|t| t.elapsed().unwrap_or_default().as_secs())
+                .unwrap_or(0)
+        );
 
         Ok(StreamingFile {
             file,
             file_size,
-            chunk_size: 64 * 1024,  // 64KB chunks
+            chunk_size: 64 * 1024, // 64KB chunks
             mime_type,
             path: file_path,
             last_modified,
@@ -381,7 +396,7 @@ impl FileServer {
             bytes_read: 0,
         })
     }
-    
+
     /// Check if a file should be served with streaming (based on size)
     pub async fn should_stream(&self, path: &str) -> Result<bool> {
         let file_path = self.config.root.join(path.trim_start_matches('/'));
@@ -391,14 +406,18 @@ impl FileServer {
         }
     }
 
-
     /// Serve a file request, choosing between a buffered body and a
     /// streaming handle: large, complete (non-Range), uncompressed
     /// responses come back as [`ServedResponse::Stream`] so the caller can
     /// write them out in chunks; everything else is
     /// [`ServedResponse::Buffered`]. One path resolution + one stat per
     /// request either way — no probe-then-fall-back double work.
-    pub async fn serve_auto(&self, path: &str, range_header: Option<&str>, accept_encoding: Option<&str>) -> Result<Option<ServedResponse>> {
+    pub async fn serve_auto(
+        &self,
+        path: &str,
+        range_header: Option<&str>,
+        accept_encoding: Option<&str>,
+    ) -> Result<Option<ServedResponse>> {
         // Lexical docroot check (rejects `..` traversal; no syscalls)
         let mut file_path = match self.resolve_path(path) {
             Some(p) => p,
@@ -406,7 +425,7 @@ impl FileServer {
         };
 
         tracing::debug!("📁 Serving request: {} -> {:?}", path, file_path);
-        
+
         // Check if metadata exists (synchronous by design — see
         // serve_streaming for why tokio::fs is avoided on this hot path)
         let metadata = match std::fs::metadata(&file_path) {
@@ -426,14 +445,15 @@ impl FileServer {
                     break;
                 }
             }
-            
+
             // If still a directory (no index found)
             if !index_found {
                 if self.config.browse {
                     let listing = self.generate_listing(&file_path, path).await?;
                     // Compress listing if enabled
                     let (content, encoding) = if self.config.compress && range_header.is_none() {
-                        self.compress_content(listing.as_bytes(), accept_encoding).await?
+                        self.compress_content(listing.as_bytes(), accept_encoding)
+                            .await?
                     } else {
                         (listing.into_bytes(), None)
                     };
@@ -460,12 +480,18 @@ impl FileServer {
             Err(_) => return Ok(None),
         };
         let file_size = metadata.len();
-        
+
         // Calculate Last-Modified and ETag
         let last_modified = metadata.modified().ok().map(httpdate::fmt_http_date);
-            
-        let etag = format!("\"{:x}-{:x}\"", file_size, 
-            metadata.modified().map(|t| t.elapsed().unwrap_or_default().as_secs()).unwrap_or(0));
+
+        let etag = format!(
+            "\"{:x}-{:x}\"",
+            file_size,
+            metadata
+                .modified()
+                .map(|t| t.elapsed().unwrap_or_default().as_secs())
+                .unwrap_or(0)
+        );
 
         // Handle Range Request
         let mut status = 200;
@@ -479,9 +505,9 @@ impl FileServer {
             start = s;
             length = e - s + 1;
             status = 206;
-            content_range = Some(format!("bytes {}-{}/{}", s, e, file_size));
+            content_range = Some(format!("bytes {s}-{e}/{file_size}"));
         }
-        
+
         // MIME type is path-based (no I/O) and needed by both the cache fast
         // path and every response below — compute it once, up front.
         let mime_type = mime_guess::from_path(&file_path)
@@ -493,7 +519,9 @@ impl FileServer {
         // never held in memory. Checked before the compression cache path,
         // which only ever applies to buffered responses.
         if self.should_stream_response(file_size, range_header, accept_encoding) {
-            return Ok(Some(ServedResponse::Stream(Self::open_stream(file_path, &metadata)?)));
+            return Ok(Some(ServedResponse::Stream(Self::open_stream(
+                file_path, &metadata,
+            )?)));
         }
 
         // Cache-key ingredients. Only full-file (200, non-range) responses
@@ -504,7 +532,9 @@ impl FileServer {
         } else {
             None
         };
-        let mtime_ns = metadata.modified().ok()
+        let mtime_ns = metadata
+            .modified()
+            .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_nanos());
 
@@ -513,9 +543,17 @@ impl FileServer {
         // whole point of the cache — a hot compressible file is compressed
         // once, then served from memory.
         if let (Some(enc), Some(mtime_ns)) = (cache_encoding, mtime_ns) {
-            let key = CompressKey { path: file_path.clone(), mtime_ns, encoding: enc };
+            let key = CompressKey {
+                path: file_path.clone(),
+                mtime_ns,
+                encoding: enc,
+            };
             if let Some(cached) = self.compress_cache.lock().unwrap().get(&key) {
-                tracing::debug!("✅ Serving cached {} compression: {}", enc, file_path.display());
+                tracing::debug!(
+                    "✅ Serving cached {} compression: {}",
+                    enc,
+                    file_path.display()
+                );
                 return Ok(Some(ServedResponse::Buffered(ServedFile {
                     content: (*cached).clone(),
                     mime_type,
@@ -539,7 +577,11 @@ impl FileServer {
             && let Some((precompressed_content, encoding)) =
                 self.try_precompressed(&file_path, accept_encoding).await
         {
-            tracing::debug!("✅ Using pre-compressed file: {} ({})", file_path.display(), encoding);
+            tracing::debug!(
+                "✅ Using pre-compressed file: {} ({})",
+                file_path.display(),
+                encoding
+            );
             return Ok(Some(ServedResponse::Buffered(ServedFile {
                 content: precompressed_content,
                 mime_type,
@@ -561,7 +603,11 @@ impl FileServer {
         // own (the cold-cache stampede behind the benchmark's cold-start
         // memory spike — see benchmarks/README.md).
         let inflight = if let (Some(enc), Some(mtime_ns)) = (cache_encoding, mtime_ns) {
-            let key = CompressKey { path: file_path.clone(), mtime_ns, encoding: enc };
+            let key = CompressKey {
+                path: file_path.clone(),
+                mtime_ns,
+                encoding: enc,
+            };
             let lock = {
                 let mut map = self.in_flight.lock().unwrap();
                 map.entry(key.clone())
@@ -575,7 +621,11 @@ impl FileServer {
             if let Some(cached) = self.compress_cache.lock().unwrap().get(&key) {
                 drop(guard);
                 Self::release_inflight(&self.in_flight, &key, &lock);
-                tracing::debug!("✅ Serving coalesced {} compression: {}", enc, file_path.display());
+                tracing::debug!(
+                    "✅ Serving coalesced {} compression: {}",
+                    enc,
+                    file_path.display()
+                );
                 return Ok(Some(ServedResponse::Buffered(ServedFile {
                     content: (*cached).clone(),
                     mime_type,
@@ -630,7 +680,12 @@ impl FileServer {
     /// result is read into memory here, so this shares the old
     /// whole-body-in-memory behavior for large files. The main HTTP path
     /// uses `serve_auto` directly.
-    pub async fn serve(&self, path: &str, range_header: Option<&str>, accept_encoding: Option<&str>) -> Result<Option<ServedFile>> {
+    pub async fn serve(
+        &self,
+        path: &str,
+        range_header: Option<&str>,
+        accept_encoding: Option<&str>,
+    ) -> Result<Option<ServedFile>> {
         match self.serve_auto(path, range_header, accept_encoding).await? {
             Some(ServedResponse::Buffered(file)) => Ok(Some(file)),
             Some(ServedResponse::Stream(mut stream)) => {
@@ -682,8 +737,15 @@ impl FileServer {
             Some(enc) => {
                 let compressed = Arc::new(Self::compress_with(&content, enc).await?);
                 if let Some(mtime_ns) = mtime_ns {
-                    let key = CompressKey { path: file_path.to_path_buf(), mtime_ns, encoding: enc };
-                    self.compress_cache.lock().unwrap().insert(key, compressed.clone());
+                    let key = CompressKey {
+                        path: file_path.to_path_buf(),
+                        mtime_ns,
+                        encoding: enc,
+                    };
+                    self.compress_cache
+                        .lock()
+                        .unwrap()
+                        .insert(key, compressed.clone());
                 }
                 Ok(((*compressed).clone(), Some(enc.to_string())))
             }
@@ -707,36 +769,37 @@ impl FileServer {
 
     /// Try to find and load a pre-compressed version of the file
     /// Checks for .br, .gz, .zst files in order of preference based on Accept-Encoding
-    async fn try_precompressed(&self, original_path: &std::path::Path, accept_encoding: Option<&str>) -> Option<(Vec<u8>, &'static str)> {
+    async fn try_precompressed(
+        &self,
+        original_path: &std::path::Path,
+        accept_encoding: Option<&str>,
+    ) -> Option<(Vec<u8>, &'static str)> {
         let accept = accept_encoding?;
-        
+
         // Priority order based on compression ratio and modern support:
         // 1. Brotli (.br) - best for web
         // 2. Zstd (.zst) - fastest decompression
         // 3. Gzip (.gz) - widest support
-        let candidates: Vec<(&'static str, &'static str)> = vec![
-            ("br", ".br"),
-            ("zstd", ".zst"),
-            ("gzip", ".gz"),
-        ];
-        
+        let candidates: Vec<(&'static str, &'static str)> =
+            vec![("br", ".br"), ("zstd", ".zst"), ("gzip", ".gz")];
+
         for (encoding, ext) in candidates {
             if !accept.contains(encoding) {
                 continue;
             }
-            
+
             // Build precompressed path
             let mut precompressed_path = original_path.as_os_str().to_owned();
             precompressed_path.push(ext);
             let precompressed_path = std::path::PathBuf::from(precompressed_path);
-            
+
             // Check if pre-compressed file exists and is readable
             // (synchronous read — same rationale as read_and_maybe_compress)
             if let Ok(content) = std::fs::read(&precompressed_path) {
                 return Some((content, encoding));
             }
         }
-        
+
         None
     }
 
@@ -758,7 +821,7 @@ impl FileServer {
 
     /// Compress `input` with a specific, already-negotiated encoding.
     async fn compress_with(input: &[u8], encoding: &str) -> Result<Vec<u8>> {
-        use async_compression::tokio::write::{GzipEncoder, BrotliEncoder, ZstdEncoder};
+        use async_compression::tokio::write::{BrotliEncoder, GzipEncoder, ZstdEncoder};
         use tokio::io::AsyncWriteExt;
 
         let out = match encoding {
@@ -787,61 +850,77 @@ impl FileServer {
 
     /// Negotiate + compress in one step (used for small, uncached bodies like
     /// directory listings). Returns the body and the chosen encoding, if any.
-    async fn compress_content(&self, input: &[u8], accept_header: Option<&str>) -> Result<(Vec<u8>, Option<String>)> {
+    async fn compress_content(
+        &self,
+        input: &[u8],
+        accept_header: Option<&str>,
+    ) -> Result<(Vec<u8>, Option<String>)> {
         match Self::negotiate_encoding(accept_header) {
-            Some(enc) => Ok((Self::compress_with(input, enc).await?, Some(enc.to_string()))),
+            Some(enc) => Ok((
+                Self::compress_with(input, enc).await?,
+                Some(enc.to_string()),
+            )),
             None => Ok((input.to_vec(), None)),
         }
     }
-    
+
     /// Generate HTML directory listing
     async fn generate_listing(&self, dir_path: &std::path::Path, req_path: &str) -> Result<String> {
         // Synchronous directory read — a readdir on a local filesystem is a
         // cheap syscall, not worth a spawn_blocking round trip.
         let entries = std::fs::read_dir(dir_path)?;
         let mut html = format!(
-            "<html><head><title>Index of {}</title></head><body><h1>Index of {}</h1><hr><pre>",
-            req_path, req_path
+            "<html><head><title>Index of {req_path}</title></head><body><h1>Index of {req_path}</h1><hr><pre>"
         );
-        
+
         // Parent link
         if req_path != "/" {
-             html.push_str("<a href=\"..\">../</a>\n");
+            html.push_str("<a href=\"..\">../</a>\n");
         }
-        
+
         for entry in entries {
             let entry = entry?;
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             let is_dir = entry.file_type()?.is_dir();
-            let display_name = if is_dir { format!("{}/", name_str) } else { name_str.to_string() };
-            
-            html.push_str(&format!("<a href=\"{}\">{}</a>\n", display_name, display_name));
+            let display_name = if is_dir {
+                format!("{name_str}/")
+            } else {
+                name_str.to_string()
+            };
+
+            html.push_str(&format!("<a href=\"{display_name}\">{display_name}</a>\n"));
         }
-        
+
         html.push_str("</pre><hr></body></html>");
         Ok(html)
     }
-    
+
     /// Parse Range header (bytes=start-end)
     fn parse_range(&self, header: &str, file_size: u64) -> Option<(u64, u64)> {
-        if !header.starts_with("bytes=") { return None; }
+        if !header.starts_with("bytes=") {
+            return None;
+        }
         let val = &header[6..];
         let parts: Vec<&str> = val.split('-').collect();
-        if parts.len() != 2 { return None; }
-        
+        if parts.len() != 2 {
+            return None;
+        }
+
         let start_str = parts[0];
         let end_str = parts[1];
-        
+
         let start = start_str.parse::<u64>().ok().unwrap_or(0);
         let end = if end_str.is_empty() {
             file_size - 1
         } else {
             end_str.parse::<u64>().ok().unwrap_or(file_size - 1)
         };
-        
-        if start > end || start >= file_size { return None; }
-        
+
+        if start > end || start >= file_size {
+            return None;
+        }
+
         Some((start, std::cmp::min(end, file_size - 1)))
     }
 }
@@ -851,7 +930,11 @@ mod compress_cache_tests {
     use super::*;
 
     fn key(path: &str, mtime: u128, enc: &'static str) -> CompressKey {
-        CompressKey { path: PathBuf::from(path), mtime_ns: mtime, encoding: enc }
+        CompressKey {
+            path: PathBuf::from(path),
+            mtime_ns: mtime,
+            encoding: enc,
+        }
     }
 
     #[test]
@@ -860,7 +943,11 @@ mod compress_cache_tests {
         let k = key("/a", 1, "gzip");
         assert!(c.get(&k).is_none(), "empty cache must miss");
         c.insert(k.clone(), Arc::new(vec![0u8; 10]));
-        assert_eq!(c.get(&k).map(|v| v.len()), Some(10), "must hit after insert");
+        assert_eq!(
+            c.get(&k).map(|v| v.len()),
+            Some(10),
+            "must hit after insert"
+        );
     }
 
     #[test]
@@ -870,7 +957,10 @@ mod compress_cache_tests {
         c.insert(key("/a", 1, "br"), Arc::new(vec![2u8; 6]));
         // A newer mtime is a different key — the old compression is stale and
         // must not be served for the new one.
-        assert!(c.get(&key("/a", 2, "gzip")).is_none(), "changed mtime must miss");
+        assert!(
+            c.get(&key("/a", 2, "gzip")).is_none(),
+            "changed mtime must miss"
+        );
         assert_eq!(c.get(&key("/a", 1, "gzip")).map(|v| v[0]), Some(1));
         assert_eq!(c.get(&key("/a", 1, "br")).map(|v| v[0]), Some(2));
     }
@@ -885,8 +975,14 @@ mod compress_cache_tests {
         assert!(c.get(&key("/a", 1, "gzip")).is_some());
         // Insert a 4th entry, forcing one eviction.
         c.insert(key("/d", 1, "gzip"), Arc::new(vec![0u8; 10]));
-        assert!(c.get(&key("/b", 1, "gzip")).is_none(), "LRU entry /b should be evicted");
-        assert!(c.get(&key("/a", 1, "gzip")).is_some(), "recently-touched /a should survive");
+        assert!(
+            c.get(&key("/b", 1, "gzip")).is_none(),
+            "LRU entry /b should be evicted"
+        );
+        assert!(
+            c.get(&key("/a", 1, "gzip")).is_some(),
+            "recently-touched /a should survive"
+        );
         assert!(c.get(&key("/c", 1, "gzip")).is_some());
         assert!(c.get(&key("/d", 1, "gzip")).is_some());
     }
@@ -896,7 +992,11 @@ mod compress_cache_tests {
         let mut c = CompressCache::new(100);
         for i in 0..50 {
             c.insert(key("/f", i, "gzip"), Arc::new(vec![0u8; 25]));
-            assert!(c.bytes <= 100, "budget exceeded at iteration {i}: {} bytes", c.bytes);
+            assert!(
+                c.bytes <= 100,
+                "budget exceeded at iteration {i}: {} bytes",
+                c.bytes
+            );
         }
     }
 
@@ -934,9 +1034,15 @@ mod traversal_tests {
         let base = tempfile::tempdir().unwrap();
         let root = base.path().join("root");
         tokio::fs::create_dir_all(root.join("sub")).await.unwrap();
-        tokio::fs::write(root.join("index.html"), b"hello").await.unwrap();
-        tokio::fs::write(root.join("sub/page.txt"), b"nested").await.unwrap();
-        tokio::fs::write(base.path().join("secret.txt"), b"top secret").await.unwrap();
+        tokio::fs::write(root.join("index.html"), b"hello")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("sub/page.txt"), b"nested")
+            .await
+            .unwrap();
+        tokio::fs::write(base.path().join("secret.txt"), b"top secret")
+            .await
+            .unwrap();
         Fixture { base, root }
     }
 
@@ -954,8 +1060,18 @@ mod traversal_tests {
     async fn dot_dot_traversal_is_rejected() {
         let f = fixture().await;
         let fs = server(&f.root);
-        assert!(fs.serve("/../secret.txt", None, None).await.unwrap().is_none());
-        assert!(fs.serve("/sub/../../secret.txt", None, None).await.unwrap().is_none());
+        assert!(
+            fs.serve("/../secret.txt", None, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fs.serve("/sub/../../secret.txt", None, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(fs.serve("..", None, None).await.unwrap().is_none());
     }
 
@@ -963,7 +1079,12 @@ mod traversal_tests {
     async fn dot_dot_traversal_is_rejected_for_streaming() {
         let f = fixture().await;
         let fs = server(&f.root);
-        assert!(fs.serve_streaming("/../secret.txt").await.unwrap().is_none());
+        assert!(
+            fs.serve_streaming("/../secret.txt")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -973,8 +1094,18 @@ mod traversal_tests {
         // and the request must come back as not-found, never as the secret.
         let f = fixture().await;
         let fs = server(&f.root);
-        assert!(fs.serve("/..%2fsecret.txt", None, None).await.unwrap().is_none());
-        assert!(fs.serve("/%2e%2e/secret.txt", None, None).await.unwrap().is_none());
+        assert!(
+            fs.serve("/..%2fsecret.txt", None, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fs.serve("/%2e%2e/secret.txt", None, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -983,7 +1114,8 @@ mod traversal_tests {
         // Caddy by default, symlinks are followed — docroot is not a
         // security boundary against someone who can plant symlinks in it.
         let f = fixture().await;
-        std::os::unix::fs::symlink(f.base.path().join("secret.txt"), f.root.join("link.txt")).unwrap();
+        std::os::unix::fs::symlink(f.base.path().join("secret.txt"), f.root.join("link.txt"))
+            .unwrap();
         let fs = server(&f.root);
         let served = fs.serve("/link.txt", None, None).await.unwrap().unwrap();
         assert_eq!(served.content, b"top secret");
@@ -992,9 +1124,14 @@ mod traversal_tests {
     #[tokio::test]
     async fn symlink_staying_inside_root_is_served() {
         let f = fixture().await;
-        std::os::unix::fs::symlink(f.root.join("sub/page.txt"), f.root.join("inner-link.txt")).unwrap();
+        std::os::unix::fs::symlink(f.root.join("sub/page.txt"), f.root.join("inner-link.txt"))
+            .unwrap();
         let fs = server(&f.root);
-        let served = fs.serve("/inner-link.txt", None, None).await.unwrap().unwrap();
+        let served = fs
+            .serve("/inner-link.txt", None, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(served.content, b"nested");
     }
 
@@ -1004,7 +1141,11 @@ mod traversal_tests {
         let fs = server(&f.root);
         let index = fs.serve("/", None, None).await.unwrap().unwrap();
         assert_eq!(index.content, b"hello");
-        let nested = fs.serve("/sub/page.txt", None, None).await.unwrap().unwrap();
+        let nested = fs
+            .serve("/sub/page.txt", None, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(nested.content, b"nested");
         let streamed = fs.serve_streaming("/sub/page.txt").await.unwrap().unwrap();
         assert_eq!(streamed.file_size, 6);
@@ -1031,10 +1172,17 @@ mod serve_auto_tests {
         // 6MB, over the 5MB streaming threshold; non-repeating so gzip
         // wouldn't trivially shrink it (not used here anyway).
         let body: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
-        tokio::fs::write(dir.path().join("big.bin"), &body).await.unwrap();
+        tokio::fs::write(dir.path().join("big.bin"), &body)
+            .await
+            .unwrap();
 
         let fs = server(dir.path(), false);
-        match fs.serve_auto("/big.bin", None, None).await.unwrap().unwrap() {
+        match fs
+            .serve_auto("/big.bin", None, None)
+            .await
+            .unwrap()
+            .unwrap()
+        {
             ServedResponse::Stream(mut stream) => {
                 assert_eq!(stream.file_size, body.len() as u64);
                 let mut got = Vec::new();
@@ -1050,14 +1198,23 @@ mod serve_auto_tests {
     #[tokio::test]
     async fn large_file_stays_buffered_when_compression_is_negotiated() {
         let dir = tempfile::tempdir().unwrap();
-        tokio::fs::write(dir.path().join("big.txt"), &vec![b'a'; 6 * 1024 * 1024]).await.unwrap();
+        tokio::fs::write(dir.path().join("big.txt"), &vec![b'a'; 6 * 1024 * 1024])
+            .await
+            .unwrap();
 
         let fs = server(dir.path(), true);
-        match fs.serve_auto("/big.txt", None, Some("gzip")).await.unwrap().unwrap() {
+        match fs
+            .serve_auto("/big.txt", None, Some("gzip"))
+            .await
+            .unwrap()
+            .unwrap()
+        {
             ServedResponse::Buffered(file) => {
                 assert_eq!(file.content_encoding.as_deref(), Some("gzip"));
             }
-            ServedResponse::Stream(_) => panic!("compressed responses must stay buffered for the cache"),
+            ServedResponse::Stream(_) => {
+                panic!("compressed responses must stay buffered for the cache")
+            }
         }
     }
 
@@ -1065,11 +1222,16 @@ mod serve_auto_tests {
     async fn serve_wrapper_buffers_a_stream_for_compat_callers() {
         let dir = tempfile::tempdir().unwrap();
         let body = vec![b'x'; 6 * 1024 * 1024];
-        tokio::fs::write(dir.path().join("big.bin"), &body).await.unwrap();
+        tokio::fs::write(dir.path().join("big.bin"), &body)
+            .await
+            .unwrap();
 
         let fs = server(dir.path(), false);
         let served = fs.serve("/big.bin", None, None).await.unwrap().unwrap();
-        assert_eq!(served.content, body, "serve() must return the full body even for streamed files");
+        assert_eq!(
+            served.content, body,
+            "serve() must return the full body even for streamed files"
+        );
     }
 }
 
@@ -1078,7 +1240,10 @@ mod stream_decision_tests {
     use super::*;
 
     fn server(compress: bool) -> FileServer {
-        FileServer::new(FileServerConfig { compress, ..Default::default() })
+        FileServer::new(FileServerConfig {
+            compress,
+            ..Default::default()
+        })
     }
 
     const BIG: u64 = 6 * 1024 * 1024; // over the 5MB threshold
@@ -1093,9 +1258,18 @@ mod stream_decision_tests {
     #[test]
     fn small_range_or_compressed_responses_stay_buffered() {
         let fs = server(true);
-        assert!(!fs.should_stream_response(SMALL, None, None), "below threshold");
-        assert!(!fs.should_stream_response(BIG, Some("bytes=0-99"), None), "range request");
-        assert!(!fs.should_stream_response(BIG, None, Some("gzip, br")), "compression negotiated");
+        assert!(
+            !fs.should_stream_response(SMALL, None, None),
+            "below threshold"
+        );
+        assert!(
+            !fs.should_stream_response(BIG, Some("bytes=0-99"), None),
+            "range request"
+        );
+        assert!(
+            !fs.should_stream_response(BIG, None, Some("gzip, br")),
+            "compression negotiated"
+        );
         // Compression disabled in config: nothing to cache, streaming is fine.
         assert!(server(false).should_stream_response(BIG, None, Some("gzip")));
         // Unsupported encodings don't count as negotiated.
@@ -1130,20 +1304,38 @@ mod serve_cache_tests {
         });
 
         // First request: cache miss, compresses and stores.
-        let first = fs.serve("/big.txt", None, Some("gzip")).await.unwrap().unwrap();
+        let first = fs
+            .serve("/big.txt", None, Some("gzip"))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(first.content_encoding.as_deref(), Some("gzip"));
         assert!(first.content.len() < body.len(), "should be compressed");
-        assert_eq!(fs.compress_cache.lock().unwrap().entries.len(), 1, "first request should populate the cache");
+        assert_eq!(
+            fs.compress_cache.lock().unwrap().entries.len(),
+            1,
+            "first request should populate the cache"
+        );
 
         // Second request: must hit the cache and return byte-identical output.
-        let second = fs.serve("/big.txt", None, Some("gzip")).await.unwrap().unwrap();
-        assert_eq!(second.content, first.content, "cached body must match freshly compressed body");
+        let second = fs
+            .serve("/big.txt", None, Some("gzip"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second.content, first.content,
+            "cached body must match freshly compressed body"
+        );
 
         // And the cached bytes must be valid gzip that round-trips.
         let mut d = flate2::read::GzDecoder::new(&second.content[..]);
         let mut out = Vec::new();
         std::io::Read::read_to_end(&mut d, &mut out).unwrap();
-        assert_eq!(out, body, "cached gzip must decompress to the original file");
+        assert_eq!(
+            out, body,
+            "cached gzip must decompress to the original file"
+        );
     }
 
     #[tokio::test]
@@ -1159,7 +1351,11 @@ mod serve_cache_tests {
             precompressed: false,
         });
 
-        let first = fs.serve("/f.txt", None, Some("gzip")).await.unwrap().unwrap();
+        let first = fs
+            .serve("/f.txt", None, Some("gzip"))
+            .await
+            .unwrap()
+            .unwrap();
         let mut d1 = flate2::read::GzDecoder::new(&first.content[..]);
         let mut out1 = Vec::new();
         std::io::Read::read_to_end(&mut d1, &mut out1).unwrap();
@@ -1174,11 +1370,19 @@ mod serve_cache_tests {
         let future = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
         filetime_set(&path, future);
 
-        let second = fs.serve("/f.txt", None, Some("gzip")).await.unwrap().unwrap();
+        let second = fs
+            .serve("/f.txt", None, Some("gzip"))
+            .await
+            .unwrap()
+            .unwrap();
         let mut d2 = flate2::read::GzDecoder::new(&second.content[..]);
         let mut out2 = Vec::new();
         std::io::Read::read_to_end(&mut d2, &mut out2).unwrap();
-        assert_eq!(out2, vec![b'z'; 8192], "must serve the NEW content, not the stale cached compression");
+        assert_eq!(
+            out2,
+            vec![b'z'; 8192],
+            "must serve the NEW content, not the stale cached compression"
+        );
     }
 
     // Minimal mtime setter without pulling in the `filetime` crate: reopen and
@@ -1212,20 +1416,35 @@ mod serve_cache_tests {
         // The key serve() will compute for this file: the lexically
         // resolved docroot-joined path (see resolve_path).
         let resolved_path = dir.path().join("big.txt");
-        let mtime_ns = std::fs::metadata(&path).unwrap().modified().unwrap()
-            .duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let key = CompressKey { path: resolved_path, mtime_ns, encoding: "gzip" };
+        let mtime_ns = std::fs::metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let key = CompressKey {
+            path: resolved_path,
+            mtime_ns,
+            encoding: "gzip",
+        };
 
         // Simulate an in-flight compression: hold the per-key lock the way
         // the first requester would.
         let leader_lock = Arc::new(tokio::sync::Mutex::new(()));
-        fs.in_flight.lock().unwrap().insert(key.clone(), leader_lock.clone());
+        fs.in_flight
+            .lock()
+            .unwrap()
+            .insert(key.clone(), leader_lock.clone());
         let leader_guard = leader_lock.clone().lock_owned().await;
 
         // A concurrent request must now block on the in-flight lock...
         let fs2 = fs.clone();
         let mut follower = tokio::spawn(async move {
-            fs2.serve("/big.txt", None, Some("gzip")).await.unwrap().unwrap()
+            fs2.serve("/big.txt", None, Some("gzip"))
+                .await
+                .unwrap()
+                .unwrap()
         });
         tokio::select! {
             _ = &mut follower => panic!("follower completed while compression was still in flight"),
@@ -1234,19 +1453,30 @@ mod serve_cache_tests {
 
         // ...until the leader publishes its result to the cache and
         // releases the lock.
-        let compressed = FileServer::compress_with(&vec![b'a'; 4096], "gzip").await.unwrap();
-        fs.compress_cache.lock().unwrap().insert(key.clone(), Arc::new(compressed.clone()));
+        let compressed = FileServer::compress_with(&vec![b'a'; 4096], "gzip")
+            .await
+            .unwrap();
+        fs.compress_cache
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Arc::new(compressed.clone()));
         drop(leader_guard);
 
         let served = tokio::time::timeout(std::time::Duration::from_secs(5), &mut follower)
             .await
             .expect("follower never unblocked after the leader finished")
             .unwrap();
-        assert_eq!(served.content, compressed, "follower must serve the leader's shared result");
+        assert_eq!(
+            served.content, compressed,
+            "follower must serve the leader's shared result"
+        );
         assert_eq!(served.content_encoding.as_deref(), Some("gzip"));
 
         // The in-flight bookkeeping must not leak: both the leader's slot
         // (removed by the follower on its coalesced hit) is gone.
-        assert!(fs.in_flight.lock().unwrap().is_empty(), "in-flight entry must be removed after use");
+        assert!(
+            fs.in_flight.lock().unwrap().is_empty(),
+            "in-flight entry must be removed after use"
+        );
     }
 }

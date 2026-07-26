@@ -2,15 +2,15 @@
 //!
 //! 🛡️ Coordinates certificate management, ACME challenges, and TLS handshakes.
 
+use crate::acme::{ChallengeHandler, MemoryChallengeHandler};
 use crate::auto_https::{AutoHttps, AutoHttpsConfig};
 use crate::cert_store::CertStore;
-use crate::acme::{ChallengeHandler, MemoryChallengeHandler};
 use crate::persistent_challenge_handler::PersistentChallengeHandler;
-use std::sync::Arc;
-use std::collections::HashMap;
-use tokio_rustls::rustls;
 use parking_lot::RwLock;
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio_rustls::rustls;
 
 /// Certificate entry with expiration tracking
 #[derive(Clone)]
@@ -41,10 +41,14 @@ pub struct TlsManager {
 
 impl TlsManager {
     /// Create a new TLS manager with persistent challenge handler (default)
-    pub async fn new(config: Option<AutoHttpsConfig>, store_path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn new(
+        config: Option<AutoHttpsConfig>,
+        store_path: &std::path::Path,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Use persistent challenge handler by default
         let challenge_storage_path = store_path.join("acme-challenges.json");
-        let challenge_handler = Arc::new(PersistentChallengeHandler::new(challenge_storage_path).await?);
+        let challenge_handler =
+            Arc::new(PersistentChallengeHandler::new(challenge_storage_path).await?);
 
         let auto_https = if let Some(config) = config {
             let store = Arc::new(CertStore::new(store_path));
@@ -63,7 +67,10 @@ impl TlsManager {
     }
 
     /// Create a new TLS manager with memory-based challenge handler (legacy)
-    pub fn new_with_memory_challenges(config: Option<AutoHttpsConfig>, store_path: &std::path::Path) -> Self {
+    pub fn new_with_memory_challenges(
+        config: Option<AutoHttpsConfig>,
+        store_path: &std::path::Path,
+    ) -> Self {
         let challenge_handler = Arc::new(MemoryChallengeHandler::new());
 
         let auto_https = if let Some(config) = config {
@@ -88,7 +95,8 @@ impl TlsManager {
         store_path: &std::path::Path,
         challenge_storage_path: &std::path::Path,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let challenge_handler = Arc::new(PersistentChallengeHandler::new(challenge_storage_path.to_path_buf()).await?);
+        let challenge_handler =
+            Arc::new(PersistentChallengeHandler::new(challenge_storage_path.to_path_buf()).await?);
 
         let auto_https = if let Some(config) = config {
             let store = Arc::new(CertStore::new(store_path));
@@ -105,13 +113,13 @@ impl TlsManager {
             cache_ttl: Duration::from_secs(3600), // 1 hour default TTL
         })
     }
-    
+
     /// Initializes the manager (async steps)
     pub async fn init(&self) -> Result<(), crate::AutoHttpsError> {
         if let Some(_auto) = &self.auto_https {
-             // We can access the store via internal field if we exposed it, or we just trust it works lazy
-             // But actually CertStore::init creates directories, which is good to do early.
-             // For this MVP, we will rely on AutoHttps lazily using it or simple directory creation.
+            // We can access the store via internal field if we exposed it, or we just trust it works lazy
+            // But actually CertStore::init creates directories, which is good to do early.
+            // For this MVP, we will rely on AutoHttps lazily using it or simple directory creation.
         }
         Ok(())
     }
@@ -157,14 +165,17 @@ impl TlsManager {
 
         // 2. Auto HTTPS (ACME store)
         if let Some(auto) = &self.auto_https {
-             match auto.get_certificate(domain, self.challenge_handler.as_ref()).await {
-                 Ok(cert) => {
-                     return Some((cert.cert_pem, cert.key_pem));
-                 },
-                 Err(e) => {
-                     tracing::warn!("❌ Failed to obtain cert for {}: {}", domain, e);
-                 }
-             }
+            match auto
+                .get_certificate(domain, self.challenge_handler.as_ref())
+                .await
+            {
+                Ok(cert) => {
+                    return Some((cert.cert_pem, cert.key_pem));
+                }
+                Err(e) => {
+                    tracing::warn!("❌ Failed to obtain cert for {}: {}", domain, e);
+                }
+            }
         }
         None
     }
@@ -183,18 +194,22 @@ impl TlsManager {
             match self.convert_to_rustls(&cert) {
                 Ok(key) => return Some(Arc::new(key)),
                 Err(e) => {
-                    tracing::error!("❌ Failed to parse manual certificate for {}: {}", domain, e);
+                    tracing::error!(
+                        "❌ Failed to parse manual certificate for {}: {}",
+                        domain,
+                        e
+                    );
                     return None;
                 }
             }
         }
-        
+
         // 2. Check cached CertifiedKey (fast path - no PEM parsing)
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::from_secs(0))
             .as_secs();
-        
+
         {
             let cache_guard = self.cached_certs.read();
             if let Some(cached) = cache_guard.get(domain) {
@@ -203,73 +218,88 @@ impl TlsManager {
                     tracing::debug!("🔐 Using cached CertifiedKey for {}", domain);
                     return Some(cached.certified_key.clone());
                 } else {
-                    tracing::debug!("⏰ Cached certificate expired for {}, removing from cache", domain);
+                    tracing::debug!(
+                        "⏰ Cached certificate expired for {}, removing from cache",
+                        domain
+                    );
                 }
             }
         }
- 
+
         // 3. Auto HTTPS (may need to fetch/renew from ACME)
         if let Some(auto) = &self.auto_https {
-             match auto.get_certificate(domain, self.challenge_handler.as_ref()).await {
-                 Ok(cert) => {
-                     // Convert to rustls CertifiedKey and cache it
-                     if let Ok(key) = self.convert_to_rustls(&cert) {
-                         let key_arc = Arc::new(key);
-                         let current_time = SystemTime::now()
-                             .duration_since(UNIX_EPOCH)
-                             .unwrap_or(Duration::from_secs(0))
-                             .as_secs();
-                         let expires_at = current_time + self.cache_ttl.as_secs();
-                         
-                         let cached_entry = CachedCert {
-                             certified_key: key_arc.clone(),
-                             expires_at,
-                             cached_at: current_time,
-                         };
-                         
-                         // Cache the converted key to avoid future PEM parsing
-                         self.cached_certs.write().insert(domain.to_string(), cached_entry);
-                         tracing::info!("🔐 Cached new CertifiedKey for {} (expires in {}s)", domain, self.cache_ttl.as_secs());
-                         return Some(key_arc);
-                     }
-                 },
-                 Err(e) => {
-                     tracing::warn!("❌ Failed to obtain cert for {}: {}", domain, e);
-                 }
-             }
+            match auto
+                .get_certificate(domain, self.challenge_handler.as_ref())
+                .await
+            {
+                Ok(cert) => {
+                    // Convert to rustls CertifiedKey and cache it
+                    if let Ok(key) = self.convert_to_rustls(&cert) {
+                        let key_arc = Arc::new(key);
+                        let current_time = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or(Duration::from_secs(0))
+                            .as_secs();
+                        let expires_at = current_time + self.cache_ttl.as_secs();
+
+                        let cached_entry = CachedCert {
+                            certified_key: key_arc.clone(),
+                            expires_at,
+                            cached_at: current_time,
+                        };
+
+                        // Cache the converted key to avoid future PEM parsing
+                        self.cached_certs
+                            .write()
+                            .insert(domain.to_string(), cached_entry);
+                        tracing::info!(
+                            "🔐 Cached new CertifiedKey for {} (expires in {}s)",
+                            domain,
+                            self.cache_ttl.as_secs()
+                        );
+                        return Some(key_arc);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("❌ Failed to obtain cert for {}: {}", domain, e);
+                }
+            }
         }
-        
+
         None
     }
-    
+
     /// Convert internal Certificate to rustls::sign::CertifiedKey
-    fn convert_to_rustls(&self, cert: &crate::Certificate) -> Result<rustls::sign::CertifiedKey, String> {
-         use rustls::pki_types::CertificateDer;
-         
-         // Parse Chain
-         let mut reader = std::io::Cursor::new(&cert.cert_pem);
-         let certs: Vec<CertificateDer> = rustls_pemfile::certs(&mut reader)
-             .filter_map(|r| r.ok())
-             .collect();
-             
-         if certs.is_empty() {
-             return Err("No certificates found".to_string());
-         }
-         
-         // Parse Key
-         let mut reader = std::io::Cursor::new(&cert.key_pem);
-         let key = rustls_pemfile::private_key(&mut reader)
-             .map_err(|e| e.to_string())?
-             .ok_or("No private key found")?;
-        
-         // Verify key type
-         // Verify key type
-         let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
-             .map_err(|_| "Unsupported key type".to_string())?;
-         
-         Ok(rustls::sign::CertifiedKey::new(certs, signing_key))
+    fn convert_to_rustls(
+        &self,
+        cert: &crate::Certificate,
+    ) -> Result<rustls::sign::CertifiedKey, String> {
+        use rustls::pki_types::CertificateDer;
+
+        // Parse Chain
+        let mut reader = std::io::Cursor::new(&cert.cert_pem);
+        let certs: Vec<CertificateDer> = rustls_pemfile::certs(&mut reader)
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if certs.is_empty() {
+            return Err("No certificates found".to_string());
+        }
+
+        // Parse Key
+        let mut reader = std::io::Cursor::new(&cert.key_pem);
+        let key = rustls_pemfile::private_key(&mut reader)
+            .map_err(|e| e.to_string())?
+            .ok_or("No private key found")?;
+
+        // Verify key type
+        // Verify key type
+        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+            .map_err(|_| "Unsupported key type".to_string())?;
+
+        Ok(rustls::sign::CertifiedKey::new(certs, signing_key))
     }
-    
+
     /// Get the challenge handler for HTTP-01
     pub fn challenge_handler(&self) -> Arc<dyn ChallengeHandler> {
         self.challenge_handler.clone()
@@ -281,12 +311,10 @@ impl TlsManager {
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::from_secs(0))
             .as_secs();
-        
+
         let mut cache_guard = self.cached_certs.write();
-        cache_guard.retain(|_domain, cached| {
-            current_time < cached.expires_at
-        });
-        
+        cache_guard.retain(|_domain, cached| current_time < cached.expires_at);
+
         tracing::debug!("🧹 Cleaned expired certificate cache entries");
     }
 
@@ -301,19 +329,15 @@ mod tests {
     use super::*;
 
     fn test_manager() -> TlsManager {
-        let dir = std::env::temp_dir()
-            .join(format!("pingclair-tls-manager-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("pingclair-tls-manager-test-{}", std::process::id()));
         TlsManager::new_with_memory_challenges(None, &dir)
     }
 
     #[tokio::test]
     async fn resolve_pem_returns_manual_cert() {
         let manager = test_manager();
-        manager.add_manual_cert(
-            "example.com",
-            "CERT_PEM".to_string(),
-            "KEY_PEM".to_string(),
-        );
+        manager.add_manual_cert("example.com", "CERT_PEM".to_string(), "KEY_PEM".to_string());
 
         let resolved = manager.resolve_pem("example.com").await;
         assert_eq!(
@@ -342,11 +366,7 @@ mod tests {
     #[tokio::test]
     async fn peek_pem_returns_manual_cert_without_issuance() {
         let manager = test_manager();
-        manager.add_manual_cert(
-            "example.com",
-            "CERT_PEM".to_string(),
-            "KEY_PEM".to_string(),
-        );
+        manager.add_manual_cert("example.com", "CERT_PEM".to_string(), "KEY_PEM".to_string());
 
         assert_eq!(
             manager.peek_pem("example.com").await,

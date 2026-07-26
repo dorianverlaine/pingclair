@@ -14,7 +14,9 @@ pub mod manager;
 pub mod persistent_challenge_handler;
 mod secure_file;
 
-pub use acme::{AcmeClient, AcmeError, Certificate, ChallengeHandler, ChallengeType, ChallengeResponse};
+pub use acme::{
+    AcmeClient, AcmeError, Certificate, ChallengeHandler, ChallengeResponse, ChallengeType,
+};
 pub use auto_https::{AutoHttps, AutoHttpsConfig, AutoHttpsError};
 pub use cert_store::{CertStore, CertStoreError};
 pub use manager::TlsManager;

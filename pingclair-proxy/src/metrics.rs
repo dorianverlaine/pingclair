@@ -16,8 +16,9 @@ pub static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
 pub static REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new("pingclair_requests_total", "Total number of HTTP requests"),
-        &["method", "status", "host"]
-    ).expect("metric can be created")
+        &["method", "status", "host"],
+    )
+    .expect("metric can be created")
 });
 
 /// Request latency in seconds
@@ -25,18 +26,23 @@ pub static REQUEST_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     HistogramVec::new(
         prometheus::HistogramOpts::new(
             "pingclair_request_duration_seconds",
-            "Request duration in seconds"
+            "Request duration in seconds",
         ),
-        &["method", "status", "host"]
-    ).expect("metric can be created")
+        &["method", "status", "host"],
+    )
+    .expect("metric can be created")
 });
 
 /// Active connections
 pub static ACTIVE_CONNECTIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
-        Opts::new("pingclair_active_connections", "Number of active connections"),
-        &["host"]
-    ).expect("metric can be created")
+        Opts::new(
+            "pingclair_active_connections",
+            "Number of active connections",
+        ),
+        &["host"],
+    )
+    .expect("metric can be created")
 });
 
 // MARK: - Initialization

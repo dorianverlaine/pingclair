@@ -3,8 +3,8 @@
 //! 🔄 Listens on HTTP port and redirects all requests to HTTPS.
 
 use std::net::SocketAddr;
-use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 /// Configuration for HTTP→HTTPS redirect server
 #[derive(Debug, Clone)]
@@ -37,22 +37,19 @@ impl HttpRedirectServer {
     pub fn new(config: RedirectConfig) -> Self {
         Self { config }
     }
-    
+
     /// Start the redirect server
     pub async fn start(&self) -> std::io::Result<()> {
         let addr: SocketAddr = format!("{}:{}", self.config.bind_addr, self.config.http_port)
             .parse()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-            
+
         let listener = TcpListener::bind(addr).await?;
-        
-        tracing::info!(
-            "🔄 HTTP→HTTPS redirect server listening on http://{}",
-            addr
-        );
-        
+
+        tracing::info!("🔄 HTTP→HTTPS redirect server listening on http://{}", addr);
+
         let https_port = self.config.https_port;
-        
+
         loop {
             match listener.accept().await {
                 Ok((mut stream, _peer_addr)) => {
@@ -63,43 +60,42 @@ impl HttpRedirectServer {
                             Ok(n) if n > 0 => n,
                             _ => return,
                         };
-                        
+
                         let request = String::from_utf8_lossy(&buf[..n]);
-                        
+
                         // Extract Host header
                         let host = request
                             .lines()
                             .find(|l| l.to_lowercase().starts_with("host:"))
                             .map(|l| l[5..].trim())
                             .unwrap_or("localhost");
-                        
+
                         // Remove port from host if present
                         let host_without_port = host.split(':').next().unwrap_or(host);
-                        
+
                         // Extract path from first line
                         let path = request
                             .lines()
                             .next()
                             .and_then(|l| l.split_whitespace().nth(1))
                             .unwrap_or("/");
-                        
+
                         // Build redirect URL
                         let redirect_url = if https_port == 443 {
-                            format!("https://{}{}", host_without_port, path)
+                            format!("https://{host_without_port}{path}")
                         } else {
-                            format!("https://{}:{}{}", host_without_port, https_port, path)
+                            format!("https://{host_without_port}:{https_port}{path}")
                         };
-                        
+
                         // Send 301 redirect
                         let response = format!(
                             "HTTP/1.1 301 Moved Permanently\r\n\
-                             Location: {}\r\n\
+                             Location: {redirect_url}\r\n\
                              Content-Length: 0\r\n\
                              Connection: close\r\n\
                              Server: Pingclair\r\n\r\n",
-                            redirect_url
                         );
-                        
+
                         let _ = stream.write_all(response.as_bytes()).await;
                     });
                 }

@@ -23,7 +23,7 @@ use x509_parser::prelude::*;
 pub mod directory {
     /// 🏭 Let's Encrypt Production - Trusted certificates.
     pub const LETS_ENCRYPT_PRODUCTION: &str = "https://acme-v02.api.letsencrypt.org/directory";
-    
+
     /// 🧪 Let's Encrypt Staging - Testing only (untrusted root).
     pub const LETS_ENCRYPT_STAGING: &str = "https://acme-staging-v02.api.letsencrypt.org/directory";
 }
@@ -35,16 +35,16 @@ pub mod directory {
 pub enum AcmeError {
     #[error("🔴 Protocol Error: {0}")]
     Protocol(#[from] instant_acme::Error),
-    
+
     #[error("⚠️ Challenge Verification Failed: {0}")]
     ChallengeFailed(String),
-    
+
     #[error("❌ Order Processing Failed: {0}")]
     OrderFailed(String),
-    
+
     #[error("🔧 Certificate Generation Failed: {0}")]
     CertGeneration(String),
-    
+
     #[error("👤 Account Management Error: {0}")]
     Account(String),
 }
@@ -67,13 +67,13 @@ pub enum ChallengeType {
 pub struct ChallengeResponse {
     /// The domain (identifier) being validated.
     pub domain: String,
-    
+
     /// The type of challenge (e.g., HTTP-01).
     pub challenge_type: ChallengeType,
-    
+
     /// The challenge token (The filename/path).
     pub token: String,
-    
+
     /// The key authorization (The content).
     pub key_authorization: String,
 }
@@ -83,13 +83,13 @@ pub struct ChallengeResponse {
 pub struct Certificate {
     /// Full certificate chain in PEM format.
     pub cert_pem: String,
-    
+
     /// Private key in PEM format.
     pub key_pem: String,
-    
+
     /// List of SANs (Subject Alternative Names) covered.
     pub domains: Vec<String>,
-    
+
     /// Expiration timestamp (Unix epoch seconds).
     pub expires_at: i64,
 }
@@ -103,7 +103,7 @@ impl Certificate {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        
+
         // Renew if less than 30 days remaining (standard practice)
         self.expires_at - now < 30 * 24 * 60 * 60
     }
@@ -117,10 +117,10 @@ impl Certificate {
 pub trait ChallengeHandler: Send + Sync {
     /// 🚦 Deploys and durably publishes the solution before returning.
     async fn deploy(&self, challenge: &ChallengeResponse) -> Result<(), AcmeError>;
-    
+
     /// 🧹 Cleans up resources after validation.
     async fn cleanup(&self, challenge: &ChallengeResponse) -> Result<(), AcmeError>;
-    
+
     /// Retrieve a deployed token (Used by HTTP server router).
     fn get_token(&self, token: &str) -> Option<String>;
 }
@@ -156,12 +156,12 @@ impl ChallengeHandler for MemoryChallengeHandler {
             .insert(challenge.token.clone(), challenge.key_authorization.clone());
         Ok(())
     }
-    
+
     async fn cleanup(&self, challenge: &ChallengeResponse) -> Result<(), AcmeError> {
         self.tokens.write().remove(&challenge.token);
         Ok(())
     }
-    
+
     fn get_token(&self, token: &str) -> Option<String> {
         self.tokens.read().get(token).cloned()
     }
@@ -187,8 +187,9 @@ async fn cleanup_challenges<H: ChallengeHandler + ?Sized>(
 fn certificate_expiry(cert_pem: &str) -> Result<i64, AcmeError> {
     let (_, pem) = parse_x509_pem(cert_pem.as_bytes())
         .map_err(|error| AcmeError::CertGeneration(format!("Invalid certificate PEM: {error}")))?;
-    let (_, certificate) = parse_x509_certificate(&pem.contents)
-        .map_err(|error| AcmeError::CertGeneration(format!("Invalid X.509 certificate: {error}")))?;
+    let (_, certificate) = parse_x509_certificate(&pem.contents).map_err(|error| {
+        AcmeError::CertGeneration(format!("Invalid X.509 certificate: {error}"))
+    })?;
     Ok(certificate.validity().not_after.timestamp())
 }
 
@@ -198,13 +199,13 @@ fn certificate_expiry(cert_pem: &str) -> Result<i64, AcmeError> {
 pub struct AcmeClient {
     /// If true, uses the Let's Encrypt Staging environment.
     staging: bool,
-    
+
     /// Contact email for account registration and expiration notices.
     email: Option<String>,
-    
+
     /// Preferred challenge type for validation.
     challenge_type: ChallengeType,
-    
+
     /// Root directory of the TLS store where the ACME account credentials
     /// are persisted. When `None`, the account is not persisted.
     account_store_root: Option<PathBuf>,
@@ -220,7 +221,7 @@ impl AcmeClient {
             account_store_root: None,
         }
     }
-    
+
     /// Creates a client configured for the Staging environment.
     pub fn staging() -> Self {
         Self {
@@ -230,26 +231,26 @@ impl AcmeClient {
             account_store_root: None,
         }
     }
-    
+
     /// Sets the contact email.
     pub fn with_email(mut self, email: impl Into<String>) -> Self {
         self.email = Some(email.into());
         self
     }
-    
+
     /// Sets the root directory of the TLS store so the ACME account
     /// credentials are persisted and reused across restarts.
     pub fn with_account_store(mut self, store_root: impl Into<PathBuf>) -> Self {
         self.account_store_root = Some(store_root.into());
         self
     }
-    
+
     /// Sets the preferred challenge type.
     pub fn with_challenge_type(mut self, challenge_type: ChallengeType) -> Self {
         self.challenge_type = challenge_type;
         self
     }
-    
+
     /// Obtains a certificate for the specified domains.
     ///
     /// This method executes the full ACME workflow:
@@ -264,7 +265,7 @@ impl AcmeClient {
         handler: &H,
     ) -> Result<Certificate, AcmeError> {
         tracing::info!("🔐 Starting ACME flow for domains: {:?}", domains);
-        
+
         // 1. Select Directory
         let directory_url = if self.staging {
             tracing::info!("🧪 Environment: Staging (Untrusted)");
@@ -273,51 +274,53 @@ impl AcmeClient {
             tracing::info!("🏭 Environment: Production (Trusted)");
             directory::LETS_ENCRYPT_PRODUCTION
         };
-        
+
         // 2. Account Setup
         let account = self.ensure_account(directory_url).await?;
-        
+
         // 3. Create Order
-        let identifiers: Vec<Identifier> = domains
-            .iter()
-            .map(|d| Identifier::Dns(d.clone()))
-            .collect();
-            
+        let identifiers: Vec<Identifier> =
+            domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
+
         let mut order = account
             .new_order(&NewOrder::new(&identifiers))
             .await
-            .map_err(|e| AcmeError::OrderFailed(format!("Failed to create order: {}", e)))?;
-            
+            .map_err(|e| AcmeError::OrderFailed(format!("Failed to create order: {e}")))?;
+
         tracing::info!("✅ Order created. URL: {}", order.url());
 
         // 4. Process Authorizations
         let mut auths_stream = order.authorizations();
         let mut active_challenges = Vec::new(); // Keep track for cleanup
-        
+
         while let Some(auth_result) = auths_stream.next().await {
-            let mut auth = auth_result
-                .map_err(|e| AcmeError::OrderFailed(format!("Failed to fetch authorization: {}", e)))?;
-                
+            let mut auth = auth_result.map_err(|e| {
+                AcmeError::OrderFailed(format!("Failed to fetch authorization: {e}"))
+            })?;
+
             let domain = auth.identifier().to_string();
-            
+
             if auth.status == AuthorizationStatus::Valid {
                 tracing::info!("✅ Authorization already valid for {}", domain);
                 continue;
             }
-            
+
             tracing::info!("🧩 Solving challenge for {}", domain);
-            
+
             // 4a. Pick Challenge
             let target_type = match self.challenge_type {
                 ChallengeType::Http01 => AcmeChallengeType::Http01,
                 ChallengeType::Dns01 => AcmeChallengeType::Dns01,
                 ChallengeType::TlsAlpn01 => AcmeChallengeType::TlsAlpn01,
             };
-            
+
             let mut challenge = auth.challenge(target_type).ok_or_else(|| {
-                AcmeError::ChallengeFailed(format!("Challenge type {:?} not offered for {}", self.challenge_type, domain))
+                AcmeError::ChallengeFailed(format!(
+                    "Challenge type {:?} not offered for {}",
+                    self.challenge_type, domain
+                ))
             })?;
-            
+
             // 4b. Deploy Solution
             let response = ChallengeResponse {
                 domain: domain.clone(),
@@ -325,13 +328,13 @@ impl AcmeClient {
                 token: challenge.token.clone(),
                 key_authorization: challenge.key_authorization().as_str().to_string(),
             };
-            
+
             if let Err(error) = handler.deploy(&response).await {
                 cleanup_challenges(handler, &active_challenges).await;
                 return Err(error);
             }
             active_challenges.push(response);
-            
+
             // 4c. Notify Server
             if let Err(error) = challenge.set_ready().await {
                 cleanup_challenges(handler, &active_challenges).await;
@@ -339,10 +342,10 @@ impl AcmeClient {
                     "Failed to set ready: {error}"
                 )));
             }
-                
+
             tracing::info!("🚀 Verification triggered for {}", domain);
         }
-        
+
         // 5. Poll for Status
         tracing::info!("⏳ Polling order status...");
         let retry_policy = instant_acme::RetryPolicy::default(); // reasonable defaults
@@ -354,21 +357,27 @@ impl AcmeClient {
         // 🧹 Challenge tokens are removed even when polling fails.
         cleanup_challenges(handler, &active_challenges).await;
         let state = state?;
-        
+
         if state != OrderStatus::Ready && state != OrderStatus::Valid {
-             return Err(AcmeError::OrderFailed(format!("Order ended in state: {:?}", state)));
+            return Err(AcmeError::OrderFailed(format!(
+                "Order ended in state: {state:?}"
+            )));
         }
-        
+
         // 6. Finalize & Download
         tracing::info!("�️ Finalizing order...");
-        let key_pem = order.finalize().await
-            .map_err(|e| AcmeError::CertGeneration(format!("Finalization failed: {}", e)))?;
-            
-        let cert_pem = order.poll_certificate(&retry_policy).await
-            .map_err(|e| AcmeError::CertGeneration(format!("Download failed: {}", e)))?;
-            
+        let key_pem = order
+            .finalize()
+            .await
+            .map_err(|e| AcmeError::CertGeneration(format!("Finalization failed: {e}")))?;
+
+        let cert_pem = order
+            .poll_certificate(&retry_policy)
+            .await
+            .map_err(|e| AcmeError::CertGeneration(format!("Download failed: {e}")))?;
+
         tracing::info!("🎉 Certificate acquired for {:?}", domains);
-        
+
         // 📅 Renewal decisions use the CA-signed leaf certificate's real expiry.
         let expires_at = certificate_expiry(&cert_pem)?;
 
@@ -387,7 +396,9 @@ impl AcmeClient {
     /// account when the credentials file is missing, unreadable, or rejected
     /// by the ACME provider, and persists the new credentials afterwards.
     async fn ensure_account(&self, directory_url: &str) -> Result<Account, AcmeError> {
-        let credentials_path = self.account_store_root.as_ref()
+        let credentials_path = self
+            .account_store_root
+            .as_ref()
             .map(|root| crate::account_store::credentials_path(root, self.staging));
 
         // 1. Try to restore the account from persisted credentials.
@@ -395,7 +406,7 @@ impl AcmeClient {
             match Self::load_account_credentials(path) {
                 Ok(Some(credentials)) => {
                     let builder = Account::builder()
-                        .map_err(|e| AcmeError::Account(format!("Builder init failed: {}", e)))?;
+                        .map_err(|e| AcmeError::Account(format!("Builder init failed: {e}")))?;
                     match builder.from_credentials(credentials).await {
                         Ok(account) => {
                             tracing::info!("🔑 Reusing persisted ACME account from {:?}", path);
@@ -410,35 +421,43 @@ impl AcmeClient {
                     }
                 }
                 Ok(None) => {
-                    tracing::debug!("No persisted ACME account at {:?}; registering a new one", path);
+                    tracing::debug!(
+                        "No persisted ACME account at {:?}; registering a new one",
+                        path
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(
                         "⚠️ Failed to load ACME account credentials from {:?}: {}; registering a new account",
-                        path, e
+                        path,
+                        e
                     );
                 }
             }
         }
 
         // 2. Register a new account.
-        let contact: Vec<String> = self.email.as_ref()
+        let contact: Vec<String> = self
+            .email
+            .as_ref()
             .map(|e| vec![format!("mailto:{}", e)])
             .unwrap_or_default();
-            
+
         let contact_refs: Vec<&str> = contact.iter().map(|s| s.as_str()).collect();
-        
+
         let new_account = NewAccount {
             contact: &contact_refs,
             terms_of_service_agreed: true,
             only_return_existing: false,
         };
-        
+
         let builder = Account::builder()
-            .map_err(|e| AcmeError::Account(format!("Builder init failed: {}", e)))?;
-            
-        let (account, credentials) = builder.create(&new_account, directory_url.to_string(), None).await
-            .map_err(|e| AcmeError::Account(format!("Registration failed: {}", e)))?;
+            .map_err(|e| AcmeError::Account(format!("Builder init failed: {e}")))?;
+
+        let (account, credentials) = builder
+            .create(&new_account, directory_url.to_string(), None)
+            .await
+            .map_err(|e| AcmeError::Account(format!("Registration failed: {e}")))?;
 
         // 3. Persist the credentials for future restarts. A failure here is
         //    non-fatal: issuance can proceed with the in-memory account.
@@ -446,13 +465,14 @@ impl AcmeClient {
             if let Err(e) = Self::store_account_credentials(path, &credentials) {
                 tracing::warn!(
                     "⚠️ Failed to persist ACME account credentials to {:?}: {}",
-                    path, e
+                    path,
+                    e
                 );
             } else {
                 tracing::info!("💾 Persisted ACME account credentials to {:?}", path);
             }
         }
-            
+
         Ok(account)
     }
 
@@ -461,13 +481,15 @@ impl AcmeClient {
     /// - Returns: `Ok(Some(_))` when valid credentials exist, `Ok(None)` when
     ///   the file is missing, or an `Err` when the file is unreadable or
     ///   corrupt.
-    fn load_account_credentials(path: &std::path::Path) -> Result<Option<AccountCredentials>, AcmeError> {
+    fn load_account_credentials(
+        path: &std::path::Path,
+    ) -> Result<Option<AccountCredentials>, AcmeError> {
         match crate::account_store::load(path)
-            .map_err(|e| AcmeError::Account(format!("Read failed: {}", e)))?
+            .map_err(|e| AcmeError::Account(format!("Read failed: {e}")))?
         {
             Some(json) => {
                 let credentials = serde_json::from_str(&json)
-                    .map_err(|e| AcmeError::Account(format!("Corrupt credentials: {}", e)))?;
+                    .map_err(|e| AcmeError::Account(format!("Corrupt credentials: {e}")))?;
                 Ok(Some(credentials))
             }
             None => Ok(None),
@@ -480,9 +502,9 @@ impl AcmeClient {
         credentials: &AccountCredentials,
     ) -> Result<(), AcmeError> {
         let json = serde_json::to_string_pretty(credentials)
-            .map_err(|e| AcmeError::Account(format!("Serialization failed: {}", e)))?;
+            .map_err(|e| AcmeError::Account(format!("Serialization failed: {e}")))?;
         crate::account_store::save(path, &json)
-            .map_err(|e| AcmeError::Account(format!("Write failed: {}", e)))
+            .map_err(|e| AcmeError::Account(format!("Write failed: {e}")))
     }
 }
 
@@ -495,31 +517,37 @@ impl Default for AcmeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_certificate_renewal_logic() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-            
+
         // Case 1: Expired
         let expired = Certificate {
-            cert_pem: "".into(), key_pem: "".into(), domains: vec![],
+            cert_pem: "".into(),
+            key_pem: "".into(),
+            domains: vec![],
             expires_at: now - 3600,
         };
         assert!(expired.needs_renewal());
-        
+
         // Case 2: Fresh (60 days left)
         let fresh = Certificate {
-            cert_pem: "".into(), key_pem: "".into(), domains: vec![],
+            cert_pem: "".into(),
+            key_pem: "".into(),
+            domains: vec![],
             expires_at: now + 60 * 86400,
         };
         assert!(!fresh.needs_renewal());
-        
-         // Case 3: Nearing expiry (29 days left)
+
+        // Case 3: Nearing expiry (29 days left)
         let near = Certificate {
-            cert_pem: "".into(), key_pem: "".into(), domains: vec![],
+            cert_pem: "".into(),
+            key_pem: "".into(),
+            domains: vec![],
             expires_at: now + 29 * 86400,
         };
         assert!(near.needs_renewal());
@@ -557,7 +585,11 @@ mod tests {
     fn load_account_credentials_returns_none_when_missing() {
         let dir = tempfile::tempdir().unwrap();
         let path = crate::account_store::credentials_path(dir.path(), false);
-        assert!(AcmeClient::load_account_credentials(&path).unwrap().is_none());
+        assert!(
+            AcmeClient::load_account_credentials(&path)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -575,7 +607,11 @@ mod tests {
         let path = crate::account_store::credentials_path(dir.path(), false);
 
         // First run: no file yet.
-        assert!(AcmeClient::load_account_credentials(&path).unwrap().is_none());
+        assert!(
+            AcmeClient::load_account_credentials(&path)
+                .unwrap()
+                .is_none()
+        );
 
         // Simulate a first issuance persisting the freshly created account.
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -606,7 +642,15 @@ mod tests {
 
         // Writing staging credentials must not make them visible to production.
         crate::account_store::save(&staging, TEST_CREDENTIALS_JSON).unwrap();
-        assert!(AcmeClient::load_account_credentials(&prod).unwrap().is_none());
-        assert!(AcmeClient::load_account_credentials(&staging).unwrap().is_some());
+        assert!(
+            AcmeClient::load_account_credentials(&prod)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            AcmeClient::load_account_credentials(&staging)
+                .unwrap()
+                .is_some()
+        );
     }
 }

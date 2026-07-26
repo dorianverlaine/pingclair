@@ -36,14 +36,14 @@ pub struct HostName(pub String);
 pub fn create_upstream(address_string: &str) -> Option<Upstream> {
     // Guard: Parse URL components
     let (socket_address, scheme, host) = parse_url_components(address_string)?;
-    
+
     // Create Backend with the resolved IP address
     let mut backend = Upstream::new(&socket_address.to_string()).ok()?;
-    
+
     // Enrich with metadata
     backend.ext.insert(scheme);
     backend.ext.insert(HostName(host));
-    
+
     Some(backend)
 }
 
@@ -55,7 +55,7 @@ pub fn create_upstream(address_string: &str) -> Option<Upstream> {
 /// - Returns: A tuple of `(SocketAddr, Scheme, HostString)` or `None`.
 fn parse_url_components(upstream: &str) -> Option<(std::net::SocketAddr, Scheme, String)> {
     let trimmed_upstream = upstream.trim();
-    
+
     // Determine scheme and strip prefix
     let (scheme, minimal_url) = if let Some(stripped) = trimmed_upstream.strip_prefix("https://") {
         (Scheme::Https, stripped)
@@ -64,7 +64,7 @@ fn parse_url_components(upstream: &str) -> Option<(std::net::SocketAddr, Scheme,
     } else {
         (Scheme::Http, trimmed_upstream)
     };
-    
+
     // Extract host and port
     let (host, port) = if let Some(colon_index) = minimal_url.rfind(':') {
         let host_part = &minimal_url[..colon_index];
@@ -75,9 +75,9 @@ fn parse_url_components(upstream: &str) -> Option<(std::net::SocketAddr, Scheme,
         let default_port = if scheme == Scheme::Https { 443 } else { 80 };
         (minimal_url, default_port)
     };
-    
+
     // Resolve address (Blocking)
-    let socket_address = format!("{}:{}", host, port).to_socket_addrs().ok()?.next()?;
-    
+    let socket_address = format!("{host}:{port}").to_socket_addrs().ok()?.next()?;
+
     Some((socket_address, scheme, host.to_string()))
 }

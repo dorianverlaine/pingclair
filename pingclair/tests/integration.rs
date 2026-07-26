@@ -437,14 +437,13 @@ async fn test_static_file_server() {
                         "path": "/",
                         "handler": {{
                             "type": "file_server",
-                            "root": "{}"
+                            "root": "{root_path}"
                         }}
                     }}
                 ]
             }}
         ]
-    }}"#,
-        root_path
+    }}"#
     );
 
     // 🚀 Start the real server binary.
@@ -486,15 +485,14 @@ async fn test_admin_api_hot_reload() {
                         "path": "/",
                         "handler": {{
                             "type": "file_server",
-                            "root": "{}",
+                            "root": "{root_path}",
                             "index": ["v1.txt"]
                         }}
                     }}
                 ]
             }}
         ]
-    }}"#,
-        root_path
+    }}"#
     );
 
     let mut server = TestServer::new(&init_config);
@@ -598,13 +596,11 @@ async fn test_basic_auth_end_to_end() {
         .unwrap();
     assert!(
         challenge.contains("Basic"),
-        "unexpected challenge: {}",
-        challenge
+        "unexpected challenge: {challenge}"
     );
     assert!(
         challenge.contains("Test Realm"),
-        "realm missing: {}",
-        challenge
+        "realm missing: {challenge}"
     );
 
     // 🚫 An incorrect password must be rejected.
@@ -703,11 +699,7 @@ async fn test_custom_error_pages() {
         .await
         .unwrap();
     let status = resp.status().as_u16();
-    assert!(
-        status == 500 || status == 502,
-        "unexpected status {}",
-        status
-    );
+    assert!(status == 500 || status == 502, "unexpected status {status}");
     assert_eq!(resp.text().await.unwrap(), "<h1>custom bad gateway</h1>");
 }
 
@@ -806,13 +798,12 @@ async fn test_regex_rewrite_reaches_the_rewritten_static_path() {
                             "regex": "^/api/(.*)$",
                             "regex_replace": "/$1"
                         }},
-                        {{ "type": "file_server", "root": "{}" }}
+                        {{ "type": "file_server", "root": "{root}" }}
                     ]
                 }}
             }}]
         }}]
-    }}"#,
-        root
+    }}"#
     );
     let mut server = TestServer::new(&config);
     assert!(server.wait_until_ready().await, "Server failed to start");
@@ -845,15 +836,14 @@ async fn test_compression() {
                         "path": "/",
                         "handler": {{
                             "type": "file_server",
-                            "root": "{}",
+                            "root": "{root_path}",
                             "compress": true
                         }}
                     }}
                 ]
             }}
         ]
-    }}"#,
-        root_path
+    }}"#
     );
 
     let mut server = TestServer::new(&config);
@@ -911,9 +901,7 @@ async fn test_reverse_proxy_custom_gzip_types() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // 🧪 Serve a MIME type excluded from the default gzip list.
-    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_address = upstream.local_addr().unwrap();
     let body = "custom gzip type ".repeat(200);
     let upstream_body = body.clone();
@@ -1046,9 +1034,7 @@ async fn test_trusted_proxies_control_verified_client_identity() {
 async fn test_untrusted_forwarding_headers_are_sanitized_upstream() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_address = upstream.local_addr().unwrap();
     let (request_tx, request_rx) = tokio::sync::oneshot::channel();
     let upstream_task = tokio::spawn(async move {

@@ -31,7 +31,7 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use thiserror::Error;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 
 use pingclair_core::config::HandlerConfig;
 use pingclair_static::ServedResponse;
@@ -39,7 +39,7 @@ use pingora_http::RequestHeader;
 use quiche::h3::NameValue;
 
 use crate::connection_filter::PingclairConnectionFilter;
-use crate::server::{find_basic_auth_config, resolve_caddy_placeholders, PingclairProxy};
+use crate::server::{PingclairProxy, find_basic_auth_config, resolve_caddy_placeholders};
 
 /// Maximum UDP payload we ask quiche to send (standard Ethernet MTU-safe).
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -130,13 +130,15 @@ impl CertTable {
     /// the SNI name has no exact or wildcard match); use
     /// [`CertTable::set_default`] to override.
     pub fn upsert_pem(&self, name: &str, cert_pem: &str, key_pem: &str) -> Result<(), QuicError> {
-        let chain = boring::x509::X509::stack_from_pem(cert_pem.as_bytes())
-            .map_err(|e| QuicError::Tls(format!("failed to parse certificate PEM for {name}: {e}")))?;
+        let chain = boring::x509::X509::stack_from_pem(cert_pem.as_bytes()).map_err(|e| {
+            QuicError::Tls(format!("failed to parse certificate PEM for {name}: {e}"))
+        })?;
         if chain.is_empty() {
             return Err(QuicError::Tls(format!("no certificates in PEM for {name}")));
         }
-        let key = boring::pkey::PKey::private_key_from_pem(key_pem.as_bytes())
-            .map_err(|e| QuicError::Tls(format!("failed to parse private key PEM for {name}: {e}")))?;
+        let key = boring::pkey::PKey::private_key_from_pem(key_pem.as_bytes()).map_err(|e| {
+            QuicError::Tls(format!("failed to parse private key PEM for {name}: {e}"))
+        })?;
 
         let entry = Arc::new(CertEntry { chain, key });
         self.inner.rcu(|current| {
@@ -240,7 +242,11 @@ fn build_quiche_config(certs: Arc<CertTable>) -> Result<quiche::Config, QuicErro
         match installed {
             Ok(()) => Ok(()),
             Err(e) => {
-                tracing::warn!("🔐 H3: failed to install certificate for SNI '{}': {}", sni, e);
+                tracing::warn!(
+                    "🔐 H3: failed to install certificate for SNI '{}': {}",
+                    sni,
+                    e
+                );
                 Err(SelectCertError::ERROR)
             }
         }
@@ -374,10 +380,7 @@ fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
             b":authority" => authority = Some(value),
             b":scheme" | b":protocol" => {}
             name if name.starts_with(b":") => return None, // unknown pseudo-header
-            name => headers.push((
-                String::from_utf8_lossy(name).into_owned(),
-                value,
-            )),
+            name => headers.push((String::from_utf8_lossy(name).into_owned(), value)),
         }
     }
 
@@ -481,14 +484,14 @@ impl QuicServer {
         upstream_keepalive_pool_size: usize,
         blocked_ips: Vec<String>,
     ) -> Self {
-        let options = pingora_core::connectors::ConnectorOptions::new(
-            upstream_keepalive_pool_size,
-        );
+        let options = pingora_core::connectors::ConnectorOptions::new(upstream_keepalive_pool_size);
         Self {
             listen,
             proxy,
             certs,
-            connector: Arc::new(pingora_core::connectors::http::Connector::new(Some(options))),
+            connector: Arc::new(pingora_core::connectors::http::Connector::new(Some(
+                options,
+            ))),
             filter: PingclairConnectionFilter::new(&blocked_ips),
         }
     }
@@ -500,7 +503,10 @@ impl QuicServer {
 
         let socket = UdpSocket::bind(self.listen).await?;
         let local_addr = socket.local_addr()?;
-        tracing::info!("🚀 HTTP/3 (quiche) server listening on {} (UDP)", local_addr);
+        tracing::info!(
+            "🚀 HTTP/3 (quiche) server listening on {} (UDP)",
+            local_addr
+        );
 
         let mut token_key = [0u8; 32];
         boring::rand::rand_bytes(&mut token_key)
@@ -604,11 +610,7 @@ impl QuicServer {
                         }
                         Err(quiche::Error::Done) => break,
                         Err(e) => {
-                            tracing::error!(
-                                "{} send failed: {:?}",
-                                cs.conn.trace_id(),
-                                e
-                            );
+                            tracing::error!("{} send failed: {:?}", cs.conn.trace_id(), e);
                             cs.conn.close(false, 0x1, b"fail").ok();
                             break;
                         }
@@ -736,7 +738,10 @@ impl QuicServer {
             return;
         };
 
-        let recv_info = quiche::RecvInfo { to: local_addr, from };
+        let recv_info = quiche::RecvInfo {
+            to: local_addr,
+            from,
+        };
         if let Err(e) = cs.conn.recv(pkt, recv_info) {
             tracing::debug!("{} recv failed: {:?}", cs.conn.trace_id(), e);
             return;
@@ -860,7 +865,15 @@ impl QuicServer {
 
         tokio::spawn(async move {
             handle_request(
-                proxy, connector, req, remote_ip, cid, stream_id, req_body_rx, resp_tx, notify,
+                proxy,
+                connector,
+                req,
+                remote_ip,
+                cid,
+                stream_id,
+                req_body_rx,
+                resp_tx,
+                notify,
             )
             .await;
         });
@@ -893,9 +906,13 @@ impl QuicServer {
     /// push back on the client; the drain is retried from the maintenance
     /// pass once the handler frees capacity.
     fn drain_request_body(cs: &mut ConnState, stream_id: u64) {
-        let ConnState { conn, h3, streams, .. } = cs;
+        let ConnState {
+            conn, h3, streams, ..
+        } = cs;
         let Some(h3) = h3.as_mut() else { return };
-        let Some(ss) = streams.get_mut(&stream_id) else { return };
+        let Some(ss) = streams.get_mut(&stream_id) else {
+            return;
+        };
 
         ss.body_read_pending = false;
         let mut tmp = [0u8; BODY_CHUNK_SIZE];
@@ -944,9 +961,13 @@ impl QuicServer {
 
     /// Apply one response message from a handler task and try to flush it.
     fn apply_resp_event(conns: &mut ConnMap, ev: RespEvent) {
-        let Some(cs) = conns.get_mut(&ev.cid) else { return };
+        let Some(cs) = conns.get_mut(&ev.cid) else {
+            return;
+        };
         {
-            let Some(ss) = cs.streams.get_mut(&ev.stream_id) else { return };
+            let Some(ss) = cs.streams.get_mut(&ev.stream_id) else {
+                return;
+            };
             if ss.dead {
                 return;
             }
@@ -974,9 +995,13 @@ impl QuicServer {
     /// `fin = true` write terminates the stream. Retried from the
     /// maintenance pass / writable events whenever flow control opens up.
     fn flush_stream(cs: &mut ConnState, stream_id: u64) {
-        let ConnState { conn, h3, streams, .. } = cs;
+        let ConnState {
+            conn, h3, streams, ..
+        } = cs;
         let Some(h3) = h3.as_mut() else { return };
-        let Some(ss) = streams.get_mut(&stream_id) else { return };
+        let Some(ss) = streams.get_mut(&stream_id) else {
+            return;
+        };
         if ss.dead {
             return;
         }
@@ -1055,7 +1080,15 @@ async fn handle_request(
     body_notify: Arc<Notify>,
 ) {
     if let Err(e) = handle_request_inner(
-        &proxy, &connector, &req, &remote_ip, &cid, stream_id, body_rx, &resp_tx, &body_notify,
+        &proxy,
+        &connector,
+        &req,
+        &remote_ip,
+        &cid,
+        stream_id,
+        body_rx,
+        &resp_tx,
+        &body_notify,
     )
     .await
     {
@@ -1083,8 +1116,8 @@ async fn handle_request_inner(
     body_notify: &Arc<Notify>,
 ) -> Result<(), HandlerError> {
     // Build a pingora RequestHeader for routing and placeholder resolution.
-    let method = http::Method::from_bytes(req.method.as_bytes())
-        .map_err(|_| (400, "Bad Request"))?;
+    let method =
+        http::Method::from_bytes(req.method.as_bytes()).map_err(|_| (400, "Bad Request"))?;
     let path_only = req.path.split('?').next().unwrap_or("/");
 
     let mut header = RequestHeader::build(method.clone(), req.path.as_bytes(), None)
@@ -1123,17 +1156,21 @@ async fn handle_request_inner(
     let body_limit = state.config.client_max_body_size;
     if body_limit > 0
         && let Some(content_length) = header
-        .headers
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
+            .headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
         && content_length > body_limit
     {
         return Err((413, "Request Entity Too Large"));
     }
 
     // 🛡️ Rate limiting uses the same verified client identity as H1 and H2.
-    if let Some(limiter) = state.rate_limiters.get(route_index).and_then(|l| l.as_ref()) {
+    if let Some(limiter) = state
+        .rate_limiters
+        .get(route_index)
+        .and_then(|l| l.as_ref())
+    {
         let key = if limiter.config.by_ip {
             Some(verified_client_ip_text.as_str())
         } else {
@@ -1145,10 +1182,7 @@ async fn handle_request_inner(
                 quiche::h3::Header::new(b"server", b"Pingclair"),
             ];
             for (k, v) in info.to_headers() {
-                headers.push(quiche::h3::Header::new(
-                    k.as_bytes(),
-                    v.as_bytes(),
-                ));
+                headers.push(quiche::h3::Header::new(k.as_bytes(), v.as_bytes()));
             }
             send_headers(resp_tx, cid, stream_id, headers, true).await;
             return Ok(());
@@ -1170,7 +1204,11 @@ async fn handle_request_inner(
     }
 
     match handler {
-        HandlerConfig::Respond { status, body, headers } => {
+        HandlerConfig::Respond {
+            status,
+            body,
+            headers,
+        } => {
             let body = body.unwrap_or_default();
             let mut hdrs = vec![
                 quiche::h3::Header::new(b":status", status.to_string().as_bytes()),
@@ -1198,24 +1236,21 @@ async fn handle_request_inner(
         }
 
         HandlerConfig::FileServer { .. } => {
-            let maybe_fs = state
-                .file_servers
-                .get(route_index)
-                .and_then(|f| f.clone());
+            let maybe_fs = state.file_servers.get(route_index).and_then(|f| f.clone());
             let Some(fs) = maybe_fs else {
                 return Err((503, "File Server Unavailable"));
             };
 
-            let range_header = header
-                .headers
-                .get("range")
-                .and_then(|v| v.to_str().ok());
+            let range_header = header.headers.get("range").and_then(|v| v.to_str().ok());
             let accept_encoding = header
                 .headers
                 .get("accept-encoding")
                 .and_then(|v| v.to_str().ok());
 
-            match fs.serve_auto(path_only, range_header, accept_encoding).await {
+            match fs
+                .serve_auto(path_only, range_header, accept_encoding)
+                .await
+            {
                 Ok(Some(ServedResponse::Stream(mut stream))) => {
                     let mut hdrs = vec![
                         quiche::h3::Header::new(b":status", b"200"),
@@ -1355,17 +1390,14 @@ async fn reverse_proxy_upstream(
 
     let peer = PingclairProxy::build_http_peer(&upstream, read_timeout, write_timeout);
 
-    let (mut session, _reused) = connector
-        .get_http_session(&peer)
-        .await
-        .map_err(|e| {
-            tracing::error!("❌ H3 upstream connect failed: {}", e);
-            (502, "Upstream Connect Failed")
-        })?;
+    let (mut session, _reused) = connector.get_http_session(&peer).await.map_err(|e| {
+        tracing::error!("❌ H3 upstream connect failed: {}", e);
+        (502, "Upstream Connect Failed")
+    })?;
 
     // Build the upstream request.
-    let method = http::Method::from_bytes(req.method.as_bytes())
-        .map_err(|_| (400, "Bad Request"))?;
+    let method =
+        http::Method::from_bytes(req.method.as_bytes()).map_err(|_| (400, "Bad Request"))?;
     let mut up_req = RequestHeader::build(method, req.path.as_bytes(), None)
         .map_err(|_| (400, "Bad Request"))?;
 
@@ -1390,8 +1422,14 @@ async fn reverse_proxy_upstream(
         let name = k.to_ascii_lowercase();
         if matches!(
             name.as_str(),
-            "host" | "connection" | "keep-alive" | "transfer-encoding" | "te" | "trailer"
-                | "upgrade" | "content-length"
+            "host"
+                | "connection"
+                | "keep-alive"
+                | "transfer-encoding"
+                | "te"
+                | "trailer"
+                | "upgrade"
+                | "content-length"
         ) {
             continue;
         }
@@ -1445,9 +1483,7 @@ async fn reverse_proxy_upstream(
             .ok();
     }
     if !has_header_up("X-Real-IP") {
-        up_req
-            .insert_header("X-Real-IP", verified_client_ip)
-            .ok();
+        up_req.insert_header("X-Real-IP", verified_client_ip).ok();
     }
 
     session
@@ -1520,10 +1556,7 @@ async fn reverse_proxy_upstream(
             ) {
                 continue;
             }
-            hdrs.push(quiche::h3::Header::new(
-                lower.as_bytes(),
-                value.as_bytes(),
-            ));
+            hdrs.push(quiche::h3::Header::new(lower.as_bytes(), value.as_bytes()));
         }
     } else {
         hdrs.push(quiche::h3::Header::new(b":status", b"502"));
@@ -1631,11 +1664,10 @@ mod tests {
 
     /// Generate a self-signed PEM cert+key for the given names.
     fn self_signed_pem(names: &[&str]) -> (String, String) {
-        let rcgen::CertifiedKey { cert, signing_key } =
-            rcgen::generate_simple_self_signed(
-                names.iter().map(|s| s.to_string()).collect::<Vec<String>>(),
-            )
-            .unwrap();
+        let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(
+            names.iter().map(|s| s.to_string()).collect::<Vec<String>>(),
+        )
+        .unwrap();
         (cert.pem(), signing_key.serialize_pem())
     }
 
@@ -1688,7 +1720,11 @@ mod tests {
     #[test]
     fn cert_table_rejects_bad_pem() {
         let table = CertTable::new();
-        assert!(table.upsert_pem("bad", "not a pem", "also not a pem").is_err());
+        assert!(
+            table
+                .upsert_pem("bad", "not a pem", "also not a pem")
+                .is_err()
+        );
         assert!(table.is_empty());
     }
 

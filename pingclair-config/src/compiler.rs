@@ -6,8 +6,8 @@ use crate::parser::ast::*;
 use pingclair_core::config::{
     AccessControlConfig as CoreAccessControlConfig, AdminConfig, HandlerConfig, LoadBalanceConfig,
     LogConfig, LogFormat as CoreLogFormat, LogOutput as CoreLogOutput, Matcher as CoreMatcher,
-    MatcherCondition, PingclairConfig, ProxyUpstream, ReverseProxyConfig, RouteConfig, ServerConfig,
-    TlsConfig, default_gzip_types,
+    MatcherCondition, PingclairConfig, ProxyUpstream, ReverseProxyConfig, RouteConfig,
+    ServerConfig, TlsConfig, default_gzip_types,
 };
 use pingclair_core::server::{MAX_BCRYPT_COST, bcrypt_hash_cost};
 use std::collections::HashMap;
@@ -293,7 +293,7 @@ fn compile_matcher(matcher: &Matcher, matchers: &HashMap<String, Matcher>) -> Co
         Matcher::Method(methods) => CoreMatcher::Method {
             methods: methods
                 .iter()
-                .map(|m| format!("{:?}", m).to_uppercase())
+                .map(|m| format!("{m:?}").to_uppercase())
                 .collect(),
         },
         Matcher::Query(qm) => {
@@ -492,7 +492,7 @@ fn compile_handler(handler: &Handler) -> CompileResult<HandlerConfig> {
                 .iter()
                 .map(|e| match e {
                     Expr::String(s) => s.clone(),
-                    _ => format!("{:?}", e),
+                    _ => format!("{e:?}"),
                 })
                 .collect();
             Ok(HandlerConfig::Plugin {

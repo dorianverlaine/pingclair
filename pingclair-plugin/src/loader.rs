@@ -9,6 +9,8 @@ impl PluginLoader {
     /// Load plugins from a directory
     pub fn load_from_dir(_path: &str) -> Result<Vec<Box<dyn crate::traits::Plugin>>> {
         // TODO: Implement plugin loading
-        Err(Error::Plugin("Plugin loading not yet implemented".to_string()))
+        Err(Error::Plugin(
+            "Plugin loading not yet implemented".to_string(),
+        ))
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! Provides O(log n) path matching with support for wildcards and parameters.
 
-use crate::config::{RouteConfig, Matcher, MatcherCondition};
+use crate::config::{Matcher, MatcherCondition, RouteConfig};
 use matchit::Router as RadixRouter;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,7 +36,7 @@ impl CompiledMatcher {
             compiled_regexes,
         }
     }
-    
+
     /// Recursively collect and compile all regex patterns in a matcher
     fn collect_regexes(matcher: &Matcher, regexes: &mut HashMap<String, Arc<regex::Regex>>) {
         match matcher {
@@ -57,7 +57,7 @@ impl CompiledMatcher {
             _ => {}
         }
     }
-    
+
     /// Get a pre-compiled regex by pattern
     pub fn get_regex(&self, pattern: &str) -> Option<&regex::Regex> {
         self.compiled_regexes.get(pattern).map(|r| r.as_ref())
@@ -91,30 +91,27 @@ impl Router {
         let mut path_router = RadixRouter::new();
         let mut default_routes = Vec::new();
         let mut path_groups: HashMap<String, Vec<CompiledRoute>> = HashMap::new();
-        
+
         for (index, config) in routes.iter().enumerate() {
             // Pre-compile matcher if present
             let compiled_matcher = config.matcher.as_ref().map(CompiledMatcher::compile);
-            
+
             let compiled = CompiledRoute {
                 config: config.clone(),
                 index,
                 compiled_matcher,
             };
-            
+
             // Normalize path for radix tree
             let path = Self::normalize_path(&config.path);
-            
+
             if path == "/*" || path == "/" {
                 default_routes.push(compiled);
             } else {
-                path_groups
-                    .entry(path)
-                    .or_default()
-                    .push(compiled);
+                path_groups.entry(path).or_default().push(compiled);
             }
         }
-        
+
         // Insert path groups into radix router
         for (path, routes) in path_groups {
             // Convert glob patterns to matchit format
@@ -143,33 +140,33 @@ impl Router {
                 tracing::warn!("Failed to insert route {}: {}", path, e);
             }
         }
-        
+
         Self {
             path_router,
             default_routes,
             all_routes: routes,
         }
     }
-    
+
     /// Match a request path and return matching routes
     pub fn match_path(&self, path: &str) -> Vec<&CompiledRoute> {
         let mut matches = Vec::new();
-        
+
         // Try radix tree match first
         if let Ok(matched) = self.path_router.at(path) {
             for route in matched.value.iter() {
                 matches.push(route);
             }
         }
-        
+
         // Add default routes
         for route in &self.default_routes {
             matches.push(route);
         }
-        
+
         matches
     }
-    
+
     /// Match request with full context (path, headers, method)
     pub fn match_request(
         &self,
@@ -189,7 +186,7 @@ impl Router {
             remote_ip,
             protocol,
         };
-        
+
         for route in candidates {
             // Check method constraint
             if let Some(methods) = &route.config.methods
@@ -197,28 +194,25 @@ impl Router {
             {
                 continue;
             }
-            
+
             // Check additional matchers (using pre-compiled version)
             if let Some(compiled) = &route.compiled_matcher
                 && !Self::evaluate_matcher_compiled(compiled, &request)
             {
                 continue;
             }
-            
+
             return Some(route);
         }
-        
+
         None
     }
-    
+
     /// Evaluate a pre-compiled matcher against request context
-    fn evaluate_matcher_compiled(
-        compiled: &CompiledMatcher,
-        request: &MatcherRequest<'_>,
-    ) -> bool {
+    fn evaluate_matcher_compiled(compiled: &CompiledMatcher, request: &MatcherRequest<'_>) -> bool {
         Self::evaluate_matcher_inner(&compiled.matcher, compiled, request)
     }
-    
+
     /// Inner matcher evaluation with access to pre-compiled regexes
     fn evaluate_matcher_inner(
         matcher: &Matcher,
@@ -226,40 +220,30 @@ impl Router {
         request: &MatcherRequest<'_>,
     ) -> bool {
         match matcher {
-            Matcher::Path { patterns } => {
-                patterns
-                    .iter()
-                    .any(|pattern| Self::path_matches(request.path, pattern))
-            }
+            Matcher::Path { patterns } => patterns
+                .iter()
+                .any(|pattern| Self::path_matches(request.path, pattern)),
             Matcher::Header { name, condition } => {
-                let header_value = request
-                    .headers
-                    .get(name)
-                    .and_then(|v| v.to_str().ok());
+                let header_value = request.headers.get(name).and_then(|v| v.to_str().ok());
                 Self::evaluate_condition(header_value, condition, compiled)
             }
-            Matcher::Method { methods } => {
-                methods
-                    .iter()
-                    .any(|method| method.eq_ignore_ascii_case(request.method))
-            }
-            Matcher::Query { name: _, condition: _ } => {
+            Matcher::Method { methods } => methods
+                .iter()
+                .any(|method| method.eq_ignore_ascii_case(request.method)),
+            Matcher::Query {
+                name: _,
+                condition: _,
+            } => {
                 // Query matching would need query string parsing
                 true
             }
-            Matcher::Host(hosts) => {
-                hosts
-                    .iter()
-                    .any(|host| host.eq_ignore_ascii_case(request.host))
-            }
-            Matcher::RemoteIp(ips) => {
-                ips.iter().any(|ip| request.remote_ip == ip)
-            }
-            Matcher::Protocol(protocols) => {
-                protocols
-                    .iter()
-                    .any(|protocol| protocol.eq_ignore_ascii_case(request.protocol))
-            }
+            Matcher::Host(hosts) => hosts
+                .iter()
+                .any(|host| host.eq_ignore_ascii_case(request.host)),
+            Matcher::RemoteIp(ips) => ips.iter().any(|ip| request.remote_ip == ip),
+            Matcher::Protocol(protocols) => protocols
+                .iter()
+                .any(|protocol| protocol.eq_ignore_ascii_case(request.protocol)),
             Matcher::And(left, right) => {
                 Self::evaluate_matcher_inner(left, compiled, request)
                     && Self::evaluate_matcher_inner(right, compiled, request)
@@ -268,19 +252,19 @@ impl Router {
                 Self::evaluate_matcher_inner(left, compiled, request)
                     || Self::evaluate_matcher_inner(right, compiled, request)
             }
-            Matcher::Not(inner) => {
-                !Self::evaluate_matcher_inner(inner, compiled, request)
-            }
+            Matcher::Not(inner) => !Self::evaluate_matcher_inner(inner, compiled, request),
         }
     }
-    
+
     /// Evaluate a condition against a value (using pre-compiled regex)
-    fn evaluate_condition(value: Option<&str>, condition: &MatcherCondition, compiled: &CompiledMatcher) -> bool {
+    fn evaluate_condition(
+        value: Option<&str>,
+        condition: &MatcherCondition,
+        compiled: &CompiledMatcher,
+    ) -> bool {
         match condition {
             MatcherCondition::Exists => value.is_some(),
-            MatcherCondition::Equals(expected) => {
-                value.map(|v| v == expected).unwrap_or(false)
-            }
+            MatcherCondition::Equals(expected) => value.map(|v| v == expected).unwrap_or(false),
             MatcherCondition::Contains(substring) => {
                 value.map(|v| v.contains(substring)).unwrap_or(false)
             }
@@ -301,7 +285,7 @@ impl Router {
             }
         }
     }
-    
+
     /// Check if path matches a glob pattern
     fn path_matches(path: &str, pattern: &str) -> bool {
         if let Some(prefix) = pattern.strip_suffix("/*") {
@@ -312,13 +296,13 @@ impl Router {
             path == pattern
         }
     }
-    
+
     /// Normalize path for consistent matching
     fn normalize_path(path: &str) -> String {
         let path = if path.is_empty() { "/" } else { path };
         path.to_string()
     }
-    
+
     /// The bare (non-wildcard) prefixes a glob path should also match.
     ///
     /// `/proxy/*` → `["/proxy", "/proxy/"]` so a request to either the bare
@@ -336,7 +320,11 @@ impl Router {
             }
         } else if let Some(prefix) = path.strip_suffix('*') {
             // "/foo*" -> prefix "/foo".
-            if prefix.is_empty() { Vec::new() } else { vec![prefix.to_string()] }
+            if prefix.is_empty() {
+                Vec::new()
+            } else {
+                vec![prefix.to_string()]
+            }
         } else {
             Vec::new()
         }
@@ -352,7 +340,7 @@ impl Router {
             path.to_string()
         }
     }
-    
+
     /// Get all routes
     pub fn routes(&self) -> &[RouteConfig] {
         &self.all_routes
@@ -369,7 +357,7 @@ impl Default for Router {
 mod tests {
     use super::*;
     use crate::config::HandlerConfig;
-    
+
     fn make_route(path: &str) -> RouteConfig {
         RouteConfig {
             path: path.to_string(),
@@ -382,38 +370,29 @@ mod tests {
             matcher: None,
         }
     }
-    
+
     #[test]
     fn test_exact_match() {
-        let routes = vec![
-            make_route("/api/users"),
-            make_route("/api/posts"),
-        ];
+        let routes = vec![make_route("/api/users"), make_route("/api/posts")];
         let router = Router::new(routes);
-        
+
         let matched = router.match_path("/api/users");
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].config.path, "/api/users");
     }
-    
+
     #[test]
     fn test_wildcard_match() {
-        let routes = vec![
-            make_route("/api/*"),
-            make_route("/static/*"),
-        ];
+        let routes = vec![make_route("/api/*"), make_route("/static/*")];
         let router = Router::new(routes);
-        
+
         let matched = router.match_path("/api/users/123");
         assert!(!matched.is_empty());
     }
-    
+
     #[test]
     fn test_default_route() {
-        let routes = vec![
-            make_route("/api/*"),
-            make_route("/*"),
-        ];
+        let routes = vec![make_route("/api/*"), make_route("/*")];
         let router = Router::new(routes);
 
         let matched = router.match_path("/unknown");
@@ -433,11 +412,20 @@ mod tests {
         let router = Router::new(routes);
 
         // With a trailing segment — always worked.
-        assert!(!router.match_path("/proxy/foo").is_empty(), "/proxy/foo should match /proxy/*");
+        assert!(
+            !router.match_path("/proxy/foo").is_empty(),
+            "/proxy/foo should match /proxy/*"
+        );
         // The bare directory with a trailing slash — the reported bug.
-        assert!(!router.match_path("/proxy/").is_empty(), "/proxy/ should match /proxy/*");
+        assert!(
+            !router.match_path("/proxy/").is_empty(),
+            "/proxy/ should match /proxy/*"
+        );
         // The bare directory with no trailing slash.
-        assert!(!router.match_path("/proxy").is_empty(), "/proxy should match /proxy/*");
+        assert!(
+            !router.match_path("/proxy").is_empty(),
+            "/proxy should match /proxy/*"
+        );
     }
 
     /// The bare-prefix registration must not over-match a sibling path that
@@ -446,7 +434,13 @@ mod tests {
     fn test_glob_bare_prefix_does_not_overmatch_siblings() {
         let routes = vec![make_route("/proxy/*")];
         let router = Router::new(routes);
-        assert!(router.match_path("/proxyfoo").is_empty(), "/proxyfoo must NOT match /proxy/*");
-        assert!(router.match_path("/other").is_empty(), "/other must NOT match /proxy/*");
+        assert!(
+            router.match_path("/proxyfoo").is_empty(),
+            "/proxyfoo must NOT match /proxy/*"
+        );
+        assert!(
+            router.match_path("/other").is_empty(),
+            "/other must NOT match /proxy/*"
+        );
     }
 }

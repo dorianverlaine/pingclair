@@ -11,16 +11,20 @@ use thiserror::Error;
 pub enum SemanticError {
     #[error("Undefined macro: {name}")]
     UndefinedMacro { name: String },
-    
+
     #[error("Macro argument count mismatch for '{name}': expected {expected}, got {got}")]
-    MacroArgCountMismatch { name: String, expected: usize, got: usize },
-    
+    MacroArgCountMismatch {
+        name: String,
+        expected: usize,
+        got: usize,
+    },
+
     #[error("Duplicate server name: {name}")]
     DuplicateServer { name: String },
-    
+
     #[error("Duplicate macro name: {name}")]
     DuplicateMacro { name: String },
-    
+
     #[error("Invalid configuration: {message}")]
     InvalidConfig { message: String },
 }
@@ -50,7 +54,8 @@ impl SemanticAnalyzer {
                     name: macro_def.name.clone(),
                 });
             }
-            self.macros.insert(macro_def.name.clone(), macro_def.clone());
+            self.macros
+                .insert(macro_def.name.clone(), macro_def.clone());
         }
 
         // Phase 2: Check for duplicate servers
@@ -77,7 +82,7 @@ impl SemanticAnalyzer {
     fn expand_server(&self, server: &mut ServerBlock) -> SemanticResult<()> {
         // Expand macro calls in directives
         let mut expanded_directives = Vec::new();
-        
+
         for directive in server.directives.drain(..) {
             match directive {
                 Directive::MacroCall(call) => {
@@ -89,9 +94,9 @@ impl SemanticAnalyzer {
                 }
             }
         }
-        
+
         server.directives = expanded_directives;
-        
+
         // Process expanded headers directives
         for directive in &server.directives {
             if let Directive::Headers(headers) = directive {
@@ -116,7 +121,7 @@ impl SemanticAnalyzer {
             Handler::Proxy(proxy) => {
                 // Expand macro calls in proxy config
                 let mut expanded_headers = HashMap::new();
-                
+
                 for call in proxy.macro_calls.drain(..) {
                     let expanded = self.expand_macro_call(&call)?;
                     for directive in expanded {
@@ -135,7 +140,7 @@ impl SemanticAnalyzer {
                         }
                     }
                 }
-                
+
                 // Merge expanded headers
                 proxy.header_up.extend(expanded_headers);
             }
@@ -150,9 +155,12 @@ impl SemanticAnalyzer {
     }
 
     fn expand_macro_call(&self, call: &MacroCall) -> SemanticResult<Vec<Directive>> {
-        let macro_def = self.macros.get(&call.name).ok_or_else(|| {
-            SemanticError::UndefinedMacro { name: call.name.clone() }
-        })?;
+        let macro_def =
+            self.macros
+                .get(&call.name)
+                .ok_or_else(|| SemanticError::UndefinedMacro {
+                    name: call.name.clone(),
+                })?;
 
         if macro_def.params.len() != call.args.len() {
             return Err(SemanticError::MacroArgCountMismatch {
@@ -178,43 +186,52 @@ impl SemanticAnalyzer {
         Ok(expanded)
     }
 
-    fn substitute_directive(&self, directive: &Directive, subs: &HashMap<String, Expr>) -> Directive {
+    fn substitute_directive(
+        &self,
+        directive: &Directive,
+        subs: &HashMap<String, Expr>,
+    ) -> Directive {
         match directive {
             Directive::MacroCall(call) => {
                 // Recursively expand nested macro calls
                 // For now, just clone
                 Directive::MacroCall(MacroCall {
                     name: call.name.clone(),
-                    args: call.args.iter().map(|a| self.substitute_expr(a, subs)).collect(),
+                    args: call
+                        .args
+                        .iter()
+                        .map(|a| Self::substitute_expr(a, subs))
+                        .collect(),
                 })
             }
-            Directive::Headers(headers) => {
-                Directive::Headers(HeadersConfig {
-                    set: headers.set.iter()
-                        .map(|(k, v)| (k.clone(), self.substitute_string(v, subs)))
-                        .collect(),
-                    add: headers.add.iter()
-                        .map(|(k, v)| (k.clone(), self.substitute_string(v, subs)))
-                        .collect(),
-                    remove: headers.remove.clone(),
-                })
-            }
-            Directive::Setting { key, value } => {
-                Directive::Setting {
-                    key: key.clone(),
-                    value: self.substitute_expr(value, subs),
-                }
-            }
-            Directive::Block { name, body } => {
-                Directive::Block {
-                    name: name.clone(),
-                    body: body.iter().map(|d| self.substitute_directive(d, subs)).collect(),
-                }
-            }
+            Directive::Headers(headers) => Directive::Headers(HeadersConfig {
+                set: headers
+                    .set
+                    .iter()
+                    .map(|(k, v)| (k.clone(), self.substitute_string(v, subs)))
+                    .collect(),
+                add: headers
+                    .add
+                    .iter()
+                    .map(|(k, v)| (k.clone(), self.substitute_string(v, subs)))
+                    .collect(),
+                remove: headers.remove.clone(),
+            }),
+            Directive::Setting { key, value } => Directive::Setting {
+                key: key.clone(),
+                value: Self::substitute_expr(value, subs),
+            },
+            Directive::Block { name, body } => Directive::Block {
+                name: name.clone(),
+                body: body
+                    .iter()
+                    .map(|d| self.substitute_directive(d, subs))
+                    .collect(),
+            },
         }
     }
 
-    fn substitute_expr(&self, expr: &Expr, subs: &HashMap<String, Expr>) -> Expr {
+    fn substitute_expr(expr: &Expr, subs: &HashMap<String, Expr>) -> Expr {
         match expr {
             Expr::Ident(name) => {
                 if let Some(replacement) = subs.get(name) {
@@ -233,14 +250,17 @@ impl SemanticAnalyzer {
                 }
                 expr.clone()
             }
-            Expr::Array(items) => {
-                Expr::Array(items.iter().map(|e| self.substitute_expr(e, subs)).collect())
-            }
-            Expr::Map(map) => {
-                Expr::Map(map.iter()
-                    .map(|(k, v)| (k.clone(), self.substitute_expr(v, subs)))
-                    .collect())
-            }
+            Expr::Array(items) => Expr::Array(
+                items
+                    .iter()
+                    .map(|e| Self::substitute_expr(e, subs))
+                    .collect(),
+            ),
+            Expr::Map(map) => Expr::Map(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), Self::substitute_expr(v, subs)))
+                    .collect(),
+            ),
             _ => expr.clone(),
         }
     }
@@ -256,9 +276,9 @@ impl SemanticAnalyzer {
         if let Some(global) = &ast.global {
             // Check for valid protocol combinations
             let has_h3 = global.inner.protocols.contains(&Protocol::H3);
-            let has_h1_or_h2 = global.inner.protocols.contains(&Protocol::H1) 
+            let has_h1_or_h2 = global.inner.protocols.contains(&Protocol::H1)
                 || global.inner.protocols.contains(&Protocol::H2);
-            
+
             if has_h3 && !has_h1_or_h2 {
                 // H3 alone is valid but might want to warn
             }
@@ -267,11 +287,14 @@ impl SemanticAnalyzer {
         // Validate servers
         for server_node in &ast.servers {
             let server = &server_node.inner;
-            
+
             // Check that server has at least listens or routes
             if server.listens.is_empty() && server.routes.is_none() {
                 return Err(SemanticError::InvalidConfig {
-                    message: format!("Server '{}' needs at least 'listen' or 'route' block", server.name),
+                    message: format!(
+                        "Server '{}' needs at least 'listen' or 'route' block",
+                        server.name
+                    ),
                 });
             }
 
@@ -320,16 +343,16 @@ mod tests {
                 listen :8080
             }
         "#;
-        
+
         let mut analyzer = SemanticAnalyzer::new();
         // Since compile() now calls analyzer internally, we can either:
         // 1. Call parse + adapt manually
         // 2. Call compile and check if it errors with DuplicateServer
-        
+
         let directives = crate::parser::parse(source).unwrap();
         let ast = crate::adapter::caddyfile::adapt(directives).unwrap();
         let result = analyzer.analyze(ast);
-        
+
         assert!(matches!(result, Err(SemanticError::DuplicateServer { .. })));
     }
 

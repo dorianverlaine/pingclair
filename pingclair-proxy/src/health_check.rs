@@ -4,10 +4,10 @@
 //! Provides a highly configurable health checker supporting HTTP checks and threshold-based status flipping.
 
 use async_trait::async_trait;
-use pingora_load_balancing::health_check::HealthCheck;
-use pingora_load_balancing::Backend;
-use std::time::Duration;
 use pingora_core::ErrorType;
+use pingora_load_balancing::Backend;
+use pingora_load_balancing::health_check::HealthCheck;
+use std::time::Duration;
 
 // MARK: - Configuration
 
@@ -16,17 +16,17 @@ use pingora_core::ErrorType;
 pub struct HealthCheckConfig {
     /// The URL path to check (e.g., "/health").
     pub path: String,
-    
+
     /// Maximum duration to wait for a connection or response.
     pub timeout: Duration,
-    
+
     /// The range of HTTP status codes considered "healthy" (inclusive).
     /// Default: 200..=299
     pub expected_status: (u16, u16),
-    
+
     /// Number of consecutive successful checks required to transition from Unhealthy -> Healthy.
     pub positive_threshold: usize,
-    
+
     /// Number of consecutive failed checks required to transition from Healthy -> Unhealthy.
     pub negative_threshold: usize,
 }
@@ -79,26 +79,36 @@ impl HealthCheck for HealthChecker {
         // Guard: Ensure we are checking an Inet address (Unix sockets not supported yet)
         let inet_address = match &target.addr {
             pingora_core::protocols::l4::socket::SocketAddr::Inet(addr) => addr,
-            pingora_core::protocols::l4::socket::SocketAddr::Unix(_) => return Err(pingora_core::Error::create(
-                ErrorType::InternalError,
-                pingora_core::ErrorSource::Downstream,
-                Some("Unix sockets not supported for basic health check".to_string().into()),
-                None
-            )),
+            pingora_core::protocols::l4::socket::SocketAddr::Unix(_) => {
+                return Err(pingora_core::Error::create(
+                    ErrorType::InternalError,
+                    pingora_core::ErrorSource::Downstream,
+                    Some(
+                        "Unix sockets not supported for basic health check"
+                            .to_string()
+                            .into(),
+                    ),
+                    None,
+                ));
+            }
         };
-        
+
         // Step 1: Establish Connection with Timeout
         let mut stream = match tokio::time::timeout(
             self.config.timeout,
-            tokio::net::TcpStream::connect(inet_address)
-        ).await {
+            tokio::net::TcpStream::connect(inet_address),
+        )
+        .await
+        {
             Ok(Ok(s)) => s,
-            _ => return Err(pingora_core::Error::create(
-                ErrorType::ConnectError,
-                pingora_core::ErrorSource::Downstream,
-                Some("Connection timeout or failed".to_string().into()),
-                None
-            )),
+            _ => {
+                return Err(pingora_core::Error::create(
+                    ErrorType::ConnectError,
+                    pingora_core::ErrorSource::Downstream,
+                    Some("Connection timeout or failed".to_string().into()),
+                    None,
+                ));
+            }
         };
 
         // Step 2: Send HTTP Request
@@ -115,24 +125,31 @@ impl HealthCheck for HealthChecker {
         );
 
         if stream.write_all(request_buffer.as_bytes()).await.is_err() {
-             return Err(pingora_core::Error::create(
+            return Err(pingora_core::Error::create(
                 ErrorType::WriteError,
                 pingora_core::ErrorSource::Downstream,
                 Some("Failed to write request".to_string().into()),
-                None
+                None,
             ));
         }
 
         // Step 3: Read Response Head
         let mut response_buffer = vec![0u8; 128]; // Small buffer, just need the status line
-        let bytes_read = match tokio::time::timeout(self.config.timeout, stream.read(&mut response_buffer)).await {
+        let bytes_read = match tokio::time::timeout(
+            self.config.timeout,
+            stream.read(&mut response_buffer),
+        )
+        .await
+        {
             Ok(Ok(n)) if n > 0 => n,
-             _ => return Err(pingora_core::Error::create(
-                ErrorType::ReadError,
-                pingora_core::ErrorSource::Downstream,
-                Some("Failed to read response".to_string().into()),
-                None
-            )),
+            _ => {
+                return Err(pingora_core::Error::create(
+                    ErrorType::ReadError,
+                    pingora_core::ErrorSource::Downstream,
+                    Some("Failed to read response".to_string().into()),
+                    None,
+                ));
+            }
         };
 
         // Step 4: Parse Status Code
@@ -151,8 +168,12 @@ impl HealthCheck for HealthChecker {
         Err(pingora_core::Error::create(
             ErrorType::ReadError,
             pingora_core::ErrorSource::Downstream,
-            Some("Invalid status code or malformed response".to_string().into()),
-            None
+            Some(
+                "Invalid status code or malformed response"
+                    .to_string()
+                    .into(),
+            ),
+            None,
         ))
     }
 
@@ -160,7 +181,7 @@ impl HealthCheck for HealthChecker {
     ///
     /// - Parameter success: Whether the transition is towards healthy (true) or unhealthy (false).
     /// - Returns: The number of consecutive checks required.
-     fn health_threshold(&self, success: bool) -> usize {
+    fn health_threshold(&self, success: bool) -> usize {
         if success {
             self.config.positive_threshold
         } else {

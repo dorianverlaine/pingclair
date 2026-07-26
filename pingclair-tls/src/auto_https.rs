@@ -3,7 +3,7 @@
 //! 🔐 Orchestra component that combines `AcmeClient` and `CertStore` to provide
 //! "Zero Configuration" HTTPS. Handles the certificate lifecycle: issuance, storage, and renewal.
 
-use crate::acme::{AcmeClient, Certificate, ChallengeHandler, AcmeError};
+use crate::acme::{AcmeClient, AcmeError, Certificate, ChallengeHandler};
 use crate::cert_store::{CertStore, CertStoreError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,10 +17,10 @@ use tokio::sync::RwLock;
 pub enum AutoHttpsError {
     #[error("🔐 ACME Protocol Error: {0}")]
     Acme(#[from] AcmeError),
-    
+
     #[error("💾 Certificate Storage Error: {0}")]
     CertStore(#[from] CertStoreError),
-    
+
     #[error("⚙️ Configuration Error: {0}")]
     Config(String),
 }
@@ -32,25 +32,25 @@ pub enum AutoHttpsError {
 pub struct AutoHttpsConfig {
     /// If false, AutoHTTPS logic is bypassed entirely.
     pub enabled: bool,
-    
+
     /// If true, uses the Let's Encrypt Staging environment (Unstrusted roots).
     pub staging: bool,
-    
+
     /// Email used for ACME account registration and expiry notices.
     pub email: Option<String>,
-    
+
     /// How often to scan for certificates needing renewal.
     pub renewal_interval: Duration,
-    
+
     /// Whether to enforce HTTP Strict Transport Security (HSTS).
     pub hsts: bool,
-    
+
     /// HSTS `max-age` directive in seconds.
     pub hsts_max_age: u64,
-    
+
     /// HSTS `includeSubDomains` directive.
     pub hsts_include_subdomains: bool,
-    
+
     /// HSTS `preload` directive.
     pub hsts_preload: bool,
 }
@@ -78,7 +78,7 @@ impl AutoHttpsConfig {
         if !self.hsts {
             return None;
         }
-        
+
         let mut value = format!("max-age={}", self.hsts_max_age);
         if self.hsts_include_subdomains {
             value.push_str("; includeSubDomains");
@@ -86,7 +86,7 @@ impl AutoHttpsConfig {
         if self.hsts_preload {
             value.push_str("; preload");
         }
-        
+
         Some(value)
     }
 }
@@ -103,7 +103,7 @@ pub struct AutoHttps {
     config: AutoHttpsConfig,
     acme: AcmeClient,
     store: Arc<CertStore>,
-    
+
     /// Set of domains currently being processed to prevent thundering herds equivalent.
     processing: Arc<RwLock<std::collections::HashSet<String>>>,
 }
@@ -116,7 +116,7 @@ impl AutoHttps {
     ///   - store: The backing `CertStore` for persistence.
     pub fn new(config: AutoHttpsConfig, store: Arc<CertStore>) -> Self {
         tracing::info!("🔐 Initializing AutoHTTPS Manager");
-        
+
         // Initialize ACME Client
         let acme = if config.staging {
             tracing::info!("🧪 ACME Environment: Staging");
@@ -125,7 +125,7 @@ impl AutoHttps {
             tracing::info!("🏭 ACME Environment: Production");
             AcmeClient::new()
         };
-        
+
         // Attach Email if provided
         let acme = if let Some(email) = &config.email {
             tracing::info!("📧 ACME Account Email: {}", email);
@@ -133,11 +133,11 @@ impl AutoHttps {
         } else {
             acme
         };
-        
+
         // Persist the ACME account next to the certificates so it is reused
         // across restarts instead of re-registering on every issuance.
         let acme = acme.with_account_store(store.path().to_path_buf());
-        
+
         Self {
             config,
             acme,
@@ -145,7 +145,7 @@ impl AutoHttps {
             processing: Arc::new(RwLock::new(std::collections::HashSet::new())),
         }
     }
-    
+
     /// Retrieves a valid certificate for the given domain.
     ///
     /// **Logic Flow:**
@@ -168,78 +168,85 @@ impl AutoHttps {
                 tracing::debug!("✅ Cache Hit: Valid certificate found for {}", domain);
                 return Ok(cert);
             }
-            tracing::info!("⏰ Expiry Warning: Certificate for {} needs renewal", domain);
+            tracing::info!(
+                "⏰ Expiry Warning: Certificate for {} needs renewal",
+                domain
+            );
         }
-        
+
         // 2. Concurrency Check
         {
             let processing = self.processing.read().await;
             if processing.contains(domain) {
-                return Err(AutoHttpsError::Config(
-                    format!("🔄 Race Protection: Certificate for {} is already being issued", domain)
-                ));
+                return Err(AutoHttpsError::Config(format!(
+                    "🔄 Race Protection: Certificate for {domain} is already being issued"
+                )));
             }
         }
-        
+
         // 3. Mark as Processing
         {
             let mut processing = self.processing.write().await;
             processing.insert(domain.to_string());
         }
-        
+
         tracing::info!("🚀 Starting issuance workflow for {}", domain);
-        
+
         // 4. Perform ACME Operation
         // Note: We use a block here to ensure the processing flag is removed even if panic occurs (though simple await shouldn't panic)
         // Actually simple robust logic:
-        let result = self.acme
+        let result = self
+            .acme
             .obtain_certificate(&[domain.to_string()], handler)
             .await;
-        
+
         // 5. Cleanup Processing Flag
         {
             let mut processing = self.processing.write().await;
             processing.remove(domain);
         }
-        
+
         let cert = result?;
-        
+
         // 6. Persistence
         self.store.store(&cert).await?;
-        
+
         tracing::info!("🎉 Certificate issuance complete for {}", domain);
-        
+
         Ok(cert)
     }
-    
+
     /// Starts the background renewal task.
     ///
     /// Scans the certificate store periodically and proactively renews certificates
     /// that are approaching expiration.
     pub fn start_renewal_task(self: Arc<Self>, handler: Arc<dyn ChallengeHandler>) {
         let interval = self.config.renewal_interval;
-        
+
         tracing::info!("🔄 Starting Renewal Daemon (Interval: {:?})", interval);
-        
+
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                
+
                 tracing::debug!("🔍 Renewal Daemon: Scanning certificates...");
-                
+
                 let renewal_candidates = self.store.get_needing_renewal().await;
-                
+
                 if renewal_candidates.is_empty() {
                     tracing::debug!("✅ Renewal Daemon: All certificates healthy");
                     continue;
                 }
-                
-                tracing::info!("⏰ Renewal Daemon: found {} cert(s) needing attention", renewal_candidates.len());
-                
+
+                tracing::info!(
+                    "⏰ Renewal Daemon: found {} cert(s) needing attention",
+                    renewal_candidates.len()
+                );
+
                 for cert in renewal_candidates {
                     if let Some(domain) = cert.domains.first() {
                         tracing::info!("🔄 Renewing {}...", domain);
-                        
+
                         match self.get_certificate(domain, handler.as_ref()).await {
                             Ok(_) => {
                                 tracing::info!("✅ Renewed successfully: {}", domain);
@@ -253,7 +260,7 @@ impl AutoHttps {
             }
         });
     }
-    
+
     /// Checks if a valid certificate currently exists for a domain.
     pub async fn has_certificate(&self, domain: &str) -> bool {
         self.store.has_valid(domain).await
@@ -273,7 +280,7 @@ impl AutoHttps {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_hsts_header_generation() {
         let config = AutoHttpsConfig::default();
@@ -282,7 +289,7 @@ mod tests {
         assert!(header.contains("includeSubDomains"));
         assert!(!header.contains("preload"));
     }
-    
+
     #[test]
     fn test_hsts_disabled() {
         let config = AutoHttpsConfig {
@@ -291,7 +298,7 @@ mod tests {
         };
         assert!(config.hsts_header().is_none());
     }
-    
+
     #[test]
     fn test_hsts_preload() {
         let config = AutoHttpsConfig {

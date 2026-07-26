@@ -64,11 +64,11 @@ impl fmt::Display for Token {
             Token::BlockOpen => write!(f, "{{"),
             Token::BlockClose => write!(f, "}}"),
             Token::Newline => write!(f, "\\n"),
-            Token::QuotedString(s) => write!(f, "\"{}\"", s),
-            Token::EnvVar(s) => write!(f, "{{${}}}", s),
-            Token::Placeholder(s) => write!(f, "{{{}}}", s),
-            Token::Word(s) => write!(f, "{}", s),
-            _ => write!(f, "{:?}", self),
+            Token::QuotedString(s) => write!(f, "\"{s}\""),
+            Token::EnvVar(s) => write!(f, "{{${s}}}"),
+            Token::Placeholder(s) => write!(f, "{{{s}}}"),
+            Token::Word(s) => write!(f, "{s}"),
+            _ => write!(f, "{self:?}"),
         }
     }
 }
@@ -133,7 +133,13 @@ pub fn tokenize(source: &str) -> LexResult {
 
         // ── Newlines (significant — statement terminators) ────────────
         if c == '\n' {
-            tokens.push(Spanned::new(Token::Newline, Location { start: pos, end: pos + 1 }));
+            tokens.push(Spanned::new(
+                Token::Newline,
+                Location {
+                    start: pos,
+                    end: pos + 1,
+                },
+            ));
             pos += 1;
             continue;
         }
@@ -243,13 +249,25 @@ pub fn tokenize(source: &str) -> LexResult {
             }
 
             // Plain block open
-            tokens.push(Spanned::new(Token::BlockOpen, Location { start, end: pos + 1 }));
+            tokens.push(Spanned::new(
+                Token::BlockOpen,
+                Location {
+                    start,
+                    end: pos + 1,
+                },
+            ));
             pos += 1;
             continue;
         }
 
         if c == '}' {
-            tokens.push(Spanned::new(Token::BlockClose, Location { start: pos, end: pos + 1 }));
+            tokens.push(Spanned::new(
+                Token::BlockClose,
+                Location {
+                    start: pos,
+                    end: pos + 1,
+                },
+            ));
             pos += 1;
             continue;
         }
@@ -259,8 +277,15 @@ pub fn tokenize(source: &str) -> LexResult {
         let start = pos;
         while pos < chars.len() {
             let wc = chars[pos];
-            if wc == ' ' || wc == '\t' || wc == '\r' || wc == '\n'
-                || wc == '\x0C' || wc == '{' || wc == '}' || wc == '#' || wc == '"'
+            if wc == ' '
+                || wc == '\t'
+                || wc == '\r'
+                || wc == '\n'
+                || wc == '\x0C'
+                || wc == '{'
+                || wc == '}'
+                || wc == '#'
+                || wc == '"'
             {
                 break;
             }
@@ -268,7 +293,10 @@ pub fn tokenize(source: &str) -> LexResult {
         }
         if pos > start {
             let word: String = chars[start..pos].iter().collect();
-            tokens.push(Spanned::new(Token::Word(word), Location { start, end: pos }));
+            tokens.push(Spanned::new(
+                Token::Word(word),
+                Location { start, end: pos },
+            ));
         } else {
             return Err(LexError::UnexpectedChar { position: pos });
         }
@@ -308,9 +336,11 @@ mod tests {
             root "/var/www/html" # Inline comment
         "#;
         let tokens = tokenize(source).unwrap();
-        let t: Vec<Token> = tokens.into_iter()
+        let t: Vec<Token> = tokens
+            .into_iter()
             .filter(|t| !matches!(t.value, Token::Newline))
-            .map(|s| s.value).collect();
+            .map(|s| s.value)
+            .collect();
         assert_eq!(t[0], Token::Word("root".to_string()));
         assert_eq!(t[1], Token::QuotedString("/var/www/html".to_string()));
     }
@@ -324,7 +354,8 @@ mod tests {
 
     #[test]
     fn test_caddy_placeholder() {
-        let tokens = tokenize("header_up X-Real-IP {http.request.header.CF-Connecting-IP}").unwrap();
+        let tokens =
+            tokenize("header_up X-Real-IP {http.request.header.CF-Connecting-IP}").unwrap();
         assert_eq!(tokens[0].value, Token::Word("header_up".to_string()));
         assert_eq!(tokens[1].value, Token::Word("X-Real-IP".to_string()));
         assert_eq!(
@@ -348,7 +379,10 @@ mod tests {
     fn test_snippet_definition() {
         // (name) is just a Word token since parens are not braces
         let tokens = tokenize("(security_headers) {\n}").unwrap();
-        assert_eq!(tokens[0].value, Token::Word("(security_headers)".to_string()));
+        assert_eq!(
+            tokens[0].value,
+            Token::Word("(security_headers)".to_string())
+        );
         assert_eq!(tokens[1].value, Token::BlockOpen);
     }
 }

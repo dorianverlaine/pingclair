@@ -348,11 +348,11 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
 
 ### P0：測試可靠性
 
-- [ ] **Workspace lint baseline** — `cargo fmt --all --check` 目前仍有大量歷史格式差異；
-  `pingclair-tls` 已可通過 clippy `-D warnings`，workspace 下一批 blocker 位於
-  `pingclair-core/src/server/router.rs` 與 `handlers.rs` 的 nested-if、manual-strip、
-  argument count 與 question-mark lint。需以獨立、可審查的格式／lint commit
-  清乾淨並加入 CI，不能把 R5 的品質閘門寫成假綠。
+- [x] **Workspace lint baseline（本機，2026-07-26）** — 全 workspace 已套用
+  Rust 1.88 `rustfmt`，並通過 `cargo fmt --all -- --check` 與
+  `cargo clippy --locked --workspace --all-targets -- -D warnings`；GitHub Actions
+  固定 Rust 1.88 並在 build/test 前執行兩項 gate。完整 workspace 測試亦通過；
+  尚待本 commit 的 GitHub runner 結果確認 Linux gate。
 - [ ] **乾淨遠端驗證工作流** — 不可再直接使用髒的 `/root/pingclair`。
   補一個以指定 commit 建立暫存 clone/worktree、測試、收集結果、清理程序的腳本。
 - [ ] **協議與解析安全回歸集** — 對 H1/H2/H3 建立 URI／header 正規化、

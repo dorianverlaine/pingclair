@@ -146,8 +146,7 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             // File server would need async file reading
             // Return placeholder for now
             Err(HandlerError::Config(format!(
-                "FileServer({:?}, {:?}) not yet implemented",
-                root, index
+                "FileServer({root:?}, {index:?}) not yet implemented"
             )))
         }
 
@@ -308,8 +307,7 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
         }
 
         HandlerConfig::Plugin { name, args: _ } => Err(HandlerError::Config(format!(
-            "Plugin {} is not yet implemented",
-            name
+            "Plugin {name} is not yet implemented"
         ))),
     }
 }
@@ -338,8 +336,7 @@ pub async fn verify_basic_auth_async(
     let has_matching_hash = credentials.iter().any(|credential| {
         credential.hashed
             && constant_time_eq(user.as_bytes(), credential.username.as_bytes())
-            && bcrypt_hash_cost(&credential.password)
-                .is_some_and(|cost| cost <= MAX_BCRYPT_COST)
+            && bcrypt_hash_cost(&credential.password).is_some_and(|cost| cost <= MAX_BCRYPT_COST)
     });
     if !has_matching_hash {
         return verify_basic_auth_pair(&user, &password, credentials);
@@ -386,11 +383,7 @@ fn parse_basic_auth(headers: &http::HeaderMap) -> Option<(String, String)> {
 }
 
 /// 🛡️ Checks a parsed credential pair and rejects unsafe bcrypt costs.
-fn verify_basic_auth_pair(
-    user: &str,
-    password: &str,
-    credentials: &[BasicAuthCredential],
-) -> bool {
+fn verify_basic_auth_pair(user: &str, password: &str, credentials: &[BasicAuthCredential]) -> bool {
     let mut matched = false;
     for credential in credentials {
         let user_ok = constant_time_eq(user.as_bytes(), credential.username.as_bytes());
@@ -411,7 +404,7 @@ fn verify_basic_auth_pair(
 
 /// Build the `WWW-Authenticate` challenge value for a 401 response.
 pub fn basic_auth_challenge(realm: &str) -> String {
-    format!("Basic realm=\"{}\"", realm)
+    format!("Basic realm=\"{realm}\"")
 }
 
 /// ⏱️ Compares equal-length byte strings without content-dependent early exits.
@@ -497,10 +490,10 @@ mod tests {
 
     fn headers_with_basic_auth(user: &str, password: &str) -> http::HeaderMap {
         let mut headers = http::HeaderMap::new();
-        let encoded = BASE64.encode(format!("{}:{}", user, password));
+        let encoded = BASE64.encode(format!("{user}:{password}"));
         headers.insert(
             http::header::AUTHORIZATION,
-            format!("Basic {}", encoded).parse().unwrap(),
+            format!("Basic {encoded}").parse().unwrap(),
         );
         headers
     }

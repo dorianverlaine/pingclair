@@ -3,10 +3,10 @@
 //! Implements high-performance rate limiting using Pingora's native `pingora-limits` crate.
 //! Utilizes probabilistic data structures (Count-Min Sketch) for efficient, lock-minimized rate estimation.
 
-use std::time::Duration;
-use std::sync::Arc;
-use pingora_limits::rate::Rate;
 use pingora_limits::rate::PROPORTIONAL_RATE_ESTIMATE_CALC_FN;
+use pingora_limits::rate::Rate;
+use std::sync::Arc;
+use std::time::Duration;
 
 // MARK: - Configuration
 
@@ -15,13 +15,13 @@ use pingora_limits::rate::PROPORTIONAL_RATE_ESTIMATE_CALC_FN;
 pub struct RateLimitConfig {
     /// Maximum allowed requests per time window.
     pub requests_per_window: u64,
-    
+
     /// The duration of the sliding window for rate estimation.
     pub window: Duration,
-    
+
     /// If true, limits are applied per IP address. If false, a global limit is applied.
     pub by_ip: bool,
-    
+
     /// Burst allowance.
     /// Note: `pingora-limits` uses a smoothed rate estimator, so "burst" is implicitly handled
     /// by the windowing logic rather than a strict token bucket capacity.
@@ -48,7 +48,7 @@ impl Default for RateLimitConfig {
 pub struct RateLimiter {
     /// The configuration for this limiter.
     pub config: RateLimitConfig,
-    
+
     /// The underlying native rate estimator.
     rate_estimator: Rate,
 }
@@ -62,13 +62,13 @@ impl RateLimiter {
         // Initialize Pingora's Rate estimator with the configured window.
         // The window defines the granularity of the sliding window estimation.
         let rate_estimator = Rate::new(config.window);
-        
+
         Arc::new(Self {
             config,
             rate_estimator,
         })
     }
-    
+
     /// Checks if a request should be allowed based on the current rate.
     ///
     /// - Parameter key: An optional key (e.g., IP address) to track usage against.
@@ -86,25 +86,27 @@ impl RateLimiter {
         } else {
             "global"
         };
-        
+
         // 1. Observe: Register this request event
         self.rate_estimator.observe(&lookup_key, 1);
-        
+
         // 2. Estimate: Calculate current rate (events per second)
-        let current_rps = self.rate_estimator.rate_with(&lookup_key, PROPORTIONAL_RATE_ESTIMATE_CALC_FN);
-        
+        let current_rps = self
+            .rate_estimator
+            .rate_with(&lookup_key, PROPORTIONAL_RATE_ESTIMATE_CALC_FN);
+
         // 3. Limit: Convert limit to RPS (Requests / WindowSeconds)
         let limit_rps = self.config.requests_per_window as f64 / self.config.window.as_secs_f64();
-        
+
         // 4. Decision: Check if we strictly exceed the limit
         if current_rps > limit_rps {
-             return Err(RateLimitInfo {
+            return Err(RateLimitInfo {
                 limit: self.config.requests_per_window,
                 remaining: 0, // Probabilistic estimator does not track exact "remaining" count
                 reset_after: self.config.window,
             });
         }
-        
+
         Ok(())
     }
 }
@@ -116,10 +118,10 @@ impl RateLimiter {
 pub struct RateLimitInfo {
     /// The configured maximum requests per window.
     pub limit: u64,
-    
+
     /// estimated remaining requests (approximated).
     pub remaining: u64,
-    
+
     /// Duration until the limit window resets.
     pub reset_after: Duration,
 }
@@ -131,8 +133,14 @@ impl RateLimitInfo {
     pub fn to_headers(&self) -> Vec<(String, String)> {
         vec![
             ("X-RateLimit-Limit".to_string(), self.limit.to_string()),
-            ("X-RateLimit-Remaining".to_string(), self.remaining.to_string()),
-            ("Retry-After".to_string(), self.reset_after.as_secs().to_string()),
+            (
+                "X-RateLimit-Remaining".to_string(),
+                self.remaining.to_string(),
+            ),
+            (
+                "Retry-After".to_string(),
+                self.reset_after.as_secs().to_string(),
+            ),
         ]
     }
 }
@@ -142,7 +150,7 @@ impl RateLimitInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_rate_limiter_basic() {
         let config = RateLimitConfig {
@@ -151,25 +159,25 @@ mod tests {
             by_ip: true,
             burst: 0,
         };
-        
+
         let limiter = RateLimiter::new(config);
-        
+
         // Should allow 10 requests easily
         for _ in 0..10 {
             assert!(limiter.check(Some("192.168.1.1")).is_ok());
         }
-        
+
         // Stress test: Eventually should block
         let mut blocked = false;
         for _ in 0..20 {
-             if limiter.check(Some("192.168.1.1")).is_err() {
-                 blocked = true;
-                 break;
-             }
+            if limiter.check(Some("192.168.1.1")).is_err() {
+                blocked = true;
+                break;
+            }
         }
         assert!(blocked, "Should have rate limited eventual requests");
     }
-    
+
     #[test]
     fn test_rate_limiter_different_ips() {
         let config = RateLimitConfig {
@@ -178,14 +186,15 @@ mod tests {
             by_ip: true,
             burst: 0,
         };
-        
+
         let limiter = RateLimiter::new(config);
-        
+
         // Use up limit for IP1
-        for _ in 0..5 { // Reduced from 10 to ensure we don't accidentally hit global probability collisions in test
+        for _ in 0..5 {
+            // Reduced from 10 to ensure we don't accidentally hit global probability collisions in test
             let _ = limiter.check(Some("192.168.1.1"));
         }
-        
+
         // IP2 should still be allowed
         assert!(limiter.check(Some("192.168.1.2")).is_ok());
     }
