@@ -221,7 +221,11 @@
 - [x] **乾淨 Linux 內層驗證腳本** — `scripts/validate-linux-commit.sh` 僅接受完整
   commit SHA，建立唯一暫存 checkout，依序執行 release build、workspace tests、
   20 輪隔離測試與 release binary loopback smoke，保存 metadata、config、log、
-  metrics、listener 與 SHA-256；清理時只終止自己記錄的 process group。
+  metrics、listener 與 SHA-256；清理時只終止自己記錄的 process group。功能驗證
+  預設關閉 fat LTO 並使用 16 codegen units，避免小型 Linux 主機在最終 linker
+  階段失去回應；可透過 `PINGCLAIR_VALIDATION_RELEASE_LTO` 與
+  `PINGCLAIR_VALIDATION_RELEASE_CODEGEN_UNITS` 恢復完整 release profile，亦可用
+  `PINGCLAIR_VALIDATION_TARGET_DIR` 指定持久快取，所有實際值都會寫入 metadata。
 - [x] **公網生產 fixture** — `scripts/remote-production-fixture.sh` 在確認
   80/443/2019/9001–9003 無占用後啟動真實 release binary、三個 upstream 與
   80 TCP／443 TCP+UDP listener；stop 前逐一核對 PID cmdline 的專屬 run directory，
@@ -236,8 +240,9 @@
   覆寫。H1/H2/H3 的 route matcher、rate limit、IP hash、placeholder 與上游
   forwarding 共用 verified client IP，H1/H2/H3 均已接入同一份預編譯 access
   control policy，H1/H2 另有 access log。單元、DSL 與兩項真 binary 整合測試
-  通過；H3 access control 尚待公網驗證，RFC 7239 `Forwarded`、PROXY protocol
-  v1/v2 與 Linux/VPS 完整驗證仍待完成。
+  通過；`40f78e9` 已由 macOS 經公網以真實 H3 驗證 UA deny 連續 10 次均為
+  `403`，且 H1/H2/H3 deny 結果一致。IP／Referer 完整矩陣、RFC 7239
+  `Forwarded`、PROXY protocol v1/v2 與 Linux/VPS 完整驗證仍待完成。
 - [x] **TLS／ACME 私密狀態強化（本機，2026-07-26）** — HTTP-01 challenge
   deploy 改為 async durable contract，token 完成原子落盤並可由 handler 讀取後才
   通知 ACME ready；失敗會回滾，polling 失敗也會 cleanup。憑證續期改讀 CA
@@ -309,9 +314,11 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
   UA deny、regex rewrite＋query 與 LB backup 通過。
 - [x] **本次發現並已於新 commit 修正** — H2 未協商 ALPN；LB 3:1 實測 20:20。
   兩者已在 `af497fd` 修正並通過新一輪公網驗收，舊目錄保留失敗證據。
-- [ ] **H3 middleware parity 仍未完成** — CORS、access control 與 rewrite 路徑
-  回 501；404 使用內建頁而非 `error_page`。這是 R3 的真實缺口，不得把 H3
-  baseline 200 誤寫成 parity 完成。
+- [ ] **H3 middleware parity 仍未完成** — `40f78e9` 已讓 H3 access control
+  與 H1/H2 共用預編譯 policy；公網 UA deny 連續 10 次均回 `403`。允許的 H3
+  請求可通過 access gate，但 CORS／pipeline 與 rewrite dispatch 仍回 `501`，
+  404 亦使用內建頁而非 `error_page`。這是 R3 的真實缺口，不得把 access gate
+  或 baseline 200 誤寫成完整 parity。
 
 ### 2026-07-26 乾淨 Linux 與公網修正驗收
 
@@ -327,9 +334,14 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
   `benchmarks/results/20260726_v02_remote_af497fdd/`。
 - [x] **fixture 清理** — 驗收後 80/443/2019/9001–9003 與 21209 均無本次
   listener，沒有 Pingclair、upstream 或 watchdog 幽靈程序。
+- [x] **H3 access control 公網驗收（`40f78e9`）** — 本機 macOS 經公網送真實
+  QUIC/H3；H1/H2/H3 對封鎖 UA 均回 `403`，H3 連續 10 次穩定通過，VPS
+  tcpdump 捕獲 40 個 443/UDP 封包且零 kernel drop。允許 UA 的 H3 已越過
+  access gate，但仍由未實作的 pipeline dispatch 回 `501`。證據保存在
+  `benchmarks/results/20260726_v02_remote_40f78e9b/`。
 - [ ] **尚未覆蓋** — IP／Referer 完整 allow／deny 與 precedence、死亡
   upstream 502 自訂頁、代理 rewrite URI、primary recovery，以及 R3 的 H3
-  middleware parity。
+  CORS／rewrite／error_page parity。
 
 ### 其他已實作項目
 
@@ -353,7 +365,8 @@ HTTP/1.1、HTTP/2、HTTP/3 請求。證據保存在
   Rust 1.88 `rustfmt`，並通過 `cargo fmt --all -- --check` 與
   `cargo clippy --locked --workspace --all-targets -- -D warnings`；GitHub Actions
   固定 Rust 1.88 並在 build/test 前執行兩項 gate。完整 workspace 測試亦通過；
-  尚待本 commit 的 GitHub runner 結果確認 Linux gate。
+  GitHub Actions run `30183116467` 已在 Linux 對 `40f78e9` 通過 format、clippy、
+  build 與全 workspace tests。
 - [x] **乾淨遠端驗證工作流（2026-07-26）** —
   `scripts/validate-linux-commit.sh` 已依指定完整 SHA 建立唯一暫存 checkout，
   保存 metadata／logs／metrics／listener／checksums，並只清理本次記錄的 process
