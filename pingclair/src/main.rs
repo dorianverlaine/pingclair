@@ -293,7 +293,7 @@ fn main() -> anyhow::Result<()> {
 
             // Parse listen address
             let listen = if from.starts_with(':') {
-                format!("0.0.0.0{}", from)
+                format!("0.0.0.0{from}")
             } else {
                 from.clone()
             };
@@ -346,7 +346,7 @@ fn main() -> anyhow::Result<()> {
 
             // Parse listen address
             let listen_addr = if listen.starts_with(':') {
-                format!("0.0.0.0{}", listen)
+                format!("0.0.0.0{listen}")
             } else {
                 listen.clone()
             };
@@ -404,10 +404,10 @@ fn main() -> anyhow::Result<()> {
 
             match result {
                 Ok(_) => {
-                    println!("✅ Configuration '{}' is valid!", config);
+                    println!("✅ Configuration '{config}' is valid!");
                 }
                 Err(e) => {
-                    eprintln!("❌ Configuration Error: {}", e);
+                    eprintln!("❌ Configuration Error: {e}");
                     std::process::exit(1);
                 }
             }

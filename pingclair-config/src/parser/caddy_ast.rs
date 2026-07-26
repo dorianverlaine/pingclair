@@ -8,10 +8,10 @@
 pub struct Directive {
     /// Directive name (e.g. "server", "reverse_proxy", "example.com")
     pub name: String,
-    
+
     /// Arguments following the name
     pub args: Vec<String>,
-    
+
     /// Optional block { ... }
     pub block: Option<Block>,
 }

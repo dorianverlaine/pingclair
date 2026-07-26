@@ -53,7 +53,7 @@ pub fn compile_file(path: impl AsRef<Path>) -> Result<PingclairConfig, FullCompi
 
     if path.extension().is_some_and(|ext| ext == "json") {
         serde_json::from_str(&source)
-            .map_err(|e| FullCompileError::Io(format!("JSON parse error: {}", e)))
+            .map_err(|e| FullCompileError::Io(format!("JSON parse error: {e}")))
     } else {
         compile(&source)
     }

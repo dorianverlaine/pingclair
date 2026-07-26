@@ -18,7 +18,7 @@ use pingora_http::ResponseHeader;
 
 /// Format the `Alt-Svc` header value advertising HTTP/3 on `port`.
 pub fn alt_svc_value(port: u16) -> String {
-    format!("h3=\":{}\"; ma=86400", port)
+    format!("h3=\":{port}\"; ma=86400")
 }
 
 /// Builds a per-request [`AltSvcModule`]. One builder per Pingora service;
@@ -92,7 +92,10 @@ mod tests {
         let mut module = module_with(Some(alt_svc_value(443)));
         let mut resp = ResponseHeader::build(200, None).unwrap();
 
-        module.response_header_filter(&mut resp, false).await.unwrap();
+        module
+            .response_header_filter(&mut resp, false)
+            .await
+            .unwrap();
 
         let header = resp
             .headers
@@ -106,7 +109,10 @@ mod tests {
         let mut module = module_with(None);
         let mut resp = ResponseHeader::build(200, None).unwrap();
 
-        module.response_header_filter(&mut resp, false).await.unwrap();
+        module
+            .response_header_filter(&mut resp, false)
+            .await
+            .unwrap();
 
         assert!(resp.headers.get("alt-svc").is_none());
     }
@@ -121,13 +127,19 @@ mod tests {
         let mut module = builder.init();
 
         let mut resp = ResponseHeader::build(200, None).unwrap();
-        module.response_header_filter(&mut resp, false).await.unwrap();
+        module
+            .response_header_filter(&mut resp, false)
+            .await
+            .unwrap();
         assert!(resp.headers.get("alt-svc").is_none());
 
         slot.store(Arc::new(Some(alt_svc_value(443))));
 
         let mut resp = ResponseHeader::build(200, None).unwrap();
-        module.response_header_filter(&mut resp, false).await.unwrap();
+        module
+            .response_header_filter(&mut resp, false)
+            .await
+            .unwrap();
         assert!(resp.headers.get("alt-svc").is_some());
     }
 }

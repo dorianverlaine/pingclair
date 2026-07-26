@@ -41,9 +41,7 @@ type SnippetCollection = (SnippetMap, Vec<Directive>);
 
 /// Collect snippet `(name) { ... }` definitions from top-level directives
 /// and return (snippets_map, remaining_directives).
-fn collect_snippets(
-    directives: Vec<Directive>,
-) -> Result<SnippetCollection, AdapterError> {
+fn collect_snippets(directives: Vec<Directive>) -> Result<SnippetCollection, AdapterError> {
     let mut snippets = SnippetMap::new();
     let mut remaining = Vec::new();
 
@@ -391,7 +389,7 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                         if !(400..=599).contains(&code) {
                             return Err(AdapterError::InvalidArgument(
                                 "error_page".into(),
-                                format!("status {} is not an error code", code),
+                                format!("status {code} is not an error code"),
                             ));
                         }
                         server.error_pages.push((code, page.clone()));
@@ -1570,7 +1568,7 @@ mod global_tests {
             assert!(cfg.remove.contains(&"Server".to_string()));
             assert!(cfg.set.contains_key("X-Content-Type-Options"));
         } else {
-            panic!("Expected Headers handler, got {:?}", handler);
+            panic!("Expected Headers handler, got {handler:?}");
         }
     }
 

@@ -200,9 +200,7 @@ impl TrustedProxyPolicy {
 }
 
 /// 🔎 Parses every `X-Forwarded-For` field into one bounded, normalized chain.
-fn parse_forwarded_chain(
-    headers: &http::HeaderMap,
-) -> Result<Option<Vec<IpAddr>>, ()> {
+fn parse_forwarded_chain(headers: &http::HeaderMap) -> Result<Option<Vec<IpAddr>>, ()> {
     let values = headers.get_all("x-forwarded-for");
     if values.iter().next().is_none() {
         return Ok(None);
@@ -235,7 +233,12 @@ fn parse_forwarded_ip(value: &str) -> Option<IpAddr> {
     value
         .parse::<IpAddr>()
         .ok()
-        .or_else(|| value.parse::<std::net::SocketAddr>().ok().map(|addr| addr.ip()))
+        .or_else(|| {
+            value
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .map(|addr| addr.ip())
+        })
         .or_else(|| {
             value
                 .strip_prefix('[')
@@ -262,7 +265,7 @@ fn generate_request_id() -> String {
             .as_micros() as u64
     });
     let seq = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{:x}-{:x}", epoch, seq)
+    format!("{epoch:x}-{seq:x}")
 }
 
 /// Validate a client-supplied `X-Request-Id` before adopting it.
@@ -385,11 +388,7 @@ pub fn is_streaming_content_type(content_type: &str) -> bool {
 
 /// 🗜️ Matches a response MIME type against configured gzip patterns.
 pub fn is_compressible_content_type(content_type: &str, configured_types: &[String]) -> bool {
-    let mime = content_type
-        .split(';')
-        .next()
-        .map(str::trim)
-        .unwrap_or("");
+    let mime = content_type.split(';').next().map(str::trim).unwrap_or("");
     if mime.is_empty() {
         return false;
     }
@@ -937,11 +936,7 @@ impl PingclairProxy {
     }
 
     /// 🛡️ Resolves the verified client address shared by all request policies.
-    pub(crate) fn verified_client_ip(
-        &self,
-        peer: IpAddr,
-        headers: &http::HeaderMap,
-    ) -> IpAddr {
+    pub(crate) fn verified_client_ip(&self, peer: IpAddr, headers: &http::HeaderMap) -> IpAddr {
         self.trusted_proxies.verified_client_ip(peer, headers)
     }
 
@@ -1066,7 +1061,7 @@ impl PingclairProxy {
         for (pattern, state) in hosts.iter() {
             if let Some(wildcard_suffix) = pattern.strip_prefix("*.") {
                 // The request host must end with ".{suffix}" to match *.{suffix}
-                if host.ends_with(&format!(".{}", wildcard_suffix)) {
+                if host.ends_with(&format!(".{wildcard_suffix}")) {
                     return Some(state.clone());
                 }
             }
@@ -1169,8 +1164,7 @@ impl PingclairProxy {
         if let Some(read_timeout) = read_timeout_ms
             && read_timeout > 0
         {
-            peer.options.read_timeout =
-                Some(std::time::Duration::from_millis(read_timeout as u64));
+            peer.options.read_timeout = Some(std::time::Duration::from_millis(read_timeout as u64));
         }
 
         if let Some(write_timeout) = write_timeout_ms
@@ -1334,7 +1328,7 @@ impl PingclairProxy {
             504 => "Gateway Timeout",
             _ => "Error",
         };
-        Self::write_simple_response(session, status, &format!("{} {}", status, reason)).await
+        Self::write_simple_response(session, status, &format!("{status} {reason}")).await
     }
 
     /// Handle a specific handler configuration
@@ -1908,9 +1902,7 @@ fn resolve_single_placeholder(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string(),
-        "remote_ip" | "http.request.remote.host" => {
-            verified_client_ip.unwrap_or("").to_string()
-        }
+        "remote_ip" | "http.request.remote.host" => verified_client_ip.unwrap_or("").to_string(),
         "http.request.method" => req.method.as_str().to_string(),
         "http.request.uri" => req.uri.to_string(),
         "http.request.uri.path" => req.uri.path().to_string(),
@@ -2125,11 +2117,11 @@ impl ProxyHttp for PingclairProxy {
             let limit = state.config.client_max_body_size;
             if limit > 0
                 && let Some(content_length) = session
-                .req_header()
-                .headers
-                .get("content-length")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
+                    .req_header()
+                    .headers
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
                 && content_length > limit
             {
                 let mut header = pingora_http::ResponseHeader::build(413, Some(4)).unwrap();
@@ -2164,28 +2156,27 @@ impl ProxyHttp for PingclairProxy {
             if let Some(state) = &ctx.state
                 && let Some(limiter) = state.rate_limiters.get(index).and_then(|l| l.as_ref())
             {
-                    let key = if limiter.config.by_ip {
-                        Some(remote_ip.as_str())
-                    } else {
-                        None
-                    };
+                let key = if limiter.config.by_ip {
+                    Some(remote_ip.as_str())
+                } else {
+                    None
+                };
 
-                    if let Err(info) = limiter.check(key) {
-                        let mut header = pingora_http::ResponseHeader::build(429, Some(4)).unwrap();
-                        for (k, v) in info.to_headers() {
-                            if let Ok(val) = http::header::HeaderValue::from_str(&v)
-                                && let Ok(name) =
-                                    http::header::HeaderName::from_bytes(k.as_bytes())
-                            {
-                                header.insert_header(name, val).unwrap();
-                            }
+                if let Err(info) = limiter.check(key) {
+                    let mut header = pingora_http::ResponseHeader::build(429, Some(4)).unwrap();
+                    for (k, v) in info.to_headers() {
+                        if let Ok(val) = http::header::HeaderValue::from_str(&v)
+                            && let Ok(name) = http::header::HeaderName::from_bytes(k.as_bytes())
+                        {
+                            header.insert_header(name, val).unwrap();
                         }
-                        header.insert_header("Server", "Pingclair").unwrap();
-                        session
-                            .write_response_header(Box::new(header), true)
-                            .await?;
-                        return Ok(true);
                     }
+                    header.insert_header("Server", "Pingclair").unwrap();
+                    session
+                        .write_response_header(Box::new(header), true)
+                        .await?;
+                    return Ok(true);
+                }
             }
 
             if let Some(h) = handler
@@ -2319,10 +2310,8 @@ impl ProxyHttp for PingclairProxy {
             upstream_request.insert_header("X-Forwarded-Proto", &ctx.request_scheme)?;
         }
         if !has_header_up("X-Forwarded-Host") {
-            upstream_request.insert_header(
-                "X-Forwarded-Host",
-                request_authority(downstream_headers),
-            )?;
+            upstream_request
+                .insert_header("X-Forwarded-Host", request_authority(downstream_headers))?;
         }
 
         // 🛡️ Untrusted peers cannot smuggle a forged forwarding chain upstream.
@@ -2398,48 +2387,48 @@ impl ProxyHttp for PingclairProxy {
         if let Some(state) = &ctx.state
             && state.config.security.enabled
         {
-                upstream_response.insert_header(
-                    "X-Content-Type-Options",
-                    &state.config.security.x_content_type_options,
-                )?;
-                upstream_response
-                    .insert_header("X-Frame-Options", &state.config.security.x_frame_options)?;
-                upstream_response
-                    .insert_header("X-XSS-Protection", &state.config.security.x_xss_protection)?;
-                upstream_response.insert_header(
-                    "X-Permitted-Cross-Domain-Policies",
-                    &state.config.security.x_permitted_cross_domain,
-                )?;
-                upstream_response
-                    .insert_header("Referrer-Policy", &state.config.security.referrer_policy)?;
-                upstream_response.insert_header(
-                    "Permissions-Policy",
-                    &state.config.security.permissions_policy,
-                )?;
+            upstream_response.insert_header(
+                "X-Content-Type-Options",
+                &state.config.security.x_content_type_options,
+            )?;
+            upstream_response
+                .insert_header("X-Frame-Options", &state.config.security.x_frame_options)?;
+            upstream_response
+                .insert_header("X-XSS-Protection", &state.config.security.x_xss_protection)?;
+            upstream_response.insert_header(
+                "X-Permitted-Cross-Domain-Policies",
+                &state.config.security.x_permitted_cross_domain,
+            )?;
+            upstream_response
+                .insert_header("Referrer-Policy", &state.config.security.referrer_policy)?;
+            upstream_response.insert_header(
+                "Permissions-Policy",
+                &state.config.security.permissions_policy,
+            )?;
 
-                if state
-                    .config
-                    .tls
-                    .as_ref()
-                    .is_some_and(|tls| tls.auto || tls.cert.is_some())
-                    && let Some(ref hsts_config) = state.config.security.hsts
-                {
-                    let hsts_value = format!(
-                        "max-age={};{}{}",
-                        hsts_config.max_age,
-                        if hsts_config.include_subdomains {
-                            " includeSubDomains;"
-                        } else {
-                            ""
-                        },
-                        if hsts_config.preload { " preload" } else { "" }
-                    );
-                    upstream_response.insert_header("Strict-Transport-Security", &hsts_value)?;
-                }
+            if state
+                .config
+                .tls
+                .as_ref()
+                .is_some_and(|tls| tls.auto || tls.cert.is_some())
+                && let Some(ref hsts_config) = state.config.security.hsts
+            {
+                let hsts_value = format!(
+                    "max-age={};{}{}",
+                    hsts_config.max_age,
+                    if hsts_config.include_subdomains {
+                        " includeSubDomains;"
+                    } else {
+                        ""
+                    },
+                    if hsts_config.preload { " preload" } else { "" }
+                );
+                upstream_response.insert_header("Strict-Transport-Security", &hsts_value)?;
+            }
 
-                if let Some(ref csp) = state.config.security.csp {
-                    upstream_response.insert_header("Content-Security-Policy", csp)?;
-                }
+            if let Some(ref csp) = state.config.security.csp {
+                upstream_response.insert_header("Content-Security-Policy", csp)?;
+            }
         }
 
         // 7. Setup gzip compression if applicable
@@ -2867,10 +2856,7 @@ mod forwarded_headers_tests {
         let proxy = PingclairProxy::with_trusted_proxies(&["10.0.0.0/8".to_string()]);
         let peer = "10.0.0.5".parse().unwrap();
         let mut headers = http::HeaderMap::new();
-        headers.insert(
-            "x-forwarded-for",
-            "203.0.113.7, 10.1.2.3".parse().unwrap(),
-        );
+        headers.insert("x-forwarded-for", "203.0.113.7, 10.1.2.3".parse().unwrap());
 
         assert_eq!(
             proxy.verified_client_ip(peer, &headers),
@@ -3378,10 +3364,7 @@ mod gzip_type_tests {
             &[]
         ));
         assert!(is_compressible_content_type("application/rss+xml", &[]));
-        assert!(is_compressible_content_type(
-            "application/javascript",
-            &[]
-        ));
+        assert!(is_compressible_content_type("application/javascript", &[]));
         assert!(is_compressible_content_type("image/svg+xml", &[]));
         assert!(!is_compressible_content_type("image/png", &[]));
     }

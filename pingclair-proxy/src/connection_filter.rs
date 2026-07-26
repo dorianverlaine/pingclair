@@ -1,7 +1,7 @@
 use async_trait::async_trait;
+use ipnet::IpNet;
 use pingora_core::listeners::ConnectionFilter;
 use std::net::{IpAddr, SocketAddr};
-use ipnet::IpNet;
 
 // MARK: - Connection Filter
 
@@ -18,7 +18,7 @@ impl PingclairConnectionFilter {
     /// - Returns: A configured `PingclairConnectionFilter`.
     pub fn new(blocked_ips: &[String]) -> Self {
         let mut blocked_cidrs = Vec::new();
-        
+
         for ip_str in blocked_ips {
             match ip_str.parse::<IpNet>() {
                 Ok(cidr) => blocked_cidrs.push(cidr),
@@ -32,9 +32,12 @@ impl PingclairConnectionFilter {
                 }
             }
         }
-        
+
         if !blocked_cidrs.is_empty() {
-            tracing::info!("🛡️ Initialized L4 connection filter with {} blocked CIDR(s)", blocked_cidrs.len());
+            tracing::info!(
+                "🛡️ Initialized L4 connection filter with {} blocked CIDR(s)",
+                blocked_cidrs.len()
+            );
         }
 
         Self { blocked_cidrs }
@@ -86,10 +89,7 @@ mod tests {
     #[tokio::test]
     async fn test_connection_filter() {
         // Block loopback and a specific CIDR
-        let blocked = vec![
-            "127.0.0.1".to_string(), 
-            "192.168.1.0/24".to_string()
-        ];
+        let blocked = vec!["127.0.0.1".to_string(), "192.168.1.0/24".to_string()];
         let filter = PingclairConnectionFilter::new(&blocked);
 
         // Blocked IPs
@@ -102,7 +102,7 @@ mod tests {
         // Allowed IPs
         let addr3: SocketAddr = "10.0.0.1:80".parse().unwrap();
         assert!(filter.should_accept(Some(&addr3)).await);
-        
+
         // Edge case: Allowed IP just outside CIDR
         let addr4: SocketAddr = "192.168.2.1:80".parse().unwrap();
         assert!(filter.should_accept(Some(&addr4)).await);

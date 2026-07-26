@@ -56,7 +56,10 @@ cargo test -p pingclair-proxy
 cargo test -p pingclair --test integration -- --nocapture
 ```
 
-CI runs `cargo build --verbose` and `cargo test --verbose` on stable Rust.
+CI pins Rust 1.88 and runs `cargo fmt --all -- --check`,
+`cargo clippy --locked --workspace --all-targets -- -D warnings`,
+`cargo build --locked --workspace --verbose`, and
+`cargo test --locked --workspace --verbose`.
 Before handing off a code change, run at least `cargo test --workspace`; for
 changes to startup, listeners, proxying, static files, TLS, or middleware,
 also run `cargo build --workspace`.

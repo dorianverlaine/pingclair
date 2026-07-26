@@ -8,24 +8,24 @@
 
 // MARK: - Modules
 
-pub mod health_check;
-pub mod rate_limit;
-pub mod metrics;
 pub mod alt_svc;
-pub mod quic;
-mod load_balancer;
-mod upstream;
 pub mod connection_filter;
+pub mod health_check;
+mod load_balancer;
+pub mod metrics;
+pub mod quic;
+pub mod rate_limit;
 pub mod server;
+mod upstream;
 
 // MARK: - Exports
 
-pub use health_check::HealthChecker;
-pub use rate_limit::{RateLimiter, RateLimitConfig, RateLimitInfo};
-pub use load_balancer::{LoadBalancer, Strategy, FAIL_COOLDOWN};
-pub use upstream::Upstream;
-pub use server::PingclairProxy;
 pub use connection_filter::PingclairConnectionFilter;
+pub use health_check::HealthChecker;
+pub use load_balancer::{FAIL_COOLDOWN, LoadBalancer, Strategy};
+pub use rate_limit::{RateLimitConfig, RateLimitInfo, RateLimiter};
+pub use server::PingclairProxy;
+pub use upstream::Upstream;
 
 // MARK: - Tests
 
@@ -38,7 +38,7 @@ mod tests {
         // Setup scenarios
         let upstream1 = Upstream::new("127.0.0.1:8001").unwrap();
         let upstream2 = Upstream::new("127.0.0.1:8002").unwrap();
-        
+
         let load_balancer = LoadBalancer::new(vec![upstream1, upstream2], Strategy::RoundRobin);
 
         // Verification

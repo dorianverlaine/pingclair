@@ -2,10 +2,10 @@
 //!
 //! Consumes tokens and produces a Generic Directive AST.
 
-use crate::parser::caddy_ast::{Directive, Block};
-use crate::parser::lexer::{LexError, Location, Spanned, Token, tokenize};
+use crate::parser::caddy_ast::{Block, Directive};
 #[allow(unused_imports)]
 use crate::parser::lexer::LexResult;
+use crate::parser::lexer::{LexError, Location, Spanned, Token, tokenize};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -21,10 +21,8 @@ pub enum ParseError {
     },
 
     #[error("Unexpected end of file, expected {expected}")]
-    UnexpectedEof {
-        expected: String,
-    },
-    
+    UnexpectedEof { expected: String },
+
     #[error("Nesting too deep")]
     RecursionLimitExceeded,
 }
@@ -48,7 +46,7 @@ impl<'a> Parser<'a> {
     fn peek(&self) -> Option<&Spanned<Token>> {
         self.tokens.get(self.position)
     }
-    
+
     fn is_eof(&self) -> bool {
         self.position >= self.tokens.len()
     }
@@ -67,7 +65,7 @@ impl<'a> Parser<'a> {
     /// Parse the entire config
     pub fn parse_config(&mut self) -> Result<Vec<Directive>, ParseError> {
         let mut directives = Vec::new();
-        
+
         while !self.is_eof() {
             // Skip top-level newlines
             let Some(token) = self.peek() else {
@@ -77,10 +75,10 @@ impl<'a> Parser<'a> {
                 self.consume();
                 continue;
             }
-            
+
             directives.push(self.parse_directive()?);
         }
-        
+
         Ok(directives)
     }
 
@@ -98,15 +96,19 @@ impl<'a> Parser<'a> {
         }
 
         // 2. Normal directive name
-        let name_token = self.consume().ok_or(ParseError::UnexpectedEof { expected: "directive name".to_string() })?;
-        
+        let name_token = self.consume().ok_or(ParseError::UnexpectedEof {
+            expected: "directive name".to_string(),
+        })?;
+
         let name = match &name_token.value {
             Token::Word(s) | Token::QuotedString(s) | Token::EnvVar(s) => s.clone(),
-            other => return Err(ParseError::UnexpectedToken { 
-                token: format!("{}", other), 
-                location: name_token.span, 
-                expected: "directive name or global block".into() 
-            }),
+            other => {
+                return Err(ParseError::UnexpectedToken {
+                    token: format!("{other}"),
+                    location: name_token.span,
+                    expected: "directive name or global block".into(),
+                });
+            }
         };
 
         let mut args = Vec::new();
@@ -118,7 +120,7 @@ impl<'a> Parser<'a> {
                 Token::Newline => {
                     self.consume();
                     break; // End of directive
-                },
+                }
                 Token::BlockOpen => {
                     // Start of block
                     block = Some(self.parse_block()?);
@@ -134,32 +136,32 @@ impl<'a> Parser<'a> {
                         self.consume();
                     }
                     break;
-                },
+                }
                 Token::BlockClose => {
-                    // Should be handled by parse_block calling us. 
+                    // Should be handled by parse_block calling us.
                     // If we see it here, it means this directive ends (and enclosing block closes).
                     // We DO NOT consume it. Let parent handle.
                     break;
-                },
+                }
                 Token::Word(s) => {
                     args.push(s.clone());
                     self.consume();
-                },
+                }
                 Token::QuotedString(s) => {
                     args.push(s.clone());
                     self.consume();
-                },
+                }
                 Token::EnvVar(s) => {
                     // Preserve ${VAR} syntax for later expansion
-                    args.push(format!("${{{}}}", s));
+                    args.push(format!("${{{s}}}"));
                     self.consume();
-                },
+                }
                 Token::Placeholder(s) => {
                     // Preserve Caddy placeholder syntax {http.request.header.X}
                     // The adapter / runtime will resolve these at request time.
-                    args.push(format!("{{{}}}", s));
+                    args.push(format!("{{{s}}}"));
                     self.consume();
-                },
+                }
                 _ => {
                     // Unexpected (e.g. Comment should keep going? Wait comment is skipped by Lexer)
                     // If we encounter other tokens?
@@ -169,19 +171,15 @@ impl<'a> Parser<'a> {
                     return Err(ParseError::UnexpectedToken {
                         token: format!("{}", token.value),
                         location: token.span,
-                        expected: "argument, newline, or block".into()
+                        expected: "argument, newline, or block".into(),
                     });
                 }
             }
         }
 
-        Ok(Directive {
-            name,
-            args,
-            block,
-        })
+        Ok(Directive { name, args, block })
     }
-    
+
     /// Parse a block: { directives... }
     fn parse_block(&mut self) -> Result<Block, ParseError> {
         if self.depth > 100 {
@@ -190,15 +188,17 @@ impl<'a> Parser<'a> {
         self.depth += 1;
 
         // Consume {
-        let open_token = self.consume().ok_or(ParseError::UnexpectedEof { expected: "{".to_string() })?;
+        let open_token = self.consume().ok_or(ParseError::UnexpectedEof {
+            expected: "{".to_string(),
+        })?;
         if !matches!(open_token.value, Token::BlockOpen) {
-             return Err(ParseError::UnexpectedToken { 
-                token: format!("{}", open_token.value), 
-                location: open_token.span, 
-                expected: "{".into() 
+            return Err(ParseError::UnexpectedToken {
+                token: format!("{}", open_token.value),
+                location: open_token.span,
+                expected: "{".into(),
             });
         }
-        
+
         // Skip potential newline after {
         if let Some(t) = self.peek()
             && matches!(t.value, Token::Newline)
@@ -211,24 +211,28 @@ impl<'a> Parser<'a> {
         loop {
             let token = match self.peek() {
                 Some(t) => t,
-                None => return Err(ParseError::UnexpectedEof { expected: "}".to_string() }), // Missing }
+                None => {
+                    return Err(ParseError::UnexpectedEof {
+                        expected: "}".to_string(),
+                    });
+                } // Missing }
             };
-            
+
             match token.value {
                 Token::BlockClose => {
                     self.consume(); // Consume }
                     break;
-                },
+                }
                 Token::Newline => {
                     self.consume(); // Skip empty lines
                     continue;
-                },
+                }
                 _ => {
                     directives.push(self.parse_directive()?);
                 }
             }
         }
-        
+
         self.depth -= 1;
         Ok(Block { directives })
     }
@@ -265,7 +269,7 @@ mod tests {
         assert_eq!(directives.len(), 1);
         let server = &directives[0];
         assert_eq!(server.name, "example.com");
-        
+
         let block = server.block.as_ref().unwrap();
         assert_eq!(block.directives.len(), 1);
         assert_eq!(block.directives[0].name, "reverse_proxy");
