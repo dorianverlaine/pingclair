@@ -5,6 +5,9 @@ set -Eeuo pipefail
 readonly repository_url="${PINGCLAIR_VALIDATION_REPOSITORY:-https://github.com/dorianverlaine/pingclair.git}"
 readonly requested_commit="${1:-}"
 readonly requested_results="${2:-${PWD}/pingclair-linux-validation-results}"
+readonly requested_target="${PINGCLAIR_VALIDATION_TARGET_DIR:-}"
+readonly release_lto="${PINGCLAIR_VALIDATION_RELEASE_LTO:-false}"
+readonly release_codegen_units="${PINGCLAIR_VALIDATION_RELEASE_CODEGEN_UNITS:-16}"
 
 if [[ -z "${requested_commit}" ]]; then
     printf '%s\n' "❌ Usage: $0 <full-commit-sha> [results-directory]"
@@ -14,6 +17,17 @@ if [[ ! "${requested_commit}" =~ ^[0-9a-fA-F]{40}$ ]]; then
     printf '%s\n' "❌ The commit must be a full 40-character SHA."
     exit 2
 fi
+if [[ ! "${release_codegen_units}" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s\n' "❌ Release codegen units must be a positive integer."
+    exit 2
+fi
+case "${release_lto}" in
+    false | true | off | thin | fat) ;;
+    *)
+        printf '%s\n' "❌ Release LTO must be false, true, off, thin, or fat."
+        exit 2
+        ;;
+esac
 for command_name in cargo curl git python3 rustc setsid sha256sum; do
     if ! command -v "${command_name}" >/dev/null 2>&1; then
         printf '%s\n' "❌ Missing required command: ${command_name}."
@@ -26,9 +40,19 @@ readonly results_dir="$(cd "${requested_results}" && pwd)"
 readonly work_dir="$(mktemp -d "${TMPDIR:-/tmp}/pingclair-linux-validation.XXXXXXXX")"
 readonly checkout_dir="${work_dir}/checkout"
 
-# 🧰 Keep test linking reproducible on small validation hosts without changing runtime behavior.
+# 🧰 Keep functional validation reproducible on small hosts without changing runtime behavior.
 export CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG:-0}"
 export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
+export CARGO_PROFILE_RELEASE_LTO="${release_lto}"
+export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="${release_codegen_units}"
+
+if [[ -n "${requested_target}" ]]; then
+    mkdir -p "${requested_target}"
+    CARGO_TARGET_DIR="$(cd "${requested_target}" && pwd)"
+else
+    CARGO_TARGET_DIR="${checkout_dir}/target"
+fi
+export CARGO_TARGET_DIR
 
 active_pid=""
 server_pid=""
@@ -126,6 +150,11 @@ git -C "${checkout_dir}" checkout -q --detach "${resolved_commit}"
     printf 'cargo=%s\n' "$(cargo --version)"
     printf 'cargo_profile_test_debug=%s\n' "${CARGO_PROFILE_TEST_DEBUG}"
     printf 'cargo_incremental=%s\n' "${CARGO_INCREMENTAL}"
+    printf 'cargo_build_jobs=%s\n' "${CARGO_BUILD_JOBS:-auto}"
+    printf 'cargo_target_dir=%s\n' "${CARGO_TARGET_DIR}"
+    printf 'cargo_profile_release_lto=%s\n' "${CARGO_PROFILE_RELEASE_LTO}"
+    printf 'cargo_profile_release_codegen_units=%s\n' \
+        "${CARGO_PROFILE_RELEASE_CODEGEN_UNITS}"
     if command -v lsb_release >/dev/null 2>&1; then
         lsb_release -a 2>/dev/null || true
     fi
@@ -133,8 +162,8 @@ git -C "${checkout_dir}" checkout -q --detach "${resolved_commit}"
 git -C "${checkout_dir}" status --short --branch >"${results_dir}/git-status.txt"
 
 cd "${checkout_dir}"
-run_step release-build cargo build --release --workspace
-run_step workspace-tests cargo test --workspace
+run_step release-build cargo build --locked --release --workspace
+run_step workspace-tests cargo test --locked --workspace
 run_step integration-isolation scripts/test-integration-isolation.sh 20
 
 readonly http_port="$(allocate_port)"
@@ -167,7 +196,7 @@ cat >"${smoke_config}" <<JSON
 JSON
 cp "${smoke_config}" "${results_dir}/smoke-config.json"
 
-setsid "${checkout_dir}/target/release/pingclair" run "${smoke_config}" \
+setsid "${CARGO_TARGET_DIR}/release/pingclair" run "${smoke_config}" \
     >"${results_dir}/release-smoke.log" 2>&1 &
 server_pid=$!
 

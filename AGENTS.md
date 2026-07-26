@@ -145,6 +145,12 @@ result path, and date in `docs/TODO.md` or `benchmarks/README.md`.
 Remote testing is required before moving a runtime feature into the TODO
 completion section. A remote run should use the release binary when the change
 touches performance, linking, TLS, QUIC, process lifecycle, or Linux behavior.
+On small validation hosts, run `scripts/validate-linux-commit.sh` with its
+default low-memory release overrides and a persistent
+`PINGCLAIR_VALIDATION_TARGET_DIR`; the script records the exact profile in its
+metadata. Use the workspace's full fat-LTO release profile for performance
+claims and publication artifacts. Do not start a fresh fat-LTO build on the
+shared VPS merely to exercise functional behavior.
 
 ## Architecture constraints
 
