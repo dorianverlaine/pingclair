@@ -1165,6 +1165,11 @@ async fn handle_request_inner(
         return Err((413, "Request Entity Too Large"));
     }
 
+    // 🛡️ HTTP/3 enforces the same compiled access policy before authentication or dispatch.
+    if !state.allows_access(route_index, &verified_client_ip_text, &header.headers) {
+        return Err((403, "Forbidden"));
+    }
+
     // 🛡️ Rate limiting uses the same verified client identity as H1 and H2.
     if let Some(limiter) = state
         .rate_limiters

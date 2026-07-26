@@ -854,6 +854,19 @@ impl ProxyState {
             rewrite_regexes,
         }
     }
+
+    /// 🛡️ Applies the route's compiled access policy to a verified client.
+    pub(crate) fn allows_access(
+        &self,
+        route_index: usize,
+        remote_ip: &str,
+        headers: &http::HeaderMap,
+    ) -> bool {
+        self.access_controls
+            .get(route_index)
+            .and_then(|policy| policy.as_ref())
+            .is_none_or(|policy| policy.allows(remote_ip, headers))
+    }
 }
 
 // MARK: - Server Implementation
@@ -2142,11 +2155,7 @@ impl ProxyHttp for PingclairProxy {
             // later request path and makes the policy apply uniformly to all
             // terminal handler types.
             if let Some(state) = &ctx.state
-                && let Some(policy) = state
-                    .access_controls
-                    .get(index)
-                    .and_then(|policy| policy.as_ref())
-                && !policy.allows(&remote_ip, &session.req_header().headers)
+                && !state.allows_access(index, &remote_ip, &session.req_header().headers)
             {
                 Self::write_simple_response(session, 403, "Forbidden").await?;
                 return Ok(true);
@@ -3530,6 +3539,44 @@ mod caddy_parity_tests {
             "PingclairBot/1.0".parse().unwrap(),
         );
         assert!(!policy.allows("10.2.3.4", &headers));
+    }
+
+    #[test]
+    fn proxy_state_exposes_the_same_compiled_access_gate_to_every_protocol() {
+        let access = AccessControlConfig {
+            allowed_ips: vec!["10.0.0.0/8".into()],
+            denied_ips: Vec::new(),
+            allowed_referers: Vec::new(),
+            denied_referers: Vec::new(),
+            allowed_user_agents: Vec::new(),
+            denied_user_agents: vec!["(?i)blockedbot".into()],
+        };
+        let state = ProxyState::new(ServerConfig {
+            routes: vec![pingclair_core::config::RouteConfig {
+                path: "/*".into(),
+                handler: HandlerConfig::Pipeline {
+                    handlers: vec![
+                        HandlerConfig::AccessControl(access),
+                        HandlerConfig::Respond {
+                            status: 200,
+                            body: Some("ok".into()),
+                            headers: HashMap::new(),
+                        },
+                    ],
+                },
+                methods: None,
+                matcher: None,
+            }],
+            ..Default::default()
+        });
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::USER_AGENT, "Browser/1.0".parse().unwrap());
+
+        assert!(state.allows_access(0, "10.2.3.4", &headers));
+        assert!(!state.allows_access(0, "192.0.2.1", &headers));
+        headers.insert(http::header::USER_AGENT, "BlockedBot/1.0".parse().unwrap());
+        assert!(!state.allows_access(0, "10.2.3.4", &headers));
+        assert!(state.allows_access(99, "192.0.2.1", &headers));
     }
 
     #[test]
