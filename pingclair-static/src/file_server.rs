@@ -365,8 +365,7 @@ impl FileServer {
             .to_string();
 
         // Calculate Last-Modified and ETag
-        let last_modified = metadata.modified().ok()
-            .map(|t| httpdate::fmt_http_date(t));
+        let last_modified = metadata.modified().ok().map(httpdate::fmt_http_date);
 
         let etag = format!("\"{:x}-{:x}\"", file_size,
             metadata.modified().map(|t| t.elapsed().unwrap_or_default().as_secs()).unwrap_or(0));
@@ -463,8 +462,7 @@ impl FileServer {
         let file_size = metadata.len();
         
         // Calculate Last-Modified and ETag
-        let last_modified = metadata.modified().ok()
-            .map(|t| httpdate::fmt_http_date(t));
+        let last_modified = metadata.modified().ok().map(httpdate::fmt_http_date);
             
         let etag = format!("\"{:x}-{:x}\"", file_size, 
             metadata.modified().map(|t| t.elapsed().unwrap_or_default().as_secs()).unwrap_or(0));
@@ -475,13 +473,13 @@ impl FileServer {
         let mut start = 0;
         let mut length = file_size;
 
-        if let Some(range) = range_header {
-            if let Some((s, e)) = self.parse_range(range, file_size) {
-                start = s;
-                length = e - s + 1;
-                status = 206;
-                content_range = Some(format!("bytes {}-{}/{}", s, e, file_size));
-            }
+        if let Some(range) = range_header
+            && let Some((s, e)) = self.parse_range(range, file_size)
+        {
+            start = s;
+            length = e - s + 1;
+            status = 206;
+            content_range = Some(format!("bytes {}-{}/{}", s, e, file_size));
         }
         
         // MIME type is path-based (no I/O) and needed by both the cache fast
@@ -536,20 +534,22 @@ impl FileServer {
         // before the raw read because it doesn't need the uncompressed body
         // — when a .br/.gz/.zst variant exists we skip buffering the full
         // file entirely.
-        if self.config.precompressed && status == 200 {
-            if let Some((precompressed_content, encoding)) = self.try_precompressed(&file_path, accept_encoding).await {
-                tracing::debug!("✅ Using pre-compressed file: {} ({})", file_path.display(), encoding);
-                return Ok(Some(ServedResponse::Buffered(ServedFile {
-                    content: precompressed_content,
-                    mime_type,
-                    path: file_path,
-                    status,
-                    content_range,
-                    last_modified,
-                    etag: Some(etag),
-                    content_encoding: Some(encoding.to_string()),
-                })));
-            }
+        if self.config.precompressed
+            && status == 200
+            && let Some((precompressed_content, encoding)) =
+                self.try_precompressed(&file_path, accept_encoding).await
+        {
+            tracing::debug!("✅ Using pre-compressed file: {} ({})", file_path.display(), encoding);
+            return Ok(Some(ServedResponse::Buffered(ServedFile {
+                content: precompressed_content,
+                mime_type,
+                path: file_path,
+                status,
+                content_range,
+                last_modified,
+                etag: Some(etag),
+                content_encoding: Some(encoding.to_string()),
+            })));
         }
 
         // In-flight request coalescing: when this request will produce a

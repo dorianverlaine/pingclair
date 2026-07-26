@@ -5,6 +5,8 @@
 pub mod ast;
 pub mod caddy_ast;
 pub mod lexer;
+// 🧩 The nested name preserves the crate's existing public parser API.
+#[allow(clippy::module_inception)]
 pub mod parser;
 pub mod variables;
 pub mod semantic;

@@ -7,6 +7,16 @@ use matchit::Router as RadixRouter;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// 🧭 Bundles the immutable request attributes used by matcher evaluation.
+struct MatcherRequest<'a> {
+    path: &'a str,
+    method: &'a str,
+    headers: &'a http::HeaderMap,
+    host: &'a str,
+    remote_ip: &'a str,
+    protocol: &'a str,
+}
+
 /// Pre-compiled matcher with cached regex
 #[derive(Debug, Clone)]
 pub struct CompiledMatcher {
@@ -31,10 +41,10 @@ impl CompiledMatcher {
     fn collect_regexes(matcher: &Matcher, regexes: &mut HashMap<String, Arc<regex::Regex>>) {
         match matcher {
             Matcher::Header { condition, .. } | Matcher::Query { condition, .. } => {
-                if let MatcherCondition::Regex(pattern) = condition {
-                    if let Ok(re) = regex::Regex::new(pattern) {
-                        regexes.insert(pattern.clone(), Arc::new(re));
-                    }
+                if let MatcherCondition::Regex(pattern) = condition
+                    && let Ok(re) = regex::Regex::new(pattern)
+                {
+                    regexes.insert(pattern.clone(), Arc::new(re));
                 }
             }
             Matcher::And(left, right) | Matcher::Or(left, right) => {
@@ -171,20 +181,28 @@ impl Router {
         protocol: &str,
     ) -> Option<&CompiledRoute> {
         let candidates = self.match_path(path);
+        let request = MatcherRequest {
+            path,
+            method,
+            headers,
+            host,
+            remote_ip,
+            protocol,
+        };
         
         for route in candidates {
             // Check method constraint
-            if let Some(methods) = &route.config.methods {
-                if !methods.iter().any(|m| m.eq_ignore_ascii_case(method)) {
-                    continue;
-                }
+            if let Some(methods) = &route.config.methods
+                && !methods.iter().any(|m| m.eq_ignore_ascii_case(method))
+            {
+                continue;
             }
             
             // Check additional matchers (using pre-compiled version)
-            if let Some(compiled) = &route.compiled_matcher {
-                if !Self::evaluate_matcher_compiled(compiled, path, method, headers, host, remote_ip, protocol) {
-                    continue;
-                }
+            if let Some(compiled) = &route.compiled_matcher
+                && !Self::evaluate_matcher_compiled(compiled, &request)
+            {
+                continue;
             }
             
             return Some(route);
@@ -196,62 +214,62 @@ impl Router {
     /// Evaluate a pre-compiled matcher against request context
     fn evaluate_matcher_compiled(
         compiled: &CompiledMatcher,
-        path: &str,
-        method: &str,
-        headers: &http::HeaderMap,
-        host: &str,
-        remote_ip: &str,
-        protocol: &str,
+        request: &MatcherRequest<'_>,
     ) -> bool {
-        Self::evaluate_matcher_inner(&compiled.matcher, compiled, path, method, headers, host, remote_ip, protocol)
+        Self::evaluate_matcher_inner(&compiled.matcher, compiled, request)
     }
     
     /// Inner matcher evaluation with access to pre-compiled regexes
     fn evaluate_matcher_inner(
         matcher: &Matcher,
         compiled: &CompiledMatcher,
-        path: &str,
-        method: &str,
-        headers: &http::HeaderMap,
-        host: &str,
-        remote_ip: &str,
-        protocol: &str,
+        request: &MatcherRequest<'_>,
     ) -> bool {
         match matcher {
             Matcher::Path { patterns } => {
-                patterns.iter().any(|p| Self::path_matches(path, p))
+                patterns
+                    .iter()
+                    .any(|pattern| Self::path_matches(request.path, pattern))
             }
             Matcher::Header { name, condition } => {
-                let header_value = headers.get(name)
+                let header_value = request
+                    .headers
+                    .get(name)
                     .and_then(|v| v.to_str().ok());
                 Self::evaluate_condition(header_value, condition, compiled)
             }
             Matcher::Method { methods } => {
-                methods.iter().any(|m| m.eq_ignore_ascii_case(method))
+                methods
+                    .iter()
+                    .any(|method| method.eq_ignore_ascii_case(request.method))
             }
             Matcher::Query { name: _, condition: _ } => {
                 // Query matching would need query string parsing
                 true
             }
             Matcher::Host(hosts) => {
-                hosts.iter().any(|h| h.eq_ignore_ascii_case(host))
+                hosts
+                    .iter()
+                    .any(|host| host.eq_ignore_ascii_case(request.host))
             }
             Matcher::RemoteIp(ips) => {
-                ips.iter().any(|ip| remote_ip == ip)
+                ips.iter().any(|ip| request.remote_ip == ip)
             }
             Matcher::Protocol(protocols) => {
-                protocols.iter().any(|p| p.eq_ignore_ascii_case(protocol))
+                protocols
+                    .iter()
+                    .any(|protocol| protocol.eq_ignore_ascii_case(request.protocol))
             }
             Matcher::And(left, right) => {
-                Self::evaluate_matcher_inner(left, compiled, path, method, headers, host, remote_ip, protocol)
-                    && Self::evaluate_matcher_inner(right, compiled, path, method, headers, host, remote_ip, protocol)
+                Self::evaluate_matcher_inner(left, compiled, request)
+                    && Self::evaluate_matcher_inner(right, compiled, request)
             }
             Matcher::Or(left, right) => {
-                Self::evaluate_matcher_inner(left, compiled, path, method, headers, host, remote_ip, protocol)
-                    || Self::evaluate_matcher_inner(right, compiled, path, method, headers, host, remote_ip, protocol)
+                Self::evaluate_matcher_inner(left, compiled, request)
+                    || Self::evaluate_matcher_inner(right, compiled, request)
             }
             Matcher::Not(inner) => {
-                !Self::evaluate_matcher_inner(inner, compiled, path, method, headers, host, remote_ip, protocol)
+                !Self::evaluate_matcher_inner(inner, compiled, request)
             }
         }
     }
@@ -286,11 +304,9 @@ impl Router {
     
     /// Check if path matches a glob pattern
     fn path_matches(path: &str, pattern: &str) -> bool {
-        if pattern.ends_with("/*") {
-            let prefix = &pattern[..pattern.len() - 2];
+        if let Some(prefix) = pattern.strip_suffix("/*") {
             path.starts_with(prefix)
-        } else if pattern.ends_with("*") {
-            let prefix = &pattern[..pattern.len() - 1];
+        } else if let Some(prefix) = pattern.strip_suffix('*') {
             path.starts_with(prefix)
         } else {
             path == pattern
@@ -328,10 +344,10 @@ impl Router {
 
     /// Convert glob pattern to matchit format
     fn glob_to_matchit(path: &str) -> String {
-        if path.ends_with("/*") {
-            format!("{}/{{*rest}}", &path[..path.len() - 2])
-        } else if path.ends_with("*") {
-            format!("{}{{*rest}}", &path[..path.len() - 1])
+        if let Some(prefix) = path.strip_suffix("/*") {
+            format!("{prefix}/{{*rest}}")
+        } else if let Some(prefix) = path.strip_suffix('*') {
+            format!("{prefix}{{*rest}}")
         } else {
             path.to_string()
         }

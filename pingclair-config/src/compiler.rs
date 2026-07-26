@@ -139,10 +139,10 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
     }
 
     // Bind address (add as first listen if no explicit listens)
-    if let Some(bind) = &server.bind {
-        if config.listen.is_empty() {
-            config.listen.push(bind.clone());
-        }
+    if let Some(bind) = &server.bind
+        && config.listen.is_empty()
+    {
+        config.listen.push(bind.clone());
     }
 
     // Log configuration

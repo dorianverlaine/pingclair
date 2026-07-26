@@ -96,20 +96,20 @@ impl TlsAccept for DynamicCertResolver {
         let current_time = Self::current_time();
         {
             let cache = self.ssl_cache.read();
-            if let Some(cached) = cache.get(&sni) {
-                if cached.expires_at > current_time {
-                    // Cache hit - use cached BoringSSL objects
-                    tracing::debug!("🚀 Using cached cert for {}", sni);
-                    if let Err(e) = ssl.set_certificate(&cached.x509) {
-                        tracing::error!("Failed to set cached certificate: {}", e);
-                        return;
-                    }
-                    if let Err(e) = ssl.set_private_key(&cached.pkey) {
-                        tracing::error!("Failed to set cached private key: {}", e);
-                        return;
-                    }
+            if let Some(cached) = cache.get(&sni)
+                && cached.expires_at > current_time
+            {
+                // Cache hit - use cached BoringSSL objects
+                tracing::debug!("🚀 Using cached cert for {}", sni);
+                if let Err(e) = ssl.set_certificate(&cached.x509) {
+                    tracing::error!("Failed to set cached certificate: {}", e);
                     return;
                 }
+                if let Err(e) = ssl.set_private_key(&cached.pkey) {
+                    tracing::error!("Failed to set cached private key: {}", e);
+                    return;
+                }
+                return;
             }
         }
 
@@ -485,10 +485,10 @@ async fn refresh_h3_cert_table(
     domains: &[String],
 ) {
     for domain in domains {
-        if let Some((cert_pem, key_pem)) = tls_manager.peek_pem(domain).await {
-            if let Err(e) = table.upsert_pem(domain, &cert_pem, &key_pem) {
-                tracing::warn!("⚠️ H3: skipping certificate for {}: {}", domain, e);
-            }
+        if let Some((cert_pem, key_pem)) = tls_manager.peek_pem(domain).await
+            && let Err(e) = table.upsert_pem(domain, &cert_pem, &key_pem)
+        {
+            tracing::warn!("⚠️ H3: skipping certificate for {}: {}", domain, e);
         }
     }
 }
@@ -851,22 +851,22 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
     }
 
     // Start Admin API if enabled
-    if let Some(admin_config) = config.admin {
-        if admin_config.enabled {
-            let listen = admin_config.listen.clone();
-            let api_key = admin_config.api_key.clone();
-            let proxies = port_proxies.clone();
+    if let Some(admin_config) = config.admin
+        && admin_config.enabled
+    {
+        let listen = admin_config.listen.clone();
+        let api_key = admin_config.api_key.clone();
+        let proxies = port_proxies.clone();
 
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().expect("Failed to create admin runtime");
-                rt.block_on(async {
-                    let addr = listen.parse().expect("Invalid admin listen address");
-                    if let Err(e) = pingclair_api::run_admin_server(addr, proxies, api_key).await {
-                        tracing::error!("Admin server error: {}", e);
-                    }
-                });
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create admin runtime");
+            rt.block_on(async {
+                let addr = listen.parse().expect("Invalid admin listen address");
+                if let Err(e) = pingclair_api::run_admin_server(addr, proxies, api_key).await {
+                    tracing::error!("Admin server error: {}", e);
+                }
             });
-        }
+        });
     }
 
     // ========================================

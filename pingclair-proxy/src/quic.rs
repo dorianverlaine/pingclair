@@ -171,10 +171,10 @@ impl CertTable {
         }
 
         for (pattern, entry) in &snap.certs {
-            if let Some(suffix) = pattern.strip_prefix("*.") {
-                if servername.ends_with(&format!(".{suffix}")) {
-                    return Some(entry.clone());
-                }
+            if let Some(suffix) = pattern.strip_prefix("*.")
+                && servername.ends_with(&format!(".{suffix}"))
+            {
+                return Some(entry.clone());
             }
         }
 
@@ -827,7 +827,7 @@ impl QuicServer {
         body_notify: &Arc<Notify>,
     ) {
         // Only client-initiated bidirectional streams carry requests.
-        if stream_id % 4 != 0 {
+        if !stream_id.is_multiple_of(4) {
             return;
         }
 
@@ -901,14 +901,14 @@ impl QuicServer {
         let mut tmp = [0u8; BODY_CHUNK_SIZE];
 
         loop {
-            if let Some(tx) = &ss.req_body_tx {
-                if tx.capacity() == 0 {
-                    // Channel full: retry from the maintenance pass once the
-                    // handler frees capacity. QUIC flow control pushes back
-                    // on the client in the meantime.
-                    ss.body_read_pending = true;
-                    return;
-                }
+            if let Some(tx) = &ss.req_body_tx
+                && tx.capacity() == 0
+            {
+                // Channel full: retry from the maintenance pass once the
+                // handler frees capacity. QUIC flow control pushes back
+                // on the client in the meantime.
+                ss.body_read_pending = true;
+                return;
             }
 
             match h3.recv_body(conn, stream_id, &mut tmp) {
@@ -1121,17 +1121,15 @@ async fn handle_request_inner(
     // Request body size limit (Content-Length precheck; the streaming
     // counter in the reverse-proxy path enforces it for chunked bodies).
     let body_limit = state.config.client_max_body_size;
-    if body_limit > 0 {
-        if let Some(content_length) = header
-            .headers
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-        {
-            if content_length > body_limit {
-                return Err((413, "Request Entity Too Large"));
-            }
-        }
+    if body_limit > 0
+        && let Some(content_length) = header
+        .headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        && content_length > body_limit
+    {
+        return Err((413, "Request Entity Too Large"));
     }
 
     // 🛡️ Rate limiting uses the same verified client identity as H1 and H2.
@@ -1158,17 +1156,17 @@ async fn handle_request_inner(
     }
 
     // 🔐 The HTTP/3 gate shares the asynchronous verifier with H1 and H2.
-    if let Some((realm, credentials)) = find_basic_auth_config(&handler) {
-        if !pingclair_core::server::verify_basic_auth_async(&header.headers, credentials).await {
-            let challenge = pingclair_core::server::basic_auth_challenge(realm);
-            let hdrs = vec![
-                quiche::h3::Header::new(b":status", b"401"),
-                quiche::h3::Header::new(b"www-authenticate", challenge.as_bytes()),
-                quiche::h3::Header::new(b"server", b"Pingclair"),
-            ];
-            send_headers(resp_tx, cid, stream_id, hdrs, true).await;
-            return Ok(());
-        }
+    if let Some((realm, credentials)) = find_basic_auth_config(&handler)
+        && !pingclair_core::server::verify_basic_auth_async(&header.headers, credentials).await
+    {
+        let challenge = pingclair_core::server::basic_auth_challenge(realm);
+        let hdrs = vec![
+            quiche::h3::Header::new(b":status", b"401"),
+            quiche::h3::Header::new(b"www-authenticate", challenge.as_bytes()),
+            quiche::h3::Header::new(b"server", b"Pingclair"),
+        ];
+        send_headers(resp_tx, cid, stream_id, hdrs, true).await;
+        return Ok(());
     }
 
     match handler {
@@ -1434,17 +1432,17 @@ async fn reverse_proxy_upstream(
             .insert_header("X-Forwarded-Host", req.authority.as_str())
             .ok();
     }
-    if !has_header_up("X-Forwarded-For") {
-        if let Ok(peer_address) = peer_ip.parse::<IpAddr>() {
-            up_req
-                .insert_header(
-                    "X-Forwarded-For",
-                    proxy
-                        .forwarded_for(peer_address, &client_header.headers)
-                        .as_str(),
-                )
-                .ok();
-        }
+    if !has_header_up("X-Forwarded-For")
+        && let Ok(peer_address) = peer_ip.parse::<IpAddr>()
+    {
+        up_req
+            .insert_header(
+                "X-Forwarded-For",
+                proxy
+                    .forwarded_for(peer_address, &client_header.headers)
+                    .as_str(),
+            )
+            .ok();
     }
     if !has_header_up("X-Real-IP") {
         up_req
@@ -1483,16 +1481,16 @@ async fn reverse_proxy_upstream(
     // A declared content-length must match what was actually streamed;
     // otherwise the upstream would wait for bytes that never come (or the
     // extra bytes would poison the reused connection).
-    if let Some(cl) = client_content_length {
-        if counted != cl {
-            tracing::warn!(
-                "H3: request body length mismatch (content-length {}, streamed {})",
-                cl,
-                counted
-            );
-            session.shutdown().await;
-            return Err((400, "Bad Request"));
-        }
+    if let Some(cl) = client_content_length
+        && counted != cl
+    {
+        tracing::warn!(
+            "H3: request body length mismatch (content-length {}, streamed {})",
+            cl,
+            counted
+        );
+        session.shutdown().await;
+        return Err((400, "Bad Request"));
     }
 
     if let Err(e) = session.finish_request_body().await {

@@ -310,23 +310,22 @@ fn stream_gzip_chunk(
     }
 
     // Feed this chunk into the encoder.
-    if let Some(chunk) = body.as_ref() {
-        if let Some(encoder) = encoder_slot.as_mut() {
-            if let Err(e) = encoder.write_all(chunk) {
-                tracing::warn!(
-                    "⚠️ Gzip compression failed, aborting compression for the rest of this response: {}",
-                    e
-                );
-                // Bail out of compression entirely; the client already
-                // received a Content-Encoding: gzip header for this
-                // response so we cannot fall back to plaintext mid-stream
-                // — better to end the response short than to send a
-                // client a body it can't decode.
-                *encoder_slot = None;
-                *body = None;
-                return;
-            }
-        }
+    if let Some(chunk) = body.as_ref()
+        && let Some(encoder) = encoder_slot.as_mut()
+        && let Err(e) = encoder.write_all(chunk)
+    {
+        tracing::warn!(
+            "⚠️ Gzip compression failed, aborting compression for the rest of this response: {}",
+            e
+        );
+        // Bail out of compression entirely; the client already
+        // received a Content-Encoding: gzip header for this
+        // response so we cannot fall back to plaintext mid-stream
+        // — better to end the response short than to send a
+        // client a body it can't decode.
+        *encoder_slot = None;
+        *body = None;
+        return;
     }
 
     if end_of_stream {
@@ -648,6 +647,15 @@ fn host_matches_rule(host: &str, rule: &str) -> bool {
     }
 }
 
+/// 🧭 Groups one rewrite handler's immutable matching and replacement rules.
+struct RewriteRule<'a> {
+    strip_prefix: Option<&'a str>,
+    strip_suffix: Option<&'a str>,
+    replace: Option<&'a str>,
+    regex: Option<&'a str>,
+    regex_replace: Option<&'a str>,
+}
+
 fn rewrite_uri(
     current: &str,
     strip_prefix: Option<&str>,
@@ -659,25 +667,25 @@ fn rewrite_uri(
     let (path, query) = current.split_once('?').unwrap_or((current, ""));
     let mut rewritten = path.to_string();
 
-    if let Some(prefix) = strip_prefix {
-        if let Some(rest) = rewritten.strip_prefix(prefix) {
-            rewritten = if rest.is_empty() {
-                "/".to_string()
-            } else if rest.starts_with('/') {
-                rest.to_string()
-            } else {
-                format!("/{rest}")
-            };
-        }
+    if let Some(prefix) = strip_prefix
+        && let Some(rest) = rewritten.strip_prefix(prefix)
+    {
+        rewritten = if rest.is_empty() {
+            "/".to_string()
+        } else if rest.starts_with('/') {
+            rest.to_string()
+        } else {
+            format!("/{rest}")
+        };
     }
-    if let Some(suffix) = strip_suffix {
-        if let Some(rest) = rewritten.strip_suffix(suffix) {
-            rewritten = if rest.is_empty() {
-                "/".to_string()
-            } else {
-                rest.to_string()
-            };
-        }
+    if let Some(suffix) = strip_suffix
+        && let Some(rest) = rewritten.strip_suffix(suffix)
+    {
+        rewritten = if rest.is_empty() {
+            "/".to_string()
+        } else {
+            rest.to_string()
+        };
     }
     if let Some(replacement) = replace {
         rewritten = replacement.to_string();
@@ -1094,10 +1102,10 @@ impl PingclairProxy {
     pub fn parse_upstream(upstream: &str) -> Option<(String, u16, bool)> {
         let upstream = upstream.trim();
 
-        let (scheme, rest) = if upstream.starts_with("https://") {
-            (true, &upstream[8..])
-        } else if upstream.starts_with("http://") {
-            (false, &upstream[7..])
+        let (scheme, rest) = if let Some(stripped) = upstream.strip_prefix("https://") {
+            (true, stripped)
+        } else if let Some(stripped) = upstream.strip_prefix("http://") {
+            (false, stripped)
         } else {
             (false, upstream)
         };
@@ -1158,18 +1166,18 @@ impl PingclairProxy {
         let mut peer = HttpPeer::new(addr, tls, host);
 
         // Apply timeouts if configured
-        if let Some(read_timeout) = read_timeout_ms {
-            if read_timeout > 0 {
-                peer.options.read_timeout =
-                    Some(std::time::Duration::from_millis(read_timeout as u64));
-            }
+        if let Some(read_timeout) = read_timeout_ms
+            && read_timeout > 0
+        {
+            peer.options.read_timeout =
+                Some(std::time::Duration::from_millis(read_timeout as u64));
         }
 
-        if let Some(write_timeout) = write_timeout_ms {
-            if write_timeout > 0 {
-                peer.options.write_timeout =
-                    Some(std::time::Duration::from_millis(write_timeout as u64));
-            }
+        if let Some(write_timeout) = write_timeout_ms
+            && write_timeout > 0
+        {
+            peer.options.write_timeout =
+                Some(std::time::Duration::from_millis(write_timeout as u64));
         }
 
         // Set default connection timeout (10 seconds) if not configured
@@ -1237,11 +1245,7 @@ impl PingclairProxy {
         session: &mut Session,
         ctx: &mut RequestContext,
         route_index: usize,
-        strip_prefix: &Option<String>,
-        strip_suffix: &Option<String>,
-        replace: &Option<String>,
-        regex: &Option<String>,
-        regex_replace: &Option<String>,
+        rule: RewriteRule<'_>,
     ) -> PingoraResult<()> {
         let current = session
             .req_header()
@@ -1249,7 +1253,7 @@ impl PingclairProxy {
             .path_and_query()
             .map(|value| value.as_str())
             .unwrap_or("/");
-        let compiled = if let Some(pattern) = regex {
+        let compiled = if let Some(pattern) = rule.regex {
             ctx.state
                 .as_ref()
                 .and_then(|state| state.rewrite_regexes.get(route_index))
@@ -1257,7 +1261,7 @@ impl PingclairProxy {
         } else {
             None
         };
-        if regex.is_some() && compiled.is_none() {
+        if rule.regex.is_some() && compiled.is_none() {
             return Err(pingora_core::Error::explain(
                 pingora_core::ErrorType::InternalError,
                 "invalid rewrite regex in active configuration",
@@ -1265,11 +1269,11 @@ impl PingclairProxy {
         }
         let new_uri = rewrite_uri(
             current,
-            strip_prefix.as_deref(),
-            strip_suffix.as_deref(),
-            replace.as_deref(),
+            rule.strip_prefix,
+            rule.strip_suffix,
+            rule.replace,
             compiled,
-            regex_replace.as_deref(),
+            rule.regex_replace,
         )
         .expect("rewrite_uri always constructs a URI");
         session.req_header_mut().set_raw_path(new_uri.as_bytes())?;
@@ -1295,31 +1299,31 @@ impl PingclairProxy {
             .state
             .as_ref()
             .and_then(|s| s.config.error_pages.get(&status));
-        if let Some(path) = page {
-            if let Ok(content) = std::fs::read(path) {
-                let mime = if path.ends_with(".htm") || path.ends_with(".html") {
-                    "text/html"
-                } else {
-                    "text/plain"
-                };
-                let mut response = ResponseHeader::build(status, Some(4)).unwrap();
-                response.insert_header("Content-Type", mime).unwrap();
-                response
-                    .insert_header("Content-Length", content.len().to_string())
-                    .unwrap();
-                response.insert_header("Server", "Pingclair").unwrap();
-                response
-                    .insert_header("X-Request-Id", &ctx.request_id)
-                    .unwrap();
-                Self::apply_local_response_headers(&mut response, ctx)?;
-                session
-                    .write_response_header(Box::new(response), false)
-                    .await?;
-                session
-                    .write_response_body(Some(Bytes::from(content)), true)
-                    .await?;
-                return Ok(());
-            }
+        if let Some(path) = page
+            && let Ok(content) = std::fs::read(path)
+        {
+            let mime = if path.ends_with(".htm") || path.ends_with(".html") {
+                "text/html"
+            } else {
+                "text/plain"
+            };
+            let mut response = ResponseHeader::build(status, Some(4)).unwrap();
+            response.insert_header("Content-Type", mime).unwrap();
+            response
+                .insert_header("Content-Length", content.len().to_string())
+                .unwrap();
+            response.insert_header("Server", "Pingclair").unwrap();
+            response
+                .insert_header("X-Request-Id", &ctx.request_id)
+                .unwrap();
+            Self::apply_local_response_headers(&mut response, ctx)?;
+            session
+                .write_response_header(Box::new(response), false)
+                .await?;
+            session
+                .write_response_body(Some(Bytes::from(content)), true)
+                .await?;
+            return Ok(());
         }
         let reason = match status {
             400 => "Bad Request",
@@ -1633,11 +1637,13 @@ impl PingclairProxy {
                     session,
                     ctx,
                     route_index,
-                    strip_prefix,
-                    strip_suffix,
-                    replace,
-                    regex,
-                    regex_replace,
+                    RewriteRule {
+                        strip_prefix: strip_prefix.as_deref(),
+                        strip_suffix: strip_suffix.as_deref(),
+                        replace: replace.as_deref(),
+                        regex: regex.as_deref(),
+                        regex_replace: regex_replace.as_deref(),
+                    },
                 )?;
                 Ok(false)
             }
@@ -1730,13 +1736,13 @@ impl PingclairProxy {
                         .insert_header("Access-Control-Allow-Origin", &allow_origin)
                         .unwrap();
                     header
-                        .insert_header("Access-Control-Allow-Methods", &allowed_methods.join(", "))
+                        .insert_header("Access-Control-Allow-Methods", allowed_methods.join(", "))
                         .unwrap();
                     header
-                        .insert_header("Access-Control-Allow-Headers", &allowed_headers.join(", "))
+                        .insert_header("Access-Control-Allow-Headers", allowed_headers.join(", "))
                         .unwrap();
                     header
-                        .insert_header("Access-Control-Max-Age", &max_age.to_string())
+                        .insert_header("Access-Control-Max-Age", max_age.to_string())
                         .unwrap();
                     if *allow_credentials {
                         header
@@ -1747,7 +1753,7 @@ impl PingclairProxy {
                         header
                             .insert_header(
                                 "Access-Control-Expose-Headers",
-                                &exposed_headers.join(", "),
+                                exposed_headers.join(", "),
                             )
                             .unwrap();
                     }
@@ -1949,33 +1955,33 @@ impl ProxyHttp for PingclairProxy {
         let request_header = session.req_header();
         let path = request_header.uri.path();
 
-        if path.starts_with("/.well-known/acme-challenge/") {
-            if let Some(manager) = &self.tls_manager {
-                // Extract token
-                let token = path.trim_start_matches("/.well-known/acme-challenge/");
+        if path.starts_with("/.well-known/acme-challenge/")
+            && let Some(manager) = &self.tls_manager
+        {
+            // Extract token
+            let token = path.trim_start_matches("/.well-known/acme-challenge/");
 
-                // Lookup token in challenge handler
-                let handler = manager.challenge_handler();
-                if let Some(key_auth) = handler.get_token(token) {
-                    tracing::info!("🔐 Serving ACME challenge for token: {}", token);
+            // Lookup token in challenge handler
+            let handler = manager.challenge_handler();
+            if let Some(key_auth) = handler.get_token(token) {
+                tracing::info!("🔐 Serving ACME challenge for token: {}", token);
 
-                    let mut header = pingora_http::ResponseHeader::build(200, Some(2)).unwrap();
-                    header
-                        .insert_header("Content-Type", "application/octet-stream")
-                        .unwrap();
-                    header
-                        .insert_header("Content-Length", key_auth.len().to_string())
-                        .unwrap();
-                    session
-                        .write_response_header(Box::new(header), false)
-                        .await?;
-                    session
-                        .write_response_body(Some(Bytes::from(key_auth)), true)
-                        .await?;
-                    return Ok(true);
-                } else {
-                    tracing::warn!("⚠️ ACME challenge token not found: {}", token);
-                }
+                let mut header = pingora_http::ResponseHeader::build(200, Some(2)).unwrap();
+                header
+                    .insert_header("Content-Type", "application/octet-stream")
+                    .unwrap();
+                header
+                    .insert_header("Content-Length", key_auth.len().to_string())
+                    .unwrap();
+                session
+                    .write_response_header(Box::new(header), false)
+                    .await?;
+                session
+                    .write_response_body(Some(Bytes::from(key_auth)), true)
+                    .await?;
+                return Ok(true);
+            } else {
+                tracing::warn!("⚠️ ACME challenge token not found: {}", token);
             }
         }
 
@@ -2117,24 +2123,22 @@ impl ProxyHttp for PingclairProxy {
         // Check request body size (Content-Length)
         if let Some(state) = &ctx.state {
             let limit = state.config.client_max_body_size;
-            if limit > 0 {
-                if let Some(content_length) = session
-                    .req_header()
-                    .headers
-                    .get("content-length")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
-                {
-                    if content_length > limit {
-                        let mut header = pingora_http::ResponseHeader::build(413, Some(4)).unwrap();
-                        header.insert_header("Connection", "close").unwrap();
-                        header.insert_header("Server", "Pingclair").unwrap();
-                        session
-                            .write_response_header(Box::new(header), true)
-                            .await?;
-                        return Ok(true);
-                    }
-                }
+            if limit > 0
+                && let Some(content_length) = session
+                .req_header()
+                .headers
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                && content_length > limit
+            {
+                let mut header = pingora_http::ResponseHeader::build(413, Some(4)).unwrap();
+                header.insert_header("Connection", "close").unwrap();
+                header.insert_header("Server", "Pingclair").unwrap();
+                session
+                    .write_response_header(Box::new(header), true)
+                    .await?;
+                return Ok(true);
             }
         }
 
@@ -2145,22 +2149,21 @@ impl ProxyHttp for PingclairProxy {
             // an upstream connection. This keeps denied traffic out of every
             // later request path and makes the policy apply uniformly to all
             // terminal handler types.
-            if let Some(state) = &ctx.state {
-                if let Some(policy) = state
+            if let Some(state) = &ctx.state
+                && let Some(policy) = state
                     .access_controls
                     .get(index)
                     .and_then(|policy| policy.as_ref())
-                {
-                    if !policy.allows(&remote_ip, &session.req_header().headers) {
-                        Self::write_simple_response(session, 403, "Forbidden").await?;
-                        return Ok(true);
-                    }
-                }
+                && !policy.allows(&remote_ip, &session.req_header().headers)
+            {
+                Self::write_simple_response(session, 403, "Forbidden").await?;
+                return Ok(true);
             }
 
             // Check rate limit
-            if let Some(state) = &ctx.state {
-                if let Some(limiter) = state.rate_limiters.get(index).and_then(|l| l.as_ref()) {
+            if let Some(state) = &ctx.state
+                && let Some(limiter) = state.rate_limiters.get(index).and_then(|l| l.as_ref())
+            {
                     let key = if limiter.config.by_ip {
                         Some(remote_ip.as_str())
                     } else {
@@ -2170,11 +2173,11 @@ impl ProxyHttp for PingclairProxy {
                     if let Err(info) = limiter.check(key) {
                         let mut header = pingora_http::ResponseHeader::build(429, Some(4)).unwrap();
                         for (k, v) in info.to_headers() {
-                            if let Ok(val) = http::header::HeaderValue::from_str(&v) {
-                                if let Ok(name) = http::header::HeaderName::from_bytes(k.as_bytes())
-                                {
-                                    header.insert_header(name, val).unwrap();
-                                }
+                            if let Ok(val) = http::header::HeaderValue::from_str(&v)
+                                && let Ok(name) =
+                                    http::header::HeaderName::from_bytes(k.as_bytes())
+                            {
+                                header.insert_header(name, val).unwrap();
                             }
                         }
                         header.insert_header("Server", "Pingclair").unwrap();
@@ -2183,16 +2186,14 @@ impl ProxyHttp for PingclairProxy {
                             .await?;
                         return Ok(true);
                     }
-                }
             }
 
-            if let Some(h) = handler {
-                if self
+            if let Some(h) = handler
+                && self
                     .handle_config(session, ctx, &h, &path_str, index)
                     .await?
-                {
-                    return Ok(true);
-                }
+            {
+                return Ok(true);
             }
         }
 
@@ -2394,8 +2395,9 @@ impl ProxyHttp for PingclairProxy {
         upstream_response.insert_header("X-Request-Id", &ctx.request_id)?;
 
         // 6. Security headers based on configuration
-        if let Some(state) = &ctx.state {
-            if state.config.security.enabled {
+        if let Some(state) = &ctx.state
+            && state.config.security.enabled
+        {
                 upstream_response.insert_header(
                     "X-Content-Type-Options",
                     &state.config.security.x_content_type_options,
@@ -2419,28 +2421,25 @@ impl ProxyHttp for PingclairProxy {
                     .config
                     .tls
                     .as_ref()
-                    .map_or(false, |tls| tls.auto || tls.cert.is_some())
+                    .is_some_and(|tls| tls.auto || tls.cert.is_some())
+                    && let Some(ref hsts_config) = state.config.security.hsts
                 {
-                    if let Some(ref hsts_config) = state.config.security.hsts {
-                        let hsts_value = format!(
-                            "max-age={};{}{}",
-                            hsts_config.max_age,
-                            if hsts_config.include_subdomains {
-                                " includeSubDomains;"
-                            } else {
-                                ""
-                            },
-                            if hsts_config.preload { " preload" } else { "" }
-                        );
-                        upstream_response
-                            .insert_header("Strict-Transport-Security", &hsts_value)?;
-                    }
+                    let hsts_value = format!(
+                        "max-age={};{}{}",
+                        hsts_config.max_age,
+                        if hsts_config.include_subdomains {
+                            " includeSubDomains;"
+                        } else {
+                            ""
+                        },
+                        if hsts_config.preload { " preload" } else { "" }
+                    );
+                    upstream_response.insert_header("Strict-Transport-Security", &hsts_value)?;
                 }
 
                 if let Some(ref csp) = state.config.security.csp {
                     upstream_response.insert_header("Content-Security-Policy", csp)?;
                 }
-            }
         }
 
         // 7. Setup gzip compression if applicable
@@ -2469,7 +2468,7 @@ impl ProxyHttp for PingclairProxy {
                 .get("content-length")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok());
-            let too_small = content_length.map_or(false, |len| len < 256);
+            let too_small = content_length.is_some_and(|len| len < 256);
 
             if !already_encoded
                 && is_compressible
@@ -2531,22 +2530,19 @@ impl ProxyHttp for PingclairProxy {
         ctx: &mut Self::CTX,
         mut e: Box<pingora_core::Error>,
     ) -> Box<pingora_core::Error> {
-        if let (Some(state), Some(route_index)) = (ctx.state.as_ref(), ctx.route_index) {
-            if let Some(lb) = state
+        if let (Some(state), Some(route_index)) = (ctx.state.as_ref(), ctx.route_index)
+            && let Some(lb) = state
                 .load_balancers
                 .get(route_index)
                 .and_then(|l| l.as_ref())
-            {
-                if let pingora_core::protocols::l4::socket::SocketAddr::Inet(addr) = peer.address()
-                {
-                    tracing::warn!(
-                        "🔻 Marking upstream {} down after connect failure (cooldown {:?})",
-                        addr,
-                        crate::FAIL_COOLDOWN
-                    );
-                    lb.mark_unhealthy(addr);
-                }
-            }
+            && let pingora_core::protocols::l4::socket::SocketAddr::Inet(addr) = peer.address()
+        {
+            tracing::warn!(
+                "🔻 Marking upstream {} down after connect failure (cooldown {:?})",
+                addr,
+                crate::FAIL_COOLDOWN
+            );
+            lb.mark_unhealthy(addr);
         }
         e.retry = true.into();
         e
