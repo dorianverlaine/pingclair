@@ -79,6 +79,9 @@ dirs = "6"
 # String handling
 smartstring = "1"
 
+# 🔐 Password hashing support.
+bcrypt = "0.19"
+
 # Lock-free reads on hot paths
 arc-swap = "1"
 
@@ -88,4 +91,3 @@ codegen-units = 1
 panic = "abort"
 strip = true
 opt-level = 3
-

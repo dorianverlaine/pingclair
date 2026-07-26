@@ -1,6 +1,6 @@
-//! Abstract Syntax Tree for Pingclairfile
+//! 🌳 Abstract syntax tree for the Pingclair configuration DSL.
 //!
-//! This module defines all AST nodes for the Pingclairfile DSL.
+//! This module defines every node produced by the parser.
 
 use crate::parser::lexer::Location;
 use std::collections::HashMap;
@@ -18,7 +18,7 @@ impl<T> Node<T> {
     }
 }
 
-/// Root AST node - represents the entire Pingclairfile
+/// 🌐 Root AST node representing an entire configuration.
 #[derive(Debug, Clone, Default)]
 pub struct Ast {
     /// Global configuration block
@@ -396,13 +396,13 @@ pub enum Handler {
     Plugin { name: String, args: Vec<Expr> },
 }
 
-/// Basic authentication configuration
+/// 🔐 Basic authentication configuration.
 #[derive(Debug, Clone)]
 pub struct BasicAuthConfig {
-    /// Realm shown in the `WWW-Authenticate` challenge
+    /// 🪪 Realm shown in the `WWW-Authenticate` challenge.
     pub realm: Option<String>,
 
-    /// `(username, password)` pairs in plain text
+    /// 🔑 Username and plain-text or bcrypt password pairs.
     pub credentials: Vec<(String, String)>,
 }
 

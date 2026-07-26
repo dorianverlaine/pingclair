@@ -1,6 +1,6 @@
-//! Pingclair Configuration Parser
+//! 🧩 Pingclair configuration parser.
 //!
-//! This crate provides parsing and compilation for the Pingclairfile DSL.
+//! This crate parses and compiles the Pingclair configuration DSL.
 //!
 //! # Example
 //!
@@ -46,7 +46,7 @@ pub fn compile(source: &str) -> Result<PingclairConfig, FullCompileError> {
     Ok(config)
 }
 
-/// Load and compile a Pingclairfile from a path
+/// 📄 Loads and compiles a supported configuration file from a path.
 pub fn compile_file(path: impl AsRef<Path>) -> Result<PingclairConfig, FullCompileError> {
     let path = path.as_ref();
     let source = std::fs::read_to_string(path).map_err(|e| FullCompileError::Io(e.to_string()))?;
@@ -395,6 +395,56 @@ mod tests {
         assert_eq!(auth.1.len(), 1);
         assert_eq!(auth.1[0].username, "admin");
         assert_eq!(auth.1[0].password, "hunter2");
+    }
+
+    #[test]
+    fn test_compile_basic_auth_detects_bcrypt_hash() {
+        let source = r#"
+            example.com {
+                listen :80
+                basic_auth alice "$2y$04$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W"
+                respond "OK"
+            }
+        "#;
+
+        let config = compile(source).unwrap();
+        let HandlerConfig::Pipeline { handlers } = &config.servers[0].routes[0].handler else {
+            panic!("expected pipeline");
+        };
+        let credentials = handlers
+            .iter()
+            .find_map(|handler| match handler {
+                HandlerConfig::BasicAuth { credentials, .. } => Some(credentials),
+                _ => None,
+            })
+            .expect("basic_auth handler");
+        assert!(credentials[0].hashed);
+    }
+
+    #[test]
+    fn test_compile_basic_auth_rejects_invalid_bcrypt_hash() {
+        let source = r#"
+            example.com {
+                listen :80
+                basic_auth alice "$2b$04$not-a-valid-hash"
+                respond "OK"
+            }
+        "#;
+
+        assert!(compile(source).is_err());
+    }
+
+    #[test]
+    fn test_compile_basic_auth_rejects_excessive_bcrypt_cost() {
+        let source = r#"
+            example.com {
+                listen :80
+                basic_auth alice "$2y$15$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W"
+                respond "OK"
+            }
+        "#;
+
+        assert!(compile(source).is_err());
     }
 
     #[test]

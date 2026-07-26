@@ -4,9 +4,24 @@
 
 use crate::config::{BasicAuthCredential, HandlerConfig};
 use base64::Engine as _;
+use bcrypt::HashParts;
 use bytes::Bytes;
 use http::StatusCode;
 use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::{Arc, LazyLock};
+
+/// 🔐 The maximum bcrypt work factor accepted from configuration.
+pub const MAX_BCRYPT_COST: u32 = 14;
+
+/// 🚦 The semaphore bounds concurrent bcrypt work to available CPU capacity.
+static BCRYPT_WORKERS: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
+    let workers = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(4);
+    Arc::new(tokio::sync::Semaphore::new(workers))
+});
 
 /// Handler result
 pub type HandlerResult = Result<HandlerResponse, HandlerError>;
@@ -303,54 +318,94 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
     }
 }
 
-/// Verify a request's HTTP Basic `Authorization` header against configured
-/// credentials.
+/// 🔐 Verifies an HTTP Basic header against plain-text or bcrypt credentials.
 ///
-/// The header must carry the `Basic` scheme and a base64-encoded
-/// `user:password` pair. Every configured credential is checked without an
-/// early exit so that a rejected attempt does not reveal whether the
-/// username exists. Credentials marked `hashed` are skipped: bcrypt
-/// verification is not available in this crate, and silently comparing a
-/// hash against a plaintext password would be a false match surface.
-///
-/// This is shared by the core handler stack and the proxy dispatch paths
-/// (H1/H2 and HTTP/3) so all of them enforce identical semantics.
+/// This synchronous entry point is retained for the core handler evaluator.
+/// Network dispatch paths must use [`verify_basic_auth_async`] so bcrypt work
+/// cannot block an asynchronous I/O worker.
 pub fn verify_basic_auth(headers: &http::HeaderMap, credentials: &[BasicAuthCredential]) -> bool {
-    let Some(value) = headers
-        .get(http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-    else {
+    let Some((user, password)) = parse_basic_auth(headers) else {
+        return false;
+    };
+    verify_basic_auth_pair(&user, &password, credentials)
+}
+
+/// ⚙️ Verifies Basic Auth without blocking an asynchronous I/O worker.
+pub async fn verify_basic_auth_async(
+    headers: &http::HeaderMap,
+    credentials: &[BasicAuthCredential],
+) -> bool {
+    let Some((user, password)) = parse_basic_auth(headers) else {
         return false;
     };
 
-    // Split off the scheme; it is case-insensitive per RFC 9110.
+    let has_matching_hash = credentials.iter().any(|credential| {
+        credential.hashed
+            && constant_time_eq(user.as_bytes(), credential.username.as_bytes())
+            && bcrypt_hash_cost(&credential.password)
+                .is_some_and(|cost| cost <= MAX_BCRYPT_COST)
+    });
+    if !has_matching_hash {
+        return verify_basic_auth_pair(&user, &password, credentials);
+    }
+
+    let Ok(permit) = Arc::clone(&BCRYPT_WORKERS).acquire_owned().await else {
+        return false;
+    };
+    let credentials = credentials.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        verify_basic_auth_pair(&user, &password, credentials.as_slice())
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// 🧮 Returns a bcrypt hash's declared cost when its syntax is valid.
+pub fn bcrypt_hash_cost(hash: &str) -> Option<u32> {
+    HashParts::from_str(hash).ok().map(|parts| parts.get_cost())
+}
+
+/// 🔎 Parses the Basic scheme and its base64-encoded `user:password` payload.
+fn parse_basic_auth(headers: &http::HeaderMap) -> Option<(String, String)> {
+    let value = headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())?;
+
+    // 📜 The authentication scheme is case-insensitive under RFC 9110.
     let mut parts = value.splitn(2, char::is_whitespace);
     match parts.next() {
         Some(scheme) if scheme.eq_ignore_ascii_case("basic") => {}
-        _ => return false,
+        _ => return None,
     }
-    let Some(encoded) = parts.next() else {
-        return false;
-    };
+    let encoded = parts.next()?;
 
-    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) else {
-        return false;
-    };
-    let Ok(pair) = String::from_utf8(decoded) else {
-        return false;
-    };
-    // The username cannot contain ':', but the password may.
-    let Some((user, password)) = pair.split_once(':') else {
-        return false;
-    };
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .ok()?;
+    let pair = String::from_utf8(decoded).ok()?;
+    // 🔑 The username cannot contain a colon, while the password may contain one.
+    let (user, password) = pair.split_once(':')?;
+    Some((user.to_string(), password.to_string()))
+}
 
+/// 🛡️ Checks a parsed credential pair and rejects unsafe bcrypt costs.
+fn verify_basic_auth_pair(
+    user: &str,
+    password: &str,
+    credentials: &[BasicAuthCredential],
+) -> bool {
     let mut matched = false;
     for credential in credentials {
-        if credential.hashed {
-            continue;
-        }
         let user_ok = constant_time_eq(user.as_bytes(), credential.username.as_bytes());
-        let password_ok = constant_time_eq(password.as_bytes(), credential.password.as_bytes());
+        let password_ok = if credential.hashed {
+            user_ok
+                && bcrypt_hash_cost(&credential.password)
+                    .is_some_and(|cost| cost <= MAX_BCRYPT_COST)
+                && bcrypt::verify(password, &credential.password).unwrap_or(false)
+        } else {
+            constant_time_eq(password.as_bytes(), credential.password.as_bytes())
+        };
         if user_ok && password_ok {
             matched = true;
         }
@@ -363,8 +418,7 @@ pub fn basic_auth_challenge(realm: &str) -> String {
     format!("Basic realm=\"{}\"", realm)
 }
 
-/// Compare two byte strings without an early exit on the first difference,
-/// so the comparison time does not depend on where the bytes diverge.
+/// ⏱️ Compares equal-length byte strings without content-dependent early exits.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -544,16 +598,56 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_basic_auth_skips_hashed_credentials() {
-        // Bcrypt verification is not available in this crate; a hashed
-        // credential must never match a plaintext password.
+    fn test_verify_basic_auth_accepts_bcrypt_credentials() {
+        let hash = bcrypt::hash("s3cret", 4).unwrap();
         let credentials = vec![BasicAuthCredential {
             username: "alice".to_string(),
-            password: "s3cret".to_string(),
+            password: hash,
+            hashed: true,
+        }];
+        let headers = headers_with_basic_auth("alice", "s3cret");
+        assert!(verify_basic_auth(&headers, &credentials));
+
+        let wrong_headers = headers_with_basic_auth("alice", "wrong");
+        assert!(!verify_basic_auth(&wrong_headers, &credentials));
+    }
+
+    #[test]
+    fn test_verify_basic_auth_rejects_invalid_bcrypt_hash() {
+        let credentials = vec![BasicAuthCredential {
+            username: "alice".to_string(),
+            password: "$2b$04$not-a-valid-hash".to_string(),
             hashed: true,
         }];
         let headers = headers_with_basic_auth("alice", "s3cret");
         assert!(!verify_basic_auth(&headers, &credentials));
+    }
+
+    #[test]
+    fn test_verify_basic_auth_rejects_excessive_bcrypt_cost() {
+        let hash = bcrypt::hash("s3cret", 4)
+            .unwrap()
+            .replacen("$2b$04$", "$2b$15$", 1);
+        assert_eq!(bcrypt_hash_cost(&hash), Some(15));
+
+        let credentials = vec![BasicAuthCredential {
+            username: "alice".to_string(),
+            password: hash,
+            hashed: true,
+        }];
+        let headers = headers_with_basic_auth("alice", "s3cret");
+        assert!(!verify_basic_auth(&headers, &credentials));
+    }
+
+    #[tokio::test]
+    async fn test_verify_basic_auth_async_accepts_bcrypt_credentials() {
+        let credentials = vec![BasicAuthCredential {
+            username: "alice".to_string(),
+            password: bcrypt::hash("s3cret", 4).unwrap(),
+            hashed: true,
+        }];
+        let headers = headers_with_basic_auth("alice", "s3cret");
+        assert!(verify_basic_auth_async(&headers, &credentials).await);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Lexer for Pingclairfile (Caddyfile Syntax)
+//! 🔤 Lexer for the Pingclair configuration DSL.
 //!
 //! Tokenizes the Caddyfile-style DSL.
 //!
@@ -110,7 +110,7 @@ fn unescape_string(s: &str) -> String {
     result
 }
 
-/// Tokenize a Pingclairfile / Caddyfile source string.
+/// ✂️ Tokenizes a Pingclair DSL source string.
 ///
 /// 🏗️ ARCHITECTURE: Hand-written lexer instead of `logos` derive macro.
 /// This avoids regex priority ordering issues with `{placeholder}` vs `{`

@@ -1,6 +1,6 @@
-//! Parser module for Pingclairfile
+//! 🧩 Parser module for the Pingclair configuration DSL.
 //!
-//! This module provides the lexer, AST, and parser for the Pingclairfile DSL.
+//! This module provides the lexer, AST, and parser.
 
 pub mod ast;
 pub mod caddy_ast;
@@ -17,7 +17,7 @@ pub use semantic::{SemanticAnalyzer, SemanticError};
 
 pub use crate::adapter::caddyfile::{adapt, AdapterError};
 
-/// Parse and analyze a Pingclairfile (Caddyfile syntax)
+/// 🔎 Parses and analyzes Pingclair DSL source text.
 pub fn compile(source: &str) -> Result<ast::Ast, CompileError> {
     // 1. Parse into generic directives (Caddyfile AST)
     let directives = parse(source)?;

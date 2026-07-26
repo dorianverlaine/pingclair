@@ -23,6 +23,7 @@ tracing.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
 http.workspace = true
+bcrypt.workspace = true
 
 # Router
 regex = "1"
@@ -33,4 +34,3 @@ pingclair-tls = { version = "0.1.0", path = "../pingclair-tls" }
 
 [dev-dependencies]
 criterion.workspace = true
-

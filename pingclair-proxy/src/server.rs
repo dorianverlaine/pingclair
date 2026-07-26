@@ -1344,13 +1344,13 @@ impl PingclairProxy {
                 Ok(false)
             }
             HandlerConfig::BasicAuth { realm, credentials } => {
-                // Verify the request's credentials before any later handler
-                // in the chain runs. Success falls through (Ok(false)) like
-                // the Headers handler; failure answers a 401 challenge.
-                if pingclair_core::server::verify_basic_auth(
+                // 🔐 Authentication runs before later handlers in the chain.
+                if pingclair_core::server::verify_basic_auth_async(
                     &session.req_header().headers,
                     credentials,
-                ) {
+                )
+                .await
+                {
                     Ok(false)
                 } else {
                     let body = "Unauthorized";

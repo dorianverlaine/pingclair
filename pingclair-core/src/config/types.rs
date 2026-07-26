@@ -422,14 +422,14 @@ fn default_rate_limit_window() -> u64 {
     60
 }
 
-/// Basic auth credential
+/// 🔐 Basic Auth credential.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BasicAuthCredential {
-    /// Username
+    /// 👤 Username presented by the client.
     pub username: String,
-    /// Password hash (bcrypt recommended) or plain text (not recommended for production)
+    /// 🔑 Bcrypt hash or legacy plain-text password.
     pub password: String,
-    /// If true, password is bcrypt hashed; if false, plain text comparison
+    /// 🛡️ Indicates that `password` contains a bcrypt hash.
     #[serde(default)]
     pub hashed: bool,
 }

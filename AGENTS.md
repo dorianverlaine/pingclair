@@ -222,8 +222,10 @@ boundary against a user who can plant symlinks.
 
 ## Configuration work
 
-Pingclair accepts Pingclairfile/`.pingclair`, JSON, and directories of mixed
-config files. JSON deserializes directly into `PingclairConfig`.
+Pingclair's configuration language is the Pingclair DSL; its conventional
+extensionless filename is `Pingclairfile`, like Caddy's `Caddyfile`. Pingclair
+also accepts `*.pingclair`, JSON, and directories of mixed config files. JSON
+deserializes directly into `PingclairConfig`.
 
 For every user-facing directive, test all applicable layers:
 

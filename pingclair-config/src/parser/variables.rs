@@ -1,4 +1,4 @@
-//! Variable resolution for Pingclairfile
+//! 🧮 Variable resolution for the Pingclair configuration DSL.
 //!
 //! Handles resolution of ${...} variables at runtime.
 

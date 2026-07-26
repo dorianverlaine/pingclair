@@ -1,6 +1,6 @@
-//! Compiler for Pingclairfile
+//! 🏗️ Compiler for the Pingclair configuration DSL.
 //!
-//! Converts the AST into runtime PingclairConfig.
+//! This module converts the AST into a runtime `PingclairConfig`.
 
 use crate::parser::ast::*;
 use pingclair_core::config::{
@@ -9,6 +9,7 @@ use pingclair_core::config::{
     MatcherCondition, PingclairConfig, ProxyUpstream, ReverseProxyConfig, RouteConfig,
     ServerConfig, TlsConfig,
 };
+use pingclair_core::server::{MAX_BCRYPT_COST, bcrypt_hash_cost};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -411,23 +412,20 @@ fn compile_handler(handler: &Handler) -> CompileResult<HandlerConfig> {
             Ok(HandlerConfig::Handle { handlers: compiled })
         }
 
-        Handler::BasicAuth(config) => Ok(HandlerConfig::BasicAuth {
-            realm: config
-                .realm
-                .clone()
-                .unwrap_or_else(|| "Restricted".to_string()),
-            credentials: config
+        Handler::BasicAuth(config) => {
+            let credentials = config
                 .credentials
                 .iter()
-                .map(
-                    |(username, password)| pingclair_core::config::BasicAuthCredential {
-                        username: username.clone(),
-                        password: password.clone(),
-                        hashed: false,
-                    },
-                )
-                .collect(),
-        }),
+                .map(|(username, password)| compile_basic_auth_credential(username, password))
+                .collect::<CompileResult<Vec<_>>>()?;
+            Ok(HandlerConfig::BasicAuth {
+                realm: config
+                    .realm
+                    .clone()
+                    .unwrap_or_else(|| "Restricted".to_string()),
+                credentials,
+            })
+        }
 
         Handler::Rewrite(rewrite) => {
             if let Some(pattern) = &rewrite.regex {
@@ -496,6 +494,36 @@ fn compile_handler(handler: &Handler) -> CompileResult<HandlerConfig> {
             })
         }
     }
+}
+
+/// 🔐 Compiles and bounds a Basic Auth credential's bcrypt work factor.
+fn compile_basic_auth_credential(
+    username: &str,
+    password: &str,
+) -> CompileResult<pingclair_core::config::BasicAuthCredential> {
+    let hashed = if password.starts_with("$2") {
+        let Some(cost) = bcrypt_hash_cost(password) else {
+            return Err(CompileError::InvalidRoute {
+                message: format!("invalid bcrypt hash for basic_auth user `{username}`"),
+            });
+        };
+        if cost > MAX_BCRYPT_COST {
+            return Err(CompileError::InvalidRoute {
+                message: format!(
+                    "bcrypt cost {cost} for basic_auth user `{username}` exceeds the maximum {MAX_BCRYPT_COST}"
+                ),
+            });
+        }
+        true
+    } else {
+        false
+    };
+
+    Ok(pingclair_core::config::BasicAuthCredential {
+        username: username.to_string(),
+        password: password.to_string(),
+        hashed,
+    })
 }
 
 #[cfg(test)]

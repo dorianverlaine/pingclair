@@ -153,7 +153,7 @@ pingclair run Pingclairfile
 
 ## 🛠️ Configuration (Pingclairfile)
 
-Le Pingclairfile est un langage de configuration structuré. Il ressemble beaucoup à du Rust, mais il est conçu spécifiquement pour décrire le comportement du serveur.
+Le DSL Pingclair est un langage de configuration structuré conçu pour décrire le comportement du serveur. Comme le `Caddyfile` de Caddy, son nom de fichier conventionnel est `Pingclairfile`.
 
 ### Structure de base
 

@@ -799,15 +799,17 @@ fn adapt_access_control(d: Directive) -> Result<Handler, AdapterError> {
 
 // MARK: - basic_auth Directive Adapter
 
-/// Adapt the `basic_auth` directive. Supported forms:
+/// 🔐 Adapts the `basic_auth` directive.
+///
+/// Supported forms are:
 ///   basic_auth <user> <password> [<user2> <password2>...]
 ///   basic_auth {
 ///       realm "Restricted Area"
 ///       <user> <password>
 ///   }
 ///
-/// Passwords are stored as plain text; bcrypt-hashed credentials are not
-/// supported yet (the runtime never matches `hashed: true` entries).
+/// Password values beginning with a bcrypt marker are validated by the
+/// compiler and emitted as hashed credentials.
 fn adapt_basic_auth(d: Directive) -> Result<Handler, AdapterError> {
     let mut config = BasicAuthConfig {
         realm: None,

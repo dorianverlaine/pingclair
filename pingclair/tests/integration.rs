@@ -541,8 +541,9 @@ async fn test_admin_api_hot_reload() {
 
 #[tokio::test]
 async fn test_basic_auth_end_to_end() {
-    // 🔐 Exercise the complete Basic Auth pipeline through the real binary.
-    let config = r#"{
+    // 🔐 Exercise a bcrypt credential through the complete real-binary pipeline.
+    let password_hash = "$2y$04$EBGg0.PJo2Qi2WYiMUqXsuB9orpRrMXiABirLM33AHHNb5GzEcipS";
+    let config = serde_json::json!({
         "servers": [
             {
                 "listen": ["127.0.0.1:0"],
@@ -556,7 +557,11 @@ async fn test_basic_auth_end_to_end() {
                                     "type": "basic_auth",
                                     "realm": "Test Realm",
                                     "credentials": [
-                                        { "username": "alice", "password": "secret1" }
+                                        {
+                                            "username": "alice",
+                                            "password": password_hash,
+                                            "hashed": true
+                                        }
                                     ]
                                 },
                                 { "type": "respond", "status": 200, "body": "welcome" }
@@ -566,9 +571,10 @@ async fn test_basic_auth_end_to_end() {
                 ]
             }
         ]
-    }"#;
+    })
+    .to_string();
 
-    let mut server = TestServer::new(config);
+    let mut server = TestServer::new(&config);
     let client = no_proxy_client();
     assert!(server.wait_until_ready().await, "server failed to start");
     let url = server.url(0, "/");
