@@ -71,16 +71,24 @@ cargo test --locked --workspace
 > 尚待 Day 7 驗證：乾淨 Linux release 與 production-like Docker。
 > 在那之前不得宣稱 `tls internal` 已完成。
 
-### 🔨 Day 2 — per-server access log 真正由配置驅動
+### 🔨 Day 2 — per-server access log 真正由配置驅動 ✔ `7e9eb86`
 
-`log { output stdout; format json }` 目前只編譯成 `LogConfig`，runtime 仍用
-process-wide tracing，沒有依 per-server format／output 輸出。
+**已完成 2026-07-27。** 新增 `pingclair-proxy/src/access_log.rs`。
 
-- 讓 `LogConfig` 真正驅動輸出：text／JSON、stdout／stderr／file。
-- 欄位至少含：request ID、verified client IP、route、upstream、status、bytes、
-  TTFB、duration。
-- **完成判定**：兩個 server 各配不同 format／output，真 binary 驗證輸出正確分流。
-- **範圍外**：rotation／retention／壓縮／async writer 留到 Day 21。
+- ✅ text／JSON、stdout／stderr／file；同路徑的多個 server 共用一個 handle
+  與一把鎖（否則會交錯寫壞行），append 不截斷。
+- ✅ 欄位齊全：request_id、client_ip（verified）、route、upstream、status、
+  bytes、ttfb_ms、duration_ms、protocol、user_agent、referer、error。
+- ✅ 真 binary 驗證：兩個 server 一個 JSON 進檔案、一個 text 進另一檔案並
+  刪掉 `user_agent`，分流正確、`bytes` 精確（21／404 頁 13）。
+- ✅ Gate 四項全綠，270 → **284 tests**。
+
+> 順帶修掉三個 bug：`format filter { wrap text }` 無法表達（永遠變 JSON）、
+> `fields { x delete }` 編譯時被丟棄、靜態檔與錯誤頁的 `bytes` 恆為 0。
+> 詳見 commit message。
+
+- **範圍外（仍留 Day 21）**：rotation／retention／壓縮／bounded async writer。
+  目前寫入是同步的，磁碟卡住會擋住呼叫端——這正是 Day 21 存在的理由。
 
 ### 🔨 Day 3 — secret redaction 與 Cloudflare client identity
 
@@ -416,7 +424,7 @@ H3 CORS／rewrite／error_page parity。
 
 | 里程碑 | 範圍 | 狀態 |
 |---|---|---|
-| M1 生產站可替換 | Day 1–7 | 🔨 進行中（Day 1 ✔） |
+| M1 生產站可替換 | Day 1–7 | 🔨 進行中（Day 1–2 ✔） |
 | M2 生產護欄 | Day 8–15 | ⬜ 未開始 |
 | M3 接上 Pingora 能力（含 `proxy_cache`） | Day 16–20 | ⬜ 未開始 |
 | M4 可觀測性與運維 | Day 21–24 | ⬜ 未開始 |
