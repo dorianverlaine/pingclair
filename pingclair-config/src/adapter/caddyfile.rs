@@ -642,19 +642,29 @@ fn adapt_log_block(block: Block) -> Result<LogBlock, AdapterError> {
                 if let Some(kind) = d.args.first() {
                     match kind.as_str() {
                         "json" => format.format_type = LogFormatType::Json,
+                        "text" => format.format_type = LogFormatType::Text,
                         "filter" => {
-                            // `format filter { wrap json ... }` → extract "json"
+                            // `format filter { wrap <json|text> ... }`.
+                            // JSON is the default here because a filter block
+                            // exists to drop fields, which only structured
+                            // output makes meaningful — but an explicit
+                            // `wrap text` must still win. This previously
+                            // pinned Json before reading `wrap` at all, so
+                            // `wrap text` was impossible to express.
                             format.format_type = LogFormatType::Json;
                             if let Some(filter_block) = d.block {
                                 let mut filter = LogFilter::default();
                                 for fb_d in filter_block.directives {
-                                    if fb_d.name == "wrap"
-                                        && fb_d
-                                            .args
-                                            .first()
-                                            .is_some_and(|wrap_type| wrap_type == "json")
-                                    {
-                                        format.format_type = LogFormatType::Json;
+                                    if fb_d.name == "wrap" {
+                                        match fb_d.args.first().map(|s| s.as_str()) {
+                                            Some("json") => {
+                                                format.format_type = LogFormatType::Json
+                                            }
+                                            Some("text") | Some("console") => {
+                                                format.format_type = LogFormatType::Text
+                                            }
+                                            _ => {}
+                                        }
                                     }
                                     if fb_d.name == "fields"
                                         && let Some(fields_block) = fb_d.block
@@ -1945,5 +1955,96 @@ mod global_tests {
 
         let admin = ast.global.unwrap().inner.admin.expect("admin directive");
         assert!(!admin.enabled);
+    }
+}
+
+#[cfg(test)]
+mod log_format_tests {
+    use crate::compile;
+    use pingclair_core::config::{LogFormat as CoreLogFormat, LogOutput as CoreLogOutput};
+
+    fn log_of(source: &str) -> pingclair_core::config::LogConfig {
+        compile(source)
+            .unwrap()
+            .servers
+            .remove(0)
+            .log
+            .expect("log config")
+    }
+
+    #[test]
+    fn plain_format_directives_compile() {
+        assert!(matches!(
+            log_of(":80 {\n log { format json }\n respond \"ok\" 200\n}").format,
+            CoreLogFormat::Json
+        ));
+        assert!(matches!(
+            log_of(":80 {\n log { format text }\n respond \"ok\" 200\n}").format,
+            CoreLogFormat::Text
+        ));
+    }
+
+    /// Regression: `format filter { wrap text }` used to be impossible to
+    /// express — the adapter pinned Json before it ever read `wrap`, so a
+    /// config asking for text silently got JSON.
+    #[test]
+    fn filter_block_honors_explicit_wrap() {
+        let text = log_of(
+            ":80 {\n log { format filter { wrap text\n fields { user_agent delete } } }\n respond \"ok\" 200\n}",
+        );
+        assert!(
+            matches!(text.format, CoreLogFormat::Text),
+            "wrap text must win over the filter block's JSON default"
+        );
+
+        let json = log_of(
+            ":80 {\n log { format filter { wrap json\n fields { user_agent delete } } }\n respond \"ok\" 200\n}",
+        );
+        assert!(matches!(json.format, CoreLogFormat::Json));
+    }
+
+    /// A filter block with no explicit `wrap` still defaults to JSON, since
+    /// dropping named fields only means something for structured output.
+    #[test]
+    fn filter_block_without_wrap_defaults_to_json() {
+        let cfg = log_of(
+            ":80 {\n log { format filter { fields { referer delete } } }\n respond \"ok\" 200\n}",
+        );
+        assert!(matches!(cfg.format, CoreLogFormat::Json));
+    }
+
+    /// Regression: field exclusions were parsed into the AST and then dropped
+    /// by the compiler, so `fields { x delete }` was accepted and ignored.
+    #[test]
+    fn field_exclusions_survive_compilation() {
+        let cfg = log_of(
+            ":80 {\n log { format filter { wrap json\n fields { user_agent delete\n referer delete } } }\n respond \"ok\" 200\n}",
+        );
+        assert!(
+            cfg.exclude_fields.contains(&"user_agent".to_string()),
+            "{:?}",
+            cfg.exclude_fields
+        );
+        assert!(
+            cfg.exclude_fields.contains(&"referer".to_string()),
+            "{:?}",
+            cfg.exclude_fields
+        );
+    }
+
+    #[test]
+    fn output_targets_compile() {
+        assert!(matches!(
+            log_of(":80 {\n log { output stdout }\n respond \"ok\" 200\n}").output,
+            CoreLogOutput::Stdout
+        ));
+        assert!(matches!(
+            log_of(":80 {\n log { output stderr }\n respond \"ok\" 200\n}").output,
+            CoreLogOutput::Stderr
+        ));
+        match log_of(":80 {\n log { output file /var/log/x.log }\n respond \"ok\" 200\n}").output {
+            CoreLogOutput::File(p) => assert_eq!(p, "/var/log/x.log"),
+            other => panic!("expected file output, got {other:?}"),
+        }
     }
 }

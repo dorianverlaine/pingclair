@@ -77,6 +77,9 @@ pub struct RequestContext {
     pub request_id: String,
     /// Start time for logging
     pub start_time: std::time::Instant,
+    /// ⏱️ When the first response byte was handed downstream, for TTFB.
+    /// `None` when the response failed before producing any byte.
+    pub first_byte_at: Option<std::time::Instant>,
     /// Path produced by the most recent rewrite handler. Pipelines consume
     /// this before invoking the next local handler.
     pub rewritten_path: Option<String>,
@@ -103,6 +106,7 @@ impl Default for RequestContext {
             response_bytes: 0,
             request_id: generate_request_id(),
             start_time: std::time::Instant::now(),
+            first_byte_at: None,
             rewritten_path: None,
         }
     }
@@ -400,6 +404,9 @@ pub struct ProxyState {
     access_controls: Vec<Option<Arc<RouteAccessControl>>>,
     /// Pre-compiled regular expressions used by route rewrite handlers.
     rewrite_regexes: Vec<HashMap<String, Arc<Regex>>>,
+    /// 📝 Per-server access logger built from this server's `log` block.
+    /// `None` keeps the previous process-wide `tracing` output.
+    access_logger: Option<Arc<crate::access_log::AccessLogger>>,
 }
 
 /// Pre-compiled request access rules. Parsing and regex compilation happen
@@ -737,6 +744,21 @@ impl ProxyState {
             rewrite_regexes.push(route_regexes);
         }
 
+        // A misconfigured log sink must not take the whole server down at
+        // boot: fall back to tracing and say so loudly.
+        let access_logger = match crate::access_log::AccessLogger::from_config(config.log.as_ref())
+        {
+            Ok(logger) => logger.map(Arc::new),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    server = config.name.as_deref().unwrap_or("<default>"),
+                    "❌ Could not open configured access log; falling back to tracing output"
+                );
+                None
+            }
+        };
+
         Self {
             config: Arc::new(config),
             router: Arc::new(router),
@@ -746,6 +768,7 @@ impl ProxyState {
             rate_limiters,
             access_controls,
             rewrite_regexes,
+            access_logger,
         }
     }
 
@@ -1194,7 +1217,8 @@ impl PingclairProxy {
     /// Used for early, handler-less answers such as 404s.
     async fn write_simple_response(
         session: &mut Session,
-        ctx: &RequestContext,
+        // Takes &mut so the access log can count the body bytes it writes.
+        ctx: &mut RequestContext,
         status: u16,
         body: &str,
     ) -> PingoraResult<()> {
@@ -1209,6 +1233,7 @@ impl PingclairProxy {
         session
             .write_response_header(Box::new(response), false)
             .await?;
+        ctx.response_bytes += body.len() as u64;
         session
             .write_response_body(Some(Bytes::copy_from_slice(body.as_bytes())), true)
             .await?;
@@ -1331,7 +1356,8 @@ impl PingclairProxy {
     async fn serve_error_page(
         &self,
         session: &mut Session,
-        ctx: &RequestContext,
+        // &mut so body bytes can be counted for the access log.
+        ctx: &mut RequestContext,
         status: u16,
     ) -> PingoraResult<()> {
         if let Some((content, content_type)) = ctx
@@ -1350,6 +1376,7 @@ impl PingclairProxy {
             session
                 .write_response_header(Box::new(response), false)
                 .await?;
+            ctx.response_bytes += content.len() as u64;
             session
                 .write_response_body(Some(Bytes::from(content)), true)
                 .await?;
@@ -1392,6 +1419,7 @@ impl PingclairProxy {
                 session
                     .write_response_header(Box::new(response), false)
                     .await?;
+                ctx.response_bytes += body_bytes.len() as u64;
                 session
                     .write_response_body(Some(Bytes::copy_from_slice(body_bytes)), true)
                     .await?;
@@ -1463,6 +1491,7 @@ impl PingclairProxy {
                                 )
                             })? {
                                 let last = stream.is_complete();
+                                ctx.response_bytes += chunk.len() as u64;
                                 session
                                     .write_response_body(Some(Bytes::from(chunk)), last)
                                     .await?;
@@ -1500,6 +1529,7 @@ impl PingclairProxy {
                             session
                                 .write_response_header(Box::new(header), false)
                                 .await?;
+                            ctx.response_bytes += file.content.len() as u64;
                             session
                                 .write_response_body(Some(Bytes::from(file.content)), true)
                                 .await?;
@@ -1613,6 +1643,7 @@ impl PingclairProxy {
                     session
                         .write_response_header(Box::new(response), false)
                         .await?;
+                    ctx.response_bytes += body.len() as u64;
                     session
                         .write_response_body(Some(Bytes::copy_from_slice(body.as_bytes())), true)
                         .await?;
@@ -1702,6 +1733,7 @@ impl PingclairProxy {
                             .write_response_header(Box::new(response), body.is_empty())
                             .await?;
                         if !body.is_empty() {
+                            ctx.response_bytes += body.len() as u64;
                             session
                                 .write_response_body(
                                     Some(Bytes::copy_from_slice(body.as_bytes())),
@@ -1899,6 +1931,7 @@ impl ProxyHttp for PingclairProxy {
                 session
                     .write_response_header(Box::new(header), false)
                     .await?;
+                ctx.response_bytes += key_auth.len() as u64;
                 session
                     .write_response_body(Some(Bytes::from(key_auth)), true)
                     .await?;
@@ -2119,6 +2152,14 @@ impl ProxyHttp for PingclairProxy {
                     .handle_config(session, ctx, &h, &path_str, index)
                     .await?
             {
+                // ⏱️ A locally produced response (static file, redirect,
+                // respond, error page) never reaches `response_filter`, so
+                // record TTFB here. The write already happened synchronously just
+                // above, so this is within microseconds of the real first
+                // byte; for a single-shot local response TTFB ≈ duration by
+                // construction.
+                ctx.first_byte_at
+                    .get_or_insert_with(std::time::Instant::now);
                 return Ok(true);
             }
         }
@@ -2354,6 +2395,12 @@ impl ProxyHttp for PingclairProxy {
         // Capture response status for access log
         ctx.response_status = upstream_response.status.as_u16();
 
+        // ⏱️ TTFB is measured at the response header, which is the first byte
+        // the client can actually observe. Recorded once — a retry or an
+        // interceptor running this filter again must not reset it.
+        ctx.first_byte_at
+            .get_or_insert_with(std::time::Instant::now);
+
         ctx.response_headers
             .apply_pingora(upstream_response, &ctx.request_id)?;
 
@@ -2566,6 +2613,56 @@ impl ProxyHttp for PingclairProxy {
         metrics::REQUEST_DURATION_SECONDS
             .with_label_values(&[method, &response_code.to_string(), host])
             .observe(elapsed.as_secs_f64());
+
+        // 📝 Prefer this server's configured access logger. Only when the
+        // server has no `log` block do we fall back to the process-wide
+        // tracing output, so existing configs keep their current behavior.
+        let configured_logger = ctx
+            .state
+            .as_ref()
+            .and_then(|state| state.access_logger.clone());
+
+        if let Some(logger) = configured_logger {
+            let upstream_addr = ctx.upstream.as_ref().map(|u| u.addr.to_string());
+            let route = ctx.state.as_ref().and_then(|state| {
+                ctx.route_index
+                    .and_then(|index| state.config.routes.get(index))
+                    .map(|route| route.path.as_str())
+            });
+            let error_text = e.map(|err| err.to_string());
+
+            logger.log(&crate::access_log::AccessEntry {
+                request_id: &ctx.request_id,
+                method,
+                host,
+                path: req_header.uri.path(),
+                status: response_code,
+                // Body bytes only, matching nginx's $body_bytes_sent.
+                // Deliberately NOT pingora's Session::body_bytes_sent():
+                // despite its name that counter also adds the serialized
+                // response header on the H1 path, so it over-reports.
+                bytes: ctx.response_bytes,
+                duration_ms: elapsed.as_millis(),
+                ttfb_ms: ctx
+                    .first_byte_at
+                    .map(|at| at.duration_since(ctx.start_time).as_millis()),
+                client_ip: &remote_ip,
+                route,
+                upstream: upstream_addr.as_deref(),
+                user_agent,
+                referer,
+                protocol: match session.req_header().version {
+                    http::Version::HTTP_09 => "HTTP/0.9",
+                    http::Version::HTTP_10 => "HTTP/1.0",
+                    http::Version::HTTP_11 => "HTTP/1.1",
+                    http::Version::HTTP_2 => "HTTP/2",
+                    http::Version::HTTP_3 => "HTTP/3",
+                    _ => "-",
+                },
+                error: error_text.as_deref(),
+            });
+            return;
+        }
 
         // Structured access log
         if let Some(err) = e {

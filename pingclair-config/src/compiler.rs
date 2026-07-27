@@ -255,10 +255,21 @@ fn compile_log(log: &LogBlock) -> CompileResult<LogConfig> {
         LogFormatType::Text => CoreLogFormat::Text,
     };
 
+    // Carry the `format filter { fields { x delete } }` exclusions through.
+    // These used to be parsed and then dropped here, so the directive was
+    // accepted and silently ignored.
+    let exclude_fields = log
+        .format
+        .filter
+        .as_ref()
+        .map(|filter| filter.exclude.clone())
+        .unwrap_or_default();
+
     Ok(LogConfig {
         output,
         format,
         level: None, // Use global level
+        exclude_fields,
     })
 }
 

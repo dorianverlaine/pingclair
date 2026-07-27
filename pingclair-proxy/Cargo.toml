@@ -40,5 +40,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+tempfile = "3"
 rcgen.workspace = true
 h2.workspace = true

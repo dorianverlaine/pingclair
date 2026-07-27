@@ -2358,6 +2358,7 @@ dependencies = [
  "rcgen",
  "regex",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
