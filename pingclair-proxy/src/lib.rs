@@ -17,6 +17,7 @@ mod load_balancer;
 pub mod metrics;
 pub mod quic;
 pub mod rate_limit;
+pub mod redaction;
 pub mod server;
 mod upstream;
 

@@ -156,6 +156,25 @@ impl TrustedProxyPolicy {
             return peer;
         }
 
+        // ☁️ `CF-Connecting-IP` wins when the immediate peer is trusted.
+        //
+        // Cloudflare defines it as the single original visitor address, so it
+        // needs no chain walking and cannot be ambiguous the way a multi-hop
+        // `X-Forwarded-For` can. This is the header that matters for the
+        // `Cloudflare Tunnel → pingclair` deployment.
+        //
+        // It is read *only* inside the `self.contains(peer)` branch above, so
+        // an untrusted client sending `CF-Connecting-IP: 1.2.3.4` is ignored
+        // and its socket peer is used instead — spoofing it requires already
+        // being a trusted proxy.
+        if let Some(cf_ip) = headers
+            .get("cf-connecting-ip")
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_forwarded_ip)
+        {
+            return cf_ip;
+        }
+
         match parse_forwarded_chain(headers) {
             Ok(Some(chain)) if !chain.is_empty() => chain
                 .iter()
@@ -2631,16 +2650,37 @@ impl ProxyHttp for PingclairProxy {
             });
             let error_text = e.map(|err| err.to_string());
 
+            // 🙈 Log the full request target, but redact secret-looking query
+            // parameters first. Operators need the query to debug; a logged
+            // `?api_key=...` is a leaked credential.
+            let logged_path = match req_header.uri.path_and_query() {
+                Some(pq) => crate::redaction::redact_target(pq.as_str()),
+                None => req_header.uri.path().to_string(),
+            };
+            // Referer carries the *previous* page's URL, so it can leak a
+            // token this request never contained.
+            let redacted_referer = crate::redaction::redact_referer(referer);
+
             logger.log(&crate::access_log::AccessEntry {
                 request_id: &ctx.request_id,
                 method,
                 host,
-                path: req_header.uri.path(),
+                path: &logged_path,
                 status: response_code,
                 // Body bytes only, matching nginx's $body_bytes_sent.
-                // Deliberately NOT pingora's Session::body_bytes_sent():
-                // despite its name that counter also adds the serialized
-                // response header on the H1 path, so it over-reports.
+                //
+                // Deliberately NOT pingora's Session::body_bytes_sent(). On
+                // the H1 path that counter also adds the serialized response
+                // header (pingora-core 0.8.1, v1/server.rs:603), so a 21-byte
+                // body reports 281. H2 counts only in write_body, so the same
+                // response reports 21 there — the value changes meaning with
+                // the client's protocol.
+                //
+                // Fixed upstream in cloudflare/pingora e7de90a but not in the
+                // 0.8.1 release; see
+                // https://github.com/cloudflare/pingora/issues/846
+                // Keep our own counter even after upgrading — it is the
+                // body-only number an access log should report.
                 bytes: ctx.response_bytes,
                 duration_ms: elapsed.as_millis(),
                 ttfb_ms: ctx
@@ -2650,7 +2690,7 @@ impl ProxyHttp for PingclairProxy {
                 route,
                 upstream: upstream_addr.as_deref(),
                 user_agent,
-                referer,
+                referer: &redacted_referer,
                 protocol: match session.req_header().version {
                     http::Version::HTTP_09 => "HTTP/0.9",
                     http::Version::HTTP_10 => "HTTP/1.0",
@@ -2856,6 +2896,85 @@ mod forwarded_headers_tests {
 
         assert_eq!(proxy.verified_client_ip(peer, &headers), peer);
         assert_eq!(proxy.forwarded_for(peer, &headers), "198.51.100.4");
+    }
+
+    // ---- CF-Connecting-IP (Cloudflare Tunnel deployments) ----
+
+    /// The security boundary: an untrusted client sending CF-Connecting-IP
+    /// must be ignored entirely. If this ever regresses, any client on the
+    /// internet can forge its own identity for access control, rate limits
+    /// and logs.
+    #[test]
+    fn untrusted_peer_cannot_spoof_cf_connecting_ip() {
+        let proxy = PingclairProxy::new();
+        let peer: IpAddr = "198.51.100.4".parse().unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("cf-connecting-ip", "203.0.113.7".parse().unwrap());
+
+        assert_eq!(
+            proxy.verified_client_ip(peer, &headers),
+            peer,
+            "untrusted CF-Connecting-IP must be ignored"
+        );
+    }
+
+    #[test]
+    fn trusted_peer_cf_connecting_ip_is_honored() {
+        let proxy = PingclairProxy::with_trusted_proxies(&["10.0.0.0/8".to_string()]);
+        let peer: IpAddr = "10.0.0.5".parse().unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("cf-connecting-ip", "203.0.113.7".parse().unwrap());
+
+        assert_eq!(
+            proxy.verified_client_ip(peer, &headers),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    /// Cloudflare sends both headers. CF-Connecting-IP is the unambiguous
+    /// single original-visitor value, so it wins over chain walking.
+    #[test]
+    fn cf_connecting_ip_takes_precedence_over_forwarded_chain() {
+        let proxy = PingclairProxy::with_trusted_proxies(&["10.0.0.0/8".to_string()]);
+        let peer: IpAddr = "10.0.0.5".parse().unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("cf-connecting-ip", "203.0.113.7".parse().unwrap());
+        headers.insert("x-forwarded-for", "198.51.100.9, 10.1.2.3".parse().unwrap());
+        headers.insert("x-real-ip", "198.51.100.10".parse().unwrap());
+
+        assert_eq!(
+            proxy.verified_client_ip(peer, &headers),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    /// A malformed CF-Connecting-IP must not silently fall through to a
+    /// value an attacker also controls — it falls back to the normal chain.
+    #[test]
+    fn malformed_cf_connecting_ip_falls_back_to_the_chain() {
+        let proxy = PingclairProxy::with_trusted_proxies(&["10.0.0.0/8".to_string()]);
+        let peer: IpAddr = "10.0.0.5".parse().unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("cf-connecting-ip", "not-an-ip".parse().unwrap());
+        headers.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
+
+        assert_eq!(
+            proxy.verified_client_ip(peer, &headers),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn cf_connecting_ip_supports_ipv6() {
+        let proxy = PingclairProxy::with_trusted_proxies(&["10.0.0.0/8".to_string()]);
+        let peer: IpAddr = "10.0.0.5".parse().unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("cf-connecting-ip", "2001:db8::1".parse().unwrap());
+
+        assert_eq!(
+            proxy.verified_client_ip(peer, &headers),
+            "2001:db8::1".parse::<IpAddr>().unwrap()
+        );
     }
 
     #[test]
