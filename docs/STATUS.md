@@ -110,11 +110,13 @@ commit `0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。
   async durable contract；憑證續期改讀真實 X.509 `notAfter`；account、憑證與
   challenge snapshot 統一 temporary file＋fsync＋atomic rename，Unix 從建立起即 `0600`。
   **仍缺**：Let's Encrypt staging 與故障注入驗證。
-- **持久化 internal CA**（本機，2026-07-27）— `tls internal` 支援行內與 block DSL、
-  JSON 向後相容、衝突配置 fail closed；十年 CA cert/key 以單一 `0600` 原子檔保存，
-  另發布 `root.crt`，90 天 leaf 於 30 天前自動續期。手動 → internal → ACME precedence、
-  重啟重用、CA cert/key mismatch fail closed 均有測試。
-  **仍缺**：乾淨 Linux release 與 production-like Docker 驗證。
+- **持久化 internal CA**（本機，2026-07-27，已提交 `4b8d204`）— `tls internal`
+  支援行內與 block DSL、JSON 向後相容、衝突配置 fail closed；十年 CA cert/key 以
+  單一 `0600` 原子檔保存，另發布 `root.crt`，90 天 leaf 於 30 天前自動續期
+  （24h clock-skew allowance）。手動 → internal → ACME precedence、重啟重用、
+  CA cert/key mismatch fail closed、非法 domain 拒絕、H3 憑證表可見，均有測試。
+  啟動時 eager issuance，不讓第一次 handshake 才發現 CA 壞掉。
+  **仍缺**：乾淨 Linux release 與 production-like Docker 驗證（TODO Day 7）。
 - **Admin API 認證**（2026-07-25）— Bearer key；未配置 key 時僅允許 loopback。
 - **Basic Auth 執行時校驗**（2026-07-25）— 正確憑據放行，缺少／錯誤回 401。
 - **Basic Auth bcrypt 憑據**（2026-07-26）— DSL 對合法 `$2*` hash 自動設 `hashed: true`；

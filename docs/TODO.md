@@ -58,16 +58,18 @@ cargo test --locked --workspace
 這是最高價值的里程碑：它是真實世界的驗收，不是自訂指標。
 2026-07-26 逐項追蹤程式碼後，確認以下缺口讓那份 Caddyfile **尚不能原樣替換**。
 
-### 🔨 Day 1 — 收尾並提交 internal CA
+### 🔨 Day 1 — 收尾並提交 internal CA ✔ `4b8d204`
 
-目前 worktree 有一批未提交的 internal CA 工作（`pingclair-tls/src/internal_ca.rs`
-＋ manager／config／main 共約 420 行）。
+~~目前 worktree 有一批未提交的 internal CA 工作。~~ **已完成 2026-07-27。**
 
-- 修正 `cargo fmt` 差異（已知 `pingclair/src/main.rs`、`pingclair/tests/integration.rs`）。
-- 重跑完整 local gate。build／clippy／test 於 2026-07-27 已確認通過（270 tests），
-  僅 fmt 未過。
-- 提交並 push。
-- **完成判定**：worktree 乾淨，gate 四項全綠。
+- ✅ 修正 `cargo fmt` 差異（`pingclair/src/main.rs`、`pingclair/tests/integration.rs`）。
+- ✅ Gate 四項全綠：fmt、clippy `-D warnings`、build `--locked`、
+  test `--locked`（**270 passed / 0 failed / 1 ignored**）。
+- ✅ 已提交並 push（`4b8d204`），worktree 乾淨。
+- 順帶納入 AGENTS.md 的 TODO／STATUS／GUARDRAILS 拆分引用。
+
+> 尚待 Day 7 驗證：乾淨 Linux release 與 production-like Docker。
+> 在那之前不得宣稱 `tls internal` 已完成。
 
 ### 🔨 Day 2 — per-server access log 真正由配置驅動
 
@@ -414,7 +416,7 @@ H3 CORS／rewrite／error_page parity。
 
 | 里程碑 | 範圍 | 狀態 |
 |---|---|---|
-| M1 生產站可替換 | Day 1–7 | ⬜ 未開始 |
+| M1 生產站可替換 | Day 1–7 | 🔨 進行中（Day 1 ✔） |
 | M2 生產護欄 | Day 8–15 | ⬜ 未開始 |
 | M3 接上 Pingora 能力（含 `proxy_cache`） | Day 16–20 | ⬜ 未開始 |
 | M4 可觀測性與運維 | Day 21–24 | ⬜ 未開始 |
