@@ -158,23 +158,27 @@ fn default_body_limit() -> u64 {
     1024 * 1024 // 1MB
 }
 
-/// TLS configuration
+/// 🔐 Configures downstream TLS for one server.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TlsConfig {
-    /// Auto HTTPS mode
+    /// 🌐 Enables automatic public certificate management.
     #[serde(default)]
     pub auto: bool,
 
-    /// Certificate file path
+    /// 🏛️ Enables certificates signed by Pingclair's persistent local authority.
+    #[serde(default)]
+    pub internal: bool,
+
+    /// 📜 Identifies the certificate file path.
     pub cert: Option<String>,
 
-    /// Key file path
+    /// 🔑 Identifies the private key file path.
     pub key: Option<String>,
 
-    /// ACME email for Let's Encrypt
+    /// 📧 Identifies the ACME account email for Let's Encrypt.
     pub acme_email: Option<String>,
 
-    /// Enable HTTP/3
+    /// 🚀 Enables HTTP/3.
     #[serde(default)]
     pub http3: bool,
 }

@@ -153,25 +153,28 @@ pub struct ServerBlock {
     pub directives: Vec<Directive>,
 }
 
-/// TLS configuration for a server block (from the `tls` directive)
+/// 🔐 Represents downstream TLS configuration from a server directive.
 #[derive(Debug, Clone, Default)]
 pub struct TlsDirective {
-    /// Explicitly disable TLS (`tls off`)
+    /// 📴 Explicitly disables TLS through `tls off`.
     pub off: bool,
 
-    /// Automatic certificate management (`tls auto`)
+    /// 🌐 Enables automatic public certificate management through `tls auto`.
     pub auto: bool,
 
-    /// Certificate file path
+    /// 🏛️ Enables certificates signed by Pingclair's persistent local authority.
+    pub internal: bool,
+
+    /// 📜 Identifies the certificate file path.
     pub cert: Option<String>,
 
-    /// Private key file path
+    /// 🔑 Identifies the private key file path.
     pub key: Option<String>,
 
-    /// ACME account email
+    /// 📧 Identifies the ACME account email.
     pub acme_email: Option<String>,
 
-    /// Enable HTTP/3
+    /// 🚀 Overrides HTTP/3 for this server.
     pub http3: Option<bool>,
 }
 

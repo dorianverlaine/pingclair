@@ -283,7 +283,7 @@ fn main() -> anyhow::Result<()> {
                 }
             };
 
-            run_server(config_path.clone(), config);
+            run_server(config_path.clone(), config)?;
         }
 
         Commands::ReverseProxy { from, to } => {
@@ -335,7 +335,7 @@ fn main() -> anyhow::Result<()> {
 
             config.servers.push(server);
 
-            run_server("".to_string(), config);
+            run_server("".to_string(), config)?;
         }
 
         Commands::FileServer { listen, root } => {
@@ -388,7 +388,7 @@ fn main() -> anyhow::Result<()> {
             // not a duplicate empty ServerConfig.
             config.servers.push(server);
 
-            run_server("".to_string(), config);
+            run_server("".to_string(), config)?;
         }
 
         Commands::Validate { config } => {
@@ -513,7 +513,10 @@ fn server_requires_tls(config: &pingclair_core::config::ServerConfig, addr: &str
             .is_some_and(|port| matches!(port, 443 | 8443))
 }
 
-fn run_server(config_path: String, config: pingclair_core::config::PingclairConfig) {
+fn run_server(
+    config_path: String,
+    config: pingclair_core::config::PingclairConfig,
+) -> anyhow::Result<()> {
     #[cfg(not(target_os = "linux"))]
     let _ = config_path;
     // Create a background Tokio runtime for async tasks (HTTP/3, SIGHUP, etc.)
@@ -548,7 +551,7 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
 
     if config.servers.is_empty() {
         tracing::warn!("⚠️ No servers configured!");
-        return;
+        return Ok(());
     }
 
     // Create Pingora Server.
@@ -594,8 +597,7 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
 
     server.bootstrap();
 
-    // Initialize TLS Manager with global settings
-    // Use environment variable for testing, fallback to default path
+    // 🔐 Initialize every certificate source below one configurable persistent store.
     let tls_store_path_str = std::env::var("PINGCLAIR_TLS_STORE")
         .unwrap_or_else(|_| "/var/lib/pingclair/certs".to_string());
     let tls_store_path = std::path::Path::new(&tls_store_path_str);
@@ -611,23 +613,35 @@ fn run_server(config_path: String, config: pingclair_core::config::PingclairConf
         auto_https_config.enabled = false;
     }
 
-    // Create TLS manager with persistent challenge handler
-    let tls_manager = std::sync::Arc::new(
-        tokio::runtime::Runtime::new()
-            .expect("Failed to create runtime for TLS manager initialization")
-            .block_on(async {
-                pingclair_tls::manager::TlsManager::new(Some(auto_https_config), tls_store_path)
-                    .await
-                    .expect("Failed to create TLS manager with persistent challenge handler")
-            }),
-    );
+    // 🧰 Reuse one temporary runtime for manager initialization and eager local issuance.
+    let tls_runtime = tokio::runtime::Runtime::new()
+        .expect("Failed to create runtime for TLS manager initialization");
+    let tls_manager = std::sync::Arc::new(tls_runtime.block_on(async {
+        pingclair_tls::manager::TlsManager::new(Some(auto_https_config), tls_store_path)
+            .await
+            .expect("Failed to create TLS manager with persistent challenge handler")
+    }));
 
-    // Load manually configured TLS certificates (tls.cert + tls.key file pairs)
-    // into the TLS manager. Manual certs take precedence over ACME-issued ones.
+    // 🔐 Prepare configured certificate sources before any listener can accept a handshake.
     for server_config in &config.servers {
         let Some(tls) = &server_config.tls else {
             continue;
         };
+
+        if tls.internal {
+            let name = server_config.name.as_deref().unwrap_or_default();
+            match tls_runtime.block_on(tls_manager.enable_internal_domain(name)) {
+                Ok(_) => {
+                    tracing::info!("🏛️ Prepared an internal TLS certificate for {}", name);
+                }
+                Err(error) => {
+                    anyhow::bail!(
+                        "failed to prepare the internal TLS certificate for {name}: {error}"
+                    );
+                }
+            }
+        }
+
         let (Some(cert_path), Some(key_path)) = (&tls.cert, &tls.key) else {
             continue;
         };

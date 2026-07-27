@@ -37,11 +37,12 @@ use std::path::Path;
 
 /// Full compilation pipeline: source -> PingclairConfig
 pub fn compile(source: &str) -> Result<PingclairConfig, FullCompileError> {
-    // Parse and analyze
+    // 🧩 Parse and analyze the human-readable configuration.
     let ast = parse_and_analyze(source)?;
 
-    // Compile to config
+    // 🏗️ Compile the typed tree and enforce cross-field invariants.
     let config = compile_ast(&ast)?;
+    compiler::validate_config(&config)?;
 
     Ok(config)
 }
@@ -52,8 +53,10 @@ pub fn compile_file(path: impl AsRef<Path>) -> Result<PingclairConfig, FullCompi
     let source = std::fs::read_to_string(path).map_err(|e| FullCompileError::Io(e.to_string()))?;
 
     if path.extension().is_some_and(|ext| ext == "json") {
-        serde_json::from_str(&source)
-            .map_err(|e| FullCompileError::Io(format!("JSON parse error: {e}")))
+        let config = serde_json::from_str(&source)
+            .map_err(|e| FullCompileError::Io(format!("JSON parse error: {e}")))?;
+        compiler::validate_config(&config)?;
+        Ok(config)
     } else {
         compile(&source)
     }
@@ -226,6 +229,53 @@ mod tests {
         let config = compile(source).unwrap();
         let tls = config.servers[0].tls.as_ref().expect("tls config");
         assert!(tls.auto);
+    }
+
+    #[test]
+    fn test_compile_tls_internal() {
+        let source = r#"
+            https://example.com {
+                tls internal
+                respond "OK"
+            }
+        "#;
+
+        let config = compile(source).unwrap();
+        let tls = config.servers[0].tls.as_ref().expect("tls config");
+        assert!(tls.internal);
+        assert!(!tls.auto);
+        assert!(tls.cert.is_none());
+    }
+
+    #[test]
+    fn test_compile_tls_internal_requires_concrete_name() {
+        let error = compile(
+            r#"
+                :8443 {
+                    tls internal
+                    respond "OK"
+                }
+            "#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("concrete server name"));
+    }
+
+    #[test]
+    fn test_compile_tls_internal_rejects_conflicting_issuer() {
+        let error = compile(
+            r#"
+                example.com {
+                    tls {
+                        internal
+                        auto
+                    }
+                    respond "OK"
+                }
+            "#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("internal"));
     }
 
     #[test]

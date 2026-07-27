@@ -63,6 +63,7 @@ impl TestServer {
         let address = reserve_loopback_listener(&mut reservations);
         let config = config_template
             .replace("__PINGCLAIR_TEST_LISTEN__", &address.to_string())
+            .replace("__PINGCLAIR_TEST_PORT__", &address.port().to_string())
             .replace("__PINGCLAIR_TEST_READINESS_PATH__", &readiness_path)
             .replace("__PINGCLAIR_TEST_READINESS_TOKEN__", &readiness_token);
         assert!(
@@ -148,6 +149,16 @@ impl TestServer {
         format!("http://{}{}", self.server_addresses[server_index][0], path)
     }
 
+    /// 🔐 Builds an HTTPS URL that preserves the configured SNI host.
+    fn tls_url(&self, server_index: usize, host: &str, path: &str) -> String {
+        format!(
+            "https://{}:{}{}",
+            host,
+            self.server_addresses[server_index][0].port(),
+            path
+        )
+    }
+
     fn address(&self, server_index: usize) -> SocketAddr {
         self.server_addresses[server_index][0]
     }
@@ -225,6 +236,40 @@ impl TestServer {
         eprintln!(
             "⏳ Timed out waiting for test readiness (server={server_ready}, admin={admin_ready})."
         );
+        self.stop();
+        self.print_diagnostics();
+        false
+    }
+
+    /// 🔐 Waits for the exact readiness token through a real TLS handshake.
+    async fn wait_until_tls_ready(&mut self, host: &str) -> bool {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .danger_accept_invalid_certs(true)
+            .http1_only()
+            .resolve(host, self.address(0))
+            .build()
+            .unwrap();
+        let url = self.tls_url(0, host, &self.readiness_path);
+        for _ in 0..50 {
+            if let Some(status) = self.exit_status() {
+                eprintln!("❌ Server exited unexpectedly with status: {status}");
+                self.stop();
+                self.print_diagnostics();
+                return false;
+            }
+
+            if let Ok(response) = client.get(&url).send().await
+                && response.status().is_success()
+                && let Ok(body) = response.text().await
+                && body == self.readiness_token
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        eprintln!("⏳ Timed out waiting for TLS test readiness.");
         self.stop();
         self.print_diagnostics();
         false
@@ -1393,6 +1438,70 @@ async fn test_production_cache_headers_compose_with_reverse_proxy() {
     }
 
     upstream_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_pingclairfile_internal_tls_serves_trusted_h1_and_h2() {
+    let config = r#"
+        {
+            admin off
+        }
+
+        https://portfolio.test:__PINGCLAIR_TEST_PORT__ {
+            tls internal
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "internal-ok"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(
+        server.wait_until_tls_ready("portfolio.test").await,
+        "server failed to start with internal TLS"
+    );
+
+    let root_path = server._temp_dir.path().join("tls/internal/root.crt");
+    let authority_path = server._temp_dir.path().join("tls/internal/authority.json");
+    let leaf_path = server
+        ._temp_dir
+        .path()
+        .join("tls/internal/certificates/portfolio_test.json");
+    let root = reqwest::Certificate::from_pem(&std::fs::read(&root_path).unwrap()).unwrap();
+    let base_builder = || {
+        reqwest::Client::builder()
+            .no_proxy()
+            .add_root_certificate(root.clone())
+            .resolve("portfolio.test", server.address(0))
+    };
+
+    let h1_client = base_builder().http1_only().build().unwrap();
+    let h1_response = h1_client
+        .get(server.tls_url(0, "portfolio.test", "/h1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(h1_response.version(), reqwest::Version::HTTP_11);
+    assert_eq!(h1_response.text().await.unwrap(), "internal-ok");
+
+    let h2_client = base_builder().build().unwrap();
+    let h2_response = h2_client
+        .get(server.tls_url(0, "portfolio.test", "/h2"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(h2_response.version(), reqwest::Version::HTTP_2);
+    assert_eq!(h2_response.text().await.unwrap(), "internal-ok");
+
+    assert!(authority_path.is_file());
+    assert!(leaf_path.is_file());
+    assert_eq!(
+        std::fs::read_to_string(root_path)
+            .unwrap()
+            .matches("BEGIN CERTIFICATE")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

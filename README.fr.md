@@ -31,7 +31,7 @@ Que vous ayez besoin d'un simple serveur de fichiers statiques ou d'une passerel
 *   📝 **Configuration compatible Caddyfile** — Un DSL de configuration minimaliste, avec **HTTPS automatique**, **écouteurs multiples** et **matchers nommés**, compatible avec la syntaxe Caddyfile courante.
 *   ⚡ **HTTP/3 (QUIC) natif** — Bâti sur [quiche](https://github.com/cloudflare/quiche), la pile QUIC de production qui fait tourner l'edge de Cloudflare. Une latence réduite et une meilleure migration de connexion sur les réseaux instables. Une configuration `tls` explicite active HTTPS et H3 sur n'importe quel port d'écoute ; 443 et 8443 restent reconnus automatiquement. Les trailers de requête déclarés ne sont transférés par aucun protocole aval : Pingclair renvoie `501` avant l'envoi de la réponse ou réinitialise un flux H3 déjà engagé. Une réponse amont annonçant des trailers renvoie `502` tant que leur transfert de bout en bout n'est pas pris en charge. Les requêtes CONNECT et CONNECT étendu sur H3 renvoient `501` jusqu'à la prise en charge des tunnels.
 *   🔄 **Répartition de charge intelligente** — Plusieurs algorithmes intégrés (round-robin, least-connections, etc.), avec health checks et bascule automatique.
-*   🔐 **HTTPS entièrement automatique** — Le support ACME intégré (Let's Encrypt) émet et renouvelle les certificats SSL/TLS sans aucune configuration.
+*   🔐 **HTTPS automatique et privé** — ACME intégré (Let's Encrypt) émet les certificats publics, tandis que `tls internal` fournit une autorité locale persistante pour les origines privées et les tunnels.
 *   📁 **Service de fichiers statiques performant** — Compression Gzip/Brotli, requêtes Range et transfert de fichiers efficace.
 *   📊 **Observabilité** — Export de métriques Prometheus et traçage OpenTelemetry prêts à l'emploi.
 
@@ -166,6 +166,28 @@ localhost:8080 {
     file_server ./public
 }
 ```
+
+### TLS interne pour les origines privées
+
+Utilisez `tls internal` lorsque le client TLS est un tunnel, un load balancer
+ou un service privé de confiance et que la validation ACME publique est
+indisponible :
+
+```caddyfile
+https://origin.example.test:6688 {
+    tls internal
+    reverse_proxy app:8080
+}
+```
+
+Pingclair conserve une autorité locale valable dix ans et des certificats
+leaf renouvelables de 90 jours sous `PINGCLAIR_TLS_STORE` (par défaut
+`/var/lib/pingclair/certs`). Les clients qui vérifient l'origine doivent faire
+confiance à `$PINGCLAIR_TLS_STORE/internal/root.crt` ; la clé privée de
+l'autorité reste dans `authority.json`, lisible uniquement par son
+propriétaire. H1/H2 et H3 utilisent le même certificat leaf persistant.
+`tls internal` exige un nom de site concret et ne peut pas être combiné avec
+`tls auto`, un email ACME ou des chemins de certificat manuels.
 
 Lorsque Pingclair se trouve derrière un load balancer ou un CDN que vous
 administrez, déclarez uniquement ces réseaux mandataires dans le bloc global.
@@ -324,7 +346,7 @@ Pingclair est organisé en workspace Cargo modulaire :
 | **`pingclair-config`** | **Compilateur de configuration.** Analyse lexicale, syntaxique et sémantique du `Pingclairfile`, puis génération des objets de configuration d'exécution. |
 | **`pingclair-proxy`** | **Implémentation du proxy.** Logique de proxy HTTP/TCP bâtie sur le trait Proxy de Pingora, répartiteur de charge inclus, ainsi que l'écouteur HTTP/3 (QUIC) bâti sur quiche de Cloudflare. |
 | **`pingclair-static`** | **Service de fichiers statiques.** Lecture de fichiers efficace, déduction du type MIME et transmission en flux. |
-| **`pingclair-tls`** | **Gestion TLS.** Chargement des certificats et émission automatique via ACME (Let's Encrypt). |
+| **`pingclair-tls`** | **Gestion TLS.** Certificats manuels, autorité interne persistante et émission automatique via ACME (Let's Encrypt). |
 | **`pingclair-api`** | **API d'administration.** Interface RESTful pour consulter l'état ou recharger la configuration à chaud, à l'exécution. |
 | **`pingclair-plugin`** | **Système de plugins.** Définit l'interface permettant aux développeurs tiers d'étendre les fonctionnalités. |
 

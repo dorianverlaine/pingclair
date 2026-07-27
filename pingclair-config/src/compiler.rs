@@ -114,14 +114,14 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         }
     }
 
-    // TLS directive (`tls cert key`, `tls auto`, `tls off`, or block form).
-    // Merged with the https-scheme default above so neither clobbers the other.
+    // 🔐 The explicit directive merges with the HTTPS scheme without losing either source.
     if let Some(tls) = &server.tls {
         if tls.off {
             config.tls = None;
         } else {
             let mut merged = config.tls.take().unwrap_or_default();
             merged.auto = merged.auto || tls.auto;
+            merged.internal = merged.internal || tls.internal;
             if tls.cert.is_some() {
                 merged.cert = tls.cert.clone();
             }
@@ -173,9 +173,15 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
                         Expr::Ident(id) if id == "auto" => {
                             tls.auto = true;
                         }
+                        Expr::Ident(id) if id == "internal" => {
+                            tls.internal = true;
+                        }
                         Expr::Map(map) => {
                             if let Some(Expr::Bool(b)) = map.get("auto") {
                                 tls.auto = *b;
+                            }
+                            if let Some(Expr::Bool(b)) = map.get("internal") {
+                                tls.internal = *b;
                             }
                             if let Some(Expr::String(s)) = map.get("cert") {
                                 tls.cert = Some(s.clone());
@@ -200,6 +206,41 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
     }
 
     Ok(config)
+}
+
+/// 🛡️ Rejects TLS combinations that cannot have deterministic runtime behavior.
+pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
+    for server in &config.servers {
+        let Some(tls) = &server.tls else {
+            continue;
+        };
+
+        if tls.cert.is_some() != tls.key.is_some() {
+            return Err(CompileError::InvalidServer {
+                message: "TLS cert and key must be specified together".to_string(),
+            });
+        }
+
+        if !tls.internal {
+            continue;
+        }
+
+        if tls.auto || tls.cert.is_some() || tls.acme_email.is_some() {
+            return Err(CompileError::InvalidServer {
+                message: "tls internal cannot be combined with auto, cert/key, or an ACME email"
+                    .to_string(),
+            });
+        }
+
+        let name = server.name.as_deref().unwrap_or_default();
+        if name.is_empty() || name == "_" || name.contains('*') || name.starts_with(':') {
+            return Err(CompileError::InvalidServer {
+                message: "tls internal requires a concrete server name".to_string(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn compile_log(log: &LogBlock) -> CompileResult<LogConfig> {

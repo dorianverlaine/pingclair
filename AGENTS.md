@@ -1,9 +1,15 @@
 # AGENTS.md — Pingclair
 
 This is the operating manual for coding agents working in this repository.
-Read it together with `docs/TODO.md` before planning changes. The TODO is the
-source of truth for feature status and verification level; do not infer that
-implemented code has passed Linux/VPS validation.
+Read it together with the three planning documents before changing anything:
+
+- `docs/TODO.md` — the v0.2.0 execution plan, one Day per sitting. Read this
+  to know what to work on.
+- `docs/STATUS.md` — what is already done and **how far it has been verified**.
+  This is the source of truth for feature status; do not infer that implemented
+  code has passed Linux/VPS validation.
+- `docs/GUARDRAILS.md` — environment constraints and implementation rules.
+  Every entry is a real failure that already happened once. Read before coding.
 
 ## What Pingclair is
 
@@ -32,15 +38,19 @@ The workspace has eight crates:
 
 ## Start every task this way
 
-1. Read `docs/TODO.md`.
-2. Inspect `git status --short --branch`; preserve existing user changes.
-3. Locate the real execution path, not only the config type or AST.
-4. Decide the required verification level before editing:
+1. Read `docs/TODO.md` and work the current Day. One Day per sitting; do not
+   merge a 🔨 coding Day with a ✅ verification Day.
+2. Read the relevant section of `docs/GUARDRAILS.md` before touching H3, TLS,
+   dependencies, or anything that streams a response body.
+3. Inspect `git status --short --branch`; preserve existing user changes.
+4. Locate the real execution path, not only the config type or AST.
+5. Decide the required verification level before editing:
    unit, local real-binary integration, Linux/container, or remote VPS.
-5. Keep `docs/TODO.md` current when status or evidence changes.
+6. Keep `docs/STATUS.md` current when status or evidence changes, and mark the
+   finished Day in `docs/TODO.md`.
 
 Do not mark an item as remotely verified because unit tests or
-`cargo test --workspace` pass. The TODO deliberately distinguishes:
+`cargo test --workspace` pass. `docs/STATUS.md` deliberately distinguishes:
 
 - completed and verified on the Linux VPS;
 - implemented and locally tested, but still awaiting remote verification;
@@ -146,10 +156,10 @@ not run `git pull`, `git reset`, `git clean`, or overwrite it blindly. Inspect
 its branch, HEAD, status, running processes, and occupied ports first. For a
 new verification run, prefer a separate clean clone/worktree or copy the exact
 committed source into a new directory. Record the commit hash, command, config,
-result path, and date in `docs/TODO.md` or `benchmarks/README.md`.
+result path, and date in `docs/STATUS.md` or `benchmarks/README.md`.
 
-Remote testing is required before moving a runtime feature into the TODO
-completion section. A remote run should use the release binary when the change
+Remote testing is required before moving a runtime feature into the completed
+section of `docs/STATUS.md`. A remote run should use the release binary when the change
 touches performance, linking, TLS, QUIC, process lifecycle, or Linux behavior.
 On small validation hosts, run `scripts/validate-linux-commit.sh` with its
 default low-memory release overrides and a persistent
@@ -232,6 +242,12 @@ boundary against a user who can plant symlinks.
 
 - Never commit certificate, account-key, or TLS-store material.
 - Keep ACME staging and production accounts separate.
+- `tls internal` persists an atomic CA certificate/key record below
+  `PINGCLAIR_TLS_STORE/internal/authority.json` and publishes the trust anchor
+  as `root.crt`. Preserve owner-only private material, deterministic manual →
+  internal → ACME precedence, eager startup issuance, and shared H1/H2/H3
+  renewal behavior. A corrupt authority must fail closed, never be silently
+  replaced.
 - Treat `pingclair-api/src/auth.rs` and config reload endpoints as
   security-critical.
 - Keep the Linux jemalloc target guard intact.
@@ -287,7 +303,11 @@ configuration load or hot reload. Invalid security policy should fail closed.
 
 ## Documentation ownership
 
-- `docs/TODO.md`: canonical status and verification ledger.
+- `docs/TODO.md`: the v0.2.0 execution plan. Day-by-day only — no status,
+  no evidence, no reference material.
+- `docs/STATUS.md`: canonical status and verification ledger, plus the
+  v0.3+ backlog and ecosystem comparison.
+- `docs/GUARDRAILS.md`: environment constraints and implementation rules.
 - `docs/AUDIT_NGINX_PARITY.md`: nginx/Caddy parity and production-risk audit.
 - `benchmarks/README.md`: performance claims, methodology, raw-result links,
   and bugs discovered under load.
