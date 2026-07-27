@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! Pingclair Plugin System
 //!
 //! Extensible plugin architecture for adding custom functionality.

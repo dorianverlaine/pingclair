@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! 🔬 Semantic analysis for the Pingclair configuration DSL.
 //!
 //! Performs macro expansion, validation, and reference resolution.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! 🧩 Parser module for the Pingclair configuration DSL.
 //!
 //! This module provides the lexer, AST, and parser.

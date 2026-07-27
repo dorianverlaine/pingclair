@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! Pingclair Core Library
 //!
 //! This crate provides the core functionality for the Pingclair web server,

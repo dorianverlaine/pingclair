@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! 🔐 Atomic persistence for files containing private TLS material.
 
 use std::fs::{self, OpenOptions};

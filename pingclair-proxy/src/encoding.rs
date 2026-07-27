@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! 🗜️ Response content-coding negotiation and streaming encoders.
 //!
 //! Two concerns live here, both kept out of the `ProxyHttp` impl so they are

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! Prometheus Metrics for Pingclair
 //!
 //! Provides metrics collection for requests, errors, and latency.

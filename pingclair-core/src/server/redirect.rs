@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! HTTP to HTTPS automatic redirect server
 //!
 //! 🔄 Listens on HTTP port and redirects all requests to HTTPS.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! 📝 Per-server access logging driven by each server's `LogConfig`.
 //!
 //! Before this module, `log { output stdout; format json }` compiled into a

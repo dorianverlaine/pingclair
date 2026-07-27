@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! 🏛️ Provides a persistent local certificate authority for private origins.
 
 use crate::acme::Certificate;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! Alt-Svc advertisement for HTTP/3 discovery.
 //!
 //! When HTTP/3 (QUIC) is enabled on an HTTPS listener, clients have no way

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! 🧮 Variable resolution for the Pingclair configuration DSL.
 //!
 //! Handles resolution of ${...} variables at runtime.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! 🏗️ Compiler for the Pingclair configuration DSL.
 //!
 //! This module converts the AST into a runtime `PingclairConfig`.
