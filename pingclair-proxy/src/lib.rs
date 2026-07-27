@@ -8,6 +8,7 @@
 
 // MARK: - Modules
 
+pub mod access_log;
 pub mod alt_svc;
 pub mod connection_filter;
 pub mod health_check;

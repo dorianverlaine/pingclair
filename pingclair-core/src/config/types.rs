@@ -738,6 +738,14 @@ pub struct LogConfig {
 
     /// Log level (overrides global)
     pub level: Option<String>,
+
+    /// 🙈 Access-log field names to omit, from
+    /// `format filter { fields { <name> delete } }`.
+    ///
+    /// `#[serde(default)]` so configs written before this field existed
+    /// still load.
+    #[serde(default)]
+    pub exclude_fields: Vec<String>,
 }
 
 /// Log output destination
