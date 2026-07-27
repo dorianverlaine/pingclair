@@ -334,20 +334,14 @@ Pingclair 採用模組化的 Cargo Workspace 結構管理程式碼：
 
 我們非常歡迎社群的貢獻！無論你想修正 Bug、新增特性，或僅僅是改善文件。
 
-### 開發流程
+請先閱讀 **[CONTRIBUTING.md](CONTRIBUTING.md)**。裡面說明了每個 commit 都必須通過的四道 gate、對一個 Web 伺服器而言什麼才算測試充分，以及從程式碼本身看不出來的架構限制（BoringSSL 鏈結、HTTP/3 路徑、bounded memory）。
 
-1.  **Fork** 本儲存庫。
-2.  **建立分支**：`git checkout -b feature/my-cool-feature`
-3.  **撰寫程式碼**：遵循 Rust 的程式碼風格。
-4.  **執行測試**：確保所有測試皆通過。
-    ```bash
-    cargo test --workspace
-    ```
-5.  **送出 PR**：在 Pull Request 中描述你的改動。
+首次貢獻者需簽署一次性的 [CLA](CLA.md)。**你的著作權仍屬於你自己。**
 
 ## 📄 授權條款
 
-本專案採用 **Apache 2.0 授權條款** 開源。詳情請見 [LICENSE](LICENSE) 檔案。
+本專案採用 **Apache 2.0 授權條款** 開源。完整條款見 [LICENSE](LICENSE)，
+散布時的姓名標示義務與第三方元件見 [NOTICE](NOTICE)。
 
 ---
 
