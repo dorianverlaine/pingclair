@@ -31,7 +31,7 @@
 *   📝 **相容 Caddyfile 的設定** — 極簡的設定 DSL，支援**自動 HTTPS**、**多重監聽器**與**具名匹配器**，相容主流 Caddyfile 語法。
 *   ⚡ **原生支援 HTTP/3 (QUIC)** — 基於 Cloudflare 的 [quiche](https://github.com/cloudflare/quiche)（支撐 Cloudflare 邊緣網路的生產級 QUIC 協定棧）打造，在不穩定的網路環境下提供更低的延遲與更好的連線遷移能力。明確設定 `tls` 後，任何監聽埠都可提供 HTTPS 與 H3；443 與 8443 仍保留自動辨識。目前所有下游協議都不轉送已宣告的 request trailers：回應尚未送出時會明確回傳 `501`，H3 已送出時則重設 stream。上游回應若宣告 trailers，會在完整的端到端轉送完成前明確回傳 `502`。H3 CONNECT 與 extended CONNECT 在 tunnel 支援完成前會回傳 `501`。
 *   🔄 **智慧負載平衡** — 內建多種演算法（輪詢、最少連線等），支援健康檢查與故障自動轉移。
-*   🔐 **全自動 HTTPS** — 整合 ACME 協定（如 Let's Encrypt），自動申請與續期 SSL/TLS 憑證，零設定即可啟用加密傳輸。
+*   🔐 **自動與私有 HTTPS** — 整合 ACME（Let's Encrypt）申請公開憑證；`tls internal` 則提供持久化本機 CA，供私有源站與隧道使用。
 *   📁 **高效能靜態檔案服務** — 支援 Gzip/Brotli 壓縮、Range 請求與高效率的檔案傳輸。
 *   📊 **可觀測性** — 開箱即用的 Prometheus 指標匯出與 OpenTelemetry Tracing 支援。
 
@@ -153,6 +153,25 @@ localhost:8080 {
     file_server ./public
 }
 ```
+
+### 私有源站的 internal TLS
+
+當 TLS client 是可信隧道、負載平衡器或私有服務，而且無法完成公開 ACME 驗證時，
+可使用 `tls internal`：
+
+```caddyfile
+https://origin.example.test:6688 {
+    tls internal
+    reverse_proxy app:8080
+}
+```
+
+Pingclair 會在 `PINGCLAIR_TLS_STORE`（預設
+`/var/lib/pingclair/certs`）下持久化一個有效十年的本機 CA，以及可續期的
+90 天 leaf 憑證。需要驗證源站的 client 應信任
+`$PINGCLAIR_TLS_STORE/internal/root.crt`；CA 私鑰則保存在僅 owner 可讀的
+`authority.json`。H1/H2 與 H3 共用同一份持久化 leaf。`tls internal`
+必須搭配明確站台名稱，且不可和 `tls auto`、ACME email 或手動憑證路徑混用。
 
 若 Pingclair 位於你所管理的負載平衡器或 CDN 後方，只能在全域區塊列出可信
 代理網段。未受信任的上一跳不能透過 `X-Forwarded-For`、`X-Real-IP` 或
@@ -307,7 +326,7 @@ Pingclair 採用模組化的 Cargo Workspace 結構管理程式碼：
 | **`pingclair-config`** | **設定編譯器**。負責解析 `Pingclairfile`，進行詞法分析、語法分析與語意檢查，產生執行期設定物件。 |
 | **`pingclair-proxy`** | **代理實作**。基於 Pingora Proxy Trait 實作的 HTTP／TCP 代理邏輯，包含負載平衡器，以及基於 Cloudflare quiche 打造的 HTTP/3（QUIC）監聽器。 |
 | **`pingclair-static`** | **靜態檔案服務**。實作高效率的檔案讀取、MIME 類型推斷與串流傳輸。 |
-| **`pingclair-tls`** | **TLS 管理**。處理憑證載入與 ACME 自動申請（Let's Encrypt）。 |
+| **`pingclair-tls`** | **TLS 管理**。處理手動憑證、持久化 internal CA 與 ACME 自動申請（Let's Encrypt）。 |
 | **`pingclair-api`** | **Admin API**。提供 RESTful 介面，可在執行期動態檢視狀態或熱更新設定。 |
 | **`pingclair-plugin`** | **外掛系統**。定義外掛介面，讓第三方開發者得以擴充功能。 |
 

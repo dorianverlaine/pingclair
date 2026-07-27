@@ -546,13 +546,9 @@ fn is_ip_literal(host: &str) -> bool {
             .is_some_and(|h| h.parse::<std::net::IpAddr>().is_ok())
 }
 
-// MARK: - tls Directive
+// MARK: - 🔐 TLS Directive
 
-/// Adapt the `tls` server directive. Supported forms:
-///   tls off
-///   tls auto
-///   tls /path/cert.pem /path/key.pem
-///   tls { cert ...; key ...; acme_email ...; http3 ... }
+/// 🔐 Adapts the supported downstream TLS directive forms.
 fn adapt_tls_directive(d: &Directive) -> Result<TlsDirective, AdapterError> {
     let mut tls = TlsDirective::default();
 
@@ -563,6 +559,15 @@ fn adapt_tls_directive(d: &Directive) -> Result<TlsDirective, AdapterError> {
                 "key" => tls.key = sub.args.first().cloned(),
                 "acme_email" | "email" => tls.acme_email = sub.args.first().cloned(),
                 "auto" => tls.auto = true,
+                "internal" => {
+                    if !sub.args.is_empty() {
+                        return Err(AdapterError::InvalidArgument(
+                            "tls internal".into(),
+                            "expected no arguments".into(),
+                        ));
+                    }
+                    tls.internal = true;
+                }
                 "http3" => {
                     tls.http3 = Some(
                         sub.args
@@ -578,6 +583,7 @@ fn adapt_tls_directive(d: &Directive) -> Result<TlsDirective, AdapterError> {
         match d.args.as_slice() {
             [arg] if arg == "off" => tls.off = true,
             [arg] if arg == "auto" => tls.auto = true,
+            [arg] if arg == "internal" => tls.internal = true,
             [cert, key] => {
                 tls.cert = Some(cert.clone());
                 tls.key = Some(key.clone());
@@ -585,17 +591,25 @@ fn adapt_tls_directive(d: &Directive) -> Result<TlsDirective, AdapterError> {
             _ => {
                 return Err(AdapterError::InvalidArgument(
                     "tls".into(),
-                    "expected 'off', 'auto', '<cert> <key>', or a block".into(),
+                    "expected 'off', 'auto', 'internal', '<cert> <key>', or a block".into(),
                 ));
             }
         }
     }
 
-    // A certificate without its private key (or vice versa) is unusable.
+    // 🔗 A certificate without its matching private key is unusable.
     if tls.cert.is_some() != tls.key.is_some() {
         return Err(AdapterError::InvalidArgument(
             "tls".into(),
             "cert and key must be specified together".into(),
+        ));
+    }
+
+    // 🛡️ A local issuer must never fall through to manual or public issuance.
+    if tls.internal && (tls.auto || tls.cert.is_some() || tls.acme_email.is_some()) {
+        return Err(AdapterError::InvalidArgument(
+            "tls".into(),
+            "internal cannot be combined with auto, cert/key, or an ACME email".into(),
         ));
     }
 
@@ -1802,6 +1816,57 @@ mod global_tests {
         let tls = ast.servers[0].inner.tls.as_ref().expect("tls directive");
         assert!(tls.auto);
         assert!(tls.cert.is_none());
+    }
+
+    #[test]
+    fn test_tls_internal() {
+        let source = r#"
+            example.com {
+                listen :443
+                tls internal
+            }
+        "#;
+        let directives = parse(source).unwrap();
+        let ast = adapt(directives).unwrap();
+
+        let tls = ast.servers[0].inner.tls.as_ref().expect("tls directive");
+        assert!(tls.internal);
+        assert!(!tls.auto);
+        assert!(tls.cert.is_none());
+    }
+
+    #[test]
+    fn test_tls_internal_block_can_disable_http3() {
+        let source = r#"
+            example.com {
+                listen :443
+                tls {
+                    internal
+                    http3 off
+                }
+            }
+        "#;
+        let directives = parse(source).unwrap();
+        let ast = adapt(directives).unwrap();
+
+        let tls = ast.servers[0].inner.tls.as_ref().expect("tls directive");
+        assert!(tls.internal);
+        assert_eq!(tls.http3, Some(false));
+    }
+
+    #[test]
+    fn test_tls_internal_rejects_public_or_manual_issuers() {
+        for source in [
+            "example.com { tls { internal auto } }",
+            "example.com { tls { internal acme_email admin@example.com } }",
+            "example.com { tls { internal cert cert.pem key key.pem } }",
+        ] {
+            let directives = parse(source).unwrap();
+            assert!(matches!(
+                adapt(directives),
+                Err(AdapterError::InvalidArgument(..))
+            ));
+        }
     }
 
     #[test]

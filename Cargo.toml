@@ -44,7 +44,7 @@ ariadne = "0.6"      # error reporting
 
 # TLS / certificates
 rustls = { version = "0.23", features = ["ring"] }
-rcgen = "0.14"
+rcgen = { version = "0.14", features = ["x509-parser"] }
 x509-parser = "0.18"
 
 # HTTP/3 (QUIC) — Cloudflare quiche on BoringSSL

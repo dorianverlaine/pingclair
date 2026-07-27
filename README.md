@@ -31,7 +31,7 @@ Whether you need a simple static file server or an enterprise gateway with load 
 *   📝 **Caddyfile-compatible config** — A minimal configuration DSL with **automatic HTTPS**, **multiple listeners**, and **named matchers**, compatible with mainstream Caddyfile syntax.
 *   ⚡ **Native HTTP/3 (QUIC)** — Built on [quiche](https://github.com/cloudflare/quiche), the production QUIC stack that powers Cloudflare's edge. Lower latency and better connection migration on unreliable networks. Explicit `tls` configuration enables HTTPS and H3 on any listen port; 443 and 8443 remain automatic conventions. Declared request trailers are not forwarded on any downstream protocol: Pingclair returns `501` before response commitment or resets an already committed H3 stream. Upstream responses advertising trailers return `502` until end-to-end trailer forwarding is supported. H3 CONNECT and extended CONNECT return `501` until tunnel support is implemented.
 *   🔄 **Smart load balancing** — Several built-in algorithms (round-robin, least-connections, and more) with health checks and automatic failover.
-*   🔐 **Fully automatic HTTPS** — Built-in ACME (Let's Encrypt) support issues and renews SSL/TLS certificates with zero configuration.
+*   🔐 **Automatic and private HTTPS** — Built-in ACME (Let's Encrypt) support issues public certificates, while `tls internal` provides a persistent local CA for private origins and tunnels.
 *   📁 **Fast static file serving** — Gzip/Brotli compression, range requests, and efficient file transfer.
 *   📊 **Observability** — Prometheus metrics export and OpenTelemetry tracing out of the box.
 
@@ -161,6 +161,27 @@ localhost:8080 {
     file_server ./public
 }
 ```
+
+### Internal TLS for private origins
+
+Use `tls internal` when the TLS client is a trusted tunnel, load balancer, or
+private service and public ACME validation is unavailable:
+
+```caddyfile
+https://origin.example.test:6688 {
+    tls internal
+    reverse_proxy app:8080
+}
+```
+
+Pingclair persists one ten-year local authority and renewable 90-day leaf
+certificates below `PINGCLAIR_TLS_STORE` (default:
+`/var/lib/pingclair/certs`). Install
+`$PINGCLAIR_TLS_STORE/internal/root.crt` in clients that verify the origin;
+the authority private key remains in the owner-only `authority.json`.
+H1/H2 and H3 use the same persisted leaf. `tls internal` requires a concrete
+site name and cannot be combined with `tls auto`, ACME email, or manual
+certificate paths.
 
 When Pingclair is behind a load balancer or CDN that you operate, list only
 those proxy networks in the global block. Untrusted peers cannot supply
@@ -317,7 +338,7 @@ Pingclair is organized as a modular Cargo workspace:
 | **`pingclair-config`** | **Configuration compiler.** Lexes, parses, and semantically checks the `Pingclairfile`, producing runtime config objects. |
 | **`pingclair-proxy`** | **Proxy implementation.** HTTP/TCP proxy logic built on Pingora's proxy trait, including the load balancer, plus the HTTP/3 (QUIC) listener built on Cloudflare's quiche. |
 | **`pingclair-static`** | **Static file serving.** Efficient file reads, MIME type inference, and streaming. |
-| **`pingclair-tls`** | **TLS management.** Certificate loading and automatic ACME issuance (Let's Encrypt). |
+| **`pingclair-tls`** | **TLS management.** Manual certificates, persistent internal CA issuance, and automatic ACME issuance (Let's Encrypt). |
 | **`pingclair-api`** | **Admin API.** A RESTful interface for inspecting state and hot-reloading configuration at runtime. |
 | **`pingclair-plugin`** | **Plugin system.** The plugin interface for third-party extensions. |
 

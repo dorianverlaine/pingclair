@@ -97,14 +97,6 @@ if [[ ! -x "${binary}" ]]; then
     cargo build --manifest-path "${repository_root}/Cargo.toml" -p pingclair
 fi
 
-readonly openssl_bin="$(command -v openssl)"
-"${openssl_bin}" req -x509 -newkey rsa:2048 -nodes \
-    -keyout "${run_dir}/key.pem" \
-    -out "${run_dir}/cert.pem" \
-    -days 1 \
-    -subj "/CN=${host_name}" \
-    -addext "subjectAltName=DNS:${host_name}" \
-    >"${run_dir}/openssl.log" 2>&1
 mkdir -p "${run_dir}/tls"
 
 cat >"${run_dir}/upstream.py" <<'PY'
@@ -191,8 +183,7 @@ cat >"${run_dir}/config.json" <<JSON
     "name": "${host_name}",
     "listen": ["127.0.0.1:${h3_port}"],
     "tls": {
-      "cert": "${run_dir}/cert.pem",
-      "key": "${run_dir}/key.pem",
+      "internal": true,
       "http3": true
     },
     "routes": [
@@ -248,6 +239,12 @@ for _ in {1..100}; do
 done
 if [[ "${ready}" != "true" ]]; then
     log "❌ Pingclair did not become ready over local HTTP/3."
+    exit 1
+fi
+if [[ ! -f "${run_dir}/tls/internal/authority.json" ]] \
+    || [[ ! -f "${run_dir}/tls/internal/root.crt" ]] \
+    || [[ ! -f "${run_dir}/tls/internal/certificates/h3_local.json" ]]; then
+    log "❌ Internal CA material was not persisted before H3 readiness."
     exit 1
 fi
 

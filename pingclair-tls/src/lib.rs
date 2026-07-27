@@ -10,6 +10,7 @@ pub mod account_store;
 pub mod acme;
 pub mod auto_https;
 pub mod cert_store;
+pub mod internal_ca;
 pub mod manager;
 pub mod persistent_challenge_handler;
 mod secure_file;
@@ -19,4 +20,5 @@ pub use acme::{
 };
 pub use auto_https::{AutoHttps, AutoHttpsConfig, AutoHttpsError};
 pub use cert_store::{CertStore, CertStoreError};
+pub use internal_ca::{InternalCa, InternalCaError};
 pub use manager::TlsManager;

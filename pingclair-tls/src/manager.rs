@@ -5,47 +5,50 @@
 use crate::acme::{ChallengeHandler, MemoryChallengeHandler};
 use crate::auto_https::{AutoHttps, AutoHttpsConfig};
 use crate::cert_store::CertStore;
+use crate::internal_ca::{InternalCa, InternalCaError};
 use crate::persistent_challenge_handler::PersistentChallengeHandler;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_rustls::rustls;
 
-/// Certificate entry with expiration tracking
+/// 🗃️ Tracks a parsed certificate and its cache expiration.
 #[derive(Clone)]
 struct CachedCert {
     certified_key: Arc<rustls::sign::CertifiedKey>,
-    /// Unix timestamp when cert expires
+    /// ⏰ Records the Unix timestamp when this cache entry expires.
     expires_at: u64,
-    /// Unix timestamp when cert was cached
+    /// 🕰️ Records the Unix timestamp when this certificate was cached.
     #[allow(dead_code)]
     cached_at: u64,
 }
 
 /// 🛡️ TLS Manager for Pingclair
 pub struct TlsManager {
-    /// Auto HTTPS manager
+    /// 🌐 Manages automatic public certificates.
     auto_https: Option<Arc<AutoHttps>>,
-    /// Challenge handler (HTTP-01) - can be either memory or persistent
+    /// 🚦 Publishes HTTP-01 challenges through memory or persistent storage.
     challenge_handler: Arc<dyn ChallengeHandler>,
-    /// Manually configured certificates in PEM form (domain -> (cert_pem, key_pem)).
-    /// Loaded from the config file at startup; takes precedence over ACME certs.
+    /// 📜 Stores explicitly configured PEM pairs with the highest precedence.
     manual_pem_certs: RwLock<HashMap<String, (String, String)>>,
-    /// Cached parsed CertifiedKey from ACME certs (domain -> cached key with metadata)
-    /// Avoids expensive PEM parsing on every TLS handshake
+    /// 🏛️ Issues and persists certificates for explicitly enabled internal domains.
+    internal_ca: Arc<InternalCa>,
+    /// 🧭 Limits local issuance to domains selected by configuration.
+    internal_domains: RwLock<HashSet<String>>,
+    /// ⚡ Avoids repeated PEM parsing for generated certificates.
     cached_certs: RwLock<HashMap<String, CachedCert>>,
-    /// Cache TTL in seconds (default 1 hour to avoid stale entries)
+    /// ⏳ Limits parsed certificate lifetime so rotations become visible.
     cache_ttl: Duration,
 }
 
 impl TlsManager {
-    /// Create a new TLS manager with persistent challenge handler (default)
+    /// 🏗️ Creates a TLS manager with a persistent challenge handler.
     pub async fn new(
         config: Option<AutoHttpsConfig>,
         store_path: &std::path::Path,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        // Use persistent challenge handler by default
+        // 💾 Persistent challenges survive process restarts during validation.
         let challenge_storage_path = store_path.join("acme-challenges.json");
         let challenge_handler =
             Arc::new(PersistentChallengeHandler::new(challenge_storage_path).await?);
@@ -61,12 +64,14 @@ impl TlsManager {
             auto_https,
             challenge_handler: challenge_handler as Arc<dyn ChallengeHandler>,
             manual_pem_certs: RwLock::new(HashMap::new()),
+            internal_ca: Arc::new(InternalCa::new(store_path)),
+            internal_domains: RwLock::new(HashSet::new()),
             cached_certs: RwLock::new(HashMap::new()),
-            cache_ttl: Duration::from_secs(3600), // 1 hour default TTL
+            cache_ttl: Duration::from_secs(3600),
         })
     }
 
-    /// Create a new TLS manager with memory-based challenge handler (legacy)
+    /// 🧪 Creates a TLS manager with an in-memory challenge handler.
     pub fn new_with_memory_challenges(
         config: Option<AutoHttpsConfig>,
         store_path: &std::path::Path,
@@ -84,12 +89,14 @@ impl TlsManager {
             auto_https,
             challenge_handler: challenge_handler as Arc<dyn ChallengeHandler>,
             manual_pem_certs: RwLock::new(HashMap::new()),
+            internal_ca: Arc::new(InternalCa::new(store_path)),
+            internal_domains: RwLock::new(HashSet::new()),
             cached_certs: RwLock::new(HashMap::new()),
-            cache_ttl: Duration::from_secs(3600), // 1 hour default TTL
+            cache_ttl: Duration::from_secs(3600),
         }
     }
 
-    /// Create a new TLS manager with custom persistent challenge storage path
+    /// 🧰 Creates a TLS manager with a custom persistent challenge path.
     pub async fn new_with_custom_challenge_path(
         config: Option<AutoHttpsConfig>,
         store_path: &std::path::Path,
@@ -109,8 +116,10 @@ impl TlsManager {
             auto_https,
             challenge_handler: challenge_handler as Arc<dyn ChallengeHandler>,
             manual_pem_certs: RwLock::new(HashMap::new()),
+            internal_ca: Arc::new(InternalCa::new(store_path)),
+            internal_domains: RwLock::new(HashSet::new()),
             cached_certs: RwLock::new(HashMap::new()),
-            cache_ttl: Duration::from_secs(3600), // 1 hour default TTL
+            cache_ttl: Duration::from_secs(3600),
         })
     }
 
@@ -124,29 +133,57 @@ impl TlsManager {
         Ok(())
     }
 
-    /// Add a manually configured certificate (PEM form) for a domain.
-    /// Manual certificates take precedence over ACME-issued ones.
+    /// 📜 Adds an explicitly configured PEM pair with the highest precedence.
     pub fn add_manual_cert(&self, domain: &str, cert_pem: String, key_pem: String) {
         self.manual_pem_certs
             .write()
             .insert(domain.to_string(), (cert_pem, key_pem));
     }
 
-    /// 🔍 Resolve a certificate PEM pair WITHOUT triggering ACME issuance.
+    /// 🏛️ Enables local issuance for one configured domain and eagerly prepares its leaf.
+    pub async fn enable_internal_domain(
+        &self,
+        domain: &str,
+    ) -> Result<(String, String), InternalCaError> {
+        let domain = normalize_internal_domain(domain);
+        let certificate = self.internal_ca.get_or_issue(&domain).await?;
+        self.internal_domains.write().insert(domain);
+        Ok((certificate.cert_pem, certificate.key_pem))
+    }
+
+    /// 🌳 Returns the public root certificate for trust-store installation.
+    pub async fn internal_root_certificate_pem(&self) -> Result<String, InternalCaError> {
+        self.internal_ca.root_certificate_pem().await
+    }
+
+    /// 🔍 Resolves existing or locally renewable PEM without starting public ACME issuance.
     ///
-    /// Checks manual certificates first, then certificates already present in
-    /// the ACME store cache. Unlike [`TlsManager::resolve_pem`] this never
-    /// starts an issuance flow — it only surfaces material that already
-    /// exists. Used to populate the HTTP/3 SNI certificate table, where new
-    /// issuance must stay on the lazy HTTP/1.1 handshake path.
+    /// 🧭 This path may renew a configured internal leaf, but it never starts
+    /// public ACME issuance. HTTP/3 uses it to refresh the SNI certificate table.
     pub async fn peek_pem(&self, domain: &str) -> Option<(String, String)> {
-        // 1. Manual certs (PEM pair configured in the config file)
+        // 📜 Explicit PEM pairs always take precedence.
         let manual = self.manual_pem_certs.read().get(domain).cloned();
         if let Some(pems) = manual {
             return Some(pems);
         }
 
-        // 2. Already-issued ACME certs (store cache only — no issuance)
+        // 🏛️ Configured internal leaves can renew without contacting a public issuer.
+        let internal_domain = normalize_internal_domain(domain);
+        if self.internal_domains.read().contains(&internal_domain) {
+            return match self.internal_ca.get_or_issue(&internal_domain).await {
+                Ok(cert) => Some((cert.cert_pem, cert.key_pem)),
+                Err(error) => {
+                    tracing::error!(
+                        "❌ Failed to resolve internal certificate for {}: {}",
+                        domain,
+                        error
+                    );
+                    None
+                }
+            };
+        }
+
+        // 🗃️ Public certificates are read only from the existing ACME cache.
         if let Some(auto) = &self.auto_https
             && let Some(cert) = auto.cached_certificate(domain).await
         {
@@ -155,15 +192,31 @@ impl TlsManager {
         None
     }
 
-    /// 🔍 Resolve a certificate for a client hello (SNI) as PEM
+    /// 🔍 Resolves a PEM pair for a client hello.
     pub async fn resolve_pem(&self, domain: &str) -> Option<(String, String)> {
-        // 1. Check manual certs (PEM pair configured in the config file)
+        // 📜 Explicit PEM pairs always take precedence.
         let manual = self.manual_pem_certs.read().get(domain).cloned();
         if let Some(pems) = manual {
             return Some(pems);
         }
 
-        // 2. Auto HTTPS (ACME store)
+        // 🏛️ Internal domains must never fall through to public ACME issuance.
+        let internal_domain = normalize_internal_domain(domain);
+        if self.internal_domains.read().contains(&internal_domain) {
+            return match self.internal_ca.get_or_issue(&internal_domain).await {
+                Ok(cert) => Some((cert.cert_pem, cert.key_pem)),
+                Err(error) => {
+                    tracing::error!(
+                        "❌ Failed to resolve internal certificate for {}: {}",
+                        domain,
+                        error
+                    );
+                    None
+                }
+            };
+        }
+
+        // 🌐 Remaining names may use automatic public HTTPS.
         if let Some(auto) = &self.auto_https {
             match auto
                 .get_certificate(domain, self.challenge_handler.as_ref())
@@ -180,9 +233,9 @@ impl TlsManager {
         None
     }
 
-    /// 🔍 Resolve a certificate for a client hello (SNI) as rustls CertifiedKey
+    /// 🔍 Resolves a parsed rustls certificate for a client hello.
     pub async fn resolve_cert(&self, domain: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        // 1. Check manual certs (PEM pair configured in the config file)
+        // 📜 Explicit PEM pairs always take precedence.
         let manual = self.manual_pem_certs.read().get(domain).cloned();
         if let Some((cert_pem, key_pem)) = manual {
             let cert = crate::Certificate {
@@ -204,7 +257,7 @@ impl TlsManager {
             }
         }
 
-        // 2. Check cached CertifiedKey (fast path - no PEM parsing)
+        // ⚡ Parsed certificates avoid repeated PEM work until the bounded TTL expires.
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::from_secs(0))
@@ -213,7 +266,6 @@ impl TlsManager {
         {
             let cache_guard = self.cached_certs.read();
             if let Some(cached) = cache_guard.get(domain) {
-                // Check if cache entry is still valid (not expired by TTL)
                 if current_time < cached.expires_at {
                     tracing::debug!("🔐 Using cached CertifiedKey for {}", domain);
                     return Some(cached.certified_key.clone());
@@ -226,40 +278,29 @@ impl TlsManager {
             }
         }
 
-        // 3. Auto HTTPS (may need to fetch/renew from ACME)
+        // 🏛️ Internal domains must never fall through to public ACME issuance.
+        let internal_domain = normalize_internal_domain(domain);
+        if self.internal_domains.read().contains(&internal_domain) {
+            return match self.internal_ca.get_or_issue(&internal_domain).await {
+                Ok(cert) => self.cache_rustls_certificate(domain, &cert),
+                Err(error) => {
+                    tracing::error!(
+                        "❌ Failed to resolve internal certificate for {}: {}",
+                        domain,
+                        error
+                    );
+                    None
+                }
+            };
+        }
+
+        // 🌐 Remaining names may use automatic public HTTPS.
         if let Some(auto) = &self.auto_https {
             match auto
                 .get_certificate(domain, self.challenge_handler.as_ref())
                 .await
             {
-                Ok(cert) => {
-                    // Convert to rustls CertifiedKey and cache it
-                    if let Ok(key) = self.convert_to_rustls(&cert) {
-                        let key_arc = Arc::new(key);
-                        let current_time = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or(Duration::from_secs(0))
-                            .as_secs();
-                        let expires_at = current_time + self.cache_ttl.as_secs();
-
-                        let cached_entry = CachedCert {
-                            certified_key: key_arc.clone(),
-                            expires_at,
-                            cached_at: current_time,
-                        };
-
-                        // Cache the converted key to avoid future PEM parsing
-                        self.cached_certs
-                            .write()
-                            .insert(domain.to_string(), cached_entry);
-                        tracing::info!(
-                            "🔐 Cached new CertifiedKey for {} (expires in {}s)",
-                            domain,
-                            self.cache_ttl.as_secs()
-                        );
-                        return Some(key_arc);
-                    }
-                }
+                Ok(cert) => return self.cache_rustls_certificate(domain, &cert),
                 Err(e) => {
                     tracing::warn!("❌ Failed to obtain cert for {}: {}", domain, e);
                 }
@@ -269,14 +310,48 @@ impl TlsManager {
         None
     }
 
-    /// Convert internal Certificate to rustls::sign::CertifiedKey
+    /// ⚡ Parses and caches one generated certificate for rustls consumers.
+    fn cache_rustls_certificate(
+        &self,
+        domain: &str,
+        cert: &crate::Certificate,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let key = match self.convert_to_rustls(cert) {
+            Ok(key) => key,
+            Err(error) => {
+                tracing::error!("❌ Failed to parse certificate for {}: {}", domain, error);
+                return None;
+            }
+        };
+        let key = Arc::new(key);
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
+        self.cached_certs.write().insert(
+            domain.to_string(),
+            CachedCert {
+                certified_key: key.clone(),
+                expires_at: current_time + self.cache_ttl.as_secs(),
+                cached_at: current_time,
+            },
+        );
+        tracing::info!(
+            "🔐 Cached a parsed certificate for {} for {}s",
+            domain,
+            self.cache_ttl.as_secs()
+        );
+        Some(key)
+    }
+
+    /// 🔧 Converts one PEM certificate bundle into a rustls signing key.
     fn convert_to_rustls(
         &self,
         cert: &crate::Certificate,
     ) -> Result<rustls::sign::CertifiedKey, String> {
         use rustls::pki_types::CertificateDer;
 
-        // Parse Chain
+        // 🔗 Parse the complete certificate chain in leaf-first order.
         let mut reader = std::io::Cursor::new(&cert.cert_pem);
         let certs: Vec<CertificateDer> = rustls_pemfile::certs(&mut reader)
             .filter_map(|r| r.ok())
@@ -286,26 +361,25 @@ impl TlsManager {
             return Err("No certificates found".to_string());
         }
 
-        // Parse Key
+        // 🔑 Parse the private key corresponding to the leaf certificate.
         let mut reader = std::io::Cursor::new(&cert.key_pem);
         let key = rustls_pemfile::private_key(&mut reader)
             .map_err(|e| e.to_string())?
             .ok_or("No private key found")?;
 
-        // Verify key type
-        // Verify key type
+        // 🛡️ Reject key types that the configured rustls provider cannot sign with.
         let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
             .map_err(|_| "Unsupported key type".to_string())?;
 
         Ok(rustls::sign::CertifiedKey::new(certs, signing_key))
     }
 
-    /// Get the challenge handler for HTTP-01
+    /// 🚦 Returns the configured HTTP-01 challenge handler.
     pub fn challenge_handler(&self) -> Arc<dyn ChallengeHandler> {
         self.challenge_handler.clone()
     }
 
-    /// Clean expired cache entries
+    /// 🧹 Removes expired parsed certificate cache entries.
     pub fn cleanup_expired_cache(&self) {
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -318,10 +392,15 @@ impl TlsManager {
         tracing::debug!("🧹 Cleaned expired certificate cache entries");
     }
 
-    /// Update cache TTL
+    /// ⏳ Updates the parsed certificate cache lifetime.
     pub fn set_cache_ttl(&mut self, ttl: Duration) {
         self.cache_ttl = ttl;
     }
+}
+
+/// 🔤 Normalizes DNS case and a trailing absolute-name dot for SNI comparison.
+fn normalize_internal_domain(domain: &str) -> String {
+    domain.trim_end_matches('.').to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -375,5 +454,57 @@ mod tests {
 
         // Unknown domains return None without triggering any issuance flow.
         assert!(manager.peek_pem("other.example.com").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn internal_certificate_is_persistent_and_visible_to_h3() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = TlsManager::new_with_memory_challenges(None, directory.path());
+        let first = manager
+            .enable_internal_domain("Origin.Example.Test.")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager.peek_pem("origin.example.test").await,
+            Some(first.clone())
+        );
+        assert_eq!(
+            manager.resolve_pem("origin.example.test").await,
+            Some(first.clone())
+        );
+        assert!(
+            manager
+                .resolve_pem("unconfigured.example.test")
+                .await
+                .is_none()
+        );
+
+        let restarted = TlsManager::new_with_memory_challenges(None, directory.path());
+        let second = restarted
+            .enable_internal_domain("origin.example.test")
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn manual_certificate_precedes_internal_issuance() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = TlsManager::new_with_memory_challenges(None, directory.path());
+        manager
+            .enable_internal_domain("origin.example.test")
+            .await
+            .unwrap();
+        manager.add_manual_cert(
+            "origin.example.test",
+            "MANUAL_CERT".to_string(),
+            "MANUAL_KEY".to_string(),
+        );
+
+        assert_eq!(
+            manager.resolve_pem("origin.example.test").await,
+            Some(("MANUAL_CERT".to_string(), "MANUAL_KEY".to_string()))
+        );
     }
 }
