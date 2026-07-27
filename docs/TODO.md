@@ -90,12 +90,27 @@ cargo test --locked --workspace
 - **範圍外（仍留 Day 21）**：rotation／retention／壓縮／bounded async writer。
   目前寫入是同步的，磁碟卡住會擋住呼叫端——這正是 Day 21 存在的理由。
 
-### 🔨 Day 3 — secret redaction 與 Cloudflare client identity
+### 🔨 Day 3 — secret redaction 與 Cloudflare client identity ✔ `81aabc5`
 
-- 預設遮罩 `Authorization`、`Cookie`、`Set-Cookie`、API key 等敏感欄位。
-- 受信 cloudflared 注入的 `CF-Connecting-IP` 映射為 verified client IP，
-  接上既有的 `trusted_proxies` 機制。
-- **完成判定**：未受信來源無法偽造 `CF-Connecting-IP`；log 中敏感欄位確實被遮罩。
+**已完成 2026-07-27。** 新增 `pingclair-proxy/src/redaction.rs`。
+
+- ✅ `CF-Connecting-IP` 只在 `trusted_proxies` 分支內讀取，優先於 XFF chain
+  （Cloudflare 定義它是唯一的原始訪客位址，不需走鏈也不會歧義）。
+  畸形值退回正常 chain，不退回攻擊者同樣可控的東西。
+- ✅ 預設遮罩：query 參數（token／key／secret／password／credential／auth／
+  signature／session／code 家族）與 **Referer**。access log 現在記錄完整
+  request target 而非只有 path——operator 需要 query，而它只有先遮罩才安全。
+- ✅ header 比對用精確匹配而非子串，`x-cookie-preference` 不會被誤判為 `cookie`。
+- ✅ 真 binary 雙向驗證：可信 peer 的 `CF-Connecting-IP` 生效
+  （client_ip = 203.0.113.77）；把 127.0.0.1 移出 `trusted_proxies` 後，
+  偽造的 `CF-Connecting-IP` + `XFF` + `X-Real-IP` **全部被忽略**。
+- ✅ Gate 四項全綠，284 → **299 tests**。
+
+> ⚠️ **Referer 是最隱蔽的洩漏面**：它帶的是*前一頁*的 URL，所以 OAuth 的
+> `?code=` 可能在本次請求 URI 完全乾淨的情況下照樣進 log。
+
+- **範圍外**：`Authorization`／`Cookie` 目前不會進 access log（沒有 header
+  logging 功能），`is_sensitive_header()` 已備妥供 Day 21 記錄 header 時使用。
 
 ### 🔨 Day 4 — 反代 zstd／gzip 協商
 
@@ -424,7 +439,7 @@ H3 CORS／rewrite／error_page parity。
 
 | 里程碑 | 範圍 | 狀態 |
 |---|---|---|
-| M1 生產站可替換 | Day 1–7 | 🔨 進行中（Day 1–2 ✔） |
+| M1 生產站可替換 | Day 1–7 | 🔨 進行中（Day 1–3 ✔） |
 | M2 生產護欄 | Day 8–15 | ⬜ 未開始 |
 | M3 接上 Pingora 能力（含 `proxy_cache`） | Day 16–20 | ⬜ 未開始 |
 | M4 可觀測性與運維 | Day 21–24 | ⬜ 未開始 |
