@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! Load Balancing for Pingclair
 //!
 //! Wraps Pingora's native `LoadBalancer` to provide a consistent interface for

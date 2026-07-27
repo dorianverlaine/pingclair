@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! Request handlers for Pingclair
 //!
 //! Provides handlers for respond, redirect, and headers operations.

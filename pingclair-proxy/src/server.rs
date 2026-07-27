@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! Pingclair HTTP Proxy implementation using Pingora
 //!
 //! 🌐 This module implements the core reverse proxy using Pingora's ProxyHttp trait.

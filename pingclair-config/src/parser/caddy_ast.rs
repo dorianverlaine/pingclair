@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! Generic AST for Caddyfile syntax
 //!
 //! This AST represents the structure of a Caddyfile:

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! 🔤 Lexer for the Pingclair configuration DSL.
 //!
 //! Tokenizes the Caddyfile-style DSL.

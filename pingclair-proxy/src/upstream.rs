@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! Upstream Server Management
 //!
 //! Provides types and helpers for defining and creating backend servers.

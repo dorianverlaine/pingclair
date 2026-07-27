@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 use async_trait::async_trait;
 use ipnet::IpNet;
 use pingora_core::listeners::ConnectionFilter;

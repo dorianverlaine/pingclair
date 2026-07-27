@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! API route definitions
 
 use pingclair_core::config::PingclairConfig;

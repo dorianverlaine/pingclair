@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! 🌳 Abstract syntax tree for the Pingclair configuration DSL.
 //!
 //! This module defines every node produced by the parser.

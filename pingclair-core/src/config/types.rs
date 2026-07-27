@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! Configuration type definitions
 //!
 //! These types represent the runtime configuration for Pingclair.

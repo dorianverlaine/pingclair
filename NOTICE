@@ -1,0 +1,40 @@
+Pingclair
+Copyright 2026 Dorian Verlaine
+
+This product includes software developed for the Pingclair project
+(https://github.com/dorianverlaine/pingclair).
+
+Licensed under the Apache License, Version 2.0. You may obtain a copy of the
+License in the LICENSE file distributed with this work, or at
+http://www.apache.org/licenses/LICENSE-2.0
+
+--------------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------------
+
+This product depends on software developed by third parties. The following are
+the principal components; each is distributed under its own license, and those
+licenses govern the corresponding component rather than this NOTICE.
+
+Cloudflare Pingora (pingora-core, pingora-proxy, pingora-http, pingora-cache,
+pingora-load-balancing, pingora-limits, pingora-ketama, pingora-timeout)
+  Copyright Cloudflare, Inc.
+  Licensed under the Apache License, Version 2.0.
+  https://github.com/cloudflare/pingora
+
+Cloudflare quiche
+  Copyright Cloudflare, Inc.
+  Licensed under the BSD 2-Clause License.
+  https://github.com/cloudflare/quiche
+
+BoringSSL, via the `boring` and `boring-sys` crates
+  Copyright Google Inc. and the OpenSSL project authors.
+  BoringSSL is a fork of OpenSSL; portions fall under OpenSSL licensing, and
+  files original to BoringSSL carry a Google copyright and an ISC license.
+  See the LICENSE file shipped with `boring-sys` for the full terms.
+  https://github.com/google/boringssl
+
+The HTTP/3 server in pingclair-proxy/src/quic.rs follows the structure of
+quiche's examples/http3-server.rs, adapted to a tokio event loop.
+
+A complete dependency inventory with resolved versions is in Cargo.lock.

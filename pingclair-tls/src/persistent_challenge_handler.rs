@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! Persistent Challenge Handler
 //!
 //! 💾 ACME Challenge Handler that persists tokens to disk.

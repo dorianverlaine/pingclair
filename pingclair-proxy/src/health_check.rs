@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! Native Health Checking for Pingclair
 //!
 //! Implements Pingora's `HealthCheck` trait for custom health checking logic.

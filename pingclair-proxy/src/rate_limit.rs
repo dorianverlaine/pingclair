@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! Native Rate Limiting for Pingclair
 //!
 //! Implements high-performance rate limiting using Pingora's native `pingora-limits` crate.

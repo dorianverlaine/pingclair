@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! ACME Protocol Client
 //!
 //! 🔐 Provides automatic certificate issuance and renewal via Let's Encrypt (or compatible ACME providers).

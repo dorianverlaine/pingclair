@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! Recursive Descent Parser for Caddyfile syntax
 //!
 //! Consumes tokens and produces a Generic Directive AST.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! 🙈 Default redaction of secrets before anything reaches a log.
 //!
 //! Access logs get shipped, indexed and retained far longer than anyone

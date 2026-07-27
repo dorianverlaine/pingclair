@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! Pingclair - A modern web server built on Pingora
 //!
 //! This is the main entry point for the Pingclair CLI.

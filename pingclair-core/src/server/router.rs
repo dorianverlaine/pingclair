@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
 //! High-performance route matcher using radix tree
 //!
 //! Provides O(log n) path matching with support for wildcards and parameters.
