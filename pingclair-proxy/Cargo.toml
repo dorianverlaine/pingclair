@@ -29,6 +29,7 @@ prometheus.workspace = true
 async-recursion = "1.0"
 ipnet.workspace = true
 flate2 = "1.0"
+zstd = "0.13"
 arc-swap.workspace = true
 regex = "1"
 futures = "0.3"

@@ -128,8 +128,12 @@ pub struct ServerBlock {
     /// Bind address
     pub bind: Option<String>,
 
-    /// Compression algorithms
-    pub compress: Vec<CompressionAlgo>,
+    /// Content codings from the `encode` directive, in the order written —
+    /// that order is the server's preference when negotiating.
+    ///
+    /// `None` means the directive was absent (inherit the default), which is
+    /// a different thing from `Some(vec![])`, meaning `encode off`.
+    pub compress: Option<Vec<CompressionAlgo>>,
 
     /// 🗜️ MIME patterns eligible for reverse-proxy gzip compression.
     pub gzip_types: Vec<String>,
@@ -606,7 +610,7 @@ impl ServerBlock {
             name,
             listens: Vec::new(),
             bind: None,
-            compress: Vec::new(),
+            compress: None,
             gzip_types: Vec::new(),
             log: None,
             tls: None,
@@ -666,6 +670,8 @@ mod tests {
         let server = ServerBlock::new("example.com".to_string());
         assert_eq!(server.name, "example.com");
         assert!(server.listens.is_empty());
-        assert!(server.compress.is_empty());
+        // `None`, not `Some(vec![])` — a fresh block has no `encode`
+        // directive, which inherits the default rather than meaning "off".
+        assert!(server.compress.is_none());
     }
 }

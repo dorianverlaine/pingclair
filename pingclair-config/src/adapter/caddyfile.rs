@@ -329,18 +329,54 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                     });
                 }
                 "compress" | "encode" => {
-                    // Caddy uses `encode gzip` / `encode zstd`
+                    // Caddy spells this `encode zstd gzip`, and argument order
+                    // is meaningful: it is the server's preference order when
+                    // several codings are acceptable to the client.
+                    //
+                    // Unknown arguments are rejected rather than skipped. The
+                    // old loop ignored them, so `encode gzipp` silently gave a
+                    // server that still compressed (via the unconditional
+                    // gzip path) and looked like it had honored the typo.
+                    let mut algos = Vec::with_capacity(sub_d.args.len());
                     for arg in &sub_d.args {
-                        match arg.to_lowercase().as_str() {
-                            "gzip" => server.compress.push(CompressionAlgo::Gzip),
-                            "br" | "brotli" => server.compress.push(CompressionAlgo::Br),
-                            "zstd" => server.compress.push(CompressionAlgo::Zstd),
-                            _ => {}
+                        let algo = match arg.to_lowercase().as_str() {
+                            // `off`/`none` is the only way to opt a server out
+                            // of response compression, so it may not be mixed
+                            // with codings.
+                            "off" | "none" => {
+                                if sub_d.args.len() > 1 {
+                                    return Err(AdapterError::InvalidArgument(
+                                        sub_d.name.clone(),
+                                        "`off` cannot be combined with other codings".into(),
+                                    ));
+                                }
+                                server.compress = Some(Vec::new());
+                                continue;
+                            }
+                            "gzip" => CompressionAlgo::Gzip,
+                            "br" | "brotli" => CompressionAlgo::Br,
+                            "zstd" => CompressionAlgo::Zstd,
+                            other => {
+                                return Err(AdapterError::InvalidArgument(
+                                    sub_d.name.clone(),
+                                    format!(
+                                        "unknown coding `{other}` (expected gzip, zstd, br or off)"
+                                    ),
+                                ));
+                            }
+                        };
+                        // Duplicates would just be dead entries in the
+                        // preference list; keep the first mention's rank.
+                        if !algos.contains(&algo) {
+                            algos.push(algo);
                         }
                     }
-                    // If `encode` has no args, default to gzip
+                    // Bare `encode` with no arguments means gzip, as before.
                     if sub_d.args.is_empty() {
-                        server.compress.push(CompressionAlgo::Gzip);
+                        algos.push(CompressionAlgo::Gzip);
+                    }
+                    if !algos.is_empty() {
+                        server.compress = Some(algos);
                     }
                 }
                 "gzip_types" => {
