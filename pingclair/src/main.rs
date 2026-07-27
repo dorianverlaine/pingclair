@@ -311,6 +311,7 @@ fn main() -> anyhow::Result<()> {
                 client_max_body_size: 10 * 1024 * 1024, // 10MB
                 security: Default::default(),
                 gzip_types: pingclair_core::config::default_gzip_types(),
+                encodings: pingclair_core::config::default_encodings(),
                 error_pages: Default::default(),
             };
 
@@ -362,6 +363,7 @@ fn main() -> anyhow::Result<()> {
                 client_max_body_size: 10 * 1024 * 1024,
                 security: Default::default(),
                 gzip_types: pingclair_core::config::default_gzip_types(),
+                encodings: pingclair_core::config::default_encodings(),
                 error_pages: Default::default(),
             };
 

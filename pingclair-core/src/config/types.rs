@@ -113,8 +113,55 @@ pub fn default_gzip_types() -> Vec<String> {
         .collect()
 }
 
+/// 🗜️ A content coding Pingclair can actually *produce* for a proxied response.
+///
+/// Deliberately narrower than what the config grammar accepts: the parser also
+/// understands `br`, but the reverse-proxy path has no streaming Brotli
+/// encoder, so the compiler rejects it rather than silently downgrading to
+/// gzip. Anything present in this enum is guaranteed to have a working encoder
+/// behind it — that invariant is what lets the negotiator treat the configured
+/// list as offerable without further checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Encoding {
+    Gzip,
+    Zstd,
+}
+
+impl Encoding {
+    /// The `Content-Encoding` / `Accept-Encoding` token for this coding.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Gzip => "gzip",
+            Self::Zstd => "zstd",
+        }
+    }
+
+    /// Parses an `Accept-Encoding` token into a coding we can produce.
+    ///
+    /// Returns `None` for well-formed codings we simply do not implement
+    /// (`br`, `deflate`, …) as well as for junk — the caller treats both the
+    /// same way, by offering something else.
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "gzip" | "x-gzip" => Some(Self::Gzip),
+            "zstd" => Some(Self::Zstd),
+            _ => None,
+        }
+    }
+}
+
+/// 🗜️ Codings offered when a server declares no `encode` directive at all.
+///
+/// Gzip-only, which is what every Pingclair release through `0.1.7` did
+/// unconditionally. Keeping it as the default means making `encode` real is
+/// not a silent behavior change for configs that never mentioned it.
+pub fn default_encodings() -> Vec<Encoding> {
+    vec![Encoding::Gzip]
+}
+
 /// Server (virtual host) configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// Server name / hostname
     pub name: Option<String>,
@@ -147,11 +194,42 @@ pub struct ServerConfig {
     #[serde(default = "default_gzip_types")]
     pub gzip_types: Vec<String>,
 
+    /// 🗜️ Content codings offered for proxied responses, in *server*
+    /// preference order — the order the `encode` directive listed them.
+    ///
+    /// An empty list disables response compression for this server entirely
+    /// (`encode off`); the field is absent from older JSON configs, which
+    /// fall back to [`default_encodings`].
+    #[serde(default = "default_encodings")]
+    pub encodings: Vec<Encoding>,
+
     /// Custom error pages: HTTP status code → file path served for that
     /// error (404/500/502/504, ...). Falls back to the built-in plain-text
     /// response when unset or unreadable.
     #[serde(default)]
     pub error_pages: HashMap<u16, String>,
+}
+
+/// Hand-written rather than derived so `ServerConfig::default()` agrees with
+/// what deserializing `{}` produces. `#[derive(Default)]` ignores the
+/// `#[serde(default = ...)]` attributes, which would silently hand out
+/// `client_max_body_size: 0` (unlimited) and an empty `encodings` list
+/// (compression off) — both the opposite of the documented default.
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            name: None,
+            listen: Vec::new(),
+            tls: None,
+            routes: Vec::new(),
+            log: None,
+            client_max_body_size: default_body_limit(),
+            security: SecurityConfig::default(),
+            gzip_types: default_gzip_types(),
+            encodings: default_encodings(),
+            error_pages: HashMap::new(),
+        }
+    }
 }
 
 fn default_body_limit() -> u64 {
@@ -798,6 +876,7 @@ mod tests {
             client_max_body_size: 1024 * 1024,
             security: Default::default(),
             gzip_types: default_gzip_types(),
+            encodings: default_encodings(),
             error_pages: Default::default(),
         };
         assert_eq!(config.name, Some("example.com".to_string()));
@@ -808,6 +887,50 @@ mod tests {
         let config: ServerConfig = serde_json::from_str(r#"{"name":"example.com"}"#).unwrap();
         assert_eq!(config.gzip_types, default_gzip_types());
         assert!(config.gzip_types.contains(&"text/*".to_string()));
+    }
+
+    /// 🗜️ A `0.1.7` JSON config predates the `encodings` field entirely. It
+    /// must keep compressing exactly as it did — gzip — rather than silently
+    /// losing compression on upgrade.
+    #[test]
+    fn test_legacy_server_config_keeps_gzip_compression() {
+        let config: ServerConfig = serde_json::from_str(r#"{"name":"example.com"}"#).unwrap();
+        assert_eq!(config.encodings, vec![Encoding::Gzip]);
+    }
+
+    /// An explicitly empty list is `encode off`, and must survive a
+    /// round-trip as "no compression" rather than being re-defaulted.
+    #[test]
+    fn test_empty_encodings_round_trips_as_compression_off() {
+        let config: ServerConfig =
+            serde_json::from_str(r#"{"name":"example.com","encodings":[]}"#).unwrap();
+        assert!(config.encodings.is_empty());
+
+        let round_tripped: ServerConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert!(round_tripped.encodings.is_empty());
+    }
+
+    #[test]
+    fn test_encodings_serialize_as_wire_tokens() {
+        let json = serde_json::to_string(&vec![Encoding::Zstd, Encoding::Gzip]).unwrap();
+        assert_eq!(json, r#"["zstd","gzip"]"#);
+    }
+
+    /// `ServerConfig::default()` must agree with deserializing `{}` — a
+    /// derived `Default` silently disagrees with the `#[serde(default = ...)]`
+    /// attributes and hands out an unlimited body limit and no compression.
+    #[test]
+    fn test_default_matches_deserializing_an_empty_object() {
+        let defaulted = ServerConfig::default();
+        let deserialized: ServerConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            defaulted.client_max_body_size,
+            deserialized.client_max_body_size
+        );
+        assert_eq!(defaulted.client_max_body_size, 1024 * 1024);
+        assert_eq!(defaulted.encodings, deserialized.encodings);
+        assert_eq!(defaulted.gzip_types, deserialized.gzip_types);
     }
 
     #[test]

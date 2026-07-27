@@ -112,14 +112,45 @@ cargo test --locked --workspace
 - **範圍外**：`Authorization`／`Cookie` 目前不會進 access log（沒有 header
   logging 功能），`is_sensitive_header()` 已備妥供 Day 21 記錄 header 時使用。
 
-### 🔨 Day 4 — 反代 zstd／gzip 協商
+### 🔨 Day 4 — 反代 zstd／gzip 協商 ✔
 
-`encode zstd gzip` 目前 parser 接受，但 algorithm list 沒編譯進 runtime；
-反代實際只有 gzip，且是否壓縮並非真由該 directive 控制。
+**已完成 2026-07-27。** 新增 `pingclair-proxy/src/encoding.rs`。
 
-- algorithm list 編譯進 runtime，依 `Accept-Encoding` 正確協商。
-- **完成判定**：反代回應能協商出 zstd；SSE 與大 body 的串流與 bounded memory
-  保證不被破壞（這點必須有測試，不能只看能不能壓）。
+- ✅ algorithm list 編譯進 runtime（`ServerConfig::encodings`），directive 的
+  **參數順序就是 server 偏好順序**。
+- ✅ 協商遵守 RFC 9110：q-value 優先於 server 偏好、`q=0` 視為拒絕、
+  `*` wildcard、顯式提及永遠勝過 wildcard（不論先後）。畸形 q 當作可接受
+  而非拒絕——這個 header 是建議性的，client 送垃圾不該換來壞掉的回應。
+- ✅ `encode off` 讓 directive 真正能**關掉**壓縮；沒寫 directive 時預設 gzip，
+  所以 `0.1.7` 的既有配置行為完全不變。
+- ✅ `encode br` 在 **compile time 直接報錯**，不靜默降級成 gzip。
+  parser 仍接受 `br`（野生 Caddyfile 會寫），但 proxy 沒有 streaming Brotli
+  encoder，假裝支援只會在很久以後從一個沒人要求過的 `Content-Encoding` 被發現。
+- ✅ zstd 走**同一條 bounded-memory 路徑**：每個 chunk 寫入 → sync flush →
+  `mem::take` 排空，記憶體由 chunk 大小決定而非 body 大小。
+- ✅ 真 binary 驗證（見下表）：13 種 `Accept-Encoding` × 4 種 server 配置全部
+  符合預期；zstd/gzip body **byte-exact** 還原；SSE 仍以來源的 400ms 節奏
+  逐筆抵達；40 併發 × 9.4MB（367MB in flight）RSS 只成長 21MB／9MB。
+- ✅ Gate 四項全綠，299 → **320 tests**。
+
+| 場景 | `Accept-Encoding` | 結果 |
+|---|---|---|
+| 現代瀏覽器 | `gzip, deflate, br, zstd` | `zstd` |
+| 舊瀏覽器 | `gzip, deflate, br` | `gzip` |
+| 只收 br | `br` | identity（我們不產 Brotli） |
+| client 用 q 表態 | `zstd;q=0.1, gzip;q=1.0` | `gzip` |
+| client 拒絕 zstd | `zstd;q=0, gzip` | `gzip` |
+| `encode off` | `gzip, zstd` | identity |
+| `< 256` bytes／已編碼／`text/event-stream` | 任意 | identity |
+
+> ⚠️ **bounded memory 必須是測試而非註解**。`encoding.rs` 的
+> `memory_stays_bounded_by_chunk_size_not_body_size` 對兩種 coding 各推 64MiB，
+> 斷言單一 chunk 輸出不接近 body 大小。寫這個測試時第一版自己踩了坑：
+> 每個 chunk 餵**同一塊** 64KiB，zstd 的 window 直接把 64MiB 去重成 15KB，
+> 於是「輸出有在流動」的斷言假性失敗——payload 必須逐 chunk 唯一且不可壓縮。
+
+- **範圍外**：Brotli（需要 streaming encoder，排 v0.3）；靜態檔案路徑的協商
+  仍走 `pingclair-static` 既有的預壓縮邏輯，本日未動。
 
 ### 🔨 Day 5 — Docker DNS 重解析
 

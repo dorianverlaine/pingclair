@@ -3,11 +3,12 @@
 //! This module converts the AST into a runtime `PingclairConfig`.
 
 use crate::parser::ast::*;
+use pingclair_core::config::Encoding as CoreEncoding;
 use pingclair_core::config::{
     AccessControlConfig as CoreAccessControlConfig, AdminConfig, HandlerConfig, LoadBalanceConfig,
     LogConfig, LogFormat as CoreLogFormat, LogOutput as CoreLogOutput, Matcher as CoreMatcher,
     MatcherCondition, PingclairConfig, ProxyUpstream, ReverseProxyConfig, RouteConfig,
-    ServerConfig, TlsConfig, default_gzip_types,
+    ServerConfig, TlsConfig, default_encodings, default_gzip_types,
 };
 use pingclair_core::server::{MAX_BCRYPT_COST, bcrypt_hash_cost};
 use std::collections::HashMap;
@@ -82,6 +83,35 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
     Ok(())
 }
 
+/// 🗜️ Lowers the `encode` directive into the runtime's coding preference list.
+///
+/// The grammar accepts `br` because Caddyfiles in the wild write it, but the
+/// reverse-proxy body filter has no streaming Brotli encoder. Rejecting it
+/// here is deliberate: the alternative is to drop it from the list and quietly
+/// serve gzip, which looks identical in a smoke test and is only discovered
+/// much later, from a `Content-Encoding` that was never asked for.
+fn compile_encodings(server: &ServerBlock) -> CompileResult<Vec<CoreEncoding>> {
+    let Some(algos) = &server.compress else {
+        return Ok(default_encodings());
+    };
+
+    let mut encodings = Vec::with_capacity(algos.len());
+    for algo in algos {
+        encodings.push(match algo {
+            CompressionAlgo::Gzip => CoreEncoding::Gzip,
+            CompressionAlgo::Zstd => CoreEncoding::Zstd,
+            CompressionAlgo::Br => {
+                return Err(CompileError::UnsupportedFeature {
+                    feature: "`encode br`: Brotli is not implemented for proxied responses; \
+                              use `encode zstd gzip`"
+                        .to_string(),
+                });
+            }
+        });
+    }
+    Ok(encodings)
+}
+
 fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
     let mut config = ServerConfig {
         name: Some(server.name.clone()),
@@ -96,6 +126,7 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         } else {
             server.gzip_types.clone()
         },
+        encodings: compile_encodings(server)?,
         error_pages: server.error_pages.iter().cloned().collect(),
     };
 

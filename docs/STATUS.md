@@ -169,6 +169,12 @@ commit `0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。
   H3 已本機驗證，待公網 QUIC 驗證。
 - **反代 `gzip_types`**（2026-07-26）— 支援精確 MIME、`text/*`、`application/*+json`、`*/*`；
   自訂 `application/wasm` 已以真 binary 驗證。
+- **反代 zstd／gzip 協商**（2026-07-27）— `encode zstd gzip` 的參數順序即 server 偏好順序；
+  協商遵守 q-value、`q=0` 拒絕與 `*` wildcard，client 的明確偏好勝過 server 順序。
+  `encode off` 可關閉壓縮；`encode br` 在 compile time 報錯而非靜默降級。
+  zstd 與 gzip 共用同一條 bounded-memory streaming 路徑：真 binary 下 40 併發
+  × 9.4MB（367MB in flight）RSS 僅成長 21MB（zstd）／9MB（gzip），
+  body byte-exact 還原，SSE 仍逐筆增量抵達。
 - **`admin.api_key` DSL**、**`basic_auth` DSL**、**`redir`／`redirect` DSL**（2026-07-26）。
 - **Workspace lint baseline**（2026-07-26）— 全 workspace 套用 Rust 1.88 rustfmt，
   通過 `cargo fmt --check` 與 clippy `-D warnings`；GitHub Actions 固定 Rust 1.88

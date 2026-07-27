@@ -21,6 +21,14 @@
   順序反了會永久阻塞並留下幽靈程序。
 - 真 binary 測試一律用**動態 port**與**唯一 readiness token**。固定 port 會讓
   舊程序被誤判為 ready，測試看似通過實則測到別的東西。
+- **真 binary drill 必須設 `PINGCLAIR_TLS_STORE` 指向可寫目錄**，即使配置裡
+  完全沒有 TLS。TLS manager 在讀配置前就無條件初始化，預設路徑不可寫時
+  直接 panic（`PermissionDenied`），而 log 只有一行看不出跟 TLS store 有關。
+- **`zsh` 不會對未加引號的變數做 word splitting**。`for x in "a 1" ...; set -- $x`
+  在 bash 能拆成兩個參數，在 zsh 只會得到一個——症狀是 `$2` 空白，很容易誤讀成
+  被測程式的問題。測試腳本改用明確參數的 function。
+- **壓縮測試的 payload 必須逐 chunk 唯一且不可壓縮**。重複同一塊資料會被
+  zstd 的 window 去重（64MiB → 15KB），讓「輸出有在流動」這類斷言**假性失敗**。
 
 ---
 

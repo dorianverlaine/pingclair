@@ -577,6 +577,125 @@ mod tests {
         assert!(compile(misplaced_wildcard).is_err());
     }
 
+    /// 🗜️ The `encode` directive's argument order is the server's preference
+    /// order, so it has to survive compilation intact rather than being
+    /// normalized into some fixed ranking.
+    #[test]
+    fn test_compile_encode_preserves_argument_order() {
+        use pingclair_core::config::Encoding;
+
+        let zstd_first = compile(
+            r#"
+            example.com {
+                encode zstd gzip
+                respond "OK"
+            }
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            zstd_first.servers[0].encodings,
+            vec![Encoding::Zstd, Encoding::Gzip]
+        );
+
+        let gzip_first = compile(
+            r#"
+            example.com {
+                encode gzip zstd
+                respond "OK"
+            }
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            gzip_first.servers[0].encodings,
+            vec![Encoding::Gzip, Encoding::Zstd]
+        );
+    }
+
+    #[test]
+    fn test_compile_encode_defaults_and_off() {
+        use pingclair_core::config::Encoding;
+
+        // No directive at all: gzip, matching every release through 0.1.7.
+        let implicit = compile(
+            r#"
+            example.com {
+                respond "OK"
+            }
+        "#,
+        )
+        .unwrap();
+        assert_eq!(implicit.servers[0].encodings, vec![Encoding::Gzip]);
+
+        // Bare `encode`: also gzip.
+        let bare = compile(
+            r#"
+            example.com {
+                encode
+                respond "OK"
+            }
+        "#,
+        )
+        .unwrap();
+        assert_eq!(bare.servers[0].encodings, vec![Encoding::Gzip]);
+
+        // `encode off` is the only way to get an empty list — the runtime
+        // reads that as "never compress on this server".
+        let off = compile(
+            r#"
+            example.com {
+                encode off
+                respond "OK"
+            }
+        "#,
+        )
+        .unwrap();
+        assert!(off.servers[0].encodings.is_empty());
+    }
+
+    /// Brotli parses (Caddyfiles in the wild write it) but has no streaming
+    /// encoder on the proxy path. It must fail loudly at compile time instead
+    /// of quietly serving gzip under a config that asked for `br`.
+    #[test]
+    fn test_compile_encode_rejects_unsupported_and_unknown_codings() {
+        for source in [
+            r#"example.com { encode br
+                respond "OK" }"#,
+            r#"example.com { encode zstd br
+                respond "OK" }"#,
+            r#"example.com { encode gzipp
+                respond "OK" }"#,
+            // `off` is exclusive: mixing it with a coding is contradictory.
+            r#"example.com { encode off gzip
+                respond "OK" }"#,
+        ] {
+            assert!(
+                compile(source).is_err(),
+                "should have been rejected: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compile_encode_deduplicates() {
+        use pingclair_core::config::Encoding;
+
+        let config = compile(
+            r#"
+            example.com {
+                encode zstd gzip zstd
+                respond "OK"
+            }
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.servers[0].encodings,
+            vec![Encoding::Zstd, Encoding::Gzip]
+        );
+    }
+
     #[test]
     fn test_compile_error_page() {
         let source = r#"

@@ -15,14 +15,12 @@ use pingora_proxy::{ProxyHttp, Session};
 
 use arc_swap::ArcSwap;
 use async_recursion::async_recursion;
-use flate2::Compression;
-use flate2::write::GzEncoder;
 use std::collections::HashMap;
-use std::io::Write;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::encoding::{ResponseEncoder, negotiate, stream_chunk};
 use crate::http_policy::{
     CorsDecision, ResponseHeaderPolicy, authority_host, evaluate_cors, generate_request_id,
     rewrite_uri, sanitize_request_id,
@@ -32,6 +30,7 @@ use crate::upstream::{HostName, Scheme, create_upstream};
 use crate::{HealthChecker, LoadBalancer, Strategy, Upstream};
 use bytes::Bytes;
 use ipnet::IpNet;
+use pingclair_core::config::Encoding;
 use regex::Regex;
 
 // MARK: - Context
@@ -48,17 +47,18 @@ pub struct RequestContext {
     pub headers_upstream: HashMap<String, String>,
     /// 🧭 Transport-neutral downstream response header mutations.
     pub(crate) response_headers: ResponseHeaderPolicy,
-    /// Whether response compression is enabled for this request
-    pub compress_response: bool,
-    /// Client accepts gzip
-    pub client_accepts_gzip: bool,
+    /// 🗜️ Coding agreed between this client's `Accept-Encoding` and the
+    /// server's `encode` list, or `None` for an identity response. Decided
+    /// once per request, before the upstream response exists.
+    pub negotiated_encoding: Option<Encoding>,
     /// Whether the matched route requested immediate per-chunk flushing
     /// (`flush_interval: -1`). When true, body chunks flow downstream as
     /// they arrive from upstream and response compression is disabled so
     /// SSE / LLM-style streaming endpoints work through the proxy.
     pub streaming_response: bool,
-    /// Gzip encoder accumulating response body chunks
-    pub gzip_encoder: Option<GzEncoder<Vec<u8>>>,
+    /// Streaming encoder for the response body, created in `response_filter`
+    /// once the upstream content type proves the body is worth compressing.
+    pub response_encoder: Option<ResponseEncoder>,
     /// Request method (for access log)
     pub request_method: String,
     /// Request path (for access log)
@@ -93,10 +93,9 @@ impl Default for RequestContext {
             upstream: None,
             headers_upstream: HashMap::new(),
             response_headers: ResponseHeaderPolicy::default(),
-            compress_response: false,
-            client_accepts_gzip: false,
+            negotiated_encoding: None,
             streaming_response: false,
-            gzip_encoder: None,
+            response_encoder: None,
             request_method: String::new(),
             request_path: String::new(),
             request_host: String::new(),
@@ -261,76 +260,6 @@ fn parse_forwarded_ip(value: &str) -> Option<IpAddr> {
                 .and_then(|bracketed| bracketed.strip_suffix(']'))
                 .and_then(|ip| ip.parse::<IpAddr>().ok())
         })
-}
-
-/// Feed one response body chunk through a streaming gzip encoder.
-///
-/// 🏗️ ARCHITECTURE: real streaming, not full-body buffering.
-///
-/// A naive implementation accumulates every chunk in the encoder and only
-/// emits output once, at `end_of_stream` — so a large upstream response (or
-/// an adversarial client requesting one) means buffering the *entire* body
-/// in memory before the first byte goes out: an OOM risk independent of
-/// how big the response actually needs to be in flight at once. Here we
-/// force a sync flush after every chunk, which pushes whatever the deflate
-/// stream has buffered internally out into the encoder's small `Vec<u8>`,
-/// then drain that Vec as this chunk's output via `mem::take`. Memory use
-/// is bounded by one chunk's worth of compressed bytes, regardless of
-/// total response size.
-///
-/// Extracted as a free function (rather than inlined in the `ProxyHttp`
-/// trait impl) so it can be unit-tested without needing a live Pingora
-/// `Session`.
-fn stream_gzip_chunk(
-    encoder_slot: &mut Option<GzEncoder<Vec<u8>>>,
-    body: &mut Option<Bytes>,
-    end_of_stream: bool,
-) {
-    if encoder_slot.is_none() {
-        return;
-    }
-
-    // Feed this chunk into the encoder.
-    if let Some(chunk) = body.as_ref()
-        && let Some(encoder) = encoder_slot.as_mut()
-        && let Err(e) = encoder.write_all(chunk)
-    {
-        tracing::warn!(
-            "⚠️ Gzip compression failed, aborting compression for the rest of this response: {}",
-            e
-        );
-        // Bail out of compression entirely; the client already
-        // received a Content-Encoding: gzip header for this
-        // response so we cannot fall back to plaintext mid-stream
-        // — better to end the response short than to send a
-        // client a body it can't decode.
-        *encoder_slot = None;
-        *body = None;
-        return;
-    }
-
-    if end_of_stream {
-        // Finalize: flushes any remaining buffered bytes plus the gzip
-        // trailer (CRC32 + uncompressed size) into the encoder's Vec.
-        if let Some(encoder) = encoder_slot.take() {
-            match encoder.finish() {
-                Ok(tail) => *body = Some(Bytes::from(tail)),
-                Err(e) => {
-                    tracing::warn!("⚠️ Gzip finalize failed: {}", e);
-                    *body = Some(Bytes::new());
-                }
-            }
-        }
-        return;
-    }
-
-    if let Some(encoder) = encoder_slot.as_mut() {
-        if let Err(e) = encoder.flush() {
-            tracing::warn!("⚠️ Gzip flush failed: {}", e);
-        }
-        let out = std::mem::take(encoder.get_mut());
-        *body = Some(Bytes::from(out));
-    }
 }
 
 // MARK: - Proxy State
@@ -2077,22 +2006,19 @@ impl ProxyHttp for PingclairProxy {
             ctx.request_id = client_id;
         }
 
-        // Detect Accept-Encoding for response compression
-        {
-            let ae = session
+        // 🗜️ Negotiate the response coding against this server's `encode`
+        // list. Done here, not in `response_filter`, so the decision is made
+        // from the request alone — `response_filter` then only has to check
+        // properties of the upstream response (content type, size, whether it
+        // is already encoded).
+        if let Some(state) = &ctx.state {
+            let accept_encoding = session
                 .req_header()
                 .headers
                 .get("accept-encoding")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
-            ctx.client_accepts_gzip = ae.contains("gzip");
-        }
-
-        // Check if server has compression enabled.
-        // For now, enable for all proxied responses if the client supports
-        // gzip. This matches Caddy's `encode gzip` behavior.
-        if ctx.client_accepts_gzip && ctx.state.is_some() {
-            ctx.compress_response = true;
+            ctx.negotiated_encoding = negotiate(accept_encoding, &state.config.encodings);
         }
 
         // Check request body size (Content-Length)
@@ -2428,15 +2354,17 @@ impl ProxyHttp for PingclairProxy {
             Self::apply_security_response_headers(upstream_response, state)?;
         }
 
-        // 7. Setup gzip compression if applicable
+        // 7. Set up response compression if applicable.
         // Only compress if:
-        //   - Client accepts gzip
+        //   - A coding was negotiated (client accepts one this server offers)
         //   - Route did not request immediate flushing (`flush_interval: -1`)
         //   - Response is not a real-time stream (e.g. text/event-stream)
         //   - Response is not already compressed
         //   - Content type is compressible (text/*, application/json, etc.)
         //   - Body is not too small (> 256 bytes via Content-Length)
-        if ctx.compress_response && ctx.client_accepts_gzip && !ctx.streaming_response {
+        if let Some(encoding) = ctx.negotiated_encoding
+            && !ctx.streaming_response
+        {
             let already_encoded = upstream_response.headers.get("content-encoding").is_some();
             let content_type = upstream_response
                 .headers
@@ -2461,25 +2389,37 @@ impl ProxyHttp for PingclairProxy {
                 && !is_streaming_content_type(content_type)
                 && !too_small
             {
-                // Initialize gzip encoder
-                ctx.gzip_encoder = Some(GzEncoder::new(Vec::new(), Compression::fast()));
-                // Set response headers for compressed content
-                upstream_response.insert_header("Content-Encoding", "gzip")?;
-                let _ = upstream_response.remove_header("Content-Length");
-                // Transfer-Encoding: chunked will be set by Pingora automatically
-                upstream_response.insert_header("Vary", "Accept-Encoding")?;
+                match ResponseEncoder::new(encoding) {
+                    Ok(encoder) => {
+                        // Headers are only rewritten once the encoder exists.
+                        // Announcing a coding we then failed to construct
+                        // would hand the client a body it cannot decode.
+                        upstream_response.insert_header("Content-Encoding", encoder.token())?;
+                        ctx.response_encoder = Some(encoder);
+                        let _ = upstream_response.remove_header("Content-Length");
+                        // Transfer-Encoding: chunked will be set by Pingora automatically
+                        upstream_response.insert_header("Vary", "Accept-Encoding")?;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "⚠️ Could not initialize {} encoder, serving identity: {}",
+                            encoding.token(),
+                            e
+                        );
+                    }
+                }
             }
         }
 
         Ok(())
     }
 
-    /// Filter upstream response body chunks for gzip compression.
+    /// Filter upstream response body chunks through the negotiated coding.
     ///
-    /// 🏗️ ARCHITECTURE: Streaming gzip — each body chunk is fed into the
-    /// GzEncoder. Every chunk is written in, sync-flushed, and drained
-    /// immediately — memory use is bounded by one chunk's worth of
-    /// compressed output, never by the size of the whole response body.
+    /// 🏗️ ARCHITECTURE: Streaming, never full-body buffering — see
+    /// [`crate::encoding::stream_chunk`]. Every chunk is written in,
+    /// sync-flushed and drained immediately, so memory use is bounded by one
+    /// chunk's worth of compressed output rather than by response size.
     /// `end_of_stream` finalizes the encoder (trailer + final flush).
     fn upstream_response_body_filter(
         &self,
@@ -2493,7 +2433,7 @@ impl ProxyHttp for PingclairProxy {
             ctx.response_bytes += b.len() as u64;
         }
 
-        stream_gzip_chunk(&mut ctx.gzip_encoder, body, end_of_stream);
+        stream_chunk(&mut ctx.response_encoder, body, end_of_stream);
 
         Ok(None)
     }
@@ -3039,8 +2979,6 @@ mod forwarded_headers_tests {
 #[cfg(test)]
 mod p0_regression_tests {
     use super::*;
-    use flate2::read::GzDecoder;
-    use std::io::Read;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3068,95 +3006,12 @@ mod p0_regression_tests {
         assert_eq!(authority_port("[2001:db8::1]:443"), Some(443));
     }
 
-    // ---- Fix 1: streaming gzip stays bounded regardless of body size ----
-
-    /// Feeds a large body through `stream_gzip_chunk` one chunk at a time
-    /// and asserts the per-chunk output buffer never grows anywhere near
-    /// the size of the accumulated body — the exact OOM scenario the audit
-    /// flagged (large upstream response + gzip = whole body buffered).
-    #[test]
-    fn gzip_streaming_bounds_memory_regardless_of_total_body_size() {
-        let mut encoder_slot = Some(GzEncoder::new(Vec::new(), Compression::fast()));
-        let chunk = Bytes::from(vec![b'a'; 64 * 1024]); // 64KB per chunk
-        let total_chunks = 500; // 32MB total body
-        let mut max_single_output = 0usize;
-        let mut full_output = Vec::new();
-
-        for i in 0..total_chunks {
-            let mut body = Some(chunk.clone());
-            let end = i == total_chunks - 1;
-            stream_gzip_chunk(&mut encoder_slot, &mut body, false);
-            if let Some(out) = &body {
-                max_single_output = max_single_output.max(out.len());
-                full_output.extend_from_slice(out);
-            }
-            if end {
-                // Final empty chunk to flush the trailer.
-                let mut tail_body: Option<Bytes> = None;
-                stream_gzip_chunk(&mut encoder_slot, &mut tail_body, true);
-                if let Some(out) = &tail_body {
-                    full_output.extend_from_slice(out);
-                }
-            }
-        }
-
-        // The whole uncompressed body is 32MB; if we were still buffering
-        // the entire thing before emitting anything, `max_single_output`
-        // would be on that order. Bounded streaming keeps it tiny.
-        assert!(
-            max_single_output < 1024 * 1024,
-            "a single chunk's compressed output was {max_single_output} bytes — \
-             gzip streaming appears to be buffering the whole body again"
-        );
-        assert!(
-            encoder_slot.is_none(),
-            "encoder should be consumed after end_of_stream"
-        );
-
-        // And the output must still be valid, correct gzip data.
-        let mut decoder = GzDecoder::new(&full_output[..]);
-        let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed).unwrap();
-        assert_eq!(decompressed.len(), total_chunks * chunk.len());
-        assert!(decompressed.iter().all(|&b| b == b'a'));
-    }
-
-    #[test]
-    fn gzip_streaming_handles_single_chunk_response() {
-        let mut encoder_slot = Some(GzEncoder::new(Vec::new(), Compression::fast()));
-        let mut body = Some(Bytes::from_static(b"hello world"));
-        stream_gzip_chunk(&mut encoder_slot, &mut body, true);
-
-        let out = body.expect("should produce compressed output");
-        let mut decoder = GzDecoder::new(&out[..]);
-        let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed).unwrap();
-        assert_eq!(decompressed, b"hello world");
-    }
-
-    #[test]
-    fn gzip_streaming_handles_empty_body() {
-        let mut encoder_slot = Some(GzEncoder::new(Vec::new(), Compression::fast()));
-        let mut body: Option<Bytes> = None;
-        stream_gzip_chunk(&mut encoder_slot, &mut body, true);
-
-        // Even a zero-byte response still gets a valid (empty) gzip stream.
-        let out = body.expect("finalize should still emit gzip header+trailer");
-        let mut decoder = GzDecoder::new(&out[..]);
-        let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed).unwrap();
-        assert!(decompressed.is_empty());
-    }
-
-    #[test]
-    fn gzip_streaming_noop_when_no_encoder_present() {
-        // Uncompressed responses (client doesn't accept gzip, etc.) must
-        // pass through completely untouched.
-        let mut encoder_slot: Option<GzEncoder<Vec<u8>>> = None;
-        let mut body = Some(Bytes::from_static(b"passthrough"));
-        stream_gzip_chunk(&mut encoder_slot, &mut body, false);
-        assert_eq!(body, Some(Bytes::from_static(b"passthrough")));
-    }
+    // ---- Fix 1: streaming compression stays bounded regardless of body size
+    //
+    // The regression tests for this moved to `crate::encoding` when the
+    // encoder became multi-coding; they now assert the same bound for gzip
+    // *and* zstd. See `encoding::tests::memory_stays_bounded_by_chunk_size_
+    // not_body_size`.
 
     // ---- Fix 2: request ID generation is syscall-free per request ----
 
@@ -3448,29 +3303,39 @@ mod streaming_flush_tests {
     }
 
     #[test]
-    fn streaming_route_disables_gzip_gate() {
-        // The gzip branch in `response_filter` requires
-        // `ctx.compress_response && ctx.client_accepts_gzip && !ctx.streaming_response`.
+    fn streaming_route_disables_compression_gate() {
+        // The compression branch in `response_filter` requires
+        // `ctx.negotiated_encoding.is_some() && !ctx.streaming_response`.
         // A route with `flush_interval: -1` sets streaming_response, which
-        // must keep the gate closed even when the client accepts gzip.
+        // must keep the gate closed even when a coding was negotiated.
         let mut ctx = RequestContext {
-            compress_response: true,
-            client_accepts_gzip: true,
+            negotiated_encoding: Some(Encoding::Zstd),
             ..Default::default()
         };
         ctx.streaming_response = wants_immediate_flush(Some(-1));
-        let gzip_gate_opens =
-            ctx.compress_response && ctx.client_accepts_gzip && !ctx.streaming_response;
+        let gate_opens = ctx.negotiated_encoding.is_some() && !ctx.streaming_response;
         assert!(
-            !gzip_gate_opens,
-            "flush_interval: -1 must disable the gzip filter"
+            !gate_opens,
+            "flush_interval: -1 must disable response compression"
         );
 
         // Sanity: without the streaming flag the same request would compress.
         ctx.streaming_response = wants_immediate_flush(None);
-        let gzip_gate_opens =
-            ctx.compress_response && ctx.client_accepts_gzip && !ctx.streaming_response;
-        assert!(gzip_gate_opens);
+        let gate_opens = ctx.negotiated_encoding.is_some() && !ctx.streaming_response;
+        assert!(gate_opens);
+    }
+
+    /// A server with `encode off` compiles to an empty offer list, and no
+    /// `Accept-Encoding` value may talk it into compressing anyway.
+    #[test]
+    fn encode_off_wins_over_any_accept_encoding() {
+        for accept in ["gzip", "zstd", "gzip, zstd, br", "*"] {
+            assert_eq!(
+                negotiate(accept, &[]),
+                None,
+                "`encode off` must not compress for Accept-Encoding: {accept}"
+            );
+        }
     }
 }
 
