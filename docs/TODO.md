@@ -452,7 +452,11 @@ H3 CORS／rewrite／error_page parity。
 - DNS/Kubernetes discovery、reload-free dynamic backend control plane。
 - L4 TCP/TLS passthrough、通用 UDP、Gateway API/xDS、正式 plugin runtime。
 - Redis distributed rate limit、非冪等 request body retry、traffic mirror/canary。
-- OpenTelemetry/OpenInference、Web UI、ACME DNS-01、ECH、zero-downtime listener handoff。
+- OpenTelemetry/OpenInference、Web UI、ECH、zero-downtime listener handoff。
+- **ACME DNS-01（v0.3 優先項）** — 2026-07-27 對照 `pingap` 後上調優先級：
+  它已支援 5 家 provider（阿里／騰訊／華為／Cloudflare／manual），我們只有 HTTP-01。
+  這是同類專案中我們**唯一明確落後且使用者會直接踩到**的憑證能力
+  （wildcard 憑證、80 埠不可用的環境都必須靠 DNS-01）。詳見 `STATUS.md`「直接同類專案」。
 - 上游 HTTP/3、gRPC-web transcoding、`sub_filter`、目錄 autoindex、fault injection。
 - JWT/OIDC/forward auth、external auth/policy hooks、secrets provider 抽象。
 - **sticky cookie session persistence**（簽章／rotation／SameSite 做錯有安全後果，

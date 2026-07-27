@@ -41,10 +41,37 @@
 - **禁止引入 `pingora-openssl`、`openssl-sys` 或 reqwest `native-tls`**。
   `quiche 0.29`、`boring 4.22` 與 Pingora `boringssl` feature 是同一套 BoringSSL
   鏈結設計；過去曾因 OpenSSL／BoringSSL 符號衝突造成**啟動 SIGBUS 與 Linux link error**。
+  這三條不是偏好而是 H3 的前提，理由見下方「為什麼是自己實作」。
 
 ---
 
 ## 🚀 HTTP/3 實作護欄
+
+### 為什麼是自己實作（不要再重問這題）
+
+**Pingora 不提供 H3，而且短期內不會提供。** 核查於 2026-07-27：
+
+| 上游 | 狀態 |
+|---|---|
+| [pingora#95](https://github.com/cloudflare/pingora/issues/95) HTTP3/QUIC Support | 2024-03-02 開，**仍 open**，官方標籤 **`Long Term Goal`**（"plan to support but not likely in the near future"） |
+| [pingora#514](https://github.com/cloudflare/pingora/pull/514) server／listener 側 quiche::h3 | +3,449 行／30 檔，2025-01-16 開，**未合併**，2025-08-27 後停滯 |
+| [pingora#524](https://github.com/cloudflare/pingora/pull/524) client／connector 側 | +6,548 行／52 檔，2025-02-03 開，**未合併**，2025-02-07 後停滯 |
+
+社群已經把 server 端寫完了，掛了一年半沒合。所以「等上游」不是一個有期限的選項。
+
+**結構性阻礙是 TLS 後端,不是工作量。** quiche 只跑在 BoringSSL／QuicTLS 上，
+pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整棵依賴樹**
+釘死在 BoringSSL——這是全域且不可逆的架構決定，不是加個 feature flag。
+上面「依賴與鏈結」那三條禁令全部源自這個決定。
+
+**同生態的旁證**（2026-07-27 讀原始碼確認，非 README）：
+`vicanso/pingap`（同樣 Pingora 0.8.1，46.5k 行、兩年生產）與 `pingooio/pingoo`
+（hyper 系，非 Pingora）**都沒有 H3**——全文搜 `quiche`／`http3`／`quic` 零命中。
+這不是他們疏漏，是上游狀態的必然結果。
+
+> ⚠️ **要換回 Pingora 原生 H3 的前提**：#514 已合併進 released crate、
+> `pingora-proxy` 有 H3 整合測試、且 BoringSSL 鏈結方式與現況相容。
+> 三項缺一就不要動——代價是整份 `quic.rs` 重寫。
 
 ### 架構
 

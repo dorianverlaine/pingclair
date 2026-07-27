@@ -313,6 +313,40 @@ commit `0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。
   OAuth 2.1、PKCE、Protected Resource Metadata、OIDC discovery、Resource Indicators／
   token audience validation；明確禁止把 client token 直接 passthrough 到下游服務。
 
+### 直接同類專案（2026-07-27 讀原始碼盤點，非 README）
+
+上面列的是「主流產品的功能基準」；這裡是**同一條路上的競品**。
+數據來自 clone 後實測，README 宣稱不採信。
+
+| | **Pingclair** | [vicanso/pingap](https://github.com/vicanso/pingap) | [pingooio/pingoo](https://github.com/pingooio/pingoo) |
+|---|---|---|---|
+| 底層 | Pingora 0.8.1 | Pingora 0.8.1 | **hyper／rustls（非 Pingora）** |
+| Rust LOC | 25,441 | **46,539** | 6,411 |
+| `#[test]` 函式 | **320** | 265 | **0** |
+| HTTP/3 | ✅ | ❌ | ❌ |
+| 起點／stars | 2026-07／2 | 2024-03／1,311 | 2025-09／1,024 |
+
+- **pingap 是真正的對手**，不是 pingoo。它證明「Pingora + 好用配置」可行，
+  也證明這條路的工作量：24 個 plugin、Web UI、etcd config backend、
+  OpenTelemetry／Pyroscope／Sentry、`pingap-cache`、traffic splitting。
+- **pingap 在憑證這塊比我們成熟**：ACME **DNS-01 支援 5 家 provider**
+  （阿里／騰訊／華為／Cloudflare／manual），我們只有 HTTP-01；
+  challenge token 存 config storage（file 或 etcd）可跨重啟，
+  且原始碼註記了「token 為攻擊者可控、不可直接當儲存 key」的路徑穿越風險。
+  → **`ACME DNS-01` 的 v0.3+ 優先級應該調高**，這是實打實的落後項。
+- **pingoo 的憑證處理有三個我們已經解掉的問題**：ACME challenge 存在
+  `DashMap` 純記憶體（重啟即失效，對應我們的 `persistent_challenge_handler.rs`）、
+  自簽憑證每次啟動用 `generate_self_signed_certificates(&["*"])` 重新產生
+  （信任鏈每次重啟就斷，對應我們的 `internal_ca.rs`）、
+  TLS 目錄 `DEFAULT_TLS_FOLDER = "/etc/pingoo/tls"` 是**寫死常數**無法覆寫
+  （我們至少有 `PINGCLAIR_TLS_STORE`）。
+- **兩者皆無 H3**，原因見 `GUARDRAILS.md`「為什麼是自己實作」——
+  是上游 `pingora#95` 停滯所致，不是他們疏漏。
+
+> 誠實的結論：我們在**深度**（H3、測試密度、真 binary 驗收紀律）領先，
+> 在**廣度**（plugin 生態、Web UI、可觀測性、配置後端）明顯落後 pingap 兩年。
+> 功能數量上硬拼拼不過，差異化只能是 H3 ＋ 工程嚴謹度 ＋ Caddyfile 語法。
+
 ---
 
 ## 📌 已知的環境現況
