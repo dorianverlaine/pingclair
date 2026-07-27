@@ -354,20 +354,13 @@ Pingclair est organisé en workspace Cargo modulaire :
 
 Les contributions sont les bienvenues — qu'il s'agisse de corriger un bug, d'ajouter une fonctionnalité ou simplement d'améliorer la documentation.
 
-### Processus
+Commencez par lire **[CONTRIBUTING.md](CONTRIBUTING.md)**. Il décrit les quatre commandes que chaque commit doit passer, ce qui constitue une couverture de tests suffisante pour un serveur web, et les contraintes d'architecture que le code seul ne révèle pas (édition de liens BoringSSL, chemin HTTP/3, mémoire bornée).
 
-1.  **Forkez** le dépôt.
-2.  **Créez une branche** : `git checkout -b feature/my-cool-feature`
-3.  **Écrivez le code** en respectant le style Rust standard.
-4.  **Lancez les tests** et assurez-vous qu'ils passent :
-    ```bash
-    cargo test --workspace
-    ```
-5.  **Ouvrez une PR** en décrivant votre modification.
+Les nouveaux contributeurs signent un [CLA](CLA.md) une seule fois. **Vous conservez le droit d'auteur sur votre travail.**
 
 ## 📄 Licence
 
-Ce projet est distribué sous **licence Apache 2.0**. Voir le fichier [LICENSE](LICENSE) pour les détails.
+Ce projet est distribué sous **licence Apache 2.0**. Voir [LICENSE](LICENSE) pour les termes complets et [NOTICE](NOTICE) pour les obligations d'attribution et les composants tiers.
 
 ---
 
