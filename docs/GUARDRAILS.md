@@ -64,11 +64,6 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
 釘死在 BoringSSL——這是全域且不可逆的架構決定，不是加個 feature flag。
 上面「依賴與鏈結」那三條禁令全部源自這個決定。
 
-**同生態的旁證**（2026-07-27 讀原始碼確認，非 README）：
-`vicanso/pingap`（同樣 Pingora 0.8.1，46.5k 行、兩年生產）與 `pingooio/pingoo`
-（hyper 系，非 Pingora）**都沒有 H3**——全文搜 `quiche`／`http3`／`quic` 零命中。
-這不是他們疏漏，是上游狀態的必然結果。
-
 > ⚠️ **要換回 Pingora 原生 H3 的前提**：#514 已合併進 released crate、
 > `pingora-proxy` 有 H3 整合測試、且 BoringSSL 鏈結方式與現況相容。
 > 三項缺一就不要動——代價是整份 `quic.rs` 重寫。
