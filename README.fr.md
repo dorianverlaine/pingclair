@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🦀 Pingclair
+<img src="assets/logo.png" alt="Pingclair" width="520">
 
 **Un serveur web et reverse proxy moderne et performant, bâti sur Pingora**  
 *La performance brute de Cloudflare Pingora, dans une enveloppe aussi minimaliste que Caddy*

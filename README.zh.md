@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🦀 Pingclair
+<img src="assets/logo.png" alt="Pingclair" width="520">
 
 **基於 Pingora 打造的現代高效能 Web 伺服器與反向代理**  
 *結合 Cloudflare Pingora 的極致效能與 Caddy 的極簡開發體驗*
