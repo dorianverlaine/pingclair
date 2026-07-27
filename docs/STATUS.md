@@ -202,10 +202,11 @@ commit `0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。
 
 ### 反向代理進階
 
-- **`proxy_cache`** — host＋path＋vary cache key、ETag／Cache-Control 語意、
-  negative cache、cache lock／single-flight、stale-while-revalidate、stale-if-error、
-  range 與 PURGE；Authorization／Cookie 預設 bypass，SSE／upgrade 必須排除。
-  memory/disk tier 需硬上限與 hit/miss/stale/bypass/eviction 指標。
+> ⚠️ **`proxy_cache` 已於 2026-07-27 移出這份清單，改列入 v0.2 的 M3**
+> （TODO Day 16–18）。原因：`pingora-cache` 已提供狀態機、cache lock、
+> eviction、variance 與 predictor，我們只需寫策略與正確性。
+> `stale-while-revalidate`／`stale-if-error` 仍留在 v0.3+。
+
 - **Response interception pipeline** — 依 upstream status／header 執行 replace status、
   copy／drop headers、redirect、fallback handler；擴成 Caddy `handle_response`／
   nginx `proxy_intercept_errors` 等級，仍須保持串流。

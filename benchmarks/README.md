@@ -212,7 +212,17 @@ loopback (`-t2 -d15s`; the 2 vCPU are shared with the server under test).
 Raw output: `results/20260725_vps_onbox/`. The release build links fine
 with the box's 2GB of swap added.
 
-### VPS on-box results (July 2026, all fixes in)
+### VPS on-box results (2026-07-25 19:14 — ⚠️ PRE-perf-fix, superseded)
+
+> **These numbers are stale and were mislabeled "all fixes in".** This run
+> completed at 19:14; the static perf fix (`2fc8a0d` — `worker_threads` +
+> sync `std::fs`) landed at 23:48 the same night and **2.6x'd static
+> throughput**. Pingclair ran single-threaded here against nginx's
+> `worker_processes auto`.
+>
+> **For current numbers use the post-fix table above** (Static 1KB plain:
+> pingclair 50,145 vs nginx 53,579 — not the 3x gap this table shows).
+> Kept as the before-side of the comparison, not as a current result.
 
 Static file (1KB), plain:
 
@@ -248,27 +258,41 @@ Large body (20MB), gzip, `-c20 -d20s`, memory sampled:
 
 Readings:
 
-- **Nginx is ~2.6-2.9x pingclair on plain 1KB static** (sendfile +
-  decades of hot-path tuning); caddy and pingclair are close, pingclair
-  slightly ahead. This is the workload where pingclair has the most head
-  room left.
-- **gzip static narrows the gap** (pingclair ~60-67% of nginx, ~1.8x
-  caddy) — and note gzip here means on-the-fly per request for nginx/
-  caddy vs pingclair's compressed-body cache, so the gap shrinks as the
-  file gets bigger and more compressible (see large body).
+> ⚠️ The static and gzip readings below describe the **pre-fix** run above.
+> They are kept to document what the single-threaded + `tokio::fs` build
+> looked like. **Post-fix, the static gap to nginx is ~6%, not ~3x** — see
+> the corrected summary after this list.
+
+- ~~**Nginx is ~2.6-2.9x pingclair on plain 1KB static**~~ — this was the
+  symptom that led to fix #22/#23. Root cause was pingclair running
+  single-threaded plus `tokio::fs` spawn_blocking churn, **not** an
+  inherent sendfile/tuning gap. After the fix: 50,145 vs nginx 53,579.
+- ~~**gzip static narrows the gap** (pingclair ~60-67% of nginx)~~ —
+  post-fix pingclair is **slightly ahead** of nginx here
+  (42,982 vs 42,510).
 - **Proxying is essentially tied with nginx** (~84-99%) and ~1.8-2x
-  caddy — the container-run anomaly (pingclair "winning" at c500) did
-  not reproduce on bare metal, as expected; see the caveat below the
-  container proxy table.
+  caddy — this reading still holds post-fix (20,154 vs 21,961). The
+  container-run anomaly (pingclair "winning" at c500) did not reproduce
+  on bare metal, as expected; see the caveat below the container proxy
+  table.
 - **Large compressible bodies are the compressed-body cache's home
   turf**: ~70x nginx/caddy throughput, 0 timeouts, because repeat hits
   skip compression entirely while nginx/caddy re-compress on every
   request (their per-request CPU cost at gzip on a 20MB file on 2 shared
   vCPU is brutal). The price of the cache is the 64MB compressed-body
-  budget, visible in the 74 MiB peak RSS vs nginx's 21 MiB.
+  budget, visible in the 74 MiB peak RSS vs nginx's 21 MiB. Still valid.
 - Compression levels are not perfectly matched (nginx
   `gzip_comp_level 1` vs each engine's own default), so treat gzip
   numbers as informative, not exact.
+
+**Corrected same-box summary (post-`2fc8a0d`, wrk -t2 -c100 -d10s):**
+
+| Scenario | Pingclair | vs Nginx | vs Caddy |
+|---|---|---|---|
+| Static 1KB plain | 50,145 req/s | 0.94x | **2.9x** |
+| Static 1KB gzip | 42,982 req/s | **1.01x** | **2.8x** |
+| Reverse proxy | 20,154 req/s | 0.92x | **2.0x** |
+| 20MB gzip | 703 req/s, 0 timeouts | **~70x** | **~70x** |
 
 ## Results (Docker bridge, July 2026)
 

@@ -78,7 +78,7 @@ process-wide tracing，沒有依 per-server format／output 輸出。
 - 欄位至少含：request ID、verified client IP、route、upstream、status、bytes、
   TTFB、duration。
 - **完成判定**：兩個 server 各配不同 format／output，真 binary 驗證輸出正確分流。
-- **範圍外**：rotation／retention／壓縮／async writer 留到 Day 16。
+- **範圍外**：rotation／retention／壓縮／async writer 留到 Day 21。
 
 ### 🔨 Day 3 — secret redaction 與 Cloudflare client identity
 
@@ -166,11 +166,16 @@ process-wide tracing，沒有依 per-server format／output 輸出。
 
 ### 🔨 Day 12 — 健康檢查補齊
 
-- active／passive health 支援 Host、method、headers、request body、
-  預期 status class、response body regex、不同 health port、
-  positive／negative threshold、slow start recovery。
+> 💡 **這天比預期便宜**：`pingora-load-balancing::health_check::HttpHealthCheck`
+> 已經提供 `req`（自訂 Host／method／headers）、`validator`（status／body 檢查）、
+> `port_override`（不同 health port）、`consecutive_success/failure` 門檻、
+> `reuse_connection` 與 `health_changed_callback`。主要工作是**接線與 DSL**，
+> 不是從零實作。
+
+- 把上述 Pingora 能力接進 DSL 與 runtime。
 - 限制讀取 body 大小；為 probe 加 jitter／backoff，避免 health check 自己
   變成同步尖峰。
+- slow start recovery（Pingora 未提供，需自己做）。
 - **完成判定**：故障節點能被正確摘除並在恢復後重新加入。
 
 ### 🔨 Day 13 — Rate limit 語意補齊
@@ -198,20 +203,86 @@ process-wide tracing，沒有依 per-server format／output 輸出。
 
 ---
 
-## M3 — 可觀測性與運維（Day 16–19）
+## M3 — 接上 Pingora 已提供的能力（Day 16–20）
+
+> 盤點 `pingora 0.8.1` 全家桶後發現：**`pingora-cache` 完全沒被引入**，
+> 而它提供的正是審計裡估「1 週+」的 `proxy_cache`。`boringssl` feature 明確
+> 包含 `pingora-cache?/boringssl`，**與現有 BoringSSL 鏈結相容**，沒有
+> GUARDRAILS 裡那類符號衝突風險。
+>
+> `pingora-cache` 已提供：HTTP caching 狀態機、**cache lock**（single-flight，
+> 與我們手寫的壓縮 coalescing 同類）、LRU／simple-LRU eviction、
+> **variance**（`Vary` 處理）、**predictor**（記住不可快取資產、提前 bypass）、
+> cache put/purge 介面、`max_file_size`、memory storage 與 storage trait。
+> `ProxyHttp` trait 更已內建 7 個 cache 掛鉤
+> （`request_cache_filter`、`cache_key_callback`、`cache_hit_filter`、
+> `response_cache_filter`、`cache_vary_filter` 等）。
+>
+> 因此把 `proxy_cache` 從 v0.3+ **提前到 v0.2**：不是因為變簡單了，
+> 而是因為最難的狀態機與併發控制別人已經寫好且測過。
+> 我們要寫的是**策略與正確性**，那仍然不便宜——所以給它三天。
+
+### 🔨 Day 16 — 接上 pingora-cache 骨架
+
+- 加入 `pingora-cache` 依賴與 `cache` feature，確認 BoringSSL 鏈結無衝突
+  （這是 GUARDRAILS 明列的高風險區，先驗證再往下做）。
+- 接上 `request_cache_filter`／`cache_key_callback`：定義 host＋path＋query
+  的 cache key，memory storage 先跑通。
+- **完成判定**：同一 URL 第二次請求命中快取，且有測試證明沒有回源。
+
+### 🔨 Day 17 — 快取策略與正確性
+
+**這天是整個 M3 的風險所在**，快取的 bug 不會讓服務掛掉，只會安靜地回錯內容。
+
+- `ETag`／`Cache-Control`／`Vary` 語意（用 pingora 的 `cache_control` 與
+  `variance`）。
+- **預設 bypass**：`Authorization`、`Cookie`。
+- **必須排除**：SSE、upgrade、`flush_interval: -1` 的串流回應。
+- range 請求與 negative cache（404/5xx 的短 TTL）。
+- **完成判定**：每一條 bypass／排除規則都有負向測試——證明它**沒有**被快取。
+
+### 🔨 Day 18 — 快取運維面
+
+- cache lock（single-flight）與 predictor 接線，避免回源驚群。
+- eviction 策略與 **memory/disk tier 硬上限**。
+- hit／miss／stale／bypass／eviction 指標。
+- 受權限保護的 inspect／purge API。
+- **完成判定**：上限確實生效（超過會 evict 而不是無限長大）；purge 需認證。
+
+### 🔨 Day 19 — 一致性雜湊 LB
+
+> 💡 `pingora-ketama` 與 `pingora-load-balancing::selection::consistent`
+> 已提供 ketama 一致性雜湊；`selection::weighted` 提供加權。
+
+- 接上 consistent hash，支援 header／cookie／query 作為 hash key。
+- **範圍外**：sticky cookie 簽章／rotation 留到 v0.3（那部分 Pingora 不提供，
+  且做錯有安全後果）。
+- **完成判定**：backend 增減時 key 重映射比例符合一致性雜湊預期。
+
+### ✅ Day 20 — M3 驗證日
+
+凍結 RC，在乾淨 Linux 驗證快取正確性（尤其是 bypass／排除規則）、
+上限、purge 與一致性雜湊。
+
+> ⚠️ 快取驗證必須包含**壓測**：確認快取沒有把 20MB 串流變回全量緩衝
+> （這是專案歷史上出現過兩次的同類 bug，見 GUARDRAILS）。
+
+---
+
+## M4 — 可觀測性與運維（Day 21–24）
 
 讓它可以被值班的人操作。
 
-### 🔨 Day 16 — Access log 完整化
+### 🔨 Day 21 — Access log 完整化
 
-Day 2 做了輸出，這天做生產級韌性。
+Day 7 做了輸出，這天做生產級韌性。
 
 - file output 支援依大小／時間 rotation、retention、壓縮、access/error 分流。
 - 非同步寫入必須有 bounded queue、明確 backpressure／drop 策略與
   dropped-log metric。
 - **完成判定**：磁碟寫滿或 writer 落後時**不得拖死 request hot path**（要有測試）。
 
-### 🔨 Day 17 — Metrics 與 readiness
+### 🔨 Day 22 — Metrics 與 readiness
 
 - `/live`、`/ready`、config version、route/status、upstream latency/error、
   retry、circuit/queue、pool、TLS、H3 指標。
@@ -220,7 +291,7 @@ Day 2 做了輸出，這天做生產級韌性。
   `READY=1`，並支援 watchdog。
 - **完成判定**：程序存活但尚未可接流量時，`/ready` 必須是 not ready。
 
-### 🔨 Day 18 — Reload／shutdown 可操作
+### 🔨 Day 23 — Reload／shutdown 可操作
 
 - 配置更新原子套用；錯誤配置保留 last-known-good。
 - 手動憑證目錄的新增／更新／刪除需**原子刷新** H1/H2/H3 certificate table；
@@ -228,16 +299,16 @@ Day 2 做了輸出，這天做生產級韌性。
 - **v0.2 可明示 listener topology 變更需要 restart**，不假裝已經 zero-downtime。
 - **完成判定**：SIGHUP／SIGTERM／systemd restart／upstream drain 有真 binary 測試。
 
-### ✅ Day 19 — M3 驗證日
+### ✅ Day 24 — M4 驗證日
 
 凍結 RC，驗證 log rotation／redaction、metrics、readiness、reload／shutdown
 在乾淨 Linux 的實際行為。
 
 ---
 
-## M4 — 協議安全與 H3（Day 20–23）
+## M5 — 協議安全與 H3（Day 25–28）
 
-### 🔨 Day 20 — 協議安全回歸集
+### 🔨 Day 25 — 協議安全回歸集
 
 **這是 v0.2 唯一還沒動的 R0 項目，優先度其實很高**——最新 Caddy／nginx 都still
 在修 rewrite、header、H2/H3 解析漏洞，一般功能測試抓不到這類問題。
@@ -248,7 +319,7 @@ Day 2 做了輸出，這天做生產級韌性。
 - 可用 proptest／fuzzing，並與 nginx／Caddy 做差異測試。
 - **完成判定**：每一類都有明確的拒絕行為與測試。
 
-### 🔨 Day 21 — 協議矩陣補完
+### 🔨 Day 26 — 協議矩陣補完
 
 已通過的見 STATUS。剩餘缺口：
 
@@ -257,7 +328,7 @@ Day 2 做了輸出，這天做生產級韌性。
 - 真 H3 gRPC client 矩陣。
 - **完成判定**：不支援的組合必須 **fail clearly 並寫入文件**，不是靜默失敗。
 
-### ✅ Day 22 — H3 Linux release smoke
+### ✅ Day 27 — H3 Linux release smoke
 
 用 quiche client 驗證：SNI、Alt-Svc、靜態／代理大 body、
 Content-Length/chunked POST、413、keepalive、middleware parity、
@@ -266,7 +337,7 @@ Content-Length/chunked POST、413、keepalive、middleware parity、
 > 依 GUARDRAILS：改動 H3 或 TLS dependency 後，**macOS 單元測試不足以驗證
 > 鏈結與 QUIC 行為**，必須跑這一關。
 
-### ✅ Day 23 — 公網協議矩陣
+### ✅ Day 28 — 公網協議矩陣
 
 補完 STATUS 中列為「尚未覆蓋」的項目：IP／Referer 完整 allow／deny 與
 precedence、死亡 upstream 502 自訂頁、代理 rewrite URI、primary recovery、
@@ -274,27 +345,27 @@ H3 CORS／rewrite／error_page parity。
 
 ---
 
-## M5 — 發布（Day 24–29）
+## M6 — 發布（Day 29–34）
 
-### ✅ Day 24 — RC 凍結與品質閘門
+### ✅ Day 29 — RC 凍結與品質閘門
 
 - Linux／macOS 的 build／test／fmt／clippy `-D warnings` 全綠。
 - dependency audit 沒有未處理的 high／critical advisory；例外需**書面風險接受**。
 
-### ✅ Day 25 — Soak／chaos
+### ✅ Day 30 — Soak／chaos
 
 - 同一 release binary 至少 **1 小時**混合 static、proxy、SSE、reload、
   backend failure/recovery 與 TLS/H3 流量。
 - **完成判定**：零 crash、零卡死、零幽靈程序、**無單調 RSS 成長**。
 
-### ✅ Day 26 — 效能回歸
+### ✅ Day 31 — 效能回歸
 
 - 同一 VPS／同一 harness，對比 2026-07-25 baseline：static plain/gzip、
   reverse proxy、20MB streaming。
 - **完成判定**：吞吐或 p99 回退超過 10% 必須修復，或在 release notes 以數據解釋；
   streaming RSS 必須維持 bounded。
 
-### 🔨 Day 27 — 發布產物與安裝驗證
+### 🔨 Day 32 — 發布產物與安裝驗證
 
 - Linux glibc x86_64/aarch64、macOS x86_64/arm64 binary、GHCR image、
   SHA-256 checksums、SBOM、provenance／signature 自動產生。
@@ -303,13 +374,13 @@ H3 CORS／rewrite／error_page parity。
 - 全新安裝、`0.1.7 → 0.2.0` 升級、systemd start/reload/stop、uninstall、
   Docker 啟動與最小 Pingclairfile 都在乾淨環境驗證。
 
-### 🔨 Day 28 — 發布文件
+### 🔨 Day 33 — 發布文件
 
 - `CHANGELOG.md`、三語 README、所有 examples、配置參考、安全限制、
   H3 支援矩陣、已知問題、migration notes。
 - **完成判定**：所有範例可由 `pingclair validate` 驗證通過。
 
-### 🚀 Day 29 — 發布
+### 🚀 Day 34 — 發布
 
 只在上述全綠後：改 workspace version 為 `0.2.0` → 帶 emoji 的 release commit
 → signed `v0.2.0` tag → 確認 GitHub Release／GHCR 完成 → 把本目標移入
@@ -322,12 +393,18 @@ H3 CORS／rewrite／error_page parity。
 寫在這裡是為了**防止規劃時 scope creep**。以下留到 v0.3+：
 
 - AI Gateway、provider translation、token/cost quota、semantic routing/cache、MCP。
-- `proxy_cache`、DNS/Kubernetes discovery、reload-free dynamic backend control plane。
+- DNS/Kubernetes discovery、reload-free dynamic backend control plane。
 - L4 TCP/TLS passthrough、通用 UDP、Gateway API/xDS、正式 plugin runtime。
 - Redis distributed rate limit、非冪等 request body retry、traffic mirror/canary。
 - OpenTelemetry/OpenInference、Web UI、ACME DNS-01、ECH、zero-downtime listener handoff。
 - 上游 HTTP/3、gRPC-web transcoding、`sub_filter`、目錄 autoindex、fault injection。
 - JWT/OIDC/forward auth、external auth/policy hooks、secrets provider 抽象。
+- **sticky cookie session persistence**（簽章／rotation／SameSite 做錯有安全後果，
+  且 Pingora 不提供這部分；一致性雜湊本身已在 Day 19）。
+
+> `proxy_cache` 原本在這份清單裡，2026-07-27 盤點後**移入 v0.2 的 M3**：
+> `pingora-cache` 已提供狀態機、cache lock、eviction、variance 與 predictor，
+> 剩下的是策略與正確性。理由見 M3 開頭。
 
 完整的長期功能清單與生態對照理由見 `docs/STATUS.md` 的「v0.3+ 候選」。
 
@@ -339,9 +416,10 @@ H3 CORS／rewrite／error_page parity。
 |---|---|---|
 | M1 生產站可替換 | Day 1–7 | ⬜ 未開始 |
 | M2 生產護欄 | Day 8–15 | ⬜ 未開始 |
-| M3 可觀測性與運維 | Day 16–19 | ⬜ 未開始 |
-| M4 協議安全與 H3 | Day 20–23 | ⬜ 未開始 |
-| M5 發布 | Day 24–29 | ⬜ 未開始 |
+| M3 接上 Pingora 能力（含 `proxy_cache`） | Day 16–20 | ⬜ 未開始 |
+| M4 可觀測性與運維 | Day 21–24 | ⬜ 未開始 |
+| M5 協議安全與 H3 | Day 25–28 | ⬜ 未開始 |
+| M6 發布 | Day 29–34 | ⬜ 未開始 |
 
 > 完成一天就在對應 Day 標題後標上 `✔ <commit>`；完成一個里程碑就更新這張表，
 > 並把驗證證據路徑寫進 `docs/STATUS.md`。
