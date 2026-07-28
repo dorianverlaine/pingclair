@@ -175,6 +175,16 @@ commit `0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。
   zstd 與 gzip 共用同一條 bounded-memory streaming 路徑：真 binary 下 40 併發
   × 9.4MB（367MB in flight）RSS 僅成長 21MB（zstd）／9MB（gzip），
   body byte-exact 還原，SSE 仍逐筆增量抵達。
+- **matcher JSON／TOML round-trip**（2026-07-28）— `Matcher` 改為 externally
+  tagged（`{"not": {"path": {...}}}`），`not`／`or`／`query`／`remote_ip`／
+  `protocol` 不再在 round-trip 中被讀成別的 variant；`0.1.7` 舊格式仍可載入，
+  有歧義的舊形狀保留當時的讀法。無法辨識的 matcher fail closed。
+  **同時修掉一個可遠端觸發的 DoS**：untagged 的 `Not` newtype variant 會對
+  任何無法辨識的值無限遞迴，Admin API `POST /config` 送一個亂寫的 matcher
+  即可讓程序 stack overflow 中止。真 binary 驗證（Admin dump→post 迴圈）與
+  修復前的失敗證據：`scripts/test-matcher-roundtrip.sh`、
+  `benchmarks/results/20260728_matcher_roundtrip_pass/`、
+  `benchmarks/results/20260728_matcher_roundtrip_FAILED_prefix/`。
 - **上游 hostname 重解析**（2026-07-28）— hostname upstream 依 `dns_refresh`
   間隔（預設 30s，`off` 可關）重解析並整批 publish 新 pool；解析失敗保留
   last-known-good，開機時解析不到的名稱會在成功後自動加入。IP 字面位址完全

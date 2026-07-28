@@ -446,4 +446,66 @@ mod tests {
             "/other must NOT match /proxy/*"
         );
     }
+
+    /// The consequence of the matcher representation, not just its shape:
+    /// a route loaded from JSON must *route* the way it was written.
+    ///
+    /// This is the failure that made the tagged representation necessary.
+    /// The untagged form serialized `Not(inner)` as bare `inner`, so a
+    /// config that reached the router through JSON or an Admin hot reload
+    /// arrived with the negation stripped — the route then matched exactly
+    /// the requests it was written to exclude.
+    #[test]
+    fn a_negation_loaded_from_json_still_inverts_the_match() {
+        let json = r#"{
+            "path": "/*",
+            "handler": {"type": "respond", "status": 200},
+            "matcher": {"not": {"path": {"patterns": ["/admin/*"]}}}
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).expect("parse route");
+        let router = Router::new(vec![route]);
+        let headers = http::HeaderMap::new();
+
+        let matches = |path: &str| {
+            router
+                .match_request(path, "GET", &headers, "example.com", "10.0.0.1", "https")
+                .is_some()
+        };
+
+        assert!(matches("/public"), "`not path /admin/*` must allow /public");
+        assert!(
+            !matches("/admin/secrets"),
+            "`not path /admin/*` must exclude /admin/* — a dropped negation \
+             turns this route into the opposite of what was configured"
+        );
+    }
+
+    /// `or` must not collapse into `and` on the way through JSON: both are
+    /// two-element arrays, so the untagged form read every `or` as an `and`.
+    #[test]
+    fn an_or_loaded_from_json_still_matches_either_side() {
+        let json = r#"{
+            "path": "/*",
+            "handler": {"type": "respond", "status": 200},
+            "matcher": {"or": [
+                {"path": {"patterns": ["/a/*"]}},
+                {"path": {"patterns": ["/b/*"]}}
+            ]}
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).expect("parse route");
+        let router = Router::new(vec![route]);
+        let headers = http::HeaderMap::new();
+
+        let matches = |path: &str| {
+            router
+                .match_request(path, "GET", &headers, "example.com", "10.0.0.1", "https")
+                .is_some()
+        };
+
+        // An `and` of two disjoint paths can never match anything, which is
+        // what this config silently became before.
+        assert!(matches("/a/one"));
+        assert!(matches("/b/two"));
+        assert!(!matches("/c/three"));
+    }
 }

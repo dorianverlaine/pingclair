@@ -206,14 +206,43 @@ cargo test --locked --workspace
   每個 listener 各自持有一份 ProxyState，所以同一個 upstream 名稱的 lookup
   次數與 listener 數成正比（本日 E2E 是 2）；量級很小，未動。
 
-### 🔨 Day 6 — matcher JSON round-trip
+### 🔨 Day 6 — matcher JSON round-trip ✔
 
-遞迴 `Not` matcher 目前無法安全通過 core config 的 untagged JSON round-trip。
-直接讀 Pingclairfile 不受影響，但 JSON 配置與 Admin hot reload 會壞。
+**已完成 2026-07-28。** `Matcher` 由 `untagged` 改為 **externally tagged**，
+並手寫 `Deserialize` 保留 `0.1.7` 舊格式的讀法。
 
-- 定義可辨識且向後相容的 matcher JSON 表示。
-- **完成判定**：`not path` 等遞迴 matcher 能 round-trip；`0.1.7` 既有 JSON 配置
-  仍可載入。
+- ✅ **問題比原本記的更大**。untagged 表示法用 payload 形狀辨識 variant，
+  而這個 enum 有一半的 variant 形狀根本不可區分：
+  - `Not(inner)` 序列化後**就是 inner 本身**，round-trip 直接把否定弄丟 ——
+    這是唯一一個會**反轉**路由決策的變換。
+  - `Or` 與 `And` 都是二元陣列 → 每個 `Or` 都變成 `And`。
+  - `Query` 與 `Header` 都是 `{name, condition}` → 每個 `Query` 都變成 `Header`。
+  - `RemoteIp`／`Protocol` 與 `Host` 都是字串陣列。
+- ✅ 新表示法：`{"not": {"path": {"patterns": ["/admin/*"]}}}`。tag 就是可還原性。
+- ✅ **向後相容**：反序列化先試 tagged，再退回 `0.1.7` 真正能寫出的五種形狀。
+  兩者不會混淆——legacy 的 key 是 `patterns`／`methods`／`name`／`condition`，
+  沒有一個跟 tag 名撞。
+- ✅ 有歧義的 legacy 形狀**保留 `0.1.7` 當時的讀法**而不是猜意圖：
+  `{name, condition}` 仍然讀成 `Header`。一份一直被當 `Header` 用的配置，
+  不該因為這份程式碼現在分得清楚了就悄悄改成 `Query`——要指定就寫 tag。
+- ✅ 無法辨識的 matcher **fail closed**（400／載入失敗），不會退化成 match-all。
+- ✅ 真 binary E2E（`scripts/test-matcher-roundtrip.sh`）：Admin `GET /config`
+  的 dump 原樣 `POST` 回去後路由行為不變；手寫的 untagged legacy matcher 仍可載入；
+  無法辨識的 matcher 回 400。**同一支腳本在修復前的 binary 上會失敗**，
+  證據保留在 `benchmarks/results/20260728_matcher_roundtrip_FAILED_prefix/`。
+- ✅ Gate 四項全綠，338 → **349 tests**。
+
+> 🚨 **順帶修掉一個可遠端觸發的 DoS**。`Not(Box<Matcher>)` 是 untagged enum 的
+> **newtype** variant，所以測試它等於「把整個 payload 再當成一次 `Matcher` 解」
+> ——**沒有消耗任何輸入**。任何對不上其他 variant 的值都會無限遞迴；而 serde 的
+> untagged replay 不會再走一次 serde_json 的 parser，所以 serde_json 自己的
+> recursion limit 從來看不到它。release profile 的 `panic = "abort"` 讓它直接變成
+> 程序中止。實測：對 Admin API `POST /config` 送一個
+> `{"matcher": {"nonsense": ["/x"]}}` 就能打掛整個 pingclair。
+> 證據：`.../FAILED_prefix/server_stack_overflow.txt`。
+
+- **範圍外**：`Query` matcher 的執行期求值仍然是 `true`（router 尚未解析 query
+  string）——本日只修表示法，沒有動語意。
 
 ### ✅ Day 7 — M1 驗證日：production-like Docker 演練
 

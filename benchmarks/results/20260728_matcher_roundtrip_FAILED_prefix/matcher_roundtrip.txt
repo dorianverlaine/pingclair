@@ -1,0 +1,40 @@
+=== Matcher JSON round-trip E2E ===
+
+1. baseline, straight from the Pingclairfile
+  ✅ baseline: /public matches
+  ✅ baseline: /admin/* is still excluded
+
+2. the Admin API dump keeps the negation
+  ❌ GET /config lost the negation — {
+  "0.0.0.0:80": [
+    {
+      "name": "matcher.test",
+      "listen": [
+        "0.0.0.0:80",
+        "0.0.0.0:19310"
+      ],
+      "tls": null,
+      "routes": [
+        {
+          "path": "/*",
+          "handler": {
+            "type": "respond",
+            "status": 200,
+            "body": "matched",
+            "headers": {}
+          },
+          "methods": null,
+          "matcher": {
+
+3. posting the dump back is lossless
+  ✅ POST /config accepted the config it had just emitted
+  ❌ after hot reload: /public matches — GET /public gave 404, wanted 200
+  ❌ after hot reload: /admin/* is still excluded — GET /admin/secrets gave 200, wanted 404
+
+4. a hand-written 0.1.7 (untagged) matcher still loads
+  ✅ POST /config accepted the untagged legacy shape
+  ✅ legacy: the untagged path matcher routes
+  ✅ legacy: a non-matching path falls through
+
+5. an unreadable matcher is refused, not ignored
+./scripts/test-matcher-roundtrip.sh: line 173: 15503 Abort trap: 6           PINGCLAIR_TLS_STORE="$RESULTS_DIR/tls" RUST_LOG=warn "$BIN" run "$CONF" > "$RESULTS_DIR/server.txt" 2>&1

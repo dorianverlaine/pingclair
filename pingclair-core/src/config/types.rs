@@ -295,8 +295,29 @@ pub struct RouteConfig {
 }
 
 /// Route matcher
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+///
+/// 🏗️ SERIALIZATION: **externally tagged** — `{"not": {"path": {"patterns":
+/// ["/admin/*"]}}}`. The tag is what makes the enum recoverable. Under the
+/// `untagged` representation this type used to carry, a variant was
+/// identified purely by the shape of its payload, and half of these variants
+/// do not have a distinguishable shape:
+///
+/// - `Not(inner)` serialized as *just the inner matcher*, so a round trip
+///   read it back as the inner matcher and **dropped the negation** — the
+///   one transformation that inverts a routing decision.
+/// - `Or` and `And` are both two-element arrays, so every `Or` came back
+///   as an `And`.
+/// - `Query` and `Header` are both `{name, condition}`, so every `Query`
+///   came back as a `Header`.
+/// - `RemoteIp` and `Protocol` are both arrays of strings, like `Host`.
+///
+/// A Pingclairfile never went through this path — the compiler builds these
+/// values directly — but JSON/TOML configs and Admin API hot reload did.
+///
+/// Deserialization still accepts the old shapes so `0.1.7` configs load
+/// unchanged; see the `Deserialize` impl.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Matcher {
     /// Match by path
     Path { patterns: Vec<String> },
@@ -335,8 +356,107 @@ pub enum Matcher {
     Not(Box<Matcher>),
 }
 
+impl<'de> Deserialize<'de> for Matcher {
+    /// Reads the tagged form, falling back to the shapes a `0.1.7` config
+    /// could hold.
+    ///
+    /// The two forms cannot be confused: a tagged matcher is a map whose only
+    /// key is a variant name, and no legacy shape has a key called `path`,
+    /// `host`, `not`, and so on. The tagged form is tried first so a config
+    /// that has been rewritten always wins.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Mirrors `Matcher` purely to borrow serde's derived externally
+        // tagged reader. Kept inside the function so the two lists cannot
+        // drift apart unnoticed and so it never reaches the public API.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Tagged {
+            Path {
+                patterns: Vec<String>,
+            },
+            Header {
+                name: String,
+                condition: MatcherCondition,
+            },
+            Method {
+                methods: Vec<String>,
+            },
+            Query {
+                name: String,
+                condition: MatcherCondition,
+            },
+            Host(Vec<String>),
+            RemoteIp(Vec<String>),
+            Protocol(Vec<String>),
+            And(Box<Matcher>, Box<Matcher>),
+            Or(Box<Matcher>, Box<Matcher>),
+            Not(Box<Matcher>),
+        }
+
+        /// The shapes a `0.1.7` config could actually contain.
+        ///
+        /// Deliberately *not* one variant per matcher: several matchers
+        /// shared a shape back then, and the reading below reproduces the
+        /// one `0.1.7` performed rather than guessing at the author's
+        /// intent. A file that has always been read as a `Header` must not
+        /// quietly start behaving as a `Query` because this code now knows
+        /// the difference — the tagged form is how you say which you meant.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Legacy {
+            Path {
+                patterns: Vec<String>,
+            },
+            Method {
+                methods: Vec<String>,
+            },
+            /// Also how a `Query` was written; `0.1.7` read it as a `Header`.
+            Header {
+                name: String,
+                condition: MatcherCondition,
+            },
+            /// Also how `RemoteIp` and `Protocol` were written.
+            Host(Vec<String>),
+            /// Also how an `Or` was written.
+            And(Box<Matcher>, Box<Matcher>),
+        }
+
+        #[derive(Deserialize)]
+        #[serde(
+            untagged,
+            expecting = "a tagged matcher such as {\"path\": {\"patterns\": [\"/api/*\"]}}, or a 0.1.7 untagged matcher"
+        )]
+        enum Repr {
+            Tagged(Tagged),
+            Legacy(Legacy),
+        }
+
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Tagged(Tagged::Path { patterns }) => Matcher::Path { patterns },
+            Repr::Tagged(Tagged::Header { name, condition }) => Matcher::Header { name, condition },
+            Repr::Tagged(Tagged::Method { methods }) => Matcher::Method { methods },
+            Repr::Tagged(Tagged::Query { name, condition }) => Matcher::Query { name, condition },
+            Repr::Tagged(Tagged::Host(hosts)) => Matcher::Host(hosts),
+            Repr::Tagged(Tagged::RemoteIp(ips)) => Matcher::RemoteIp(ips),
+            Repr::Tagged(Tagged::Protocol(protocols)) => Matcher::Protocol(protocols),
+            Repr::Tagged(Tagged::And(left, right)) => Matcher::And(left, right),
+            Repr::Tagged(Tagged::Or(left, right)) => Matcher::Or(left, right),
+            Repr::Tagged(Tagged::Not(inner)) => Matcher::Not(inner),
+
+            Repr::Legacy(Legacy::Path { patterns }) => Matcher::Path { patterns },
+            Repr::Legacy(Legacy::Method { methods }) => Matcher::Method { methods },
+            Repr::Legacy(Legacy::Header { name, condition }) => Matcher::Header { name, condition },
+            Repr::Legacy(Legacy::Host(hosts)) => Matcher::Host(hosts),
+            Repr::Legacy(Legacy::And(left, right)) => Matcher::And(left, right),
+        })
+    }
+}
+
 /// Matcher condition
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatcherCondition {
     Exists,
@@ -969,5 +1089,238 @@ mod tests {
 
         let disabled: GlobalConfig = serde_json::from_str(r#"{"http3":false}"#).unwrap();
         assert!(!disabled.http3);
+    }
+
+    // ---- Matcher serialization ----
+
+    fn round_trip(matcher: &Matcher) -> Matcher {
+        let json = serde_json::to_string(matcher).expect("serialize");
+        serde_json::from_str(&json).unwrap_or_else(|error| panic!("{json}: {error}"))
+    }
+
+    fn path(pattern: &str) -> Matcher {
+        Matcher::Path {
+            patterns: vec![pattern.to_string()],
+        }
+    }
+
+    #[test]
+    fn every_matcher_survives_a_json_round_trip() {
+        let condition = MatcherCondition::Equals("v".into());
+        for matcher in [
+            path("/api/*"),
+            Matcher::Header {
+                name: "X-Test".into(),
+                condition: condition.clone(),
+            },
+            Matcher::Method {
+                methods: vec!["GET".into()],
+            },
+            Matcher::Query {
+                name: "q".into(),
+                condition: condition.clone(),
+            },
+            Matcher::Host(vec!["example.com".into()]),
+            Matcher::RemoteIp(vec!["10.0.0.1".into()]),
+            Matcher::Protocol(vec!["https".into()]),
+            Matcher::And(Box::new(path("/a")), Box::new(path("/b"))),
+            Matcher::Or(Box::new(path("/a")), Box::new(path("/b"))),
+            Matcher::Not(Box::new(path("/admin/*"))),
+        ] {
+            assert_eq!(round_trip(&matcher), matcher, "{matcher:?}");
+        }
+    }
+
+    #[test]
+    fn a_negation_is_not_lost_in_the_round_trip() {
+        // The specific failure that motivated the tagged representation: an
+        // untagged `Not` serialized as its own inner matcher, so `not path
+        // /admin/*` came back as `path /admin/*` — the exact inversion of the
+        // decision the operator wrote down.
+        let matcher = Matcher::Not(Box::new(path("/admin/*")));
+        let json = serde_json::to_string(&matcher).unwrap();
+
+        assert_eq!(json, r#"{"not":{"path":{"patterns":["/admin/*"]}}}"#);
+        assert!(
+            matches!(round_trip(&matcher), Matcher::Not(_)),
+            "the negation must still be there"
+        );
+    }
+
+    #[test]
+    fn matchers_that_share_a_payload_shape_stay_distinct() {
+        // Each pair was indistinguishable under the untagged representation:
+        // the first of the two always won on the way back in.
+        let condition = MatcherCondition::Exists;
+        let query = Matcher::Query {
+            name: "q".into(),
+            condition: condition.clone(),
+        };
+        let header = Matcher::Header {
+            name: "q".into(),
+            condition,
+        };
+        assert_eq!(round_trip(&query), query);
+        assert_eq!(round_trip(&header), header);
+        assert_ne!(round_trip(&query), header);
+
+        let or = Matcher::Or(Box::new(path("/a")), Box::new(path("/b")));
+        let and = Matcher::And(Box::new(path("/a")), Box::new(path("/b")));
+        assert!(matches!(round_trip(&or), Matcher::Or(..)));
+        assert!(matches!(round_trip(&and), Matcher::And(..)));
+
+        let addresses = vec!["10.0.0.1".to_string()];
+        assert!(matches!(
+            round_trip(&Matcher::RemoteIp(addresses.clone())),
+            Matcher::RemoteIp(_)
+        ));
+        assert!(matches!(
+            round_trip(&Matcher::Protocol(addresses.clone())),
+            Matcher::Protocol(_)
+        ));
+        assert!(matches!(
+            round_trip(&Matcher::Host(addresses)),
+            Matcher::Host(_)
+        ));
+    }
+
+    #[test]
+    fn deeply_nested_matchers_round_trip() {
+        let matcher = Matcher::Not(Box::new(Matcher::And(
+            Box::new(Matcher::Or(
+                Box::new(path("/a")),
+                Box::new(Matcher::Not(Box::new(Matcher::Host(vec![
+                    "example.com".into(),
+                ])))),
+            )),
+            Box::new(Matcher::Not(Box::new(Matcher::Method {
+                methods: vec!["POST".into()],
+            }))),
+        )));
+
+        assert_eq!(round_trip(&matcher), matcher);
+    }
+
+    #[test]
+    fn legacy_untagged_configs_still_load() {
+        // Every shape a `0.1.7` config could actually hold. These must keep
+        // loading unchanged, tag or no tag.
+        let cases: [(&str, Matcher); 5] = [
+            (r#"{"patterns":["/api/*"]}"#, path("/api/*")),
+            (
+                r#"{"methods":["GET","POST"]}"#,
+                Matcher::Method {
+                    methods: vec!["GET".into(), "POST".into()],
+                },
+            ),
+            (
+                r#"{"name":"X-Test","condition":{"equals":"v"}}"#,
+                Matcher::Header {
+                    name: "X-Test".into(),
+                    condition: MatcherCondition::Equals("v".into()),
+                },
+            ),
+            (
+                r#"["example.com","www.example.com"]"#,
+                Matcher::Host(vec!["example.com".into(), "www.example.com".into()]),
+            ),
+            (
+                r#"[{"patterns":["/a"]},{"patterns":["/b"]}]"#,
+                Matcher::And(Box::new(path("/a")), Box::new(path("/b"))),
+            ),
+        ];
+
+        for (json, expected) in cases {
+            let parsed: Matcher =
+                serde_json::from_str(json).unwrap_or_else(|e| panic!("{json}: {e}"));
+            assert_eq!(parsed, expected, "{json}");
+        }
+    }
+
+    #[test]
+    fn a_legacy_shape_keeps_the_reading_it_always_had() {
+        // `{name, condition}` was written by both `Header` and `Query`, and
+        // `0.1.7` read it as a `Header`. Re-reading it as a `Query` now would
+        // silently change how an existing config routes; the tagged form is
+        // how an author says which one they meant.
+        let legacy: Matcher = serde_json::from_str(r#"{"name":"q","condition":"exists"}"#).unwrap();
+        assert!(matches!(legacy, Matcher::Header { .. }));
+
+        let tagged: Matcher =
+            serde_json::from_str(r#"{"query":{"name":"q","condition":"exists"}}"#).unwrap();
+        assert!(matches!(tagged, Matcher::Query { .. }));
+    }
+
+    #[test]
+    fn an_unrecognised_matcher_does_not_blow_the_stack() {
+        // Regression, and the reason this is more than a correctness fix.
+        //
+        // `Not(Box<Matcher>)` was a *newtype* variant of an untagged enum, so
+        // testing it meant deserializing the whole payload as a `Matcher`
+        // again — with no input consumed. Any value that matched no other
+        // variant therefore recursed forever, and since serde's untagged
+        // replay does not go back through serde_json's parser, serde_json's
+        // own recursion limit never saw it. A single unrecognised matcher
+        // posted to the Admin API aborted the process with a stack overflow.
+        //
+        // The tagged form terminates because the tag selects one variant, and
+        // the legacy fallback only recurses through a sequence, which always
+        // consumes input.
+        assert!(serde_json::from_str::<Matcher>(r#"{"nonsense":["/x"]}"#).is_err());
+
+        // Deep nesting must still be refused rather than ridden all the way
+        // down: serde_json caps parse depth, and every recursion here costs
+        // one array level.
+        let deep = format!("{}{}", "[".repeat(400), "]".repeat(400));
+        assert!(serde_json::from_str::<Matcher>(&deep).is_err());
+    }
+
+    #[test]
+    fn a_matcher_that_is_neither_form_is_rejected() {
+        // Fail closed: an unreadable matcher must not degrade into one that
+        // matches everything.
+        for json in [
+            r#"{"nope":{"patterns":["/a"]}}"#,
+            r#"{"path":{"wrong_field":[]}}"#,
+            r#""just-a-string""#,
+            r#"42"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Matcher>(json).is_err(),
+                "{json} should not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn matchers_round_trip_through_toml_too() {
+        // The loader accepts TOML as well as JSON, and external tagging has
+        // to survive both.
+        let config = PingclairConfig {
+            servers: vec![ServerConfig {
+                name: Some("example.com".into()),
+                routes: vec![RouteConfig {
+                    path: "/*".into(),
+                    handler: HandlerConfig::Respond {
+                        status: 200,
+                        body: None,
+                        headers: HashMap::new(),
+                    },
+                    methods: None,
+                    matcher: Some(Matcher::Not(Box::new(path("/admin/*")))),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let toml_text = toml::to_string(&config).expect("serialize TOML");
+        let parsed: PingclairConfig = toml::from_str(&toml_text).expect("parse TOML");
+
+        assert_eq!(
+            parsed.servers[0].routes[0].matcher.as_ref().unwrap(),
+            &Matcher::Not(Box::new(path("/admin/*"))),
+            "\n{toml_text}"
+        );
     }
 }
