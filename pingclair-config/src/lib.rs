@@ -421,6 +421,47 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_dns_refresh() {
+        let with_directive = |value: &str| {
+            let source = format!(
+                r#"{{
+                    dns_refresh {value}
+                }}
+
+                example.com {{
+                    listen :80
+                    respond "OK"
+                }}"#
+            );
+            compile(&source)
+        };
+
+        assert_eq!(
+            with_directive("10s").unwrap().global.dns_refresh_secs,
+            10,
+            "an explicit interval wins"
+        );
+        assert_eq!(with_directive("2m").unwrap().global.dns_refresh_secs, 120);
+        assert_eq!(
+            with_directive("off").unwrap().global.dns_refresh_secs,
+            0,
+            "`off` pins upstreams to their startup addresses"
+        );
+
+        // A bare number reads as milliseconds elsewhere in the grammar, so
+        // accepting it here would turn `dns_refresh 30` into 30ms of lookups.
+        assert!(with_directive("30").is_err());
+        assert!(with_directive("500ms").is_err());
+        assert!(with_directive("soon").is_err());
+
+        let default = compile("example.com {\n listen :80\n respond \"OK\"\n}").unwrap();
+        assert_eq!(
+            default.global.dns_refresh_secs, 30,
+            "the default must survive a config that never mentions dns_refresh"
+        );
+    }
+
+    #[test]
     fn test_compile_basic_auth_inline() {
         let source = r#"
             example.com {

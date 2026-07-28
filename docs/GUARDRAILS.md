@@ -29,6 +29,17 @@
   被測程式的問題。測試腳本改用明確參數的 function。
 - **壓縮測試的 payload 必須逐 chunk 唯一且不可壓縮**。重複同一塊資料會被
   zstd 的 window 去重（64MiB → 15KB），讓「輸出有在流動」這類斷言**假性失敗**。
+- **要在容器 log 裡看到 ERROR 以下的內容必須設 `RUST_LOG`**。subscriber 是
+  `EnvFilter::from_default_env()` 建的，沒設等於只留 ERROR——症狀是功能明明
+  正常卻「什麼都沒 log」。
+- **grep 容器 log 前要先剝掉 ANSI**。tracing 的 fmt layer 即使 stdout 不是 tty
+  也會給欄位名上色，`from=1.2.3.4` 實際上是 `from<ESC>[0m<ESC>[2m=<ESC>[0m1.2.3.4`，
+  直接 grep 字面字串會**假性失敗**。
+- **測 DNS 重解析時容器位址要用 `--ip` 明確指定**。讓 Docker 自己配，
+  「backend 有沒有跟著搬」就變成看 daemon 的位址回收策略；只有在剛好拿到新
+  IP 時才會過的測試不算測試。要製造「名稱解析不到但舊位址還健康」，用
+  `docker network disconnect` 後再 `connect --ip <同一個位址>`（不帶 alias）——
+  同一個容器、同一個位址，只是名稱查不到了。
 
 ---
 

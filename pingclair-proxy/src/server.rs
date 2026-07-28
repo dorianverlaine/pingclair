@@ -29,8 +29,8 @@ use crate::http_policy::{
     rewrite_uri, sanitize_request_id,
 };
 use crate::metrics;
-use crate::upstream::{HostName, Scheme, create_upstream};
-use crate::{HealthChecker, LoadBalancer, Strategy, Upstream};
+use crate::upstream::{HostName, Scheme, UpstreamSpec};
+use crate::{HealthChecker, LoadBalancer, Strategy, Upstream, UpstreamEntry};
 use bytes::Bytes;
 use ipnet::IpNet;
 use pingclair_core::config::Encoding;
@@ -595,6 +595,7 @@ impl ProxyState {
                 if primary.is_empty() && backup.is_empty() {
                     tracing::warn!("⚠️ No valid upstreams found for route {}", route.path);
                 }
+                let primary_is_empty = primary.is_empty();
 
                 let strategy = match proxy_config.load_balance.strategy.as_str() {
                     "random" => Strategy::Random,
@@ -604,37 +605,31 @@ impl ProxyState {
                     _ => Strategy::RoundRobin,
                 };
 
-                let mut load_balancer = Arc::new(if primary.is_empty() {
+                let load_balancer = Arc::new(if primary_is_empty {
                     // A backup-only configuration is still useful for a
                     // deliberately standby-only route; there is no primary
                     // pool to wait on in that case.
-                    LoadBalancer::new(backup, strategy)
+                    LoadBalancer::from_entries(backup, vec![], strategy)
                 } else {
-                    LoadBalancer::with_backup(primary, backup, strategy)
+                    LoadBalancer::from_entries(primary, backup, strategy)
                 });
 
                 if let Some(hc_config) = &proxy_config.health_check {
-                    let health_check_conf = crate::health_check::HealthCheckConfig {
+                    load_balancer.set_health_check(crate::health_check::HealthCheckConfig {
                         path: hc_config.path.clone(),
                         timeout: std::time::Duration::from_secs(hc_config.timeout),
                         positive_threshold: 1,
                         negative_threshold: hc_config.threshold as usize,
                         expected_status: (200, 299),
-                    };
-
-                    let health_checker = HealthChecker::new(health_check_conf);
-
-                    if let Some(load_balancer_mut) = Arc::get_mut(&mut load_balancer) {
-                        load_balancer_mut.set_health_check(health_checker);
-                        load_balancer_mut.set_health_check_frequency(
-                            std::time::Duration::from_secs(hc_config.interval),
-                        );
-                    } else {
-                        tracing::warn!(
-                            "Correlation ID: Init - Could not attach health checker to LB"
-                        );
-                    }
+                    });
+                    load_balancer.set_health_check_frequency(std::time::Duration::from_secs(
+                        hc_config.interval,
+                    ));
                 }
+
+                // Hostname upstreams are re-resolved by the shared refresher;
+                // pools of IP literals are ignored by `register`.
+                crate::dns::register(&load_balancer);
 
                 load_balancers.push(Some(load_balancer));
                 tracing::info!(
@@ -2191,10 +2186,21 @@ impl ProxyHttp for PingclairProxy {
             )));
         }
 
-        // No upstream found
-        Err(pingora_core::Error::new(
-            pingora_core::ErrorType::ConnectNoRoute,
-        ))
+        // A route matched a reverse_proxy, but no backend was selectable:
+        // every one is marked down, or the upstream hostname has not resolved
+        // yet. That is an *upstream* problem, so it answers 502 like nginx and
+        // Caddy do — `ConnectNoRoute` would surface as 500 and tell an
+        // operator (and any load balancer in front) that the proxy itself
+        // broke. With DNS re-resolution the unresolved case is an ordinary
+        // transient state: the proxy may legitimately start before its app.
+        tracing::warn!(
+            route = route_index,
+            "⚠️ No upstream available for the matched route"
+        );
+        pingora_core::Error::e_explain(
+            pingora_core::ErrorType::HTTPStatus(502),
+            "no upstream available",
+        )
     }
 
     /// 🔒 Rejects `h2://` peers that did not negotiate HTTP/2 over TLS.
@@ -2709,7 +2715,13 @@ fn find_reverse_proxy_config(handler: &HandlerConfig) -> Option<&ReverseProxyCon
 /// Repeating an identical backend is incorrect because Pingora stores its
 /// backend set by value and deduplicates those entries before selection.
 /// A defensive cap keeps every selector's internal weighted table bounded.
-fn build_weighted_upstreams(config: &ReverseProxyConfig) -> (Vec<Upstream>, Vec<Upstream>) {
+///
+/// Addresses are *not* resolved here: the load balancer keeps the parsed
+/// specs so a hostname can be re-resolved later, and an upstream that is not
+/// answering DNS yet stays in the list instead of being dropped for good.
+fn build_weighted_upstreams(
+    config: &ReverseProxyConfig,
+) -> (Vec<UpstreamEntry>, Vec<UpstreamEntry>) {
     let options: Vec<_> = if config.upstream_options.is_empty() {
         config
             .upstreams
@@ -2733,11 +2745,11 @@ fn build_weighted_upstreams(config: &ReverseProxyConfig) -> (Vec<Upstream>, Vec<
         } else {
             &mut primary
         };
-        match create_upstream(&option.address) {
-            Some(mut upstream) => {
-                upstream.weight = weight as usize;
-                target.push(upstream);
-            }
+        match UpstreamSpec::parse(&option.address) {
+            Some(spec) => target.push(UpstreamEntry {
+                spec,
+                weight: weight as usize,
+            }),
             None => tracing::warn!(upstream = %option.address, "Ignoring invalid upstream address"),
         }
     }
@@ -3391,6 +3403,7 @@ mod gzip_type_tests {
 #[cfg(test)]
 mod caddy_parity_tests {
     use super::*;
+    use crate::upstream::create_upstream;
 
     #[test]
     fn access_control_enforces_cidr_referer_and_user_agent_rules() {
@@ -3529,11 +3542,17 @@ mod caddy_parity_tests {
         };
         let (primary, backup) = build_weighted_upstreams(&config);
         assert_eq!(primary.len(), 1);
-        assert_eq!(primary[0].addr.to_string(), "127.0.0.1:8301");
+        assert_eq!(primary[0].spec.authority(), "127.0.0.1:8301");
         assert_eq!(primary[0].weight, 3);
         assert_eq!(backup.len(), 1);
-        assert_eq!(backup[0].addr.to_string(), "127.0.0.1:8302");
+        assert_eq!(backup[0].spec.authority(), "127.0.0.1:8302");
         assert_eq!(backup[0].weight, 2);
+
+        // The weights must survive all the way into the built pool.
+        let load_balancer = LoadBalancer::from_entries(primary, backup, Strategy::RoundRobin);
+        let selected = load_balancer.select(None).unwrap();
+        assert_eq!(selected.addr.to_string(), "127.0.0.1:8301");
+        assert_eq!(selected.weight, 3);
     }
 
     #[test]

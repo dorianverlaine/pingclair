@@ -1,5 +1,19 @@
 # Reverse proxy example
 
+{
+    # Hostname upstreams are re-resolved on this interval, so a container that
+    # restarts on a new address is followed without a reload. A failed lookup
+    # keeps the previous address in rotation. `off` pins upstreams to the
+    # address they had at startup. A unit is required: `30` is not `30s`.
+    dns_refresh 30s
+}
+
 api.example.com {
     reverse_proxy localhost:8080 localhost:8081 localhost:8082
+}
+
+# In Docker or Compose, address the app by its service name: the name is the
+# stable identity and the IP is the perishable part.
+app.example.com {
+    reverse_proxy http://app:8080
 }

@@ -416,3 +416,17 @@ cd benchmarks
                                        # (the methodology used for the VPS
                                        # results above — no network in the way)
 ```
+
+Not a benchmark, but it lives here because it needs the same Docker image:
+
+```bash
+docker build -t pingclair:dns-e2e ..
+./scripts/run_dns_refresh_e2e.sh       # upstream DNS re-resolution E2E
+```
+
+It runs the real release image against Docker's own embedded resolver and
+checks that the backend follows a container to a new IP, that a failed lookup
+keeps the last known address serving, that an upstream absent at boot is
+adopted later, and that `dns_refresh off` pins the startup address. Container
+addresses are pinned with `--ip` so the result never depends on how the daemon
+happens to recycle its address pool.

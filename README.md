@@ -302,6 +302,21 @@ uses HTTP/1.1, `https://` negotiates HTTP/2 with HTTP/1.1 fallback through ALPN,
 over TLS. Use `h2c://` or `h2://` for native gRPC so response trailers remain
 end-to-end metadata.
 
+Upstreams written as hostnames are re-resolved while the server runs, so a
+container that restarts on a new address is picked up without a reload. A
+lookup that fails leaves the previous address in rotation — a resolver outage
+should not take the site down — and a name that does not resolve at startup
+joins the pool as soon as it does, which lets the proxy start before its app.
+IP literals never reach a resolver at all.
+
+```caddyfile
+{
+    # Default 30s. `dns_refresh off` pins every upstream to the address it
+    # had at startup. A unit is required: `30` is not `30s`.
+    dns_refresh 15s
+}
+```
+
 ### Caddy parity controls
 
 ```caddyfile

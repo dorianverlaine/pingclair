@@ -68,6 +68,17 @@ pub struct GlobalConfig {
     /// available parallelism (nginx `worker_processes auto` semantics).
     #[serde(default)]
     pub worker_threads: Option<usize>,
+
+    /// How often hostname upstreams are re-resolved, in seconds. `0` turns
+    /// re-resolution off and pins every upstream to the address it had at
+    /// startup. Only names are affected: IP literals never reach a resolver.
+    #[serde(default = "default_dns_refresh_secs")]
+    pub dns_refresh_secs: u64,
+}
+
+/// Default upstream re-resolution interval (seconds).
+pub fn default_dns_refresh_secs() -> u64 {
+    30
 }
 
 impl Default for GlobalConfig {
@@ -80,6 +91,7 @@ impl Default for GlobalConfig {
             upstream_keepalive_pool_size: None,
             http3: true,
             worker_threads: None,
+            dns_refresh_secs: default_dns_refresh_secs(),
         }
     }
 }
