@@ -35,6 +35,17 @@
 - **grep 容器 log 前要先剝掉 ANSI**。tracing 的 fmt layer 即使 stdout 不是 tty
   也會給欄位名上色，`from=1.2.3.4` 實際上是 `from<ESC>[0m<ESC>[2m=<ESC>[0m1.2.3.4`，
   直接 grep 字面字串會**假性失敗**。
+- **改 bind-mount 的單一檔案禁止用 `sed -i`**。bind mount 綁的是 **inode 不是路徑**：
+  `sed -i` 寫新檔再改名蓋過去，宿主看到改動、**容器繼續讀舊 inode**。這個失敗
+  完全無聲——reload 會回報「成功」（它確實重載了，只是內容一模一樣），於是
+  「壞配置被拒」「last-known-good 還在」這類斷言**全部假性通過**。
+  一律用 `cat new > target` 這種**原地截斷改寫**，並在演練開頭斷言
+  `stat -c %i` 宿主與容器一致。2026-07-28 Day 7 實際踩到，兩條 ✅ 是假的。
+- **`grep -q` 不要放在 `set -o pipefail` 的 pipeline 尾端**。命中即提前退出會把
+  上游 SIGPIPE 掉，141 變成整條 pipeline 的狀態，**命中反而被讀成失敗**；
+  而且只有輸出夠長才輸掉這個 race，所以會間歇性假性失敗。先存檔再 grep 檔案。
+- **腳本收 results 目錄參數時要處理絕對路徑**。`-v "$(pwd)/$conf"` 遇到絕對路徑
+  會變成 `/tmp//tmp/...`，Docker 靜默建一個空目錄當掛載點，程式起不來。
 - **測 DNS 重解析時容器位址要用 `--ip` 明確指定**。讓 Docker 自己配，
   「backend 有沒有跟著搬」就變成看 daemon 的位址回收策略；只有在剛好拿到新
   IP 時才會過的測試不算測試。要製造「名稱解析不到但舊位址還健康」，用

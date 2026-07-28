@@ -27,11 +27,13 @@ RESULTS_DIR="${1:-results/dns_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$RESULTS_DIR"
 LOG="$RESULTS_DIR/dns_refresh.txt"
 
-IMAGE="pingclair:dns-e2e"
+IMAGE="${PINGCLAIR_IMAGE:-pingclair:dns-e2e}"
 NET=pingclair-dns-e2e
-SUBNET=172.31.77.0/24
-APP_A_IP=172.31.77.10
-APP_B_IP=172.31.77.20
+# Overridable: a hard-coded 172.31/16 would shadow an AWS VPC's own range on
+# an EC2 host and take the box's networking with it.
+SUBNET="${DNS_E2E_SUBNET:-10.77.0.0/24}"
+APP_A_IP="${SUBNET%.*}.10"
+APP_B_IP="${SUBNET%.*}.20"
 PROXY_PORT=18099
 REFRESH=3        # seconds; the config below must match
 SETTLE=12        # generous multiple of REFRESH before declaring a failure
@@ -61,7 +63,7 @@ start_app() {
         net_args+=(--network-alias app)
     fi
     docker run -d --name "$name" "${net_args[@]}" \
-        nginx:1.27-alpine >/dev/null
+        "${APP_IMAGE:-nginx:1.27-alpine}" >/dev/null
     docker exec "$name" sh -c "printf '%s' '$body' > /usr/share/nginx/html/index.html"
 }
 
@@ -134,7 +136,7 @@ EOF
     # refresher's own account of what it did.
     docker run -d --name pc-dns-proxy --network "$NET" \
         -p "$PROXY_PORT:8080" \
-        -v "$(pwd)/$conf:/etc/pingclair/Pingclairfile:ro" \
+        -v "$(cd "$(dirname "$conf")" && pwd)/$(basename "$conf"):/etc/pingclair/Pingclairfile:ro" \
         -e PINGCLAIR_TLS_STORE=/tmp/pingclair-tls \
         -e RUST_LOG=info \
         "$IMAGE" pingclair run /etc/pingclair/Pingclairfile >/dev/null
@@ -143,11 +145,16 @@ EOF
 # Assert the proxy logged something, so the operator-facing signal is part of
 # the evidence and not just the response body.
 expect_log() {
-    local pattern="$1" desc="$2"
-    # The fmt layer colours field names even when stdout is not a tty, so
-    # `from=1.2.3.4` is really `from<ESC>[0m<ESC>[2m=<ESC>[0m1.2.3.4` on the
-    # wire. Strip the escapes before matching.
-    if docker logs pc-dns-proxy 2>&1 | sed $'s/\033\\[[0-9;]*m//g' | grep -qa -- "$pattern"; then
+    local pattern="$1" desc="$2" snapshot="$RESULTS_DIR/.logsnap"
+    # Snapshot to a file rather than grepping a live pipeline. `grep -q` exits
+    # as soon as it matches, which SIGPIPEs the upstream `docker logs`, and
+    # under `set -o pipefail` that 141 becomes the pipeline's status — a match
+    # then reads as a failure, and only once the log is long enough for the
+    # race to be lost. The fmt layer also colours field names even when stdout
+    # is not a tty, so the escapes come out here too.
+    docker logs pc-dns-proxy >"$snapshot" 2>&1 || true
+    sed -i.bak $'s/\033\\[[0-9;]*m//g' "$snapshot" 2>/dev/null || true
+    if grep -qa -- "$pattern" "$snapshot"; then
         pass "$desc"
     else
         fail "$desc — no log line matching '$pattern'"
