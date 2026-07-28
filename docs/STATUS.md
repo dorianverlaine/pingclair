@@ -372,6 +372,33 @@ commit `0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。
   客戶端斷鏈）、TLS store 路徑可經 `PINGCLAIR_TLS_STORE` 覆寫
   （寫死路徑在不可寫環境會直接 panic）。
 
+### 缺少 `Via` 標頭 —— RFC 9110 的 MUST（2026-07-28）
+
+實測比對（真站、同一個 echo upstream、同一份配置語意）：
+
+| 方向 | Caddy | Pingclair |
+|---|---|---|
+| 送給 upstream 的請求 | `Via: 2.0 Caddy` | **無** |
+| 回給 client 的回應 | `Via: 1.1 Caddy` | **無** |
+
+RFC 9110 §7.6.3：*"An HTTP-to-HTTP gateway **MUST** send an appropriate Via
+header field in each inbound request message and **MAY** send a Via header
+field in forwarded response messages."* 反向代理就是 RFC 定義的 gateway，
+所以**請求方向是 MUST**，我們現在違反了；回應方向是 MAY，Caddy 有做我們沒有。
+
+實作要點（別做成 `Server` 那樣的覆寫）：
+- 必須**附加**到既有的 `Via` 之後，不可覆寫——這個標頭的用途就是記錄整條
+  代理鏈，覆寫等於把上游的紀錄抹掉。
+- version token 是**收到這一跳時的協議版本**（H2 進來就是 `2.0`），
+  不是送出去的版本。Caddy 上表兩個值不同正是這個原因。
+- 要能像 `-Server` 一樣關掉（有些人不想暴露拓撲）。
+- RFC 允許用 `Via` 做迴圈偵測，之後可接。
+
+> 📌 順帶一提：`Server` 標頭**不是**缺口。預設會送 `Server: Pingclair`
+> （已實測），生產站看不到是因為兩個獨立原因——使用者的配置有 `-Server`，
+> 而且 Cloudflare 邊緣一律覆寫成 `server: cloudflare`。
+> `x-request-id` 則能穿過 Cloudflare 抵達瀏覽器。
+
 ### 主動健康檢查目前沒有在跑（2026-07-28）
 
 - `HealthChecker` 會被建出來、`health_check_frequency` 會被設定，但**驅動它的
