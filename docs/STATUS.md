@@ -25,6 +25,36 @@
 
 ## ✅ 已通過遠端驗證
 
+### 2026-07-28 M1 真站驗收（RC `8294116`）
+
+**北極星驗收達成。** 不是 production-like，是使用者唯一的生產站本身：
+`aqeonet-aws-tw-xray`，Amazon Linux 2023 aarch64，
+`Cloudflare Tunnel → :6688 → app:8080`。生產 Caddyfile 逐 directive 譯成
+Pingclairfile（`benchmarks/configs/production/Pingclairfile`），
+image `pingclair:rc-8294116`（linux/arm64）。
+
+- **主演練 27/27**，全部是**差分**驗證——同一請求問 pingclair 也問 Caddy：
+  `admin off`、自訂 HTTPS port + `tls internal`、安全標頭 set/remove
+  （**CSP 與 Caddy byte-identical**、`-Server` 真的移除）、三類 Cache-Control
+  與 `not path` AND 語意、壓縮協商（zstd/gzip/identity，**gzip 解出來 byte-exact**）、
+  真實 client IP、JSON log 與 redaction（query token／Cookie／Authorization／
+  Referer `?code=` 全數未進 log）、internal CA 重啟後 **leaf 重用而非重簽**、
+  `/` 與 `/api/ping` body byte-identical、H2 協商、SIGTERM exit 0。
+- **DNS 恢復**在 Linux arm64 真 image 上全過；**reload** 套用好配置、
+  拒絕壞配置並保持 last-known-good 續服務。
+- **真實切換**：隧道切到 pingclair，4 條連線乾淨註冊，reconnect 後 origin
+  錯誤數 0；真瀏覽器已登入 session（IPv6 client）實際使用正常。
+  **回滾 8.9 秒**一條命令，Caddy 全程沒停。目標「起著但服務不了」時**拒絕切換**。
+- 工具：`benchmarks/scripts/run_m1_production_drill.sh`、
+  `run_m1_reload_drill.sh`、`deployment/switch-proxy.sh`。
+  證據：`benchmarks/results/20260728_m1_production_8294116/`。
+
+> ⚠️ **範圍界線**：隧道那一跳實測是 **HTTP/1.1**（cloudflared 對 origin 預設
+> 不開 h2）；**H2 是在 origin 直接驗的**，不是經隧道驗的。公網路徑無法用 curl
+> 驗——Cloudflare managed challenge 在邊緣就回 403，請求到不了源站，改用真
+> 瀏覽器加源站 access log 交叉確認。client IP 偽造的**否定面**沿用 2026-07-27
+> 的專用 fixture，本次未在受信網段內重驗。
+
 ### 2026-07-25 VPS 生產情境測試
 
 環境：阿里雲深圳，Ubuntu 24.04，2 vCPU／1.6GB。

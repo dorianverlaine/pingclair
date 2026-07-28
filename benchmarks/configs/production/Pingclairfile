@@ -1,0 +1,64 @@
+# Day 7 — M1 verification: the production Caddyfile, expressed in Pingclair.
+#
+# Mirrors /home/ec2-user/aqeo/Caddyfile on `aqeonet-aws-tw-xray` directive for
+# directive, so a difference in behaviour is a difference in the server and not
+# in the configuration. Topology is unchanged:
+#
+#   Cloudflare Tunnel → https://<proxy>:6688 → app:8080
+#
+# The origin publishes no host port; the tunnel dials out.
+
+{
+	admin off
+
+	# The Caddyfile does not have this, and it is the one deliberate addition.
+	# Caddy merely logs `CF-Connecting-IP`; Pingclair *acts* on it — access
+	# control, rate limiting and logs all read the verified client IP — so the
+	# peer allowed to assert it has to be named. Only the tunnel sits in front,
+	# and it is the only thing on this network.
+	trusted_proxies 172.18.0.0/16
+}
+
+https://portefeuille.aqeo.dev:6688 {
+	# DNS points at the CDN, so the origin can never answer an ACME challenge.
+	# The tunnel does not verify the origin certificate, and the hop is still
+	# encrypted. Note: `auto_https off` would also switch off internal issuance.
+	tls internal
+
+	# JSON to stdout; docker's json-file driver rotates it (20m × 3 in compose).
+	# Pingclair redacts credential headers and sensitive query parameters by
+	# default, so session tokens do not reach the log.
+	log {
+		output stdout
+		format json
+	}
+
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Content-Security-Policy "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; frame-ancestors 'none'; frame-src https://challenges.cloudflare.com; base-uri 'self'; form-action 'self'"
+		-Server
+	}
+
+	# Session-bearing API responses: never cached, by the CDN or the browser.
+	@api path /api/*
+	header @api Cache-Control "no-store"
+
+	# Vite's hashed assets: the name changes when the content does.
+	@hashed path /assets/*
+	header @hashed Cache-Control "public, max-age=31536000, immutable"
+
+	# Everything else (index.html, logo): cacheable but revalidated every time,
+	# so a deploy takes effect immediately.
+	@rest {
+		not path /assets/*
+		not path /api/*
+	}
+	header @rest Cache-Control "no-cache"
+
+	reverse_proxy app:8080
+}

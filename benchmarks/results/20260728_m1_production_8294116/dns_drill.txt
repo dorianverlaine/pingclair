@@ -1,0 +1,26 @@
+=== Upstream DNS re-resolution E2E ===
+image=pingclair:dns-e2e refresh=3s subnet=10.77.0.0/24
+started 2026-07-28T01:38:34Z
+
+1. upstream absent at boot
+  ✅ no backend yet → 502 rather than a crash or a hang
+  ✅ the upstream is adopted once it resolves (after 2s)
+
+2. container moves to a new address
+  app: 10.77.0.10 → 10.77.0.20
+  ✅ the backend follows the container to its new IP (after 3s)
+  ✅ the move is logged with both addresses
+
+3. resolver failure with a healthy old address
+  ✅ precondition: `app` no longer resolves
+  ✅ the last known address keeps serving (held for 12s)
+  ✅ the failed lookup is logged as a warning, not swallowed
+  ✅ traffic continues once the name resolves again (after 0s)
+
+4. dns_refresh off
+  ✅ baseline: the pinned address serves (after 1s)
+  app: 10.77.0.20 → 10.77.0.10, but re-resolution is off
+  ✅ the address stays pinned (got '<no response>')
+
+=== PASS ===
+evidence: /tmp/dns_pass

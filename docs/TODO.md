@@ -244,16 +244,57 @@ cargo test --locked --workspace
 - **範圍外**：`Query` matcher 的執行期求值仍然是 `true`（router 尚未解析 query
   string）——本日只修表示法，沒有動語意。
 
-### ✅ Day 7 — M1 驗證日：production-like Docker 演練
+### ✅ Day 7 — M1 驗證日：production 演練 ✔
 
-凍結一個 RC commit，用**真 release binary**在 production-like Docker network
-跑完整替換演練。
+**已完成 2026-07-28。RC = `8294116`（`pingclair:rc-8294116`，linux/arm64）。**
+不是 production-like，是**真的那一台**：`aqeonet-aws-tw-xray`，
+Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
 
-- 覆蓋：`admin off`、自訂 HTTPS port、internal CA 重啟／續期、三類 Cache-Control、
-  安全標頭 set/remove、`not path` AND 語意、壓縮協商、真實 client IP、
-  JSON log／redaction、app restart／DNS recovery、reload、shutdown、**回滾**。
-- 經 Cloudflare Tunnel 路徑驗證 TLS 與 H1/H2。
-- **完成判定**：以上全過才可宣稱「可以替換那台 Caddy」。在此之前不得宣稱。
+演練分三段，前兩段對線上**零影響**——pingclair 以第四個容器掛進同一個
+`aqeo_default`，用同一份配置打同一個 app，Caddy 全程照常服務隧道。
+
+**① 主演練 27/27**（`benchmarks/scripts/run_m1_production_drill.sh`）。
+每一項都是**差分**的：同一個請求問 pingclair 也問 Caddy，該相同的地方逐 byte 比。
+
+- ✅ `admin off`（容器內無 admin listener）、自訂 HTTPS port 6688、`tls internal`。
+- ✅ 安全標頭：4 條 set 正確、**CSP 與 Caddy byte-identical**、`-Server` 真的移除。
+- ✅ 三類 Cache-Control 與 `not path` AND 語意（`/api`、`/assets` 都沒漏進 `@rest`）。
+- ✅ 壓縮協商 zstd／gzip／identity 全對，**gzip 解出來與 Caddy byte-exact**。
+- ✅ 真實 client IP：受信隧道網段的 `CF-Connecting-IP` 被採用。
+- ✅ JSON log 與 redaction：query token、Cookie、Authorization、Referer 的 `?code=`
+  **全數未進 log**。
+- ✅ internal CA 重啟：root 同一把、**leaf 重用而非重簽**。
+- ✅ `/` 與 `/api/ping` body 與 Caddy byte-identical；H2 協商成功；
+  SIGTERM exit 0 沒被 SIGKILL。
+
+**② DNS 恢復與 reload**，同樣零影響：
+
+- ✅ `run_dns_refresh_e2e.sh` 在 Linux arm64 真 image 上全過。
+- ✅ SIGHUP 套用新配置且 listener 不斷；**壞配置被拒且 last-known-good 續服務**。
+
+**③ 真實切換與回滾**（`deployment/switch-proxy.sh`）：
+
+- ✅ 切到 pingclair 後隧道 4 條連線乾淨註冊，**reconnect 之後 origin 錯誤數 0**。
+- ✅ 真瀏覽器實際使用（已登入 session、IPv6 client）：`/`、`/api/*`
+  路由正確，`client_ip` 是 CF 給的訪客位址而非隧道容器位址，
+  `referer` 的 query 被剝掉。
+- ✅ **回滾 8.9 秒**，一條命令；Caddy 全程沒停過。
+- ✅ 目標「起著但服務不了」時**拒絕切換**並保持現況（用壞配置實測）。
+
+**完成判定達成**：可以宣稱「可以替換那台 Caddy」——因為它現在就在替換。
+
+> ⚠️ **必須說清楚的範圍**：
+> - 隧道那一跳實測是 **HTTP/1.1**（cloudflared 對 origin 預設不開 h2，
+>   要 `http2Origin: true`）。**H2 是在 origin 直接驗的**，不是經隧道驗的。
+> - 公網路徑無法用 curl 驗——Cloudflare 的 managed challenge 在**邊緣**就回 403，
+>   請求根本到不了源站。改用真瀏覽器加源站 access log 交叉確認。
+> - client IP 偽造的**否定面**（未受信來源不得偽造）沿用 2026-07-27 的專用
+>   fixture，本次未在受信網段內重驗。
+> - `aqeo-pingclair` **不在 `docker-compose.yml` 裡**，由 `switch-proxy.sh` 管理
+>   （有 `--restart unless-stopped`）。要長期留著就該收進 compose。
+
+> 🤡 這天踩到的三個雷**全部在測試腳本裡，一個都不在產品**，其中
+> `sed -i` 換 inode 那個造成**兩條假性通過**。三條都已寫進 GUARDRAILS。
 
 ---
 
@@ -588,7 +629,7 @@ H3 CORS／rewrite／error_page parity。
 
 | 里程碑 | 範圍 | 狀態 |
 |---|---|---|
-| M1 生產站可替換 | Day 1–7 | 🔨 進行中（Day 1–6 ✔，只剩驗證日） |
+| M1 生產站可替換 | Day 1–7 | ✅ **完成**（`8294116`，2026-07-28 真站驗收） |
 | M2 生產護欄 | Day 8–15 | ⬜ 未開始 |
 | M3 接上 Pingora 能力（含 `proxy_cache`） | Day 16–20 | ⬜ 未開始 |
 | M4 可觀測性與運維 | Day 21–24 | ⬜ 未開始 |
