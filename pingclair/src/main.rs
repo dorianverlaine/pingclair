@@ -993,6 +993,26 @@ fn run_server(
     }
 
     // ========================================
+    // 🔄 Upstream DNS re-resolution
+    // ========================================
+    // Every route was resolved once while its ProxyState was built. Container
+    // addresses do not stay put, so one shared task re-resolves the hostname
+    // pools on an interval; pools built from IP literals never registered and
+    // cost nothing here.
+    //
+    // The task runs even when no pool has registered yet: a hot reload can
+    // introduce the first hostname upstream, and it would have no refresher
+    // if starting one depended on the boot-time config.
+    let dns_refresh_secs = config.global.dns_refresh_secs;
+    if dns_refresh_secs == 0 {
+        tracing::info!("🔄 Upstream DNS re-resolution disabled (dns_refresh off)");
+    } else {
+        bg_handle.spawn(pingclair_proxy::dns::run(std::time::Duration::from_secs(
+            dns_refresh_secs,
+        )));
+    }
+
+    // ========================================
     // 🛑 Signal Handling for Shutdown (SIGINT/SIGTERM)
     // ========================================
     // Pingora's `run_forever()` blocks indefinitely, so without explicit

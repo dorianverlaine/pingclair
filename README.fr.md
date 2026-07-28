@@ -310,6 +310,21 @@ ALPN, `h2c://` impose HTTP/2 en clair avec connaissance préalable, et `h2://`
 impose HTTP/2 sur TLS. Utilisez `h2c://` ou `h2://` pour gRPC natif afin de
 préserver les trailers de réponse comme métadonnées de bout en bout.
 
+Les amonts écrits sous forme de noms d'hôtes sont ré-résolus pendant l'exécution :
+un conteneur qui redémarre sur une nouvelle adresse est suivi sans rechargement.
+Une résolution en échec laisse l'adresse précédente en rotation — une panne du
+résolveur ne doit pas faire tomber le site — et un nom qui ne résout pas au
+démarrage rejoint le pool dès qu'il le fait, ce qui permet au proxy de démarrer
+avant son application. Les adresses IP littérales n'atteignent jamais un résolveur.
+
+```caddyfile
+{
+    # 30s par défaut. `dns_refresh off` fige chaque amont sur l'adresse qu'il
+    # avait au démarrage. L'unité est obligatoire : `30` n'est pas `30s`.
+    dns_refresh 15s
+}
+```
+
 ### Contrôles de parité Caddy
 
 ```caddyfile

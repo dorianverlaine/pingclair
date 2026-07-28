@@ -152,14 +152,59 @@ cargo test --locked --workspace
 - **範圍外**：Brotli（需要 streaming encoder，排 v0.3）；靜態檔案路徑的協商
   仍走 `pingclair-static` 既有的預壓縮邏輯，本日未動。
 
-### 🔨 Day 5 — Docker DNS 重解析
+### 🔨 Day 5 — Docker DNS 重解析 ✔
 
-目前 hostname 只在配置載入／reload 時以 blocking resolver 取第一個 IP，
-沒有 TTL 重解析，app 容器換 IP 後不會更新。
+**已完成 2026-07-28。** 新增 `pingclair-proxy/src/dns.rs`；`upstream.rs` 拆出
+`UpstreamSpec`／`Resolve`；`load_balancer.rs` 的 selector set 移到 `ArcSwap` 之後。
 
-- 依 TTL／受控間隔重解析，更新 backend。
-- 解析暫時失敗時保留 last-known-good，不可直接讓站台掛掉。
-- **完成判定**：app 容器換 IP 後 backend 能跟上；resolver 失效時舊 backend 仍可用。
+- ✅ **hostname 才是穩定身分，IP 是會過期的部分**。upstream 不再只保留開機當下
+  解析到的位址，而是保留 spec；refresher 依間隔重解析並整批 publish 新 pool，
+  request path 讀到的永遠是完整快照，不會看到半更新的 backend list。
+- ✅ **解析失敗一律非破壞性**：lookup 失敗時保留前一個位址繼續服務。resolver
+  故障（DNS 容器重啟、`resolv.conf` 短暫消失）不該讓站台跟著掛掉——舊位址
+  通常還在好好服務。單一名稱失敗也不會連累同 pool 的其他 backend。
+- ✅ **開機解析不到的名稱不再被永久丟棄**，會在解析成功後自動加入 pool。
+  代理因此可以先於 app 容器啟動，這在 Compose 裡是常態而非例外。
+- ✅ **IP 字面位址完全不進 resolver**，literal-only 的 pool 根本不會註冊，
+  沒有 hostname 的配置一次 lookup 都不會發。
+- ✅ 多筆 A record 的挑選是**確定性**的（IPv4 優先、再依數值排序）。
+  `to_socket_addrs` 不保證順序且 glibc 會刻意輪替，直接取第一筆會讓 refresher
+  對一個根本沒搬家的名稱每輪都重建 pool。
+- ✅ 重解析**不會偷偷讓故障 backend 復活**：沒搬家的位址沿用同一個 down-until
+  slot；搬走的位址則整個丟掉，map 不會隨重解析次數無限成長。
+- ✅ 重解析後 weight、scheme 與**設定的 hostname**（SNI 與上游 `Host` 都靠它）
+  全部保留。
+- ✅ `dns_refresh` 全域指令：預設 `30s`，`off` 把 upstream 釘在開機位址。
+  單位是必填的——grammar 其他地方把裸數字讀成毫秒，接受 `dns_refresh 30`
+  等於默默裝了一場 30ms 的 lookup 風暴。
+- ✅ 真 Docker network E2E（`benchmarks/scripts/run_dns_refresh_e2e.sh`，
+  真 release image + Docker 內建 resolver）：見下表。
+- ✅ Gate 四項全綠，320 → **338 tests**。
+
+| 場景 | 手法 | 結果 |
+|---|---|---|
+| 開機時 upstream 不存在 | 先起代理再起 app | 502（非 crash／hang），app 起來後 3s 內接管 |
+| 容器換 IP | `.10` 容器換成 `.20` 容器（`--ip` 明確指定） | 3s 內跟上，log 有 `from=…10:80 to=…20:80` |
+| resolver 失效但舊位址仍健康 | 拔掉 network alias、同容器同位址續跑 | 12s 內持續 200，log 有 `keeping the last known address` |
+| 名稱恢復 | 重新掛回 alias | 立即恢復 |
+| `dns_refresh off` | 同樣換容器 | 位址維持釘死，不跟隨 |
+
+> ⚠️ **為什麼是受控間隔而不是 TTL**。std resolver 只回位址、不回 TTL，要讀 TTL
+> 就得引入完整 DNS client 與它的 transport 依賴；而在最該生效的場景它也買不到
+> 什麼——Docker 內建 resolver 回的是 **600s TTL**，遠長於「重啟的容器需要被
+> 發現」的時間窗。固定且可設定的間隔既是更小的依賴，也是更緊的上界。
+
+> ⚠️ **順帶修掉一個一直存在的錯誤語意**：route 匹配到 `reverse_proxy` 但沒有
+> 可選 backend 時原本回 **500**（`ConnectNoRoute`），與 `load_balancer.rs`
+> 自己的註解（「all down → 502, nginx-style」）矛盾，也等於告訴 operator
+> 和前面的 LB「是代理壞了」。改成 `HTTPStatus(502)`。這在本日之後更要緊：
+> 「名稱還沒解析出來」現在是**正常的暫態**。失敗證據保留在
+> `benchmarks/results/20260728_dns_refresh_FAILED_500_not_502/`。
+
+- **範圍外**：一個名稱多筆 A record 目前只取一個位址（不會展開成多個 backend），
+  SRV／服務發現、resolver override、TTL/jitter 仍在 v0.3+ 清單。
+  每個 listener 各自持有一份 ProxyState，所以同一個 upstream 名稱的 lookup
+  次數與 listener 數成正比（本日 E2E 是 2）；量級很小，未動。
 
 ### 🔨 Day 6 — matcher JSON round-trip
 

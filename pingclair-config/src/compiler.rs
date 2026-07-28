@@ -83,6 +83,10 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
 
     config.global.trusted_proxies = global.trusted_proxies.clone();
 
+    if let Some(secs) = global.dns_refresh_secs {
+        config.global.dns_refresh_secs = secs;
+    }
+
     Ok(())
 }
 

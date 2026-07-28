@@ -14,22 +14,23 @@
 pub mod access_log;
 pub mod alt_svc;
 pub mod connection_filter;
+pub mod dns;
 pub mod encoding;
 pub mod health_check;
 mod http_policy;
-mod load_balancer;
+pub mod load_balancer;
 pub mod metrics;
 pub mod quic;
 pub mod rate_limit;
 pub mod redaction;
 pub mod server;
-mod upstream;
+pub mod upstream;
 
 // MARK: - Exports
 
 pub use connection_filter::PingclairConnectionFilter;
 pub use health_check::HealthChecker;
-pub use load_balancer::{FAIL_COOLDOWN, LoadBalancer, Strategy};
+pub use load_balancer::{DnsRefresh, FAIL_COOLDOWN, LoadBalancer, Strategy, UpstreamEntry};
 pub use rate_limit::{RateLimitConfig, RateLimitInfo, RateLimiter};
 pub use server::PingclairProxy;
 pub use upstream::Upstream;

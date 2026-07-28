@@ -10,10 +10,18 @@
 //! `KetamaHashing` selection algorithms. `LeastConn` is implemented here as a
 //! lightweight atomic-counter wrapper that tracks active connections per backend
 //! independently from the native load balancer.
+//!
+//! 🔄 DNS: the selector set lives behind an `ArcSwap` because upstream
+//! hostnames are re-resolved while the server runs (see [`LoadBalancer::refresh_dns`]).
+//! Readers on the request path take a wait-free snapshot; the refresher
+//! publishes a whole new pool at once, so a request never observes a
+//! half-updated backend list.
 
-use crate::health_check::HealthChecker;
-use crate::upstream::Upstream;
+use crate::health_check::{HealthCheckConfig, HealthChecker};
+use crate::upstream::{Resolve, SystemResolver, Upstream, UpstreamSpec};
+use arc_swap::ArcSwap;
 use futures::FutureExt;
+use parking_lot::Mutex;
 use pingora_load_balancing::Backends;
 use pingora_load_balancing::LoadBalancer as NativeLoadBalancer;
 use pingora_load_balancing::discovery::Static;
@@ -39,6 +47,14 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// The inet address of a backend, or `None` for a unix-socket backend.
+fn inet_address(backend: &Upstream) -> Option<SocketAddr> {
+    match &backend.addr {
+        pingora_core::protocols::l4::socket::SocketAddr::Inet(inet) => Some(*inet),
+        _ => None,
+    }
 }
 
 // MARK: - Types
@@ -67,15 +83,31 @@ pub enum Strategy {
 /// cooldown expires the backend automatically becomes selectable again, so
 /// no background re-enable task is needed — the next request through is the
 /// half-open probe. Values are unix milliseconds; 0 means healthy.
+///
+/// The map is immutable once built, which keeps the request path lock-free.
+/// A DNS refresh builds a fresh map via [`BackendHealth::rebuilt`], carrying
+/// over the marks of addresses that survived so a re-resolution cannot
+/// silently un-fail a backend that is still refusing connections.
 struct BackendHealth {
     down_until: HashMap<SocketAddr, Arc<AtomicU64>>,
 }
 
 impl BackendHealth {
-    fn new(addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
+    /// Builds the map for a new backend set, reusing the slots of addresses
+    /// that are still present. Addresses that went away are dropped, so the
+    /// map cannot grow without bound across refreshes.
+    fn rebuilt(
+        previous: Option<&BackendHealth>,
+        addrs: impl IntoIterator<Item = SocketAddr>,
+    ) -> Self {
         let down_until = addrs
             .into_iter()
-            .map(|addr| (addr, Arc::new(AtomicU64::new(0))))
+            .map(|addr| {
+                let slot = previous
+                    .and_then(|health| health.down_until.get(&addr).cloned())
+                    .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
+                (addr, slot)
+            })
             .collect();
         Self { down_until }
     }
@@ -102,10 +134,10 @@ impl BackendHealth {
     }
 
     fn is_up_backend(&self, backend: &Upstream) -> bool {
-        match &backend.addr {
-            pingora_core::protocols::l4::socket::SocketAddr::Inet(inet) => self.is_up(inet),
+        match inet_address(backend) {
+            Some(inet) => self.is_up(&inet),
             // Unix-socket backends: no passive marking, always selectable.
-            _ => true,
+            None => true,
         }
     }
 }
@@ -132,13 +164,7 @@ impl LeastConnTracker {
     fn new(upstreams: Vec<Upstream>, health: Arc<BackendHealth>) -> Self {
         let counters = upstreams
             .iter()
-            .filter_map(|u| {
-                if let pingora_core::protocols::l4::socket::SocketAddr::Inet(inet) = &u.addr {
-                    Some((*inet, Arc::new(AtomicUsize::new(0))))
-                } else {
-                    None
-                }
-            })
+            .filter_map(|u| inet_address(u).map(|inet| (inet, Arc::new(AtomicUsize::new(0)))))
             .collect();
         Self {
             counters,
@@ -168,6 +194,79 @@ impl LeastConnTracker {
     }
 }
 
+// MARK: - Backend Pool
+
+/// One immutable snapshot of the selectable backends.
+///
+/// Everything that depends on the concrete address list lives here, so a DNS
+/// refresh is a single `ArcSwap` store rather than a series of mutations that
+/// a concurrent request could catch mid-flight.
+struct Pool {
+    native_rr: Option<Arc<NativeLoadBalancer<RoundRobin>>>,
+    native_ketama: Option<Arc<NativeLoadBalancer<KetamaHashing>>>,
+    least_conn: Option<LeastConnTracker>,
+    health: Arc<BackendHealth>,
+}
+
+/// Active health-check settings, kept so they can be re-applied every time a
+/// DNS refresh rebuilds the native load balancer.
+#[derive(Clone)]
+struct HealthCheckSettings {
+    config: HealthCheckConfig,
+    frequency: Option<Duration>,
+}
+
+// MARK: - Tracked Upstreams
+
+/// One configured upstream and the address it is currently using.
+///
+/// `spec` is `None` for backends handed in already resolved (the plain
+/// [`LoadBalancer::new`] path used by tests and examples); those are never
+/// re-resolved. `backend` is `None` while a hostname has never resolved
+/// successfully — the entry stays in the list so a later refresh can adopt
+/// it, which is what lets the proxy start before its app container does.
+struct TrackedUpstream {
+    spec: Option<UpstreamSpec>,
+    weight: usize,
+    backend: Option<Upstream>,
+}
+
+/// One configured upstream before resolution.
+#[derive(Debug, Clone)]
+pub struct UpstreamEntry {
+    pub spec: UpstreamSpec,
+    pub weight: usize,
+}
+
+/// What a [`LoadBalancer::refresh_dns`] pass did. Summed across pools by the
+/// refresher so a tick can be logged (and asserted on) as one line.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DnsRefresh {
+    /// Backends whose address moved to a new one.
+    pub changed: usize,
+    /// Hostnames that resolved for the first time and joined the pool.
+    pub adopted: usize,
+    /// Lookups that failed while a last-known-good address was kept in place.
+    pub kept_stale: usize,
+    /// Lookups that failed with no address to fall back to.
+    pub unresolved: usize,
+}
+
+impl DnsRefresh {
+    /// Folds another pass's counters into this one.
+    pub fn merge(&mut self, other: DnsRefresh) {
+        self.changed += other.changed;
+        self.adopted += other.adopted;
+        self.kept_stale += other.kept_stale;
+        self.unresolved += other.unresolved;
+    }
+
+    /// Whether the pass actually altered any backend list.
+    pub fn is_noop(&self) -> bool {
+        self.changed == 0 && self.adopted == 0
+    }
+}
+
 // MARK: - LoadBalancer
 
 /// A wrapper that dispatches to the correct underlying implementation based on
@@ -179,18 +278,16 @@ impl LeastConnTracker {
 pub struct LoadBalancer {
     /// Strategy in use (determines dispatch path in `select`).
     strategy: Strategy,
-    /// Pingora native LB (RoundRobin / Random).
-    native_rr: Option<Arc<NativeLoadBalancer<RoundRobin>>>,
-    /// Pingora native LB (IP Hash via Ketama).
-    native_ketama: Option<Arc<NativeLoadBalancer<KetamaHashing>>>,
-    /// Least-connection tracker (LeastConn only).
-    least_conn: Option<Arc<LeastConnTracker>>,
-    /// Passive health marks shared by every strategy: `fail_to_connect`
-    /// marks a backend down here and `select` skips it until the cooldown
-    /// expires. Implemented outside the native LB so it works uniformly
-    /// for the native (RoundRobin/Random/IpHash) and custom (LeastConn)
-    /// selection paths.
-    health: Arc<BackendHealth>,
+    /// The current backend snapshot, replaced wholesale by a DNS refresh.
+    pool: ArcSwap<Pool>,
+    /// Configured upstreams plus their last-known-good addresses. Only the
+    /// refresher touches this, so a plain mutex is enough and never appears
+    /// on the request path.
+    tracked: Mutex<Vec<TrackedUpstream>>,
+    /// Resolver used by [`Self::refresh_dns`]; injectable for tests.
+    resolver: Arc<dyn Resolve>,
+    /// Health-check settings re-applied to every rebuilt pool.
+    health_check: Mutex<Option<HealthCheckSettings>>,
     /// Backup pool consulted only when no primary backend is selectable.
     backup: Option<Arc<LoadBalancer>>,
 }
@@ -217,57 +314,24 @@ where
 impl LoadBalancer {
     /// Creates a new `LoadBalancer` instance with the specified upstreams and strategy.
     ///
+    /// The addresses are taken as given and never re-resolved; use
+    /// [`Self::from_entries`] when the upstreams come from configuration and
+    /// may be hostnames.
+    ///
     /// - Parameters:
     ///   - upstreams: A vector of `Upstream` (Backend) instances to balance traffic across.
     ///   - strategy: The selection strategy to use.
     /// - Returns: A configured `LoadBalancer` instance.
     pub fn new(upstreams: Vec<Upstream>, strategy: Strategy) -> Self {
-        let health = Arc::new(BackendHealth::new(upstreams.iter().filter_map(|u| {
-            if let pingora_core::protocols::l4::socket::SocketAddr::Inet(inet) = &u.addr {
-                Some(*inet)
-            } else {
-                None
-            }
-        })));
-        match strategy {
-            Strategy::LeastConn => {
-                let tracker = Arc::new(LeastConnTracker::new(upstreams, health.clone()));
-                Self {
-                    strategy,
-                    native_rr: None,
-                    native_ketama: None,
-                    least_conn: Some(tracker),
-                    health,
-                    backup: None,
-                }
-            }
-            Strategy::IpHash => {
-                let native: NativeLoadBalancer<KetamaHashing> =
-                    build_native_load_balancer(upstreams);
-                Self {
-                    strategy,
-                    native_rr: None,
-                    native_ketama: Some(Arc::new(native)),
-                    least_conn: None,
-                    health,
-                    backup: None,
-                }
-            }
-            // RoundRobin and Random share the same Pingora RoundRobin backend;
-            // Pingora's `Random` algorithm is separate but our wrapper uses the
-            // RR native LB for both — the strategy enum drives the key.
-            Strategy::RoundRobin | Strategy::Random => {
-                let native: NativeLoadBalancer<RoundRobin> = build_native_load_balancer(upstreams);
-                Self {
-                    strategy,
-                    native_rr: Some(Arc::new(native)),
-                    native_ketama: None,
-                    least_conn: None,
-                    health,
-                    backup: None,
-                }
-            }
-        }
+        let tracked = upstreams
+            .into_iter()
+            .map(|backend| TrackedUpstream {
+                spec: None,
+                weight: backend.weight,
+                backend: Some(backend),
+            })
+            .collect();
+        Self::from_tracked(tracked, strategy, Arc::new(SystemResolver), None)
     }
 
     /// Creates a primary pool with an optional backup pool. Backup peers are
@@ -282,11 +346,176 @@ impl LoadBalancer {
         load_balancer
     }
 
+    /// Builds a load balancer from *unresolved* configuration entries.
+    ///
+    /// Hostnames are resolved once here so boot behaves exactly as before,
+    /// but the specs are retained: an entry that fails to resolve now stays
+    /// in the list and joins the pool as soon as [`Self::refresh_dns`]
+    /// succeeds, instead of being dropped for the lifetime of the process.
+    pub fn from_entries(
+        primary: Vec<UpstreamEntry>,
+        backup: Vec<UpstreamEntry>,
+        strategy: Strategy,
+    ) -> Self {
+        Self::from_entries_with_resolver(primary, backup, strategy, Arc::new(SystemResolver))
+    }
+
+    /// [`Self::from_entries`] with an injected resolver (tests).
+    pub fn from_entries_with_resolver(
+        primary: Vec<UpstreamEntry>,
+        backup: Vec<UpstreamEntry>,
+        strategy: Strategy,
+        resolver: Arc<dyn Resolve>,
+    ) -> Self {
+        let backup_pool = (!backup.is_empty()).then(|| {
+            Arc::new(Self::from_tracked(
+                resolve_entries(backup, resolver.as_ref()),
+                strategy,
+                resolver.clone(),
+                None,
+            ))
+        });
+
+        Self::from_tracked(
+            resolve_entries(primary, resolver.as_ref()),
+            strategy,
+            resolver,
+            backup_pool,
+        )
+    }
+
+    fn from_tracked(
+        tracked: Vec<TrackedUpstream>,
+        strategy: Strategy,
+        resolver: Arc<dyn Resolve>,
+        backup: Option<Arc<LoadBalancer>>,
+    ) -> Self {
+        let backends: Vec<Upstream> = tracked.iter().filter_map(|t| t.backend.clone()).collect();
+        let pool = build_pool(strategy, backends, None, None);
+        Self {
+            strategy,
+            pool: ArcSwap::from_pointee(pool),
+            tracked: Mutex::new(tracked),
+            resolver,
+            health_check: Mutex::new(None),
+            backup,
+        }
+    }
+
+    /// Whether this pool (or its backup) has any hostname worth re-resolving.
+    /// Pools built purely from IP literals are never registered with the
+    /// refresher, so a config without hostnames generates no DNS traffic.
+    pub fn needs_dns_refresh(&self) -> bool {
+        let own = self
+            .tracked
+            .lock()
+            .iter()
+            .any(|t| t.spec.as_ref().is_some_and(|spec| spec.needs_dns()));
+        own || self.backup.as_ref().is_some_and(|b| b.needs_dns_refresh())
+    }
+
+    /// Re-resolves every hostname upstream and republishes the pool if any
+    /// address moved.
+    ///
+    /// Failure is deliberately non-destructive: a lookup that errors leaves
+    /// the previous address in rotation. A resolver outage — a DNS container
+    /// restarting, a `resolv.conf` briefly missing — must not empty the pool
+    /// and take the site down, because the old address is very often still
+    /// serving traffic perfectly well.
+    pub fn refresh_dns(&self) -> DnsRefresh {
+        let mut report = DnsRefresh::default();
+        if let Some(backup) = &self.backup {
+            report.merge(backup.refresh_dns());
+        }
+
+        let mut tracked = self.tracked.lock();
+        let mut changed = false;
+
+        for entry in tracked.iter_mut() {
+            let Some(spec) = entry.spec.as_ref() else {
+                continue;
+            };
+            if !spec.needs_dns() {
+                continue;
+            }
+
+            match spec.resolve(self.resolver.as_ref()) {
+                Ok(address) => {
+                    let current = entry.backend.as_ref().and_then(inet_address);
+                    if current == Some(address) {
+                        continue;
+                    }
+                    let Some(backend) = spec.backend(address, entry.weight) else {
+                        report.unresolved += 1;
+                        continue;
+                    };
+                    match current {
+                        Some(previous) => {
+                            report.changed += 1;
+                            tracing::info!(
+                                upstream = %spec.authority(),
+                                from = %previous,
+                                to = %address,
+                                "🔄 Upstream address changed"
+                            );
+                        }
+                        None => {
+                            report.adopted += 1;
+                            tracing::info!(
+                                upstream = %spec.authority(),
+                                %address,
+                                "🔄 Upstream resolved and joined the pool"
+                            );
+                        }
+                    }
+                    entry.backend = Some(backend);
+                    changed = true;
+                }
+                Err(error) => {
+                    if entry.backend.is_some() {
+                        report.kept_stale += 1;
+                        tracing::warn!(
+                            upstream = %spec.authority(),
+                            %error,
+                            "⚠️ Upstream lookup failed; keeping the last known address"
+                        );
+                    } else {
+                        report.unresolved += 1;
+                        tracing::warn!(
+                            upstream = %spec.authority(),
+                            %error,
+                            "⚠️ Upstream has never resolved; it stays out of the pool"
+                        );
+                    }
+                }
+            }
+        }
+
+        if changed {
+            self.publish(&tracked);
+        }
+        report
+    }
+
+    /// Rebuilds and atomically installs the selector set for `tracked`.
+    fn publish(&self, tracked: &[TrackedUpstream]) {
+        let backends: Vec<Upstream> = tracked.iter().filter_map(|t| t.backend.clone()).collect();
+        let previous = self.pool.load();
+        let settings = self.health_check.lock().clone();
+        let pool = build_pool(
+            self.strategy,
+            backends,
+            Some(previous.health.as_ref()),
+            settings.as_ref(),
+        );
+        self.pool.store(Arc::new(pool));
+    }
+
     /// Mark a backend as down (passive health check). Called from
     /// `ProxyHttp::fail_to_connect` when a connection attempt to the
     /// backend fails; `select` then skips it for [`FAIL_COOLDOWN`].
     pub fn mark_unhealthy(&self, addr: &SocketAddr) {
-        self.health.mark_down(addr);
+        self.pool.load().health.mark_down(addr);
         if let Some(backup) = &self.backup {
             backup.mark_unhealthy(addr);
         }
@@ -294,32 +523,47 @@ impl LoadBalancer {
 
     /// Configures the health checker for this load balancer.
     ///
-    /// - Parameter health_checker: The `HealthChecker` instance to use for monitoring upstream health.
-    pub fn set_health_check(&mut self, health_checker: HealthChecker) {
-        if let Some(native) = &mut self.native_rr {
-            if let Some(lb) = Arc::get_mut(native) {
-                lb.set_health_check(Box::new(health_checker));
-            } else {
-                tracing::warn!("⚠️ Failed to set health check: LoadBalancer already shared");
+    /// The configuration is stored rather than applied once, so a DNS refresh
+    /// that rebuilds the native load balancer keeps checking the new backends.
+    ///
+    /// - Parameter config: The health check configuration to use for monitoring upstream health.
+    pub fn set_health_check(&self, config: HealthCheckConfig) {
+        let mut settings = self.health_check.lock();
+        match settings.as_mut() {
+            Some(existing) => existing.config = config,
+            None => {
+                *settings = Some(HealthCheckSettings {
+                    config,
+                    frequency: None,
+                })
             }
         }
-        // Note: LeastConn active health checking is not integrated — the
-        // native background health-check service only drives `native_rr`.
-        // LeastConn (and every other strategy) is still covered by the
-        // passive fail_to_connect marking in `select`.
+        drop(settings);
+        self.reapply_health_check();
     }
 
     /// Sets the frequency of health checks.
     ///
     /// - Parameter frequency: The duration interval between health checks.
-    pub fn set_health_check_frequency(&mut self, frequency: std::time::Duration) {
-        if let Some(native) = &mut self.native_rr {
-            if let Some(lb) = Arc::get_mut(native) {
-                lb.health_check_frequency = Some(frequency);
-            } else {
-                tracing::warn!("⚠️ Failed to set HC frequency: LoadBalancer already shared");
+    pub fn set_health_check_frequency(&self, frequency: Duration) {
+        let mut settings = self.health_check.lock();
+        match settings.as_mut() {
+            Some(existing) => existing.frequency = Some(frequency),
+            None => {
+                *settings = Some(HealthCheckSettings {
+                    config: HealthCheckConfig::default(),
+                    frequency: Some(frequency),
+                })
             }
         }
+        drop(settings);
+        self.reapply_health_check();
+    }
+
+    /// Rebuilds the current pool so newly-set health-check settings take hold.
+    fn reapply_health_check(&self) {
+        let tracked = self.tracked.lock();
+        self.publish(&tracked);
     }
 
     /// Selects an upstream backend for a request.
@@ -328,12 +572,13 @@ impl LoadBalancer {
     ///   Ignored for other strategies.
     /// - Returns: An optional `Upstream` if a healthy backend is available.
     pub fn select(&self, key: Option<&[u8]>) -> Option<Upstream> {
+        let pool = self.pool.load();
         let primary = match self.strategy {
             Strategy::LeastConn => {
                 // ⚡ LeastConn: pick minimum active-connection upstream.
                 // The counter slot is released immediately — for the simple
                 // select() API we count a "selection" as one request unit.
-                self.least_conn
+                pool.least_conn
                     .as_ref()
                     .and_then(|tracker| tracker.select().map(|(upstream, _guard)| upstream))
             }
@@ -341,14 +586,14 @@ impl LoadBalancer {
                 let hash_key = key.unwrap_or(b"");
                 // select_with keeps Pingora's own health verdict (`ready`,
                 // used by active health checks) and adds our passive marks.
-                self.native_ketama.as_ref().and_then(|native| {
+                pool.native_ketama.as_ref().and_then(|native| {
                     native.select_with(hash_key, 256, |b, ready| {
-                        ready && self.health.is_up_backend(b)
+                        ready && pool.health.is_up_backend(b)
                     })
                 })
             }
-            Strategy::RoundRobin | Strategy::Random => self.native_rr.as_ref().and_then(|native| {
-                native.select_with(b"", 256, |b, ready| ready && self.health.is_up_backend(b))
+            Strategy::RoundRobin | Strategy::Random => pool.native_rr.as_ref().and_then(|native| {
+                native.select_with(b"", 256, |b, ready| ready && pool.health.is_up_backend(b))
             }),
         };
         primary.or_else(|| self.backup.as_ref().and_then(|backup| backup.select(key)))
@@ -357,9 +602,85 @@ impl LoadBalancer {
     /// Provides access to the underlying native Pingora load balancer (RoundRobin variant).
     ///
     /// Useful for integrating with Pingora's background health-check services.
-    pub fn native(&self) -> Option<&Arc<NativeLoadBalancer<RoundRobin>>> {
-        self.native_rr.as_ref()
+    /// Note the handle belongs to the *current* pool: a DNS refresh publishes a
+    /// new one, so callers that hold on to it will keep checking the old
+    /// backend set.
+    pub fn native(&self) -> Option<Arc<NativeLoadBalancer<RoundRobin>>> {
+        self.pool.load().native_rr.clone()
     }
+}
+
+/// Resolves configuration entries once, keeping the ones that fail so a later
+/// refresh can adopt them.
+fn resolve_entries(entries: Vec<UpstreamEntry>, resolver: &dyn Resolve) -> Vec<TrackedUpstream> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            let backend = match entry.spec.resolve(resolver) {
+                Ok(address) => entry.spec.backend(address, entry.weight),
+                Err(error) => {
+                    tracing::warn!(
+                        upstream = %entry.spec.authority(),
+                        %error,
+                        "⚠️ Upstream did not resolve at startup; it will be retried"
+                    );
+                    None
+                }
+            };
+            TrackedUpstream {
+                spec: Some(entry.spec),
+                weight: entry.weight,
+                backend,
+            }
+        })
+        .collect()
+}
+
+/// Builds the selector set for one concrete backend list.
+fn build_pool(
+    strategy: Strategy,
+    backends: Vec<Upstream>,
+    previous_health: Option<&BackendHealth>,
+    health_check: Option<&HealthCheckSettings>,
+) -> Pool {
+    let health = Arc::new(BackendHealth::rebuilt(
+        previous_health,
+        backends.iter().filter_map(inet_address),
+    ));
+
+    match strategy {
+        Strategy::LeastConn => Pool {
+            native_rr: None,
+            native_ketama: None,
+            least_conn: Some(LeastConnTracker::new(backends, health.clone())),
+            health,
+        },
+        Strategy::IpHash => Pool {
+            native_rr: None,
+            native_ketama: Some(Arc::new(build_native_load_balancer(backends))),
+            least_conn: None,
+            health,
+        },
+        // RoundRobin and Random share the same Pingora RoundRobin backend;
+        // Pingora's `Random` algorithm is separate but our wrapper uses the
+        // RR native LB for both — the strategy enum drives the key.
+        Strategy::RoundRobin | Strategy::Random => {
+            let mut native: NativeLoadBalancer<RoundRobin> = build_native_load_balancer(backends);
+            if let Some(settings) = health_check {
+                native.set_health_check(Box::new(HealthChecker::new(settings.config.clone())));
+                native.health_check_frequency = settings.frequency;
+            }
+            Pool {
+                native_rr: Some(Arc::new(native)),
+                native_ketama: None,
+                least_conn: None,
+                health,
+            }
+        }
+    }
+    // Note: LeastConn and IpHash active health checking is not integrated —
+    // the native background health-check service only drives `native_rr`.
+    // Both are still covered by the passive fail_to_connect marking in `select`.
 }
 
 // MARK: - Tests
@@ -367,6 +688,8 @@ impl LoadBalancer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::upstream::Scheme;
+    use std::collections::HashMap as StdHashMap;
 
     #[test]
     fn test_round_robin_order() {
@@ -409,15 +732,16 @@ mod tests {
         let u2 = Upstream::new("127.0.0.1:9002").unwrap();
         let lb = LoadBalancer::new(vec![u1, u2], Strategy::LeastConn);
 
-        if let Some(tracker) = &lb.least_conn {
-            // Manually inflate u1's counter to simulate a busy upstream
-            tracker.counters[0].1.store(5, Ordering::Relaxed);
-            // LeastConn should now return u2 (counter = 0)
-            let (selected, _guard) = tracker.select().unwrap();
-            assert_eq!(selected.addr.to_string(), "127.0.0.1:9002");
-        } else {
-            panic!("Expected LeastConn tracker");
-        }
+        let pool = lb.pool.load();
+        let tracker = pool
+            .least_conn
+            .as_ref()
+            .expect("Expected LeastConn tracker");
+        // Manually inflate u1's counter to simulate a busy upstream
+        tracker.counters[0].1.store(5, Ordering::Relaxed);
+        // LeastConn should now return u2 (counter = 0)
+        let (selected, _guard) = tracker.select().unwrap();
+        assert_eq!(selected.addr.to_string(), "127.0.0.1:9002");
     }
 
     // ---- Passive health marking (fail_to_connect failover) ----
@@ -472,7 +796,9 @@ mod tests {
         let lb = LoadBalancer::new(vec![u1, u2], Strategy::RoundRobin);
 
         // Mark down with a short cooldown (tests can't wait out FAIL_COOLDOWN).
-        lb.health
+        lb.pool
+            .load()
+            .health
             .mark_down_for(&addr("127.0.0.1:8001"), Duration::from_millis(50));
         assert_eq!(lb.select(None).unwrap().addr.to_string(), "127.0.0.1:8002");
 
@@ -511,5 +837,291 @@ mod tests {
         assert_eq!(lb.select(None).unwrap().addr.to_string(), "127.0.0.1:8201");
         lb.mark_unhealthy(&addr("127.0.0.1:8201"));
         assert_eq!(lb.select(None).unwrap().addr.to_string(), "127.0.0.1:8202");
+    }
+
+    // ---- DNS re-resolution ----
+
+    /// A resolver whose answers the test rewrites between refreshes, so a
+    /// container moving to a new IP — and a resolver going away entirely —
+    /// can both be reproduced deterministically.
+    #[derive(Default)]
+    struct ScriptedResolver {
+        answers: Mutex<StdHashMap<String, std::io::Result<Vec<SocketAddr>>>>,
+        lookups: AtomicUsize,
+    }
+
+    impl ScriptedResolver {
+        fn with(host: &str, address: &str) -> Arc<Self> {
+            let resolver = Arc::new(Self::default());
+            resolver.set(host, address);
+            resolver
+        }
+
+        fn set(&self, host: &str, address: &str) {
+            self.answers
+                .lock()
+                .insert(host.to_string(), Ok(vec![address.parse().unwrap()]));
+        }
+
+        fn fail(&self, host: &str) {
+            self.answers.lock().insert(
+                host.to_string(),
+                Err(std::io::Error::other("resolver unavailable")),
+            );
+        }
+
+        fn lookups(&self) -> usize {
+            self.lookups.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Resolve for ScriptedResolver {
+        fn resolve(&self, host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
+            self.lookups.fetch_add(1, Ordering::Relaxed);
+            match self.answers.lock().get(host) {
+                Some(Ok(addrs)) => Ok(addrs.clone()),
+                Some(Err(error)) => Err(std::io::Error::new(error.kind(), error.to_string())),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such host",
+                )),
+            }
+        }
+    }
+
+    fn entry(address: &str) -> UpstreamEntry {
+        UpstreamEntry {
+            spec: UpstreamSpec::parse(address).unwrap(),
+            weight: 1,
+        }
+    }
+
+    fn selected(lb: &LoadBalancer) -> String {
+        lb.select(None).unwrap().addr.to_string()
+    }
+
+    #[test]
+    fn backend_follows_the_container_to_its_new_address() {
+        let resolver = ScriptedResolver::with("app", "172.20.0.3:8080");
+        let lb = LoadBalancer::from_entries_with_resolver(
+            vec![entry("http://app:8080")],
+            vec![],
+            Strategy::RoundRobin,
+            resolver.clone(),
+        );
+        assert_eq!(selected(&lb), "172.20.0.3:8080");
+
+        // The container restarts on a different address.
+        resolver.set("app", "172.20.0.9:8080");
+        let report = lb.refresh_dns();
+
+        assert_eq!(report.changed, 1);
+        assert_eq!(report.kept_stale, 0);
+        assert_eq!(selected(&lb), "172.20.0.9:8080");
+    }
+
+    #[test]
+    fn the_upstream_hostname_survives_a_re_resolution() {
+        let resolver = ScriptedResolver::with("app.internal", "172.20.0.3:8443");
+        let lb = LoadBalancer::from_entries_with_resolver(
+            vec![entry("https://app.internal:8443")],
+            vec![],
+            Strategy::RoundRobin,
+            resolver.clone(),
+        );
+
+        resolver.set("app.internal", "172.20.0.9:8443");
+        lb.refresh_dns();
+
+        // SNI and the upstream Host header both read these back, so losing
+        // them on a refresh would break TLS to the new address.
+        let backend = lb.select(None).unwrap();
+        assert_eq!(
+            backend.ext.get::<crate::upstream::HostName>().unwrap().0,
+            "app.internal"
+        );
+        assert_eq!(*backend.ext.get::<Scheme>().unwrap(), Scheme::Https);
+    }
+
+    #[test]
+    fn a_failing_resolver_keeps_the_last_known_backend() {
+        let resolver = ScriptedResolver::with("app", "172.20.0.3:8080");
+        let lb = LoadBalancer::from_entries_with_resolver(
+            vec![entry("http://app:8080")],
+            vec![],
+            Strategy::RoundRobin,
+            resolver.clone(),
+        );
+
+        resolver.fail("app");
+        let report = lb.refresh_dns();
+
+        assert_eq!(report.kept_stale, 1);
+        assert_eq!(report.changed, 0);
+        assert_eq!(
+            selected(&lb),
+            "172.20.0.3:8080",
+            "a resolver outage must not empty the pool"
+        );
+
+        // And it recovers once the resolver answers again.
+        resolver.set("app", "172.20.0.4:8080");
+        assert_eq!(lb.refresh_dns().changed, 1);
+        assert_eq!(selected(&lb), "172.20.0.4:8080");
+    }
+
+    #[test]
+    fn one_failing_name_does_not_evict_its_healthy_neighbours() {
+        let resolver = ScriptedResolver::with("app-a", "172.20.0.3:8080");
+        resolver.set("app-b", "172.20.0.4:8080");
+        let lb = LoadBalancer::from_entries_with_resolver(
+            vec![entry("http://app-a:8080"), entry("http://app-b:8080")],
+            vec![],
+            Strategy::RoundRobin,
+            resolver.clone(),
+        );
+
+        resolver.fail("app-a");
+        resolver.set("app-b", "172.20.0.5:8080");
+        let report = lb.refresh_dns();
+
+        assert_eq!(report.kept_stale, 1);
+        assert_eq!(report.changed, 1);
+
+        let mut seen: Vec<String> = (0..2).map(|_| selected(&lb)).collect();
+        seen.sort();
+        assert_eq!(seen, vec!["172.20.0.3:8080", "172.20.0.5:8080"]);
+    }
+
+    #[test]
+    fn an_upstream_that_is_not_up_yet_joins_on_a_later_refresh() {
+        let resolver = Arc::new(ScriptedResolver::default());
+        let lb = LoadBalancer::from_entries_with_resolver(
+            vec![entry("http://app:8080")],
+            vec![],
+            Strategy::RoundRobin,
+            resolver.clone(),
+        );
+        // Boot happened before the app container existed.
+        assert!(lb.select(None).is_none());
+        assert_eq!(lb.refresh_dns().unresolved, 1);
+
+        resolver.set("app", "172.20.0.7:8080");
+        let report = lb.refresh_dns();
+
+        assert_eq!(report.adopted, 1);
+        assert_eq!(selected(&lb), "172.20.0.7:8080");
+    }
+
+    #[test]
+    fn a_backend_that_did_not_move_keeps_its_failure_mark() {
+        let resolver = ScriptedResolver::with("app-a", "172.20.0.3:8080");
+        resolver.set("app-b", "172.20.0.4:8080");
+        let lb = LoadBalancer::from_entries_with_resolver(
+            vec![entry("http://app-a:8080"), entry("http://app-b:8080")],
+            vec![],
+            Strategy::RoundRobin,
+            resolver.clone(),
+        );
+
+        // app-a is refusing connections, so it is out of rotation.
+        lb.mark_unhealthy(&addr("172.20.0.3:8080"));
+        // Only app-b moves.
+        resolver.set("app-b", "172.20.0.5:8080");
+        lb.refresh_dns();
+
+        for _ in 0..4 {
+            assert_eq!(
+                selected(&lb),
+                "172.20.0.5:8080",
+                "a refresh elsewhere must not silently revive a failed backend"
+            );
+        }
+    }
+
+    #[test]
+    fn ip_literals_are_never_looked_up() {
+        let resolver = Arc::new(ScriptedResolver::default());
+        let lb = LoadBalancer::from_entries_with_resolver(
+            vec![entry("http://127.0.0.1:8001")],
+            vec![],
+            Strategy::RoundRobin,
+            resolver.clone(),
+        );
+
+        assert!(!lb.needs_dns_refresh());
+        assert_eq!(lb.refresh_dns(), DnsRefresh::default());
+        assert_eq!(resolver.lookups(), 0);
+        assert_eq!(selected(&lb), "127.0.0.1:8001");
+    }
+
+    #[test]
+    fn a_refresh_that_changes_nothing_does_not_republish() {
+        let resolver = ScriptedResolver::with("app", "172.20.0.3:8080");
+        let lb = LoadBalancer::from_entries_with_resolver(
+            vec![entry("http://app:8080")],
+            vec![],
+            Strategy::RoundRobin,
+            resolver.clone(),
+        );
+
+        let before = Arc::as_ptr(&lb.pool.load_full());
+        let report = lb.refresh_dns();
+        let after = Arc::as_ptr(&lb.pool.load_full());
+
+        assert!(report.is_noop());
+        assert_eq!(before, after, "a steady name must not churn the pool");
+    }
+
+    #[test]
+    fn backup_pools_are_refreshed_too() {
+        let resolver = ScriptedResolver::with("primary", "172.20.0.3:8080");
+        resolver.set("standby", "172.20.0.4:8080");
+        let lb = LoadBalancer::from_entries_with_resolver(
+            vec![entry("http://primary:8080")],
+            vec![entry("http://standby:8080")],
+            Strategy::RoundRobin,
+            resolver.clone(),
+        );
+        assert!(lb.needs_dns_refresh());
+
+        resolver.set("standby", "172.20.0.8:8080");
+        assert_eq!(lb.refresh_dns().changed, 1);
+
+        lb.mark_unhealthy(&addr("172.20.0.3:8080"));
+        assert_eq!(selected(&lb), "172.20.0.8:8080");
+    }
+
+    #[test]
+    fn a_moved_backend_keeps_its_weight_and_strategy() {
+        let resolver = ScriptedResolver::with("heavy", "172.20.0.3:8080");
+        resolver.set("light", "172.20.0.4:8080");
+        let lb = LoadBalancer::from_entries_with_resolver(
+            vec![
+                UpstreamEntry {
+                    spec: UpstreamSpec::parse("http://heavy:8080").unwrap(),
+                    weight: 3,
+                },
+                entry("http://light:8080"),
+            ],
+            vec![],
+            Strategy::RoundRobin,
+            resolver.clone(),
+        );
+
+        resolver.set("heavy", "172.20.0.9:8080");
+        lb.refresh_dns();
+
+        let mut heavy = 0;
+        let mut light = 0;
+        for _ in 0..40 {
+            match selected(&lb).as_str() {
+                "172.20.0.9:8080" => heavy += 1,
+                "172.20.0.4:8080" => light += 1,
+                other => panic!("unexpected backend {other}"),
+            }
+        }
+        assert_eq!(heavy, 30);
+        assert_eq!(light, 10);
     }
 }

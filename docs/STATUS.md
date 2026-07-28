@@ -175,6 +175,13 @@ commit `0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。
   zstd 與 gzip 共用同一條 bounded-memory streaming 路徑：真 binary 下 40 併發
   × 9.4MB（367MB in flight）RSS 僅成長 21MB（zstd）／9MB（gzip），
   body byte-exact 還原，SSE 仍逐筆增量抵達。
+- **上游 hostname 重解析**（2026-07-28）— hostname upstream 依 `dns_refresh`
+  間隔（預設 30s，`off` 可關）重解析並整批 publish 新 pool；解析失敗保留
+  last-known-good，開機時解析不到的名稱會在成功後自動加入。IP 字面位址完全
+  不進 resolver。真 Docker network + 真 release image 驗證：容器換 IP 後 3s
+  內跟上、拔掉 alias 後舊位址持續服務 12s、`dns_refresh off` 維持釘死。
+  腳本與證據：`benchmarks/scripts/run_dns_refresh_e2e.sh`、
+  `benchmarks/results/20260728_dns_refresh_pass/`。
 - **`admin.api_key` DSL**、**`basic_auth` DSL**、**`redir`／`redirect` DSL**（2026-07-26）。
 - **Workspace lint baseline**（2026-07-26）— 全 workspace 套用 Rust 1.88 rustfmt，
   通過 `cargo fmt --check` 與 clippy `-D warnings`；GitHub Actions 固定 Rust 1.88
@@ -218,8 +225,9 @@ commit `0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。
 - **Response interception pipeline** — 依 upstream status／header 執行 replace status、
   copy／drop headers、redirect、fallback handler；擴成 Caddy `handle_response`／
   nginx `proxy_intercept_errors` 等級，仍須保持串流。
-- **動態 upstream 與服務發現** — A/AAAA/SRV 定期重解析、TTL／jitter、resolver override、
-  last-known-good；再接 Consul、Docker、Kubernetes EndpointSlice／Gateway API。
+- **動態 upstream 與服務發現** — 定期重解析與 last-known-good 已於 2026-07-28 完成
+  （見上）。**仍缺**：一個名稱展開成多個 backend、SRV、TTL／jitter、resolver
+  override；再接 Consul、Docker、Kubernetes EndpointSlice／Gateway API。
 - **Reload-free backend topology** — 參考 HAProxy 3.4 dynamic backends，Admin API
   可新增／下線／drain upstream。
 - **進階 LB／session persistence** — consistent hash、sticky cookie（須簽章、可 rotation、

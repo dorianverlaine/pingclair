@@ -208,6 +208,12 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                         global.trusted_proxies.push(rule);
                     }
                 }
+                "dns_refresh" => {
+                    let Some(value) = sub.args.first() else {
+                        return Err(AdapterError::ArgumentCount("dns_refresh".into(), 1, 0));
+                    };
+                    global.dns_refresh_secs = Some(parse_dns_refresh(value)?);
+                }
                 "protocols" => {
                     for arg in &sub.args {
                         match arg.to_lowercase().as_str() {
@@ -1150,6 +1156,33 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
     }
 
     Ok(Handler::Proxy(Box::new(proxy)))
+}
+
+/// Parse the global `dns_refresh` argument into seconds.
+///
+/// `off`/`none` disable re-resolution. Everything else is a duration, and a
+/// unit is mandatory: `parse_duration_ms` reads a bare number as
+/// milliseconds, so accepting `dns_refresh 30` would silently install a
+/// 30 ms lookup storm instead of the half-minute the operator meant. Sub-second
+/// intervals are refused for the same reason rather than clamped, so the
+/// mistake surfaces at load time instead of in production DNS traffic.
+fn parse_dns_refresh(value: &str) -> Result<u64, AdapterError> {
+    if matches!(value.to_ascii_lowercase().as_str(), "off" | "none") {
+        return Ok(0);
+    }
+
+    let invalid = || {
+        AdapterError::InvalidArgument(
+            "dns_refresh".into(),
+            format!("expected `off` or a duration of at least 1s, got `{value}`"),
+        )
+    };
+
+    let millis = parse_duration_ms(value).ok_or_else(invalid)?;
+    if millis < 1_000 {
+        return Err(invalid());
+    }
+    Ok(millis / 1_000)
 }
 
 /// Parse Caddy duration strings like "300s", "5m", "100ms" into milliseconds.
