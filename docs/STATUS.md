@@ -342,6 +342,18 @@ commit `0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。
   客戶端斷鏈）、TLS store 路徑可經 `PINGCLAIR_TLS_STORE` 覆寫
   （寫死路徑在不可寫環境會直接 panic）。
 
+### 主動健康檢查目前沒有在跑（2026-07-28）
+
+- `HealthChecker` 會被建出來、`health_check_frequency` 會被設定，但**驅動它的
+  Pingora background service 從來沒有註冊**：全 workspace 沒有任何
+  `background_service`／`run_health_check` 呼叫，`LoadBalancer::native()`
+  的呼叫者數量是 0。`select` 讀到的 `ready` 因此永遠是初始值。
+- 也就是說 STATUS 上方那條 2026-07-25 的驗證結果是準確的——它驗的是**被動**
+  健康檢查（`fail_to_connect` 標記＋冷卻），而那確實在運作。缺的是主動探測：
+  **沒有流量打過去的故障節點不會被摘除**。
+- 修復排在 TODO Day 12。判定必須是「在沒有請求經過該節點的情況下被摘除」，
+  否則只是重驗被動標記。
+
 ---
 
 ## 📌 已知的環境現況

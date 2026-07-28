@@ -7,7 +7,7 @@
 > - nginx 功能對照 → `docs/AUDIT_NGINX_PARITY.md`
 > - 效能數據與壓測發現 → `benchmarks/README.md`
 >
-> 最後整理：2026-07-27
+> 最後整理：2026-07-28
 
 ---
 
@@ -302,11 +302,25 @@ cargo test --locked --workspace
 > `reuse_connection` 與 `health_changed_callback`。主要工作是**接線與 DSL**，
 > 不是從零實作。
 
+> 🚨 **但比預期少了一塊**（2026-07-28 於 Day 5 改動時發現）：主動健康檢查
+> 目前**根本沒有在跑**。`HealthChecker` 有被建出來、`health_check_frequency`
+> 有被設定，但驅動它的 Pingora background service **從來沒有註冊**——
+> 全 workspace 沒有任何 `background_service`／`run_health_check` 呼叫，
+> `LoadBalancer::native()` 的呼叫者數量是 **0**。也就是說今天能運作的只有
+> `fail_to_connect` 的被動標記，`select` 讀到的 `ready` 永遠是初始值。
+> 這天的第一件事是把 background service 接上，不是調 DSL。
+
+- **先把 background service 註冊起來**，讓已經配置好的主動檢查真的執行；
+  加測試證明「upstream 掛掉但沒有流量打過去」時也會被摘除——這正是被動
+  標記做不到、而主動檢查存在的理由。
 - 把上述 Pingora 能力接進 DSL 與 runtime。
+- 注意 DNS 重解析會重建 pool（Day 5），健康檢查設定必須跟著新 pool 一起重建；
+  `LoadBalancer` 已保存設定並在 `publish` 時重套，接線時不要繞過它。
 - 限制讀取 body 大小；為 probe 加 jitter／backoff，避免 health check 自己
   變成同步尖峰。
 - slow start recovery（Pingora 未提供，需自己做）。
-- **完成判定**：故障節點能被正確摘除並在恢復後重新加入。
+- **完成判定**：故障節點能被正確摘除並在恢復後重新加入，**且該摘除發生在
+  沒有請求經過該節點的情況下**（否則就只是驗到被動標記）。
 
 ### 🔨 Day 13 — Rate limit 語意補齊
 
@@ -352,10 +366,28 @@ cargo test --locked --workspace
 > 而是因為最難的狀態機與併發控制別人已經寫好且測過。
 > 我們要寫的是**策略與正確性**，那仍然不便宜——所以給它三天。
 
+> ✅ **鏈結相容性已實測（2026-07-28，macOS arm64）**，不再是推論。
+> 在 `40d3b20` 上開丟棄分支加入
+> `pingora-cache = { version = "0.8", default-features = false, features = ["boringssl"] }`
+> 並強制一個 `pingora_cache::CachePhase` 符號進入鏈結：
+> debug 與 release 都連得起來、`--version` 正常、349 tests 全綠、
+> 沒有 SIGBUS；依賴圖仍然只有一份 BoringSSL
+> （`boring-sys 4.22.0` + `pingora-boringssl 0.8.1`），**沒有 `openssl-sys`**。
+> 實驗後已完整還原。
+>
+> ⚠️ **只驗了 macOS**。GUARDRAILS 記錄的失敗模式包含 *Linux link error*，
+> 這一半還沒關掉。Day 7 本來就會建 Linux release image，順手在那個環境
+> 補建一次帶 `pingora-cache` 的 binary 即可關閉——不需要額外開一天。
+>
+> 📦 **新發現的依賴面**：`pingora-cache` 會**無條件**帶進
+> `cf-rustracing` 與 `cf-rustracing-jaeger`。不是 blocker，但 v0.2 的
+> 「明確不做」把 OpenTelemetry 排除在外，這等於從側門進來一套 tracing 依賴。
+> Day 29 的 dependency audit 與產物大小要把它算進去。
+
 ### 🔨 Day 16 — 接上 pingora-cache 骨架
 
-- 加入 `pingora-cache` 依賴與 `cache` feature，確認 BoringSSL 鏈結無衝突
-  （這是 GUARDRAILS 明列的高風險區，先驗證再往下做）。
+- 加入 `pingora-cache` 依賴與 `cache` feature。BoringSSL 鏈結已於
+  2026-07-28 在 macOS 實測通過（見上），這天只需確認 Linux 那一半。
 - 接上 `request_cache_filter`／`cache_key_callback`：定義 host＋path＋query
   的 cache key，memory storage 先跑通。
 - **完成判定**：同一 URL 第二次請求命中快取，且有測試證明沒有回源。
@@ -405,7 +437,7 @@ cargo test --locked --workspace
 
 ### 🔨 Day 21 — Access log 完整化
 
-Day 7 做了輸出，這天做生產級韌性。
+Day 2 做了配置驅動的輸出，這天做生產級韌性。
 
 - file output 支援依大小／時間 rotation、retention、壓縮、access/error 分流。
 - 非同步寫入必須有 bounded queue、明確 backpressure／drop 策略與
@@ -440,8 +472,15 @@ Day 7 做了輸出，這天做生產級韌性。
 
 ### 🔨 Day 25 — 協議安全回歸集
 
-**這是 v0.2 唯一還沒動的 R0 項目，優先度其實很高**——最新 Caddy／nginx 都still
+**這是 v0.2 唯一還沒動的 R0 項目，優先度其實很高**——最新 Caddy／nginx 仍然
 在修 rewrite、header、H2/H3 解析漏洞，一般功能測試抓不到這類問題。
+
+> ⚠️ **若時程需要壓縮，這一天優先於整個 M3。** 2026-07-28 有了實證：Day 6
+> 在修 matcher 表示法時**順手撞到**一個可由 Admin API 遠端觸發的
+> stack-overflow DoS（畸形 matcher → untagged newtype variant 無限遞迴）。
+> 那是「畸形輸入打進 parser」的典型，正好是這天要系統性覆蓋的類別，
+> 而它是**碰巧**被發現的，不是被找出來的。同類問題還有多少沒人知道。
+> 相較之下 M3 是加速功能：先護欄後加速，順序不該倒過來。
 
 - H1/H2/H3 的 URI／header 正規化、hop-by-hop headers、重複
   `Content-Length`／`Transfer-Encoding`、oversized headers、request smuggling、
@@ -549,7 +588,7 @@ H3 CORS／rewrite／error_page parity。
 
 | 里程碑 | 範圍 | 狀態 |
 |---|---|---|
-| M1 生產站可替換 | Day 1–7 | 🔨 進行中（Day 1–3 ✔） |
+| M1 生產站可替換 | Day 1–7 | 🔨 進行中（Day 1–6 ✔，只剩驗證日） |
 | M2 生產護欄 | Day 8–15 | ⬜ 未開始 |
 | M3 接上 Pingora 能力（含 `proxy_cache`） | Day 16–20 | ⬜ 未開始 |
 | M4 可觀測性與運維 | Day 21–24 | ⬜ 未開始 |
