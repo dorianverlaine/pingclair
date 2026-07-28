@@ -129,6 +129,15 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
 - 敏感欄位（`Authorization`、`Cookie`、API key）在 log／metrics／Admin dump／panic
   訊息中**預設遮罩**。
 - `insecure_skip_verify` 這類降級開關必須**顯眼且預設關閉**。
+- **遞迴型別禁止用 `#[serde(untagged)]`**。newtype variant（`Not(Box<Self>)`）
+  在 untagged 下會「把整個 payload 再當成一次自己解」而**不消耗任何輸入**，
+  任何對不上其他 variant 的值都會無限遞迴；serde 的 untagged replay 不會再經過
+  serde_json 的 parser，所以 serde_json 的 recursion limit 攔不到，`panic = "abort"`
+  的 release binary 直接中止。這在 `Matcher` 上是可由 Admin API 遠端觸發的
+  DoS（2026-07-28 修）。遞迴 enum 一律用 tag 表示。
+- **untagged 也代表「不可還原」**。variant 只靠 payload 形狀辨識，形狀相同的
+  variant round-trip 後會變成別人——`Not` 甚至會整個消失，直接反轉路由決策。
+  凡是會被序列化回去的設定型別（Admin dump→post、config 檔）都必須有 tag。
 
 ---
 
