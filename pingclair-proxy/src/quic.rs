@@ -1910,6 +1910,13 @@ async fn reverse_proxy_upstream(
     if !has_header_up("X-Request-Id") {
         up_req.insert_header("X-Request-Id", request_id).ok();
     }
+    // 🔀 RFC 9110 §7.6.3, same rule as the H1/H2 path. This hop was always
+    // received over HTTP/3, hence the fixed token.
+    if !response_policy.suppresses_via() {
+        up_req
+            .append_header("via", crate::http_policy::via_value(http::Version::HTTP_3))
+            .ok();
+    }
 
     session
         .write_request_header(Box::new(up_req))
@@ -2007,6 +2014,18 @@ async fn reverse_proxy_upstream(
     let mut effective_policy = response_policy.clone();
     if let Some(cfg) = &proxy_config {
         effective_policy.merge_proxy_set(&cfg.headers_down);
+    }
+    // 🔀 Only the proxied path gets a `Via`: the other H3 responses are
+    // produced by this server, so there is no hop to record. Appended after
+    // the upstream's own value, and describing the version we received the
+    // response over rather than the H3 we are about to answer with.
+    if !effective_policy.suppresses_via()
+        && let Some(resp) = session.response_header()
+    {
+        hdrs.push(quiche::h3::Header::new(
+            b"via",
+            crate::http_policy::via_value(resp.version).as_bytes(),
+        ));
     }
     apply_h3_response_policy(&mut hdrs, &effective_policy, request_id, Some(state));
 

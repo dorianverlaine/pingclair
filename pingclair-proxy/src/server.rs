@@ -26,7 +26,7 @@ use std::time::Duration;
 use crate::encoding::{ResponseEncoder, negotiate, stream_chunk};
 use crate::http_policy::{
     CorsDecision, ResponseHeaderPolicy, authority_host, evaluate_cors, generate_request_id,
-    rewrite_uri, sanitize_request_id,
+    rewrite_uri, sanitize_request_id, via_value,
 };
 use crate::metrics;
 use crate::upstream::{HostName, Scheme, UpstreamSpec};
@@ -1194,7 +1194,7 @@ impl PingclairProxy {
         ctx: &RequestContext,
     ) -> PingoraResult<()> {
         ctx.response_headers
-            .apply_pingora(response, &ctx.request_id)?;
+            .apply_pingora(response, &ctx.request_id, None)?;
         if let Some(state) = &ctx.state {
             Self::apply_security_response_headers(response, state)?;
         }
@@ -2302,6 +2302,16 @@ impl ProxyHttp for PingclairProxy {
             upstream_request.insert_header("X-Request-Id", &ctx.request_id)?;
         }
 
+        // 🔀 RFC 9110 §7.6.3: a gateway MUST announce itself in `Via` on every
+        // request it forwards. Appended rather than inserted — the header is a
+        // record of the whole chain, and `upstream_request` already carries
+        // whatever the client (or Cloudflare, or another proxy) put there.
+        // The version token is the one we *received* on, not the one we are
+        // about to speak upstream.
+        if !ctx.response_headers.suppresses_via() {
+            upstream_request.append_header("via", via_value(downstream_headers.version))?;
+        }
+
         Ok(())
     }
 
@@ -2355,8 +2365,11 @@ impl ProxyHttp for PingclairProxy {
         ctx.first_byte_at
             .get_or_insert_with(std::time::Instant::now);
 
-        ctx.response_headers
-            .apply_pingora(upstream_response, &ctx.request_id)?;
+        ctx.response_headers.apply_pingora(
+            upstream_response,
+            &ctx.request_id,
+            Some(upstream_response.version),
+        )?;
 
         // 🛡️ Applies the same security policy used by locally generated responses.
         if let Some(state) = &ctx.state {
