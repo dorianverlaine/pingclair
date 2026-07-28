@@ -35,7 +35,7 @@ CADDY_ORIGIN="${CADDY_ORIGIN:-caddy}"
 
 PC_CONTAINER="${PC_CONTAINER:-aqeo-pingclair}"
 PC_ORIGIN="${PC_ORIGIN:-$PC_CONTAINER}"
-PC_IMAGE="${PC_IMAGE:-pingclair:rc-8294116}"
+PC_IMAGE="${PC_IMAGE:-pingclair:rc-3d4dd53}"
 PC_CONFIG="${PC_CONFIG:-$STACK_DIR/Pingclairfile}"
 PC_TLS_VOLUME="${PC_TLS_VOLUME:-pingclair-tls}"
 
