@@ -27,6 +27,33 @@ pub(crate) fn authority_host(authority: &str) -> &str {
         .map_or(authority, |(host, _)| host)
 }
 
+/// 🔀 The pseudonym this proxy identifies itself by in `Via`.
+pub(crate) const VIA_PSEUDONYM: &str = "Pingclair";
+
+/// 🔀 The `Via` protocol-version token for one hop, per RFC 9110 §7.6.3.
+///
+/// The token describes the protocol the message was **received** over, not the
+/// one it will leave by — which is why a proxy that takes HTTP/2 from a client
+/// and speaks HTTP/1.1 upstream ends up writing `2.0` on the request and `1.1`
+/// on the response. `protocol-name` is omitted because it defaults to HTTP.
+pub(crate) fn via_version(version: http::Version) -> &'static str {
+    match version {
+        http::Version::HTTP_09 => "0.9",
+        http::Version::HTTP_10 => "1.0",
+        http::Version::HTTP_2 => "2.0",
+        http::Version::HTTP_3 => "3.0",
+        // HTTP_11 and anything a future http crate adds: 1.1 is the safe
+        // reading, since Via is advisory and a wrong token is worse than a
+        // conservative one.
+        _ => "1.1",
+    }
+}
+
+/// 🔀 This hop's `Via` field value, e.g. `1.1 Pingclair`.
+pub(crate) fn via_value(version: http::Version) -> String {
+    format!("{} {VIA_PSEUDONYM}", via_version(version))
+}
+
 /// 🧭 Stores transport-neutral downstream header mutations in execution order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ResponseHeaderPolicy {
@@ -34,6 +61,7 @@ pub(crate) struct ResponseHeaderPolicy {
     add: Vec<(String, String)>,
     remove: Vec<String>,
     suppress_server: bool,
+    suppress_via: bool,
 }
 
 impl ResponseHeaderPolicy {
@@ -54,6 +82,9 @@ impl ResponseHeaderPolicy {
         let name = name.as_ref().to_ascii_lowercase();
         if name == "server" {
             self.suppress_server = true;
+        }
+        if name == "via" {
+            self.suppress_via = true;
         }
         if !self.remove.iter().any(|existing| existing == &name) {
             self.remove.push(name);
@@ -77,6 +108,7 @@ impl ResponseHeaderPolicy {
             self.remove(name);
         }
         self.suppress_server |= other.suppress_server;
+        self.suppress_via |= other.suppress_via;
     }
 
     /// 🍎 Applies the shared policy to a Pingora response.
@@ -84,6 +116,7 @@ impl ResponseHeaderPolicy {
         &self,
         response: &mut ResponseHeader,
         request_id: &str,
+        via_hop: Option<http::Version>,
     ) -> PingoraResult<()> {
         for (name, value) in &self.set {
             response.insert_header(name.clone(), value.as_str())?;
@@ -99,8 +132,22 @@ impl ResponseHeaderPolicy {
         } else {
             response.insert_header("server", "Pingclair")?;
         }
+
+        // `Via` is *appended*, never inserted: the field records the whole
+        // chain of intermediaries, so replacing it would erase whoever sits
+        // in front of us. `via_hop` is `None` for a response this server
+        // produced itself — there was no hop, and claiming one would be a lie.
+        if let Some(version) = via_hop.filter(|_| !self.suppress_via) {
+            response.append_header("via", via_value(version))?;
+        }
+
         response.insert_header("x-request-id", request_id)?;
         Ok(())
+    }
+
+    /// 🔀 Whether `-Via` asked for the proxy chain to stay hidden.
+    pub(crate) fn suppresses_via(&self) -> bool {
+        self.suppress_via
     }
 
     /// 🌐 Exposes normalized set mutations to protocol adapters.
@@ -421,5 +468,89 @@ mod tests {
         assert_eq!(authority_host("example.com"), "example.com");
         assert_eq!(authority_host("[2001:db8::1]:443"), "2001:db8::1");
         assert_eq!(authority_host("2001:db8::1"), "2001:db8::1");
+    }
+
+    // ---- Via (RFC 9110 §7.6.3) ----
+
+    fn applied(policy: &ResponseHeaderPolicy, hop: Option<http::Version>) -> ResponseHeader {
+        let mut response = ResponseHeader::build(200, None).unwrap();
+        policy.apply_pingora(&mut response, "req-1", hop).unwrap();
+        response
+    }
+
+    fn via_values(response: &ResponseHeader) -> Vec<String> {
+        response
+            .headers
+            .get_all("via")
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_via_token_names_the_protocol_the_hop_arrived_on() {
+        // Not the one it leaves by — a proxy taking HTTP/2 from a client and
+        // HTTP/1.1 from an origin writes a different token in each direction.
+        assert_eq!(via_version(http::Version::HTTP_10), "1.0");
+        assert_eq!(via_version(http::Version::HTTP_11), "1.1");
+        assert_eq!(via_version(http::Version::HTTP_2), "2.0");
+        assert_eq!(via_version(http::Version::HTTP_3), "3.0");
+        assert_eq!(via_value(http::Version::HTTP_2), "2.0 Pingclair");
+    }
+
+    #[test]
+    fn a_proxied_response_carries_via_and_a_local_one_does_not() {
+        let policy = ResponseHeaderPolicy::default();
+
+        assert_eq!(
+            via_values(&applied(&policy, Some(http::Version::HTTP_11))),
+            vec!["1.1 Pingclair"]
+        );
+        // Nothing was proxied, so there is no hop to record and claiming one
+        // would be a lie about the message's path.
+        assert!(via_values(&applied(&policy, None)).is_empty());
+    }
+
+    #[test]
+    fn via_is_appended_so_the_chain_in_front_of_us_survives() {
+        // The whole point of the field is recording every intermediary. An
+        // `insert` here would erase Cloudflare, or any proxy ahead of it, from
+        // a header whose only job is to say who handled the message.
+        let mut response = ResponseHeader::build(200, None).unwrap();
+        response.insert_header("via", "1.1 upstream-cache").unwrap();
+        ResponseHeaderPolicy::default()
+            .apply_pingora(&mut response, "req-1", Some(http::Version::HTTP_11))
+            .unwrap();
+
+        assert_eq!(
+            via_values(&response),
+            vec!["1.1 upstream-cache", "1.1 Pingclair"]
+        );
+    }
+
+    #[test]
+    fn removing_via_hides_the_chain_entirely() {
+        // `-Via` is for operators who do not want their topology advertised,
+        // so it has to drop the upstream's value too, not just ours.
+        let mut policy = ResponseHeaderPolicy::default();
+        policy.remove("Via");
+        assert!(policy.suppresses_via());
+
+        let mut response = ResponseHeader::build(200, None).unwrap();
+        response.insert_header("via", "1.1 upstream-cache").unwrap();
+        policy
+            .apply_pingora(&mut response, "req-1", Some(http::Version::HTTP_11))
+            .unwrap();
+
+        assert!(via_values(&response).is_empty());
+    }
+
+    #[test]
+    fn suppression_survives_a_middleware_merge() {
+        let mut outer = ResponseHeaderPolicy::default();
+        let mut inner = ResponseHeaderPolicy::default();
+        inner.remove("via");
+        outer.merge(inner);
+        assert!(outer.suppresses_via());
     }
 }
