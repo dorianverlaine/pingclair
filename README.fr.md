@@ -384,11 +384,28 @@ server "shop.example.com" {
         lb_policy least_conn
         to 10.0.0.1:8080 { weight 3 }
         to 10.0.0.2:8080
-        # Utilisé seulement quand tous les backends principaux sont indisponibles.
+        # 🛟 Utilisé seulement quand tous les backends principaux sont indisponibles.
         to 10.0.0.3:8080 { backup }
+        health_check {
+            path /health
+            interval 5s
+            timeout 2s
+            status 200 204
+            consecutive_failure 3
+            consecutive_success 2
+            max_response_body_bytes 65536
+            slow_start 30s
+        }
     }
 }
 ```
+
+Les vérifications actives s'exécutent hors bande : un backend inactif en panne
+quitte la rotation avant de recevoir une requête utilisateur, puis la rejoint
+après les succès consécutifs configurés. Les sondes acceptent method, Host,
+headers, statuts, comparaison de body bornée, port dédié, réutilisation de
+connexion, seuils et slow-start. En HTTPS, elles réutilisent la CA épinglée,
+le certificat client, le SNI et la politique de protocole de la route.
 
 Le schéma de l'amont sélectionne le protocole de connexion : une adresse nue ou
 `http://` utilise HTTP/1.1, `https://` négocie HTTP/2 avec repli HTTP/1.1 par

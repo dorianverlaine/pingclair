@@ -525,6 +525,128 @@ fn protocol_proxy_config_url(upstream_address: String) -> String {
 }
 
 #[tokio::test]
+async fn test_active_health_check_removes_idle_failed_upstream() {
+    use tokio::io::AsyncWriteExt;
+
+    async fn spawn_upstream(body: &'static str) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let request =
+                        read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+                    let request_text = String::from_utf8_lossy(&request);
+                    let path = request_text
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap();
+                    let response_body = if path == "/health" { "healthy" } else { body };
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                                response_body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        (address, task)
+    }
+
+    let (first_address, first_task) = spawn_upstream("first").await;
+    let (second_address, second_task) = spawn_upstream("second").await;
+    let config = serde_json::json!({
+        "global": { "http3": false },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "routes": [{
+                "path": "/*",
+                "handler": {
+                    "type": "reverse_proxy",
+                    "upstreams": [
+                        format!("http://{first_address}"),
+                        format!("http://{second_address}")
+                    ],
+                    "load_balance": { "strategy": "round_robin" },
+                    "health_check": {
+                        "path": "/health",
+                        "interval": 1,
+                        "timeout": 1,
+                        "threshold": 1
+                    },
+                    "retry": { "max_attempts": 1 }
+                }
+            }]
+        }]
+    })
+    .to_string();
+    let mut server = TestServer::new(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    // 🧪 Stop one origin and allow two probe intervals without sending any
+    // proxy traffic, so only an out-of-band active check can remove it.
+    first_task.abort();
+    let _ = first_task.await;
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+
+    let client = no_proxy_client();
+    for _ in 0..4 {
+        let response = client.get(server.url(0, "/probe")).send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            200,
+            "an idle failed upstream stayed in rotation instead of being actively removed"
+        );
+        assert_eq!(response.text().await.unwrap(), "second");
+    }
+
+    // 🌱 Rebind the exact address and wait without proxy traffic again; an
+    // active success must rejoin the recovered origin.
+    let recovered_listener = tokio::net::TcpListener::bind(first_address)
+        .await
+        .expect("failed to rebind recovered upstream");
+    let recovered_task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = recovered_listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let _ = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nrecovered",
+                    )
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    let mut bodies = Vec::new();
+    for _ in 0..4 {
+        let response = client.get(server.url(0, "/probe")).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        bodies.push(response.text().await.unwrap());
+    }
+    assert!(
+        bodies.iter().any(|body| body == "recovered"),
+        "the recovered upstream never rejoined rotation: {bodies:?}"
+    );
+
+    recovered_task.abort();
+    let _ = recovered_task.await;
+    second_task.abort();
+    let _ = second_task.await;
+}
+
+#[tokio::test]
 async fn test_bounded_upstream_status_retry_preserves_request_body_safety() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3192,6 +3314,66 @@ async fn test_upstream_tls_verifies_by_default_and_honours_configured_trust() {
         assert_eq!(response.text().await.unwrap(), "secure-origin");
         origin_task.abort();
     }
+}
+
+#[tokio::test]
+async fn test_active_health_check_uses_the_route_pinned_ca() {
+    let mut params = rcgen::CertificateParams::new(vec!["origin.test".to_string()])
+        .expect("certificate parameters");
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "origin.test");
+    let key = rcgen::KeyPair::generate().expect("key pair");
+    let certificate = params.self_signed(&key).expect("self-signed origin");
+    let certificate_pem = certificate.pem();
+    let key_pem = key.serialize_pem();
+    let trust_store = tempfile::tempdir().expect("trust store dir");
+    let trust_path = trust_store.path().join("origin-ca.pem");
+    std::fs::write(&trust_path, &certificate_pem).expect("publish trust root");
+
+    let (origin, origin_task) = spawn_self_signed_tls_origin(&certificate_pem, &key_pem, 16).await;
+    let config = serde_json::json!({
+        "global": { "http3": false },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "routes": [{
+                "path": "/*",
+                "handler": {
+                    "type": "reverse_proxy",
+                    "upstreams": [format!("https://{origin}")],
+                    "health_check": {
+                        "path": "/health",
+                        "interval": 1,
+                        "timeout": 1,
+                        "threshold": 1,
+                        "expected_body": "secure-origin"
+                    },
+                    "upstream_tls": {
+                        "server_name": "origin.test",
+                        "trusted_ca_certs": [trust_path.to_string_lossy()]
+                    }
+                }
+            }]
+        }]
+    })
+    .to_string();
+    let mut server = TestServer::new(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    // 🔐 No proxy request occurs before the active checker has completed a
+    // pinned-CA handshake; a mismatched probe policy would mark the only peer down.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let response = no_proxy_client()
+        .get(server.url(0, "/"))
+        .send()
+        .await
+        .expect("the proxy must answer");
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "secure-origin");
+
+    origin_task.abort();
+    let _ = origin_task.await;
 }
 
 #[tokio::test]

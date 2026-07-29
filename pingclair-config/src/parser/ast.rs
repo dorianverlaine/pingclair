@@ -461,6 +461,9 @@ pub struct ProxyConfig {
     /// Load-balancing strategy selected by `lb_policy`.
     pub lb_policy: Option<String>,
 
+    /// 🩺 Active health-check policy for this upstream pool.
+    pub health_check: Option<HealthCheckConfig>,
+
     /// Flush interval
     pub flush_interval: Option<FlushInterval>,
 
@@ -489,6 +492,46 @@ pub struct ProxyUpstreamConfig {
     pub address: String,
     pub weight: u32,
     pub backup: bool,
+}
+
+/// 🩺 Typed active health-check policy produced by the Pingclairfile adapter.
+#[derive(Debug, Clone)]
+pub struct HealthCheckConfig {
+    pub path: String,
+    pub interval_secs: u64,
+    pub timeout_secs: u64,
+    pub method: String,
+    pub host: Option<String>,
+    pub headers: HashMap<String, String>,
+    pub expected_statuses: Vec<u16>,
+    pub expected_body: Option<String>,
+    pub port: Option<u16>,
+    pub consecutive_success: u32,
+    pub consecutive_failure: u32,
+    pub reuse_connection: bool,
+    pub max_response_body_bytes: usize,
+    pub slow_start_ms: u64,
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            path: "/".to_string(),
+            interval_secs: 30,
+            timeout_secs: 5,
+            method: "GET".to_string(),
+            host: None,
+            headers: HashMap::new(),
+            expected_statuses: vec![200],
+            expected_body: None,
+            port: None,
+            consecutive_success: 1,
+            consecutive_failure: 3,
+            reuse_connection: false,
+            max_response_body_bytes: 64 * 1024,
+            slow_start_ms: 0,
+        }
+    }
 }
 
 /// Rewrite configuration. A two-argument `rewrite` directive is a regex
@@ -772,6 +815,7 @@ impl ProxyConfig {
                 .collect(),
             upstreams,
             lb_policy: None,
+            health_check: None,
             flush_interval: None,
             header_up: HashMap::new(),
             transport: None,

@@ -372,11 +372,27 @@ server "shop.example.com" {
         lb_policy least_conn
         to 10.0.0.1:8080 { weight 3 }
         to 10.0.0.2:8080
-        # Used only when every primary is unavailable.
+        # 🛟 Used only when every primary is unavailable.
         to 10.0.0.3:8080 { backup }
+        health_check {
+            path /health
+            interval 5s
+            timeout 2s
+            status 200 204
+            consecutive_failure 3
+            consecutive_success 2
+            max_response_body_bytes 65536
+            slow_start 30s
+        }
     }
 }
 ```
+
+Active checks run out of band, so an idle failed backend leaves rotation before
+a user request reaches it and rejoins after the configured successful probes.
+Checks support a custom method, Host, headers, status set, bounded body match,
+health port, connection reuse, thresholds, and slow-start. HTTPS checks reuse
+the route's pinned CA, client certificate, SNI, and protocol policy.
 
 The upstream scheme selects the connection protocol: a bare address or `http://`
 uses HTTP/1.1, `https://` negotiates HTTP/2 with HTTP/1.1 fallback through ALPN,

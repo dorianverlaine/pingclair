@@ -812,17 +812,63 @@ impl ProxyState {
                     LoadBalancer::from_entries(primary, backup, strategy)
                 });
 
+                // 🔐 Compile the route policy before its probe peer so health and
+                // ordinary traffic use identical trust roots, client identity, and SNI.
+                let route_tls = compile_route_upstream_tls(&route.path, &proxy_config.upstream_tls);
                 if let Some(hc_config) = &proxy_config.health_check {
-                    load_balancer.set_health_check(crate::health_check::HealthCheckConfig {
-                        path: hc_config.path.clone(),
-                        timeout: std::time::Duration::from_secs(hc_config.timeout),
-                        positive_threshold: 1,
-                        negative_threshold: hc_config.threshold as usize,
-                        expected_status: (200, 299),
-                    });
-                    load_balancer.set_health_check_frequency(std::time::Duration::from_secs(
-                        hc_config.interval,
-                    ));
+                    let tls_policy = match &route_tls {
+                        RouteUpstreamTls::Default => Some(None),
+                        RouteUpstreamTls::Compiled(policy) => Some(Some(policy)),
+                        RouteUpstreamTls::Broken => None,
+                    };
+                    if let (Some(upstream), Some(tls_policy)) =
+                        (load_balancer.first_backend(), tls_policy)
+                    {
+                        let timeout = Duration::from_secs(hc_config.timeout);
+                        let peer_template = PingclairProxy::build_http_peer(
+                            &upstream,
+                            Some(proxy_config),
+                            Some(timeout),
+                            Some(timeout),
+                            tls_policy,
+                        );
+                        let host = hc_config.host.clone().unwrap_or_else(|| {
+                            upstream
+                                .ext
+                                .get::<HostName>()
+                                .map(|host| host.0.clone())
+                                .unwrap_or_else(|| upstream.addr.to_string())
+                        });
+                        load_balancer.set_health_check(
+                            crate::health_check::HealthCheckConfig {
+                                path: hc_config.path.clone(),
+                                timeout,
+                                positive_threshold: hc_config.consecutive_success as usize,
+                                negative_threshold: hc_config
+                                    .consecutive_failure
+                                    .unwrap_or(hc_config.threshold)
+                                    as usize,
+                                expected_statuses: hc_config.expected_statuses.clone(),
+                                expected_body: hc_config.expected_body.clone(),
+                                method: hc_config.method.clone(),
+                                host,
+                                headers: hc_config.headers.clone(),
+                                port_override: hc_config.port,
+                                reuse_connection: hc_config.reuse_connection,
+                                max_response_body_bytes: hc_config.max_response_body_bytes,
+                                slow_start: Duration::from_millis(hc_config.slow_start_ms),
+                            },
+                            peer_template,
+                        );
+                        load_balancer
+                            .set_health_check_frequency(Duration::from_secs(hc_config.interval));
+                        crate::health_check::register(&load_balancer);
+                    } else {
+                        tracing::error!(
+                            route = %route.path,
+                            "🚫 Active health checking did not start because no valid TLS probe peer exists"
+                        );
+                    }
                 }
 
                 // Hostname upstreams are re-resolved by the shared refresher;
@@ -861,10 +907,7 @@ impl ProxyState {
                     ))
                 })));
 
-                upstream_tls.push(compile_route_upstream_tls(
-                    &route.path,
-                    &proxy_config.upstream_tls,
-                ));
+                upstream_tls.push(route_tls);
             } else {
                 load_balancers.push(None);
                 route_protections.push(None);

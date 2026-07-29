@@ -1139,6 +1139,9 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
                 "circuit_breaker" => {
                     proxy.circuit_breaker = adapt_circuit_breaker_policy(&sub)?;
                 }
+                "health_check" => {
+                    proxy.health_check = Some(adapt_health_check(&sub)?);
+                }
                 "lb_policy" => {
                     let policy = sub
                         .args
@@ -1228,6 +1231,110 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
     }
 
     Ok(Handler::Proxy(Box::new(proxy)))
+}
+
+/// 🩺 Adapts one bounded active health-check policy.
+fn adapt_health_check(directive: &Directive) -> Result<HealthCheckConfig, AdapterError> {
+    if !directive.args.is_empty() {
+        return Err(AdapterError::ArgumentCount(
+            "health_check".into(),
+            0,
+            directive.args.len(),
+        ));
+    }
+    let block = directive.block.as_ref().ok_or_else(|| {
+        AdapterError::InvalidArgument("health_check".into(), "block required".into())
+    })?;
+    let mut health = HealthCheckConfig::default();
+    for sub in &block.directives {
+        match sub.name.as_str() {
+            "path" => health.path = expect_one_argument(sub)?.to_string(),
+            "interval" => {
+                let millis = parse_required_duration(sub)?;
+                if millis < 1_000 || millis % 1_000 != 0 {
+                    return Err(AdapterError::InvalidArgument(
+                        sub.name.clone(),
+                        "interval must be a whole number of seconds".into(),
+                    ));
+                }
+                health.interval_secs = millis / 1_000;
+            }
+            "timeout" => {
+                let millis = parse_required_duration(sub)?;
+                if millis < 1_000 || millis % 1_000 != 0 {
+                    return Err(AdapterError::InvalidArgument(
+                        sub.name.clone(),
+                        "timeout must be a whole number of seconds".into(),
+                    ));
+                }
+                health.timeout_secs = millis / 1_000;
+            }
+            "method" => {
+                health.method = expect_one_argument(sub)?.to_ascii_uppercase();
+            }
+            "host" => health.host = Some(expect_one_argument(sub)?.to_string()),
+            "header" => {
+                if sub.args.len() != 2 {
+                    return Err(AdapterError::ArgumentCount(
+                        sub.name.clone(),
+                        2,
+                        sub.args.len(),
+                    ));
+                }
+                health
+                    .headers
+                    .insert(sub.args[0].clone(), sub.args[1].clone());
+            }
+            "status" => {
+                if sub.args.is_empty() {
+                    return Err(AdapterError::ArgumentCount(sub.name.clone(), 1, 0));
+                }
+                health.expected_statuses = sub
+                    .args
+                    .iter()
+                    .map(|value| {
+                        value.parse::<u16>().map_err(|_| {
+                            AdapterError::InvalidArgument(sub.name.clone(), value.clone())
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
+            "body" => health.expected_body = Some(expect_one_argument(sub)?.to_string()),
+            "port" => {
+                let raw = expect_one_argument(sub)?;
+                health.port = Some(raw.parse::<u16>().map_err(|_| {
+                    AdapterError::InvalidArgument(sub.name.clone(), raw.to_string())
+                })?);
+            }
+            "consecutive_success" => {
+                health.consecutive_success =
+                    u32::try_from(parse_positive_usize(sub)?).map_err(|_| {
+                        AdapterError::InvalidArgument(sub.name.clone(), "value is too large".into())
+                    })?;
+            }
+            "consecutive_failure" => {
+                health.consecutive_failure =
+                    u32::try_from(parse_positive_usize(sub)?).map_err(|_| {
+                        AdapterError::InvalidArgument(sub.name.clone(), "value is too large".into())
+                    })?;
+            }
+            "reuse_connection" => {
+                expect_no_arguments(sub)?;
+                health.reuse_connection = true;
+            }
+            "max_response_body_bytes" => {
+                health.max_response_body_bytes = parse_positive_usize(sub)?;
+            }
+            "slow_start" => health.slow_start_ms = parse_required_duration(sub)?,
+            _ => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "health_check: {}",
+                    sub.name
+                )));
+            }
+        }
+    }
+    Ok(health)
 }
 
 /// 🔁 Adapts one bounded, idempotent-only redispatch policy.

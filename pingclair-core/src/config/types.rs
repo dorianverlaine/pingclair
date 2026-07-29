@@ -737,9 +737,9 @@ pub struct ReverseProxyConfig {
     #[serde(default)]
     pub load_balance: LoadBalanceConfig,
 
-    /// Health check configuration
+    /// 🩺 Active upstream health-check configuration.
     #[serde(default)]
-    pub health_check: Option<HealthCheckConfig>,
+    pub health_check: Option<Box<HealthCheckConfig>>,
 
     /// Headers to add to upstream request
     #[serde(default)]
@@ -1056,23 +1056,67 @@ fn default_lb_strategy() -> String {
     "round_robin".to_string()
 }
 
-/// Health check configuration
+/// 🩺 Active upstream health-check configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthCheckConfig {
-    /// Health check path
+    /// 🛣️ Request path sent to the probe endpoint.
     pub path: String,
 
-    /// Check interval in seconds
+    /// ⏲️ Base interval between probe rounds, in seconds.
     #[serde(default = "default_health_interval")]
     pub interval: u64,
 
-    /// Timeout in seconds
+    /// ⌛ Hard timeout for one probe, in seconds.
     #[serde(default = "default_health_timeout")]
     pub timeout: u64,
 
-    /// Number of failures before marking unhealthy
+    /// 🧯 Legacy failure threshold retained for JSON compatibility.
     #[serde(default = "default_health_threshold")]
     pub threshold: u32,
+
+    /// 📨 HTTP method used for the probe.
+    #[serde(default = "default_health_method")]
+    pub method: String,
+
+    /// 🏷️ Optional Host header and TLS server name override.
+    #[serde(default)]
+    pub host: Option<String>,
+
+    /// 🧾 Additional request headers sent by the probe.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+
+    /// ✅ Exact response statuses accepted as healthy.
+    #[serde(default = "default_health_statuses")]
+    pub expected_statuses: Vec<u16>,
+
+    /// 🔎 Optional UTF-8 response-body fragment required for success.
+    #[serde(default)]
+    pub expected_body: Option<String>,
+
+    /// 🔌 Optional health endpoint port on each backend IP.
+    #[serde(default)]
+    pub port: Option<u16>,
+
+    /// 🌱 Consecutive successful probes required before recovery.
+    #[serde(default = "default_health_success_threshold")]
+    pub consecutive_success: u32,
+
+    /// 🧯 Consecutive failed probes required before removal.
+    #[serde(default)]
+    pub consecutive_failure: Option<u32>,
+
+    /// ♻️ Whether probes may reuse an established upstream connection.
+    #[serde(default)]
+    pub reuse_connection: bool,
+
+    /// 🧱 Maximum response-body bytes a probe may read.
+    #[serde(default = "default_health_body_limit")]
+    pub max_response_body_bytes: usize,
+
+    /// 🌤️ Time in milliseconds for a recovered backend to regain full traffic.
+    #[serde(default)]
+    pub slow_start_ms: u64,
 }
 
 fn default_health_interval() -> u64 {
@@ -1085,6 +1129,22 @@ fn default_health_timeout() -> u64 {
 
 fn default_health_threshold() -> u32 {
     3
+}
+
+fn default_health_method() -> String {
+    "GET".to_string()
+}
+
+fn default_health_statuses() -> Vec<u16> {
+    vec![200]
+}
+
+fn default_health_success_threshold() -> u32 {
+    1
+}
+
+fn default_health_body_limit() -> usize {
+    64 * 1024
 }
 
 /// Admin API configuration
