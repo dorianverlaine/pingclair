@@ -772,6 +772,211 @@ async fn test_bounded_upstream_status_retry_preserves_request_body_safety() {
 }
 
 #[tokio::test]
+async fn test_overload_and_circuit_breaker_fail_fast_and_survive_reload() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncWriteExt;
+
+    let upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let queue_hits = Arc::new(AtomicUsize::new(0));
+    let capacity_hits = Arc::new(AtomicUsize::new(0));
+    let circuit_hits = Arc::new(AtomicUsize::new(0));
+    let counters = (
+        queue_hits.clone(),
+        capacity_hits.clone(),
+        circuit_hits.clone(),
+    );
+    let upstream_task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let counters = counters.clone();
+            tokio::spawn(async move {
+                let request =
+                    read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+                let path = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap()
+                    .to_string();
+                let (status, body) = match path.as_str() {
+                    "/queue" => {
+                        counters.0.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        ("200 OK", "queue")
+                    }
+                    "/capacity" => {
+                        counters.1.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        ("200 OK", "capacity")
+                    }
+                    "/circuit" => {
+                        let hit = counters.2.fetch_add(1, Ordering::SeqCst) + 1;
+                        if hit <= 2 {
+                            ("503 Service Unavailable", "failure")
+                        } else {
+                            ("200 OK", "recovered")
+                        }
+                    }
+                    _ => panic!("unexpected overload-test path: {path}"),
+                };
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+
+    let queue_route = serde_json::json!({
+        "path": "/queue",
+        "handler": {
+            "type": "reverse_proxy",
+            "upstreams": [format!("http://{upstream_address}")],
+            "overload": {
+                "max_in_flight": 1,
+                "max_pending": 1,
+                "pending_timeout_ms": 100
+            }
+        }
+    });
+    let capacity_route = serde_json::json!({
+        "path": "/capacity",
+        "handler": {
+            "type": "reverse_proxy",
+            "upstreams": [format!("http://{upstream_address}")],
+            "overload": { "upstream_max_connections": 1 }
+        }
+    });
+    let circuit_route = serde_json::json!({
+        "path": "/circuit",
+        "handler": {
+            "type": "reverse_proxy",
+            "upstreams": [format!("http://{upstream_address}")],
+            "retry": { "max_attempts": 1 },
+            "circuit_breaker": {
+                "consecutive_failures": 2,
+                "open_duration_ms": 2000,
+                "half_open_requests": 1,
+                "failure_statuses": [503]
+            }
+        }
+    });
+    let config = serde_json::json!({
+        "global": { "http3": false },
+        "admin": { "enabled": true, "listen": "127.0.0.1:0" },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "routes": [
+                queue_route.clone(),
+                capacity_route.clone(),
+                circuit_route.clone()
+            ]
+        }]
+    })
+    .to_string();
+    let mut server = TestServer::new(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let first_client = client.clone();
+    let first_url = server.url(0, "/queue");
+    let first = tokio::spawn(async move { first_client.get(first_url).send().await.unwrap() });
+    while queue_hits.load(Ordering::SeqCst) != 1 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let pending_client = client.clone();
+    let pending_url = server.url(0, "/queue");
+    let pending =
+        tokio::spawn(async move { pending_client.get(pending_url).send().await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let rejected = client.get(server.url(0, "/queue")).send().await.unwrap();
+    assert_eq!(rejected.status(), 429);
+    assert_eq!(pending.await.unwrap().status(), 503);
+    assert_eq!(first.await.unwrap().status(), 200);
+    assert_eq!(queue_hits.load(Ordering::SeqCst), 1);
+
+    let held_client = client.clone();
+    let held_url = server.url(0, "/capacity");
+    let held = tokio::spawn(async move { held_client.get(held_url).send().await.unwrap() });
+    while capacity_hits.load(Ordering::SeqCst) != 1 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let rejected = client.get(server.url(0, "/capacity")).send().await.unwrap();
+    assert_eq!(rejected.status(), 503);
+    assert_eq!(held.await.unwrap().status(), 200);
+    assert_eq!(capacity_hits.load(Ordering::SeqCst), 1);
+
+    for _ in 0..2 {
+        let response = client.get(server.url(0, "/circuit")).send().await.unwrap();
+        assert_eq!(response.status(), 503);
+    }
+    let rejected = client.get(server.url(0, "/circuit")).send().await.unwrap();
+    assert_eq!(rejected.status(), 503);
+    assert_eq!(circuit_hits.load(Ordering::SeqCst), 2);
+
+    let reloaded = serde_json::json!({
+        "listen": [server.address(0).to_string()],
+        "routes": [
+            {
+                "path": server.readiness_path.clone(),
+                "handler": {
+                    "type": "respond",
+                    "status": 200,
+                    "body": server.readiness_token.clone()
+                }
+            },
+            queue_route,
+            capacity_route,
+            circuit_route
+        ]
+    });
+    let response = client
+        .post(server.admin_url("/config/0"))
+        .json(&reloaded)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let still_open = client.get(server.url(0, "/circuit")).send().await.unwrap();
+    assert_eq!(still_open.status(), 503);
+    assert_eq!(circuit_hits.load(Ordering::SeqCst), 2);
+
+    let metrics = client
+        .get(server.admin_url("/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.contains("pingclair_overload_rejections_total"));
+    assert!(metrics.contains("reason=\"queue_full\""));
+    assert!(metrics.contains("reason=\"queue_timeout\""));
+    assert!(metrics.contains("reason=\"upstream_capacity\""));
+    assert!(metrics.contains("reason=\"circuit_open\""));
+    assert!(metrics.contains("pingclair_circuit_state"));
+
+    tokio::time::sleep(Duration::from_millis(2_050)).await;
+    let recovered = client.get(server.url(0, "/circuit")).send().await.unwrap();
+    assert_eq!(recovered.status(), 200);
+    assert_eq!(recovered.text().await.unwrap(), "recovered");
+    assert_eq!(circuit_hits.load(Ordering::SeqCst), 3);
+
+    upstream_task.abort();
+    let _ = upstream_task.await;
+}
+
+#[tokio::test]
 async fn test_listener_resource_limits_reject_before_dispatch_without_hanging() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

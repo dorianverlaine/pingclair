@@ -230,6 +230,21 @@ example.com {
             status_codes 429 502 503 504
             methods GET HEAD
         }
+        overload {
+            max_in_flight 256
+            max_pending 64
+            pending_timeout 250ms
+            upstream_max_connections 64
+        }
+        circuit_breaker {
+            consecutive_failures 5
+            error_rate_percent 50
+            minimum_requests 20
+            window_requests 100
+            open_for 30s
+            half_open_requests 1
+            failure_statuses 429 502 503 504
+        }
         transport http {
             connect_timeout 3s
             first_byte_timeout 30s
@@ -244,6 +259,17 @@ retry because no request bytes reached that peer. Status retries require a
 configured idempotent method and an actually bodyless request; Pingclair never
 buffers or replays a request body for this policy. Omitting `retry` preserves
 the legacy connect-failover limit and does not retry response statuses.
+
+`max_in_flight` bounds work executing inside the route, while `max_pending`
+adds a bounded wait queue. A full queue fails fast with 429 and an expired
+pending wait returns 503. `upstream_max_connections` is a conservative
+per-backend request-occupancy cap; it also bounds multiplexed H2 use rather
+than attempting to count physical sockets. Circuit breakers track each
+concrete backend independently. They open on either configured threshold,
+fail fast with 503, and admit only the configured number of half-open probes
+after `open_for`. An empty `failure_statuses` list counts every 5xx response.
+Compatible Admin/SIGHUP reloads retain live circuit state; changing the
+protection policy or configured upstream set starts fresh state.
 
 Exceeded header, body, and request budgets receive an explicit HTTP error when
 the protocol can still send one; idle transports and excess HTTP/2 or HTTP/3

@@ -323,7 +323,7 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
         }
 
         for route in &server.routes {
-            validate_retry_handler(&route.handler)?;
+            validate_proxy_protection_handler(&route.handler)?;
         }
 
         let Some(tls) = &server.tls else {
@@ -358,8 +358,8 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
     Ok(())
 }
 
-/// 🔁 Rejects retry policies that could exceed Pingora's bounded retry loop or replay unsafe methods.
-fn validate_retry_handler(handler: &HandlerConfig) -> CompileResult<()> {
+/// 🛡️ Rejects unsafe retry, overload, and circuit-breaker policies.
+fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<()> {
     match handler {
         HandlerConfig::ReverseProxy(proxy) => {
             let retry = &proxy.retry;
@@ -427,18 +427,124 @@ fn validate_retry_handler(handler: &HandlerConfig) -> CompileResult<()> {
                     message: "retry methods must be unique".to_string(),
                 });
             }
+
+            let overload = &proxy.overload;
+            if overload
+                .max_in_flight
+                .is_some_and(|value| value == 0 || value > 1_000_000)
+                || overload
+                    .upstream_max_connections
+                    .is_some_and(|value| value == 0 || value > 1_000_000)
+                || overload.max_pending > 1_000_000
+            {
+                return Err(CompileError::InvalidRoute {
+                    message: "overload limits must be between 1 and 1000000".to_string(),
+                });
+            }
+            if overload.max_pending > 0 && overload.max_in_flight.is_none() {
+                return Err(CompileError::InvalidRoute {
+                    message: "overload max_pending requires max_in_flight".to_string(),
+                });
+            }
+            if **overload != pingclair_core::config::OverloadConfig::default()
+                && overload.max_in_flight.is_none()
+                && overload.max_pending == 0
+                && overload.upstream_max_connections.is_none()
+            {
+                return Err(CompileError::InvalidRoute {
+                    message: "overload requires at least one active limit".to_string(),
+                });
+            }
+            if overload.max_pending > 0
+                && (overload.pending_timeout_ms == 0
+                    || overload.pending_timeout_ms > 31_536_000_000)
+            {
+                return Err(CompileError::InvalidRoute {
+                    message:
+                        "overload pending_timeout_ms must be between 1 ms and 365 days when queuing"
+                            .to_string(),
+                });
+            }
+
+            let breaker = &proxy.circuit_breaker;
+            if !breaker.enabled()
+                && **breaker != pingclair_core::config::CircuitBreakerConfig::default()
+            {
+                return Err(CompileError::InvalidRoute {
+                    message: "circuit_breaker requires consecutive_failures or error_rate_percent"
+                        .to_string(),
+                });
+            }
+            if breaker
+                .consecutive_failures
+                .is_some_and(|value| value == 0 || value > 1_000_000)
+            {
+                return Err(CompileError::InvalidRoute {
+                    message: "circuit_breaker consecutive_failures must be between 1 and 1000000"
+                        .to_string(),
+                });
+            }
+            if breaker
+                .error_rate_percent
+                .is_some_and(|value| !(1..=100).contains(&value))
+            {
+                return Err(CompileError::InvalidRoute {
+                    message: "circuit_breaker error_rate_percent must be between 1 and 100"
+                        .to_string(),
+                });
+            }
+            if breaker.enabled()
+                && (breaker.minimum_requests == 0
+                    || breaker.window_requests == 0
+                    || breaker.minimum_requests > breaker.window_requests
+                    || breaker.window_requests > 10_000)
+            {
+                return Err(CompileError::InvalidRoute {
+                    message:
+                        "circuit_breaker requires 1 <= minimum_requests <= window_requests <= 10000"
+                            .to_string(),
+                });
+            }
+            if breaker.enabled()
+                && (breaker.open_duration_ms == 0
+                    || breaker.open_duration_ms > 31_536_000_000
+                    || breaker.half_open_requests == 0
+                    || breaker.half_open_requests > 1_000)
+            {
+                return Err(CompileError::InvalidRoute {
+                    message: "circuit_breaker recovery values are outside their safe bounds"
+                        .to_string(),
+                });
+            }
+            if breaker
+                .failure_statuses
+                .iter()
+                .any(|status| !(400..=599).contains(status))
+                || breaker.failure_statuses.len() > 200
+                || breaker
+                    .failure_statuses
+                    .iter()
+                    .collect::<HashSet<_>>()
+                    .len()
+                    != breaker.failure_statuses.len()
+            {
+                return Err(CompileError::InvalidRoute {
+                    message: "circuit_breaker failure_statuses must be unique 4xx or 5xx values"
+                        .to_string(),
+                });
+            }
         }
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::Handle { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
             for handler in handlers {
-                validate_retry_handler(handler)?;
+                validate_proxy_protection_handler(handler)?;
             }
         }
         HandlerConfig::HandleErrors { errors } => {
             for handlers in errors.values() {
                 for handler in handlers {
-                    validate_retry_handler(handler)?;
+                    validate_proxy_protection_handler(handler)?;
                 }
             }
         }
@@ -608,6 +714,21 @@ fn compile_handler(handler: &Handler) -> CompileResult<HandlerConfig> {
                     backoff_ms: proxy.retry.backoff_ms,
                     status_codes: proxy.retry.status_codes.clone(),
                     methods: proxy.retry.methods.clone(),
+                }),
+                overload: Box::new(pingclair_core::config::OverloadConfig {
+                    max_in_flight: proxy.overload.max_in_flight,
+                    max_pending: proxy.overload.max_pending,
+                    pending_timeout_ms: proxy.overload.pending_timeout_ms,
+                    upstream_max_connections: proxy.overload.upstream_max_connections,
+                }),
+                circuit_breaker: Box::new(pingclair_core::config::CircuitBreakerConfig {
+                    consecutive_failures: proxy.circuit_breaker.consecutive_failures,
+                    error_rate_percent: proxy.circuit_breaker.error_rate_percent,
+                    minimum_requests: proxy.circuit_breaker.minimum_requests,
+                    window_requests: proxy.circuit_breaker.window_requests,
+                    open_duration_ms: proxy.circuit_breaker.open_duration_ms,
+                    half_open_requests: proxy.circuit_breaker.half_open_requests,
+                    failure_statuses: proxy.circuit_breaker.failure_statuses.clone(),
                 }),
             };
 

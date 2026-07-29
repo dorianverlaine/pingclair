@@ -159,9 +159,23 @@ commit `0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。
   `benchmarks/results/20260729_day9_local_failed_status_retry/`；另外五個獨立目錄
   保留 20 MiB 上限、backend 順序、closed downstream reuse 與 large-enum clippy
   等 fixture／gate 失敗。
+- **Circuit breaker／overload protection（Day 10，本機 2026-07-29）** —
+  `reverse_proxy overload` 提供 route in-flight、bounded pending queue／timeout
+  與每 backend request occupancy cap；queue full 回 429，queue timeout、容量耗盡
+  或 open circuit 回 503。`circuit_breaker` 依 backend 追蹤連續失敗與 bounded
+  rolling error-rate window，支援 open／受限 half-open probes／closed recovery。
+  H1/H2 與獨立 H3 bridge 共用狀態與 metrics，等待不會引入 request body replay
+  或完整 buffering。相容的 Admin／SIGHUP reload 保留 circuit 狀態，政策或設定
+  upstream 集合改變才重建。真 binary 已覆蓋 429／503、容量釋放、狀態復原、
+  metrics 與 open state 跨 Admin reload；H3 bridge 另有 open-circuit 負向測試。
+  完整 locked gate 共 **375 tests** 全綠。
+  修正前 reload 意外清空 open state 的證據保留於
+  `benchmarks/results/20260729_day10_local_failed_admin_reload_state/`。
 - **仍缺** — 乾淨 Linux release、VPS 與真 QUIC client 矩陣留到 Day 15；
   所以仍是 🧪，不是 ✅。非冪等 body replay、AI POST fallback、exponential／jitter、
   `Retry-After` 與有上限的 memory／disk replay policy 未實作。
+  `upstream_max_connections` 是 request occupancy cap（包含 H2 multiplex），
+  不是 Pingora 實體 socket pool 的直接計數。
 
 ### 安全與身分
 

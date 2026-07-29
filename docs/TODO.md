@@ -380,12 +380,36 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
     opt-in、`Idempotency-Key`，以及**有上限的** memory／disk replay 策略；
     禁止悄悄全量緩衝無上限 body。
 
-### 🔨 Day 10 — Circuit breaker／overload protection
+### 🔨 Day 10 — Circuit breaker／overload protection ✔
 
-- route／upstream 級的 max connections、in-flight requests、pending queue、
-  連續失敗／錯誤比例上限。
-- open／half-open recovery、超限快速回 503/429、metrics。
-- **完成判定**：狀態轉換有測試，含 hot reload 下的狀態處理。
+**已完成 2026-07-29，本機 gate 全綠，尚待 Day 15 遠端驗證。**
+
+- ✅ `reverse_proxy overload`：route `max_in_flight`、bounded `max_pending`、
+  `pending_timeout`，以及每個 backend 的 `upstream_max_connections` request
+  occupancy cap；queue 滿快速回 429，等待逾時或 backend 全部滿載回 503。
+- ✅ `reverse_proxy circuit_breaker`：每個具體 backend 分開計算連續失敗與 bounded
+  rolling error-rate window；open 到期後只放行受限 half-open probes，成功關閉、
+  失敗重新 open。
+- ✅ H1/H2 與獨立 H3 bridge 共用同一份 admission/circuit state；沒有新增 body
+  buffering，等待期間仍由既有 transport backpressure 與 bounded H3 channel 控制。
+- ✅ 相容的 Admin／SIGHUP hot reload 保留 active/open/half-open 狀態；政策或設定的
+  upstream 集合改變時重建，避免舊門檻污染新政策與舊位址狀態無限累積。
+- ✅ Prometheus 輸出 route in-flight/pending、upstream occupancy、拒絕原因、circuit
+  狀態與轉換；真 binary 覆蓋 queue full／timeout、upstream cap、open → half-open
+  → closed，以及 open state 跨 Admin reload 保留。
+- ✅ 總測試數 368 → **375**。
+- ✅ regression 先紅後綠：Admin API 原先走 `add_server` 重建 state，open circuit
+  reload 後意外回源；修正後同一真 binary 測試通過。失敗證據保留於
+  `benchmarks/results/20260729_day10_local_failed_admin_reload_state/`。
+- ✅ Gate：`cargo fmt --all -- --check`、locked clippy、locked workspace build、
+  locked workspace tests 全綠。
+
+- **範圍外／尚未驗證**：
+  - `upstream_max_connections` 是保守的 request occupancy cap（也限制 H2
+    multiplex），不是實體 socket pool 計數；Pingora 0.8 未公開可可靠掛接的
+    per-route physical connection counter。
+  - 尚未做乾淨 Linux release、VPS 或真 QUIC client 矩陣；留到 Day 15，
+    因此本日仍是 🧪，不是遠端 ✅。
 
 ### 🔨 Day 11 — 上游 TLS／mTLS
 

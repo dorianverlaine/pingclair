@@ -5,7 +5,7 @@
 //!
 //! Provides metrics collection for requests, errors, and latency.
 
-use prometheus::{Encoder, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder};
+use prometheus::{Encoder, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder};
 use std::sync::LazyLock;
 
 // MARK: - Global Registry
@@ -48,6 +48,78 @@ pub static ACTIVE_CONNECTIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("metric can be created")
 });
 
+/// 🚦 Requests rejected before upstream dispatch.
+pub static OVERLOAD_REJECTIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "pingclair_overload_rejections_total",
+            "Requests rejected by overload or circuit-breaker policy",
+        ),
+        &["host", "route", "reason"],
+    )
+    .expect("metric can be created")
+});
+
+/// 🧱 Requests currently executing inside a protected route.
+pub static ROUTE_IN_FLIGHT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "pingclair_route_in_flight",
+            "Requests currently executing inside a protected route",
+        ),
+        &["host", "route"],
+    )
+    .expect("metric can be created")
+});
+
+/// 🕰️ Requests currently waiting for a protected route slot.
+pub static ROUTE_PENDING: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "pingclair_route_pending",
+            "Requests currently waiting for a protected route slot",
+        ),
+        &["host", "route"],
+    )
+    .expect("metric can be created")
+});
+
+/// 🔌 Requests currently occupying one upstream capacity slot.
+pub static UPSTREAM_IN_FLIGHT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "pingclair_upstream_in_flight",
+            "Requests currently occupying one upstream capacity slot",
+        ),
+        &["host", "route", "upstream"],
+    )
+    .expect("metric can be created")
+});
+
+/// 🔄 Circuit-breaker state transitions.
+pub static CIRCUIT_TRANSITIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "pingclair_circuit_transitions_total",
+            "Per-upstream circuit-breaker state transitions",
+        ),
+        &["host", "route", "upstream", "state"],
+    )
+    .expect("metric can be created")
+});
+
+/// 🔌 Current circuit-breaker state: closed 0, half-open 1, open 2.
+pub static CIRCUIT_STATE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "pingclair_circuit_state",
+            "Current per-upstream circuit state: closed 0, half-open 1, open 2",
+        ),
+        &["host", "route", "upstream"],
+    )
+    .expect("metric can be created")
+});
+
 // MARK: - Initialization
 
 /// Initialize metrics
@@ -60,6 +132,12 @@ pub fn init() {
     let _ = REGISTRY.register(Box::new(REQUESTS_TOTAL.clone()));
     let _ = REGISTRY.register(Box::new(REQUEST_DURATION_SECONDS.clone()));
     let _ = REGISTRY.register(Box::new(ACTIVE_CONNECTIONS.clone()));
+    let _ = REGISTRY.register(Box::new(OVERLOAD_REJECTIONS_TOTAL.clone()));
+    let _ = REGISTRY.register(Box::new(ROUTE_IN_FLIGHT.clone()));
+    let _ = REGISTRY.register(Box::new(ROUTE_PENDING.clone()));
+    let _ = REGISTRY.register(Box::new(UPSTREAM_IN_FLIGHT.clone()));
+    let _ = REGISTRY.register(Box::new(CIRCUIT_TRANSITIONS_TOTAL.clone()));
+    let _ = REGISTRY.register(Box::new(CIRCUIT_STATE.clone()));
 }
 
 // MARK: - Export

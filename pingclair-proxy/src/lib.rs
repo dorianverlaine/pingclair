@@ -20,6 +20,7 @@ pub mod health_check;
 mod http_policy;
 pub mod load_balancer;
 pub mod metrics;
+pub mod overload;
 pub mod quic;
 pub mod rate_limit;
 pub mod redaction;

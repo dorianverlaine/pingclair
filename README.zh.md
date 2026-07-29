@@ -218,6 +218,21 @@ example.com {
             status_codes 429 502 503 504
             methods GET HEAD
         }
+        overload {
+            max_in_flight 256
+            max_pending 64
+            pending_timeout 250ms
+            upstream_max_connections 64
+        }
+        circuit_breaker {
+            consecutive_failures 5
+            error_rate_percent 50
+            minimum_requests 20
+            window_requests 100
+            open_for 30s
+            half_open_requests 1
+            failure_statuses 429 502 503 504
+        }
         transport http {
             connect_timeout 3s
             first_byte_timeout 30s
@@ -232,6 +247,14 @@ example.com {
 而且 request 必須實際沒有 body。Pingclair 不會為此策略緩衝或重送 request
 body。省略 `retry` 時會保留舊有的連線失敗切換上限，也不會因 response
 status 進行重試。
+
+`max_in_flight` 限制 route 內正在執行的工作，`max_pending` 則提供有界等待佇列；
+佇列已滿會快速回 429，等待逾時回 503。`upstream_max_connections` 是保守的
+單一 backend request 占用上限；H2 多工也受同一上限約束，而不是猜測實體 socket
+數量。Circuit breaker 依具體 backend 分開計算，任一設定門檻成立就 open 並快速
+回 503；`open_for` 到期後只允許設定數量的 half-open probe。未列
+`failure_statuses` 時，所有 5xx 都算失敗。相容的 Admin／SIGHUP reload 會保留
+既有 circuit 狀態；變更保護政策或 upstream 集合則建立全新狀態。
 
 header、body 與整體 request 超限時，只要協議仍能送出回應，就會回傳明確的
 HTTP 錯誤；idle transport 與超出上限的 HTTP/2、HTTP/3 連線則會關閉。

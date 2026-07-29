@@ -1092,6 +1092,12 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
                 "retry" => {
                     proxy.retry = adapt_retry_policy(&sub)?;
                 }
+                "overload" => {
+                    proxy.overload = adapt_overload_policy(&sub)?;
+                }
+                "circuit_breaker" => {
+                    proxy.circuit_breaker = adapt_circuit_breaker_policy(&sub)?;
+                }
                 "lb_policy" => {
                     let policy = sub
                         .args
@@ -1243,6 +1249,126 @@ fn adapt_retry_policy(directive: &Directive) -> Result<RetryConfig, AdapterError
         }
     }
     Ok(retry)
+}
+
+/// 🚦 Adapts bounded route and upstream admission controls.
+fn adapt_overload_policy(directive: &Directive) -> Result<OverloadConfig, AdapterError> {
+    if !directive.args.is_empty() {
+        return Err(AdapterError::ArgumentCount(
+            "overload".into(),
+            0,
+            directive.args.len(),
+        ));
+    }
+    let block = directive
+        .block
+        .as_ref()
+        .ok_or_else(|| AdapterError::InvalidArgument("overload".into(), "block required".into()))?;
+    if block.directives.is_empty() {
+        return Err(AdapterError::InvalidArgument(
+            "overload".into(),
+            "at least one limit is required".into(),
+        ));
+    }
+    let mut overload = OverloadConfig::default();
+    for sub in &block.directives {
+        match sub.name.as_str() {
+            "max_in_flight" => overload.max_in_flight = Some(parse_positive_usize(sub)?),
+            "max_pending" => overload.max_pending = parse_positive_usize(sub)?,
+            "pending_timeout" => {
+                overload.pending_timeout_ms = parse_required_duration(sub)?;
+            }
+            "upstream_max_connections" => {
+                overload.upstream_max_connections = Some(parse_positive_usize(sub)?);
+            }
+            _ => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "overload: {}",
+                    sub.name
+                )));
+            }
+        }
+    }
+    if overload.max_in_flight.is_none()
+        && overload.max_pending == 0
+        && overload.upstream_max_connections.is_none()
+    {
+        return Err(AdapterError::InvalidArgument(
+            "overload".into(),
+            "at least one active limit is required".into(),
+        ));
+    }
+    Ok(overload)
+}
+
+/// 🔌 Adapts one per-upstream circuit-breaker policy.
+fn adapt_circuit_breaker_policy(
+    directive: &Directive,
+) -> Result<CircuitBreakerConfig, AdapterError> {
+    if !directive.args.is_empty() {
+        return Err(AdapterError::ArgumentCount(
+            "circuit_breaker".into(),
+            0,
+            directive.args.len(),
+        ));
+    }
+    let block = directive.block.as_ref().ok_or_else(|| {
+        AdapterError::InvalidArgument("circuit_breaker".into(), "block required".into())
+    })?;
+    if block.directives.is_empty() {
+        return Err(AdapterError::InvalidArgument(
+            "circuit_breaker".into(),
+            "at least one threshold is required".into(),
+        ));
+    }
+    let mut breaker = CircuitBreakerConfig::default();
+    for sub in &block.directives {
+        match sub.name.as_str() {
+            "consecutive_failures" => {
+                breaker.consecutive_failures =
+                    Some(u32::try_from(parse_positive_usize(sub)?).map_err(|_| {
+                        AdapterError::InvalidArgument(sub.name.clone(), "value is too large".into())
+                    })?);
+            }
+            "error_rate_percent" => {
+                breaker.error_rate_percent =
+                    Some(u8::try_from(parse_positive_usize(sub)?).map_err(|_| {
+                        AdapterError::InvalidArgument(sub.name.clone(), "value is too large".into())
+                    })?);
+            }
+            "minimum_requests" => breaker.minimum_requests = parse_positive_usize(sub)?,
+            "window_requests" => breaker.window_requests = parse_positive_usize(sub)?,
+            "open_for" => breaker.open_duration_ms = parse_required_duration(sub)?,
+            "half_open_requests" => breaker.half_open_requests = parse_positive_usize(sub)?,
+            "failure_statuses" => {
+                if sub.args.is_empty() {
+                    return Err(AdapterError::ArgumentCount(sub.name.clone(), 1, 0));
+                }
+                breaker.failure_statuses = sub
+                    .args
+                    .iter()
+                    .map(|value| {
+                        value.parse::<u16>().map_err(|_| {
+                            AdapterError::InvalidArgument(sub.name.clone(), value.clone())
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
+            _ => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "circuit_breaker: {}",
+                    sub.name
+                )));
+            }
+        }
+    }
+    if breaker.consecutive_failures.is_none() && breaker.error_rate_percent.is_none() {
+        return Err(AdapterError::InvalidArgument(
+            "circuit_breaker".into(),
+            "consecutive_failures or error_rate_percent is required".into(),
+        ));
+    }
+    Ok(breaker)
 }
 
 /// Parse the global `dns_refresh` argument into seconds.
