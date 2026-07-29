@@ -612,6 +612,11 @@ fn run_server(
     );
 
     server.bootstrap();
+    // 🩺 One Pingora-owned driver follows weak pool registrations across hot reloads.
+    server.add_service(pingora::services::background::background_service(
+        "Pingclair active health checks",
+        pingclair_proxy::health_check::HealthCheckDriver,
+    ));
 
     // 🔐 Initialize every certificate source below one configurable persistent store.
     let tls_store_path_str = std::env::var("PINGCLAIR_TLS_STORE")

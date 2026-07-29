@@ -459,7 +459,7 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
     `pingora_core::tls` 沒有 re-export `asn1`，為此加 `boring` 直接依賴不划算。
   - 尚未做乾淨 Linux release、VPS 或真 mTLS 上游矩陣；留到 Day 15，本日是 🧪。
 
-### 🔨 Day 12 — 健康檢查補齊
+### 🔨 Day 12 — 健康檢查補齊 🧪
 
 > 💡 **這天比預期便宜**：`pingora-load-balancing::health_check::HttpHealthCheck`
 > 已經提供 `req`（自訂 Host／method／headers）、`validator`（status／body 檢查）、

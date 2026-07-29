@@ -17,7 +17,7 @@
 //! publishes a whole new pool at once, so a request never observes a
 //! half-updated backend list.
 
-use crate::health_check::{HealthCheckConfig, HealthChecker};
+use crate::health_check::{HealthCheckConfig, HealthChecker, RecoveryState};
 use crate::upstream::{Resolve, SystemResolver, Upstream, UpstreamSpec};
 use arc_swap::ArcSwap;
 use futures::FutureExt;
@@ -55,6 +55,44 @@ fn inet_address(backend: &Upstream) -> Option<SocketAddr> {
         pingora_core::protocols::l4::socket::SocketAddr::Inet(inet) => Some(*inet),
         _ => None,
     }
+}
+
+/// 🩺 Reads Pingora's active verdict without coupling it to one selection strategy.
+fn active_ready(active: Option<&Arc<NativeLoadBalancer<RoundRobin>>>, backend: &Upstream) -> bool {
+    active.is_none_or(|health| health.backends().ready(backend))
+}
+
+/// 🌤️ Gradually admits a recovered backend while keeping the request path lock-free.
+fn slow_start_ready(
+    address: &SocketAddr,
+    slots: &HashMap<SocketAddr, Arc<AtomicU64>>,
+    duration: Duration,
+) -> bool {
+    if duration.is_zero() {
+        return true;
+    }
+    let Some(started) = slots.get(address).map(|slot| slot.load(Ordering::Acquire)) else {
+        return true;
+    };
+    if started == 0 {
+        return true;
+    }
+    let elapsed = now_millis().saturating_sub(started);
+    let total = duration.as_millis() as u64;
+    if elapsed >= total {
+        return true;
+    }
+    let allowance = elapsed.saturating_mul(1_000) / total.max(1);
+    let phase = now_millis() / 100;
+    let address_hash = match address.ip() {
+        std::net::IpAddr::V4(ip) => u32::from(ip) as u64,
+        std::net::IpAddr::V6(ip) => {
+            let octets = ip.octets();
+            u64::from_be_bytes(octets[..8].try_into().unwrap_or_default())
+                ^ u64::from_be_bytes(octets[8..].try_into().unwrap_or_default())
+        }
+    } ^ u64::from(address.port());
+    address_hash.wrapping_add(phase.wrapping_mul(1_103_515_245)) % 1_000 < allowance
 }
 
 // MARK: - Types
@@ -176,14 +214,28 @@ impl LeastConnTracker {
     /// Select the upstream with the fewest active connections among the
     /// backends that are not currently marked down. Returns `None` when all
     /// backends are down (the caller then answers 502, nginx-style).
-    fn select(&self, excluded: &HashSet<SocketAddr>) -> Option<(Upstream, Arc<AtomicUsize>)> {
+    fn select(
+        &self,
+        excluded: &HashSet<SocketAddr>,
+        active: Option<&Arc<NativeLoadBalancer<RoundRobin>>>,
+        recovery_slots: &HashMap<SocketAddr, Arc<AtomicU64>>,
+        slow_start: Duration,
+    ) -> Option<(Upstream, Arc<AtomicUsize>)> {
         // ⚡ OPTIMIZATION: Linear scan is acceptable — backend counts are typically
         // in the tens, making a full sort unnecessary overhead.
         let (min_idx, _) = self
             .counters
             .iter()
             .enumerate()
-            .filter(|(_, (addr, _))| self.health.is_up(addr) && !excluded.contains(addr))
+            .filter(|(index, (addr, _))| {
+                self.health.is_up(addr)
+                    && !excluded.contains(addr)
+                    && self
+                        .upstreams
+                        .get(*index)
+                        .is_some_and(|backend| active_ready(active, backend))
+                    && slow_start_ready(addr, recovery_slots, slow_start)
+            })
             .min_by_key(|(_, (_, ctr))| ctr.load(Ordering::Relaxed))?;
 
         let upstream = self.upstreams.get(min_idx)?.clone();
@@ -205,6 +257,9 @@ struct Pool {
     native_rr: Option<Arc<NativeLoadBalancer<RoundRobin>>>,
     native_ketama: Option<Arc<NativeLoadBalancer<KetamaHashing>>>,
     least_conn: Option<LeastConnTracker>,
+    active_health: Option<Arc<NativeLoadBalancer<RoundRobin>>>,
+    recovery_slots: HashMap<SocketAddr, Arc<AtomicU64>>,
+    slow_start: Duration,
     health: Arc<BackendHealth>,
 }
 
@@ -213,6 +268,7 @@ struct Pool {
 #[derive(Clone)]
 struct HealthCheckSettings {
     config: HealthCheckConfig,
+    peer_template: pingora_core::upstreams::peer::HttpPeer,
     frequency: Option<Duration>,
 }
 
@@ -288,6 +344,11 @@ pub struct LoadBalancer {
     resolver: Arc<dyn Resolve>,
     /// Health-check settings re-applied to every rebuilt pool.
     health_check: Mutex<Option<HealthCheckSettings>>,
+    /// 🌤️ Recovery slots are pruned whenever DNS publishes a new backend set.
+    recovery: Arc<RecoveryState>,
+    /// ⏲️ Next probe round and all-dead backoff are maintained off request paths.
+    next_health_check_ms: AtomicU64,
+    health_backoff: AtomicU64,
     /// Backup pool consulted only when no primary backend is selectable.
     backup: Option<Arc<LoadBalancer>>,
     /// Bumped every time a new pool is published. Lets a collaborator that
@@ -396,13 +457,17 @@ impl LoadBalancer {
         backup: Option<Arc<LoadBalancer>>,
     ) -> Self {
         let backends: Vec<Upstream> = tracked.iter().filter_map(|t| t.backend.clone()).collect();
-        let pool = build_pool(strategy, backends, None, None);
+        let recovery = Arc::new(RecoveryState::default());
+        let pool = build_pool(strategy, backends, None, None, &recovery);
         Self {
             strategy,
             pool: ArcSwap::from_pointee(pool),
             tracked: Mutex::new(tracked),
             resolver,
             health_check: Mutex::new(None),
+            recovery,
+            next_health_check_ms: AtomicU64::new(0),
+            health_backoff: AtomicU64::new(0),
             backup,
             generation: AtomicU64::new(0),
         }
@@ -513,9 +578,13 @@ impl LoadBalancer {
             backends,
             Some(previous.health.as_ref()),
             settings.as_ref(),
+            &self.recovery,
         );
         self.pool.store(Arc::new(pool));
         self.generation.fetch_add(1, Ordering::Release);
+        // 🩺 A DNS generation starts with Pingora's default-ready health table,
+        // so schedule its first real probe immediately instead of waiting a full interval.
+        self.next_health_check_ms.store(0, Ordering::Release);
     }
 
     /// Mark a backend as down (passive health check). Called from
@@ -534,13 +603,25 @@ impl LoadBalancer {
     /// that rebuilds the native load balancer keeps checking the new backends.
     ///
     /// - Parameter config: The health check configuration to use for monitoring upstream health.
-    pub fn set_health_check(&self, config: HealthCheckConfig) {
+    pub fn set_health_check(
+        &self,
+        config: HealthCheckConfig,
+        peer_template: pingora_core::upstreams::peer::HttpPeer,
+    ) {
+        if let Some(backup) = &self.backup {
+            backup.set_health_check(config.clone(), peer_template.clone());
+            crate::health_check::register(backup);
+        }
         let mut settings = self.health_check.lock();
         match settings.as_mut() {
-            Some(existing) => existing.config = config,
+            Some(existing) => {
+                existing.config = config;
+                existing.peer_template = peer_template;
+            }
             None => {
                 *settings = Some(HealthCheckSettings {
                     config,
+                    peer_template,
                     frequency: None,
                 })
             }
@@ -553,14 +634,17 @@ impl LoadBalancer {
     ///
     /// - Parameter frequency: The duration interval between health checks.
     pub fn set_health_check_frequency(&self, frequency: Duration) {
+        if let Some(backup) = &self.backup {
+            backup.set_health_check_frequency(frequency);
+        }
         let mut settings = self.health_check.lock();
         match settings.as_mut() {
             Some(existing) => existing.frequency = Some(frequency),
             None => {
-                *settings = Some(HealthCheckSettings {
-                    config: HealthCheckConfig::default(),
-                    frequency: Some(frequency),
-                })
+                tracing::error!(
+                    "🚫 Health-check frequency was set before its validated probe policy"
+                );
+                return;
             }
         }
         drop(settings);
@@ -571,6 +655,57 @@ impl LoadBalancer {
     fn reapply_health_check(&self) {
         let tracked = self.tracked.lock();
         self.publish(&tracked);
+    }
+
+    /// 🩺 Runs the current DNS generation's active checker when its jittered deadline arrives.
+    pub(crate) async fn run_health_check_if_due(&self) {
+        let Some(frequency) = self
+            .health_check
+            .lock()
+            .as_ref()
+            .and_then(|settings| settings.frequency)
+        else {
+            return;
+        };
+        let now = now_millis();
+        if self.next_health_check_ms.load(Ordering::Acquire) > now {
+            return;
+        }
+        self.next_health_check_ms.store(
+            now.saturating_add(frequency.as_millis() as u64),
+            Ordering::Release,
+        );
+
+        let Some(active) = self.pool.load().active_health.clone() else {
+            return;
+        };
+        active.backends().run_health_check(true).await;
+        let backends = active.backends().get_backend();
+        let any_ready = backends
+            .iter()
+            .any(|backend| active.backends().ready(backend));
+        let exponent = if any_ready {
+            self.health_backoff.store(0, Ordering::Release);
+            0
+        } else {
+            self.health_backoff
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    Some((value + 1).min(3))
+                })
+                .unwrap_or(0)
+                .saturating_add(1)
+                .min(3)
+        };
+        let base = frequency.as_millis() as u64;
+        let backed_off = base.saturating_mul(1u64 << exponent);
+        let generation = self.generation();
+        let jitter_span = (backed_off / 5).max(1);
+        let jitter = generation.wrapping_mul(1_103_515_245).wrapping_add(now) % jitter_span;
+        self.next_health_check_ms.store(
+            now.saturating_add(backed_off.saturating_sub(jitter_span / 2))
+                .saturating_add(jitter),
+            Ordering::Release,
+        );
     }
 
     /// Selects an upstream backend for a request.
@@ -594,28 +729,77 @@ impl LoadBalancer {
                 // ⚡ LeastConn: pick minimum active-connection upstream.
                 // The counter slot is released immediately — for the simple
                 // select() API we count a "selection" as one request unit.
-                pool.least_conn
-                    .as_ref()
-                    .and_then(|tracker| tracker.select(excluded).map(|(upstream, _guard)| upstream))
+                pool.least_conn.as_ref().and_then(|tracker| {
+                    tracker
+                        .select(
+                            excluded,
+                            pool.active_health.as_ref(),
+                            &pool.recovery_slots,
+                            pool.slow_start,
+                        )
+                        .or_else(|| {
+                            // 🌤️ Never turn a recovering singleton into a total outage.
+                            tracker.select(
+                                excluded,
+                                pool.active_health.as_ref(),
+                                &pool.recovery_slots,
+                                Duration::ZERO,
+                            )
+                        })
+                        .map(|(upstream, _guard)| upstream)
+                })
             }
             Strategy::IpHash => {
                 let hash_key = key.unwrap_or(b"");
                 // select_with keeps Pingora's own health verdict (`ready`,
                 // used by active health checks) and adds our passive marks.
                 pool.native_ketama.as_ref().and_then(|native| {
-                    native.select_with(hash_key, 256, |b, ready| {
-                        ready
-                            && pool.health.is_up_backend(b)
-                            && inet_address(b).is_none_or(|address| !excluded.contains(&address))
-                    })
+                    native
+                        .select_with(hash_key, 256, |b, ready| {
+                            ready
+                                && active_ready(pool.active_health.as_ref(), b)
+                                && pool.health.is_up_backend(b)
+                                && inet_address(b).is_none_or(|address| {
+                                    slow_start_ready(
+                                        &address,
+                                        &pool.recovery_slots,
+                                        pool.slow_start,
+                                    )
+                                })
+                                && inet_address(b)
+                                    .is_none_or(|address| !excluded.contains(&address))
+                        })
+                        .or_else(|| {
+                            native.select_with(hash_key, 256, |b, ready| {
+                                ready
+                                    && active_ready(pool.active_health.as_ref(), b)
+                                    && pool.health.is_up_backend(b)
+                                    && inet_address(b)
+                                        .is_none_or(|address| !excluded.contains(&address))
+                            })
+                        })
                 })
             }
             Strategy::RoundRobin | Strategy::Random => pool.native_rr.as_ref().and_then(|native| {
-                native.select_with(b"", 256, |b, ready| {
-                    ready
-                        && pool.health.is_up_backend(b)
-                        && inet_address(b).is_none_or(|address| !excluded.contains(&address))
-                })
+                native
+                    .select_with(b"", 256, |b, ready| {
+                        ready
+                            && active_ready(pool.active_health.as_ref(), b)
+                            && pool.health.is_up_backend(b)
+                            && inet_address(b).is_none_or(|address| {
+                                slow_start_ready(&address, &pool.recovery_slots, pool.slow_start)
+                            })
+                            && inet_address(b).is_none_or(|address| !excluded.contains(&address))
+                    })
+                    .or_else(|| {
+                        native.select_with(b"", 256, |b, ready| {
+                            ready
+                                && active_ready(pool.active_health.as_ref(), b)
+                                && pool.health.is_up_backend(b)
+                                && inet_address(b)
+                                    .is_none_or(|address| !excluded.contains(&address))
+                        })
+                    })
             }),
         };
         primary.or_else(|| {
@@ -646,6 +830,19 @@ impl LoadBalancer {
         addresses
     }
 
+    /// 🧩 Returns one resolved backend for constructing an address-substituted probe template.
+    pub fn first_backend(&self) -> Option<Upstream> {
+        self.tracked
+            .lock()
+            .iter()
+            .find_map(|entry| entry.backend.clone())
+            .or_else(|| {
+                self.backup
+                    .as_ref()
+                    .and_then(|backup| backup.first_backend())
+            })
+    }
+
     fn live_addresses(&self) -> HashSet<SocketAddr> {
         self.tracked
             .lock()
@@ -661,7 +858,7 @@ impl LoadBalancer {
     /// new one, so callers that hold on to it will keep checking the old
     /// backend set.
     pub fn native(&self) -> Option<Arc<NativeLoadBalancer<RoundRobin>>> {
-        self.pool.load().native_rr.clone()
+        self.pool.load().active_health.clone()
     }
 }
 
@@ -697,45 +894,64 @@ fn build_pool(
     backends: Vec<Upstream>,
     previous_health: Option<&BackendHealth>,
     health_check: Option<&HealthCheckSettings>,
+    recovery: &Arc<RecoveryState>,
 ) -> Pool {
     let health = Arc::new(BackendHealth::rebuilt(
         previous_health,
         backends.iter().filter_map(inet_address),
     ));
 
+    let recovery_slots = recovery.rebuild(backends.iter().filter_map(inet_address));
+    let slow_start = health_check.map_or(Duration::ZERO, |settings| settings.config.slow_start);
+    let active_health = health_check.map(|settings| {
+        let mut native: NativeLoadBalancer<RoundRobin> =
+            build_native_load_balancer(backends.clone());
+        let checker = HealthChecker::new(
+            settings.config.clone(),
+            settings.peer_template.clone(),
+            recovery.clone(),
+        )
+        .expect("validated active health-check configuration must build");
+        native.set_health_check(Box::new(checker));
+        native.parallel_health_check = true;
+        Arc::new(native)
+    });
+
     match strategy {
         Strategy::LeastConn => Pool {
             native_rr: None,
             native_ketama: None,
             least_conn: Some(LeastConnTracker::new(backends, health.clone())),
+            active_health,
+            recovery_slots,
+            slow_start,
             health,
         },
         Strategy::IpHash => Pool {
             native_rr: None,
             native_ketama: Some(Arc::new(build_native_load_balancer(backends))),
             least_conn: None,
+            active_health,
+            recovery_slots,
+            slow_start,
             health,
         },
         // RoundRobin and Random share the same Pingora RoundRobin backend;
         // Pingora's `Random` algorithm is separate but our wrapper uses the
         // RR native LB for both — the strategy enum drives the key.
         Strategy::RoundRobin | Strategy::Random => {
-            let mut native: NativeLoadBalancer<RoundRobin> = build_native_load_balancer(backends);
-            if let Some(settings) = health_check {
-                native.set_health_check(Box::new(HealthChecker::new(settings.config.clone())));
-                native.health_check_frequency = settings.frequency;
-            }
+            let native: NativeLoadBalancer<RoundRobin> = build_native_load_balancer(backends);
             Pool {
                 native_rr: Some(Arc::new(native)),
                 native_ketama: None,
                 least_conn: None,
+                active_health,
+                recovery_slots,
+                slow_start,
                 health,
             }
         }
     }
-    // Note: LeastConn and IpHash active health checking is not integrated —
-    // the native background health-check service only drives `native_rr`.
-    // Both are still covered by the passive fail_to_connect marking in `select`.
 }
 
 // MARK: - Tests
@@ -795,7 +1011,9 @@ mod tests {
         // Manually inflate u1's counter to simulate a busy upstream
         tracker.counters[0].1.store(5, Ordering::Relaxed);
         // LeastConn should now return u2 (counter = 0)
-        let (selected, _guard) = tracker.select(&HashSet::new()).unwrap();
+        let (selected, _guard) = tracker
+            .select(&HashSet::new(), None, &HashMap::new(), Duration::ZERO)
+            .unwrap();
         assert_eq!(selected.addr.to_string(), "127.0.0.1:9002");
     }
 
@@ -1010,6 +1228,55 @@ mod tests {
         assert_eq!(report.changed, 1);
         assert_eq!(report.kept_stale, 0);
         assert_eq!(selected(&lb), "172.20.0.9:8080");
+    }
+
+    #[test]
+    fn dns_publish_reapplies_health_settings_to_the_new_pool() {
+        let resolver = ScriptedResolver::with("app", "172.20.0.3:8080");
+        let lb = LoadBalancer::from_entries_with_resolver(
+            vec![entry("http://app:8080")],
+            vec![],
+            Strategy::RoundRobin,
+            resolver.clone(),
+        );
+        let peer = pingora_core::upstreams::peer::HttpPeer::new(
+            "172.20.0.3:8080",
+            false,
+            "app".to_string(),
+        );
+        lb.set_health_check(
+            HealthCheckConfig {
+                path: "/health".to_string(),
+                timeout: Duration::from_secs(1),
+                expected_statuses: vec![200],
+                expected_body: None,
+                positive_threshold: 1,
+                negative_threshold: 1,
+                method: "GET".to_string(),
+                host: "app".to_string(),
+                headers: HashMap::new(),
+                port_override: None,
+                reuse_connection: false,
+                max_response_body_bytes: 1_024,
+                slow_start: Duration::ZERO,
+            },
+            peer,
+        );
+        lb.set_health_check_frequency(Duration::from_secs(5));
+        let before = lb.native().expect("initial health pool");
+
+        resolver.set("app", "172.20.0.9:8080");
+        assert_eq!(lb.refresh_dns().changed, 1);
+        let after = lb.native().expect("refreshed health pool");
+
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert!(
+            after
+                .backends()
+                .get_backend()
+                .iter()
+                .any(|backend| { backend.addr.to_string() == "172.20.0.9:8080" })
+        );
     }
 
     #[test]

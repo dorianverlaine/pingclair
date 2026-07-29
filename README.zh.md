@@ -357,11 +357,26 @@ server "shop.example.com" {
         lb_policy least_conn
         to 10.0.0.1:8080 { weight 3 }
         to 10.0.0.2:8080
-        # 僅在所有主要後端皆不可用時使用。
+        # 🛟 僅在所有主要後端皆不可用時使用。
         to 10.0.0.3:8080 { backup }
+        health_check {
+            path /health
+            interval 5s
+            timeout 2s
+            status 200 204
+            consecutive_failure 3
+            consecutive_success 2
+            max_response_body_bytes 65536
+            slow_start 30s
+        }
     }
 }
 ```
+
+主動健康檢查在請求之外執行，因此閒置的故障後端會在使用者請求碰到它之前退出
+輪詢，並在連續探測成功後重新加入。探測可設定 method、Host、header、狀態碼集合、
+有 byte 上限的 body 比對、獨立連接埠、連線重用、門檻與 slow-start。HTTPS 探測
+會沿用該 route 的 pinned CA、client certificate、SNI 與協議政策。
 
 上游 scheme 會決定連線協議：裸位址或 `http://` 使用 HTTP/1.1；`https://`
 透過 ALPN 協商 HTTP/2，並可回退至 HTTP/1.1；`h2c://` 強制使用明文

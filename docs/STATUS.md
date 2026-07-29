@@ -447,17 +447,31 @@ commit `0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。
   客戶端斷鏈）、TLS store 路徑可經 `PINGCLAIR_TLS_STORE` 覆寫
   （寫死路徑在不可寫環境會直接 panic）。
 
-### 主動健康檢查目前沒有在跑（2026-07-28）
+### 主動健康檢查已在本機接線（Day 12，2026-07-29）🧪
 
-- `HealthChecker` 會被建出來、`health_check_frequency` 會被設定，但**驅動它的
-  Pingora background service 從來沒有註冊**：全 workspace 沒有任何
-  `background_service`／`run_health_check` 呼叫，`LoadBalancer::native()`
-  的呼叫者數量是 0。`select` 讀到的 `ready` 因此永遠是初始值。
-- 也就是說 STATUS 上方那條 2026-07-25 的驗證結果是準確的——它驗的是**被動**
-  健康檢查（`fail_to_connect` 標記＋冷卻），而那確實在運作。缺的是主動探測：
-  **沒有流量打過去的故障節點不會被摘除**。
-- 修復排在 TODO Day 12。判定必須是「在沒有請求經過該節點的情況下被摘除」，
-  否則只是重驗被動標記。
+- Pingora background service 現在驅動全域 weak pool registry；hot reload 會讓舊
+  pool 自然釋放，DNS publish 後每輪讀取新 generation，不會持續探測已淘汰的 IP。
+  registry 與 recovery map 都有明確 pruner，長期狀態不會隨 reload／DNS 輪替無限成長。
+- Pingclairfile 與 JSON 支援 path、interval、timeout、method、Host、header、
+  status 集合、body fragment、health port、success／failure threshold、
+  connection reuse、bounded response body 與 slow-start；同一組 core validation
+  保護 Admin API 直入路徑，錯誤設定 fail closed。
+- health peer 經 `PingclairProxy::build_http_peer` 建立，沿用正常回源的 pinned CA、
+  client certificate、SNI、protocol group 與 timeout；self-signed TLS origin 的
+  pinned-CA 主動探測已以真 binary 驗證。
+- 探測加入時間 jitter；全 pool 不可用時做 bounded exponential backoff。恢復節點
+  經連續成功門檻後，以 lock-free recovery timestamp slow-start 漸進承接流量；
+  DNS publish 會剪除離開 pool 的 recovery slots。
+- Pingora 0.8.1 原生 `HttpHealthCheck` 的 validator 只收到 response header，且其
+  body drain 沒有 byte cap；直接使用會違反本專案 bounded-body 守則。因此保留其
+  `HealthCheck`／`Backends` 驅動模型與 Pingora HTTP connector，但在
+  `pingclair-proxy/src/health_check.rs` 實作 bounded streaming validator。
+- red test 先證明：停止 upstream 後完全不送代理流量，等待兩個 interval，第一個
+  request 仍命中死亡節點並回 502。修復後同一真 binary 測試證明節點會在無流量時
+  摘除，原址恢復後主動重新加入；另有 pinned-CA TLS probe 測試。兩條新增整合測試
+  以 Rust 1.88、`--test-threads=2` **連跑 30 次全綠**。
+- locked local gate 全綠，總測試數 **408 → 415**。尚未做乾淨 Linux release、
+  VPS 或真 QUIC client 驗證；留到 Day 15，因此本項是 🧪，不是遠端 ✅。
 
 ---
 
