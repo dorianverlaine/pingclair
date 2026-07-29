@@ -205,6 +205,50 @@ placeholders et les journaux d'accès partagent la même adresse client
 vérifiée. La modification de `trusted_proxies` nécessite actuellement un
 redémarrage.
 
+### Limites de ressources et délais
+
+Les limites en aval se configurent au niveau du site, et les phases de délai
+amont dans `reverse_proxy`. Une durée exige une unité. Les WebSocket upgrades,
+`flush_interval -1` et `text/event-stream` utilisent les paramètres de connexion
+longue ; `off` supprime explicitement le délai correspondant.
+
+```caddyfile
+example.com {
+    limits {
+        header_timeout 5s
+        body_timeout 30s
+        idle_timeout 30s
+        request_timeout 2m
+        max_headers 100
+        max_header_bytes 65536
+        max_connections 10000
+        upload_bytes_per_sec 10485760
+        download_bytes_per_sec 52428800
+        long_connections {
+            idle_timeout 5m
+            request_timeout off
+        }
+    }
+
+    reverse_proxy app:8080 {
+        transport http {
+            connect_timeout 3s
+            first_byte_timeout 30s
+            between_reads_timeout 15s
+        }
+    }
+}
+```
+
+Les dépassements d'en-têtes, de body et de durée totale reçoivent une erreur
+HTTP explicite tant que le protocole peut encore l'envoyer ; les transports
+inactifs et les connexions HTTP/2 ou HTTP/3 en excès sont fermés. Pingora 0.8
+n'expose qu'un seul timer de lecture amont en H1/H2 : la valeur la plus stricte
+entre `first_byte_timeout` et `between_reads_timeout` régit donc les deux
+phases. Le bridge H3 change de timer après réception de l'en-tête de réponse.
+La modification du `header_timeout` avant routage, de la limite de section H2
+ou du nombre de connexions H1/H2 exige actuellement un redémarrage du listener.
+
 ### Routage et matchers
 
 Pingclair dispose d'un système de matchers puissant : routez les requêtes selon le chemin, le domaine, les en-têtes, etc.

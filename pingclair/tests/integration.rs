@@ -462,6 +462,27 @@ async fn read_until_marker(
     .expect("timed out before the expected marker arrived")
 }
 
+/// 🧾 Reads one connection-closing HTTP/1 response under a hard test deadline.
+async fn read_http1_to_end(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(read) => response.extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break,
+                Err(error) => panic!("HTTP/1 response read failed: {error}"),
+            }
+        }
+        response
+    })
+    .await
+    .expect("HTTP/1 response hung instead of rejecting")
+}
+
 /// 📤 Writes one HTTP/1.1 chunk without buffering the event stream.
 async fn write_http_chunk(
     stream: &mut tokio::net::tcp::OwnedWriteHalf,
@@ -501,6 +522,445 @@ fn protocol_proxy_config_url(upstream_address: String) -> String {
         }]
     })
     .to_string()
+}
+
+#[tokio::test]
+async fn test_listener_resource_limits_reject_before_dispatch_without_hanging() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let config = serde_json::json!({
+        "global": { "http3": false },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "limits": {
+                "header_timeout_ms": 200,
+                "max_header_count": 16,
+                "max_header_bytes": 512,
+                "max_connections": 1
+            },
+            "routes": [{
+                "path": "/*",
+                "handler": { "type": "respond", "status": 200, "body": "ok" }
+            }]
+        }]
+    })
+    .to_string();
+    let mut server = TestServer::new(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let address = server.address(0);
+
+    // 🔌 Hold the only connection slot with an incomplete header.
+    let mut held = tokio::net::TcpStream::connect(address).await.unwrap();
+    held.write_all(b"GET / HTTP/1.1\r\nHost:").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let mut excess = tokio::net::TcpStream::connect(address).await.unwrap();
+    excess
+        .write_all(b"GET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let rejected = read_http1_to_end(&mut excess).await;
+    assert!(
+        rejected.starts_with(b"HTTP/1.1 503"),
+        "{}",
+        String::from_utf8_lossy(&rejected)
+    );
+
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut too_many = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut request = b"GET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n".to_vec();
+    for index in 0..17 {
+        request.extend_from_slice(format!("X-H-{index}: x\r\n").as_bytes());
+    }
+    request.extend_from_slice(b"\r\n");
+    too_many.write_all(&request).await.unwrap();
+    let response = read_http1_to_end(&mut too_many).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 431"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+
+    let mut too_large = tokio::net::TcpStream::connect(address).await.unwrap();
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: test\r\nX-Pad: {}\r\nConnection: close\r\n\r\n",
+        "x".repeat(600)
+    );
+    too_large.write_all(request.as_bytes()).await.unwrap();
+    let response = read_http1_to_end(&mut too_large).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 431"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+
+    drop(server);
+    let timeout_config = serde_json::json!({
+        "global": { "http3": false },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "limits": {
+                "header_timeout_ms": 200,
+                "idle_timeout_ms": 200
+            },
+            "routes": [{
+                "path": "/*",
+                "handler": { "type": "respond", "status": 200, "body": "ok" }
+            }]
+        }]
+    })
+    .to_string();
+    let mut timeout_server = TestServer::new(&timeout_config);
+    assert!(
+        timeout_server.wait_until_ready().await,
+        "timeout server failed to start"
+    );
+    let mut partial = tokio::net::TcpStream::connect(timeout_server.address(0))
+        .await
+        .unwrap();
+    partial.write_all(b"GET / HTTP/1.1\r\nHost:").await.unwrap();
+    let mut byte = [0u8; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(1), partial.read(&mut byte))
+        .await
+        .expect("partial request header hung")
+        .unwrap();
+    assert_eq!(closed, 0);
+
+    let mut idle = tokio::net::TcpStream::connect(timeout_server.address(0))
+        .await
+        .unwrap();
+    idle.write_all(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n")
+        .await
+        .unwrap();
+    let _ = read_until_marker(&mut idle, b"ok", Duration::from_secs(1)).await;
+    let closed = tokio::time::timeout(Duration::from_secs(2), idle.read(&mut byte))
+        .await
+        .expect("idle keepalive connection hung")
+        .unwrap();
+    assert_eq!(closed, 0);
+}
+
+#[tokio::test]
+async fn test_streamed_limits_and_timeout_phases_are_explicit_and_bounded() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let blackhole = socket.listen(1).unwrap();
+    let blackhole_address = blackhole.local_addr().unwrap();
+    let mut saturated_backlog = Vec::new();
+    let mut backlog_saturated = false;
+    for _ in 0..64 {
+        match tokio::time::timeout(
+            Duration::from_millis(20),
+            tokio::net::TcpStream::connect(blackhole_address),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => saturated_backlog.push(stream),
+            Ok(Err(error)) => panic!("failed to saturate connect backlog: {error}"),
+            Err(_) => {
+                backlog_saturated = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        backlog_saturated,
+        "connect-timeout fixture did not saturate its accept backlog"
+    );
+    let upstream_task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            tokio::spawn(async move {
+                let request =
+                    read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+                let line = String::from_utf8_lossy(&request);
+                if line.starts_with("POST /upload ") {
+                    let header_end = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .unwrap()
+                        + 4;
+                    let mut received = request.len() - header_end;
+                    let mut chunk = [0u8; 4096];
+                    while received < 2_000 {
+                        let read = stream.read(&mut chunk).await.unwrap();
+                        assert!(read > 0);
+                        received += read;
+                    }
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await
+                        .unwrap();
+                } else if line.starts_with("GET /between ") {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                } else if line.starts_with("GET /bandwidth ") {
+                    let body = vec![b'x'; 2_000];
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    stream.write_all(&body).await.unwrap();
+                } else if line.starts_with("GET /sse ") || line.starts_with("GET /sse-content ") {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    stream
+                        .write_all(b"D\r\ndata: alive\n\n\r\n0\r\n\r\n")
+                        .await
+                        .unwrap();
+                } else {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            });
+        }
+    });
+
+    let proxy = |path: &str,
+                 flush_interval: Option<i64>,
+                 first_byte_timeout: i64,
+                 between_reads_timeout: i64| {
+        serde_json::json!({
+            "path": path,
+            "handler": {
+                "type": "reverse_proxy",
+                "upstreams": [format!("http://{upstream_address}")],
+                "load_balance": { "strategy": "round_robin" },
+                "headers_up": {},
+                "headers_down": {},
+                "flush_interval": flush_interval,
+                "connect_timeout": 200,
+                "first_byte_timeout": first_byte_timeout,
+                "between_reads_timeout": between_reads_timeout
+            }
+        })
+    };
+    let config = serde_json::json!({
+        "global": { "http3": false },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "client_max_body_size": 4000,
+            "limits": {
+                "body_timeout_ms": 100,
+                "idle_timeout_ms": 500,
+                "request_timeout_ms": 150,
+                "upload_bytes_per_sec": 1000,
+                "download_bytes_per_sec": 1000,
+                "long_connections": {
+                    "idle_timeout_ms": 1000,
+                    "request_timeout_ms": 0
+                }
+            },
+            "routes": [
+                {
+                    "path": "/local-body",
+                    "handler": { "type": "respond", "status": 200, "body": "ok" }
+                },
+                proxy("/body", None, 500, 500),
+                proxy("/upload", Some(-1), 5000, 5000),
+                {
+                    "path": "/connect",
+                    "handler": {
+                        "type": "reverse_proxy",
+                        "upstreams": [format!("http://{blackhole_address}")],
+                        "load_balance": { "strategy": "round_robin" },
+                        "headers_up": {},
+                        "headers_down": {},
+                        "connect_timeout": 100,
+                        "first_byte_timeout": 500,
+                        "between_reads_timeout": 500
+                    }
+                },
+                proxy("/first", None, 100, 500),
+                proxy("/whole", None, 500, 500),
+                proxy("/between", Some(-1), 500, 100),
+                proxy("/bandwidth", Some(-1), 500, 500),
+                proxy("/sse", Some(-1), 500, 500),
+                {
+                    "path": "/sse-content",
+                    "handler": {
+                        "type": "reverse_proxy",
+                        "upstreams": [format!("http://{upstream_address}")],
+                        "load_balance": { "strategy": "round_robin" },
+                        "headers_up": {},
+                        "headers_down": {},
+                        "connect_timeout": 200
+                    }
+                }
+            ]
+        }]
+    })
+    .to_string();
+    let mut server = TestServer::new(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let address = server.address(0);
+
+    let mut oversized = tokio::net::TcpStream::connect(address).await.unwrap();
+    let oversized_request = format!(
+        "POST /body HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1388\r\n{}\r\n0\r\n\r\n",
+        "x".repeat(5_000)
+    );
+    oversized
+        .write_all(oversized_request.as_bytes())
+        .await
+        .unwrap();
+    let response = read_http1_to_end(&mut oversized).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 413"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+
+    let mut oversized_local = tokio::net::TcpStream::connect(address).await.unwrap();
+    let oversized_local_request = format!(
+        "POST /local-body HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1388\r\n{}\r\n0\r\n\r\n",
+        "x".repeat(5_000)
+    );
+    oversized_local
+        .write_all(oversized_local_request.as_bytes())
+        .await
+        .unwrap();
+    let response = read_http1_to_end(&mut oversized_local).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 413"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+
+    let mut stalled_body = tokio::net::TcpStream::connect(address).await.unwrap();
+    stalled_body
+        .write_all(
+            b"POST /body HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let response = read_http1_to_end(&mut stalled_body).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 408"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+
+    let client = no_proxy_client();
+    let started = std::time::Instant::now();
+    let upload = client
+        .post(server.url(0, "/upload"))
+        .body(vec![b'u'; 2_000])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), reqwest::StatusCode::OK);
+    assert!(started.elapsed() >= Duration::from_millis(1_800));
+
+    let mut connect = tokio::net::TcpStream::connect(address).await.unwrap();
+    connect
+        .write_all(b"GET /connect HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let response = read_http1_to_end(&mut connect).await;
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(
+        response.starts_with(b"HTTP/1.1 504"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+
+    let mut first = tokio::net::TcpStream::connect(address).await.unwrap();
+    first
+        .write_all(b"GET /first HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let response = read_http1_to_end(&mut first).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 504"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    let mut whole = tokio::net::TcpStream::connect(address).await.unwrap();
+    whole
+        .write_all(b"GET /whole HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let response = read_http1_to_end(&mut whole).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 408"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+
+    let mut between = tokio::net::TcpStream::connect(address).await.unwrap();
+    between
+        .write_all(b"GET /between HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let response = read_http1_to_end(&mut between).await;
+    assert!(started.elapsed() < Duration::from_millis(800));
+    assert!(response.windows(5).any(|window| window == b"hello"));
+
+    let started = std::time::Instant::now();
+    let body = client
+        .get(server.url(0, "/bandwidth"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(body.len(), 2_000);
+    assert!(started.elapsed() >= Duration::from_millis(1_800));
+
+    let mut sse = tokio::net::TcpStream::connect(address).await.unwrap();
+    sse.write_all(b"GET /sse HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let response = read_until_marker(&mut sse, b"data: alive\n\n", Duration::from_secs(1)).await;
+    assert!(
+        response
+            .windows(13)
+            .any(|window| window == b"data: alive\n\n")
+    );
+
+    let mut content_sse = tokio::net::TcpStream::connect(address).await.unwrap();
+    content_sse
+        .write_all(b"GET /sse-content HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let response =
+        read_until_marker(&mut content_sse, b"data: alive\n\n", Duration::from_secs(1)).await;
+    assert!(
+        response
+            .windows(13)
+            .any(|window| window == b"data: alive\n\n")
+    );
+
+    upstream_task.abort();
 }
 
 #[tokio::test]
@@ -1706,7 +2166,32 @@ async fn test_expect_continue_round_trips_before_the_request_body() {
             .unwrap();
     });
 
-    let mut server = TestServer::new(&protocol_proxy_config(upstream_address));
+    let config = serde_json::json!({
+        "global": { "http3": false },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "limits": {
+                "idle_timeout_ms": 100,
+                "request_timeout_ms": 100,
+                "long_connections": {
+                    "idle_timeout_ms": 1000,
+                    "request_timeout_ms": 0
+                }
+            },
+            "routes": [{
+                "path": "/*",
+                "handler": {
+                    "type": "reverse_proxy",
+                    "upstreams": [format!("http://{upstream_address}")],
+                    "load_balance": { "strategy": "round_robin" },
+                    "headers_up": {},
+                    "headers_down": {}
+                }
+            }]
+        }]
+    })
+    .to_string();
+    let mut server = TestServer::new(&config);
     assert!(server.wait_until_ready().await, "server failed to start");
     let mut client = tokio::net::TcpStream::connect(server.address(0))
         .await
@@ -2029,6 +2514,7 @@ async fn test_websocket_upgrade_tunnels_bytes_in_both_directions() {
         "unexpected upgrade response: {}",
         String::from_utf8_lossy(&response)
     );
+    tokio::time::sleep(Duration::from_millis(300)).await;
     client.write_all(b"client-ping").await.unwrap();
     let downstream = read_until_marker(&mut client, b"upstream-pong", Duration::from_secs(2)).await;
     assert!(

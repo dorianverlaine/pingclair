@@ -203,6 +203,70 @@ mod tests {
     }
 
     #[test]
+    fn resource_limits_and_upstream_timeout_phases_compile() {
+        let source = r#"
+            :8080 {
+                limits {
+                    header_timeout 2s
+                    body_timeout 3s
+                    idle_timeout 4s
+                    request_timeout 5s
+                    max_headers 40
+                    max_header_bytes 8192
+                    max_connections 64
+                    upload_bytes_per_sec 1000
+                    download_bytes_per_sec 2000
+                    long_connections {
+                        idle_timeout 10m
+                        request_timeout off
+                    }
+                }
+                reverse_proxy 127.0.0.1:9000 {
+                    transport http {
+                        connect_timeout 100ms
+                        first_byte_timeout 200ms
+                        between_reads_timeout 300ms
+                        write_timeout 400ms
+                    }
+                }
+            }
+        "#;
+
+        let config = compile(source).expect("resource limits compile");
+        let server = &config.servers[0];
+        assert_eq!(server.limits.header_timeout_ms, Some(2_000));
+        assert_eq!(server.limits.body_timeout_ms, Some(3_000));
+        assert_eq!(server.limits.max_header_count, Some(40));
+        assert_eq!(server.limits.max_header_bytes, Some(8_192));
+        assert_eq!(server.limits.max_connections, Some(64));
+        assert_eq!(
+            server.limits.long_connections.idle_timeout_ms,
+            Some(600_000)
+        );
+        assert_eq!(server.limits.long_connections.request_timeout_ms, Some(0));
+        let HandlerConfig::ReverseProxy(proxy) = &server.routes[0].handler else {
+            panic!("expected reverse proxy");
+        };
+        assert_eq!(proxy.connect_timeout, Some(100));
+        assert_eq!(proxy.first_byte_timeout, Some(200));
+        assert_eq!(proxy.between_reads_timeout, Some(300));
+        assert_eq!(proxy.write_timeout, Some(400));
+    }
+
+    #[test]
+    fn resource_limit_typos_and_invalid_durations_fail_closed() {
+        for source in [
+            ":8080 { limits { max_conections 4 } respond \"ok\" }",
+            ":8080 { limits { header_timeout nope } respond \"ok\" }",
+            ":8080 { limits { max_headers 0 } respond \"ok\" }",
+            ":8080 { limits { request_timeout 18446744073709551615m } respond \"ok\" }",
+            ":8080 { reverse_proxy 127.0.0.1:9000 { transport http { first_byte_timeout nope } } }",
+        ] {
+            assert!(compile(source).is_err(), "{source} must fail");
+        }
+    }
+
+    #[test]
     fn test_compile_tls_cert_key() {
         let source = r#"
             example.com {

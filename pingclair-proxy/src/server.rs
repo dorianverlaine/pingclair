@@ -6,7 +6,7 @@
 //! 🌐 This module implements the core reverse proxy using Pingora's ProxyHttp trait.
 
 use pingclair_core::config::{
-    AccessControlConfig, HandlerConfig, ReverseProxyConfig, ServerConfig,
+    AccessControlConfig, HandlerConfig, ResourceLimitsConfig, ReverseProxyConfig, ServerConfig,
 };
 use pingclair_core::server::Router;
 
@@ -86,6 +86,18 @@ pub struct RequestContext {
     /// Path produced by the most recent rewrite handler. Pipelines consume
     /// this before invoking the next local handler.
     pub rewritten_path: Option<String>,
+    /// 📦 Request-body bytes observed incrementally by the streaming filter.
+    pub request_body_bytes: u64,
+    /// ⌛ Active whole-request deadline after applying long-connection policy.
+    pub request_deadline: Option<std::time::Instant>,
+    /// 🌊 Whether this request uses the separately configured long-connection policy.
+    pub long_connection: bool,
+    /// 📥 Streaming upload-rate pacer with constant memory use.
+    upload_pacer: Option<BandwidthPacer>,
+    /// 📤 Streaming download-rate pacer with constant memory use.
+    download_pacer: Option<BandwidthPacer>,
+    /// ⏱️ Whether the last exhausted upstream failed specifically by connect timeout.
+    upstream_connect_timed_out: bool,
 }
 
 impl Default for RequestContext {
@@ -110,12 +122,73 @@ impl Default for RequestContext {
             start_time: std::time::Instant::now(),
             first_byte_at: None,
             rewritten_path: None,
+            request_body_bytes: 0,
+            request_deadline: None,
+            long_connection: false,
+            upload_pacer: None,
+            download_pacer: None,
+            upstream_connect_timed_out: false,
         }
+    }
+}
+
+/// 🚦 Paces a byte stream against one cumulative, allocation-free rate budget.
+struct BandwidthPacer {
+    rate: u64,
+    bytes: u64,
+    started: std::time::Instant,
+}
+
+impl BandwidthPacer {
+    fn new(rate: u64) -> Self {
+        Self {
+            rate,
+            bytes: 0,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    fn delay_for(&mut self, bytes: usize) -> Option<Duration> {
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+        let target = Duration::from_secs_f64(self.bytes as f64 / self.rate as f64);
+        target.checked_sub(self.started.elapsed())
     }
 }
 
 /// 🧱 Maximum accepted hops in an inbound `X-Forwarded-For` chain.
 const MAX_FORWARDED_HOPS: usize = 32;
+
+/// 🧱 Keeps the smallest configured listener-wide bound across virtual hosts.
+fn merge_listener_limit<T: Ord + Copy>(target: &mut Option<T>, candidate: Option<T>) {
+    if let Some(candidate) = candidate {
+        *target = Some(target.map_or(candidate, |current| current.min(candidate)));
+    }
+}
+
+/// ⏱️ Selects the stricter of two optional time budgets.
+fn shortest_duration(left: Option<Duration>, right: Option<Duration>) -> Option<Duration> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+/// 🔌 Detects an HTTP/1 WebSocket upgrade before the response enters tunnel mode.
+fn is_websocket_upgrade(headers: &http::HeaderMap) -> bool {
+    headers
+        .get("upgrade")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+        && headers
+            .get("connection")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+            })
+}
 
 /// 🔐 Records the protocol selected by an upstream TLS handshake.
 #[derive(Debug)]
@@ -924,6 +997,39 @@ impl PingclairProxy {
         }
     }
 
+    /// 🧱 Returns the strictest pre-routing limits shared by a listener's virtual hosts.
+    pub fn listener_limits(&self) -> ResourceLimitsConfig {
+        let mut limits = ResourceLimitsConfig::default();
+        let hosts = self.hosts.load();
+        for state in hosts.values().chain(self.default.load().iter()) {
+            merge_listener_limit(
+                &mut limits.header_timeout_ms,
+                state.config.limits.header_timeout_ms,
+            );
+            merge_listener_limit(
+                &mut limits.max_header_count,
+                state.config.limits.max_header_count,
+            );
+            merge_listener_limit(
+                &mut limits.max_header_bytes,
+                state.config.limits.max_header_bytes,
+            );
+            merge_listener_limit(
+                &mut limits.max_connections,
+                state.config.limits.max_connections,
+            );
+            merge_listener_limit(
+                &mut limits.idle_timeout_ms,
+                state.config.limits.idle_timeout_ms,
+            );
+            merge_listener_limit(
+                &mut limits.long_connections.idle_timeout_ms,
+                state.config.limits.long_connections.idle_timeout_ms,
+            );
+        }
+        limits
+    }
+
     /// Replace all server configurations with a new list
     pub fn update_config(&self, servers: Vec<ServerConfig>) {
         let mut new_hosts = HashMap::new();
@@ -1093,8 +1199,9 @@ impl PingclairProxy {
     /// between the Pingora and HTTP/3 paths.
     pub(crate) fn build_http_peer(
         upstream: &Upstream,
-        read_timeout_ms: Option<i64>,
-        write_timeout_ms: Option<i64>,
+        config: Option<&ReverseProxyConfig>,
+        request_budget: Option<Duration>,
+        read_budget: Option<Duration>,
     ) -> HttpPeer {
         let addr = upstream.addr.clone();
         let scheme = upstream.ext.get::<Scheme>().unwrap_or(&Scheme::Http);
@@ -1137,26 +1244,186 @@ impl PingclairProxy {
         // 🧩 Prevents differently negotiated protocols from sharing a connection pool.
         peer.group_key = protocol_group;
 
-        // ⏱️ Applies route-specific read and write timeouts when configured.
-        if let Some(read_timeout) = read_timeout_ms
-            && read_timeout > 0
-        {
-            peer.options.read_timeout = Some(std::time::Duration::from_millis(read_timeout as u64));
-        }
-
-        if let Some(write_timeout) = write_timeout_ms
-            && write_timeout > 0
-        {
-            peer.options.write_timeout =
-                Some(std::time::Duration::from_millis(write_timeout as u64));
-        }
-
-        // ⏱️ Bounds upstream connection establishment when no override exists.
-        if peer.options.connection_timeout.is_none() {
-            peer.options.connection_timeout = Some(std::time::Duration::from_secs(10));
-        }
+        let legacy_read = config
+            .and_then(|config| config.read_timeout)
+            .filter(|value| *value > 0)
+            .map(|value| Duration::from_millis(value as u64));
+        let first_byte = config
+            .and_then(|config| config.first_byte_timeout)
+            .filter(|value| *value > 0)
+            .map(|value| Duration::from_millis(value as u64))
+            .or(legacy_read);
+        let between_reads = config
+            .and_then(|config| config.between_reads_timeout)
+            .filter(|value| *value > 0)
+            .map(|value| Duration::from_millis(value as u64))
+            .or(legacy_read);
+        // ⏱️ Pingora 0.8 exposes one upstream read timer for both H1/H2 phases.
+        // 🌊 Preserve explicit phase timers so a response can become SSE after its header.
+        let phase_read_timeout = shortest_duration(first_byte, between_reads);
+        peer.options.read_timeout = phase_read_timeout.or(read_budget);
+        peer.options.write_timeout = shortest_duration(
+            config
+                .and_then(|config| config.write_timeout)
+                .filter(|value| *value > 0)
+                .map(|value| Duration::from_millis(value as u64)),
+            request_budget,
+        );
+        let connect_timeout = config
+            .and_then(|config| config.connect_timeout)
+            .filter(|value| *value > 0)
+            .map(|value| Duration::from_millis(value as u64))
+            .unwrap_or(Duration::from_secs(10));
+        peer.options.connection_timeout = shortest_duration(Some(connect_timeout), request_budget);
+        peer.options.total_connection_timeout = peer.options.connection_timeout;
 
         peer
+    }
+
+    /// 🧱 Applies one virtual host's request deadlines without buffering body data.
+    fn initialize_request_limits(
+        session: &mut Session,
+        ctx: &mut RequestContext,
+        state: &ProxyState,
+    ) {
+        let limits = &state.config.limits;
+        ctx.request_deadline = limits
+            .request_timeout_ms
+            .map(Duration::from_millis)
+            .map(|duration| ctx.start_time + duration);
+        ctx.upload_pacer = limits.upload_bytes_per_sec.map(BandwidthPacer::new);
+        ctx.download_pacer = limits.download_bytes_per_sec.map(BandwidthPacer::new);
+
+        let read_timeout = shortest_duration(
+            limits.body_timeout_ms.map(Duration::from_millis),
+            limits.idle_timeout_ms.map(Duration::from_millis),
+        );
+        session.as_mut().set_read_timeout(read_timeout);
+        session
+            .as_mut()
+            .set_write_timeout(limits.idle_timeout_ms.map(Duration::from_millis));
+        session.as_mut().set_total_drain_timeout(read_timeout);
+        session.as_mut().set_keepalive(Some(
+            limits
+                .idle_timeout_ms
+                .map_or(60, |idle_ms| idle_ms.div_ceil(1_000)),
+        ));
+    }
+
+    /// 🌊 Replaces ordinary deadlines for an intentional streaming response or tunnel.
+    fn activate_long_connection(
+        session: &mut Session,
+        ctx: &mut RequestContext,
+        state: &ProxyState,
+    ) {
+        if ctx.long_connection {
+            return;
+        }
+        ctx.long_connection = true;
+        let long = &state.config.limits.long_connections;
+        if let Some(request_ms) = long.request_timeout_ms {
+            ctx.request_deadline =
+                (request_ms > 0).then(|| ctx.start_time + Duration::from_millis(request_ms));
+        }
+        if let Some(idle_ms) = long.idle_timeout_ms {
+            let timeout = (idle_ms > 0).then(|| Duration::from_millis(idle_ms));
+            session.as_mut().set_read_timeout(timeout);
+            session.as_mut().set_write_timeout(timeout);
+            session.as_mut().set_total_drain_timeout(timeout);
+            session
+                .as_mut()
+                .set_keepalive((idle_ms > 0).then(|| idle_ms.div_ceil(1_000)));
+        }
+    }
+
+    /// ⌛ Returns a fail-closed timeout error when the whole-request budget expired.
+    fn enforce_request_deadline(ctx: &RequestContext) -> pingora_core::Result<()> {
+        if ctx
+            .request_deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return pingora_core::Error::e_explain(
+                pingora_core::ErrorType::HTTPStatus(408),
+                "whole-request timeout exceeded",
+            );
+        }
+        Ok(())
+    }
+
+    /// 📥 Enforces one streamed request-body chunk without retaining it.
+    async fn enforce_request_body_chunk(
+        session: &mut Session,
+        ctx: &mut RequestContext,
+        bytes: usize,
+    ) -> pingora_core::Result<()> {
+        Self::enforce_request_deadline(ctx)?;
+        ctx.request_body_bytes = ctx.request_body_bytes.saturating_add(bytes as u64);
+        if ctx.state.as_ref().is_some_and(|state| {
+            let limit = state.config.client_max_body_size;
+            limit > 0 && ctx.request_body_bytes > limit
+        }) {
+            session.as_mut().set_keepalive(None);
+            return pingora_core::Error::e_explain(
+                pingora_core::ErrorType::HTTPStatus(413),
+                "streamed request body exceeds configured limit",
+            );
+        }
+        if let Some(delay) = ctx
+            .upload_pacer
+            .as_mut()
+            .and_then(|pacer| pacer.delay_for(bytes))
+        {
+            if ctx
+                .request_deadline
+                .is_some_and(|deadline| std::time::Instant::now() + delay >= deadline)
+            {
+                return pingora_core::Error::e_explain(
+                    pingora_core::ErrorType::HTTPStatus(408),
+                    "upload rate budget exceeds whole-request deadline",
+                );
+            }
+            tokio::time::sleep(delay).await;
+        }
+        Ok(())
+    }
+
+    /// 📥 Drains a local handler's body through the same streaming limits as a proxy.
+    async fn drain_local_request_body(
+        session: &mut Session,
+        ctx: &mut RequestContext,
+    ) -> pingora_core::Result<()> {
+        while let Some(bytes) = session.read_request_body().await? {
+            Self::enforce_request_body_chunk(session, ctx, bytes.len()).await?;
+        }
+        Ok(())
+    }
+
+    /// 📤 Writes one local response chunk through the configured streaming budget.
+    async fn write_local_body(
+        session: &mut Session,
+        ctx: &mut RequestContext,
+        body: Bytes,
+        end_of_stream: bool,
+    ) -> PingoraResult<()> {
+        Self::enforce_request_deadline(ctx)?;
+        if let Some(delay) = ctx
+            .download_pacer
+            .as_mut()
+            .and_then(|pacer| pacer.delay_for(body.len()))
+        {
+            if ctx
+                .request_deadline
+                .is_some_and(|deadline| std::time::Instant::now() + delay >= deadline)
+            {
+                return pingora_core::Error::e_explain(
+                    pingora_core::ErrorType::HTTPStatus(408),
+                    "download rate budget exceeds whole-request deadline",
+                );
+            }
+            tokio::time::sleep(delay).await;
+        }
+        ctx.response_bytes += body.len() as u64;
+        session.write_response_body(Some(body), end_of_stream).await
     }
 
     /// Write a minimal plain-text response and end the request.
@@ -1179,10 +1446,7 @@ impl PingclairProxy {
         session
             .write_response_header(Box::new(response), false)
             .await?;
-        ctx.response_bytes += body.len() as u64;
-        session
-            .write_response_body(Some(Bytes::copy_from_slice(body.as_bytes())), true)
-            .await?;
+        Self::write_local_body(session, ctx, Bytes::copy_from_slice(body.as_bytes()), true).await?;
         Ok(())
     }
 
@@ -1322,10 +1586,7 @@ impl PingclairProxy {
             session
                 .write_response_header(Box::new(response), false)
                 .await?;
-            ctx.response_bytes += content.len() as u64;
-            session
-                .write_response_body(Some(Bytes::from(content)), true)
-                .await?;
+            Self::write_local_body(session, ctx, Bytes::from(content), true).await?;
             return Ok(());
         }
         let reason = error_reason(status);
@@ -1365,9 +1626,7 @@ impl PingclairProxy {
                 session
                     .write_response_header(Box::new(response), false)
                     .await?;
-                ctx.response_bytes += body_bytes.len() as u64;
-                session
-                    .write_response_body(Some(Bytes::copy_from_slice(body_bytes)), true)
+                Self::write_local_body(session, ctx, Bytes::copy_from_slice(body_bytes), true)
                     .await?;
                 Ok(true)
             }
@@ -1437,9 +1696,7 @@ impl PingclairProxy {
                                 )
                             })? {
                                 let last = stream.is_complete();
-                                ctx.response_bytes += chunk.len() as u64;
-                                session
-                                    .write_response_body(Some(Bytes::from(chunk)), last)
+                                Self::write_local_body(session, ctx, Bytes::from(chunk), last)
                                     .await?;
                             }
                             return Ok(true);
@@ -1475,9 +1732,7 @@ impl PingclairProxy {
                             session
                                 .write_response_header(Box::new(header), false)
                                 .await?;
-                            ctx.response_bytes += file.content.len() as u64;
-                            session
-                                .write_response_body(Some(Bytes::from(file.content)), true)
+                            Self::write_local_body(session, ctx, Bytes::from(file.content), true)
                                 .await?;
                             return Ok(true);
                         }
@@ -1589,10 +1844,13 @@ impl PingclairProxy {
                     session
                         .write_response_header(Box::new(response), false)
                         .await?;
-                    ctx.response_bytes += body.len() as u64;
-                    session
-                        .write_response_body(Some(Bytes::copy_from_slice(body.as_bytes())), true)
-                        .await?;
+                    Self::write_local_body(
+                        session,
+                        ctx,
+                        Bytes::copy_from_slice(body.as_bytes()),
+                        true,
+                    )
+                    .await?;
                     Ok(true)
                 }
             }
@@ -1679,13 +1937,13 @@ impl PingclairProxy {
                             .write_response_header(Box::new(response), body.is_empty())
                             .await?;
                         if !body.is_empty() {
-                            ctx.response_bytes += body.len() as u64;
-                            session
-                                .write_response_body(
-                                    Some(Bytes::copy_from_slice(body.as_bytes())),
-                                    true,
-                                )
-                                .await?;
+                            Self::write_local_body(
+                                session,
+                                ctx,
+                                Bytes::copy_from_slice(body.as_bytes()),
+                                true,
+                            )
+                            .await?;
                         }
                         Ok(true)
                     }
@@ -1841,6 +2099,40 @@ impl ProxyHttp for PingclairProxy {
         )));
     }
 
+    /// 🧾 Rejects decoded headers that exceed the selected virtual host's explicit bounds.
+    async fn early_request_filter(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> pingora_core::Result<()> {
+        let request = session.req_header();
+        let host = authority_host(request_authority(request));
+        let Some(state) = self.get_state(host) else {
+            return Ok(());
+        };
+        let limits = &state.config.limits;
+        let header_count = request.headers.len();
+        let header_bytes = request.headers.iter().fold(0usize, |total, (name, value)| {
+            total
+                .saturating_add(name.as_str().len())
+                .saturating_add(value.as_bytes().len())
+        });
+        if limits
+            .max_header_count
+            .is_some_and(|limit| header_count > limit)
+            || limits
+                .max_header_bytes
+                .is_some_and(|limit| header_bytes > limit)
+        {
+            session.as_mut().set_keepalive(None);
+            return pingora_core::Error::e_explain(
+                pingora_core::ErrorType::HTTPStatus(431),
+                "request headers exceed configured limits",
+            );
+        }
+        Ok(())
+    }
+
     /*
     // Removed in Pingora 0.6: TLS resolution is handled by listeners, not the proxy trait.
     /// Resolve TLS certificate for SNI
@@ -1991,6 +2283,10 @@ impl ProxyHttp for PingclairProxy {
         ctx.verified_client_ip = remote_ip.parse().ok();
         ctx.request_scheme = request_scheme;
 
+        if let Some(state) = ctx.state.clone() {
+            Self::initialize_request_limits(session, ctx, &state);
+        }
+
         // Honor a client-supplied request ID so traces can be correlated
         // across chained proxies; fall back to the generated one when the
         // header is absent or malformed.
@@ -2044,6 +2340,15 @@ impl ProxyHttp for PingclairProxy {
         if let Some(index) = route_index {
             ctx.route_index = Some(index);
 
+            if let Some(state) = ctx.state.clone() {
+                let immediate_flush = self
+                    .get_proxy_config(&state, index)
+                    .is_some_and(|config| wants_immediate_flush(config.flush_interval));
+                if immediate_flush || is_websocket_upgrade(&session.req_header().headers) {
+                    Self::activate_long_connection(session, ctx, &state);
+                }
+            }
+
             // Access rules run before authentication, static-file lookup, or
             // an upstream connection. This keeps denied traffic out of every
             // later request path and makes the policy apply uniformly to all
@@ -2090,20 +2395,20 @@ impl ProxyHttp for PingclairProxy {
                 }
             }
 
-            if let Some(h) = handler
-                && self
+            if let Some(h) = handler {
+                if find_reverse_proxy_config(&h).is_none() {
+                    Self::drain_local_request_body(session, ctx).await?;
+                }
+                if self
                     .handle_config(session, ctx, &h, &path_str, index)
                     .await?
-            {
-                // ⏱️ A locally produced response (static file, redirect,
-                // respond, error page) never reaches `response_filter`, so
-                // record TTFB here. The write already happened synchronously just
-                // above, so this is within microseconds of the real first
-                // byte; for a single-shot local response TTFB ≈ duration by
-                // construction.
-                ctx.first_byte_at
-                    .get_or_insert_with(std::time::Instant::now);
-                return Ok(true);
+                {
+                    // ⏱️ A locally produced response never reaches `response_filter`.
+                    // ⏱️ Record its TTFB immediately after the synchronous write.
+                    ctx.first_byte_at
+                        .get_or_insert_with(std::time::Instant::now);
+                    return Ok(true);
+                }
             }
         }
 
@@ -2118,6 +2423,23 @@ impl ProxyHttp for PingclairProxy {
         }
 
         Ok(false)
+    }
+
+    /// 📦 Enforces streamed body size, timeout, and upload rate without replay buffering.
+    async fn request_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> pingora_core::Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        let Some(bytes) = body.as_ref() else {
+            return Ok(());
+        };
+        Self::enforce_request_body_chunk(session, ctx, bytes.len()).await
     }
 
     /// Called for each request to determine the upstream
@@ -2164,41 +2486,44 @@ impl ProxyHttp for PingclairProxy {
         if let Some(upstream) = self.select_upstream(state, route_index, client_ip.as_deref()) {
             ctx.upstream = Some(upstream.clone()); // Backend is light to clone
 
-            // Get proxy config for headers and timeouts
-            let mut read_timeout_ms = None;
-            let mut write_timeout_ms = None;
-
-            if let Some(proxy_config) = self.get_proxy_config(state, route_index) {
+            Self::enforce_request_deadline(ctx)?;
+            let proxy_config = self.get_proxy_config(state, route_index);
+            if let Some(proxy_config) = &proxy_config {
                 ctx.headers_upstream = proxy_config.headers_up.clone();
                 ctx.response_headers
                     .merge_proxy_set(&proxy_config.headers_down);
-                read_timeout_ms = proxy_config.read_timeout;
-                write_timeout_ms = proxy_config.write_timeout;
                 ctx.streaming_response = wants_immediate_flush(proxy_config.flush_interval);
             }
+            let request_budget = ctx
+                .request_deadline
+                .and_then(|deadline| deadline.checked_duration_since(std::time::Instant::now()));
+            let read_budget = match state.config.limits.long_connections.idle_timeout_ms {
+                Some(0) => None,
+                Some(value) => Some(Duration::from_millis(value)),
+                None => request_budget,
+            };
 
-            // Parse and create peer (shared with the HTTP/3 path so both
-            // honor identical timeout semantics).
+            // 🌐 Builds the peer through the transport-neutral timeout policy.
             return Ok(Box::new(Self::build_http_peer(
                 &upstream,
-                read_timeout_ms,
-                write_timeout_ms,
+                proxy_config.as_ref(),
+                request_budget,
+                read_budget,
             )));
         }
 
-        // A route matched a reverse_proxy, but no backend was selectable:
-        // every one is marked down, or the upstream hostname has not resolved
-        // yet. That is an *upstream* problem, so it answers 502 like nginx and
-        // Caddy do — `ConnectNoRoute` would surface as 500 and tell an
-        // operator (and any load balancer in front) that the proxy itself
-        // broke. With DNS re-resolution the unresolved case is an ordinary
-        // transient state: the proxy may legitimately start before its app.
+        // ⏱️ Preserve a 504 when a connect timeout exhausted the selectable pool.
+        let status = if ctx.upstream_connect_timed_out {
+            504
+        } else {
+            502
+        };
         tracing::warn!(
             route = route_index,
             "⚠️ No upstream available for the matched route"
         );
         pingora_core::Error::e_explain(
-            pingora_core::ErrorType::HTTPStatus(502),
+            pingora_core::ErrorType::HTTPStatus(status),
             "no upstream available",
         )
     }
@@ -2349,13 +2674,24 @@ impl ProxyHttp for PingclairProxy {
     ///   7. Add request ID header
     async fn response_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> pingora_core::Result<()>
     where
         Self::CTX: Send + Sync,
     {
+        Self::enforce_request_deadline(ctx)?;
+        if upstream_response
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(is_streaming_content_type)
+            && let Some(state) = ctx.state.clone()
+        {
+            Self::activate_long_connection(session, ctx, &state);
+        }
+
         // Capture response status for access log
         ctx.response_status = upstream_response.status.as_u16();
 
@@ -2450,6 +2786,7 @@ impl ProxyHttp for PingclairProxy {
         end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> pingora_core::Result<Option<Duration>> {
+        Self::enforce_request_deadline(ctx)?;
         // Track response bytes for access log
         if let Some(b) = body.as_ref() {
             ctx.response_bytes += b.len() as u64;
@@ -2457,7 +2794,21 @@ impl ProxyHttp for PingclairProxy {
 
         stream_chunk(&mut ctx.response_encoder, body, end_of_stream);
 
-        Ok(None)
+        let delay = body.as_ref().and_then(|bytes| {
+            ctx.download_pacer
+                .as_mut()
+                .and_then(|pacer| pacer.delay_for(bytes.len()))
+        });
+        if delay.is_some_and(|delay| {
+            ctx.request_deadline
+                .is_some_and(|deadline| std::time::Instant::now() + delay >= deadline)
+        }) {
+            return pingora_core::Error::e_explain(
+                pingora_core::ErrorType::HTTPStatus(408),
+                "download rate budget exceeds whole-request deadline",
+            );
+        }
+        Ok(delay)
     }
 
     /// Called when establishing the connection to the selected upstream fails.
@@ -2478,6 +2829,11 @@ impl ProxyHttp for PingclairProxy {
         ctx: &mut Self::CTX,
         mut e: Box<pingora_core::Error>,
     ) -> Box<pingora_core::Error> {
+        ctx.upstream_connect_timed_out = matches!(
+            e.etype(),
+            pingora_core::ErrorType::ConnectTimedout
+                | pingora_core::ErrorType::TLSHandshakeTimedout
+        );
         if let (Some(state), Some(route_index)) = (ctx.state.as_ref(), ctx.route_index)
             && let Some(lb) = state
                 .load_balancers
@@ -2533,16 +2889,32 @@ impl ProxyHttp for PingclairProxy {
         Self::CTX: Send + Sync,
     {
         use pingora_core::{ErrorSource, ErrorType};
-        let code = match e.etype() {
-            ErrorType::HTTPStatus(code) => *code,
-            _ => match e.esource() {
-                ErrorSource::Upstream => 502,
-                ErrorSource::Downstream => match e.etype() {
-                    ErrorType::WriteError | ErrorType::ReadError | ErrorType::ConnectionClosed => 0,
-                    _ => 400,
+        let code = if ctx
+            .request_deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            408
+        } else {
+            match e.etype() {
+                ErrorType::HTTPStatus(code) => *code,
+                _ => match e.esource() {
+                    ErrorSource::Upstream => match e.etype() {
+                        ErrorType::ConnectTimedout
+                        | ErrorType::TLSHandshakeTimedout
+                        | ErrorType::ReadTimedout
+                        | ErrorType::WriteTimedout => 504,
+                        _ => 502,
+                    },
+                    ErrorSource::Downstream => match e.etype() {
+                        ErrorType::WriteError
+                        | ErrorType::ReadError
+                        | ErrorType::ConnectionClosed => 0,
+                        ErrorType::ReadTimedout | ErrorType::WriteTimedout => 408,
+                        _ => 400,
+                    },
+                    ErrorSource::Internal | ErrorSource::Unset => 500,
                 },
-                ErrorSource::Internal | ErrorSource::Unset => 500,
-            },
+            }
         };
         if code > 0 {
             let _ = self.serve_error_page(session, ctx, code).await;
@@ -3169,6 +3541,18 @@ mod p0_regression_tests {
     }
 
     #[test]
+    fn listener_limits_include_the_default_virtual_host() {
+        let proxy = PingclairProxy::new();
+        let mut config = minimal_server_config("_");
+        config.limits.header_timeout_ms = Some(200);
+        config.limits.max_connections = Some(1);
+        proxy.add_server(config);
+        let limits = proxy.listener_limits();
+        assert_eq!(limits.header_timeout_ms, Some(200));
+        assert_eq!(limits.max_connections, Some(1));
+    }
+
+    #[test]
     fn concurrent_add_server_calls_never_lose_entries() {
         // This is the test a naive `hosts.write(); *hosts = ...` swap (or a
         // non-retrying read-modify-write) would fail: under contention,
@@ -3577,7 +3961,7 @@ mod caddy_parity_tests {
             ("h2://127.0.0.1:8304", true, 2, 2, 4),
         ] {
             let upstream = create_upstream(address).unwrap();
-            let peer = PingclairProxy::build_http_peer(&upstream, None, None);
+            let peer = PingclairProxy::build_http_peer(&upstream, None, None, None);
 
             assert_eq!(peer.is_tls(), tls);
             assert_eq!(
@@ -3613,5 +3997,44 @@ mod caddy_parity_tests {
             ),
             "/v1/users/42?verbose=1",
         );
+    }
+
+    #[test]
+    fn upstream_timeout_policy_preserves_streaming_read_phases() {
+        let spec = UpstreamSpec::parse("127.0.0.1:9000").unwrap();
+        let upstream = spec.backend("127.0.0.1:9000".parse().unwrap(), 1).unwrap();
+        let config = ReverseProxyConfig {
+            connect_timeout: Some(100),
+            first_byte_timeout: Some(200),
+            between_reads_timeout: Some(300),
+            write_timeout: Some(400),
+            ..Default::default()
+        };
+        let peer = PingclairProxy::build_http_peer(
+            &upstream,
+            Some(&config),
+            Some(Duration::from_millis(50)),
+            Some(Duration::from_millis(60)),
+        );
+        assert_eq!(
+            peer.options.connection_timeout,
+            Some(Duration::from_millis(50))
+        );
+        assert_eq!(
+            peer.options.total_connection_timeout,
+            Some(Duration::from_millis(50))
+        );
+        assert_eq!(peer.options.read_timeout, Some(Duration::from_millis(200)));
+        assert_eq!(peer.options.write_timeout, Some(Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn bandwidth_pacer_retains_only_counters() {
+        let mut pacer = BandwidthPacer::new(1_000);
+        let first = pacer.delay_for(500).expect("first chunk should be paced");
+        assert!(first <= Duration::from_millis(500));
+        pacer.started -= Duration::from_secs(2);
+        assert_eq!(pacer.delay_for(500), None);
+        assert_eq!(pacer.bytes, 1_000);
     }
 }

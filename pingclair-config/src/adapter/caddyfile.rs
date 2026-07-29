@@ -416,6 +416,9 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                 "tls" => {
                     server.tls = Some(adapt_tls_directive(&sub_d)?);
                 }
+                "limits" => {
+                    server.limits = adapt_resource_limits(&sub_d)?;
+                }
                 "error_page" => {
                     // nginx-style: error_page 404 /404.html
                     //              error_page 500 502 503 504 /50x.html
@@ -1048,20 +1051,39 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
                     // transport http { read_timeout 300s; write_timeout 300s }
                     if let Some(transport_block) = sub.block {
                         let mut transport = TransportConfig {
+                            connect_timeout: None,
+                            first_byte_timeout: None,
+                            between_reads_timeout: None,
                             read_timeout: None,
                             write_timeout: None,
                         };
                         for t_sub in transport_block.directives {
                             match t_sub.name.as_str() {
+                                "connect_timeout" => {
+                                    transport.connect_timeout =
+                                        Some(parse_required_duration(&t_sub)?);
+                                }
+                                "first_byte_timeout" => {
+                                    transport.first_byte_timeout =
+                                        Some(parse_required_duration(&t_sub)?);
+                                }
+                                "between_reads_timeout" => {
+                                    transport.between_reads_timeout =
+                                        Some(parse_required_duration(&t_sub)?);
+                                }
                                 "read_timeout" => {
-                                    transport.read_timeout =
-                                        t_sub.args.first().and_then(|s| parse_duration_ms(s));
+                                    transport.read_timeout = Some(parse_required_duration(&t_sub)?);
                                 }
                                 "write_timeout" => {
                                     transport.write_timeout =
-                                        t_sub.args.first().and_then(|s| parse_duration_ms(s));
+                                        Some(parse_required_duration(&t_sub)?);
                                 }
-                                _ => {}
+                                _ => {
+                                    return Err(AdapterError::UnknownDirective(format!(
+                                        "transport http: {}",
+                                        t_sub.name
+                                    )));
+                                }
                             }
                         }
                         proxy.transport = Some(transport);
@@ -1185,17 +1207,172 @@ fn parse_dns_refresh(value: &str) -> Result<u64, AdapterError> {
     Ok(millis / 1_000)
 }
 
-/// Parse Caddy duration strings like "300s", "5m", "100ms" into milliseconds.
+/// ⏱️ Parses one mandatory, positive duration argument without permissive fallback.
+fn parse_required_duration(directive: &Directive) -> Result<u64, AdapterError> {
+    let value = directive.args.first().ok_or_else(|| {
+        AdapterError::ArgumentCount(directive.name.clone(), 1, directive.args.len())
+    })?;
+    if directive.args.len() != 1 {
+        return Err(AdapterError::ArgumentCount(
+            directive.name.clone(),
+            1,
+            directive.args.len(),
+        ));
+    }
+    parse_duration_ms(value)
+        .filter(|millis| *millis > 0 && *millis <= 31_536_000_000)
+        .ok_or_else(|| AdapterError::InvalidArgument(directive.name.clone(), value.clone()))
+}
+
+/// 🧱 Adapts one fail-closed downstream resource-limit block.
+fn adapt_resource_limits(directive: &Directive) -> Result<ResourceLimitsConfig, AdapterError> {
+    if !directive.args.is_empty() {
+        return Err(AdapterError::ArgumentCount(
+            "limits".into(),
+            0,
+            directive.args.len(),
+        ));
+    }
+    let block = directive
+        .block
+        .as_ref()
+        .ok_or_else(|| AdapterError::InvalidArgument("limits".into(), "block required".into()))?;
+    let mut limits = ResourceLimitsConfig::default();
+    for sub in &block.directives {
+        match sub.name.as_str() {
+            "header_timeout" => {
+                limits.header_timeout_ms = Some(parse_required_duration(sub)?);
+            }
+            "body_timeout" => {
+                limits.body_timeout_ms = Some(parse_required_duration(sub)?);
+            }
+            "idle_timeout" => {
+                limits.idle_timeout_ms = Some(parse_required_duration(sub)?);
+            }
+            "request_timeout" => {
+                limits.request_timeout_ms = Some(parse_required_duration(sub)?);
+            }
+            "max_headers" => {
+                limits.max_header_count = Some(parse_positive_usize(sub)?);
+            }
+            "max_header_bytes" => {
+                limits.max_header_bytes = Some(parse_positive_usize(sub)?);
+            }
+            "max_connections" => {
+                limits.max_connections = Some(parse_positive_usize(sub)?);
+            }
+            "upload_bytes_per_sec" => {
+                limits.upload_bytes_per_sec = Some(parse_positive_u64(sub)?);
+            }
+            "download_bytes_per_sec" => {
+                limits.download_bytes_per_sec = Some(parse_positive_u64(sub)?);
+            }
+            "long_connections" => {
+                limits.long_connections = adapt_long_connection_limits(sub)?;
+            }
+            _ => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "limits: {}",
+                    sub.name
+                )));
+            }
+        }
+    }
+    Ok(limits)
+}
+
+/// 🌊 Adapts long-connection overrides, where `off` deliberately removes a deadline.
+fn adapt_long_connection_limits(
+    directive: &Directive,
+) -> Result<LongConnectionLimits, AdapterError> {
+    if !directive.args.is_empty() {
+        return Err(AdapterError::ArgumentCount(
+            "long_connections".into(),
+            0,
+            directive.args.len(),
+        ));
+    }
+    let block = directive.block.as_ref().ok_or_else(|| {
+        AdapterError::InvalidArgument("long_connections".into(), "block required".into())
+    })?;
+    let mut limits = LongConnectionLimits::default();
+    for sub in &block.directives {
+        let value = sub
+            .args
+            .first()
+            .ok_or_else(|| AdapterError::ArgumentCount(sub.name.clone(), 1, sub.args.len()))?;
+        if sub.args.len() != 1 {
+            return Err(AdapterError::ArgumentCount(
+                sub.name.clone(),
+                1,
+                sub.args.len(),
+            ));
+        }
+        let millis = if matches!(value.as_str(), "off" | "none") {
+            0
+        } else {
+            parse_duration_ms(value)
+                .filter(|millis| *millis > 0 && *millis <= 31_536_000_000)
+                .ok_or_else(|| AdapterError::InvalidArgument(sub.name.clone(), value.clone()))?
+        };
+        match sub.name.as_str() {
+            "idle_timeout" => limits.idle_timeout_ms = Some(millis),
+            "request_timeout" => limits.request_timeout_ms = Some(millis),
+            _ => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "long_connections: {}",
+                    sub.name
+                )));
+            }
+        }
+    }
+    Ok(limits)
+}
+
+/// 🔢 Parses one mandatory positive `usize` argument.
+fn parse_positive_usize(directive: &Directive) -> Result<usize, AdapterError> {
+    parse_positive_u64(directive).and_then(|value| {
+        usize::try_from(value)
+            .map_err(|_| AdapterError::InvalidArgument(directive.name.clone(), value.to_string()))
+    })
+}
+
+/// 🔢 Parses one mandatory positive integer argument.
+fn parse_positive_u64(directive: &Directive) -> Result<u64, AdapterError> {
+    let value = directive.args.first().ok_or_else(|| {
+        AdapterError::ArgumentCount(directive.name.clone(), 1, directive.args.len())
+    })?;
+    if directive.args.len() != 1 {
+        return Err(AdapterError::ArgumentCount(
+            directive.name.clone(),
+            1,
+            directive.args.len(),
+        ));
+    }
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|parsed| *parsed > 0)
+        .ok_or_else(|| AdapterError::InvalidArgument(directive.name.clone(), value.clone()))
+}
+
+/// ⏱️ Parses Caddy durations without overflowing unit conversion.
 fn parse_duration_ms(s: &str) -> Option<u64> {
     if let Some(secs) = s.strip_suffix('s') {
         if let Some(ms) = secs.strip_suffix('m') {
             // "100ms" → strip 's' first gets "100m", then strip 'm' gets "100"
             return ms.parse::<u64>().ok();
         }
-        return secs.parse::<u64>().ok().map(|v| v * 1000);
+        return secs
+            .parse::<u64>()
+            .ok()
+            .and_then(|value| value.checked_mul(1_000));
     }
     if let Some(mins) = s.strip_suffix('m') {
-        return mins.parse::<u64>().ok().map(|v| v * 60_000);
+        return mins
+            .parse::<u64>()
+            .ok()
+            .and_then(|value| value.checked_mul(60_000));
     }
     // Plain number → milliseconds
     s.parse::<u64>().ok()

@@ -19,6 +19,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+mod resource_guard;
+
 #[cfg(target_os = "linux")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -312,6 +314,7 @@ fn main() -> anyhow::Result<()> {
                 tls: None,
                 log: None,
                 client_max_body_size: 10 * 1024 * 1024, // 10MB
+                limits: Default::default(),
                 security: Default::default(),
                 gzip_types: pingclair_core::config::default_gzip_types(),
                 encodings: pingclair_core::config::default_encodings(),
@@ -328,6 +331,9 @@ fn main() -> anyhow::Result<()> {
                 flush_interval: None,
                 read_timeout: None,
                 write_timeout: None,
+                connect_timeout: None,
+                first_byte_timeout: None,
+                between_reads_timeout: None,
             });
 
             server.routes.push(RouteConfig {
@@ -364,6 +370,7 @@ fn main() -> anyhow::Result<()> {
                 tls: None,
                 log: None,
                 client_max_body_size: 10 * 1024 * 1024,
+                limits: Default::default(),
                 security: Default::default(),
                 gzip_types: pingclair_core::config::default_gzip_types(),
                 encodings: pingclair_core::config::default_encodings(),
@@ -765,12 +772,15 @@ fn run_server(
             // 🌐 Enables prior-knowledge h2c only on plaintext listeners while TLS uses ALPN.
             let mut server_options = pingora_core::apps::HttpServerOptions::default();
             server_options.h2c = !is_https;
-            let proxy_service =
-                pingora_proxy::ProxyServiceBuilder::new(&server.configuration, proxy_logic.clone())
-                    .server_options(server_options)
-                    .build();
-
-            let mut service = proxy_service;
+            let listener_limits = proxy_logic.listener_limits();
+            let proxy =
+                pingora_proxy::HttpProxy::new(proxy_logic.clone(), server.configuration.clone());
+            let app =
+                resource_guard::ResourceGuardedProxy::new(proxy, listener_limits, server_options);
+            let mut service = pingora_core::services::listening::Service::new(
+                "Pingclair HTTP Proxy Service".to_string(),
+                app,
+            );
 
             // Add L4 Connection Filter (Global Blocked IPs)
             let blocked_ips = &config.global.blocked_ips;

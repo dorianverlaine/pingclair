@@ -201,6 +201,10 @@ pub struct ServerConfig {
     #[serde(default = "default_body_limit")]
     pub client_max_body_size: u64,
 
+    /// 🧱 Configurable downstream resource and time bounds.
+    #[serde(default)]
+    pub limits: ResourceLimitsConfig,
+
     /// Security headers configuration
     #[serde(default)]
     pub security: SecurityConfig,
@@ -239,6 +243,7 @@ impl Default for ServerConfig {
             routes: Vec::new(),
             log: None,
             client_max_body_size: default_body_limit(),
+            limits: ResourceLimitsConfig::default(),
             security: SecurityConfig::default(),
             gzip_types: default_gzip_types(),
             encodings: default_encodings(),
@@ -249,6 +254,41 @@ impl Default for ServerConfig {
 
 fn default_body_limit() -> u64 {
     1024 * 1024 // 1MB
+}
+
+/// 🧱 Bounds one virtual host's downstream resource consumption.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ResourceLimitsConfig {
+    /// ⏱️ Maximum time spent reading an HTTP/1 request header.
+    pub header_timeout_ms: Option<u64>,
+    /// ⏱️ Maximum pause allowed while receiving request-body chunks.
+    pub body_timeout_ms: Option<u64>,
+    /// 💤 Maximum inactive downstream interval for ordinary requests.
+    pub idle_timeout_ms: Option<u64>,
+    /// ⌛ Maximum wall-clock duration after request headers are accepted.
+    pub request_timeout_ms: Option<u64>,
+    /// 🧾 Maximum number of decoded request fields, excluding pseudo-headers.
+    pub max_header_count: Option<usize>,
+    /// 📏 Maximum decoded request-header bytes, including names and values.
+    pub max_header_bytes: Option<usize>,
+    /// 🔌 Maximum simultaneous downstream transport connections per listener.
+    pub max_connections: Option<usize>,
+    /// 📥 Maximum downstream request-body throughput in bytes per second.
+    pub upload_bytes_per_sec: Option<u64>,
+    /// 📤 Maximum downstream response-body throughput in bytes per second.
+    pub download_bytes_per_sec: Option<u64>,
+    /// 🌊 Overrides ordinary deadlines for SSE, immediate-flush, and WebSocket traffic.
+    #[serde(default)]
+    pub long_connections: LongConnectionLimits,
+}
+
+/// 🌊 Deadline overrides for intentionally long-lived responses and tunnels.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct LongConnectionLimits {
+    /// 💤 Long-connection inactivity timeout; zero explicitly disables it.
+    pub idle_timeout_ms: Option<u64>,
+    /// ⌛ Long-connection wall-clock timeout; zero explicitly disables it.
+    pub request_timeout_ms: Option<u64>,
 }
 
 /// 🔐 Configures downstream TLS for one server.
@@ -717,6 +757,15 @@ pub struct ReverseProxyConfig {
 
     /// Write timeout in milliseconds
     pub write_timeout: Option<i64>,
+
+    /// 🔌 Maximum time allowed for upstream connection establishment.
+    pub connect_timeout: Option<i64>,
+
+    /// ⏱️ Maximum time allowed before the upstream response header arrives.
+    pub first_byte_timeout: Option<i64>,
+
+    /// 🌊 Maximum pause allowed between upstream response-body reads.
+    pub between_reads_timeout: Option<i64>,
 }
 
 /// Load balancing configuration
@@ -1009,6 +1058,7 @@ mod tests {
             routes: vec![],
             log: None,
             client_max_body_size: 1024 * 1024,
+            limits: ResourceLimitsConfig::default(),
             security: Default::default(),
             gzip_types: default_gzip_types(),
             encodings: default_encodings(),
@@ -1022,6 +1072,7 @@ mod tests {
         let config: ServerConfig = serde_json::from_str(r#"{"name":"example.com"}"#).unwrap();
         assert_eq!(config.gzip_types, default_gzip_types());
         assert!(config.gzip_types.contains(&"text/*".to_string()));
+        assert_eq!(config.limits, ResourceLimitsConfig::default());
     }
 
     /// 🗜️ A `0.1.7` JSON config predates the `encodings` field entirely. It
@@ -1076,6 +1127,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.flush_interval, Some(-1));
+    }
+
+    #[test]
+    fn legacy_reverse_proxy_json_keeps_timeout_behavior() {
+        let config: ReverseProxyConfig =
+            serde_json::from_str(r#"{"upstreams":["127.0.0.1:9000"],"read_timeout":250}"#).unwrap();
+        assert_eq!(config.read_timeout, Some(250));
+        assert_eq!(config.connect_timeout, None);
+        assert_eq!(config.first_byte_timeout, None);
+        assert_eq!(config.between_reads_timeout, None);
     }
 
     #[test]

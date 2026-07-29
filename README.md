@@ -197,6 +197,49 @@ The verified client IP is shared by access control, rate limiting, IP-hash
 load balancing, upstream forwarding, placeholders, and access logs. Changes
 to `trusted_proxies` currently require a restart.
 
+### Resource limits and timeouts
+
+Set downstream limits at site scope and upstream timeout phases inside
+`reverse_proxy`. Durations require a unit. Long-connection overrides apply to
+WebSocket upgrades, `flush_interval -1`, and `text/event-stream`; `off`
+explicitly removes that long-connection deadline.
+
+```caddyfile
+example.com {
+    limits {
+        header_timeout 5s
+        body_timeout 30s
+        idle_timeout 30s
+        request_timeout 2m
+        max_headers 100
+        max_header_bytes 65536
+        max_connections 10000
+        upload_bytes_per_sec 10485760
+        download_bytes_per_sec 52428800
+        long_connections {
+            idle_timeout 5m
+            request_timeout off
+        }
+    }
+
+    reverse_proxy app:8080 {
+        transport http {
+            connect_timeout 3s
+            first_byte_timeout 30s
+            between_reads_timeout 15s
+        }
+    }
+}
+```
+
+Exceeded header, body, and request budgets receive an explicit HTTP error when
+the protocol can still send one; idle transports and excess HTTP/2 or HTTP/3
+connections are closed. Pingora 0.8 exposes one upstream read timer for H1/H2,
+so the stricter of `first_byte_timeout` and `between_reads_timeout` governs
+both phases there. The H3 bridge switches timers after receiving the response
+header. Changing the H1/H2 pre-routing `header_timeout`, H2 field-section cap,
+or H1/H2 connection limit currently requires a listener restart.
+
 ### Routing and matching
 
 Pingclair has a powerful matcher system — route requests by path, host, headers, and more.

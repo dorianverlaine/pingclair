@@ -29,7 +29,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -49,6 +49,7 @@ use crate::http_policy::{
     rewrite_uri,
 };
 use crate::server::{PingclairProxy, ProxyState, error_reason, resolve_caddy_placeholders};
+use crate::server::{is_streaming_content_type, wants_immediate_flush};
 
 /// Maximum UDP payload we ask quiche to send (standard Ethernet MTU-safe).
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -69,6 +70,86 @@ const NO_TIMER_SLEEP: Duration = Duration::from_secs(3600);
 
 /// Length of the authentication tag appended to stateless-retry tokens.
 const TOKEN_TAG_LEN: usize = 16;
+
+/// 🚦 Paces one H3 body stream without retaining any body chunk.
+struct StreamPacer {
+    rate: u64,
+    bytes: u64,
+    started: Instant,
+}
+
+impl StreamPacer {
+    fn new(rate: u64) -> Self {
+        Self {
+            rate,
+            bytes: 0,
+            started: Instant::now(),
+        }
+    }
+
+    fn delay_for(&mut self, bytes: usize) -> Option<Duration> {
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+        Duration::from_secs_f64(self.bytes as f64 / self.rate as f64)
+            .checked_sub(self.started.elapsed())
+    }
+}
+
+/// 📥 Drains one local H3 request through bounded streaming policy.
+async fn drain_local_h3_body(
+    body_rx: &mut mpsc::Receiver<Vec<u8>>,
+    body_notify: &Arc<Notify>,
+    body_limit: u64,
+    body_timeout_ms: Option<u64>,
+    upload_rate: Option<u64>,
+    request_deadline: Option<Instant>,
+) -> Result<(), HandlerError> {
+    let mut counted = 0u64;
+    let mut pacer = upload_rate.map(StreamPacer::new);
+    loop {
+        let next = match body_timeout_ms {
+            Some(timeout_ms) => {
+                tokio::time::timeout(Duration::from_millis(timeout_ms), body_rx.recv())
+                    .await
+                    .map_err(|_| (408, "Request Body Timeout"))?
+            }
+            None => body_rx.recv().await,
+        };
+        let Some(chunk) = next else { break };
+        body_notify.notify_one();
+        counted = counted.saturating_add(chunk.len() as u64);
+        if body_limit > 0 && counted > body_limit {
+            return Err((413, "Request Entity Too Large"));
+        }
+        if let Some(delay) = pacer
+            .as_mut()
+            .and_then(|pacer| pacer.delay_for(chunk.len()))
+        {
+            if request_deadline.is_some_and(|deadline| Instant::now() + delay >= deadline) {
+                return Err((408, "Request Timeout"));
+            }
+            tokio::time::sleep(delay).await;
+        }
+    }
+    Ok(())
+}
+
+/// 📤 Delays one H3 response chunk without retaining additional body data.
+async fn pace_h3_body(
+    pacer: &mut Option<StreamPacer>,
+    request_deadline: Option<Instant>,
+    bytes: usize,
+) -> Result<(), HandlerError> {
+    if request_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err((408, "Request Timeout"));
+    }
+    if let Some(delay) = pacer.as_mut().and_then(|pacer| pacer.delay_for(bytes)) {
+        if request_deadline.is_some_and(|deadline| Instant::now() + delay >= deadline) {
+            return Err((408, "Request Timeout"));
+        }
+        tokio::time::sleep(delay).await;
+    }
+    Ok(())
+}
 
 // MARK: - Errors
 
@@ -212,7 +293,10 @@ impl Default for CertTable {
 }
 
 /// Build the quiche configuration with an SNI-aware BoringSSL context.
-fn build_quiche_config(certs: Arc<CertTable>) -> Result<quiche::Config, QuicError> {
+fn build_quiche_config(
+    certs: Arc<CertTable>,
+    max_idle_timeout_ms: u64,
+) -> Result<quiche::Config, QuicError> {
     use boring::ssl::{NameType, SelectCertError, SslContext, SslMethod, SslVersion};
 
     let mut builder = SslContext::builder(SslMethod::tls())
@@ -268,7 +352,7 @@ fn build_quiche_config(certs: Arc<CertTable>) -> Result<quiche::Config, QuicErro
         .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
         .map_err(|e| QuicError::Tls(format!("failed to set ALPN: {e}")))?;
 
-    config.set_max_idle_timeout(30_000);
+    config.set_max_idle_timeout(max_idle_timeout_ms);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_initial_max_data(10_000_000);
@@ -564,8 +648,18 @@ impl QuicServer {
 
     /// Run the event loop forever (or until the task is aborted).
     pub async fn run(self) -> Result<(), QuicError> {
-        let mut config = build_quiche_config(self.certs.clone())?;
-        let h3_config = quiche::h3::Config::new().map_err(|e| QuicError::H3(e.to_string()))?;
+        let limits = self.proxy.listener_limits();
+        let transport_idle_ms = limits
+            .long_connections
+            .idle_timeout_ms
+            .filter(|value| *value > 0)
+            .or(limits.idle_timeout_ms)
+            .unwrap_or(30_000);
+        let mut config = build_quiche_config(self.certs.clone(), transport_idle_ms)?;
+        let mut h3_config = quiche::h3::Config::new().map_err(|e| QuicError::H3(e.to_string()))?;
+        if let Some(max_header_bytes) = limits.max_header_bytes {
+            h3_config.set_max_field_section_size(max_header_bytes as u64);
+        }
 
         let socket = UdpSocket::bind(self.listen).await?;
         let local_addr = socket.local_addr()?;
@@ -727,6 +821,16 @@ impl QuicServer {
         if !conns.contains_key(&cid) {
             if hdr.ty != quiche::Type::Initial {
                 tracing::trace!("H3: packet for unknown connection is not Initial");
+                return;
+            }
+
+            if self
+                .proxy
+                .listener_limits()
+                .max_connections
+                .is_some_and(|limit| conns.len() >= limit)
+            {
+                tracing::warn!("🚫 Rejecting an HTTP/3 connection at the configured limit");
                 return;
             }
 
@@ -1482,6 +1586,7 @@ async fn handle_request_inner(
     error_state: &mut Option<ProxyState>,
     response_policy: &mut ResponseHeaderPolicy,
 ) -> Result<(), HandlerError> {
+    let request_started = Instant::now();
     // 🧭 Builds one Pingora header map for routing and placeholder resolution.
     let method =
         http::Method::from_bytes(req.method.as_bytes()).map_err(|_| (400, "Bad Request"))?;
@@ -1529,6 +1634,25 @@ async fn handle_request_inner(
         .get(route_index)
         .ok_or((500, "Missing Route Handler"))?
         .handler;
+
+    // 🧾 Applies the selected virtual host's decoded H3 field bounds.
+    let header_count = req.headers.len();
+    let header_bytes = req.headers.iter().fold(0usize, |total, (name, value)| {
+        total.saturating_add(name.len()).saturating_add(value.len())
+    });
+    if state
+        .config
+        .limits
+        .max_header_count
+        .is_some_and(|limit| header_count > limit)
+        || state
+            .config
+            .limits
+            .max_header_bytes
+            .is_some_and(|limit| header_bytes > limit)
+    {
+        return Err((431, "Request Header Fields Too Large"));
+    }
 
     // 🔌 Rejects CONNECT tunnels because the current H3 path is request-response only.
     if method == http::Method::CONNECT || req.protocol.is_some() {
@@ -1591,6 +1715,11 @@ async fn handle_request_inner(
     )
     .await?;
 
+    let request_deadline = state
+        .config
+        .limits
+        .request_timeout_ms
+        .map(|value| request_started + Duration::from_millis(value));
     let handler = match plan {
         H3Plan::Terminal(handler) => handler,
         H3Plan::Respond(response) => {
@@ -1601,13 +1730,30 @@ async fn handle_request_inner(
                 response,
                 response_policy,
                 request_id,
-                Some(&state),
+                &state,
             )
-            .await;
+            .await?;
             return Ok(());
         }
         H3Plan::Continue => return Err((501, "Handler Pipeline Produced No Response")),
     };
+
+    if !matches!(&handler, H3Terminal::ReverseProxy) {
+        drain_local_h3_body(
+            &mut body_rx,
+            body_notify,
+            body_limit,
+            state.config.limits.body_timeout_ms,
+            state.config.limits.upload_bytes_per_sec,
+            request_deadline,
+        )
+        .await?;
+    }
+    let mut download_pacer = state
+        .config
+        .limits
+        .download_bytes_per_sec
+        .map(StreamPacer::new);
 
     match handler {
         H3Terminal::Respond {
@@ -1626,6 +1772,7 @@ async fn handle_request_inner(
             apply_h3_response_policy(&mut hdrs, response_policy, request_id, Some(&state));
             send_headers(resp_tx, cid, stream_id, hdrs, body.is_empty()).await;
             if !body.is_empty() {
+                pace_h3_body(&mut download_pacer, request_deadline, body.len()).await?;
                 send_body(resp_tx, cid, stream_id, body.into_bytes(), true).await;
             }
             Ok(())
@@ -1683,6 +1830,8 @@ async fn handle_request_inner(
                         match stream.read_chunk() {
                             Ok(Some(chunk)) => {
                                 let last = stream.is_complete();
+                                pace_h3_body(&mut download_pacer, request_deadline, chunk.len())
+                                    .await?;
                                 send_body(resp_tx, cid, stream_id, chunk, last).await;
                                 fin_sent = last;
                             }
@@ -1723,6 +1872,8 @@ async fn handle_request_inner(
                     apply_h3_response_policy(&mut hdrs, response_policy, request_id, Some(&state));
                     send_headers(resp_tx, cid, stream_id, hdrs, file.content.is_empty()).await;
                     if !file.content.is_empty() {
+                        pace_h3_body(&mut download_pacer, request_deadline, file.content.len())
+                            .await?;
                         send_body(resp_tx, cid, stream_id, file.content, true).await;
                     }
                     Ok(())
@@ -1754,6 +1905,7 @@ async fn handle_request_inner(
                 &mut body_rx,
                 resp_tx,
                 body_notify,
+                request_started,
             )
             .await
         }
@@ -1781,6 +1933,7 @@ async fn reverse_proxy_upstream(
     body_rx: &mut mpsc::Receiver<Vec<u8>>,
     resp_tx: &RespSender,
     body_notify: &Arc<Notify>,
+    request_started: Instant,
 ) -> Result<(), HandlerError> {
     // ⚖️ Selects the upstream with the verified client IP for IP-hash routing.
     let ip_bytes: Vec<u8> = match verified_client_ip.parse::<IpAddr>() {
@@ -1793,12 +1946,32 @@ async fn reverse_proxy_upstream(
         .ok_or((502, "No Upstream Available"))?;
 
     let proxy_config = proxy.get_proxy_config(state, route_index);
-    let (read_timeout, write_timeout) = proxy_config
+    let limits = &state.config.limits;
+    let immediate_stream = proxy_config
         .as_ref()
-        .map(|c| (c.read_timeout, c.write_timeout))
-        .unwrap_or((None, None));
-
-    let peer = PingclairProxy::build_http_peer(&upstream, read_timeout, write_timeout);
+        .is_some_and(|config| wants_immediate_flush(config.flush_interval));
+    let request_timeout_ms = if immediate_stream {
+        limits
+            .long_connections
+            .request_timeout_ms
+            .or(limits.request_timeout_ms)
+    } else {
+        limits.request_timeout_ms
+    };
+    let mut request_deadline = request_timeout_ms
+        .filter(|value| *value > 0)
+        .map(|value| request_started + Duration::from_millis(value));
+    let request_budget =
+        request_deadline.and_then(|deadline| deadline.checked_duration_since(Instant::now()));
+    if request_timeout_ms.is_some() && request_budget.is_none() {
+        return Err((408, "Request Timeout"));
+    }
+    let peer = PingclairProxy::build_http_peer(
+        &upstream,
+        proxy_config.as_ref(),
+        request_budget,
+        request_budget,
+    );
 
     let (mut session, _reused) = connector.get_http_session(&peer).await.map_err(|e| {
         tracing::error!("❌ H3 upstream connect failed: {}", e);
@@ -1928,7 +2101,17 @@ async fn reverse_proxy_upstream(
 
     // 🌊 Streams request chunks after the upstream has accepted the headers.
     let mut counted = 0u64;
-    while let Some(chunk) = body_rx.recv().await {
+    let mut upload_pacer = limits.upload_bytes_per_sec.map(StreamPacer::new);
+    loop {
+        let next = match limits.body_timeout_ms {
+            Some(timeout_ms) => {
+                tokio::time::timeout(Duration::from_millis(timeout_ms), body_rx.recv())
+                    .await
+                    .map_err(|_| (408, "Request Body Timeout"))?
+            }
+            None => body_rx.recv().await,
+        };
+        let Some(chunk) = next else { break };
         // 🔔 Wakes the event loop after freeing request-channel capacity.
         body_notify.notify_one();
 
@@ -1937,6 +2120,16 @@ async fn reverse_proxy_upstream(
             // 🛑 Aborts the upstream exchange before returning the body-limit response.
             session.shutdown().await;
             return Err((413, "Request Entity Too Large"));
+        }
+        if let Some(delay) = upload_pacer
+            .as_mut()
+            .and_then(|pacer| pacer.delay_for(chunk.len()))
+        {
+            if request_deadline.is_some_and(|deadline| Instant::now() + delay >= deadline) {
+                session.shutdown().await;
+                return Err((408, "Request Timeout"));
+            }
+            tokio::time::sleep(delay).await;
         }
         if let Err(e) = session.write_request_body(Bytes::from(chunk), false).await {
             tracing::error!("❌ H3 upstream write body failed: {}", e);
@@ -1969,6 +2162,46 @@ async fn reverse_proxy_upstream(
         session.shutdown().await;
         return Err((502, "Upstream Read Failed"));
     }
+
+    let response_streaming = session
+        .response_header()
+        .and_then(|response| response.headers.get("content-type"))
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(is_streaming_content_type);
+    if response_streaming && let Some(request_ms) = limits.long_connections.request_timeout_ms {
+        request_deadline =
+            (request_ms > 0).then(|| request_started + Duration::from_millis(request_ms));
+    }
+    let between_reads_ms = if response_streaming || immediate_stream {
+        limits
+            .long_connections
+            .idle_timeout_ms
+            .filter(|value| *value > 0)
+            .map(|value| value as i64)
+            .or_else(|| {
+                proxy_config
+                    .as_ref()
+                    .and_then(|config| config.between_reads_timeout.or(config.read_timeout))
+            })
+    } else {
+        proxy_config
+            .as_ref()
+            .and_then(|config| config.between_reads_timeout.or(config.read_timeout))
+    };
+    let between_reads = between_reads_ms
+        .filter(|value| *value > 0)
+        .map(|value| Duration::from_millis(value as u64));
+    let remaining =
+        request_deadline.and_then(|deadline| deadline.checked_duration_since(Instant::now()));
+    if request_deadline.is_some() && remaining.is_none() {
+        session.shutdown().await;
+        return Err((408, "Request Timeout"));
+    }
+    session.set_read_timeout(match (between_reads, remaining) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    });
 
     let upstream_status = session
         .response_header()
@@ -2033,9 +2266,21 @@ async fn reverse_proxy_upstream(
 
     // 🌊 Streams the upstream response without committing the final H3 frame early.
     let mut clean = true;
+    let mut download_pacer = limits.download_bytes_per_sec.map(StreamPacer::new);
     loop {
         match session.read_response_body().await {
             Ok(Some(bytes)) => {
+                if let Some(delay) = download_pacer
+                    .as_mut()
+                    .and_then(|pacer| pacer.delay_for(bytes.len()))
+                {
+                    if request_deadline.is_some_and(|deadline| Instant::now() + delay >= deadline) {
+                        tracing::warn!("⏱️ H3 whole-request timeout reached during response body");
+                        clean = false;
+                        break;
+                    }
+                    tokio::time::sleep(delay).await;
+                }
                 send_body(resp_tx, cid, stream_id, bytes.to_vec(), false).await;
             }
             Ok(None) => break,
@@ -2178,9 +2423,14 @@ async fn send_immediate_response(
     response: H3ImmediateResponse,
     policy: &ResponseHeaderPolicy,
     request_id: &str,
-    state: Option<&ProxyState>,
-) {
+    state: &ProxyState,
+) -> Result<(), HandlerError> {
     let body = response.body.into_bytes();
+    let mut pacer = state
+        .config
+        .limits
+        .download_bytes_per_sec
+        .map(StreamPacer::new);
     let has_content_type = response
         .headers
         .iter()
@@ -2195,11 +2445,18 @@ async fn send_immediate_response(
     for (name, value) in response.headers {
         headers.push(quiche::h3::Header::new(name.as_bytes(), value.as_bytes()));
     }
-    apply_h3_response_policy(&mut headers, policy, request_id, state);
+    apply_h3_response_policy(&mut headers, policy, request_id, Some(state));
     send_headers(resp_tx, cid, stream_id, headers, body.is_empty()).await;
     if !body.is_empty() {
+        let request_deadline = state
+            .config
+            .limits
+            .request_timeout_ms
+            .map(|value| Instant::now() + Duration::from_millis(value));
+        pace_h3_body(&mut pacer, request_deadline, body.len()).await?;
         send_body(resp_tx, cid, stream_id, body, true).await;
     }
+    Ok(())
 }
 
 async fn send_headers(
@@ -2628,6 +2885,7 @@ mod tests {
             &mut body_rx,
             &resp_tx,
             &body_notify,
+            Instant::now(),
         )
         .await
         .unwrap();
