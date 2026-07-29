@@ -220,11 +220,24 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                             "h1" => global.protocols.push(Protocol::H1),
                             "h2" => global.protocols.push(Protocol::H2),
                             "h3" => global.protocols.push(Protocol::H3),
-                            _ => {}
+                            other => {
+                                return Err(AdapterError::InvalidArgument(
+                                    "protocols".into(),
+                                    other.to_string(),
+                                ));
+                            }
                         }
                     }
                 }
-                _ => {}
+                // 🚩 An unrecognised global directive is a typo, and a silently
+                // ignored typo is a silently missing setting. `trusted_proxis`
+                // would have meant "no trusted proxies at all" while reading
+                // like the opposite — the same shape as `encode gzipp` and
+                // `listen :443 proxy_protocol`, both of which were fixed for
+                // exactly this reason.
+                other => {
+                    return Err(AdapterError::UnknownDirective(format!("global: {other}")));
+                }
             }
         }
     }
