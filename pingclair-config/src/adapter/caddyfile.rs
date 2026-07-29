@@ -208,6 +208,19 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                         global.trusted_proxies.push(rule);
                     }
                 }
+                "proxy_protocol" => {
+                    let value = expect_one_argument(&sub)?;
+                    global.proxy_protocol = Some(match value {
+                        "on" => true,
+                        "off" => false,
+                        _ => {
+                            return Err(AdapterError::InvalidArgument(
+                                "proxy_protocol".into(),
+                                value.to_string(),
+                            ));
+                        }
+                    });
+                }
                 "dns_refresh" => {
                     let Some(value) = sub.args.first() else {
                         return Err(AdapterError::ArgumentCount("dns_refresh".into(), 1, 0));

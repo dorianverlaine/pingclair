@@ -197,12 +197,22 @@ commit `0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。
 
 ### 安全與身分
 
-- **可信代理 client identity**（本機，2026-07-26）— 全域 `trusted_proxies` IP/CIDR；
+- **可信代理 client identity**（本機，2026-07-29）🧪 — 全域 `trusted_proxies` IP/CIDR；
   只有受信任的直接上一跳可提供 `X-Forwarded-For`／`X-Real-IP`／`X-Forwarded-Proto`。
-  XFF 最多 32 hops，由右向左跳過可信代理，畸形或過長鏈 fail closed。
+  XFF 與 RFC 7239 `Forwarded` 都有 32 hops／8 KiB 上限，由右向左跳過可信代理；
+  兩者並存但 client 不一致、語法畸形或超過上限時 fail closed。
+  `proxy_protocol on` 會在 TLS／HTTP 之前要求 v1 或 v2 TCP header；外層 ingress
+  先按實際 transport peer 驗證 `trusted_proxies`，未受信來源直接斷線。合法流量
+  進入只綁 loopback 的私有 Pingora listener，沒有對應 registry identity 的旁路
+  request 仍會被拒絕。tunnel 結束即刪除 identity，register／lookup 另有 10 分鐘
+  stale-entry pruner。
   H1/H2/H3 的 route matcher、rate limit、IP hash、placeholder 與上游 forwarding
-  共用 verified client IP。
-  **仍缺**：RFC 7239 `Forwarded`、PROXY protocol v1/v2、IP／Referer 完整矩陣、VPS 驗證。
+  共用 verified client IP；轉送到 upstream 的 `Forwarded` 會重建為已驗證值，
+  不保留未受信任輸入。
+  真 binary 測試涵蓋 v1、v2、XFF／Forwarded 一致與衝突、以及從 `127.0.0.2`
+  嘗試偽造的未受信 transport peer，並以 Rust 1.88 **連跑 30 次全綠**。
+  locked local gate 全綠，總測試數 **422 → 431**。
+  **仍缺**：IP／Referer 完整矩陣、乾淨 Linux／VPS 驗證；留到 Day 15。
 - **TLS／ACME 私密狀態強化**（本機，2026-07-26）— HTTP-01 challenge deploy 改為
   async durable contract；憑證續期改讀真實 X.509 `notAfter`；account、憑證與
   challenge snapshot 統一 temporary file＋fsync＋atomic rename，Unix 從建立起即 `0600`。
@@ -476,6 +486,7 @@ commit `0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。
 
 ### 精確 rate limit 已在本機接線（Day 13，2026-07-29）🧪
 
+- Day 13 commit：`6eefe808cfee987aefe985e1bbc29ea508a1115f`。
 - 以有鎖但短臨界區的精確 token bucket 取代 Count-Min Sketch 機率估算；
   `requests + burst` 是可立即使用的容量，按 `requests / window` 速率補回。
 - H1／H2／H3 共用同一份 limiter 狀態與 verified client IP，可依 IP、global、

@@ -281,8 +281,17 @@ impl TrustedProxyPolicy {
     }
 
     fn verified_client_ip(&self, peer: IpAddr, headers: &http::HeaderMap) -> IpAddr {
-        if !self.contains(peer) {
-            return peer;
+        self.verified_client_ip_with_fallback(peer, peer, headers)
+    }
+
+    fn verified_client_ip_with_fallback(
+        &self,
+        transport_peer: IpAddr,
+        fallback: IpAddr,
+        headers: &http::HeaderMap,
+    ) -> IpAddr {
+        if !self.contains(transport_peer) {
+            return fallback;
         }
 
         // ☁️ `CF-Connecting-IP` wins when the immediate peer is trusted.
@@ -304,37 +313,61 @@ impl TrustedProxyPolicy {
             return cf_ip;
         }
 
-        match parse_forwarded_chain(headers) {
-            Ok(Some(chain)) if !chain.is_empty() => chain
+        let xff = parse_forwarded_chain(headers);
+        let forwarded = parse_rfc_forwarded_chain(headers);
+        let client_from = |chain: &[IpAddr]| {
+            chain
                 .iter()
                 .rev()
                 .copied()
                 .find(|candidate| !self.contains(*candidate))
-                .unwrap_or(chain[0]),
-            Ok(None) => headers
+                .unwrap_or(chain[0])
+        };
+        match (xff, forwarded) {
+            (Ok(Some(xff)), Ok(Some(forwarded))) => {
+                let xff_client = client_from(&xff);
+                let forwarded_client = client_from(&forwarded);
+                if xff_client == forwarded_client {
+                    xff_client
+                } else {
+                    tracing::warn!(
+                        xff = %xff_client,
+                        forwarded = %forwarded_client,
+                        "🚫 Conflicting forwarding identity headers failed closed"
+                    );
+                    fallback
+                }
+            }
+            (Ok(Some(chain)), Ok(None)) | (Ok(None), Ok(Some(chain))) => client_from(&chain),
+            (Ok(None), Ok(None)) => headers
                 .get("x-real-ip")
                 .and_then(|value| value.to_str().ok())
                 .and_then(parse_forwarded_ip)
-                .unwrap_or(peer),
-            _ => peer,
+                .unwrap_or(fallback),
+            _ => fallback,
         }
     }
 
-    fn forwarded_for(&self, peer: IpAddr, headers: &http::HeaderMap) -> String {
-        if !self.contains(peer) {
-            return peer.to_string();
+    fn forwarded_for_with_fallback(
+        &self,
+        transport_peer: IpAddr,
+        fallback: IpAddr,
+        headers: &http::HeaderMap,
+    ) -> String {
+        if !self.contains(transport_peer) {
+            return fallback.to_string();
         }
 
         let Ok(Some(mut chain)) = parse_forwarded_chain(headers) else {
-            let client = self.verified_client_ip(peer, headers);
-            return if client == peer {
-                peer.to_string()
+            let client = self.verified_client_ip_with_fallback(transport_peer, fallback, headers);
+            return if client == transport_peer {
+                transport_peer.to_string()
             } else {
-                format!("{client}, {peer}")
+                format!("{client}, {transport_peer}")
             };
         };
-        if chain.last().copied() != Some(peer) {
-            chain.push(peer);
+        if chain.last().copied() != Some(transport_peer) {
+            chain.push(transport_peer);
         }
         chain
             .iter()
@@ -365,6 +398,115 @@ fn parse_forwarded_chain(headers: &http::HeaderMap) -> Result<Option<Vec<IpAddr>
         Err(())
     } else {
         Ok(Some(chain))
+    }
+}
+
+/// 🧭 Parses RFC 7239 `Forwarded` elements into one bounded `for` chain.
+fn parse_rfc_forwarded_chain(headers: &http::HeaderMap) -> Result<Option<Vec<IpAddr>>, ()> {
+    let values = headers.get_all("forwarded");
+    if values.iter().next().is_none() {
+        return Ok(None);
+    }
+
+    let mut chain = Vec::new();
+    let mut total_bytes = 0usize;
+    for value in values.iter() {
+        let value = value.to_str().map_err(|_| ())?;
+        total_bytes = total_bytes.checked_add(value.len()).ok_or(())?;
+        if total_bytes > 8_192 {
+            return Err(());
+        }
+        for element in split_quoted(value, ',')? {
+            if chain.len() >= MAX_FORWARDED_HOPS {
+                return Err(());
+            }
+            let mut forwarded_for = None;
+            for parameter in split_quoted(&element, ';')? {
+                let (name, raw_value) = parameter.split_once('=').ok_or(())?;
+                if !name.trim().eq_ignore_ascii_case("for") {
+                    continue;
+                }
+                if forwarded_for.is_some() {
+                    return Err(());
+                }
+                let decoded = decode_forwarded_value(raw_value.trim())?;
+                forwarded_for = parse_forwarded_ip(&decoded);
+            }
+            chain.push(forwarded_for.ok_or(())?);
+        }
+    }
+    if chain.is_empty() {
+        Err(())
+    } else {
+        Ok(Some(chain))
+    }
+}
+
+fn split_quoted(value: &str, delimiter: char) -> Result<Vec<String>, ()> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    for character in value.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        if quoted && character == '\\' {
+            current.push(character);
+            escaped = true;
+            continue;
+        }
+        if character == '"' {
+            quoted = !quoted;
+            current.push(character);
+            continue;
+        }
+        if character == delimiter && !quoted {
+            if current.trim().is_empty() {
+                return Err(());
+            }
+            values.push(current.trim().to_string());
+            current.clear();
+        } else {
+            current.push(character);
+        }
+    }
+    if quoted || escaped || current.trim().is_empty() {
+        return Err(());
+    }
+    values.push(current.trim().to_string());
+    Ok(values)
+}
+
+fn decode_forwarded_value(value: &str) -> Result<String, ()> {
+    if !value.starts_with('"') {
+        if value.bytes().any(|byte| byte.is_ascii_control()) {
+            return Err(());
+        }
+        return Ok(value.to_string());
+    }
+    let inner = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .ok_or(())?;
+    let mut decoded = String::new();
+    let mut escaped = false;
+    for character in inner.chars() {
+        if escaped {
+            decoded.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else {
+            decoded.push(character);
+        }
+    }
+    if escaped || decoded.bytes().any(|byte| byte.is_ascii_control()) {
+        Err(())
+    } else {
+        Ok(decoded)
     }
 }
 
@@ -720,6 +862,18 @@ fn session_peer_ip(session: &Session) -> IpAddr {
             }
         })
         .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+}
+
+fn session_inet_addresses(session: &Session) -> Option<(SocketAddr, SocketAddr)> {
+    let peer = match session.client_addr()? {
+        pingora_core::protocols::l4::socket::SocketAddr::Inet(address) => *address,
+        pingora_core::protocols::l4::socket::SocketAddr::Unix(_) => return None,
+    };
+    let listener = match session.server_addr()? {
+        pingora_core::protocols::l4::socket::SocketAddr::Inet(address) => *address,
+        pingora_core::protocols::l4::socket::SocketAddr::Unix(_) => return None,
+    };
+    Some((peer, listener))
 }
 
 fn authority_port(authority: &str) -> Option<u16> {
@@ -1117,6 +1271,10 @@ pub struct PingclairProxy {
     pub alt_svc: Arc<ArcSwap<Option<String>>>,
     /// 🛡️ Immutable policy used by every protocol to resolve client identity.
     trusted_proxies: Arc<TrustedProxyPolicy>,
+    /// 🧭 Trusted transport claims keyed by the private ingress tunnel sockets.
+    proxy_protocol_registry: Arc<crate::proxy_protocol::ProxyProtocolRegistry>,
+    /// 🚫 Rejects TCP requests that bypass the required external PROXY ingress.
+    proxy_protocol_required: bool,
 }
 
 impl Default for PingclairProxy {
@@ -1127,6 +1285,10 @@ impl Default for PingclairProxy {
             tls_manager: None,
             alt_svc: Arc::new(ArcSwap::from_pointee(None)),
             trusted_proxies: Arc::new(TrustedProxyPolicy::from_rules(&[])),
+            proxy_protocol_registry: Arc::new(
+                crate::proxy_protocol::ProxyProtocolRegistry::default(),
+            ),
+            proxy_protocol_required: false,
         }
     }
 }
@@ -1145,6 +1307,10 @@ impl PingclairProxy {
             tls_manager: Some(tls_manager),
             alt_svc: Arc::new(ArcSwap::from_pointee(None)),
             trusted_proxies: Arc::new(TrustedProxyPolicy::from_rules(&[])),
+            proxy_protocol_registry: Arc::new(
+                crate::proxy_protocol::ProxyProtocolRegistry::default(),
+            ),
+            proxy_protocol_required: false,
         }
     }
 
@@ -1152,6 +1318,7 @@ impl PingclairProxy {
     pub fn with_tls_and_trusted_proxies(
         tls_manager: Arc<pingclair_tls::manager::TlsManager>,
         trusted_proxies: &[String],
+        proxy_protocol_required: bool,
     ) -> Self {
         Self {
             hosts: Arc::new(ArcSwap::from_pointee(HashMap::new())),
@@ -1159,6 +1326,10 @@ impl PingclairProxy {
             tls_manager: Some(tls_manager),
             alt_svc: Arc::new(ArcSwap::from_pointee(None)),
             trusted_proxies: Arc::new(TrustedProxyPolicy::from_rules(trusted_proxies)),
+            proxy_protocol_registry: Arc::new(
+                crate::proxy_protocol::ProxyProtocolRegistry::default(),
+            ),
+            proxy_protocol_required,
         }
     }
 
@@ -1176,6 +1347,40 @@ impl PingclairProxy {
         self.trusted_proxies.verified_client_ip(peer, headers)
     }
 
+    fn downstream_identity(
+        &self,
+        session: &Session,
+        headers: &http::HeaderMap,
+    ) -> (IpAddr, IpAddr, IpAddr) {
+        if let Some(identity) = self.proxy_protocol_identity(session) {
+            let client = self.trusted_proxies.verified_client_ip_with_fallback(
+                identity.transport_peer.ip(),
+                identity.client.ip(),
+                headers,
+            );
+            return (identity.transport_peer.ip(), identity.client.ip(), client);
+        }
+        let peer = session_peer_ip(session);
+        (
+            peer,
+            peer,
+            self.trusted_proxies.verified_client_ip(peer, headers),
+        )
+    }
+
+    fn proxy_protocol_identity(
+        &self,
+        session: &Session,
+    ) -> Option<crate::proxy_protocol::ProxyProtocolIdentity> {
+        let (peer, listener) = session_inet_addresses(session)?;
+        self.proxy_protocol_registry.resolve(peer, listener)
+    }
+
+    /// 🧭 Exposes the per-listener tunnel registry to the startup ingress.
+    pub fn proxy_protocol_registry(&self) -> Arc<crate::proxy_protocol::ProxyProtocolRegistry> {
+        self.proxy_protocol_registry.clone()
+    }
+
     /// 🔒 Reports whether the immediate peer may assert proxy headers.
     pub(crate) fn is_trusted_proxy(&self, peer: IpAddr) -> bool {
         self.trusted_proxies.contains(peer)
@@ -1183,7 +1388,8 @@ impl PingclairProxy {
 
     /// 📤 Builds a sanitized upstream `X-Forwarded-For` value.
     pub(crate) fn forwarded_for(&self, peer: IpAddr, headers: &http::HeaderMap) -> String {
-        self.trusted_proxies.forwarded_for(peer, headers)
+        self.trusted_proxies
+            .forwarded_for_with_fallback(peer, peer, headers)
     }
 
     /// Advertise HTTP/3 availability for this listener via the `Alt-Svc`
@@ -2497,6 +2703,13 @@ impl ProxyHttp for PingclairProxy {
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> pingora_core::Result<bool> {
+        if self.proxy_protocol_required && self.proxy_protocol_identity(session).is_none() {
+            tracing::warn!("🚫 Rejected a TCP request that bypassed the PROXY protocol ingress");
+            session.as_mut().set_keepalive(None);
+            Self::write_simple_response(session, ctx, 400, "PROXY Protocol Required").await?;
+            return Ok(true);
+        }
+
         // Handle ACME Challenges (HTTP-01)
         let request_header = session.req_header();
         let path = request_header.uri.path();
@@ -2565,10 +2778,9 @@ impl ProxyHttp for PingclairProxy {
             ctx.state = Some(state.clone());
 
             // 🛡️ Resolve proxy headers only when the immediate peer is trusted.
-            let peer_ip = session_peer_ip(session);
-            let remote_ip = self
-                .verified_client_ip(peer_ip, &request_header.headers)
-                .to_string();
+            let (transport_peer_ip, _transport_client_ip, verified_client_ip) =
+                self.downstream_identity(session, &request_header.headers);
+            let remote_ip = verified_client_ip.to_string();
 
             // ⚡ OPTIMIZATION: Identify protocol via URI scheme, forwarding header, or port.
             // Pingora 0.6 removed the per-request TLS flag; we detect HTTPS by:
@@ -2576,7 +2788,7 @@ impl ProxyHttp for PingclairProxy {
             //   (b) checking X-Forwarded-Proto, or
             //   (c) checking whether the authority uses port 443 / 8443.
             let protocol = {
-                let via_header = if self.is_trusted_proxy(peer_ip) {
+                let via_header = if self.is_trusted_proxy(transport_peer_ip) {
                     request_header
                         .headers
                         .get("x-forwarded-proto")
@@ -2831,7 +3043,12 @@ impl ProxyHttp for PingclairProxy {
         // ⚖️ IP-hash uses the same verified identity as every request policy.
         let client_ip = ctx
             .verified_client_ip
-            .or_else(|| Some(session_peer_ip(session)))
+            .or_else(|| {
+                Some(
+                    self.downstream_identity(session, &session.req_header().headers)
+                        .2,
+                )
+            })
             .map(|address| match address {
                 IpAddr::V4(ip) => ip.octets().to_vec(),
                 IpAddr::V6(ip) => ip.octets().to_vec(),
@@ -3052,18 +3269,28 @@ impl ProxyHttp for PingclairProxy {
         }
 
         // 🛡️ Untrusted peers cannot smuggle a forged forwarding chain upstream.
-        let peer_ip = session_peer_ip(session);
-        let client_ip = ctx
-            .verified_client_ip
-            .unwrap_or_else(|| self.verified_client_ip(peer_ip, &downstream_headers.headers));
+        let (transport_peer_ip, transport_client_ip, resolved_client_ip) =
+            self.downstream_identity(session, &downstream_headers.headers);
+        let client_ip = ctx.verified_client_ip.unwrap_or(resolved_client_ip);
         if !has_header_up("X-Forwarded-For") {
             upstream_request.insert_header(
                 "X-Forwarded-For",
-                self.forwarded_for(peer_ip, &downstream_headers.headers),
+                self.trusted_proxies.forwarded_for_with_fallback(
+                    transport_peer_ip,
+                    transport_client_ip,
+                    &downstream_headers.headers,
+                ),
             )?;
         }
         if !has_header_up("X-Real-IP") {
             upstream_request.insert_header("X-Real-IP", client_ip.to_string())?;
+        }
+        if !has_header_up("Forwarded") {
+            let value = match client_ip {
+                IpAddr::V4(address) => format!("for={address}"),
+                IpAddr::V6(address) => format!("for=\"[{address}]\""),
+            };
+            upstream_request.insert_header("Forwarded", value)?;
         }
 
         // Forward the request ID so upstream services can correlate their
@@ -3757,6 +3984,48 @@ mod forwarded_headers_tests {
 
         assert_eq!(proxy.verified_client_ip(peer, &headers), peer);
         assert_eq!(proxy.forwarded_for(peer, &headers), "198.51.100.4");
+    }
+
+    #[test]
+    fn untrusted_peer_cannot_spoof_rfc_forwarded_identity() {
+        let proxy = PingclairProxy::new();
+        let peer = "198.51.100.4".parse().unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("forwarded", "for=203.0.113.7;proto=https".parse().unwrap());
+
+        assert_eq!(proxy.verified_client_ip(peer, &headers), peer);
+    }
+
+    #[test]
+    fn conflicting_xff_and_rfc_forwarded_fail_closed_to_peer() {
+        let proxy = PingclairProxy::with_trusted_proxies(&["10.0.0.0/8".to_string()]);
+        let peer = "10.0.0.5".parse().unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
+        headers.insert("forwarded", "for=198.51.100.9".parse().unwrap());
+
+        assert_eq!(proxy.verified_client_ip(peer, &headers), peer);
+    }
+
+    #[test]
+    fn trusted_rfc_forwarded_chain_supports_quoted_ipv6_and_ports() {
+        let proxy = PingclairProxy::with_trusted_proxies(&[
+            "10.0.0.0/8".to_string(),
+            "2001:db8:ffff::/48".to_string(),
+        ]);
+        let peer = "10.0.0.5".parse().unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "forwarded",
+            "for=\"[2001:db8::7]:4567\";proto=https, for=\"[2001:db8:ffff::1]\""
+                .parse()
+                .unwrap(),
+        );
+
+        assert_eq!(
+            proxy.verified_client_ip(peer, &headers),
+            "2001:db8::7".parse::<IpAddr>().unwrap()
+        );
     }
 
     // ---- CF-Connecting-IP (Cloudflare Tunnel deployments) ----

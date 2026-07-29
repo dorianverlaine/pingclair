@@ -180,11 +180,16 @@ Pingclair 會在 `PINGCLAIR_TLS_STORE`（預設
 ```caddyfile
 {
     trusted_proxies 10.0.0.0/8 2001:db8::/32
+    proxy_protocol on
 }
 ```
 
 存取控制、rate limit、IP-hash 負載平衡、上游轉送、placeholder 與 access log
 會共用同一個已驗證 client IP。目前變更 `trusted_proxies` 後需要重新啟動。
+`proxy_protocol on` 會要求每條 TCP 連線帶有 PROXY v1 或 v2，並在 TLS／HTTP
+解析前拒絕不在 `trusted_proxies` 的 transport peer。XFF 與 RFC 7239
+`Forwarded` chain 都有上限；畸形或彼此衝突的身分會 fail closed。PROXY
+protocol 不適用於 UDP HTTP/3 listener。
 
 ### 資源上限與 timeout
 

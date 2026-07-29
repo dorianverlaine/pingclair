@@ -496,7 +496,7 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
 - **範圍外**：Redis distributed limit 不列入 v0.2。
 - **完成判定**：burst 行為與 header 數值正確，不是估算。
 
-### 🔨 Day 14 — PROXY protocol 與 RFC 7239
+### 🔨 Day 14 — PROXY protocol 與 RFC 7239 🧪
 
 `trusted_proxies` 與受限 XFF 解析已完成（見 STATUS）。剩下：
 

@@ -83,6 +83,9 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
     }
 
     config.global.trusted_proxies = global.trusted_proxies.clone();
+    if let Some(enabled) = global.proxy_protocol {
+        config.global.proxy_protocol = enabled;
+    }
 
     if let Some(secs) = global.dns_refresh_secs {
         config.global.dns_refresh_secs = secs;
@@ -264,6 +267,19 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
 
 /// 🛡️ Rejects TLS combinations that cannot have deterministic runtime behavior.
 pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
+    for rule in &config.global.trusted_proxies {
+        if rule.parse::<ipnet::IpNet>().is_err() && rule.parse::<std::net::IpAddr>().is_err() {
+            return Err(CompileError::InvalidServer {
+                message: format!("trusted_proxies contains invalid IP or CIDR `{rule}`"),
+            });
+        }
+    }
+    if config.global.proxy_protocol && config.global.trusted_proxies.is_empty() {
+        return Err(CompileError::InvalidServer {
+            message: "proxy_protocol requires at least one trusted_proxies rule".to_string(),
+        });
+    }
+
     for server in &config.servers {
         let limits = &server.limits;
         let positive_durations = [
@@ -1332,6 +1348,19 @@ mod tests {
         .unwrap();
 
         assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn json_proxy_protocol_validation_cannot_bypass_the_adapter() {
+        let mut config = PingclairConfig::default();
+        config.global.proxy_protocol = true;
+        assert!(validate_config(&config).is_err());
+
+        config.global.trusted_proxies = vec!["not-a-network".to_string()];
+        assert!(validate_config(&config).is_err());
+
+        config.global.trusted_proxies = vec!["127.0.0.1/32".to_string()];
+        assert!(validate_config(&config).is_ok());
     }
 
     #[test]
