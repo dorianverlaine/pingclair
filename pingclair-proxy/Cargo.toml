@@ -36,6 +36,7 @@ futures = "0.3"
 
 # HTTP/3 (QUIC) — quiche + BoringSSL
 quiche.workspace = true
+tokio-quiche.workspace = true
 boring.workspace = true
 thiserror.workspace = true
 
