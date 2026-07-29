@@ -736,11 +736,10 @@ mod tests {
     fn test_compile_trusted_proxies() {
         let source = r#"{
             trusted_proxies 127.0.0.1 10.0.0.0/8 2001:db8::/32
-            proxy_protocol on
         }
 
         example.com {
-            listen :80
+            listen :80 proxy_protocol
             respond "OK"
         }"#;
 
@@ -749,7 +748,95 @@ mod tests {
             config.global.trusted_proxies,
             ["127.0.0.1", "10.0.0.0/8", "2001:db8::/32"]
         );
-        assert!(config.global.proxy_protocol);
+        assert_eq!(config.servers[0].proxy_protocol_listen, ["0.0.0.0:80"]);
+    }
+
+    #[test]
+    fn proxy_protocol_is_declared_per_listener_not_globally() {
+        // Setup scenarios
+        //
+        // nginx spells this `listen 443 proxy_protocol`. It has to be
+        // per-listener: a deployment commonly has one port behind an L4
+        // balancer and another reached directly, and a single switch would
+        // make the direct one reject every connection.
+        let config = compile(
+            r#"{
+                trusted_proxies 10.0.0.0/8
+            }
+
+            example.com {
+                listen :80
+                listen :8443 proxy_protocol
+                respond "OK"
+            }"#,
+        )
+        .expect("per-listener proxy_protocol compiles");
+
+        // Verification
+        let server = &config.servers[0];
+        assert!(server.listen.contains(&"0.0.0.0:80".to_string()));
+        assert!(server.listen.contains(&"0.0.0.0:8443".to_string()));
+        assert_eq!(
+            server.proxy_protocol_listen,
+            ["0.0.0.0:8443"],
+            "only the declared listener may require the header"
+        );
+    }
+
+    #[test]
+    fn proxy_protocol_survives_a_json_round_trip() {
+        // Setup scenarios
+        let compiled = compile(
+            r#"{
+                trusted_proxies 10.0.0.0/8
+            }
+
+            example.com {
+                listen :8443 proxy_protocol
+                respond "OK"
+            }"#,
+        )
+        .expect("compiles");
+
+        // Verification
+        let encoded = serde_json::to_string(&compiled).expect("serialises");
+        let decoded: PingclairConfig = serde_json::from_str(&encoded).expect("round-trips");
+        assert_eq!(
+            decoded.servers[0].proxy_protocol_listen,
+            compiled.servers[0].proxy_protocol_listen
+        );
+        assert_eq!(decoded.servers[0].listen, compiled.servers[0].listen);
+        compiler::validate_config(&decoded).expect("round-tripped document still validates");
+
+        // A document written before this field existed loads as "no listener
+        // requires the header" rather than failing.
+        let legacy: PingclairConfig = serde_json::from_value(serde_json::json!({
+            "servers": [{ "listen": ["0.0.0.0:8443"], "routes": [] }]
+        }))
+        .expect("legacy document loads");
+        assert!(legacy.servers[0].proxy_protocol_listen.is_empty());
+        compiler::validate_config(&legacy).expect("legacy document validates");
+    }
+
+    #[test]
+    fn misdeclared_proxy_protocol_listeners_fail_closed() {
+        for source in [
+            // An unknown listener flag is a typo, not something to drop.
+            r#"{ trusted_proxies 10.0.0.0/8 }
+               a.example { listen :8443 proxy_protocolo
+                           respond "OK" }"#,
+            // Requiring the header with nothing trusted rejects every peer.
+            r#"a.example { listen :8443 proxy_protocol
+                           respond "OK" }"#,
+            // One socket cannot both require and not require the header.
+            r#"{ trusted_proxies 10.0.0.0/8 }
+               a.example { listen :8443 proxy_protocol
+                           respond "OK" }
+               b.example { listen :8443
+                           respond "OK" }"#,
+        ] {
+            assert!(compile(source).is_err(), "{source} must fail");
+        }
     }
 
     #[test]
@@ -767,11 +854,10 @@ mod tests {
 
     #[test]
     fn test_proxy_protocol_requires_a_trusted_transport_network() {
-        let source = r#"{
-            proxy_protocol on
-        }
-
-        example.com {
+        // A listener that demands the header with nothing trusted would reject
+        // every peer, so the configuration is refused rather than started.
+        let source = r#"example.com {
+            listen :8443 proxy_protocol
             respond "OK"
         }"#;
 

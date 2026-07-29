@@ -157,6 +157,14 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
   只寫在 `adapter/caddyfile.rs` 的檢查等於留了一條繞道。矛盾或半套的設定
   （`insecure_skip_verify` ＋ pinned CA、只有 cert 沒有 key）兩條路都要拒。
   2026-07-29 Day 11 上游 TLS 依此同時補了 `compiler::validate_config`。
+- **listener 層級的開關不要做成全域**。PROXY protocol 一度是 `global.proxy_protocol`，
+  開了之後每個 listener 都要求 header，直連的那個就全掛。nginx 是
+  `listen 443 proxy_protocol;`、Caddy 是 per-server listener wrapper，兩者都不是
+  全域，因為真實部署常常一個 port 在 L4 LB 後面、另一個直連。
+  順帶一提，`listen` 以前會**靜默丟棄多餘參數**，所以 `listen :443 proxy_protocol`
+  會產生一個「名字寫了但其實不要求」的 listener——跟 `encode gzipp` 同一類。
+  2026-07-30 在凍結 RC 前改掉:**已知是錯的設定介面不要拿去做遠端驗證**，
+  發布之後就改不動了。
 - **在 Pingora listener 前面再加一層自己的 ingress，會讓 Pingora 那層的
   admission control 失去意義**。Day 14 的 PROXY protocol 把 Pingora app 搬到
   私有 loopback listener，前面自建 ingress；`limits { max_connections }` 由

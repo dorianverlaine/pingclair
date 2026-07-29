@@ -208,19 +208,6 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                         global.trusted_proxies.push(rule);
                     }
                 }
-                "proxy_protocol" => {
-                    let value = expect_one_argument(&sub)?;
-                    global.proxy_protocol = Some(match value {
-                        "on" => true,
-                        "off" => false,
-                        _ => {
-                            return Err(AdapterError::InvalidArgument(
-                                "proxy_protocol".into(),
-                                value.to_string(),
-                            ));
-                        }
-                    });
-                }
                 "dns_refresh" => {
                     let Some(value) = sub.args.first() else {
                         return Err(AdapterError::ArgumentCount("dns_refresh".into(), 1, 0));
@@ -340,6 +327,22 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                         return Err(AdapterError::ArgumentCount("listen".into(), 1, 0));
                     }
                     let addr = &sub_d.args[0];
+                    // 🚩 Trailing flags are rejected rather than dropped. This
+                    // loop previously read `args[0]` only, so `listen :443
+                    // proxy_protocol` produced a listener that quietly did not
+                    // require the header it named.
+                    let mut proxy_protocol = false;
+                    for flag in &sub_d.args[1..] {
+                        match flag.as_str() {
+                            "proxy_protocol" => proxy_protocol = true,
+                            other => {
+                                return Err(AdapterError::InvalidArgument(
+                                    "listen".into(),
+                                    format!("unknown listener flag `{other}`"),
+                                ));
+                            }
+                        }
+                    }
                     server.listens.push(ListenAddr {
                         scheme: if addr.starts_with("https") {
                             Scheme::Https
@@ -348,6 +351,7 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                         },
                         host: "0.0.0.0".to_string(),
                         port: addr.split(':').next_back().and_then(|p| p.parse().ok()),
+                        proxy_protocol,
                     });
                 }
                 "compress" | "encode" => {
@@ -593,6 +597,8 @@ fn parse_server_address(addr: &str) -> Option<ParsedAddress> {
             scheme,
             host: bind_host,
             port,
+            // 🧭 A site address carries no listener flags; `listen` does.
+            proxy_protocol: false,
         },
     })
 }
