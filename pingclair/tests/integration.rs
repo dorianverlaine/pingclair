@@ -3760,3 +3760,96 @@ async fn test_proxy_protocol_is_required_per_listener_not_process_wide() {
         "a listener requiring PROXY protocol must not serve a header-less request"
     );
 }
+
+/// 🧹 Reports every header the origin received, so hop-by-hop handling can be
+/// asserted from the far side rather than inferred from our own code.
+async fn spawn_header_reporting_origin() -> (SocketAddr, tokio::sync::oneshot::Receiver<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = vec![0u8; 8192];
+        let read = stream.read(&mut buffer).await.unwrap_or(0);
+        let _ = tx.send(String::from_utf8_lossy(&buffer[..read]).to_string());
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await;
+    });
+    (address, rx)
+}
+
+#[tokio::test]
+async fn test_hop_by_hop_headers_do_not_reach_the_origin() {
+    // 🧹 RFC 9110 §7.6.1: a proxy removes the Connection field, every field it
+    // names, and the connection-specific fields. §11.7.1 adds that
+    // Proxy-Authorization is consumed by the first inbound proxy — forwarding it
+    // hands the origin a credential that was addressed to us.
+    //
+    // `Trailer` is deliberately absent: this proxy already answers 501 to a
+    // declared request trailer, because Pingora discards H1 trailers and
+    // silently dropping them would be worse. That behaviour has its own test.
+    let (origin, origin_headers) = spawn_header_reporting_origin().await;
+    let config = serde_json::json!({
+        "global": { "http3": false },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "routes": [{
+                "path": "/*",
+                "handler": {
+                    "type": "reverse_proxy",
+                    "upstreams": [format!("http://{origin}")],
+                    "load_balance": { "strategy": "round_robin" },
+                    "headers_up": {},
+                    "headers_down": {}
+                }
+            }]
+        }]
+    })
+    .to_string();
+
+    let mut server = TestServer::new(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/"))
+        .header("Proxy-Authorization", "Basic c2VjcmV0OmNyZWRlbnRpYWw=")
+        .header("Proxy-Connection", "keep-alive")
+        .header("Keep-Alive", "timeout=5")
+        .header("TE", "trailers")
+        .header("X-Sacrificial", "should-be-dropped")
+        // A client naming its own fields in Connection: a compliant proxy must
+        // drop those fields, and must not let the instruction reach the origin.
+        .header("Connection", "X-Sacrificial")
+        .send()
+        .await
+        .expect("the proxy must answer");
+    assert_eq!(response.status(), 200);
+
+    let seen = origin_headers.await.expect("origin observed the request");
+    let lower = seen.to_ascii_lowercase();
+    std::fs::write("/tmp/pingclair_hop_by_hop_seen.txt", &seen).ok();
+
+    for forbidden in [
+        "proxy-authorization:",
+        "proxy-connection:",
+        "keep-alive:",
+        "\r\nte:",
+        "connection:",
+        // Named in Connection, so it is connection-scoped and must not survive.
+        "x-sacrificial:",
+    ] {
+        assert!(
+            !lower.contains(forbidden),
+            "`{forbidden}` reached the origin; hop-by-hop headers must stop at this proxy.\n\
+             origin saw:\n{seen}"
+        );
+    }
+
+    // End-to-end headers must still arrive, or the strip is too broad.
+    assert!(
+        lower.contains("x-forwarded-for:"),
+        "the proxy's own forwarded identity must still reach the origin:\n{seen}"
+    );
+}
