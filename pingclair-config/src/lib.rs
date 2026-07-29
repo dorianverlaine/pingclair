@@ -378,6 +378,174 @@ mod tests {
     }
 
     #[test]
+    fn upstream_tls_compiles_from_the_dsl_into_the_route_handler() {
+        // Setup scenarios
+        let source = r#"
+            :8080 {
+                reverse_proxy https://backend.internal:8443 {
+                    transport http {
+                        tls_server_name origin.internal
+                        tls_trusted_ca_certs /etc/pingclair/internal-ca.pem
+                        tls_client_auth /etc/pingclair/client.crt /etc/pingclair/client.key
+                    }
+                }
+            }
+        "#;
+
+        // Verification
+        let config = compile(source).expect("upstream tls compiles");
+        let HandlerConfig::ReverseProxy(proxy) = &config.servers[0].routes[0].handler else {
+            panic!("expected reverse proxy");
+        };
+        assert_eq!(
+            proxy.upstream_tls.server_name.as_deref(),
+            Some("origin.internal")
+        );
+        assert_eq!(
+            proxy.upstream_tls.trusted_ca_certs,
+            vec!["/etc/pingclair/internal-ca.pem"]
+        );
+        assert_eq!(
+            proxy.upstream_tls.client_identity().expect("complete pair"),
+            Some(("/etc/pingclair/client.crt", "/etc/pingclair/client.key"))
+        );
+        assert!(!proxy.upstream_tls.insecure_skip_verify);
+    }
+
+    #[test]
+    fn a_route_without_a_tls_block_carries_the_verifying_default() {
+        // Setup scenarios
+        let config = compile(":8080 { reverse_proxy https://backend:8443 }").expect("compiles");
+
+        // Verification
+        let HandlerConfig::ReverseProxy(proxy) = &config.servers[0].routes[0].handler else {
+            panic!("expected reverse proxy");
+        };
+        assert!(
+            !proxy.upstream_tls.is_customized(),
+            "an untouched route must not carry any TLS customisation"
+        );
+        assert!(
+            !proxy.upstream_tls.insecure_skip_verify,
+            "verification must never be off by default"
+        );
+    }
+
+    #[test]
+    fn contradictory_upstream_tls_fails_closed_in_the_dsl() {
+        for source in [
+            ":8080 { reverse_proxy https://b:8443 { transport http { tls_client_auth /a.crt } } }",
+            ":8080 { reverse_proxy https://b:8443 { transport http { tls_client_auth /a.crt /a.key /extra } } }",
+            ":8080 { reverse_proxy https://b:8443 { transport http { tls_trusted_ca_certs } } }",
+            ":8080 { reverse_proxy https://b:8443 { transport http { tls_server_name } } }",
+            ":8080 { reverse_proxy https://b:8443 { transport http { tls_server_name a b } } }",
+            ":8080 { reverse_proxy https://b:8443 { transport http { tls_insecure_skip_verify yes } } }",
+            ":8080 { reverse_proxy https://b:8443 { transport http { tls_trusted_ca_certs /ca.pem\n tls_insecure_skip_verify } } }",
+            ":8080 { reverse_proxy https://b:8443 { transport http { tls_server_name x\n tls_insecure_skip_verify } } }",
+            ":8080 { reverse_proxy https://b:8443 { transport http { tls_insecure_skip_verifyy } } }",
+        ] {
+            assert!(compile(source).is_err(), "{source} must fail");
+        }
+    }
+
+    #[test]
+    fn contradictory_upstream_tls_also_fails_closed_over_json() {
+        // Setup scenarios
+        //
+        // The Admin API posts a configuration document straight into the core
+        // types, so every rule the Pingclairfile adapter enforces has to be
+        // enforced here too or it can simply be routed around.
+        let base = serde_json::json!({
+            "servers": [{
+                "listen": ["127.0.0.1:8080"],
+                "routes": [{
+                    "path": "/*",
+                    "handler": {
+                        "type": "reverse_proxy",
+                        "upstreams": ["https://127.0.0.1:9000"]
+                    }
+                }]
+            }]
+        });
+
+        // Verification
+        for upstream_tls in [
+            serde_json::json!({ "client_cert": "/a.crt" }),
+            serde_json::json!({ "client_key": "/a.key" }),
+            serde_json::json!({
+                "insecure_skip_verify": true,
+                "trusted_ca_certs": ["/ca.pem"]
+            }),
+            serde_json::json!({
+                "insecure_skip_verify": true,
+                "server_name": "origin.internal"
+            }),
+            serde_json::json!({ "trusted_ca_certs": ["  "] }),
+        ] {
+            let mut document = base.clone();
+            document["servers"][0]["routes"][0]["handler"]["upstream_tls"] = upstream_tls.clone();
+            let parsed: PingclairConfig =
+                serde_json::from_value(document).expect("document parses");
+            assert!(
+                compiler::validate_config(&parsed).is_err(),
+                "{upstream_tls} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_tls_survives_a_json_round_trip_and_legacy_documents_still_load() {
+        // Setup scenarios
+        let compiled = compile(
+            r#"
+            :8080 {
+                reverse_proxy https://backend:8443 {
+                    transport http {
+                        tls
+                        tls_server_name origin.internal
+                        tls_trusted_ca_certs /ca.pem
+                    }
+                }
+            }
+        "#,
+        )
+        .expect("compiles");
+
+        // Verification
+        let encoded = serde_json::to_string(&compiled).expect("serialises");
+        let decoded: PingclairConfig = serde_json::from_str(&encoded).expect("round-trips");
+        let (HandlerConfig::ReverseProxy(before), HandlerConfig::ReverseProxy(after)) = (
+            &compiled.servers[0].routes[0].handler,
+            &decoded.servers[0].routes[0].handler,
+        ) else {
+            panic!("expected reverse proxy on both sides");
+        };
+        assert_eq!(before.upstream_tls, after.upstream_tls);
+        assert!(after.upstream_tls.enable);
+
+        // A 0.1.7 document has no `upstream_tls` key at all and must still load
+        // into the verifying default rather than being rejected.
+        let legacy: PingclairConfig = serde_json::from_value(serde_json::json!({
+            "servers": [{
+                "listen": ["127.0.0.1:8080"],
+                "routes": [{
+                    "path": "/*",
+                    "handler": { "type": "reverse_proxy", "upstreams": ["127.0.0.1:9000"] }
+                }]
+            }]
+        }))
+        .expect("legacy document loads");
+        compiler::validate_config(&legacy).expect("legacy document validates");
+        let HandlerConfig::ReverseProxy(proxy) = &legacy.servers[0].routes[0].handler else {
+            panic!("expected reverse proxy");
+        };
+        assert_eq!(
+            *proxy.upstream_tls,
+            pingclair_core::config::UpstreamTlsConfig::default()
+        );
+    }
+
+    #[test]
     fn test_compile_tls_cert_key() {
         let source = r#"
             example.com {

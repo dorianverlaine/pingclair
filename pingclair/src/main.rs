@@ -337,6 +337,7 @@ fn main() -> anyhow::Result<()> {
                 retry: Default::default(),
                 overload: Default::default(),
                 circuit_breaker: Default::default(),
+                upstream_tls: Default::default(),
             });
 
             server.routes.push(RouteConfig {

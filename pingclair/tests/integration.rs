@@ -3004,3 +3004,220 @@ async fn test_websocket_upgrade_tunnels_bytes_in_both_directions() {
     );
     upstream_task.await.unwrap();
 }
+
+/// 🔐 Serves one TLS request from a self-signed origin and returns its address.
+///
+/// The origin is deliberately self-signed and names only `origin.test`: it is
+/// trusted by nothing the proxy already knows, so any successful proxy request
+/// against it proves the route's configured trust was the reason.
+async fn spawn_self_signed_tls_origin(
+    certificate_pem: &str,
+    key_pem: &str,
+    responses: usize,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use pingora_core::tls::ssl::{SslContext, SslFiletype, SslMethod};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // 🔑 BoringSSL's acceptor builder loads from paths, so the PEMs are staged
+    // in a directory the task owns for its whole life.
+    let staging = tempfile::tempdir().expect("tls staging dir");
+    let certificate_path = staging.path().join("origin.crt");
+    let key_path = staging.path().join("origin.key");
+    std::fs::write(&certificate_path, certificate_pem).expect("write origin certificate");
+    std::fs::write(&key_path, key_pem).expect("write origin key");
+
+    let mut builder = SslContext::builder(SslMethod::tls()).expect("tls context builder");
+    builder
+        .set_certificate_chain_file(&certificate_path)
+        .expect("load origin certificate");
+    builder
+        .set_private_key_file(&key_path, SslFiletype::PEM)
+        .expect("load origin key");
+    let context = builder.build();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind tls origin");
+    let address = listener.local_addr().expect("origin address");
+
+    let task = tokio::spawn(async move {
+        // 🗂️ Moved in so the staged PEMs outlive every handshake.
+        let _staging = staging;
+        for _ in 0..responses {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let context = context.clone();
+            tokio::spawn(async move {
+                let ssl = pingora_core::tls::ssl::Ssl::new(&context).expect("ssl session");
+                let Ok(mut tls) = pingora_core::tls::tokio_ssl::SslStream::new(ssl, stream) else {
+                    return;
+                };
+                if std::pin::Pin::new(&mut tls).accept().await.is_err() {
+                    // 🔒 A refused handshake is the expected outcome of the
+                    // untrusted case; the client side asserts on it.
+                    return;
+                }
+                let mut request = vec![0u8; 8192];
+                let Ok(read) = tls.read(&mut request).await else {
+                    return;
+                };
+                if read == 0 {
+                    return;
+                }
+                let _ = tls
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nsecure-origin",
+                    )
+                    .await;
+                let _ = tls.flush().await;
+            });
+        }
+    });
+
+    (address, task)
+}
+
+/// 🔐 Builds a one-route reverse proxy at `https://` with an explicit TLS block.
+fn tls_upstream_config(origin: SocketAddr, upstream_tls: serde_json::Value) -> String {
+    serde_json::json!({
+        "global": { "http3": false },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "routes": [{
+                "path": "/*",
+                "handler": {
+                    "type": "reverse_proxy",
+                    "upstreams": [format!("https://{origin}")],
+                    "load_balance": { "strategy": "round_robin" },
+                    "headers_up": {},
+                    "headers_down": {},
+                    "upstream_tls": upstream_tls
+                }
+            }]
+        }]
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn test_upstream_tls_verifies_by_default_and_honours_configured_trust() {
+    // 🎫 One self-signed origin named `origin.test`, reachable only at an IP.
+    let mut params = rcgen::CertificateParams::new(vec!["origin.test".to_string()])
+        .expect("certificate parameters");
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "origin.test");
+    let key = rcgen::KeyPair::generate().expect("key pair");
+    let certificate = params.self_signed(&key).expect("self-signed origin");
+    let certificate_pem = certificate.pem();
+    let key_pem = key.serialize_pem();
+
+    let trust_store = tempfile::tempdir().expect("trust store dir");
+    let trust_path = trust_store.path().join("origin-ca.pem");
+    std::fs::write(&trust_path, &certificate_pem).expect("publish trust root");
+    let trust_path = trust_path.to_string_lossy().to_string();
+
+    // 🚫 Default configuration: nothing tells the proxy to trust this origin.
+    {
+        let (origin, origin_task) =
+            spawn_self_signed_tls_origin(&certificate_pem, &key_pem, 1).await;
+        let config = tls_upstream_config(origin, serde_json::json!({}));
+        let mut server = TestServer::new(&config);
+        assert!(server.wait_until_ready().await, "server failed to start");
+
+        let response = no_proxy_client()
+            .get(server.url(0, "/"))
+            .send()
+            .await
+            .expect("the proxy must answer, not hang");
+        assert!(
+            response.status().is_server_error(),
+            "an untrusted self-signed origin must not be proxied, got {}",
+            response.status()
+        );
+        assert_ne!(
+            response.text().await.unwrap(),
+            "secure-origin",
+            "the origin's body must never reach the client through an unverified handshake"
+        );
+        origin_task.abort();
+    }
+
+    // ✅ The same origin, with its certificate pinned as this route's trust root.
+    {
+        let (origin, origin_task) =
+            spawn_self_signed_tls_origin(&certificate_pem, &key_pem, 1).await;
+        let config = tls_upstream_config(
+            origin,
+            serde_json::json!({
+                "server_name": "origin.test",
+                "trusted_ca_certs": [trust_path.clone()]
+            }),
+        );
+        let mut server = TestServer::new(&config);
+        assert!(server.wait_until_ready().await, "server failed to start");
+
+        let response = no_proxy_client()
+            .get(server.url(0, "/"))
+            .send()
+            .await
+            .expect("the proxy must answer");
+        assert_eq!(
+            response.status(),
+            200,
+            "pinning the origin's own certificate must make it verifiable"
+        );
+        assert_eq!(response.text().await.unwrap(), "secure-origin");
+        origin_task.abort();
+    }
+
+    // ⚠️ The documented escape hatch, which also proves the failure above was
+    // verification and not a broken origin.
+    {
+        let (origin, origin_task) =
+            spawn_self_signed_tls_origin(&certificate_pem, &key_pem, 1).await;
+        let config =
+            tls_upstream_config(origin, serde_json::json!({ "insecure_skip_verify": true }));
+        let mut server = TestServer::new(&config);
+        assert!(server.wait_until_ready().await, "server failed to start");
+
+        let response = no_proxy_client()
+            .get(server.url(0, "/"))
+            .send()
+            .await
+            .expect("the proxy must answer");
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), "secure-origin");
+        origin_task.abort();
+    }
+}
+
+#[tokio::test]
+async fn test_upstream_tls_material_that_fails_to_load_refuses_the_route() {
+    // 🚫 A route pinned to a CA file that does not exist must refuse rather
+    // than quietly connecting with system trust and no pinning at all.
+    let origin: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let config = tls_upstream_config(
+        origin,
+        serde_json::json!({ "trusted_ca_certs": ["/nonexistent/pingclair-day11-ca.pem"] }),
+    );
+
+    let mut server = TestServer::new(&config);
+    assert!(
+        server.wait_until_ready().await,
+        "one broken route must not stop the server from starting"
+    );
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/"))
+        .send()
+        .await
+        .expect("the proxy must answer rather than hang");
+    assert_eq!(
+        response.status(),
+        500,
+        "a route whose trust material is missing must fail closed"
+    );
+}

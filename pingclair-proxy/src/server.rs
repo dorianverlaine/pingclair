@@ -177,6 +177,34 @@ impl BandwidthPacer {
 /// 🧱 Maximum accepted hops in an inbound `X-Forwarded-For` chain.
 const MAX_FORWARDED_HOPS: usize = 32;
 
+/// 🧩 Bits of [`HttpPeer::group_key`] reserved for the upstream protocol.
+///
+/// A peer's group key isolates connection reuse. Pingclair packs two
+/// independent reasons to isolate into it: the negotiated protocol in the low
+/// bits, and the TLS trust identity above them. Keeping the protocol in a
+/// fixed field means [`peer_protocol_group`] can still recover it after the
+/// TLS half is mixed in.
+const PROTOCOL_GROUP_BITS: u32 = 8;
+
+/// 🌐 Cleartext HTTP/1.1.
+const PROTOCOL_GROUP_HTTP: u64 = 1;
+/// 🔒 TLS with HTTP/1.1 or HTTP/2 by ALPN.
+const PROTOCOL_GROUP_HTTPS: u64 = 2;
+/// 🔓 Cleartext HTTP/2 with prior knowledge.
+const PROTOCOL_GROUP_H2C: u64 = 3;
+/// 🔐 TLS that must negotiate HTTP/2.
+const PROTOCOL_GROUP_H2: u64 = 4;
+
+/// 🧩 Recovers the protocol a peer was built for from its packed group key.
+pub(crate) fn peer_protocol_group(peer: &HttpPeer) -> u64 {
+    peer.group_key & ((1 << PROTOCOL_GROUP_BITS) - 1)
+}
+
+/// 🔐 Reports whether this peer must negotiate `h2` or be rejected.
+pub(crate) fn peer_requires_h2_alpn(peer: &HttpPeer) -> bool {
+    peer_protocol_group(peer) == PROTOCOL_GROUP_H2
+}
+
 /// 🚫 Distinguishes an empty load-balancer pool from policy rejection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UpstreamSelectionError {
@@ -452,6 +480,8 @@ pub struct ProxyState {
     pub rate_limiters: Vec<Option<Arc<crate::rate_limit::RateLimiter>>>,
     /// 🚦 Admission and circuit state per reverse-proxy route.
     pub(crate) route_protections: Vec<Option<Arc<RouteProtection>>>,
+    /// 🔐 Compiled upstream TLS trust and identity per reverse-proxy route.
+    pub(crate) upstream_tls: Vec<RouteUpstreamTls>,
     /// Pre-compiled per-route access policies.
     access_controls: Vec<Option<Arc<RouteAccessControl>>>,
     /// Pre-compiled regular expressions used by route rewrite handlers.
@@ -459,6 +489,65 @@ pub struct ProxyState {
     /// 📝 Per-server access logger built from this server's `log` block.
     /// `None` keeps the previous process-wide `tracing` output.
     access_logger: Option<Arc<crate::access_log::AccessLogger>>,
+}
+
+/// 🔐 A route's upstream TLS posture, resolved once per configuration load.
+#[derive(Clone)]
+pub(crate) enum RouteUpstreamTls {
+    /// 🌐 No `transport http` TLS directives: Pingora's system-trust default
+    /// applies, which already verifies the chain and the hostname.
+    Default,
+    /// 🎫 Trust roots, client identity, or an SNI override are in force.
+    Compiled(Arc<crate::upstream_tls::UpstreamTls>),
+    /// 🚫 The route asked for TLS material that could not be loaded.
+    ///
+    /// This deliberately has no fallback. A route configured to pin a private
+    /// CA or present a client certificate, whose material is missing, must not
+    /// quietly connect using system trust and no identity — that is precisely
+    /// the connection the operator wrote the block to forbid.
+    Broken,
+}
+
+/// 🔐 Compiles one route's upstream TLS block, logging what an operator needs.
+///
+/// Certificate problems are reported here, at load time, with the offending
+/// path — not at the first request, where a handshake alert looks like every
+/// other upstream failure. A failure marks the route [`RouteUpstreamTls::Broken`]
+/// rather than aborting the process: one misconfigured route should not take
+/// down the server's other routes, but it must not serve either.
+fn compile_route_upstream_tls(
+    route_path: &str,
+    config: &pingclair_core::config::UpstreamTlsConfig,
+) -> RouteUpstreamTls {
+    match crate::upstream_tls::UpstreamTls::compile(config) {
+        Ok(None) => RouteUpstreamTls::Default,
+        Ok(Some(policy)) => {
+            if !policy.verifies() {
+                // ⚠️ Logged at every load, not once: an operator who inherits
+                // this configuration must see it without reading the file.
+                tracing::warn!(
+                    route = route_path,
+                    "⚠️ Upstream certificate verification is DISABLED for this route; \
+                     anything answering on the upstream address will be trusted"
+                );
+            }
+            tracing::info!(
+                route = route_path,
+                policy = %policy.summary(),
+                "🔐 Upstream TLS policy loaded"
+            );
+            RouteUpstreamTls::Compiled(policy)
+        }
+        Err(error) => {
+            tracing::error!(
+                route = route_path,
+                %error,
+                "🚫 Upstream TLS material failed to load; this route will refuse requests \
+                 instead of connecting without the trust it was configured to require"
+            );
+            RouteUpstreamTls::Broken
+        }
+    }
 }
 
 /// Pre-compiled request access rules. Parsing and regex compilation happen
@@ -680,6 +769,7 @@ impl ProxyState {
         let mut file_servers = Vec::new();
         let mut rate_limiters = Vec::new();
         let mut route_protections = Vec::new();
+        let mut upstream_tls = Vec::new();
         let mut access_controls = Vec::new();
         let mut rewrite_regexes = Vec::new();
 
@@ -770,9 +860,15 @@ impl ProxyState {
                         proxy_config.upstreams.clone(),
                     ))
                 })));
+
+                upstream_tls.push(compile_route_upstream_tls(
+                    &route.path,
+                    &proxy_config.upstream_tls,
+                ));
             } else {
                 load_balancers.push(None);
                 route_protections.push(None);
+                upstream_tls.push(RouteUpstreamTls::Default);
             }
 
             // Health checker is stored inside the LB object; this slot is a
@@ -847,9 +943,28 @@ impl ProxyState {
             file_servers,
             rate_limiters,
             route_protections,
+            upstream_tls,
             access_controls,
             rewrite_regexes,
             access_logger,
+        }
+    }
+
+    /// 🔐 Returns the compiled TLS policy for a route, or `None` for the default.
+    ///
+    /// `Err(())` means the route's TLS material failed to load and the request
+    /// must be refused rather than downgraded.
+    pub(crate) fn upstream_tls_for(
+        &self,
+        route_index: usize,
+    ) -> Result<Option<&Arc<crate::upstream_tls::UpstreamTls>>, ()> {
+        match self.upstream_tls.get(route_index) {
+            Some(RouteUpstreamTls::Compiled(policy)) => Ok(Some(policy)),
+            Some(RouteUpstreamTls::Broken) => Err(()),
+            // 🧩 A missing slot can only mean an index-alignment bug; treating
+            // it as the default keeps behaviour identical to before this field
+            // existed rather than inventing a new failure mode.
+            Some(RouteUpstreamTls::Default) | None => Ok(None),
         }
     }
 
@@ -1362,6 +1477,7 @@ impl PingclairProxy {
         config: Option<&ReverseProxyConfig>,
         request_budget: Option<Duration>,
         read_budget: Option<Duration>,
+        tls_policy: Option<&Arc<crate::upstream_tls::UpstreamTls>>,
     ) -> HttpPeer {
         let addr = upstream.addr.clone();
         let scheme = upstream.ext.get::<Scheme>().unwrap_or(&Scheme::Http);
@@ -1378,12 +1494,22 @@ impl PingclairProxy {
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or("unix_socket".to_string()),
             });
-        let (tls, max_http_version, min_http_version, protocol_group) = match scheme {
-            Scheme::Http => (false, 1, 1, 1),
-            Scheme::Https => (true, 2, 1, 2),
-            Scheme::H2c => (false, 2, 2, 3),
-            Scheme::H2 => (true, 2, 2, 4),
+        let (mut tls, max_http_version, min_http_version, mut protocol_group) = match scheme {
+            Scheme::Http => (false, 1, 1, PROTOCOL_GROUP_HTTP),
+            Scheme::Https => (true, 2, 1, PROTOCOL_GROUP_HTTPS),
+            Scheme::H2c => (false, 2, 2, PROTOCOL_GROUP_H2C),
+            Scheme::H2 => (true, 2, 2, PROTOCOL_GROUP_H2),
         };
+        // 🔒 A bare `tls` directive upgrades a scheme-less upstream, matching
+        // Caddy. It adds encryption and nothing else — the offered ALPN stays
+        // HTTP/1.1. Quietly widening it to h2 would let the same directive
+        // change which protocol the upstream speaks, so `h2://`/`https://`
+        // remain the only ways to ask for that. `h2c://` is likewise left
+        // alone: prior-knowledge h2 has no TLS form to be upgraded into.
+        if !tls && matches!(scheme, Scheme::Http) && tls_policy.is_some_and(|p| p.forces_tls()) {
+            tls = true;
+            protocol_group = PROTOCOL_GROUP_HTTPS;
+        }
 
         let mut peer = HttpPeer::new(addr, tls, host);
         peer.options
@@ -1402,7 +1528,16 @@ impl PingclairProxy {
             }));
         }
         // 🧩 Prevents differently negotiated protocols from sharing a connection pool.
-        peer.group_key = protocol_group;
+        // 🔐 The TLS identity rides in the upper bits: Pingora hashes a peer's
+        // client certificate and verify flags when deciding on connection
+        // reuse, but never its CA bundle, so two routes with different trust
+        // roots would otherwise share a session verified under whichever
+        // roots happened to open it first.
+        peer.group_key = protocol_group
+            | (tls_policy.map_or(0, |policy| policy.pool_key()) << PROTOCOL_GROUP_BITS);
+        if let Some(policy) = tls_policy {
+            policy.apply(&mut peer);
+        }
 
         let legacy_read = config
             .and_then(|config| config.read_timeout)
@@ -2711,6 +2846,20 @@ impl ProxyHttp for PingclairProxy {
             );
         }
 
+        // 🔐 Checked before a backend is chosen: a route whose TLS material
+        // failed to load must not connect at all, so there is nothing to gain
+        // from selecting, admitting, and then dropping an upstream.
+        let Ok(tls_policy) = state.upstream_tls_for(route_index) else {
+            tracing::error!(
+                route = route_index,
+                "🚫 Refusing to dispatch: this route's upstream TLS material did not load"
+            );
+            return pingora_core::Error::e_explain(
+                pingora_core::ErrorType::HTTPStatus(500),
+                "upstream TLS configuration failed to load",
+            );
+        };
+
         let mut selected = self.select_admitted_upstream(
             &state,
             route_index,
@@ -2761,6 +2910,7 @@ impl ProxyHttp for PingclairProxy {
                 proxy_config.as_ref(),
                 attempt_budget,
                 read_budget,
+                tls_policy,
             );
             // ⌛ A configured retry total is a hard bound, even when phase timers are longer.
             peer.options.read_timeout = shortest_duration(peer.options.read_timeout, retry_budget);
@@ -2799,7 +2949,7 @@ impl ProxyHttp for PingclairProxy {
     where
         Self::CTX: Send + Sync,
     {
-        if peer.group_key != 4 {
+        if !peer_requires_h2_alpn(peer) {
             return Ok(());
         }
 
@@ -4335,7 +4485,7 @@ mod caddy_parity_tests {
             ("h2://127.0.0.1:8304", true, 2, 2, 4),
         ] {
             let upstream = create_upstream(address).unwrap();
-            let peer = PingclairProxy::build_http_peer(&upstream, None, None, None);
+            let peer = PingclairProxy::build_http_peer(&upstream, None, None, None, None);
 
             assert_eq!(peer.is_tls(), tls);
             assert_eq!(
@@ -4350,11 +4500,180 @@ mod caddy_parity_tests {
             );
             assert_eq!(peer.group_key, group_key);
             assert_eq!(
+                peer_protocol_group(&peer),
+                group_key,
+                "a peer without a TLS policy must leave the group key unpacked: {address}"
+            );
+            assert_eq!(
                 peer.options.upstream_tls_handshake_complete_hook.is_some(),
                 group_key == 4,
                 "{address}"
             );
         }
+    }
+
+    /// 🧪 Compiles a TLS policy from an in-memory configuration.
+    fn compile_tls(
+        config: pingclair_core::config::UpstreamTlsConfig,
+    ) -> Arc<crate::upstream_tls::UpstreamTls> {
+        crate::upstream_tls::UpstreamTls::compile(&config)
+            .expect("policy compiles")
+            .expect("policy is a customisation")
+    }
+
+    #[test]
+    fn a_tls_policy_reaches_the_peer_without_disturbing_the_protocol_group() {
+        // Setup scenarios
+        let policy = compile_tls(pingclair_core::config::UpstreamTlsConfig {
+            server_name: Some("internal.example".into()),
+            ..Default::default()
+        });
+        let upstream = create_upstream("https://10.0.0.7:8443").unwrap();
+
+        // Verification
+        let peer =
+            PingclairProxy::build_http_peer(&upstream, None, None, None, Some(&policy)).clone();
+        assert_eq!(peer.sni, "internal.example");
+        assert_eq!(
+            peer_protocol_group(&peer),
+            PROTOCOL_GROUP_HTTPS,
+            "packing the TLS identity must not change which protocol the peer speaks"
+        );
+        assert_ne!(
+            peer.group_key, PROTOCOL_GROUP_HTTPS,
+            "the TLS identity must actually be present in the group key"
+        );
+    }
+
+    #[test]
+    fn different_trust_domains_do_not_share_a_connection_pool() {
+        // Setup scenarios
+        // Two routes reaching the same address with the same SNI, differing
+        // only in the name they will accept. Pingora's own peer hash ignores
+        // the CA bundle, so without the packed group key these would reuse
+        // each other's connections.
+        let upstream = create_upstream("https://10.0.0.7:8443").unwrap();
+        let strict = compile_tls(pingclair_core::config::UpstreamTlsConfig {
+            server_name: Some("strict.internal".into()),
+            ..Default::default()
+        });
+        let other = compile_tls(pingclair_core::config::UpstreamTlsConfig {
+            server_name: Some("other.internal".into()),
+            ..Default::default()
+        });
+
+        // Verification
+        let left = PingclairProxy::build_http_peer(&upstream, None, None, None, Some(&strict));
+        let right = PingclairProxy::build_http_peer(&upstream, None, None, None, Some(&other));
+        assert_ne!(left.group_key, right.group_key);
+        assert_eq!(peer_protocol_group(&left), peer_protocol_group(&right));
+    }
+
+    #[test]
+    fn skipping_verification_reaches_both_peer_flags() {
+        // Setup scenarios
+        let policy = compile_tls(pingclair_core::config::UpstreamTlsConfig {
+            insecure_skip_verify: true,
+            ..Default::default()
+        });
+        let upstream = create_upstream("https://127.0.0.1:8443").unwrap();
+
+        // Verification
+        let peer = PingclairProxy::build_http_peer(&upstream, None, None, None, Some(&policy));
+        assert!(!peer.options.verify_cert);
+        assert!(!peer.options.verify_hostname);
+    }
+
+    #[test]
+    fn a_bare_tls_directive_adds_encryption_without_widening_alpn() {
+        // Setup scenarios
+        let policy = compile_tls(pingclair_core::config::UpstreamTlsConfig {
+            enable: true,
+            ..Default::default()
+        });
+        let plain = create_upstream("127.0.0.1:8443").unwrap();
+        let prior_knowledge_h2 = create_upstream("h2c://127.0.0.1:8443").unwrap();
+
+        // Verification
+        let upgraded = PingclairProxy::build_http_peer(&plain, None, None, None, Some(&policy));
+        assert!(
+            upgraded.is_tls(),
+            "`tls` must upgrade a scheme-less upstream"
+        );
+        assert_eq!(
+            upgraded.options.alpn.get_max_http_version(),
+            1,
+            "`tls` must not silently start offering h2 to an HTTP/1.1 upstream"
+        );
+        assert_eq!(peer_protocol_group(&upgraded), PROTOCOL_GROUP_HTTPS);
+
+        let untouched =
+            PingclairProxy::build_http_peer(&prior_knowledge_h2, None, None, None, Some(&policy));
+        assert!(
+            !untouched.is_tls(),
+            "prior-knowledge h2c has no TLS form to be upgraded into"
+        );
+    }
+
+    /// 🧪 Builds a one-route reverse-proxy server around a TLS block.
+    fn state_with_upstream_tls(tls: pingclair_core::config::UpstreamTlsConfig) -> ProxyState {
+        ProxyState::new(ServerConfig {
+            routes: vec![pingclair_core::config::RouteConfig {
+                path: "/*".into(),
+                handler: HandlerConfig::ReverseProxy(ReverseProxyConfig {
+                    upstreams: vec!["https://127.0.0.1:8443".into()],
+                    upstream_tls: Box::new(tls),
+                    ..Default::default()
+                }),
+                methods: None,
+                matcher: None,
+            }],
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn a_route_whose_trust_material_is_missing_refuses_instead_of_downgrading() {
+        // Setup scenarios
+        let state = state_with_upstream_tls(pingclair_core::config::UpstreamTlsConfig {
+            trusted_ca_certs: vec!["/nonexistent/pingclair-day11-ca.pem".into()],
+            ..Default::default()
+        });
+
+        // Verification
+        assert!(
+            state.upstream_tls_for(0).is_err(),
+            "a route that could not load its trust roots must not fall back to system trust"
+        );
+    }
+
+    #[test]
+    fn a_route_with_no_tls_block_keeps_the_shared_default() {
+        // Setup scenarios
+        let state = state_with_upstream_tls(pingclair_core::config::UpstreamTlsConfig::default());
+
+        // Verification
+        assert!(
+            matches!(state.upstream_tls_for(0), Ok(None)),
+            "an untouched route must not allocate per-route TLS state"
+        );
+    }
+
+    #[test]
+    fn a_route_that_asked_for_an_sni_override_compiles_it() {
+        // Setup scenarios
+        let state = state_with_upstream_tls(pingclair_core::config::UpstreamTlsConfig {
+            server_name: Some("origin.internal".into()),
+            ..Default::default()
+        });
+
+        // Verification
+        let policy = state
+            .upstream_tls_for(0)
+            .expect("policy loads")
+            .expect("policy is a customisation");
+        assert_eq!(policy.server_name(), Some("origin.internal"));
+        assert!(policy.verifies());
     }
 
     #[test]
@@ -4389,6 +4708,7 @@ mod caddy_parity_tests {
             Some(&config),
             Some(Duration::from_millis(50)),
             Some(Duration::from_millis(60)),
+            None,
         );
         assert_eq!(
             peer.options.connection_timeout,

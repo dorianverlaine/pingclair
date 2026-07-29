@@ -778,6 +778,10 @@ pub struct ReverseProxyConfig {
     /// 🔌 Per-upstream circuit-breaker policy.
     #[serde(default)]
     pub circuit_breaker: Box<CircuitBreakerConfig>,
+
+    /// 🔐 How this route authenticates and verifies its TLS upstreams.
+    #[serde(default)]
+    pub upstream_tls: Box<UpstreamTlsConfig>,
 }
 
 /// 🔁 Controls safe, request-local upstream redispatch.
@@ -916,6 +920,87 @@ fn default_breaker_open_duration_ms() -> u64 {
 
 fn default_breaker_half_open_requests() -> usize {
     1
+}
+
+/// 🔐 Describes how a reverse-proxy route speaks TLS to its upstreams.
+///
+/// Every field is inert unless the connection is actually TLS — either the
+/// upstream address carries an `https://`/`h2://` scheme, or [`Self::enable`]
+/// forces it. The defaults verify the upstream chain against the system trust
+/// store and present no client certificate, which is what a plain
+/// `reverse_proxy https://host` already did before this block existed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct UpstreamTlsConfig {
+    /// 🔒 Speaks TLS even when the upstream address declares no scheme.
+    #[serde(default)]
+    pub enable: bool,
+
+    /// 🏷️ Overrides the SNI sent and the name the upstream chain must match.
+    ///
+    /// Without this the proxy uses the upstream's configured hostname, which is
+    /// the correct default; set it only when the address is an IP or an
+    /// internal alias that the certificate does not name.
+    #[serde(default)]
+    pub server_name: Option<String>,
+
+    /// 📜 PEM bundles that **replace** the system trust store for this route.
+    ///
+    /// Replacement, not addition: naming a private CA here means public CAs no
+    /// longer verify for this route. That is deliberate — an internal upstream
+    /// should not be satisfiable by a publicly issued certificate.
+    #[serde(default)]
+    pub trusted_ca_certs: Vec<String>,
+
+    /// 🎫 PEM chain presented to the upstream for mutual TLS.
+    #[serde(default)]
+    pub client_cert: Option<String>,
+
+    /// 🔑 PEM private key matching [`Self::client_cert`].
+    #[serde(default)]
+    pub client_key: Option<String>,
+
+    /// ⚠️ Disables upstream certificate and hostname verification.
+    ///
+    /// This turns the upstream leg into unauthenticated encryption: anything
+    /// able to answer on the upstream address is trusted. It exists for
+    /// bootstrapping against a self-signed origin; `trusted_ca_certs` is the
+    /// correct answer in every other case.
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
+}
+
+impl UpstreamTlsConfig {
+    /// 🔍 Reports whether anything here changes the default TLS behaviour.
+    ///
+    /// A route whose block is entirely defaults needs no compiled state, so the
+    /// runtime can keep using the shared system-trust path.
+    pub fn is_customized(&self) -> bool {
+        self.enable
+            || self.server_name.is_some()
+            || !self.trusted_ca_certs.is_empty()
+            || self.client_cert.is_some()
+            || self.client_key.is_some()
+            || self.insecure_skip_verify
+    }
+
+    /// 🎫 Returns the client certificate and key when mutual TLS is requested.
+    ///
+    /// Returns an error describing the missing half when only one is present,
+    /// because a half-configured client identity silently degrades to an
+    /// anonymous handshake and the upstream's rejection looks like a network
+    /// fault.
+    pub fn client_identity(&self) -> Result<Option<(&str, &str)>, &'static str> {
+        match (self.client_cert.as_deref(), self.client_key.as_deref()) {
+            (Some(cert), Some(key)) => Ok(Some((cert, key))),
+            (None, None) => Ok(None),
+            (Some(_), None) => {
+                Err("tls_client_auth needs a key file, but only a certificate was configured")
+            }
+            (None, Some(_)) => {
+                Err("tls_client_auth needs a certificate file, but only a key was configured")
+            }
+        }
+    }
 }
 
 /// Load balancing configuration

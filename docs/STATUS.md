@@ -171,6 +171,24 @@ commit `0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。
   完整 locked gate 共 **375 tests** 全綠。
   修正前 reload 意外清空 open state 的證據保留於
   `benchmarks/results/20260729_day10_local_failed_admin_reload_state/`。
+- **上游 TLS／mTLS（Day 11，本機 2026-07-29）** — `transport http` 新增
+  `tls`、`tls_server_name`、`tls_trusted_ca_certs`、`tls_client_auth`、
+  `tls_insecure_skip_verify`（Caddy 相容）。TLS 素材在**設定載入時編譯一次**
+  （`pingclair-proxy/src/upstream_tls.rs`），request path 只 clone `Arc`。
+  預設維持驗證憑證與 hostname，走 system trust store；`trusted_ca_certs`
+  是**取代**該 store 而非疊加。載入失敗的 route 標記 `Broken`，H1/H2 與 H3
+  bridge 都回 500 並記 ERROR，**不會**退回 system trust ＋ 無 client cert。
+  矛盾組合（skip verify ＋ pinned CA／SNI、半套 `tls_client_auth`）在 DSL 與
+  **JSON 兩條路**都拒絕。診斷一律帶檔案路徑與角色，另外自己驗 cert/key 配對，
+  因為 BoringSSL 要到 handshake 才會發現不匹配。
+  修掉一個信任外洩：`HttpPeer` 的 reuse hash 不含 CA bundle，同位址同 SNI
+  但 trust roots 不同的 route 會共用 pooled connection；改為把 TLS identity
+  打包進 `group_key` 高位（protocol group 保留低 8 bits）。
+  真 handshake 整合測試以同一份 self-signed origin 做三段對照：預設拒絕 →
+  pin 憑證後 200 → `insecure_skip_verify` 200，**連跑 30 次全綠**。
+  完整 locked gate 共 **408 tests** 全綠（`cargo +1.88.0` 與預設 1.97.1 各一次）。
+  範圍外：沒有檔案 watcher（輪替只在 reload 生效）、沒有 `alternative_cn`、
+  憑證到期只在 log 顯示 `notAfter` 字串而不做比較。
 - **仍缺** — 乾淨 Linux release、VPS 與真 QUIC client 矩陣留到 Day 15；
   所以仍是 🧪，不是 ✅。非冪等 body replay、AI POST fallback、exponential／jitter、
   `Retry-After` 與有上限的 memory／disk replay policy 未實作。

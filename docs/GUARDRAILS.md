@@ -152,6 +152,26 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
   serde_json 的 parser，所以 serde_json 的 recursion limit 攔不到，`panic = "abort"`
   的 release binary 直接中止。這在 `Matcher` 上是可由 Admin API 遠端觸發的
   DoS（2026-07-28 修）。遞迴 enum 一律用 tag 表示。
+- **設定規則必須擋在 core config 層，不能只擋 Pingclairfile adapter**。
+  Admin API 直接把 config document 反序列化進 core 型別，**完全不經過 adapter**。
+  只寫在 `adapter/caddyfile.rs` 的檢查等於留了一條繞道。矛盾或半套的設定
+  （`insecure_skip_verify` ＋ pinned CA、只有 cert 沒有 key）兩條路都要拒。
+  2026-07-29 Day 11 上游 TLS 依此同時補了 `compiler::validate_config`。
+- **Pingora 的 `HttpPeer` reuse hash 沒有算 `options.ca`**。它算了 client cert、
+  `verify_cert`／`verify_hostname`／`alternative_cn`、SNI 與 `group_key`，
+  但 **CA bundle 不在裡面**。同位址同 SNI、trust roots 不同的兩條 route 會共用
+  pooled connection，嚴格那條會沿用寬鬆那條驗過的 session（reuse 直接跳過
+  handshake）。任何新的「誰可以被信任」維度都必須自己打包進 `group_key`。
+  Pingclair 的做法：protocol group 佔低 8 bits，TLS identity hash 左移進高位，
+  用 `peer_protocol_group()` 取回協定，不要再直接比較 `group_key == 4`。
+- **BoringSSL 在設定期接受不匹配的 cert/key**，只有 handshake 才失敗，
+  而上游回的 `bad certificate` alert 跟十幾種無關的網路錯誤長得一樣。
+  載入 client identity 時一定要自己驗 `cert.public_key()?.public_eq(&key)`，
+  並在錯誤訊息裡**同時點名兩個檔案**——半套輪替（只換憑證沒換 key）就是靠這個抓的。
+- **`trusted_ca_certs` 是取代不是疊加**。Pingora 走
+  `SSL_set1_verify_cert_store`，會覆蓋整個 store 而非附加。這是我們要的語意
+  （pin 內部 CA 的 route 不該同時接受公開 CA 簽的同名憑證），但必須寫在文件裡，
+  否則會被誤讀成「額外信任」。
 - **untagged 也代表「不可還原」**。variant 只靠 payload 形狀辨識，形狀相同的
   variant round-trip 後會變成別人——`Not` 甚至會整個消失，直接反轉路由決策。
   凡是會被序列化回去的設定型別（Admin dump→post、config 檔）都必須有 tag。

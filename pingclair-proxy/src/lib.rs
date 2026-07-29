@@ -27,6 +27,7 @@ pub mod redaction;
 mod retry;
 pub mod server;
 pub mod upstream;
+pub mod upstream_tls;
 
 // MARK: - Exports
 

@@ -411,11 +411,53 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
   - 尚未做乾淨 Linux release、VPS 或真 QUIC client 矩陣；留到 Day 15，
     因此本日仍是 🧪，不是遠端 ✅。
 
-### 🔨 Day 11 — 上游 TLS／mTLS
+### 🔨 Day 11 — 上游 TLS／mTLS ✔
 
-- CA 驗證、SNI／Host、ALPN、client certificate、憑證 rotation、錯誤診斷。
-- **預設驗證憑證**，`insecure_skip_verify` 必須顯眼且預設關閉。
-- **完成判定**：憑證錯誤時有可操作的診斷訊息，不是無聲失敗。
+**已完成 2026-07-29，本機 gate 全綠（1.88.0 與 1.97.1 各跑一次），尚待 Day 15 遠端驗證。**
+
+- ✅ 新增 `pingclair-proxy/src/upstream_tls.rs`：**設定載入時編譯一次**，
+  request path 只 clone `Arc`。PEM 解析不上熱路徑，也不會讓憑證輪替在
+  route 之間半生效。
+- ✅ DSL（Caddy 相容）：`transport http { tls, tls_server_name, tls_trusted_ca_certs,
+  tls_client_auth, tls_insecure_skip_verify }`。
+- ✅ **預設就是驗證的**：Pingora `verify_cert`／`verify_hostname` 預設為 true，
+  且 `pingora-proxy` 一定帶 `ConnectorOptions`，所以 system trust store 有被載入。
+  這次確認過而不是假設——真 handshake 測試證明未受信的 self-signed origin
+  會被拒，body 不會外流。
+- ✅ **trust roots 是「取代」不是「疊加」**：`SSL_set1_verify_cert_store` 覆蓋整個
+  store，所以 pin 內部 CA 的 route 不會同時接受公開 CA 簽的同名憑證。已寫進 doc。
+- 🐛 **修掉一個信任外洩**：`HttpPeer` 的 reuse hash 有算 client cert／verify flags，
+  **但沒有算 CA bundle**。同位址、同 SNI、不同 trust roots 的兩條 route 會共用
+  pooled connection，嚴格的那條會沿用寬鬆那條驗過的 session。改成把 TLS identity
+  打包進 `group_key` 高位、protocol group 留低 8 bits（`peer_protocol_group()`）。
+- ✅ **可操作的診斷**：每個錯誤都帶檔案路徑與角色（trust root／client certificate／
+  client key）。額外做了 **cert/key 配對檢查**（`public_eq`）——BoringSSL 在設定期
+  接受不匹配的一對，只在 handshake 才爆，而上游的 `bad certificate` alert 跟十幾種
+  無關的網路問題長得一模一樣。
+- ✅ **fail closed**：TLS 素材載入失敗的 route 標記為 `Broken`，H1/H2 與 H3 bridge
+  **都**回 500 並記 ERROR，絕不退回「system trust ＋ 無 client cert」——那正是
+  operator 寫這個 block 要防的連線。其他 route 照常服務。
+- ✅ **矛盾組合一律拒絕**：`tls_insecure_skip_verify` 不可與 `tls_trusted_ca_certs`
+  或 `tls_server_name` 併用；`tls_client_auth` 必須兩個檔案。**DSL 與 JSON 兩條路
+  都擋**——Admin API 直接吃 config document，只擋 adapter 等於沒擋（Day 6 教訓）。
+- ✅ 憑證輪替：reload 重讀同一批路徑；輪替後 `pool_key` 改變，舊憑證開的連線不會
+  被新身分沿用；只換憑證沒換 key 的半套輪替會在 reload 當下失敗並同時點名兩個檔案。
+- ✅ `tls` 只加密不擴 ALPN：scheme-less upstream 升級成 TLS 但仍只 offer HTTP/1.1，
+  `h2c://` 不動。要 h2 over TLS 就寫 `h2://`／`https://`。
+- ✅ 真 handshake 整合測試（self-signed origin，同一份 origin 程式碼三段對照）：
+  預設拒絕 → pin 該憑證後 200 → `insecure_skip_verify` 也 200。
+  **連跑 30 次全綠**（`--test-threads=2`）。
+- ✅ 總測試數 377 → **408**。
+- ✅ Gate：fmt、clippy `-D warnings`、`build --locked`、`test --locked` 在
+  `cargo +1.88.0` 與預設工具鏈上各跑一次全綠。
+
+- **範圍外／尚未驗證**：
+  - **沒有做檔案 watcher**：輪替只在 reload（SIGHUP／Admin）時生效，不是自動偵測。
+  - 沒有暴露 `alternative_cn`（送 SNI X 但接受憑證名 Y）——Caddy 沒有對應語法，
+    不想自創；`tls_server_name` 已覆蓋實際需求。
+  - 憑證到期只以 `notAfter` 字串呈現在 log，沒有做「快過期」比較：
+    `pingora_core::tls` 沒有 re-export `asn1`，為此加 `boring` 直接依賴不划算。
+  - 尚未做乾淨 Linux release、VPS 或真 mTLS 上游矩陣；留到 Day 15，本日是 🧪。
 
 ### 🔨 Day 12 — 健康檢查補齊
 
@@ -712,7 +754,7 @@ H3 CORS／rewrite／error_page parity。
 | 里程碑 | 範圍 | 狀態 |
 |---|---|---|
 | M1 生產站可替換 | Day 1–7 | ✅ **完成**（`8294116`，2026-07-28 真站驗收） |
-| M2 生產護欄 | Day 8–15 | 🧪 **進行中**（Day 8 本機完成，待 Day 15 遠端驗證） |
+| M2 生產護欄 | Day 8–15 | 🧪 **進行中**（Day 8–11 本機完成，待 Day 15 遠端驗證） |
 | M3 接上 Pingora 能力（含 `proxy_cache`） | Day 16–20 | ⬜ 未開始 |
 | M4 可觀測性與運維 | Day 21–24 | ⬜ 未開始 |
 | M5 協議安全與 H3 | Day 25–28 | ⬜ 未開始 |
