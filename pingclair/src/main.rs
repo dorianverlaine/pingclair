@@ -309,6 +309,7 @@ fn main() -> anyhow::Result<()> {
 
             let mut server = ServerConfig {
                 name: Some("_".to_string()),
+                proxy_protocol_listen: Vec::new(),
                 listen: vec![listen],
                 routes: Vec::new(),
                 tls: None,
@@ -369,6 +370,7 @@ fn main() -> anyhow::Result<()> {
 
             let mut server = ServerConfig {
                 name: Some("_".to_string()),
+                proxy_protocol_listen: Vec::new(),
                 listen: vec![listen_addr],
                 routes: Vec::new(),
                 tls: None,
@@ -607,14 +609,22 @@ fn run_server(
         "🛡️ Trusted proxy networks: {}",
         config.global.trusted_proxies.len()
     );
-    tracing::info!(
-        "🧭 PROXY protocol ingress: {}",
-        if config.global.proxy_protocol {
-            "required"
-        } else {
-            "disabled"
-        }
-    );
+    {
+        let required: Vec<&str> = config
+            .servers
+            .iter()
+            .flat_map(|server| server.proxy_protocol_listen.iter())
+            .map(String::as_str)
+            .collect();
+        tracing::info!(
+            "🧭 PROXY protocol listeners: {}",
+            if required.is_empty() {
+                "none".to_string()
+            } else {
+                required.join(", ")
+            }
+        );
+    }
 
     let mut server = pingora::server::Server::new_with_opt_and_conf(
         Some(pingora::server::configuration::Opt {
@@ -734,7 +744,14 @@ fn run_server(
     let h3_pool_size = config.global.upstream_keepalive_pool_size.unwrap_or(128);
     let h3_blocked_ips = config.global.blocked_ips.clone();
     let trusted_proxies = config.global.trusted_proxies.clone();
-    let proxy_protocol_enabled = config.global.proxy_protocol;
+    // 🧭 Which listen addresses require a PROXY header, resolved once. The
+    // compiler has already rejected any address two servers disagree about, so
+    // membership here is the whole answer for a given socket.
+    let proxy_protocol_addresses: std::collections::HashSet<String> = config
+        .servers
+        .iter()
+        .flat_map(|server| server.proxy_protocol_listen.iter().cloned())
+        .collect();
     let proxy_protocol_networks =
         pingclair_proxy::proxy_protocol::parse_networks(&trusted_proxies)?;
     let blocked_client_networks =
@@ -770,7 +787,7 @@ fn run_server(
                 pingclair_proxy::server::PingclairProxy::with_tls_and_trusted_proxies(
                     tls_manager.clone(),
                     &trusted_proxies,
-                    proxy_protocol_enabled,
+                    proxy_protocol_addresses.contains(&addr),
                 )
             });
 
@@ -801,7 +818,8 @@ fn run_server(
         let proxies_guard = port_proxies.read();
         for (addr, proxy_logic) in proxies_guard.iter() {
             let is_https = tls_listeners.contains(addr);
-            let internal_reservation = proxy_protocol_enabled
+            let requires_proxy_protocol = proxy_protocol_addresses.contains(addr);
+            let internal_reservation = requires_proxy_protocol
                 .then(reserve_private_listener_address)
                 .transpose()?;
             let internal_address = internal_reservation.as_ref().map(|(_, address)| *address);
@@ -826,7 +844,7 @@ fn run_server(
 
             // Add L4 Connection Filter (Global Blocked IPs)
             let blocked_ips = &config.global.blocked_ips;
-            if !proxy_protocol_enabled && !blocked_ips.is_empty() {
+            if !requires_proxy_protocol && !blocked_ips.is_empty() {
                 let filter = std::sync::Arc::new(pingclair_proxy::PingclairConnectionFilter::new(
                     blocked_ips,
                 ));

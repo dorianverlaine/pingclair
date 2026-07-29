@@ -50,10 +50,6 @@ pub struct GlobalConfig {
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
 
-    /// 🧭 Requires PROXY protocol v1 or v2 on every configured TCP listener.
-    #[serde(default)]
-    pub proxy_protocol: bool,
-
     /// Max number of idle upstream connections Pingora keeps open per
     /// worker thread for reuse. Explicitly configurable rather than left
     /// as an implicit framework default, so a deployment under load has a
@@ -92,7 +88,6 @@ impl Default for GlobalConfig {
             auto_https: AutoHttpsMode::default(),
             blocked_ips: Vec::new(),
             trusted_proxies: Vec::new(),
-            proxy_protocol: false,
             upstream_keepalive_pool_size: None,
             http3: true,
             worker_threads: None,
@@ -190,6 +185,19 @@ pub struct ServerConfig {
     #[serde(default)]
     pub listen: Vec<String>,
 
+    /// 🧭 The subset of [`Self::listen`] that requires a PROXY protocol header.
+    ///
+    /// Kept as a parallel list rather than folded into `listen` so the shape of
+    /// `listen` stays a plain array of strings: it round-trips through the
+    /// Admin API unchanged, and a configuration written before this field
+    /// existed still loads as "no listener requires the header".
+    ///
+    /// Every entry must also appear in `listen`. An address here that is not
+    /// listened on is rejected rather than ignored — silently dropping it would
+    /// leave a listener the operator believes is protected accepting anything.
+    #[serde(default)]
+    pub proxy_protocol_listen: Vec<String>,
+
     /// TLS configuration
     #[serde(default)]
     pub tls: Option<TlsConfig>,
@@ -244,6 +252,7 @@ impl Default for ServerConfig {
         Self {
             name: None,
             listen: Vec::new(),
+            proxy_protocol_listen: Vec::new(),
             tls: None,
             routes: Vec::new(),
             log: None,
@@ -1378,6 +1387,7 @@ mod tests {
         let config = ServerConfig {
             name: Some("example.com".to_string()),
             listen: vec!["127.0.0.1:8080".to_string()],
+            proxy_protocol_listen: Vec::new(),
             tls: None,
             routes: vec![],
             log: None,

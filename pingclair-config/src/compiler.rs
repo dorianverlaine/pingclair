@@ -83,9 +83,6 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
     }
 
     config.global.trusted_proxies = global.trusted_proxies.clone();
-    if let Some(enabled) = global.proxy_protocol {
-        config.global.proxy_protocol = enabled;
-    }
 
     if let Some(secs) = global.dns_refresh_secs {
         config.global.dns_refresh_secs = secs;
@@ -127,6 +124,7 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
     let mut config = ServerConfig {
         name: Some(server.name.clone()),
         listen: Vec::new(),
+        proxy_protocol_listen: Vec::new(),
         routes: Vec::new(),
         tls: None,
         log: None,
@@ -163,6 +161,9 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         } else {
             listen.host.clone()
         };
+        if listen.proxy_protocol && !config.proxy_protocol_listen.contains(&addr) {
+            config.proxy_protocol_listen.push(addr.clone());
+        }
         config.listen.push(addr);
 
         // Set TLS based on scheme
@@ -274,11 +275,7 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
             });
         }
     }
-    if config.global.proxy_protocol && config.global.trusted_proxies.is_empty() {
-        return Err(CompileError::InvalidServer {
-            message: "proxy_protocol requires at least one trusted_proxies rule".to_string(),
-        });
-    }
+    validate_proxy_protocol_listeners(config)?;
 
     for server in &config.servers {
         let limits = &server.limits;
@@ -716,6 +713,62 @@ fn validate_health_check(health: &pingclair_core::config::HealthCheckConfig) -> 
             message:
                 "health_check port, body bound, expected body, or slow_start is outside safe bounds"
                     .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// 🧭 Rejects PROXY protocol listener declarations that cannot be honoured.
+///
+/// Three ways this can be written wrong, each of which would otherwise leave a
+/// listener the operator believes is protected accepting anything:
+///
+/// - naming an address that is not listened on, usually a typo;
+/// - two servers sharing a port and disagreeing about it, since a port is one
+///   socket and can only have one answer;
+/// - requiring the header with no `trusted_proxies`, which would reject every
+///   connection because no peer can ever be authorised to send one.
+fn validate_proxy_protocol_listeners(config: &PingclairConfig) -> CompileResult<()> {
+    let mut requires: HashSet<&str> = HashSet::new();
+    let mut listens: HashSet<&str> = HashSet::new();
+
+    for server in &config.servers {
+        for address in &server.listen {
+            listens.insert(address.as_str());
+        }
+        for address in &server.proxy_protocol_listen {
+            if !server.listen.iter().any(|listen| listen == address) {
+                return Err(CompileError::InvalidServer {
+                    message: format!(
+                        "proxy_protocol is declared on `{address}`, which this server does not listen on"
+                    ),
+                });
+            }
+            requires.insert(address.as_str());
+        }
+    }
+
+    // 🔌 A port is a single socket. If one server wants the header there and
+    // another does not, there is no configuration that satisfies both, and
+    // picking either one silently would be a security decision made by
+    // accident.
+    for server in &config.servers {
+        for address in &server.listen {
+            let declared = server.proxy_protocol_listen.iter().any(|a| a == address);
+            if requires.contains(address.as_str()) && !declared {
+                return Err(CompileError::InvalidServer {
+                    message: format!(
+                        "listener `{address}` is shared by servers that disagree about \
+                         proxy_protocol; declare it on every server bound to that address"
+                    ),
+                });
+            }
+        }
+    }
+
+    if !requires.is_empty() && config.global.trusted_proxies.is_empty() {
+        return Err(CompileError::InvalidServer {
+            message: "proxy_protocol requires at least one trusted_proxies rule".to_string(),
         });
     }
     Ok(())
@@ -1352,8 +1405,16 @@ mod tests {
 
     #[test]
     fn json_proxy_protocol_validation_cannot_bypass_the_adapter() {
+        // 🧭 The Admin API posts this document straight into the core types, so
+        // every rule the Pingclairfile adapter enforces has to hold here too.
         let mut config = PingclairConfig::default();
-        config.global.proxy_protocol = true;
+        config.servers.push(ServerConfig {
+            listen: vec!["0.0.0.0:443".to_string()],
+            proxy_protocol_listen: vec!["0.0.0.0:443".to_string()],
+            ..Default::default()
+        });
+
+        // Requiring the header with nothing trusted would reject every peer.
         assert!(validate_config(&config).is_err());
 
         config.global.trusted_proxies = vec!["not-a-network".to_string()];
@@ -1361,6 +1422,18 @@ mod tests {
 
         config.global.trusted_proxies = vec!["127.0.0.1/32".to_string()];
         assert!(validate_config(&config).is_ok());
+
+        // An address that is not listened on is a typo, not a no-op.
+        config.servers[0].proxy_protocol_listen = vec!["0.0.0.0:8443".to_string()];
+        assert!(validate_config(&config).is_err());
+
+        // Two servers on one socket cannot disagree about it.
+        config.servers[0].proxy_protocol_listen = vec!["0.0.0.0:443".to_string()];
+        config.servers.push(ServerConfig {
+            listen: vec!["0.0.0.0:443".to_string()],
+            ..Default::default()
+        });
+        assert!(validate_config(&config).is_err());
     }
 
     #[test]

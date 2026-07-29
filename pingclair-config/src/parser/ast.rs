@@ -49,8 +49,6 @@ pub struct GlobalBlock {
     pub admin: Option<AdminDirective>,
     /// 🛡️ Proxy IP or CIDR ranges allowed to supply client identity headers.
     pub trusted_proxies: Vec<String>,
-    /// 🧭 Requires PROXY protocol v1 or v2 on downstream TCP listeners.
-    pub proxy_protocol: Option<bool>,
     /// 🔄 Upstream re-resolution interval in seconds; `Some(0)` disables it.
     /// `None` means the directive was absent and the default applies.
     pub dns_refresh_secs: Option<u64>,
@@ -221,6 +219,11 @@ pub struct ListenAddr {
     pub scheme: Scheme,
     pub host: String,
     pub port: Option<u16>,
+    /// 🧭 Requires a PROXY protocol header on this listener, as nginx spells
+    /// `listen 443 proxy_protocol`. It is per-listener because a deployment
+    /// commonly has one port behind an L4 balancer and another reached
+    /// directly; a single global switch would break the direct one.
+    pub proxy_protocol: bool,
 }
 
 /// URL scheme

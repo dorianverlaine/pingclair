@@ -543,11 +543,19 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
 > ingress 會把外部流量轉給它**。同樣受限於 Pingora 0.8 沒有 FD 傳遞。
 > Day 15 要在真機確認一次；長期解法是等上游或改用 socket activation。
 
-- **範圍外（v0.3）**：`proxy_protocol` 目前是**全域**開關，不是 per-listener。
-  nginx 是 `listen 443 proxy_protocol;`、Caddy 是 per-server listener wrapper。
-  開了之後**每個** listener 都要求 PROXY header，直連的瀏覽器會被拒（有 log、
-  fail closed，但很意外）。單一入口的部署沒差；要混用直連與 L4 LB 就會踩到。
-  修法要動 `listen` 的 grammar，屬於 DSL 設計題，不在 review 範圍。
+- ✅ **改成 per-listener（2026-07-30）**：`listen :8443 proxy_protocol`，
+  就是 nginx 的寫法。全域開關**整個移除**——它從未進過任何 release，
+  所以不留相容包袱。這個介面一旦隨 `0.2.0` 發布就改不動了，所以趕在凍結 RC
+  之前修完，而不是拿一個已知是錯的設定介面去做遠端驗證。
+  - `listen` 的多餘參數以前被靜默丟棄，`listen :443 proxy_protocol` 會產生一個
+    「名字寫了但其實不要求」的 listener。現在未知 flag 一律拒絕。
+  - core config 用 `proxy_protocol_listen: Vec<String>`（`listen` 的子集），
+    `listen` 的形狀不動,所以 Admin dump→post 原樣往返，舊文件照常載入。
+  - 三種寫錯法全部 fail closed：位址不在 `listen` 裡（打錯字）、同一個 port
+    被兩個 server 給出不同答案（一個 socket 不能有兩個答案）、要求 header
+    但沒有 `trusted_proxies`（那會拒絕所有連線）。DSL 與 JSON 兩條路都擋。
+  - 真 binary 測試：同一個 process 兩個 listener，直連的那個不帶 header 回 200，
+    L4 那個帶 header 回同一條 route、不帶 header 被拒。連跑 30 次全綠。
 
 ### ✅ Day 15 — M2 驗證日
 

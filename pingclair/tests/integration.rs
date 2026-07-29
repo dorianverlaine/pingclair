@@ -166,6 +166,11 @@ impl TestServer {
         self.server_addresses[server_index][0]
     }
 
+    /// 🎧 Returns one specific listener of a server that binds several.
+    fn listener_address(&self, server_index: usize, listener_index: usize) -> SocketAddr {
+        self.server_addresses[server_index][listener_index]
+    }
+
     fn admin_url(&self, path: &str) -> String {
         format!(
             "http://{}{}",
@@ -387,6 +392,26 @@ fn prepare_server_listeners(
                 .iter()
                 .map(|address| serde_json::Value::String(address.to_string()))
                 .collect();
+
+            // 🧭 `proxy_protocol_listen` names addresses, but the addresses are
+            // only known here. Test configs therefore write listener *indices*
+            // ("0", "1"), which this maps onto the reserved addresses.
+            if let Some(requires) = server
+                .get_mut("proxy_protocol_listen")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                *requires = requires
+                    .iter()
+                    .map(|index| {
+                        let index: usize = index
+                            .as_str()
+                            .expect("proxy_protocol_listen entries are listener indices")
+                            .parse()
+                            .expect("proxy_protocol_listen entries are listener indices");
+                        serde_json::Value::String(addresses[index].to_string())
+                    })
+                    .collect();
+            }
 
             // 🪪 A per-process token proves that readiness came from this child.
             let routes = server
@@ -3565,11 +3590,11 @@ async fn test_proxy_protocol_and_forwarded_share_verified_identity() {
     let config = serde_json::json!({
         "global": {
             "http3": false,
-            "trusted_proxies": ["127.0.0.1/32"],
-            "proxy_protocol": true
+            "trusted_proxies": ["127.0.0.1/32"]
         },
         "servers": [{
             "listen": ["127.0.0.1:0"],
+            "proxy_protocol_listen": ["0"],
             "routes": [{
                 "path": "/",
                 "handler": {
@@ -3656,4 +3681,82 @@ async fn test_proxy_protocol_and_forwarded_share_verified_identity() {
     .await
     .unwrap();
     assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+}
+
+#[tokio::test]
+async fn test_proxy_protocol_is_required_per_listener_not_process_wide() {
+    // 🧭 The deployment this exists for: one port behind an L4 balancer that
+    // speaks PROXY protocol, another reached directly. A process-wide switch
+    // would force the direct port to reject every connection.
+    let config = serde_json::json!({
+        "global": {
+            "http3": false,
+            "trusted_proxies": ["127.0.0.1/32"]
+        },
+        "servers": [{
+            "listen": ["127.0.0.1:0", "127.0.0.1:0"],
+            "proxy_protocol_listen": ["1"],
+            "routes": [{
+                "path": "/",
+                "handler": { "type": "respond", "status": 200, "body": "served" }
+            }]
+        }]
+    })
+    .to_string();
+
+    let mut server = TestServer::new(&config);
+    let direct = server.listener_address(0, 0);
+    let behind_balancer = server.listener_address(0, 1);
+    let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+    // The direct listener must be reachable with no PROXY header at all.
+    assert!(
+        server.wait_until_ready().await,
+        "the direct listener must come up and serve plain HTTP"
+    );
+    let plain = no_proxy_client()
+        .get(format!("http://{direct}/"))
+        .send()
+        .await
+        .expect("the direct listener must answer without a PROXY header");
+    assert_eq!(plain.status(), 200);
+    assert_eq!(plain.text().await.unwrap(), "served");
+
+    // The balancer-facing listener must serve the same route once the header
+    // is present, proving the two listeners really are one server.
+    let mut answered = None;
+    for _ in 0..50 {
+        let prefix = proxy_v1_prefix("203.0.113.7", behind_balancer);
+        if let Ok(response) =
+            proxy_protocol_request(behind_balancer, loopback, &prefix, "/", &[]).await
+            && String::from_utf8_lossy(&response).contains("served")
+        {
+            answered = Some(response);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        answered.is_some(),
+        "the PROXY listener must serve the same route once the header is present"
+    );
+
+    // And it must refuse a connection that omits the header, rather than
+    // treating the raw request line as application data.
+    let mut bare = tokio::net::TcpStream::connect(behind_balancer)
+        .await
+        .expect("connect to the PROXY listener");
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    bare.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let mut refused = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), bare.read_to_end(&mut refused))
+        .await
+        .expect("a header-less connection must be terminated, not left hanging")
+        .ok();
+    assert!(
+        !String::from_utf8_lossy(&refused).contains("served"),
+        "a listener requiring PROXY protocol must not serve a header-less request"
+    );
 }
