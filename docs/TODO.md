@@ -609,7 +609,50 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
 - **完成判定**：每一類都有明確的拒絕行為與測試。
 
 
-## M3 — 接上 Pingora 已提供的能力（Day 17–21）
+## M2.6 — 設定只有一條驗證路徑（Day 17）
+
+### 🔨 Day 17 — 設定只有一條驗證路徑
+
+2026-07-31 加入。起因是一次外部架構審視,其中的關鍵指控**經查證屬實**,
+而且它推翻的是我自己這週寫下的東西。
+
+> 🚨 **Day 11 與 per-listener `proxy_protocol` 兩次把規則加進
+> `compiler::validate_config`,並在 commit message 與 GUARDRAILS 寫下
+> 「Admin 這條路也擋住了」。實際上 Admin 從來不呼叫 `validate_config`**:
+>
+> ```rust
+> let body_bytes = req.collect().await.unwrap().to_bytes();
+> let config: ServerConfig = serde_json::from_slice(&body_bytes)?;
+> proxy.add_server(config.clone());          // 中間沒有驗證
+> ```
+>
+> 測試呼叫的是那個**函式**,它確實會拒絕;真正的**路徑**沒經過它。
+> 這跟 2026-07-30 抓到的「不可能失敗的否定斷言」是同一個錯誤形狀——
+> **驗了函式,沒驗路徑**。
+
+- **Admin POST 走 canonical `validate_config`**。錯誤配置完整拒絕,
+  保留 last-known-good,不得部分套用(現在的迴圈會逐個 listener 套,
+  中途失敗就留下半套狀態)。
+- **Admin body 上限,並拿掉 `req.collect().await.unwrap()`**。
+  release profile 是 `panic = "abort"`,所以一個已認證的 client 上傳到一半
+  斷線會讓**整個程序 abort**。不需要惡意,網路抖一下就夠。
+- **未實作的 plugin 必須 fail closed**。目前 `{"type":"plugin","name":"totally-fictional","args":[]}`
+  通過驗證,runtime 落進 `server.rs` 的 `_ => Ok(false)` 靜默什麼都不做。
+  DSL 與 JSON 兩條都要在驗證階段拒絕。
+- **`_ => Ok(false)` 改成 exhaustive match**,新增 handler variant 時
+  讓編譯器逼每個 transport 處理,而不是靜默跳過。
+- **完成判定**:負向測試必須**真的 POST 進 Admin**,不是呼叫
+  `validate_config()`。這一天存在的唯一原因就是上次那樣測。
+
+> 📌 **插件系統本身不做,而且要明講。** `pingclair-plugin` 目前是未接線骨架:
+> `load_from_dir()` 永遠回 "not yet implemented"、`PluginContext` 是空
+> struct、`PluginRegistry` 全 workspace 零呼叫者。README 三語與 STATUS
+> 必須標成 **stub／roadmap**,不能讓使用者以為能用。
+> 完整插件系統排到 v0.3 M0,理由見「v0.3+ 架構 backlog」。
+
+---
+
+## M3 — 接上 Pingora 已提供的能力（Day 18–22）
 
 > 盤點 `pingora 0.8.1` 全家桶後發現：**`pingora-cache` 完全沒被引入**，
 > 而它提供的正是審計裡估「1 週+」的 `proxy_cache`。`boringssl` feature 明確
@@ -646,7 +689,7 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
 > 「明確不做」把 OpenTelemetry 排除在外，這等於從側門進來一套 tracing 依賴。
 > Day 29 的 dependency audit 與產物大小要把它算進去。
 
-### 🔨 Day 17 — 接上 pingora-cache 骨架
+### 🔨 Day 18 — 接上 pingora-cache 骨架
 
 - 加入 `pingora-cache` 依賴與 `cache` feature。BoringSSL 鏈結已於
   2026-07-28 在 macOS 實測通過（見上），這天只需確認 Linux 那一半。
@@ -654,7 +697,7 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
   的 cache key，memory storage 先跑通。
 - **完成判定**：同一 URL 第二次請求命中快取，且有測試證明沒有回源。
 
-### 🔨 Day 18 — 快取策略與正確性
+### 🔨 Day 19 — 快取策略與正確性
 
 **這天是整個 M3 的風險所在**，快取的 bug 不會讓服務掛掉，只會安靜地回錯內容。
 
@@ -677,7 +720,7 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
   不能偽造 header」那條斷言永遠會過。這一天整天都是否定斷言,每一條都要
   先確認它**能夠**失敗。
 
-### 🔨 Day 19 — 快取運維面
+### 🔨 Day 20 — 快取運維面
 
 - cache lock（single-flight）與 predictor 接線，避免回源驚群。
 - eviction 策略與 **memory/disk tier 硬上限**。
@@ -685,7 +728,7 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
 - 受權限保護的 inspect／purge API。
 - **完成判定**：上限確實生效（超過會 evict 而不是無限長大）；purge 需認證。
 
-### 🔨 Day 20 — 一致性雜湊 LB
+### 🔨 Day 21 — 一致性雜湊 LB
 
 > 💡 `pingora-ketama` 與 `pingora-load-balancing::selection::consistent`
 > 已提供 ketama 一致性雜湊；`selection::weighted` 提供加權。
@@ -695,7 +738,7 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
   且做錯有安全後果）。
 - **完成判定**：backend 增減時 key 重映射比例符合一致性雜湊預期。
 
-### ✅ Day 21 — M3 驗證日
+### ✅ Day 22 — M3 驗證日
 
 凍結 RC，在乾淨 Linux 驗證快取正確性（尤其是 bypass／排除規則）、
 上限、purge 與一致性雜湊。
@@ -705,11 +748,11 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
 
 ---
 
-## M4 — 可觀測性與運維（Day 22–25）
+## M4 — 可觀測性與運維（Day 23–26）
 
 讓它可以被值班的人操作。
 
-### 🔨 Day 22 — Access log 完整化
+### 🔨 Day 23 — Access log 完整化
 
 Day 2 做了配置驅動的輸出，這天做生產級韌性。
 
@@ -718,7 +761,7 @@ Day 2 做了配置驅動的輸出，這天做生產級韌性。
   dropped-log metric。
 - **完成判定**：磁碟寫滿或 writer 落後時**不得拖死 request hot path**（要有測試）。
 
-### 🔨 Day 23 — Metrics 與 readiness
+### 🔨 Day 24 — Metrics 與 readiness
 
 - `/live`、`/ready`、config version、route/status、upstream latency/error、
   retry、circuit/queue、pool、TLS、H3 指標。
@@ -727,24 +770,43 @@ Day 2 做了配置驅動的輸出，這天做生產級韌性。
   `READY=1`，並支援 watchdog。
 - **完成判定**：程序存活但尚未可接流量時，`/ready` 必須是 not ready。
 
-### 🔨 Day 24 — Reload／shutdown 可操作
+### 🔨 Day 25 — Reload／shutdown 可操作
 
 - 配置更新原子套用；錯誤配置保留 last-known-good。
 - 手動憑證目錄的新增／更新／刪除需**原子刷新** H1/H2/H3 certificate table；
   畸形或半寫入檔案保留 last-known-good 並輸出可操作診斷。
 - **v0.2 可明示 listener topology 變更需要 restart**，不假裝已經 zero-downtime。
-- **完成判定**：SIGHUP／SIGTERM／systemd restart／upstream drain 有真 binary 測試。
 
-### ✅ Day 25 — M4 驗證日
+> 🐛 **已知壞掉的部分**（2026-07-31 查證）:SIGHUP reload 只取
+> `s.listen.first()`（`main.rs:1048`），與 startup 把同一個 server 加進
+> **所有** listen address 的行為不一致。這在昨天之後更要緊——
+> `proxy_protocol` 已經是 per-listener 的,一個只看 `listen[0]` 的 reload
+> 會對這個新欄位做出錯的事。
+>
+> 必須明確處理:一個 server 綁多個 listener、新增 listener、刪除 listener、
+> server 從一個 listener 搬到另一個。**先完整 prepare/diff,再一次 publish
+> 或整份拒絕**——不得先更新部分 port 再回報 partial success,也不得讓被刪掉的
+> 舊配置無限留在舊 listener 上。
+
+> 🗂️ **directory config merge 同日處理**。`compile_multiple_files()` 目前
+> 手寫合併少數欄位,每新增一個 `GlobalConfig` 欄位就靠開發者記得改一串
+> assignment——`trusted_proxies`、`dns_refresh_secs`、`worker_threads` 都在
+> 這個風險上。要求:寫清楚每個欄位的 merge policy、**合併後對最終配置再驗一次**、
+> 補跨檔案衝突測試。
+
+- **完成判定**：SIGHUP／SIGTERM／systemd restart／upstream drain 有真 binary 測試，
+  且上述多 listener 情境每一種都有測試。
+
+### ✅ Day 26 — M4 驗證日
 
 凍結 RC，驗證 log rotation／redaction、metrics、readiness、reload／shutdown
 在乾淨 Linux 的實際行為。
 
 ---
 
-## M5 — 協議矩陣與 H3（Day 26–28）
+## M5 — 協議矩陣與 H3（Day 27–29）
 
-### 🔨 Day 26 — 協議矩陣補完
+### 🔨 Day 27 — 協議矩陣補完
 
 已通過的見 STATUS。剩餘缺口：
 
@@ -753,7 +815,7 @@ Day 2 做了配置驅動的輸出，這天做生產級韌性。
 - 真 H3 gRPC client 矩陣。
 - **完成判定**：不支援的組合必須 **fail clearly 並寫入文件**，不是靜默失敗。
 
-### ✅ Day 27 — H3 Linux release smoke
+### ✅ Day 28 — H3 Linux release smoke
 
 用 quiche client 驗證：SNI、Alt-Svc、靜態／代理大 body、
 Content-Length/chunked POST、413、keepalive、middleware parity、
@@ -762,7 +824,7 @@ Content-Length/chunked POST、413、keepalive、middleware parity、
 > 依 GUARDRAILS：改動 H3 或 TLS dependency 後，**macOS 單元測試不足以驗證
 > 鏈結與 QUIC 行為**，必須跑這一關。
 
-### ✅ Day 28 — 公網協議矩陣
+### ✅ Day 29 — 公網協議矩陣
 
 補完 STATUS 中列為「尚未覆蓋」的項目：IP／Referer 完整 allow／deny 與
 precedence、死亡 upstream 502 自訂頁、代理 rewrite URI、primary recovery、
@@ -770,28 +832,28 @@ H3 CORS／rewrite／error_page parity。
 
 ---
 
-## M6 — 發布（Day 29–36）
+## M6 — 發布（Day 30–37）
 
-### ✅ Day 29 — RC 凍結與品質閘門
+### ✅ Day 30 — RC 凍結與品質閘門
 
 - Linux／macOS 的 build／test／fmt／clippy `-D warnings` 全綠。
 - dependency audit 沒有未處理的 high／critical advisory；例外需**書面風險接受**。
   含 `site/` 的 `npm audit`——文件站的依賴樹也是這個專案發布出去的東西。
 
-### ✅ Day 30 — Soak／chaos
+### ✅ Day 31 — Soak／chaos
 
 - 同一 release binary 至少 **1 小時**混合 static、proxy、SSE、reload、
   backend failure/recovery 與 TLS/H3 流量。
 - **完成判定**：零 crash、零卡死、零幽靈程序、**無單調 RSS 成長**。
 
-### ✅ Day 31 — 效能回歸
+### ✅ Day 32 — 效能回歸
 
 - 同一 VPS／同一 harness，對比 2026-07-25 baseline：static plain/gzip、
   reverse proxy、20MB streaming。
 - **完成判定**：吞吐或 p99 回退超過 10% 必須修復，或在 release notes 以數據解釋；
   streaming RSS 必須維持 bounded。
 
-### 🔨 Day 32 — 發布產物與安裝驗證
+### 🔨 Day 33 — 發布產物與安裝驗證
 
 - Linux glibc x86_64/aarch64、macOS x86_64/arm64 binary、GHCR image、
   SHA-256 checksums、SBOM、provenance／signature 自動產生。
@@ -800,7 +862,7 @@ H3 CORS／rewrite／error_page parity。
 - 全新安裝、`0.1.7 → 0.2.0` 升級、systemd start/reload/stop、uninstall、
   Docker 啟動與最小 Pingclairfile 都在乾淨環境驗證。
 
-### 🔨 Day 33 — 設定參考手冊
+### 🔨 Day 34 — 設定參考手冊
 
 原本 Day 33 是「一天寫完所有文件」,2026-07-30 拆成三天。理由：光是設定表面
 就有 `limits`（10 條）、`reverse_proxy` 底下 7 個子區塊、`rate_limit`、
@@ -814,7 +876,7 @@ M4 的 metrics。一天寫完的品質會是「能交差」而不是「能用」
 - **完成判定**：`cargo test -p pingclair-config --test documentation` 全綠,
   且參考手冊裡每個 directive 都能在 `examples/` 找到一個可驗證的用例。
 
-### 🔨 Day 34 — 官網與 README
+### 🔨 Day 35 — 官網與 README
 
 - **Astro ＋ Starlight**。選它不是因為好看（雖然是）,而是因為這個專案
   **已經是三語的**,而 Starlight 的 i18n 是一級支援——語言切換、per-locale
@@ -831,7 +893,7 @@ M4 的 metrics。一天寫完的品質會是「能交差」而不是「能用」
 - 三語 README 收斂成「入口 ＋ 連到站上」,不再各自維護一份完整文件。
 - **完成判定**：站可離線建置；三語導航皆可用；站上每個設定區塊都被守衛編譯過。
 
-### 🔨 Day 35 — CHANGELOG 與 migration
+### 🔨 Day 36 — CHANGELOG 與 migration
 
 - `CHANGELOG.md`：`0.1.7 → 0.2.0` 的完整條目,含**行為變更**與**移除的設定**。
 - migration notes：`proxy_protocol` 從全域改成 per-listener、`encode br` 變成
@@ -841,11 +903,76 @@ M4 的 metrics。一天寫完的品質會是「能交差」而不是「能用」
 - **完成判定**：拿一份 `0.1.7` 的真實設定,照 migration notes 改完能通過
   `pingclair validate`。
 
-### 🚀 Day 36 — 發布
+### 🚀 Day 37 — 發布
 
 只在上述全綠後：改 workspace version 為 `0.2.0` → 帶 emoji 的 release commit
 → signed `v0.2.0` tag → 確認 GitHub Release／GHCR 完成 → 把本目標移入
 `docs/STATUS.md`。
+
+---
+
+## v0.3+ 架構 backlog
+
+2026-07-31 一次外部架構審視的產物。**這些不是 v0.2 的工作**——列在這裡是因為
+它們一旦忘記,就會用「每次新增欄位都要記得改五個地方」的形式反覆收利息。
+
+### M0 — 插件系統（v0.3 第一個里程碑）
+
+**先決條件:至少有兩個真實的插件需求。** 零需求設計出來的 ABI 是照想像長的,
+不是照需要長的。候選:JWT/OIDC、external auth、AI Gateway middleware、
+自訂 access logger。**在湊到兩個之前不要固定 ABI。**
+
+順序:
+
+1. **插件 RFC**——identity/version、capability、directive scope、
+   init/prepare/start/shutdown、config hash 與 reload、ordering、failure policy、
+   timeout、body limit、cancellation、H1/H2/H3 支援宣告、trust boundary。
+2. **`ValidatedConfig → PreparedConfig`**——所有會失敗或耗資源的工作
+   （regex、CIDR、TLS 素材、檔案路徑、plugin config、load balancer、
+   rate limiter、handler plan）在 publish **之前**完成,然後一次 atomic publish。
+3. **`ProxyState` 的平行 Vec 改成 `CompiledRoute`**。
+   > ⚠️ 這條不是理論風險:2026-07-29／30 加 `upstream_tls` 與 `route_protections`
+   > 時各踩過一次——每個 branch 都得記得 push 一次,漏一個整條 route index 錯位。
+4. **收斂 transport-neutral handler plan**。目前有三套部分重疊的執行器
+   （`pingclair-core::execute_handler()`、H1/H2 `handle_config()`、
+   H3 `plan_h3_handler()`）。**不要試圖刪掉獨立的 quiche H3 transport**——
+   Pingora 0.8 的限制是真的（見 GUARDRAILS）,要消除的是 middleware policy
+   重複,不是 transport。
+5. **Directive/module registry**。第一版**只支援編譯進 binary 的 Rust module**;
+   不要做 `.so` trait-object loader,Rust ABI 不穩定。按能力拆:
+   RequestHeadFilter、streamed RequestBodyFilter、LocalHandler、UpstreamSelector、
+   ResponseHeadFilter、streamed ResponseBodyFilter、AccessLogger、Lifecycle。
+   > 🚫 **不得用整體 `Vec<u8>` 當 body API**。這正是本專案犯過**兩次**的
+   > 全量緩衝錯誤（`ecf7b45` 靜態檔、`7100e83` 反代）,把它寫進 ABI 等於
+   > 讓第三次變成合約。
+6. **之後再評估 WASM／external processor**。不可信插件優先考慮帶 memory、
+   fuel、deadline 限制的 WASM;OPA／DLP／ext-auth 走有 timeout、body limit、
+   fail policy 的 HTTP/gRPC external processor。
+
+### 其他
+
+- 拆分 1,200 行的 `main.rs`：ConfigManager、RuntimeServices、ListenerSupervisor、
+  CertificateSupervisor、AdminControlPlane、ShutdownCoordinator。
+- 收斂 background／TLS／Admin 多個 Tokio runtime 的 ownership。
+- 拆分約 3,000 行的 `adapter/caddyfile.rs`。
+- **保留 source span**——adapter 現在到處建 `Location { start: 0, end: 0 }`,
+  等於把「錯在第幾行」丟掉了。
+- 整併重複的 `ConfigLoader`／TOML loader ownership。
+- DNS、health-check 的 process-global registry 改由 RuntimeServices 持有,
+  改善 reload、測試隔離與 shutdown ownership。
+
+### 重構時不得破壞
+
+以下不是問題,是刻意的設計:
+
+- request path 上 `ArcSwap` 的 lock-free snapshot
+- 配置期預編譯 regex／CIDR／TLS policy
+- bounded streaming 與 cancellation
+- 靜態檔 hot path 的同步 page-cache read
+- H3 獨立的 quiche transport
+- 單一 BoringSSL 依賴圖
+- v0.2 明確要求 listener topology 變更需 restart——**這比假裝已經
+  zero-downtime 好**
 
 ---
 
@@ -883,10 +1010,11 @@ M4 的 metrics。一天寫完的品質會是「能交差」而不是「能用」
 | M1 生產站可替換 | Day 1–7 | ✅ **完成**（`8294116`，2026-07-28 真站驗收） |
 | M2 生產護欄 | Day 8–15 | ✅ **完成**（矩陣 23/23、原站 M1 回歸 27/27、已上線;浸泡進行中） |
 | M2.5 協議硬化 | Day 16 | ⬜ 未開始（**由 M5 提前**：先護欄後加速） |
-| M3 接上 Pingora 能力（含 `proxy_cache`） | Day 17–21 | ⬜ 未開始 |
-| M4 可觀測性與運維 | Day 22–25 | ⬜ 未開始 |
-| M5 協議矩陣與 H3 | Day 26–28 | ⬜ 未開始 |
-| M6 發布 | Day 29–36 | ⬜ 未開始 |
+| M2.6 設定只有一條驗證路徑 | Day 17 | ⬜ 未開始（**外部審視查證屬實**：Admin 繞過 canonical validation） |
+| M3 接上 Pingora 能力（含 `proxy_cache`） | Day 18–22 | ⬜ 未開始 |
+| M4 可觀測性與運維 | Day 23–26 | ⬜ 未開始 |
+| M5 協議矩陣與 H3 | Day 27–29 | ⬜ 未開始 |
+| M6 發布 | Day 30–37 | ⬜ 未開始 |
 
 > 完成一天就在對應 Day 標題後標上 `✔ <commit>`；完成一個里程碑就更新這張表，
 > 並把驗證證據路徑寫進 `docs/STATUS.md`。
