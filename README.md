@@ -190,15 +190,21 @@ those proxy networks in the global block. Untrusted peers cannot supply
 ```caddyfile
 {
     trusted_proxies 10.0.0.0/8 2001:db8::/32
-    proxy_protocol on
+}
+
+example.com {
+    listen :8443 proxy_protocol
+    reverse_proxy app:8080
 }
 ```
 
 The verified client IP is shared by access control, rate limiting, IP-hash
 load balancing, upstream forwarding, placeholders, and access logs. Changes
-to `trusted_proxies` currently require a restart. `proxy_protocol on` requires
-PROXY v1 or v2 on every TCP connection and rejects transport peers outside
-`trusted_proxies` before TLS or HTTP parsing. XFF and RFC 7239 `Forwarded`
+to `trusted_proxies` currently require a restart. `listen … proxy_protocol`
+requires PROXY v1 or v2 on that listener and rejects transport peers outside
+`trusted_proxies` before TLS or HTTP parsing. It is per-listener, as in nginx,
+so a port behind an L4 balancer and a port reached directly can coexist in one
+server. XFF and RFC 7239 `Forwarded`
 chains are bounded; malformed or conflicting identities fail closed. PROXY
 protocol does not apply to the UDP HTTP/3 listener.
 

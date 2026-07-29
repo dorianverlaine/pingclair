@@ -197,14 +197,18 @@ Un pair non approuvé ne peut pas fournir l'identité via `X-Forwarded-For`,
 ```caddyfile
 {
     trusted_proxies 10.0.0.0/8 2001:db8::/32
-    proxy_protocol on
+}
+
+example.com {
+    listen :8443 proxy_protocol
+    reverse_proxy app:8080
 }
 ```
 
 Le contrôle d'accès, le rate limiting, l'IP-hash, les en-têtes transmis, les
 placeholders et les journaux d'accès partagent la même adresse client
 vérifiée. La modification de `trusted_proxies` nécessite actuellement un
-redémarrage. `proxy_protocol on` exige PROXY v1 ou v2 sur chaque connexion TCP
+redémarrage. `listen … proxy_protocol` exige PROXY v1 ou v2 sur chaque connexion TCP
 et rejette avant TLS ou HTTP tout pair de transport absent de
 `trusted_proxies`. Les chaînes XFF et RFC 7239 `Forwarded` sont bornées ; une
 syntaxe invalide ou des identités contradictoires échouent en mode fermé.

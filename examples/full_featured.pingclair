@@ -29,8 +29,12 @@ example.com {
         http3
     }
 
-    # Response compression for static files (gzip, brotli, zstd)
-    encode gzip br zstd
+    # Response compression. Argument order is the server's preference when
+    # more than one coding is acceptable to the client, so zstd comes first.
+    # Brotli is deliberately absent: the proxy has no streaming Brotli
+    # encoder, and `encode br` is a compile error rather than a silent
+    # downgrade to gzip.
+    encode zstd gzip
     # 🗜️ Reverse-proxy gzip uses these exact or wildcard MIME patterns.
     gzip_types text/* application/json application/*+json application/x-ndjson
 
