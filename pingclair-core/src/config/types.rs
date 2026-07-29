@@ -507,6 +507,24 @@ pub enum MatcherCondition {
     Regex(String),
 }
 
+/// 🔑 Selects the identity charged by one rate-limit policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitKey {
+    /// 🌐 Charges each verified client IP independently.
+    Ip,
+    /// 🌍 Charges every request reaching this limiter to one shared bucket.
+    Global,
+    /// 🛣️ Charges the matched route as one bucket.
+    Route,
+    /// 🎫 Charges the bearer token or `X-API-Key` value without retaining the secret.
+    ApiKey,
+    /// 🏷️ Charges the value of an arbitrary request header.
+    Header(String),
+    /// 🏢 Charges the value of a tenant header.
+    Tenant(String),
+}
+
 /// Handler configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -603,6 +621,12 @@ pub enum HandlerConfig {
         /// Extra burst allowance
         #[serde(default)]
         burst: u64,
+        /// 🔑 Overrides the legacy `by_ip` switch with an explicit key source.
+        #[serde(default)]
+        key: Option<RateLimitKey>,
+        /// 🧪 Reports exact quota state without rejecting over-limit requests.
+        #[serde(default)]
+        dry_run: bool,
     },
 
     /// Error handling

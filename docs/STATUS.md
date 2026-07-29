@@ -449,6 +449,7 @@ commit `0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。
 
 ### 主動健康檢查已在本機接線（Day 12，2026-07-29）🧪
 
+- Day 12 commit：`e5efe2384d484cbe646b5792e1abd4f0c4aa1c31`。
 - Pingora background service 現在驅動全域 weak pool registry；hot reload 會讓舊
   pool 自然釋放，DNS publish 後每輪讀取新 generation，不會持續探測已淘汰的 IP。
   registry 與 recovery map 都有明確 pruner，長期狀態不會隨 reload／DNS 輪替無限成長。
@@ -472,6 +473,26 @@ commit `0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。
   以 Rust 1.88、`--test-threads=2` **連跑 30 次全綠**。
 - locked local gate 全綠，總測試數 **408 → 415**。尚未做乾淨 Linux release、
   VPS 或真 QUIC client 驗證；留到 Day 15，因此本項是 🧪，不是遠端 ✅。
+
+### 精確 rate limit 已在本機接線（Day 13，2026-07-29）🧪
+
+- 以有鎖但短臨界區的精確 token bucket 取代 Count-Min Sketch 機率估算；
+  `requests + burst` 是可立即使用的容量，按 `requests / window` 速率補回。
+- H1／H2／H3 共用同一份 limiter 狀態與 verified client IP，可依 IP、global、
+  route、Bearer／`X-API-Key`、任意 header 或 tenant header 分桶；敏感 key
+  只保留 hash，不會把 token 原文留在長期 map。
+- 每 1,024 次檢查由 request-path pruner 清除閒置超過兩個 window 的 bucket；
+  map 硬上限為 65,536 keys，達上限且無閒置項可清時 fail closed，避免攻擊者用
+  高基數 header 讓記憶體無界成長。
+- 一般與 dry-run 回應都輸出精確 `RateLimit-Limit`、`RateLimit-Remaining`、
+  `RateLimit-Reset`；超額另輸出 `Retry-After`，dry-run 只計數與報告而不回 429。
+- Pingclairfile 與 JSON 共用 compiler validation；requests、window、burst 與
+  header name 的錯誤設定會在載入時拒絕，Admin API 不能繞過 adapter。
+- red unit test 先證明舊實作在 `5 + burst 2` 時第六個 request 就錯誤拒絕。
+  修復後真 binary 整合測試驗證容量邊界、header、獨立 key、429 與一個 window
+  後 refill，並以 Rust 1.88 **連跑 30 次全綠**。
+- locked local gate 全綠，總測試數 **415 → 422**。Redis／distributed limit
+  按 v0.2 範圍明確不做；Linux／VPS 驗證留到 Day 15，所以本項仍是 🧪。
 
 ---
 

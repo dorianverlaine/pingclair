@@ -3403,3 +3403,104 @@ async fn test_upstream_tls_material_that_fails_to_load_refuses_the_route() {
         "a route whose trust material is missing must fail closed"
     );
 }
+
+#[tokio::test]
+async fn test_exact_rate_limit_burst_headers_and_refill() {
+    let config = r#"
+        {
+            admin off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            @limited path /limited
+            route @limited {
+                rate_limit 2 1s {
+                    burst 1
+                    key header X-Client
+                }
+                respond "limited-ok"
+            }
+
+            @dry path /dry
+            route @dry {
+                rate_limit 1 60s {
+                    key api_key
+                    dry_run
+                }
+                respond "dry-run-ok"
+            }
+
+            respond "fallback"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+    let url = server.url(0, "/limited");
+
+    for expected_remaining in [2, 1, 0] {
+        let response = client
+            .get(&url)
+            .header("X-Client", "client-a")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["ratelimit-limit"], "3");
+        assert_eq!(
+            response.headers()["ratelimit-remaining"],
+            expected_remaining.to_string()
+        );
+    }
+
+    let rejected = client
+        .get(&url)
+        .header("X-Client", "client-a")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), 429);
+    assert_eq!(rejected.headers()["ratelimit-limit"], "3");
+    assert_eq!(rejected.headers()["ratelimit-remaining"], "0");
+    assert_eq!(rejected.headers()["ratelimit-reset"], "2");
+    assert_eq!(rejected.headers()["retry-after"], "1");
+
+    // 🪙 A different configured header value owns an independent bucket.
+    let independent = client
+        .get(&url)
+        .header("X-Client", "client-b")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(independent.status(), 200);
+    assert_eq!(independent.headers()["ratelimit-remaining"], "2");
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let refilled = client
+        .get(&url)
+        .header("X-Client", "client-a")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refilled.status(), 200);
+    assert_eq!(refilled.headers()["ratelimit-remaining"], "1");
+
+    // 🧪 Dry-run still counts and reports excess traffic without returning 429.
+    for expected_remaining in [0, 0] {
+        let response = client
+            .get(server.url(0, "/dry"))
+            .bearer_auth("integration-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.headers()["ratelimit-remaining"],
+            expected_remaining.to_string()
+        );
+        assert_eq!(response.headers()["ratelimit-dry-run"], "true");
+    }
+}

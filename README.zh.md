@@ -378,6 +378,27 @@ server "shop.example.com" {
 有 byte 上限的 body 比對、獨立連接埠、連線重用、門檻與 slow-start。HTTPS 探測
 會沿用該 route 的 pinned CA、client certificate、SNI 與協議政策。
 
+### 精確的本機 rate limit
+
+```caddyfile
+api.example.com {
+    @api path /api/*
+    route @api {
+        rate_limit 100 60s {
+            burst 20
+            key tenant X-Tenant-ID
+        }
+        reverse_proxy app:8080
+    }
+}
+```
+
+Token bucket 會輸出精確的 `RateLimit-Limit`、`RateLimit-Remaining` 與
+`RateLimit-Reset` response header，拒絕時另有 `Retry-After`。在 block 加上
+`dry_run` 可只計數與回報、不回 429。key 可選 `ip`、`global`、`route`、
+`api_key`、`header <name>` 或 `tenant [name]`。這是 process-local limiter；
+Redis distributed limit 不在 v0.2 範圍內。
+
 上游 scheme 會決定連線協議：裸位址或 `http://` 使用 HTTP/1.1；`https://`
 透過 ALPN 協商 HTTP/2，並可回退至 HTTP/1.1；`h2c://` 強制使用明文
 prior-knowledge HTTP/2；`h2://` 則強制使用 TLS HTTP/2。原生 gRPC 應使用

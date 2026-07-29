@@ -426,6 +426,9 @@ pub enum Handler {
     /// HTTP Basic authentication gate
     BasicAuth(BasicAuthConfig),
 
+    /// 🚦 Exact local rate-limit policy.
+    RateLimit(RateLimitConfig),
+
     /// Internal URI rewrite.
     Rewrite(RewriteConfig),
 
@@ -447,6 +450,27 @@ pub struct BasicAuthConfig {
 
     /// 🔑 Username and plain-text or bcrypt password pairs.
     pub credentials: Vec<(String, String)>,
+}
+
+/// 🚦 Typed rate-limit policy produced by the Pingclairfile adapter.
+#[derive(Debug, Clone)]
+pub struct RateLimitConfig {
+    pub requests: u64,
+    pub window_ms: u64,
+    pub burst: u64,
+    pub key: RateLimitKey,
+    pub dry_run: bool,
+}
+
+/// 🔑 Selects the request identity charged by a rate-limit policy.
+#[derive(Debug, Clone)]
+pub enum RateLimitKey {
+    Ip,
+    Global,
+    Route,
+    ApiKey,
+    Header(String),
+    Tenant(String),
 }
 
 /// Proxy configuration

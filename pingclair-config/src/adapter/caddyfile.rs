@@ -793,11 +793,75 @@ fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
             Ok(Handler::Handle(handlers))
         }
         "basic_auth" | "basicauth" => adapt_basic_auth(d),
+        "rate_limit" => adapt_rate_limit(d),
         "rewrite" => adapt_rewrite(d),
         "cors" => adapt_cors(d),
         "access_control" => adapt_access_control(d),
         _ => Err(AdapterError::UnknownDirective(d.name)),
     }
+}
+
+/// 🚦 Adapts an exact local rate-limit policy and rejects ambiguous options.
+fn adapt_rate_limit(directive: Directive) -> Result<Handler, AdapterError> {
+    let [requests, window] = directive.args.as_slice() else {
+        return Err(AdapterError::InvalidArgument(
+            directive.name,
+            "expected <requests> <window> followed by an optional block".into(),
+        ));
+    };
+    let requests = requests
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| AdapterError::InvalidArgument("rate_limit".into(), requests.clone()))?;
+    let window_ms = parse_duration_ms(window)
+        .filter(|value| *value >= 1_000 && value % 1_000 == 0)
+        .ok_or_else(|| AdapterError::InvalidArgument("rate_limit".into(), window.clone()))?;
+    let mut config = RateLimitConfig {
+        requests,
+        window_ms,
+        burst: 0,
+        key: RateLimitKey::Ip,
+        dry_run: false,
+    };
+
+    if let Some(block) = directive.block {
+        for option in block.directives {
+            match option.name.as_str() {
+                "burst" => {
+                    let value = expect_one_argument(&option)?;
+                    config.burst = value.parse::<u64>().map_err(|_| {
+                        AdapterError::InvalidArgument(option.name.clone(), value.to_string())
+                    })?;
+                }
+                "dry_run" => {
+                    expect_no_arguments(&option)?;
+                    config.dry_run = true;
+                }
+                "key" => {
+                    config.key = match option.args.as_slice() {
+                        [kind] if kind == "ip" => RateLimitKey::Ip,
+                        [kind] if kind == "global" => RateLimitKey::Global,
+                        [kind] if kind == "route" => RateLimitKey::Route,
+                        [kind] if kind == "api_key" => RateLimitKey::ApiKey,
+                        [kind] if kind == "tenant" => RateLimitKey::Tenant("X-Tenant-ID".into()),
+                        [kind, name] if kind == "header" => RateLimitKey::Header(name.clone()),
+                        [kind, name] if kind == "tenant" => RateLimitKey::Tenant(name.clone()),
+                        _ => {
+                            return Err(AdapterError::InvalidArgument(
+                                option.name,
+                                "expected ip, global, route, api_key, header <name>, or tenant [name]"
+                                    .into(),
+                            ));
+                        }
+                    };
+                }
+                _ => return Err(AdapterError::UnknownDirective(option.name)),
+            }
+        }
+    }
+
+    Ok(Handler::RateLimit(config))
 }
 
 fn adapt_redirect(d: Directive) -> Result<Handler, AdapterError> {
@@ -2040,6 +2104,7 @@ fn handler_has_terminal(handler: &Handler) -> bool {
         }
         Handler::Headers(_)
         | Handler::BasicAuth(_)
+        | Handler::RateLimit(_)
         | Handler::Rewrite(_)
         | Handler::Cors(_)
         | Handler::AccessControl(_)

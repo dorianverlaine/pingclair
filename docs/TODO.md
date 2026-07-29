@@ -487,7 +487,7 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
 - **完成判定**：故障節點能被正確摘除並在恢復後重新加入，**且該摘除發生在
   沒有請求經過該節點的情況下**（否則就只是驗到被動標記）。
 
-### 🔨 Day 13 — Rate limit 語意補齊
+### 🔨 Day 13 — Rate limit 語意補齊 🧪
 
 現有 `burst` 未真正生效，key 只有 IP／global，remaining 是估算值。
 

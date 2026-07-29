@@ -239,30 +239,9 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             }
         }
 
-        HandlerConfig::RateLimit {
-            requests,
-            window_secs,
-            by_ip: _,
-            burst,
-        } => {
-            // RateLimit handler - this signals rate limiting is configured for this route
-            // The actual rate limit checking is done at the proxy layer
-            // Here we return headers that indicate the rate limit config
-            let mut response = HandlerResponse::status(429);
-            response
-                .headers
-                .insert("X-RateLimit-Limit".to_string(), requests.to_string());
-            response
-                .headers
-                .insert("X-RateLimit-Window".to_string(), window_secs.to_string());
-            response
-                .headers
-                .insert("X-RateLimit-Burst".to_string(), burst.to_string());
-            response
-                .headers
-                .insert("Retry-After".to_string(), window_secs.to_string());
-            response.body = Some(bytes::Bytes::from("Too Many Requests"));
-            Ok(response)
+        HandlerConfig::RateLimit { .. } => {
+            // 🚦 Enforcement and exact counters live in the protocol-neutral proxy layer.
+            Ok(HandlerResponse::status(200))
         }
 
         HandlerConfig::HandleErrors { errors: _ } => {
