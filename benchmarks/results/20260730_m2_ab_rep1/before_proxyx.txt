@@ -1,0 +1,14 @@
+Running 20s test @ http://127.0.0.1:18099/proxy/x
+  2 threads and 50 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    29.74ms   60.53ms 602.10ms   84.72%
+    Req/Sec    16.44k     3.02k   26.40k    70.82%
+  Latency Distribution
+     50%    1.06ms
+     75%   16.58ms
+     90%  130.39ms
+     99%  198.58ms
+  655850 requests in 20.10s, 225.79MB read
+  Non-2xx or 3xx responses: 655850
+Requests/sec:  32629.89
+Transfer/sec:     11.23MB

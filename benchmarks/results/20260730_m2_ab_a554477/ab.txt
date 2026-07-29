@@ -1,0 +1,21 @@
+📊 M2 A/B throughput regression
+   before: pingclair:pre-m2-39c5623
+   after:  pingclair:rc-a554477
+   load:   wrk -t2 -c50 -d20s, one side at a time, 2 CPU / 512M each
+   date:   2026-07-29T17:36:54Z
+
+── before ──────────────────────────────────────────
+  before / → 53473.64 req/s, p99 197.76ms
+  before /proxy/x → 1118.89 req/s, p99 961.98ms
+  before idle after load → 0.23% 22.7MiB / 512MiB
+
+── after ───────────────────────────────────────────
+  after / → 53380.12 req/s, p99 195.94ms
+  after /proxy/x → 1122.62 req/s, p99 975.27ms
+  after idle after load → 0.41% 15.27MiB / 512MiB
+
+── delta ───────────────────────────────────────────
+  root: 53473.64 → 53380.12 req/s  (-0.2%)
+  proxyx: 1118.89 → 1122.62 req/s  (+0.3%)
+
+Full wrk output per side and route is in /Users/sinclairverlaine/code/pingclair/benchmarks/results/20260730_m2_ab_a554477.

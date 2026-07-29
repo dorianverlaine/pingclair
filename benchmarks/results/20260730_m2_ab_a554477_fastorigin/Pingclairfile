@@ -1,0 +1,11 @@
+{
+	admin off
+}
+
+:8080 {
+	handle /proxy/* {
+		reverse_proxy http://origin-ab:8080
+	}
+
+	respond "ab-control"
+}

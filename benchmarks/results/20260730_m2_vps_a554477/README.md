@@ -52,14 +52,39 @@ registry, and DNS pools. A leak in any of them appears over hours, not in a
 short load run, so the live site is the right instrument for this one thing
 even though it is the wrong instrument for fault injection.
 
-Baseline: `soak_start.csv`.
+### Result after 40 minutes: plateau, not a leak
 
 ```
-2026-07-29T17:13:29Z, 8.77MiB, 0.34%, 200
+17:13  8.770 MiB   0.34%   200
+17:18  8.844 MiB   0.28%   200
+17:23  9.434 MiB   0.35%   200
+17:28  9.504 MiB   0.36%   200
+17:33  9.957 MiB   0.31%   200   ← growth stops here
+17:38  9.969 MiB   0.36%   200
+17:43  9.922 MiB   0.37%   200
+17:48  9.922 MiB   0.33%   200
 ```
 
-CPU is worth watching specifically: the health-check driver polls every 100 ms
-whether or not any route configures a probe, and this server configures none.
+RSS climbed 1.2 MiB over the first twenty minutes and has been **flat for the
+twenty since**. The shape is warm-up — allocator arenas, the TLS certificate
+cache, connection pools — not accumulation. The previous build sat at
+**10.07 MiB after 39 hours**, so this one plateaus slightly *below* the version
+it replaced. Every sample returned 200.
+
+The structural argument agrees. This server's configuration uses none of the
+new features: no `rate_limit`, no `health_check`, no `proxy_protocol`, one
+plain `reverse_proxy app:8080`. Four of the five new long-lived maps are
+therefore empty by construction, and the fifth holds a single backend. There is
+nothing here for a leak to accumulate *in*, which is why the plateau is the
+expected answer rather than a lucky one.
+
+### Idle CPU
+
+Old build 0.23%, new build 0.28–0.37%. About a tenth of a percentage point,
+consistent with the health-check driver's 100 ms poll running whether or not
+any route configures a probe — which this one does not. Small, but it is real
+and it is paid by every deployment. Worth removing when the driver can sleep
+until the next due probe instead of polling.
 
 ## A harness trap fixed on the way
 
