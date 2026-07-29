@@ -435,6 +435,59 @@ fn no_proxy_client() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
+/// 🧭 Sends one raw HTTP request through a chosen PROXY protocol transport source.
+async fn proxy_protocol_request(
+    address: SocketAddr,
+    source_ip: std::net::IpAddr,
+    prefix: &[u8],
+    path: &str,
+    extra_headers: &[(&str, &str)],
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let socket = match source_ip {
+        std::net::IpAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        std::net::IpAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    };
+    socket.bind(SocketAddr::new(source_ip, 0))?;
+    let mut stream = socket.connect(address).await?;
+    let mut request = prefix.to_vec();
+    request.extend_from_slice(format!("GET {path} HTTP/1.1\r\nHost: {address}\r\n").as_bytes());
+    for (name, value) in extra_headers {
+        request.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    request.extend_from_slice(b"Connection: close\r\n\r\n");
+    stream.write_all(&request).await?;
+
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut response))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "response timed out"))??;
+    Ok(response)
+}
+
+fn proxy_v1_prefix(client: &str, destination: SocketAddr) -> Vec<u8> {
+    format!(
+        "PROXY TCP4 {client} {} 4567 {}\r\n",
+        destination.ip(),
+        destination.port()
+    )
+    .into_bytes()
+}
+
+fn proxy_v2_prefix(client: [u8; 4], destination: SocketAddr) -> Vec<u8> {
+    let std::net::IpAddr::V4(destination_ip) = destination.ip() else {
+        panic!("the integration fixture requires an IPv4 listener");
+    };
+    let mut header = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+    header.extend_from_slice(&[0x21, 0x11, 0, 12]);
+    header.extend_from_slice(&client);
+    header.extend_from_slice(&destination_ip.octets());
+    header.extend_from_slice(&4567u16.to_be_bytes());
+    header.extend_from_slice(&destination.port().to_be_bytes());
+    header
+}
+
 /// 🌊 Reads incrementally until the expected protocol marker arrives.
 async fn read_until_marker(
     stream: &mut tokio::net::TcpStream,
@@ -522,6 +575,128 @@ fn protocol_proxy_config_url(upstream_address: String) -> String {
         }]
     })
     .to_string()
+}
+
+#[tokio::test]
+async fn test_active_health_check_removes_idle_failed_upstream() {
+    use tokio::io::AsyncWriteExt;
+
+    async fn spawn_upstream(body: &'static str) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let request =
+                        read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+                    let request_text = String::from_utf8_lossy(&request);
+                    let path = request_text
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap();
+                    let response_body = if path == "/health" { "healthy" } else { body };
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                                response_body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        (address, task)
+    }
+
+    let (first_address, first_task) = spawn_upstream("first").await;
+    let (second_address, second_task) = spawn_upstream("second").await;
+    let config = serde_json::json!({
+        "global": { "http3": false },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "routes": [{
+                "path": "/*",
+                "handler": {
+                    "type": "reverse_proxy",
+                    "upstreams": [
+                        format!("http://{first_address}"),
+                        format!("http://{second_address}")
+                    ],
+                    "load_balance": { "strategy": "round_robin" },
+                    "health_check": {
+                        "path": "/health",
+                        "interval": 1,
+                        "timeout": 1,
+                        "threshold": 1
+                    },
+                    "retry": { "max_attempts": 1 }
+                }
+            }]
+        }]
+    })
+    .to_string();
+    let mut server = TestServer::new(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    // 🧪 Stop one origin and allow two probe intervals without sending any
+    // proxy traffic, so only an out-of-band active check can remove it.
+    first_task.abort();
+    let _ = first_task.await;
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+
+    let client = no_proxy_client();
+    for _ in 0..4 {
+        let response = client.get(server.url(0, "/probe")).send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            200,
+            "an idle failed upstream stayed in rotation instead of being actively removed"
+        );
+        assert_eq!(response.text().await.unwrap(), "second");
+    }
+
+    // 🌱 Rebind the exact address and wait without proxy traffic again; an
+    // active success must rejoin the recovered origin.
+    let recovered_listener = tokio::net::TcpListener::bind(first_address)
+        .await
+        .expect("failed to rebind recovered upstream");
+    let recovered_task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = recovered_listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let _ = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nrecovered",
+                    )
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    let mut bodies = Vec::new();
+    for _ in 0..4 {
+        let response = client.get(server.url(0, "/probe")).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        bodies.push(response.text().await.unwrap());
+    }
+    assert!(
+        bodies.iter().any(|body| body == "recovered"),
+        "the recovered upstream never rejoined rotation: {bodies:?}"
+    );
+
+    recovered_task.abort();
+    let _ = recovered_task.await;
+    second_task.abort();
+    let _ = second_task.await;
 }
 
 #[tokio::test]
@@ -2189,6 +2364,7 @@ async fn test_untrusted_forwarding_headers_are_sanitized_upstream() {
         .header("X-Forwarded-For", "203.0.113.7")
         .header("X-Real-IP", "203.0.113.8")
         .header("X-Forwarded-Proto", "https")
+        .header("Forwarded", "for=203.0.113.9;proto=https")
         .send()
         .await
         .unwrap();
@@ -2200,6 +2376,7 @@ async fn test_untrusted_forwarding_headers_are_sanitized_upstream() {
     assert!(upstream_request.contains("\r\nx-forwarded-for: 127.0.0.1\r\n"));
     assert!(upstream_request.contains("\r\nx-real-ip: 127.0.0.1\r\n"));
     assert!(upstream_request.contains("\r\nx-forwarded-proto: http\r\n"));
+    assert!(upstream_request.contains("\r\nforwarded: for=127.0.0.1\r\n"));
     assert!(
         upstream_request.contains("\r\nx-forwarded-host: 127.0.0.1:"),
         "unexpected upstream request:\n{upstream_request}"
@@ -3195,6 +3372,66 @@ async fn test_upstream_tls_verifies_by_default_and_honours_configured_trust() {
 }
 
 #[tokio::test]
+async fn test_active_health_check_uses_the_route_pinned_ca() {
+    let mut params = rcgen::CertificateParams::new(vec!["origin.test".to_string()])
+        .expect("certificate parameters");
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "origin.test");
+    let key = rcgen::KeyPair::generate().expect("key pair");
+    let certificate = params.self_signed(&key).expect("self-signed origin");
+    let certificate_pem = certificate.pem();
+    let key_pem = key.serialize_pem();
+    let trust_store = tempfile::tempdir().expect("trust store dir");
+    let trust_path = trust_store.path().join("origin-ca.pem");
+    std::fs::write(&trust_path, &certificate_pem).expect("publish trust root");
+
+    let (origin, origin_task) = spawn_self_signed_tls_origin(&certificate_pem, &key_pem, 16).await;
+    let config = serde_json::json!({
+        "global": { "http3": false },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "routes": [{
+                "path": "/*",
+                "handler": {
+                    "type": "reverse_proxy",
+                    "upstreams": [format!("https://{origin}")],
+                    "health_check": {
+                        "path": "/health",
+                        "interval": 1,
+                        "timeout": 1,
+                        "threshold": 1,
+                        "expected_body": "secure-origin"
+                    },
+                    "upstream_tls": {
+                        "server_name": "origin.test",
+                        "trusted_ca_certs": [trust_path.to_string_lossy()]
+                    }
+                }
+            }]
+        }]
+    })
+    .to_string();
+    let mut server = TestServer::new(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    // 🔐 No proxy request occurs before the active checker has completed a
+    // pinned-CA handshake; a mismatched probe policy would mark the only peer down.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let response = no_proxy_client()
+        .get(server.url(0, "/"))
+        .send()
+        .await
+        .expect("the proxy must answer");
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "secure-origin");
+
+    origin_task.abort();
+    let _ = origin_task.await;
+}
+
+#[tokio::test]
 async fn test_upstream_tls_material_that_fails_to_load_refuses_the_route() {
     // 🚫 A route pinned to a CA file that does not exist must refuse rather
     // than quietly connecting with system trust and no pinning at all.
@@ -3220,4 +3457,203 @@ async fn test_upstream_tls_material_that_fails_to_load_refuses_the_route() {
         500,
         "a route whose trust material is missing must fail closed"
     );
+}
+
+#[tokio::test]
+async fn test_exact_rate_limit_burst_headers_and_refill() {
+    let config = r#"
+        {
+            admin off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            @limited path /limited
+            route @limited {
+                rate_limit 2 1s {
+                    burst 1
+                    key header X-Client
+                }
+                respond "limited-ok"
+            }
+
+            @dry path /dry
+            route @dry {
+                rate_limit 1 60s {
+                    key api_key
+                    dry_run
+                }
+                respond "dry-run-ok"
+            }
+
+            respond "fallback"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+    let url = server.url(0, "/limited");
+
+    for expected_remaining in [2, 1, 0] {
+        let response = client
+            .get(&url)
+            .header("X-Client", "client-a")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["ratelimit-limit"], "3");
+        assert_eq!(
+            response.headers()["ratelimit-remaining"],
+            expected_remaining.to_string()
+        );
+    }
+
+    let rejected = client
+        .get(&url)
+        .header("X-Client", "client-a")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), 429);
+    assert_eq!(rejected.headers()["ratelimit-limit"], "3");
+    assert_eq!(rejected.headers()["ratelimit-remaining"], "0");
+    assert_eq!(rejected.headers()["ratelimit-reset"], "2");
+    assert_eq!(rejected.headers()["retry-after"], "1");
+
+    // 🪙 A different configured header value owns an independent bucket.
+    let independent = client
+        .get(&url)
+        .header("X-Client", "client-b")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(independent.status(), 200);
+    assert_eq!(independent.headers()["ratelimit-remaining"], "2");
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let refilled = client
+        .get(&url)
+        .header("X-Client", "client-a")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refilled.status(), 200);
+    assert_eq!(refilled.headers()["ratelimit-remaining"], "1");
+
+    // 🧪 Dry-run still counts and reports excess traffic without returning 429.
+    for expected_remaining in [0, 0] {
+        let response = client
+            .get(server.url(0, "/dry"))
+            .bearer_auth("integration-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.headers()["ratelimit-remaining"],
+            expected_remaining.to_string()
+        );
+        assert_eq!(response.headers()["ratelimit-dry-run"], "true");
+    }
+}
+
+#[tokio::test]
+async fn test_proxy_protocol_and_forwarded_share_verified_identity() {
+    let config = serde_json::json!({
+        "global": {
+            "http3": false,
+            "trusted_proxies": ["127.0.0.1/32"],
+            "proxy_protocol": true
+        },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "routes": [{
+                "path": "/",
+                "handler": {
+                    "type": "pipeline",
+                    "handlers": [
+                        {
+                            "type": "access_control",
+                            "allowed_ips": ["203.0.113.7/32"]
+                        },
+                        { "type": "respond", "status": 200, "body": "verified" }
+                    ]
+                }
+            }]
+        }]
+    })
+    .to_string();
+    let mut server = TestServer::new(&config);
+    let address = server.address(0);
+    let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+    let mut ready = false;
+    for _ in 0..50 {
+        if server.exit_status().is_some() {
+            break;
+        }
+        let prefix = proxy_v1_prefix("127.0.0.1", address);
+        if let Ok(response) =
+            proxy_protocol_request(address, loopback, &prefix, &server.readiness_path, &[]).await
+            && String::from_utf8_lossy(&response).contains(&server.readiness_token)
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !ready {
+        server.print_diagnostics();
+    }
+    assert!(ready, "PROXY protocol listener failed to start");
+
+    // 🚫 A non-trusted transport peer is rejected before its PROXY claim is parsed.
+    let untrusted_source: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+    let forged = proxy_v1_prefix("203.0.113.7", address);
+    let rejected = proxy_protocol_request(address, untrusted_source, &forged, "/", &[]).await;
+    assert!(
+        rejected.is_err() || rejected.as_ref().is_ok_and(Vec::is_empty),
+        "an untrusted transport unexpectedly reached HTTP: {rejected:?}"
+    );
+
+    // 🧭 PROXY v1 and matching XFF/RFC 7239 claims resolve to one client.
+    let v1 = proxy_v1_prefix("203.0.113.7", address);
+    let response = proxy_protocol_request(
+        address,
+        loopback,
+        &v1,
+        "/",
+        &[
+            ("X-Forwarded-For", "203.0.113.7"),
+            ("Forwarded", "for=203.0.113.7;proto=https"),
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+
+    // 🧭 PROXY v2 carries the same verified client address.
+    let v2 = proxy_v2_prefix([203, 0, 113, 7], address);
+    let response = proxy_protocol_request(address, loopback, &v2, "/", &[])
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+
+    // 🚫 Conflicting HTTP identity claims fail closed to the trusted PROXY address.
+    let response = proxy_protocol_request(
+        address,
+        loopback,
+        &v1,
+        "/",
+        &[
+            ("X-Forwarded-For", "198.51.100.9"),
+            ("Forwarded", "for=203.0.113.7"),
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
 }

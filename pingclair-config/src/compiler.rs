@@ -10,8 +10,9 @@ use pingclair_core::config::Encoding as CoreEncoding;
 use pingclair_core::config::{
     AccessControlConfig as CoreAccessControlConfig, AdminConfig, HandlerConfig, LoadBalanceConfig,
     LogConfig, LogFormat as CoreLogFormat, LogOutput as CoreLogOutput, Matcher as CoreMatcher,
-    MatcherCondition, PingclairConfig, ProxyUpstream, ReverseProxyConfig, RouteConfig,
-    ServerConfig, TlsConfig, default_encodings, default_gzip_types,
+    MatcherCondition, PingclairConfig, ProxyUpstream, RateLimitKey as CoreRateLimitKey,
+    ReverseProxyConfig, RouteConfig, ServerConfig, TlsConfig, default_encodings,
+    default_gzip_types,
 };
 use pingclair_core::server::{MAX_BCRYPT_COST, bcrypt_hash_cost};
 use std::collections::{HashMap, HashSet};
@@ -82,6 +83,9 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
     }
 
     config.global.trusted_proxies = global.trusted_proxies.clone();
+    if let Some(enabled) = global.proxy_protocol {
+        config.global.proxy_protocol = enabled;
+    }
 
     if let Some(secs) = global.dns_refresh_secs {
         config.global.dns_refresh_secs = secs;
@@ -263,6 +267,19 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
 
 /// 🛡️ Rejects TLS combinations that cannot have deterministic runtime behavior.
 pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
+    for rule in &config.global.trusted_proxies {
+        if rule.parse::<ipnet::IpNet>().is_err() && rule.parse::<std::net::IpAddr>().is_err() {
+            return Err(CompileError::InvalidServer {
+                message: format!("trusted_proxies contains invalid IP or CIDR `{rule}`"),
+            });
+        }
+    }
+    if config.global.proxy_protocol && config.global.trusted_proxies.is_empty() {
+        return Err(CompileError::InvalidServer {
+            message: "proxy_protocol requires at least one trusted_proxies rule".to_string(),
+        });
+    }
+
     for server in &config.servers {
         let limits = &server.limits;
         let positive_durations = [
@@ -534,7 +551,40 @@ fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<(
                 });
             }
 
+            if let Some(health) = &proxy.health_check {
+                validate_health_check(health)?;
+            }
             validate_upstream_tls(&proxy.upstream_tls)?;
+        }
+        HandlerConfig::RateLimit {
+            requests,
+            window_secs,
+            burst,
+            key,
+            ..
+        } => {
+            if *requests == 0 || *requests > 1_000_000_000 {
+                return Err(CompileError::InvalidRoute {
+                    message: "rate_limit requests must be between 1 and 1000000000".to_string(),
+                });
+            }
+            if *window_secs == 0 || *window_secs > 86_400 {
+                return Err(CompileError::InvalidRoute {
+                    message: "rate_limit window_secs must be between 1 and 86400".to_string(),
+                });
+            }
+            if *burst > 1_000_000_000 || requests.checked_add(*burst).is_none() {
+                return Err(CompileError::InvalidRoute {
+                    message: "rate_limit burst must not exceed 1000000000".to_string(),
+                });
+            }
+            if let Some(CoreRateLimitKey::Header(name) | CoreRateLimitKey::Tenant(name)) = key
+                && (name.len() > 128 || http::HeaderName::from_bytes(name.as_bytes()).is_err())
+            {
+                return Err(CompileError::InvalidRoute {
+                    message: "rate_limit key header must be a valid HTTP field name".to_string(),
+                });
+            }
         }
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::Handle { handlers }
@@ -551,6 +601,122 @@ fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<(
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// 🩺 Rejects health probes that are ambiguous, unbounded, or unsafe to send.
+fn validate_health_check(health: &pingclair_core::config::HealthCheckConfig) -> CompileResult<()> {
+    if !health.path.starts_with('/')
+        || health.path.bytes().any(|byte| byte.is_ascii_control())
+        || health.path.len() > 8_192
+    {
+        return Err(CompileError::InvalidRoute {
+            message: "health_check path must be a control-free absolute path".to_string(),
+        });
+    }
+    if health.interval == 0
+        || health.interval > 86_400
+        || health.timeout == 0
+        || health.timeout > 86_400
+    {
+        return Err(CompileError::InvalidRoute {
+            message: "health_check interval and timeout must be between 1 and 86400 seconds"
+                .to_string(),
+        });
+    }
+    if !matches!(health.method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+        return Err(CompileError::InvalidRoute {
+            message: "health_check method must be GET, HEAD, or OPTIONS".to_string(),
+        });
+    }
+    if health.method == "HEAD" && health.expected_body.is_some() {
+        return Err(CompileError::InvalidRoute {
+            message: "health_check cannot validate a response body with method HEAD".to_string(),
+        });
+    }
+    if health.host.as_ref().is_some_and(|host| {
+        host.is_empty() || host.len() > 253 || host.bytes().any(|byte| byte.is_ascii_control())
+    }) {
+        return Err(CompileError::InvalidRoute {
+            message: "health_check host must be a non-empty, control-free hostname".to_string(),
+        });
+    }
+    if health.headers.len() > 64
+        || health.headers.iter().any(|(name, value)| {
+            let managed =
+                name.eq_ignore_ascii_case("host") || name.eq_ignore_ascii_case("connection");
+            name.is_empty()
+                || managed
+                || name.len() > 256
+                || !name.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric()
+                        || matches!(
+                            byte,
+                            b'!' | b'#'
+                                | b'$'
+                                | b'%'
+                                | b'&'
+                                | b'\''
+                                | b'*'
+                                | b'+'
+                                | b'-'
+                                | b'.'
+                                | b'^'
+                                | b'_'
+                                | b'`'
+                                | b'|'
+                                | b'~'
+                        )
+                })
+                || value.len() > 8_192
+                || value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+        })
+    {
+        return Err(CompileError::InvalidRoute {
+            message: "health_check headers contain an invalid or oversized name/value".to_string(),
+        });
+    }
+    let failure_threshold = health.consecutive_failure.unwrap_or(health.threshold);
+    if !(1..=1_000_000).contains(&health.consecutive_success)
+        || !(1..=1_000_000).contains(&failure_threshold)
+    {
+        return Err(CompileError::InvalidRoute {
+            message: "health_check consecutive thresholds must be between 1 and 1000000"
+                .to_string(),
+        });
+    }
+    if health.expected_statuses.is_empty()
+        || health.expected_statuses.len() > 500
+        || health
+            .expected_statuses
+            .iter()
+            .any(|status| !(100..=599).contains(status))
+        || health
+            .expected_statuses
+            .iter()
+            .collect::<HashSet<_>>()
+            .len()
+            != health.expected_statuses.len()
+    {
+        return Err(CompileError::InvalidRoute {
+            message: "health_check expected_statuses must be unique HTTP status codes".to_string(),
+        });
+    }
+    if health.port == Some(0)
+        || health.max_response_body_bytes == 0
+        || health.max_response_body_bytes > 1_048_576
+        || health
+            .expected_body
+            .as_ref()
+            .is_some_and(|body| body.is_empty() || body.len() > health.max_response_body_bytes)
+        || health.slow_start_ms > 86_400_000
+    {
+        return Err(CompileError::InvalidRoute {
+            message:
+                "health_check port, body bound, expected body, or slow_start is outside safe bounds"
+                    .to_string(),
+        });
     }
     Ok(())
 }
@@ -739,7 +905,25 @@ fn compile_handler(handler: &Handler) -> CompileResult<HandlerConfig> {
                     })
                     .collect(),
                 load_balance: LoadBalanceConfig::default(),
-                health_check: None,
+                health_check: proxy.health_check.as_ref().map(|health| {
+                    Box::new(pingclair_core::config::HealthCheckConfig {
+                        path: health.path.clone(),
+                        interval: health.interval_secs,
+                        timeout: health.timeout_secs,
+                        threshold: health.consecutive_failure,
+                        method: health.method.clone(),
+                        host: health.host.clone(),
+                        headers: health.headers.clone(),
+                        expected_statuses: health.expected_statuses.clone(),
+                        expected_body: health.expected_body.clone(),
+                        port: health.port,
+                        consecutive_success: health.consecutive_success,
+                        consecutive_failure: Some(health.consecutive_failure),
+                        reuse_connection: health.reuse_connection,
+                        max_response_body_bytes: health.max_response_body_bytes,
+                        slow_start_ms: health.slow_start_ms,
+                    })
+                }),
                 headers_up: HashMap::new(),
                 headers_down: HashMap::new(),
                 flush_interval: None,
@@ -872,6 +1056,22 @@ fn compile_handler(handler: &Handler) -> CompileResult<HandlerConfig> {
                 credentials,
             })
         }
+
+        Handler::RateLimit(config) => Ok(HandlerConfig::RateLimit {
+            requests: config.requests,
+            window_secs: config.window_ms / 1_000,
+            by_ip: matches!(config.key, RateLimitKey::Ip),
+            burst: config.burst,
+            key: Some(match &config.key {
+                RateLimitKey::Ip => CoreRateLimitKey::Ip,
+                RateLimitKey::Global => CoreRateLimitKey::Global,
+                RateLimitKey::Route => CoreRateLimitKey::Route,
+                RateLimitKey::ApiKey => CoreRateLimitKey::ApiKey,
+                RateLimitKey::Header(name) => CoreRateLimitKey::Header(name.clone()),
+                RateLimitKey::Tenant(name) => CoreRateLimitKey::Tenant(name.clone()),
+            }),
+            dry_run: config.dry_run,
+        }),
 
         Handler::Rewrite(rewrite) => {
             if let Some(pattern) = &rewrite.regex {
@@ -1006,6 +1206,161 @@ mod tests {
 
         let config = compile_ast(&ast).unwrap();
         assert_eq!(config.servers[0].routes.len(), 1);
+    }
+
+    #[test]
+    fn active_health_check_reaches_compiled_runtime_config() {
+        let ast = crate::parser::compile(
+            r#"
+            api.example.com {
+                reverse_proxy https://origin.internal:8443 {
+                    health_check {
+                        path /ready
+                        interval 2s
+                        timeout 1s
+                        method GET
+                        host health.internal
+                        header X-Probe pingclair
+                        status 200 204
+                        body ready
+                        port 9443
+                        consecutive_success 2
+                        consecutive_failure 4
+                        reuse_connection
+                        max_response_body_bytes 4096
+                        slow_start 15s
+                    }
+                }
+            }
+        "#,
+        )
+        .unwrap();
+        let config = compile_ast(&ast).unwrap();
+        validate_config(&config).unwrap();
+        let HandlerConfig::ReverseProxy(proxy) = &config.servers[0].routes[0].handler else {
+            panic!("expected reverse proxy");
+        };
+        let health = proxy.health_check.as_ref().expect("health check");
+        assert_eq!(health.path, "/ready");
+        assert_eq!(health.interval, 2);
+        assert_eq!(health.method, "GET");
+        assert_eq!(health.host.as_deref(), Some("health.internal"));
+        assert_eq!(
+            health.headers.get("X-Probe").map(String::as_str),
+            Some("pingclair")
+        );
+        assert_eq!(health.expected_statuses, [200, 204]);
+        assert_eq!(health.expected_body.as_deref(), Some("ready"));
+        assert_eq!(health.port, Some(9443));
+        assert_eq!(health.consecutive_success, 2);
+        assert_eq!(health.consecutive_failure, Some(4));
+        assert!(health.reuse_connection);
+        assert_eq!(health.max_response_body_bytes, 4096);
+        assert_eq!(health.slow_start_ms, 15_000);
+    }
+
+    #[test]
+    fn json_health_check_validation_cannot_bypass_the_adapter() {
+        let mut config: PingclairConfig = serde_json::from_value(serde_json::json!({
+            "servers": [{
+                "listen": ["127.0.0.1:8080"],
+                "routes": [{
+                    "path": "/*",
+                    "handler": {
+                        "type": "reverse_proxy",
+                        "upstreams": ["127.0.0.1:9000"],
+                        "health_check": {
+                            "path": "/health",
+                            "method": "POST"
+                        }
+                    }
+                }]
+            }]
+        }))
+        .unwrap();
+        let error = validate_config(&config).unwrap_err().to_string();
+        assert!(error.contains("method must be GET, HEAD, or OPTIONS"));
+
+        let HandlerConfig::ReverseProxy(proxy) = &mut config.servers[0].routes[0].handler else {
+            panic!("expected reverse proxy");
+        };
+        proxy.health_check.as_mut().unwrap().method = "GET".to_string();
+        proxy.health_check.as_mut().unwrap().max_response_body_bytes = 0;
+        let error = validate_config(&config).unwrap_err().to_string();
+        assert!(error.contains("outside safe bounds"));
+    }
+
+    #[test]
+    fn exact_rate_limit_reaches_compiled_runtime_config() {
+        let ast = crate::parser::compile(
+            r#"
+            api.example.com {
+                rate_limit 5 60s {
+                    burst 2
+                    key tenant X-Tenant
+                    dry_run
+                }
+                respond "ok"
+            }
+        "#,
+        )
+        .unwrap();
+        let config = compile_ast(&ast).unwrap();
+        validate_config(&config).unwrap();
+        let HandlerConfig::Pipeline { handlers } = &config.servers[0].routes[0].handler else {
+            panic!("expected middleware pipeline");
+        };
+        let HandlerConfig::RateLimit {
+            requests,
+            window_secs,
+            burst,
+            key,
+            dry_run,
+            ..
+        } = &handlers[0]
+        else {
+            panic!("expected rate limiter");
+        };
+        assert_eq!((*requests, *window_secs, *burst), (5, 60, 2));
+        assert_eq!(key, &Some(CoreRateLimitKey::Tenant("X-Tenant".to_string())));
+        assert!(*dry_run);
+    }
+
+    #[test]
+    fn json_rate_limit_validation_cannot_bypass_the_adapter() {
+        let config: PingclairConfig = serde_json::from_value(serde_json::json!({
+            "servers": [{
+                "listen": ["127.0.0.1:8080"],
+                "routes": [{
+                    "path": "/*",
+                    "handler": {
+                        "type": "rate_limit",
+                        "requests": 5,
+                        "window_secs": 60,
+                        "by_ip": false,
+                        "burst": 2,
+                        "key": {"header": "bad header"},
+                        "dry_run": false
+                    }
+                }]
+            }]
+        }))
+        .unwrap();
+
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn json_proxy_protocol_validation_cannot_bypass_the_adapter() {
+        let mut config = PingclairConfig::default();
+        config.global.proxy_protocol = true;
+        assert!(validate_config(&config).is_err());
+
+        config.global.trusted_proxies = vec!["not-a-network".to_string()];
+        assert!(validate_config(&config).is_err());
+
+        config.global.trusted_proxies = vec!["127.0.0.1/32".to_string()];
+        assert!(validate_config(&config).is_ok());
     }
 
     #[test]

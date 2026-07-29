@@ -190,12 +190,17 @@ those proxy networks in the global block. Untrusted peers cannot supply
 ```caddyfile
 {
     trusted_proxies 10.0.0.0/8 2001:db8::/32
+    proxy_protocol on
 }
 ```
 
 The verified client IP is shared by access control, rate limiting, IP-hash
 load balancing, upstream forwarding, placeholders, and access logs. Changes
-to `trusted_proxies` currently require a restart.
+to `trusted_proxies` currently require a restart. `proxy_protocol on` requires
+PROXY v1 or v2 on every TCP connection and rejects transport peers outside
+`trusted_proxies` before TLS or HTTP parsing. XFF and RFC 7239 `Forwarded`
+chains are bounded; malformed or conflicting identities fail closed. PROXY
+protocol does not apply to the UDP HTTP/3 listener.
 
 ### Resource limits and timeouts
 
@@ -372,11 +377,49 @@ server "shop.example.com" {
         lb_policy least_conn
         to 10.0.0.1:8080 { weight 3 }
         to 10.0.0.2:8080
-        # Used only when every primary is unavailable.
+        # 🛟 Used only when every primary is unavailable.
         to 10.0.0.3:8080 { backup }
+        health_check {
+            path /health
+            interval 5s
+            timeout 2s
+            status 200 204
+            consecutive_failure 3
+            consecutive_success 2
+            max_response_body_bytes 65536
+            slow_start 30s
+        }
     }
 }
 ```
+
+Active checks run out of band, so an idle failed backend leaves rotation before
+a user request reaches it and rejoins after the configured successful probes.
+Checks support a custom method, Host, headers, status set, bounded body match,
+health port, connection reuse, thresholds, and slow-start. HTTPS checks reuse
+the route's pinned CA, client certificate, SNI, and protocol policy.
+
+### Exact local rate limiting
+
+```caddyfile
+api.example.com {
+    @api path /api/*
+    route @api {
+        rate_limit 100 60s {
+            burst 20
+            key tenant X-Tenant-ID
+        }
+        reverse_proxy app:8080
+    }
+}
+```
+
+The token bucket reports exact `RateLimit-Limit`, `RateLimit-Remaining`, and
+`RateLimit-Reset` response fields, with `Retry-After` on a rejected request.
+Use `dry_run` in the block to count and report without returning 429. Keys may
+be `ip`, `global`, `route`, `api_key`, `header <name>`, or `tenant [name]`.
+This limiter is process-local; Redis-backed distributed limiting is outside
+v0.2.
 
 The upstream scheme selects the connection protocol: a bare address or `http://`
 uses HTTP/1.1, `https://` negotiates HTTP/2 with HTTP/1.1 fallback through ALPN,

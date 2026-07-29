@@ -459,7 +459,7 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
     `pingora_core::tls` 沒有 re-export `asn1`，為此加 `boring` 直接依賴不划算。
   - 尚未做乾淨 Linux release、VPS 或真 mTLS 上游矩陣；留到 Day 15，本日是 🧪。
 
-### 🔨 Day 12 — 健康檢查補齊
+### 🔨 Day 12 — 健康檢查補齊 🧪
 
 > 💡 **這天比預期便宜**：`pingora-load-balancing::health_check::HttpHealthCheck`
 > 已經提供 `req`（自訂 Host／method／headers）、`validator`（status／body 檢查）、
@@ -487,7 +487,24 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
 - **完成判定**：故障節點能被正確摘除並在恢復後重新加入，**且該摘除發生在
   沒有請求經過該節點的情況下**（否則就只是驗到被動標記）。
 
-### 🔨 Day 13 — Rate limit 語意補齊
+**已完成 2026-07-30（Codex 實作，本機 gate 全綠）。**
+
+- ✅ `HealthCheckDriver` 是真的 Pingora `BackgroundService`，經 `Weak` registry
+  驅動所有 pool（與 `dns.rs` 同一個模式），DNS 換代後 checker 狀態跟著重建。
+- ✅ probe peer 套用該 route 的 Day 11 TLS policy，pin 私有 CA 的 route 不會被
+  健康檢查全數標成 down。TLS policy 載入失敗時**不啟動**健康檢查並記 ERROR。
+- ✅ 紅燈先行證據：`benchmarks/results/20260729_day12_local_failed_active_health/`
+  ——停掉一個 origin、**完全不送流量**、兩個 probe 週期後第一個請求回 502。
+- ✅ probe body 有上限、jitter、全滅時 backoff（上限 8×）、slow start。
+- 🐛 **review 時修掉一個可用性 bug**：`check_inner` 只替換位址，
+  `sni`／`Host` 沿用 **first backend** 的名字。`to https://a.internal` ＋
+  `to https://b.internal` 這種 pool 會用 a 的 SNI 去探 b，hostname 驗證必失敗，
+  b 被永久標成 down，而它其實服務得好好的（正常流量走 `build_http_peer`，
+  用的是各自的名字）。現在改讀每個 backend 自己的 `HostName` ext，
+  operator 明寫的 `health_check.host`／`tls_server_name` 優先。
+  失敗證據：`benchmarks/results/20260730_day12_review_failed_probe_sni/`。
+
+### 🔨 Day 13 — Rate limit 語意補齊 🧪
 
 現有 `burst` 未真正生效，key 只有 IP／global，remaining 是估算值。
 
@@ -496,7 +513,7 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
 - **範圍外**：Redis distributed limit 不列入 v0.2。
 - **完成判定**：burst 行為與 header 數值正確，不是估算。
 
-### 🔨 Day 14 — PROXY protocol 與 RFC 7239
+### 🔨 Day 14 — PROXY protocol 與 RFC 7239 🧪
 
 `trusted_proxies` 與受限 XFF 解析已完成（見 STATUS）。剩下：
 
@@ -754,7 +771,7 @@ H3 CORS／rewrite／error_page parity。
 | 里程碑 | 範圍 | 狀態 |
 |---|---|---|
 | M1 生產站可替換 | Day 1–7 | ✅ **完成**（`8294116`，2026-07-28 真站驗收） |
-| M2 生產護欄 | Day 8–15 | 🧪 **進行中**（Day 8–11 本機完成，待 Day 15 遠端驗證） |
+| M2 生產護欄 | Day 8–15 | 🧪 **進行中**（Day 8–14 本機完成，待 Day 15 遠端驗證） |
 | M3 接上 Pingora 能力（含 `proxy_cache`） | Day 16–20 | ⬜ 未開始 |
 | M4 可觀測性與運維 | Day 21–24 | ⬜ 未開始 |
 | M5 協議安全與 H3 | Day 25–28 | ⬜ 未開始 |

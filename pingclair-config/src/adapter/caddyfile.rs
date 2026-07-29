@@ -208,6 +208,19 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                         global.trusted_proxies.push(rule);
                     }
                 }
+                "proxy_protocol" => {
+                    let value = expect_one_argument(&sub)?;
+                    global.proxy_protocol = Some(match value {
+                        "on" => true,
+                        "off" => false,
+                        _ => {
+                            return Err(AdapterError::InvalidArgument(
+                                "proxy_protocol".into(),
+                                value.to_string(),
+                            ));
+                        }
+                    });
+                }
                 "dns_refresh" => {
                     let Some(value) = sub.args.first() else {
                         return Err(AdapterError::ArgumentCount("dns_refresh".into(), 1, 0));
@@ -793,11 +806,75 @@ fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
             Ok(Handler::Handle(handlers))
         }
         "basic_auth" | "basicauth" => adapt_basic_auth(d),
+        "rate_limit" => adapt_rate_limit(d),
         "rewrite" => adapt_rewrite(d),
         "cors" => adapt_cors(d),
         "access_control" => adapt_access_control(d),
         _ => Err(AdapterError::UnknownDirective(d.name)),
     }
+}
+
+/// 🚦 Adapts an exact local rate-limit policy and rejects ambiguous options.
+fn adapt_rate_limit(directive: Directive) -> Result<Handler, AdapterError> {
+    let [requests, window] = directive.args.as_slice() else {
+        return Err(AdapterError::InvalidArgument(
+            directive.name,
+            "expected <requests> <window> followed by an optional block".into(),
+        ));
+    };
+    let requests = requests
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| AdapterError::InvalidArgument("rate_limit".into(), requests.clone()))?;
+    let window_ms = parse_duration_ms(window)
+        .filter(|value| *value >= 1_000 && value % 1_000 == 0)
+        .ok_or_else(|| AdapterError::InvalidArgument("rate_limit".into(), window.clone()))?;
+    let mut config = RateLimitConfig {
+        requests,
+        window_ms,
+        burst: 0,
+        key: RateLimitKey::Ip,
+        dry_run: false,
+    };
+
+    if let Some(block) = directive.block {
+        for option in block.directives {
+            match option.name.as_str() {
+                "burst" => {
+                    let value = expect_one_argument(&option)?;
+                    config.burst = value.parse::<u64>().map_err(|_| {
+                        AdapterError::InvalidArgument(option.name.clone(), value.to_string())
+                    })?;
+                }
+                "dry_run" => {
+                    expect_no_arguments(&option)?;
+                    config.dry_run = true;
+                }
+                "key" => {
+                    config.key = match option.args.as_slice() {
+                        [kind] if kind == "ip" => RateLimitKey::Ip,
+                        [kind] if kind == "global" => RateLimitKey::Global,
+                        [kind] if kind == "route" => RateLimitKey::Route,
+                        [kind] if kind == "api_key" => RateLimitKey::ApiKey,
+                        [kind] if kind == "tenant" => RateLimitKey::Tenant("X-Tenant-ID".into()),
+                        [kind, name] if kind == "header" => RateLimitKey::Header(name.clone()),
+                        [kind, name] if kind == "tenant" => RateLimitKey::Tenant(name.clone()),
+                        _ => {
+                            return Err(AdapterError::InvalidArgument(
+                                option.name,
+                                "expected ip, global, route, api_key, header <name>, or tenant [name]"
+                                    .into(),
+                            ));
+                        }
+                    };
+                }
+                _ => return Err(AdapterError::UnknownDirective(option.name)),
+            }
+        }
+    }
+
+    Ok(Handler::RateLimit(config))
 }
 
 fn adapt_redirect(d: Directive) -> Result<Handler, AdapterError> {
@@ -1139,6 +1216,9 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
                 "circuit_breaker" => {
                     proxy.circuit_breaker = adapt_circuit_breaker_policy(&sub)?;
                 }
+                "health_check" => {
+                    proxy.health_check = Some(adapt_health_check(&sub)?);
+                }
                 "lb_policy" => {
                     let policy = sub
                         .args
@@ -1228,6 +1308,110 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
     }
 
     Ok(Handler::Proxy(Box::new(proxy)))
+}
+
+/// 🩺 Adapts one bounded active health-check policy.
+fn adapt_health_check(directive: &Directive) -> Result<HealthCheckConfig, AdapterError> {
+    if !directive.args.is_empty() {
+        return Err(AdapterError::ArgumentCount(
+            "health_check".into(),
+            0,
+            directive.args.len(),
+        ));
+    }
+    let block = directive.block.as_ref().ok_or_else(|| {
+        AdapterError::InvalidArgument("health_check".into(), "block required".into())
+    })?;
+    let mut health = HealthCheckConfig::default();
+    for sub in &block.directives {
+        match sub.name.as_str() {
+            "path" => health.path = expect_one_argument(sub)?.to_string(),
+            "interval" => {
+                let millis = parse_required_duration(sub)?;
+                if millis < 1_000 || millis % 1_000 != 0 {
+                    return Err(AdapterError::InvalidArgument(
+                        sub.name.clone(),
+                        "interval must be a whole number of seconds".into(),
+                    ));
+                }
+                health.interval_secs = millis / 1_000;
+            }
+            "timeout" => {
+                let millis = parse_required_duration(sub)?;
+                if millis < 1_000 || millis % 1_000 != 0 {
+                    return Err(AdapterError::InvalidArgument(
+                        sub.name.clone(),
+                        "timeout must be a whole number of seconds".into(),
+                    ));
+                }
+                health.timeout_secs = millis / 1_000;
+            }
+            "method" => {
+                health.method = expect_one_argument(sub)?.to_ascii_uppercase();
+            }
+            "host" => health.host = Some(expect_one_argument(sub)?.to_string()),
+            "header" => {
+                if sub.args.len() != 2 {
+                    return Err(AdapterError::ArgumentCount(
+                        sub.name.clone(),
+                        2,
+                        sub.args.len(),
+                    ));
+                }
+                health
+                    .headers
+                    .insert(sub.args[0].clone(), sub.args[1].clone());
+            }
+            "status" => {
+                if sub.args.is_empty() {
+                    return Err(AdapterError::ArgumentCount(sub.name.clone(), 1, 0));
+                }
+                health.expected_statuses = sub
+                    .args
+                    .iter()
+                    .map(|value| {
+                        value.parse::<u16>().map_err(|_| {
+                            AdapterError::InvalidArgument(sub.name.clone(), value.clone())
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
+            "body" => health.expected_body = Some(expect_one_argument(sub)?.to_string()),
+            "port" => {
+                let raw = expect_one_argument(sub)?;
+                health.port = Some(raw.parse::<u16>().map_err(|_| {
+                    AdapterError::InvalidArgument(sub.name.clone(), raw.to_string())
+                })?);
+            }
+            "consecutive_success" => {
+                health.consecutive_success =
+                    u32::try_from(parse_positive_usize(sub)?).map_err(|_| {
+                        AdapterError::InvalidArgument(sub.name.clone(), "value is too large".into())
+                    })?;
+            }
+            "consecutive_failure" => {
+                health.consecutive_failure =
+                    u32::try_from(parse_positive_usize(sub)?).map_err(|_| {
+                        AdapterError::InvalidArgument(sub.name.clone(), "value is too large".into())
+                    })?;
+            }
+            "reuse_connection" => {
+                expect_no_arguments(sub)?;
+                health.reuse_connection = true;
+            }
+            "max_response_body_bytes" => {
+                health.max_response_body_bytes = parse_positive_usize(sub)?;
+            }
+            "slow_start" => health.slow_start_ms = parse_required_duration(sub)?,
+            _ => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "health_check: {}",
+                    sub.name
+                )));
+            }
+        }
+    }
+    Ok(health)
 }
 
 /// 🔁 Adapts one bounded, idempotent-only redispatch policy.
@@ -1933,6 +2117,7 @@ fn handler_has_terminal(handler: &Handler) -> bool {
         }
         Handler::Headers(_)
         | Handler::BasicAuth(_)
+        | Handler::RateLimit(_)
         | Handler::Rewrite(_)
         | Handler::Cors(_)
         | Handler::AccessControl(_)

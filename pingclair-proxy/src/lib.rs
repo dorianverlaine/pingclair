@@ -21,6 +21,7 @@ mod http_policy;
 pub mod load_balancer;
 pub mod metrics;
 pub mod overload;
+pub mod proxy_protocol;
 pub mod quic;
 pub mod rate_limit;
 pub mod redaction;

@@ -197,12 +197,22 @@ commit `0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。
 
 ### 安全與身分
 
-- **可信代理 client identity**（本機，2026-07-26）— 全域 `trusted_proxies` IP/CIDR；
+- **可信代理 client identity**（本機，2026-07-29）🧪 — 全域 `trusted_proxies` IP/CIDR；
   只有受信任的直接上一跳可提供 `X-Forwarded-For`／`X-Real-IP`／`X-Forwarded-Proto`。
-  XFF 最多 32 hops，由右向左跳過可信代理，畸形或過長鏈 fail closed。
+  XFF 與 RFC 7239 `Forwarded` 都有 32 hops／8 KiB 上限，由右向左跳過可信代理；
+  兩者並存但 client 不一致、語法畸形或超過上限時 fail closed。
+  `proxy_protocol on` 會在 TLS／HTTP 之前要求 v1 或 v2 TCP header；外層 ingress
+  先按實際 transport peer 驗證 `trusted_proxies`，未受信來源直接斷線。合法流量
+  進入只綁 loopback 的私有 Pingora listener，沒有對應 registry identity 的旁路
+  request 仍會被拒絕。tunnel 結束即刪除 identity，register／lookup 另有 10 分鐘
+  stale-entry pruner。
   H1/H2/H3 的 route matcher、rate limit、IP hash、placeholder 與上游 forwarding
-  共用 verified client IP。
-  **仍缺**：RFC 7239 `Forwarded`、PROXY protocol v1/v2、IP／Referer 完整矩陣、VPS 驗證。
+  共用 verified client IP；轉送到 upstream 的 `Forwarded` 會重建為已驗證值，
+  不保留未受信任輸入。
+  真 binary 測試涵蓋 v1、v2、XFF／Forwarded 一致與衝突、以及從 `127.0.0.2`
+  嘗試偽造的未受信 transport peer，並以 Rust 1.88 **連跑 30 次全綠**。
+  locked local gate 全綠，總測試數 **422 → 431**。
+  **仍缺**：IP／Referer 完整矩陣、乾淨 Linux／VPS 驗證；留到 Day 15。
 - **TLS／ACME 私密狀態強化**（本機，2026-07-26）— HTTP-01 challenge deploy 改為
   async durable contract；憑證續期改讀真實 X.509 `notAfter`；account、憑證與
   challenge snapshot 統一 temporary file＋fsync＋atomic rename，Unix 從建立起即 `0600`。
@@ -447,17 +457,53 @@ commit `0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。
   客戶端斷鏈）、TLS store 路徑可經 `PINGCLAIR_TLS_STORE` 覆寫
   （寫死路徑在不可寫環境會直接 panic）。
 
-### 主動健康檢查目前沒有在跑（2026-07-28）
+### 主動健康檢查已在本機接線（Day 12，2026-07-29）🧪
 
-- `HealthChecker` 會被建出來、`health_check_frequency` 會被設定，但**驅動它的
-  Pingora background service 從來沒有註冊**：全 workspace 沒有任何
-  `background_service`／`run_health_check` 呼叫，`LoadBalancer::native()`
-  的呼叫者數量是 0。`select` 讀到的 `ready` 因此永遠是初始值。
-- 也就是說 STATUS 上方那條 2026-07-25 的驗證結果是準確的——它驗的是**被動**
-  健康檢查（`fail_to_connect` 標記＋冷卻），而那確實在運作。缺的是主動探測：
-  **沒有流量打過去的故障節點不會被摘除**。
-- 修復排在 TODO Day 12。判定必須是「在沒有請求經過該節點的情況下被摘除」，
-  否則只是重驗被動標記。
+- Day 12 commit：`e5efe2384d484cbe646b5792e1abd4f0c4aa1c31`。
+- Pingora background service 現在驅動全域 weak pool registry；hot reload 會讓舊
+  pool 自然釋放，DNS publish 後每輪讀取新 generation，不會持續探測已淘汰的 IP。
+  registry 與 recovery map 都有明確 pruner，長期狀態不會隨 reload／DNS 輪替無限成長。
+- Pingclairfile 與 JSON 支援 path、interval、timeout、method、Host、header、
+  status 集合、body fragment、health port、success／failure threshold、
+  connection reuse、bounded response body 與 slow-start；同一組 core validation
+  保護 Admin API 直入路徑，錯誤設定 fail closed。
+- health peer 經 `PingclairProxy::build_http_peer` 建立，沿用正常回源的 pinned CA、
+  client certificate、SNI、protocol group 與 timeout；self-signed TLS origin 的
+  pinned-CA 主動探測已以真 binary 驗證。
+- 探測加入時間 jitter；全 pool 不可用時做 bounded exponential backoff。恢復節點
+  經連續成功門檻後，以 lock-free recovery timestamp slow-start 漸進承接流量；
+  DNS publish 會剪除離開 pool 的 recovery slots。
+- Pingora 0.8.1 原生 `HttpHealthCheck` 的 validator 只收到 response header，且其
+  body drain 沒有 byte cap；直接使用會違反本專案 bounded-body 守則。因此保留其
+  `HealthCheck`／`Backends` 驅動模型與 Pingora HTTP connector，但在
+  `pingclair-proxy/src/health_check.rs` 實作 bounded streaming validator。
+- red test 先證明：停止 upstream 後完全不送代理流量，等待兩個 interval，第一個
+  request 仍命中死亡節點並回 502。修復後同一真 binary 測試證明節點會在無流量時
+  摘除，原址恢復後主動重新加入；另有 pinned-CA TLS probe 測試。兩條新增整合測試
+  以 Rust 1.88、`--test-threads=2` **連跑 30 次全綠**。
+- locked local gate 全綠，總測試數 **408 → 415**。尚未做乾淨 Linux release、
+  VPS 或真 QUIC client 驗證；留到 Day 15，因此本項是 🧪，不是遠端 ✅。
+
+### 精確 rate limit 已在本機接線（Day 13，2026-07-29）🧪
+
+- Day 13 commit：`6eefe808cfee987aefe985e1bbc29ea508a1115f`。
+- 以有鎖但短臨界區的精確 token bucket 取代 Count-Min Sketch 機率估算；
+  `requests + burst` 是可立即使用的容量，按 `requests / window` 速率補回。
+- H1／H2／H3 共用同一份 limiter 狀態與 verified client IP，可依 IP、global、
+  route、Bearer／`X-API-Key`、任意 header 或 tenant header 分桶；敏感 key
+  只保留 hash，不會把 token 原文留在長期 map。
+- 每 1,024 次檢查由 request-path pruner 清除閒置超過兩個 window 的 bucket；
+  map 硬上限為 65,536 keys，達上限且無閒置項可清時 fail closed，避免攻擊者用
+  高基數 header 讓記憶體無界成長。
+- 一般與 dry-run 回應都輸出精確 `RateLimit-Limit`、`RateLimit-Remaining`、
+  `RateLimit-Reset`；超額另輸出 `Retry-After`，dry-run 只計數與報告而不回 429。
+- Pingclairfile 與 JSON 共用 compiler validation；requests、window、burst 與
+  header name 的錯誤設定會在載入時拒絕，Admin API 不能繞過 adapter。
+- red unit test 先證明舊實作在 `5 + burst 2` 時第六個 request 就錯誤拒絕。
+  修復後真 binary 整合測試驗證容量邊界、header、獨立 key、429 與一個 window
+  後 refill，並以 Rust 1.88 **連跑 30 次全綠**。
+- locked local gate 全綠，總測試數 **415 → 422**。Redis／distributed limit
+  按 v0.2 範圍明確不做；Linux／VPS 驗證留到 Day 15，所以本項仍是 🧪。
 
 ---
 
