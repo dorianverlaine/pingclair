@@ -2284,6 +2284,7 @@ version = "0.1.7"
 dependencies = [
  "ariadne",
  "criterion",
+ "http 1.4.2",
  "ipnet",
  "pingclair-core",
  "regex",

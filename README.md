@@ -394,6 +394,28 @@ Checks support a custom method, Host, headers, status set, bounded body match,
 health port, connection reuse, thresholds, and slow-start. HTTPS checks reuse
 the route's pinned CA, client certificate, SNI, and protocol policy.
 
+### Exact local rate limiting
+
+```caddyfile
+api.example.com {
+    @api path /api/*
+    route @api {
+        rate_limit 100 60s {
+            burst 20
+            key tenant X-Tenant-ID
+        }
+        reverse_proxy app:8080
+    }
+}
+```
+
+The token bucket reports exact `RateLimit-Limit`, `RateLimit-Remaining`, and
+`RateLimit-Reset` response fields, with `Retry-After` on a rejected request.
+Use `dry_run` in the block to count and report without returning 429. Keys may
+be `ip`, `global`, `route`, `api_key`, `header <name>`, or `tenant [name]`.
+This limiter is process-local; Redis-backed distributed limiting is outside
+v0.2.
+
 The upstream scheme selects the connection protocol: a bare address or `http://`
 uses HTTP/1.1, `https://` negotiates HTTP/2 with HTTP/1.1 fallback through ALPN,
 `h2c://` requires prior-knowledge plaintext HTTP/2, and `h2://` requires HTTP/2

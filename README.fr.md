@@ -407,6 +407,28 @@ headers, statuts, comparaison de body bornée, port dédié, réutilisation de
 connexion, seuils et slow-start. En HTTPS, elles réutilisent la CA épinglée,
 le certificat client, le SNI et la politique de protocole de la route.
 
+### Limitation de débit locale et exacte
+
+```caddyfile
+api.example.com {
+    @api path /api/*
+    route @api {
+        rate_limit 100 60s {
+            burst 20
+            key tenant X-Tenant-ID
+        }
+        reverse_proxy app:8080
+    }
+}
+```
+
+Le token bucket émet des champs de réponse exacts `RateLimit-Limit`,
+`RateLimit-Remaining` et `RateLimit-Reset`, ainsi que `Retry-After` lors d'un
+refus. Ajoutez `dry_run` au bloc pour compter et signaler sans renvoyer 429.
+La clé peut être `ip`, `global`, `route`, `api_key`, `header <name>` ou
+`tenant [name]`. Ce limiteur est local au processus ; la limitation distribuée
+avec Redis est hors du périmètre de la v0.2.
+
 Le schéma de l'amont sélectionne le protocole de connexion : une adresse nue ou
 `http://` utilise HTTP/1.1, `https://` négocie HTTP/2 avec repli HTTP/1.1 par
 ALPN, `h2c://` impose HTTP/2 en clair avec connaissance préalable, et `h2://`

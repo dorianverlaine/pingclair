@@ -10,8 +10,9 @@ use pingclair_core::config::Encoding as CoreEncoding;
 use pingclair_core::config::{
     AccessControlConfig as CoreAccessControlConfig, AdminConfig, HandlerConfig, LoadBalanceConfig,
     LogConfig, LogFormat as CoreLogFormat, LogOutput as CoreLogOutput, Matcher as CoreMatcher,
-    MatcherCondition, PingclairConfig, ProxyUpstream, ReverseProxyConfig, RouteConfig,
-    ServerConfig, TlsConfig, default_encodings, default_gzip_types,
+    MatcherCondition, PingclairConfig, ProxyUpstream, RateLimitKey as CoreRateLimitKey,
+    ReverseProxyConfig, RouteConfig, ServerConfig, TlsConfig, default_encodings,
+    default_gzip_types,
 };
 use pingclair_core::server::{MAX_BCRYPT_COST, bcrypt_hash_cost};
 use std::collections::{HashMap, HashSet};
@@ -539,6 +540,36 @@ fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<(
             }
             validate_upstream_tls(&proxy.upstream_tls)?;
         }
+        HandlerConfig::RateLimit {
+            requests,
+            window_secs,
+            burst,
+            key,
+            ..
+        } => {
+            if *requests == 0 || *requests > 1_000_000_000 {
+                return Err(CompileError::InvalidRoute {
+                    message: "rate_limit requests must be between 1 and 1000000000".to_string(),
+                });
+            }
+            if *window_secs == 0 || *window_secs > 86_400 {
+                return Err(CompileError::InvalidRoute {
+                    message: "rate_limit window_secs must be between 1 and 86400".to_string(),
+                });
+            }
+            if *burst > 1_000_000_000 || requests.checked_add(*burst).is_none() {
+                return Err(CompileError::InvalidRoute {
+                    message: "rate_limit burst must not exceed 1000000000".to_string(),
+                });
+            }
+            if let Some(CoreRateLimitKey::Header(name) | CoreRateLimitKey::Tenant(name)) = key
+                && (name.len() > 128 || http::HeaderName::from_bytes(name.as_bytes()).is_err())
+            {
+                return Err(CompileError::InvalidRoute {
+                    message: "rate_limit key header must be a valid HTTP field name".to_string(),
+                });
+            }
+        }
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::Handle { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
@@ -1010,6 +1041,22 @@ fn compile_handler(handler: &Handler) -> CompileResult<HandlerConfig> {
             })
         }
 
+        Handler::RateLimit(config) => Ok(HandlerConfig::RateLimit {
+            requests: config.requests,
+            window_secs: config.window_ms / 1_000,
+            by_ip: matches!(config.key, RateLimitKey::Ip),
+            burst: config.burst,
+            key: Some(match &config.key {
+                RateLimitKey::Ip => CoreRateLimitKey::Ip,
+                RateLimitKey::Global => CoreRateLimitKey::Global,
+                RateLimitKey::Route => CoreRateLimitKey::Route,
+                RateLimitKey::ApiKey => CoreRateLimitKey::ApiKey,
+                RateLimitKey::Header(name) => CoreRateLimitKey::Header(name.clone()),
+                RateLimitKey::Tenant(name) => CoreRateLimitKey::Tenant(name.clone()),
+            }),
+            dry_run: config.dry_run,
+        }),
+
         Handler::Rewrite(rewrite) => {
             if let Some(pattern) = &rewrite.regex {
                 regex::Regex::new(pattern).map_err(|error| CompileError::InvalidRoute {
@@ -1225,6 +1272,66 @@ mod tests {
         proxy.health_check.as_mut().unwrap().max_response_body_bytes = 0;
         let error = validate_config(&config).unwrap_err().to_string();
         assert!(error.contains("outside safe bounds"));
+    }
+
+    #[test]
+    fn exact_rate_limit_reaches_compiled_runtime_config() {
+        let ast = crate::parser::compile(
+            r#"
+            api.example.com {
+                rate_limit 5 60s {
+                    burst 2
+                    key tenant X-Tenant
+                    dry_run
+                }
+                respond "ok"
+            }
+        "#,
+        )
+        .unwrap();
+        let config = compile_ast(&ast).unwrap();
+        validate_config(&config).unwrap();
+        let HandlerConfig::Pipeline { handlers } = &config.servers[0].routes[0].handler else {
+            panic!("expected middleware pipeline");
+        };
+        let HandlerConfig::RateLimit {
+            requests,
+            window_secs,
+            burst,
+            key,
+            dry_run,
+            ..
+        } = &handlers[0]
+        else {
+            panic!("expected rate limiter");
+        };
+        assert_eq!((*requests, *window_secs, *burst), (5, 60, 2));
+        assert_eq!(key, &Some(CoreRateLimitKey::Tenant("X-Tenant".to_string())));
+        assert!(*dry_run);
+    }
+
+    #[test]
+    fn json_rate_limit_validation_cannot_bypass_the_adapter() {
+        let config: PingclairConfig = serde_json::from_value(serde_json::json!({
+            "servers": [{
+                "listen": ["127.0.0.1:8080"],
+                "routes": [{
+                    "path": "/*",
+                    "handler": {
+                        "type": "rate_limit",
+                        "requests": 5,
+                        "window_secs": 60,
+                        "by_ip": false,
+                        "burst": 2,
+                        "key": {"header": "bad header"},
+                        "dry_run": false
+                    }
+                }]
+            }]
+        }))
+        .unwrap();
+
+        assert!(validate_config(&config).is_err());
     }
 
     #[test]

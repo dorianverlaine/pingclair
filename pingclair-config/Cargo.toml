@@ -19,6 +19,7 @@ thiserror.workspace = true
 smartstring.workspace = true
 regex = "1"
 ipnet.workspace = true
+http.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

@@ -945,7 +945,7 @@ impl ProxyState {
             }
 
             // Check for rate limit config
-            if let Some(rl_config) = find_rate_limit_config(&route.handler) {
+            if let Some(rl_config) = find_rate_limit_config(&route.handler, &route.path) {
                 use crate::rate_limit::RateLimiter;
                 rate_limiters.push(Some(RateLimiter::new(rl_config)));
                 tracing::info!("🚦 Initialized rate limiter for route {}", route.path);
@@ -2721,25 +2721,17 @@ impl ProxyHttp for PingclairProxy {
                 return Ok(true);
             }
 
-            // Check rate limit
+            // 🚦 Charges the configured exact token bucket before handler dispatch.
             if let Some(state) = &ctx.state
                 && let Some(limiter) = state.rate_limiters.get(index).and_then(|l| l.as_ref())
             {
-                let key = if limiter.config.by_ip {
-                    Some(remote_ip.as_str())
-                } else {
-                    None
-                };
-
-                if let Err(info) = limiter.check(key) {
-                    let mut header = pingora_http::ResponseHeader::build(429, Some(4)).unwrap();
-                    for (k, v) in info.to_headers() {
-                        if let Ok(val) = http::header::HeaderValue::from_str(&v)
-                            && let Ok(name) = http::header::HeaderName::from_bytes(k.as_bytes())
-                        {
-                            header.insert_header(name, val).unwrap();
-                        }
-                    }
+                let decision =
+                    limiter.check_request(remote_ip.as_str(), &session.req_header().headers);
+                for (name, value) in decision.info.to_headers() {
+                    ctx.response_headers.set(name, value);
+                }
+                if decision.reject {
+                    let mut header = pingora_http::ResponseHeader::build(429, Some(8)).unwrap();
                     Self::apply_local_response_headers(&mut header, ctx)?;
                     session
                         .write_response_header(Box::new(header), true)
@@ -3708,24 +3700,35 @@ fn find_file_server_config(handler: &HandlerConfig) -> Option<&HandlerConfig> {
     }
 }
 
-fn find_rate_limit_config(handler: &HandlerConfig) -> Option<crate::rate_limit::RateLimitConfig> {
+fn find_rate_limit_config(
+    handler: &HandlerConfig,
+    route: &str,
+) -> Option<crate::rate_limit::RateLimitConfig> {
     match handler {
         HandlerConfig::RateLimit {
             requests,
             window_secs,
             by_ip,
             burst,
+            key,
+            dry_run,
         } => Some(crate::rate_limit::RateLimitConfig {
             requests_per_window: *requests,
             window: std::time::Duration::from_secs(*window_secs),
-            by_ip: *by_ip,
+            key: key.clone().unwrap_or(if *by_ip {
+                pingclair_core::config::RateLimitKey::Ip
+            } else {
+                pingclair_core::config::RateLimitKey::Global
+            }),
             burst: *burst,
+            dry_run: *dry_run,
+            route: route.to_string(),
         }),
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::Handle { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
             for h in handlers {
-                if let Some(config) = find_rate_limit_config(h) {
+                if let Some(config) = find_rate_limit_config(h, route) {
                     return Some(config);
                 }
             }
