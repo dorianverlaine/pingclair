@@ -5,7 +5,7 @@
 > - 接下來要做什麼 → `docs/TODO.md`
 > - 環境限制與實作守則 → `docs/GUARDRAILS.md`
 >
-> 最後整理：2026-07-27
+> 最後整理：2026-07-29
 
 ## 三種狀態的嚴格定義
 
@@ -127,6 +127,26 @@ commit `0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。
 ## 🧪 已實作，待乾淨遠端驗證
 
 > 這些是 v0.2 驗證日（TODO 的 Day 7／15／19／22／23）要清掉的積欠。
+
+### M2 生產護欄
+
+- **資源邊界與 timeout（Day 8，本機 2026-07-29）** — `limits` DSL 與 JSON
+  default 已涵蓋 header read、request body、idle、整體 request、header
+  count／bytes、listener connection、upload／download bandwidth；
+  `reverse_proxy transport http` 涵蓋 connect、first-byte、between-reads。
+  body 與 bandwidth 逐 chunk 執行，不新增完整 request／response buffer；
+  靜態、本機 response、反代與獨立 H3 bridge 均已接線。SSE、
+  `flush_interval -1` 與 H1 WebSocket 使用獨立 long-connection policy。
+- **本機證據** — 真 binary 超限矩陣 27/27 integration tests 全綠；完整 locked
+  gate 共 **362 tests** 全綠。修正前的 header slowloris 與 connect-timeout
+  status 失敗保留於
+  `benchmarks/results/20260729_day8_local_failed_header_timeout/`、
+  `benchmarks/results/20260729_day8_local_failed_connect_status/`、
+  `benchmarks/results/20260729_day8_local_failed_sse_content_type/`。
+- **仍缺** — 乾淨 Linux release、VPS 與真 QUIC client 矩陣留到 Day 15；
+  所以仍是 🧪，不是 ✅。H3 extended CONNECT／WebSocket 仍為既有 501。
+  Pingora 0.8 對 H1/H2 只有一個 upstream read timer，兩階段採較嚴格值；
+  pre-routing header／H2 field-section／H1/H2 connection 上限變更目前需要 restart。
 
 ### 安全與身分
 

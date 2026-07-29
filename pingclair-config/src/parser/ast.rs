@@ -161,6 +161,31 @@ pub struct ServerBlock {
 
     /// Other directives (including macro calls)
     pub directives: Vec<Directive>,
+
+    /// 🧱 Downstream time, size, connection, and bandwidth bounds.
+    pub limits: ResourceLimitsConfig,
+}
+
+/// 🧱 Typed server resource limits produced by the Caddyfile adapter.
+#[derive(Debug, Clone, Default)]
+pub struct ResourceLimitsConfig {
+    pub header_timeout_ms: Option<u64>,
+    pub body_timeout_ms: Option<u64>,
+    pub idle_timeout_ms: Option<u64>,
+    pub request_timeout_ms: Option<u64>,
+    pub max_header_count: Option<usize>,
+    pub max_header_bytes: Option<usize>,
+    pub max_connections: Option<usize>,
+    pub upload_bytes_per_sec: Option<u64>,
+    pub download_bytes_per_sec: Option<u64>,
+    pub long_connections: LongConnectionLimits,
+}
+
+/// 🌊 Typed overrides for SSE, immediate-flush, and WebSocket traffic.
+#[derive(Debug, Clone, Default)]
+pub struct LongConnectionLimits {
+    pub idle_timeout_ms: Option<u64>,
+    pub request_timeout_ms: Option<u64>,
 }
 
 /// 🔐 Represents downstream TLS configuration from a server directive.
@@ -498,6 +523,12 @@ pub enum FlushInterval {
 /// Transport configuration
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
+    /// 🔌 Connection-establishment timeout in milliseconds.
+    pub connect_timeout: Option<u64>,
+    /// ⏱️ Response-header timeout in milliseconds.
+    pub first_byte_timeout: Option<u64>,
+    /// 🌊 Between-response-read timeout in milliseconds.
+    pub between_reads_timeout: Option<u64>,
     pub read_timeout: Option<u64>,  // milliseconds
     pub write_timeout: Option<u64>, // milliseconds
 }
@@ -624,6 +655,7 @@ impl ServerBlock {
             matchers: HashMap::new(),
             error_pages: Vec::new(),
             directives: Vec::new(),
+            limits: ResourceLimitsConfig::default(),
         }
     }
 }

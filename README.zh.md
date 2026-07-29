@@ -186,6 +186,48 @@ Pingclair 會在 `PINGCLAIR_TLS_STORE`（預設
 存取控制、rate limit、IP-hash 負載平衡、上游轉送、placeholder 與 access log
 會共用同一個已驗證 client IP。目前變更 `trusted_proxies` 後需要重新啟動。
 
+### 資源上限與 timeout
+
+下游上限設定在站台層級，上游各階段 timeout 則設定於 `reverse_proxy`。
+時間長度必須附帶單位。WebSocket upgrade、`flush_interval -1` 與
+`text/event-stream` 會套用長連線覆寫；`off` 代表明確移除該長連線期限。
+
+```caddyfile
+example.com {
+    limits {
+        header_timeout 5s
+        body_timeout 30s
+        idle_timeout 30s
+        request_timeout 2m
+        max_headers 100
+        max_header_bytes 65536
+        max_connections 10000
+        upload_bytes_per_sec 10485760
+        download_bytes_per_sec 52428800
+        long_connections {
+            idle_timeout 5m
+            request_timeout off
+        }
+    }
+
+    reverse_proxy app:8080 {
+        transport http {
+            connect_timeout 3s
+            first_byte_timeout 30s
+            between_reads_timeout 15s
+        }
+    }
+}
+```
+
+header、body 與整體 request 超限時，只要協議仍能送出回應，就會回傳明確的
+HTTP 錯誤；idle transport 與超出上限的 HTTP/2、HTTP/3 連線則會關閉。
+Pingora 0.8 對 H1/H2 僅提供一個上游 read timer，因此兩個階段會採用
+`first_byte_timeout` 與 `between_reads_timeout` 中較嚴格者；H3 bridge
+則會在收到 response header 後切換 timer。目前修改 H1/H2 pre-routing
+`header_timeout`、H2 field-section cap 或 H1/H2 connection limit 後，
+需要重新啟動 listener。
+
 ### 路由與匹配
 
 Pingclair 提供強大的路由匹配能力，你可以依照路徑、網域、標頭等條件分流請求。

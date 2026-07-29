@@ -302,13 +302,50 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
 
 讓它在壓力、故障與惡意流量下不會失控。
 
-### 🔨 Day 8 — 資源邊界與 timeout
+### 🔨 Day 8 — 資源邊界與 timeout ✔
 
-- client header read／request body／idle／整體 request timeout。
-- upstream connect／first-byte／between-reads timeout。
-- header count／bytes、connection、bandwidth 上限。
-- SSE／WebSocket 需可另外配置長連線策略（不能被一般 idle timeout 砍掉）。
-- **完成判定**：每個上限都有超限測試，且超限行為明確（不是掛住）。
+**已完成 2026-07-29，本機 gate 全綠，尚待 Day 15 遠端驗證。**
+
+- ✅ 新增 fail-closed `limits` DSL、compiler 與向後相容 JSON default：
+  header read、request body、idle、整體 request timeout，header count／bytes、
+  listener connection、upload／download bytes-per-second。
+- ✅ `reverse_proxy transport http` 新增 connect、first-byte、between-reads timeout；
+  舊 `read_timeout`／`write_timeout` JSON 行為保留。H1/H2 因 Pingora 0.8 只暴露
+  一個 upstream read timer，採兩階段中較嚴格者；H3 在 response header 後
+  切換到 between-reads timer。
+- ✅ H1/H2 在 parser 前限制 header slowloris 與 connection 數；選定 vhost 後
+  再限制 decoded header count／bytes。H3 共用同一份配置，並維持既有 bounded
+  request／response channels，不新增完整 body buffer。
+- ✅ request body、靜態／本機 handler 與反代 body 都以 chunk 計數並套用
+  timeout／bandwidth；large body 的記憶體上限仍由既有 chunk/channel 邊界決定。
+- ✅ `flush_interval -1`、`text/event-stream`、H1 WebSocket upgrade 會切換到
+  可獨立設定的 `long_connections` idle／request policy；`off` 可明確取消期限。
+- ✅ **完成判定**：真 binary 測試實際超過 header read、body、idle、整體 request、
+  upstream connect／first-byte／between-reads、header count／bytes、connection、
+  upload／download bandwidth 上限；分別得到 431、413、408、504、503 或明確
+  transport close，沒有任何 case 掛住。SSE 與 WebSocket 均在一般 100–150 ms
+  deadline 後仍成功傳輸。總測試數 354 → **362**。
+- ✅ regression 先紅後綠：h2c preface peek 原本繞過 header timeout；connect timeout
+  經安全 redispatch 後原本退化為 502。失敗證據保留於
+  `benchmarks/results/20260729_day8_local_failed_header_timeout/` 與
+  `benchmarks/results/20260729_day8_local_failed_connect_status/`；
+  content-type 才辨識出的 SSE regression 則保留於
+  `benchmarks/results/20260729_day8_local_failed_sse_content_type/`。
+- ✅ Gate：`cargo fmt --all -- --check`、locked clippy、locked workspace build、
+  locked workspace tests 全綠。
+
+- **範圍外／尚未驗證**：
+  - 尚未做乾淨 Linux release、VPS 或真 QUIC client 矩陣；不得列為遠端完成。
+  - H3 extended CONNECT／WebSocket 原本即不支援，仍明確回 501；本日長連線
+    WebSocket policy 只涵蓋已支援 tunnel 的 H1/H2 路徑。
+  - H1/H2 的 first-byte 與 between-reads 無法比 Pingora 公開 API 更細分；
+    採較嚴格值可保證不超限，但可能比 H3 提早中止。若未設定 phase timer、
+    卻配置 long-connection idle policy，H1/H2 upstream read 會先採該 long
+    bound，讓 response header 可依 content type 升級；一般 request deadline
+    仍於每個 proxy phase 邊界 fail closed，而非中途改寫 Pingora 的 read future。
+  - H1/H2 的 pre-routing header timeout、H2 field-section cap 與 connection
+    semaphore 在 listener 建立時擷取；修改這三項目前需要 restart。其他選定
+    vhost 後套用的 body／request／bandwidth policy 可隨 hot reload 更新。
 
 ### 🔨 Day 9 — 可配置 retry／redispatch
 
@@ -630,7 +667,7 @@ H3 CORS／rewrite／error_page parity。
 | 里程碑 | 範圍 | 狀態 |
 |---|---|---|
 | M1 生產站可替換 | Day 1–7 | ✅ **完成**（`8294116`，2026-07-28 真站驗收） |
-| M2 生產護欄 | Day 8–15 | ⬜ 未開始 |
+| M2 生產護欄 | Day 8–15 | 🧪 **進行中**（Day 8 本機完成，待 Day 15 遠端驗證） |
 | M3 接上 Pingora 能力（含 `proxy_cache`） | Day 16–20 | ⬜ 未開始 |
 | M4 可觀測性與運維 | Day 21–24 | ⬜ 未開始 |
 | M5 協議安全與 H3 | Day 25–28 | ⬜ 未開始 |

@@ -127,6 +127,21 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         tls: None,
         log: None,
         client_max_body_size: 1024 * 1024, // 1MB default
+        limits: pingclair_core::config::ResourceLimitsConfig {
+            header_timeout_ms: server.limits.header_timeout_ms,
+            body_timeout_ms: server.limits.body_timeout_ms,
+            idle_timeout_ms: server.limits.idle_timeout_ms,
+            request_timeout_ms: server.limits.request_timeout_ms,
+            max_header_count: server.limits.max_header_count,
+            max_header_bytes: server.limits.max_header_bytes,
+            max_connections: server.limits.max_connections,
+            upload_bytes_per_sec: server.limits.upload_bytes_per_sec,
+            download_bytes_per_sec: server.limits.download_bytes_per_sec,
+            long_connections: pingclair_core::config::LongConnectionLimits {
+                idle_timeout_ms: server.limits.long_connections.idle_timeout_ms,
+                request_timeout_ms: server.limits.long_connections.request_timeout_ms,
+            },
+        },
         security: Default::default(),
         gzip_types: if server.gzip_types.is_empty() {
             default_gzip_types()
@@ -249,6 +264,64 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
 /// 🛡️ Rejects TLS combinations that cannot have deterministic runtime behavior.
 pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
     for server in &config.servers {
+        let limits = &server.limits;
+        let positive_durations = [
+            ("header_timeout_ms", limits.header_timeout_ms),
+            ("body_timeout_ms", limits.body_timeout_ms),
+            ("idle_timeout_ms", limits.idle_timeout_ms),
+            ("request_timeout_ms", limits.request_timeout_ms),
+        ];
+        if let Some((name, _)) = positive_durations
+            .into_iter()
+            .find(|(_, value)| value.is_some_and(|value| value == 0 || value > 31_536_000_000))
+        {
+            return Err(CompileError::InvalidServer {
+                message: format!("{name} must be between 1 ms and 365 days"),
+            });
+        }
+        for (name, value) in [
+            (
+                "long_connections.idle_timeout_ms",
+                limits.long_connections.idle_timeout_ms,
+            ),
+            (
+                "long_connections.request_timeout_ms",
+                limits.long_connections.request_timeout_ms,
+            ),
+        ] {
+            if value.is_some_and(|value| value > 31_536_000_000) {
+                return Err(CompileError::InvalidServer {
+                    message: format!("{name} must be off, zero, or at most 365 days"),
+                });
+            }
+        }
+        if limits
+            .max_header_count
+            .is_some_and(|value| value == 0 || value > 256)
+        {
+            return Err(CompileError::InvalidServer {
+                message: "max_header_count must be between 1 and 256".to_string(),
+            });
+        }
+        if limits
+            .max_header_bytes
+            .is_some_and(|value| value == 0 || value > 1_048_575)
+        {
+            return Err(CompileError::InvalidServer {
+                message: "max_header_bytes must be between 1 and 1048575".to_string(),
+            });
+        }
+        if limits.max_connections == Some(0) {
+            return Err(CompileError::InvalidServer {
+                message: "max_connections must be greater than zero".to_string(),
+            });
+        }
+        if limits.upload_bytes_per_sec == Some(0) || limits.download_bytes_per_sec == Some(0) {
+            return Err(CompileError::InvalidServer {
+                message: "bandwidth limits must be greater than zero".to_string(),
+            });
+        }
+
         let Some(tls) = &server.tls else {
             continue;
         };
@@ -433,6 +506,9 @@ fn compile_handler(handler: &Handler) -> CompileResult<HandlerConfig> {
                 flush_interval: None,
                 read_timeout: None,
                 write_timeout: None,
+                connect_timeout: None,
+                first_byte_timeout: None,
+                between_reads_timeout: None,
             };
 
             if let Some(policy) = &proxy.lb_policy {
@@ -459,6 +535,9 @@ fn compile_handler(handler: &Handler) -> CompileResult<HandlerConfig> {
 
             // Transport
             if let Some(transport) = &proxy.transport {
+                config.connect_timeout = transport.connect_timeout.map(|ms| ms as i64);
+                config.first_byte_timeout = transport.first_byte_timeout.map(|ms| ms as i64);
+                config.between_reads_timeout = transport.between_reads_timeout.map(|ms| ms as i64);
                 config.read_timeout = transport.read_timeout.map(|ms| ms as i64);
                 config.write_timeout = transport.write_timeout.map(|ms| ms as i64);
             }
