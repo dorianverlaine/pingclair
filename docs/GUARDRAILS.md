@@ -157,6 +157,15 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
   只寫在 `adapter/caddyfile.rs` 的檢查等於留了一條繞道。矛盾或半套的設定
   （`insecure_skip_verify` ＋ pinned CA、只有 cert 沒有 key）兩條路都要拒。
   2026-07-29 Day 11 上游 TLS 依此同時補了 `compiler::validate_config`。
+- **在 Pingora listener 前面再加一層自己的 ingress，會讓 Pingora 那層的
+  admission control 失去意義**。Day 14 的 PROXY protocol 把 Pingora app 搬到
+  私有 loopback listener，前面自建 ingress；`limits { max_connections }` 由
+  `ResourceGuardedProxy` 持有,於是它只再管**內部那一跳**，外部連線變成無上限。
+  Pingora 回的 503 也救不了——外部 socket 屬於 ingress 不屬於 Pingora。
+  **任何自建的 accept loop 都必須自己帶上同一個上限**，而且信任檢查要放在
+  取 permit **之前**，否則未受信的洪水會吃掉留給真流量的額度。
+  2026-07-30 Day 14 review 修，證據見
+  `benchmarks/results/20260730_day14_review_failed_ingress_limit/`。
 - **`HttpHealthCheck` 只替換位址，其他全部沿用 `peer_template`**。SNI、`Host`、
   TLS 素材都來自那個 template，而 template 通常是用 **first backend** 建的。
   所以 backend 名字不同的 pool（`to https://a.internal` ＋ `to https://b.internal`）

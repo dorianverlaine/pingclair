@@ -812,6 +812,9 @@ fn run_server(
             let mut server_options = pingora_core::apps::HttpServerOptions::default();
             server_options.h2c = !is_https;
             let listener_limits = proxy_logic.listener_limits();
+            // 🧱 Captured before the guard consumes the limits, so the public
+            // PROXY ingress can carry the same ceiling as the private hop.
+            let ingress_max_connections = listener_limits.max_connections;
             let proxy =
                 pingora_proxy::HttpProxy::new(proxy_logic.clone(), server.configuration.clone());
             let app =
@@ -878,6 +881,7 @@ fn run_server(
                         registry,
                         trusted,
                         blocked,
+                        ingress_max_connections,
                     )
                     .await
                     {

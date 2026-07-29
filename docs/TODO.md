@@ -522,6 +522,33 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
 - **完成判定**：三種來源（XFF／Forwarded／PROXY protocol）的 verified client IP
   一致，且未受信來源無法偽造。
 
+**已完成 2026-07-30（Codex 實作，本機 gate 全綠）。**
+
+- ✅ PROXY protocol v1／v2 有界解析，未受信 transport peer 在 accept 後立即丟棄。
+- ✅ RFC 7239 `Forwarded` 有界解析；與 XFF 衝突時**兩邊都不信**，退回 socket
+  peer（不可偽造的那個值）。信任閘門在讀任何 header 之前。
+- ✅ 身分 registry 有 TTL 與雙路徑修剪，`register` 在轉發第一個 byte 之前完成。
+- 🐛 **review 時修掉一個 Day 8 保證的回歸**：ingress 完全沒有 admission
+  control，`limits { max_connections }` 只再管內部那一跳，外部連線無上限。
+  已補上同一個上限，信任檢查排在取 permit 之前。證據：
+  `benchmarks/results/20260730_day14_review_failed_ingress_limit/`。
+
+> ⚠️ **架構限制（Pingora 0.8 沒有更好的路）**：PROXY protocol 是「公開 ingress
+> ＋ 本機 loopback 中繼 → 私有 Pingora listener」。Pingora 0.8 的 listener 不懂
+> PROXY protocol，也不接受既有 FD，所以無法在 listener 上原地解析。代價是
+> 每條外部連線多一個 fd、一個 task 與一次 userspace copy。
+>
+> 另有一個 TOCTOU：私有位址是先 bind `127.0.0.1:0` 取得再釋放給 Pingora 綁。
+> 窗口極小且是 loopback ephemeral port，但**本機上的對手若搶到該 port，
+> ingress 會把外部流量轉給它**。同樣受限於 Pingora 0.8 沒有 FD 傳遞。
+> Day 15 要在真機確認一次；長期解法是等上游或改用 socket activation。
+
+- **範圍外（v0.3）**：`proxy_protocol` 目前是**全域**開關，不是 per-listener。
+  nginx 是 `listen 443 proxy_protocol;`、Caddy 是 per-server listener wrapper。
+  開了之後**每個** listener 都要求 PROXY header，直連的瀏覽器會被拒（有 log、
+  fail closed，但很意外）。單一入口的部署沒差；要混用直連與 L4 LB 就會踩到。
+  修法要動 `listen` 的 grammar，屬於 DSL 設計題，不在 review 範圍。
+
 ### ✅ Day 15 — M2 驗證日
 
 凍結 RC，在乾淨 Linux／VPS 驗證 Day 8–14 全部項目，加上先前積欠的
