@@ -50,6 +50,10 @@ pub struct GlobalConfig {
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
 
+    /// 🧭 Requires PROXY protocol v1 or v2 on every configured TCP listener.
+    #[serde(default)]
+    pub proxy_protocol: bool,
+
     /// Max number of idle upstream connections Pingora keeps open per
     /// worker thread for reuse. Explicitly configurable rather than left
     /// as an implicit framework default, so a deployment under load has a
@@ -88,6 +92,7 @@ impl Default for GlobalConfig {
             auto_https: AutoHttpsMode::default(),
             blocked_ips: Vec::new(),
             trusted_proxies: Vec::new(),
+            proxy_protocol: false,
             upstream_keepalive_pool_size: None,
             http3: true,
             worker_threads: None,

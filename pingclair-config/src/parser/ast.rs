@@ -49,6 +49,8 @@ pub struct GlobalBlock {
     pub admin: Option<AdminDirective>,
     /// 🛡️ Proxy IP or CIDR ranges allowed to supply client identity headers.
     pub trusted_proxies: Vec<String>,
+    /// 🧭 Requires PROXY protocol v1 or v2 on downstream TCP listeners.
+    pub proxy_protocol: Option<bool>,
     /// 🔄 Upstream re-resolution interval in seconds; `Some(0)` disables it.
     /// `None` means the directive was absent and the default applies.
     pub dns_refresh_secs: Option<u64>,

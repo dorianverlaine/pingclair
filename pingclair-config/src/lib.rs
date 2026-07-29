@@ -736,6 +736,7 @@ mod tests {
     fn test_compile_trusted_proxies() {
         let source = r#"{
             trusted_proxies 127.0.0.1 10.0.0.0/8 2001:db8::/32
+            proxy_protocol on
         }
 
         example.com {
@@ -748,12 +749,26 @@ mod tests {
             config.global.trusted_proxies,
             ["127.0.0.1", "10.0.0.0/8", "2001:db8::/32"]
         );
+        assert!(config.global.proxy_protocol);
     }
 
     #[test]
     fn test_compile_trusted_proxies_rejects_invalid_rule() {
         let source = r#"{
             trusted_proxies definitely-not-a-network
+        }
+
+        example.com {
+            respond "OK"
+        }"#;
+
+        assert!(compile(source).is_err());
+    }
+
+    #[test]
+    fn test_proxy_protocol_requires_a_trusted_transport_network() {
+        let source = r#"{
+            proxy_protocol on
         }
 
         example.com {
