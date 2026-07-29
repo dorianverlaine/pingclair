@@ -183,7 +183,11 @@ impl RouteProtection {
     /// 📊 Records one rejection without creating unbounded metric labels.
     pub fn reject(&self, error: AdmissionError) {
         metrics::OVERLOAD_REJECTIONS_TOTAL
-            .with_label_values(&[&self.host, &self.route, error.metric_reason()])
+            .with_label_values(&[
+                self.host.as_str(),
+                self.route.as_str(),
+                error.metric_reason(),
+            ])
             .inc();
     }
 
@@ -555,7 +559,12 @@ impl CircuitBreaker {
             ),
         }
         metrics::CIRCUIT_TRANSITIONS_TOTAL
-            .with_label_values(&[&self.host, &self.route, &self.upstream, label])
+            .with_label_values(&[
+                self.host.as_str(),
+                self.route.as_str(),
+                self.upstream.as_str(),
+                label,
+            ])
             .inc();
         metrics::CIRCUIT_STATE
             .with_label_values(&[&self.host, &self.route, &self.upstream])

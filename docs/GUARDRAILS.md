@@ -29,6 +29,12 @@
   被測程式的問題。測試腳本改用明確參數的 function。
 - **壓縮測試的 payload 必須逐 chunk 唯一且不可壓縮**。重複同一塊資料會被
   zstd 的 window 去重（64MiB → 15KB），讓「輸出有在流動」這類斷言**假性失敗**。
+- **本機 gate 必須用 `cargo +1.88.0`,不是預設工具鏈**。CI 釘 `1.88.0`
+  （`.github/workflows/rust.yml`），workspace 也宣告 `rust-version = "1.88"`,
+  但本機預設可能新上好幾個版本。新編譯器的型別推論更寬鬆——`&[&String, &String,
+  &str]` 這種混型陣列在 1.97 過、在 1.88 是 `E0308`。本機四項全綠然後 CI 全紅,
+  就是這樣來的（2026-07-29）。`rustfmt` 的換行決策也隨版本變,所以 fmt 也要用
+  同一個工具鏈跑。
 - **要在容器 log 裡看到 ERROR 以下的內容必須設 `RUST_LOG`**。subscriber 是
   `EnvFilter::from_default_env()` 建的，沒設等於只留 ERROR——症狀是功能明明
   正常卻「什麼都沒 log」。
