@@ -985,7 +985,11 @@ async fn test_listener_resource_limits_reject_before_dispatch_without_hanging() 
         "servers": [{
             "listen": ["127.0.0.1:0"],
             "limits": {
-                "header_timeout_ms": 200,
+                // Long enough that the connection held open below is not
+                // reaped mid-test. The header timeout itself is asserted in
+                // `test_streamed_limits_and_timeout_phases_are_explicit_and_bounded`;
+                // at 200ms it did nothing here except race the probe.
+                "header_timeout_ms": 5000,
                 "max_header_count": 16,
                 "max_header_bytes": 512,
                 "max_connections": 1
@@ -1002,16 +1006,40 @@ async fn test_listener_resource_limits_reject_before_dispatch_without_hanging() 
     let address = server.address(0);
 
     // 🔌 Hold the only connection slot with an incomplete header.
-    let mut held = tokio::net::TcpStream::connect(address).await.unwrap();
-    held.write_all(b"GET / HTTP/1.1\r\nHost:").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    //
+    // Acquiring the slot and verifying it are the same step, because `held`
+    // only occupies the slot if `held` was itself admitted. The readiness
+    // check that ran a moment ago went through a pooled client and leaves a
+    // keep-alive connection behind; while that is still open it is `held`
+    // that gets the 503, after which nothing holds the slot and every probe
+    // below is admitted. That lost about one run in ten under a loaded
+    // machine. Retrying the pair is self-correcting no matter what else is
+    // briefly holding a connection.
+    let mut held = None;
+    let mut rejected = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        let mut candidate = tokio::net::TcpStream::connect(address).await.unwrap();
+        candidate
+            .write_all(b"GET / HTTP/1.1\r\nHost:")
+            .await
+            .unwrap();
 
-    let mut excess = tokio::net::TcpStream::connect(address).await.unwrap();
-    excess
-        .write_all(b"GET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
-        .await
-        .unwrap();
-    let rejected = read_http1_to_end(&mut excess).await;
+        let mut excess = tokio::net::TcpStream::connect(address).await.unwrap();
+        excess
+            .write_all(b"GET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let response = read_http1_to_end(&mut excess).await;
+        if response.starts_with(b"HTTP/1.1 503") {
+            rejected = response;
+            held = Some(candidate);
+            break;
+        }
+        drop(candidate);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let held = held.expect("max_connections never rejected a second connection");
     assert!(
         rejected.starts_with(b"HTTP/1.1 503"),
         "{}",
