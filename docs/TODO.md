@@ -7,7 +7,7 @@
 > - nginx 功能對照 → `docs/AUDIT_NGINX_PARITY.md`
 > - 效能數據與壓測發現 → `benchmarks/README.md`
 >
-> 最後整理：2026-07-28
+> 最後整理：2026-07-30
 
 ---
 
@@ -42,11 +42,25 @@ network，源站不發布任何 host port）。不是「相似 DSL 能通過 par
 **每個 🔨 日的收工條件**（缺一不可）：
 
 ```
-cargo fmt --all -- --check
-cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo build --locked --workspace
-cargo test --locked --workspace
+cargo +1.88.0 fmt --all -- --check
+cargo +1.88.0 clippy --locked --workspace --all-targets -- -D warnings
+cargo +1.88.0 build --locked --workspace
+cargo +1.88.0 test --locked --workspace
 ```
+
+> ⚠️ `+1.88.0` 不是裝飾。CI 釘這個版本,workspace 也宣告 `rust-version = "1.88"`,
+> 而新編譯器的型別推論更寬鬆、rustfmt 換行決策也不同。本機四項全綠然後 CI
+> 全紅,2026-07-29 已經發生過一次。
+
+**外加一條**：**這天加的東西,文件當天改**。README／examples／設定參考裡任何
+會因為今天的改動而變成假話的地方,今天就改掉。
+
+> 📌 **為什麼不是留到最後一起寫**：2026-07-30 查出來,
+> `examples/full_featured.pingclair` 已經壞了三天沒人發現（Day 4 把
+> `encode br` 改成編譯錯誤,但沒改用到它的範例）,三份 README 也還在教
+> 前一天剛被刪掉的 `proxy_protocol on`。**文件不會在自己變成假話時通知你。**
+> 現在有 `pingclair-config/tests/documentation.rs` 會編譯每個範例與每個
+> 文件裡的設定區塊,所以「今天改」的成本只有寫字,不用自己找哪裡壞了。
 
 **每個 ✅ 日的收工條件**：結果寫進 `benchmarks/results/<date>_<commit>/`，
 並更新 `docs/STATUS.md`。失敗的證據**不可覆寫**，另開目錄保留。
@@ -756,12 +770,13 @@ H3 CORS／rewrite／error_page parity。
 
 ---
 
-## M6 — 發布（Day 29–34）
+## M6 — 發布（Day 29–36）
 
 ### ✅ Day 29 — RC 凍結與品質閘門
 
 - Linux／macOS 的 build／test／fmt／clippy `-D warnings` 全綠。
 - dependency audit 沒有未處理的 high／critical advisory；例外需**書面風險接受**。
+  含 `site/` 的 `npm audit`——文件站的依賴樹也是這個專案發布出去的東西。
 
 ### ✅ Day 30 — Soak／chaos
 
@@ -785,13 +800,48 @@ H3 CORS／rewrite／error_page parity。
 - 全新安裝、`0.1.7 → 0.2.0` 升級、systemd start/reload/stop、uninstall、
   Docker 啟動與最小 Pingclairfile 都在乾淨環境驗證。
 
-### 🔨 Day 33 — 發布文件
+### 🔨 Day 33 — 設定參考手冊
 
-- `CHANGELOG.md`、三語 README、所有 examples、配置參考、安全限制、
-  H3 支援矩陣、已知問題、migration notes。
-- **完成判定**：所有範例可由 `pingclair validate` 驗證通過。
+原本 Day 33 是「一天寫完所有文件」,2026-07-30 拆成三天。理由：光是設定表面
+就有 `limits`（10 條）、`reverse_proxy` 底下 7 個子區塊、`rate_limit`、
+`upstream_tls`、listen flags、tls、encode、matchers、handle/handle_path、
+access_control、cors、basic_auth、rewrite、error_page、log,再加 M3 的快取與
+M4 的 metrics。一天寫完的品質會是「能交差」而不是「能用」。
 
-### 🚀 Day 34 — 發布
+- 每個 directive：語法、預設值、有效範圍、**錯誤時的行為**、與 Caddy 的差異。
+- 補完 M1–M2 積欠的部分（Day 1–15 加的東西目前只有 commit message 講過）。
+- 安全限制與 H3 支援矩陣；**明確寫出不支援什麼**,不是留白。
+- **完成判定**：`cargo test -p pingclair-config --test documentation` 全綠,
+  且參考手冊裡每個 directive 都能在 `examples/` 找到一個可驗證的用例。
+
+### 🔨 Day 34 — 官網與 README
+
+- **Astro ＋ Starlight**。選它不是因為好看（雖然是）,而是因為這個專案
+  **已經是三語的**,而 Starlight 的 i18n 是一級支援——語言切換、per-locale
+  導航、缺翻譯 fallback 全內建。mdBook 每翻一次痛一次。
+  上游 Cloudflare 的開發者文件也是這套,對一個蓋在 Pingora 上的東西算順。
+- **必須關住的四件事**（Rust repo 裡多一棵 Node 依賴樹不是零成本）：
+  - `site/` 自己的 `package.json` 與 lockfile,**不進 cargo workspace**；
+  - CI 獨立 job,site 壞掉**不得**擋 Rust 的 merge；
+  - `npm audit` 併進 Day 29 的 dependency audit；
+  - **設定範例單一來源**——把 `site/src/content/` 加進
+    `tests/documentation.rs` 的掃描範圍。站上出現一份繞過守衛的範例,
+    2026-07-30 修的問題三個月後會原樣長回來。
+- landing page 依賴的是**效能數字**,所以它必須在 Day 31 之後才寫。
+- 三語 README 收斂成「入口 ＋ 連到站上」,不再各自維護一份完整文件。
+- **完成判定**：站可離線建置；三語導航皆可用；站上每個設定區塊都被守衛編譯過。
+
+### 🔨 Day 35 — CHANGELOG 與 migration
+
+- `CHANGELOG.md`：`0.1.7 → 0.2.0` 的完整條目,含**行為變更**與**移除的設定**。
+- migration notes：`proxy_protocol` 從全域改成 per-listener、`encode br` 變成
+  編譯錯誤、global block 不再吞未知 directive——這三個都會讓舊設定**啟動失敗**,
+  必須逐條寫出「舊寫法 → 新寫法」。
+- 已知問題清單。
+- **完成判定**：拿一份 `0.1.7` 的真實設定,照 migration notes 改完能通過
+  `pingclair validate`。
+
+### 🚀 Day 36 — 發布
 
 只在上述全綠後：改 workspace version 為 `0.2.0` → 帶 emoji 的 release commit
 → signed `v0.2.0` tag → 確認 GitHub Release／GHCR 完成 → 把本目標移入
@@ -836,7 +886,7 @@ H3 CORS／rewrite／error_page parity。
 | M3 接上 Pingora 能力（含 `proxy_cache`） | Day 17–21 | ⬜ 未開始 |
 | M4 可觀測性與運維 | Day 22–25 | ⬜ 未開始 |
 | M5 協議矩陣與 H3 | Day 26–28 | ⬜ 未開始 |
-| M6 發布 | Day 29–34 | ⬜ 未開始 |
+| M6 發布 | Day 29–36 | ⬜ 未開始 |
 
 > 完成一天就在對應 Day 標題後標上 `✔ <commit>`；完成一個里程碑就更新這張表，
 > 並把驗證證據路徑寫進 `docs/STATUS.md`。
