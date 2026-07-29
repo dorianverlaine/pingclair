@@ -1,0 +1,122 @@
+# M2 guardrail matrix.
+#
+# Every route here isolates one guardrail. They are deliberately not combined:
+# an overload ceiling and a retry policy on the same route would make a 503
+# ambiguous, and the point of the matrix is that each rejection has exactly
+# one possible cause.
+#
+# The origins behind these routes are controllable (see origin.py) — their
+# failure mode is changed from outside while this process keeps running, so
+# what is measured is the proxy reacting, not the proxy restarting.
+
+{
+	# Only the L4 balancer is trusted, not the whole subnet. A wide CIDR here
+	# would include the Docker gateway that the test client arrives through,
+	# which makes the negative half of the identity check — that an untrusted
+	# source cannot forge X-Forwarded-For — impossible to fail.
+	trusted_proxies 10.88.0.6/32
+	dns_refresh off
+}
+
+:8080 {
+	# 🧭 Day 14 — the same server, also reachable through an L4 balancer that
+	# speaks PROXY protocol. :8080 stays direct; only :8081 demands the
+	# header. Two listeners, one route table, different admission rules —
+	# which is the whole reason this is per-listener and not global.
+	listen :8081 proxy_protocol
+
+	limits {
+		header_timeout 2s
+		request_timeout 20s
+		max_headers 30
+		max_header_bytes 8192
+		max_connections 64
+	}
+
+	# 🩺 Day 12 — active health checking.
+	# Two origins, one probe path. The second origin is taken down with no
+	# traffic sent to it, so only an out-of-band probe can notice.
+	handle /health-check/* {
+		reverse_proxy http://origin-a:8080 http://origin-b:8080 {
+			health_check {
+				path /health
+				interval 1s
+				timeout 1s
+				consecutive_failure 1
+				consecutive_success 1
+			}
+			retry {
+				max_attempts 1
+			}
+		}
+	}
+
+	# 🔁 Day 9 — bounded redispatch on an idempotent status.
+	handle /retry/* {
+		reverse_proxy http://origin-c:8080 http://origin-d:8080 {
+			retry {
+				max_attempts 3
+				status_codes 503
+				methods GET
+			}
+		}
+	}
+
+	# 🚦 Day 10 — admission control. One slot, no queue: the second
+	# concurrent request must be refused rather than made to wait.
+	handle /overload/* {
+		reverse_proxy http://origin-e:8080 {
+			overload {
+				max_in_flight 1
+			}
+			retry {
+				max_attempts 1
+			}
+		}
+	}
+
+	# 🔌 Day 10 — circuit breaker. Opens after two consecutive failures and
+	# stays open long enough to be observed before half-open probing.
+	handle /breaker/* {
+		reverse_proxy http://origin-f:8080 {
+			circuit_breaker {
+				consecutive_failures 2
+				open_for 5s
+				half_open_requests 1
+			}
+			retry {
+				max_attempts 1
+			}
+		}
+	}
+
+	# ⏱️ Day 8 — upstream phase timers, separated from the retry path so a
+	# 504 here can only mean the timer fired.
+	handle /timeout/* {
+		reverse_proxy http://origin-g:8080 {
+			transport http {
+				first_byte_timeout 2s
+			}
+			retry {
+				max_attempts 1
+			}
+		}
+	}
+
+	# 🚦 Day 13 — exact token bucket: 3 per 10s with 2 burst tokens, so the
+	# first 5 requests pass and the sixth does not.
+	handle /ratelimit/* {
+		rate_limit 3 10s {
+			burst 2
+			key ip
+		}
+		respond "limited-ok"
+	}
+
+	# 🪪 Day 14 — identity, reported by the origin rather than inferred.
+	handle /identity/* {
+		reverse_proxy http://origin-a:8080
+	}
+
+	respond "matrix-root"
+}
