@@ -842,14 +842,30 @@ fn compile_log(log: &LogBlock) -> CompileResult<LogConfig> {
     })
 }
 
-fn find_path_pattern(matcher: &Matcher, matchers: &HashMap<String, Matcher>) -> Option<String> {
+/// 🕳️ Maximum matcher nesting, mirroring the block-nesting cap in `parser.rs`.
+///
+/// Matchers are a *separate* recursion from blocks and were never given the
+/// same bound, so `not not not …` five thousand deep exhausted the stack and,
+/// under a release profile that aborts on panic, took the process with it.
+/// Nothing legitimate nests matchers more than a handful deep.
+const MAX_MATCHER_DEPTH: usize = 32;
+
+fn find_path_pattern(
+    matcher: &Matcher,
+    matchers: &HashMap<String, Matcher>,
+    depth: usize,
+) -> Option<String> {
+    if depth > MAX_MATCHER_DEPTH {
+        return None;
+    }
     match matcher {
         Matcher::Path(pm) => pm.patterns.first().cloned(),
         Matcher::Named(name) => matchers
             .get(name)
-            .and_then(|m| find_path_pattern(m, matchers)),
+            .and_then(|m| find_path_pattern(m, matchers, depth + 1)),
         Matcher::And(left, right) | Matcher::Or(left, right) => {
-            find_path_pattern(left, matchers).or_else(|| find_path_pattern(right, matchers))
+            find_path_pattern(left, matchers, depth + 1)
+                .or_else(|| find_path_pattern(right, matchers, depth + 1))
         }
         _ => None,
     }
@@ -863,11 +879,15 @@ fn compile_route_arm(
     let path = arm
         .matcher
         .as_ref()
-        .and_then(|m| find_path_pattern(m, matchers))
+        .and_then(|m| find_path_pattern(m, matchers, 0))
         .unwrap_or_else(|| "/*".to_string());
 
     // Compile matcher conditions
-    let matcher = arm.matcher.as_ref().map(|m| compile_matcher(m, matchers));
+    let matcher = arm
+        .matcher
+        .as_ref()
+        .map(|m| compile_matcher(m, matchers, 0))
+        .transpose()?;
 
     // Compile handler
     let handler = compile_handler(&arm.handler)?;
@@ -880,19 +900,34 @@ fn compile_route_arm(
     })
 }
 
-fn compile_matcher(matcher: &Matcher, matchers: &HashMap<String, Matcher>) -> CoreMatcher {
-    match matcher {
+fn compile_matcher(
+    matcher: &Matcher,
+    matchers: &HashMap<String, Matcher>,
+    depth: usize,
+) -> CompileResult<CoreMatcher> {
+    if depth > MAX_MATCHER_DEPTH {
+        return Err(CompileError::InvalidRoute {
+            message: format!("matcher nesting exceeds the maximum depth of {MAX_MATCHER_DEPTH}"),
+        });
+    }
+    Ok(match matcher {
         Matcher::Named(name) => {
-            if let Some(m) = matchers.get(name) {
-                compile_matcher(m, matchers)
-            } else {
-                // Fallback or error? CoreMatcher doesn't have a "None" that's safe here
-                // but we can use an empty And or similar if needed.
-                // For now, assume it exists or return a dummy.
-                CoreMatcher::Path {
-                    patterns: vec!["/*".to_string()],
-                }
-            }
+            // 🚨 An unresolved name used to fall through to `path /*`, which
+            // matches *everything*. So `handle @admin_onlyy` — one typo — turned
+            // a restricted route into an open one, and the configuration
+            // validated cleanly. A name that does not resolve is a mistake, and
+            // the only safe reading of a mistake in a matcher is to refuse.
+            let Some(inner) = matchers.get(name) else {
+                return Err(CompileError::InvalidRoute {
+                    message: format!(
+                        "matcher `{}` is not defined; define it or fix the name \
+                         (an unresolved matcher would otherwise match every request)",
+                        // The stored name already carries its `@`.
+                        name.strip_prefix('@').map_or(name.as_str(), |bare| bare)
+                    ),
+                });
+            };
+            compile_matcher(inner, matchers, depth + 1)?
         }
         Matcher::Path(pm) => CoreMatcher::Path {
             patterns: pm.patterns.clone(),
@@ -932,15 +967,17 @@ fn compile_matcher(matcher: &Matcher, matchers: &HashMap<String, Matcher>) -> Co
         Matcher::RemoteIp(ips) => CoreMatcher::RemoteIp(ips.clone()),
         Matcher::Protocol(protocols) => CoreMatcher::Protocol(protocols.clone()),
         Matcher::And(left, right) => CoreMatcher::And(
-            Box::new(compile_matcher(left, matchers)),
-            Box::new(compile_matcher(right, matchers)),
+            Box::new(compile_matcher(left, matchers, depth + 1)?),
+            Box::new(compile_matcher(right, matchers, depth + 1)?),
         ),
         Matcher::Or(left, right) => CoreMatcher::Or(
-            Box::new(compile_matcher(left, matchers)),
-            Box::new(compile_matcher(right, matchers)),
+            Box::new(compile_matcher(left, matchers, depth + 1)?),
+            Box::new(compile_matcher(right, matchers, depth + 1)?),
         ),
-        Matcher::Not(inner) => CoreMatcher::Not(Box::new(compile_matcher(inner, matchers))),
-    }
+        Matcher::Not(inner) => {
+            CoreMatcher::Not(Box::new(compile_matcher(inner, matchers, depth + 1)?))
+        }
+    })
 }
 
 fn compile_handler(handler: &Handler) -> CompileResult<HandlerConfig> {

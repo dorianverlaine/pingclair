@@ -2038,7 +2038,24 @@ fn parse_matcher_definition(d: &Directive) -> Result<Matcher, AdapterError> {
     }
 }
 
+/// 🕳️ Maximum matcher nesting accepted from a Pingclairfile.
+///
+/// Blocks are capped at 100 in the parser; matchers are a separate recursion
+/// and were never capped, so `not not not …` deep enough exhausted the stack
+/// and aborted the process. Nothing legitimate nests more than a few deep.
+const MAX_MATCHER_NESTING: usize = 32;
+
 fn parse_single_matcher(d: &Directive) -> Result<Matcher, AdapterError> {
+    parse_single_matcher_at(d, 0)
+}
+
+fn parse_single_matcher_at(d: &Directive, depth: usize) -> Result<Matcher, AdapterError> {
+    if depth > MAX_MATCHER_NESTING {
+        return Err(AdapterError::InvalidArgument(
+            d.name.clone(),
+            format!("matcher nesting exceeds the maximum depth of {MAX_MATCHER_NESTING}"),
+        ));
+    }
     match d.name.as_str() {
         "path" => Ok(Matcher::Path(PathMatcher {
             patterns: d.args.clone(),
@@ -2048,7 +2065,7 @@ fn parse_single_matcher(d: &Directive) -> Result<Matcher, AdapterError> {
                 let mut matchers = block
                     .directives
                     .iter()
-                    .map(parse_single_matcher)
+                    .map(|inner| parse_single_matcher_at(inner, depth + 1))
                     .collect::<Result<Vec<_>, _>>()?;
                 if matchers.is_empty() {
                     return Err(AdapterError::InvalidArgument(
@@ -2070,7 +2087,7 @@ fn parse_single_matcher(d: &Directive) -> Result<Matcher, AdapterError> {
                     args: d.args[1..].to_vec(),
                     block: None,
                 };
-                parse_single_matcher(&nested)?
+                parse_single_matcher_at(&nested, depth + 1)?
             };
             Ok(Matcher::Not(Box::new(inner)))
         }

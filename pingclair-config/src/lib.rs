@@ -840,6 +840,61 @@ mod tests {
     }
 
     #[test]
+    fn an_undefined_matcher_name_is_refused_rather_than_matching_everything() {
+        // Setup scenarios
+        //
+        // `compile_matcher` used to resolve an unknown name to `path /*`, so one
+        // typo turned a restricted route into an open one — and the config
+        // validated cleanly. Found 2026-07-30 while searching the parser on
+        // purpose rather than bumping into it; evidence in
+        // benchmarks/results/20260730_day16_failed_matcher_fail_open/.
+        let source = r#"
+            :8080 {
+                @admin_only path /admin/*
+                handle @admin_onlyy { respond "SECRET" 200 }
+                respond "public"
+            }"#;
+
+        // Verification
+        let error = compile(source).expect_err("an undefined matcher must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("admin_onlyy"),
+            "the diagnostic must name the matcher that does not resolve: {message}"
+        );
+        assert!(
+            !message.contains("@@"),
+            "the stored name already carries its @: {message}"
+        );
+
+        // The same config with the name spelled correctly still compiles.
+        compile(&source.replace("@admin_onlyy", "@admin_only")).expect("the fixed name compiles");
+    }
+
+    #[test]
+    fn matcher_nesting_is_bounded_rather_than_exhausting_the_stack() {
+        // Setup scenarios
+        //
+        // Blocks were capped at 100 in the parser; matchers are a separate
+        // recursion and were not capped at all, so this aborted the process
+        // under a release profile that aborts on panic.
+        for depth in [40usize, 5_000, 50_000] {
+            let source = format!(
+                ":8080 {{\n  @deep {}path /x\n  handle @deep {{ respond \"ok\" }}\n}}",
+                "not ".repeat(depth)
+            );
+            assert!(
+                compile(&source).is_err(),
+                "matcher nesting {depth} deep must be refused, not accepted"
+            );
+        }
+
+        // A realistic amount of nesting still works.
+        compile(":8080 {\n  @x not path /admin/*\n  handle @x { respond \"ok\" }\n}")
+            .expect("one level of negation is ordinary and must still compile");
+    }
+
+    #[test]
     fn test_compile_trusted_proxies_rejects_invalid_rule() {
         let source = r#"{
             trusted_proxies definitely-not-a-network
