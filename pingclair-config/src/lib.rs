@@ -229,6 +229,21 @@ mod tests {
                         status_codes 429 502 503 504
                         methods GET HEAD PUT
                     }
+                    overload {
+                        max_in_flight 32
+                        max_pending 8
+                        pending_timeout 75ms
+                        upstream_max_connections 16
+                    }
+                    circuit_breaker {
+                        consecutive_failures 3
+                        error_rate_percent 50
+                        minimum_requests 4
+                        window_requests 10
+                        open_for 2s
+                        half_open_requests 2
+                        failure_statuses 429 502 503 504
+                    }
                     transport http {
                         connect_timeout 100ms
                         first_byte_timeout 200ms
@@ -263,6 +278,20 @@ mod tests {
         assert_eq!(proxy.retry.backoff_ms, 50);
         assert_eq!(proxy.retry.status_codes, vec![429, 502, 503, 504]);
         assert_eq!(proxy.retry.methods, vec!["GET", "HEAD", "PUT"]);
+        assert_eq!(proxy.overload.max_in_flight, Some(32));
+        assert_eq!(proxy.overload.max_pending, 8);
+        assert_eq!(proxy.overload.pending_timeout_ms, 75);
+        assert_eq!(proxy.overload.upstream_max_connections, Some(16));
+        assert_eq!(proxy.circuit_breaker.consecutive_failures, Some(3));
+        assert_eq!(proxy.circuit_breaker.error_rate_percent, Some(50));
+        assert_eq!(proxy.circuit_breaker.minimum_requests, 4);
+        assert_eq!(proxy.circuit_breaker.window_requests, 10);
+        assert_eq!(proxy.circuit_breaker.open_duration_ms, 2_000);
+        assert_eq!(proxy.circuit_breaker.half_open_requests, 2);
+        assert_eq!(
+            proxy.circuit_breaker.failure_statuses,
+            vec![429, 502, 503, 504]
+        );
     }
 
     #[test]
@@ -280,6 +309,17 @@ mod tests {
             ":8080 { reverse_proxy 127.0.0.1:9000 { retry { status_codes 503 503 } } }",
             ":8080 { reverse_proxy 127.0.0.1:9000 { retry { total_timeout 10ms backoff 10ms } } }",
             ":8080 { reverse_proxy 127.0.0.1:9000 { retry { statu_codes 503 } } }",
+            ":8080 { reverse_proxy 127.0.0.1:9000 { overload { max_pending 2 } } }",
+            ":8080 { reverse_proxy 127.0.0.1:9000 { overload { max_in_flight 1 max_pending 1 pending_timeout 0ms } } }",
+            ":8080 { reverse_proxy 127.0.0.1:9000 { overload { max_in_flight 0 } } }",
+            ":8080 { reverse_proxy 127.0.0.1:9000 { overload { pending_timeout 1s } } }",
+            ":8080 { reverse_proxy 127.0.0.1:9000 { overload { max_in_filght 1 } } }",
+            ":8080 { reverse_proxy 127.0.0.1:9000 { circuit_breaker { open_for 1s } } }",
+            ":8080 { reverse_proxy 127.0.0.1:9000 { circuit_breaker { error_rate_percent 101 } } }",
+            ":8080 { reverse_proxy 127.0.0.1:9000 { circuit_breaker { consecutive_failures 2 minimum_requests 5 window_requests 4 } } }",
+            ":8080 { reverse_proxy 127.0.0.1:9000 { circuit_breaker { consecutive_failures 2 failure_statuses 200 } } }",
+            ":8080 { reverse_proxy 127.0.0.1:9000 { circuit_breaker { consecutive_failures 2 failure_statuses 503 503 } } }",
+            ":8080 { reverse_proxy 127.0.0.1:9000 { circuit_breaker { consecuitive_failures 2 } } }",
         ] {
             assert!(compile(source).is_err(), "{source} must fail");
         }
@@ -306,14 +346,34 @@ mod tests {
         };
         assert_eq!(proxy.retry.max_attempts, 16);
         assert!(proxy.retry.status_codes.is_empty());
+        assert_eq!(
+            *proxy.overload,
+            pingclair_core::config::OverloadConfig::default()
+        );
+        assert_eq!(
+            *proxy.circuit_breaker,
+            pingclair_core::config::CircuitBreakerConfig::default()
+        );
 
-        let mut unsafe_source = legacy_source;
+        let mut unsafe_source = legacy_source.clone();
         unsafe_source["servers"][0]["routes"][0]["handler"]["retry"] = serde_json::json!({
             "max_attempts": 2,
             "status_codes": [503],
             "methods": ["POST"]
         });
         let unsafe_config: PingclairConfig = serde_json::from_value(unsafe_source).unwrap();
+        assert!(compiler::validate_config(&unsafe_config).is_err());
+
+        let mut unsafe_overload = legacy_source.clone();
+        unsafe_overload["servers"][0]["routes"][0]["handler"]["overload"] =
+            serde_json::json!({ "max_pending": 1 });
+        let unsafe_config: PingclairConfig = serde_json::from_value(unsafe_overload).unwrap();
+        assert!(compiler::validate_config(&unsafe_config).is_err());
+
+        let mut unsafe_breaker = legacy_source;
+        unsafe_breaker["servers"][0]["routes"][0]["handler"]["circuit_breaker"] =
+            serde_json::json!({ "consecutive_failures": 0 });
+        let unsafe_config: PingclairConfig = serde_json::from_value(unsafe_breaker).unwrap();
         assert!(compiler::validate_config(&unsafe_config).is_err());
     }
 

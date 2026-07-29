@@ -29,6 +29,7 @@ use crate::http_policy::{
     rewrite_uri, sanitize_request_id, via_value,
 };
 use crate::metrics;
+use crate::overload::{AdmissionError, RouteAdmission, RouteProtection, UpstreamAdmission};
 use crate::upstream::{HostName, Scheme, UpstreamSpec};
 use crate::{HealthChecker, LoadBalancer, Strategy, Upstream, UpstreamEntry};
 use bytes::Bytes;
@@ -106,6 +107,10 @@ pub struct RequestContext {
     retry_pending: bool,
     /// 🔁 Backends already attempted during the current redispatch cycle.
     retry_excluded: HashSet<SocketAddr>,
+    /// 🚦 Route execution slot retained until this request context is dropped.
+    route_admission: Option<RouteAdmission>,
+    /// 🔌 Selected backend capacity and circuit admission for the active attempt.
+    upstream_admission: Option<UpstreamAdmission>,
 }
 
 impl Default for RequestContext {
@@ -140,6 +145,8 @@ impl Default for RequestContext {
             retry_deadline: None,
             retry_pending: false,
             retry_excluded: HashSet::new(),
+            route_admission: None,
+            upstream_admission: None,
         }
     }
 }
@@ -169,6 +176,13 @@ impl BandwidthPacer {
 
 /// 🧱 Maximum accepted hops in an inbound `X-Forwarded-For` chain.
 const MAX_FORWARDED_HOPS: usize = 32;
+
+/// 🚫 Distinguishes an empty load-balancer pool from policy rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpstreamSelectionError {
+    NoUpstream,
+    Unavailable,
+}
 
 /// 🧱 Keeps the smallest configured listener-wide bound across virtual hosts.
 fn merge_listener_limit<T: Ord + Copy>(target: &mut Option<T>, candidate: Option<T>) {
@@ -436,6 +450,8 @@ pub struct ProxyState {
     pub file_servers: Vec<Option<Arc<pingclair_static::FileServer>>>,
     /// Rate limiters per route
     pub rate_limiters: Vec<Option<Arc<crate::rate_limit::RateLimiter>>>,
+    /// 🚦 Admission and circuit state per reverse-proxy route.
+    pub(crate) route_protections: Vec<Option<Arc<RouteProtection>>>,
     /// Pre-compiled per-route access policies.
     access_controls: Vec<Option<Arc<RouteAccessControl>>>,
     /// Pre-compiled regular expressions used by route rewrite handlers.
@@ -650,17 +666,24 @@ impl ProxyState {
     /// - Parameter config: The server configuration to load.
     /// - Returns: A fully initialized `ProxyState`.
     pub fn new(config: ServerConfig) -> Self {
-        let router = Router::new(config.routes.clone());
+        Self::new_with_previous(config, None)
+    }
 
-        // Initialize components for each route
+    /// ♻️ Rebuilds configuration while retaining compatible breaker state.
+    fn new_with_previous(config: ServerConfig, previous: Option<&ProxyState>) -> Self {
+        let router = Router::new(config.routes.clone());
+        let host_label = config.name.clone().unwrap_or_else(|| "_".to_string());
+
+        // 🧩 Initializes index-aligned components for each route.
         let mut load_balancers = Vec::new();
         let mut health_checkers = Vec::new();
         let mut file_servers = Vec::new();
         let mut rate_limiters = Vec::new();
+        let mut route_protections = Vec::new();
         let mut access_controls = Vec::new();
         let mut rewrite_regexes = Vec::new();
 
-        for route in &config.routes {
+        for (route_index, route) in config.routes.iter().enumerate() {
             // Each per-route slot is resolved independently by walking the
             // route's handler tree. A `reverse_proxy`/`file_server`/
             // `rate_limit` may sit at the top level *or* be nested inside a
@@ -722,8 +745,34 @@ impl ProxyState {
                     route.path,
                     strategy
                 );
+
+                let retained = previous
+                    .and_then(|state| state.config.routes.get(route_index).map(|old| (state, old)))
+                    .filter(|(_, old)| old.path == route.path)
+                    .and_then(|(state, _)| state.route_protections.get(route_index))
+                    .and_then(|protection| protection.as_ref())
+                    .filter(|protection| {
+                        protection.compatible(
+                            &proxy_config.overload,
+                            &proxy_config.circuit_breaker,
+                            &host_label,
+                            &route.path,
+                            &proxy_config.upstreams,
+                        )
+                    })
+                    .cloned();
+                route_protections.push(Some(retained.unwrap_or_else(|| {
+                    Arc::new(RouteProtection::new(
+                        (*proxy_config.overload).clone(),
+                        (*proxy_config.circuit_breaker).clone(),
+                        host_label.clone(),
+                        route.path.clone(),
+                        proxy_config.upstreams.clone(),
+                    ))
+                })));
             } else {
                 load_balancers.push(None);
+                route_protections.push(None);
             }
 
             // Health checker is stored inside the LB object; this slot is a
@@ -797,6 +846,7 @@ impl ProxyState {
             health_checkers,
             file_servers,
             rate_limiters,
+            route_protections,
             access_controls,
             rewrite_regexes,
             access_logger,
@@ -988,12 +1038,15 @@ impl PingclairProxy {
 
     /// Add a server configuration to this proxy
     pub fn add_server(&self, config: ServerConfig) {
-        let state = ProxyState::new(config.clone());
-
         if let Some(domain) = &config.name {
             if domain == "_" || domain == "*" || domain.starts_with(':') {
+                let current = self.default.load();
+                let state =
+                    ProxyState::new_with_previous(config.clone(), current.as_ref().as_ref());
                 self.default.store(Arc::new(Some(state)));
             } else {
+                let current = self.hosts.load();
+                let state = ProxyState::new_with_previous(config.clone(), current.get(domain));
                 // Read-Copy-Update: clone the current map, insert into the
                 // copy, then publish it atomically. add_server is a rare,
                 // low-frequency admin operation, so an O(n) copy here is a
@@ -1005,6 +1058,8 @@ impl PingclairProxy {
                 });
             }
         } else {
+            let current = self.default.load();
+            let state = ProxyState::new_with_previous(config.clone(), current.as_ref().as_ref());
             self.default.store(Arc::new(Some(state)));
         }
     }
@@ -1046,16 +1101,25 @@ impl PingclairProxy {
     pub fn update_config(&self, servers: Vec<ServerConfig>) {
         let mut new_hosts = HashMap::new();
         let mut new_default = None;
+        let old_hosts = self.hosts.load();
+        let old_default = self.default.load();
 
         for config in servers {
-            let state = ProxyState::new(config.clone());
             if let Some(domain) = &config.name {
                 if domain == "_" || domain == "*" || domain.starts_with(':') {
+                    let state = ProxyState::new_with_previous(
+                        config.clone(),
+                        old_default.as_ref().as_ref(),
+                    );
                     new_default = Some(state);
                 } else {
+                    let state =
+                        ProxyState::new_with_previous(config.clone(), old_hosts.get(domain));
                     new_hosts.insert(domain.clone(), state);
                 }
             } else {
+                let state =
+                    ProxyState::new_with_previous(config.clone(), old_default.as_ref().as_ref());
                 new_default = Some(state);
             }
         }
@@ -1159,6 +1223,65 @@ impl PingclairProxy {
             .get(route_index)
             .and_then(|load_balancer| load_balancer.as_ref())
             .and_then(|load_balancer| load_balancer.select_excluding(remote_addr, excluded))
+    }
+
+    /// 🚦 Acquires the selected route's bounded execution slot.
+    pub(crate) async fn admit_route(
+        &self,
+        state: &ProxyState,
+        route_index: usize,
+    ) -> Result<RouteAdmission, AdmissionError> {
+        match state
+            .route_protections
+            .get(route_index)
+            .and_then(|protection| protection.as_ref())
+        {
+            Some(protection) => protection.admit_route().await,
+            None => Err(AdmissionError::QueueFull),
+        }
+    }
+
+    /// 🔌 Selects a backend that has both load-balancer and protection capacity.
+    pub(crate) fn select_admitted_upstream(
+        &self,
+        state: &ProxyState,
+        route_index: usize,
+        remote_addr: Option<&[u8]>,
+        excluded: &HashSet<SocketAddr>,
+    ) -> Result<(Upstream, Option<UpstreamAdmission>), UpstreamSelectionError> {
+        let protection = state
+            .route_protections
+            .get(route_index)
+            .and_then(|protection| protection.as_ref());
+        let mut local_excluded = excluded.clone();
+        let mut rejected = false;
+        loop {
+            let Some(upstream) =
+                self.select_upstream_excluding(state, route_index, remote_addr, &local_excluded)
+            else {
+                return Err(if rejected {
+                    UpstreamSelectionError::Unavailable
+                } else {
+                    UpstreamSelectionError::NoUpstream
+                });
+            };
+            let pingora_core::protocols::l4::socket::SocketAddr::Inet(address) = &upstream.addr
+            else {
+                return Ok((upstream, None));
+            };
+            let Some(protection) = protection else {
+                return Ok((upstream, None));
+            };
+            match protection.admit_upstream(*address) {
+                Ok(admission) => return Ok((upstream, Some(admission))),
+                Err(error @ (AdmissionError::UpstreamCapacity | AdmissionError::CircuitOpen)) => {
+                    rejected = true;
+                    local_excluded.insert(*address);
+                    protection.reject(error);
+                }
+                Err(_) => return Err(UpstreamSelectionError::Unavailable),
+            }
+        }
     }
 
     /// 🔻 Applies the existing passive-health cooldown to one route backend.
@@ -2435,6 +2558,30 @@ impl ProxyHttp for PingclairProxy {
                 }
             }
 
+            if handler
+                .as_ref()
+                .is_some_and(|handler| find_reverse_proxy_config(handler).is_some())
+                && let Some(state) = ctx.state.clone()
+            {
+                match self.admit_route(&state, index).await {
+                    Ok(admission) => ctx.route_admission = Some(admission),
+                    Err(AdmissionError::QueueFull) => {
+                        Self::write_simple_response(session, ctx, 429, "Too Many Requests").await?;
+                        return Ok(true);
+                    }
+                    Err(AdmissionError::QueueTimeout) => {
+                        Self::write_simple_response(session, ctx, 503, "Service Unavailable")
+                            .await?;
+                        return Ok(true);
+                    }
+                    Err(_) => {
+                        Self::write_simple_response(session, ctx, 503, "Service Unavailable")
+                            .await?;
+                        return Ok(true);
+                    }
+                }
+            }
+
             if let Some(h) = handler {
                 if find_reverse_proxy_config(&h).is_none() {
                     Self::drain_local_request_body(session, ctx).await?;
@@ -2552,16 +2699,18 @@ impl ProxyHttp for PingclairProxy {
             );
         }
 
-        let mut upstream = self.select_upstream_excluding(
+        let mut selected = self.select_admitted_upstream(
             &state,
             route_index,
             client_ip.as_deref(),
             &ctx.retry_excluded,
         );
-        if upstream.is_none() && !ctx.retry_excluded.is_empty() {
+        if matches!(selected, Err(UpstreamSelectionError::NoUpstream))
+            && !ctx.retry_excluded.is_empty()
+        {
             // ♻️ A status policy may revisit a backend after every candidate was tried once.
             ctx.retry_excluded.clear();
-            upstream = self.select_upstream_excluding(
+            selected = self.select_admitted_upstream(
                 &state,
                 route_index,
                 client_ip.as_deref(),
@@ -2569,9 +2718,10 @@ impl ProxyHttp for PingclairProxy {
             );
         }
 
-        if let Some(upstream) = upstream {
+        if let Ok((upstream, admission)) = selected {
             ctx.retry_attempts += 1;
-            ctx.upstream = Some(upstream.clone()); // Backend is light to clone
+            ctx.upstream = Some(upstream.clone());
+            ctx.upstream_admission = admission;
 
             Self::enforce_request_deadline(ctx)?;
             if let Some(proxy_config) = &proxy_config {
@@ -2605,8 +2755,10 @@ impl ProxyHttp for PingclairProxy {
             return Ok(Box::new(peer));
         }
 
-        // ⏱️ Preserve a 504 when a connect timeout exhausted the selectable pool.
-        let status = if ctx.upstream_connect_timed_out {
+        // ⏱️ Preserves timeout and overload status when selection exhausts the pool.
+        let status = if matches!(selected, Err(UpstreamSelectionError::Unavailable)) {
+            503
+        } else if ctx.upstream_connect_timed_out {
             504
         } else {
             502
@@ -2630,7 +2782,7 @@ impl ProxyHttp for PingclairProxy {
         #[cfg(unix)] _fd: std::os::unix::io::RawFd,
         #[cfg(windows)] _sock: std::os::windows::io::RawSocket,
         digest: Option<&pingora_core::protocols::Digest>,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> PingoraResult<()>
     where
         Self::CTX: Send + Sync,
@@ -2651,6 +2803,9 @@ impl ProxyHttp for PingclairProxy {
             peer = %peer,
             "🔒 TLS H2 upstream did not negotiate the required h2 ALPN"
         );
+        if let Some(mut admission) = ctx.upstream_admission.take() {
+            admission.report_failure();
+        }
         pingora_core::Error::e_explain(
             pingora_core::ErrorType::HTTPStatus(502),
             "TLS H2 upstream did not negotiate h2",
@@ -2764,6 +2919,9 @@ impl ProxyHttp for PingclairProxy {
         let method = session.req_header().method.clone();
         let body_is_empty = session.as_mut().is_body_empty();
         let status = upstream_response.status.as_u16();
+        if let Some(admission) = &mut ctx.upstream_admission {
+            admission.report_status(status);
+        }
         if crate::retry::permits_status_retry(
             &retry_policy,
             &method,
@@ -2778,6 +2936,7 @@ impl ProxyHttp for PingclairProxy {
             {
                 ctx.retry_excluded.insert(*address);
             }
+            ctx.upstream_admission.take();
             ctx.retry_pending = true;
             tracing::warn!(
                 status,
@@ -2966,6 +3125,9 @@ impl ProxyHttp for PingclairProxy {
         ctx: &mut Self::CTX,
         mut e: Box<pingora_core::Error>,
     ) -> Box<pingora_core::Error> {
+        if let Some(mut admission) = ctx.upstream_admission.take() {
+            admission.report_failure();
+        }
         ctx.upstream_connect_timed_out = matches!(
             e.etype(),
             pingora_core::ErrorType::ConnectTimedout
@@ -3009,6 +3171,9 @@ impl ProxyHttp for PingclairProxy {
         ctx: &mut Self::CTX,
         _client_reused: bool,
     ) -> Box<pingora_core::Error> {
+        if let Some(mut admission) = ctx.upstream_admission.take() {
+            admission.report_failure();
+        }
         let elapsed = ctx.start_time.elapsed();
         tracing::error!(
             peer = %peer,
@@ -3529,6 +3694,55 @@ mod p0_regression_tests {
     use super::*;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn protected_server(max_in_flight: usize) -> ServerConfig {
+        let proxy = ReverseProxyConfig {
+            upstreams: vec!["127.0.0.1:9000".to_string()],
+            overload: Box::new(pingclair_core::config::OverloadConfig {
+                max_in_flight: Some(max_in_flight),
+                ..Default::default()
+            }),
+            circuit_breaker: Box::new(pingclair_core::config::CircuitBreakerConfig {
+                consecutive_failures: Some(2),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        ServerConfig {
+            name: Some("reload.example".to_string()),
+            routes: vec![pingclair_core::config::RouteConfig {
+                path: "/api/*".to_string(),
+                handler: HandlerConfig::ReverseProxy(proxy),
+                methods: None,
+                matcher: None,
+            }],
+            ..ServerConfig::default()
+        }
+    }
+
+    #[test]
+    fn hot_reload_retains_only_compatible_route_protection_state() {
+        let proxy = PingclairProxy::new();
+        proxy.add_server(protected_server(2));
+        let before = proxy.get_state("reload.example").unwrap().route_protections[0]
+            .as_ref()
+            .unwrap()
+            .clone();
+
+        proxy.update_config(vec![protected_server(2)]);
+        let retained = proxy.get_state("reload.example").unwrap().route_protections[0]
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert!(Arc::ptr_eq(&before, &retained));
+
+        proxy.update_config(vec![protected_server(3)]);
+        let replaced = proxy.get_state("reload.example").unwrap().route_protections[0]
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert!(!Arc::ptr_eq(&retained, &replaced));
+    }
 
     #[test]
     fn request_authority_supports_http1_host_and_http2_authority() {

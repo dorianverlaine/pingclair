@@ -238,6 +238,21 @@ example.com {
             status_codes 429 502 503 504
             methods GET HEAD
         }
+        overload {
+            max_in_flight 256
+            max_pending 64
+            pending_timeout 250ms
+            upstream_max_connections 64
+        }
+        circuit_breaker {
+            consecutive_failures 5
+            error_rate_percent 50
+            minimum_requests 20
+            window_requests 100
+            open_for 30s
+            half_open_requests 1
+            failure_statuses 429 502 503 504
+        }
         transport http {
             connect_timeout 3s
             first_byte_timeout 30s
@@ -254,6 +269,18 @@ configurée et une requête réellement sans body ; Pingclair ne met jamais un
 body en mémoire tampon et ne le rejoue pas pour cette politique. Sans bloc
 `retry`, la limite historique de repli après échec de connexion est conservée
 et aucun statut de réponse n'est retenté.
+
+`max_in_flight` borne le travail en cours dans la route et `max_pending` ajoute
+une file d'attente bornée. Une file pleine échoue immédiatement avec 429 ; une
+attente expirée renvoie 503. `upstream_max_connections` est une limite
+conservatrice des requêtes occupant chaque backend ; elle borne aussi le
+multiplexage H2 au lieu de prétendre compter les sockets physiques. Chaque
+backend concret possède son propre circuit breaker. Il s'ouvre dès qu'un des
+seuils configurés est atteint, répond rapidement 503, puis n'admet que le
+nombre configuré de sondes half-open après `open_for`. Sans
+`failure_statuses`, toutes les réponses 5xx sont des échecs. Un rechargement
+Admin/SIGHUP compatible conserve l'état ; modifier la politique de protection
+ou la liste des upstreams repart d'un état neuf.
 
 Les dépassements d'en-têtes, de body et de durée totale reçoivent une erreur
 HTTP explicite tant que le protocole peut encore l'envoyer ; les transports

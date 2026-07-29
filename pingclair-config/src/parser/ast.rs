@@ -473,6 +473,12 @@ pub struct ProxyConfig {
     /// 🔁 Request-local redispatch policy.
     pub retry: RetryConfig,
 
+    /// 🚦 Route and per-upstream admission limits.
+    pub overload: OverloadConfig,
+
+    /// 🔌 Per-upstream circuit-breaker policy.
+    pub circuit_breaker: CircuitBreakerConfig,
+
     /// Macro calls (use xxx!())
     pub macro_calls: Vec<MacroCall>,
 }
@@ -557,6 +563,52 @@ impl Default for RetryConfig {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+        }
+    }
+}
+
+/// 🚦 Typed overload policy produced by the Pingclairfile adapter.
+#[derive(Debug, Clone)]
+pub struct OverloadConfig {
+    pub max_in_flight: Option<usize>,
+    pub max_pending: usize,
+    pub pending_timeout_ms: u64,
+    pub upstream_max_connections: Option<usize>,
+}
+
+impl Default for OverloadConfig {
+    fn default() -> Self {
+        Self {
+            max_in_flight: None,
+            max_pending: 0,
+            pending_timeout_ms: 1_000,
+            upstream_max_connections: None,
+        }
+    }
+}
+
+/// 🔌 Typed circuit-breaker policy produced by the Pingclairfile adapter.
+#[derive(Debug, Clone)]
+pub struct CircuitBreakerConfig {
+    pub consecutive_failures: Option<u32>,
+    pub error_rate_percent: Option<u8>,
+    pub minimum_requests: usize,
+    pub window_requests: usize,
+    pub open_duration_ms: u64,
+    pub half_open_requests: usize,
+    pub failure_statuses: Vec<u16>,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            consecutive_failures: None,
+            error_rate_percent: None,
+            minimum_requests: 20,
+            window_requests: 100,
+            open_duration_ms: 30_000,
+            half_open_requests: 1,
+            failure_statuses: Vec::new(),
         }
     }
 }
@@ -705,6 +757,8 @@ impl ProxyConfig {
             header_up: HashMap::new(),
             transport: None,
             retry: RetryConfig::default(),
+            overload: OverloadConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
             macro_calls: Vec::new(),
         }
     }

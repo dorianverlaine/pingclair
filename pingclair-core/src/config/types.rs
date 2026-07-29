@@ -770,6 +770,14 @@ pub struct ReverseProxyConfig {
     /// 🔁 Bounded redispatch policy for this reverse-proxy route.
     #[serde(default)]
     pub retry: Box<RetryConfig>,
+
+    /// 🚦 Route and per-upstream admission limits.
+    #[serde(default)]
+    pub overload: Box<OverloadConfig>,
+
+    /// 🔌 Per-upstream circuit-breaker policy.
+    #[serde(default)]
+    pub circuit_breaker: Box<CircuitBreakerConfig>,
 }
 
 /// 🔁 Controls safe, request-local upstream redispatch.
@@ -813,6 +821,101 @@ fn default_retry_methods() -> Vec<String> {
         .into_iter()
         .map(str::to_string)
         .collect()
+}
+
+/// 🚦 Bounds concurrent work before an upstream request starts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OverloadConfig {
+    /// 🧱 Maximum requests executing inside this reverse-proxy route.
+    #[serde(default)]
+    pub max_in_flight: Option<usize>,
+    /// 🕰️ Maximum requests waiting for one route execution slot.
+    #[serde(default)]
+    pub max_pending: usize,
+    /// ⌛ Maximum time a pending request may wait.
+    #[serde(default = "default_pending_timeout_ms")]
+    pub pending_timeout_ms: u64,
+    /// 🔌 Maximum requests simultaneously occupying one selected upstream.
+    #[serde(default)]
+    pub upstream_max_connections: Option<usize>,
+}
+
+impl Default for OverloadConfig {
+    fn default() -> Self {
+        Self {
+            max_in_flight: None,
+            max_pending: 0,
+            pending_timeout_ms: default_pending_timeout_ms(),
+            upstream_max_connections: None,
+        }
+    }
+}
+
+fn default_pending_timeout_ms() -> u64 {
+    1_000
+}
+
+/// 🔌 Opens a per-upstream circuit after bounded failure evidence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CircuitBreakerConfig {
+    /// 🔻 Consecutive failures required to open the circuit.
+    #[serde(default)]
+    pub consecutive_failures: Option<u32>,
+    /// 📉 Failure percentage required to open the circuit.
+    #[serde(default)]
+    pub error_rate_percent: Option<u8>,
+    /// 🧪 Minimum observations required before error-rate evaluation.
+    #[serde(default = "default_breaker_minimum_requests")]
+    pub minimum_requests: usize,
+    /// 🪟 Maximum observations retained in the rolling error window.
+    #[serde(default = "default_breaker_window_requests")]
+    pub window_requests: usize,
+    /// ⏳ Time an open circuit waits before admitting half-open probes.
+    #[serde(default = "default_breaker_open_duration_ms")]
+    pub open_duration_ms: u64,
+    /// 🚪 Successful half-open probes required to close the circuit.
+    #[serde(default = "default_breaker_half_open_requests")]
+    pub half_open_requests: usize,
+    /// 🚨 Response statuses counted as failures; empty means every 5xx status.
+    #[serde(default)]
+    pub failure_statuses: Vec<u16>,
+}
+
+impl CircuitBreakerConfig {
+    /// 🔌 Reports whether either opening threshold enables the breaker.
+    pub fn enabled(&self) -> bool {
+        self.consecutive_failures.is_some() || self.error_rate_percent.is_some()
+    }
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            consecutive_failures: None,
+            error_rate_percent: None,
+            minimum_requests: default_breaker_minimum_requests(),
+            window_requests: default_breaker_window_requests(),
+            open_duration_ms: default_breaker_open_duration_ms(),
+            half_open_requests: default_breaker_half_open_requests(),
+            failure_statuses: Vec::new(),
+        }
+    }
+}
+
+fn default_breaker_minimum_requests() -> usize {
+    20
+}
+
+fn default_breaker_window_requests() -> usize {
+    100
+}
+
+fn default_breaker_open_duration_ms() -> u64 {
+    30_000
+}
+
+fn default_breaker_half_open_requests() -> usize {
+    1
 }
 
 /// Load balancing configuration
@@ -1187,6 +1290,8 @@ mod tests {
         assert_eq!(*config.retry, RetryConfig::default());
         assert_eq!(config.retry.max_attempts, 16);
         assert!(config.retry.status_codes.is_empty());
+        assert_eq!(*config.overload, OverloadConfig::default());
+        assert_eq!(*config.circuit_breaker, CircuitBreakerConfig::default());
     }
 
     #[test]

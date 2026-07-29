@@ -1935,6 +1935,13 @@ async fn reverse_proxy_upstream(
     body_notify: &Arc<Notify>,
     request_started: Instant,
 ) -> Result<(), HandlerError> {
+    let _route_admission = match proxy.admit_route(state, route_index).await {
+        Ok(admission) => admission,
+        Err(crate::overload::AdmissionError::QueueFull) => {
+            return Err((429, "Too Many Requests"));
+        }
+        Err(_) => return Err((503, "Service Unavailable")),
+    };
     // ⚖️ Selects the upstream with the verified client IP for IP-hash routing.
     let ip_bytes: Vec<u8> = match verified_client_ip.parse::<IpAddr>() {
         Ok(IpAddr::V4(v4)) => v4.octets().to_vec(),
@@ -1973,7 +1980,7 @@ async fn reverse_proxy_upstream(
     let mut attempts = 0usize;
     let mut excluded = HashSet::new();
 
-    let (mut session, peer, mut request_deadline) = loop {
+    let (mut session, peer, mut request_deadline, _upstream_admission) = loop {
         if attempts > 0 {
             let delay = crate::retry::backoff(&retry_policy);
             if !delay.is_zero() {
@@ -1991,14 +1998,21 @@ async fn reverse_proxy_upstream(
         }
 
         let mut selected =
-            proxy.select_upstream_excluding(state, route_index, Some(&ip_bytes), &excluded);
-        if selected.is_none() && !excluded.is_empty() {
+            proxy.select_admitted_upstream(state, route_index, Some(&ip_bytes), &excluded);
+        if matches!(
+            selected,
+            Err(crate::server::UpstreamSelectionError::NoUpstream)
+        ) && !excluded.is_empty()
+        {
             // ♻️ A status policy may revisit a backend after every candidate was tried once.
             excluded.clear();
             selected =
-                proxy.select_upstream_excluding(state, route_index, Some(&ip_bytes), &excluded);
+                proxy.select_admitted_upstream(state, route_index, Some(&ip_bytes), &excluded);
         }
-        let upstream = selected.ok_or((502, "No Upstream Available"))?;
+        let (upstream, mut admission) = selected.map_err(|error| match error {
+            crate::server::UpstreamSelectionError::NoUpstream => (502, "No Upstream Available"),
+            crate::server::UpstreamSelectionError::Unavailable => (503, "Upstream Overloaded"),
+        })?;
         attempts += 1;
 
         let request_budget = base_request_deadline
@@ -2029,6 +2043,9 @@ async fn reverse_proxy_upstream(
         let (mut session, _reused) = match connector.get_http_session(&peer).await {
             Ok(result) => result,
             Err(error) => {
+                if let Some(admission) = &mut admission {
+                    admission.report_failure();
+                }
                 tracing::warn!(
                     attempt = attempts,
                     error = %error,
@@ -2053,6 +2070,9 @@ async fn reverse_proxy_upstream(
         };
         let upstream_is_h2 = matches!(&session, HttpSession::H2(_));
         if peer.group_key == 4 && !upstream_is_h2 {
+            if let Some(admission) = &mut admission {
+                admission.report_failure();
+            }
             tracing::error!("🔒 H3 bridge rejected a TLS upstream without h2 ALPN");
             session.shutdown().await;
             if let pingora_core::protocols::l4::socket::SocketAddr::Inet(address) = &upstream.addr {
@@ -2250,6 +2270,9 @@ async fn reverse_proxy_upstream(
             .response_header()
             .map(|response| response.status.as_u16())
             .unwrap_or(502);
+        if let Some(admission) = &mut admission {
+            admission.report_status(upstream_status);
+        }
         if crate::retry::permits_status_retry(
             &retry_policy,
             &method,
@@ -2272,7 +2295,7 @@ async fn reverse_proxy_upstream(
             continue;
         }
 
-        break (session, peer, base_request_deadline);
+        break (session, peer, base_request_deadline, admission);
     };
 
     let response_streaming = session
@@ -3029,6 +3052,111 @@ mod tests {
             RespMsg::Body(ref bytes, false) if bytes == b"ok"
         ));
         upstream_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn h3_bridge_respects_an_open_upstream_circuit() {
+        use pingclair_core::config::CircuitBreakerConfig;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "H3 bridge request closed before its headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 6\r\nConnection: close\r\n\r\nfailed",
+                )
+                .await
+                .unwrap();
+        });
+
+        let state = proxy_state(HandlerConfig::ReverseProxy(ReverseProxyConfig {
+            upstreams: vec![format!("http://{upstream_address}")],
+            retry: Box::new(RetryConfig {
+                max_attempts: 1,
+                ..Default::default()
+            }),
+            circuit_breaker: Box::new(CircuitBreakerConfig {
+                consecutive_failures: Some(1),
+                open_duration_ms: 30_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        let proxy = PingclairProxy::new();
+        let connector = pingora_core::connectors::http::Connector::new(Some(
+            pingora_core::connectors::ConnectorOptions::new(16),
+        ));
+        let request = H3Request {
+            method: "GET".to_string(),
+            protocol: None,
+            path: "/circuit".to_string(),
+            authority: "example.test".to_string(),
+            headers: Vec::new(),
+        };
+        let client_header = RequestHeader::build(http::Method::GET, b"/circuit", None).unwrap();
+        let cid = quiche::ConnectionId::from_vec(vec![6, 7, 8, 9]);
+
+        let (body_tx, mut body_rx) = mpsc::channel(1);
+        drop(body_tx);
+        let (resp_tx, _resp_rx) = mpsc::channel(8);
+        reverse_proxy_upstream(
+            &proxy,
+            &connector,
+            &state,
+            0,
+            &request,
+            &client_header,
+            &request.path,
+            "127.0.0.1",
+            "127.0.0.1",
+            "circuit-request-id",
+            &ResponseHeaderPolicy::default(),
+            0,
+            &cid,
+            0,
+            &mut body_rx,
+            &resp_tx,
+            &Arc::new(Notify::new()),
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+        upstream_task.await.unwrap();
+
+        let (body_tx, mut body_rx) = mpsc::channel(1);
+        drop(body_tx);
+        let (resp_tx, _resp_rx) = mpsc::channel(8);
+        let result = reverse_proxy_upstream(
+            &proxy,
+            &connector,
+            &state,
+            0,
+            &request,
+            &client_header,
+            &request.path,
+            "127.0.0.1",
+            "127.0.0.1",
+            "circuit-request-id",
+            &ResponseHeaderPolicy::default(),
+            0,
+            &cid,
+            4,
+            &mut body_rx,
+            &resp_tx,
+            &Arc::new(Notify::new()),
+            Instant::now(),
+        )
+        .await;
+        assert_eq!(result, Err((503, "Upstream Overloaded")));
     }
 
     #[tokio::test]
