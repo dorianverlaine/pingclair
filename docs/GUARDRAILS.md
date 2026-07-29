@@ -157,6 +157,14 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
   只寫在 `adapter/caddyfile.rs` 的檢查等於留了一條繞道。矛盾或半套的設定
   （`insecure_skip_verify` ＋ pinned CA、只有 cert 沒有 key）兩條路都要拒。
   2026-07-29 Day 11 上游 TLS 依此同時補了 `compiler::validate_config`。
+- **`HttpHealthCheck` 只替換位址，其他全部沿用 `peer_template`**。SNI、`Host`、
+  TLS 素材都來自那個 template，而 template 通常是用 **first backend** 建的。
+  所以 backend 名字不同的 pool（`to https://a.internal` ＋ `to https://b.internal`）
+  會用 a 的 SNI 去探 b，hostname 驗證必定失敗、b 被永久摘除，但它服務正常——
+  正常流量走 `build_http_peer`，用的是各自的 `HostName` ext。
+  探測時一定要讀 `target.ext.get::<HostName>()`。這個 bug 在單一 backend、
+  同名 backend 或純 HTTP pool 上**完全看不出來**，也就是幾乎所有既有測試。
+  2026-07-30 Day 12 review 修。
 - **Pingora 的 `HttpPeer` reuse hash 沒有算 `options.ca`**。它算了 client cert、
   `verify_cert`／`verify_hostname`／`alternative_cn`、SNI 與 `group_key`，
   但 **CA bundle 不在裡面**。同位址同 SNI、trust roots 不同的兩條 route 會共用
