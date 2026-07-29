@@ -159,11 +159,28 @@ CSP 與 `/`、`/api/ping` 的 body 仍與 Caddy **byte-identical**;internal CA �
 舊容器保留為 `aqeo-pingclair-rollback`,回滾只是改名重啟。
 RSS 8.81MiB（舊版跑 39 小時是 10.07MiB）。
 
-> 🕐 **浸泡中,尚未有結論**：本版新增五個長生命週期 map（rate-limit buckets、
-> per-backend circuit state、health recovery slots、PROXY identity registry、
-> DNS pools）。洩漏要幾小時才看得出來,取樣器每 5 分鐘記錄一次。
-> 另外要特別看 CPU：health-check driver **不論有沒有配置探測都每 100ms 醒一次**,
-> 而這台正好一個都沒配。
+**浸泡 4.1 小時：不是洩漏,它到頂之後掉回來了。** 兩個獨立儀器
+（`docker stats` 的 cgroup 記憶體、`/proc` 的 `VmRSS`）在大約同一點轉向:
+
+| | 起 | 峰 | 末 |
+|---|---|---|---|
+| VmRSS | 18.98 MiB | 19.29（min 150） | **17.66 MiB** |
+| docker MemUsage | 8.77 MiB | 10.47（min 132） | **9.48 MiB** |
+
+洩漏的導數是正的;這條變負了。VmRSS 淨值比起點低 1.32 MiB,最後一小時在
+0.32 MiB 的帶子內震盪。Thread 全程 11–12,50/50 取樣皆 200,
+`RestartCount=0`、`OOMKilled=false`。形狀是暖機→到頂→allocator 還 page,
+就是 jemalloc 的行為;前 80 分鐘只看到上升段所以誤讀成線性。
+
+Idle CPU 平均 **0.332%**（舊版 0.23%）——約 0.1 個百分點,對應
+health-check driver **不論有沒有配置探測都每 100ms 醒一次**。小,但真實,
+而且每個部署都在付。改成睡到下一次該探測即可移除,已列入 backlog。
+
+> ⚠️ **這不能證明什麼**：4.1 小時不是 24 小時,而且這台流量很輕。它排除了
+> 上升段暗示的那種快速洩漏,但排除不了週期超過四小時的東西,也排除不了
+> 「新功能真的被配置之後」才出現的東西——線上這份配置四個新 map 是空的。
+> **Day 30 的 soak 必須在負載下實際配置 `rate_limit`、`health_check` 與
+> `proxy_protocol`**,那才是這次留空的部分。
 > 證據：`benchmarks/results/20260730_m2_vps_a554477/`
 
 ---

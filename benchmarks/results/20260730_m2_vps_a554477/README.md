@@ -52,39 +52,50 @@ registry, and DNS pools. A leak in any of them appears over hours, not in a
 short load run, so the live site is the right instrument for this one thing
 even though it is the wrong instrument for fault injection.
 
-### Result after 40 minutes: plateau, not a leak
+### Result after 4.1 hours: not a leak — it peaked and came back down
 
-```
-17:13  8.770 MiB   0.34%   200
-17:18  8.844 MiB   0.28%   200
-17:23  9.434 MiB   0.35%   200
-17:28  9.504 MiB   0.36%   200
-17:33  9.957 MiB   0.31%   200   ← growth stops here
-17:38  9.969 MiB   0.36%   200
-17:43  9.922 MiB   0.37%   200
-17:48  9.922 MiB   0.33%   200
-```
+Two instruments, because `docker stats` reports cgroup memory and can include
+page cache, while `VmRSS` from `/proc` is the process's own resident set and is
+not ambiguous. `soak.csv` and `soak_rss.csv`.
 
-RSS climbed 1.2 MiB over the first twenty minutes and has been **flat for the
-twenty since**. The shape is warm-up — allocator arenas, the TLS certificate
-cache, connection pools — not accumulation. The previous build sat at
-**10.07 MiB after 39 hours**, so this one plateaus slightly *below* the version
-it replaced. Every sample returned 200.
+| | start | peak | end |
+|---|---|---|---|
+| VmRSS | 18.98 MiB | 19.29 MiB (min 150) | **17.66 MiB** |
+| docker MemUsage | 8.77 MiB | 10.47 MiB (min 132) | **9.48 MiB** |
 
-The structural argument agrees. This server's configuration uses none of the
-new features: no `rate_limit`, no `health_check`, no `proxy_protocol`, one
-plain `reverse_proxy app:8080`. Four of the five new long-lived maps are
-therefore empty by construction, and the fifth holds a single backend. There is
-nothing here for a leak to accumulate *in*, which is why the plateau is the
-expected answer rather than a lucky one.
+Both series turn at roughly the same point and decline. **A leak's derivative
+is positive; this one went negative.** VmRSS ends 1.32 MiB *below* where it
+started, and docker's figure ends below its own one-hour value. The last hour
+oscillates inside a 0.32 MiB band.
+
+The shape is warm-up, peak, allocator returning dirty pages, then an
+oscillating steady state — which is what jemalloc does. Reading only the rising
+段 for the first eighty minutes made it look linear; it was not.
+
+- Threads: **11–12 for the whole run**, so no task accumulated either.
+- Liveness: **50/50 samples returned 200**.
+- Container: `RestartCount=0`, `OOMKilled=false`.
+
+The structural argument agrees and is worth repeating: this server's
+configuration uses none of the new features — no `rate_limit`, no
+`health_check`, no `proxy_protocol`, one plain `reverse_proxy app:8080`. Four
+of the five new long-lived maps are empty by construction and the fifth holds
+one backend. There was nothing here for a leak to accumulate *in*.
+
+> ⚠️ **What this does not establish.** 4.1 hours is not 24, and this box serves
+> light traffic. It rules out the fast leak the rising 段 suggested; it does not
+> rule out something with a period longer than four hours, nor anything that
+> only appears once the new features are actually configured. Day 30's soak has
+> to exercise `rate_limit`, `health_check` and `proxy_protocol` under load,
+> because those are the maps this run left empty.
 
 ### Idle CPU
 
-Old build 0.23%, new build 0.28–0.37%. About a tenth of a percentage point,
-consistent with the health-check driver's 100 ms poll running whether or not
-any route configures a probe — which this one does not. Small, but it is real
-and it is paid by every deployment. Worth removing when the driver can sleep
-until the next due probe instead of polling.
+Old build 0.23%; this one averages **0.332%** across 50 samples (range
+0.23–0.38). About a tenth of a percentage point, consistent with the
+health-check driver's 100 ms poll running whether or not any route configures a
+probe — which this one does not. Small, real, and paid by every deployment.
+Worth removing by letting the driver sleep until the next due probe.
 
 ## A harness trap fixed on the way
 
