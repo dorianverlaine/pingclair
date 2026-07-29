@@ -124,6 +124,50 @@ commit `0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。
 
 ---
 
+### 2026-07-30 M2 生產護欄驗證（RC `a554477`）
+
+**Days 8–14 全部遠端驗證通過。** 兩個環境,因為它們回答不同的問題。
+
+**故障注入矩陣 — 23/23**（`benchmarks/scripts/run_m2_matrix.sh`,
+linux/arm64 release image,真 HAProxy `send-proxy` 在前）。M2 的每一條護欄
+都只在上游出事時才作用,所以 origin 是**可從外部改變故障模式**的
+（`benchmarks/fixtures/m2/origin.py`）,proxy 全程不重啟——觀察到的是 proxy
+在反應,不是 proxy 在重來。每條 route 只隔離一項護欄,否則 503 會有多個成因。
+
+- Day 8：靜默 origin 觸發 first-byte timer（2050ms → 504）、超過
+  `max_headers`／`max_header_bytes` → 431、慢速 header client 被 header timer
+  釋放（3ms）
+- Day 9：503 origin 被重新派送、候選耗盡回 503 而非卡住、帶 body 的請求不重放
+- Day 10：超過 route 上限快速回 429、slot 釋放後恢復、open circuit 15ms 快速
+  失敗、half-open 探測後關閉
+- Day 12：**停掉一個 origin 的健康狀態且完全不送流量**,後續 8 個請求全部落到
+  另一個且全 200——被動標記做不到這件事
+- Day 13：`rate_limit 3 10s { burst 2 }` 精確 5 通過第 6 個拒絕;
+  `ratelimit-limit: 5`／`remaining: 0`／`reset: 17`／`retry-after: 4` 是實數
+- Day 14：直連 listener 不需 header 照常服務、PROXY listener 經 HAProxy 服務
+  同一條 route、無 header 直連被拒;**身分是差分驗的**——未受信來源偽造的
+  `X-Forwarded-For: 203.0.113.99` 被換成 socket peer,受信 balancer 的宣告保留
+- 證據：`benchmarks/results/20260730_m2_a554477_final/`
+
+**生產原站 M1 回歸 — 27/27**（`aqeonet-aws-tw-xray`,aarch64 2vCPU/916MB）。
+這是本次最重要的一項:這個 RC 改動了**所有** route 的請求路徑,不只用到新功能的。
+CSP 與 `/`、`/api/ping` 的 body 仍與 Caddy **byte-identical**;internal CA 重啟
+後重用 leaf;H2 照常協商;SIGTERM exit 0。
+
+**已切換上線**：`pingclair:rc-3d4dd53` → `rc-a554477`,原地換、同一個位址
+（172.18.0.5,隧道連重新解析都不需要）,cloudflared 零 origin error。
+舊容器保留為 `aqeo-pingclair-rollback`,回滾只是改名重啟。
+RSS 8.81MiB（舊版跑 39 小時是 10.07MiB）。
+
+> 🕐 **浸泡中,尚未有結論**：本版新增五個長生命週期 map（rate-limit buckets、
+> per-backend circuit state、health recovery slots、PROXY identity registry、
+> DNS pools）。洩漏要幾小時才看得出來,取樣器每 5 分鐘記錄一次。
+> 另外要特別看 CPU：health-check driver **不論有沒有配置探測都每 100ms 醒一次**,
+> 而這台正好一個都沒配。
+> 證據：`benchmarks/results/20260730_m2_vps_a554477/`
+
+---
+
 ## 🧪 已實作，待乾淨遠端驗證
 
 > 這些是 v0.2 驗證日（TODO 的 Day 7／15／19／22／23）要清掉的積欠。
