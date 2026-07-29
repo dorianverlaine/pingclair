@@ -1006,6 +1006,10 @@ impl ProxyState {
                                 expected_body: hc_config.expected_body.clone(),
                                 method: hc_config.method.clone(),
                                 host,
+                                host_override: hc_config.host.clone(),
+                                sni_override: tls_policy
+                                    .and_then(|policy| policy.server_name())
+                                    .map(str::to_string),
                                 headers: hc_config.headers.clone(),
                                 port_override: hc_config.port,
                                 reuse_connection: hc_config.reuse_connection,

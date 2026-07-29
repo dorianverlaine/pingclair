@@ -1254,6 +1254,8 @@ mod tests {
                 negative_threshold: 1,
                 method: "GET".to_string(),
                 host: "app".to_string(),
+                host_override: None,
+                sni_override: None,
                 headers: HashMap::new(),
                 port_override: None,
                 reuse_connection: false,

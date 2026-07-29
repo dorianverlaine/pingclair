@@ -120,6 +120,11 @@ pub struct HealthCheckConfig {
     pub negative_threshold: usize,
     pub method: String,
     pub host: String,
+    /// 🏷️ `Host` written by the operator, which outranks each backend's own name.
+    pub host_override: Option<String>,
+    /// 🔐 `tls_server_name` written by the operator, which outranks each
+    /// backend's own name because it states what the certificate actually says.
+    pub sni_override: Option<String>,
     pub headers: HashMap<String, String>,
     pub port_override: Option<u16>,
     pub reuse_connection: bool,
@@ -177,10 +182,39 @@ impl HealthChecker {
         if let Some(port) = self.config.port_override {
             peer._address.set_port(port);
         }
+
+        // 🏷️ The template carries the *first* backend's name, because Pingora's
+        // health check substitutes only the address. A pool written as
+        // `to https://a.internal` / `to https://b.internal` would therefore
+        // probe every backend with the first one's SNI, fail hostname
+        // verification everywhere but the first, and mark healthy origins down.
+        // Each backend's own name wins unless the operator stated one.
+        let backend_name = target
+            .ext
+            .get::<crate::upstream::HostName>()
+            .map(|host| host.0.as_str());
+        let mut request = self.request.clone();
+        if let Some(sni) = self
+            .config
+            .sni_override
+            .as_deref()
+            .or(backend_name)
+            .filter(|name| *name != peer.sni)
+        {
+            peer.sni = sni.to_string();
+        }
+        if let Some(host) = self
+            .config
+            .host_override
+            .as_deref()
+            .or(backend_name)
+            .filter(|name| *name != self.config.host)
+        {
+            request.insert_header("Host", host)?;
+        }
+
         let (mut session, _) = self.connector.get_http_session(&peer).await?;
-        session
-            .write_request_header(Box::new(self.request.clone()))
-            .await?;
+        session.write_request_header(Box::new(request)).await?;
         session.finish_request_body().await?;
         if let Some(read_timeout) = peer.options.read_timeout {
             session.set_read_timeout(Some(read_timeout));
@@ -296,6 +330,8 @@ mod tests {
             negative_threshold: 1,
             method: "GET".to_string(),
             host,
+            host_override: None,
+            sni_override: None,
             headers: HashMap::new(),
             port_override: None,
             reuse_connection: false,
@@ -333,6 +369,103 @@ mod tests {
 
         let error = checker.check(&target).await.unwrap_err().to_string();
         assert!(error.contains("configured byte limit"), "{error}");
+        origin.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn each_backend_is_probed_with_its_own_name_not_the_first_ones() {
+        // Setup scenarios
+        //
+        // Pingora's health check substitutes only the address into the peer
+        // template, so a pool of differently named origins would otherwise be
+        // probed entirely with the first backend's SNI and `Host` — every
+        // other origin would fail hostname verification and be marked down
+        // while serving traffic perfectly well.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen_host, host_rx) = tokio::sync::oneshot::channel();
+        let origin = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 1024];
+            let read = stream.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+            seen_host.send(request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        // The template is built from a *different* backend, exactly as the
+        // first-backend template would be for a multi-origin pool.
+        let mut target = Backend::new(&address.to_string()).unwrap();
+        target
+            .ext
+            .insert(crate::upstream::HostName("second.internal".to_string()));
+        let recovery = Arc::new(RecoveryState::default());
+        recovery.rebuild([address]);
+        let checker = HealthChecker::new(
+            config("first.internal".to_string()),
+            HttpPeer::new(address, false, "first.internal".to_string()),
+            recovery,
+        )
+        .unwrap();
+
+        // Verification
+        checker.check(&target).await.expect("probe succeeds");
+        let request = host_rx.await.unwrap().to_ascii_lowercase();
+        assert!(
+            request.contains("\r\nhost: second.internal\r\n"),
+            "the probe must carry the backend's own name, not the template's:\n{request}"
+        );
+        origin.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_operator_stated_host_outranks_the_backend_name() {
+        // Setup scenarios
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen_host, host_rx) = tokio::sync::oneshot::channel();
+        let origin = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 1024];
+            let read = stream.read(&mut buffer).await.unwrap();
+            seen_host
+                .send(String::from_utf8_lossy(&buffer[..read]).to_string())
+                .unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let mut target = Backend::new(&address.to_string()).unwrap();
+        target
+            .ext
+            .insert(crate::upstream::HostName("backend.internal".to_string()));
+        let recovery = Arc::new(RecoveryState::default());
+        recovery.rebuild([address]);
+        let mut probe = config("backend.internal".to_string());
+        probe.host_override = Some("stated.example".to_string());
+        let checker = HealthChecker::new(
+            probe,
+            HttpPeer::new(address, false, "backend.internal".to_string()),
+            recovery,
+        )
+        .unwrap();
+
+        // Verification
+        checker.check(&target).await.expect("probe succeeds");
+        let request = host_rx.await.unwrap().to_ascii_lowercase();
+        assert!(
+            request.contains("\r\nhost: stated.example\r\n"),
+            "an explicit health_check host must win over the backend name:\n{request}"
+        );
         origin.await.unwrap();
     }
 
