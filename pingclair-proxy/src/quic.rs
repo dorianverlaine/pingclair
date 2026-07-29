@@ -292,11 +292,16 @@ impl Default for CertTable {
     }
 }
 
-/// Build the quiche configuration with an SNI-aware BoringSSL context.
-fn build_quiche_config(
+/// Build an SNI-aware BoringSSL context that serves certificates out of
+/// `certs` at handshake time.
+///
+/// The certificate lookup is a callback, not a snapshot, so it observes every
+/// [`CertTable`] publication — an ACME renewal applies to the next handshake
+/// without rebuilding the context. BoringSSL builds this context once per
+/// socket, so that indirection is the only thing that makes reload work.
+fn build_ssl_context_builder(
     certs: Arc<CertTable>,
-    max_idle_timeout_ms: u64,
-) -> Result<quiche::Config, QuicError> {
+) -> Result<boring::ssl::SslContextBuilder, QuicError> {
     use boring::ssl::{NameType, SelectCertError, SslContext, SslMethod, SslVersion};
 
     let mut builder = SslContext::builder(SslMethod::tls())
@@ -344,6 +349,61 @@ fn build_quiche_config(
             }
         }
     });
+
+    Ok(builder)
+}
+
+/// Sentinel handed to `tokio_quiche` in place of on-disk certificate paths.
+///
+/// `tokio-quiche` only calls [`ConnectionHook::create_custom_ssl_context_builder`]
+/// when `ConnectionParams::tls_cert` is `Some` — verified in 0.19.1 at
+/// `settings/config.rs:122`, the `.zip(params.tls_cert)`. But the paths are
+/// only ever *passed to* the hook: the sole reader is `quiche_config_with_tls`
+/// (`settings/config.rs:224`), which is the `else` branch taken when the hook
+/// returns `None`. A hook that returns `Some(builder)` means these strings are
+/// never opened.
+///
+/// 🔐 That is what keeps private keys in the in-memory [`CertTable`] and off
+/// the filesystem. Writing keys to temp files to satisfy the type would be a
+/// regression, not a workaround.
+pub const IN_MEMORY_CERT_SENTINEL: &str = "<pingclair:in-memory-cert-table>";
+
+/// Serves certificates to `tokio_quiche` from an in-memory [`CertTable`].
+pub struct CertTableSslHook {
+    certs: Arc<CertTable>,
+}
+
+impl CertTableSslHook {
+    pub fn new(certs: Arc<CertTable>) -> Self {
+        Self { certs }
+    }
+}
+
+impl tokio_quiche::quic::ConnectionHook for CertTableSslHook {
+    fn create_custom_ssl_context_builder(
+        &self,
+        _settings: tokio_quiche::settings::TlsCertificatePaths<'_>,
+    ) -> Option<boring::ssl::SslContextBuilder> {
+        // The paths are deliberately ignored; see `IN_MEMORY_CERT_SENTINEL`.
+        match build_ssl_context_builder(Arc::clone(&self.certs)) {
+            Ok(builder) => Some(builder),
+            Err(e) => {
+                // Returning `None` makes tokio-quiche fall back to reading the
+                // sentinel path, which cannot open — so the listener fails to
+                // start rather than serving without our certificates.
+                tracing::error!("🔐 H3: failed to build TLS context, listener will not start: {e}");
+                None
+            }
+        }
+    }
+}
+
+/// Build the quiche configuration with an SNI-aware BoringSSL context.
+fn build_quiche_config(
+    certs: Arc<CertTable>,
+    max_idle_timeout_ms: u64,
+) -> Result<quiche::Config, QuicError> {
+    let builder = build_ssl_context_builder(certs)?;
 
     let mut config = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)
         .map_err(|e| QuicError::Tls(format!("failed to build quiche config: {e}")))?;

@@ -60,10 +60,29 @@ x509-parser = "0.18"
 #
 # The dependency versions align exactly — it pulls `quiche 0.29.3` and
 # `boring 4.22.0`, the same ones below, with no `openssl-sys` anywhere — so the
-# single-BoringSSL invariant survives the migration. Replacing the hand-written
-# loop is therefore viable and scheduled; see `docs/TODO.md`.
+# single-BoringSSL invariant survives the migration. Verified in this workspace,
+# not in a probe crate: `cargo tree -i boring-sys` shows one `boring-sys 4.22.0`
+# shared by `pingora-boringssl`, `quiche` and `tokio-quiche`, and
+# `cargo tree -i openssl-sys` matches no package at all.
+#
+# 🔐 The blocker was TLS, not the accept API: `ConnectionParams` demands a
+# `TlsCertificatePaths`, which looks like it forces private keys onto disk. It
+# does not. The paths are only handed to `ConnectionHook`; their sole reader,
+# `quiche_config_with_tls` (settings/config.rs:224 in 0.19.1), is the branch
+# taken when the hook returns `None`. A hook returning `Some(builder)` means the
+# paths are never opened, so certificates stay in the in-memory `CertTable`.
+# Proven by `pingclair-proxy/tests/h3_in_memory_certs.rs` against real
+# handshakes, including red-first: with the hook declining, every one of those
+# tests fails `TlsFail`.
+#
+# ⚠️ The cost is not free — `tokio-quiche` depends unconditionally on
+# `foundations` (feature `server-client-common-default`), which adds 86 crates
+# to the lock file, `tonic`/`prost` (gRPC, for OTLP export) among them.
 quiche = "0.29"
 boring = "4.22"   # must stay on the same release quiche 0.29 links against
+# Pinned: the ConnectionHook/tls_cert behaviour documented above was read from
+# 0.19.1's source. A minor bump could start reading the sentinel paths.
+tokio-quiche = { version = "=0.19.1", default-features = false }
 
 # HTTP
 http = "1"
