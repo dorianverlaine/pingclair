@@ -1,0 +1,9 @@
+HTTP/1.1 429 Too Many Requests
+ratelimit-limit: 5
+ratelimit-reset: 17
+ratelimit-remaining: 0
+retry-after: 4
+server: Pingclair
+x-request-id: 657c2ea3c41c6-36
+Date: Wed, 29 Jul 2026 17:02:35 GMT
+Connection: keep-alive

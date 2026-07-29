@@ -1,0 +1,43 @@
+🧊 M2 guardrail matrix
+   image:  pingclair:rc-a554477
+   commit: a5544770f3b889981c1f8bee09874c9b26ce6b9c
+   date:   2026-07-29T17:01:45Z
+   results: /Users/sinclairverlaine/code/pingclair/benchmarks/results/20260730_m2_a554477
+🚀 Stack up
+
+🩺 Day 12 — active health checking
+  ✅ both origins serve while healthy
+  ✅ an idle failed origin was removed with no request having reached it
+  ✅ a recovered origin rejoined the pool
+
+🔁 Day 9 — bounded redispatch
+  ✅ a 503 origin was redispatched to a healthy one (statuses: 200 200 200 200 200 200)
+  ✅ exhausting every candidate surfaces 503 rather than hanging
+  ✅ a request with a body still completes on the first attempt
+
+🚦 Day 10 — admission control
+  ✅ a request over the route ceiling was refused fast (429)
+  ✅ the slot was released once the holder finished
+
+🔌 Day 10 — circuit breaker
+  ✅ an open circuit fails fast (13ms, 503)
+  ✅ a healthy origin closed the circuit through half-open probing
+
+⏱️ Day 8 — timers and downstream limits
+  ✅ a silent origin hit the first-byte timer (2037ms, 504)
+  ✅ a request over the header-count limit was refused (431)
+  ✅ a request over the header-byte limit was refused (431)
+  ❌ slow header client was not released (8018ms)
+
+🚦 Day 13 — exact rate limiting
+  ✅ burst capacity is exact: five allowed, the sixth refused
+  ✅ RateLimit-Limit, RateLimit-Remaining and Retry-After are all present
+
+🧭 Day 14 — PROXY protocol, per listener
+  ✅ the direct listener serves without a PROXY header
+  ✅ the PROXY listener serves through HAProxy's send-proxy
+  ❌ a listener requiring PROXY protocol served a header-less request (000000)
+  ❌ origin saw no forwarded identity (see identity_via_haproxy.txt)
+  ✅ a spoofed X-Forwarded-For was replaced with the socket peer
+
+❌ M2 matrix: 3 failure(s)

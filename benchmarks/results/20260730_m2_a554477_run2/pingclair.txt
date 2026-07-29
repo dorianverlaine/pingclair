@@ -1,0 +1,146 @@
+2026-07-29T17:04:11.941611Z  INFO pingclair: Starting Pingclair with config: /etc/pingclair/Pingclairfile
+2026-07-29T17:04:11.942725Z  INFO pingclair: 🚀 Starting Pingclair v0.1.7
+2026-07-29T17:04:11.942746Z  INFO pingclair: 📄 Loaded configuration from: /etc/pingclair/Pingclairfile
+2026-07-29T17:04:11.942759Z  INFO pingclair: 🔧 Configured 1 server(s)
+2026-07-29T17:04:11.942902Z  INFO pingclair: 🔐 Auto HTTPS: enabled
+2026-07-29T17:04:11.942947Z  INFO pingclair: 🔗 Upstream keepalive pool size: 128 connections/thread
+2026-07-29T17:04:11.942958Z  INFO pingclair: 🧵 Worker threads per service: 8
+2026-07-29T17:04:11.942970Z  INFO pingclair: 🛡️ Trusted proxy networks: 1
+2026-07-29T17:04:11.942980Z  INFO pingclair: 🧭 PROXY protocol listeners: 0.0.0.0:8081
+2026-07-29T17:04:11.942996Z  INFO pingora_core::server::bootstrap_services: Bootstrap starting
+2026-07-29T17:04:11.943023Z  INFO pingora_core::server::bootstrap_services: Bootstrap done
+2026-07-29T17:04:11.949180Z  INFO pingclair_tls::auto_https: 🔐 Initializing AutoHTTPS Manager
+2026-07-29T17:04:11.949189Z  INFO pingclair_tls::auto_https: 🏭 ACME Environment: Production
+2026-07-29T17:04:11.981711Z  INFO pingclair_proxy::server: ⚖️ Initialized load balancer for route /health-check/* with strategy RoundRobin
+2026-07-29T17:04:11.983449Z  INFO pingclair_proxy::server: ⚖️ Initialized load balancer for route /retry/* with strategy RoundRobin
+2026-07-29T17:04:11.983658Z  INFO pingclair_proxy::server: ⚖️ Initialized load balancer for route /overload/* with strategy RoundRobin
+2026-07-29T17:04:11.983857Z  INFO pingclair_proxy::server: ⚖️ Initialized load balancer for route /breaker/* with strategy RoundRobin
+2026-07-29T17:04:11.984009Z  INFO pingclair_proxy::server: ⚖️ Initialized load balancer for route /timeout/* with strategy RoundRobin
+2026-07-29T17:04:11.984046Z  INFO pingclair_proxy::server: 🚦 Initialized rate limiter for route /ratelimit/*
+2026-07-29T17:04:11.984156Z  INFO pingclair_proxy::server: ⚖️ Initialized load balancer for route /identity/* with strategy RoundRobin
+2026-07-29T17:04:12.013783Z  INFO pingclair_proxy::server: ⚖️ Initialized load balancer for route /health-check/* with strategy RoundRobin
+2026-07-29T17:04:12.014949Z  INFO pingclair_proxy::server: ⚖️ Initialized load balancer for route /retry/* with strategy RoundRobin
+2026-07-29T17:04:12.015160Z  INFO pingclair_proxy::server: ⚖️ Initialized load balancer for route /overload/* with strategy RoundRobin
+2026-07-29T17:04:12.015284Z  INFO pingclair_proxy::server: ⚖️ Initialized load balancer for route /breaker/* with strategy RoundRobin
+2026-07-29T17:04:12.015420Z  INFO pingclair_proxy::server: ⚖️ Initialized load balancer for route /timeout/* with strategy RoundRobin
+2026-07-29T17:04:12.015457Z  INFO pingclair_proxy::server: 🚦 Initialized rate limiter for route /ratelimit/*
+2026-07-29T17:04:12.015588Z  INFO pingclair_proxy::server: ⚖️ Initialized load balancer for route /identity/* with strategy RoundRobin
+2026-07-29T17:04:12.015675Z  INFO pingclair: 🌐 Server binding information:
+2026-07-29T17:04:12.015704Z  INFO pingclair:    📍 0.0.0.0:8080 -> [_]
+2026-07-29T17:04:12.015720Z  INFO pingclair:    📍 0.0.0.0:8081 -> [_]
+2026-07-29T17:04:12.026969Z  INFO pingclair:    🌐 Server listening on 0.0.0.0:8081 (TLS: disabled, HTTP/3: disabled)
+2026-07-29T17:04:12.039001Z  INFO pingclair:    🌐 Server listening on 0.0.0.0:8080 (TLS: disabled, HTTP/3: disabled)
+2026-07-29T17:04:12.039065Z  INFO pingclair: 🔄 Upstream DNS re-resolution disabled (dns_refresh off)
+🚀 Pingclair running...
+2026-07-29T17:04:12.039212Z  INFO pingora_core::server: Server starting
+2026-07-29T17:04:12.039272Z  INFO pingora_core::server: Starting services in dependency order: ["Pingclair HTTP Proxy Service", "Pingclair HTTP Proxy Service", "BG Pingclair active health checks"]
+2026-07-29T17:04:12.039285Z  INFO pingora_core::server: Starting service: Pingclair HTTP Proxy Service
+2026-07-29T17:04:12.039259Z  INFO pingclair: 📡 SIGHUP listener active (Config: /etc/pingclair/Pingclairfile)
+2026-07-29T17:04:12.039491Z  INFO pingora_core::server: Starting service: Pingclair HTTP Proxy Service
+2026-07-29T17:04:12.039880Z  INFO pingora_core::server: Starting service: BG Pingclair active health checks
+2026-07-29T17:04:12.141155Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-0 method="GET" host="127.0.0.1:18088" path="/" status=200 bytes=11 duration_ms=0 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=None
+2026-07-29T17:04:12.168966Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-1 method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=0 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.10:8080))
+2026-07-29T17:04:12.190800Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-2 method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=1 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.11:8080))
+2026-07-29T17:04:12.208791Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-3 method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=0 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.10:8080))
+2026-07-29T17:04:12.263159Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-4 method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=42 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.11:8080))
+2026-07-29T17:04:12.277934Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-5 method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=0 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.10:8080))
+2026-07-29T17:04:12.332569Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-6 method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=41 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.11:8080))
+2026-07-29T17:04:12.350083Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-7 method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=0 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.10:8080))
+2026-07-29T17:04:12.405303Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-8 method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=42 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.11:8080))
+2026-07-29T17:04:13.076161Z  INFO pingclair_proxy::health_check: 🩺 Active upstream health changed backend=Inet(10.88.0.11:8080) healthy=false
+2026-07-29T17:04:13.076199Z  WARN pingora_load_balancing: Backend { addr: Inet(10.88.0.11:8080), weight: 1, ext: {pingclair_proxy::upstream::Scheme, pingclair_proxy::upstream::HostName} } becomes unhealthy,  HTTPStatus context: health response status was not accepted
+2026-07-29T17:04:13.083881Z  INFO pingclair_proxy::health_check: 🩺 Active upstream health changed backend=Inet(10.88.0.11:8080) healthy=false
+2026-07-29T17:04:13.083978Z  WARN pingora_load_balancing: Backend { addr: Inet(10.88.0.11:8080), weight: 1, ext: {pingclair_proxy::upstream::Scheme, pingclair_proxy::upstream::HostName} } becomes unhealthy,  HTTPStatus context: health response status was not accepted
+2026-07-29T17:04:16.449335Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-9 method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=3 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.10:8080))
+2026-07-29T17:04:16.513990Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-a method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=43 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.10:8080))
+2026-07-29T17:04:16.575386Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-b method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=42 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.10:8080))
+2026-07-29T17:04:16.634480Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-c method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=41 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.10:8080))
+2026-07-29T17:04:16.693822Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-d method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=41 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.10:8080))
+2026-07-29T17:04:16.751647Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-e method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=41 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.10:8080))
+2026-07-29T17:04:16.809463Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-f method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=42 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.10:8080))
+2026-07-29T17:04:16.867678Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-10 method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=41 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.10:8080))
+2026-07-29T17:04:17.449561Z  INFO pingclair_proxy::health_check: 🩺 Active upstream health changed backend=Inet(10.88.0.11:8080) healthy=true
+2026-07-29T17:04:17.449642Z  INFO pingora_load_balancing: Backend { addr: Inet(10.88.0.11:8080), weight: 1, ext: {pingclair_proxy::upstream::Scheme, pingclair_proxy::upstream::HostName} } becomes healthy
+2026-07-29T17:04:17.450668Z  INFO pingclair_proxy::health_check: 🩺 Active upstream health changed backend=Inet(10.88.0.11:8080) healthy=true
+2026-07-29T17:04:17.450713Z  INFO pingora_load_balancing: Backend { addr: Inet(10.88.0.11:8080), weight: 1, ext: {pingclair_proxy::upstream::Scheme, pingclair_proxy::upstream::HostName} } becomes healthy
+2026-07-29T17:04:20.911505Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-11 method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=1 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.11:8080))
+2026-07-29T17:04:20.930280Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-12 method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=1 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.10:8080))
+2026-07-29T17:04:20.986707Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-13 method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=42 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.11:8080))
+2026-07-29T17:04:21.003139Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-14 method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=0 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.10:8080))
+2026-07-29T17:04:21.058549Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-15 method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=42 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.11:8080))
+2026-07-29T17:04:21.074914Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-16 method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=1 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.10:8080))
+2026-07-29T17:04:21.129747Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-17 method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=41 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.11:8080))
+2026-07-29T17:04:21.145248Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-18 method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=1 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.10:8080))
+2026-07-29T17:04:21.198654Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-19 method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=41 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.11:8080))
+2026-07-29T17:04:21.212778Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-1a method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=1 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.10:8080))
+2026-07-29T17:04:21.268430Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-1b method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=43 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.11:8080))
+2026-07-29T17:04:21.282322Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-1c method="GET" host="127.0.0.1:18088" path="/health-check/" status=200 bytes=8 duration_ms=1 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.10:8080))
+2026-07-29T17:04:21.305768Z  WARN pingclair_proxy::server: 🔁 Redispatching a bodyless request after an upstream status status=503 method=GET attempt=1 max_attempts=3
+2026-07-29T17:04:21.306115Z ERROR pingclair_proxy::server: ❌ Proxy error peer=addr: 10.88.0.12:8080, scheme: HTTP, sni: origin-c elapsed_ms=3 error= HTTPStatus context: configured upstream status retry
+2026-07-29T17:04:21.306135Z  WARN pingora_proxy: Fail to proxy:  HTTPStatus context: configured upstream status retry, tries: 1, retry: true, GET /retry/, Host: 127.0.0.1:18088
+2026-07-29T17:04:21.308252Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-1d method="GET" host="127.0.0.1:18088" path="/retry/" status=200 bytes=8 duration_ms=5 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.13:8080))
+2026-07-29T17:04:21.319423Z  WARN pingclair_proxy::server: 🔁 Redispatching a bodyless request after an upstream status status=503 method=GET attempt=1 max_attempts=3
+2026-07-29T17:04:21.319945Z ERROR pingclair_proxy::server: ❌ Proxy error peer=addr: 10.88.0.12:8080, scheme: HTTP, sni: origin-c elapsed_ms=2 error= HTTPStatus context: configured upstream status retry
+2026-07-29T17:04:21.319981Z  WARN pingora_proxy: Fail to proxy:  HTTPStatus context: configured upstream status retry, tries: 1, retry: true, GET /retry/, Host: 127.0.0.1:18088
+2026-07-29T17:04:21.361592Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-1e method="GET" host="127.0.0.1:18088" path="/retry/" status=200 bytes=8 duration_ms=44 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.13:8080))
+2026-07-29T17:04:21.375332Z  WARN pingclair_proxy::server: 🔁 Redispatching a bodyless request after an upstream status status=503 method=GET attempt=1 max_attempts=3
+2026-07-29T17:04:21.375728Z ERROR pingclair_proxy::server: ❌ Proxy error peer=addr: 10.88.0.12:8080, scheme: HTTP, sni: origin-c elapsed_ms=2 error= HTTPStatus context: configured upstream status retry
+2026-07-29T17:04:21.375759Z  WARN pingora_proxy: Fail to proxy:  HTTPStatus context: configured upstream status retry, tries: 1, retry: true, GET /retry/, Host: 127.0.0.1:18088
+2026-07-29T17:04:21.417617Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-1f method="GET" host="127.0.0.1:18088" path="/retry/" status=200 bytes=8 duration_ms=44 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.13:8080))
+2026-07-29T17:04:21.430440Z  WARN pingclair_proxy::server: 🔁 Redispatching a bodyless request after an upstream status status=503 method=GET attempt=1 max_attempts=3
+2026-07-29T17:04:21.430651Z ERROR pingclair_proxy::server: ❌ Proxy error peer=addr: 10.88.0.12:8080, scheme: HTTP, sni: origin-c elapsed_ms=1 error= HTTPStatus context: configured upstream status retry
+2026-07-29T17:04:21.430667Z  WARN pingora_proxy: Fail to proxy:  HTTPStatus context: configured upstream status retry, tries: 1, retry: true, GET /retry/, Host: 127.0.0.1:18088
+2026-07-29T17:04:21.471590Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-20 method="GET" host="127.0.0.1:18088" path="/retry/" status=200 bytes=8 duration_ms=42 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.13:8080))
+2026-07-29T17:04:21.485433Z  WARN pingclair_proxy::server: 🔁 Redispatching a bodyless request after an upstream status status=503 method=GET attempt=1 max_attempts=3
+2026-07-29T17:04:21.485593Z ERROR pingclair_proxy::server: ❌ Proxy error peer=addr: 10.88.0.12:8080, scheme: HTTP, sni: origin-c elapsed_ms=1 error= HTTPStatus context: configured upstream status retry
+2026-07-29T17:04:21.485846Z  WARN pingora_proxy: Fail to proxy:  HTTPStatus context: configured upstream status retry, tries: 1, retry: true, GET /retry/, Host: 127.0.0.1:18088
+2026-07-29T17:04:21.527525Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-21 method="GET" host="127.0.0.1:18088" path="/retry/" status=200 bytes=8 duration_ms=43 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.13:8080))
+2026-07-29T17:04:21.542366Z  WARN pingclair_proxy::server: 🔁 Redispatching a bodyless request after an upstream status status=503 method=GET attempt=1 max_attempts=3
+2026-07-29T17:04:21.542712Z ERROR pingclair_proxy::server: ❌ Proxy error peer=addr: 10.88.0.12:8080, scheme: HTTP, sni: origin-c elapsed_ms=2 error= HTTPStatus context: configured upstream status retry
+2026-07-29T17:04:21.542741Z  WARN pingora_proxy: Fail to proxy:  HTTPStatus context: configured upstream status retry, tries: 1, retry: true, GET /retry/, Host: 127.0.0.1:18088
+2026-07-29T17:04:21.584537Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-22 method="GET" host="127.0.0.1:18088" path="/retry/" status=200 bytes=8 duration_ms=44 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.13:8080))
+2026-07-29T17:04:21.601725Z  WARN pingclair_proxy::server: 🔁 Redispatching a bodyless request after an upstream status status=503 method=GET attempt=1 max_attempts=3
+2026-07-29T17:04:21.601812Z ERROR pingclair_proxy::server: ❌ Proxy error peer=addr: 10.88.0.12:8080, scheme: HTTP, sni: origin-c elapsed_ms=2 error= HTTPStatus context: configured upstream status retry
+2026-07-29T17:04:21.601832Z  WARN pingora_proxy: Fail to proxy:  HTTPStatus context: configured upstream status retry, tries: 1, retry: true, GET /retry/, Host: 127.0.0.1:18088
+2026-07-29T17:04:21.602772Z  WARN pingclair_proxy::server: 🔁 Redispatching a bodyless request after an upstream status status=503 method=GET attempt=2 max_attempts=3
+2026-07-29T17:04:21.603061Z ERROR pingclair_proxy::server: ❌ Proxy error peer=addr: 10.88.0.13:8080, scheme: HTTP, sni: origin-d elapsed_ms=3 error= HTTPStatus context: configured upstream status retry
+2026-07-29T17:04:21.603160Z  WARN pingora_proxy: Fail to proxy:  HTTPStatus context: configured upstream status retry, tries: 2, retry: true, GET /retry/, Host: 127.0.0.1:18088
+2026-07-29T17:04:21.604359Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-23 method="GET" host="127.0.0.1:18088" path="/retry/" status=503 bytes=20 duration_ms=4 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.12:8080))
+2026-07-29T17:04:21.619872Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-24 method="POST" host="127.0.0.1:18088" path="/retry/" status=200 bytes=10 duration_ms=1 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.13:8080))
+2026-07-29T17:04:23.657617Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-26 method="GET" host="127.0.0.1:18088" path="/overload/" status=429 bytes=17 duration_ms=0 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=None
+2026-07-29T17:04:23.659869Z ERROR pingclair_proxy::server: ❌ Proxy error peer=addr: 10.88.0.14:8080, scheme: HTTP, sni: origin-e elapsed_ms=2023 error=Downstream ConnectionClosed context: Prematurely before response header is sent
+2026-07-29T17:04:23.659905Z ERROR pingora_proxy: Fail to proxy: Downstream ConnectionClosed context: Prematurely before response header is sent, status: 0, tries: 1, retry: false, GET /overload/, Host: 127.0.0.1:18088
+2026-07-29T17:04:23.659917Z ERROR pingclair_proxy::server: ❌ Access request_id=657c2f1cae1bf-25 method="GET" host="127.0.0.1:18088" path="/overload/" status=0 bytes=0 duration_ms=2023 remote_ip=10.88.0.1 user_agent="curl/8.7.1" error=Downstream ConnectionClosed context: Prematurely before response header is sent
+2026-07-29T17:04:24.698969Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-27 method="GET" host="127.0.0.1:18088" path="/overload/" status=200 bytes=8 duration_ms=3 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.14:8080))
+2026-07-29T17:04:24.732335Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-28 method="GET" host="127.0.0.1:18088" path="/breaker/" status=503 bytes=20 duration_ms=3 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.15:8080))
+2026-07-29T17:04:24.745538Z  WARN pingclair_proxy::overload: 🔌 Upstream circuit opened host=_ route=/breaker/* upstream=10.88.0.15:8080
+2026-07-29T17:04:24.786395Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-29 method="GET" host="127.0.0.1:18088" path="/breaker/" status=503 bytes=20 duration_ms=42 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.15:8080))
+2026-07-29T17:04:24.799609Z  WARN pingclair_proxy::server: ⚠️ No upstream available for the matched route route=3
+2026-07-29T17:04:24.799863Z ERROR pingora_proxy: Fail to proxy:  HTTPStatus context: no upstream available, status: 503, tries: 1, retry: false, GET /breaker/, Host: 127.0.0.1:18088
+2026-07-29T17:04:24.799890Z ERROR pingclair_proxy::server: ❌ Access request_id=657c2f1cae1bf-2a method="GET" host="127.0.0.1:18088" path="/breaker/" status=503 bytes=23 duration_ms=0 remote_ip=10.88.0.1 user_agent="curl/8.7.1" error= HTTPStatus context: no upstream available
+2026-07-29T17:04:24.813946Z  WARN pingclair_proxy::server: ⚠️ No upstream available for the matched route route=3
+2026-07-29T17:04:24.814203Z ERROR pingora_proxy: Fail to proxy:  HTTPStatus context: no upstream available, status: 503, tries: 1, retry: false, GET /breaker/, Host: 127.0.0.1:18088
+2026-07-29T17:04:24.814220Z ERROR pingclair_proxy::server: ❌ Access request_id=657c2f1cae1bf-2b method="GET" host="127.0.0.1:18088" path="/breaker/" status=503 bytes=23 duration_ms=0 remote_ip=10.88.0.1 user_agent="curl/8.7.1" error= HTTPStatus context: no upstream available
+2026-07-29T17:04:31.858520Z  INFO pingclair_proxy::overload: 🧪 Upstream circuit entered half-open recovery host=_ route=/breaker/* upstream=10.88.0.15:8080
+2026-07-29T17:04:31.863637Z  INFO pingclair_proxy::overload: ✅ Upstream circuit closed after recovery host=_ route=/breaker/* upstream=10.88.0.15:8080
+2026-07-29T17:04:31.863926Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-2c method="GET" host="127.0.0.1:18088" path="/breaker/" status=200 bytes=8 duration_ms=5 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.15:8080))
+2026-07-29T17:04:33.909595Z ERROR pingclair_proxy::server: ❌ Proxy error peer=addr: 10.88.0.16:8080, scheme: HTTP, sni: origin-g elapsed_ms=2016 error=Upstream ReadTimedout context: while reading response headers
+2026-07-29T17:04:33.910075Z ERROR pingora_proxy: Fail to proxy: Upstream ReadTimedout context: while reading response headers, status: 504, tries: 1, retry: false, GET /timeout/, Host: 127.0.0.1:18088
+2026-07-29T17:04:33.910165Z ERROR pingclair_proxy::server: ❌ Access request_id=657c2f1cae1bf-2d method="GET" host="127.0.0.1:18088" path="/timeout/" status=504 bytes=19 duration_ms=2017 remote_ip=10.88.0.1 user_agent="curl/8.7.1" error=Upstream ReadTimedout context: while reading response headers
+2026-07-29T17:04:33.949961Z ERROR pingora_proxy: Fail to early filter request:  HTTPStatus context: request headers exceed configured limits, status: 431, GET /, Host: 127.0.0.1:18088
+2026-07-29T17:04:33.950040Z ERROR pingclair_proxy::server: ❌ Access request_id=657c2f1cae1bf-2e method="GET" host="127.0.0.1:18088" path="/" status=431 bytes=9 duration_ms=0 remote_ip=10.88.0.1 user_agent="curl/8.7.1" error= HTTPStatus context: request headers exceed configured limits
+2026-07-29T17:04:33.973620Z ERROR pingora_proxy: Fail to early filter request:  HTTPStatus context: request headers exceed configured limits, status: 431, GET /, Host: 127.0.0.1:18088
+2026-07-29T17:04:33.973647Z ERROR pingclair_proxy::server: ❌ Access request_id=657c2f1cae1bf-2f method="GET" host="127.0.0.1:18088" path="/" status=431 bytes=9 duration_ms=0 remote_ip=10.88.0.1 user_agent="curl/8.7.1" error= HTTPStatus context: request headers exceed configured limits
+2026-07-29T17:04:33.984954Z ERROR pingora_proxy: Fail to proxy: Downstream ConnectionClosed context: while reading request headers, bytes already read: 25
+2026-07-29T17:04:34.006888Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-30 method="GET" host="127.0.0.1:18088" path="/ratelimit/" status=200 bytes=10 duration_ms=0 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=None
+2026-07-29T17:04:34.016343Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-31 method="GET" host="127.0.0.1:18088" path="/ratelimit/" status=200 bytes=10 duration_ms=0 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=None
+2026-07-29T17:04:34.025828Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-32 method="GET" host="127.0.0.1:18088" path="/ratelimit/" status=200 bytes=10 duration_ms=0 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=None
+2026-07-29T17:04:34.036221Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-33 method="GET" host="127.0.0.1:18088" path="/ratelimit/" status=200 bytes=10 duration_ms=0 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=None
+2026-07-29T17:04:34.045668Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-34 method="GET" host="127.0.0.1:18088" path="/ratelimit/" status=200 bytes=10 duration_ms=0 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=None
+2026-07-29T17:04:34.055208Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-35 method="GET" host="127.0.0.1:18088" path="/ratelimit/" status=429 bytes=0 duration_ms=0 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=None
+2026-07-29T17:04:34.067324Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-36 method="GET" host="127.0.0.1:18088" path="/ratelimit/" status=429 bytes=0 duration_ms=0 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=None
+2026-07-29T17:04:34.090421Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-37 method="GET" host="127.0.0.1:18088" path="/" status=200 bytes=11 duration_ms=0 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=None
+2026-07-29T17:04:34.104234Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-38 method="GET" host="127.0.0.1:19000" path="/" status=200 bytes=11 duration_ms=0 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=None
+2026-07-29T17:04:34.115244Z  WARN pingclair_proxy::proxy_protocol: 🚫 Rejected invalid PROXY protocol connection peer=10.88.0.1:36596 error=missing PROXY protocol v1 or v2 signature
+2026-07-29T17:04:34.128359Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-39 method="GET" host="127.0.0.1:19000" path="/identity/echo" status=200 bytes=248 duration_ms=1 remote_ip=10.88.0.1 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.10:8080))
+2026-07-29T17:04:34.147076Z  INFO pingclair_proxy::server: 📝 Access request_id=657c2f1cae1bf-3a method="GET" host="127.0.0.1:18088" path="/identity/echo" status=200 bytes=257 duration_ms=1 remote_ip=203.0.113.99 user_agent="curl/8.7.1" referer="-" upstream=Some(Inet(10.88.0.10:8080))
