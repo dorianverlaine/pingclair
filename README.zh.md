@@ -180,11 +180,16 @@ Pingclair 會在 `PINGCLAIR_TLS_STORE`（預設
 ```caddyfile
 {
     trusted_proxies 10.0.0.0/8 2001:db8::/32
+    proxy_protocol on
 }
 ```
 
 存取控制、rate limit、IP-hash 負載平衡、上游轉送、placeholder 與 access log
 會共用同一個已驗證 client IP。目前變更 `trusted_proxies` 後需要重新啟動。
+`proxy_protocol on` 會要求每條 TCP 連線帶有 PROXY v1 或 v2，並在 TLS／HTTP
+解析前拒絕不在 `trusted_proxies` 的 transport peer。XFF 與 RFC 7239
+`Forwarded` chain 都有上限；畸形或彼此衝突的身分會 fail closed。PROXY
+protocol 不適用於 UDP HTTP/3 listener。
 
 ### 資源上限與 timeout
 
@@ -357,11 +362,47 @@ server "shop.example.com" {
         lb_policy least_conn
         to 10.0.0.1:8080 { weight 3 }
         to 10.0.0.2:8080
-        # 僅在所有主要後端皆不可用時使用。
+        # 🛟 僅在所有主要後端皆不可用時使用。
         to 10.0.0.3:8080 { backup }
+        health_check {
+            path /health
+            interval 5s
+            timeout 2s
+            status 200 204
+            consecutive_failure 3
+            consecutive_success 2
+            max_response_body_bytes 65536
+            slow_start 30s
+        }
     }
 }
 ```
+
+主動健康檢查在請求之外執行，因此閒置的故障後端會在使用者請求碰到它之前退出
+輪詢，並在連續探測成功後重新加入。探測可設定 method、Host、header、狀態碼集合、
+有 byte 上限的 body 比對、獨立連接埠、連線重用、門檻與 slow-start。HTTPS 探測
+會沿用該 route 的 pinned CA、client certificate、SNI 與協議政策。
+
+### 精確的本機 rate limit
+
+```caddyfile
+api.example.com {
+    @api path /api/*
+    route @api {
+        rate_limit 100 60s {
+            burst 20
+            key tenant X-Tenant-ID
+        }
+        reverse_proxy app:8080
+    }
+}
+```
+
+Token bucket 會輸出精確的 `RateLimit-Limit`、`RateLimit-Remaining` 與
+`RateLimit-Reset` response header，拒絕時另有 `Retry-After`。在 block 加上
+`dry_run` 可只計數與回報、不回 429。key 可選 `ip`、`global`、`route`、
+`api_key`、`header <name>` 或 `tenant [name]`。這是 process-local limiter；
+Redis distributed limit 不在 v0.2 範圍內。
 
 上游 scheme 會決定連線協議：裸位址或 `http://` 使用 HTTP/1.1；`https://`
 透過 ALPN 協商 HTTP/2，並可回退至 HTTP/1.1；`h2c://` 強制使用明文

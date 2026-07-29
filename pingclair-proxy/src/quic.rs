@@ -1682,22 +1682,18 @@ async fn handle_request_inner(
         return Err((403, "Forbidden"));
     }
 
-    // 🛡️ Rate limiting uses the same verified client identity as H1 and H2.
+    // 🚦 HTTP/3 charges the same exact limiter and identity source as H1 and H2.
     if let Some(limiter) = state
         .rate_limiters
         .get(route_index)
         .and_then(|l| l.as_ref())
     {
-        let key = if limiter.config.by_ip {
-            Some(verified_client_ip_text.as_str())
-        } else {
-            None
-        };
-        if let Err(info) = limiter.check(key) {
+        let decision = limiter.check_request(&verified_client_ip_text, &header.headers);
+        for (name, value) in decision.info.to_headers() {
+            response_policy.set(name, value);
+        }
+        if decision.reject {
             let mut headers = vec![quiche::h3::Header::new(b":status", b"429")];
-            for (k, v) in info.to_headers() {
-                headers.push(quiche::h3::Header::new(k.as_bytes(), v.as_bytes()));
-            }
             apply_h3_response_policy(&mut headers, response_policy, request_id, Some(&state));
             send_headers(resp_tx, cid, stream_id, headers, true).await;
             return Ok(());

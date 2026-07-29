@@ -520,6 +520,14 @@ fn normalize_listen_addr(addr: &str) -> String {
     }
 }
 
+/// 🧭 Reserves a unique private loopback address for one PROXY protocol ingress hop.
+fn reserve_private_listener_address()
+-> anyhow::Result<(std::net::TcpListener, std::net::SocketAddr)> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    Ok((listener, address))
+}
+
 /// 🔐 Treats explicit TLS configuration as authoritative on every listen port.
 fn server_requires_tls(config: &pingclair_core::config::ServerConfig, addr: &str) -> bool {
     config.tls.is_some()
@@ -599,6 +607,14 @@ fn run_server(
         "🛡️ Trusted proxy networks: {}",
         config.global.trusted_proxies.len()
     );
+    tracing::info!(
+        "🧭 PROXY protocol ingress: {}",
+        if config.global.proxy_protocol {
+            "required"
+        } else {
+            "disabled"
+        }
+    );
 
     let mut server = pingora::server::Server::new_with_opt_and_conf(
         Some(pingora::server::configuration::Opt {
@@ -612,6 +628,11 @@ fn run_server(
     );
 
     server.bootstrap();
+    // 🩺 One Pingora-owned driver follows weak pool registrations across hot reloads.
+    server.add_service(pingora::services::background::background_service(
+        "Pingclair active health checks",
+        pingclair_proxy::health_check::HealthCheckDriver,
+    ));
 
     // 🔐 Initialize every certificate source below one configurable persistent store.
     let tls_store_path_str = std::env::var("PINGCLAIR_TLS_STORE")
@@ -713,6 +734,11 @@ fn run_server(
     let h3_pool_size = config.global.upstream_keepalive_pool_size.unwrap_or(128);
     let h3_blocked_ips = config.global.blocked_ips.clone();
     let trusted_proxies = config.global.trusted_proxies.clone();
+    let proxy_protocol_enabled = config.global.proxy_protocol;
+    let proxy_protocol_networks =
+        pingclair_proxy::proxy_protocol::parse_networks(&trusted_proxies)?;
+    let blocked_client_networks =
+        pingclair_proxy::proxy_protocol::parse_networks(&config.global.blocked_ips)?;
 
     // Track binding information for diagnostic logging
     let mut binding_info = std::collections::HashMap::new();
@@ -744,6 +770,7 @@ fn run_server(
                 pingclair_proxy::server::PingclairProxy::with_tls_and_trusted_proxies(
                     tls_manager.clone(),
                     &trusted_proxies,
+                    proxy_protocol_enabled,
                 )
             });
 
@@ -769,10 +796,18 @@ fn run_server(
 
     // Create services for each proxy
     let mut https_ports = Vec::new();
+    let mut private_listener_reservations = Vec::new();
     {
         let proxies_guard = port_proxies.read();
         for (addr, proxy_logic) in proxies_guard.iter() {
             let is_https = tls_listeners.contains(addr);
+            let internal_reservation = proxy_protocol_enabled
+                .then(reserve_private_listener_address)
+                .transpose()?;
+            let internal_address = internal_reservation.as_ref().map(|(_, address)| *address);
+            let service_address = internal_address
+                .map(|address| address.to_string())
+                .unwrap_or_else(|| addr.clone());
             // 🌐 Enables prior-knowledge h2c only on plaintext listeners while TLS uses ALPN.
             let mut server_options = pingora_core::apps::HttpServerOptions::default();
             server_options.h2c = !is_https;
@@ -788,7 +823,7 @@ fn run_server(
 
             // Add L4 Connection Filter (Global Blocked IPs)
             let blocked_ips = &config.global.blocked_ips;
-            if !blocked_ips.is_empty() {
+            if !proxy_protocol_enabled && !blocked_ips.is_empty() {
                 let filter = std::sync::Arc::new(pingclair_proxy::PingclairConnectionFilter::new(
                     blocked_ips,
                 ));
@@ -805,7 +840,7 @@ fn run_server(
                 match TlsSettings::with_callbacks(Box::new(acceptor)) {
                     Ok(mut tls_settings) => {
                         tls_settings.enable_h2();
-                        service.add_tls_with_settings(addr, None, tls_settings);
+                        service.add_tls_with_settings(&service_address, None, tls_settings);
                         tls_enabled = true;
                     }
                     Err(e) => {
@@ -826,7 +861,35 @@ fn run_server(
                     }
                 }
             } else {
-                service.add_tcp(addr);
+                service.add_tcp(&service_address);
+            }
+
+            if let Some(internal_address) = internal_address {
+                let public_listener = std::net::TcpListener::bind(addr).map_err(|error| {
+                    anyhow::anyhow!("failed to bind PROXY protocol ingress on {addr}: {error}")
+                })?;
+                let registry = proxy_logic.proxy_protocol_registry();
+                let trusted = proxy_protocol_networks.clone();
+                let blocked = blocked_client_networks.clone();
+                bg_handle.spawn(async move {
+                    if let Err(error) = pingclair_proxy::proxy_protocol::run_ingress(
+                        public_listener,
+                        internal_address,
+                        registry,
+                        trusted,
+                        blocked,
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            %error,
+                            "❌ PROXY protocol ingress stopped unexpectedly"
+                        );
+                    }
+                });
+            }
+            if let Some((reservation, _)) = internal_reservation {
+                private_listener_reservations.push(reservation);
             }
 
             // Enhanced diagnostic logging for each binding
@@ -1068,6 +1131,8 @@ fn run_server(
     });
 
     println!("🚀 Pingclair running...");
+    // 🔓 Releases every unique private address immediately before Pingora binds it.
+    drop(private_listener_reservations);
     server.run_forever();
 }
 
