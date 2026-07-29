@@ -47,9 +47,21 @@ rustls = { version = "0.23", features = ["ring"] }
 rcgen = { version = "0.14", features = ["x509-parser"] }
 x509-parser = "0.18"
 
-# HTTP/3 (QUIC) — Cloudflare quiche on BoringSSL
-# (tokio-quiche was evaluated and rejected: its server-side accept API is
-# pub(crate); the raw quiche event loop is implemented in pingclair-proxy.)
+# HTTP/3 (QUIC) — Cloudflare quiche on BoringSSL, with a hand-written event
+# loop in `pingclair-proxy/src/quic.rs`.
+#
+# ⚠️ The note that used to sit here — "tokio-quiche was evaluated and rejected:
+# its server-side accept API is pub(crate)" — was WRONG, and it was wrong in the
+# way a rejection note is most harmful: it stopped anyone re-examining the
+# question. Only the internal `quic::start_listener()` is `pub(crate)`. The
+# facade is public, verified against `tokio-quiche 0.19.1` on 2026-07-30:
+# `tokio_quiche::listen()` (lib.rs:191), plus `ServerH3Driver`,
+# `ServerH3Controller`, `InitialQuicConnection` and `ApplicationOverQuic`.
+#
+# The dependency versions align exactly — it pulls `quiche 0.29.3` and
+# `boring 4.22.0`, the same ones below, with no `openssl-sys` anywhere — so the
+# single-BoringSSL invariant survives the migration. Replacing the hand-written
+# loop is therefore viable and scheduled; see `docs/TODO.md`.
 quiche = "0.29"
 boring = "4.22"   # must stay on the same release quiche 0.29 links against
 

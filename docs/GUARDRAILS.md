@@ -92,6 +92,18 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
 釘死在 BoringSSL——這是全域且不可逆的架構決定，不是加個 feature flag。
 上面「依賴與鏈結」那三條禁令全部源自這個決定。
 
+> 🚨 **「評估過並否決」的註解,如果沒有留下可驗證的依據,比沒有註解更糟。**
+> `Cargo.toml` 曾經寫著「tokio-quiche was evaluated and rejected: its
+> server-side accept API is pub(crate)」。**這句是錯的**,而且錯在最有害的地方:
+> 它讓後來的人不再去看。實際上只有內部的 `quic::start_listener()` 是
+> `pub(crate)`,公開 facade 一直都在——2026-07-30 對 `tokio-quiche 0.19.1`
+> 實測:`tokio_quiche::listen()`（`lib.rs:191`）、`ServerH3Driver`、
+> `ServerH3Controller`、`InitialQuicConnection`、`ApplicationOverQuic` 全部公開。
+> 依賴版本也完全對齊（`quiche 0.29.3`＋`boring 4.22.0`,無 `openssl-sys`）。
+>
+> **寫否決註解的規則**:必須寫下「哪一版、看了哪個符號、什麼日期」。
+> 只寫結論的否決註解會變成一道沒人敢推的門。
+
 > ⚠️ **要換回 Pingora 原生 H3 的前提**：#514 已合併進 released crate、
 > `pingora-proxy` 有 H3 整合測試、且 BoringSSL 鏈結方式與現況相容。
 > 三項缺一就不要動——代價是整份 `quic.rs` 重寫。
