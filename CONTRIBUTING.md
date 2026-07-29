@@ -37,19 +37,19 @@ Every commit on `main` passes all four. CI runs them on Rust 1.88; run them
 locally before pushing so you find failures faster than the runner does.
 
 ```bash
-cargo fmt --all -- --check
+cargo +1.88.0 fmt --all -- --check
 ```
 
 ```bash
-cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo +1.88.0 clippy --locked --workspace --all-targets -- -D warnings
 ```
 
 ```bash
-cargo build --locked --workspace
+cargo +1.88.0 build --locked --workspace
 ```
 
 ```bash
-cargo test --locked --workspace
+cargo +1.88.0 test --locked --workspace
 ```
 
 Warnings are errors. **Never silence one with a broad `allow` attribute** — if
