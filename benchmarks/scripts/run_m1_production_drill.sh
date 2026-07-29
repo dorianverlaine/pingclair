@@ -86,6 +86,18 @@ log "image=$IMAGE  host=$(hostname)  $(uname -m)  $(date -u +%Y-%m-%dT%H:%M:%SZ)
 log "Caddy keeps serving the tunnel throughout; Pingclair is a parallel container."
 
 section "0. bring Pingclair up beside Caddy"
+
+# 🗂️ Stage the config before the mount. Docker silently creates a *directory*
+# at a bind-mount source that does not exist, and the container then exits
+# without a word — the drill previously reported only "never became ready".
+CONFIG_SRC="${PINGCLAIR_CONFIG:-$HOME/aqeo/Pingclairfile}"
+if [ ! -f "$CONFIG_SRC" ]; then
+    log "  ❌ config not found: $CONFIG_SRC (set PINGCLAIR_CONFIG)"
+    exit 1
+fi
+rm -rf "$RESULTS_DIR/Pingclairfile"
+cp "$CONFIG_SRC" "$RESULTS_DIR/Pingclairfile"
+
 d rm -f "$PC" >/dev/null 2>&1
 d volume create pingclair-verify-tls >/dev/null
 d run -d --name "$PC" --network "$NET" \
