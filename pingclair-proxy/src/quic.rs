@@ -25,7 +25,7 @@
 //!   keepalive connection pool, TLS-to-upstream support and timeout
 //!   semantics as the H1/H2 path.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -1941,10 +1941,6 @@ async fn reverse_proxy_upstream(
         Ok(IpAddr::V6(v6)) => v6.octets().to_vec(),
         Err(_) => Vec::new(),
     };
-    let upstream = proxy
-        .select_upstream(state, route_index, Some(&ip_bytes))
-        .ok_or((502, "No Upstream Available"))?;
-
     let proxy_config = proxy.get_proxy_config(state, route_index);
     let limits = &state.config.limits;
     let immediate_stream = proxy_config
@@ -1958,210 +1954,326 @@ async fn reverse_proxy_upstream(
     } else {
         limits.request_timeout_ms
     };
-    let mut request_deadline = request_timeout_ms
+    let base_request_deadline = request_timeout_ms
         .filter(|value| *value > 0)
         .map(|value| request_started + Duration::from_millis(value));
-    let request_budget =
-        request_deadline.and_then(|deadline| deadline.checked_duration_since(Instant::now()));
-    if request_timeout_ms.is_some() && request_budget.is_none() {
-        return Err((408, "Request Timeout"));
-    }
-    let peer = PingclairProxy::build_http_peer(
-        &upstream,
-        proxy_config.as_ref(),
-        request_budget,
-        request_budget,
-    );
-
-    let (mut session, _reused) = connector.get_http_session(&peer).await.map_err(|e| {
-        tracing::error!("❌ H3 upstream connect failed: {}", e);
-        (502, "Upstream Connect Failed")
-    })?;
-    let upstream_is_h2 = matches!(&session, HttpSession::H2(_));
-    if peer.group_key == 4 && !upstream_is_h2 {
-        tracing::error!("🔒 H3 bridge rejected a TLS upstream without h2 ALPN");
-        session.shutdown().await;
-        return Err((502, "TLS H2 Upstream Negotiation Failed"));
-    }
-
-    // 📤 Builds the upstream request with every middleware rewrite already applied.
     let method =
         http::Method::from_bytes(req.method.as_bytes()).map_err(|_| (400, "Bad Request"))?;
-    let mut up_req = RequestHeader::build(method, effective_uri.as_bytes(), None)
-        .map_err(|_| (400, "Bad Request"))?;
-
-    // Host: the upstream's, not the downstream client's.
-    up_req
-        .insert_header("Host", peer.sni.clone())
-        .map_err(|_| (502, "Upstream Request Error"))?;
-
     // 📦 Preserves a trusted content length while selecting framing for the upstream protocol.
     let client_content_length: Option<u64> = req
         .headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
         .and_then(|(_, v)| v.parse::<u64>().ok());
+    let retry_policy = proxy_config
+        .as_ref()
+        .map(|config| config.retry.clone())
+        .unwrap_or_default();
+    let retry_deadline = crate::retry::deadline(request_started, &retry_policy);
+    let mut attempts = 0usize;
+    let mut excluded = HashSet::new();
 
-    // 🧹 Forwards end-to-end headers while stripping hop-by-hop framing metadata.
-    for (k, v) in &req.headers {
-        let name = k.to_ascii_lowercase();
-        if name == "te" {
-            if upstream_is_h2
-                && v.split(',')
-                    .any(|token| token.trim().eq_ignore_ascii_case("trailers"))
-            {
-                up_req.insert_header("te", "trailers").ok();
+    let (mut session, peer, mut request_deadline) = loop {
+        if attempts > 0 {
+            let delay = crate::retry::backoff(&retry_policy);
+            if !delay.is_zero() {
+                tracing::debug!(
+                    route = route_index,
+                    attempt = attempts + 1,
+                    backoff_ms = delay.as_millis(),
+                    "💤 Waiting before the next H3 upstream attempt"
+                );
+                tokio::time::sleep(delay).await;
             }
-            continue;
         }
-        if matches!(
-            name.as_str(),
-            "host"
-                | "connection"
-                | "keep-alive"
-                | "transfer-encoding"
-                | "trailer"
-                | "upgrade"
-                | "content-length"
-        ) {
-            continue;
+        if retry_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err((504, "Upstream Retry Timeout"));
         }
-        up_req.insert_header(k.clone(), v.as_str()).ok();
-    }
 
-    match client_content_length {
-        Some(cl) => {
-            up_req.insert_header("Content-Length", cl.to_string()).ok();
+        let mut selected =
+            proxy.select_upstream_excluding(state, route_index, Some(&ip_bytes), &excluded);
+        if selected.is_none() && !excluded.is_empty() {
+            // ♻️ A status policy may revisit a backend after every candidate was tried once.
+            excluded.clear();
+            selected =
+                proxy.select_upstream_excluding(state, route_index, Some(&ip_bytes), &excluded);
         }
-        None if !upstream_is_h2
-            && matches!(req.method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") =>
-        {
-            up_req.insert_header("Transfer-Encoding", "chunked").ok();
+        let upstream = selected.ok_or((502, "No Upstream Available"))?;
+        attempts += 1;
+
+        let request_budget = base_request_deadline
+            .and_then(|deadline| deadline.checked_duration_since(Instant::now()));
+        if request_timeout_ms.is_some() && request_budget.is_none() {
+            return Err((408, "Request Timeout"));
         }
-        None => {}
-    }
-
-    // Configured headers_up with Caddy placeholder resolution.
-    if let Some(cfg) = &proxy_config {
-        for (key, template) in &cfg.headers_up {
-            let resolved =
-                resolve_caddy_placeholders(template, client_header, Some(verified_client_ip));
-            up_req.insert_header(key.clone(), resolved.as_str()).ok();
-        }
-    }
-
-    let has_header_up = |name: &str| {
-        proxy_config
-            .as_ref()
-            .map(|c| c.headers_up.keys().any(|k| k.eq_ignore_ascii_case(name)))
-            .unwrap_or(false)
-    };
-
-    if !has_header_up("X-Forwarded-Proto") {
-        up_req.insert_header("X-Forwarded-Proto", "https").ok();
-    }
-    if !has_header_up("X-Forwarded-Host") {
-        up_req
-            .insert_header("X-Forwarded-Host", req.authority.as_str())
-            .ok();
-    }
-    if !has_header_up("X-Forwarded-For")
-        && let Ok(peer_address) = peer_ip.parse::<IpAddr>()
-    {
-        up_req
-            .insert_header(
-                "X-Forwarded-For",
-                proxy
-                    .forwarded_for(peer_address, &client_header.headers)
-                    .as_str(),
-            )
-            .ok();
-    }
-    if !has_header_up("X-Real-IP") {
-        up_req.insert_header("X-Real-IP", verified_client_ip).ok();
-    }
-    if !has_header_up("X-Request-Id") {
-        up_req.insert_header("X-Request-Id", request_id).ok();
-    }
-    // 🔀 RFC 9110 §7.6.3, same rule as the H1/H2 path. This hop was always
-    // received over HTTP/3, hence the fixed token.
-    if !response_policy.suppresses_via() {
-        up_req
-            .append_header("via", crate::http_policy::via_value(http::Version::HTTP_3))
-            .ok();
-    }
-
-    session
-        .write_request_header(Box::new(up_req))
-        .await
-        .map_err(|e| {
-            tracing::error!("❌ H3 upstream write header failed: {}", e);
-            (502, "Upstream Write Failed")
-        })?;
-
-    // 🌊 Streams request chunks after the upstream has accepted the headers.
-    let mut counted = 0u64;
-    let mut upload_pacer = limits.upload_bytes_per_sec.map(StreamPacer::new);
-    loop {
-        let next = match limits.body_timeout_ms {
-            Some(timeout_ms) => {
-                tokio::time::timeout(Duration::from_millis(timeout_ms), body_rx.recv())
-                    .await
-                    .map_err(|_| (408, "Request Body Timeout"))?
-            }
-            None => body_rx.recv().await,
+        let retry_budget =
+            retry_deadline.and_then(|deadline| deadline.checked_duration_since(Instant::now()));
+        let attempt_budget = match (request_budget, retry_budget) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => None,
         };
-        let Some(chunk) = next else { break };
-        // 🔔 Wakes the event loop after freeing request-channel capacity.
-        body_notify.notify_one();
+        let mut peer = PingclairProxy::build_http_peer(
+            &upstream,
+            proxy_config.as_ref(),
+            attempt_budget,
+            attempt_budget,
+        );
+        // ⌛ The retry total bounds response-header wait even when phase timers are longer.
+        peer.options.read_timeout = match (peer.options.read_timeout, retry_budget) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => None,
+        };
 
-        counted += chunk.len() as u64;
-        if body_limit > 0 && counted > body_limit {
-            // 🛑 Aborts the upstream exchange before returning the body-limit response.
-            session.shutdown().await;
-            return Err((413, "Request Entity Too Large"));
-        }
-        if let Some(delay) = upload_pacer
-            .as_mut()
-            .and_then(|pacer| pacer.delay_for(chunk.len()))
-        {
-            if request_deadline.is_some_and(|deadline| Instant::now() + delay >= deadline) {
-                session.shutdown().await;
-                return Err((408, "Request Timeout"));
+        let (mut session, _reused) = match connector.get_http_session(&peer).await {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(
+                    attempt = attempts,
+                    error = %error,
+                    "🔌 H3 upstream connection attempt failed"
+                );
+                if let pingora_core::protocols::l4::socket::SocketAddr::Inet(address) =
+                    &upstream.addr
+                {
+                    excluded.insert(*address);
+                    proxy.mark_upstream_unhealthy(state, route_index, address);
+                    tracing::warn!(
+                        "🔻 Marking H3 upstream {} down after connect failure (cooldown {:?})",
+                        address,
+                        crate::FAIL_COOLDOWN
+                    );
+                }
+                if crate::retry::permits_another_attempt(&retry_policy, attempts, retry_deadline) {
+                    continue;
+                }
+                return Err((502, "Upstream Connect Failed"));
             }
-            tokio::time::sleep(delay).await;
+        };
+        let upstream_is_h2 = matches!(&session, HttpSession::H2(_));
+        if peer.group_key == 4 && !upstream_is_h2 {
+            tracing::error!("🔒 H3 bridge rejected a TLS upstream without h2 ALPN");
+            session.shutdown().await;
+            if let pingora_core::protocols::l4::socket::SocketAddr::Inet(address) = &upstream.addr {
+                excluded.insert(*address);
+                proxy.mark_upstream_unhealthy(state, route_index, address);
+            }
+            if crate::retry::permits_another_attempt(&retry_policy, attempts, retry_deadline) {
+                continue;
+            }
+            return Err((502, "TLS H2 Upstream Negotiation Failed"));
         }
-        if let Err(e) = session.write_request_body(Bytes::from(chunk), false).await {
-            tracing::error!("❌ H3 upstream write body failed: {}", e);
+
+        // 📤 Builds the upstream request with every middleware rewrite already applied.
+        let mut up_req = RequestHeader::build(method.clone(), effective_uri.as_bytes(), None)
+            .map_err(|_| (400, "Bad Request"))?;
+
+        // 🏷️ Uses the selected upstream's authority instead of the downstream host.
+        up_req
+            .insert_header("Host", peer.sni.clone())
+            .map_err(|_| (502, "Upstream Request Error"))?;
+
+        // 🧹 Forwards end-to-end headers while stripping hop-by-hop framing metadata.
+        for (key, value) in &req.headers {
+            let name = key.to_ascii_lowercase();
+            if name == "te" {
+                if upstream_is_h2
+                    && value
+                        .split(',')
+                        .any(|token| token.trim().eq_ignore_ascii_case("trailers"))
+                {
+                    up_req.insert_header("te", "trailers").ok();
+                }
+                continue;
+            }
+            if matches!(
+                name.as_str(),
+                "host"
+                    | "connection"
+                    | "keep-alive"
+                    | "transfer-encoding"
+                    | "trailer"
+                    | "upgrade"
+                    | "content-length"
+            ) {
+                continue;
+            }
+            up_req.insert_header(key.clone(), value.as_str()).ok();
+        }
+
+        match client_content_length {
+            Some(content_length) => {
+                up_req
+                    .insert_header("Content-Length", content_length.to_string())
+                    .ok();
+            }
+            None if !upstream_is_h2
+                && matches!(req.method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") =>
+            {
+                up_req.insert_header("Transfer-Encoding", "chunked").ok();
+            }
+            None => {}
+        }
+
+        // 🧩 Resolves configured upstream header placeholders for each selected peer.
+        if let Some(config) = &proxy_config {
+            for (key, template) in &config.headers_up {
+                let resolved =
+                    resolve_caddy_placeholders(template, client_header, Some(verified_client_ip));
+                up_req.insert_header(key.clone(), resolved.as_str()).ok();
+            }
+        }
+
+        let has_header_up = |name: &str| {
+            proxy_config
+                .as_ref()
+                .map(|config| {
+                    config
+                        .headers_up
+                        .keys()
+                        .any(|key| key.eq_ignore_ascii_case(name))
+                })
+                .unwrap_or(false)
+        };
+
+        if !has_header_up("X-Forwarded-Proto") {
+            up_req.insert_header("X-Forwarded-Proto", "https").ok();
+        }
+        if !has_header_up("X-Forwarded-Host") {
+            up_req
+                .insert_header("X-Forwarded-Host", req.authority.as_str())
+                .ok();
+        }
+        if !has_header_up("X-Forwarded-For")
+            && let Ok(peer_address) = peer_ip.parse::<IpAddr>()
+        {
+            up_req
+                .insert_header(
+                    "X-Forwarded-For",
+                    proxy
+                        .forwarded_for(peer_address, &client_header.headers)
+                        .as_str(),
+                )
+                .ok();
+        }
+        if !has_header_up("X-Real-IP") {
+            up_req.insert_header("X-Real-IP", verified_client_ip).ok();
+        }
+        if !has_header_up("X-Request-Id") {
+            up_req.insert_header("X-Request-Id", request_id).ok();
+        }
+        // 🔀 RFC 9110 §7.6.3 uses the downstream HTTP/3 version for this received-by hop.
+        if !response_policy.suppresses_via() {
+            up_req
+                .append_header("via", crate::http_policy::via_value(http::Version::HTTP_3))
+                .ok();
+        }
+
+        session
+            .write_request_header(Box::new(up_req))
+            .await
+            .map_err(|error| {
+                tracing::error!("❌ H3 upstream write header failed: {}", error);
+                (502, "Upstream Write Failed")
+            })?;
+
+        // 🌊 Streams request chunks after the upstream has accepted the headers.
+        let mut counted = 0u64;
+        let mut upload_pacer = limits.upload_bytes_per_sec.map(StreamPacer::new);
+        loop {
+            let next = match limits.body_timeout_ms {
+                Some(timeout_ms) => {
+                    tokio::time::timeout(Duration::from_millis(timeout_ms), body_rx.recv())
+                        .await
+                        .map_err(|_| (408, "Request Body Timeout"))?
+                }
+                None => body_rx.recv().await,
+            };
+            let Some(chunk) = next else { break };
+            // 🔔 Wakes the event loop after freeing request-channel capacity.
+            body_notify.notify_one();
+
+            counted += chunk.len() as u64;
+            if body_limit > 0 && counted > body_limit {
+                // 🛑 Aborts the upstream exchange before returning the body-limit response.
+                session.shutdown().await;
+                return Err((413, "Request Entity Too Large"));
+            }
+            if let Some(delay) = upload_pacer
+                .as_mut()
+                .and_then(|pacer| pacer.delay_for(chunk.len()))
+            {
+                if base_request_deadline.is_some_and(|deadline| Instant::now() + delay >= deadline)
+                {
+                    session.shutdown().await;
+                    return Err((408, "Request Timeout"));
+                }
+                tokio::time::sleep(delay).await;
+            }
+            if let Err(error) = session.write_request_body(Bytes::from(chunk), false).await {
+                tracing::error!("❌ H3 upstream write body failed: {}", error);
+                session.shutdown().await;
+                return Err((502, "Upstream Write Failed"));
+            }
+        }
+        // 📏 Rejects a body length mismatch before it can poison a reused connection.
+        if let Some(content_length) = client_content_length
+            && counted != content_length
+        {
+            tracing::warn!(
+                "⚠️ H3 request body length mismatch (content-length {}, streamed {})",
+                content_length,
+                counted
+            );
+            session.shutdown().await;
+            return Err((400, "Bad Request"));
+        }
+
+        if let Err(error) = session.finish_request_body().await {
+            tracing::error!("❌ H3 upstream finish body failed: {}", error);
             session.shutdown().await;
             return Err((502, "Upstream Write Failed"));
         }
-    }
-    // 📏 Rejects a body length mismatch before it can poison a reused connection.
-    if let Some(cl) = client_content_length
-        && counted != cl
-    {
-        tracing::warn!(
-            "⚠️ H3 request body length mismatch (content-length {}, streamed {})",
-            cl,
-            counted
-        );
-        session.shutdown().await;
-        return Err((400, "Bad Request"));
-    }
 
-    if let Err(e) = session.finish_request_body().await {
-        tracing::error!("❌ H3 upstream finish body failed: {}", e);
-        session.shutdown().await;
-        return Err((502, "Upstream Write Failed"));
-    }
+        // 📥 Reads upstream response metadata before committing an H3 response.
+        if let Err(error) = session.read_response_header().await {
+            tracing::error!("❌ H3 upstream read response header failed: {}", error);
+            session.shutdown().await;
+            if retry_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err((504, "Upstream Retry Timeout"));
+            }
+            return Err((502, "Upstream Read Failed"));
+        }
 
-    // 📥 Reads upstream response metadata before committing an H3 response.
-    if let Err(e) = session.read_response_header().await {
-        tracing::error!("❌ H3 upstream read response header failed: {}", e);
-        session.shutdown().await;
-        return Err((502, "Upstream Read Failed"));
-    }
+        let upstream_status = session
+            .response_header()
+            .map(|response| response.status.as_u16())
+            .unwrap_or(502);
+        if crate::retry::permits_status_retry(
+            &retry_policy,
+            &method,
+            counted == 0,
+            upstream_status,
+            attempts,
+            retry_deadline,
+        ) {
+            tracing::warn!(
+                status = upstream_status,
+                method = %method,
+                attempt = attempts,
+                max_attempts = retry_policy.max_attempts,
+                "🔁 Redispatching a bodyless H3 request after an upstream status"
+            );
+            session.shutdown().await;
+            if let pingora_core::protocols::l4::socket::SocketAddr::Inet(address) = &upstream.addr {
+                excluded.insert(*address);
+            }
+            continue;
+        }
+
+        break (session, peer, base_request_deadline);
+    };
 
     let response_streaming = session
         .response_header()
@@ -2191,12 +2303,28 @@ async fn reverse_proxy_upstream(
     let between_reads = between_reads_ms
         .filter(|value| *value > 0)
         .map(|value| Duration::from_millis(value as u64));
-    let remaining =
+    let request_remaining =
         request_deadline.and_then(|deadline| deadline.checked_duration_since(Instant::now()));
-    if request_deadline.is_some() && remaining.is_none() {
+    if request_deadline.is_some() && request_remaining.is_none() {
         session.shutdown().await;
         return Err((408, "Request Timeout"));
     }
+    let retry_remaining =
+        retry_deadline.and_then(|deadline| deadline.checked_duration_since(Instant::now()));
+    if retry_deadline.is_some() && retry_remaining.is_none() {
+        session.shutdown().await;
+        return Err((504, "Upstream Retry Timeout"));
+    }
+    let remaining = match (request_remaining, retry_remaining) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    };
+    request_deadline = match (request_deadline, retry_deadline) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    };
     session.set_read_timeout(match (between_reads, remaining) {
         (Some(left), Some(right)) => Some(left.min(right)),
         (Some(value), None) | (None, Some(value)) => Some(value),
@@ -2540,7 +2668,7 @@ async fn send_error_response(
 mod tests {
     use super::*;
     use pingclair_core::config::{
-        BasicAuthCredential, ReverseProxyConfig, RouteConfig, ServerConfig,
+        BasicAuthCredential, RetryConfig, ReverseProxyConfig, RouteConfig, ServerConfig,
     };
 
     fn proxy_state(handler: HandlerConfig) -> ProxyState {
@@ -2799,6 +2927,108 @@ mod tests {
         let result = run_until_request_cancelled(&mut cancel_rx, async { 7 }).await;
 
         assert_eq!(result, Some(7));
+    }
+
+    #[tokio::test]
+    async fn h3_bridge_retries_a_configured_bodyless_status() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            for attempt in 1..=2 {
+                let (mut stream, _) = upstream.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert!(read > 0, "H3 bridge request closed before its headers");
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let (status, body) = if attempt == 1 {
+                    ("503 Service Unavailable", "retry")
+                } else {
+                    ("200 OK", "ok")
+                };
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let state = proxy_state(HandlerConfig::ReverseProxy(ReverseProxyConfig {
+            upstreams: vec![format!("http://{upstream_address}")],
+            retry: Box::new(RetryConfig {
+                max_attempts: 2,
+                status_codes: vec![503],
+                methods: vec!["GET".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        let proxy = PingclairProxy::new();
+        let connector = pingora_core::connectors::http::Connector::new(Some(
+            pingora_core::connectors::ConnectorOptions::new(16),
+        ));
+        let request = H3Request {
+            method: "GET".to_string(),
+            protocol: None,
+            path: "/retry".to_string(),
+            authority: "example.test".to_string(),
+            headers: Vec::new(),
+        };
+        let client_header = RequestHeader::build(http::Method::GET, b"/retry", None).unwrap();
+        let (body_tx, mut body_rx) = mpsc::channel(1);
+        drop(body_tx);
+        let (resp_tx, mut resp_rx) = mpsc::channel(8);
+        let body_notify = Arc::new(Notify::new());
+        let cid = quiche::ConnectionId::from_vec(vec![5, 6, 7, 8]);
+
+        reverse_proxy_upstream(
+            &proxy,
+            &connector,
+            &state,
+            0,
+            &request,
+            &client_header,
+            &request.path,
+            "127.0.0.1",
+            "127.0.0.1",
+            "retry-request-id",
+            &ResponseHeaderPolicy::default(),
+            0,
+            &cid,
+            0,
+            &mut body_rx,
+            &resp_tx,
+            &body_notify,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+
+        let response = resp_rx.recv().await.unwrap();
+        let RespMsg::Headers(headers, false) = response.msg else {
+            panic!("expected H3 response headers");
+        };
+        assert!(
+            headers
+                .iter()
+                .any(|header| header.name() == b":status" && header.value() == b"200")
+        );
+        let body = resp_rx.recv().await.unwrap();
+        assert!(matches!(
+            body.msg,
+            RespMsg::Body(ref bytes, false) if bytes == b"ok"
+        ));
+        upstream_task.await.unwrap();
     }
 
     #[tokio::test]

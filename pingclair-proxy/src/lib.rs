@@ -23,6 +23,7 @@ pub mod metrics;
 pub mod quic;
 pub mod rate_limit;
 pub mod redaction;
+mod retry;
 pub mod server;
 pub mod upstream;
 

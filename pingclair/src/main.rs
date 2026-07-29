@@ -334,6 +334,7 @@ fn main() -> anyhow::Result<()> {
                 connect_timeout: None,
                 first_byte_timeout: None,
                 between_reads_timeout: None,
+                retry: Default::default(),
             });
 
             server.routes.push(RouteConfig {

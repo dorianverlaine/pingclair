@@ -470,6 +470,9 @@ pub struct ProxyConfig {
     /// Transport configuration
     pub transport: Option<TransportConfig>,
 
+    /// 🔁 Request-local redispatch policy.
+    pub retry: RetryConfig,
+
     /// Macro calls (use xxx!())
     pub macro_calls: Vec<MacroCall>,
 }
@@ -531,6 +534,31 @@ pub struct TransportConfig {
     pub between_reads_timeout: Option<u64>,
     pub read_timeout: Option<u64>,  // milliseconds
     pub write_timeout: Option<u64>, // milliseconds
+}
+
+/// 🔁 Typed retry policy produced by the Pingclairfile adapter.
+#[derive(Debug, Clone)]
+pub struct RetryConfig {
+    pub max_attempts: usize,
+    pub total_timeout_ms: Option<u64>,
+    pub backoff_ms: u64,
+    pub status_codes: Vec<u16>,
+    pub methods: Vec<String>,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 16,
+            total_timeout_ms: None,
+            backoff_ms: 0,
+            status_codes: Vec::new(),
+            methods: ["GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        }
+    }
 }
 
 /// Static response configuration
@@ -676,6 +704,7 @@ impl ProxyConfig {
             flush_interval: None,
             header_up: HashMap::new(),
             transport: None,
+            retry: RetryConfig::default(),
             macro_calls: Vec::new(),
         }
     }

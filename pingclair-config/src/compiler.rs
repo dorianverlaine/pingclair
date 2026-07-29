@@ -14,7 +14,7 @@ use pingclair_core::config::{
     ServerConfig, TlsConfig, default_encodings, default_gzip_types,
 };
 use pingclair_core::server::{MAX_BCRYPT_COST, bcrypt_hash_cost};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 /// Compiler errors
@@ -322,6 +322,10 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
             });
         }
 
+        for route in &server.routes {
+            validate_retry_handler(&route.handler)?;
+        }
+
         let Some(tls) = &server.tls else {
             continue;
         };
@@ -351,6 +355,95 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
         }
     }
 
+    Ok(())
+}
+
+/// 🔁 Rejects retry policies that could exceed Pingora's bounded retry loop or replay unsafe methods.
+fn validate_retry_handler(handler: &HandlerConfig) -> CompileResult<()> {
+    match handler {
+        HandlerConfig::ReverseProxy(proxy) => {
+            let retry = &proxy.retry;
+            if !(1..=16).contains(&retry.max_attempts) {
+                return Err(CompileError::InvalidRoute {
+                    message: "retry max_attempts must be between 1 and 16".to_string(),
+                });
+            }
+            if retry
+                .total_timeout_ms
+                .is_some_and(|value| value == 0 || value > 31_536_000_000)
+            {
+                return Err(CompileError::InvalidRoute {
+                    message: "retry total_timeout_ms must be between 1 ms and 365 days".to_string(),
+                });
+            }
+            if retry.backoff_ms > 31_536_000_000 {
+                return Err(CompileError::InvalidRoute {
+                    message: "retry backoff_ms must not exceed 365 days".to_string(),
+                });
+            }
+            if retry
+                .total_timeout_ms
+                .is_some_and(|total| retry.max_attempts > 1 && retry.backoff_ms >= total)
+            {
+                return Err(CompileError::InvalidRoute {
+                    message: "retry backoff_ms must be shorter than total_timeout_ms".to_string(),
+                });
+            }
+            if retry
+                .status_codes
+                .iter()
+                .any(|status| !(400..=599).contains(status))
+            {
+                return Err(CompileError::InvalidRoute {
+                    message: "retry status_codes must contain only 4xx or 5xx values".to_string(),
+                });
+            }
+            if retry.status_codes.len() > 200
+                || retry.status_codes.iter().collect::<HashSet<_>>().len()
+                    != retry.status_codes.len()
+            {
+                return Err(CompileError::InvalidRoute {
+                    message: "retry status_codes must be unique and contain at most 200 values"
+                        .to_string(),
+                });
+            }
+            const IDEMPOTENT_METHODS: [&str; 6] =
+                ["GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE"];
+            if let Some(method) = retry
+                .methods
+                .iter()
+                .find(|method| !IDEMPOTENT_METHODS.contains(&method.as_str()))
+            {
+                return Err(CompileError::InvalidRoute {
+                    message: format!(
+                        "retry method {method} is not idempotent; v0.2 does not replay it"
+                    ),
+                });
+            }
+            if retry.methods.len() > IDEMPOTENT_METHODS.len()
+                || retry.methods.iter().collect::<HashSet<_>>().len() != retry.methods.len()
+            {
+                return Err(CompileError::InvalidRoute {
+                    message: "retry methods must be unique".to_string(),
+                });
+            }
+        }
+        HandlerConfig::Pipeline { handlers }
+        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::HandlePath { handlers, .. } => {
+            for handler in handlers {
+                validate_retry_handler(handler)?;
+            }
+        }
+        HandlerConfig::HandleErrors { errors } => {
+            for handlers in errors.values() {
+                for handler in handlers {
+                    validate_retry_handler(handler)?;
+                }
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -509,6 +602,13 @@ fn compile_handler(handler: &Handler) -> CompileResult<HandlerConfig> {
                 connect_timeout: None,
                 first_byte_timeout: None,
                 between_reads_timeout: None,
+                retry: Box::new(pingclair_core::config::RetryConfig {
+                    max_attempts: proxy.retry.max_attempts,
+                    total_timeout_ms: proxy.retry.total_timeout_ms,
+                    backoff_ms: proxy.retry.backoff_ms,
+                    status_codes: proxy.retry.status_codes.clone(),
+                    methods: proxy.retry.methods.clone(),
+                }),
             };
 
             if let Some(policy) = &proxy.lb_policy {

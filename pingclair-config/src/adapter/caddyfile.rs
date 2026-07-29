@@ -1089,6 +1089,9 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
                         proxy.transport = Some(transport);
                     }
                 }
+                "retry" => {
+                    proxy.retry = adapt_retry_policy(&sub)?;
+                }
                 "lb_policy" => {
                     let policy = sub
                         .args
@@ -1178,6 +1181,68 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
     }
 
     Ok(Handler::Proxy(Box::new(proxy)))
+}
+
+/// 🔁 Adapts one bounded, idempotent-only redispatch policy.
+fn adapt_retry_policy(directive: &Directive) -> Result<RetryConfig, AdapterError> {
+    if !directive.args.is_empty() {
+        return Err(AdapterError::ArgumentCount(
+            "retry".into(),
+            0,
+            directive.args.len(),
+        ));
+    }
+    let block = directive
+        .block
+        .as_ref()
+        .ok_or_else(|| AdapterError::InvalidArgument("retry".into(), "block required".into()))?;
+    let mut retry = RetryConfig::default();
+    for sub in &block.directives {
+        match sub.name.as_str() {
+            "max_attempts" => retry.max_attempts = parse_positive_usize(sub)?,
+            "total_timeout" => {
+                retry.total_timeout_ms = Some(parse_required_duration(sub)?);
+            }
+            "backoff" => {
+                retry.backoff_ms = if sub.args.as_slice() == ["off"] {
+                    0
+                } else {
+                    parse_required_duration(sub)?
+                };
+            }
+            "status_codes" => {
+                if sub.args.is_empty() {
+                    return Err(AdapterError::ArgumentCount(sub.name.clone(), 1, 0));
+                }
+                retry.status_codes = sub
+                    .args
+                    .iter()
+                    .map(|value| {
+                        value.parse::<u16>().map_err(|_| {
+                            AdapterError::InvalidArgument(sub.name.clone(), value.clone())
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
+            "methods" => {
+                if sub.args.is_empty() {
+                    return Err(AdapterError::ArgumentCount(sub.name.clone(), 1, 0));
+                }
+                retry.methods = sub
+                    .args
+                    .iter()
+                    .map(|method| method.to_ascii_uppercase())
+                    .collect();
+            }
+            _ => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "retry: {}",
+                    sub.name
+                )));
+            }
+        }
+    }
+    Ok(retry)
 }
 
 /// Parse the global `dns_refresh` argument into seconds.
