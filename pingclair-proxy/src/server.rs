@@ -228,6 +228,73 @@ fn shortest_duration(left: Option<Duration>, right: Option<Duration>) -> Option<
     }
 }
 
+/// 🧹 Fields that never cross a hop, whatever the client says.
+///
+/// `Transfer-Encoding` is deliberately absent: HTTP/1 framing belongs to
+/// Pingora, which re-frames the body for the upstream, and removing the field
+/// underneath it would describe a body that is not what gets sent.
+const ALWAYS_HOP_BY_HOP: &[&str] = &[
+    "proxy-connection",
+    "keep-alive",
+    "te",
+    // 🔑 RFC 9110 §11.7.1: consumed by the first inbound proxy. Relaying it is
+    // only correct when proxies cooperatively authenticate, which is not a
+    // thing this server does, so the safe default is to consume it.
+    "proxy-authorization",
+    "proxy-authenticate",
+];
+
+/// 🧹 Removes connection-scoped fields from a request about to be forwarded.
+///
+/// RFC 9110 §7.6.1 requires removing `Connection`, every field it names, and
+/// the connection-specific fields. The one exception is a genuine protocol
+/// upgrade: Pingora detects a WebSocket tunnel by seeing `Connection: upgrade`
+/// together with `Upgrade`, so stripping those would not harden anything — it
+/// would simply break WebSocket.
+fn strip_hop_by_hop_headers(
+    session: &Session,
+    upstream_request: &mut RequestHeader,
+) -> pingora_core::Result<()> {
+    let downstream = session.req_header();
+    let upgrading = is_websocket_upgrade(&downstream.headers);
+
+    // 🎯 Collected before anything is removed, since the list lives in the very
+    // field being removed.
+    let named: Vec<String> = downstream
+        .headers
+        .get_all("connection")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect();
+
+    for name in &named {
+        // `close` and `keep-alive` describe the connection, not a field, and
+        // `upgrade` is handled by the exception below.
+        if matches!(name.as_str(), "close" | "keep-alive" | "upgrade") {
+            continue;
+        }
+        upstream_request.remove_header(name.as_str());
+    }
+
+    for name in ALWAYS_HOP_BY_HOP {
+        if upgrading && *name == "te" {
+            // A tunnelling client may legitimately negotiate transfer codings.
+            continue;
+        }
+        upstream_request.remove_header(*name);
+    }
+
+    if upgrading {
+        return Ok(());
+    }
+    upstream_request.remove_header("connection");
+    upstream_request.remove_header("upgrade");
+    Ok(())
+}
+
 /// 🔌 Detects an HTTP/1 WebSocket upgrade before the response enters tunnel mode.
 fn is_websocket_upgrade(headers: &http::HeaderMap) -> bool {
     headers
@@ -3245,6 +3312,17 @@ impl ProxyHttp for PingclairProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // 🧹 Hop-by-hop fields stop here, before anything of ours is added.
+        //
+        // Doing this first matters twice over: a client naming our own fields in
+        // `Connection` cannot strip headers we are about to set, and the fields
+        // it does name are gone before the origin can see either them or the
+        // instruction. Pingora removes these only on the HTTP/2 upstream path,
+        // where the h2 crate insists; the HTTP/1 path forwarded them verbatim,
+        // including `Proxy-Authorization` — a credential addressed to this
+        // proxy, handed to the origin.
+        strip_hop_by_hop_headers(session, upstream_request)?;
+
         let downstream_headers = session.req_header();
         let has_header_up = |name: &str| {
             ctx.headers_upstream
