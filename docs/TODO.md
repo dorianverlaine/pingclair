@@ -87,8 +87,8 @@ cargo test --locked --workspace
 > `fields { x delete }` 編譯時被丟棄、靜態檔與錯誤頁的 `bytes` 恆為 0。
 > 詳見 commit message。
 
-- **範圍外（仍留 Day 21）**：rotation／retention／壓縮／bounded async writer。
-  目前寫入是同步的，磁碟卡住會擋住呼叫端——這正是 Day 21 存在的理由。
+- **範圍外（仍留 Day 22）**：rotation／retention／壓縮／bounded async writer。
+  目前寫入是同步的，磁碟卡住會擋住呼叫端——這正是 Day 22 存在的理由。
 
 ### 🔨 Day 3 — secret redaction 與 Cloudflare client identity ✔ `81aabc5`
 
@@ -110,7 +110,7 @@ cargo test --locked --workspace
 > `?code=` 可能在本次請求 URI 完全乾淨的情況下照樣進 log。
 
 - **範圍外**：`Authorization`／`Cookie` 目前不會進 access log（沒有 header
-  logging 功能），`is_sensitive_header()` 已備妥供 Day 21 記錄 header 時使用。
+  logging 功能），`is_sensitive_header()` 已備妥供 Day 22 記錄 header 時使用。
 
 ### 🔨 Day 4 — 反代 zstd／gzip 協商 ✔
 
@@ -564,7 +564,38 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
 
 ---
 
-## M3 — 接上 Pingora 已提供的能力（Day 16–20）
+## M2.5 — 協議硬化（Day 16）
+
+### 🔨 Day 16 — 協議安全回歸集
+
+**這是 v0.2 唯一還沒動的 R0 項目，優先度其實很高**——最新 Caddy／nginx 仍然
+在修 rewrite、header、H2/H3 解析漏洞，一般功能測試抓不到這類問題。
+
+> 📌 **2026-07-30 從 Day 25 提前到這裡。** 原本排在 M5,結論是排錯了。
+>
+> 理由一:**這個 codebase 的嚴重問題目前都是「撞到」的,不是「找出來」的。**
+> Day 6 在修 matcher 表示法時順手撞到一個可由 Admin API 遠端觸發的
+> stack-overflow DoS(畸形 matcher → untagged newtype variant 無限遞迴);
+> Day 14 的 PROXY ingress 讓 `limits { max_connections }` 失效,是 review
+> 時看出來的,沒有任何功能測試會抓到。兩個都不是被搜出來的。
+> 同類還有多少沒人知道——而這一天正是把「畸形輸入打進 parser」這整類
+> 系統性覆蓋掉的日子。
+>
+> 理由二:**M3 是加速功能,不是安全功能。** 快取讓它更快,不讓它更穩。
+> 先護欄後加速,順序不該倒過來。
+>
+> 理由三:**這一天會給 Day 18 打地基。** 快取正確性要跟 URI 正規化、
+> header 語意、hop-by-hop 規則同時成立;先把那些邊界釘死,Day 18 才有
+> 可以依賴的東西。
+
+- H1/H2/H3 的 URI／header 正規化、hop-by-hop headers、重複
+  `Content-Length`／`Transfer-Encoding`、oversized headers、request smuggling、
+  malformed frame 的**負向測試**。
+- 可用 proptest／fuzzing，並與 nginx／Caddy 做差異測試。
+- **完成判定**：每一類都有明確的拒絕行為與測試。
+
+
+## M3 — 接上 Pingora 已提供的能力（Day 17–21）
 
 > 盤點 `pingora 0.8.1` 全家桶後發現：**`pingora-cache` 完全沒被引入**，
 > 而它提供的正是審計裡估「1 週+」的 `proxy_cache`。`boringssl` feature 明確
@@ -601,7 +632,7 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
 > 「明確不做」把 OpenTelemetry 排除在外，這等於從側門進來一套 tracing 依賴。
 > Day 29 的 dependency audit 與產物大小要把它算進去。
 
-### 🔨 Day 16 — 接上 pingora-cache 骨架
+### 🔨 Day 17 — 接上 pingora-cache 骨架
 
 - 加入 `pingora-cache` 依賴與 `cache` feature。BoringSSL 鏈結已於
   2026-07-28 在 macOS 實測通過（見上），這天只需確認 Linux 那一半。
@@ -609,18 +640,30 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
   的 cache key，memory storage 先跑通。
 - **完成判定**：同一 URL 第二次請求命中快取，且有測試證明沒有回源。
 
-### 🔨 Day 17 — 快取策略與正確性
+### 🔨 Day 18 — 快取策略與正確性
 
 **這天是整個 M3 的風險所在**，快取的 bug 不會讓服務掛掉，只會安靜地回錯內容。
 
 - `ETag`／`Cache-Control`／`Vary` 語意（用 pingora 的 `cache_control` 與
-  `variance`）。
+  `variance`）。**要跟 Day 4 的壓縮協商一起想**,不是分開想。
 - **預設 bypass**：`Authorization`、`Cookie`。
 - **必須排除**：SSE、upgrade、`flush_interval: -1` 的串流回應。
+
+> 🔁 **這個錯誤這個專案已經犯過兩次,而且是在兩個不同的 crate 各犯一次**:
+> `ecf7b45` 靜態檔的冷快取 gzip 驚群(20MB benchmark 峰值 RSS
+> **374 MiB → 21 MiB**),以及 `7100e83` 反代把 SSE／`flush_interval: -1`
+> 的回應送進 gzip filter 而緩衝掉。同一個形狀、獨立犯兩次——所以它是護欄
+> 而不只是兩個修好的 bug。**快取會是第三個可以犯同一個錯的地方**,
+> 而且這次它還疊在壓縮之上:存壓過的還是沒壓的、`Vary: Accept-Encoding`
+> 漏了會讓 zstd client 拿到 gzip body。
 - range 請求與 negative cache（404/5xx 的短 TTL）。
 - **完成判定**：每一條 bypass／排除規則都有負向測試——證明它**沒有**被快取。
+  ⚠️ 2026-07-30 的教訓:**一條不可能失敗的否定斷言不是測試**。當時
+  `trusted_proxies` 寫得太寬,涵蓋了測試 client 的來源,於是「未受信來源
+  不能偽造 header」那條斷言永遠會過。這一天整天都是否定斷言,每一條都要
+  先確認它**能夠**失敗。
 
-### 🔨 Day 18 — 快取運維面
+### 🔨 Day 19 — 快取運維面
 
 - cache lock（single-flight）與 predictor 接線，避免回源驚群。
 - eviction 策略與 **memory/disk tier 硬上限**。
@@ -628,7 +671,7 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
 - 受權限保護的 inspect／purge API。
 - **完成判定**：上限確實生效（超過會 evict 而不是無限長大）；purge 需認證。
 
-### 🔨 Day 19 — 一致性雜湊 LB
+### 🔨 Day 20 — 一致性雜湊 LB
 
 > 💡 `pingora-ketama` 與 `pingora-load-balancing::selection::consistent`
 > 已提供 ketama 一致性雜湊；`selection::weighted` 提供加權。
@@ -638,7 +681,7 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
   且做錯有安全後果）。
 - **完成判定**：backend 增減時 key 重映射比例符合一致性雜湊預期。
 
-### ✅ Day 20 — M3 驗證日
+### ✅ Day 21 — M3 驗證日
 
 凍結 RC，在乾淨 Linux 驗證快取正確性（尤其是 bypass／排除規則）、
 上限、purge 與一致性雜湊。
@@ -648,11 +691,11 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
 
 ---
 
-## M4 — 可觀測性與運維（Day 21–24）
+## M4 — 可觀測性與運維（Day 22–25）
 
 讓它可以被值班的人操作。
 
-### 🔨 Day 21 — Access log 完整化
+### 🔨 Day 22 — Access log 完整化
 
 Day 2 做了配置驅動的輸出，這天做生產級韌性。
 
@@ -661,7 +704,7 @@ Day 2 做了配置驅動的輸出，這天做生產級韌性。
   dropped-log metric。
 - **完成判定**：磁碟寫滿或 writer 落後時**不得拖死 request hot path**（要有測試）。
 
-### 🔨 Day 22 — Metrics 與 readiness
+### 🔨 Day 23 — Metrics 與 readiness
 
 - `/live`、`/ready`、config version、route/status、upstream latency/error、
   retry、circuit/queue、pool、TLS、H3 指標。
@@ -670,7 +713,7 @@ Day 2 做了配置驅動的輸出，這天做生產級韌性。
   `READY=1`，並支援 watchdog。
 - **完成判定**：程序存活但尚未可接流量時，`/ready` 必須是 not ready。
 
-### 🔨 Day 23 — Reload／shutdown 可操作
+### 🔨 Day 24 — Reload／shutdown 可操作
 
 - 配置更新原子套用；錯誤配置保留 last-known-good。
 - 手動憑證目錄的新增／更新／刪除需**原子刷新** H1/H2/H3 certificate table；
@@ -678,32 +721,14 @@ Day 2 做了配置驅動的輸出，這天做生產級韌性。
 - **v0.2 可明示 listener topology 變更需要 restart**，不假裝已經 zero-downtime。
 - **完成判定**：SIGHUP／SIGTERM／systemd restart／upstream drain 有真 binary 測試。
 
-### ✅ Day 24 — M4 驗證日
+### ✅ Day 25 — M4 驗證日
 
 凍結 RC，驗證 log rotation／redaction、metrics、readiness、reload／shutdown
 在乾淨 Linux 的實際行為。
 
 ---
 
-## M5 — 協議安全與 H3（Day 25–28）
-
-### 🔨 Day 25 — 協議安全回歸集
-
-**這是 v0.2 唯一還沒動的 R0 項目，優先度其實很高**——最新 Caddy／nginx 仍然
-在修 rewrite、header、H2/H3 解析漏洞，一般功能測試抓不到這類問題。
-
-> ⚠️ **若時程需要壓縮，這一天優先於整個 M3。** 2026-07-28 有了實證：Day 6
-> 在修 matcher 表示法時**順手撞到**一個可由 Admin API 遠端觸發的
-> stack-overflow DoS（畸形 matcher → untagged newtype variant 無限遞迴）。
-> 那是「畸形輸入打進 parser」的典型，正好是這天要系統性覆蓋的類別，
-> 而它是**碰巧**被發現的，不是被找出來的。同類問題還有多少沒人知道。
-> 相較之下 M3 是加速功能：先護欄後加速，順序不該倒過來。
-
-- H1/H2/H3 的 URI／header 正規化、hop-by-hop headers、重複
-  `Content-Length`／`Transfer-Encoding`、oversized headers、request smuggling、
-  malformed frame 的**負向測試**。
-- 可用 proptest／fuzzing，並與 nginx／Caddy 做差異測試。
-- **完成判定**：每一類都有明確的拒絕行為與測試。
+## M5 — 協議矩陣與 H3（Day 26–28）
 
 ### 🔨 Day 26 — 協議矩陣補完
 
@@ -791,7 +816,7 @@ H3 CORS／rewrite／error_page parity。
 - 上游 HTTP/3、gRPC-web transcoding、`sub_filter`、目錄 autoindex、fault injection。
 - JWT/OIDC/forward auth、external auth/policy hooks、secrets provider 抽象。
 - **sticky cookie session persistence**（簽章／rotation／SameSite 做錯有安全後果，
-  且 Pingora 不提供這部分；一致性雜湊本身已在 Day 19）。
+  且 Pingora 不提供這部分；一致性雜湊本身已在 Day 20）。
 
 > `proxy_cache` 原本在這份清單裡，2026-07-27 盤點後**移入 v0.2 的 M3**：
 > `pingora-cache` 已提供狀態機、cache lock、eviction、variance 與 predictor，
@@ -807,9 +832,10 @@ H3 CORS／rewrite／error_page parity。
 |---|---|---|
 | M1 生產站可替換 | Day 1–7 | ✅ **完成**（`8294116`，2026-07-28 真站驗收） |
 | M2 生產護欄 | Day 8–15 | ✅ **完成**（矩陣 23/23、原站 M1 回歸 27/27、已上線;浸泡進行中） |
-| M3 接上 Pingora 能力（含 `proxy_cache`） | Day 16–20 | ⬜ 未開始 |
-| M4 可觀測性與運維 | Day 21–24 | ⬜ 未開始 |
-| M5 協議安全與 H3 | Day 25–28 | ⬜ 未開始 |
+| M2.5 協議硬化 | Day 16 | ⬜ 未開始（**由 M5 提前**：先護欄後加速） |
+| M3 接上 Pingora 能力（含 `proxy_cache`） | Day 17–21 | ⬜ 未開始 |
+| M4 可觀測性與運維 | Day 22–25 | ⬜ 未開始 |
+| M5 協議矩陣與 H3 | Day 26–28 | ⬜ 未開始 |
 | M6 發布 | Day 29–34 | ⬜ 未開始 |
 
 > 完成一天就在對應 Day 標題後標上 `✔ <commit>`；完成一個里程碑就更新這張表，

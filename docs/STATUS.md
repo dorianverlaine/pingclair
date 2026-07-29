@@ -387,7 +387,7 @@ RSS 8.81MiB（舊版跑 39 小時是 10.07MiB）。
 ### 反向代理進階
 
 > ⚠️ **`proxy_cache` 已於 2026-07-27 移出這份清單，改列入 v0.2 的 M3**
-> （TODO Day 16–18）。原因：`pingora-cache` 已提供狀態機、cache lock、
+> （TODO Day 17–19）。原因：`pingora-cache` 已提供狀態機、cache lock、
 > eviction、variance 與 predictor，我們只需寫策略與正確性。
 > `stale-while-revalidate`／`stale-if-error` 仍留在 v0.3+。
 
