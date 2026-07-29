@@ -6,10 +6,10 @@
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use pingclair_core::config::{CircuitBreakerConfig, OverloadConfig};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
@@ -46,6 +46,15 @@ pub struct RouteProtection {
     route_slots: Option<Arc<Semaphore>>,
     pending: AtomicUsize,
     backends: ArcSwap<HashMap<SocketAddr, Arc<BackendProtection>>>,
+    /// Load-balancer generation this map was last reconciled against.
+    ///
+    /// Per-address state has to be dropped when its address leaves the pool,
+    /// or a proxy whose upstream moves — which is the normal case once
+    /// hostnames are re-resolved on an interval — accumulates one dead entry
+    /// per move for the lifetime of the process. Comparing a generation counter
+    /// keeps that reconciliation off the request path: one atomic load says
+    /// nothing moved, which is the answer almost every time.
+    reconciled_generation: AtomicU64,
 }
 
 impl RouteProtection {
@@ -69,7 +78,42 @@ impl RouteProtection {
             route_slots,
             pending: AtomicUsize::new(0),
             backends: ArcSwap::from_pointee(HashMap::new()),
+            reconciled_generation: AtomicU64::new(0),
         }
+    }
+
+    /// ♻️ Drops per-address state for backends that have left the pool.
+    ///
+    /// `live` is only consulted when `generation` differs from the last one
+    /// reconciled, so the walk happens once per pool change rather than once
+    /// per request. An address that is still selectable keeps its circuit and
+    /// its capacity accounting untouched — losing those on a refresh would
+    /// silently re-close an open circuit, which is the same class of mistake
+    /// `BackendHealth::rebuilt` exists to avoid.
+    pub fn reconcile_backends(&self, generation: u64, live: impl FnOnce() -> HashSet<SocketAddr>) {
+        if self.reconciled_generation.load(AtomicOrdering::Acquire) == generation {
+            return;
+        }
+        let live = live();
+        self.backends.rcu(|current| {
+            if current.keys().all(|address| live.contains(address)) {
+                return current.clone();
+            }
+            Arc::new(
+                current
+                    .iter()
+                    .filter(|(address, _)| live.contains(*address))
+                    .map(|(address, protection)| (*address, protection.clone()))
+                    .collect::<HashMap<_, _>>(),
+            )
+        });
+        self.reconciled_generation
+            .store(generation, AtomicOrdering::Release);
+    }
+
+    /// 🧮 How many backend addresses currently carry state.
+    pub fn tracked_backends(&self) -> usize {
+        self.backends.load().len()
     }
 
     /// ♻️ Reports whether a hot reload may retain this exact runtime state.
@@ -101,7 +145,7 @@ impl RouteProtection {
 
         let pending = self
             .pending
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |current| {
                 (current < self.overload.max_pending).then_some(current + 1)
             })
             .map_err(|_| {
@@ -238,7 +282,7 @@ impl<'a> PendingGuard<'a> {
 
 impl Drop for PendingGuard<'_> {
     fn drop(&mut self) {
-        self.pending.fetch_sub(1, Ordering::AcqRel);
+        self.pending.fetch_sub(1, AtomicOrdering::AcqRel);
         metrics::ROUTE_PENDING
             .with_label_values(&[self.host, self.route])
             .dec();
@@ -676,5 +720,86 @@ mod tests {
         ));
         drop(held);
         assert!(protection.admit_upstream(address).is_ok());
+    }
+
+    #[test]
+    fn state_for_departed_backends_is_dropped_but_survivors_keep_their_circuit() {
+        // Once hostnames are re-resolved on an interval, an upstream moving to
+        // a new address is routine. Without reconciliation every move leaves a
+        // dead circuit and a dead semaphore behind for the life of the process.
+        let protection = RouteProtection::new(
+            OverloadConfig::default(),
+            CircuitBreakerConfig {
+                consecutive_failures: Some(1),
+                ..Default::default()
+            },
+            "example.com".to_string(),
+            "/*".to_string(),
+            vec!["app:8080".to_string()],
+        );
+
+        let moved: SocketAddr = "10.0.0.1:8080".parse().unwrap();
+        let stayed: SocketAddr = "10.0.0.2:8080".parse().unwrap();
+
+        // Open the circuit on the backend that is going to stay put.
+        let mut admission = protection.admit_upstream(stayed).expect("admitted");
+        admission.report_failure();
+        drop(admission);
+        assert_eq!(protection.phase(stayed), Some(CircuitPhase::Open));
+
+        let mut admission = protection.admit_upstream(moved).expect("admitted");
+        admission.report_failure();
+        drop(admission);
+        assert_eq!(protection.tracked_backends(), 2);
+
+        // The pool republishes without the address that moved.
+        protection.reconcile_backends(1, || HashSet::from([stayed]));
+
+        assert_eq!(
+            protection.tracked_backends(),
+            1,
+            "the departed address must go"
+        );
+        assert_eq!(
+            protection.phase(stayed),
+            Some(CircuitPhase::Open),
+            "a backend that is still in the pool must not have its circuit \
+             silently re-closed by an unrelated address leaving"
+        );
+    }
+
+    #[test]
+    fn reconciliation_is_skipped_while_the_pool_is_unchanged() {
+        // The generation check is what keeps this off the request path: the
+        // live set must not even be computed when nothing moved.
+        let protection = RouteProtection::new(
+            OverloadConfig::default(),
+            CircuitBreakerConfig::default(),
+            "example.com".to_string(),
+            "/*".to_string(),
+            vec!["app:8080".to_string()],
+        );
+        let address: SocketAddr = "10.0.0.1:8080".parse().unwrap();
+        drop(protection.admit_upstream(address).expect("admitted"));
+
+        let mut computed = 0;
+        for _ in 0..5 {
+            protection.reconcile_backends(0, || {
+                computed += 1;
+                HashSet::new()
+            });
+        }
+        assert_eq!(
+            computed, 0,
+            "an unchanged generation must not walk the pool"
+        );
+        assert_eq!(protection.tracked_backends(), 1);
+
+        protection.reconcile_backends(1, || {
+            computed += 1;
+            HashSet::new()
+        });
+        assert_eq!(computed, 1);
+        assert_eq!(protection.tracked_backends(), 0);
     }
 }

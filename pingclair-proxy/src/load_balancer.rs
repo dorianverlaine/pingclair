@@ -290,6 +290,11 @@ pub struct LoadBalancer {
     health_check: Mutex<Option<HealthCheckSettings>>,
     /// Backup pool consulted only when no primary backend is selectable.
     backup: Option<Arc<LoadBalancer>>,
+    /// Bumped every time a new pool is published. Lets a collaborator that
+    /// caches per-address state notice a backend set change with one atomic
+    /// load, instead of walking the pool on every request to find out nothing
+    /// moved.
+    generation: AtomicU64,
 }
 
 // MARK: - Implementation
@@ -399,6 +404,7 @@ impl LoadBalancer {
             resolver,
             health_check: Mutex::new(None),
             backup,
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -509,6 +515,7 @@ impl LoadBalancer {
             settings.as_ref(),
         );
         self.pool.store(Arc::new(pool));
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// Mark a backend as down (passive health check). Called from
@@ -616,6 +623,35 @@ impl LoadBalancer {
                 .as_ref()
                 .and_then(|backup| backup.select_excluding(key, excluded))
         })
+    }
+
+    /// 🔢 Counts how many times a new backend set has been published.
+    ///
+    /// Only ever compared for equality — a caller caches the value it last
+    /// reconciled against and re-reads it per request, so the check has to stay
+    /// a single atomic load.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// 📍 Every address currently selectable, primary and backup.
+    ///
+    /// Walks the pool, so it belongs on a reconciliation path and not on the
+    /// request path. Pair it with [`Self::generation`] to know when to call it.
+    pub fn backend_addresses(&self) -> HashSet<SocketAddr> {
+        let mut addresses = self.live_addresses();
+        if let Some(backup) = &self.backup {
+            addresses.extend(backup.backend_addresses());
+        }
+        addresses
+    }
+
+    fn live_addresses(&self) -> HashSet<SocketAddr> {
+        self.tracked
+            .lock()
+            .iter()
+            .filter_map(|entry| entry.backend.as_ref().and_then(inet_address))
+            .collect()
     }
 
     /// Provides access to the underlying native Pingora load balancer (RoundRobin variant).

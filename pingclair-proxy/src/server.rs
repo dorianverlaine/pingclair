@@ -1253,6 +1253,18 @@ impl PingclairProxy {
             .route_protections
             .get(route_index)
             .and_then(|protection| protection.as_ref());
+
+        // ♻️ Drop protection state for backends that have left the pool. The
+        // load balancer bumps a generation on every republish, so this is one
+        // atomic comparison unless a DNS refresh actually moved something —
+        // without it, an upstream that changes address leaves a dead circuit
+        // and a dead semaphore behind on every move, forever.
+        if let (Some(protection), Some(Some(balancer))) =
+            (protection, state.load_balancers.get(route_index))
+        {
+            protection.reconcile_backends(balancer.generation(), || balancer.backend_addresses());
+        }
+
         let mut local_excluded = excluded.clone();
         let mut rejected = false;
         loop {
