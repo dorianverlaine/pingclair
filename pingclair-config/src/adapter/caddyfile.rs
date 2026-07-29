@@ -1056,6 +1056,7 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
                             between_reads_timeout: None,
                             read_timeout: None,
                             write_timeout: None,
+                            tls: UpstreamTlsConfig::default(),
                         };
                         for t_sub in transport_block.directives {
                             match t_sub.name.as_str() {
@@ -1078,6 +1079,45 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
                                     transport.write_timeout =
                                         Some(parse_required_duration(&t_sub)?);
                                 }
+                                "tls" => {
+                                    expect_no_arguments(&t_sub)?;
+                                    transport.tls.enable = true;
+                                }
+                                "tls_server_name" => {
+                                    transport.tls.server_name =
+                                        Some(expect_one_argument(&t_sub)?.to_string());
+                                }
+                                "tls_trusted_ca_certs" => {
+                                    if t_sub.args.is_empty() {
+                                        return Err(AdapterError::ArgumentCount(
+                                            "tls_trusted_ca_certs".into(),
+                                            1,
+                                            0,
+                                        ));
+                                    }
+                                    transport
+                                        .tls
+                                        .trusted_ca_certs
+                                        .extend(t_sub.args.iter().cloned());
+                                }
+                                "tls_client_auth" => {
+                                    // 🎫 Both halves are required together: a certificate
+                                    // without its key silently becomes an anonymous
+                                    // handshake that the upstream rejects much later.
+                                    if t_sub.args.len() != 2 {
+                                        return Err(AdapterError::ArgumentCount(
+                                            "tls_client_auth".into(),
+                                            2,
+                                            t_sub.args.len(),
+                                        ));
+                                    }
+                                    transport.tls.client_cert = Some(t_sub.args[0].clone());
+                                    transport.tls.client_key = Some(t_sub.args[1].clone());
+                                }
+                                "tls_insecure_skip_verify" => {
+                                    expect_no_arguments(&t_sub)?;
+                                    transport.tls.insecure_skip_verify = true;
+                                }
                                 _ => {
                                     return Err(AdapterError::UnknownDirective(format!(
                                         "transport http: {}",
@@ -1086,6 +1126,7 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
                                 }
                             }
                         }
+                        validate_upstream_tls(&transport.tls)?;
                         proxy.transport = Some(transport);
                     }
                 }
@@ -1396,6 +1437,55 @@ fn parse_dns_refresh(value: &str) -> Result<u64, AdapterError> {
         return Err(invalid());
     }
     Ok(millis / 1_000)
+}
+
+/// 🔐 Rejects upstream TLS blocks whose directives contradict each other.
+///
+/// Both cases below are configurations where one directive silently cancels
+/// another, so the operator's stated intent and the resulting security posture
+/// differ. Refusing to load is the only outcome that cannot be misread.
+fn validate_upstream_tls(tls: &UpstreamTlsConfig) -> Result<(), AdapterError> {
+    if tls.insecure_skip_verify && !tls.trusted_ca_certs.is_empty() {
+        return Err(AdapterError::InvalidArgument(
+            "tls_insecure_skip_verify".into(),
+            "cannot be combined with tls_trusted_ca_certs: skipping verification \
+             would make the configured trust roots meaningless"
+                .into(),
+        ));
+    }
+    if tls.insecure_skip_verify && tls.server_name.is_some() {
+        return Err(AdapterError::InvalidArgument(
+            "tls_insecure_skip_verify".into(),
+            "cannot be combined with tls_server_name: the name would be sent as \
+             SNI but never verified"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// 🚩 Accepts a bare flag directive, rejecting stray arguments instead of dropping them.
+fn expect_no_arguments(directive: &Directive) -> Result<(), AdapterError> {
+    if directive.args.is_empty() {
+        return Ok(());
+    }
+    Err(AdapterError::ArgumentCount(
+        directive.name.clone(),
+        0,
+        directive.args.len(),
+    ))
+}
+
+/// 🏷️ Reads exactly one argument, rejecting both none and extras.
+fn expect_one_argument(directive: &Directive) -> Result<&str, AdapterError> {
+    if directive.args.len() != 1 {
+        return Err(AdapterError::ArgumentCount(
+            directive.name.clone(),
+            1,
+            directive.args.len(),
+        ));
+    }
+    Ok(directive.args[0].as_str())
 }
 
 /// ⏱️ Parses one mandatory, positive duration argument without permissive fallback.
@@ -1994,6 +2084,174 @@ mod global_tests {
         } else {
             panic!("Expected Proxy handler");
         }
+    }
+
+    /// 🧪 Adapts one `reverse_proxy` source and returns its proxy handler.
+    fn proxy_from(source: &str) -> ProxyConfig {
+        let directives = parse(source).expect("parses");
+        let ast = adapt(directives).expect("adapts");
+        let routes = ast.servers[0].inner.routes.as_ref().expect("routes");
+        match &routes.inner.arms[0].inner.handler {
+            Handler::Proxy(proxy) => (**proxy).clone(),
+            other => panic!("expected a Proxy handler, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upstream_tls_directives_reach_the_transport_block() {
+        // Setup scenarios
+        let proxy = proxy_from(
+            r#"
+            api.example.com {
+                listen :80
+                reverse_proxy https://backend.internal:8443 {
+                    transport http {
+                        tls
+                        tls_server_name origin.internal
+                        tls_trusted_ca_certs /etc/pingclair/internal-ca.pem
+                        tls_client_auth /etc/pingclair/client.crt /etc/pingclair/client.key
+                    }
+                }
+            }
+        "#,
+        );
+
+        // Verification
+        let tls = &proxy.transport.as_ref().expect("transport").tls;
+        assert!(tls.enable);
+        assert_eq!(tls.server_name.as_deref(), Some("origin.internal"));
+        assert_eq!(tls.trusted_ca_certs, vec!["/etc/pingclair/internal-ca.pem"]);
+        assert_eq!(
+            tls.client_cert.as_deref(),
+            Some("/etc/pingclair/client.crt")
+        );
+        assert_eq!(tls.client_key.as_deref(), Some("/etc/pingclair/client.key"));
+        assert!(
+            !tls.insecure_skip_verify,
+            "verification must stay on unless it is asked for by name"
+        );
+    }
+
+    #[test]
+    fn several_trusted_ca_bundles_accumulate_in_order() {
+        // Setup scenarios
+        let proxy = proxy_from(
+            r#"
+            :80 {
+                reverse_proxy https://backend:8443 {
+                    transport http {
+                        tls_trusted_ca_certs /a.pem /b.pem
+                        tls_trusted_ca_certs /c.pem
+                    }
+                }
+            }
+        "#,
+        );
+
+        // Verification
+        assert_eq!(
+            proxy
+                .transport
+                .as_ref()
+                .expect("transport")
+                .tls
+                .trusted_ca_certs,
+            vec!["/a.pem", "/b.pem", "/c.pem"]
+        );
+    }
+
+    /// 🧪 Adapts a source expected to be rejected, returning the error.
+    fn adapt_error(source: &str) -> AdapterError {
+        let directives = parse(source).expect("parses");
+        adapt(directives).expect_err("must be rejected")
+    }
+
+    #[test]
+    fn a_lone_client_certificate_is_rejected_at_config_time() {
+        // Setup scenarios & Verification
+        //
+        // Accepting this would produce an anonymous handshake, and the
+        // upstream's rejection would arrive as an opaque TLS alert at the
+        // first request rather than as a message about the config.
+        let error = adapt_error(
+            r#"
+            :80 {
+                reverse_proxy https://backend:8443 {
+                    transport http { tls_client_auth /only.crt }
+                }
+            }
+        "#,
+        );
+        assert!(
+            matches!(&error, AdapterError::ArgumentCount(name, 2, 1) if name == "tls_client_auth"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn skipping_verification_cannot_be_combined_with_pinned_roots() {
+        // Setup scenarios & Verification
+        let error = adapt_error(
+            r#"
+            :80 {
+                reverse_proxy https://backend:8443 {
+                    transport http {
+                        tls_trusted_ca_certs /internal-ca.pem
+                        tls_insecure_skip_verify
+                    }
+                }
+            }
+        "#,
+        );
+        let message = format!("{error}");
+        assert!(
+            message.contains("tls_trusted_ca_certs"),
+            "the diagnostic must name the directive being cancelled: {message}"
+        );
+    }
+
+    #[test]
+    fn skipping_verification_cannot_be_combined_with_an_sni_override() {
+        // Setup scenarios & Verification
+        let error = adapt_error(
+            r#"
+            :80 {
+                reverse_proxy https://backend:8443 {
+                    transport http {
+                        tls_server_name origin.internal
+                        tls_insecure_skip_verify
+                    }
+                }
+            }
+        "#,
+        );
+        let message = format!("{error}");
+        assert!(
+            message.contains("tls_server_name"),
+            "the diagnostic must name the directive being cancelled: {message}"
+        );
+    }
+
+    #[test]
+    fn a_bare_tls_flag_rejects_stray_arguments() {
+        // Setup scenarios & Verification
+        //
+        // Caddy's `tls` inside `transport http` takes no arguments. Dropping
+        // an argument silently would let a typo such as `tls off` read as
+        // "enable TLS".
+        let error = adapt_error(
+            r#"
+            :80 {
+                reverse_proxy backend:8443 {
+                    transport http { tls off }
+                }
+            }
+        "#,
+        );
+        assert!(
+            matches!(&error, AdapterError::ArgumentCount(name, 0, 1) if name == "tls"),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]

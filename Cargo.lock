@@ -2247,6 +2247,7 @@ dependencies = [
  "pingora",
  "pingora-core",
  "pingora-proxy",
+ "rcgen",
  "reqwest",
  "rustls 0.23.42",
  "serde_json",

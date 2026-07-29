@@ -540,6 +540,25 @@ pub struct TransportConfig {
     pub between_reads_timeout: Option<u64>,
     pub read_timeout: Option<u64>,  // milliseconds
     pub write_timeout: Option<u64>, // milliseconds
+    /// 🔐 Upstream TLS trust, identity, and SNI for this transport.
+    pub tls: UpstreamTlsConfig,
+}
+
+/// 🔐 Upstream TLS settings collected from a `transport http` block.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpstreamTlsConfig {
+    /// 🔒 `tls` — speak TLS regardless of the upstream address scheme.
+    pub enable: bool,
+    /// 🏷️ `tls_server_name <name>` — SNI and verification name override.
+    pub server_name: Option<String>,
+    /// 📜 `tls_trusted_ca_certs <pem>...` — trust roots replacing the system store.
+    pub trusted_ca_certs: Vec<String>,
+    /// 🎫 `tls_client_auth <cert> <key>` — certificate half of mutual TLS.
+    pub client_cert: Option<String>,
+    /// 🔑 `tls_client_auth <cert> <key>` — key half of mutual TLS.
+    pub client_key: Option<String>,
+    /// ⚠️ `tls_insecure_skip_verify` — accept any upstream certificate.
+    pub insecure_skip_verify: bool,
 }
 
 /// 🔁 Typed retry policy produced by the Pingclairfile adapter.

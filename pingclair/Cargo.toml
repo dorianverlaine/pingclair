@@ -58,5 +58,6 @@ uuid = { version = "1.0", features = ["v4"] }
 flate2 = "1.0"
 libc = "0.2"
 h2.workspace = true
+rcgen.workspace = true
 bytes.workspace = true
 http.workspace = true

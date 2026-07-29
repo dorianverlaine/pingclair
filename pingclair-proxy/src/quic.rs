@@ -1980,6 +1980,17 @@ async fn reverse_proxy_upstream(
     let mut attempts = 0usize;
     let mut excluded = HashSet::new();
 
+    // 🔐 The H3 bridge answers the same routes as the Pingora path, so it
+    // enforces the same rule: a route whose upstream TLS material did not load
+    // refuses rather than connecting without the trust it was configured with.
+    let tls_policy = state.upstream_tls_for(route_index).map_err(|()| {
+        tracing::error!(
+            route = route_index,
+            "🚫 Refusing to dispatch: this route's upstream TLS material did not load"
+        );
+        (500, "Upstream TLS Configuration Error")
+    })?;
+
     let (mut session, peer, mut request_deadline, _upstream_admission) = loop {
         if attempts > 0 {
             let delay = crate::retry::backoff(&retry_policy);
@@ -2032,6 +2043,7 @@ async fn reverse_proxy_upstream(
             proxy_config.as_ref(),
             attempt_budget,
             attempt_budget,
+            tls_policy,
         );
         // ⌛ The retry total bounds response-header wait even when phase timers are longer.
         peer.options.read_timeout = match (peer.options.read_timeout, retry_budget) {
@@ -2069,7 +2081,7 @@ async fn reverse_proxy_upstream(
             }
         };
         let upstream_is_h2 = matches!(&session, HttpSession::H2(_));
-        if peer.group_key == 4 && !upstream_is_h2 {
+        if crate::server::peer_requires_h2_alpn(&peer) && !upstream_is_h2 {
             if let Some(admission) = &mut admission {
                 admission.report_failure();
             }

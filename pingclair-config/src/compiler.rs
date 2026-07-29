@@ -533,6 +533,8 @@ fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<(
                         .to_string(),
                 });
             }
+
+            validate_upstream_tls(&proxy.upstream_tls)?;
         }
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::Handle { handlers }
@@ -549,6 +551,44 @@ fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<(
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// 🔐 Rejects upstream TLS settings whose parts cancel each other out.
+///
+/// The Pingclairfile adapter refuses the same combinations, but this is the
+/// check that protects the JSON path — the Admin API accepts a configuration
+/// document directly and never passes through the adapter, so a rule enforced
+/// only there is a rule an operator can post straight past.
+fn validate_upstream_tls(tls: &pingclair_core::config::UpstreamTlsConfig) -> CompileResult<()> {
+    if let Err(message) = tls.client_identity() {
+        return Err(CompileError::InvalidRoute {
+            message: message.to_string(),
+        });
+    }
+    if tls.insecure_skip_verify && !tls.trusted_ca_certs.is_empty() {
+        return Err(CompileError::InvalidRoute {
+            message: "upstream_tls cannot set insecure_skip_verify together with \
+                      trusted_ca_certs: the configured roots would never be consulted"
+                .to_string(),
+        });
+    }
+    if tls.insecure_skip_verify && tls.server_name.is_some() {
+        return Err(CompileError::InvalidRoute {
+            message: "upstream_tls cannot set insecure_skip_verify together with \
+                      server_name: the name would be sent as SNI but never verified"
+                .to_string(),
+        });
+    }
+    if tls
+        .trusted_ca_certs
+        .iter()
+        .any(|path| path.trim().is_empty())
+    {
+        return Err(CompileError::InvalidRoute {
+            message: "upstream_tls trusted_ca_certs entries must be non-empty paths".to_string(),
+        });
     }
     Ok(())
 }
@@ -730,6 +770,7 @@ fn compile_handler(handler: &Handler) -> CompileResult<HandlerConfig> {
                     half_open_requests: proxy.circuit_breaker.half_open_requests,
                     failure_statuses: proxy.circuit_breaker.failure_statuses.clone(),
                 }),
+                upstream_tls: Box::new(pingclair_core::config::UpstreamTlsConfig::default()),
             };
 
             if let Some(policy) = &proxy.lb_policy {
@@ -761,6 +802,14 @@ fn compile_handler(handler: &Handler) -> CompileResult<HandlerConfig> {
                 config.between_reads_timeout = transport.between_reads_timeout.map(|ms| ms as i64);
                 config.read_timeout = transport.read_timeout.map(|ms| ms as i64);
                 config.write_timeout = transport.write_timeout.map(|ms| ms as i64);
+                config.upstream_tls = Box::new(pingclair_core::config::UpstreamTlsConfig {
+                    enable: transport.tls.enable,
+                    server_name: transport.tls.server_name.clone(),
+                    trusted_ca_certs: transport.tls.trusted_ca_certs.clone(),
+                    client_cert: transport.tls.client_cert.clone(),
+                    client_key: transport.tls.client_key.clone(),
+                    insecure_skip_verify: transport.tls.insecure_skip_verify,
+                });
             }
 
             Ok(HandlerConfig::ReverseProxy(config))
