@@ -18,8 +18,8 @@ use pingora_proxy::{ProxyHttp, Session};
 
 use arc_swap::ArcSwap;
 use async_recursion::async_recursion;
-use std::collections::HashMap;
-use std::net::IpAddr;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -98,6 +98,14 @@ pub struct RequestContext {
     download_pacer: Option<BandwidthPacer>,
     /// ⏱️ Whether the last exhausted upstream failed specifically by connect timeout.
     upstream_connect_timed_out: bool,
+    /// 🔢 Number of upstream attempts already started for this request.
+    retry_attempts: usize,
+    /// ⌛ Request-local deadline shared by retry attempts and backoff.
+    retry_deadline: Option<std::time::Instant>,
+    /// 💤 Whether the next upstream selection must apply retry backoff.
+    retry_pending: bool,
+    /// 🔁 Backends already attempted during the current redispatch cycle.
+    retry_excluded: HashSet<SocketAddr>,
 }
 
 impl Default for RequestContext {
@@ -128,6 +136,10 @@ impl Default for RequestContext {
             upload_pacer: None,
             download_pacer: None,
             upstream_connect_timed_out: false,
+            retry_attempts: 0,
+            retry_deadline: None,
+            retry_pending: false,
+            retry_excluded: HashSet::new(),
         }
     }
 }
@@ -1134,21 +1146,34 @@ impl PingclairProxy {
         (**self.default.load()).clone()
     }
 
-    /// Select an upstream using the load balancer
-    pub(crate) fn select_upstream(
+    /// 🔁 Selects a healthy backend outside the current request's attempted set.
+    pub(crate) fn select_upstream_excluding(
         &self,
         state: &ProxyState,
         route_index: usize,
         remote_addr: Option<&[u8]>,
+        excluded: &HashSet<SocketAddr>,
     ) -> Option<Upstream> {
+        state
+            .load_balancers
+            .get(route_index)
+            .and_then(|load_balancer| load_balancer.as_ref())
+            .and_then(|load_balancer| load_balancer.select_excluding(remote_addr, excluded))
+    }
+
+    /// 🔻 Applies the existing passive-health cooldown to one route backend.
+    pub(crate) fn mark_upstream_unhealthy(
+        &self,
+        state: &ProxyState,
+        route_index: usize,
+        address: &SocketAddr,
+    ) {
         if let Some(load_balancer) = state
             .load_balancers
             .get(route_index)
-            .and_then(|lb| lb.as_ref())
+            .and_then(|load_balancer| load_balancer.as_ref())
         {
-            load_balancer.select(remote_addr)
-        } else {
-            None
+            load_balancer.mark_unhealthy(address);
         }
     }
 
@@ -1350,6 +1375,20 @@ impl PingclairProxy {
         Ok(())
     }
 
+    /// 🔁 Returns a gateway timeout when the route's total retry budget expired.
+    fn enforce_retry_deadline(ctx: &RequestContext) -> pingora_core::Result<()> {
+        if ctx
+            .retry_deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return pingora_core::Error::e_explain(
+                pingora_core::ErrorType::HTTPStatus(504),
+                "upstream retry timeout exceeded",
+            );
+        }
+        Ok(())
+    }
+
     /// 📥 Enforces one streamed request-body chunk without retaining it.
     async fn enforce_request_body_chunk(
         session: &mut Session,
@@ -1357,6 +1396,7 @@ impl PingclairProxy {
         bytes: usize,
     ) -> pingora_core::Result<()> {
         Self::enforce_request_deadline(ctx)?;
+        Self::enforce_retry_deadline(ctx)?;
         ctx.request_body_bytes = ctx.request_body_bytes.saturating_add(bytes as u64);
         if ctx.state.as_ref().is_some_and(|state| {
             let limit = state.config.client_max_body_size;
@@ -2442,7 +2482,7 @@ impl ProxyHttp for PingclairProxy {
         Self::enforce_request_body_chunk(session, ctx, bytes.len()).await
     }
 
-    /// Called for each request to determine the upstream
+    /// 🔁 Selects one upstream while enforcing request-local retry bounds.
     async fn upstream_peer(
         &self,
         session: &mut Session,
@@ -2451,8 +2491,6 @@ impl ProxyHttp for PingclairProxy {
     where
         Self::CTX: Send + Sync,
     {
-        // Route should be matched in request_filter
-
         let route_index = if let Some(index) = ctx.route_index {
             index
         } else {
@@ -2470,10 +2508,9 @@ impl ProxyHttp for PingclairProxy {
                 IpAddr::V6(ip) => ip.octets().to_vec(),
             });
 
-        // 🛑 SAFETY: state must have been set by request_filter. If it wasn't
-        // (e.g. no virtual host matched), fail gracefully instead of panic.
-        let state = match ctx.state.as_ref() {
-            Some(s) => s,
+        // 🛑 A matched route must retain its immutable state across redispatch attempts.
+        let state = match ctx.state.clone() {
+            Some(state) => state,
             None => {
                 tracing::warn!(
                     "⚠️ upstream_peer called with no state in context — no virtual host matched"
@@ -2483,11 +2520,60 @@ impl ProxyHttp for PingclairProxy {
                 ));
             }
         };
-        if let Some(upstream) = self.select_upstream(state, route_index, client_ip.as_deref()) {
+
+        let proxy_config = self.get_proxy_config(&state, route_index);
+        let retry_policy = proxy_config
+            .as_ref()
+            .map(|config| config.retry.clone())
+            .unwrap_or_default();
+        if ctx.retry_attempts == 0 {
+            ctx.retry_deadline = crate::retry::deadline(ctx.start_time, &retry_policy);
+        }
+        if ctx.retry_pending {
+            let delay = crate::retry::backoff(&retry_policy);
+            if !delay.is_zero() {
+                tracing::debug!(
+                    route = route_index,
+                    attempt = ctx.retry_attempts + 1,
+                    backoff_ms = delay.as_millis(),
+                    "💤 Waiting before the next upstream attempt"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            ctx.retry_pending = false;
+        }
+        if ctx
+            .retry_deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return pingora_core::Error::e_explain(
+                pingora_core::ErrorType::HTTPStatus(504),
+                "upstream retry deadline exceeded",
+            );
+        }
+
+        let mut upstream = self.select_upstream_excluding(
+            &state,
+            route_index,
+            client_ip.as_deref(),
+            &ctx.retry_excluded,
+        );
+        if upstream.is_none() && !ctx.retry_excluded.is_empty() {
+            // ♻️ A status policy may revisit a backend after every candidate was tried once.
+            ctx.retry_excluded.clear();
+            upstream = self.select_upstream_excluding(
+                &state,
+                route_index,
+                client_ip.as_deref(),
+                &ctx.retry_excluded,
+            );
+        }
+
+        if let Some(upstream) = upstream {
+            ctx.retry_attempts += 1;
             ctx.upstream = Some(upstream.clone()); // Backend is light to clone
 
             Self::enforce_request_deadline(ctx)?;
-            let proxy_config = self.get_proxy_config(state, route_index);
             if let Some(proxy_config) = &proxy_config {
                 ctx.headers_upstream = proxy_config.headers_up.clone();
                 ctx.response_headers
@@ -2497,19 +2583,26 @@ impl ProxyHttp for PingclairProxy {
             let request_budget = ctx
                 .request_deadline
                 .and_then(|deadline| deadline.checked_duration_since(std::time::Instant::now()));
+            let retry_budget = ctx
+                .retry_deadline
+                .and_then(|deadline| deadline.checked_duration_since(std::time::Instant::now()));
+            let attempt_budget = shortest_duration(request_budget, retry_budget);
             let read_budget = match state.config.limits.long_connections.idle_timeout_ms {
                 Some(0) => None,
                 Some(value) => Some(Duration::from_millis(value)),
-                None => request_budget,
+                None => attempt_budget,
             };
 
             // 🌐 Builds the peer through the transport-neutral timeout policy.
-            return Ok(Box::new(Self::build_http_peer(
+            let mut peer = Self::build_http_peer(
                 &upstream,
                 proxy_config.as_ref(),
-                request_budget,
+                attempt_budget,
                 read_budget,
-            )));
+            );
+            // ⌛ A configured retry total is a hard bound, even when phase timers are longer.
+            peer.options.read_timeout = shortest_duration(peer.options.read_timeout, retry_budget);
+            return Ok(Box::new(peer));
         }
 
         // ⏱️ Preserve a 504 when a connect timeout exhausted the selectable pool.
@@ -2640,16 +2733,17 @@ impl ProxyHttp for PingclairProxy {
         Ok(())
     }
 
-    /// 🚫 Rejects upstream trailers before a response can lose integrity metadata.
+    /// 🔁 Redispatches configured status responses before committing downstream headers.
     async fn upstream_response_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_response: &mut ResponseHeader,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> pingora_core::Result<()>
     where
         Self::CTX: Send + Sync,
     {
+        Self::enforce_retry_deadline(ctx)?;
         if upstream_response.headers.contains_key("trailer") {
             tracing::warn!(
                 "🚫 Rejecting an upstream response that requires unsupported trailer forwarding"
@@ -2658,6 +2752,46 @@ impl ProxyHttp for PingclairProxy {
                 pingora_core::ErrorType::HTTPStatus(502),
                 "Upstream response trailers are unsupported",
             );
+        }
+
+        let retry_policy = ctx
+            .state
+            .as_ref()
+            .zip(ctx.route_index)
+            .and_then(|(state, route_index)| self.get_proxy_config(state, route_index))
+            .map(|config| config.retry)
+            .unwrap_or_default();
+        let method = session.req_header().method.clone();
+        let body_is_empty = session.as_mut().is_body_empty();
+        let status = upstream_response.status.as_u16();
+        if crate::retry::permits_status_retry(
+            &retry_policy,
+            &method,
+            body_is_empty,
+            status,
+            ctx.retry_attempts,
+            ctx.retry_deadline,
+        ) {
+            if let Some(upstream) = ctx.upstream.as_ref()
+                && let pingora_core::protocols::l4::socket::SocketAddr::Inet(address) =
+                    &upstream.addr
+            {
+                ctx.retry_excluded.insert(*address);
+            }
+            ctx.retry_pending = true;
+            tracing::warn!(
+                status,
+                method = %method,
+                attempt = ctx.retry_attempts,
+                max_attempts = retry_policy.max_attempts,
+                "🔁 Redispatching a bodyless request after an upstream status"
+            );
+            let mut error = pingora_core::Error::explain(
+                pingora_core::ErrorType::HTTPStatus(status),
+                "configured upstream status retry",
+            );
+            error.retry = true.into();
+            return Err(error);
         }
         Ok(())
     }
@@ -2787,6 +2921,7 @@ impl ProxyHttp for PingclairProxy {
         ctx: &mut Self::CTX,
     ) -> pingora_core::Result<Option<Duration>> {
         Self::enforce_request_deadline(ctx)?;
+        Self::enforce_retry_deadline(ctx)?;
         // Track response bytes for access log
         if let Some(b) = body.as_ref() {
             ctx.response_bytes += b.len() as u64;
@@ -2808,20 +2943,22 @@ impl ProxyHttp for PingclairProxy {
                 "download rate budget exceeds whole-request deadline",
             );
         }
+        if delay.is_some_and(|delay| {
+            ctx.retry_deadline
+                .is_some_and(|deadline| std::time::Instant::now() + delay >= deadline)
+        }) {
+            return pingora_core::Error::e_explain(
+                pingora_core::ErrorType::HTTPStatus(504),
+                "download rate budget exceeds upstream retry deadline",
+            );
+        }
         Ok(delay)
     }
 
-    /// Called when establishing the connection to the selected upstream fails.
+    /// 🔌 Handles a connection failure before any request bytes reach an upstream.
     ///
-    /// Passive health check with nginx `max_fails`/`fail_timeout` semantics:
-    /// the failed backend is marked down on the route's load balancer (see
-    /// [`LoadBalancer::mark_unhealthy`]) so `select` skips it for
-    /// [`crate::FAIL_COOLDOWN`], and the error is marked retryable so
-    /// Pingora's retry loop calls `upstream_peer` again *within the same
-    /// request* — the client sees a single slightly-slower request instead
-    /// of a 502, as long as another backend is up. Retrying is safe here
-    /// because the connection never came up: no part of the request was
-    /// sent to the failed peer.
+    /// 🔁 Passive health removes the failed backend from selection, while the
+    /// route policy bounds whether Pingora may make another safe attempt.
     fn fail_to_connect(
         &self,
         _session: &mut Session,
@@ -2834,21 +2971,32 @@ impl ProxyHttp for PingclairProxy {
             pingora_core::ErrorType::ConnectTimedout
                 | pingora_core::ErrorType::TLSHandshakeTimedout
         );
-        if let (Some(state), Some(route_index)) = (ctx.state.as_ref(), ctx.route_index)
-            && let Some(lb) = state
-                .load_balancers
-                .get(route_index)
-                .and_then(|l| l.as_ref())
-            && let pingora_core::protocols::l4::socket::SocketAddr::Inet(addr) = peer.address()
-        {
-            tracing::warn!(
-                "🔻 Marking upstream {} down after connect failure (cooldown {:?})",
-                addr,
-                crate::FAIL_COOLDOWN
-            );
-            lb.mark_unhealthy(addr);
+        if let pingora_core::protocols::l4::socket::SocketAddr::Inet(address) = peer.address() {
+            ctx.retry_excluded.insert(*address);
+            if let (Some(state), Some(route_index)) = (ctx.state.as_ref(), ctx.route_index) {
+                tracing::warn!(
+                    "🔻 Marking upstream {} down after connect failure (cooldown {:?})",
+                    address,
+                    crate::FAIL_COOLDOWN
+                );
+                self.mark_upstream_unhealthy(state, route_index, address);
+            }
         }
-        e.retry = true.into();
+
+        let retry_policy = ctx
+            .state
+            .as_ref()
+            .zip(ctx.route_index)
+            .and_then(|(state, route_index)| self.get_proxy_config(state, route_index))
+            .map(|config| config.retry)
+            .unwrap_or_default();
+        let retry = crate::retry::permits_another_attempt(
+            &retry_policy,
+            ctx.retry_attempts,
+            ctx.retry_deadline,
+        );
+        ctx.retry_pending = retry;
+        e.retry = retry.into();
         e
     }
 

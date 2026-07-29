@@ -147,6 +147,21 @@ commit `0d2e05247e186ed205ad7c1a8c1c98de53282b5b`。
   所以仍是 🧪，不是 ✅。H3 extended CONNECT／WebSocket 仍為既有 501。
   Pingora 0.8 對 H1/H2 只有一個 upstream read timer，兩階段採較嚴格值；
   pre-routing header／H2 field-section／H1/H2 connection 上限變更目前需要 restart。
+- **可配置 retry／redispatch（Day 9，本機 2026-07-29）** —
+  `reverse_proxy retry` 已涵蓋最大嘗試次數、總時限、固定 backoff、狀態碼與方法；
+  舊 JSON 未出現該欄位時維持最多 16 次 connect-before-send failover，且不因 status
+  重試。H1/H2 與獨立 H3 bridge 共用 policy；status redispatch 只接受設定允許的
+  冪等方法與實際無 body 的 request，connect-before-send 則仍可安全切換。
+- **本機證據** — 真 binary 覆蓋嘗試上限、503→200、最終 503、backoff、總時限、
+  POST 不重送，以及已允許的 PUT 帶 20 MiB body 仍只串流一次；四種 LB strategy
+  的 request-local 排除與 H3 503→200 另有單元測試。完整 locked gate 共
+  **368 tests** 全綠。修正前的 status regression 保留於
+  `benchmarks/results/20260729_day9_local_failed_status_retry/`；另外五個獨立目錄
+  保留 20 MiB 上限、backend 順序、closed downstream reuse 與 large-enum clippy
+  等 fixture／gate 失敗。
+- **仍缺** — 乾淨 Linux release、VPS 與真 QUIC client 矩陣留到 Day 15；
+  所以仍是 🧪，不是 ✅。非冪等 body replay、AI POST fallback、exponential／jitter、
+  `Retry-After` 與有上限的 memory／disk replay policy 未實作。
 
 ### 安全與身分
 

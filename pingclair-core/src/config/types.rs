@@ -766,6 +766,53 @@ pub struct ReverseProxyConfig {
 
     /// 🌊 Maximum pause allowed between upstream response-body reads.
     pub between_reads_timeout: Option<i64>,
+
+    /// 🔁 Bounded redispatch policy for this reverse-proxy route.
+    #[serde(default)]
+    pub retry: Box<RetryConfig>,
+}
+
+/// 🔁 Controls safe, request-local upstream redispatch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetryConfig {
+    /// 🔢 Maximum upstream attempts, including the initial attempt.
+    #[serde(default = "default_retry_attempts")]
+    pub max_attempts: usize,
+    /// ⌛ Maximum elapsed time across every attempt and backoff.
+    #[serde(default)]
+    pub total_timeout_ms: Option<u64>,
+    /// 💤 Fixed delay before each retry.
+    #[serde(default)]
+    pub backoff_ms: u64,
+    /// 🔄 Upstream status codes that trigger redispatch before response commit.
+    #[serde(default)]
+    pub status_codes: Vec<u16>,
+    /// 🛡️ Idempotent methods eligible for status-code redispatch.
+    #[serde(default = "default_retry_methods")]
+    pub methods: Vec<String>,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_retry_attempts(),
+            total_timeout_ms: None,
+            backoff_ms: 0,
+            status_codes: Vec::new(),
+            methods: default_retry_methods(),
+        }
+    }
+}
+
+fn default_retry_attempts() -> usize {
+    16
+}
+
+fn default_retry_methods() -> Vec<String> {
+    ["GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 /// Load balancing configuration
@@ -1137,6 +1184,9 @@ mod tests {
         assert_eq!(config.connect_timeout, None);
         assert_eq!(config.first_byte_timeout, None);
         assert_eq!(config.between_reads_timeout, None);
+        assert_eq!(*config.retry, RetryConfig::default());
+        assert_eq!(config.retry.max_attempts, 16);
+        assert!(config.retry.status_codes.is_empty());
     }
 
     #[test]

@@ -231,6 +231,13 @@ example.com {
     }
 
     reverse_proxy app:8080 {
+        retry {
+            max_attempts 4
+            total_timeout 2s
+            backoff 50ms
+            status_codes 429 502 503 504
+            methods GET HEAD
+        }
         transport http {
             connect_timeout 3s
             first_byte_timeout 30s
@@ -239,6 +246,14 @@ example.com {
     }
 }
 ```
+
+`max_attempts` inclut la première tentative. Un échec de connexion peut être
+retenté sans risque, puisqu'aucun octet de la requête n'a atteint ce backend.
+Une nouvelle tentative déclenchée par le statut exige une méthode idempotente
+configurée et une requête réellement sans body ; Pingclair ne met jamais un
+body en mémoire tampon et ne le rejoue pas pour cette politique. Sans bloc
+`retry`, la limite historique de repli après échec de connexion est conservée
+et aucun statut de réponse n'est retenté.
 
 Les dépassements d'en-têtes, de body et de durée totale reçoivent une erreur
 HTTP explicite tant que le protocole peut encore l'envoyer ; les transports

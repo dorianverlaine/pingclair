@@ -222,6 +222,13 @@ mod tests {
                     }
                 }
                 reverse_proxy 127.0.0.1:9000 {
+                    retry {
+                        max_attempts 4
+                        total_timeout 2s
+                        backoff 50ms
+                        status_codes 429 502 503 504
+                        methods GET HEAD PUT
+                    }
                     transport http {
                         connect_timeout 100ms
                         first_byte_timeout 200ms
@@ -251,6 +258,11 @@ mod tests {
         assert_eq!(proxy.first_byte_timeout, Some(200));
         assert_eq!(proxy.between_reads_timeout, Some(300));
         assert_eq!(proxy.write_timeout, Some(400));
+        assert_eq!(proxy.retry.max_attempts, 4);
+        assert_eq!(proxy.retry.total_timeout_ms, Some(2_000));
+        assert_eq!(proxy.retry.backoff_ms, 50);
+        assert_eq!(proxy.retry.status_codes, vec![429, 502, 503, 504]);
+        assert_eq!(proxy.retry.methods, vec!["GET", "HEAD", "PUT"]);
     }
 
     #[test]
@@ -261,9 +273,48 @@ mod tests {
             ":8080 { limits { max_headers 0 } respond \"ok\" }",
             ":8080 { limits { request_timeout 18446744073709551615m } respond \"ok\" }",
             ":8080 { reverse_proxy 127.0.0.1:9000 { transport http { first_byte_timeout nope } } }",
+            ":8080 { reverse_proxy 127.0.0.1:9000 { retry { max_attempts 17 } } }",
+            ":8080 { reverse_proxy 127.0.0.1:9000 { retry { methods GET POST } } }",
+            ":8080 { reverse_proxy 127.0.0.1:9000 { retry { methods GET GET } } }",
+            ":8080 { reverse_proxy 127.0.0.1:9000 { retry { status_codes 200 } } }",
+            ":8080 { reverse_proxy 127.0.0.1:9000 { retry { status_codes 503 503 } } }",
+            ":8080 { reverse_proxy 127.0.0.1:9000 { retry { total_timeout 10ms backoff 10ms } } }",
+            ":8080 { reverse_proxy 127.0.0.1:9000 { retry { statu_codes 503 } } }",
         ] {
             assert!(compile(source).is_err(), "{source} must fail");
         }
+    }
+
+    #[test]
+    fn legacy_json_keeps_connect_only_retry_and_unsafe_json_fails_closed() {
+        let legacy_source = serde_json::json!({
+            "servers": [{
+                "listen": ["127.0.0.1:8080"],
+                "routes": [{
+                    "path": "/*",
+                    "handler": {
+                        "type": "reverse_proxy",
+                        "upstreams": ["127.0.0.1:9000"]
+                    }
+                }]
+            }]
+        });
+        let legacy: PingclairConfig = serde_json::from_value(legacy_source.clone()).unwrap();
+        compiler::validate_config(&legacy).unwrap();
+        let HandlerConfig::ReverseProxy(proxy) = &legacy.servers[0].routes[0].handler else {
+            panic!("expected reverse proxy");
+        };
+        assert_eq!(proxy.retry.max_attempts, 16);
+        assert!(proxy.retry.status_codes.is_empty());
+
+        let mut unsafe_source = legacy_source;
+        unsafe_source["servers"][0]["routes"][0]["handler"]["retry"] = serde_json::json!({
+            "max_attempts": 2,
+            "status_codes": [503],
+            "methods": ["POST"]
+        });
+        let unsafe_config: PingclairConfig = serde_json::from_value(unsafe_source).unwrap();
+        assert!(compiler::validate_config(&unsafe_config).is_err());
     }
 
     #[test]

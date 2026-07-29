@@ -28,7 +28,7 @@ use pingora_load_balancing::discovery::Static;
 use pingora_load_balancing::prelude::RoundRobin;
 use pingora_load_balancing::selection::consistent::KetamaHashing;
 use pingora_load_balancing::selection::{BackendIter, BackendSelection};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -176,14 +176,14 @@ impl LeastConnTracker {
     /// Select the upstream with the fewest active connections among the
     /// backends that are not currently marked down. Returns `None` when all
     /// backends are down (the caller then answers 502, nginx-style).
-    fn select(&self) -> Option<(Upstream, Arc<AtomicUsize>)> {
+    fn select(&self, excluded: &HashSet<SocketAddr>) -> Option<(Upstream, Arc<AtomicUsize>)> {
         // ⚡ OPTIMIZATION: Linear scan is acceptable — backend counts are typically
         // in the tens, making a full sort unnecessary overhead.
         let (min_idx, _) = self
             .counters
             .iter()
             .enumerate()
-            .filter(|(_, (addr, _))| self.health.is_up(addr))
+            .filter(|(_, (addr, _))| self.health.is_up(addr) && !excluded.contains(addr))
             .min_by_key(|(_, (_, ctr))| ctr.load(Ordering::Relaxed))?;
 
         let upstream = self.upstreams.get(min_idx)?.clone();
@@ -572,6 +572,15 @@ impl LoadBalancer {
     ///   Ignored for other strategies.
     /// - Returns: An optional `Upstream` if a healthy backend is available.
     pub fn select(&self, key: Option<&[u8]>) -> Option<Upstream> {
+        self.select_excluding(key, &HashSet::new())
+    }
+
+    /// 🔁 Selects a healthy backend that this request has not already attempted.
+    pub fn select_excluding(
+        &self,
+        key: Option<&[u8]>,
+        excluded: &HashSet<SocketAddr>,
+    ) -> Option<Upstream> {
         let pool = self.pool.load();
         let primary = match self.strategy {
             Strategy::LeastConn => {
@@ -580,7 +589,7 @@ impl LoadBalancer {
                 // select() API we count a "selection" as one request unit.
                 pool.least_conn
                     .as_ref()
-                    .and_then(|tracker| tracker.select().map(|(upstream, _guard)| upstream))
+                    .and_then(|tracker| tracker.select(excluded).map(|(upstream, _guard)| upstream))
             }
             Strategy::IpHash => {
                 let hash_key = key.unwrap_or(b"");
@@ -588,15 +597,25 @@ impl LoadBalancer {
                 // used by active health checks) and adds our passive marks.
                 pool.native_ketama.as_ref().and_then(|native| {
                     native.select_with(hash_key, 256, |b, ready| {
-                        ready && pool.health.is_up_backend(b)
+                        ready
+                            && pool.health.is_up_backend(b)
+                            && inet_address(b).is_none_or(|address| !excluded.contains(&address))
                     })
                 })
             }
             Strategy::RoundRobin | Strategy::Random => pool.native_rr.as_ref().and_then(|native| {
-                native.select_with(b"", 256, |b, ready| ready && pool.health.is_up_backend(b))
+                native.select_with(b"", 256, |b, ready| {
+                    ready
+                        && pool.health.is_up_backend(b)
+                        && inet_address(b).is_none_or(|address| !excluded.contains(&address))
+                })
             }),
         };
-        primary.or_else(|| self.backup.as_ref().and_then(|backup| backup.select(key)))
+        primary.or_else(|| {
+            self.backup
+                .as_ref()
+                .and_then(|backup| backup.select_excluding(key, excluded))
+        })
     }
 
     /// Provides access to the underlying native Pingora load balancer (RoundRobin variant).
@@ -740,8 +759,45 @@ mod tests {
         // Manually inflate u1's counter to simulate a busy upstream
         tracker.counters[0].1.store(5, Ordering::Relaxed);
         // LeastConn should now return u2 (counter = 0)
-        let (selected, _guard) = tracker.select().unwrap();
+        let (selected, _guard) = tracker.select(&HashSet::new()).unwrap();
         assert_eq!(selected.addr.to_string(), "127.0.0.1:9002");
+    }
+
+    #[test]
+    fn request_local_exclusions_cover_every_selection_strategy() {
+        for strategy in [
+            Strategy::RoundRobin,
+            Strategy::Random,
+            Strategy::LeastConn,
+            Strategy::IpHash,
+        ] {
+            let first_address = addr("127.0.0.1:8201");
+            let second_address = addr("127.0.0.1:8202");
+            let load_balancer = LoadBalancer::new(
+                vec![
+                    Upstream::new("127.0.0.1:8201").unwrap(),
+                    Upstream::new("127.0.0.1:8202").unwrap(),
+                ],
+                strategy,
+            );
+            let key = Some(b"stable-client".as_slice());
+            let first = load_balancer.select(key).unwrap();
+            let pingora_core::protocols::l4::socket::SocketAddr::Inet(first) = first.addr else {
+                panic!("expected an internet upstream");
+            };
+            let mut excluded = HashSet::from([first]);
+
+            let alternative = load_balancer.select_excluding(key, &excluded).unwrap();
+            assert_ne!(alternative.addr.to_string(), first.to_string());
+
+            // 🚫 Excluding the complete pool must fail instead of reusing an attempted peer.
+            excluded.insert(if first == first_address {
+                second_address
+            } else {
+                first_address
+            });
+            assert!(load_balancer.select_excluding(key, &excluded).is_none());
+        }
     }
 
     // ---- Passive health marking (fail_to_connect failover) ----

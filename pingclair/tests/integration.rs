@@ -525,6 +525,253 @@ fn protocol_proxy_config_url(upstream_address: String) -> String {
 }
 
 #[tokio::test]
+async fn test_bounded_upstream_status_retry_preserves_request_body_safety() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let (dead_listener, live_listener) =
+        if first_listener.local_addr().unwrap() < second_listener.local_addr().unwrap() {
+            (first_listener, second_listener)
+        } else {
+            (second_listener, first_listener)
+        };
+    let dead_address = dead_listener.local_addr().unwrap();
+    let upstream_address = live_listener.local_addr().unwrap();
+    drop(dead_listener);
+    live_listener.set_nonblocking(true).unwrap();
+    let upstream = tokio::net::TcpListener::from_std(live_listener).unwrap();
+    let success_hits = Arc::new(AtomicUsize::new(0));
+    let capped_hits = Arc::new(AtomicUsize::new(0));
+    let deadline_hits = Arc::new(AtomicUsize::new(0));
+    let post_hits = Arc::new(AtomicUsize::new(0));
+    let put_hits = Arc::new(AtomicUsize::new(0));
+    let put_bytes = Arc::new(AtomicUsize::new(0));
+    let connect_hits = Arc::new(AtomicUsize::new(0));
+    let slow_deadline_hits = Arc::new(AtomicUsize::new(0));
+    let counters = [
+        success_hits.clone(),
+        capped_hits.clone(),
+        deadline_hits.clone(),
+        post_hits.clone(),
+        put_hits.clone(),
+        connect_hits.clone(),
+        slow_deadline_hits.clone(),
+    ];
+    let observed_put_bytes = put_bytes.clone();
+    let upstream_task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let counters = counters.clone();
+            let observed_put_bytes = observed_put_bytes.clone();
+            tokio::spawn(async move {
+                let mut request =
+                    read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+                let header_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|position| position + 4)
+                    .unwrap();
+                let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+                let path = headers
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap()
+                    .to_string();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while request.len() - header_end < content_length {
+                    let mut chunk = [0u8; 1024];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert!(read > 0, "request body closed before content-length");
+                    request.extend_from_slice(&chunk[..read]);
+                }
+
+                let counter = match path.as_str() {
+                    "/success" => &counters[0],
+                    "/capped" => &counters[1],
+                    "/deadline" => &counters[2],
+                    "/post" => &counters[3],
+                    "/put" => &counters[4],
+                    "/connect-twice" => &counters[5],
+                    "/slow-deadline" => &counters[6],
+                    _ => panic!("unexpected retry-test path: {path}"),
+                };
+                let hit = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if path == "/put" {
+                    observed_put_bytes.store(content_length, Ordering::SeqCst);
+                }
+                if path == "/slow-deadline" {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                let (status, body) = if (path == "/success" && hit == 2) || path == "/connect-twice"
+                {
+                    ("200 OK", "ok")
+                } else {
+                    ("503 Service Unavailable", "retry")
+                };
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+
+    let route = |path: &str,
+                 max_attempts: usize,
+                 total_timeout_ms: Option<u64>,
+                 backoff_ms: u64,
+                 methods: Vec<&str>| {
+        serde_json::json!({
+            "path": path,
+            "handler": {
+                "type": "reverse_proxy",
+                "upstreams": [format!("http://{upstream_address}")],
+                "retry": {
+                    "max_attempts": max_attempts,
+                    "total_timeout_ms": total_timeout_ms,
+                    "backoff_ms": backoff_ms,
+                    "status_codes": [503],
+                    "methods": methods
+                }
+            }
+        })
+    };
+    let config = serde_json::json!({
+        "global": { "http3": false },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "client_max_body_size": 25 * 1024 * 1024,
+            "routes": [
+                route("/success", 3, None, 30, vec!["GET"]),
+                route("/capped", 2, None, 0, vec!["GET"]),
+                route("/deadline", 3, Some(150), 100, vec!["GET"]),
+                route("/slow-deadline", 2, Some(100), 0, vec!["GET"]),
+                route("/post", 3, None, 0, vec!["GET"]),
+                route("/put", 3, None, 0, vec!["GET", "PUT"]),
+                {
+                    "path": "/connect-once",
+                    "handler": {
+                        "type": "reverse_proxy",
+                        "upstreams": [
+                            format!("http://{dead_address}"),
+                            format!("http://{upstream_address}")
+                        ],
+                        "retry": { "max_attempts": 1 }
+                    }
+                },
+                {
+                    "path": "/connect-twice",
+                    "handler": {
+                        "type": "reverse_proxy",
+                        "upstreams": [
+                            format!("http://{dead_address}"),
+                            format!("http://{upstream_address}")
+                        ],
+                        "retry": { "max_attempts": 2 }
+                    }
+                }
+            ]
+        }]
+    })
+    .to_string();
+    let mut server = TestServer::new(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let started = std::time::Instant::now();
+    let response = client.get(server.url(0, "/success")).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "ok");
+    assert!(started.elapsed() >= Duration::from_millis(25));
+    assert_eq!(success_hits.load(Ordering::SeqCst), 2);
+
+    let response = client.get(server.url(0, "/capped")).send().await.unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(capped_hits.load(Ordering::SeqCst), 2);
+
+    let started = std::time::Instant::now();
+    let response = client.get(server.url(0, "/deadline")).send().await.unwrap();
+    assert_eq!(response.status(), 503);
+    assert!(started.elapsed() >= Duration::from_millis(90));
+    assert!(started.elapsed() < Duration::from_millis(250));
+    assert_eq!(deadline_hits.load(Ordering::SeqCst), 2);
+
+    let started = std::time::Instant::now();
+    let response = client
+        .get(server.url(0, "/slow-deadline"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 504);
+    assert!(started.elapsed() >= Duration::from_millis(70));
+    assert!(started.elapsed() < Duration::from_millis(250));
+    assert_eq!(slow_deadline_hits.load(Ordering::SeqCst), 1);
+
+    // ⌛ The terminal retry timeout also closes its downstream connection.
+    let body_client = no_proxy_client();
+    let response = body_client
+        .post(server.url(0, "/post"))
+        .body("unsafe-to-replay")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(post_hits.load(Ordering::SeqCst), 1);
+
+    let response = body_client
+        .put(server.url(0, "/put"))
+        .body(vec![b'x'; 20 * 1024 * 1024])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(put_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(put_bytes.load(Ordering::SeqCst), 20 * 1024 * 1024);
+
+    let response = client
+        .get(server.url(0, "/connect-once"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 502);
+    assert_eq!(connect_hits.load(Ordering::SeqCst), 0);
+
+    // 🔌 The terminal connect error intentionally closes its downstream connection.
+    let retry_client = no_proxy_client();
+    let response = match retry_client
+        .get(server.url(0, "/connect-twice"))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            server.print_diagnostics();
+            panic!("connect redispatch request failed: {error}");
+        }
+    };
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "ok");
+    assert_eq!(connect_hits.load(Ordering::SeqCst), 1);
+
+    upstream_task.abort();
+    let _ = upstream_task.await;
+}
+
+#[tokio::test]
 async fn test_listener_resource_limits_reject_before_dispatch_without_hanging() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

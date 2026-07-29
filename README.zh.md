@@ -211,6 +211,13 @@ example.com {
     }
 
     reverse_proxy app:8080 {
+        retry {
+            max_attempts 4
+            total_timeout 2s
+            backoff 50ms
+            status_codes 429 502 503 504
+            methods GET HEAD
+        }
         transport http {
             connect_timeout 3s
             first_byte_timeout 30s
@@ -219,6 +226,12 @@ example.com {
     }
 }
 ```
+
+`max_attempts` 包含第一次嘗試。連線建立失敗時，因尚未有 request bytes
+送到該後端，可安全改送其他後端；狀態碼重試則只接受設定允許的冪等方法，
+而且 request 必須實際沒有 body。Pingclair 不會為此策略緩衝或重送 request
+body。省略 `retry` 時會保留舊有的連線失敗切換上限，也不會因 response
+status 進行重試。
 
 header、body 與整體 request 超限時，只要協議仍能送出回應，就會回傳明確的
 HTTP 錯誤；idle transport 與超出上限的 HTTP/2、HTTP/3 連線則會關閉。

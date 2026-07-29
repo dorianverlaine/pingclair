@@ -223,6 +223,13 @@ example.com {
     }
 
     reverse_proxy app:8080 {
+        retry {
+            max_attempts 4
+            total_timeout 2s
+            backoff 50ms
+            status_codes 429 502 503 504
+            methods GET HEAD
+        }
         transport http {
             connect_timeout 3s
             first_byte_timeout 30s
@@ -231,6 +238,12 @@ example.com {
     }
 }
 ```
+
+`max_attempts` includes the initial attempt. Connect failures remain safe to
+retry because no request bytes reached that peer. Status retries require a
+configured idempotent method and an actually bodyless request; Pingclair never
+buffers or replays a request body for this policy. Omitting `retry` preserves
+the legacy connect-failover limit and does not retry response statuses.
 
 Exceeded header, body, and request budgets receive an explicit HTTP error when
 the protocol can still send one; idle transports and excess HTTP/2 or HTTP/3

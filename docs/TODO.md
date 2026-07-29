@@ -347,17 +347,38 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
     semaphore 在 listener 建立時擷取；修改這三項目前需要 restart。其他選定
     vhost 後套用的 body／request／bandwidth policy 可隨 hot reload 更新。
 
-### 🔨 Day 9 — 可配置 retry／redispatch
+### 🔨 Day 9 — 可配置 retry／redispatch ✔
 
-目前只在「尚未送出 request」的 connect failure 安全重試。
+**已完成 2026-07-29，本機 gate 全綠，尚待 Day 15 遠端驗證。**
 
-- 加入最大次數、總時限、backoff、可重試狀態碼與方法。
-- **v0.2 預設且只保證冪等請求**。非冪等 body replay 與 AI POST fallback 明確延後，
-  **不以隱式 buffering 假裝支援**。
-- **完成判定**：重試邊界有測試；非冪等請求確實不被重放。
-- **未來方向（不在 v0.2）**：POST／AI request 若要支援重試，必須有明確 opt-in、
-  `Idempotency-Key`，以及**有上限的** memory／disk replay 策略。
-  禁止悄悄全量緩衝無上限 body。
+- ✅ `reverse_proxy retry` 新增最大嘗試次數（含第一次）、總時限、固定 backoff、
+  可重試狀態碼與方法；DSL、compiler、JSON 與舊設定 default 均有測試。
+- ✅ H1/H2 的 Pingora lifecycle 與獨立 H3 bridge 共用同一份 policy。
+  connect failure 只在尚未送出 request 時安全切換後端；status redispatch 則必須是
+  設定允許的冪等方法，而且 request 實際沒有 body。
+- ✅ 每個 request 追蹤已嘗試位址，Round Robin、Random、Least Conn 與 IP Hash
+  都會先避開該集合；候選全部走過後，只有 status policy 可以在剩餘 budget 內
+  重新走一輪。原有 passive health cooldown 仍負責跨 request 排除 connect failure。
+- ✅ **完成判定**：真 binary 覆蓋 `max_attempts` 1／2、503→200、最終 503、
+  固定 backoff 與總時限；POST body 只送一次，已列入 methods 的 PUT 帶 20 MiB
+  body 也只串流一次。H3 bridge 另以單元整合測試確認 503→200。
+  總測試數 362 → **368**。
+- ✅ regression 先紅後綠：暫時移除 status 判斷後，真 binary 的 `/success`
+  固定停在 503；失敗證據保留於
+  `benchmarks/results/20260729_day9_local_failed_status_retry/`。測試 fixture 與
+  locked clippy 途中發現的失敗也各自保留，未覆寫。
+- ✅ Gate：`cargo fmt --all -- --check`、locked clippy、locked workspace build、
+  locked workspace tests 全綠。
+
+- **範圍外／尚未驗證**：
+  - 非冪等 body replay、AI POST fallback、`Idempotency-Key` 與 memory／disk replay
+    policy 均未實作；v0.2 不會為 retry 緩衝完整 request body。
+  - backoff 目前只有固定間隔，沒有 exponential、jitter 或 `Retry-After`。
+  - 尚未做乾淨 Linux release、VPS 或真 QUIC client 矩陣；留到 Day 15，
+    因此本日仍是 🧪，不是遠端 ✅。
+  - **未來方向（不在 v0.2）**：POST／AI request 若要支援重試，必須有明確
+    opt-in、`Idempotency-Key`，以及**有上限的** memory／disk replay 策略；
+    禁止悄悄全量緩衝無上限 body。
 
 ### 🔨 Day 10 — Circuit breaker／overload protection
 
