@@ -308,7 +308,8 @@ configuration load or hot reload. Invalid security policy should fail closed.
   conventional, imperative summary; for example,
   `✨ feat(proxy): add weighted backup pools` or
   `🐛 fix(test): reap stale integration children`.
-- Use Traditional Chinese with Taiwan terminology in Chinese documentation.
+- Write Chinese documentation in Traditional Chinese, matching the vocabulary
+  already used in `docs/` rather than introducing another variant.
 - Update `README.md`, `README.zh.md`, and `README.fr.md` together for
   user-facing behavior.
 - Do not run repository-wide formatting casually in a dirty worktree.
