@@ -162,6 +162,34 @@ localhost:8080 {
 }
 ```
 
+### Automatic HTTPS for public names
+
+`tls auto` obtains and renews a public certificate over ACME (Let's Encrypt):
+
+```caddyfile
+{
+    email admin@example.com
+}
+
+example.com {
+    listen :80
+    listen :443
+    tls auto
+    reverse_proxy app:8080
+}
+```
+
+Keep the `:80` listener. ACME's HTTP-01 challenge is fetched over **cleartext**
+HTTP on port 80 (RFC 8555 §8.3), so Pingclair always leaves port 80 unencrypted
+even inside a block that configures TLS — otherwise the CA's plaintext probe
+would arrive at a TLS listener and every certificate order would fail. Every
+other port in such a block does use TLS.
+
+The certificate Pingclair installs includes the intermediates the CA issued
+with it. A server that sends only its leaf certificate appears to work in a
+browser — browsers cache intermediates and fetch missing ones over AIA — while
+`curl`, Go, and Java reject it outright.
+
 ### Internal TLS for private origins
 
 Use `tls internal` when the TLS client is a trusted tunnel, load balancer, or

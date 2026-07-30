@@ -10,7 +10,7 @@
 [![Status](https://img.shields.io/badge/status-active-green.svg)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/dorianverlaine/pingclair/pulls)
 
-[English](README.md) · **繁體中文** · [Français](README.fr.md)
+[English](README.md) · **中文** · [Français](README.fr.md)
 
 </div>
 
@@ -153,6 +153,32 @@ localhost:8080 {
     file_server ./public
 }
 ```
+
+### 公開網域的自動 HTTPS
+
+`tls auto` 透過 ACME（Let's Encrypt）申請並自動續簽公開憑證：
+
+```caddyfile
+{
+    email admin@example.com
+}
+
+example.com {
+    listen :80
+    listen :443
+    tls auto
+    reverse_proxy app:8080
+}
+```
+
+請保留 `:80` listener。ACME 的 HTTP-01 挑戰是以**明文** HTTP 打在 port 80
+（RFC 8555 §8.3），所以即使 block 裡設定了 TLS，Pingclair 仍會讓 port 80
+維持明文——否則 CA 的明文探測會撞上 TLS listener，導致每一次憑證申請都失敗。
+同一個 block 的其他 port 則照常啟用 TLS。
+
+Pingclair 安裝憑證時會一併送出 CA 簽發的中繼憑證。只送 leaf 的伺服器在瀏覽器
+裡看起來是正常的——瀏覽器會快取中繼憑證，也會用 AIA 自行補抓——但 `curl`、
+Go 與 Java 會直接拒絕連線。
 
 ### 私有源站的 internal TLS
 

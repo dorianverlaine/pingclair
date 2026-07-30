@@ -31,6 +31,48 @@
 > ⚠️ 已在**舊 commit** 驗證過的能力，仍須使用同一個 release-candidate commit
 > 重新跑乾淨 Linux 驗證才能計入 v0.2。
 
+## 🧪 2026-07-30 雙區域公網協議矩陣（`484c4a0`，部分通過）
+
+Oregon 與 Paris 兩台 Amazon Linux 2023 arm64 EC2 以同一個 release binary
+雙向經真實公網驗證。H1／H2／H3 health、1 MiB／20 MiB body、H2 connection
+reuse 與 H3 單連線多 request 均通過，檔案逐位元組一致。Paris egress 額外套用
+40±10 ms delay、0.5% loss、5% reorder；核心實際丟棄 11／2,108 packets，
+H3 20 MiB 仍完整通過。H3 傳輸期間 60 筆 server RSS 均為 46,824 KiB。
+
+**發布閘門仍失敗**，不能升為完整遠端驗證：
+
+- 同一個 site block 同時設定 port 80／443 與 `tls auto` 時，顯式 TLS 會套到
+  port 80，Let's Encrypt HTTP-01 明文請求被當成 TLS 並使 order 變成 Invalid。
+  拆成 wildcard plaintext port 80 與具名 TLS port 443 後，兩端 production
+  ACME 都成功簽發。
+- H1／H2 的動態 TLS callback 只送 leaf，兩端 curl 都因缺少 intermediate
+  以 `unable to get local issuer certificate (20)` 失敗。H3 的憑證鏈正常；
+  aioquic 不加 `--insecure` 時雙向皆驗證成功。
+
+完整證據：`benchmarks/results/20260730_day29_wan_484c4a0/`。兩台 EC2 均已
+確認 `terminated`，兩個測試 security group 已刪除；沒有修改程式碼。
+
+### 🔧 兩個缺陷已於同日修正（本機驗證，遠端待重跑）
+
+- **憑證鏈**：`DynamicCertResolver` 的 `X509::from_pem` 換成
+  `stack_from_pem`，`CachedSslCert` 改存整條鏈，handshake 依序
+  `set_certificate` + `add_chain_cert`。H3 的 `quic.rs` 本來就是這樣做的，
+  所以只有 H1／H2 受影響。
+- **port 80**：`server_requires_tls` 現在讓 port 80 一律維持明文，
+  `tls auto` 加 `listen :80` 這個最自然的寫法可以直接運作。
+
+新增三個回歸測試，全部經過**紅燈驗證**（先撤掉修復確認會失敗）：
+
+| 測試 | 撤掉修復時的失敗訊息 |
+| --- | --- |
+| `test_tls_handshake_sends_the_intermediate_not_just_the_leaf` | `the server sent 1 certificate(s)` |
+| `port_80_stays_plaintext_even_with_an_explicit_tls_block` | ACME HTTP-01 明文請求無法抵達 proxy |
+| `parsing_a_bundle_keeps_every_certificate_after_the_leaf` | bundle 只剩 1 張憑證 |
+
+> ⚠️ **狀態仍是「本機測試通過」，不是「遠端已驗證」。** 這兩個修正尚未在
+> 真實 CA 憑證的公網環境重跑，升級前必須用同一個 RC commit 重做一次
+> 雙區域驗證。
+
 ---
 
 ## ✅ 已通過遠端驗證

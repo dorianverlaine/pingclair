@@ -2664,6 +2664,158 @@ async fn test_pingclairfile_internal_tls_serves_trusted_h1_and_h2() {
     );
 }
 
+/// 🎫 Builds a real two-level trust path: root CA → intermediate CA → leaf.
+///
+/// Why not just self-sign, the way every other TLS test here does? Because a
+/// self-signed certificate is its own issuer, so it has no intermediate at all
+/// — "leaf only" and "full chain" are byte-for-byte the same file. A server
+/// that drops intermediates is therefore *invisible* to a self-signed fixture.
+/// Only a leaf whose issuer is a separate certificate can expose it.
+fn build_two_level_chain(dns_name: &str) -> (String, String) {
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+
+    let mut root_params = CertificateParams::new(Vec::new()).expect("root parameters");
+    root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    root_params
+        .distinguished_name
+        .push(DnType::CommonName, "Pingclair Test Root");
+    let root_key = KeyPair::generate().expect("root key");
+
+    let mut intermediate_params =
+        CertificateParams::new(Vec::new()).expect("intermediate parameters");
+    intermediate_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    intermediate_params
+        .distinguished_name
+        .push(DnType::CommonName, "Pingclair Test Intermediate");
+    let intermediate_key = KeyPair::generate().expect("intermediate key");
+    let intermediate_certificate = intermediate_params
+        .signed_by(
+            &intermediate_key,
+            &Issuer::from_params(&root_params, &root_key),
+        )
+        .expect("intermediate certificate");
+
+    let mut leaf_params =
+        CertificateParams::new(vec![dns_name.to_string()]).expect("leaf parameters");
+    leaf_params
+        .distinguished_name
+        .push(DnType::CommonName, dns_name);
+    let leaf_key = KeyPair::generate().expect("leaf key");
+    let leaf_certificate = leaf_params
+        .signed_by(
+            &leaf_key,
+            &Issuer::from_params(&intermediate_params, &intermediate_key),
+        )
+        .expect("leaf certificate");
+
+    // 🔗 A CA returns leaf-then-intermediates, and that is the order a server
+    // has to replay on the wire for a client to build a path to the root.
+    let fullchain = format!(
+        "{}{}",
+        leaf_certificate.pem(),
+        intermediate_certificate.pem()
+    );
+    (fullchain, leaf_key.serialize_pem())
+}
+
+/// 🔐 Counts the certificates a TLS server actually sends during a handshake.
+///
+/// Trust verification is deliberately switched off: the question here is not
+/// "does this chain validate" but "how many certificates arrived". Those are
+/// different failures, and mixing them would let a trust-store quirk mask a
+/// missing intermediate.
+fn count_certificates_sent_by_server(address: SocketAddr, sni: &str) -> usize {
+    use pingora_core::tls::ssl::{SslConnector, SslMethod, SslVerifyMode};
+
+    let mut builder = SslConnector::builder(SslMethod::tls()).expect("tls connector builder");
+    builder.set_verify(SslVerifyMode::NONE);
+    let connector = builder.build();
+
+    let stream = std::net::TcpStream::connect(address).expect("connect to the test server");
+    let session = connector
+        .configure()
+        .expect("connect configuration")
+        .verify_hostname(false)
+        .use_server_name_indication(true)
+        .connect(sni, stream)
+        .expect("tls handshake");
+
+    // 🔗 On the client side BoringSSL includes the leaf in this stack, so a
+    // correctly configured server reports leaf + intermediate = 2.
+    session
+        .ssl()
+        .peer_cert_chain()
+        .expect("the server presented no certificate at all")
+        .len()
+}
+
+/// 🛡️ A server must send its intermediates, not just the leaf.
+///
+/// This is a real defect found on 2026-07-30 by two EC2 hosts testing each
+/// other over the public internet: `X509::from_pem` stops at the first
+/// certificate in a PEM bundle and silently discards the rest, so every H1/H2
+/// handshake presented a lone leaf. `curl`, Go, and Java reject that with
+/// "unable to get local issuer certificate"; browsers hide it by caching
+/// intermediates and fetching missing ones over AIA, which is exactly why it
+/// survived so long.
+#[tokio::test]
+async fn test_tls_handshake_sends_the_intermediate_not_just_the_leaf() {
+    let (fullchain_pem, key_pem) = build_two_level_chain("chained.test");
+    assert_eq!(
+        fullchain_pem.matches("BEGIN CERTIFICATE").count(),
+        2,
+        "the fixture itself must carry a leaf and an intermediate"
+    );
+
+    // 📁 The certificate files must exist before the server parses its config,
+    // so they live in their own directory rather than the server's temp dir.
+    let material = tempfile::tempdir().expect("certificate material dir");
+    let cert_path = material.path().join("fullchain.pem");
+    let key_path = material.path().join("privkey.pem");
+    std::fs::write(&cert_path, &fullchain_pem).expect("write fullchain");
+    std::fs::write(&key_path, &key_pem).expect("write private key");
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        https://chained.test:__PINGCLAIR_TEST_PORT__ {{
+            tls {{
+                cert {}
+                key {}
+            }}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "chained-ok"
+        }}
+        "#,
+        cert_path.to_string_lossy(),
+        key_path.to_string_lossy()
+    );
+
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(
+        server.wait_until_tls_ready("chained.test").await,
+        "server failed to start with a chained certificate"
+    );
+
+    let address = server.address(0);
+    let presented = tokio::task::spawn_blocking(move || {
+        count_certificates_sent_by_server(address, "chained.test")
+    })
+    .await
+    .expect("handshake task");
+
+    assert_eq!(
+        presented, 2,
+        "the server sent {presented} certificate(s); a lone leaf cannot be \
+         verified by any client that does not already hold the intermediate"
+    );
+}
+
 #[tokio::test]
 async fn test_sse_proxy_flushes_each_event_incrementally() {
     use tokio::io::AsyncWriteExt;

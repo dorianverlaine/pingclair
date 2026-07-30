@@ -880,8 +880,10 @@ Content-Length/chunked POST、413、keepalive、middleware parity、
 > `benchmarks/results/20260730_day28_f26d0a1/`。當時的觸發原因是 `561d802`
 > 同時改了 H3 實作與 TLS 依賴樹。那次額外覆蓋了兩項：
 >
-> - **與真實客戶端的互通性**：瀏覽器與 `curl --http3`。現有端對端測試用的是
->   手寫 quiche client，證明的是我們對 quiche 協定實作正確，不是互通性。
+> - **與真實客戶端的互通性**：`curl --http3`（ngtcp2 與 quiche 兩種堆疊）。
+>   現有端對端測試用的是手寫 quiche client，證明的是我們對 quiche 協定實作
+>   正確，不是互通性。**瀏覽器不在這次覆蓋範圍內**——2026-07-30 訂正，原文
+>   把瀏覽器寫成已覆蓋，但同一份證據的 `RESULT.md` 明白列它為未覆蓋。
 > - **`tokio-quiche` 帶進來的 86 個 crate 在 Linux 上鏈結正常**，
 >   且單一 BoringSSL 不變式成立（`cargo tree -i boring-sys`、
 >   `cargo tree -i openssl-sys` 應無 openssl）。
@@ -891,6 +893,19 @@ Content-Length/chunked POST、413、keepalive、middleware parity、
 補完 STATUS 中列為「尚未覆蓋」的項目：IP／Referer 完整 allow／deny 與
 precedence、死亡 upstream 502 自訂頁、代理 rewrite URI、primary recovery、
 H3 CORS／rewrite／error_page parity。
+
+> 🧪 **2026-07-30 已對 `484c4a0` 提前跑過一輪雙區域公網驗證**（Oregon ×
+> Paris 兩台 EC2 互測，真實 Let's Encrypt production 憑證），判定
+> **PARTIAL**。證據在 `benchmarks/results/20260730_day29_wan_484c4a0/`。
+> 傳輸層通過：H1／H2／H3、20 MiB 串流、connection reuse、netem
+> delay／loss／reorder、RSS 全程 bounded。
+>
+> 但抓到**兩個發布級缺陷，當天已修**（見 STATUS）：H1／H2 只送 leaf 憑證，
+> 以及 `tls auto` 會把 port 80 一起變成 TLS listener 而讓 ACME 永遠失敗。
+>
+> ⚠️ **這一天還沒完成**：修正只有本機測試證據，上面列的功能矩陣
+> （IP／Referer、502 自訂頁、rewrite、primary recovery、H3 parity）
+> 這輪完全沒跑。正式 Day 29 要用新的 RC commit 重做，並**重驗這兩個修正**。
 
 ---
 

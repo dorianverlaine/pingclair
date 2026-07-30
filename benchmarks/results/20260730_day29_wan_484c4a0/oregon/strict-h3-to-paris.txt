@@ -1,0 +1,8 @@
+2026-07-30 04:20:46,995 INFO quic [6c53330f7ead83e4] Retrying with token (44 bytes)
+2026-07-30 04:20:47,132 INFO quic [6c53330f7ead83e4] Negotiated protocol version 0x00000001 (VERSION_1)
+2026-07-30 04:20:47,148 INFO quic [6c53330f7ead83e4] ALPN negotiated protocol h3
+2026-07-30 04:20:47,282 INFO client New session ticket received
+2026-07-30 04:20:47,283 INFO client New session ticket received
+2026-07-30 04:20:47,284 INFO client Response received for GET /healthz : 8 bytes in 0.1 s (0.000 Mbps)
+2026-07-30 04:20:47,284 INFO quic [6c53330f7ead83e4] Connection close sent (code 0x100, reason )
+exit=0

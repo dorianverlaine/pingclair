@@ -10,7 +10,7 @@
 [![Status](https://img.shields.io/badge/status-active-green.svg)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/dorianverlaine/pingclair/pulls)
 
-[English](README.md) · [繁體中文](README.zh.md) · **Français**
+[English](README.md) · [中文](README.zh.md) · **Français**
 
 </div>
 
@@ -166,6 +166,34 @@ localhost:8080 {
     file_server ./public
 }
 ```
+
+### HTTPS automatique pour les noms publics
+
+`tls auto` obtient et renouvelle un certificat public via ACME (Let's Encrypt) :
+
+```caddyfile
+{
+    email admin@example.com
+}
+
+example.com {
+    listen :80
+    listen :443
+    tls auto
+    reverse_proxy app:8080
+}
+```
+
+Conservez le listener `:80`. Le challenge HTTP-01 d'ACME est récupéré en HTTP
+**en clair** sur le port 80 (RFC 8555 §8.3) : Pingclair laisse donc toujours le
+port 80 non chiffré, même dans un bloc qui configure TLS. Sans cela, la sonde en
+clair de l'autorité arriverait sur un listener TLS et chaque demande de
+certificat échouerait. Tous les autres ports du bloc utilisent bien TLS.
+
+Le certificat installé inclut les intermédiaires émis par l'autorité. Un serveur
+qui n'envoie que son certificat feuille semble fonctionner dans un navigateur —
+les navigateurs mettent les intermédiaires en cache et récupèrent les manquants
+via AIA — alors que `curl`, Go et Java le rejettent sans appel.
 
 ### TLS interne pour les origines privées
 

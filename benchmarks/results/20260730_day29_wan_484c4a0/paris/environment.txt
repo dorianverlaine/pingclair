@@ -1,0 +1,9 @@
+role=paris client_target=oregon
+Linux ip-172-31-28-162.eu-west-3.compute.internal 6.1.176-223.369.amzn2023.aarch64 #1 SMP Fri Jul 24 13:35:51 UTC 2026 aarch64 aarch64 aarch64 GNU/Linux
+curl 8.17.0 (aarch64-amazon-linux-gnu) libcurl/8.17.0 OpenSSL/3.5.5 zlib/1.2.11 libidn2/2.3.2 libpsl/0.21.5 nghttp2/1.59.0 mit-krb5/1.21.3
+Release-Date: 2025-11-05
+Protocols: file ftp ftps http https ipfs ipns
+Features: alt-svc AsynchDNS GSS-API HSTS HTTP2 HTTPS-proxy IDN IPv6 Kerberos Largefile libz PSL SPNEGO SSL threadsafe UnixSockets
+aioquic=1.2.0
+35.163.216.237 via 172.31.16.1 dev ens5 src 172.31.28.162 uid 1000 
+    cache 
