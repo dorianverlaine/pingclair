@@ -515,63 +515,89 @@ pub(crate) fn check_request_host(
     Ok(())
 }
 
-/// 🚫 Reports whether a request path still contains a traversal segment.
+/// 🧭 Resolves `.` and `..` in a request path, the way nginx and Caddy do.
 ///
 /// A path arriving at a proxy is supposed to be normalized already
-/// (RFC 9110 §4.2.3), so `.` and `..` segments are not a client convenience —
-/// they are how a request escapes the route it appears to belong to. The
-/// dangerous case is not the static file server, which resolves paths
-/// lexically and simply misses; it is the reverse-proxy route.
+/// (RFC 9110 §4.2.3), so these segments are not a client convenience — left
+/// alone they let a request match one route while the origin resolves it to a
+/// different resource. `GET /api/../admin/x` would match an `/api/*` route
+/// here, so a policy bound to `/admin/*` never runs, and the origin — which
+/// almost certainly normalizes — serves `/admin/x` anyway.
 ///
-/// `GET /api/../admin/x` matches an `/api/*` route here, so any policy bound
-/// to `/admin/*` never runs, and the origin — which almost certainly does
-/// normalize — resolves it to `/admin/x` and serves it. Proxy and origin
-/// disagree about which resource was requested, and the disagreement is
-/// exactly the attacker's goal.
+/// Resolving rather than refusing is the deliberate choice: both reference
+/// implementations answer 403 for that request because the policy on the
+/// resolved path is what runs, and matching them matters more than the
+/// marginally stricter 400 that refusing would give. The security property is
+/// identical either way — routing decides on the same path the origin will.
 ///
-/// Percent-encoded forms count, because the origin may decode before it
-/// normalizes: `%2e%2e` and `%2E%2E` are `..`, and `%2f` is a separator. The
-/// check decodes once for inspection only; the request itself is never
-/// rewritten, so nothing downstream sees a path this proxy invented.
+/// `%2e` and `%2E` are decoded to `.` first, because an origin that decodes
+/// before it normalizes sees `..` either way. Nothing else is decoded: turning
+/// `%2f` into a separator would change which resource is named, which is a
+/// documented footgun rather than a hardening measure.
 ///
-/// 🛡️ Refusing is deliberate rather than rewriting: normalizing in place would
-/// change what every origin receives, whereas a well-formed client never needs
-/// to send these in the first place.
-pub(crate) fn path_escapes_its_route(path: &str) -> bool {
-    // 🧮 Bytes throughout: a path is not required to be valid UTF-8 once the
-    // escapes are resolved, and the comparison only ever needs ASCII.
-    percent_decode_once(path)
-        .split(|byte| *byte == b'/')
-        .any(|segment| segment == b"." || segment == b"..")
+/// `..` can never climb above the root; empty segments collapse, so `//a`
+/// becomes `/a`. Returns `None` when the path is already normal, so the common
+/// request pays for a scan and no allocation.
+pub(crate) fn normalize_request_path(path: &str) -> Option<String> {
+    let decoded = decode_encoded_dots(path);
+    let source = decoded.as_deref().unwrap_or(path);
+
+    // 🍃 A cheap scan first, so an ordinary request allocates nothing. No
+    // slicing by index: this reads attacker-controlled bytes, and `path[1..]`
+    // panics on an empty string or a multi-byte first character — which, with
+    // `panic = "abort"`, would be a remote kill rather than a bad request.
+    let needs_work = decoded.is_some()
+        || source.contains("//")
+        || source
+            .split('/')
+            .any(|segment| segment == "." || segment == "..");
+    if !needs_work {
+        return None;
+    }
+
+    let (raw_path, query) = match source.split_once('?') {
+        Some((raw_path, query)) => (raw_path, Some(query)),
+        None => (source, None),
+    };
+
+    let mut resolved: Vec<&str> = Vec::new();
+    for segment in raw_path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                // 🧱 The root is the floor; `/../x` is `/x`, never an escape.
+                resolved.pop();
+            }
+            other => resolved.push(other),
+        }
+    }
+
+    let mut out = String::with_capacity(raw_path.len());
+    for segment in &resolved {
+        out.push('/');
+        out.push_str(segment);
+    }
+    if out.is_empty() {
+        out.push('/');
+    }
+    // 🏁 A trailing slash is meaningful to origins, so it survives.
+    if raw_path.len() > 1 && raw_path.ends_with('/') && !out.ends_with('/') {
+        out.push('/');
+    }
+    if let Some(query) = query {
+        out.push('?');
+        out.push_str(query);
+    }
+
+    (out != path).then_some(out)
 }
 
-/// Decode `%XX` escapes a single time, leaving anything malformed untouched.
-///
-/// Returns bytes rather than a `String` deliberately: a decoded path need not
-/// be valid UTF-8, and treating each byte as a code point would both corrupt
-/// multi-byte characters and make the output longer than the input.
-///
-/// One pass, not to exhaustion: `%252e` decodes to the literal text `%2e`,
-/// which is what an origin doing one decode would see, and that is the
-/// comparison worth making.
-fn percent_decode_once(input: &str) -> Vec<u8> {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            let high = (bytes[index + 1] as char).to_digit(16);
-            let low = (bytes[index + 2] as char).to_digit(16);
-            if let (Some(high), Some(low)) = (high, low) {
-                out.push((high * 16 + low) as u8);
-                index += 3;
-                continue;
-            }
-        }
-        out.push(bytes[index]);
-        index += 1;
+/// Decode only `%2e` and `%2E` into `.`, leaving every other escape alone.
+fn decode_encoded_dots(path: &str) -> Option<String> {
+    if !path.contains("%2e") && !path.contains("%2E") {
+        return None;
     }
-    out
+    Some(path.replace("%2e", ".").replace("%2E", "."))
 }
 
 #[cfg(test)]
@@ -619,30 +645,40 @@ mod tests {
         }
 
         #[test]
-        fn path_check_never_panics(path in ".*") {
-            let _ = path_escapes_its_route(&path);
+        fn normalizing_never_panics(path in ".*") {
+            let _ = normalize_request_path(&path);
         }
 
         #[test]
-        fn decoding_never_grows_the_input(input in ".*") {
-            // 🔍 One pass can only replace three bytes with one, never expand —
-            // an expanding decoder fed a long path would be an amplification bug.
-            let decoded = percent_decode_once(&input);
-            proptest::prop_assert!(decoded.len() <= input.len());
-        }
-
-        #[test]
-        fn any_traversal_segment_is_refused(
+        fn a_normalized_path_has_no_traversal_left(
             prefix in "[a-z/]{0,12}",
             dots in proptest::sample::select(vec!["..", ".", "%2e%2e", "%2E.", ".%2e"]),
             suffix in "[a-z/]{0,12}",
         ) {
-            // 🛡️ The security property, stated directly: however the segment is
-            // spelled, a path containing it must never be accepted.
+            // 🛡️ The security property, stated directly: whatever went in, what
+            // routing sees afterwards contains no segment that could resolve
+            // somewhere else at the origin.
             let path = format!("/{prefix}/{dots}/{suffix}");
+            let normalized = normalize_request_path(&path).unwrap_or(path.clone());
+            let settled = normalize_request_path(&normalized);
             proptest::prop_assert!(
-                path_escapes_its_route(&path),
-                "{path:?} contains a traversal segment and must be refused"
+                settled.is_none(),
+                "{path:?} normalized to {normalized:?}, which still needs work"
+            );
+            proptest::prop_assert!(
+                !normalized.split('/').any(|s| s == "." || s == ".."),
+                "{path:?} normalized to {normalized:?}, which still contains traversal"
+            );
+        }
+
+        #[test]
+        fn normalizing_never_escapes_the_root(depth in 1usize..8) {
+            // 🧱 However many times a client climbs, it cannot get above `/`.
+            let path = format!("/{}", "../".repeat(depth));
+            let normalized = normalize_request_path(&path).unwrap_or(path);
+            proptest::prop_assert!(
+                normalized.starts_with('/') && !normalized.contains(".."),
+                "climbing produced {normalized:?}"
             );
         }
 
@@ -698,38 +734,60 @@ mod tests {
     }
 
     #[test]
-    fn traversal_is_detected_raw_and_percent_encoded() {
-        for path in [
-            "/api/../admin/x",
-            "/api/%2e%2e/admin/x",
-            "/api/%2E%2E/admin/x",
-            "/./admin",
-            "/a/b/..",
-            "/..",
-            "/.",
+    fn traversal_is_resolved_the_way_nginx_and_caddy_resolve_it() {
+        for (input, expected) in [
+            ("/api/../admin/x", "/admin/x"),
+            ("/api/%2e%2e/admin/x", "/admin/x"),
+            ("/api/%2E%2E/admin/x", "/admin/x"),
+            ("/admin/./x", "/admin/x"),
+            ("//admin/x", "/admin/x"),
+            ("/a/b/../../c", "/c"),
+            ("/a/b/..", "/a"),
         ] {
-            assert!(
-                path_escapes_its_route(path),
-                "{path:?} escapes its route and must be refused"
+            assert_eq!(
+                normalize_request_path(input).as_deref(),
+                Some(expected),
+                "{input:?} must normalize to {expected:?}"
             );
         }
     }
 
     #[test]
-    fn ordinary_paths_are_not_mistaken_for_traversal() {
+    fn normalizing_cannot_climb_above_the_root() {
+        // 🧱 `..` at the root is absorbed, never an escape.
+        assert_eq!(
+            normalize_request_path("/../secret").as_deref(),
+            Some("/secret")
+        );
+        assert_eq!(normalize_request_path("/../../..").as_deref(), Some("/"));
+    }
+
+    #[test]
+    fn normalizing_preserves_query_and_trailing_slash() {
+        assert_eq!(
+            normalize_request_path("/api/../admin/?x=1").as_deref(),
+            Some("/admin/?x=1")
+        );
+        assert_eq!(normalize_request_path("/a/./b/").as_deref(), Some("/a/b/"));
+    }
+
+    #[test]
+    fn ordinary_paths_are_left_exactly_alone() {
+        // 🍃 `None` means no allocation and no rewriting for the common request.
         for path in [
             "/api/users",
             "/static/ok.txt",
-            "/a..b/c", // dots inside a segment are just characters
-            "/...",    // three dots is a real directory name
+            "/a..b/c",
+            "/...",
             "/file.tar.gz",
             "/",
-            "/%2fencoded",       // an encoded separator alone is not traversal
-            "/api/%252e%252e/x", // double-encoded: one decode leaves "%2e%2e"
+            "/api/%252e%252e/x",
+            "/api/a%2fb",
         ] {
-            assert!(
-                !path_escapes_its_route(path),
-                "{path:?} is ordinary and must be allowed"
+            assert_eq!(
+                normalize_request_path(path),
+                None,
+                "{path:?} is already normal and must not be rewritten"
             );
         }
     }

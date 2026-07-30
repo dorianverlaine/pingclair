@@ -2806,17 +2806,6 @@ impl ProxyHttp for PingclairProxy {
         {
             let request_header = session.req_header();
 
-            // 🚫 A path that still carries `.` or `..` would match one route
-            // here and resolve to a different resource at the origin.
-            if crate::http_policy::path_escapes_its_route(request_header.uri.path()) {
-                tracing::warn!(
-                    "🚫 Rejected a request whose path escapes the route it matched: {}",
-                    request_header.uri.path()
-                );
-                Self::write_simple_response(session, ctx, 400, "Unnormalized Request Path").await?;
-                return Ok(true);
-            }
-
             // 🏠 RFC 9112 §3.2 makes this a MUST: exactly one well-formed Host,
             // or this proxy and the origin may resolve different virtual hosts.
             if let Err(rejection) = crate::http_policy::check_request_host(
@@ -2844,6 +2833,51 @@ impl ProxyHttp for PingclairProxy {
                 session.as_mut().set_keepalive(None);
                 Self::write_simple_response(session, ctx, 400, rejection.reason()).await?;
                 return Ok(true);
+            }
+        }
+
+        // 🧭 Resolve `.` and `..` before anything routes on the path, so this
+        // proxy and the origin agree on which resource was asked for. nginx and
+        // Caddy both do this, and the policy that matters is the one attached to
+        // the resolved path.
+        //
+        // ⚠️ Only the path-and-query is rewritten, never the whole URI. An H2
+        // request target is absolute (`https://host/path`), and folding its
+        // `//` as if it were a duplicate separator would corrupt the authority.
+        {
+            let path_and_query = session
+                .req_header()
+                .uri
+                .path_and_query()
+                .map(|value| value.as_str().to_string());
+            if let Some(current) = path_and_query
+                && let Some(normalized) = crate::http_policy::normalize_request_path(&current)
+            {
+                let mut parts = session.req_header().uri.clone().into_parts();
+                match normalized.parse::<http::uri::PathAndQuery>() {
+                    Ok(rebuilt) => {
+                        tracing::debug!("🧭 Normalized request path to {}", normalized);
+                        parts.path_and_query = Some(rebuilt);
+                        match http::Uri::from_parts(parts) {
+                            Ok(uri) => session.req_header_mut().set_uri(uri),
+                            Err(_) => {
+                                tracing::warn!(
+                                    "🚫 Rejected a request path that could not be rebuilt"
+                                );
+                                Self::write_simple_response(session, ctx, 400, "Bad Request")
+                                    .await?;
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // 🚫 A path we cannot rebuild is one we cannot reason
+                        // about, so it must not be routed on a guess.
+                        tracing::warn!("🚫 Rejected a request path that could not be normalized");
+                        Self::write_simple_response(session, ctx, 400, "Bad Request").await?;
+                        return Ok(true);
+                    }
+                }
             }
         }
 
