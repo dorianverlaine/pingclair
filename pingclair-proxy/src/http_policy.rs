@@ -394,6 +394,12 @@ pub(crate) enum FramingRejection {
     TransferEncodingForbidden,
     /// `Content-Length` was not `1*DIGIT` (RFC 9110 §8.6).
     MalformedContentLength,
+    /// An HTTP/1.1 request arrived without a `Host` field.
+    MissingHost,
+    /// More than one `Host` field, so the virtual host is a matter of opinion.
+    AmbiguousHost,
+    /// `Host` carried something that is not a bare authority.
+    MalformedHost,
 }
 
 impl FramingRejection {
@@ -404,6 +410,9 @@ impl FramingRejection {
             Self::AmbiguousLength => "Ambiguous Message Framing",
             Self::TransferEncodingForbidden => "Transfer-Encoding Not Allowed",
             Self::MalformedContentLength => "Malformed Content-Length",
+            Self::MissingHost => "Missing Host Header",
+            Self::AmbiguousHost => "Ambiguous Host Header",
+            Self::MalformedHost => "Malformed Host Header",
         }
     }
 }
@@ -456,6 +465,51 @@ pub(crate) fn check_request_framing(
         if raw.is_empty() || !raw.iter().all(u8::is_ascii_digit) {
             return Err(FramingRejection::MalformedContentLength);
         }
+    }
+
+    Ok(())
+}
+
+/// 🏠 Rejects a request whose `Host` cannot be resolved to exactly one authority.
+///
+/// RFC 9112 §3.2 is unusually blunt here: a server **must** answer 400 to an
+/// HTTP/1.1 request that lacks `Host`, carries more than one, or carries one
+/// with an invalid value. The reason is the same shape as path confusion — this
+/// proxy picks a virtual host from the first field it finds, and an origin that
+/// picks the last one is serving a different site than the one whose policy was
+/// just applied.
+///
+/// Only HTTP/1.1 and later are checked. HTTP/1.0 predates `Host` and may
+/// legitimately omit it, and HTTP/2 and HTTP/3 carry `:authority` instead,
+/// which their own parsers already validate.
+pub(crate) fn check_request_host(
+    version: http::Version,
+    headers: &HeaderMap,
+) -> Result<(), FramingRejection> {
+    if version == http::Version::HTTP_09 || version == http::Version::HTTP_10 {
+        return Ok(());
+    }
+    if version != http::Version::HTTP_11 {
+        return Ok(());
+    }
+
+    let mut hosts = headers.get_all(http::header::HOST).into_iter();
+    let Some(host) = hosts.next() else {
+        return Err(FramingRejection::MissingHost);
+    };
+    if hosts.next().is_some() {
+        return Err(FramingRejection::AmbiguousHost);
+    }
+
+    // 🔍 An authority has no spaces, no control characters, and no embedded
+    // separators. Anything else lets two parsers disagree about the name.
+    let raw = host.as_bytes();
+    if raw.is_empty()
+        || raw
+            .iter()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control() || *byte == b',')
+    {
+        return Err(FramingRejection::MalformedHost);
     }
 
     Ok(())
@@ -528,6 +582,45 @@ mod tests {
             );
         }
         headers
+    }
+
+    #[test]
+    fn host_must_be_present_exactly_once_and_well_formed() {
+        let ok = headers_of(&[("host", "example.test:8443")]);
+        assert_eq!(check_request_host(http::Version::HTTP_11, &ok), Ok(()));
+
+        assert_eq!(
+            check_request_host(http::Version::HTTP_11, &headers_of(&[])),
+            Err(FramingRejection::MissingHost)
+        );
+        assert_eq!(
+            check_request_host(
+                http::Version::HTTP_11,
+                &headers_of(&[("host", "a.test"), ("host", "evil.test")])
+            ),
+            Err(FramingRejection::AmbiguousHost)
+        );
+        for bad in ["a b", "a\tb", "a,b", ""] {
+            assert_eq!(
+                check_request_host(http::Version::HTTP_11, &headers_of(&[("host", bad)])),
+                Err(FramingRejection::MalformedHost),
+                "Host {bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn host_is_not_required_before_http_1_1() {
+        // 🕰️ HTTP/1.0 predates the field, so its absence is not an error.
+        assert_eq!(
+            check_request_host(http::Version::HTTP_10, &headers_of(&[])),
+            Ok(())
+        );
+        // 🔀 H2 and H3 carry `:authority`; their own parsers own this rule.
+        assert_eq!(
+            check_request_host(http::Version::HTTP_2, &headers_of(&[])),
+            Ok(())
+        );
     }
 
     #[test]
