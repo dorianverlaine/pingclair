@@ -1,0 +1,73 @@
+==============================================================================
+### CL:6 + TE:chunked  (body: '0\r\n\r\nGARBAGE')
+-- pingclair 回給客戶端 --
+HTTP/1.1 200 OK
+Content-Length: 238
+server: Pingclair
+via: 1.1 Pingclair
+x-request-id: 657cad177724c-0
+Date: Thu, 30 Jul 2026 02:27:49 GMT
+Connection: keep-alive
+-- 上游實際收到 --
+POST /echo HTTP/1.1
+Host: a
+Transfer-Encoding: chunked
+X-Forwarded-Proto: http
+X-Forwarded-Host: a
+X-Forwarded-For: 127.0.0.1
+X-Real-IP: 127.0.0.1
+Forwarded: for=127.0.0.1
+X-Request-Id: 657cad177724c-0
+via: 1.1 Pingclair
+
+0
+
+
+==============================================================================
+### TE:chunked + CL:4
+-- pingclair 回給客戶端 --
+HTTP/1.1 200 OK
+Content-Length: 238
+server: Pingclair
+via: 1.1 Pingclair
+x-request-id: 657cad177724c-1
+Date: Thu, 30 Jul 2026 02:27:49 GMT
+Connection: keep-alive
+-- 上游實際收到 --
+POST /echo HTTP/1.1
+Host: a
+Transfer-Encoding: chunked
+X-Forwarded-Proto: http
+X-Forwarded-Host: a
+X-Forwarded-For: 127.0.0.1
+X-Real-IP: 127.0.0.1
+Forwarded: for=127.0.0.1
+X-Request-Id: 657cad177724c-1
+via: 1.1 Pingclair
+
+0
+
+
+==============================================================================
+### Content-Length: +5
+-- pingclair 回給客戶端 --
+HTTP/1.1 200 OK
+Content-Length: 230
+server: Pingclair
+via: 1.1 Pingclair
+x-request-id: 657cad177724c-2
+Date: Thu, 30 Jul 2026 02:27:52 GMT
+Connection: keep-alive
+-- 上游實際收到 --
+POST /echo HTTP/1.1
+Host: a
+Content-Length: +5
+X-Forwarded-Proto: http
+X-Forwarded-Host: a
+X-Forwarded-For: 127.0.0.1
+X-Real-IP: 127.0.0.1
+Forwarded: for=127.0.0.1
+X-Request-Id: 657cad177724c-2
+via: 1.1 Pingclair
+
+HELLO

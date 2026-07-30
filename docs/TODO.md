@@ -607,9 +607,14 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
   `Proxy-Connection` 一律止步於本 hop（RFC 9110 §7.6.1、§11.7.1）；
   真正的 WebSocket upgrade 例外。證據在
   `benchmarks/results/20260730_day16_failed_hop_by_hop/`（原站抓包，修前／修後）。
-- ⬜ **剩下的都還沒做**：H1/H2/H3 的 URI／header 正規化、重複
-  `Content-Length`／`Transfer-Encoding`、oversized headers、request smuggling、
-  malformed frame 的**負向測試**。
+- ✔ **訊息框架與 request smuggling**（`benchmarks/results/20260730_day16_framing_df68612/`）。
+  15 個原始 socket 向量，上游回傳實際收到的位元組所以看得到有沒有被走私。
+  12 個修前就被 httparse／Pingora 擋掉;`Content-Length: +5` 是真 bug 且已修
+  ——修前上游原封不動收到那個非法值;CL+TE 由 Pingora 在解析時處理（我沒修，
+  只加了會在它放寬時變紅的測試）;bare LF 放行且判定可接受。
+- ⬜ **剩下的**：URI 正規化（`..`、編碼斜線、雙重編碼）、oversized headers 的
+  系統性負向測試、H2／H3 的畸形 frame（framing 檢查已實作但只有單元測試，
+  缺 frame 級負向測試——需要能發畸形 frame 的客戶端）。
 - 可用 proptest／fuzzing，並與 nginx／Caddy 做差異測試。
 - **完成判定**：每一類都有明確的拒絕行為與測試。
 

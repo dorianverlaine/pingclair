@@ -378,9 +378,183 @@ pub(crate) fn rewrite_uri(
     }
 }
 
+// MARK: - Request framing
+
+/// 🚫 Why a request's message framing cannot be trusted.
+///
+/// Each variant is a way for this proxy and the origin behind it to disagree
+/// about where one request ends and the next begins. That disagreement is the
+/// whole of HTTP request smuggling, so the answer is always to refuse the
+/// request rather than to guess well.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FramingRejection {
+    /// The message carries both `Content-Length` and `Transfer-Encoding`.
+    AmbiguousLength,
+    /// `Transfer-Encoding` appeared on a protocol that forbids it entirely.
+    TransferEncodingForbidden,
+    /// `Content-Length` was not `1*DIGIT` (RFC 9110 §8.6).
+    MalformedContentLength,
+}
+
+impl FramingRejection {
+    /// A reason safe to hand back to the client: it names the offending field
+    /// without echoing the attacker's own bytes.
+    pub(crate) fn reason(&self) -> &'static str {
+        match self {
+            Self::AmbiguousLength => "Ambiguous Message Framing",
+            Self::TransferEncodingForbidden => "Transfer-Encoding Not Allowed",
+            Self::MalformedContentLength => "Malformed Content-Length",
+        }
+    }
+}
+
+/// 🛡️ Rejects requests whose length is open to more than one reading.
+///
+/// The rules differ by protocol version, so the caller passes the version it
+/// actually parsed rather than the one the client claimed:
+///
+/// - **HTTP/1.1** — carrying both `Content-Length` and `Transfer-Encoding` is
+///   forbidden to senders and "ought to be handled as an error" by recipients
+///   (RFC 9112 §6.1). ⚠️ In practice this branch does not fire today: Pingora
+///   settles the ambiguity while parsing, removing `Content-Length` and
+///   disabling keepalive (`pingora-core-0.8.1`
+///   `protocols/http/v1/server.rs:272`), so by the time any filter runs the
+///   evidence is already gone. The check stays as defence in depth for the day
+///   that behaviour changes under us, and
+///   `test_conflicting_length_headers_cannot_smuggle_a_second_request` is what
+///   actually holds Pingora to it.
+/// - **HTTP/2 and HTTP/3** — `Transfer-Encoding` is not merely discouraged, it
+///   is forbidden outright (RFC 9113 §8.2.2, RFC 9114 §4.1), because those
+///   protocols carry their own framing.
+///
+/// `Content-Length` is validated on every version. `httparse` already rejects
+/// negative and hex-looking values, but it accepts a leading `+`, and a value
+/// like `+5` is the ideal smuggling primitive: lenient parsers read five bytes
+/// and strict ones reject, so the two ends of a chain disagree about how much
+/// body they just consumed.
+pub(crate) fn check_request_framing(
+    version: http::Version,
+    headers: &HeaderMap,
+) -> Result<(), FramingRejection> {
+    let has_transfer_encoding = headers.contains_key(http::header::TRANSFER_ENCODING);
+    let has_content_length = headers.contains_key(http::header::CONTENT_LENGTH);
+
+    if has_transfer_encoding {
+        if version == http::Version::HTTP_2 || version == http::Version::HTTP_3 {
+            return Err(FramingRejection::TransferEncodingForbidden);
+        }
+        if has_content_length {
+            return Err(FramingRejection::AmbiguousLength);
+        }
+    }
+
+    // 🔢 RFC 9110 §8.6: `Content-Length = 1*DIGIT`. No sign, no whitespace, no
+    // empty value — and every duplicate must independently satisfy that, since
+    // a lenient reader might take the first and a strict one the last.
+    for value in headers.get_all(http::header::CONTENT_LENGTH) {
+        let raw = value.as_bytes();
+        if raw.is_empty() || !raw.iter().all(u8::is_ascii_digit) {
+            return Err(FramingRejection::MalformedContentLength);
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn headers_of(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(
+                http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                http::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn framing_accepts_a_single_well_formed_length() {
+        assert_eq!(
+            check_request_framing(
+                http::Version::HTTP_11,
+                &headers_of(&[("content-length", "5")])
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check_request_framing(
+                http::Version::HTTP_11,
+                &headers_of(&[("transfer-encoding", "chunked")])
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check_request_framing(http::Version::HTTP_11, &headers_of(&[])),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn framing_rejects_content_length_with_transfer_encoding() {
+        // 🚨 Both header orders, because a parser that only looks at the first
+        // length field it meets would disagree depending on the order.
+        assert_eq!(
+            check_request_framing(
+                http::Version::HTTP_11,
+                &headers_of(&[("content-length", "6"), ("transfer-encoding", "chunked")])
+            ),
+            Err(FramingRejection::AmbiguousLength)
+        );
+        assert_eq!(
+            check_request_framing(
+                http::Version::HTTP_11,
+                &headers_of(&[("transfer-encoding", "chunked"), ("content-length", "6")])
+            ),
+            Err(FramingRejection::AmbiguousLength)
+        );
+    }
+
+    #[test]
+    fn framing_rejects_transfer_encoding_on_h2_and_h3() {
+        for version in [http::Version::HTTP_2, http::Version::HTTP_3] {
+            assert_eq!(
+                check_request_framing(version, &headers_of(&[("transfer-encoding", "chunked")])),
+                Err(FramingRejection::TransferEncodingForbidden),
+                "Transfer-Encoding must be refused on {version:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn framing_rejects_content_length_that_is_not_all_digits() {
+        for bad in ["+5", " 5", "5 ", "", "5,5", "0x5", "-1", "५"] {
+            assert_eq!(
+                check_request_framing(
+                    http::Version::HTTP_11,
+                    &headers_of(&[("content-length", bad)])
+                ),
+                Err(FramingRejection::MalformedContentLength),
+                "Content-Length {bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn framing_checks_every_duplicate_content_length() {
+        // 🧮 The first value is valid, so a check that stopped at `get()`
+        // instead of `get_all()` would let this through.
+        assert_eq!(
+            check_request_framing(
+                http::Version::HTTP_11,
+                &headers_of(&[("content-length", "5"), ("content-length", "+5")])
+            ),
+            Err(FramingRejection::MalformedContentLength)
+        );
+    }
 
     #[test]
     fn cors_preflight_rejects_disallowed_methods() {

@@ -4006,3 +4006,187 @@ async fn test_fail_fast_rejection_keeps_the_downstream_connection_reusable() {
     upstream_task.abort();
     let _ = upstream_task.await;
 }
+
+/// 🧾 An origin that records every request line it ever receives.
+///
+/// Unlike `spawn_header_reporting_origin`, this one keeps serving and keeps
+/// accumulating, because the smuggling tests need to assert that a second
+/// request **never** arrived — which a one-shot channel cannot express.
+async fn spawn_request_recording_origin()
+-> (SocketAddr, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let recorder = Arc::clone(&recorder);
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 16384];
+                loop {
+                    let read = match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => read,
+                    };
+                    recorder
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buffer[..read]).to_string());
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+                        )
+                        .await;
+                }
+            });
+        }
+    });
+    (address, seen)
+}
+
+/// 🛡️ A request whose length two parsers could read differently must never
+/// place a second request in the origin's buffer.
+///
+/// This is the classic CL.TE smuggle: `Content-Length` says six bytes, the
+/// chunked body says zero, and the attacker's trailing bytes are whatever the
+/// next reader mistakes for a fresh request line.
+///
+/// Pingclair does not resolve this itself — Pingora settles it while parsing,
+/// dropping `Content-Length` and disabling keepalive per RFC 9112 §6.1. That
+/// makes this test a contract with a dependency rather than with our own code,
+/// which is exactly why it is worth having: a Pingora upgrade that relaxed the
+/// rule would otherwise reintroduce a smuggling path in silence.
+#[tokio::test]
+async fn test_conflicting_length_headers_cannot_smuggle_a_second_request() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (origin, origin_headers) = spawn_request_recording_origin().await;
+    let config = serde_json::json!({
+        "global": { "http3": false },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "routes": [{
+                "path": "/*",
+                "handler": {
+                    "type": "reverse_proxy",
+                    "upstreams": [format!("http://{origin}")],
+                    "load_balance": { "strategy": "round_robin" },
+                    "headers_up": {},
+                    "headers_down": {}
+                }
+            }]
+        }]
+    })
+    .to_string();
+    let mut server = TestServer::new(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let mut stream = tokio::net::TcpStream::connect(server.address(0))
+        .await
+        .unwrap();
+
+    // 🚨 `GARBAGE...` is the smuggled prefix: if anything downstream treats the
+    // six Content-Length bytes as the body, what follows becomes a request.
+    stream
+        .write_all(
+            b"POST /first HTTP/1.1\r\n\
+              Host: smuggle-probe\r\n\
+              Content-Length: 6\r\n\
+              Transfer-Encoding: chunked\r\n\
+              \r\n\
+              0\r\n\
+              \r\n\
+              GET /smuggled HTTP/1.1\r\nHost: smuggle-probe\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response)).await;
+    let text = String::from_utf8_lossy(&response);
+
+    // 🔌 Exactly one response, and the connection closed rather than staying
+    // available for a second request whose boundary we cannot vouch for.
+    assert_eq!(
+        text.matches("HTTP/1.1 ").count(),
+        1,
+        "the ambiguous request must produce exactly one response:\n{text}"
+    );
+
+    let seen = origin_headers.lock().unwrap().join("\n");
+    assert!(
+        !seen.contains("/smuggled"),
+        "the smuggled request line reached the origin:\n{seen}"
+    );
+    assert!(
+        !seen.to_lowercase().contains("content-length: 6"),
+        "the conflicting Content-Length was forwarded to the origin:\n{seen}"
+    );
+}
+
+/// 🔢 `Content-Length` must be `1*DIGIT` (RFC 9110 §8.6).
+///
+/// `httparse` already refuses negative and hex-looking values, but it accepts a
+/// leading `+`, and `+5` is an ideal smuggling primitive: a lenient reader
+/// takes five body bytes while a strict one rejects the message, so the two
+/// ends of a proxy chain disagree about how much they just consumed. Before
+/// this was fixed, Pingclair accepted `+5` **and forwarded it verbatim**.
+#[tokio::test]
+async fn test_malformed_content_length_is_rejected_before_it_reaches_the_origin() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (origin, origin_headers) = spawn_request_recording_origin().await;
+    let config = serde_json::json!({
+        "global": { "http3": false },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "routes": [{
+                "path": "/*",
+                "handler": {
+                    "type": "reverse_proxy",
+                    "upstreams": [format!("http://{origin}")],
+                    "load_balance": { "strategy": "round_robin" },
+                    "headers_up": {},
+                    "headers_down": {}
+                }
+            }]
+        }]
+    })
+    .to_string();
+    let mut server = TestServer::new(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    // 🧪 Only `+5` is tested here. Leading and trailing whitespace around a
+    // field value is optional whitespace that RFC 9112 §5 requires the parser
+    // to strip, so `" 5"` legitimately reaches us as `5` and accepting it is
+    // correct rather than lax.
+    for bad_value in ["+5"] {
+        let mut stream = tokio::net::TcpStream::connect(server.address(0))
+            .await
+            .unwrap();
+        let request = format!(
+            "POST /probe HTTP/1.1\r\nHost: length-probe\r\nContent-Length: {bad_value}\r\n\r\nHELLO"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        let _ =
+            tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response)).await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(
+            text.starts_with("HTTP/1.1 400 "),
+            "Content-Length {bad_value:?} must be rejected, got:\n{text}"
+        );
+    }
+
+    let seen = origin_headers.lock().unwrap().join("\n");
+    assert!(
+        !seen.contains("/probe"),
+        "a request with a malformed Content-Length reached the origin:\n{seen}"
+    );
+}

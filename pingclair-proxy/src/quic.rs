@@ -967,6 +967,31 @@ impl H3App {
             return;
         };
 
+        // 🛡️ HTTP/3 carries its own framing, so `Transfer-Encoding` is forbidden
+        // outright here rather than merely discouraged, and `Content-Length`
+        // still has to be `1*DIGIT`. Same rule set as H1/H2, one implementation.
+        {
+            let mut headers = http::HeaderMap::new();
+            for (name, value) in &req.headers {
+                if let (Ok(name), Ok(value)) = (
+                    http::header::HeaderName::from_bytes(name.as_bytes()),
+                    http::HeaderValue::from_str(value),
+                ) {
+                    headers.append(name, value);
+                }
+            }
+            if let Err(rejection) =
+                crate::http_policy::check_request_framing(http::Version::HTTP_3, &headers)
+            {
+                tracing::warn!(
+                    "🚫 H3: rejected a request with untrustworthy message framing: {}",
+                    rejection.reason()
+                );
+                self.queue_simple_response(qconn, stream_id, 400, rejection.reason());
+                return;
+            }
+        }
+
         let (req_body_tx, req_body_rx) = mpsc::channel::<Vec<u8>>(REQ_BODY_CHANNEL_CAPACITY);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         self.streams.insert(
