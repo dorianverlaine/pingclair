@@ -46,12 +46,17 @@ benchmarks/results/**
 !benchmarks/results/**/commit.txt
 !benchmarks/results/**/result.txt
 
-# 📋 The execution plan is a working document, kept local.
+# 📋 Planning documents are working material, kept local.
 #
-# It tracks known-but-unfixed weaknesses day by day, including reproducible
-# ones in already-released code. A public, prioritised list of your own
-# unpatched defects is a target list; publish the fix, not the queue.
+# TODO.md tracks known-but-unfixed weaknesses day by day, including
+# reproducible ones in already-released code. A public, prioritised list of
+# your own unpatched defects is a target list; publish the fix, not the queue.
+#
+# SITE.md is the website plan. Same shelf for the same reason plans belong
+# there: they contradict themselves as facts arrive, and a plan read as a
+# promise is worse than no plan. Publish the site, not the sketch of it.
 docs/TODO.md
+docs/SITE.md
 
 # Test coverage
 *.profraw
