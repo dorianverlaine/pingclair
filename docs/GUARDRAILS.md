@@ -12,8 +12,24 @@
 
 ## 🧪 測試與除錯
 
+- **自簽憑證測不出憑證鏈的缺陷。** 自簽憑證自己就是自己的簽發者，它**沒有**
+  中繼憑證——「只送 leaf」和「送完整鏈」產生的位元組完全相同。所以任何用
+  自簽 fixture 的 TLS 測試，對「伺服器把中繼憑證丟掉了」這類 bug 是**物理上
+  不可觀測**的。2026-07-30 的雙區域公網驗證就是這樣抓到 H1／H2 只送 leaf：
+  在那之前 474 個測試沒有一個可能發現它。要驗憑證鏈，fixture 必須是
+  root → intermediate → leaf 的真實兩層信任路徑（`rcgen` 可以直接建，見
+  `pingclair/tests/integration.rs` 的 `build_two_level_chain`），
+  斷言用 client 端的 `peer_cert_chain().len()`。
+- **瀏覽器不能當 TLS 憑證鏈的驗收工具。** Chrome 與 Firefox 會快取中繼憑證，
+  也會用 AIA 自己去補抓缺少的那張，所以**伺服器少送中繼，瀏覽器照樣顯示綠鎖**。
+  curl、Go、Java、Python requests 則會直接以
+  `unable to get local issuer certificate (20)` 硬失敗。驗收要用嚴格 client，
+  不要用瀏覽器「看起來正常」當證據。
 - **本機 macOS 有系統代理 `127.0.0.1:1082`**；reqwest 整合測試必須 `.no_proxy()`，
   否則請求會被代理攔截，症狀看起來像路由錯誤。
+- **本機 `dig` 會回假 IP。** 系統代理用 fake-IP DNS，直接 `dig example.com`
+  得到的是 `198.18.x.x`，看起來像 DNS 還沒生效。查真實解析必須指定公開
+  resolver：`dig @8.8.8.8 example.com`。
 - **遇到固定 404／502 或 readiness 異常**，先用 `lsof`／`ss` 查 port owner，
   再查 child 是否已因 bind failure 退出。**不要先假設是路由邏輯錯誤**——
   這個誤判浪費過整輪除錯。

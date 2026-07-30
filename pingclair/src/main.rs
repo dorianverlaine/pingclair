@@ -27,7 +27,12 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 /// Cached BoringSSL certificate with expiration tracking
 struct CachedSslCert {
-    x509: X509,
+    /// 🔗 The leaf first, then every intermediate the CA issued alongside it.
+    ///
+    /// This is a whole chain rather than a single certificate because a TLS
+    /// server has to hand the client everything between its leaf and a trusted
+    /// root. Keeping only the leaf here is exactly the bug this field replaced.
+    chain: Vec<X509>,
     pkey: PKey<Private>,
     /// Unix timestamp when this cache entry expires
     expires_at: u64,
@@ -83,6 +88,43 @@ impl DynamicCertResolver {
     }
 }
 
+/// 🔗 Parses a PEM bundle into the leaf plus every intermediate that follows it.
+///
+/// The distinction that matters: `X509::from_pem` stops at the first
+/// `-----END CERTIFICATE-----` and silently discards the rest, while
+/// `stack_from_pem` returns all of them. A CA-issued bundle is leaf-then-
+/// intermediates, so the first parser quietly produces a certificate that no
+/// strict client can build a trust path from.
+fn parse_certificate_chain(cert_pem: &str) -> Result<Vec<X509>, String> {
+    let chain = X509::stack_from_pem(cert_pem.as_bytes()).map_err(|e| e.to_string())?;
+    if chain.is_empty() {
+        // 🚫 An empty bundle must fail closed: handing BoringSSL no leaf at all
+        // would otherwise surface as a confusing handshake error much later.
+        return Err("the PEM bundle contained no certificate".to_string());
+    }
+    Ok(chain)
+}
+
+/// 🔗 Installs one leaf, its intermediates, and the matching key on a handshake.
+///
+/// Sending only the leaf still completes a handshake against any client that
+/// already happens to hold the intermediate — browsers cache them and will even
+/// fetch a missing one over AIA. That is precisely why a missing chain hides so
+/// well: it looks fine in a browser and fails hard in `curl`, Go, and Java.
+fn install_certificate_chain(
+    ssl: &mut TlsRef,
+    chain: &[X509],
+    pkey: &PKey<Private>,
+) -> Result<(), boring::error::ErrorStack> {
+    let (leaf, intermediates) = chain.split_first().expect("chain is never empty");
+    ssl.set_certificate(leaf)?;
+    for intermediate in intermediates {
+        ssl.add_chain_cert(intermediate)?;
+    }
+    ssl.set_private_key(pkey)?;
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl TlsAccept for DynamicCertResolver {
     async fn certificate_callback(&self, ssl: &mut TlsRef) {
@@ -106,13 +148,8 @@ impl TlsAccept for DynamicCertResolver {
             {
                 // Cache hit - use cached BoringSSL objects
                 tracing::debug!("🚀 Using cached cert for {}", sni);
-                if let Err(e) = ssl.set_certificate(&cached.x509) {
-                    tracing::error!("Failed to set cached certificate: {}", e);
-                    return;
-                }
-                if let Err(e) = ssl.set_private_key(&cached.pkey) {
-                    tracing::error!("Failed to set cached private key: {}", e);
-                    return;
+                if let Err(e) = install_certificate_chain(ssl, &cached.chain, &cached.pkey) {
+                    tracing::error!("Failed to install cached certificate chain: {}", e);
                 }
                 return;
             }
@@ -120,7 +157,7 @@ impl TlsAccept for DynamicCertResolver {
 
         // Step 2: Cache miss or expired - fetch and parse PEM
         if let Some((cert_pem, key_pem)) = self.tls_manager.resolve_pem(&sni).await {
-            let x509 = match X509::from_pem(cert_pem.as_bytes()) {
+            let chain = match parse_certificate_chain(&cert_pem) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!("Failed to parse cert PEM: {}", e);
@@ -136,20 +173,16 @@ impl TlsAccept for DynamicCertResolver {
                 }
             };
 
-            // Step 3: Set the certificate and key
-            if let Err(e) = ssl.set_certificate(&x509) {
-                tracing::error!("Failed to set certificate: {}", e);
-                return;
-            }
-            if let Err(e) = ssl.set_private_key(&pkey) {
-                tracing::error!("Failed to set private key: {}", e);
+            // Step 3: Set the leaf, its intermediates, and the key
+            if let Err(e) = install_certificate_chain(ssl, &chain, &pkey) {
+                tracing::error!("Failed to install certificate chain: {}", e);
                 return;
             }
 
             // Step 4: Cache the parsed BoringSSL objects for future handshakes
             let expires_at = current_time + CERT_CACHE_TTL_SECS;
             let cached_entry = CachedSslCert {
-                x509,
+                chain,
                 pkey,
                 expires_at,
             };
@@ -530,13 +563,29 @@ fn reserve_private_listener_address()
     Ok((listener, address))
 }
 
-/// 🔐 Treats explicit TLS configuration as authoritative on every listen port.
+/// 🚫 Port 80 is plaintext HTTP and never carries TLS, whatever the block says.
+///
+/// RFC 8555 §8.3 has the ACME server fetch the HTTP-01 token over **cleartext**
+/// HTTP on port 80. So the moment a `tls` block also wraps port 80, the CA's
+/// plaintext probe hits a TLS listener, the handshake is rejected as
+/// `[HTTP_REQUEST]`, and the order fails validation — automatic HTTPS can never
+/// obtain the certificate it is trying to install.
+const PLAINTEXT_ONLY_PORT: u16 = 80;
+
+/// 🔐 Treats explicit TLS configuration as authoritative, except on port 80.
+///
+/// Everything except port 80 keeps the previous rule: an explicit `tls` block
+/// enables TLS anywhere, and 443/8443 imply it even without one.
 fn server_requires_tls(config: &pingclair_core::config::ServerConfig, addr: &str) -> bool {
-    config.tls.is_some()
-        || addr
-            .rsplit_once(':')
-            .and_then(|(_, port)| port.parse::<u16>().ok())
-            .is_some_and(|port| matches!(port, 443 | 8443))
+    let port = addr
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok());
+
+    if port == Some(PLAINTEXT_ONLY_PORT) {
+        return false;
+    }
+
+    config.tls.is_some() || port.is_some_and(|port| matches!(port, 443 | 8443))
 }
 
 fn run_server(
@@ -1197,5 +1246,64 @@ mod tests {
         assert!(!server_requires_tls(&plain, "127.0.0.1:21209"));
         assert!(server_requires_tls(&plain, "0.0.0.0:443"));
         assert!(server_requires_tls(&plain, "[::]:8443"));
+    }
+
+    /// 🚫 A `tls` block must not drag port 80 into TLS along with it.
+    ///
+    /// `example.com { listen :80  listen :443  tls auto }` is the config anyone
+    /// writes first, and it used to make port 80 a TLS listener. Let's Encrypt
+    /// then sent its plaintext HTTP-01 probe into a TLS handshake, the listener
+    /// logged `[HTTP_REQUEST]`, and the order failed — automatic HTTPS could
+    /// never obtain the certificate it was trying to install.
+    #[test]
+    fn port_80_stays_plaintext_even_with_an_explicit_tls_block() {
+        let config = pingclair_core::config::ServerConfig {
+            listen: vec!["0.0.0.0:80".to_string(), "0.0.0.0:443".to_string()],
+            tls: Some(Default::default()),
+            ..Default::default()
+        };
+
+        assert!(
+            !server_requires_tls(&config, "0.0.0.0:80"),
+            "ACME HTTP-01 validation is plaintext on port 80 and must reach the proxy"
+        );
+        assert!(
+            server_requires_tls(&config, "0.0.0.0:443"),
+            "the TLS block must still apply to the HTTPS listener"
+        );
+    }
+
+    /// 🔗 A CA bundle carries the leaf and its intermediates; keep all of them.
+    #[test]
+    fn parsing_a_bundle_keeps_every_certificate_after_the_leaf() {
+        let leaf = certificate_pem("leaf.test");
+        let intermediate = certificate_pem("intermediate.test");
+
+        let single = parse_certificate_chain(&leaf).expect("a lone leaf parses");
+        assert_eq!(single.len(), 1);
+
+        let bundle = format!("{leaf}{intermediate}");
+        let chain = parse_certificate_chain(&bundle).expect("a bundle parses");
+        assert_eq!(
+            chain.len(),
+            2,
+            "the intermediate was dropped; clients cannot build a trust path without it"
+        );
+
+        // 🚫 An empty bundle fails closed rather than reaching BoringSSL with
+        // no leaf and surfacing as a confusing handshake error much later.
+        assert!(parse_certificate_chain("").is_err());
+    }
+
+    /// 🎫 Generates one throwaway self-signed certificate in PEM form.
+    #[cfg(test)]
+    fn certificate_pem(common_name: &str) -> String {
+        let mut params =
+            rcgen::CertificateParams::new(vec![common_name.to_string()]).expect("parameters");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        let key = rcgen::KeyPair::generate().expect("key pair");
+        params.self_signed(&key).expect("certificate").pem()
     }
 }
