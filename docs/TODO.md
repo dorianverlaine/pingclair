@@ -621,9 +621,19 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
   修前都回 200。形狀同路徑逃逸：代理取第一個、origin 可能取最後一個。已修。
 - ✔ **oversized headers**：Day 8 已完成（431），M2 矩陣在 Linux 遠端驗證過
   （`a request over the header-count limit was refused (431)`）。本日重新確認。
-- ⬜ **剩下的**：H2／H3 的畸形 frame 負向測試（framing 檢查已實作但只有單元
-  測試，缺 frame 級的——需要能發畸形 frame 的客戶端）;proptest／fuzzing 打
-  HTTP parser;與 nginx／Caddy 的差異測試。
+- ✔ **H2 畸形 frame**：h2spec 2.6.0 全套 **146 項 145 過 1 skip 0 失敗**
+  （`h2spec.txt`）。含 HPACK、flow control、stream 狀態機。
+- ✔ **H3 畸形 frame**：兩個永久回歸測試（請求串流上的 SETTINGS、HEADERS 之前的
+  DATA），都必須以 `H3_FRAME_UNEXPECTED` 關閉連線。
+- ✔ **proptest**：打自家驗證器，目標是「任何輸入都不 panic」——`panic = "abort"`
+  讓請求路徑上的 panic 等於遠端 DoS。當場抓到 `percent_decode_once` 把位元組
+  當 Latin-1 碼點導致膨脹的缺陷，已修。
+- ✔ **與 nginx／Caddy 差異測試**（`differential-vs-nginx-caddy.txt`）。
+- 🟡 **待決策（相容性，非安全）**：路徑逃逸我選拒絕（400），nginx 與 Caddy 選
+  正規化（403）。安全結果相同，但北極星是「與 Caddy 一致」，所以這是我造成的
+  相容性缺口。改成正規化會變動每個 origin 收到的路徑，需要自己的驗證循環。
+- 🟡 **已知缺口**：完全沒有 header 的請求，我們不回應就關連線（nginx／Caddy 回
+  400）。發生在 Pingora 解析層，在我們所有 hook 之前。可診斷性問題，非安全。
 - 可用 proptest／fuzzing，並與 nginx／Caddy 做差異測試。
 - **完成判定**：每一類都有明確的拒絕行為與測試。
 

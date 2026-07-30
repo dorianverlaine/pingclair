@@ -126,3 +126,62 @@ HTTP/1.0 不檢查（`Host` 比它晚出現，缺席是合法的）；H2／H3 �
 | oversized headers | ✔ Day 8 已完成（431），M2 矩陣遠端驗證過 |
 | malformed frame（H2／H3） | ⬜ framing 檢查已實作但只有單元測試 |
 | proptest／fuzzing、與 nginx／Caddy 差異測試 | ⬜ |
+
+## 第四輪：H2 一致性、H3 畸形 frame、proptest、差異測試
+
+### h2spec 2.6.0 — 146 項，145 通過，1 skip，**0 失敗**
+
+`h2spec.txt`。涵蓋畸形 frame、HPACK（含 EOS 符號、無效索引、動態表更新）、
+flow control、stream 狀態機。H2 的 frame 層不需要我們自己再寫負向測試。
+
+### H3 畸形 frame — 兩個永久回歸測試
+
+`pingclair-proxy/tests/h3_end_to_end.rs`。在請求串流上塞原始位元組：
+
+- SETTINGS frame 出現在請求串流（RFC 9114 §7.2.4 規定只能在 control stream）
+- DATA frame 出現在任何 HEADERS 之前（RFC 9114 §4.1）
+
+兩者都必須以 `H3_FRAME_UNEXPECTED`（0x0105）關閉連線，實測符合。
+這是 quiche 的 h3 層在做事，但現在被我們的測試釘住了。
+
+### proptest — 目標是「不會 panic」
+
+`release` 設定了 `panic = "abort"`，所以請求路徑上任何 panic 都是遠端 DoS，
+不是錯誤訊息。這幾個驗證器是最早讀到攻擊者位元組的地方。
+
+proptest 當場抓到一個真缺陷：`percent_decode_once` 用 `byte as char` 把每個
+位元組當 Latin-1 碼點，所以 ≥0x80 的位元組會膨脹成 2 bytes 的 UTF-8，並弄壞
+多位元組字元。對 traversal 判斷無害（只比對 ASCII），但寫法是錯的。已改成
+全程走位元組。
+
+### 與 nginx／Caddy 差異測試
+
+`differential-vs-nginx-caddy.txt`（nginx:alpine、caddy:alpine，同一組路由）。
+
+| 向量 | pingclair | nginx | caddy | |
+|---|---|---|---|---|
+| `/api/../admin/x` | **400** | 403 | 403 | ⚠️ 不一致 |
+| `/api/%2e%2e/admin/x` | **400** | 403 | 403 | ⚠️ 不一致 |
+| `/admin/./x` | **400** | 403 | 403 | ⚠️ 不一致 |
+| 重複 Host | 400 | 400 | 400 | ✅ |
+| 缺 Host（且無任何 header） | **(無回應)** | 400 | 400 | ⚠️ 不一致 |
+| Host 含空白 | 400 | 400 | 400 | ✅ |
+| `Content-Length: +5` | 400 | 400 | 400 | ✅ |
+| CL + TE | 200 | 400 | 200 | 與 Caddy 一致 |
+| 重複 CL 值不同 | 400 | 400 | 400 | ✅ |
+| obs-fold | 400 | 400 | 200 | 與 nginx 一致 |
+| bare LF | 200 | 200 | 200 | ✅ |
+
+**兩個不一致要記下來，因為它們是不同性質的問題。**
+
+**一、路徑逃逸：我選了拒絕，nginx 和 Caddy 選了正規化。**
+安全結果相同——三者都沒有把資源交出去，政策都有套用。但 Caddy 回 403（政策
+生效），我回 400（請求被拒）。這個專案的北極星是「與 Caddy 表現一致但更快」，
+所以**這是相容性缺口，不是安全缺口**，而且是我造成的。改成正規化會同時滿足
+兩者，但那會變動每個 origin 收到的路徑，需要自己的驗證循環（M2 矩陣＋生產
+回歸），不該塞進這一天。**列為待決策項。**
+
+**二、完全沒有 header 的請求，我們不回應就關連線。**
+`GET /api/x HTTP/1.1\r\n\r\n` 得不到任何位元組；只要帶任何一個其他 header
+就會正確回 400。發生在 Pingora 的解析層，在我們所有 hook 之前。nginx 與
+Caddy 都回 400。不是安全問題，是可診斷性缺口。
