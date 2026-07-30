@@ -10,6 +10,9 @@ description = "Admin REST API for Pingclair"
 
 [dependencies]
 pingclair-core = { path = "../pingclair-core" }
+# 🛡️ The Admin API must reach the canonical validator, not re-implement
+# a second set of rules that drifts from the Pingclairfile path.
+pingclair-config = { path = "../pingclair-config" }
 tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true

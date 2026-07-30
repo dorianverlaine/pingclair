@@ -2664,6 +2664,266 @@ async fn test_pingclairfile_internal_tls_serves_trusted_h1_and_h2() {
     );
 }
 
+/// 🛠️ Starts a server with the Admin API enabled and one readiness route.
+///
+/// Every Day 17 test drives the real Admin socket rather than calling
+/// `validate_config` directly. That distinction is the whole point: the
+/// function always rejected these configurations, and the *path* did not
+/// call the function.
+fn admin_test_config(readiness_path: &str, readiness_token: &str) -> String {
+    serde_json::json!({
+        "global": { "http3": false },
+        "admin": { "enabled": true, "listen": "127.0.0.1:0" },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "routes": [{
+                "path": readiness_path,
+                "handler": { "type": "respond", "status": 200, "body": readiness_token }
+            }]
+        }]
+    })
+    .to_string()
+}
+
+/// 🚫 An unimplemented handler must be refused at the Admin door.
+///
+/// `pingclair-plugin` is an unwired skeleton: no caller anywhere in the
+/// workspace. A configuration naming a plugin used to validate, install, and
+/// then do nothing at request time — the H1/H2 dispatcher fell through a
+/// wildcard arm that returned "not handled" without logging. An operator who
+/// wrote a plugin route to authenticate or filter got a route that was simply
+/// absent, and nothing ever said so.
+#[tokio::test]
+async fn test_admin_rejects_a_config_naming_an_unimplemented_plugin() {
+    let mut server = TestServer::new(&admin_test_config("/__ready_plugin", "ready-plugin-token"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let poisoned = serde_json::json!({
+        "listen": [server.address(0).to_string()],
+        "routes": [{
+            "path": "/*",
+            "handler": { "type": "plugin", "name": "totally-fictional", "args": [] }
+        }]
+    });
+
+    let response = client
+        .post(server.admin_url("/config/0"))
+        .json(&poisoned)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        400,
+        "a plugin handler must fail closed, not install as a silent no-op"
+    );
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains("plugin"),
+        "the rejection must name the offending handler, got: {body}"
+    );
+
+    // 🛡️ The rejection must also leave the running configuration untouched.
+    let still_serving = client
+        .get(server.url(0, "/__ready_plugin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(still_serving.status(), 200);
+    assert_eq!(still_serving.text().await.unwrap(), "ready-plugin-token");
+}
+
+/// 🛡️ The Admin door runs the same safety rules as a Pingclairfile.
+///
+/// `validate_config` rejected a retry policy of 999 attempts all along. The
+/// Admin API just never asked it, so the one interface reachable over a socket
+/// was the one with no rules.
+#[tokio::test]
+async fn test_admin_runs_the_canonical_validator_on_posted_config() {
+    let mut server = TestServer::new(&admin_test_config("/__ready_retry", "ready-retry-token"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let unsafe_retry = serde_json::json!({
+        "listen": [server.address(0).to_string()],
+        "routes": [{
+            "path": "/*",
+            "handler": {
+                "type": "reverse_proxy",
+                "upstreams": ["http://127.0.0.1:9"],
+                "retry": { "max_attempts": 999 }
+            }
+        }]
+    });
+
+    let response = client
+        .post(server.admin_url("/config/0"))
+        .json(&unsafe_retry)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+
+    let still_serving = client
+        .get(server.url(0, "/__ready_retry"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(still_serving.status(), 200);
+}
+
+/// 🧭 A config naming an unbound listener applies nothing at all.
+///
+/// The old loop applied per listener as it walked the list, so a config naming
+/// a live address and a bogus one left the first on the new settings and the
+/// second on the old — a half-applied state that was never reported.
+#[tokio::test]
+async fn test_admin_config_for_an_unknown_listener_applies_nothing() {
+    let mut server = TestServer::new(&admin_test_config(
+        "/__ready_partial",
+        "ready-partial-token",
+    ));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let half_valid = serde_json::json!({
+        "listen": [server.address(0).to_string(), "127.0.0.1:1"],
+        "routes": [{
+            "path": "/*",
+            "handler": { "type": "respond", "status": 200, "body": "should-never-apply" }
+        }]
+    });
+
+    let response = client
+        .post(server.admin_url("/config/0"))
+        .json(&half_valid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+
+    // 🛡️ The live listener named first must not have been rewritten.
+    let untouched = client
+        .get(server.url(0, "/__ready_partial"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(untouched.status(), 200);
+    assert_eq!(untouched.text().await.unwrap(), "ready-partial-token");
+}
+
+/// 🧱 An oversized body is refused, and the process survives it.
+///
+/// The old code read the body with `req.collect().await.unwrap()` and had no
+/// ceiling at all. This asserts the limit answers 413 — and, just as
+/// importantly, that the server is still alive afterwards to answer anything.
+#[tokio::test]
+async fn test_admin_rejects_an_oversized_config_body() {
+    let mut server = TestServer::new(&admin_test_config("/__ready_big", "ready-big-token"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    // 🐘 Two megabytes of valid JSON, over the one-megabyte ceiling.
+    let filler = "x".repeat(2 * 1024 * 1024);
+    let oversized = serde_json::json!({
+        "listen": [server.address(0).to_string()],
+        "routes": [{
+            "path": "/*",
+            "handler": { "type": "respond", "status": 200, "body": filler }
+        }]
+    });
+
+    let response = client
+        .post(server.admin_url("/config/0"))
+        .json(&oversized)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 413);
+
+    let alive = client
+        .get(server.admin_url("/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        alive.status(),
+        200,
+        "the admin server must still be running"
+    );
+}
+
+/// 💀 A truncated upload must not take the process down with it.
+///
+/// This is the one that mattered. `panic = "abort"` is set for release builds,
+/// so `unwrap()` on a failed body read aborted the entire server: every
+/// in-flight request on every listener, gone. No malice required — an
+/// authenticated client whose connection dropped mid-upload was enough,
+/// because a truncated body is an `Err`, not a short `Ok`.
+///
+/// A raw socket is used rather than an HTTP client because the point is to
+/// promise a body and then vanish, which a well-behaved client will not do.
+#[tokio::test]
+async fn test_admin_survives_a_client_that_disconnects_mid_body() {
+    use tokio::io::AsyncWriteExt;
+
+    let mut server = TestServer::new(&admin_test_config("/__ready_abort", "ready-abort-token"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let admin_address = server
+        .admin_address
+        .expect("this fixture enables the admin API");
+
+    // 🔌 Announce 4096 bytes, send 16, then drop the connection.
+    {
+        let mut socket = tokio::net::TcpStream::connect(admin_address).await.unwrap();
+        socket
+            .write_all(
+                b"POST /config/0 HTTP/1.1\r\n\
+                  Host: localhost\r\n\
+                  Content-Type: application/json\r\n\
+                  Content-Length: 4096\r\n\r\n\
+                  {\"listen\":[\"127",
+            )
+            .await
+            .unwrap();
+        socket.flush().await.unwrap();
+    }
+
+    // 🩺 Liveness alone is not enough to prove this, and assuming it would
+    // make the test worthless. `panic = "abort"` is set only for the release
+    // profile, so in this debug build the old `unwrap()` merely unwound the
+    // connection task and the server stayed up — a liveness check passes
+    // against the very bug it is meant to catch. The panic itself is the
+    // observable that survives both profiles, and it lands on stderr.
+    let alive = client
+        .get(server.admin_url("/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        alive.status(),
+        200,
+        "a truncated upload must not abort the process"
+    );
+    let serving = client
+        .get(server.url(0, "/__ready_abort"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(serving.status(), 200, "proxy listeners must still serve");
+
+    let stderr = std::fs::read_to_string(&server.stderr_path).unwrap_or_default();
+    assert!(
+        !stderr.contains("panicked at"),
+        "reading the body panicked; under the release profile's `panic = \\\"abort\\\"` \
+         that is not a dropped connection but the whole server going down. stderr:\n{stderr}"
+    );
+}
+
 /// 🧭 A redirect target is a template, so `{host}` and `{uri}` must expand.
 ///
 /// This is what Automatic HTTPS relies on to send a plaintext visitor to the

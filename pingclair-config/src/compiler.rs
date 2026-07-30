@@ -338,6 +338,7 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
 
         for route in &server.routes {
             validate_proxy_protection_handler(&route.handler)?;
+            reject_unimplemented_handler(&route.handler)?;
         }
 
         let Some(tls) = &server.tls else {
@@ -370,6 +371,64 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
     }
 
     Ok(())
+}
+
+/// 🚫 Rejects handlers the server cannot actually execute.
+///
+/// A configuration that validates and then does nothing is the worst of both
+/// worlds: the operator believes a rule is in force and no error ever says
+/// otherwise. `plugin` was exactly that — `{"type":"plugin","name":"totally-
+/// fictional"}` passed validation, and at request time the H1/H2 dispatcher
+/// fell through to a catch-all that returned "not handled" without a word in
+/// the log. A route meant to authenticate or filter would simply be absent.
+///
+/// The plugin system is a stub, not a feature (`pingclair-plugin` has no
+/// callers), so the honest answer is to refuse the configuration up front.
+/// Living here rather than in the DSL adapter is deliberate: the Admin API
+/// deserializes straight into core types, so an adapter-only check is a
+/// bypass — see the note on `validate_config` being the single validation path.
+fn reject_unimplemented_handler(handler: &HandlerConfig) -> CompileResult<()> {
+    match handler {
+        HandlerConfig::Plugin { name, .. } => Err(CompileError::InvalidRoute {
+            message: format!(
+                "handler `plugin` is not implemented, so the route named `{name}` would \
+                 silently do nothing; the plugin system is planned but unwired"
+            ),
+        }),
+        HandlerConfig::Pipeline { handlers }
+        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::HandlePath { handlers, .. } => {
+            for handler in handlers {
+                reject_unimplemented_handler(handler)?;
+            }
+            Ok(())
+        }
+        HandlerConfig::HandleErrors { errors } => {
+            for handlers in errors.values() {
+                for handler in handlers {
+                    reject_unimplemented_handler(handler)?;
+                }
+            }
+            Ok(())
+        }
+        HandlerConfig::TryFiles { fallback, .. } => match fallback {
+            Some(fallback) => reject_unimplemented_handler(fallback),
+            None => Ok(()),
+        },
+        // 🧭 Named exhaustively rather than with a wildcard: a new handler
+        // variant must force a decision here about whether it is executable,
+        // instead of defaulting to "allowed" and shipping as a silent no-op.
+        HandlerConfig::FileServer { .. }
+        | HandlerConfig::ReverseProxy(_)
+        | HandlerConfig::Redirect { .. }
+        | HandlerConfig::Rewrite { .. }
+        | HandlerConfig::Respond { .. }
+        | HandlerConfig::Headers { .. }
+        | HandlerConfig::BasicAuth { .. }
+        | HandlerConfig::RateLimit { .. }
+        | HandlerConfig::Cors { .. }
+        | HandlerConfig::AccessControl(_) => Ok(()),
+    }
 }
 
 /// 🛡️ Rejects unsafe retry, overload, and circuit-breaker policies.

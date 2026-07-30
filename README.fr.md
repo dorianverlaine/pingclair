@@ -549,7 +549,7 @@ Pingclair est organisé en workspace Cargo modulaire :
 | **`pingclair-static`** | **Service de fichiers statiques.** Lecture de fichiers efficace, déduction du type MIME et transmission en flux. |
 | **`pingclair-tls`** | **Gestion TLS.** Certificats manuels, autorité interne persistante et émission automatique via ACME (Let's Encrypt). |
 | **`pingclair-api`** | **API d'administration.** Interface RESTful pour consulter l'état ou recharger la configuration à chaud, à l'exécution. |
-| **`pingclair-plugin`** | **Système de plugins.** Définit l'interface permettant aux développeurs tiers d'étendre les fonctionnalités. |
+| **`pingclair-plugin`** | 🚧 **Ébauche, inutilisable.** Squelette d'une future interface de plugins, sans aucun appelant dans l'espace de travail. Une configuration nommant un handler `plugin` est **rejetée**, plutôt qu'acceptée puis silencieusement ignorée. Prévu pour v0.3. |
 
 ## 🤝 Contribuer
 

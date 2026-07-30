@@ -2727,6 +2727,7 @@ dependencies = [
  "hyper 1.11.0",
  "hyper-util",
  "parking_lot",
+ "pingclair-config",
  "pingclair-core",
  "pingclair-proxy",
  "serde",

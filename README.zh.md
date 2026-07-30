@@ -511,7 +511,7 @@ Pingclair 採用模組化的 Cargo Workspace 結構管理程式碼：
 | **`pingclair-static`** | **靜態檔案服務**。實作高效率的檔案讀取、MIME 類型推斷與串流傳輸。 |
 | **`pingclair-tls`** | **TLS 管理**。處理手動憑證、持久化 internal CA 與 ACME 自動申請（Let's Encrypt）。 |
 | **`pingclair-api`** | **Admin API**。提供 RESTful 介面，可在執行期動態檢視狀態或熱更新設定。 |
-| **`pingclair-plugin`** | **外掛系統**。定義外掛介面，讓第三方開發者得以擴充功能。 |
+| **`pingclair-plugin`** | 🚧 **骨架，尚不可用**。未來外掛介面的雛形，整個 workspace 沒有任何呼叫者。設定裡寫 `plugin` handler 會被**拒絕**，而不是接受後靜默忽略。規劃於 v0.3。 |
 
 ## 🤝 參與貢獻
 
