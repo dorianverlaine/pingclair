@@ -538,32 +538,37 @@ pub(crate) fn check_request_host(
 /// change what every origin receives, whereas a well-formed client never needs
 /// to send these in the first place.
 pub(crate) fn path_escapes_its_route(path: &str) -> bool {
-    let decoded = percent_decode_once(path);
-    decoded
-        .split('/')
-        .any(|segment| segment == "." || segment == "..")
+    // 🧮 Bytes throughout: a path is not required to be valid UTF-8 once the
+    // escapes are resolved, and the comparison only ever needs ASCII.
+    percent_decode_once(path)
+        .split(|byte| *byte == b'/')
+        .any(|segment| segment == b"." || segment == b"..")
 }
 
 /// Decode `%XX` escapes a single time, leaving anything malformed untouched.
 ///
+/// Returns bytes rather than a `String` deliberately: a decoded path need not
+/// be valid UTF-8, and treating each byte as a code point would both corrupt
+/// multi-byte characters and make the output longer than the input.
+///
 /// One pass, not to exhaustion: `%252e` decodes to the literal text `%2e`,
 /// which is what an origin doing one decode would see, and that is the
 /// comparison worth making.
-fn percent_decode_once(input: &str) -> String {
+fn percent_decode_once(input: &str) -> Vec<u8> {
     let bytes = input.as_bytes();
-    let mut out = String::with_capacity(bytes.len());
+    let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' && index + 2 < bytes.len() {
             let high = (bytes[index + 1] as char).to_digit(16);
             let low = (bytes[index + 2] as char).to_digit(16);
             if let (Some(high), Some(low)) = (high, low) {
-                out.push(((high * 16 + low) as u8) as char);
+                out.push((high * 16 + low) as u8);
                 index += 3;
                 continue;
             }
         }
-        out.push(bytes[index] as char);
+        out.push(bytes[index]);
         index += 1;
     }
     out
@@ -582,6 +587,75 @@ mod tests {
             );
         }
         headers
+    }
+
+    // MARK: - Property tests
+    //
+    // 💥 `panic = "abort"` is set for release builds, so a panic anywhere on the
+    // request path is not an error message — it is the whole process dying at a
+    // remote client's choosing. These validators read attacker-controlled bytes
+    // before anything else does, which makes "never panics, for any input" the
+    // property worth proving rather than assuming.
+
+    proptest::proptest! {
+        #[test]
+        fn framing_never_panics(value in ".*", te in ".*") {
+            let mut headers = HeaderMap::new();
+            if let Ok(value) = http::HeaderValue::from_str(&value) {
+                headers.append(http::header::CONTENT_LENGTH, value);
+            }
+            if let Ok(te) = http::HeaderValue::from_str(&te) {
+                headers.append(http::header::TRANSFER_ENCODING, te);
+            }
+            for version in [
+                http::Version::HTTP_10,
+                http::Version::HTTP_11,
+                http::Version::HTTP_2,
+                http::Version::HTTP_3,
+            ] {
+                let _ = check_request_framing(version, &headers);
+                let _ = check_request_host(version, &headers);
+            }
+        }
+
+        #[test]
+        fn path_check_never_panics(path in ".*") {
+            let _ = path_escapes_its_route(&path);
+        }
+
+        #[test]
+        fn decoding_never_grows_the_input(input in ".*") {
+            // 🔍 One pass can only replace three bytes with one, never expand —
+            // an expanding decoder fed a long path would be an amplification bug.
+            let decoded = percent_decode_once(&input);
+            proptest::prop_assert!(decoded.len() <= input.len());
+        }
+
+        #[test]
+        fn any_traversal_segment_is_refused(
+            prefix in "[a-z/]{0,12}",
+            dots in proptest::sample::select(vec!["..", ".", "%2e%2e", "%2E.", ".%2e"]),
+            suffix in "[a-z/]{0,12}",
+        ) {
+            // 🛡️ The security property, stated directly: however the segment is
+            // spelled, a path containing it must never be accepted.
+            let path = format!("/{prefix}/{dots}/{suffix}");
+            proptest::prop_assert!(
+                path_escapes_its_route(&path),
+                "{path:?} contains a traversal segment and must be refused"
+            );
+        }
+
+        #[test]
+        fn a_content_length_of_only_digits_is_always_accepted(digits in "[0-9]{1,18}") {
+            // 🔢 The inverse of the rejection rule, so a future tightening cannot
+            // quietly start refusing ordinary requests.
+            let headers = headers_of(&[("content-length", &digits)]);
+            proptest::prop_assert_eq!(
+                check_request_framing(http::Version::HTTP_11, &headers),
+                Ok(())
+            );
+        }
     }
 
     #[test]
