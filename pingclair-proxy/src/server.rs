@@ -111,6 +111,9 @@ pub struct RequestContext {
     route_admission: Option<RouteAdmission>,
     /// 🔌 Selected backend capacity and circuit admission for the active attempt.
     upstream_admission: Option<UpstreamAdmission>,
+    /// 🚦 The first attempt's admitted backend, chosen in `proxy_upstream_filter`
+    /// and handed to the first `upstream_peer` call so admission still runs once.
+    preadmitted_upstream: Option<(Upstream, Option<UpstreamAdmission>)>,
 }
 
 impl Default for RequestContext {
@@ -147,6 +150,7 @@ impl Default for RequestContext {
             retry_excluded: HashSet::new(),
             route_admission: None,
             upstream_admission: None,
+            preadmitted_upstream: None,
         }
     }
 }
@@ -1676,6 +1680,21 @@ impl PingclairProxy {
         }
     }
 
+    /// ⚖️ Returns the identity IP-hash balancing uses, matching request policy.
+    fn balancing_identity(&self, session: &mut Session, ctx: &RequestContext) -> Option<Vec<u8>> {
+        ctx.verified_client_ip
+            .or_else(|| {
+                Some(
+                    self.downstream_identity(session, &session.req_header().headers)
+                        .2,
+                )
+            })
+            .map(|address| match address {
+                IpAddr::V4(ip) => ip.octets().to_vec(),
+                IpAddr::V6(ip) => ip.octets().to_vec(),
+            })
+    }
+
     /// 🔌 Selects a backend that has both load-balancer and protection capacity.
     pub(crate) fn select_admitted_upstream(
         &self,
@@ -3094,6 +3113,65 @@ impl ProxyHttp for PingclairProxy {
         Self::enforce_request_body_chunk(session, ctx, bytes.len()).await
     }
 
+    /// 🚦 Decides the first attempt's admission before the request is committed
+    /// to an upstream, so a fail-fast rejection stays a locally served response.
+    ///
+    /// The overload rejections (circuit open, upstream capacity) used to surface
+    /// as an `Err` out of `upstream_peer`. That error reaches `fail_to_proxy` on
+    /// pingora-proxy's `process_request` path, which logs `error_code` but hands
+    /// its own `server_reuse` flag — always `false` after a failed upstream
+    /// selection — to `finish()`, and `finish()` is what decides whether the
+    /// *downstream* connection is reused. `can_reuse_downstream` is only honoured
+    /// on the `handle_error` paths, so a fail-fast 503 always closed the client's
+    /// connection while the response itself advertised `Connection: keep-alive`.
+    ///
+    /// Declining here instead returns `Ok(false)`, the one signal pingora-proxy
+    /// documents as "a response was written, keep the session reusable". The
+    /// admission decision is not repeated: a successful selection is stashed for
+    /// the first `upstream_peer` call to consume, and later retry attempts admit
+    /// inside `upstream_peer` as they always did.
+    async fn proxy_upstream_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> pingora_core::Result<bool>
+    where
+        Self::CTX: Send + Sync,
+    {
+        let (Some(state), Some(route_index)) = (ctx.state.clone(), ctx.route_index) else {
+            return Ok(true);
+        };
+
+        let client_ip = self.balancing_identity(session, ctx);
+        match self.select_admitted_upstream(
+            &state,
+            route_index,
+            client_ip.as_deref(),
+            &ctx.retry_excluded,
+        ) {
+            Ok(selected) => {
+                ctx.preadmitted_upstream = Some(selected);
+                Ok(true)
+            }
+            Err(UpstreamSelectionError::Unavailable) => {
+                tracing::warn!(
+                    route = route_index,
+                    "⚠️ Failing fast: every backend for this route was rejected by overload protection"
+                );
+                self.serve_error_page(session, ctx, 503).await?;
+                Ok(false)
+            }
+            // 🛤️ A route with no reachable backend at all is not an overload
+            // rejection. Leave it to `upstream_peer`, which owns the 502/504
+            // distinction and the redispatch-cycle exclusion reset. This is also
+            // the answer for a route that has no load balancer to select from,
+            // which is why no separate handler-type guard is needed here: reaching
+            // this hook at all means `request_filter` declined to serve locally,
+            // and `NoUpstream` is reported before any backend is charged.
+            Err(UpstreamSelectionError::NoUpstream) => Ok(true),
+        }
+    }
+
     /// 🔁 Selects one upstream while enforcing request-local retry bounds.
     async fn upstream_peer(
         &self,
@@ -3110,20 +3188,6 @@ impl ProxyHttp for PingclairProxy {
                 pingora_core::ErrorType::ConnectNoRoute,
             ));
         };
-
-        // ⚖️ IP-hash uses the same verified identity as every request policy.
-        let client_ip = ctx
-            .verified_client_ip
-            .or_else(|| {
-                Some(
-                    self.downstream_identity(session, &session.req_header().headers)
-                        .2,
-                )
-            })
-            .map(|address| match address {
-                IpAddr::V4(ip) => ip.octets().to_vec(),
-                IpAddr::V6(ip) => ip.octets().to_vec(),
-            });
 
         // 🛑 A matched route must retain its immutable state across redispatch attempts.
         let state = match ctx.state.clone() {
@@ -3183,12 +3247,23 @@ impl ProxyHttp for PingclairProxy {
             );
         };
 
-        let mut selected = self.select_admitted_upstream(
-            &state,
-            route_index,
-            client_ip.as_deref(),
-            &ctx.retry_excluded,
-        );
+        // 🚦 `proxy_upstream_filter` already admitted the first attempt; taking
+        // its result keeps a backend slot and a circuit probe charged exactly
+        // once per attempt, and spares the common path a second identity lookup.
+        // Retry attempts find the slot empty and admit here as they always did.
+        let mut client_ip = None;
+        let mut selected = match ctx.preadmitted_upstream.take() {
+            Some(preadmitted) => Ok(preadmitted),
+            None => {
+                client_ip = self.balancing_identity(session, ctx);
+                self.select_admitted_upstream(
+                    &state,
+                    route_index,
+                    client_ip.as_deref(),
+                    &ctx.retry_excluded,
+                )
+            }
+        };
         if matches!(selected, Err(UpstreamSelectionError::NoUpstream))
             && !ctx.retry_excluded.is_empty()
         {
@@ -3708,6 +3783,9 @@ impl ProxyHttp for PingclairProxy {
         Self::CTX: Send + Sync,
     {
         use pingora_core::{ErrorSource, ErrorType};
+        // 🧾 A response already on the wire means the error page cannot own the
+        // framing, so the connection is no longer in a state anyone can reuse.
+        let already_responded = session.response_written().is_some();
         let code = if ctx
             .request_deadline
             .is_some_and(|deadline| std::time::Instant::now() >= deadline)
@@ -3735,12 +3813,30 @@ impl ProxyHttp for PingclairProxy {
                 },
             }
         };
-        if code > 0 {
-            let _ = self.serve_error_page(session, ctx, code).await;
-        }
+        let served = code > 0 && self.serve_error_page(session, ctx, code).await.is_ok();
+
+        // 🔁 A fail-fast rejection is a complete, locally generated response, so
+        // the keep-alive connection it was written on is still perfectly good.
+        // Refusing reuse here made every circuit-open or capacity 503 tear down
+        // the client's connection while the response itself still advertised
+        // `Connection: keep-alive` — a reconnect storm provoked at precisely the
+        // moment the server is already shedding load, and a reset that races
+        // whatever the client had already pipelined onto that socket.
+        //
+        // Reuse is claimed only for a response this hop wrote in full, on a
+        // connection the downstream transport has not already implicated:
+        // a downstream read/write error, a malformed request, or a response that
+        // was partly streamed before the failure all leave framing we cannot
+        // vouch for. Pingora's own `reuse()` remains the second gate — it honours
+        // every `set_keepalive(None)` on the request path (413, 431, 501, PROXY
+        // protocol), drains the request body, and refuses a connection that
+        // overread a pipelined request.
+        let can_reuse_downstream =
+            served && !already_responded && !matches!(e.esource(), ErrorSource::Downstream);
+
         pingora_proxy::FailToProxy {
             error_code: code,
-            can_reuse_downstream: false,
+            can_reuse_downstream,
         }
     }
 
