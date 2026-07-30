@@ -2800,6 +2800,27 @@ impl ProxyHttp for PingclairProxy {
             return Ok(true);
         }
 
+        // 🛡️ Framing is settled before anything else reads the request, because
+        // a message whose length two parsers can read differently must not be
+        // routed, logged as a normal request, or forwarded at all.
+        {
+            let request_header = session.req_header();
+            if let Err(rejection) = crate::http_policy::check_request_framing(
+                request_header.version,
+                &request_header.headers,
+            ) {
+                tracing::warn!(
+                    "🚫 Rejected a request with untrustworthy message framing: {}",
+                    rejection.reason()
+                );
+                // 🔌 The connection is no longer safe to reuse: we and the client
+                // may already disagree about where this request body ends.
+                session.as_mut().set_keepalive(None);
+                Self::write_simple_response(session, ctx, 400, rejection.reason()).await?;
+                return Ok(true);
+            }
+        }
+
         // Handle ACME Challenges (HTTP-01)
         let request_header = session.req_header();
         let path = request_header.uri.path();
