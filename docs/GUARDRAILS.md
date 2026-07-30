@@ -231,6 +231,18 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
   只寫在 `adapter/caddyfile.rs` 的檢查等於留了一條繞道。矛盾或半套的設定
   （`insecure_skip_verify` ＋ pinned CA、只有 cert 沒有 key）兩條路都要拒。
   2026-07-29 Day 11 上游 TLS 依此同時補了 `compiler::validate_config`。
+- 🎯 **把規則寫進 `validate_config` 不等於那條路徑會執行它。** 上面那條規則
+  被遵守了，結論卻仍然是假的：Day 11 與 per-listener `proxy_protocol` 都
+  正確地把規則加進 `compiler::validate_config`，並在 commit message 與這份
+  文件寫下「Admin 這條路也擋住了」——**而 Admin API 從來沒呼叫過那個函式**
+  （2026-07-30 Day 17 修）。測試呼叫的是**函式**，真正的**路徑**沒經過它。
+  加了規則之後，要沿著每一個入口追到底確認它真的被叫到；否定測試要打真正的
+  介面（真的 POST 進 Admin socket），不是呼叫驗證函式。
+- 🎯 **`panic = "abort"` 只設在 release profile，所以測試抓不到 abort。**
+  debug 是 unwind，一個 `unwrap()` 只會炸掉該連線的 task，伺服器照樣活著。
+  於是「伺服器還在嗎」這種斷言，對著它要抓的 panic 也會通過——2026-07-30
+  我就寫出過這種測試。要驗 panic，檢查子程序 stderr 有沒有 `panicked at`，
+  這個訊號在兩種 profile 下都成立。
 - **listener 層級的開關不要做成全域**。PROXY protocol 一度是 `global.proxy_protocol`，
   開了之後每個 listener 都要求 header，直連的那個就全掛。nginx 是
   `listen 443 proxy_protocol;`、Caddy 是 per-server listener wrapper，兩者都不是

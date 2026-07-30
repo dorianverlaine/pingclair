@@ -110,6 +110,42 @@ listener，也沒有任何 HTTP→HTTPS 重導，而 `auto_https disable_redirec
 > ⚠️ 同樣**只有本機證據**。自動 port 80 與重導都還沒在公網跑過，
 > 下一輪 Day 29 必須一起驗。
 
+## 🧪 2026-07-30 Day 17：設定只有一條驗證路徑
+
+起因是一次外部架構審視，指控經查證屬實：Day 11 與 per-listener
+`proxy_protocol` 兩次把規則加進 `compiler::validate_config`，並在 commit
+message 與 GUARDRAILS 寫下「Admin 這條路也擋住了」——**而 Admin 從來不呼叫
+那個函式**。測試呼叫的是那個**函式**，真正的**路徑**沒經過它。
+
+四項都已修，全部經過紅燈驗證：
+
+- **程序中止**：`req.collect().await.unwrap()` 換成有上限、不 panic 的
+  逐 frame 讀取。release profile 是 `panic = "abort"`，所以那個 `unwrap`
+  等於一個遠端關機開關——一個已認證的 client 連線在上傳中途斷掉就夠了，
+  截斷的 body 是 `Err` 而不是短的 `Ok`。
+- **body 上限**：1 MiB 上限，超過回 413。超限後仍**繼續讀取但不保留**
+  （上限 8 MiB），讓 client 寫完並真的收到 413 而不是連線重置。
+- **canonical 驗證**：Admin POST 現在走 `validate_config`，與 Pingclairfile
+  同一份規則。
+- **全有全無**：先解析所有目標 listener 再套用。舊迴圈邊走邊套，
+  配置寫了兩個 listener 而只有一個存在時，會留下半套狀態且沒有任何回報。
+- **plugin fail closed**：`plugin` handler 在驗證階段被拒絕（DSL 與 JSON
+  兩條都經過 `validate_config`，所以一處即可）。H1/H2 的 `_ => Ok(false)`
+  改成 exhaustive match，新增 handler variant 時編譯器會逼每個 transport
+  做決定，而不是靜默跳過。
+
+五個新測試**全部真的 POST 進 Admin socket**，不是呼叫 `validate_config()`
+——這一天存在的唯一原因就是上次那樣測。
+
+> 🎯 **其中一個測試我第一版寫成了不可能失敗的斷言。** `panic = "abort"`
+> 只設在 release，測試跑 debug（unwind），所以舊的 `unwrap()` 只炸掉連線
+> task、伺服器照樣活著——「伺服器還在嗎」這個斷言對著它要抓的 bug 也會通過。
+> 改成檢查子程序 stderr 有沒有 `panicked at`，這個訊號在兩種 profile 下都成立。
+
+> ⚠️ **尚未涵蓋**：跨 server 比對的規則（例如兩個 listener 對 PROXY protocol
+> 的宣告互相矛盾）仍不在 Admin 路徑的驗證範圍內，因為那需要把現行完整設定
+> 當上下文組起來。明寫在這裡而不是留給人發現。
+
 ---
 
 ## ✅ 已通過遠端驗證

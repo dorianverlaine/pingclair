@@ -2640,7 +2640,27 @@ impl PingclairProxy {
                 }
                 Ok(false)
             }
-            _ => Ok(false),
+            // 🔁 A reverse proxy is not answered here on purpose: returning
+            // "not handled" is what hands the request to Pingora's
+            // `upstream_peer` phase, which is where proxying actually happens.
+            HandlerConfig::ReverseProxy(_) => Ok(false),
+            // 🚫 Unreachable by construction — `validate_config` refuses a
+            // `plugin` handler, so no accepted configuration contains one.
+            // It is answered rather than ignored anyway: this used to be a
+            // wildcard arm that returned "not handled", which made an
+            // unimplemented handler indistinguishable from a route that
+            // deliberately falls through. A loud 500 beats a silent bypass.
+            HandlerConfig::Plugin { name, .. } => {
+                tracing::error!(
+                    plugin = %name,
+                    "🚫 A plugin handler reached the request path, which validation should \
+                     have refused; failing closed"
+                );
+                Err(pingora_core::Error::explain(
+                    pingora_core::ErrorType::InternalError,
+                    "plugin handler is not implemented",
+                ))
+            }
         }
     }
 }
