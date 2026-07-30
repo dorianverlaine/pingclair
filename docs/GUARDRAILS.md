@@ -167,14 +167,23 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
   upstream keepalive。
 - **macOS 單元測試不足以驗證鏈結與 QUIC 行為。**
 
-> 🔴 **這一關目前是欠的。** `561d802` 同時改了 H3 實作與 TLS 依賴樹
-> （新增 `tokio-quiche`，連帶 86 個 crate），正是這條規則針對的情況。
-> 現有證據只有 macOS 上的 454 個測試，**依本節規定不算數**。
-> 在 Linux 上跑完 Day 28 之前，H3 的狀態是「本機綠、未驗證」。
->
-> 端對端測試（`pingclair-proxy/tests/h3_end_to_end.rs`）用的是手寫 quiche
-> client，它證明的是我們的事件迴圈對 quiche 協定實作正確，**不證明與瀏覽器
-> 或 `curl --http3` 的互通性**。
+- 跑這一關用 `scripts/test-h3-day28-local.sh`（功能矩陣，需要支援 HTTP/3 的
+  curl）與 `scripts/test-h3-cancellation-local.sh`（SSE／取消／trailer）。
+  Linux 那一半用 docker `rust:1.88-bookworm`。
+
+> ✅ **`561d802` 的遷移已通過這一關**（2026-07-30，證據在
+> `benchmarks/results/20260730_day28_f26d0a1/`）：Linux release build、
+> 無 `openssl-sys`、無動態 `libssl`／`libcrypto`、Linux 454 測試全綠、
+> 與 quiche 0.18 的 curl 跨版本互通、功能矩陣 14/14。
+
+> ⚠️ **在 Linux 上建置需要 `cmake`（BoringSSL）與 `clang`／`libclang-dev`
+> （bindgen）**。乾淨的 `rust:1.88-bookworm` 兩者都沒有，缺了會在
+> `boring-sys` 的 build script 失敗。發布產物與 CI 環境都要帶上。
+
+> 📌 **端對端測試（`pingclair-proxy/tests/h3_end_to_end.rs`）用的是手寫 quiche
+> client**，它證明的是我們的事件迴圈對 quiche 協定實作正確，**不證明互通性**。
+> 互通性要靠上面那兩支腳本裡的真 curl，而且刻意用不同的 QUIC 實作
+> （ngtcp2／nghttp3，以及 quiche 0.18）。
 
 ---
 

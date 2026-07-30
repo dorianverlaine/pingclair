@@ -625,9 +625,11 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
 - ✔ 手寫 event loop 換成 `ApplicationOverQuic`（`561d802`），quic.rs 少 143 行。
 - ✔ H3 首次有端對端測試——**在此之前沒有任何測試啟動過 `QuicServer`**，
   整條 H3 路徑是零自動化覆蓋。這也正是這次遷移敢做的原因。
-- 🔴 **未完成**：Day 28 的 Linux＋quiche client 驗證。依 GUARDRAILS，
-  改過 H3 或 TLS 依賴後 macOS 測試不算數。**在那關跑完前，這兩個 commit
-  的狀態是「本機綠、未驗證」**，不要當成已交付。
+- ✅ **Day 28 已補跑並通過**（2026-07-30，`f26d0a1`）。證據在
+  `benchmarks/results/20260730_day28_f26d0a1/`：Linux release build、
+  無 `openssl-sys`、無動態 `libssl`／`libcrypto`、Linux 454 測試全綠、
+  與 quiche 0.18 的 curl 跨版本互通、功能矩陣 14/14、SSE／取消／trailer 通過。
+- ⚠️ **仍未覆蓋**：真實瀏覽器的 H3、公網路徑（MTU／NAT／封包重排）。
 
 
 ## M2.6 — 設定只有一條驗證路徑（Day 17）
@@ -845,8 +847,9 @@ Content-Length/chunked POST、413、keepalive、middleware parity、
 > 依 GUARDRAILS：改動 H3 或 TLS dependency 後，**macOS 單元測試不足以驗證
 > 鏈結與 QUIC 行為**，必須跑這一關。
 
-> 🔴 **這一關已經欠著了，不能等到 M5。** `561d802` 同時改了 H3 實作與 TLS
-> 依賴樹，正是上面那條規則針對的情況。多加兩項：
+> ✅ **已於 2026-07-30 對 `f26d0a1` 提前跑過並通過**，證據在
+> `benchmarks/results/20260730_day28_f26d0a1/`。當時的觸發原因是 `561d802`
+> 同時改了 H3 實作與 TLS 依賴樹。那次額外覆蓋了兩項：
 >
 > - **與真實客戶端的互通性**：瀏覽器與 `curl --http3`。現有端對端測試用的是
 >   手寫 quiche client，證明的是我們對 quiche 協定實作正確，不是互通性。
@@ -1040,11 +1043,11 @@ M4 的 metrics。一天寫完的品質會是「能交差」而不是「能用」
 | M1 生產站可替換 | Day 1–7 | ✅ **完成**（`8294116`，2026-07-28 真站驗收） |
 | M2 生產護欄 | Day 8–15 | ✅ **完成**（矩陣 23/23、原站 M1 回歸 27/27、已上線;浸泡進行中） |
 | M2.5 協議硬化 | Day 16 | 🟡 **一半**（hop-by-hop `b6fbd26` ✔;URI/header 正規化、重複 CL/TE、smuggling、malformed frame 未做） |
-| 🛰️ 計畫外 — H3 換 tokio-quiche | — | 🟡 **程式碼完成、驗證未做**（`aa7bb90`＋`561d802`;**欠 Day 28 Linux 驗證**） |
+| 🛰️ 計畫外 — H3 換 tokio-quiche | — | ✅ **完成**（`aa7bb90`＋`561d802`;Day 28 已於 `f26d0a1` 補跑通過） |
 | M2.6 設定只有一條驗證路徑 | Day 17 | ⬜ 未開始（**外部審視查證屬實**：Admin 繞過 canonical validation） |
 | M3 接上 Pingora 能力（含 `proxy_cache`） | Day 18–22 | ⬜ 未開始 |
 | M4 可觀測性與運維 | Day 23–26 | ⬜ 未開始 |
-| M5 協議矩陣與 H3 | Day 27–29 | ⬜ 未開始（**Day 28 已提前成為必要前置**，見上） |
+| M5 協議矩陣與 H3 | Day 27–29 | 🟡 **Day 28 已提前跑掉**（`f26d0a1` PASS）;Day 27／29 未開始 |
 | M6 發布 | Day 30–37 | ⬜ 未開始 |
 
 > 📌 **計畫外的產品修復**（不屬於任何 Day，記在這裡以免失去出處）：
