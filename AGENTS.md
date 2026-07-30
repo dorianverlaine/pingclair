@@ -195,14 +195,30 @@ The QUIC stack and Pingora must share BoringSSL. Do not reintroduce Pingora's
 OpenSSL feature: OpenSSL and quiche's BoringSSL collide on libcrypto symbols
 and have previously crashed the binary at startup.
 
-The H3 event pump must also run during maintenance, not only after packet
-receipt. A body drain can queue a `Finished` event without another packet.
+Deferred request-body drains must be retried before the H3 event pump, not only
+after packet receipt. `recv_body` queues the `Finished` event internally once
+the last body bytes are consumed, so a drain that stopped on a full handler
+channel would otherwise never see end-of-body and a large POST would hang
+forever. `H3App::process_reads` is where that ordering lives.
 
-The listener intentionally uses raw Tokio UDP plus quiche because
-tokio-quiche's server accept path was not public when this implementation was
-built. Each HTTPS port owns one task and one lock-free connection map. Request
-tasks return response events through bounded channels; preserve that
-backpressure and never buffer complete bodies to simplify middleware.
+The transport belongs to `tokio-quiche`: UDP socket, packet parsing, version
+negotiation, stateless retry and address validation, connection-ID routing,
+GSO, pacing, and per-connection timers. `quic.rs` keeps only the application
+layer, as `H3App`, this crate's `ApplicationOverQuic`. An earlier note claimed
+tokio-quiche's server accept path was not public; that was wrong, and it cost
+this project a hand-written QUIC transport that was deleted in `561d802`.
+
+Two things tokio-quiche does not do, so they stay in the accept loop: the L4
+blocklist and the listener's `max_connections`. Request tasks return response
+events through bounded channels; preserve that backpressure and never buffer
+complete bodies to simplify middleware.
+
+H3 certificates never touch disk. `ConnectionParams` demands a
+`TlsCertificatePaths`, but the paths are only handed to the `ConnectionHook`,
+and the code that reads them runs only when the hook declines — so a sentinel
+path is enough and keys stay in the in-memory `CertTable`. Do not "fix" this by
+writing private keys to temporary files. `tokio-quiche` is pinned to `=0.19.1`
+because that behavior was read out of its source.
 
 H3 certificates are published through an `ArcSwap` table. The refresh path
 uses `TlsManager::peek_pem`, which may read only certificates that already
