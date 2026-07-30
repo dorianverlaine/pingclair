@@ -69,13 +69,13 @@
 - **禁止引入 `pingora-openssl`、`openssl-sys` 或 reqwest `native-tls`**。
   `quiche 0.29`、`boring 4.22` 與 Pingora `boringssl` feature 是同一套 BoringSSL
   鏈結設計；過去曾因 OpenSSL／BoringSSL 符號衝突造成**啟動 SIGBUS 與 Linux link error**。
-  這三條不是偏好而是 H3 的前提，理由見下方「為什麼是自己實作」。
+  這三條不是偏好而是 H3 的前提，理由見下方「為什麼 H3 釘在 quiche／BoringSSL」。
 
 ---
 
 ## 🚀 HTTP/3 實作護欄
 
-### 為什麼是自己實作（不要再重問這題）
+### 為什麼 H3 釘在 quiche／BoringSSL（不要再重問這題）
 
 **Pingora 不提供 H3，而且短期內不會提供。** 核查於 2026-07-27：
 
@@ -101,6 +101,10 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
 > `ServerH3Controller`、`InitialQuicConnection`、`ApplicationOverQuic` 全部公開。
 > 依賴版本也完全對齊（`quiche 0.29.3`＋`boring 4.22.0`,無 `openssl-sys`）。
 >
+> **代價已經付掉了**:那句話的存在讓這個專案手寫並維護了一整套 QUIC 傳輸層
+> ——socket 迴圈、connection map、計時器、版本協商、stateless retry 與 token
+> 驗證,約 500 行。2026-07-30 全部刪除,換成 `tokio-quiche`（`561d802`）。
+>
 > **寫否決註解的規則**:必須寫下「哪一版、看了哪個符號、什麼日期」。
 > 只寫結論的否決註解會變成一道沒人敢推的門。
 
@@ -110,16 +114,40 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
 
 ### 架構
 
-- H3 是 `pingclair-proxy/src/quic.rs` 的 **raw Tokio UDP／quiche 路徑**，每個 HTTPS
-  port 一個 task 與一個無鎖 connection map。**它不是 Pingora `ProxyHttp Session`
-  的延伸**。
+> 📌 **2026-07-30（`561d802`）換掉了傳輸層。** 以下描述的是換完之後的樣子；
+> 手寫的 UDP 迴圈與無鎖 connection map 已經不存在。
+
+- **分界線是傳輸／應用。** `tokio-quiche` 擁有 UDP socket、封包解析、版本協商、
+  stateless retry 與位址驗證、connection-ID 路由、GSO、pacing、每連線計時器。
+  `pingclair-proxy/src/quic.rs` 只保留應用層。
+- 每條連線由 `H3App` 驅動，它是本專案的 `ApplicationOverQuic` 實作。
+  **它不是 Pingora `ProxyHttp Session` 的延伸**。
+- **`tokio-quiche` 不管的兩件事必須留在 accept 迴圈**：L4 blocklist 與
+  listener 的 `max_connections`。連線數由 `ConnectionSlot` 在 drop 時釋放，
+  所以是 worker task 結束時才減,不是 accept 迴圈往前走時就減。
+- 憑證**永遠不落盤**。`ConnectionParams` 要求一個 `TlsCertificatePaths`，但那組
+  路徑只會被交給 `ConnectionHook`；真正讀檔的 `quiche_config_with_tls` 是 hook
+  回傳 `None` 時才走的分支。所以我們傳 `IN_MEMORY_CERT_SENTINEL` 這個假路徑，
+  憑證留在記憶體的 `CertTable` 裡。
+  **不得為了滿足型別而把私鑰寫進暫存檔**——那是安全倒退，不是變通。
 - middleware parity 應抽出 **transport-neutral 邏輯**（見 `http_policy.rs`），
   不可硬把 H1/H2 Session 塞進 H3。
 
+> ⚠️ **`tokio-quiche` 版本釘死在 `=0.19.1`。** 上面「憑證不落盤」那條依賴的是
+> 0.19.1 原始碼裡 `settings/config.rs:122` 的 `.zip(params.tls_cert)` 與
+> `settings/config.rs:224` 的讀檔分支。minor 版本一升就可能開始真的去讀那組
+> 路徑。要升版**必須先重讀這兩處**，並確認
+> `pingclair-proxy/tests/h3_in_memory_certs.rs` 仍然紅字先行會掛。
+
 ### 正確性
 
-- **`pump_h3_events` 必須同時由收包與 maintenance pass 驅動**。request body drain
-  可能在沒有新 UDP packet 時產生 `Finished`；只在收包時 pump 會讓大型 POST **永久卡住**。
+- **request body drain 必須在 pump 之前重試,而且不能只由收包驅動**。
+  `h3::Connection::recv_body` 會在最後一段 body 被消化時才在內部排入 `Finished`,
+  所以一個因為 handler channel 滿而中止的 drain,若不重試就永遠等不到結束訊號
+  ——大型 POST 會**永久卡住**。現在這條由 `H3App::process_reads` 保證：
+  它先重試 `body_read_pending` 的串流,再 `pump_h3_events`。
+  （舊結構是「收包 ＋ maintenance pass 都要 pump」,maintenance pass 已隨手寫
+  迴圈一起刪除,但要求本身沒變。）
 - H3 憑證表以 `ArcSwap` 發佈，透過 `TlsManager::peek_pem` 讀取既有憑證並每 60 秒刷新。
   **`peek_pem` 不可觸發 ACME 簽發**。
 - listener port、憑證 domain 清單等 topology 主要在啟動時擷取；
@@ -138,6 +166,15 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
   Alt-Svc、SNI、多大小靜態／代理 body、含／不含 Content-Length 的 POST、413、
   upstream keepalive。
 - **macOS 單元測試不足以驗證鏈結與 QUIC 行為。**
+
+> 🔴 **這一關目前是欠的。** `561d802` 同時改了 H3 實作與 TLS 依賴樹
+> （新增 `tokio-quiche`，連帶 86 個 crate），正是這條規則針對的情況。
+> 現有證據只有 macOS 上的 454 個測試，**依本節規定不算數**。
+> 在 Linux 上跑完 Day 28 之前，H3 的狀態是「本機綠、未驗證」。
+>
+> 端對端測試（`pingclair-proxy/tests/h3_end_to_end.rs`）用的是手寫 quiche
+> client，它證明的是我們的事件迴圈對 quiche 協定實作正確，**不證明與瀏覽器
+> 或 `curl --http3` 的互通性**。
 
 ---
 

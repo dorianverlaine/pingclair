@@ -602,11 +602,32 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
 > header 語意、hop-by-hop 規則同時成立;先把那些邊界釘死,Day 18 才有
 > 可以依賴的東西。
 
-- H1/H2/H3 的 URI／header 正規化、hop-by-hop headers、重複
+- ✔ **hop-by-hop headers**（`b6fbd26`）。`Connection` 點名的欄位與
+  `Proxy-Authorization`／`Proxy-Authenticate`／`TE`／`Keep-Alive`／
+  `Proxy-Connection` 一律止步於本 hop（RFC 9110 §7.6.1、§11.7.1）；
+  真正的 WebSocket upgrade 例外。證據在
+  `benchmarks/results/20260730_day16_failed_hop_by_hop/`（原站抓包，修前／修後）。
+- ⬜ **剩下的都還沒做**：H1/H2/H3 的 URI／header 正規化、重複
   `Content-Length`／`Transfer-Encoding`、oversized headers、request smuggling、
   malformed frame 的**負向測試**。
 - 可用 proptest／fuzzing，並與 nginx／Caddy 做差異測試。
 - **完成判定**：每一類都有明確的拒絕行為與測試。
+
+
+## 🛰️ 計畫外：H3 換 tokio-quiche（2026-07-30）
+
+排在這裡是為了留下時序，不是新的一天。這件事不在原計畫裡——它來自
+「tokio-quiche 因為 accept API 是 `pub(crate)` 而不可用」這個**錯誤結論**被推翻
+（詳見 `docs/GUARDRAILS.md`「為什麼 H3 釘在 quiche／BoringSSL」）。那句話讓專案
+手寫並維護了一整套 QUIC 傳輸層，現在把它扳回來。
+
+- ✔ 憑證從記憶體進 tokio-quiche，私鑰不落盤（`aa7bb90`）。
+- ✔ 手寫 event loop 換成 `ApplicationOverQuic`（`561d802`），quic.rs 少 143 行。
+- ✔ H3 首次有端對端測試——**在此之前沒有任何測試啟動過 `QuicServer`**，
+  整條 H3 路徑是零自動化覆蓋。這也正是這次遷移敢做的原因。
+- 🔴 **未完成**：Day 28 的 Linux＋quiche client 驗證。依 GUARDRAILS，
+  改過 H3 或 TLS 依賴後 macOS 測試不算數。**在那關跑完前，這兩個 commit
+  的狀態是「本機綠、未驗證」**，不要當成已交付。
 
 
 ## M2.6 — 設定只有一條驗證路徑（Day 17）
@@ -824,6 +845,15 @@ Content-Length/chunked POST、413、keepalive、middleware parity、
 > 依 GUARDRAILS：改動 H3 或 TLS dependency 後，**macOS 單元測試不足以驗證
 > 鏈結與 QUIC 行為**，必須跑這一關。
 
+> 🔴 **這一關已經欠著了，不能等到 M5。** `561d802` 同時改了 H3 實作與 TLS
+> 依賴樹，正是上面那條規則針對的情況。多加兩項：
+>
+> - **與真實客戶端的互通性**：瀏覽器與 `curl --http3`。現有端對端測試用的是
+>   手寫 quiche client，證明的是我們對 quiche 協定實作正確，不是互通性。
+> - **`tokio-quiche` 帶進來的 86 個 crate 在 Linux 上鏈結正常**，
+>   且單一 BoringSSL 不變式成立（`cargo tree -i boring-sys`、
+>   `cargo tree -i openssl-sys` 應無 openssl）。
+
 ### ✅ Day 29 — 公網協議矩陣
 
 補完 STATUS 中列為「尚未覆蓋」的項目：IP／Referer 完整 allow／deny 與
@@ -1009,12 +1039,18 @@ M4 的 metrics。一天寫完的品質會是「能交差」而不是「能用」
 |---|---|---|
 | M1 生產站可替換 | Day 1–7 | ✅ **完成**（`8294116`，2026-07-28 真站驗收） |
 | M2 生產護欄 | Day 8–15 | ✅ **完成**（矩陣 23/23、原站 M1 回歸 27/27、已上線;浸泡進行中） |
-| M2.5 協議硬化 | Day 16 | ⬜ 未開始（**由 M5 提前**：先護欄後加速） |
+| M2.5 協議硬化 | Day 16 | 🟡 **一半**（hop-by-hop `b6fbd26` ✔;URI/header 正規化、重複 CL/TE、smuggling、malformed frame 未做） |
+| 🛰️ 計畫外 — H3 換 tokio-quiche | — | 🟡 **程式碼完成、驗證未做**（`aa7bb90`＋`561d802`;**欠 Day 28 Linux 驗證**） |
 | M2.6 設定只有一條驗證路徑 | Day 17 | ⬜ 未開始（**外部審視查證屬實**：Admin 繞過 canonical validation） |
 | M3 接上 Pingora 能力（含 `proxy_cache`） | Day 18–22 | ⬜ 未開始 |
 | M4 可觀測性與運維 | Day 23–26 | ⬜ 未開始 |
-| M5 協議矩陣與 H3 | Day 27–29 | ⬜ 未開始 |
+| M5 協議矩陣與 H3 | Day 27–29 | ⬜ 未開始（**Day 28 已提前成為必要前置**，見上） |
 | M6 發布 | Day 30–37 | ⬜ 未開始 |
+
+> 📌 **計畫外的產品修復**（不屬於任何 Day，記在這裡以免失去出處）：
+> `b6e4514` — 熔斷／容量的 fail-fast 503 會拆掉客戶端連線，而回應本身還寫著
+> `Connection: keep-alive`，等於在伺服器正在洩負載時逼出一波重連風暴。
+> 成因是 pingora-proxy 0.8.1 兩條錯誤路徑對 `can_reuse_downstream` 處理不一致。
 
 > 完成一天就在對應 Day 標題後標上 `✔ <commit>`；完成一個里程碑就更新這張表，
 > 並把驗證證據路徑寫進 `docs/STATUS.md`。
