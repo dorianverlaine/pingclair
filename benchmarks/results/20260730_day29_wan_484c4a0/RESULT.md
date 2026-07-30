@@ -9,6 +9,11 @@
 延遲／丟包／重排。H3 與資料完整性通過，但 TCP TLS 的公開信任鏈不完整，
 因此整體不能判定 PASS。
 
+> 🗂️ 下文以 `code` 標示的檔名是**本機歸檔**中的原始輸出，不在倉庫裡。倉庫只
+> 收結論與 `SHA256SUMS`；要核對歸檔是否被動過，用該檔逐位元組比對即可。
+> 這麼做的理由：原始 dump 沒人讀，而且是環境細節（ACME 帳號地址、
+> instance id）反覆外流的地方。
+
 ## 1. 測試環境
 
 | 位置 | Instance | 類型 | 公網位址 | 系統 |
@@ -25,8 +30,8 @@
   - 20 MiB：`88a31cc6e974d27437264f571b6ef12369f43839cb374956ddc8acacce497e9e`
 
 兩端部署檔的 hash 均與本機相同。環境原始資料見
-[`oregon/environment.txt`](oregon/environment.txt) 與
-[`paris/environment.txt`](paris/environment.txt)。
+`oregon/environment.txt` 與
+`paris/environment.txt`。
 
 ## 2. 真實 ACME：簽發成功，但發現兩個問題
 
@@ -39,26 +44,26 @@
 
 失敗證據：
 
-- [`oregon/original-config-failure.log`](oregon/original-config-failure.log)
-- [`paris/original-config-failure.log`](paris/original-config-failure.log)
+- `oregon/original-config-failure.log`
+- `paris/original-config-failure.log`
 - 原始設定：
-  [`oregon/Pingclairfile.original`](oregon/Pingclairfile.original)、
-  [`paris/Pingclairfile.original`](paris/Pingclairfile.original)
+  `oregon/Pingclairfile.original`、
+  `paris/Pingclairfile.original`
 
 為了繼續驗證而沒有修改程式碼，本次把 port 80 改成獨立的 wildcard plaintext
 block，port 443 保留具名 TLS block。兩份 workaround 設定先以本機 binary
 執行 `validate`，均通過：
 
-- [`oregon/Pingclairfile`](oregon/Pingclairfile)
-- [`paris/Pingclairfile`](paris/Pingclairfile)
+- `oregon/Pingclairfile`
+- `paris/Pingclairfile`
 
 拆開 listener 後，兩端皆由 Let's Encrypt Production 完成 HTTP-01 與簽發：
 
 - Oregon：`pingclairtest-oregon.aqeo.dev`
 - Paris：`pingclairtest-paris.aqeo.dev`
 - 事件摘要：
-  [`oregon/acme-summary.txt`](oregon/acme-summary.txt)、
-  [`paris/acme-summary.txt`](paris/acme-summary.txt)
+  `oregon/acme-summary.txt`、
+  `paris/acme-summary.txt`
 
 ### 2.2 H1／H2 只送 leaf，公開信任鏈驗證失敗
 
@@ -72,15 +77,15 @@ SSL certificate OpenSSL verify result: unable to get local issuer certificate (2
 原始證據：
 
 - Oregon → Paris：
-  [`oregon/strict-tcp-tls-to-paris.txt`](oregon/strict-tcp-tls-to-paris.txt)
+  `oregon/strict-tcp-tls-to-paris.txt`
 - Paris → Oregon：
-  [`paris/strict-tcp-tls-to-oregon.txt`](paris/strict-tcp-tls-to-oregon.txt)
+  `paris/strict-tcp-tls-to-oregon.txt`
 
 H3 的憑證路徑沒有同樣問題。aioquic 在**沒有** `--insecure` 時，雙向皆成功
 驗證憑證、協商 QUIC v1／ALPN `h3`，並取得 200：
 
-- [`oregon/strict-h3-to-paris.txt`](oregon/strict-h3-to-paris.txt)
-- [`paris/strict-h3-to-oregon.txt`](paris/strict-h3-to-oregon.txt)
+- `oregon/strict-h3-to-paris.txt`
+- `paris/strict-h3-to-oregon.txt`
 
 因此缺陷範圍是 Pingora TCP TLS callback 的 chain publication，不是 ACME
 沒有簽發，也不是 H3 certificate table。
@@ -104,14 +109,14 @@ log 只有一個 QUIC connection ID，四筆 response 都在該連線完成。
 原始證據：
 
 - H1／H2：
-  [`oregon/h1h2-summary.txt`](oregon/h1h2-summary.txt)、
-  [`paris/h1h2-summary.txt`](paris/h1h2-summary.txt)
+  `oregon/h1h2-summary.txt`、
+  `paris/h1h2-summary.txt`
 - H3：
-  [`oregon/h3-baseline.log`](oregon/h3-baseline.log)、
-  [`paris/h3-baseline.log`](paris/h3-baseline.log)
+  `oregon/h3-baseline.log`、
+  `paris/h3-baseline.log`
 - H3 hash：
-  [`oregon/h3-sha256.txt`](oregon/h3-sha256.txt)、
-  [`paris/h3-sha256.txt`](paris/h3-sha256.txt)
+  `oregon/h3-sha256.txt`、
+  `paris/h3-sha256.txt`
 
 ## 4. netem 丟包／重排
 
@@ -125,13 +130,13 @@ Paris → Oregon 的同一條 H3 連線仍完成 health、1 MiB 與 20 MiB；兩
 SHA-256 均相符。核心 qdisc 統計為 2,108 packets、實際 dropped 11：
 
 - 套用前後：
-  [`paris/qdisc-before.txt`](paris/qdisc-before.txt)、
-  [`paris/qdisc-after.txt`](paris/qdisc-after.txt)
-- H3 log：[`paris/h3-netem.log`](paris/h3-netem.log)
-- Hash：[`paris/h3-netem-sha256.txt`](paris/h3-netem-sha256.txt)
+  `paris/qdisc-before.txt`、
+  `paris/qdisc-after.txt`
+- H3 log：`paris/h3-netem.log`
+- Hash：`paris/h3-netem-sha256.txt`
 
 測試命令使用 trap 移除 netem；最後
-[`paris/qdisc-final.txt`](paris/qdisc-final.txt) 只剩原本的 `mq/fq_codel`，
+`paris/qdisc-final.txt` 只剩原本的 `mq/fq_codel`，
 沒有殘留 netem。
 
 本次沒有另外降低 `ens5` MTU，也沒有保存 packet capture；MTU／NAT 覆蓋來自
@@ -144,8 +149,8 @@ Paris 經 H3 下載 Oregon 的 20 MiB 檔案時，每 250 ms 採樣一次 Oregon
 Pingclair RSS，共 60 筆。下載完成 20,971,520 bytes、SHA-256 相符；
 服務端 60 筆 RSS 全部是 **46,824 KiB**，沒有隨 body 大小增加。
 
-- Server RSS 時序：[`oregon/stream-rss-server.txt`](oregon/stream-rss-server.txt)
-- Client H3 log：[`paris/stderr.log`](paris/stderr.log)
+- Server RSS 時序：`oregon/stream-rss-server.txt`
+- Client H3 log：`paris/stderr.log`
 
 這證明本次真實 WAN 傳輸沒有重新引入 20 MiB response 全量記憶體緩衝。
 

@@ -1,41 +1,0 @@
-* Added pingclair-v02.test:443:47.106.89.225 to DNS cache
-* Hostname pingclair-v02.test was found in DNS cache
-* Host pingclair-v02.test:443 was resolved.
-* IPv6: (none)
-* IPv4: 47.106.89.225
-*   Trying 47.106.89.225:443...
-* SSL Trust: peer verification disabled
-* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384 / x25519 / RSASSA-PSS
-* Server certificate:
-*   subject: CN=pingclair-v02.test
-*   start date: Jul 25 22:55:48 2026 GMT
-*   expire date: Jul 27 22:55:48 2026 GMT
-*   issuer: CN=pingclair-v02.test
-*   Certificate level 0: Public key type RSA (2048/112 Bits/secBits), signed using sha256WithRSAEncryption
-* OpenSSL verify result: 12
-*  SSL certificate verification failed, continuing anyway!
-* Established connection to pingclair-v02.test (47.106.89.225 port 443) from 198.18.0.1 port 62361 
-  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current
-                                 Dload  Upload  Total   Spent   Left   Speed
-  0      0   0      0   0      0      0      0                              0* using HTTP/3
-* [HTTP/3] [0] OPENED stream for https://pingclair-v02.test/ready
-* [HTTP/3] [0] [:method: GET]
-* [HTTP/3] [0] [:scheme: https]
-* [HTTP/3] [0] [:authority: pingclair-v02.test]
-* [HTTP/3] [0] [:path: /ready]
-* [HTTP/3] [0] [user-agent: curl/8.21.0]
-* [HTTP/3] [0] [accept: */*]
-> GET /ready HTTP/3
-> Host: pingclair-v02.test
-> User-Agent: curl/8.21.0
-> Accept: */*
-> 
-* Request completely sent off
-< HTTP/3 200 
-< content-length: 52
-< server: Pingclair
-< 
-{ [52 bytes data]
-100     52 100     52   0      0    264      0                              0100     52 100     52   0      0    264      0                              0100     52 100     52   0      0    264      0                              0
-* Connection #0 to host pingclair-v02.test:443 left intact
-pingclair-public-pingclair-v02.test-1785020148-https

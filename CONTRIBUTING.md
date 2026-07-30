@@ -127,7 +127,7 @@ misleading.
 
 | File | Owns |
 |---|---|
-| `docs/TODO.md` | The v0.2.0 execution plan, day by day. No status, no evidence. |
+| `docs/TODO.md` | The v0.2.0 execution plan, day by day. 🔒 Maintainer-local, not in this repository — it lists unfixed weaknesses, and publishing that queue would just hand out a target list. Ask if you need the current plan. |
 | `docs/STATUS.md` | Canonical status and verification ledger, v0.3+ backlog. |
 | `docs/GUARDRAILS.md` | Environment constraints and implementation rules. |
 | `docs/AUDIT_NGINX_PARITY.md` | nginx/Caddy parity and production-risk audit. |

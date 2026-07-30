@@ -1,2 +1,0 @@
-primary-a=30
-primary-b=10

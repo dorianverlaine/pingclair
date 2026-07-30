@@ -2,7 +2,7 @@
 
 > 這份文件記錄**已經做了什麼、驗證到什麼程度**，是證據存放處，不是計畫。
 >
-> - 接下來要做什麼 → `docs/TODO.md`
+> - 接下來要做什麼 → `docs/TODO.md`（🔒 維護者本機文件，未進倉庫）
 > - 環境限制與實作守則 → `docs/GUARDRAILS.md`
 >
 > 最後整理：2026-07-30
@@ -147,7 +147,7 @@ image `pingclair:rc-8294116`（linux/arm64）。
 ### 2026-07-25 VPS 生產情境測試
 
 環境：阿里雲深圳，Ubuntu 24.04，2 vCPU／1.6GB。
-原始結果：`benchmarks/results/20260725_vps_onbox/`，方法與數據見 `benchmarks/README.md`。
+方法與數據見 `benchmarks/README.md`；原始 `ab` 輸出保留在本機歸檔。
 
 - **具名虛擬主機與 listener 綁定** — `bench.local:8080` 綁 wildcard，依 Host 路由；
   靜態、gzip、range、反向代理、Admin API、TLS 均以真 binary 驗證。
@@ -446,17 +446,15 @@ health-check driver **不論有沒有配置探測都每 100ms 醒一次**。小,
   有歧義的舊形狀保留當時的讀法。無法辨識的 matcher fail closed。
   **同時修掉一個可遠端觸發的 DoS**：untagged 的 `Not` newtype variant 會對
   任何無法辨識的值無限遞迴，Admin API `POST /config` 送一個亂寫的 matcher
-  即可讓程序 stack overflow 中止。真 binary 驗證（Admin dump→post 迴圈）與
-  修復前的失敗證據：`scripts/test-matcher-roundtrip.sh`、
-  `benchmarks/results/20260728_matcher_roundtrip_pass/`、
-  `benchmarks/results/20260728_matcher_roundtrip_FAILED_prefix/`。
+  即可讓程序 stack overflow 中止。真 binary 驗證（Admin dump→post 迴圈）的
+  重現腳本：`scripts/test-matcher-roundtrip.sh`；修復前後的原始輸出保留在
+  本機歸檔。
 - **上游 hostname 重解析**（2026-07-28）— hostname upstream 依 `dns_refresh`
   間隔（預設 30s，`off` 可關）重解析並整批 publish 新 pool；解析失敗保留
   last-known-good，開機時解析不到的名稱會在成功後自動加入。IP 字面位址完全
   不進 resolver。真 Docker network + 真 release image 驗證：容器換 IP 後 3s
   內跟上、拔掉 alias 後舊位址持續服務 12s、`dns_refresh off` 維持釘死。
-  腳本與證據：`benchmarks/scripts/run_dns_refresh_e2e.sh`、
-  `benchmarks/results/20260728_dns_refresh_pass/`。
+  重現腳本：`benchmarks/scripts/run_dns_refresh_e2e.sh`。
 - **`admin.api_key` DSL**、**`basic_auth` DSL**、**`redir`／`redirect` DSL**（2026-07-26）。
 - **Workspace lint baseline**（2026-07-26）— 全 workspace 套用 Rust 1.88 rustfmt，
   通過 `cargo fmt --check` 與 clippy `-D warnings`；GitHub Actions 固定 Rust 1.88
@@ -488,7 +486,7 @@ health-check driver **不論有沒有配置探測都每 100ms 醒一次**。小,
 ## ⬜ v0.3+ 候選
 
 > 這些**不是** v0.2 blocker。放在這裡是為了不遺失分析，不是為了現在做。
-> v0.2 的範圍邊界見 `docs/TODO.md` 的「明確不做」。
+> v0.2 的範圍邊界見 `docs/TODO.md`（🔒 本機）的「明確不做」。
 
 ### 反向代理進階
 
@@ -600,7 +598,7 @@ health-check driver **不論有沒有配置探測都每 100ms 醒一次**。小,
 
 - **ACME 只有 HTTP-01，沒有 DNS-01。** 這擋掉兩類使用者：需要 **wildcard 憑證**的
   （`*.example.com` 只能靠 DNS-01 簽發），以及 **80 埠不可用**的環境
-  （雲端 LB 後方、ISP 封鎖、純內網）。已在 `TODO.md` 列為 v0.3 具名優先項。
+  （雲端 LB 後方、ISP 封鎖、純內網）。已在本機 `TODO.md` 列為 v0.3 具名優先項。
 - 已解掉、不要退化的三項：ACME challenge token 跨重啟存活
   （`persistent_challenge_handler.rs`——純記憶體的話重啟即簽發失敗）、
   internal CA 跨重啟同一把（`internal_ca.rs`——每次啟動重簽會讓已信任的

@@ -4,7 +4,11 @@ This is the operating manual for coding agents working in this repository.
 Read it together with the three planning documents before changing anything:
 
 - `docs/TODO.md` — the v0.2.0 execution plan, one Day per sitting. Read this
-  to know what to work on.
+  to know what to work on. 🔒 **Kept local, deliberately not in the
+  repository**: it tracks known-but-unfixed weaknesses day by day, and a
+  public, prioritised list of unpatched defects in released code is a target
+  list. Publish the fix, not the queue. If you are working from a clone and
+  this file is missing, that is expected — ask the maintainer for it.
 - `docs/STATUS.md` — what is already done and **how far it has been verified**.
   This is the source of truth for feature status; do not infer that implemented
   code has passed Linux/VPS validation.

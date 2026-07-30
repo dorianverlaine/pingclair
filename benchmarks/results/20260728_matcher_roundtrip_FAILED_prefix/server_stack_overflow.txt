@@ -1,5 +1,0 @@
-🚀 Pingclair running...
-[2m2026-07-28T00:59:59.590457Z[0m [33m WARN[0m [2mpingclair_api::server[0m[2m:[0m ⚠️  Admin API is running WITHOUT authentication: no `api_key` configured. Only loopback clients are allowed; set `admin.api_key` to enable remote access.
-
-thread 'tokio-rt-worker' (3258613) has overflowed its stack
-fatal runtime error: stack overflow, aborting

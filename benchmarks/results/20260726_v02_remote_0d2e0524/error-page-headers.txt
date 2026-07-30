@@ -1,9 +1,0 @@
-HTTP/1.1 404 Not Found
-Content-Type: text/html
-Content-Length: 27
-Server: Pingclair
-X-Request-Id: 6577763e7d087-8
-Alt-Svc: h3=":443"; ma=86400
-Date: Sat, 25 Jul 2026 22:57:24 GMT
-Connection: keep-alive
-

@@ -1,3 +1,0 @@
-600 /var/lib/pingclair-wan/acme-challenges.json 13 bytes
-600 /var/lib/pingclair-wan/acme/account.json 339 bytes
-600 /var/lib/pingclair-wan/pingclairtest-paris_aqeo_dev.json 5306 bytes

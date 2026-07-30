@@ -1,6 +1,0 @@
-pingclair.log:[2m2026-07-30T04:13:38.307696Z[0m [32m INFO[0m [2mpingclair_tls::auto_https[0m[2m:[0m 🚀 Starting issuance workflow for pingclairtest-oregon.aqeo.dev
-pingclair.log:[2m2026-07-30T04:13:38.867306Z[0m [32m INFO[0m [2mpingclair_tls::acme[0m[2m:[0m ✅ Order created. URL: https://acme-v02.api.letsencrypt.org/acme/order/3582626181/538429592101
-pingclair.log:[2m2026-07-30T04:13:38.918371Z[0m [32m INFO[0m [2mpingclair_tls::acme[0m[2m:[0m 🧩 Solving challenge for pingclairtest-oregon.aqeo.dev
-pingclair.log:[2m2026-07-30T04:13:39.021040Z[0m [32m INFO[0m [2mpingclair_tls::acme[0m[2m:[0m 🚀 Verification triggered for pingclairtest-oregon.aqeo.dev
-pingclair.log:[2m2026-07-30T04:13:43.946206Z[0m [32m INFO[0m [2mpingclair_tls::auto_https[0m[2m:[0m 🎉 Certificate issuance complete for pingclairtest-oregon.aqeo.dev
-original-config-failure.log:[2m2026-07-30T04:11:14.381908Z[0m [31mERROR[0m [2mpingora_core::services::listening[0m[2m:[0m Downstream handshake error from 35.163.216.237:60458:  TLSHandshakeFailure context: TLS accept() failed: [HTTP_REQUEST]
