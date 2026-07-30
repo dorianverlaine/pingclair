@@ -2664,6 +2664,52 @@ async fn test_pingclairfile_internal_tls_serves_trusted_h1_and_h2() {
     );
 }
 
+/// 🧭 A redirect target is a template, so `{host}` and `{uri}` must expand.
+///
+/// This is what Automatic HTTPS relies on to send a plaintext visitor to the
+/// same resource over TLS. A literal `https://{host}{uri}` in the `Location`
+/// header would send every client to a hostname that does not exist.
+#[tokio::test]
+async fn test_redirect_expands_host_and_uri_placeholders() {
+    let config = r#"
+        {
+            admin off
+        }
+
+        :__PINGCLAIR_TEST_PORT__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            redir "https://{host}{uri}" 308
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let response = client
+        .get(server.url(0, "/deep/path?q=1"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 308);
+    let location = response
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .expect("a redirect must carry a Location");
+    assert_eq!(
+        location,
+        format!("https://{}/deep/path?q=1", server.address(0))
+    );
+}
+
 /// 🎫 Builds a real two-level trust path: root CA → intermediate CA → leaf.
 ///
 /// Why not just self-sign, the way every other TLS test here does? Because a

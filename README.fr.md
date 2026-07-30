@@ -169,7 +169,8 @@ localhost:8080 {
 
 ### HTTPS automatique pour les noms publics
 
-`tls auto` obtient et renouvelle un certificat public via ACME (Let's Encrypt) :
+`tls auto` obtient et renouvelle un certificat public via ACME (Let's Encrypt).
+Aucun `listen` n'est nécessaire :
 
 ```caddyfile
 {
@@ -177,23 +178,46 @@ localhost:8080 {
 }
 
 example.com {
-    listen :80
-    listen :443
     tls auto
     reverse_proxy app:8080
 }
 ```
 
-Conservez le listener `:80`. Le challenge HTTP-01 d'ACME est récupéré en HTTP
-**en clair** sur le port 80 (RFC 8555 §8.3) : Pingclair laisse donc toujours le
-port 80 non chiffré, même dans un bloc qui configure TLS. Sans cela, la sonde en
-clair de l'autorité arriverait sur un listener TLS et chaque demande de
-certificat échouerait. Tous les autres ports du bloc utilisent bien TLS.
+C'est toute la configuration. Un site avec TLS et sans `listen` sert HTTPS sur
+443, et Pingclair provisionne un second listener, en clair, sur le port 80. Il
+remplit deux rôles : répondre au challenge HTTP-01 d'ACME — que l'autorité
+récupère en HTTP **en clair** sur ce port précis (RFC 8555 §8.3) — et rediriger
+toute autre requête vers HTTPS avec un 308. Le port 80 reste donc non chiffré
+même dans un bloc qui configure TLS : un listener TLS y rejetterait la sonde en
+clair de l'autorité et aucun certificat ne pourrait être émis.
+
+Le comportement se pilote depuis le bloc global :
+
+| `auto_https` | Effet |
+| --- | --- |
+| `on` (par défaut) | Provisionne le port 80, répond aux challenges ACME, redirige vers HTTPS. |
+| `disable_redirects` | Provisionne le port 80 et répond aux challenges ACME, sans rediriger. |
+| `off` | Ne provisionne rien ; la gestion des certificats est également désactivée. |
+
+Écrire votre propre `listen :80` dans le bloc désactive le listener automatique :
+Pingclair sert alors ce port exactement comme configuré. Si le port 80 ne peut
+pas être lié (déjà utilisé, ou privilèges insuffisants), le listener automatique
+est ignoré avec un avertissement et HTTPS continue de servir ; la validation
+HTTP-01 d'ACME, elle, ne fonctionnera pas.
 
 Le certificat installé inclut les intermédiaires émis par l'autorité. Un serveur
 qui n'envoie que son certificat feuille semble fonctionner dans un navigateur —
 les navigateurs mettent les intermédiaires en cache et récupèrent les manquants
 via AIA — alors que `curl`, Go et Java le rejettent sans appel.
+
+Pour rediriger à la main, `redir` développe `{host}` et `{uri}`. Mettez la cible
+entre guillemets pour que `{` ne soit pas lu comme un début de bloc :
+
+```caddyfile
+http://example.com {
+    redir "https://{host}{uri}" 308
+}
+```
 
 ### TLS interne pour les origines privées
 

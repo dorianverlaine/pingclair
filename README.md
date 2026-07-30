@@ -164,7 +164,8 @@ localhost:8080 {
 
 ### Automatic HTTPS for public names
 
-`tls auto` obtains and renews a public certificate over ACME (Let's Encrypt):
+`tls auto` obtains and renews a public certificate over ACME (Let's Encrypt).
+No `listen` is needed:
 
 ```caddyfile
 {
@@ -172,23 +173,45 @@ localhost:8080 {
 }
 
 example.com {
-    listen :80
-    listen :443
     tls auto
     reverse_proxy app:8080
 }
 ```
 
-Keep the `:80` listener. ACME's HTTP-01 challenge is fetched over **cleartext**
-HTTP on port 80 (RFC 8555 §8.3), so Pingclair always leaves port 80 unencrypted
-even inside a block that configures TLS — otherwise the CA's plaintext probe
-would arrive at a TLS listener and every certificate order would fail. Every
-other port in such a block does use TLS.
+That is the whole configuration. A site with TLS and no `listen` serves HTTPS on
+443, and Pingclair provisions a second, plaintext listener on port 80 that does
+two jobs: it answers the ACME HTTP-01 challenge, which the CA fetches over
+**cleartext** HTTP on that exact port (RFC 8555 §8.3), and it redirects every
+other request to HTTPS with a 308. Port 80 therefore stays unencrypted even
+inside a block that configures TLS — a TLS listener there would reject the CA's
+plaintext probe and no certificate could ever be issued.
 
-The certificate Pingclair installs includes the intermediates the CA issued
-with it. A server that sends only its leaf certificate appears to work in a
-browser — browsers cache intermediates and fetch missing ones over AIA — while
-`curl`, Go, and Java reject it outright.
+Control it from the global block:
+
+| `auto_https` | Effect |
+| --- | --- |
+| `on` (default) | Provision port 80, answer ACME challenges, redirect to HTTPS. |
+| `disable_redirects` | Provision port 80 and answer ACME challenges, but do not redirect. |
+| `off` | Provision nothing; certificate management is disabled too. |
+
+Writing your own `listen :80` in the block opts out of the automatic listener —
+Pingclair then serves that port exactly as configured. If port 80 cannot be
+bound (already in use, or unprivileged), the automatic listener is skipped with
+a warning and HTTPS still serves; ACME HTTP-01 validation will not work.
+
+The certificate Pingclair installs includes the intermediates the CA issued with
+it. A server that sends only its leaf certificate appears to work in a browser —
+browsers cache intermediates and fetch missing ones over AIA — while `curl`, Go,
+and Java reject it outright.
+
+To redirect by hand, `redir` expands `{host}` and `{uri}`. Quote the target so
+the `{` is not read as the start of a block:
+
+```caddyfile
+http://example.com {
+    redir "https://{host}{uri}" 308
+}
+```
 
 ### Internal TLS for private origins
 

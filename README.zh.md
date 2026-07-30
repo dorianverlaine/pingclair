@@ -156,7 +156,8 @@ localhost:8080 {
 
 ### 公開網域的自動 HTTPS
 
-`tls auto` 透過 ACME（Let's Encrypt）申請並自動續簽公開憑證：
+`tls auto` 透過 ACME（Let's Encrypt）申請並自動續簽公開憑證，不需要寫
+`listen`：
 
 ```caddyfile
 {
@@ -164,21 +165,41 @@ localhost:8080 {
 }
 
 example.com {
-    listen :80
-    listen :443
     tls auto
     reverse_proxy app:8080
 }
 ```
 
-請保留 `:80` listener。ACME 的 HTTP-01 挑戰是以**明文** HTTP 打在 port 80
-（RFC 8555 §8.3），所以即使 block 裡設定了 TLS，Pingclair 仍會讓 port 80
-維持明文——否則 CA 的明文探測會撞上 TLS listener，導致每一次憑證申請都失敗。
-同一個 block 的其他 port 則照常啟用 TLS。
+這就是完整的設定。有 TLS 而沒寫 `listen` 的 site 會在 443 提供 HTTPS，
+Pingclair 另外自動開一個 port 80 的明文 listener，做兩件事：回應 ACME 的
+HTTP-01 挑戰——CA 是以**明文** HTTP 打在這個 port（RFC 8555 §8.3）——以及把
+其餘請求以 308 導向 HTTPS。所以即使 block 裡設定了 TLS，port 80 仍維持明文：
+那裡放 TLS listener 會拒絕 CA 的明文探測，憑證永遠簽不下來。
+
+行為由全域區塊控制：
+
+| `auto_https` | 效果 |
+| --- | --- |
+| `on`（預設） | 自動開 port 80、回應 ACME 挑戰、重導到 HTTPS。 |
+| `disable_redirects` | 自動開 port 80 並回應 ACME 挑戰，但不重導。 |
+| `off` | 什麼都不開，憑證管理也一併關閉。 |
+
+在 block 裡自己寫 `listen :80` 就等於放棄自動 listener，Pingclair 會完全照你
+的設定服務那個 port。若 port 80 無法綁定（已被占用，或權限不足），自動
+listener 會被跳過並留下警告，HTTPS 照常服務，但 ACME HTTP-01 驗證不會運作。
 
 Pingclair 安裝憑證時會一併送出 CA 簽發的中繼憑證。只送 leaf 的伺服器在瀏覽器
 裡看起來是正常的——瀏覽器會快取中繼憑證，也會用 AIA 自行補抓——但 `curl`、
 Go 與 Java 會直接拒絕連線。
+
+要自己寫重導，`redir` 支援 `{host}` 與 `{uri}`。目標要加引號，否則 `{` 會被
+當成 block 的開頭：
+
+```caddyfile
+http://example.com {
+    redir "https://{host}{uri}" 308
+}
+```
 
 ### 私有源站的 internal TLS
 

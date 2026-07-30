@@ -2280,8 +2280,16 @@ impl PingclairProxy {
                 Ok(true)
             }
             HandlerConfig::Redirect { to, code } => {
+                // 🧭 A redirect target is a template, so `redir https://{host}{uri}`
+                // can send a client to the same resource over another scheme.
+                let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
+                let location = resolve_caddy_placeholders(
+                    to,
+                    session.req_header(),
+                    verified_client_ip.as_deref(),
+                );
                 let mut response = ResponseHeader::build(*code, Some(3)).unwrap();
-                response.insert_header("Location", to.as_str()).unwrap();
+                response.insert_header("Location", location).unwrap();
                 Self::apply_local_response_headers(&mut response, ctx)?;
                 session
                     .write_response_header(Box::new(response), true)
@@ -2720,8 +2728,10 @@ fn resolve_single_placeholder(
             .to_string(),
         "remote_ip" | "http.request.remote.host" => verified_client_ip.unwrap_or("").to_string(),
         "http.request.method" => req.method.as_str().to_string(),
-        "http.request.uri" => req.uri.to_string(),
-        "http.request.uri.path" => req.uri.path().to_string(),
+        // 🧭 `{uri}` is Caddy's shorthand for the full request target, and it is
+        // what `redir https://{host}{uri}` depends on.
+        "uri" | "http.request.uri" => req.uri.to_string(),
+        "path" | "http.request.uri.path" => req.uri.path().to_string(),
         _ => {
             tracing::debug!("⚠️ Unresolved Caddy placeholder: {{{}}}", name);
             String::new()
