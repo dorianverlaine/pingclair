@@ -615,9 +615,15 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
 - ✔ **URI 正規化**（同一份證據目錄，`after-uri-matrix.txt`）。反代路由的
   `GET /api/../admin/x` 修前回 200 且原封不動轉給上游——`/admin/*` 的政策
   從未執行，而 origin 會自己正規化並提供服務。已改為拒絕（不是改寫）。
-- ⬜ **剩下的**：oversized headers 的
-  系統性負向測試、H2／H3 的畸形 frame（framing 檢查已實作但只有單元測試，
-  缺 frame 級負向測試——需要能發畸形 frame 的客戶端）。
+- ✔ **header 正規化**（同一份證據目錄，`after-header-matrix.txt`）。obs-fold、
+  bare CR、NUL、`:` 開頭與空 header 名稱修前就已擋掉;但 **`Host` 的三條
+  RFC 9112 §3.2 MUST 全部沒遵守**——重複 `Host`、缺 `Host`、`Host` 含空白
+  修前都回 200。形狀同路徑逃逸：代理取第一個、origin 可能取最後一個。已修。
+- ✔ **oversized headers**：Day 8 已完成（431），M2 矩陣在 Linux 遠端驗證過
+  （`a request over the header-count limit was refused (431)`）。本日重新確認。
+- ⬜ **剩下的**：H2／H3 的畸形 frame 負向測試（framing 檢查已實作但只有單元
+  測試，缺 frame 級的——需要能發畸形 frame 的客戶端）;proptest／fuzzing 打
+  HTTP parser;與 nginx／Caddy 的差異測試。
 - 可用 proptest／fuzzing，並與 nginx／Caddy 做差異測試。
 - **完成判定**：每一類都有明確的拒絕行為與測試。
 

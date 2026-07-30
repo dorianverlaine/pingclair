@@ -2817,6 +2817,20 @@ impl ProxyHttp for PingclairProxy {
                 return Ok(true);
             }
 
+            // 🏠 RFC 9112 §3.2 makes this a MUST: exactly one well-formed Host,
+            // or this proxy and the origin may resolve different virtual hosts.
+            if let Err(rejection) = crate::http_policy::check_request_host(
+                request_header.version,
+                &request_header.headers,
+            ) {
+                tracing::warn!(
+                    "🚫 Rejected a request whose Host cannot be resolved: {}",
+                    rejection.reason()
+                );
+                Self::write_simple_response(session, ctx, 400, rejection.reason()).await?;
+                return Ok(true);
+            }
+
             if let Err(rejection) = crate::http_policy::check_request_framing(
                 request_header.version,
                 &request_header.headers,

@@ -1,0 +1,11 @@
+vector                                       | status               | upstream
+--------------------------------------------------------------------------------------------------------
+obs-fold (header continuation line)          | 400 Bad Request      | 上游: 
+duplicate Host                               | 400 Bad Request      | 上游: 
+missing Host (HTTP/1.1)                      | 400 Bad Request      | 上游: 
+header value with bare CR                    | 400 Bad Request      | 上游: 
+header value with NUL                        | 400 Bad Request      | 上游: 
+header name with colon prefix                | 400 Bad Request      | 上游: 
+mixed-case header preserved?                 | 200 OK               | 上游: X-PrObE: MiXeD
+empty header name                            | 400 Bad Request      | 上游: 
+Host with whitespace                         | 400 Bad Request      | 上游: 

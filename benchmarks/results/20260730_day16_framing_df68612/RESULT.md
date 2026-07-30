@@ -93,3 +93,36 @@ Pingclair 用 `/api/*` 匹配它，所以綁在 `/admin/*` 上的 403 政策**�
   RFC 9113 §8.2.2、RFC 9114 §4.1），但**只有單元測試**，沒有像 H1 這樣的
   原始 frame 級負向測試。H2 需要能發畸形 frame 的客戶端。
 - URI 正規化（`..`、編碼過的斜線、雙重編碼）尚未系統性覆蓋。
+
+## 第三輪：header 正規化 —— Host 的三個 MUST
+
+見 `after-header-matrix.txt`（探針 `hdr.py`）。obs-fold、bare CR、NUL、
+`:` 開頭的 header 名稱、空 header 名稱修前就已經全部 400。
+
+但 **Host 的三條 RFC 9112 §3.2 的 MUST 全部沒有遵守**：
+
+| 向量 | 修前 | 修後 |
+|---|---|---|
+| 重複 `Host` | 200，只取第一個轉發 | 400 |
+| 缺 `Host`（HTTP/1.1） | 200 | 400 |
+| `Host: a b`（含空白） | 200，原樣轉發 | 400 |
+
+RFC 9112 §3.2 對這三種情況都寫 MUST respond 400。形狀跟路徑逃逸完全一樣：
+這個代理從第一個欄位挑虛擬主機，origin 若挑最後一個，**服務的就是另一個站，
+而剛剛套用的是前一個站的政策**。
+
+HTTP/1.0 不檢查（`Host` 比它晚出現，缺席是合法的）；H2／H3 走 `:authority`，
+由它們自己的 parser 負責。
+
+## Day 16 完成度
+
+| 類別 | 狀態 |
+|---|---|
+| hop-by-hop headers | ✔ `b6fbd26` |
+| 重複 `Content-Length`／`Transfer-Encoding` | ✔ `06f19e7`（含 `+5` 真 bug） |
+| request smuggling | ✔ 30 向量，上游視角驗證 |
+| URI 正規化 | ✔ `7e89167`（路徑逃逸繞過路由政策） |
+| header 正規化 | ✔ 本輪（Host 三條 MUST） |
+| oversized headers | ✔ Day 8 已完成（431），M2 矩陣遠端驗證過 |
+| malformed frame（H2／H3） | ⬜ framing 檢查已實作但只有單元測試 |
+| proptest／fuzzing、與 nginx／Caddy 差異測試 | ⬜ |
