@@ -1,26 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dorian Verlaine
 
-//! HTTP/3 (QUIC) server built on Cloudflare's quiche (BoringSSL).
+//! HTTP/3 (QUIC) server built on Cloudflare's tokio-quiche (quiche + BoringSSL).
 //!
 //! 🏗️ ARCHITECTURE
 //!
-//! - One UDP socket and one tokio task per HTTPS listen port
-//!   ([`QuicServer::run`]). The task single-threads the whole QUIC state:
-//!   a `HashMap<ConnectionId, ConnState>` with no locks on the hot path.
-//! - The datagram/timeout loop follows the structure of quiche's
-//!   `examples/http3-server.rs`, adapted to tokio (`UdpSocket` +
-//!   `tokio::select!` + `tokio::time::sleep` for `conn.timeout()`).
+//! The split is between transport and application. `tokio_quiche` owns the
+//! transport: the UDP socket, packet parsing, version negotiation, stateless
+//! retry and address validation, connection-ID routing, GSO, pacing, and each
+//! connection's timers. This module owns what is left, and it is the part
+//! that is actually ours.
+//!
+//! - [`QuicServer::run`] binds the port, hands `tokio_quiche` a
+//!   [`ConnectionParams`](tokio_quiche::ConnectionParams), and then does only
+//!   what the transport has no opinion about: the L4 blocklist and the
+//!   listener's connection limit.
+//! - Each accepted connection is driven by an [`H3App`], the crate's
+//!   [`ApplicationOverQuic`](tokio_quiche::ApplicationOverQuic)
+//!   implementation. Its four callbacks are the old event loop turned inside
+//!   out — `process_reads` pumps HTTP/3 events, `process_writes` flushes
+//!   pending response bytes, `wait_for_data` waits on the handler channel.
 //! - SNI multi-certificate support uses BoringSSL's
 //!   `select_certificate_callback` backed by an [`ArcSwap`]-published
-//!   [`CertTable`], so ACME renewals are picked up by new handshakes
-//!   without restarting the listener.
+//!   [`CertTable`], installed through a
+//!   [`ConnectionHook`](tokio_quiche::quic::ConnectionHook). The certificates
+//!   live in memory and are never written to disk; see
+//!   [`IN_MEMORY_CERT_SENTINEL`]. Because the lookup is a callback rather than
+//!   a snapshot, an ACME renewal applies to the next handshake with no
+//!   restart.
 //! - 🧭 Every HTTP/3 request is dispatched to a tokio task that reuses
 //!   [`PingclairProxy::match_route_index`] (the same route matcher as the
-//!   H1/H2 path). Response bytes flow back to the event loop over a
-//!   channel and are written through quiche with real flow control
-//!   (pending buffers + writable-stream events), so large static files
-//!   and upstream responses are streamed, never buffered whole.
+//!   H1/H2 path). Response bytes flow back over a per-connection channel and
+//!   are written through quiche with real flow control (pending buffers +
+//!   writable-stream events), so large static files and upstream responses
+//!   are streamed, never buffered whole.
 //! - Reverse-proxying goes through Pingora's [`Connector`], i.e. the same
 //!   keepalive connection pool, TLS-to-upstream support and timeout
 //!   semantics as the H1/H2 path.
@@ -29,6 +42,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -64,12 +78,6 @@ const RESP_CHANNEL_CAPACITY: usize = 256;
 
 /// Read size for draining request bodies out of quiche.
 const BODY_CHUNK_SIZE: usize = 16 * 1024;
-
-/// Idle fallback for the event loop when no connection has an active timer.
-const NO_TIMER_SLEEP: Duration = Duration::from_secs(3600);
-
-/// Length of the authentication tag appended to stateless-retry tokens.
-const TOKEN_TAG_LEN: usize = 16;
 
 /// 🚦 Paces one H3 body stream without retaining any body chunk.
 struct StreamPacer {
@@ -398,113 +406,6 @@ impl tokio_quiche::quic::ConnectionHook for CertTableSslHook {
     }
 }
 
-/// Build the quiche configuration with an SNI-aware BoringSSL context.
-fn build_quiche_config(
-    certs: Arc<CertTable>,
-    max_idle_timeout_ms: u64,
-) -> Result<quiche::Config, QuicError> {
-    let builder = build_ssl_context_builder(certs)?;
-
-    let mut config = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)
-        .map_err(|e| QuicError::Tls(format!("failed to build quiche config: {e}")))?;
-
-    config
-        .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
-        .map_err(|e| QuicError::Tls(format!("failed to set ALPN: {e}")))?;
-
-    config.set_max_idle_timeout(max_idle_timeout_ms);
-    config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
-    config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-    config.set_initial_max_data(10_000_000);
-    config.set_initial_max_stream_data_bidi_local(1_000_000);
-    config.set_initial_max_stream_data_bidi_remote(1_000_000);
-    config.set_initial_max_stream_data_uni(1_000_000);
-    config.set_initial_max_streams_bidi(100);
-    config.set_initial_max_streams_uni(100);
-    config.set_disable_active_migration(true);
-    // 🛡️ Keeps 0-RTT disabled until replay-safe route and method policies are explicit.
-
-    Ok(config)
-}
-
-// MARK: - Stateless retry tokens
-
-/// Compute the authentication tag for a retry token.
-///
-/// BoringSSL's Rust bindings don't expose a bare HMAC, so we use PBKDF2
-/// with a single iteration: its PRF is HMAC-SHA256 keyed by `key`, which
-/// makes this a strong keyed PRF of the token body.
-fn token_tag(key: &[u8; 32], body: &[u8]) -> [u8; TOKEN_TAG_LEN] {
-    let mut tag = [0u8; TOKEN_TAG_LEN];
-    // Infallible in practice (all buffers are small); a failure would just
-    // yield a tag that never validates, which fails closed.
-    let _ = boring::pkcs5::pbkdf2_hmac(
-        key,
-        body,
-        1,
-        boring::hash::MessageDigest::sha256(),
-        &mut tag,
-    );
-    tag
-}
-
-/// Mint a stateless retry token binding the client IP to the original
-/// destination connection ID it chose.
-fn mint_token(key: &[u8; 32], dcid: &[u8], src: &SocketAddr) -> Vec<u8> {
-    let mut token = Vec::new();
-    match src.ip() {
-        IpAddr::V4(a) => {
-            token.push(4u8);
-            token.extend_from_slice(&a.octets());
-        }
-        IpAddr::V6(a) => {
-            token.push(6u8);
-            token.extend_from_slice(&a.octets());
-        }
-    }
-    token.extend_from_slice(dcid);
-    let tag = token_tag(key, &token);
-    token.extend_from_slice(&tag);
-    token
-}
-
-/// Validate a retry token; on success returns the original destination
-/// connection ID to pass to `quiche::accept`.
-fn validate_token<'a>(
-    key: &[u8; 32],
-    src: &SocketAddr,
-    token: &'a [u8],
-) -> Option<quiche::ConnectionId<'a>> {
-    let (family, rest) = token.split_first()?;
-    let ip_len = match family {
-        4 => 4usize,
-        6 => 16usize,
-        _ => return None,
-    };
-    if rest.len() < ip_len + TOKEN_TAG_LEN + 1 {
-        return None;
-    }
-
-    let (ip_bytes, rest) = rest.split_at(ip_len);
-    let matches_ip = match (src.ip(), family) {
-        (IpAddr::V4(a), 4) => a.octets() == ip_bytes,
-        (IpAddr::V6(a), 6) => a.octets() == ip_bytes,
-        _ => false,
-    };
-    if !matches_ip {
-        return None;
-    }
-
-    let (odcid, tag) = rest.split_at(rest.len() - TOKEN_TAG_LEN);
-    let body_len = 1 + ip_len + odcid.len();
-    let expected = token_tag(key, &token[..body_len]);
-    if !boring::memcmp::eq(&expected, tag) {
-        return None;
-    }
-
-    Some(quiche::ConnectionId::from_ref(odcid))
-}
-
 // MARK: - Request/response plumbing
 
 /// One parsed HTTP/3 request, handed to a handler task.
@@ -567,15 +468,13 @@ enum RespMsg {
     Trailers(Vec<quiche::h3::Header>),
 }
 
+/// One handler task's output, on this connection's own channel.
 struct RespEvent {
-    cid: quiche::ConnectionId<'static>,
     stream_id: u64,
     msg: RespMsg,
 }
 
 type RespSender = mpsc::Sender<RespEvent>;
-
-type ConnMap = HashMap<quiche::ConnectionId<'static>, ConnState>;
 
 // MARK: - Connection / stream state
 
@@ -607,19 +506,167 @@ struct StreamState {
     dead: bool,
 }
 
-struct ConnState {
-    conn: quiche::Connection,
+/// 🚦 One connection's HTTP/3 layer, driven by tokio-quiche's worker loop.
+///
+/// The worker owns the socket, the `quiche::Connection`, pacing, timers,
+/// address validation and connection-ID routing, and hands the connection in
+/// as `qconn` on every callback — which is why this type holds no transport
+/// state of its own. What stays here is what the worker has no opinion about:
+/// the HTTP/3 connection, per-stream response assembly, and the channels back
+/// from the handler tasks.
+struct H3App {
+    proxy: Arc<PingclairProxy>,
+    connector: Arc<pingora_core::connectors::http::Connector>,
+    h3_config: Arc<quiche::h3::Config>,
     h3: Option<quiche::h3::Connection>,
     remote_addr: SocketAddr,
     streams: HashMap<u64, StreamState>,
+    resp_tx: RespSender,
+    resp_rx: mpsc::Receiver<RespEvent>,
+    body_notify: Arc<Notify>,
+    /// 🔢 Releases this connection's slot against `limits.max_connections`.
+    _slot: ConnectionSlot,
+    /// 📦 Lent to the worker for outbound packets; see `ApplicationOverQuic::buffer`.
+    out: Vec<u8>,
 }
 
-impl Drop for ConnState {
+impl Drop for H3App {
     fn drop(&mut self) {
         // 🛑 Cancels every handler before a closed QUIC connection releases its stream state.
         for stream in self.streams.values_mut() {
             cancel_stream_handler(stream);
         }
+    }
+}
+
+/// 🔢 Holds one connection's admission against `limits.max_connections`.
+///
+/// The count has to fall when the worker task ends, not when the accept loop
+/// moves on, so this rides along inside [`H3App`] and releases on drop.
+struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
+impl tokio_quiche::ApplicationOverQuic for H3App {
+    /// 🤝 Builds the HTTP/3 layer once TLS and the QUIC handshake are done.
+    fn on_conn_established(
+        &mut self,
+        qconn: &mut tokio_quiche::quic::QuicheConnection,
+        _handshake_info: &tokio_quiche::quic::HandshakeInfo,
+    ) -> tokio_quiche::QuicResult<()> {
+        self.h3 = Some(quiche::h3::Connection::with_transport(
+            qconn,
+            &self.h3_config,
+        )?);
+        Ok(())
+    }
+
+    fn should_act(&self) -> bool {
+        true
+    }
+
+    fn buffer(&mut self) -> &mut [u8] {
+        &mut self.out
+    }
+
+    /// ⏳ Waits for a handler task to produce output.
+    ///
+    /// The worker races this against inbound packets and the connection's
+    /// timers, so it must only report events this layer originates: responses
+    /// from handler tasks, and the notification that a handler freed
+    /// request-body channel capacity.
+    ///
+    /// # Cancel safety
+    /// `mpsc::Receiver::recv` and `Notify::notified` are both cancel safe, and
+    /// an event taken from the channel is applied to `self` before this returns
+    /// — so a cancelled future has either not yet dequeued, or fully applied.
+    async fn wait_for_data(
+        &mut self,
+        _qconn: &mut tokio_quiche::quic::QuicheConnection,
+    ) -> tokio_quiche::QuicResult<()> {
+        tokio::select! {
+            event = self.resp_rx.recv() => {
+                // 🧯 The sender is held by this app, so the channel outlives
+                // every handler; `None` cannot mean "no more work".
+                if let Some(event) = event {
+                    self.apply_resp_event(event);
+                }
+            }
+            _ = self.body_notify.notified() => {
+                // A handler freed request-body channel capacity; the deferred
+                // drains are retried in `process_reads`.
+            }
+        }
+        Ok(())
+    }
+
+    /// 📥 Turns received packets into HTTP/3 work.
+    fn process_reads(
+        &mut self,
+        qconn: &mut tokio_quiche::quic::QuicheConnection,
+    ) -> tokio_quiche::QuicResult<()> {
+        if self.h3.is_none() {
+            return Ok(());
+        }
+
+        // 🔁 Retries drains that stopped on a full handler channel before
+        // polling, so the Finished event that ends a request body is not
+        // observed until its bytes have been handed over.
+        let pending_reads: Vec<u64> = self
+            .streams
+            .iter()
+            .filter(|(_, s)| s.body_read_pending)
+            .map(|(id, _)| *id)
+            .collect();
+        for stream_id in pending_reads {
+            self.drain_request_body(qconn, stream_id);
+        }
+
+        self.pump_h3_events(qconn);
+        Ok(())
+    }
+
+    /// 📤 Hands quiche everything the handlers have produced.
+    ///
+    /// Called on every worker iteration, immediately before packets go to the
+    /// socket, so this is the only place stream writes need to happen.
+    fn process_writes(
+        &mut self,
+        qconn: &mut tokio_quiche::quic::QuicheConnection,
+    ) -> tokio_quiche::QuicResult<()> {
+        if self.h3.is_none() {
+            return Ok(());
+        }
+
+        let dirty: Vec<u64> = self
+            .streams
+            .iter()
+            .filter(|(_, s)| {
+                !s.dead
+                    && (s.pending_headers.is_some()
+                        || !s.pending_body.is_empty()
+                        || s.pending_trailers.is_some()
+                        || (s.body_fin && !s.fin_sent))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for stream_id in dirty {
+            self.flush_stream(qconn, stream_id);
+        }
+
+        // 🌊 Flow control may have opened up on streams with nothing newly
+        // queued, which is what lets a blocked large response resume.
+        let writable: Vec<u64> = qconn.writable().collect();
+        for stream_id in writable {
+            self.flush_stream(qconn, stream_id);
+        }
+
+        self.streams.retain(|_, s| !s.dead);
+        Ok(())
     }
 }
 
@@ -706,8 +753,16 @@ impl QuicServer {
         }
     }
 
-    /// Run the event loop forever (or until the task is aborted).
+    /// Serve HTTP/3 on this listener until the task is aborted.
+    ///
+    /// tokio-quiche owns the UDP socket, packet parsing, version negotiation,
+    /// address validation (stateless retry), connection-ID routing, pacing and
+    /// per-connection timers. Everything this server still decides — who is
+    /// allowed to connect, how many at once, and what HTTP/3 means — lives in
+    /// the accept loop below and in [`H3App`].
     pub async fn run(self) -> Result<(), QuicError> {
+        use futures::StreamExt;
+
         let limits = self.proxy.listener_limits();
         let transport_idle_ms = limits
             .long_connections
@@ -715,285 +770,119 @@ impl QuicServer {
             .filter(|value| *value > 0)
             .or(limits.idle_timeout_ms)
             .unwrap_or(30_000);
-        let mut config = build_quiche_config(self.certs.clone(), transport_idle_ms)?;
+
         let mut h3_config = quiche::h3::Config::new().map_err(|e| QuicError::H3(e.to_string()))?;
         if let Some(max_header_bytes) = limits.max_header_bytes {
             h3_config.set_max_field_section_size(max_header_bytes as u64);
         }
+        let h3_config = Arc::new(h3_config);
+
+        // `QuicSettings` is `#[non_exhaustive]`, so these are assignments and
+        // not a struct literal — which also keeps every value we deliberately
+        // choose sitting next to the reason for it.
+        let mut quic_settings = tokio_quiche::settings::QuicSettings::default();
+        quic_settings.alpn = vec![quiche::h3::APPLICATION_PROTOCOL[0].to_vec()];
+        quic_settings.max_idle_timeout = Some(Duration::from_millis(transport_idle_ms));
+        quic_settings.max_recv_udp_payload_size = MAX_DATAGRAM_SIZE;
+        quic_settings.max_send_udp_payload_size = MAX_DATAGRAM_SIZE;
+        quic_settings.initial_max_data = 10_000_000;
+        quic_settings.initial_max_stream_data_bidi_local = 1_000_000;
+        quic_settings.initial_max_stream_data_bidi_remote = 1_000_000;
+        quic_settings.initial_max_stream_data_uni = 1_000_000;
+        quic_settings.initial_max_streams_bidi = 100;
+        quic_settings.initial_max_streams_uni = 100;
+        quic_settings.disable_active_migration = true;
+        // 🛡️ Two 2^16-entry DATAGRAM queues per connection buy nothing without
+        // MASQUE or WebTransport, and quiche turns them on by default — so this
+        // must be set, not left alone.
+        quic_settings.enable_dgram = false;
+        // 🛡️ Keeps 0-RTT disabled until replay-safe route and method policies
+        // are explicit.
+        quic_settings.enable_early_data = false;
 
         let socket = UdpSocket::bind(self.listen).await?;
         let local_addr = socket.local_addr()?;
+
+        let hooks = tokio_quiche::settings::Hooks {
+            // 🔐 Certificates come from the in-memory table, never from disk;
+            // see `IN_MEMORY_CERT_SENTINEL`.
+            connection_hook: Some(Arc::new(CertTableSslHook::new(self.certs.clone()))),
+        };
+
+        let mut listeners = tokio_quiche::listen(
+            [socket],
+            tokio_quiche::ConnectionParams::new_server(
+                quic_settings,
+                tokio_quiche::settings::TlsCertificatePaths {
+                    cert: IN_MEMORY_CERT_SENTINEL,
+                    private_key: IN_MEMORY_CERT_SENTINEL,
+                    kind: tokio_quiche::settings::CertificateKind::X509,
+                },
+                hooks,
+            ),
+            tokio_quiche::metrics::DefaultMetrics,
+        )?;
+
         tracing::info!(
-            "🚀 HTTP/3 (quiche) server listening on {} (UDP)",
+            "🚀 HTTP/3 (tokio-quiche) server listening on {} (UDP)",
             local_addr
         );
 
-        let mut token_key = [0u8; 32];
-        boring::rand::rand_bytes(&mut token_key)
-            .map_err(|e| QuicError::Tls(format!("failed to generate retry token key: {e}")))?;
+        let live_connections = Arc::new(AtomicUsize::new(0));
+        let mut incoming = listeners.remove(0);
 
-        let mut conns: ConnMap = HashMap::new();
-        let (resp_tx, mut resp_rx) = mpsc::channel::<RespEvent>(RESP_CHANNEL_CAPACITY);
-        let body_notify = Arc::new(Notify::new());
+        while let Some(connection) = incoming.next().await {
+            let connection = match connection {
+                Ok(connection) => connection,
+                // 🧯 A failed QUIC initial is one client's problem, not the
+                // listener's; the stream keeps producing after this.
+                Err(e) => {
+                    tracing::debug!("H3: dropping an inbound connection: {}", e);
+                    continue;
+                }
+            };
 
-        let mut buf = vec![0u8; 65535];
-        let mut out = vec![0u8; MAX_DATAGRAM_SIZE];
+            let remote_addr = connection.peer_addr();
 
-        loop {
-            // Earliest timer across all connections.
-            let timeout = conns.values().filter_map(|c| c.conn.timeout()).min();
-
-            tokio::select! {
-                res = socket.recv_from(&mut buf) => {
-                    match res {
-                        Ok((len, from)) => {
-                            self.handle_packet(
-                                &socket,
-                                local_addr,
-                                &mut config,
-                                &mut conns,
-                                &h3_config,
-                                &resp_tx,
-                                &body_notify,
-                                &token_key,
-                                &mut buf[..len],
-                                from,
-                                &mut out,
-                            ).await;
-                        }
-                        Err(e) => {
-                            tracing::error!("H3: UDP recv failed: {}", e);
-                        }
-                    }
-                }
-                Some(ev) = resp_rx.recv() => {
-                    Self::apply_resp_event(&mut conns, ev);
-                }
-                _ = body_notify.notified() => {
-                    // A handler freed request-body channel capacity; the
-                    // deferred drains are retried in the maintenance pass.
-                }
-                _ = tokio::time::sleep(timeout.unwrap_or(NO_TIMER_SLEEP)) => {
-                    for c in conns.values_mut() {
-                        c.conn.on_timeout();
-                    }
-                }
+            // 🚫 L4 blocklist, same semantics and same list as the TCP
+            // listener's connection filter. The handshake has already begun by
+            // the time we see this, so dropping the connection here refuses
+            // service rather than refusing the packet.
+            if !self.filter.allows(&remote_addr) {
+                continue;
             }
 
-            // Maintenance pass: retry deferred request-body drains, pump any
-            // HTTP/3 events those drains queued inside quiche (e.g. the
-            // Finished event that ends a request body), flush streams that
-            // have something to send, push out QUIC packets, and
-            // garbage-collect.
-            for (cid, cs) in conns.iter_mut() {
-                let pending_reads: Vec<u64> = cs
-                    .streams
-                    .iter()
-                    .filter(|(_, s)| s.body_read_pending)
-                    .map(|(id, _)| *id)
-                    .collect();
-                for stream_id in pending_reads {
-                    Self::drain_request_body(cs, stream_id);
-                }
-
-                if cs.h3.is_some() {
-                    self.pump_h3_events(cs, cid, &resp_tx, &body_notify);
-                }
-
-                let dirty: Vec<u64> = cs
-                    .streams
-                    .iter()
-                    .filter(|(_, s)| {
-                        !s.dead
-                            && (s.pending_headers.is_some()
-                                || !s.pending_body.is_empty()
-                                || s.pending_trailers.is_some()
-                                || (s.body_fin && !s.fin_sent))
-                    })
-                    .map(|(id, _)| *id)
-                    .collect();
-                for stream_id in dirty {
-                    Self::flush_stream(cs, stream_id);
-                }
-
-                let writable: Vec<u64> = cs.conn.writable().collect();
-                for stream_id in writable {
-                    Self::flush_stream(cs, stream_id);
-                }
-
-                loop {
-                    match cs.conn.send(&mut out) {
-                        Ok((written, send_info)) => {
-                            if let Err(e) = socket.send_to(&out[..written], send_info.to).await {
-                                tracing::error!("H3: UDP send failed: {}", e);
-                                break;
-                            }
-                        }
-                        Err(quiche::Error::Done) => break,
-                        Err(e) => {
-                            tracing::error!("{} send failed: {:?}", cs.conn.trace_id(), e);
-                            cs.conn.close(false, 0x1, b"fail").ok();
-                            break;
-                        }
-                    }
-                }
-
-                cs.streams.retain(|_, s| !s.dead);
-            }
-
-            conns.retain(|_, cs| !cs.conn.is_closed());
-        }
-    }
-
-    /// Handle one incoming UDP datagram: route it to an existing connection
-    /// or run the new-connection handshake (version negotiation, stateless
-    /// retry, `quiche::accept`), then pump HTTP/3 events.
-    #[allow(clippy::too_many_arguments)]
-    async fn handle_packet(
-        &self,
-        socket: &UdpSocket,
-        local_addr: SocketAddr,
-        config: &mut quiche::Config,
-        conns: &mut ConnMap,
-        h3_config: &quiche::h3::Config,
-        resp_tx: &RespSender,
-        body_notify: &Arc<Notify>,
-        token_key: &[u8; 32],
-        pkt: &mut [u8],
-        from: SocketAddr,
-        out: &mut [u8],
-    ) {
-        let hdr = match quiche::Header::from_slice(pkt, quiche::MAX_CONN_ID_LEN) {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::debug!("H3: parsing packet header failed: {:?}", e);
-                return;
-            }
-        };
-
-        // L4 blocklist, same semantics as the TCP connection filter.
-        if !self.filter.allows(&from) {
-            return;
-        }
-
-        let cid: quiche::ConnectionId<'static> = hdr.dcid.as_ref().to_vec().into();
-
-        if !conns.contains_key(&cid) {
-            if hdr.ty != quiche::Type::Initial {
-                tracing::trace!("H3: packet for unknown connection is not Initial");
-                return;
-            }
-
-            if self
-                .proxy
-                .listener_limits()
-                .max_connections
-                .is_some_and(|limit| conns.len() >= limit)
+            // 🔢 Only this loop increments, so a load-then-add cannot race
+            // itself; drops of `ConnectionSlot` are the only decrements.
+            if let Some(limit) = self.proxy.listener_limits().max_connections
+                && live_connections.load(Ordering::Acquire) >= limit
             {
                 tracing::warn!("🚫 Rejecting an HTTP/3 connection at the configured limit");
-                return;
+                continue;
             }
+            live_connections.fetch_add(1, Ordering::AcqRel);
 
-            if !quiche::version_is_supported(hdr.version) {
-                tracing::debug!("H3: doing version negotiation");
-                match quiche::negotiate_version(&hdr.scid, &hdr.dcid, out) {
-                    Ok(len) => {
-                        if let Err(e) = socket.send_to(&out[..len], from).await {
-                            tracing::error!("H3: failed to send version negotiation: {}", e);
-                        }
-                    }
-                    Err(e) => tracing::error!("H3: version negotiation failed: {:?}", e),
-                }
-                return;
-            }
-
-            // Token is always present in Initial packets.
-            let token = hdr.token.as_deref().unwrap_or(&[]);
-
-            // Do stateless retry if the client didn't send a token.
-            if token.is_empty() {
-                let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
-                if boring::rand::rand_bytes(&mut scid_bytes).is_err() {
-                    tracing::error!("H3: failed to generate connection ID");
-                    return;
-                }
-                let scid = quiche::ConnectionId::from_ref(&scid_bytes);
-                let new_token = mint_token(token_key, &hdr.dcid, &from);
-
-                match quiche::retry(&hdr.scid, &hdr.dcid, &scid, &new_token, hdr.version, out) {
-                    Ok(len) => {
-                        if let Err(e) = socket.send_to(&out[..len], from).await {
-                            tracing::error!("H3: failed to send retry: {}", e);
-                        }
-                    }
-                    Err(e) => tracing::error!("H3: retry failed: {:?}", e),
-                }
-                return;
-            }
-
-            let Some(odcid) = validate_token(token_key, &from, token) else {
-                tracing::warn!("H3: invalid address validation token from {}", from);
-                return;
-            };
-
-            if hdr.dcid.len() != quiche::MAX_CONN_ID_LEN {
-                tracing::warn!("H3: invalid destination connection ID length");
-                return;
-            }
-
-            // Reuse the source connection ID we sent in the Retry packet,
-            // instead of changing it again.
-            let scid = hdr.dcid.clone();
-
-            let conn = match quiche::accept(&scid, Some(&odcid), local_addr, from, config) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("H3: accept failed: {:?}", e);
-                    return;
-                }
-            };
-
-            tracing::debug!("H3: new connection from {}", from);
-            conns.insert(
-                cid.clone(),
-                ConnState {
-                    conn,
-                    h3: None,
-                    remote_addr: from,
-                    streams: HashMap::new(),
-                },
-            );
+            let (resp_tx, resp_rx) = mpsc::channel::<RespEvent>(RESP_CHANNEL_CAPACITY);
+            connection.start(H3App {
+                proxy: self.proxy.clone(),
+                connector: self.connector.clone(),
+                h3_config: Arc::clone(&h3_config),
+                h3: None,
+                remote_addr,
+                streams: HashMap::new(),
+                resp_tx,
+                resp_rx,
+                body_notify: Arc::new(Notify::new()),
+                _slot: ConnectionSlot(Arc::clone(&live_connections)),
+                out: vec![0u8; MAX_DATAGRAM_SIZE],
+            });
         }
 
-        let Some(cs) = conns.get_mut(&cid) else {
-            return;
-        };
-
-        let recv_info = quiche::RecvInfo {
-            to: local_addr,
-            from,
-        };
-        if let Err(e) = cs.conn.recv(pkt, recv_info) {
-            tracing::debug!("{} recv failed: {:?}", cs.conn.trace_id(), e);
-            return;
-        }
-
-        // 🤝 Creates HTTP/3 state only after the replay-safe handshake completes.
-        if cs.conn.is_established() && cs.h3.is_none() {
-            match quiche::h3::Connection::with_transport(&mut cs.conn, h3_config) {
-                Ok(h3) => cs.h3 = Some(h3),
-                Err(e) => {
-                    tracing::error!("H3: failed to create HTTP/3 connection: {}", e);
-                    return;
-                }
-            }
-        }
-
-        if cs.h3.is_some() {
-            self.pump_h3_events(cs, &cid, resp_tx, body_notify);
-        }
+        Ok(())
     }
+}
 
+impl H3App {
     /// Pump queued HTTP/3 events until quiche reports `Error::Done`.
     ///
     /// Must be called after every `conn.recv` AND from the event loop's
@@ -1003,35 +892,29 @@ impl QuicServer {
     /// can produce events even when no new packet arrived. Without the
     /// maintenance-pass pump a large request body would deadlock: the
     /// handler waits for end-of-body that never gets signaled.
-    fn pump_h3_events(
-        &self,
-        cs: &mut ConnState,
-        cid: &quiche::ConnectionId<'static>,
-        resp_tx: &RespSender,
-        body_notify: &Arc<Notify>,
-    ) {
+    fn pump_h3_events(&mut self, qconn: &mut tokio_quiche::quic::QuicheConnection) {
         loop {
             let poll_result = {
-                let h3 = cs.h3.as_mut().expect("checked above");
-                h3.poll(&mut cs.conn)
+                let h3 = self.h3.as_mut().expect("checked by the caller");
+                h3.poll(qconn)
             };
 
             match poll_result {
                 Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
-                    self.handle_h3_headers(cs, cid, stream_id, list, resp_tx, body_notify);
+                    self.handle_h3_headers(qconn, stream_id, list);
                 }
                 Ok((stream_id, quiche::h3::Event::Data)) => {
-                    Self::drain_request_body(cs, stream_id);
+                    self.drain_request_body(qconn, stream_id);
                 }
                 Ok((stream_id, quiche::h3::Event::Finished)) => {
                     // 🧹 Drains buffered bytes before closing the handler's request channel.
-                    if let Some(ss) = cs.streams.get_mut(&stream_id) {
+                    if let Some(ss) = self.streams.get_mut(&stream_id) {
                         ss.req_stream_finished = true;
                     }
-                    Self::drain_request_body(cs, stream_id);
+                    self.drain_request_body(qconn, stream_id);
                 }
                 Ok((stream_id, quiche::h3::Event::Reset(_))) => {
-                    if let Some(ss) = cs.streams.get_mut(&stream_id) {
+                    if let Some(ss) = self.streams.get_mut(&stream_id) {
                         cancel_stream_handler(ss);
                         ss.dead = true;
                     }
@@ -1040,7 +923,7 @@ impl QuicServer {
                 Ok((_, quiche::h3::Event::GoAway)) => (),
                 Err(quiche::h3::Error::Done) => break,
                 Err(e) => {
-                    tracing::error!("{} HTTP/3 error {:?}", cs.conn.trace_id(), e);
+                    tracing::error!("{} HTTP/3 error {:?}", qconn.trace_id(), e);
                     break;
                 }
             }
@@ -1050,13 +933,10 @@ impl QuicServer {
     /// Handle a request HEADERS event: parse the request, register stream
     /// state, and spawn the handler task.
     fn handle_h3_headers(
-        &self,
-        cs: &mut ConnState,
-        cid: &quiche::ConnectionId<'static>,
+        &mut self,
+        qconn: &mut tokio_quiche::quic::QuicheConnection,
         stream_id: u64,
         list: Vec<quiche::h3::Header>,
-        resp_tx: &RespSender,
-        body_notify: &Arc<Notify>,
     ) {
         // 🧭 Accepts requests only on client-initiated bidirectional streams.
         if !stream_id.is_multiple_of(4) {
@@ -1064,15 +944,15 @@ impl QuicServer {
         }
 
         // 🚫 Rejects request trailers explicitly because upstream forwarding is unsupported.
-        if let Some(stream) = cs.streams.get_mut(&stream_id) {
+        if let Some(stream) = self.streams.get_mut(&stream_id) {
             tracing::debug!(
                 "🚫 H3 request trailers are unsupported on stream {}; rejecting request",
                 stream_id
             );
             match reject_request_trailers(stream) {
-                TrailerRejection::ResponseQueued => Self::flush_stream(cs, stream_id),
+                TrailerRejection::ResponseQueued => self.flush_stream(qconn, stream_id),
                 TrailerRejection::ResetRequired => {
-                    let _ = cs.conn.stream_shutdown(
+                    let _ = qconn.stream_shutdown(
                         stream_id,
                         quiche::Shutdown::Write,
                         quiche::h3::WireErrorCode::RequestCancelled as u64,
@@ -1083,13 +963,13 @@ impl QuicServer {
         }
 
         let Some(req) = parse_h3_request(&list) else {
-            Self::queue_simple_response(cs, stream_id, 400, "Bad Request");
+            self.queue_simple_response(qconn, stream_id, 400, "Bad Request");
             return;
         };
 
         let (req_body_tx, req_body_rx) = mpsc::channel::<Vec<u8>>(REQ_BODY_CHANNEL_CAPACITY);
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        cs.streams.insert(
+        self.streams.insert(
             stream_id,
             StreamState {
                 req_body_tx: Some(req_body_tx),
@@ -1100,10 +980,9 @@ impl QuicServer {
 
         let proxy = self.proxy.clone();
         let connector = self.connector.clone();
-        let resp_tx = resp_tx.clone();
-        let notify = body_notify.clone();
-        let remote_ip = cs.remote_addr.ip().to_string();
-        let cid = cid.clone();
+        let resp_tx = self.resp_tx.clone();
+        let notify = Arc::clone(&self.body_notify);
+        let remote_ip = self.remote_addr.ip().to_string();
 
         tokio::spawn(async move {
             handle_request(
@@ -1111,7 +990,6 @@ impl QuicServer {
                 connector,
                 req,
                 remote_ip,
-                cid,
                 stream_id,
                 req_body_rx,
                 resp_tx,
@@ -1123,14 +1001,20 @@ impl QuicServer {
     }
 
     /// 🚫 Queues a plain-text response without spawning a handler task.
-    fn queue_simple_response(cs: &mut ConnState, stream_id: u64, status: u16, body: &str) {
+    fn queue_simple_response(
+        &mut self,
+        qconn: &mut tokio_quiche::quic::QuicheConnection,
+        stream_id: u64,
+        status: u16,
+        body: &str,
+    ) {
         let headers = vec![
             quiche::h3::Header::new(b":status", status.to_string().as_bytes()),
             quiche::h3::Header::new(b"content-type", b"text/plain"),
             quiche::h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
             quiche::h3::Header::new(b"server", b"Pingclair"),
         ];
-        cs.streams.insert(
+        self.streams.insert(
             stream_id,
             StreamState {
                 pending_headers: Some((headers, false)),
@@ -1139,7 +1023,7 @@ impl QuicServer {
                 ..Default::default()
             },
         );
-        Self::flush_stream(cs, stream_id);
+        self.flush_stream(qconn, stream_id);
     }
 
     /// Drain request-body bytes out of quiche into the handler's channel.
@@ -1147,10 +1031,13 @@ impl QuicServer {
     /// When the channel is full we stop draining and let QUIC flow control
     /// push back on the client; the drain is retried from the maintenance
     /// pass once the handler frees capacity.
-    fn drain_request_body(cs: &mut ConnState, stream_id: u64) {
-        let ConnState {
-            conn, h3, streams, ..
-        } = cs;
+    fn drain_request_body(
+        &mut self,
+        qconn: &mut tokio_quiche::quic::QuicheConnection,
+        stream_id: u64,
+    ) {
+        let Self { h3, streams, .. } = self;
+        let conn = qconn;
         let Some(h3) = h3.as_mut() else { return };
         let Some(ss) = streams.get_mut(&stream_id) else {
             return;
@@ -1203,12 +1090,12 @@ impl QuicServer {
     }
 
     /// Apply one response message from a handler task and try to flush it.
-    fn apply_resp_event(conns: &mut ConnMap, ev: RespEvent) {
-        let Some(cs) = conns.get_mut(&ev.cid) else {
-            return;
-        };
+    ///
+    /// The write itself waits for `process_writes`, which the worker calls on
+    /// every iteration right before it drains packets to the socket.
+    fn apply_resp_event(&mut self, ev: RespEvent) {
         {
-            let Some(ss) = cs.streams.get_mut(&ev.stream_id) else {
+            let Some(ss) = self.streams.get_mut(&ev.stream_id) else {
                 return;
             };
             if ss.dead || ss.handler_cancelled {
@@ -1232,7 +1119,6 @@ impl QuicServer {
                 }
             }
         }
-        Self::flush_stream(cs, ev.stream_id);
     }
 
     /// Write as much of a stream's pending response as quiche currently
@@ -1240,10 +1126,9 @@ impl QuicServer {
     /// queue drains and the handler signaled end-of-body, a final empty
     /// `fin = true` write terminates the stream. Retried from the
     /// maintenance pass / writable events whenever flow control opens up.
-    fn flush_stream(cs: &mut ConnState, stream_id: u64) {
-        let ConnState {
-            conn, h3, streams, ..
-        } = cs;
+    fn flush_stream(&mut self, qconn: &mut tokio_quiche::quic::QuicheConnection, stream_id: u64) {
+        let Self { h3, streams, .. } = self;
+        let conn = qconn;
         let Some(h3) = h3.as_mut() else { return };
         let Some(ss) = streams.get_mut(&stream_id) else {
             return;
@@ -1573,7 +1458,6 @@ async fn handle_request(
     connector: Arc<pingora_core::connectors::http::Connector>,
     req: H3Request,
     remote_ip: String,
-    cid: quiche::ConnectionId<'static>,
     stream_id: u64,
     body_rx: mpsc::Receiver<Vec<u8>>,
     resp_tx: RespSender,
@@ -1595,7 +1479,6 @@ async fn handle_request(
             &connector,
             &req,
             &remote_ip,
-            &cid,
             stream_id,
             body_rx,
             &resp_tx,
@@ -1616,7 +1499,6 @@ async fn handle_request(
         &mut cancel_rx,
         send_error_response(
             &resp_tx,
-            &cid,
             stream_id,
             status,
             msg,
@@ -1637,7 +1519,6 @@ async fn handle_request_inner(
     connector: &pingora_core::connectors::http::Connector,
     req: &H3Request,
     peer_ip: &str,
-    cid: &quiche::ConnectionId<'static>,
     stream_id: u64,
     mut body_rx: mpsc::Receiver<Vec<u8>>,
     resp_tx: &RespSender,
@@ -1755,7 +1636,7 @@ async fn handle_request_inner(
         if decision.reject {
             let mut headers = vec![quiche::h3::Header::new(b":status", b"429")];
             apply_h3_response_policy(&mut headers, response_policy, request_id, Some(&state));
-            send_headers(resp_tx, cid, stream_id, headers, true).await;
+            send_headers(resp_tx, stream_id, headers, true).await;
             return Ok(());
         }
     }
@@ -1781,7 +1662,6 @@ async fn handle_request_inner(
         H3Plan::Respond(response) => {
             send_immediate_response(
                 resp_tx,
-                cid,
                 stream_id,
                 response,
                 response_policy,
@@ -1826,10 +1706,10 @@ async fn handle_request_inner(
                 hdrs.push(quiche::h3::Header::new(k.as_bytes(), v.as_bytes()));
             }
             apply_h3_response_policy(&mut hdrs, response_policy, request_id, Some(&state));
-            send_headers(resp_tx, cid, stream_id, hdrs, body.is_empty()).await;
+            send_headers(resp_tx, stream_id, hdrs, body.is_empty()).await;
             if !body.is_empty() {
                 pace_h3_body(&mut download_pacer, request_deadline, body.len()).await?;
-                send_body(resp_tx, cid, stream_id, body.into_bytes(), true).await;
+                send_body(resp_tx, stream_id, body.into_bytes(), true).await;
             }
             Ok(())
         }
@@ -1840,7 +1720,7 @@ async fn handle_request_inner(
                 quiche::h3::Header::new(b"location", to.as_bytes()),
             ];
             apply_h3_response_policy(&mut hdrs, response_policy, request_id, Some(&state));
-            send_headers(resp_tx, cid, stream_id, hdrs, true).await;
+            send_headers(resp_tx, stream_id, hdrs, true).await;
             Ok(())
         }
 
@@ -1878,7 +1758,7 @@ async fn handle_request_inner(
                         hdrs.push(quiche::h3::Header::new(b"etag", etag.as_bytes()));
                     }
                     apply_h3_response_policy(&mut hdrs, response_policy, request_id, Some(&state));
-                    send_headers(resp_tx, cid, stream_id, hdrs, false).await;
+                    send_headers(resp_tx, stream_id, hdrs, false).await;
 
                     // 🌊 Streams file chunks without buffering the complete representation.
                     let mut fin_sent = false;
@@ -1888,7 +1768,7 @@ async fn handle_request_inner(
                                 let last = stream.is_complete();
                                 pace_h3_body(&mut download_pacer, request_deadline, chunk.len())
                                     .await?;
-                                send_body(resp_tx, cid, stream_id, chunk, last).await;
+                                send_body(resp_tx, stream_id, chunk, last).await;
                                 fin_sent = last;
                             }
                             Ok(None) => break,
@@ -1899,7 +1779,7 @@ async fn handle_request_inner(
                         }
                     }
                     if !fin_sent {
-                        send_body(resp_tx, cid, stream_id, Vec::new(), true).await;
+                        send_body(resp_tx, stream_id, Vec::new(), true).await;
                     }
                     Ok(())
                 }
@@ -1926,11 +1806,11 @@ async fn handle_request_inner(
                         hdrs.push(quiche::h3::Header::new(b"content-encoding", enc.as_bytes()));
                     }
                     apply_h3_response_policy(&mut hdrs, response_policy, request_id, Some(&state));
-                    send_headers(resp_tx, cid, stream_id, hdrs, file.content.is_empty()).await;
+                    send_headers(resp_tx, stream_id, hdrs, file.content.is_empty()).await;
                     if !file.content.is_empty() {
                         pace_h3_body(&mut download_pacer, request_deadline, file.content.len())
                             .await?;
-                        send_body(resp_tx, cid, stream_id, file.content, true).await;
+                        send_body(resp_tx, stream_id, file.content, true).await;
                     }
                     Ok(())
                 }
@@ -1956,7 +1836,6 @@ async fn handle_request_inner(
                 request_id,
                 response_policy,
                 body_limit,
-                cid,
                 stream_id,
                 &mut body_rx,
                 resp_tx,
@@ -1984,7 +1863,6 @@ async fn reverse_proxy_upstream(
     request_id: &str,
     response_policy: &ResponseHeaderPolicy,
     body_limit: u64,
-    cid: &quiche::ConnectionId<'static>,
     stream_id: u64,
     body_rx: &mut mpsc::Receiver<Vec<u8>>,
     resp_tx: &RespSender,
@@ -2481,7 +2359,7 @@ async fn reverse_proxy_upstream(
     }
     apply_h3_response_policy(&mut hdrs, &effective_policy, request_id, Some(state));
 
-    send_headers(resp_tx, cid, stream_id, hdrs, false).await;
+    send_headers(resp_tx, stream_id, hdrs, false).await;
 
     // 🌊 Streams the upstream response without committing the final H3 frame early.
     let mut clean = true;
@@ -2500,7 +2378,7 @@ async fn reverse_proxy_upstream(
                     }
                     tokio::time::sleep(delay).await;
                 }
-                send_body(resp_tx, cid, stream_id, bytes.to_vec(), false).await;
+                send_body(resp_tx, stream_id, bytes.to_vec(), false).await;
             }
             Ok(None) => break,
             Err(e) => {
@@ -2542,9 +2420,9 @@ async fn reverse_proxy_upstream(
     }
 
     if let Some(trailers) = response_trailers.filter(|trailers| !trailers.is_empty()) {
-        send_trailers(resp_tx, cid, stream_id, trailers).await;
+        send_trailers(resp_tx, stream_id, trailers).await;
     } else {
-        send_body(resp_tx, cid, stream_id, Vec::new(), true).await;
+        send_body(resp_tx, stream_id, Vec::new(), true).await;
     }
 
     if clean {
@@ -2637,7 +2515,6 @@ fn apply_h3_response_policy(
 /// 📤 Sends one middleware-generated H3 response with the shared header policy.
 async fn send_immediate_response(
     resp_tx: &RespSender,
-    cid: &quiche::ConnectionId<'static>,
     stream_id: u64,
     response: H3ImmediateResponse,
     policy: &ResponseHeaderPolicy,
@@ -2665,7 +2542,7 @@ async fn send_immediate_response(
         headers.push(quiche::h3::Header::new(name.as_bytes(), value.as_bytes()));
     }
     apply_h3_response_policy(&mut headers, policy, request_id, Some(state));
-    send_headers(resp_tx, cid, stream_id, headers, body.is_empty()).await;
+    send_headers(resp_tx, stream_id, headers, body.is_empty()).await;
     if !body.is_empty() {
         let request_deadline = state
             .config
@@ -2673,37 +2550,28 @@ async fn send_immediate_response(
             .request_timeout_ms
             .map(|value| Instant::now() + Duration::from_millis(value));
         pace_h3_body(&mut pacer, request_deadline, body.len()).await?;
-        send_body(resp_tx, cid, stream_id, body, true).await;
+        send_body(resp_tx, stream_id, body, true).await;
     }
     Ok(())
 }
 
 async fn send_headers(
     resp_tx: &RespSender,
-    cid: &quiche::ConnectionId<'static>,
     stream_id: u64,
     headers: Vec<quiche::h3::Header>,
     fin: bool,
 ) {
     let _ = resp_tx
         .send(RespEvent {
-            cid: cid.clone(),
             stream_id,
             msg: RespMsg::Headers(headers, fin),
         })
         .await;
 }
 
-async fn send_body(
-    resp_tx: &RespSender,
-    cid: &quiche::ConnectionId<'static>,
-    stream_id: u64,
-    bytes: Vec<u8>,
-    fin: bool,
-) {
+async fn send_body(resp_tx: &RespSender, stream_id: u64, bytes: Vec<u8>, fin: bool) {
     let _ = resp_tx
         .send(RespEvent {
-            cid: cid.clone(),
             stream_id,
             msg: RespMsg::Body(bytes, fin),
         })
@@ -2711,15 +2579,9 @@ async fn send_body(
 }
 
 /// 🧾 Queues H3 response trailers after every response body chunk.
-async fn send_trailers(
-    resp_tx: &RespSender,
-    cid: &quiche::ConnectionId<'static>,
-    stream_id: u64,
-    headers: Vec<quiche::h3::Header>,
-) {
+async fn send_trailers(resp_tx: &RespSender, stream_id: u64, headers: Vec<quiche::h3::Header>) {
     let _ = resp_tx
         .send(RespEvent {
-            cid: cid.clone(),
             stream_id,
             msg: RespMsg::Trailers(headers),
         })
@@ -2730,7 +2592,6 @@ async fn send_trailers(
 #[allow(clippy::too_many_arguments)]
 async fn send_error_response(
     resp_tx: &RespSender,
-    cid: &quiche::ConnectionId<'static>,
     stream_id: u64,
     status: u16,
     msg: &str,
@@ -2747,9 +2608,9 @@ async fn send_error_response(
         quiche::h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
     ];
     apply_h3_response_policy(&mut headers, policy, request_id, state);
-    send_headers(resp_tx, cid, stream_id, headers, body.is_empty()).await;
+    send_headers(resp_tx, stream_id, headers, body.is_empty()).await;
     if !body.is_empty() {
-        send_body(resp_tx, cid, stream_id, body, true).await;
+        send_body(resp_tx, stream_id, body, true).await;
     }
 }
 
@@ -2855,50 +2716,6 @@ mod tests {
 
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(table.len(), 1);
-    }
-
-    #[test]
-    fn retry_token_roundtrip() {
-        let key = [7u8; 32];
-        let src: SocketAddr = "192.0.2.10:55555".parse().unwrap();
-        let dcid = quiche::ConnectionId::from_ref(&[1, 2, 3, 4, 5, 6, 7, 8]);
-
-        let token = mint_token(&key, &dcid, &src);
-        let odcid = validate_token(&key, &src, &token).expect("token should validate");
-        assert_eq!(odcid.as_ref(), dcid.as_ref());
-    }
-
-    #[test]
-    fn retry_token_roundtrip_ipv6() {
-        let key = [9u8; 32];
-        let src: SocketAddr = "[2001:db8::1]:4433".parse().unwrap();
-        let dcid = quiche::ConnectionId::from_ref(&[42; 20]);
-
-        let token = mint_token(&key, &dcid, &src);
-        let odcid = validate_token(&key, &src, &token).expect("v6 token should validate");
-        assert_eq!(odcid.as_ref(), dcid.as_ref());
-    }
-
-    #[test]
-    fn retry_token_rejects_wrong_ip_and_tampering() {
-        let key = [7u8; 32];
-        let src: SocketAddr = "192.0.2.10:55555".parse().unwrap();
-        let dcid = quiche::ConnectionId::from_ref(&[9, 9, 9, 9]);
-
-        let token = mint_token(&key, &dcid, &src);
-
-        // Different source IP must not validate (anti-spoofing).
-        let other: SocketAddr = "198.51.100.20:4444".parse().unwrap();
-        assert!(validate_token(&key, &other, &token).is_none());
-
-        // Tampered token must not validate.
-        let mut tampered = token.clone();
-        let n = tampered.len();
-        tampered[n - 1] ^= 0xFF;
-        assert!(validate_token(&key, &src, &tampered).is_none());
-
-        // Garbage must not validate.
-        assert!(validate_token(&key, &src, b"garbage").is_none());
     }
 
     #[test]
@@ -3080,7 +2897,6 @@ mod tests {
         drop(body_tx);
         let (resp_tx, mut resp_rx) = mpsc::channel(8);
         let body_notify = Arc::new(Notify::new());
-        let cid = quiche::ConnectionId::from_vec(vec![5, 6, 7, 8]);
 
         reverse_proxy_upstream(
             &proxy,
@@ -3095,7 +2911,6 @@ mod tests {
             "retry-request-id",
             &ResponseHeaderPolicy::default(),
             0,
-            &cid,
             0,
             &mut body_rx,
             &resp_tx,
@@ -3171,7 +2986,6 @@ mod tests {
             headers: Vec::new(),
         };
         let client_header = RequestHeader::build(http::Method::GET, b"/circuit", None).unwrap();
-        let cid = quiche::ConnectionId::from_vec(vec![6, 7, 8, 9]);
 
         let (body_tx, mut body_rx) = mpsc::channel(1);
         drop(body_tx);
@@ -3189,7 +3003,6 @@ mod tests {
             "circuit-request-id",
             &ResponseHeaderPolicy::default(),
             0,
-            &cid,
             0,
             &mut body_rx,
             &resp_tx,
@@ -3216,7 +3029,6 @@ mod tests {
             "circuit-request-id",
             &ResponseHeaderPolicy::default(),
             0,
-            &cid,
             4,
             &mut body_rx,
             &resp_tx,
@@ -3291,7 +3103,6 @@ mod tests {
         drop(body_tx);
         let (resp_tx, mut resp_rx) = mpsc::channel(8);
         let body_notify = Arc::new(Notify::new());
-        let cid = quiche::ConnectionId::from_vec(vec![1, 2, 3, 4]);
 
         reverse_proxy_upstream(
             &proxy,
@@ -3306,7 +3117,6 @@ mod tests {
             "test-request-id",
             &ResponseHeaderPolicy::default(),
             0,
-            &cid,
             0,
             &mut body_rx,
             &resp_tx,
