@@ -629,11 +629,16 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
   讓請求路徑上的 panic 等於遠端 DoS。當場抓到 `percent_decode_once` 把位元組
   當 Latin-1 碼點導致膨脹的缺陷，已修。
 - ✔ **與 nginx／Caddy 差異測試**（`differential-vs-nginx-caddy.txt`）。
-- 🟡 **待決策（相容性，非安全）**：路徑逃逸我選拒絕（400），nginx 與 Caddy 選
-  正規化（403）。安全結果相同，但北極星是「與 Caddy 一致」，所以這是我造成的
-  相容性缺口。改成正規化會變動每個 origin 收到的路徑，需要自己的驗證循環。
-- 🟡 **已知缺口**：完全沒有 header 的請求，我們不回應就關連線（nginx／Caddy 回
-  400）。發生在 Pingora 解析層，在我們所有 hook 之前。可診斷性問題，非安全。
+- ✔ **路徑正規化改為與 nginx／Caddy 一致**：原本回 400，現在解析 `.`／`..`
+  後再路由，三方都回 403（政策套用在解析後的路徑上）。安全結果不變。
+- ⛔ **缺 Host 且無任何其他 header：`ProxyHttp` 層碰不到**。
+  `pingora-proxy-0.8.1/src/lib.rs:232` 在 `read_request` 回 `Ok(false)` 時
+  直接 `return None`,不呼叫 `respond_error`;只有 `Err(InvalidHTTPHeader)`
+  才會回 400。要修得改 Pingora。帶任何其他 header 時我們正確回 400。
+- 🟡 **CL + TE 與 nginx 不一致（與 Caddy 一致）**：偵測需依賴
+  `get_keepalive() == None`,但 `Connection: close` 也會讓它是 `None`,
+  會誤殺合法的 `Connection: close` + chunked。決定不追;要嚴格模式應做成
+  預設關閉的開關。
 - 可用 proptest／fuzzing，並與 nginx／Caddy 做差異測試。
 - **完成判定**：每一類都有明確的拒絕行為與測試。
 

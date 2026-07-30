@@ -172,16 +172,23 @@ proptest 當場抓到一個真缺陷：`percent_decode_once` 用 `byte as char` 
 | obs-fold | 400 | 400 | 200 | 與 nginx 一致 |
 | bare LF | 200 | 200 | 200 | ✅ |
 
-**兩個不一致要記下來，因為它們是不同性質的問題。**
+**改為正規化之後（`normalize_request_path`）**：三個路徑向量全部與 nginx／
+Caddy 一致回 403——政策套用在解析後的路徑上，安全結果不變，相容性補上了。
 
-**一、路徑逃逸：我選了拒絕，nginx 和 Caddy 選了正規化。**
-安全結果相同——三者都沒有把資源交出去，政策都有套用。但 Caddy 回 403（政策
-生效），我回 400（請求被拒）。這個專案的北極星是「與 Caddy 表現一致但更快」，
-所以**這是相容性缺口，不是安全缺口**，而且是我造成的。改成正規化會同時滿足
-兩者，但那會變動每個 origin 收到的路徑，需要自己的驗證循環（M2 矩陣＋生產
-回歸），不該塞進這一天。**列為待決策項。**
+**剩下兩個不一致，性質不同，都查到底了。**
 
-**二、完全沒有 header 的請求，我們不回應就關連線。**
-`GET /api/x HTTP/1.1\r\n\r\n` 得不到任何位元組；只要帶任何一個其他 header
-就會正確回 400。發生在 Pingora 的解析層，在我們所有 hook 之前。nginx 與
-Caddy 都回 400。不是安全問題，是可診斷性缺口。
+**一、缺 Host（且完全沒有其他 header）：我們碰不到。**
+`pingora-proxy-0.8.1/src/lib.rs:232`——`read_request` 回 `Ok(false)` 時直接
+`return None`，連 `respond_error(400)` 都不呼叫（上游自己在那行留了
+`// TODO: close connection?`）。只有 `Err(InvalidHTTPHeader)` 那條分支才會回
+400。`read_request` 與那個 return 之間**沒有任何 `ProxyHttp` hook**，
+`request_filter` 從未被呼叫。要修得改 Pingora。
+只要帶任何一個其他 header，我們的 `check_request_host` 就會正確回 400。
+
+**二、CL + TE：偵測得到，但代價是誤殺合法請求。**
+Pingora 在解析時移除 CL 並關閉 keepalive，`get_keepalive()` 可讀。但同一個
+`respect_keepalive()` 也會因為客戶端送 `Connection: close` 而設成 `None`，
+所以「TE 存在且 keepalive 為 None」這個推論**會把合法的
+`Connection: close` + `Transfer-Encoding: chunked` 誤判成 400**。
+Caddy 在這一項與我們一致（200），RFC 9112 §6.1 也明文允許中介移除 CL 後轉發。
+**決定不追**;若要嚴格模式，應做成預設關閉的開關而不是預設行為。

@@ -967,17 +967,6 @@ impl H3App {
             return;
         };
 
-        // 🚫 Same route-escape rule as H1/H2: a path carrying `.` or `..` would
-        // match one route here and resolve to another resource at the origin.
-        if crate::http_policy::path_escapes_its_route(&req.path) {
-            tracing::warn!(
-                "🚫 H3: rejected a request whose path escapes the route it matched: {}",
-                req.path
-            );
-            self.queue_simple_response(qconn, stream_id, 400, "Unnormalized Request Path");
-            return;
-        }
-
         // 🛡️ HTTP/3 carries its own framing, so `Transfer-Encoding` is forbidden
         // outright here rather than merely discouraged, and `Content-Length`
         // still has to be `1*DIGIT`. Same rule set as H1/H2, one implementation.
@@ -1001,6 +990,14 @@ impl H3App {
                 self.queue_simple_response(qconn, stream_id, 400, rejection.reason());
                 return;
             }
+        }
+
+        // 🧭 Same resolution as H1/H2, from the same function, so the two
+        // transports cannot drift on which resource a path names.
+        let mut req = req;
+        if let Some(normalized) = crate::http_policy::normalize_request_path(&req.path) {
+            tracing::debug!("🧭 H3: normalized request path to {}", normalized);
+            req.path = normalized;
         }
 
         let (req_body_tx, req_body_rx) = mpsc::channel::<Vec<u8>>(REQ_BODY_CHANNEL_CAPACITY);
