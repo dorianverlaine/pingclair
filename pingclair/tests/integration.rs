@@ -858,7 +858,19 @@ async fn test_bounded_upstream_status_retry_preserves_request_body_safety() {
             "routes": [
                 route("/success", 3, None, 30, vec!["GET"]),
                 route("/capped", 2, None, 0, vec!["GET"]),
-                route("/deadline", 3, Some(150), 100, vec!["GET"]),
+                // ⌛ `/deadline` pins the branch where the retry budget runs out
+                // *between* attempts, so the second attempt's own 503 is what
+                // the client sees. `response_filter` checks the budget before it
+                // looks at the response, so the whole assertion rests on attempt
+                // two's reply landing inside `total_timeout_ms`, and the slack for
+                // that is `total_timeout_ms - backoff_ms`. At 150/100 the slack
+                // was 50ms, which two upstream round trips plus timer wake-up
+                // scheduling can eat under a loaded machine — the budget then
+                // expires with the 503 already in hand and 504 is surfaced
+                // instead. 750/400 keeps the same branch (a third attempt still
+                // cannot fit, since `backoff_ms * 2` exceeds the budget) with
+                // 350ms of slack rather than 50ms.
+                route("/deadline", 3, Some(750), 400, vec!["GET"]),
                 route("/slow-deadline", 2, Some(100), 0, vec!["GET"]),
                 route("/post", 3, None, 0, vec!["GET"]),
                 route("/put", 3, None, 0, vec!["GET", "PUT"]),
@@ -906,8 +918,11 @@ async fn test_bounded_upstream_status_retry_preserves_request_body_safety() {
     let started = std::time::Instant::now();
     let response = client.get(server.url(0, "/deadline")).send().await.unwrap();
     assert_eq!(response.status(), 503);
-    assert!(started.elapsed() >= Duration::from_millis(90));
-    assert!(started.elapsed() < Duration::from_millis(250));
+    // 💤 One backoff was served, and `deadline_hits` is what proves no third
+    // attempt was made; the upper bound here only has to stay loose enough that
+    // a loaded machine cannot trip it on scheduling delay alone.
+    assert!(started.elapsed() >= Duration::from_millis(380));
+    assert!(started.elapsed() < Duration::from_millis(1_500));
     assert_eq!(deadline_hits.load(Ordering::SeqCst), 2);
 
     let started = std::time::Instant::now();
@@ -3852,4 +3867,142 @@ async fn test_hop_by_hop_headers_do_not_reach_the_origin() {
         lower.contains("x-forwarded-for:"),
         "the proxy's own forwarded identity must still reach the origin:\n{seen}"
     );
+}
+
+/// 🔁 A fail-fast rejection must leave the keep-alive connection reusable.
+///
+/// The circuit-open 503 is generated locally by `fail_to_proxy`, which used to
+/// refuse downstream reuse unconditionally: the response advertised
+/// `Connection: keep-alive` and the server then closed the socket anyway. A
+/// pooling client that had already picked that idle connection for its next
+/// request saw `ConnectionReset` or `IncompleteMessage` instead of the 503,
+/// which is what made `test_overload_and_circuit_breaker_fail_fast_and_survive_reload`
+/// flake under parallel load. Raw sockets here so the assertion is about the
+/// wire and not about any client's pool heuristics.
+#[tokio::test]
+async fn test_fail_fast_rejection_keeps_the_downstream_connection_reusable() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            tokio::spawn(async move {
+                let _ = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 7\r\nConnection: close\r\n\r\nfailure",
+                    )
+                    .await;
+            });
+        }
+    });
+
+    let config = serde_json::json!({
+        "global": { "http3": false },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "routes": [{
+                "path": "/circuit",
+                "handler": {
+                    "type": "reverse_proxy",
+                    "upstreams": [format!("http://{upstream_address}")],
+                    "retry": { "max_attempts": 1 },
+                    "circuit_breaker": {
+                        "consecutive_failures": 2,
+                        "open_duration_ms": 60_000,
+                        "half_open_requests": 1,
+                        "failure_statuses": [503]
+                    }
+                }
+            }]
+        }]
+    })
+    .to_string();
+    let mut server = TestServer::new(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let mut stream = tokio::net::TcpStream::connect(server.address(0))
+        .await
+        .unwrap();
+
+    // 🔻 Two upstream 503s trip the breaker; every later request fails fast.
+    // Requests three and four are the fast-fail path, and four only gets an
+    // answer at all if the response to three left the connection usable.
+    for attempt in 1..=4 {
+        stream
+            .write_all(b"GET /circuit HTTP/1.1\r\nHost: reuse-probe\r\n\r\n")
+            .await
+            .unwrap_or_else(|error| {
+                panic!("request {attempt} could not be written to a keep-alive connection: {error}")
+            });
+
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let response = loop {
+            let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
+                .await
+                .unwrap_or_else(|_| panic!("request {attempt} timed out awaiting a response"))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "request {attempt} lost a connection the server advertised as keep-alive: {error}"
+                    )
+                });
+            assert!(
+                read > 0,
+                "request {attempt}: server closed a connection it advertised as keep-alive"
+            );
+            buffer.extend_from_slice(&chunk[..read]);
+            let text = String::from_utf8_lossy(&buffer).to_string();
+            if let Some(header_end) = text.find("\r\n\r\n") {
+                let body_length = text[..header_end]
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                if buffer.len() >= header_end + 4 + body_length {
+                    break text;
+                }
+            }
+        };
+
+        assert!(
+            response.starts_with("HTTP/1.1 503 "),
+            "request {attempt} expected a 503 rejection, got:\n{response}"
+        );
+        let advertises_close = response[..response.find("\r\n\r\n").unwrap()]
+            .lines()
+            .any(|line| {
+                let Some((name, value)) = line.split_once(':') else {
+                    return false;
+                };
+                name.eq_ignore_ascii_case("connection")
+                    && value.trim().eq_ignore_ascii_case("close")
+            });
+        assert!(
+            !advertises_close,
+            "request {attempt} advertised Connection: close, so reuse cannot be asserted:\n{response}"
+        );
+    }
+
+    // 👂 Nothing was written after the last response was fully read, so a
+    // readable socket here could only be the server closing it unprompted.
+    let mut trailing = [0u8; 16];
+    match tokio::time::timeout(Duration::from_millis(750), stream.read(&mut trailing)).await {
+        Err(_) => {}
+        Ok(Ok(0)) => panic!("the server sent FIN on a connection it advertised as keep-alive"),
+        Ok(Ok(read)) => panic!("unexpected {read} trailing bytes after the last response"),
+        Ok(Err(error)) => {
+            panic!("the server reset a connection it advertised as keep-alive: {error}")
+        }
+    }
+
+    upstream_task.abort();
+    let _ = upstream_task.await;
 }
