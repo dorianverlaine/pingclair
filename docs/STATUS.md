@@ -73,6 +73,43 @@ H3 20 MiB 仍完整通過。H3 傳輸期間 60 筆 server RSS 均為 46,824 KiB�
 > 真實 CA 憑證的公網環境重跑，升級前必須用同一個 RC commit 重做一次
 > 雙區域驗證。
 
+### 🔁 同日補上 Caddy 式 Automatic HTTPS
+
+上面那兩個修正暴露出更根本的缺口：Pingclair 從來沒有自動的 port 80
+listener，也沒有任何 HTTP→HTTPS 重導，而 `auto_https disable_redirects`
+一路被解析、編譯、存進設定，**卻沒有任何 runtime 程式碼讀它**——一個
+能通過驗證、行為卻完全不變的設定。這違反倉庫自己的 fail-closed 原則。
+
+現在的行為與 Caddy 對齊：
+
+- 有 TLS 而未寫 `listen` 的 site 預設綁 **443**（以前預設 80，等於把要求
+  加密的 site 放到明文 port）。
+- `auto_https on`（預設）為每個具名 TLS site 自動補一個 port 80 明文
+  listener，回應 ACME HTTP-01 並以 **308** 重導其餘請求。
+- `auto_https disable_redirects` 仍開 port 80 但不帶路由；ACME 挑戰在路由
+  之前就被處理，所以驗證照常運作而沒有重導。這個模式**第一次真的有作用**。
+- 自己寫 `listen :80` 即視為明確指定，不會被自動 listener 覆蓋。
+- `redir` 的目標現在會展開 `{host}`／`{uri}`，H1/H2 與 H3 共用同一份
+  `resolve_caddy_placeholders`，避免只有一種傳輸能用的老問題。
+
+**兩處刻意與 Caddy 不同，理由記在這裡：**
+
+1. port 80 綁不上（權限不足或被占用）時，**跳過自動 listener 並留下警告**，
+   而不是讓程序啟動失敗。Pingora 在很後期才綁 listener，那時失敗會拖垮一個
+   HTTPS 本來完全正常的 server；私有源站（`tls internal`，見 README）也常
+   根本不需要 port 80。HTTPS 照常服務，警告明確說出 ACME HTTP-01 不可用。
+2. `redir` 的目標含 `{` 時**必須加引號**，因為 Caddyfile lexer 會把 `{`
+   當成 block 開頭。Caddy 不需要。已寫進三份 README。
+
+新增四個測試（`automatic_https_provisions_a_redirecting_http_listener`、
+`automatic_https_leaves_these_sites_alone`、
+`disable_redirects_keeps_acme_reachable_without_redirecting`、
+`test_redirect_expands_host_and_uri_placeholders`）。placeholder 那個經過
+紅燈驗證：撤掉展開後 `Location` 就是字面的 `https://{host}{uri}`。
+
+> ⚠️ 同樣**只有本機證據**。自動 port 80 與重導都還沒在公網跑過，
+> 下一輪 Day 29 必須一起驗。
+
 ---
 
 ## ✅ 已通過遠端驗證

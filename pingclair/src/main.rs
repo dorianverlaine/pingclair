@@ -572,6 +572,92 @@ fn reserve_private_listener_address()
 /// obtain the certificate it is trying to install.
 const PLAINTEXT_ONLY_PORT: u16 = 80;
 
+/// 🔁 The plaintext HTTP address Automatic HTTPS provisions for an HTTPS site.
+const AUTOMATIC_HTTP_LISTEN: &str = "0.0.0.0:80";
+
+/// 🔁 Builds the port-80 companion site for an HTTPS site, as Caddy does.
+///
+/// The idea in one sentence: a visitor who types `example.com` without a scheme
+/// arrives over plain HTTP, so something has to be listening there to send them
+/// to HTTPS — and the CA needs that same port in the clear to validate the
+/// certificate. Caddy provisions both automatically, which is why a Caddyfile
+/// never mentions `listen` or port 80 at all.
+///
+/// Returns `None` when there is nothing to provision:
+///
+/// - `auto_https off` — the operator opted out of all of this.
+/// - the site serves no TLS, so there is no HTTPS to redirect to.
+/// - the site has no concrete name; a redirect needs a host to send them to,
+///   and a wildcard would guess wrong.
+/// - the site already listens on port 80, meaning the operator has said what
+///   they want served there and we must not overrule it.
+///
+/// Under `auto_https disable_redirects` the listener is still provisioned but
+/// carries no routes: the ACME challenge path is answered before routing, so
+/// validation keeps working while ordinary requests get no redirect. That is
+/// precisely what the mode asks for, and until now it did nothing at all.
+fn automatic_http_companion(
+    server_config: &pingclair_core::config::ServerConfig,
+    mode: pingclair_core::config::AutoHttpsMode,
+    listen_addrs: &[String],
+) -> Option<pingclair_core::config::ServerConfig> {
+    use pingclair_core::config::AutoHttpsMode;
+
+    if mode == AutoHttpsMode::Off || server_config.tls.is_none() {
+        return None;
+    }
+
+    let name = server_config.name.as_deref()?;
+    if name.is_empty() || name.contains('*') {
+        return None;
+    }
+
+    let already_serving_http = listen_addrs.iter().any(|addr| {
+        addr.rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            == Some(PLAINTEXT_ONLY_PORT)
+    });
+    if already_serving_http {
+        return None;
+    }
+
+    let routes = if mode == AutoHttpsMode::DisableRedirects {
+        Vec::new()
+    } else {
+        vec![pingclair_core::config::RouteConfig {
+            path: "/*".to_string(),
+            // 🧭 308 rather than 302: the redirect is permanent, and unlike 301
+            // it forbids a client from rewriting POST into GET, so a form
+            // submitted over HTTP survives the hop to HTTPS.
+            handler: pingclair_core::config::HandlerConfig::Redirect {
+                to: "https://{host}{uri}".to_string(),
+                code: 308,
+            },
+            methods: None,
+            matcher: None,
+        }]
+    };
+
+    Some(pingclair_core::config::ServerConfig {
+        name: server_config.name.clone(),
+        listen: vec![AUTOMATIC_HTTP_LISTEN.to_string()],
+        proxy_protocol_listen: Vec::new(),
+        tls: None,
+        routes,
+        ..Default::default()
+    })
+}
+
+/// 🔎 Reports whether this process can actually take the plaintext HTTP port.
+///
+/// Port 80 is privileged on Unix and is often already taken, and Pingora binds
+/// its listeners far later — at which point a failure aborts a server that was
+/// otherwise ready to serve HTTPS perfectly well. Probing first lets the
+/// automatic listener be skipped with an explanation instead.
+fn can_bind_automatic_http_port() -> bool {
+    std::net::TcpListener::bind(AUTOMATIC_HTTP_LISTEN).is_ok()
+}
+
 /// 🔐 Treats explicit TLS configuration as authoritative, except on port 80.
 ///
 /// Everything except port 80 keeps the previous rule: an explicit `tls` block
@@ -810,6 +896,14 @@ fn run_server(
     let mut binding_info = std::collections::HashMap::new();
     let mut tls_listeners = HashSet::new();
 
+    // 🔎 Probed once, before any listener is registered: whether an automatic
+    // port-80 companion is even possible here. Doing it per site would probe a
+    // privileged port repeatedly for one unchanging answer.
+    let auto_https_mode = config.global.auto_https.clone();
+    let automatic_http_available = auto_https_mode != pingclair_core::config::AutoHttpsMode::Off
+        && config.servers.iter().any(|server| server.tls.is_some())
+        && can_bind_automatic_http_port();
+
     for server_config in config.servers {
         tracing::debug!(
             "🚀 Processing ServerConfig: name={:?}, listens={:?}",
@@ -817,8 +911,15 @@ fn run_server(
             server_config.listen
         );
 
-        let listen_addrs = if server_config.listen.is_empty() {
-            vec!["0.0.0.0:80".to_string()]
+        let listen_addrs: Vec<String> = if server_config.listen.is_empty() {
+            // 🔐 A site that configures TLS but no port means HTTPS, so it
+            // belongs on 443. Defaulting it to 80 would quietly serve a site
+            // the operator asked to encrypt on the plaintext port instead.
+            if server_config.tls.is_some() {
+                vec!["0.0.0.0:443".to_string()]
+            } else {
+                vec![AUTOMATIC_HTTP_LISTEN.to_string()]
+            }
         } else {
             server_config
                 .listen
@@ -826,6 +927,26 @@ fn run_server(
                 .map(|a| normalize_listen_addr(a))
                 .collect()
         };
+
+        // 🔁 Automatic HTTPS: give an HTTPS site its plaintext port-80 companion
+        // so ACME validation and the HTTP→HTTPS redirect both work unattended.
+        let companion =
+            automatic_http_companion(&server_config, auto_https_mode.clone(), &listen_addrs)
+                .filter(|_| {
+                    if automatic_http_available {
+                        true
+                    } else {
+                        tracing::warn!(
+                            "🚫 Automatic HTTPS could not take {} for {:?}: HTTP→HTTPS \
+                     redirects and ACME HTTP-01 validation are unavailable. \
+                     Free the port, run with CAP_NET_BIND_SERVICE, or add an \
+                     explicit `listen` for the plaintext port.",
+                            AUTOMATIC_HTTP_LISTEN,
+                            server_config.name
+                        );
+                        false
+                    }
+                });
 
         for addr in listen_addrs {
             if server_requires_tls(&server_config, &addr) {
@@ -851,6 +972,26 @@ fn run_server(
                 .push(site_name);
 
             proxy.add_server(server_config.clone());
+        }
+
+        if let Some(companion) = companion {
+            let addr = AUTOMATIC_HTTP_LISTEN.to_string();
+            let mut proxies_guard = port_proxies.write();
+            let proxy = proxies_guard.entry(addr.clone()).or_insert_with(|| {
+                pingclair_proxy::server::PingclairProxy::with_tls_and_trusted_proxies(
+                    tls_manager.clone(),
+                    &trusted_proxies,
+                    proxy_protocol_addresses.contains(&addr),
+                )
+            });
+            binding_info
+                .entry(addr)
+                .or_insert_with(Vec::new)
+                .push(format!(
+                    "{} (automatic HTTP)",
+                    companion.name.as_deref().unwrap_or("default")
+                ));
+            proxy.add_server(companion);
         }
     }
 
@@ -1293,6 +1434,119 @@ mod tests {
         // 🚫 An empty bundle fails closed rather than reaching BoringSSL with
         // no leaf and surfacing as a confusing handshake error much later.
         assert!(parse_certificate_chain("").is_err());
+    }
+
+    /// 🔁 An HTTPS site gets a plaintext port-80 companion, like Caddy's.
+    #[test]
+    fn automatic_https_provisions_a_redirecting_http_listener() {
+        use pingclair_core::config::{AutoHttpsMode, HandlerConfig};
+
+        let site = pingclair_core::config::ServerConfig {
+            name: Some("example.com".to_string()),
+            listen: vec!["0.0.0.0:443".to_string()],
+            tls: Some(Default::default()),
+            ..Default::default()
+        };
+
+        let companion =
+            automatic_http_companion(&site, AutoHttpsMode::On, &["0.0.0.0:443".to_string()])
+                .expect("an HTTPS site needs its plaintext companion");
+
+        assert_eq!(companion.listen, vec![AUTOMATIC_HTTP_LISTEN.to_string()]);
+        assert!(
+            companion.tls.is_none(),
+            "the companion carries ACME validation traffic and must stay plaintext"
+        );
+        match &companion.routes.as_slice() {
+            [route] => match &route.handler {
+                HandlerConfig::Redirect { to, code } => {
+                    assert_eq!(to, "https://{host}{uri}");
+                    assert_eq!(*code, 308);
+                }
+                other => panic!("expected a redirect, got {other:?}"),
+            },
+            other => panic!("expected exactly one catch-all route, got {other:?}"),
+        }
+    }
+
+    /// 🚫 Every reason to provision nothing at all.
+    #[test]
+    fn automatic_https_leaves_these_sites_alone() {
+        use pingclair_core::config::AutoHttpsMode;
+
+        let https = |name: Option<&str>| pingclair_core::config::ServerConfig {
+            name: name.map(str::to_string),
+            listen: vec!["0.0.0.0:443".to_string()],
+            tls: Some(Default::default()),
+            ..Default::default()
+        };
+        let ports = vec!["0.0.0.0:443".to_string()];
+
+        assert!(
+            automatic_http_companion(&https(Some("example.com")), AutoHttpsMode::Off, &ports)
+                .is_none(),
+            "`auto_https off` opts out of all of this"
+        );
+        assert!(
+            automatic_http_companion(&https(None), AutoHttpsMode::On, &ports).is_none(),
+            "a redirect needs a concrete host to send the client to"
+        );
+        assert!(
+            automatic_http_companion(&https(Some("*.example.com")), AutoHttpsMode::On, &ports)
+                .is_none(),
+            "a wildcard would have to guess which host to redirect to"
+        );
+
+        let plaintext = pingclair_core::config::ServerConfig {
+            name: Some("example.com".to_string()),
+            listen: vec!["0.0.0.0:8080".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            automatic_http_companion(&plaintext, AutoHttpsMode::On, &["0.0.0.0:8080".to_string()])
+                .is_none(),
+            "there is no HTTPS to redirect to"
+        );
+
+        // 🛡️ An operator who wrote `listen :80` has said what belongs there.
+        assert!(
+            automatic_http_companion(
+                &https(Some("example.com")),
+                AutoHttpsMode::On,
+                &["0.0.0.0:80".to_string(), "0.0.0.0:443".to_string()]
+            )
+            .is_none(),
+            "an explicit port 80 listener must not be overruled"
+        );
+    }
+
+    /// 🔁 `disable_redirects` keeps the listener but drops the redirect.
+    ///
+    /// Before this existed the mode parsed, compiled, and then went unread —
+    /// a setting that validated and silently did nothing.
+    #[test]
+    fn disable_redirects_keeps_acme_reachable_without_redirecting() {
+        use pingclair_core::config::AutoHttpsMode;
+
+        let site = pingclair_core::config::ServerConfig {
+            name: Some("example.com".to_string()),
+            listen: vec!["0.0.0.0:443".to_string()],
+            tls: Some(Default::default()),
+            ..Default::default()
+        };
+
+        let companion = automatic_http_companion(
+            &site,
+            AutoHttpsMode::DisableRedirects,
+            &["0.0.0.0:443".to_string()],
+        )
+        .expect("ACME still needs to be reachable on port 80");
+
+        assert_eq!(companion.listen, vec![AUTOMATIC_HTTP_LISTEN.to_string()]);
+        assert!(
+            companion.routes.is_empty(),
+            "the challenge path is answered before routing, so no route means no redirect"
+        );
     }
 
     /// 🎫 Generates one throwaway self-signed certificate in PEM form.

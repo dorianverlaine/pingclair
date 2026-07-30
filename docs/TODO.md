@@ -906,6 +906,11 @@ H3 CORS／rewrite／error_page parity。
 > ⚠️ **這一天還沒完成**：修正只有本機測試證據，上面列的功能矩陣
 > （IP／Referer、502 自訂頁、rewrite、primary recovery、H3 parity）
 > 這輪完全沒跑。正式 Day 29 要用新的 RC commit 重做，並**重驗這兩個修正**。
+>
+> 🔁 同日還補上了 Caddy 式 Automatic HTTPS（自動 port 80 listener、
+> HTTP→HTTPS 308 重導、讓 `auto_https disable_redirects` 真的有作用、
+> `redir` 支援 `{host}`／`{uri}`）。細節與兩處刻意的差異見 STATUS。
+> **這些也全部只有本機證據**，同樣要進下一輪 Day 29 的驗證清單。
 
 ---
 

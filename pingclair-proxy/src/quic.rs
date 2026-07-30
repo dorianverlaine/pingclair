@@ -1449,8 +1449,11 @@ async fn plan_h3_handler(
             body: body.clone(),
             headers: headers.clone(),
         })),
+        // 🧭 Resolved here rather than at send time so H3 and H1/H2 expand the
+        // same templates from the same request; a redirect that only works on
+        // one transport is the parity gap this crate keeps having to fix.
         HandlerConfig::Redirect { to, code } => Ok(H3Plan::Terminal(H3Terminal::Redirect {
-            to: to.clone(),
+            to: resolve_caddy_placeholders(to, request_header, None),
             code: *code,
         })),
         HandlerConfig::FileServer { .. } => Ok(H3Plan::Terminal(H3Terminal::FileServer)),
