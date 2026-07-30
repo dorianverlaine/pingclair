@@ -2805,6 +2805,18 @@ impl ProxyHttp for PingclairProxy {
         // routed, logged as a normal request, or forwarded at all.
         {
             let request_header = session.req_header();
+
+            // 🚫 A path that still carries `.` or `..` would match one route
+            // here and resolve to a different resource at the origin.
+            if crate::http_policy::path_escapes_its_route(request_header.uri.path()) {
+                tracing::warn!(
+                    "🚫 Rejected a request whose path escapes the route it matched: {}",
+                    request_header.uri.path()
+                );
+                Self::write_simple_response(session, ctx, 400, "Unnormalized Request Path").await?;
+                return Ok(true);
+            }
+
             if let Err(rejection) = crate::http_policy::check_request_framing(
                 request_header.version,
                 &request_header.headers,

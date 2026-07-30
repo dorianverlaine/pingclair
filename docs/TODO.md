@@ -612,7 +612,10 @@ Amazon Linux 2023 aarch64，`Cloudflare Tunnel → :6688 → app:8080`。
   12 個修前就被 httparse／Pingora 擋掉;`Content-Length: +5` 是真 bug 且已修
   ——修前上游原封不動收到那個非法值;CL+TE 由 Pingora 在解析時處理（我沒修，
   只加了會在它放寬時變紅的測試）;bare LF 放行且判定可接受。
-- ⬜ **剩下的**：URI 正規化（`..`、編碼斜線、雙重編碼）、oversized headers 的
+- ✔ **URI 正規化**（同一份證據目錄，`after-uri-matrix.txt`）。反代路由的
+  `GET /api/../admin/x` 修前回 200 且原封不動轉給上游——`/admin/*` 的政策
+  從未執行，而 origin 會自己正規化並提供服務。已改為拒絕（不是改寫）。
+- ⬜ **剩下的**：oversized headers 的
   系統性負向測試、H2／H3 的畸形 frame（framing 檢查已實作但只有單元測試，
   缺 frame 級負向測試——需要能發畸形 frame 的客戶端）。
 - 可用 proptest／fuzzing，並與 nginx／Caddy 做差異測試。

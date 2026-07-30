@@ -66,6 +66,27 @@ RFC 9110 §8.6 規定 `Content-Length = 1*DIGIT`。httparse 擋掉了負數與�
 RFC 9112 §2.2 允許接收端把單獨的 LF 視為行終止符。Pingora 解析後會用 CRLF
 重新序列化再送上游，所以前後端不會因為行尾差異而分歧。
 
+## 第二輪：URI 正規化 —— 又一個真漏洞
+
+見 `after-uri-matrix.txt`（探針 `uri.py`）。靜態檔的路徑逃逸全數擋掉（404），
+但**反代路由沒有**：
+
+    GET /api/../admin/x   → 200，上游收到 /api/../admin/x（原封不動）
+    GET /api/%2e%2e/admin/x → 200，上游收到 /api/%2e%2e/admin/x
+
+Pingclair 用 `/api/*` 匹配它，所以綁在 `/admin/*` 上的 403 政策**從未執行**；
+而 origin 幾乎都會自己正規化，解析成 `/admin/x` 並提供服務。代理與源站對
+「請求的是哪個資源」產生分歧——這就是攻擊者要的。
+
+**修法：拒絕，不是改寫。** 改寫會變動每一個 origin 收到的東西；而合法客戶端
+本來就不該送出未正規化的路徑（RFC 9110 §4.2.3）。符合專案的 fail-closed 規則。
+
+修後 `/api/../admin/x`、`/api/%2e%2e/admin/x`、`/admin/./x`、`/static/..%2f...`
+全部回 400，兩條傳輸共用同一個判斷。
+
+`%252e%252e`（雙重編碼）維持 404 而非 400，是**正確的**：解一次碼之後是字面的
+`%2e%2e`，不是 `..`；origin 若也只解一次同樣不會當成 traversal。
+
 ## 尚未涵蓋
 
 - H2／H3 的 framing 檢查已實作（H2/H3 一律拒絕 `Transfer-Encoding`，
