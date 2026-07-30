@@ -15,7 +15,7 @@ defect:
 
 | Document | Owns |
 | --- | --- |
-| `docs/TODO.md` | The v0.2.0 plan, one Day per sitting. What to work on. |
+| `docs/TODO.md` | The v0.2.0 plan, one Day per sitting. What to work on. 🔒 Local only — not committed, see `AGENTS.md`. |
 | `docs/STATUS.md` | What is done and **how far it was verified**. Evidence ledger. |
 | `docs/GUARDRAILS.md` | Environment constraints and implementation rules. Every entry is a failure that already happened. |
 | `benchmarks/README.md` | Performance claims and methodology. |
