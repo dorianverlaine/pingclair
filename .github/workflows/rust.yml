@@ -11,33 +11,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # 🎩 Fedora rather than a native ubuntu-latest toolchain, because the release
-  # image (deployment/Dockerfile) is built on Fedora with a rustup-pinned
-  # 1.88.0. Testing on a different base than the one that ships is how a
-  # missing system package (this repo has now hit that twice: cmake/clang,
-  # then git for boring-sys's `git init`) survives every green CI run until
-  # someone tries to actually build the release artifact.
-  #
-  # The package list below must be kept in sync with deployment/Dockerfile's
-  # builder stage — they exist to test the same thing.
+  # 🎩 Everything builds on the hosted Ubuntu runners now: the dev binaries
+  # are native per-architecture builds (x86_64 and arm64 runners), so the
+  # smoke tests execute the artifact they just built — a cross-compiled
+  # arm64 binary cannot run on an x86_64 host. The release image
+  # (deployment/Dockerfile) stays Fedora-based, and the docker-image job
+  # below builds and boots that exact Dockerfile, so Fedora-specific
+  # packaging mistakes are still caught in CI.
   test:
-    name: Build & test (Fedora, Rust 1.88)
+    name: Build & test (Ubuntu, Rust 1.88)
     runs-on: ubuntu-latest
-    container: fedora:latest
 
     steps:
       - name: Install build dependencies
         run: |
-          dnf install -y --setopt=install_weak_deps=False \
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
             cmake \
-            gcc-c++ \
-            perl-interpreter \
-            pkgconf-pkg-config \
+            g++ \
+            perl \
+            pkg-config \
             clang \
-            clang-devel \
+            libclang-dev \
             git \
             curl
-          dnf clean all
 
       - uses: actions/checkout@v5
 
@@ -68,13 +65,10 @@ jobs:
             target
           # 🔑 Keyed on Cargo.lock so a dependency bump invalidates it; on a
           # cache miss the restore-keys fallback still saves recompiling
-          # everything unchanged. Not keyed on the Fedora image itself — an
-          # unpinned `fedora:latest` moves over time, and a stale cache here
-          # costs a slower build, not a wrong one, since cargo tracks its own
-          # fingerprints regardless of what the underlying image changed.
-          key: fedora-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # everything unchanged.
+          key: ubuntu-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            fedora-cargo-
+            ubuntu-cargo-
 
       - name: Check shell syntax
         run: bash -n scripts/*.sh benchmarks/scripts/*.sh
@@ -177,15 +171,17 @@ jobs:
     name: Dev binaries - ${{ matrix.platform.name }}
     if: github.event_name != 'pull_request'
     needs: test
-    runs-on: ubuntu-26.04
+    runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
       matrix:
         platform:
           - name: Linux x86_64
+            runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             key: x86_64
           - name: Linux aarch64
+            runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             key: aarch64
 
@@ -193,14 +189,12 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install build dependencies
-        # 🧱 Ubuntu 26.04 with the cross-gcc packages. The test job and the
-        # release image stay on Fedora to prove the shipped artifact builds,
-        # while these dev snapshots are convenience binaries for test
-        # deployments — a fresh Ubuntu toolchain is the more reliable base.
-        # Ubuntu's gcc-aarch64-linux-gnu pulls in libc6-dev-arm64-cross, so
-        # the aarch64 leg gets the target glibc headers with no extra sysroot
-        # step; Fedora's cross-gcc packages ship none, which broke this job
-        # on its first Fedora run. boring-sys needs cmake + g++ for
+        # 🧱 Native per-architecture builds on hosted Ubuntu runners: the
+        # x86_64 leg runs on ubuntu-latest and the aarch64 leg on the native
+        # ubuntu-24.04-arm runner. No cross toolchain is needed, and the
+        # smoke test can execute the binary it just built — a cross-compiled
+        # arm64 binary cannot run on an x86_64 host (hit on the ubuntu-26.04
+        # attempt: "Exec format error"). boring-sys needs cmake + g++ for
         # BoringSSL, clang/libclang-dev for bindgen and perl for its scripts.
         run: |
           sudo apt-get update
@@ -213,11 +207,6 @@ jobs:
             libclang-dev \
             git \
             curl
-          if [ "${{ matrix.platform.target }}" == "aarch64-unknown-linux-gnu" ]; then
-            sudo apt-get install -y --no-install-recommends \
-              gcc-aarch64-linux-gnu \
-              g++-aarch64-linux-gnu
-          fi
 
       - name: Install Rust 1.88
         uses: dtolnay/rust-toolchain@1.88.0
@@ -233,21 +222,14 @@ jobs:
             target
           # 🔑 Keyed on Cargo.lock so a dependency bump invalidates it, with
           # the matrix leg appended so each target keeps its own entry. The
-          # Ubuntu-only namespace deliberately never reuses the test job's
-          # Fedora cache: binaries built against Fedora's glibc must not be
-          # served from a build that now links Ubuntu's.
+          # shared `ubuntu-cargo-` namespace lets the dev binaries warm from
+          # the test job's cache on the same architecture.
           key: ubuntu-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.platform.target }}
           restore-keys: |
             ubuntu-cargo-
 
       - name: Build
-        run: |
-          if [ "${{ matrix.platform.target }}" == "aarch64-unknown-linux-gnu" ]; then
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
-            export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
-          fi
-          cargo build --release --locked --target ${{ matrix.platform.target }}
+        run: cargo build --release --locked --target ${{ matrix.platform.target }}
 
       - name: Smoke test the binary
         run: |
