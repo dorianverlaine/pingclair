@@ -1,0 +1,57 @@
+# 📦 Dependabot configuration for Pingclair.
+#
+# Two ecosystems are watched:
+#   - github-actions: low risk, grouped into one PR per week.
+#   - cargo: grouped by risk. The H3/TLS group (quiche, boring,
+#     tokio-quiche, pingora*, rustls, rcgen, x509-parser) must not be merged
+#     without the Linux release + quiche-client gate in docs/GUARDRAILS.md —
+#     a Dependabot PR is a reminder, not a decision.
+#
+# 🎯 `versioning-strategy: increase` is deliberate: a dependency constraint
+# change (for example the `=0.19.1` pin on tokio-quiche) must be visible in
+# the PR diff so the human gate can see exactly what would change.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Taipei"
+    open-pull-requests-limit: 3
+    labels:
+      - "ci"
+    commit-message:
+      prefix: "🔧 chore(ci)"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Taipei"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "⬆️ deps(cargo)"
+    versioning-strategy: increase
+    groups:
+      h3-tls:
+        patterns:
+          - "quiche"
+          - "boring"
+          - "tokio-quiche"
+          - "pingora*"
+          - "rustls"
+          - "rcgen"
+          - "x509-parser"
+      core:
+        patterns:
+          - "*"
