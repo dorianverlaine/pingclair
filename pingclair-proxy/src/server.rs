@@ -19,8 +19,11 @@ use pingora_proxy::{ProxyHttp, Session};
 
 // 🗄️ Response caching. Already linked through pingora-proxy; named directly so
 // the storage and metadata types are reachable.
-use pingora_cache::key::CacheKey;
-use pingora_cache::{CacheMeta, MemCache, NoCacheReason, RespCacheable};
+use pingora_cache::cache_control::CacheControl;
+use pingora_cache::key::{CacheKey, HashBinary};
+use pingora_cache::meta::CacheMetaDefaults;
+
+use pingora_cache::{CacheMeta, MemCache, NoCacheReason, RespCacheable, VarianceBuilder, filters};
 
 use arc_swap::ArcSwap;
 use async_recursion::async_recursion;
@@ -1808,6 +1811,34 @@ impl PingclairProxy {
     }
 
     /// Get proxy config for a route
+    /// 🗄️ Default freshness per status, used when the origin states none.
+    ///
+    /// The negative entries are the point. An origin that starts failing gets
+    /// hammered by every client at once precisely when it can least afford it,
+    /// so a not-found or a server error is worth holding briefly — long enough
+    /// to absorb a stampede, short enough that a fix is visible almost at once.
+    /// Ten and five seconds are deliberately small: this is a shock absorber,
+    /// not a cache of failure.
+    ///
+    /// A status absent from this table is never stored by default. That is why
+    /// redirects, 206 and everything else fall through rather than being listed
+    /// with a guessed lifetime.
+    fn cache_defaults() -> &'static CacheMetaDefaults {
+        static DEFAULTS: CacheMetaDefaults = CacheMetaDefaults::new(
+            |status| match status.as_u16() {
+                // 📄 Success uses a placeholder; the route's `ttl` replaces it
+                // whenever the origin did not state a lifetime of its own.
+                200 => Some(Duration::from_secs(60)),
+                404 | 410 => Some(Duration::from_secs(10)),
+                500 | 502 | 503 | 504 => Some(Duration::from_secs(5)),
+                _ => None,
+            },
+            0,
+            0,
+        );
+        &DEFAULTS
+    }
+
     /// 🗄️ Returns the matched route's cache policy, if it configured one.
     fn route_cache_config(&self, ctx: &RequestContext) -> Option<CacheConfig> {
         let state = ctx.state.as_ref()?;
@@ -1830,6 +1861,17 @@ impl PingclairProxy {
             return false;
         }
         if request.headers.contains_key("authorization") || request.headers.contains_key("cookie") {
+            return false;
+        }
+        // 🔌 A protocol upgrade is a `GET`, so the method check above lets it
+        // through. What follows is a live tunnel, not a document — there is
+        // nothing to store and a replayed handshake is not a connection.
+        //
+        // A `101` is already absent from the status defaults, so nothing would
+        // be stored anyway. This is stated rather than left implied: relying on
+        // a table entry's absence means the protection disappears the day
+        // somebody adds one, and nothing would say so.
+        if is_websocket_upgrade(&request.headers) {
             return false;
         }
         // 🚫 A client asking to bypass the cache is asking the shared cache too.
@@ -2739,46 +2781,80 @@ fn response_cache_storage() -> &'static MemCache {
 /// anything not understood is refused by the caller's status check rather than
 /// guessed at.
 fn uncacheable_response_reason(response: &ResponseHeader) -> Option<&'static str> {
-    // 📄 Only a plain, complete 200 body has an obvious shared meaning. Redirects
-    // and errors are cheap to re-fetch; 206 is a fragment; 304 has no body.
-    if response.status != 200 {
-        return Some("status is not 200");
-    }
-
     // 🍪 A response that sets a cookie is establishing per-client state. Storing
-    // it hands the same cookie to everyone who follows.
+    // it hands the same cookie to everyone who follows. RFC 9111 permits a
+    // shared cache to store it; doing so safely means stripping the field, and
+    // a cache that silently edits responses is worse than one that declines.
     if response.headers.contains_key("set-cookie") {
         return Some("response sets a cookie");
     }
 
-    let directives = response
+    // 🌊 A streaming media type is consumed as it arrives and never ends on a
+    // useful boundary. Storing it means holding the whole thing in memory —
+    // the exact shape of the bug this project shipped twice, once for static
+    // gzip and once for reverse-proxy SSE.
+    if response
         .headers
-        .get("cache-control")
+        .get("content-type")
         .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_ascii_lowercase())
-        .unwrap_or_default();
-
-    if directives.contains("no-store") {
-        return Some("upstream sent Cache-Control: no-store");
-    }
-    if directives.contains("private") {
-        return Some("upstream sent Cache-Control: private");
-    }
-    // 🔁 `no-cache` permits storage but requires revalidation before reuse, and
-    // revalidation does not exist yet. Refusing to store is the honest reading
-    // until Day 19 implements it.
-    if directives.contains("no-cache") {
-        return Some("upstream sent Cache-Control: no-cache");
+        .is_some_and(is_streaming_content_type)
+    {
+        return Some("response is a stream");
     }
 
-    // 🎯 `Vary` means the response depends on request headers this key ignores.
-    // Day 19 wires Pingora's variance support; storing one variant under a
-    // key that ignores it would serve the wrong one.
-    if response.headers.contains_key("vary") {
-        return Some("response varies on request headers");
+    // 🔀 `Vary: *` says no two requests are interchangeable, so no stored copy
+    // can ever be reused. Named fields are handled by `cache_vary_filter`.
+    if response
+        .headers
+        .get_all("vary")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| value.split(',').any(|name| name.trim() == "*"))
+    {
+        return Some("response varies on everything");
+    }
+
+    // 🗜️ An origin that encoded the body itself produced one specific coding.
+    // Serving that stored copy to a client which did not ask for it hands over
+    // bytes it cannot decode, and the cache key alone cannot tell them apart —
+    // only a `Vary: Accept-Encoding` from the origin makes the variants
+    // distinguishable. Our own compression is not affected: it runs after the
+    // cache stores the original, so every client is encoded on the way out.
+    if response.headers.contains_key("content-encoding")
+        && !response
+            .headers
+            .get_all("vary")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .any(|value| {
+                value
+                    .split(',')
+                    .any(|name| name.trim().eq_ignore_ascii_case("accept-encoding"))
+            })
+    {
+        return Some("origin-encoded response without Vary: Accept-Encoding");
     }
 
     None
+}
+
+/// ⏳ Reports whether the origin declared how long its response stays fresh.
+///
+/// Only then does the origin's lifetime take precedence over the route's `ttl`.
+/// `Age` alone does not count: it says how long a response has already been
+/// held, not how long it remains valid.
+fn origin_stated_its_own_freshness(
+    cache_control: Option<&CacheControl>,
+    response: &ResponseHeader,
+) -> bool {
+    if let Some(cache_control) = cache_control
+        && (cache_control.has_key("max-age")
+            || cache_control.has_key("s-maxage")
+            || cache_control.no_cache())
+    {
+        return true;
+    }
+    response.headers.contains_key("expires")
 }
 
 /// Resolve Caddy-style `{placeholder}` variables in a header value string
@@ -3014,15 +3090,89 @@ impl ProxyHttp for PingclairProxy {
             return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(reason)));
         }
 
+        // 📜 The freshness rules are RFC 9111's, and Pingora already implements
+        // them: `Cache-Control` (`no-store`, `private`, `no-cache`, `max-age`,
+        // `s-maxage`), the `Expires` fallback, `Age`, stale-while-revalidate,
+        // stale-if-error, and stripping the fields `private=<field>` names.
+        // Re-deriving any of that here would be a second, worse copy.
+        //
+        // `no-cache` is the one worth spelling out: it means "store, but
+        // revalidate before reuse", and Pingora expresses that as a zero
+        // freshness duration, which lands the entry in cache already stale.
+        // Day 18 refused to store it instead — honest at the time, since
+        // revalidation was not wired, but wrong now that it is.
+        let cache_control = CacheControl::from_resp_headers(response);
+        let decision = filters::resp_cacheable(
+            cache_control.as_ref(),
+            response.clone(),
+            // 🛡️ Requests carrying credentials never reach here: they are
+            // refused before the cache is enabled at all.
+            false,
+            Self::cache_defaults(),
+        );
+
+        // ⏳ The route's `ttl` is a fallback, not an override — the same shape
+        // as nginx's `proxy_cache_valid`. An origin that states its own
+        // lifetime knows more about its content than the proxy config does,
+        // so it wins; the route only answers for responses that say nothing.
+        let RespCacheable::Cacheable(meta) = decision else {
+            return Ok(decision);
+        };
+        if origin_stated_its_own_freshness(cache_control.as_ref(), response) {
+            return Ok(RespCacheable::Cacheable(meta));
+        }
+
         let created = SystemTime::now();
         let fresh_until = created + Duration::from_secs(ttl_secs);
         Ok(RespCacheable::Cacheable(CacheMeta::new(
             fresh_until,
             created,
-            0,
-            0,
+            meta.stale_while_revalidate_sec(),
+            meta.stale_if_error_sec(),
             response.clone(),
         )))
+    }
+
+    /// 🎯 Builds the variance key from the request fields `Vary` names.
+    ///
+    /// Without this a response that differs by request header is stored under a
+    /// key that cannot tell the variants apart, and the first one stored is
+    /// served to everyone. `Vary: *` is handled earlier by refusing to store at
+    /// all, since it means "no two requests are interchangeable".
+    fn cache_vary_filter(
+        &self,
+        meta: &CacheMeta,
+        _ctx: &mut Self::CTX,
+        request: &RequestHeader,
+    ) -> Option<HashBinary> {
+        let vary = meta.headers().get("vary")?.to_str().ok()?;
+
+        let mut variance = VarianceBuilder::new();
+        let mut names: Vec<String> = vary
+            .split(',')
+            .map(|name| name.trim().to_ascii_lowercase())
+            .filter(|name| !name.is_empty())
+            .collect();
+        // 🔑 The hash must not depend on the order the origin happened to list
+        // them, or the same variant would key differently between responses.
+        names.sort();
+        names.dedup();
+
+        let values: Vec<(String, Vec<u8>)> = names
+            .into_iter()
+            .map(|name| {
+                let value = request
+                    .headers
+                    .get(&name)
+                    .map(|value| value.as_bytes().to_vec())
+                    .unwrap_or_default();
+                (name, value)
+            })
+            .collect();
+        for (name, value) in &values {
+            variance.add_value(name, value);
+        }
+        variance.finalize()
     }
 
     /// Request filter (Handle static files and early return)

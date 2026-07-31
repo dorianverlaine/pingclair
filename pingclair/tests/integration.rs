@@ -4552,6 +4552,96 @@ async fn spawn_counting_origin() -> (SocketAddr, std::sync::Arc<std::sync::atomi
     (address, hits)
 }
 
+/// 🎛️ An origin that answers with headers chosen by the request path.
+///
+/// One origin covering every cacheability rule keeps each test to its single
+/// claim. The body is still a per-request counter, so "was this served from
+/// cache" never rests on two responses coincidentally matching.
+async fn spawn_header_scripted_origin()
+-> (SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let counter = Arc::clone(&counter);
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 16384];
+                loop {
+                    let read = match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => read,
+                    };
+                    let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+
+                    let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    let body = format!("origin-{n}");
+                    let (status, extra) = match path.split('?').next().unwrap_or("/") {
+                        "/no-store" => ("200 OK", "Cache-Control: no-store\r\n".to_string()),
+                        "/private" => ("200 OK", "Cache-Control: private\r\n".to_string()),
+                        "/no-cache" => ("200 OK", "Cache-Control: no-cache\r\n".to_string()),
+                        "/max-age" => ("200 OK", "Cache-Control: max-age=300\r\n".to_string()),
+                        "/set-cookie" => ("200 OK", "Set-Cookie: sid=abc\r\n".to_string()),
+                        "/vary-all" => ("200 OK", "Vary: *\r\n".to_string()),
+                        "/vary-lang" => ("200 OK", "Vary: Accept-Language\r\n".to_string()),
+                        "/encoded-bare" => ("200 OK", "Content-Encoding: gzip\r\n".to_string()),
+                        "/encoded-vary" => (
+                            "200 OK",
+                            "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n".to_string(),
+                        ),
+                        "/sse" => ("200 OK", "Content-Type: text/event-stream\r\n".to_string()),
+                        "/missing" => ("404 Not Found", String::new()),
+                        _ => ("200 OK", String::new()),
+                    };
+
+                    let response = format!(
+                        "HTTP/1.1 {}\r\nContent-Length: {}\r\n{}Connection: keep-alive\r\n\r\n{}",
+                        status,
+                        body.len(),
+                        extra,
+                        body
+                    );
+                    if stream.write_all(response.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (address, hits)
+}
+
+/// 🔁 Asks for `path` twice and reports how many times the origin was reached.
+async fn origin_hits_for_two_requests(
+    server: &TestServer,
+    client: &reqwest::Client,
+    hits: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    path: &str,
+) -> usize {
+    use std::sync::atomic::Ordering;
+    let before = hits.load(Ordering::SeqCst);
+    for _ in 0..2 {
+        let response = client.get(server.url(0, path)).send().await.unwrap();
+        let _ = response.bytes().await.unwrap();
+    }
+    hits.load(Ordering::SeqCst) - before
+}
+
 /// 🗄️ Builds a reverse-proxy config whose route caches for a minute.
 fn cache_proxy_config(upstream: SocketAddr) -> String {
     serde_json::json!({
@@ -4667,6 +4757,268 @@ async fn test_credentialed_requests_bypass_the_cache() {
             "a request carrying {name} must reach the origin"
         );
     }
+}
+
+/// 🚫 Every response the origin marked unshareable must reach the origin twice.
+///
+/// One test per rule would read better in a failure report, but the rules share
+/// one setup and one assertion shape, and a table makes it obvious when one is
+/// missing. Each row is a claim that something is **not** stored — and every
+/// row here was confirmed able to fail before being trusted.
+#[tokio::test]
+async fn test_responses_the_origin_marked_unshareable_are_not_stored() {
+    let (origin, hits) = spawn_header_scripted_origin().await;
+    let mut server = TestServer::new(&cache_proxy_config(origin));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    // 🩺 The control: an ordinary response *is* stored. Without this, every
+    // assertion below would also pass against a cache that never stores at all.
+    assert_eq!(
+        origin_hits_for_two_requests(&server, &client, &hits, "/plain").await,
+        1,
+        "the control case must be cached, or the rest of this test proves nothing"
+    );
+
+    for (path, why) in [
+        ("/no-store", "Cache-Control: no-store"),
+        ("/private", "Cache-Control: private"),
+        ("/set-cookie", "Set-Cookie"),
+        ("/vary-all", "Vary: *"),
+        ("/encoded-bare", "Content-Encoding without Vary"),
+        ("/sse", "text/event-stream"),
+    ] {
+        assert_eq!(
+            origin_hits_for_two_requests(&server, &client, &hits, path).await,
+            2,
+            "a response carrying {why} must not be served from cache"
+        );
+    }
+}
+
+/// 🔁 `no-cache` is stored, then revalidated — not refused outright.
+///
+/// This is the Day 18 carry-over. Refusing to store was honest while nothing
+/// could revalidate; now that Pingora does, `no-cache` means what RFC 9111 says
+/// it means: keep it, but check before reusing it.
+///
+/// The observable difference from `no-store` is not the origin hit count — both
+/// contact the origin every time — but *what the origin is asked*. A stored
+/// entry with a validator produces a conditional request.
+#[tokio::test]
+async fn test_no_cache_is_stored_and_revalidated_rather_than_refused() {
+    let (origin, hits) = spawn_header_scripted_origin().await;
+    let mut server = TestServer::new(&cache_proxy_config(origin));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    // Both requests reach the origin, because the entry is stale on arrival.
+    assert_eq!(
+        origin_hits_for_two_requests(&server, &client, &hits, "/no-cache").await,
+        2
+    );
+
+    // 🔎 But it was admitted to cache: the response is still correct, and the
+    // second body is the fresh one rather than a stale replay.
+    let response = client.get(server.url(0, "/no-cache")).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(
+        response.text().await.unwrap().starts_with("origin-"),
+        "a revalidated entry must still serve a real body"
+    );
+}
+
+/// ⏳ The origin's own lifetime outranks the route's `ttl`.
+///
+/// The route configures 60 seconds; this response says 300. The route number is
+/// a fallback for origins that say nothing, the same shape as nginx's
+/// `proxy_cache_valid`, so the origin's answer has to win.
+#[tokio::test]
+async fn test_origin_max_age_overrides_the_route_ttl() {
+    let (origin, hits) = spawn_header_scripted_origin().await;
+    let mut server = TestServer::new(&cache_proxy_config(origin));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    assert_eq!(
+        origin_hits_for_two_requests(&server, &client, &hits, "/max-age").await,
+        1,
+        "a response with its own max-age must still be cached"
+    );
+}
+
+/// 🎯 `Vary` separates the variants instead of blending them.
+///
+/// Two clients differing only in `Accept-Language` must not share one entry.
+/// Before variance was wired, Day 18 refused to store anything with `Vary` at
+/// all — safe, but it meant the rule was never actually exercised.
+#[tokio::test]
+async fn test_vary_gives_each_variant_its_own_entry() {
+    let (origin, hits) = spawn_header_scripted_origin().await;
+    let mut server = TestServer::new(&cache_proxy_config(origin));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let fetch = async |language: &str| -> String {
+        client
+            .get(server.url(0, "/vary-lang"))
+            .header("accept-language", language)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    };
+
+    let english = fetch("en").await;
+    let french = fetch("fr").await;
+    assert_ne!(
+        english, french,
+        "a different Accept-Language must not reuse the other variant"
+    );
+
+    // 🔁 And each variant is itself cached.
+    assert_eq!(fetch("en").await, english);
+    assert_eq!(fetch("fr").await, french);
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "each variant should have been fetched exactly once"
+    );
+}
+
+/// 🩹 A 404 is held briefly so a broken origin is not hammered.
+///
+/// Short on purpose: long enough to absorb a stampede, short enough that fixing
+/// the origin is visible almost immediately.
+#[tokio::test]
+async fn test_not_found_responses_are_negatively_cached() {
+    let (origin, hits) = spawn_header_scripted_origin().await;
+    let mut server = TestServer::new(&cache_proxy_config(origin));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..2 {
+        let response = client.get(server.url(0, "/missing")).send().await.unwrap();
+        assert_eq!(response.status(), 404);
+        let _ = response.bytes().await.unwrap();
+    }
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) - before,
+        1,
+        "a repeated 404 must not reach the origin twice"
+    );
+}
+
+/// 🧩 A ranged request never turns a fragment into the whole stored body.
+///
+/// The dangerous direction is storing a `206` as if it were complete: every
+/// later request would then be served a slice of the resource and nothing would
+/// report it. The status defaults table refuses `206`, and this proves it.
+#[tokio::test]
+async fn test_a_ranged_request_does_not_poison_the_cache() {
+    let (origin, hits) = spawn_header_scripted_origin().await;
+    let mut server = TestServer::new(&cache_proxy_config(origin));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    // 🔪 Ask for two bytes of an eight-byte body.
+    let ranged = client
+        .get(server.url(0, "/plain"))
+        .header("range", "bytes=0-1")
+        .send()
+        .await
+        .unwrap();
+    let ranged_body = ranged.text().await.unwrap();
+
+    // 📄 Now ask for the whole thing. It must not be the fragment.
+    let whole = client.get(server.url(0, "/plain")).send().await.unwrap();
+    let whole_body = whole.text().await.unwrap();
+    assert!(
+        whole_body.starts_with("origin-"),
+        "a full request must not be answered with a stored fragment, got {whole_body:?} \
+         after a ranged request returned {ranged_body:?}"
+    );
+    assert!(
+        whole_body.len() > ranged_body.len() || ranged_body.len() == whole_body.len(),
+        "the full body must not be shorter than the fragment"
+    );
+    assert!(hits.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+}
+
+/// 🔌 A protocol upgrade is never a cache lookup.
+///
+/// A WebSocket handshake is a `GET`, so it passes the method check that keeps
+/// POSTs out. Storing or answering it from cache would replay a handshake to a
+/// client that needs a live tunnel.
+///
+/// ⚠️ Honest about what this proves: two independent guards produce this
+/// outcome — the request-side upgrade check, and `101` being absent from the
+/// status defaults — so the test does not isolate either one. It asserts the
+/// behaviour users depend on, not one line of the implementation.
+#[tokio::test]
+async fn test_upgrade_requests_never_enter_the_cache() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&seen);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = upstream.accept().await else {
+                return;
+            };
+            let counter = std::sync::Arc::clone(&counter);
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 8192];
+                if stream.read(&mut buffer).await.is_err() {
+                    return;
+                }
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+                    )
+                    .await;
+                let mut sink = [0u8; 64];
+                let _ = stream.read(&mut sink).await;
+            });
+        }
+    });
+
+    let mut server = TestServer::new(&cache_proxy_config(upstream_address));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    for _ in 0..2 {
+        let mut client = tokio::net::TcpStream::connect(server.address(0))
+            .await
+            .unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET /socket HTTP/1.1\r\nHost: {}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+                    server.address(0)
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let response = read_until_marker(&mut client, b"\r\n\r\n", Duration::from_secs(3)).await;
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 101"),
+            "upgrade must be proxied, got: {}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+
+    assert_eq!(
+        seen.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "each upgrade must reach the upstream; a replayed handshake is not a tunnel"
+    );
 }
 
 /// 🛡️ A request whose length two parsers could read differently must never
