@@ -110,6 +110,81 @@ listener，也沒有任何 HTTP→HTTPS 重導，而 `auto_https disable_redirec
 > ⚠️ 同樣**只有本機證據**。自動 port 80 與重導都還沒在公網跑過，
 > 下一輪 Day 29 必須一起驗。
 
+## 🧪 2026-07-31 Day 19：快取策略與正確性
+
+計畫把這天標為「整個 M3 的風險所在」，理由是快取的 bug 不會讓服務掛掉，
+只會安靜地回錯內容。
+
+### 🎯 先確定的架構事實：壓縮在快取之後
+
+Pingora 的 `h1_response_filter` 註解寫得很明白——
+*"cache the original response before any downstream transformation"*——而
+`response_filter` 在**命中與未命中都會跑**。所以：
+
+```
+上游回應 ──► [快取存原始的] ──► response_filter（我們的壓縮）──► client
+快取回應 ────────────────────► response_filter（我們的壓縮）──► client
+```
+
+快取存 identity，壓縮是每個 client 出去時各自套用。**zstd 與 gzip 兩個 client
+共用一份儲存也拿不到錯的 body**——這是結構上就正確，不是靠我們小心。計畫擔心的
+「存壓過的還是沒壓的」這個問題在這個排序下不存在。
+
+真正的危險是**上游自己送 `Content-Encoding`**：那份特定編碼會被原樣存下，而
+cache key 分不出誰能解。現在的規則是——除非上游同時送了
+`Vary: Accept-Encoding`，否則不儲存。
+
+### 改用 pingora 的 RFC 9111 實作
+
+`filters::resp_cacheable` 已經實作了 `Cache-Control`（`no-store`／`private`／
+`no-cache`／`max-age`／`s-maxage`）、`Expires` 回退、`Age`、
+stale-while-revalidate、stale-if-error，並會剝掉 `private=<field>` 指名的欄位。
+自己再寫一份只會是更差的複本。
+
+**Day 18 欠的那筆補上了**：`no-cache` 的意思是「可以存，但重用前必須重新驗證」，
+pingora 用「新鮮期為零」表達，所以進快取時就已經過期。Day 18 當時直接拒絕儲存
+——在重新驗證還沒接上時是誠實的，但現在接上了就是錯的。
+
+`ttl` 是**回退不是覆蓋**（同 nginx 的 `proxy_cache_valid`）：上游講了自己的
+生命週期就聽上游的，路由的數字只負責回答那些什麼都沒說的回應。
+
+### Negative cache
+
+404／410 存 10 秒，500／502／503／504 存 5 秒。故意很短：這是**吸震器不是失敗
+快取**——長到能吸收驚群，短到修好之後幾乎立刻可見。表裡沒有的狀態碼一律不存，
+所以 301、206 這些是落空而不是被猜一個生命週期。
+
+### 完成判定：九條斷言全部經過紅燈驗證
+
+這天整天都是否定斷言，而 2026-07-30 的教訓是**一條不可能失敗的否定斷言不是
+測試**。所以每一條都先確認它能夠失敗：
+
+| 斷言 | 撤掉什麼時失敗 |
+| --- | --- |
+| `Set-Cookie` 不儲存 | 停用該條規則 |
+| `text/event-stream` 不儲存 | 停用該條規則 |
+| `Vary: *` 不儲存 | 停用該條規則 |
+| `Content-Encoding` 無 `Vary` 不儲存 | 停用該條規則 |
+| `no-store` 不儲存 | 繞過 `resp_cacheable` |
+| `private` 不儲存 | 同上 |
+| `Vary` 分離變體 | `cache_vary_filter` 回 `None` |
+| 404 negative cache | 從 defaults 表移除 404 |
+| 上游 `max-age` 優先 | 忽略上游 freshness 且 ttl 設 0 |
+
+四條規則是**個別停用**驗證的（用暫時的環境變數開關，驗完移除），確認每條各自
+只讓它那一行失敗，不是靠第一條擋住全部。
+
+測試裡另外放了一個**對照組**：`/plain` 必須被快取。沒有它的話，上面每一條
+否定斷言對著一個「從不儲存任何東西」的快取也會通過。
+
+### ⚠️ 誠實標注
+
+`test_upgrade_requests_never_enter_the_cache` **不隔離單一規則**：請求端的
+upgrade 排除與「101 不在 defaults 表裡」兩道保護都會產生同樣結果。它斷言的是
+使用者依賴的行為，不是某一行實作。這寫在測試的註解裡。
+
+> ⚠️ 仍然**只有本機證據**，且記憶體無上限（Day 20）。README 依舊未提及。
+
 ## 🧪 2026-07-31 Day 18：接上 pingora-cache 骨架
 
 `reverse_proxy` 底下新增 `cache { ttl <duration> }`，每條路由各自選擇加入。
