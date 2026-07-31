@@ -1226,6 +1226,9 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
                         proxy.transport = Some(transport);
                     }
                 }
+                "cache" => {
+                    proxy.cache = Some(adapt_cache_policy(&sub)?);
+                }
                 "retry" => {
                     proxy.retry = adapt_retry_policy(&sub)?;
                 }
@@ -1434,6 +1437,43 @@ fn adapt_health_check(directive: &Directive) -> Result<HealthCheckConfig, Adapte
 }
 
 /// 🔁 Adapts one bounded, idempotent-only redispatch policy.
+/// 🗄️ Adapts `cache { ttl <duration> }` inside a `reverse_proxy` block.
+///
+/// `ttl` has no default on purpose. Deciding how long someone else's content
+/// stays valid is the operator's call, and guessing it silently is how a proxy
+/// ends up serving yesterday's page with nobody able to say why.
+fn adapt_cache_policy(directive: &Directive) -> Result<CacheConfig, AdapterError> {
+    if !directive.args.is_empty() {
+        return Err(AdapterError::ArgumentCount(
+            "cache".into(),
+            0,
+            directive.args.len(),
+        ));
+    }
+    let block = directive
+        .block
+        .as_ref()
+        .ok_or_else(|| AdapterError::InvalidArgument("cache".into(), "block required".into()))?;
+
+    let mut ttl_secs = None;
+    for sub in &block.directives {
+        match sub.name.as_str() {
+            "ttl" => {
+                // ⏳ Durations arrive in milliseconds; caching reasons in seconds.
+                let ms = parse_required_duration(sub)?;
+                ttl_secs = Some(ms / 1000);
+            }
+            other => {
+                return Err(AdapterError::UnknownDirective(other.to_string()));
+            }
+        }
+    }
+
+    let ttl_secs = ttl_secs
+        .ok_or_else(|| AdapterError::InvalidArgument("cache".into(), "ttl is required".into()))?;
+    Ok(CacheConfig { ttl_secs })
+}
+
 fn adapt_retry_policy(directive: &Directive) -> Result<RetryConfig, AdapterError> {
     if !directive.args.is_empty() {
         return Err(AdapterError::ArgumentCount(

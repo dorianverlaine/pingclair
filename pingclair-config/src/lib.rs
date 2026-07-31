@@ -562,6 +562,67 @@ mod tests {
         assert!(!tls.auto);
     }
 
+    /// 🗄️ `cache { ttl }` survives the whole DSL → core pipeline.
+    #[test]
+    fn test_compile_reverse_proxy_cache() {
+        let source = r#"
+            example.com {
+                reverse_proxy app:8080 {
+                    cache {
+                        ttl 60s
+                    }
+                }
+            }
+        "#;
+
+        let config = compile(source).unwrap();
+        let handler = &config.servers[0].routes[0].handler;
+        let pingclair_core::config::HandlerConfig::ReverseProxy(proxy) = handler else {
+            panic!("expected a reverse proxy, got {handler:?}");
+        };
+        let cache = proxy.cache.as_ref().expect("cache policy");
+        assert_eq!(cache.ttl_secs, 60);
+    }
+
+    /// 🚫 No `ttl` means no cache, rather than a lifetime chosen for you.
+    #[test]
+    fn test_compile_cache_requires_a_ttl() {
+        let error = compile(
+            r#"
+            example.com {
+                reverse_proxy app:8080 {
+                    cache {
+                    }
+                }
+            }
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("ttl"), "unhelpful error: {error}");
+    }
+
+    /// 🛡️ The JSON document reaches the same rule, not just the Pingclairfile.
+    ///
+    /// Day 17's lesson applied on the day the rule was written: a check that
+    /// only the DSL adapter runs is a check the Admin API walks straight past.
+    #[test]
+    fn test_cache_ttl_bounds_apply_to_json_documents() {
+        for ttl in [0u64, 99_999_999] {
+            let document = format!(
+                r#"{{"servers":[{{"listen":["127.0.0.1:8080"],"routes":[{{"path":"/*",
+                   "handler":{{"type":"reverse_proxy","upstreams":["http://127.0.0.1:9"],
+                   "cache":{{"ttl_secs":{ttl}}}}}}}]}}]}}"#
+            );
+            let parsed: pingclair_core::config::PingclairConfig =
+                serde_json::from_str(&document).expect("document parses");
+            let error = compiler::validate_config(&parsed)
+                .expect_err("ttl {ttl} must be rejected")
+                .to_string();
+            assert!(error.contains("cache ttl"), "unhelpful error: {error}");
+        }
+    }
+
     #[test]
     fn test_compile_tls_auto() {
         let source = r#"

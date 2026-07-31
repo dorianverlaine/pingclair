@@ -358,6 +358,9 @@ fn main() -> anyhow::Result<()> {
             let handler = HandlerConfig::ReverseProxy(ReverseProxyConfig {
                 upstreams: vec![to.clone()],
                 upstream_options: Vec::new(),
+                // 🗄️ `pingclair reverse-proxy` is a throwaway one-liner; caching
+                // is a deliberate per-route decision, so it stays off here.
+                cache: None,
                 load_balance: LoadBalanceConfig::default(),
                 health_check: None,
                 headers_up: std::collections::HashMap::new(),

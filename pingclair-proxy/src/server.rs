@@ -6,7 +6,8 @@
 //! 🌐 This module implements the core reverse proxy using Pingora's ProxyHttp trait.
 
 use pingclair_core::config::{
-    AccessControlConfig, HandlerConfig, ResourceLimitsConfig, ReverseProxyConfig, ServerConfig,
+    AccessControlConfig, CacheConfig, HandlerConfig, ResourceLimitsConfig, ReverseProxyConfig,
+    ServerConfig,
 };
 use pingclair_core::server::Router;
 
@@ -16,12 +17,18 @@ use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 
+// 🗄️ Response caching. Already linked through pingora-proxy; named directly so
+// the storage and metadata types are reachable.
+use pingora_cache::key::CacheKey;
+use pingora_cache::{CacheMeta, MemCache, NoCacheReason, RespCacheable};
+
 use arc_swap::ArcSwap;
 use async_recursion::async_recursion;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime};
 
 use crate::encoding::{ResponseEncoder, negotiate, stream_chunk};
 use crate::http_policy::{
@@ -77,6 +84,11 @@ pub struct RequestContext {
     pub response_status: u16,
     /// Response body bytes written (for access log)
     pub response_bytes: u64,
+    /// 🗄️ Freshness lifetime for this route, set only when caching is enabled.
+    ///
+    /// Carried on the context because `response_cache_filter` runs long after
+    /// the route was matched and has no other way back to its configuration.
+    pub cache_ttl_secs: Option<u64>,
     /// Unique request ID
     pub request_id: String,
     /// Start time for logging
@@ -121,6 +133,7 @@ impl Default for RequestContext {
         Self {
             state: None,
             route_index: None,
+            cache_ttl_secs: None,
             upstream: None,
             headers_upstream: HashMap::new(),
             response_headers: ResponseHeaderPolicy::default(),
@@ -1795,6 +1808,41 @@ impl PingclairProxy {
     }
 
     /// Get proxy config for a route
+    /// 🗄️ Returns the matched route's cache policy, if it configured one.
+    fn route_cache_config(&self, ctx: &RequestContext) -> Option<CacheConfig> {
+        let state = ctx.state.as_ref()?;
+        let route_index = ctx.route_index?;
+        let proxy = self.get_proxy_config(state, route_index)?;
+        proxy.cache.map(|cache| *cache)
+    }
+
+    /// 🔎 Reports whether a shared copy of this request's response is meaningful.
+    ///
+    /// `Authorization` and `Cookie` both mean "this answer is for this caller",
+    /// and a cache keyed only on the URL cannot tell two callers apart. Storing
+    /// such a response is how a proxy serves one person's account page to the
+    /// next visitor. RFC 9111 §3.5 allows caching authorized responses under
+    /// narrow conditions; none of them are implemented yet, so both are
+    /// refused outright.
+    fn request_may_be_served_from_cache(session: &Session) -> bool {
+        let request = session.req_header();
+        if !matches!(request.method, http::Method::GET | http::Method::HEAD) {
+            return false;
+        }
+        if request.headers.contains_key("authorization") || request.headers.contains_key("cookie") {
+            return false;
+        }
+        // 🚫 A client asking to bypass the cache is asking the shared cache too.
+        request
+            .headers
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok())
+            .is_none_or(|value| {
+                let value = value.to_ascii_lowercase();
+                !value.contains("no-store") && !value.contains("no-cache")
+            })
+    }
+
     pub(crate) fn get_proxy_config(
         &self,
         state: &ProxyState,
@@ -2667,6 +2715,72 @@ impl PingclairProxy {
 
 // MARK: - Caddy Placeholder Resolution
 
+// MARK: - Response cache
+
+/// 🗄️ The process-wide in-memory response store.
+///
+/// Pingora wants a `&'static` storage handle because a cached body outlives the
+/// request that admitted it. One store is leaked at first use rather than being
+/// rebuilt per reload, so a configuration change does not silently discard
+/// every entry the previous configuration had warmed.
+///
+/// Memory-only for now, and therefore unbounded — Day 20 owns eviction and the
+/// hard size ceiling. Until then a route enabling `cache` can grow the process
+/// without limit, which is why nothing enables it by default.
+fn response_cache_storage() -> &'static MemCache {
+    static STORAGE: OnceLock<&'static MemCache> = OnceLock::new();
+    STORAGE.get_or_init(|| Box::leak(Box::new(MemCache::new())))
+}
+
+/// 🚫 Names the reason a response must not be stored, or `None` if it may be.
+///
+/// Deliberately a small, explicit list rather than full RFC 9111 evaluation.
+/// Each entry answers "would a shared copy of this be wrong or useless?", and
+/// anything not understood is refused by the caller's status check rather than
+/// guessed at.
+fn uncacheable_response_reason(response: &ResponseHeader) -> Option<&'static str> {
+    // 📄 Only a plain, complete 200 body has an obvious shared meaning. Redirects
+    // and errors are cheap to re-fetch; 206 is a fragment; 304 has no body.
+    if response.status != 200 {
+        return Some("status is not 200");
+    }
+
+    // 🍪 A response that sets a cookie is establishing per-client state. Storing
+    // it hands the same cookie to everyone who follows.
+    if response.headers.contains_key("set-cookie") {
+        return Some("response sets a cookie");
+    }
+
+    let directives = response
+        .headers
+        .get("cache-control")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if directives.contains("no-store") {
+        return Some("upstream sent Cache-Control: no-store");
+    }
+    if directives.contains("private") {
+        return Some("upstream sent Cache-Control: private");
+    }
+    // 🔁 `no-cache` permits storage but requires revalidation before reuse, and
+    // revalidation does not exist yet. Refusing to store is the honest reading
+    // until Day 19 implements it.
+    if directives.contains("no-cache") {
+        return Some("upstream sent Cache-Control: no-cache");
+    }
+
+    // 🎯 `Vary` means the response depends on request headers this key ignores.
+    // Day 19 wires Pingora's variance support; storing one variant under a
+    // key that ignores it would serve the wrong one.
+    if response.headers.contains_key("vary") {
+        return Some("response varies on request headers");
+    }
+
+    None
+}
+
 /// Resolve Caddy-style `{placeholder}` variables in a header value string
 /// using the actual downstream request headers.
 ///
@@ -2816,6 +2930,100 @@ impl ProxyHttp for PingclairProxy {
     // Removed in Pingora 0.6: TLS resolution is handled by listeners, not the proxy trait.
     /// Resolve TLS certificate for SNI
      */
+
+    /// 🗄️ Turns caching on for this request, or leaves it off.
+    ///
+    /// Runs after `request_filter`, so the matched route is already in `ctx`.
+    /// Everything here is a reason *not* to cache: the route has to ask for it,
+    /// and the request has to be one where a shared copy is meaningful. Getting
+    /// this wrong does not fail loudly — it serves one visitor's response to
+    /// somebody else — so the conditions are deliberately narrow.
+    fn request_cache_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> pingora_core::Result<()> {
+        let Some(cache) = self.route_cache_config(ctx) else {
+            return Ok(());
+        };
+
+        if !Self::request_may_be_served_from_cache(session) {
+            return Ok(());
+        }
+
+        // 🌊 A streaming route hands chunks downstream as they arrive; storing
+        // that response means buffering it whole, which is the memory bug this
+        // project has already shipped twice.
+        if ctx.streaming_response {
+            return Ok(());
+        }
+
+        ctx.cache_ttl_secs = Some(cache.ttl_secs);
+        session
+            .cache
+            .enable(response_cache_storage(), None, None, None, None);
+        Ok(())
+    }
+
+    /// 🔑 Identifies a cached response by the parts that change what is served.
+    ///
+    /// Host, path and query — the same triple nginx's default `proxy_cache_key`
+    /// uses. The method is not in the key because only safe methods reach here,
+    /// and the scheme is not either: a route serves the same upstream bytes
+    /// whichever way the client arrived.
+    fn cache_key_callback(
+        &self,
+        session: &Session,
+        _ctx: &mut Self::CTX,
+    ) -> pingora_core::Result<CacheKey> {
+        let request = session.req_header();
+        let host = request
+            .headers
+            .get("host")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let path_and_query = request
+            .uri
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/");
+
+        Ok(CacheKey::new(host, path_and_query, ""))
+    }
+
+    /// 🗄️ Decides whether an upstream response may be stored.
+    ///
+    /// Day 18 keeps this conservative on purpose: a fixed per-route lifetime,
+    /// and a refusal for anything carrying a hint that the response is not
+    /// shareable. Full `Cache-Control` / `ETag` / `Vary` semantics are Day 19's
+    /// job, and until they exist this must err towards not storing.
+    fn response_cache_filter(
+        &self,
+        _session: &Session,
+        response: &ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> pingora_core::Result<RespCacheable> {
+        let Some(ttl_secs) = ctx.cache_ttl_secs else {
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
+                "cache not enabled for this route",
+            )));
+        };
+
+        if let Some(reason) = uncacheable_response_reason(response) {
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(reason)));
+        }
+
+        let created = SystemTime::now();
+        let fresh_until = created + Duration::from_secs(ttl_secs);
+        Ok(RespCacheable::Cacheable(CacheMeta::new(
+            fresh_until,
+            created,
+            0,
+            0,
+            response.clone(),
+        )))
+    }
 
     /// Request filter (Handle static files and early return)
     async fn request_filter(

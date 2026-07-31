@@ -502,6 +502,9 @@ pub struct ProxyConfig {
     /// Transport configuration
     pub transport: Option<TransportConfig>,
 
+    /// 🗄️ Response caching for this route, absent unless configured.
+    pub cache: Option<CacheConfig>,
+
     /// 🔁 Request-local redispatch policy.
     pub retry: RetryConfig,
 
@@ -631,6 +634,13 @@ pub struct UpstreamTlsConfig {
     pub client_key: Option<String>,
     /// ⚠️ `tls_insecure_skip_verify` — accept any upstream certificate.
     pub insecure_skip_verify: bool,
+}
+
+/// 🗄️ Typed cache policy produced by the Pingclairfile adapter.
+#[derive(Debug, Clone)]
+pub struct CacheConfig {
+    /// ⏳ How long a stored response stays fresh, in seconds.
+    pub ttl_secs: u64,
 }
 
 /// 🔁 Typed retry policy produced by the Pingclairfile adapter.
@@ -848,6 +858,7 @@ impl ProxyConfig {
             flush_interval: None,
             header_up: HashMap::new(),
             transport: None,
+            cache: None,
             retry: RetryConfig::default(),
             overload: OverloadConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),

@@ -110,6 +110,41 @@ listener，也沒有任何 HTTP→HTTPS 重導，而 `auto_https disable_redirec
 > ⚠️ 同樣**只有本機證據**。自動 port 80 與重導都還沒在公網跑過，
 > 下一輪 Day 29 必須一起驗。
 
+## 🧪 2026-07-31 Day 18：接上 pingora-cache 骨架
+
+`reverse_proxy` 底下新增 `cache { ttl <duration> }`，每條路由各自選擇加入。
+記憶體儲存、host＋path＋query 的 cache key、三個 `ProxyHttp` 掛鉤
+（`request_cache_filter`／`cache_key_callback`／`response_cache_filter`）。
+
+**依賴樹零變化。** `pingora-cache` 早就透過 `pingora-proxy` 連進二進位，
+這天只是把它加成直接依賴以取用 API；`Cargo.lock` 唯一的改動是那一行引用，
+`cargo tree -i openssl-sys` 仍然無結果。原計畫寫的「鏈結風險」不存在
+（見 TODO 的 M3 訂正）。
+
+三個新測試全部經過**紅燈驗證**：
+
+| 測試 | 撤掉哪一段時會失敗 |
+| --- | --- |
+| `test_second_request_is_served_from_cache_without_touching_the_origin` | `response_cache_filter` 一律拒絕儲存 |
+| `test_cache_key_separates_distinct_paths` | cache key 忽略路徑 |
+| `test_credentialed_requests_bypass_the_cache` | 移除 Cookie／Authorization 檢查 |
+
+計數式 origin 每次回不同 body，所以「命中」不能靠巧合成立：沒命中的話第二次
+會拿到 `origin-2`。
+
+**刻意保守的部分**（Day 19 才補完）：只快取 GET／HEAD 的 200；帶
+`Authorization`／`Cookie`／`Cache-Control: no-store|no-cache` 的請求不進快取；
+回應帶 `Set-Cookie`／`no-store`／`private`／`no-cache`／`Vary` 一律不儲存；
+`flush_interval: -1` 的串流路由不快取。`no-cache` 其實允許儲存但要求重新驗證，
+而重新驗證還不存在，所以現在直接拒絕儲存——這是誠實的讀法，不是正確的實作。
+
+> ⚠️ **記憶體無上限，Day 20 才做淘汰與硬上限。** 因此這個功能**尚未寫進
+> README**：目前開啟它的路由可以無限制地把程序撐大。文件要等 Day 20。
+
+> 🛡️ Day 17 的教訓當天就套用了：`cache ttl` 的界限規則寫在
+> `compiler::validate_config`，並**分別驗證 DSL 與 JSON 兩條路徑都會拒絕**
+> （`test_cache_ttl_bounds_apply_to_json_documents`），不是只測那個函式。
+
 ## 🧪 2026-07-30 Day 17：設定只有一條驗證路徑
 
 起因是一次外部架構審視，指控經查證屬實：Day 11 與 per-listener

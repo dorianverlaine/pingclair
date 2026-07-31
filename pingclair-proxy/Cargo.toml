@@ -15,6 +15,10 @@ pingclair-static = { path = "../pingclair-static" }
 pingclair-tls = { path = "../pingclair-tls" }
 
 pingora-proxy.workspace = true
+# 🗄️ Already linked into the binary through pingora-proxy, which depends on it
+# unconditionally. Naming it here only makes the API reachable — it adds no
+# crate to the dependency tree.
+pingora-cache = { version = "0.8.1", default-features = false, features = ["boringssl"] }
 pingora-load-balancing.workspace = true
 pingora-limits.workspace = true
 pingora-core = { workspace = true, features = ["boringssl", "connection_filter"] }

@@ -820,6 +820,24 @@ pub struct ReverseProxyConfig {
     /// 🔐 How this route authenticates and verifies its TLS upstreams.
     #[serde(default)]
     pub upstream_tls: Box<UpstreamTlsConfig>,
+
+    /// 🗄️ Response caching for this route, off unless configured.
+    #[serde(default)]
+    pub cache: Option<Box<CacheConfig>>,
+}
+
+/// 🗄️ Stores upstream responses so identical requests skip the origin.
+///
+/// Caching is opt-in per route. There is no global default because a wrong
+/// cache does not fail loudly — it serves the wrong bytes to the wrong person,
+/// and keeps doing it until the entry expires.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CacheConfig {
+    /// ⏳ How long a stored response stays fresh, in seconds.
+    ///
+    /// Required rather than defaulted: picking a lifetime for someone else's
+    /// content is exactly the decision an operator has to make deliberately.
+    pub ttl_secs: u64,
 }
 
 /// 🔁 Controls safe, request-local upstream redispatch.
