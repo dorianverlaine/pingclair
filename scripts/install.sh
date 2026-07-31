@@ -223,6 +223,7 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 Environment="RUST_LOG=info"
 ExecStartPre=/usr/local/bin/pingclair validate /etc/Pingclair/Pingclairfile
 ExecStart=/usr/local/bin/pingclair run /etc/Pingclair/Pingclairfile
+ExecReload=/bin/kill -HUP \$MAINPID
 WorkingDirectory=/var/lib/pingclair
 Restart=always
 RestartSec=5s
