@@ -195,6 +195,32 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
 > ⚠️ **在 Linux 上建置需要 `cmake`（BoringSSL）與 `clang`／`libclang-dev`
 > （bindgen）**。乾淨的 `rust:1.88-bookworm` 兩者都沒有，缺了會在
 > `boring-sys` 的 build script 失敗。發布產物與 CI 環境都要帶上。
+>
+> 🐛 **還缺第三樣：`git`（2026-07-31 第一次真的建 production image 時撞到）。**
+> `boring-sys` 在沒設 `BORING_BSSL_ASSUME_PATCHED` 時，會對 vendored 的
+> BoringSSL 原始碼跑 `git init` 再套 patch（`ensure_patches_applied` →
+> `Command::new("git")`）。沒有 `git` 執行檔就 panic 成
+> `Os { code: 2, kind: NotFound }`——**訊息完全看不出跟 git 有關**，而且跟缺
+> `clang` 的失敗長得幾乎一樣，所以第一次修錯了方向。
+>
+> 完整清單（Fedora 套件名）：`cmake gcc-c++ perl-interpreter
+> pkgconf-pkg-config clang clang-devel git`。Debian 對應：`cmake g++ perl
+> pkg-config clang libclang-dev git`。
+>
+> 📌 **這個坑之所以拖到現在才現形**：`deployment/Dockerfile` 自從 H3 換成
+> tokio-quiche（`561d802`）之後**從來沒有人真的建過**。線上跑的
+> `rc-a554477` image 是在依賴樹改變之前建的。一份不會被 CI 執行的建置腳本
+> 就是一份沒有測試的程式碼。
+>
+> 🐛 **`-slim` 變體還缺第三樣：`git`（2026-07-31 首次建置 production image 時
+> 撞到）。** `boring-sys` 的 build script 在沒有 `BORING_BSSL_ASSUME_PATCHED`
+> 時，會對 vendored BoringSSL 原始碼跑 `git init` 再套用 patch
+> （`ensure_patches_applied` → `Command::new("git")`）；沒有 `git` 執行檔會
+> 直接 panic 成 `Os { code: 2, kind: NotFound }`，訊息完全看不出跟 git 有關。
+> `deployment/Dockerfile` 用 `rust:1.88-slim-bookworm`（不是上面驗證過的
+> 完整版 `rust:1.88-bookworm`），slim 版連 `git` 都沒有——這也是為什麼這個
+> 問題直到現在才第一次出現：`561d802` 之後從沒有人真的建過這份 production
+> Dockerfile。三個都要裝：`cmake g++ pkg-config clang libclang-dev git`。
 
 > 📌 **端對端測試（`pingclair-proxy/tests/h3_end_to_end.rs`）用的是手寫 quiche
 > client**，它證明的是我們的事件迴圈對 quiche 協定實作正確，**不證明互通性**。
