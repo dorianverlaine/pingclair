@@ -102,11 +102,15 @@ curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scrip
 
 腳本提供兩個旗標，可以追蹤 `main` 而非穩定版：
 
-```bash
-# 安裝最新的 main 開發版建置（預先編譯好的 binary）
-curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --dev
+安裝最新的 main 開發版建置（預先編譯好的 binary）：
 
-# Clone main 並在本機編譯（需要 Rust 1.88+）
+```bash
+curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --dev
+```
+
+Clone main 並在本機編譯（需要 Rust 1.88+）：
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --main
 ```
 
