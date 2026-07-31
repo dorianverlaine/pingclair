@@ -628,11 +628,12 @@ health-check driver **不論有沒有配置探測都每 100ms 醒一次**。小,
 - CI 新增每 push 的開發產物：`rust.yml` 在 test 全綠後於原生 **Ubuntu**
   runner 上構建 Linux x86_64（`ubuntu-latest`）／aarch64
   （`ubuntu-24.04-arm`）dev binary——不做交叉編譯，冒煙測試直接執行
-  剛建好的二進位檔（artifact 保留 14 天），並把同一個 Dockerfile 以
-  `dev`＋commit SHA 雙 tag 推上 GHCR（amd64＋arm64，arm64 以 QEMU 模擬
-  構建，image 基座維持 Ubuntu）。dev binary 另上傳到 rolling `dev`
-  release（每次 push 重建），供 `install.sh --dev` 一行安裝。這些不是
-  發布，Day 33 的正式產物流程不受影響。
+  剛建好的二進位檔（artifact 保留 14 天），並把同一個 Dockerfile 在
+  amd64／arm64 原生 runner 上各自建置、原生冒煙後，用 `imagetools
+  create` 合併成 `dev`＋commit SHA 雙 tag 的 multi-arch manifest 推上
+  GHCR（image 基座為 Ubuntu，不經 QEMU 模擬）。dev binary 另上傳到
+  rolling `dev` release（每次 push 重建），供 `install.sh --dev` 一行
+  安裝。這些不是發布，Day 33 的正式產物流程不受影響。
 - 三份 README 新增「開發版建置」小節：GHCR `dev` image 的 docker run
   用法、Actions artifact 下載方式，並標明每次建置皆非穩定版。
 - `scripts/install.sh` 新增 Fedora 支援（apt 優先，dnf 保留給 Fedora）
