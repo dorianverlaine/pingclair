@@ -103,6 +103,10 @@ jobs:
             set -e
             if [ "$status" -eq 0 ]; then
               echo "✅ cargo test passed (attempt ${attempt}/${max_attempts})"
+              # 📊 The full output lives in the log file; print the
+              # per-binary run counts and results so the record shows the
+              # whole suite actually ran, not just this summary line.
+              grep -E 'running [0-9]+ test|test result:' "$log" || true
               exit 0
             fi
             failed="$(awk '/^failures:$/{f=1; next} f && /^    [^ ]/{gsub(/^ +/, ""); print} f && /^$/{f=0}' "$log" | sort -u)"
