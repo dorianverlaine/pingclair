@@ -41,10 +41,22 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install Rust 1.88
+        # 🎯 Downloaded to a file and run as a second, separate command —
+        # never `curl | sh`. A pipe's exit status is the last command's only,
+        # so a transient `curl: (35) Recv failure: Connection reset by peer`
+        # (hit on 2026-07-31) fed `sh` an empty script, `sh` exited 0 having
+        # done nothing, and this step reported success. Rust was never
+        # installed; every later step failed with a `cargo: command not
+        # found` that pointed nowhere near the actual cause. `--retry` covers
+        # the transient case; the final `cargo --version` is what actually
+        # closes the gap — no later step can silently run without a toolchain.
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile default --default-toolchain 1.88.0
+          curl --proto '=https' --tlsv1.2 --retry 3 --retry-connrefused -sSf \
+            https://sh.rustup.rs -o /tmp/rustup-init.sh
+          sh /tmp/rustup-init.sh -y --profile default --default-toolchain 1.88.0
+          rm -f /tmp/rustup-init.sh
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/cargo" --version
 
       - name: Cache cargo registry and build artifacts
         uses: actions/cache@v4

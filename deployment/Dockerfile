@@ -28,8 +28,17 @@ RUN dnf install -y --setopt=install_weak_deps=False \
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --profile minimal --default-toolchain 1.88.0
+# 🎯 Downloaded to a file rather than `curl | sh`: `RUN` execs a plain shell
+# with no `pipefail`, so a `curl` that dies mid-stream feeds `sh` an empty
+# script that exits 0, and the layer succeeds having installed nothing. The
+# next `RUN` would then fail on a plain `cargo: command not found` that names
+# no cause. The final `cargo --version` is the actual guard: no later layer
+# can build against a toolchain that silently never arrived.
+RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-connrefused -sSf \
+        https://sh.rustup.rs -o /tmp/rustup-init.sh \
+    && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.88.0 \
+    && rm -f /tmp/rustup-init.sh \
+    && cargo --version
 
 WORKDIR /usr/src/pingclair
 COPY . .
