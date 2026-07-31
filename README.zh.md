@@ -91,9 +91,9 @@ cargo install --path ./pingclair
 
 安裝完成後，`pingclair` 指令便會加入你的系統 `PATH`。
 
-### Fedora 一鍵安裝（推薦）
+### Ubuntu／Debian 一鍵安裝（推薦）
 
-如果你使用 Fedora，可以直接執行安裝腳本。該腳本會自動下載（或編譯）執行檔、設定 `systemd` 服務，並建立低權限的 `pingclair` 使用者（透過 `setcap` 綁定低號連接埠）。
+如果你使用 Ubuntu 或 Debian，可以直接執行安裝腳本。該腳本會自動下載（或編譯）執行檔、設定 `systemd` 服務，並建立低權限的 `pingclair` 使用者（透過 `setcap` 綁定低號連接埠）。
 
 ```bash
 # 執行安裝腳本（需要 sudo 權限）
@@ -110,9 +110,9 @@ curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scrip
 curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --main
 ```
 
-### Ubuntu／Debian 一鍵安裝
+### Fedora 一鍵安裝
 
-同一支腳本也支援 Ubuntu 與 Debian。
+同一支腳本也支援 Fedora。
 
 安裝完成後，可以使用 `pc`（pingclair 的縮寫）指令來管理服務。
 

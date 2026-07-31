@@ -630,16 +630,16 @@ health-check driver **不論有沒有配置探測都每 100ms 醒一次**。小,
   （`ubuntu-24.04-arm`）dev binary——不做交叉編譯，冒煙測試直接執行
   剛建好的二進位檔（artifact 保留 14 天），並把同一個 Dockerfile 以
   `dev`＋commit SHA 雙 tag 推上 GHCR（amd64＋arm64，arm64 以 QEMU 模擬
-  構建，image 基座維持 Fedora）。dev binary 另上傳到 rolling `dev`
+  構建，image 基座維持 Ubuntu）。dev binary 另上傳到 rolling `dev`
   release（每次 push 重建），供 `install.sh --dev` 一行安裝。這些不是
   發布，Day 33 的正式產物流程不受影響。
 - 三份 README 新增「開發版建置」小節：GHCR `dev` image 的 docker run
   用法、Actions artifact 下載方式，並標明每次建置皆非穩定版。
-- `scripts/install.sh` 新增 Fedora 支援（優先偵測 `dnf`，apt 保留給
-  Ubuntu/Debian）與 `--dev`／`--main` 旗標：`--dev` 從 rolling `dev`
+- `scripts/install.sh` 新增 Fedora 支援（apt 優先，dnf 保留給 Fedora）
+  與 `--dev`／`--main` 旗標：`--dev` 從 rolling `dev`
   release 安裝最新 main 快照並驗證 SHA-256，`--main` 本機 clone main
   編譯（需 Rust 1.88+，會補裝 BoringSSL 建置套件）。三份 README 的安裝
-  段改為 Fedora 優先、Ubuntu/Debian 次之，並補旗標用法。
+  段改為 Ubuntu/Debian 優先、Fedora 次之，並補旗標用法。
 - 刪除未使用的 `pingclair-api/src/handlers.rs` 與 `mod handlers;`。
 - 修正 `pingclair-core/src/config/loader.rs` 過時 TODO。
 - 核實並改寫 proxy rate-limit 的過時 TODO 註釋。
