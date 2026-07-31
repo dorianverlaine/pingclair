@@ -177,8 +177,7 @@ jobs:
     name: Dev binaries - ${{ matrix.platform.name }}
     if: github.event_name != 'pull_request'
     needs: test
-    runs-on: ubuntu-latest
-    container: fedora:latest
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -194,28 +193,31 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install build dependencies
-        # 🧱 Same Fedora package list as the test job and the release image,
-        # so the dev binaries link against the same glibc the published image
-        # ships. boring-sys needs cmake + gcc-c++ for BoringSSL,
-        # clang/clang-devel for bindgen, git for the vendored patch step and
-        # perl for its scripts. The aarch64 leg additionally needs the cross
-        # toolchain.
+        # 🧱 Ubuntu 26.04 with the cross-gcc packages. The test job and the
+        # release image stay on Fedora to prove the shipped artifact builds,
+        # while these dev snapshots are convenience binaries for test
+        # deployments — a fresh Ubuntu toolchain is the more reliable base.
+        # Ubuntu's gcc-aarch64-linux-gnu pulls in libc6-dev-arm64-cross, so
+        # the aarch64 leg gets the target glibc headers with no extra sysroot
+        # step; Fedora's cross-gcc packages ship none, which broke this job
+        # on its first Fedora run. boring-sys needs cmake + g++ for
+        # BoringSSL, clang/libclang-dev for bindgen and perl for its scripts.
         run: |
-          dnf install -y --setopt=install_weak_deps=False \
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
             cmake \
-            gcc-c++ \
-            perl-interpreter \
-            pkgconf-pkg-config \
+            g++ \
+            perl \
+            pkg-config \
             clang \
-            clang-devel \
+            libclang-dev \
             git \
             curl
           if [ "${{ matrix.platform.target }}" == "aarch64-unknown-linux-gnu" ]; then
-            dnf install -y --setopt=install_weak_deps=False \
+            sudo apt-get install -y --no-install-recommends \
               gcc-aarch64-linux-gnu \
-              gcc-c++-aarch64-linux-gnu
+              g++-aarch64-linux-gnu
           fi
-          dnf clean all
 
       - name: Install Rust 1.88
         uses: dtolnay/rust-toolchain@1.88.0
@@ -229,13 +231,14 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          # 🔑 Shares the `fedora-cargo-` namespace with the test job: both
-          # run in the same Fedora base, so a warm cache from the test run
-          # carries over. The matrix leg is appended to the key so each target
-          # keeps its own entry.
-          key: fedora-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.platform.target }}
+          # 🔑 Keyed on Cargo.lock so a dependency bump invalidates it, with
+          # the matrix leg appended so each target keeps its own entry. The
+          # Ubuntu-only namespace deliberately never reuses the test job's
+          # Fedora cache: binaries built against Fedora's glibc must not be
+          # served from a build that now links Ubuntu's.
+          key: ubuntu-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.platform.target }}
           restore-keys: |
-            fedora-cargo-
+            ubuntu-cargo-
 
       - name: Build
         run: |
@@ -249,7 +252,7 @@ jobs:
       - name: Smoke test the binary
         run: |
           binary="target/${{ matrix.platform.target }}/release/pingclair"
-          version_output="$("$binary" --version)"
+          version_output="$("$binary" version)"
           echo "$version_output"
           echo "$version_output" | grep -q "Pingclair v"
           "$binary" validate examples/full_featured.pingclair
