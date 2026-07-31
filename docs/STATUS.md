@@ -640,7 +640,7 @@ health-check driver **不論有沒有配置探測都每 100ms 醒一次**。小,
   與 `--dev`／`--main` 旗標：`--dev` 從 rolling `dev`
   release 安裝最新 main 快照並驗證 SHA-256，`--main` 本機 clone main
   編譯（需 Rust 1.88+，會補裝 BoringSSL 建置套件）。三份 README 的安裝
-  段改為 Ubuntu/Debian 優先、Fedora 次之，並補旗標用法。
+  段合併為單一 Linux 段落，並補旗標用法。
 - 刪除未使用的 `pingclair-api/src/handlers.rs` 與 `mod handlers;`。
 - 修正 `pingclair-core/src/config/loader.rs` 過時 TODO。
 - 核實並改寫 proxy rate-limit 的過時 TODO 註釋。
