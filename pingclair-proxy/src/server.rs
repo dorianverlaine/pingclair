@@ -2766,9 +2766,10 @@ impl PingclairProxy {
 /// rebuilt per reload, so a configuration change does not silently discard
 /// every entry the previous configuration had warmed.
 ///
-/// Memory-only for now, and therefore unbounded — Day 20 owns eviction and the
-/// hard size ceiling. Until then a route enabling `cache` can grow the process
-/// without limit, which is why nothing enables it by default.
+/// ⚠️ Memory-only, and currently **unbounded**: there is no eviction and no
+/// size ceiling yet. A route that enables `cache` can therefore grow the
+/// process without limit, which is why caching is off unless asked for and
+/// why it is not yet documented as a feature.
 fn response_cache_storage() -> &'static MemCache {
     static STORAGE: OnceLock<&'static MemCache> = OnceLock::new();
     STORAGE.get_or_init(|| Box::leak(Box::new(MemCache::new())))
@@ -3070,10 +3071,10 @@ impl ProxyHttp for PingclairProxy {
 
     /// 🗄️ Decides whether an upstream response may be stored.
     ///
-    /// Day 18 keeps this conservative on purpose: a fixed per-route lifetime,
-    /// and a refusal for anything carrying a hint that the response is not
-    /// shareable. Full `Cache-Control` / `ETag` / `Vary` semantics are Day 19's
-    /// job, and until they exist this must err towards not storing.
+    /// Two stages: a short list of refusals this proxy owns, then RFC 9111's
+    /// freshness rules. Anything a shared copy could get wrong is refused
+    /// before the standard logic runs, because the cost of a wrong answer here
+    /// is not an error — it is the wrong bytes, served repeatedly, in silence.
     fn response_cache_filter(
         &self,
         _session: &Session,
@@ -3099,8 +3100,8 @@ impl ProxyHttp for PingclairProxy {
         // `no-cache` is the one worth spelling out: it means "store, but
         // revalidate before reuse", and Pingora expresses that as a zero
         // freshness duration, which lands the entry in cache already stale.
-        // Day 18 refused to store it instead — honest at the time, since
-        // revalidation was not wired, but wrong now that it is.
+        // Refusing to store it would be a plausible-looking mistake — it reads
+        // like a stricter choice, and it silently disables revalidation.
         let cache_control = CacheControl::from_resp_headers(response);
         let decision = filters::resp_cacheable(
             cache_control.as_ref(),
