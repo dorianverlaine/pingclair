@@ -104,9 +104,9 @@ cargo install --path ./pingclair
 
 Une fois l'installation terminée, la commande `pingclair` est disponible dans votre `PATH`.
 
-### Installation en une ligne sur Ubuntu/Debian (recommandée)
+### Installation en une ligne sur Linux
 
-Sous Ubuntu ou Debian, vous pouvez utiliser le script d'installation. Il télécharge (ou compile) le binaire, met en place un service `systemd` et crée un utilisateur `pingclair` non privilégié, autorisé à se lier aux ports bas via `setcap`.
+Sur n'importe quelle distribution Linux, le script d'installation fonctionne : il télécharge (ou compile) le binaire, met en place un service `systemd` et crée un utilisateur `pingclair` non privilégié, autorisé à se lier aux ports bas via `setcap`. Après l'installation, la commande `pc` (abréviation de `pingclair`) permet de gérer le service.
 
 ```bash
 # Exécuter le script d'installation (droits sudo requis)
@@ -122,12 +122,6 @@ curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scrip
 # Cloner main et le compiler localement (nécessite Rust 1.88+)
 curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --main
 ```
-
-### Installation en une ligne sur Fedora
-
-Le même script fonctionne sous Fedora.
-
-Après l'installation, la commande `pc` (abréviation de `pingclair`) permet de gérer le service.
 
 ### Versions de développement (instables)
 
