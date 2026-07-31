@@ -8,7 +8,9 @@
 FROM ubuntu:latest AS builder
 
 # 🔨 What each of these is for, because a missing one fails far from its cause:
-#   cmake, g++, perl     — BoringSSL's own build
+#   cmake, make, g++     — BoringSSL's own build; cmake on Ubuntu does not
+#                          pull `make`, so the "Unix Makefiles" generator
+#                          has nothing to run without it
 #   clang, libclang-dev  — bindgen needs libclang to generate the FFI bindings
 #   git                  — boring-sys runs `git init` on the vendored BoringSSL
 #                          source to apply its patches; without the binary it
@@ -19,6 +21,7 @@ FROM ubuntu:latest AS builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         cmake \
+        make \
         g++ \
         perl \
         pkg-config \
