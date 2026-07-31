@@ -51,6 +51,24 @@
   &str]` 這種混型陣列在 1.97 過、在 1.88 是 `E0308`。本機四項全綠然後 CI 全紅,
   就是這樣來的（2026-07-29）。`rustfmt` 的換行決策也隨版本變,所以 fmt 也要用
   同一個工具鏈跑。
+- 🎩 **2026-07-31 起 `rust.yml` 的 `test` job 跑在 `fedora:latest` 容器裡**,
+  跟 `deployment/Dockerfile` 同一個 base、同一份 rustup 釘版 1.88.0、同一份
+  `dnf` 套件清單。理由是同一天先撞到的事：那份 Dockerfile 自從 H3 換
+  tokio-quiche 之後**從沒被建過**,線上跑的 image 是依賴樹改變前建的,
+  Rust 版本也早就跟 `Cargo.toml` 的宣告不一致。CI 跑在 Debian／ubuntu 上
+  完全遮住這件事。**兩份套件清單必須手動保持同步**——CI 的 `dnf install`
+  跟 Dockerfile builder stage 那份改一邊就要改另一邊,目前沒有機制強制同步,
+  這條本身就是下一個可能重犯的坑。
+- 🐳 **`rust.yml` 新增 `docker-image` job,真的建 `deployment/Dockerfile`
+  並開機驗證**（`docker run ... version`、`docker run ... validate` 一份真
+  Pingclairfile）。這是「一份沒人跑的建置腳本等於沒測試過的程式碼」這句話
+  的直接對策——上面那次 Dockerfile 漂移,如果這個 job 當時存在,第一次
+  push 就會紅。
+- 🔒 **新增 `security-audit` job（`cargo audit`）,每次 push 都跑**,不只在
+  發布前跑一次。RustSec 公告的時間不受這個專案控制,一個已合併但後來被公告
+  漏洞的依賴,只有持續跑才抓得到。真的出現 finding 時的例外處理是**書面風險
+  接受**（`docs/STATUS.md` Day 30 的既有規則),不是把這個 job 改成
+  `continue-on-error`。
 - **要在容器 log 裡看到 ERROR 以下的內容必須設 `RUST_LOG`**。subscriber 是
   `EnvFilter::from_default_env()` 建的，沒設等於只留 ERROR——症狀是功能明明
   正常卻「什麼都沒 log」。

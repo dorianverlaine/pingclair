@@ -1,0 +1,21 @@
+# 🐳 Keeps `docker build`'s context to what the Rust build actually reads.
+#
+# Without this file `COPY . .` sends the whole working tree — on this machine
+# that includes a `target/` in the tens of gigabytes, gitignored so it never
+# reaches CI, but very real for anyone running `docker build` locally from a
+# repo they have been building in. A slow, disk-hungry `docker build` is
+# exactly the kind of friction that makes people stop trusting the Dockerfile,
+# which is the thing this repo already paid for once today.
+
+.git
+/target
+**/target
+
+# 📄 Evidence and planning material the binary never reads.
+benchmarks/results
+docs
+
+# 🌐 The doc site's own dependency tree, once it has one (docs/SITE.md).
+site/node_modules
+
+.DS_Store

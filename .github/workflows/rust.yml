@@ -10,29 +10,148 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  # 🎩 Fedora rather than a native ubuntu-latest toolchain, because the release
+  # image (deployment/Dockerfile) is built on Fedora with a rustup-pinned
+  # 1.88.0. Testing on a different base than the one that ships is how a
+  # missing system package (this repo has now hit that twice: cmake/clang,
+  # then git for boring-sys's `git init`) survives every green CI run until
+  # someone tries to actually build the release artifact.
+  #
+  # The package list below must be kept in sync with deployment/Dockerfile's
+  # builder stage — they exist to test the same thing.
+  test:
+    name: Build & test (Fedora, Rust 1.88)
+    runs-on: ubuntu-latest
+    container: fedora:latest
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            cmake \
+            gcc-c++ \
+            perl-interpreter \
+            pkgconf-pkg-config \
+            clang \
+            clang-devel \
+            git \
+            curl
+          dnf clean all
+
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.88
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile default --default-toolchain 1.88.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # 🔑 Keyed on Cargo.lock so a dependency bump invalidates it; on a
+          # cache miss the restore-keys fallback still saves recompiling
+          # everything unchanged. Not keyed on the Fedora image itself — an
+          # unpinned `fedora:latest` moves over time, and a stale cache here
+          # costs a slower build, not a wrong one, since cargo tracks its own
+          # fingerprints regardless of what the underlying image changed.
+          key: fedora-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            fedora-cargo-
+
+      - name: Check shell syntax
+        run: bash -n scripts/*.sh benchmarks/scripts/*.sh
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --locked --workspace --verbose
+
+      - name: Run tests
+        run: cargo test --locked --workspace --verbose
+
+      - name: Verify the single-BoringSSL invariant
+        # 🔐 quiche only runs on BoringSSL and pingora-core defaults to
+        # OpenSSL; the two collide on libcrypto symbols at link time (has
+        # crashed the binary at startup before). This is the same check
+        # GUARDRAILS asks a human to run by hand — it belongs in CI instead,
+        # where a stray `pingora-openssl` or `openssl-sys` dependency fails
+        # the build instead of waiting to be noticed.
+        run: |
+          if cargo tree -i openssl-sys > /tmp/openssl-sys-tree.txt 2>/dev/null; then
+            echo "::error::openssl-sys is present in the dependency tree — this must stay BoringSSL-only:"
+            cat /tmp/openssl-sys-tree.txt
+            exit 1
+          fi
+          echo "✅ no openssl-sys in the dependency tree"
+
+  # 🐳 Builds the exact Dockerfile the production host runs, and boots it.
+  #
+  # This is the job that would have caught today's incident: the Fedora
+  # Dockerfile had drifted (wrong Rust version, missing git and perl) because
+  # nothing had built it since H3 moved onto tokio-quiche's dependency tree.
+  # GUARDRAILS says it plainly — "a build script no CI job runs is code with
+  # no tests" — so this job exists to make that statement false going forward.
+  docker-image:
+    name: Build & smoke-test the release image
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build the release image
+        run: docker build -f deployment/Dockerfile -t pingclair:ci .
+
+      - name: Version must be reported and match the crate
+        run: |
+          version_output="$(docker run --rm pingclair:ci version)"
+          echo "$version_output"
+          echo "$version_output" | grep -q "Pingclair v" || {
+            echo "::error::unexpected 'pingclair version' output"
+            exit 1
+          }
+
+      - name: A real Pingclairfile must validate inside the image
+        # 🧭 Exercises the same binary, the same libc, the same BoringSSL build
+        # that will actually run in production — `cargo test` on the host
+        # proves the logic is right, this proves the *artifact* is right.
+        run: |
+          docker run --rm -v "$PWD/examples:/examples:ro" \
+            pingclair:ci validate /examples/full_featured.pingclair
+
+  # 🔒 New RustSec advisories land on a schedule this repo does not control,
+  # so this runs on every push rather than only at release time. Per
+  # docs/GUARDRAILS.md, an exception to a real finding needs a written risk
+  # acceptance — this job is what makes silently living with one impossible.
+  security-audit:
+    name: Dependency security audit
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
 
-    - name: Install Rust 1.88
-      uses: dtolnay/rust-toolchain@1.88.0
-      with:
-        components: rustfmt, clippy
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.88.0
 
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y cmake pkg-config
+      - name: Cache cargo-audit and the advisory database
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/advisory-db
+          key: cargo-audit-${{ runner.os }}
 
-    - name: Check shell syntax
-      run: bash -n scripts/*.sh benchmarks/scripts/*.sh
-    - name: Check formatting
-      run: cargo fmt --all -- --check
-    - name: Run Clippy
-      run: cargo clippy --locked --workspace --all-targets -- -D warnings
-    - name: Build
-      run: cargo build --locked --workspace --verbose
-    - name: Run tests
-      run: cargo test --locked --workspace --verbose
+      - name: Install cargo-audit
+        run: command -v cargo-audit || cargo install cargo-audit --locked
+
+      - name: Audit dependencies
+        run: cargo audit
