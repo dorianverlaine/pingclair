@@ -64,6 +64,11 @@
   Pingclairfile）。這是「一份沒人跑的建置腳本等於沒測試過的程式碼」這句話
   的直接對策——上面那次 Dockerfile 漂移,如果這個 job 當時存在,第一次
   push 就會紅。
+- 🎲 **`test_websocket_upgrade_tunnels_bytes_in_both_directions` 是已知的
+  上游（Pingora）flaky**。`rust.yml` 的 `Run tests` 步驟會重跑整輪測試
+  （最多三次），但**僅限**該測試是唯一失敗項；其他測試失敗或三次都失敗
+  仍然直接紅。**不要為了這個 flake 改測試代碼**——它偶發失敗不代表有
+  回歸，用 retry 消掉雜訊就好。
 - 🔒 **新增 `security-audit` job（`cargo audit`）,每次 push 都跑**,不只在
   發布前跑一次。RustSec 公告的時間不受這個專案控制,一個已合併但後來被公告
   漏洞的依賴,只有持續跑才抓得到。真的出現 finding 時的例外處理是**書面風險

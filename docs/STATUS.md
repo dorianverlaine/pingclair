@@ -636,6 +636,9 @@ health-check driver **不論有沒有配置探測都每 100ms 醒一次**。小,
   安裝。這些不是發布，Day 33 的正式產物流程不受影響。
 - 三份 README 新增「開發版建置」小節：GHCR `dev` image 的 docker run
   用法、Actions artifact 下載方式，並標明每次建置皆非穩定版。
+- `rust.yml` 的 `Run tests` 步驟針對已知上游 flaky 的
+  `test_websocket_upgrade_tunnels_bytes_in_both_directions` 自動重跑
+  （最多三次，僅限該測試為唯一失敗項）。
 - `scripts/install.sh` 新增 Fedora 支援（apt 優先，dnf 保留給 Fedora）
   與 `--dev`／`--main` 旗標：`--dev` 從 rolling `dev`
   release 安裝最新 main 快照並驗證 SHA-256，`--main` 本機 clone main

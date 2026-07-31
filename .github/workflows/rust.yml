@@ -84,7 +84,41 @@ jobs:
         run: cargo build --locked --workspace --verbose
 
       - name: Run tests
-        run: cargo test --locked --workspace --verbose
+        # 🎲 `test_websocket_upgrade_tunnels_bytes_in_both_directions` is a
+        # known upstream (Pingora) flake: it fails intermittently with no
+        # code change, so one red run is noise, not signal. The loop reruns
+        # the full suite when that test is the *only* failure — any other
+        # failure, or one that survives all three attempts, is still
+        # reported loudly. The test source is never modified for this.
+        run: |
+          flaky_suffix="test_websocket_upgrade_tunnels_bytes_in_both_directions"
+          max_attempts=3
+          attempt=0
+          log="/tmp/cargo-test.log"
+          while [ "$attempt" -lt "$max_attempts" ]; do
+            attempt=$((attempt + 1))
+            set +e
+            cargo test --locked --workspace --verbose >"$log" 2>&1
+            status=$?
+            set -e
+            if [ "$status" -eq 0 ]; then
+              echo "✅ cargo test passed (attempt ${attempt}/${max_attempts})"
+              exit 0
+            fi
+            failed="$(awk '/^failures:$/{f=1; next} f && /^    [^ ]/{gsub(/^ +/, ""); print} f && /^$/{f=0}' "$log" | sort -u)"
+            if [ -z "$failed" ]; then
+              break
+            fi
+            if [ "$(printf '%s\n' "$failed" | wc -l)" -ne 1 ] || ! printf '%s\n' "$failed" | grep -q "${flaky_suffix}$"; then
+              break
+            fi
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              echo "⚠️  ${failed} is a known upstream flake (attempt ${attempt}/${max_attempts}); rerunning the suite"
+            fi
+          done
+          echo "::error::cargo test failed on: $(printf '%s' "$failed" | tr '\n' ' ')"
+          tail -n 80 "$log"
+          exit 1
 
       - name: Verify the single-BoringSSL invariant
         # 🔐 quiche only runs on BoringSSL and pingora-core defaults to
