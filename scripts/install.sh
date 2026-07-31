@@ -190,15 +190,9 @@ if [ ! -f /etc/Pingclair/Pingclairfile ]; then
 # 🦀 Pingclair default configuration file
 # Management commands: pc service <start|stop|reload|status>
 
-server "default" {
-    listen: "0.0.0.0:80";
-    
-    route {
-        # Welcome page
-        _ => {
-            file_server "/var/lib/pingclair/html";
-        }
-    }
+:80 {
+    # Welcome page
+    file_server /var/lib/pingclair/html
 }
 EOF
 fi
