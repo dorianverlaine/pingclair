@@ -625,13 +625,13 @@ health-check driver **不論有沒有配置探測都每 100ms 醒一次**。小,
   Cargo 依風險分組——quiche／boring／tokio-quiche／pingora*／rustls 等
   H3/TLS 依賴單獨成組，該組 PR 必須先過 GUARDRAILS 的 Linux release＋
   quiche client 驗證關卡才能合併。
-- CI 新增每 push 的開發產物：`rust.yml` 在 test 全綠後於 **Fedora 容器**
-  內構建 Linux x86_64／aarch64 dev binary（artifact 保留 14 天），並把
-  同一個 Dockerfile 以 `dev`＋commit SHA 雙 tag 推上 GHCR（amd64＋arm64，
-  arm64 以 QEMU 模擬構建——原生 arm64 runner 是 Ubuntu，本專案刻意保持
-  Fedora 基座）。dev binary 另上傳到 rolling `dev` release（每次 push
-  重建），供 `install.sh --dev` 一行安裝。這些不是發布，Day 33 的正式
-  產物流程不受影響。
+- CI 新增每 push 的開發產物：`rust.yml` 在 test 全綠後於 **Ubuntu 26.04**
+  上構建 Linux x86_64／aarch64 dev binary（aarch64 以 cross-gcc 交叉編譯，
+  artifact 保留 14 天），並把同一個 Dockerfile 以 `dev`＋commit SHA 雙
+  tag 推上 GHCR（amd64＋arm64，arm64 以 QEMU 模擬構建，image 基座維持
+  Fedora）。dev binary 另上傳到 rolling `dev` release（每次 push 重建），
+  供 `install.sh --dev` 一行安裝。這些不是發布，Day 33 的正式產物流程
+  不受影響。
 - 三份 README 新增「開發版建置」小節：GHCR `dev` image 的 docker run
   用法、Actions artifact 下載方式，並標明每次建置皆非穩定版。
 - `scripts/install.sh` 新增 Fedora 支援（優先偵測 `dnf`，apt 保留給
