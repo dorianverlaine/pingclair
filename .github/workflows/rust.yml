@@ -15,9 +15,9 @@ jobs:
   # are native per-architecture builds (x86_64 and arm64 runners), so the
   # smoke tests execute the artifact they just built — a cross-compiled
   # arm64 binary cannot run on an x86_64 host. The release image
-  # (deployment/Dockerfile) stays Fedora-based, and the docker-image job
-  # below builds and boots that exact Dockerfile, so Fedora-specific
-  # packaging mistakes are still caught in CI.
+  # (deployment/Dockerfile) is Ubuntu-based as well, and the docker-image
+  # job below builds and boots that exact Dockerfile, so packaging mistakes
+  # are still caught in CI.
   test:
     name: Build & test (Ubuntu, Rust 1.88)
     runs-on: ubuntu-latest
@@ -102,8 +102,8 @@ jobs:
 
   # 🐳 Builds the exact Dockerfile the production host runs, and boots it.
   #
-  # This is the job that would have caught today's incident: the Fedora
-  # Dockerfile had drifted (wrong Rust version, missing git and perl) because
+  # This is the job that would have caught today's incident: the Dockerfile
+  # had drifted (wrong Rust version, missing git and perl) because
   # nothing had built it since H3 moved onto tokio-quiche's dependency tree.
   # GUARDRAILS says it plainly — "a build script no CI job runs is code with
   # no tests" — so this job exists to make that statement false going forward.
@@ -307,10 +307,9 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Set up QEMU
-        # 🐮 Native arm64 GitHub runners are Ubuntu-based; this project builds
-        # on Fedora by choice, so the arm64 leg of the image stays emulated —
-        # slower than native, but it preserves the Fedora runtime the
-        # production image ships.
+        # 🐮 The multi-arch image build runs on a single x86_64 runner, so
+        # the arm64 leg is emulated rather than built natively — slower, but
+        # it keeps one job building and pushing both platforms.
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx

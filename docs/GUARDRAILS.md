@@ -51,14 +51,14 @@
   &str]` 這種混型陣列在 1.97 過、在 1.88 是 `E0308`。本機四項全綠然後 CI 全紅,
   就是這樣來的（2026-07-29）。`rustfmt` 的換行決策也隨版本變,所以 fmt 也要用
   同一個工具鏈跑。
-- 🎩 **2026-07-31 起 `rust.yml` 的 `test` job 跑在 `fedora:latest` 容器裡**,
-  跟 `deployment/Dockerfile` 同一個 base、同一份 rustup 釘版 1.88.0、同一份
-  `dnf` 套件清單。理由是同一天先撞到的事：那份 Dockerfile 自從 H3 換
-  tokio-quiche 之後**從沒被建過**,線上跑的 image 是依賴樹改變前建的,
-  Rust 版本也早就跟 `Cargo.toml` 的宣告不一致。CI 跑在 Debian／ubuntu 上
-  完全遮住這件事。**兩份套件清單必須手動保持同步**——CI 的 `dnf install`
-  跟 Dockerfile builder stage 那份改一邊就要改另一邊,目前沒有機制強制同步,
-  這條本身就是下一個可能重犯的坑。
+- 🎩 **2026-08-01 起 `rust.yml` 的 `test` job 跑在 `ubuntu-latest` runner 上**,
+  跟 `deployment/Dockerfile` 同一個 base（Ubuntu）、同一份 rustup 釘版
+  1.88.0、同一份 `apt` 套件清單。這條規則源自 2026-07-31 的事故：那份
+  Dockerfile 從 H3 換 tokio-quiche 之後**從沒被建過**,線上跑的 image 是
+  依賴樹改變前建的,Rust 版本也早就跟 `Cargo.toml` 的宣告不一致。CI 跑在
+  別的發行版上會完全遮住這件事。**兩份套件清單必須手動保持同步**——CI 的
+  `apt-get install` 跟 Dockerfile builder stage 那份改一邊就要改另一邊,
+  目前沒有機制強制同步,這條本身就是下一個可能重犯的坑。
 - 🐳 **`rust.yml` 新增 `docker-image` job,真的建 `deployment/Dockerfile`
   並開機驗證**（`docker run ... version`、`docker run ... validate` 一份真
   Pingclairfile）。這是「一份沒人跑的建置腳本等於沒測試過的程式碼」這句話
@@ -221,7 +221,7 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
 > `Os { code: 2, kind: NotFound }`——**訊息完全看不出跟 git 有關**，而且跟缺
 > `clang` 的失敗長得幾乎一樣，所以第一次修錯了方向。
 >
-> 完整清單（Fedora 套件名）：`cmake gcc-c++ perl-interpreter
+> 完整清單（當時 Fedora 套件名）：`cmake gcc-c++ perl-interpreter
 > pkgconf-pkg-config clang clang-devel git`。Debian 對應：`cmake g++ perl
 > pkg-config clang libclang-dev git`。
 >

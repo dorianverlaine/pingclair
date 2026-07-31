@@ -32,7 +32,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-echo -e "${GREEN}🦀 Pingclair Installer for Fedora / Ubuntu / Debian (${INSTALL_MODE} mode)${NC}"
+echo -e "${GREEN}🦀 Pingclair Installer for Ubuntu / Debian / Fedora (${INSTALL_MODE} mode)${NC}"
 
 # 1. Check Root
 if [ "$EUID" -ne 0 ]; then
@@ -41,14 +41,15 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # 2. Dependencies
-# 🧭 Fedora is the first-class base, so dnf is detected first; apt is kept
-# for Ubuntu/Debian. `libcap` on Fedora is what provides `setcap`.
+# 🧭 Ubuntu/Debian is the first-class base, so apt is detected first; dnf is
+# kept for Fedora. `libssl-dev` covers Ubuntu/Debian, while `libcap` on
+# Fedora is what provides `setcap`.
 echo "Installing runtime dependencies..."
-if command -v dnf >/dev/null 2>&1; then
-    dnf install -y openssl ca-certificates curl jq libcap
-else
+if command -v apt-get >/dev/null 2>&1; then
     apt-get update -qq
     apt-get install -y -qq openssl ca-certificates curl jq libssl-dev
+else
+    dnf install -y openssl ca-certificates curl jq libcap
 fi
 
 # 🔨 `--main` compiles BoringSSL from source, so it needs the same build
@@ -56,10 +57,10 @@ fi
 # bindgen, and git for boring-sys's vendored patch step.
 if [ "$INSTALL_MODE" = "main" ]; then
     echo "Installing build dependencies..."
-    if command -v dnf >/dev/null 2>&1; then
-        dnf install -y cmake gcc-c++ perl-interpreter pkgconf-pkg-config clang clang-devel git
-    else
+    if command -v apt-get >/dev/null 2>&1; then
         apt-get install -y -qq cmake g++ perl pkg-config clang libclang-dev git
+    else
+        dnf install -y cmake gcc-c++ perl-interpreter pkgconf-pkg-config clang clang-devel git
     fi
 fi
 
