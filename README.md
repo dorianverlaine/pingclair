@@ -110,11 +110,15 @@ curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scrip
 
 The script accepts two flags for tracking `main` instead of the stable release:
 
-```bash
-# Install the latest development build of main (prebuilt binary)
-curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --dev
+Install the latest development build of main (prebuilt binary):
 
-# Clone main and compile it locally (requires Rust 1.88+)
+```bash
+curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --dev
+```
+
+Clone main and compile it locally (requires Rust 1.88+):
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --main
 ```
 

@@ -115,11 +115,15 @@ curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scrip
 
 Le script accepte deux drapeaux pour suivre `main` au lieu de la version stable :
 
-```bash
-# Installer la dernière version de développement de main (binaire précompilé)
-curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --dev
+Installer la dernière version de développement de main (binaire précompilé) :
 
-# Cloner main et le compiler localement (nécessite Rust 1.88+)
+```bash
+curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --dev
+```
+
+Cloner main et le compiler localement (nécessite Rust 1.88+) :
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --main
 ```
 
