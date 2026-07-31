@@ -91,16 +91,50 @@ cargo install --path ./pingclair
 
 安裝完成後，`pingclair` 指令便會加入你的系統 `PATH`。
 
-### Ubuntu／Debian 一鍵安裝（推薦）
+### Fedora 一鍵安裝（推薦）
 
-如果你使用 Ubuntu 或 Debian，可以直接執行安裝腳本。該腳本會自動下載（或編譯）執行檔、設定 `systemd` 服務，並建立低權限的 `pingclair` 使用者（透過 `setcap` 綁定低號連接埠）。
+如果你使用 Fedora，可以直接執行安裝腳本。該腳本會自動下載（或編譯）執行檔、設定 `systemd` 服務，並建立低權限的 `pingclair` 使用者（透過 `setcap` 綁定低號連接埠）。
 
 ```bash
 # 執行安裝腳本（需要 sudo 權限）
 curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash
 ```
 
+腳本提供兩個旗標，可以追蹤 `main` 而非穩定版：
+
+```bash
+# 安裝最新的 main 開發版建置（預先編譯好的 binary）
+curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --dev
+
+# Clone main 並在本機編譯（需要 Rust 1.88+）
+curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --main
+```
+
+### Ubuntu／Debian 一鍵安裝
+
+同一支腳本也支援 Ubuntu 與 Debian。
+
 安裝完成後，可以使用 `pc`（pingclair 的縮寫）指令來管理服務。
+
+### 開發版建置（不穩定）
+
+專案仍在快速迭代，每次 push 到 `main` 都會產出供部署測試用的快照——
+**不是穩定版**：
+
+- **容器映像**（GHCR）：`dev` tag 跟隨最新 push，每個 build 另有完整的
+  commit SHA tag，可以釘住特定快照。
+
+  ```bash
+  docker pull ghcr.io/dorianverlaine/pingclair:dev
+  docker run --rm -p 8080:80 \
+    -v "$PWD/Pingclairfile:/etc/pingclair/Pingclairfile:ro" \
+    ghcr.io/dorianverlaine/pingclair:dev
+  ```
+
+- **Linux 二進位檔**（x86_64 與 aarch64）：附在對應的 GitHub Actions run，
+  保留 14 天，從該次 run 的 artifact 清單下載。
+
+每個開發版都是移動中的樹的快照，部署到重要環境前請自行驗證。
 
 ## 🏃 快速上手
 

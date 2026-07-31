@@ -104,16 +104,53 @@ cargo install --path ./pingclair
 
 Une fois l'installation terminée, la commande `pingclair` est disponible dans votre `PATH`.
 
-### Installation en une ligne sur Ubuntu/Debian (recommandé)
+### Installation en une ligne sur Fedora (recommandé)
 
-Sous Ubuntu ou Debian, vous pouvez utiliser le script d'installation. Il télécharge (ou compile) le binaire, met en place un service `systemd` et crée un utilisateur `pingclair` non privilégié, autorisé à se lier aux ports bas via `setcap`.
+Sous Fedora, vous pouvez utiliser le script d'installation. Il télécharge (ou compile) le binaire, met en place un service `systemd` et crée un utilisateur `pingclair` non privilégié, autorisé à se lier aux ports bas via `setcap`.
 
 ```bash
 # Exécuter le script d'installation (droits sudo requis)
 curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash
 ```
 
+Le script accepte deux drapeaux pour suivre `main` au lieu de la version stable :
+
+```bash
+# Installer la dernière version de développement de main (binaire précompilé)
+curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --dev
+
+# Cloner main et le compiler localement (nécessite Rust 1.88+)
+curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --main
+```
+
+### Installation en une ligne sur Ubuntu/Debian
+
+Le même script fonctionne sous Ubuntu ou Debian.
+
 Après l'installation, la commande `pc` (abréviation de `pingclair`) permet de gérer le service.
+
+### Versions de développement (instables)
+
+Le projet est en itération rapide : chaque push sur `main` produit aussi des
+instantanés destinés aux tests de déploiement — **pas des versions stables**.
+
+- **Image conteneur** (GHCR) : le tag `dev` suit le dernier push, et chaque
+  build est aussi tagué avec le SHA complet du commit pour épingler un
+  instantané précis.
+
+  ```bash
+  docker pull ghcr.io/dorianverlaine/pingclair:dev
+  docker run --rm -p 8080:80 \
+    -v "$PWD/Pingclairfile:/etc/pingclair/Pingclairfile:ro" \
+    ghcr.io/dorianverlaine/pingclair:dev
+  ```
+
+- **Binaires Linux** (x86_64 et aarch64) : joints au run GitHub Actions
+  correspondant, conservés 14 jours, à télécharger depuis la liste des
+  artifacts de ce run.
+
+Chaque version de développement est un instantané d'un arbre en mouvement —
+vérifiez-la avant de déployer.
 
 ## 🏃 Démarrage rapide
 

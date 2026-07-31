@@ -100,15 +100,51 @@ cargo install --path ./pingclair
 
 Once installed, the `pingclair` command is available on your `PATH`.
 
-### One-line install on Ubuntu/Debian (recommended)
+### One-line install on Fedora (recommended)
 
-On Ubuntu or Debian you can use the install script. It downloads (or builds) the binary, sets up a `systemd` service, and creates an unprivileged `pingclair` user that binds low ports via `setcap`.
+On Fedora you can use the install script. It downloads (or builds) the binary, sets up a `systemd` service, and creates an unprivileged `pingclair` user that binds low ports via `setcap`.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash
 ```
 
+The script accepts two flags for tracking `main` instead of the stable release:
+
+```bash
+# Install the latest development build of main (prebuilt binary)
+curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --dev
+
+# Clone main and compile it locally (requires Rust 1.88+)
+curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --main
+```
+
+### One-line install on Ubuntu/Debian
+
+The same script works on Ubuntu or Debian.
+
 After installation, manage the service with the `pc` command (short for `pingclair`).
+
+### Development builds (unstable)
+
+While Pingclair is in rapid iteration, every push to `main` also publishes
+snapshots for deployment testing — **not** stable releases:
+
+- **Container image** on GHCR: `dev` follows the latest push, and each build
+  is also tagged with its full commit SHA so a specific snapshot can be pinned.
+
+  ```bash
+  docker pull ghcr.io/dorianverlaine/pingclair:dev
+  docker run --rm -p 8080:80 \
+    -v "$PWD/Pingclairfile:/etc/pingclair/Pingclairfile:ro" \
+    ghcr.io/dorianverlaine/pingclair:dev
+  ```
+
+- **Linux binaries** (x86_64 and aarch64): attached to the corresponding
+  GitHub Actions run and kept for 14 days; download them from that run's
+  artifact list.
+
+Treat every development build as a snapshot of a moving tree — verify it
+before deploying anywhere that matters.
 
 ## 🏃 Quick start
 

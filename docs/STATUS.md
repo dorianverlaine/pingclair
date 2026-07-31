@@ -621,6 +621,24 @@ health-check driver **不論有沒有配置探測都每 100ms 醒一次**。小,
 
 不適用「遠端功能驗證」，保留作為變更紀錄：
 
+- 新增 `.github/dependabot.yml`：GitHub Actions 每週合併成一筆 PR；
+  Cargo 依風險分組——quiche／boring／tokio-quiche／pingora*／rustls 等
+  H3/TLS 依賴單獨成組，該組 PR 必須先過 GUARDRAILS 的 Linux release＋
+  quiche client 驗證關卡才能合併。
+- CI 新增每 push 的開發產物：`rust.yml` 在 test 全綠後於 **Fedora 容器**
+  內構建 Linux x86_64／aarch64 dev binary（artifact 保留 14 天），並把
+  同一個 Dockerfile 以 `dev`＋commit SHA 雙 tag 推上 GHCR（amd64＋arm64，
+  arm64 以 QEMU 模擬構建——原生 arm64 runner 是 Ubuntu，本專案刻意保持
+  Fedora 基座）。dev binary 另上傳到 rolling `dev` release（每次 push
+  重建），供 `install.sh --dev` 一行安裝。這些不是發布，Day 33 的正式
+  產物流程不受影響。
+- 三份 README 新增「開發版建置」小節：GHCR `dev` image 的 docker run
+  用法、Actions artifact 下載方式，並標明每次建置皆非穩定版。
+- `scripts/install.sh` 新增 Fedora 支援（優先偵測 `dnf`，apt 保留給
+  Ubuntu/Debian）與 `--dev`／`--main` 旗標：`--dev` 從 rolling `dev`
+  release 安裝最新 main 快照並驗證 SHA-256，`--main` 本機 clone main
+  編譯（需 Rust 1.88+，會補裝 BoringSSL 建置套件）。三份 README 的安裝
+  段改為 Fedora 優先、Ubuntu/Debian 次之，並補旗標用法。
 - 刪除未使用的 `pingclair-api/src/handlers.rs` 與 `mod handlers;`。
 - 修正 `pingclair-core/src/config/loader.rs` 過時 TODO。
 - 核實並改寫 proxy rate-limit 的過時 TODO 註釋。

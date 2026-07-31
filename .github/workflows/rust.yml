@@ -5,6 +5,7 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -167,3 +168,194 @@ jobs:
 
       - name: Audit dependencies
         run: cargo audit
+
+  # 🧪 Per-push development binaries. Day 33 owns the versioned release
+  # artifacts; this job only makes the current main testable sooner. The
+  # artifacts are named "-dev" and never represent a stable release — treat
+  # every run as a snapshot of a moving tree.
+  dev-binaries:
+    name: Dev binaries - ${{ matrix.platform.name }}
+    if: github.event_name != 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: Linux x86_64
+            target: x86_64-unknown-linux-gnu
+            key: x86_64
+          - name: Linux aarch64
+            target: aarch64-unknown-linux-gnu
+            key: aarch64
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        # 🧱 Same Fedora package list as the test job and the release image,
+        # so the dev binaries link against the same glibc the published image
+        # ships. boring-sys needs cmake + gcc-c++ for BoringSSL,
+        # clang/clang-devel for bindgen, git for the vendored patch step and
+        # perl for its scripts. The aarch64 leg additionally needs the cross
+        # toolchain.
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            cmake \
+            gcc-c++ \
+            perl-interpreter \
+            pkgconf-pkg-config \
+            clang \
+            clang-devel \
+            git \
+            curl
+          if [ "${{ matrix.platform.target }}" == "aarch64-unknown-linux-gnu" ]; then
+            dnf install -y --setopt=install_weak_deps=False \
+              gcc-aarch64-linux-gnu \
+              gcc-c++-aarch64-linux-gnu
+          fi
+          dnf clean all
+
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: ${{ matrix.platform.target }}
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # 🔑 Shares the `fedora-cargo-` namespace with the test job: both
+          # run in the same Fedora base, so a warm cache from the test run
+          # carries over. The matrix leg is appended to the key so each target
+          # keeps its own entry.
+          key: fedora-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.platform.target }}
+          restore-keys: |
+            fedora-cargo-
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.platform.target }}" == "aarch64-unknown-linux-gnu" ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+            export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+          fi
+          cargo build --release --locked --target ${{ matrix.platform.target }}
+
+      - name: Smoke test the binary
+        run: |
+          binary="target/${{ matrix.platform.target }}/release/pingclair"
+          version_output="$("$binary" --version)"
+          echo "$version_output"
+          echo "$version_output" | grep -q "Pingclair v"
+          "$binary" validate examples/full_featured.pingclair
+
+      - name: Package and checksum
+        run: |
+          cd target/${{ matrix.platform.target }}/release
+          tar -czf pingclair-linux-${{ matrix.platform.key }}-dev.tar.gz pingclair
+          shasum -a 256 pingclair-linux-${{ matrix.platform.key }}-dev.tar.gz > SHA256SUMS-dev-${{ matrix.platform.key }}.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pingclair-linux-${{ matrix.platform.key }}-dev
+          path: |
+            target/${{ matrix.platform.target }}/release/pingclair-linux-${{ matrix.platform.key }}-dev.tar.gz
+            target/${{ matrix.platform.target }}/release/SHA256SUMS-dev-${{ matrix.platform.key }}.txt
+          retention-days: 14
+
+  # 🚀 Rolling `dev` release. `install.sh --dev` downloads from here, so the
+  # per-push binaries need a stable public URL even though they are never a
+  # stable release. The `dev` tag is force-moved on every push — last writer
+  # wins, which is acceptable for a solo iteration loop and is exactly why
+  # the tag is named "dev".
+  publish-dev-release:
+    name: Publish rolling dev release
+    if: github.event_name != 'pull_request'
+    needs: dev-binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download dev binaries
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Replace the rolling dev release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete dev --yes --cleanup-tag 2>/dev/null || true
+          gh release create dev \
+            pingclair-linux-x86_64-dev.tar.gz \
+            pingclair-linux-aarch64-dev.tar.gz \
+            SHA256SUMS-dev-x86_64.txt \
+            SHA256SUMS-dev-aarch64.txt \
+            --title "Development builds (unstable)" \
+            --notes "Snapshots of main, rebuilt on every push — not stable releases. Install with: sudo bash scripts/install.sh --dev"
+
+  # 🐳 Rolling development image. The `docker-image` job above proves the
+  # artifact boots on the native runner; this job publishes the same
+  # Dockerfile as a mutable `dev` tag plus an immutable commit-SHA tag, so a
+  # test deployment can either follow the latest snapshot or pin one build.
+  # Explicitly not a release: the `dev` tag is a moving target by design
+  # while the project is in rapid iteration.
+  publish-dev-image:
+    name: Publish dev image to GHCR
+    if: github.event_name != 'pull_request'
+    needs: docker-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up QEMU
+        # 🐮 Native arm64 GitHub runners are Ubuntu-based; this project builds
+        # on Fedora by choice, so the arm64 leg of the image stays emulated —
+        # slower than native, but it preserves the Fedora runtime the
+        # production image ships.
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push multi-arch dev image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deployment/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/dorianverlaine/pingclair:dev
+            ghcr.io/dorianverlaine/pingclair:${{ github.sha }}
+
+      - name: Smoke the published image
+        # 🧭 Smoke exactly what a test deployment will pull, not a local
+        # build: `docker run` resolves the multi-arch manifest to the runner's
+        # platform (amd64 here) and exercises the published artifact.
+        run: |
+          version_output="$(docker run --rm ghcr.io/dorianverlaine/pingclair:dev version)"
+          echo "$version_output"
+          echo "$version_output" | grep -q "Pingclair v"
+          docker run --rm -v "$PWD/examples:/examples:ro" \
+            ghcr.io/dorianverlaine/pingclair:dev validate /examples/full_featured.pingclair
