@@ -4,7 +4,7 @@ FROM rust:1.88-slim-bookworm AS builder
 WORKDIR /usr/src/pingclair
 COPY . .
 
-RUN apt-get update && apt-get install -y cmake g++ pkg-config
+RUN apt-get update && apt-get install -y cmake g++ pkg-config clang libclang-dev
 RUN cargo build --release
 
 # Runtime Stage
