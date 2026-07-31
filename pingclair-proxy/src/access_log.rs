@@ -9,11 +9,11 @@
 //! ignored. This module makes that configuration actually decide where a
 //! request line goes and how it is shaped.
 //!
-//! Scope note: this is the *routing and formatting* layer only. Rotation,
-//! retention, compression and a bounded async writer are deliberately not
-//! here — see `docs/TODO.md` Day 21. Writes are synchronous and serialized
-//! per sink, which is correct but will block the caller if the disk stalls;
-//! that limitation is the reason Day 21 exists.
+//! ⚠️ Scope note: this is the *routing and formatting* layer only. Rotation,
+//! retention, compression and a bounded async writer are deliberately absent.
+//! Writes are synchronous and serialized per sink — correct, but they block
+//! the caller if the disk stalls, so a slow or full disk becomes back-pressure
+//! on the request path rather than a dropped log line.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};

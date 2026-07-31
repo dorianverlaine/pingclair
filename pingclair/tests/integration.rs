@@ -2666,7 +2666,7 @@ async fn test_pingclairfile_internal_tls_serves_trusted_h1_and_h2() {
 
 /// 🛠️ Starts a server with the Admin API enabled and one readiness route.
 ///
-/// Every Day 17 test drives the real Admin socket rather than calling
+/// These tests drive the real Admin socket rather than calling
 /// `validate_config` directly. That distinction is the whole point: the
 /// function always rejected these configurations, and the *path* did not
 /// call the function.
@@ -4663,9 +4663,9 @@ fn cache_proxy_config(upstream: SocketAddr) -> String {
 
 /// 🗄️ The second request for the same URL is answered without the origin.
 ///
-/// This is Day 18's completion criterion. The origin's hit counter is the
-/// assertion that matters — a body comparison alone would still pass if the
-/// origin were contacted and happened to reply identically.
+/// The origin's hit counter is the assertion that matters — a body comparison
+/// alone would still pass if the origin were contacted and happened to reply
+/// identically.
 #[tokio::test]
 async fn test_second_request_is_served_from_cache_without_touching_the_origin() {
     let (origin, hits) = spawn_counting_origin().await;
@@ -4798,9 +4798,9 @@ async fn test_responses_the_origin_marked_unshareable_are_not_stored() {
 
 /// 🔁 `no-cache` is stored, then revalidated — not refused outright.
 ///
-/// This is the Day 18 carry-over. Refusing to store was honest while nothing
-/// could revalidate; now that Pingora does, `no-cache` means what RFC 9111 says
-/// it means: keep it, but check before reusing it.
+/// Refusing to store would look like the stricter choice and is not: it
+/// silently disables revalidation. `no-cache` means what RFC 9111 says it
+/// means — keep it, but check before reusing it.
 ///
 /// The observable difference from `no-store` is not the origin hit count — both
 /// contact the origin every time — but *what the origin is asked*. A stored
@@ -4850,8 +4850,9 @@ async fn test_origin_max_age_overrides_the_route_ttl() {
 /// 🎯 `Vary` separates the variants instead of blending them.
 ///
 /// Two clients differing only in `Accept-Language` must not share one entry.
-/// Before variance was wired, Day 18 refused to store anything with `Vary` at
-/// all — safe, but it meant the rule was never actually exercised.
+/// Refusing to store anything carrying `Vary` would also be safe, and would
+/// leave this rule permanently unexercised — which is how it stops being true
+/// without anyone noticing.
 #[tokio::test]
 async fn test_vary_gives_each_variant_its_own_entry() {
     let (origin, hits) = spawn_header_scripted_origin().await;

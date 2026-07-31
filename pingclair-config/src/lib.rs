@@ -604,8 +604,10 @@ mod tests {
 
     /// 🛡️ The JSON document reaches the same rule, not just the Pingclairfile.
     ///
-    /// Day 17's lesson applied on the day the rule was written: a check that
-    /// only the DSL adapter runs is a check the Admin API walks straight past.
+    /// A rule that only the DSL adapter runs is a rule the Admin API walks
+    /// straight past: it deserializes JSON into the core types directly. So the
+    /// check lives in `validate_config`, and this proves the JSON path reaches
+    /// it — testing the function alone would prove nothing about the route.
     #[test]
     fn test_cache_ttl_bounds_apply_to_json_documents() {
         for ttl in [0u64, 99_999_999] {
