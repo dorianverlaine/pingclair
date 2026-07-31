@@ -275,18 +275,49 @@ jobs:
         with:
           merge-multiple: true
 
+      - name: Verify the checksums
+        # 🔒 A release page is a trust boundary even for machine-built
+        # snapshots: refuse to publish a tarball whose checksum does not
+        # match what the build produced. Each arch ships its own sums file,
+        # so verify both against their tarball before anything goes live.
+        run: |
+          shasum -a 256 -c SHA256SUMS-dev-x86_64.txt
+          shasum -a 256 -c SHA256SUMS-dev-aarch64.txt
+
+      - name: Write the release notes
+        run: |
+          {
+            echo "Snapshot of \`main\` at [\`${GITHUB_SHA:0:7}\`](https://github.com/${{ github.repository }}/commit/${GITHUB_SHA}), built by [run #${{ github.run_number }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})."
+            echo
+            echo "**Not a stable release.** The \`dev\` tag is a moving target: it is force-replaced on every push while the project is in rapid iteration, so the binary you install today will not be the same one you install next week."
+            echo
+            echo "## Install"
+            echo
+            echo '```bash'
+            echo 'curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/scripts/install.sh | sudo bash -s -- --dev'
+            echo '```'
+            echo
+            echo "## Assets"
+            ls -lh pingclair-linux-*-dev.tar.gz SHA256SUMS-dev-*.txt | sed 's/^/- /'
+          } > /tmp/dev-release-notes.md
+
       - name: Replace the rolling dev release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release delete dev --yes --cleanup-tag 2>/dev/null || true
+          # 🗑️ Only delete what actually exists; the first push of the day
+          # has no `dev` release yet, and a delete that fails for a real
+          # reason must not be swallowed by `|| true`.
+          if gh release view dev >/dev/null 2>&1; then
+            gh release delete dev --yes --cleanup-tag
+          fi
           gh release create dev \
             pingclair-linux-x86_64-dev.tar.gz \
             pingclair-linux-aarch64-dev.tar.gz \
             SHA256SUMS-dev-x86_64.txt \
             SHA256SUMS-dev-aarch64.txt \
             --title "Development builds (unstable)" \
-            --notes "Snapshots of main, rebuilt on every push — not stable releases. Install with: sudo bash scripts/install.sh --dev"
+            --notes-file /tmp/dev-release-notes.md
 
   # 🐳 Rolling development image. The `docker-image` job above proves the
   # artifact boots on the native runner; this job publishes the same
