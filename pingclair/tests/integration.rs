@@ -4507,6 +4507,168 @@ async fn spawn_request_recording_origin()
     (address, seen)
 }
 
+/// 🔢 An origin whose body changes on every request, and that counts them.
+///
+/// A counter alone proves the origin was not contacted; a body that changes
+/// proves *which* response the client got. Together they leave no reading in
+/// which a cache miss could pass as a hit.
+async fn spawn_counting_origin() -> (SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let counter = Arc::clone(&counter);
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 16384];
+                loop {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {}
+                    }
+                    let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    let body = format!("origin-{n}");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    if stream.write_all(response.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (address, hits)
+}
+
+/// 🗄️ Builds a reverse-proxy config whose route caches for a minute.
+fn cache_proxy_config(upstream: SocketAddr) -> String {
+    serde_json::json!({
+        "global": { "http3": false },
+        "servers": [{
+            "listen": ["127.0.0.1:0"],
+            "routes": [{
+                "path": "/*",
+                "handler": {
+                    "type": "reverse_proxy",
+                    "upstreams": [format!("http://{upstream}")],
+                    "cache": { "ttl_secs": 60 }
+                }
+            }]
+        }]
+    })
+    .to_string()
+}
+
+/// 🗄️ The second request for the same URL is answered without the origin.
+///
+/// This is Day 18's completion criterion. The origin's hit counter is the
+/// assertion that matters — a body comparison alone would still pass if the
+/// origin were contacted and happened to reply identically.
+#[tokio::test]
+async fn test_second_request_is_served_from_cache_without_touching_the_origin() {
+    let (origin, hits) = spawn_counting_origin().await;
+    let mut server = TestServer::new(&cache_proxy_config(origin));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let first = client.get(server.url(0, "/cached")).send().await.unwrap();
+    assert_eq!(first.status(), 200);
+    assert_eq!(first.text().await.unwrap(), "origin-1");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let second = client.get(server.url(0, "/cached")).send().await.unwrap();
+    assert_eq!(second.status(), 200);
+    assert_eq!(
+        second.text().await.unwrap(),
+        "origin-1",
+        "the second response must be the stored copy, not a fresh origin reply"
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the origin must not have been contacted a second time"
+    );
+}
+
+/// 🔑 A different path is a different entry, not a stale hit.
+///
+/// Without this, a cache key that ignored the path would pass the test above
+/// and serve every URL the first response it ever stored.
+#[tokio::test]
+async fn test_cache_key_separates_distinct_paths() {
+    let (origin, hits) = spawn_counting_origin().await;
+    let mut server = TestServer::new(&cache_proxy_config(origin));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let first = client.get(server.url(0, "/one")).send().await.unwrap();
+    assert_eq!(first.text().await.unwrap(), "origin-1");
+
+    let other = client.get(server.url(0, "/two")).send().await.unwrap();
+    assert_eq!(
+        other.text().await.unwrap(),
+        "origin-2",
+        "a second path must reach the origin rather than reuse /one's entry"
+    );
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    // 🔁 And each path keeps its own stored copy.
+    let again = client.get(server.url(0, "/one")).send().await.unwrap();
+    assert_eq!(again.text().await.unwrap(), "origin-1");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// 🛡️ A request carrying credentials is never answered from the shared copy.
+///
+/// A cache keyed only on the URL cannot tell two callers apart, so storing or
+/// serving an authorized response would hand one visitor's page to the next.
+#[tokio::test]
+async fn test_credentialed_requests_bypass_the_cache() {
+    let (origin, hits) = spawn_counting_origin().await;
+    let mut server = TestServer::new(&cache_proxy_config(origin));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    // 🍪 Warm the entry with an anonymous request first, so a later credentialed
+    // request has something it *could* wrongly be served.
+    let warm = client.get(server.url(0, "/private")).send().await.unwrap();
+    assert_eq!(warm.text().await.unwrap(), "origin-1");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    for (name, value) in [("cookie", "session=abc"), ("authorization", "Bearer token")] {
+        let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+        let response = client
+            .get(server.url(0, "/private"))
+            .header(name, value)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_ne!(
+            response.text().await.unwrap(),
+            "origin-1",
+            "a request carrying {name} must not be served the shared copy"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1,
+            "a request carrying {name} must reach the origin"
+        );
+    }
+}
+
 /// 🛡️ A request whose length two parsers could read differently must never
 /// place a second request in the origin's buffer.
 ///

@@ -435,6 +435,17 @@ fn reject_unimplemented_handler(handler: &HandlerConfig) -> CompileResult<()> {
 fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<()> {
     match handler {
         HandlerConfig::ReverseProxy(proxy) => {
+            // ⏳ A zero TTL would admit entries that are stale on arrival, and an
+            // unbounded one would pin a response past any plausible deployment.
+            // Both are configuration mistakes rather than useful settings.
+            if let Some(cache) = &proxy.cache
+                && (cache.ttl_secs == 0 || cache.ttl_secs > 31_536_000)
+            {
+                return Err(CompileError::InvalidRoute {
+                    message: "cache ttl must be between 1 second and 365 days".to_string(),
+                });
+            }
+
             let retry = &proxy.retry;
             if !(1..=16).contains(&retry.max_attempts) {
                 return Err(CompileError::InvalidRoute {
@@ -1081,6 +1092,11 @@ fn compile_handler(handler: &Handler) -> CompileResult<HandlerConfig> {
                 connect_timeout: None,
                 first_byte_timeout: None,
                 between_reads_timeout: None,
+                cache: proxy.cache.as_ref().map(|cache| {
+                    Box::new(pingclair_core::config::CacheConfig {
+                        ttl_secs: cache.ttl_secs,
+                    })
+                }),
                 retry: Box::new(pingclair_core::config::RetryConfig {
                     max_attempts: proxy.retry.max_attempts,
                     total_timeout_ms: proxy.retry.total_timeout_ms,

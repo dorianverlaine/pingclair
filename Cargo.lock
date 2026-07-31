@@ -2809,6 +2809,7 @@ dependencies = [
  "pingclair-core",
  "pingclair-static",
  "pingclair-tls",
+ "pingora-cache",
  "pingora-core",
  "pingora-http",
  "pingora-limits",
