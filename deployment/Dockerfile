@@ -13,7 +13,9 @@ FROM ubuntu:latest AS builder
 #   git                  — boring-sys runs `git init` on the vendored BoringSSL
 #                          source to apply its patches; without the binary it
 #                          panics as a bare `NotFound` that names no file
-#   curl                 — fetching rustup below
+#   curl, ca-certificates — fetching rustup below; the Ubuntu base ships no
+#                           CA bundle, so curl cannot verify sh.rustup.rs
+#                           without it
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         cmake \
@@ -24,6 +26,7 @@ RUN apt-get update \
         libclang-dev \
         git \
         curl \
+        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 ENV RUSTUP_HOME=/usr/local/rustup \

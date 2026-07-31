@@ -34,7 +34,8 @@ jobs:
             clang \
             libclang-dev \
             git \
-            curl
+            curl \
+            ca-certificates
 
       - uses: actions/checkout@v5
 
