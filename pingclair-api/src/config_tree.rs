@@ -173,6 +173,42 @@ pub fn expand_append(doc: &mut Value, segments: &[String], body: &Value) -> Resu
     Ok(())
 }
 
+/// 🏷️ Finds the document path of the first object tagged with `@id == name`.
+///
+/// Caddy lets any JSON object carry an `@id` and then addresses it as
+/// `/id/<name>`; the returned path points at that object so the caller can
+/// read or mutate it like any other traversal target.
+pub fn find_id_path(doc: &Value, name: &str) -> Option<Vec<String>> {
+    fn walk(node: &Value, path: &mut Vec<String>, name: &str) -> Option<Vec<String>> {
+        match node {
+            Value::Object(map) => {
+                if map.get("@id").and_then(Value::as_str) == Some(name) {
+                    return Some(path.clone());
+                }
+                for (key, child) in map {
+                    path.push(key.clone());
+                    if let Some(found) = walk(child, path, name) {
+                        return Some(found);
+                    }
+                    path.pop();
+                }
+            }
+            Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    path.push(index.to_string());
+                    if let Some(found) = walk(child, path, name) {
+                        return Some(found);
+                    }
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+    walk(doc, &mut Vec::new(), name)
+}
+
 fn traverse_parent_mut<'a>(
     doc: &'a mut Value,
     segments: &[String],
@@ -321,5 +357,15 @@ mod tests {
             doc["servers"][0]["listen"],
             json!(["127.0.0.1:8080", "127.0.0.1:1", "127.0.0.1:2"])
         );
+    }
+
+    #[test]
+    fn id_tags_resolve_to_their_object_path() {
+        let mut doc = sample();
+        doc["servers"][0]["routes"][0]["handler"]["@id"] = json!("msg");
+
+        let path = find_id_path(&doc, "msg").expect("tag is found");
+        assert_eq!(path, ["servers", "0", "routes", "0", "handler"]);
+        assert!(find_id_path(&doc, "missing").is_none());
     }
 }
