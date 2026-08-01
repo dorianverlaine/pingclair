@@ -2978,6 +2978,48 @@ async fn test_admin_adapt_export_and_load() {
     assert_eq!(response.text().await.unwrap(), "loaded-ok");
 }
 
+/// 🚫 POST /load must refuse a Caddy JSON document instead of answering
+/// "Config loaded" while applying zero servers.
+///
+/// The Getting Started tutorial uploads Caddy's native
+/// `{"apps":{"http":{...}}}` document. Pingclair's root config schema has no
+/// `apps` field, and serde used to ignore unknown fields, so the request
+/// returned 200 with an empty configuration and the running server stayed
+/// untouched. An operator following the tutorial believed the config was
+/// live; the regression test pins the fail-closed behavior on the real
+/// binary and the real admin socket.
+#[tokio::test]
+async fn test_admin_load_rejects_caddy_json() {
+    let mut server = TestServer::new(&admin_test_config("/__ready_caddy_json", "still-ready"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let caddy_document = r#"{"apps":{"http":{"servers":{"example":{"listen":[":2015"],"routes":[{"handle":[{"handler":"static_response","body":"Hello, world!"}]}]}}}}}"#;
+    let response = client
+        .post(server.admin_url("/load"))
+        .header("Content-Type", "application/json")
+        .body(caddy_document)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains("unknown field `apps`"),
+        "error must name the unknown field; got: {body}"
+    );
+
+    // 🧭 The previously loaded server must still be answering unchanged.
+    let response = client
+        .get(server.url(0, "/__ready_caddy_json"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "still-ready");
+}
+
 /// 🔔 SIGHUP/SIGUSR1 reload the running server from its config file — on any
 /// Unix, including the macOS dev machines this suite runs on. The test edits
 /// the Pingclairfile, signals the real binary, and checks that the new route

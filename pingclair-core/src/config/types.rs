@@ -10,6 +10,10 @@ use std::collections::HashMap;
 
 /// Root configuration for Pingclair
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+// 🚫 Reject unknown top-level fields: a Caddy JSON document must never be
+// silently parsed into an empty Pingclair config, which would report success
+// while loading nothing.
+#[serde(deny_unknown_fields)]
 pub struct PingclairConfig {
     /// Debug mode
     #[serde(default)]
