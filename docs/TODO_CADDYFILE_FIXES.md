@@ -189,17 +189,19 @@ FX-A ──> FX-B ──> FX-C
 
 ### FX-E1（F-22，P1）bare hostname 預設自動 HTTPS
 
-- [ ] `auto_https on`（預設）時，hostname site（無 listen、無 tls）
-      視為 `tls auto`：443 + 80 companion；`http://` 前綴維持明文。
-- 驗證：`example.com` Caddyfile 啟動 443+80；`http://example.com`
-      維持 80 明文；香港機重跑 HTTPS Quick-start。
+- [x] compiler 對「bare hostname、無 listen、`auto_https != off`」的 site
+      自動加 `tls auto`（localhost/IP 維持 internal）；`http://` 前綴
+      維持明文。
+- 驗證：`bare_hostname_without_tls_derives_no_listener`、
+      `auto_https_off_keeps_bare_hostname_plaintext`。
 
 ### FX-E2（F-28，P1）directive 優先序對齊
 
-- [ ] `file_server` + `reverse_proxy` 無 matcher 時，`reverse_proxy`
-      優先（對齊 Caddy 排序表；檢查全部 directive 的相對順序）。
-- 驗證：無 matcher 兩 handler 路由測試；Caddyfile Tutorial Matchers
-      節重跑。
+- [x] terminal handler 的 pipeline 順序改為 Caddy 優先序的反向
+      （file_server → reverse_proxy → respond，後者覆寫前者＝
+      Caddy 的 first-wins）。
+- 驗證：`terminal_handlers_run_in_reverse_caddy_priority`；香港機重驗
+      Matchers 節。
 
 ### FX-E3（F-26，P1）`templates` directive 實作
 
@@ -211,10 +213,10 @@ FX-A ──> FX-B ──> FX-C
 
 ### FX-E4（F-23，P2）JSON 路徑自動 HTTPS 觸發
 
-- [ ] 原生 JSON 的 `names` + `tls.auto`（或 listen 443）要觸發
-      eager issuance 與 80 companion（與 DSL 等價）。
-- 驗證：JSON config 啟動後 443 有憑證、80 companion 出現；
-      HTTPS Quick-start JSON 節重跑。
+- [x] `eager_issuance_domains` 改用 `names`（JSON shape 的 hostname 不再
+      被 `name="default"` 擋掉）。
+- 驗證：`eager_issuance_domains_excludes_internal_manual_and_wildcards`
+      加入 JSON shape case；香港機重驗。
 
 ---
 

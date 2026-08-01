@@ -8,8 +8,9 @@
 use crate::parser::ast::*;
 use pingclair_core::config::Encoding as CoreEncoding;
 use pingclair_core::config::{
-    AccessControlConfig as CoreAccessControlConfig, AdminConfig, HandlerConfig, LoadBalanceConfig,
-    LogConfig, LogFormat as CoreLogFormat, LogOutput as CoreLogOutput, Matcher as CoreMatcher,
+    AccessControlConfig as CoreAccessControlConfig, AdminConfig,
+    AutoHttpsMode as CoreAutoHttpsMode, HandlerConfig, LoadBalanceConfig, LogConfig,
+    LogFormat as CoreLogFormat, LogOutput as CoreLogOutput, Matcher as CoreMatcher,
     MatcherCondition, PingclairConfig, ProxyUpstream, RateLimitKey as CoreRateLimitKey,
     ReverseProxyConfig, RouteConfig, ServerConfig, TlsConfig, default_encodings,
     default_gzip_types,
@@ -44,7 +45,32 @@ pub fn compile_ast(ast: &Ast) -> CompileResult<PingclairConfig> {
 
     // Compile servers
     for server_node in &ast.servers {
-        let server_config = compile_server(&server_node.inner)?;
+        let block = &server_node.inner;
+        let mut server_config = compile_server(block)?;
+        // 🌐 Caddy serves any named site over HTTPS by default: a bare
+        // hostname with no explicit scheme/listen and automatic HTTPS
+        // enabled gets `tls auto` (localhost/IP sites already get the
+        // internal authority from the adapter). `http://` sites keep their
+        // explicit plaintext listener.
+        if server_config.tls.is_none()
+            && block.listens.is_empty()
+            && config.global.auto_https != CoreAutoHttpsMode::Off
+            && block
+                .names
+                .iter()
+                .any(|name| !name.is_empty() && name != "_")
+        {
+            let internal = block.names.iter().any(|name| {
+                name == "localhost"
+                    || name.ends_with(".localhost")
+                    || name.parse::<std::net::IpAddr>().is_ok()
+            });
+            server_config.tls = Some(TlsConfig {
+                auto: !internal,
+                internal,
+                ..Default::default()
+            });
+        }
         config.servers.push(server_config);
     }
 

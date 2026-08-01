@@ -249,7 +249,15 @@ fn eager_issuance_domains(config: &pingclair_core::config::PingclairConfig) -> V
                 .as_ref()
                 .is_some_and(|tls| tls.auto && !tls.internal && tls.cert.is_none())
         })
-        .filter_map(|server| server.name.clone())
+        .flat_map(|server| {
+            // 🧭 JSON documents may carry hostnames in `names` while `name`
+            // stays the listener label; issuance must honor both shapes.
+            if server.names.is_empty() {
+                server.name.clone().into_iter().collect::<Vec<_>>()
+            } else {
+                server.names.clone()
+            }
+        })
         .filter(|name| !name.is_empty() && name != "_" && !name.contains('*'))
         .collect()
 }
@@ -2447,12 +2455,24 @@ mod tests {
             tls: None,
             ..Default::default()
         };
-
-        let config = pingclair_core::config::PingclairConfig {
-            servers: vec![auto, internal, manual, wildcard, plain],
+        let json_shape = ServerConfig {
+            name: Some("default".to_string()),
+            names: vec!["json.example".to_string()],
+            tls: Some(TlsConfig {
+                auto: true,
+                ..Default::default()
+            }),
             ..Default::default()
         };
-        assert_eq!(eager_issuance_domains(&config), vec!["auto.example"]);
+
+        let config = pingclair_core::config::PingclairConfig {
+            servers: vec![auto, internal, manual, wildcard, plain, json_shape],
+            ..Default::default()
+        };
+        assert_eq!(
+            eager_issuance_domains(&config),
+            vec!["auto.example", "json.example"]
+        );
     }
 
     #[test]

@@ -882,9 +882,14 @@ fn caddy_handler_rank(handler: &Handler) -> usize {
         Handler::BasicAuth(_) => 3,
         Handler::RateLimit(_) | Handler::Cors(_) | Handler::AccessControl(_) => 4,
         Handler::Pipeline(_) | Handler::Handle(_) => 5,
-        Handler::Respond(_) => 6,
+        // 🧭 Caddy's directive order runs `respond` before `reverse_proxy`
+        // before `file_server`, and the first terminal handler wins. The
+        // runtime pipeline lets a later handler override the body, so the
+        // pipeline order must be the reverse of Caddy's priority: file_server
+        // first, proxy next, respond last.
+        Handler::FileServer(_) => 6,
         Handler::Proxy(_) => 7,
-        Handler::FileServer(_) => 8,
+        Handler::Respond(_) => 8,
         Handler::Plugin { .. } => 9,
     }
 }
@@ -4215,7 +4220,26 @@ mod address_semantics_tests {
         let server = first_server("example.com {\n    file_server ./public\n}");
         assert!(
             server.listen.is_empty(),
-            "a bare hostname without TLS must leave the listener to the runtime"
+            "a bare hostname must leave the listener to the runtime"
+        );
+        assert!(
+            server.tls.is_some(),
+            "a bare hostname must default to automatic HTTPS like Caddy"
+        );
+        assert!(
+            server.tls.as_ref().unwrap().auto,
+            "the default must be `tls auto`, not internal"
+        );
+    }
+
+    #[test]
+    fn auto_https_off_keeps_bare_hostname_plaintext() {
+        let config =
+            compile("{\n    auto_https off\n}\nexample.com {\n    file_server ./public\n}")
+                .expect("compiles");
+        assert!(
+            config.servers[0].tls.is_none(),
+            "auto_https off must suppress the automatic TLS default"
         );
     }
 
@@ -4615,6 +4639,33 @@ mod directive_order_tests {
             }
             other => panic!("expected pipeline, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn terminal_handlers_run_in_reverse_caddy_priority() {
+        // 🧭 Caddy: reverse_proxy beats file_server; respond beats both. The
+        // pipeline lets the later handler override the body, so the order
+        // must be the reverse of Caddy's priority.
+        let proxy_first =
+            compile("example.com {\n    reverse_proxy 127.0.0.1:9005\n    file_server\n}")
+                .expect("compile");
+        let HandlerConfig::Pipeline { handlers } = &proxy_first.servers[0].routes[0].handler else {
+            panic!("expected a pipeline");
+        };
+        assert!(
+            matches!(handlers[0], HandlerConfig::FileServer { .. }),
+            "file_server must run first so reverse_proxy wins, got {handlers:?}"
+        );
+        assert!(matches!(handlers[1], HandlerConfig::ReverseProxy(_)));
+
+        let respond_last =
+            compile("example.com {\n    respond \"x\"\n    file_server\n}").expect("compile");
+        let HandlerConfig::Pipeline { handlers } = &respond_last.servers[0].routes[0].handler
+        else {
+            panic!("expected a pipeline");
+        };
+        assert!(matches!(handlers[0], HandlerConfig::FileServer { .. }));
+        assert!(matches!(handlers[1], HandlerConfig::Respond { .. }));
     }
 
     #[test]
