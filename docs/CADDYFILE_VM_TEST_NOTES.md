@@ -718,6 +718,25 @@ bcrypt cost 14，輸出 `$2a$14$`（Caddy）與 `$2b$14$`（Pingclair），
   （wildcard listen 雙棧，IPv4/IPv6 同時 200）；FX-G（本 commit）：
   completion/environ/list-modules/build-info/manpage/storage export|import/
   trust|untrust（F-12）。
+
+## 最終整體對比測試（2026-08-02，香港機）
+
+Caddy v2.11.4 vs 修復後 Pingclair（`360e21c`）在同一台機器對跑核心場景：
+
+| 場景 | Caddy | Pingclair | 判定 |
+| --- | --- | --- | --- |
+| localhost HTTPS + `http://` 308 | ✅ | ✅ | 一致 |
+| `templates` 渲染 caddy.html | ✅ | ✅ | 一致（minor：MST 顯示 `UTC` vs `+00:00`） |
+| file_server charset | `text/html; charset=utf-8` | 同 | 一致 |
+| `reverse_proxy /api/*` matcher | proxy/file 分流 | 同 | 一致 |
+| 無 matcher proxy vs file_server | proxy 勝 | proxy 勝 | 一致 |
+| SIGUSR1 reload | v2-caddy | v2-pingclair | 一致 |
+| `version`／hash-password | v2.11.4／bcrypt | v0.1.7／bcrypt+argon2id | 預期差異 |
+| 真域名 production ACME | `caddy-test.aqeo.dev` 200 | `pingclair-test.aqeo.dev` 200（先前） | 一致 |
+
+結論：九組測試發現的 P1/P2 修復後，Pingclair 的核心使用路徑（HTTPS、
+代理、靜態檔、模板、API、reload、CLI、signals、真域名簽發）與 Caddy
+行為一致。剩餘 minor：`date "MST"` 時區縮寫格式、fmt 保留引號（v0.3）。
 - 未修 P1 清單：F-02（`/load` 不能開新 listener）、F-07（非 root 無
   TLS store 無法啟動）、F-10（`/load` 累加更新非整包替換）、F-14
   （reload 換 handler/browse 不生效）、F-20（`reverse_proxy :9000`
