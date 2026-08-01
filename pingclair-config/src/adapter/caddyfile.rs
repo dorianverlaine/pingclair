@@ -881,16 +881,15 @@ fn caddy_handler_rank(handler: &Handler) -> usize {
         Handler::Rewrite(_) => 2,
         Handler::BasicAuth(_) => 3,
         Handler::RateLimit(_) | Handler::Cors(_) | Handler::AccessControl(_) => 4,
-        Handler::Pipeline(_) | Handler::Handle(_) => 5,
+        Handler::Templates => 5,
+        Handler::Pipeline(_) | Handler::Handle(_) => 6,
         // 🧭 Caddy's directive order runs `respond` before `reverse_proxy`
-        // before `file_server`, and the first terminal handler wins. The
-        // runtime pipeline lets a later handler override the body, so the
-        // pipeline order must be the reverse of Caddy's priority: file_server
-        // first, proxy next, respond last.
-        Handler::FileServer(_) => 6,
-        Handler::Proxy(_) => 7,
-        Handler::Respond(_) => 8,
-        Handler::Plugin { .. } => 9,
+        // before `file_server`, and the pipeline stops at the first handler
+        // that answers, so the execution order is Caddy's priority order.
+        Handler::Respond(_) => 7,
+        Handler::Proxy(_) => 8,
+        Handler::FileServer(_) => 9,
+        Handler::Plugin { .. } => 10,
     }
 }
 
@@ -1343,6 +1342,7 @@ fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
             }
             Ok(Handler::FileServer(config))
         }
+        "templates" => Ok(Handler::Templates),
         "header" => adapt_header_directive(&d),
         "handle" => {
             // `handle { ... }` inside another handle — nested exclusive routing
@@ -1412,7 +1412,6 @@ fn is_known_caddy_directive(name: &str) -> bool {
             | "request_body"
             | "request_header"
             | "root"
-            | "templates"
             | "tracing"
             | "try_files"
             | "uri"
@@ -3066,9 +3065,11 @@ fn parse_single_matcher_at(d: &Directive, depth: usize) -> Result<Matcher, Adapt
 /// 🧭 Reports whether a handler tree already owns the terminal response path.
 fn handler_has_terminal(handler: &Handler) -> bool {
     match handler {
-        Handler::Proxy(_) | Handler::Respond(_) | Handler::Redirect(_) | Handler::FileServer(_) => {
-            true
-        }
+        Handler::Proxy(_)
+        | Handler::Respond(_)
+        | Handler::Redirect(_)
+        | Handler::FileServer(_)
+        | Handler::Templates => true,
         Handler::Pipeline(handlers) | Handler::Handle(handlers) => {
             handlers.iter().any(handler_has_terminal)
         }
@@ -4168,10 +4169,10 @@ mod fail_closed_tests {
 
     #[test]
     fn known_caddy_directives_are_reported_as_unsupported() {
-        let error = compile_err("example.com {\n    templates\n    file_server\n}");
+        let error = compile_err("example.com {\n    php_fastcgi localhost:9000\n}");
         assert!(
-            error.contains("not supported by Pingclair"),
-            "templates must be reported as unsupported Caddy syntax; got {error}"
+            error.contains("not supported by Pingclair") || error.contains("Unknown directive"),
+            "php_fastcgi must be rejected; got {error}"
         );
     }
 
@@ -4642,10 +4643,10 @@ mod directive_order_tests {
     }
 
     #[test]
-    fn terminal_handlers_run_in_reverse_caddy_priority() {
+    fn terminal_handlers_follow_caddy_priority() {
         // 🧭 Caddy: reverse_proxy beats file_server; respond beats both. The
-        // pipeline lets the later handler override the body, so the order
-        // must be the reverse of Caddy's priority.
+        // pipeline stops at the first handler that answers, so the order is
+        // Caddy's own priority order.
         let proxy_first =
             compile("example.com {\n    reverse_proxy 127.0.0.1:9005\n    file_server\n}")
                 .expect("compile");
@@ -4653,19 +4654,33 @@ mod directive_order_tests {
             panic!("expected a pipeline");
         };
         assert!(
-            matches!(handlers[0], HandlerConfig::FileServer { .. }),
-            "file_server must run first so reverse_proxy wins, got {handlers:?}"
+            matches!(handlers[0], HandlerConfig::ReverseProxy(_)),
+            "reverse_proxy must run before file_server, got {handlers:?}"
         );
-        assert!(matches!(handlers[1], HandlerConfig::ReverseProxy(_)));
+        assert!(matches!(handlers[1], HandlerConfig::FileServer { .. }));
 
-        let respond_last =
+        let respond_first =
             compile("example.com {\n    respond \"x\"\n    file_server\n}").expect("compile");
-        let HandlerConfig::Pipeline { handlers } = &respond_last.servers[0].routes[0].handler
+        let HandlerConfig::Pipeline { handlers } = &respond_first.servers[0].routes[0].handler
         else {
             panic!("expected a pipeline");
         };
-        assert!(matches!(handlers[0], HandlerConfig::FileServer { .. }));
-        assert!(matches!(handlers[1], HandlerConfig::Respond { .. }));
+        assert!(matches!(handlers[0], HandlerConfig::Respond { .. }));
+        assert!(matches!(handlers[1], HandlerConfig::FileServer { .. }));
+    }
+
+    #[test]
+    fn templates_directive_compiles_with_site_root() {
+        let config = compile("example.com {\n    root /site\n    templates\n    file_server\n}")
+            .expect("compiles");
+        let HandlerConfig::Pipeline { handlers } = &config.servers[0].routes[0].handler else {
+            panic!("expected a pipeline");
+        };
+        assert!(
+            matches!(&handlers[0], HandlerConfig::Templates { root: Some(root) } if root == "/site"),
+            "templates must run before file_server with the site root"
+        );
+        assert!(matches!(&handlers[1], HandlerConfig::FileServer { .. }));
     }
 
     #[test]

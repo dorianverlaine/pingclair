@@ -442,6 +442,9 @@ pub enum Handler {
     /// File server (future)
     FileServer(FileServerConfig),
 
+    /// Caddy-compatible template rendering
+    Templates,
+
     /// Exclusive routing group
     Handle(Vec<Handler>),
 

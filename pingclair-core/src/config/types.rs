@@ -603,6 +603,13 @@ pub enum HandlerConfig {
         compress: bool,
     },
 
+    /// Caddy-compatible template rendering (`{{now | date "..."}}`)
+    Templates {
+        /// Site root used to resolve `include` paths.
+        #[serde(default)]
+        root: Option<String>,
+    },
+
     /// Reverse proxy
     ReverseProxy(ReverseProxyConfig),
 
