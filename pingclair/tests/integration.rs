@@ -3413,6 +3413,78 @@ fn cli_hash_password_argon2id() {
     );
 }
 
+/// 🧪 FX-G CLI surface: completion/environ/list-modules/build-info/manpage/
+/// storage.
+#[test]
+fn test_cli_surface_commands() {
+    use std::process::Command;
+
+    let bin = env!("CARGO_BIN_EXE_pingclair");
+
+    let completion = Command::new(bin)
+        .args(["completion", "bash"])
+        .output()
+        .unwrap();
+    assert!(completion.status.success());
+    assert!(!completion.stdout.is_empty(), "completion script is empty");
+
+    let environ = Command::new(bin).args(["environ"]).output().unwrap();
+    assert!(environ.status.success());
+    assert!(String::from_utf8_lossy(&environ.stdout).contains("PATH="));
+
+    let modules = Command::new(bin).args(["list-modules"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&modules.stdout).contains("http.handlers.respond"));
+    let modules_json = Command::new(bin)
+        .args(["list-modules", "--json"])
+        .output()
+        .unwrap();
+    let modules_value: serde_json::Value = serde_json::from_slice(&modules_json.stdout).unwrap();
+    assert!(modules_value["modules"].as_array().unwrap().len() >= 5);
+
+    let build = Command::new(bin).args(["build-info"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&build.stdout).contains("pingclair"));
+
+    let man_dir = tempfile::tempdir().unwrap();
+    let man = Command::new(bin)
+        .args(["manpage", "-d", man_dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        man.status.success(),
+        "{}",
+        String::from_utf8_lossy(&man.stderr)
+    );
+    assert!(man_dir.path().join("pingclair.1").is_file());
+
+    let tls = tempfile::tempdir().unwrap();
+    let store = tls.path().join("store");
+    std::fs::create_dir_all(store.join("internal")).unwrap();
+    std::fs::write(store.join("internal/root.crt"), "fake-root").unwrap();
+    let out = tls.path().join("store.tar");
+    let export = Command::new(bin)
+        .args(["storage-export", "-o", out.to_str().unwrap()])
+        .env("PINGCLAIR_TLS_STORE", &store)
+        .output()
+        .unwrap();
+    assert!(
+        export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let store2 = tls.path().join("store2");
+    let import = Command::new(bin)
+        .args(["storage-import", "-i", out.to_str().unwrap()])
+        .env("PINGCLAIR_TLS_STORE", &store2)
+        .output()
+        .unwrap();
+    assert!(
+        import.status.success(),
+        "{}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+    assert!(store2.join("pingclair/internal/root.crt").is_file());
+}
+
 /// 🧪 `pingclair respond` serves a hard-coded response like `caddy respond`.
 #[tokio::test]
 async fn test_cli_respond_serves_body() {

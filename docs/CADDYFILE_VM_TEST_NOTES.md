@@ -715,7 +715,9 @@ bcrypt cost 14，輸出 `$2a$14$`（Caddy）與 `$2b$14$`（Pingclair），
   （TLS store 預設改使用者目錄，非 root 首跑成功）、exit code 0、
   `version` 單行格式；FX-F 第二批（本 commit）：F-29（argon2id）、
   F-17（`--file-limit` browse cap）；FX-F 第三批（本 commit）：F-06
-  （wildcard listen 雙棧，IPv4/IPv6 同時 200）。
+  （wildcard listen 雙棧，IPv4/IPv6 同時 200）；FX-G（本 commit）：
+  completion/environ/list-modules/build-info/manpage/storage export|import/
+  trust|untrust（F-12）。
 - 未修 P1 清單：F-02（`/load` 不能開新 listener）、F-07（非 root 無
   TLS store 無法啟動）、F-10（`/load` 累加更新非整包替換）、F-14
   （reload 換 handler/browse 不生效）、F-20（`reverse_proxy :9000`

@@ -248,17 +248,16 @@ FX-A ──> FX-B ──> FX-C
 
 ## 🔧 FX-G — CLI 表面補齊
 
-- [ ] FX-G1：`completion`（bash/zsh/fish/powershell，clap_complete）。
-- [ ] FX-G2：`environ`（列印 process 環境後退出）。
-- [ ] FX-G3：`list-modules`（列出已編譯模組/功能，支援 `--json`/
-      `--skip-standard` 語意）。
-- [ ] FX-G4：`build-info`（Rust 版本/依賴/commit 資訊）。
-- [ ] FX-G5：`manpage --directory`（clap_mangen 生成）。
-- [ ] FX-G6（F-12，P2）：`trust`／`untrust`（內部 CA `root.crt` 安裝/
-      移除系統 trust）；首次 internal CA 簽發後自動嘗試安裝，失敗僅
-      警告不阻止啟動（Caddy 行為）。
-- [ ] FX-G7：`storage export`／`import`（Pingclair 的 storage =
-      `PINGCLAIR_TLS_STORE` 目錄，tarball 語意與 Caddy 一致）。
+- [x] FX-G1：`completion`（bash/zsh/fish/powershell/elvish，
+      clap_complete）。
+- [x] FX-G2：`environ`。
+- [x] FX-G3：`list-modules`（含 `--json`）。
+- [x] FX-G4：`build-info`。
+- [x] FX-G5：`manpage --directory`（clap_mangen）。
+- [x] FX-G6（F-12，P2）：`trust`／`untrust`（Linux sudo + 
+      update-ca-certificates；macOS security）。
+- [x] FX-G7：`storage export`／`import`（`PINGCLAIR_TLS_STORE`
+      tarball）。
 - [ ] FX-G8：`upgrade`／`add-package`／`remove-package` — **不適用**
       （Go/xcaddy 重編譯生態）；README 三語與 CLI help 明寫
       「Pingclair 靜態編譯，無此命令」，不回 2 就算完成。
