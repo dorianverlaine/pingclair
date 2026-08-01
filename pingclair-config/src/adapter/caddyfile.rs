@@ -748,25 +748,27 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                     // Try to extract matcher and adapt as handler
                     let (matcher, _) = parse_matcher_and_block(&sub_d)?;
                     let mut handler_d = sub_d.clone();
-                    // 🔁 Caddy's `redir /old.html /new.html` and
-                    // `rewrite /old /new` carry an inline path matcher whose
-                    // first argument does not end in `*`. Detect that shape so
-                    // official examples compile.
-                    let inline_path_matcher = if handler_d.name == "redir"
-                        || handler_d.name == "redirect"
-                        || handler_d.name == "rewrite"
-                    {
-                        if handler_d.name == "rewrite" {
-                            handler_d.args.len() >= 2 && handler_d.args[0].starts_with('/')
-                        } else {
+                    // 🔁 Caddy's `redir /old.html /new.html`,
+                    // `rewrite /old /new` and `reverse_proxy /ws
+                    // 127.0.0.1:9001` all carry an inline path matcher in
+                    // their first argument even when it does not end in
+                    // `*`. Detect that shape so official examples compile
+                    // and a bare path never becomes an upstream address.
+                    let inline_path_matcher = match handler_d.name.as_str() {
+                        "redir" | "redirect" => {
                             handler_d.args.len() >= 2
                                 && handler_d.args[0].starts_with('/')
                                 && (handler_d.args[1].starts_with('/')
                                     || handler_d.args[1].contains("://"))
                                 && !handler_d.args[1].parse::<u16>().is_ok()
                         }
-                    } else {
-                        false
+                        "rewrite" => {
+                            handler_d.args.len() >= 2 && handler_d.args[0].starts_with('/')
+                        }
+                        "reverse_proxy" => {
+                            handler_d.args.first().is_some_and(|a| a.starts_with('/'))
+                        }
+                        _ => false,
                     };
                     if inline_path_matcher {
                         let path = handler_d.args.remove(0);
@@ -776,6 +778,14 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                         let handler = adapt_handler(handler_d)?;
                         add_route(&mut server, Some(route_matcher), handler);
                         continue;
+                    }
+                    // 🌐 Caddy's `*` matcher token matches every request and
+                    // exists only to disambiguate data arguments from path
+                    // matchers; it must never reach an upstream list.
+                    let wildcard_matcher = handler_d.name == "reverse_proxy"
+                        && handler_d.args.first().is_some_and(|a| a == "*");
+                    if wildcard_matcher {
+                        handler_d.args.remove(0);
                     }
                     if matcher.is_some() {
                         if handler_d.args.is_empty() {
@@ -1698,6 +1708,21 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
     for arg in &d.args {
         if arg.starts_with('@') {
             continue;
+        }
+        // 🧭 A leading `/` in the argument list is a path matcher token in
+        // Caddy (`reverse_proxy /ws 127.0.0.1:9001`), never an upstream
+        // address. Site-level adaptation strips it before this function
+        // runs; a token that still reaches here (for example inside a
+        // `route`/`handle` block) must fail load instead of becoming a
+        // hostname that can never dial.
+        if arg.starts_with('/') {
+            return Err(AdapterError::UnsupportedFeature(
+                "reverse_proxy".into(),
+                format!(
+                    "`{arg}` is an inline path matcher; matcher tokens inside \
+                     route/handle blocks are not implemented yet"
+                ),
+            ));
         }
         // 🚫 A Unix-socket upstream (`unix//run/php.sock`) used to compile
         // into a bogus hostname that could never dial. Refuse it here instead
@@ -3229,6 +3254,98 @@ mod global_tests {
         }
     }
 
+    #[test]
+    fn reverse_proxy_bare_path_is_a_matcher_not_an_upstream() {
+        // 🧭 Caddy treats any leading `/` in the matcher position as a path
+        // matcher: `/ws` proxies exactly that path (exact match, no `*`),
+        // while every other request falls through to the file server.
+        let routes = compiled_routes(
+            r#"
+            example.com {
+                reverse_proxy /ws 127.0.0.1:9001
+                file_server /var/www/html
+            }
+        "#,
+        );
+
+        let proxy = routes
+            .iter()
+            .find(|r| {
+                matches!(
+                    &r.handler,
+                    pingclair_core::config::HandlerConfig::ReverseProxy(_)
+                )
+            })
+            .expect("proxy route should exist");
+        assert_eq!(proxy.path, "/ws", "bare /ws must scope the proxy route");
+        match &proxy.handler {
+            pingclair_core::config::HandlerConfig::ReverseProxy(proxy) => {
+                assert_eq!(proxy.upstreams, vec!["127.0.0.1:9001".to_string()]);
+            }
+            other => panic!("expected a proxy handler, got {other:?}"),
+        }
+
+        let fs = routes
+            .iter()
+            .find(|r| {
+                matches!(
+                    &r.handler,
+                    pingclair_core::config::HandlerConfig::FileServer { .. }
+                )
+            })
+            .expect("file server route should exist");
+        assert_eq!(
+            fs.path, "/*",
+            "file_server /var/www/html stays the catch-all"
+        );
+    }
+
+    #[test]
+    fn reverse_proxy_bare_path_matcher_works_with_to_block() {
+        let routes = compiled_routes(
+            r#"
+            example.com {
+                reverse_proxy /ws {
+                    to 127.0.0.1:9001
+                }
+            }
+        "#,
+        );
+        assert_eq!(routes.len(), 1, "only the /ws route should be emitted");
+        assert_eq!(routes[0].path, "/ws");
+        match &routes[0].handler {
+            pingclair_core::config::HandlerConfig::ReverseProxy(proxy) => {
+                assert_eq!(proxy.upstreams, vec!["127.0.0.1:9001".to_string()]);
+            }
+            other => panic!("expected a proxy handler, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reverse_proxy_wildcard_token_stays_a_matcher() {
+        // 🌐 `reverse_proxy * 127.0.0.1:9000` is Caddy's explicit spelling
+        // of the default matcher; the `*` must not be dialed as an upstream.
+        let routes = compiled_routes(
+            r#"
+            example.com {
+                reverse_proxy * 127.0.0.1:9000
+            }
+        "#,
+        );
+        assert_eq!(
+            routes.len(),
+            1,
+            "only the catch-all route should be emitted"
+        );
+        assert_eq!(routes[0].path, "/*");
+        match &routes[0].handler {
+            pingclair_core::config::HandlerConfig::ReverseProxy(proxy) => {
+                assert_eq!(proxy.upstreams, vec!["127.0.0.1:9000".to_string()]);
+            }
+            other => panic!("expected a proxy handler, got {other:?}"),
+        }
+    }
+
     /// 🧪 Adapts one `reverse_proxy` source and returns its proxy handler.
     fn proxy_from(source: &str) -> ProxyConfig {
         let directives = parse(source).expect("parses");
@@ -4048,6 +4165,21 @@ mod fail_closed_tests {
         assert!(
             error.contains("Unix-socket"),
             "unix// upstream must be refused with a clear message; got {error}"
+        );
+    }
+
+    #[test]
+    fn reverse_proxy_path_matcher_inside_handle_fails_closed() {
+        let error = compile_err(
+            r#"example.com {
+                handle /ws {
+                    reverse_proxy /ws 127.0.0.1:9001
+                }
+            }"#,
+        );
+        assert!(
+            error.contains("inline path matcher"),
+            "a matcher token inside handle must fail closed, got: {error}"
         );
     }
 
