@@ -9,4 +9,4 @@ mod auth;
 mod config_tree;
 pub mod server;
 
-pub use server::run_admin_server;
+pub use server::{AdminServerOptions, run_admin_server};

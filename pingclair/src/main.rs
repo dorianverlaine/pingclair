@@ -1200,6 +1200,58 @@ impl pingclair_proxy::server::DynamicListeners for RuntimeListeners {
     }
 }
 
+/// 🧭 Maps every server (and its automatic HTTP companion) to the concrete
+/// bind addresses it serves, exactly like the startup listener derivation.
+///
+/// Reload used to key on `listen.first()` alone, which put a hostname site
+/// on `0.0.0.0:80` and never touched the TLS listener that actually served
+/// it — the reload reported success while behavior stayed frozen.
+fn servers_by_bind_address(
+    config: &pingclair_core::config::PingclairConfig,
+) -> HashMap<String, Vec<pingclair_core::config::ServerConfig>> {
+    let http_port = config.global.http_port;
+    let https_port = config.global.https_port;
+    let mut by_port: HashMap<String, Vec<pingclair_core::config::ServerConfig>> = HashMap::new();
+    for server in &config.servers {
+        let addrs: Vec<String> = if server.listen.is_empty() {
+            let host = server
+                .bind
+                .as_deref()
+                .filter(|host| !host.is_empty())
+                .unwrap_or("0.0.0.0");
+            let port = if server.tls.is_some() {
+                https_port
+            } else {
+                http_port
+            };
+            vec![format!("{host}:{port}")]
+        } else {
+            server
+                .listen
+                .iter()
+                .map(|addr| normalize_listen_addr(addr))
+                .collect()
+        };
+        for addr in &addrs {
+            by_port
+                .entry(addr.clone())
+                .or_default()
+                .push(server.clone());
+        }
+        if let Some(companion) = automatic_http_companion(
+            server,
+            config.global.auto_https.clone(),
+            &addrs,
+            http_port,
+            https_port,
+        ) {
+            let addr = format!("0.0.0.0:{http_port}");
+            by_port.entry(addr).or_default().push(companion);
+        }
+    }
+    by_port
+}
+
 fn run_server(
     config_path: String,
     config: pingclair_core::config::PingclairConfig,
@@ -1449,7 +1501,7 @@ fn run_server(
         pingclair_proxy::proxy_protocol::parse_networks(&config.global.blocked_ips)?;
 
     // Track binding information for diagnostic logging
-    let mut binding_info = std::collections::HashMap::new();
+    let mut binding_info: HashMap<String, Vec<String>> = HashMap::new();
     let mut tls_listeners = HashSet::new();
 
     // 🔎 Probed once, before any listener is registered: whether an automatic
@@ -1536,7 +1588,7 @@ fn run_server(
                 .unwrap_or_else(|| "default".to_string());
             binding_info
                 .entry(addr.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(site_name);
 
             proxy.add_server(server_config.clone());
@@ -1552,13 +1604,10 @@ fn run_server(
                     proxy_protocol_addresses.contains(&addr),
                 )
             });
-            binding_info
-                .entry(addr)
-                .or_insert_with(Vec::new)
-                .push(format!(
-                    "{} (automatic HTTP)",
-                    companion.name.as_deref().unwrap_or("default")
-                ));
+            binding_info.entry(addr).or_default().push(format!(
+                "{} (automatic HTTP)",
+                companion.name.as_deref().unwrap_or("default")
+            ));
             proxy.add_server(companion);
         }
     }
@@ -1746,6 +1795,9 @@ fn run_server(
 
     // 🛑 `POST /stop` notifies this; the shutdown task treats it like SIGTERM.
     let admin_shutdown = Arc::new(tokio::sync::Notify::new());
+    // 🚫 Caddy disables SIGUSR1 reloads once the Admin API has changed the
+    // config; this flag records that transition.
+    let api_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // 🧭 `/load` can create listeners at runtime; the manager is handed to
     // the admin server so a document naming a new address is honored.
     let dynamic_listeners: Arc<dyn pingclair_proxy::server::DynamicListeners> =
@@ -1778,22 +1830,23 @@ fn run_server(
             serde_json::to_value(config.clone())
                 .unwrap_or_else(|_| serde_json::Value::Object(Default::default())),
         ));
+        let dynamic_listeners_for_admin = dynamic_listeners.clone();
+        let api_changed_for_admin = api_changed.clone();
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create admin runtime");
             rt.block_on(async {
                 let addr = listen.parse().expect("Invalid admin listen address");
-                if let Err(e) = pingclair_api::run_admin_server(
-                    addr,
+                let options = pingclair_api::AdminServerOptions {
                     proxies,
                     document,
-                    shutdown_for_admin,
-                    Some(autosave),
-                    Some(dynamic_listeners.clone()),
+                    shutdown: shutdown_for_admin,
+                    autosave: Some(autosave),
+                    listeners: Some(dynamic_listeners_for_admin),
+                    api_changed: api_changed_for_admin,
                     api_key,
-                )
-                .await
-                {
+                };
+                if let Err(e) = pingclair_api::run_admin_server(addr, options).await {
                     tracing::error!("Admin server error: {}", e);
                 }
             });
@@ -1801,12 +1854,14 @@ fn run_server(
     }
 
     // ========================================
-    // 🔔 Signal Handling for SIGHUP/SIGUSR1 (Reload)
+    // 🔔 Signal Handling for SIGUSR1 (Reload)
     // ========================================
     #[cfg(unix)]
     if !config_path.is_empty() {
         let config_path = config_path.clone();
         let port_proxies = port_proxies.clone();
+        let dynamic_listeners_for_reload = dynamic_listeners.clone();
+        let api_changed_for_reload = api_changed.clone();
         // 🧭 Snapshot the global settings the process started with, so a
         // reload that changes them can say so instead of silently ignoring
         // the difference.
@@ -1815,15 +1870,17 @@ fn run_server(
         bg_handle.spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
 
-            let mut hup_stream = match signal(SignalKind::hangup()) {
+            // 🚦 SIGUSR1 is Caddy's reload signal; SIGHUP is deliberately
+            // ignored, matching Caddy's signal table.
+            // 🙈 Claiming the stream registers the handler, so the default
+            // terminate-on-SIGHUP action never fires; the signal is dropped.
+            let mut _hup_ignored = match signal(SignalKind::hangup()) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("❌ Failed to create SIGHUP listener: {}", e);
                     return;
                 }
             };
-            // 🚦 SIGUSR1 is Caddy's reload signal; keep SIGHUP working for
-            // deployments that already use it.
             let mut usr1_stream = match signal(SignalKind::user_defined1()) {
                 Ok(s) => s,
                 Err(e) => {
@@ -1832,13 +1889,19 @@ fn run_server(
                 }
             };
 
-            tracing::info!("📡 Reload listeners active (SIGHUP/SIGUSR1, Config: {})", config_path);
+            tracing::info!("📡 Reload listener active (SIGUSR1, Config: {})", config_path);
 
             loop {
                 let signal_name = tokio::select! {
-                    _ = hup_stream.recv() => "SIGHUP",
                     _ = usr1_stream.recv() => "SIGUSR1",
                 };
+                if api_changed_for_reload.load(std::sync::atomic::Ordering::SeqCst) {
+                    tracing::warn!(
+                        "🚫 SIGUSR1 reload disabled: the configuration was changed through \
+                         the Admin API after startup (Caddy semantics)"
+                    );
+                    continue;
+                }
                 let reload_start = std::time::Instant::now();
                 tracing::info!("🔔 Received {signal_name}, reloading configuration from: {}", config_path);
                 // 🛑 Let the new configuration start its own ACME transactions
@@ -1873,40 +1936,57 @@ fn run_server(
                         tracing::info!("✅ Step 1/3: Configuration validation successful");
                         tracing::info!("📋 Step 2/3: Preparing configuration update...");
 
-                        let mut new_config_by_port = std::collections::HashMap::new();
-                        for s in new_config.servers {
-                            let addr = s.listen.first().map(|a| normalize_listen_addr(a)).unwrap_or_else(|| "0.0.0.0:80".to_string());
-                            new_config_by_port.entry(addr).or_insert_with(Vec::new).push(s);
-                        }
+                        // 🧭 Derive every bind address the same way startup
+                        // does (including the automatic HTTP companion), so a
+                        // hostname site updates its TLS listener and not just
+                        // a phantom `:80` entry.
+                        let new_config_by_port = servers_by_bind_address(&new_config);
 
                         tracing::info!("📋 Step 3/3: Applying configuration to {} port(s)...", new_config_by_port.len());
-
-                        // Use read lock to get existing proxies (safe because we only read)
-                        let proxies_guard = port_proxies.read();
                         let mut success_count = 0;
-                        let mut error_count = 0;
+                        let mut warnings: Vec<String> = Vec::new();
 
                         for (addr, servers) in new_config_by_port {
-                            if let Some(proxy) = proxies_guard.get(&addr) {
+                            let proxy = port_proxies.read().get(&addr).cloned();
+                            if let Some(proxy) = proxy {
                                 proxy.update_config(servers);
                                 success_count += 1;
                                 tracing::debug!("   ✓ Updated configuration for {}", addr);
                             } else {
-                                tracing::warn!("⚠️ New listen address {} found in config during reload. Restart required for new ports.", addr);
-                                error_count += 1;
+                                // 🧭 Caddy's reload applies new listeners too;
+                                // the runtime listener manager makes that true
+                                // here instead of demanding a restart.
+                                match dynamic_listeners_for_reload.start_listener(&addr, &servers[0]) {
+                                    Ok(()) => {
+                                        for extra in &servers[1..] {
+                                            if let Some(proxy) =
+                                                port_proxies.read().get(&addr)
+                                            {
+                                                proxy.add_server(extra.clone());
+                                            }
+                                        }
+                                        success_count += 1;
+                                    }
+                                    Err(error) => {
+                                        warnings.push(format!("{addr}: {error}"));
+                                    }
+                                }
                             }
                         }
 
                         let reload_duration = reload_start.elapsed();
 
-                        if error_count == 0 {
+                        if warnings.is_empty() {
                             tracing::info!("✅ Configuration reload completed successfully in {:?}", reload_duration);
                             tracing::info!("   📊 {} server(s) updated", success_count);
                             println!("✅ Configuration reloaded successfully ({success_count} servers updated in {reload_duration:?})");
                         } else {
+                            for warning in &warnings {
+                                tracing::warn!("⚠️ Reload listener warning: {warning}");
+                            }
                             tracing::warn!("⚠️ Configuration reload completed with warnings in {:?}", reload_duration);
-                            tracing::warn!("   📊 {} server(s) updated, {} warning(s)", success_count, error_count);
-                            println!("⚠️ Configuration partially reloaded ({success_count} servers updated, {error_count} warnings in {reload_duration:?})");
+                            tracing::warn!("   📊 {} server(s) updated, {} warning(s)", success_count, warnings.len());
+                            println!("⚠️ Configuration partially reloaded ({success_count} servers updated, {} warnings in {reload_duration:?})", warnings.len());
                         }
                     }
                     Err(e) => {
@@ -1963,6 +2043,13 @@ fn run_server(
                     std::process::exit(0);
                 }
             };
+            let mut sigquit = match signal(SignalKind::quit()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("❌ Failed to create SIGQUIT listener: {}", e);
+                    return;
+                }
+            };
 
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
@@ -1970,6 +2057,13 @@ fn run_server(
                 }
                 _ = sigterm.recv() => {
                     tracing::info!("🛑 Received SIGTERM, shutting down");
+                }
+                _ = sigquit.recv() => {
+                    // 🏃 Caddy exits immediately on SIGQUIT (code 2) after
+                    // cleaning storage locks; Pingora has no equivalent lock
+                    // step, so a prompt exit is the faithful behavior.
+                    tracing::info!("🏃 Received SIGQUIT, forced exit");
+                    std::process::exit(2);
                 }
                 _ = shutdown_for_task.notified() => {
                     tracing::info!("🛑 Admin API requested shutdown");

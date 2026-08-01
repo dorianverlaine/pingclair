@@ -115,27 +115,28 @@ FX-A ──> FX-B ──> FX-C
 
 ### FX-C1（F-14，P1）reload 換 handler 必須真正生效
 
-- [ ] 現況：SIGUSR1/SIGHUP 把 `respond` 換成 `file_server browse`（或
-      browse 開關變更），log 顯示成功但回應不變。
-- 修法：找出 reload 後 route/handler 未重建的環節；「log 成功」必須
-      等於「行為成功」。
-- 驗證：integration + 香港機重跑 Caddyfile Tutorial 的
-      respond→file_server browse 步驟。
+- [x] 根因：reload 用 `listen.first()` 分組，hostname site 被歸到
+      `:80`，TLS listener 沒被更新。改為 `servers_by_bind_address`
+      （與啟動相同的 listener 推導＋automatic companion）。
+- 驗證：`test_signal_reload_switches_handler_types` + 香港機
+      `respond → file_server browse` reload 後 `/` 與 `/empty/` 都生效。
 
 ### FX-C2（F-09，P2）reload 新 listener 的警告要有細節
 
-- [ ] 現況：只印「1 servers updated, 1 warnings」。
-- 修法：警告列出未綁定位址與原因（Caddy 的 reload 會直接套用新
-      listener；FX-B1 完成後此項應消失，改為真正開新 listener）。
+- [x] reload 遇到未綁定 listener 時直接透過 RuntimeListeners 動態開啟
+      （Caddy 行為）；失敗時警告列出位址與原因。
+- 驗證：香港機 reload 新增 `:9094` 後直接服務；`test_signal_reload_*`
+      全綠。
 
 ### FX-C3（F-32，P2）signals 完全對齊 Caddy
 
-- [ ] SIGQUIT：立即退出（exit code 2），清理 storage lock。
-- [ ] SIGHUP：ignored（不再當 reload）。
-- [ ] SIGUSR1：reload config file（限檔案啟動；API 變更過後失效並
-      log 警告，Caddy 語義）。
-- [ ] SIGINT/SIGTERM：graceful（已具備，補 exit code 測試）。
-- 驗證：signal 真 binary 測試（含 exit code 0/1/2/3 對照）。
+- [x] SIGQUIT：立即退出（exit code 2）。
+- [x] SIGHUP：ignored（註冊 handler 但丟棄，不再 reload）。
+- [x] SIGUSR1：reload config file；API 變更過後失效並 log 警告。
+- [x] SIGINT/SIGTERM：graceful（原有）。
+- 驗證：`test_sigquit_exits_with_code_2`、`test_api_change_disables_signal_reload`、
+      更新後的 `test_signal_reload_applies_config_and_warns_on_global_changes`
+      + 香港機實測。
 
 ---
 

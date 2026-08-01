@@ -8,6 +8,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -33,26 +34,42 @@ struct AdminState {
     shutdown: Arc<Notify>,
     autosave: Option<PathBuf>,
     listeners: Option<Arc<dyn pingclair_proxy::server::DynamicListeners>>,
+    api_changed: Arc<AtomicBool>,
     auth: Option<Arc<ApiKeyAuth>>,
+}
+
+/// 🧭 Everything the admin server needs beyond its socket address.
+pub struct AdminServerOptions {
+    pub proxies:
+        Arc<RwLock<std::collections::HashMap<String, pingclair_proxy::server::PingclairProxy>>>,
+    pub document: Arc<RwLock<Value>>,
+    pub shutdown: Arc<Notify>,
+    pub autosave: Option<PathBuf>,
+    pub listeners: Option<Arc<dyn pingclair_proxy::server::DynamicListeners>>,
+    pub api_changed: Arc<AtomicBool>,
+    pub api_key: Option<String>,
+}
+
+/// 🧭 Read-only context threaded through the config mutation helpers.
+struct ApplyContext<'a> {
+    document: &'a Arc<RwLock<Value>>,
+    proxies:
+        &'a Arc<RwLock<std::collections::HashMap<String, pingclair_proxy::server::PingclairProxy>>>,
+    autosave: Option<&'a Path>,
+    listeners: Option<&'a dyn pingclair_proxy::server::DynamicListeners>,
+    changed: &'a AtomicBool,
 }
 
 /// Run the admin server
 pub async fn run_admin_server(
     addr: SocketAddr,
-    proxies: Arc<
-        RwLock<std::collections::HashMap<String, pingclair_proxy::server::PingclairProxy>>,
-    >,
-    document: Arc<RwLock<Value>>,
-    shutdown: Arc<Notify>,
-    autosave: Option<PathBuf>,
-    listeners: Option<Arc<dyn pingclair_proxy::server::DynamicListeners>>,
-    api_key: Option<String>,
+    options: AdminServerOptions,
 ) -> pingclair_core::Result<()> {
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| pingclair_core::Error::Server(format!("Failed to bind admin API: {e}")))?;
 
-    let auth = api_key.map(|key| Arc::new(ApiKeyAuth::new(key)));
+    let auth = options.api_key.map(|key| Arc::new(ApiKeyAuth::new(key)));
     if auth.is_none() {
         tracing::warn!(
             "⚠️  Admin API is running WITHOUT authentication: no `api_key` configured. \
@@ -73,11 +90,12 @@ pub async fn run_admin_server(
 
         let io = TokioIo::new(stream);
         let state = Arc::new(AdminState {
-            proxies: proxies.clone(),
-            document: document.clone(),
-            shutdown: shutdown.clone(),
-            autosave: autosave.clone(),
-            listeners: listeners.clone(),
+            proxies: options.proxies.clone(),
+            document: options.document.clone(),
+            shutdown: options.shutdown.clone(),
+            autosave: options.autosave.clone(),
+            listeners: options.listeners.clone(),
+            api_changed: options.api_changed.clone(),
             auth: auth.clone(),
         });
 
@@ -121,7 +139,15 @@ async fn handle_request_inner(
     let shutdown = &state.shutdown;
     let autosave = state.autosave.as_deref();
     let listeners = state.listeners.as_deref();
+    let changed = state.api_changed.as_ref();
     let auth = state.auth.as_deref();
+    let ctx = ApplyContext {
+        document,
+        proxies,
+        autosave,
+        listeners,
+        changed,
+    };
     let authorization = req
         .headers()
         .get(hyper::header::AUTHORIZATION)
@@ -251,6 +277,7 @@ async fn handle_request_inner(
             let value = serde_json::to_value(&config).unwrap_or_default();
             match commit_document(&value, proxies, listeners) {
                 Ok(()) => {
+                    changed.store(true, Ordering::SeqCst);
                     *document.write() = value;
                     if let Some(path) = autosave {
                         autosave_document(document, path);
@@ -326,14 +353,7 @@ async fn handle_request_inner(
                 Ok(value) => value,
                 Err(error_response) => return Ok(error_response),
             };
-            apply_full_document(
-                document,
-                proxies,
-                value,
-                autosave,
-                listeners,
-            )
-            .await
+            apply_full_document(&ctx, value).await
         }
         (&Method::POST, path) if path.starts_with("/config/") => {
             // 🧭 POST traverses into the document: create or replace at the
@@ -342,132 +362,51 @@ async fn handle_request_inner(
                 Ok(value) => value,
                 Err(error_response) => return Ok(error_response),
             };
-            apply_config_traversal(
-                document,
-                proxies,
-                Method::POST,
-                path,
-                Some(value),
-                autosave,
-                listeners,
-            )
-            .await
+            apply_config_traversal(&ctx, Method::POST, path, Some(value)).await
         }
         (&Method::PUT, path) if path.starts_with("/config") => {
             let value = match read_json_body(req).await {
                 Ok(value) => value,
                 Err(error_response) => return Ok(error_response),
             };
-            apply_config_traversal(
-                document,
-                proxies,
-                Method::PUT,
-                path,
-                Some(value),
-                autosave,
-                listeners,
-            )
-            .await
+            apply_config_traversal(&ctx, Method::PUT, path, Some(value)).await
         }
         (&Method::PATCH, path) if path.starts_with("/config") => {
             let value = match read_json_body(req).await {
                 Ok(value) => value,
                 Err(error_response) => return Ok(error_response),
             };
-            apply_config_traversal(
-                document,
-                proxies,
-                Method::PATCH,
-                path,
-                Some(value),
-                autosave,
-                listeners,
-            )
-            .await
+            apply_config_traversal(&ctx, Method::PATCH, path, Some(value)).await
         }
         (&Method::DELETE, path) if path.starts_with("/config") => {
-            apply_config_traversal(
-                document,
-                proxies,
-                Method::DELETE,
-                path,
-                None,
-                autosave,
-                listeners,
-            )
-            .await
+            apply_config_traversal(&ctx, Method::DELETE, path, None).await
         }
         (&Method::GET, path) if path.starts_with("/id/") => {
-            apply_id_request(
-                document,
-                proxies,
-                Method::GET,
-                path,
-                None,
-                autosave,
-                listeners,
-            )
-            .await
+            apply_id_request(&ctx, Method::GET, path, None).await
         }
         (&Method::POST, path) if path.starts_with("/id/") => {
             let value = match read_json_body(req).await {
                 Ok(value) => value,
                 Err(error_response) => return Ok(error_response),
             };
-            apply_id_request(
-                document,
-                proxies,
-                Method::POST,
-                path,
-                Some(value),
-                autosave,
-                listeners,
-            )
-            .await
+            apply_id_request(&ctx, Method::POST, path, Some(value)).await
         }
         (&Method::PUT, path) if path.starts_with("/id/") => {
             let value = match read_json_body(req).await {
                 Ok(value) => value,
                 Err(error_response) => return Ok(error_response),
             };
-            apply_id_request(
-                document,
-                proxies,
-                Method::PUT,
-                path,
-                Some(value),
-                autosave,
-                listeners,
-            )
-            .await
+            apply_id_request(&ctx, Method::PUT, path, Some(value)).await
         }
         (&Method::PATCH, path) if path.starts_with("/id/") => {
             let value = match read_json_body(req).await {
                 Ok(value) => value,
                 Err(error_response) => return Ok(error_response),
             };
-            apply_id_request(
-                document,
-                proxies,
-                Method::PATCH,
-                path,
-                Some(value),
-                autosave,
-                listeners,
-            )
-            .await
+            apply_id_request(&ctx, Method::PATCH, path, Some(value)).await
         }
         (&Method::DELETE, path) if path.starts_with("/id/") => {
-            apply_id_request(
-                document,
-                proxies,
-                Method::DELETE,
-                path,
-                None,
-                autosave,
-                listeners,
-            )
-            .await
+            apply_id_request(&ctx, Method::DELETE, path, None).await
         }
         _ => Ok(response(StatusCode::NOT_FOUND, "Not Found")),
     }
@@ -498,19 +437,15 @@ async fn read_json_body(
 
 /// 📤 Applies a full replacement document and commits it as the active tree.
 async fn apply_full_document(
-    document: &Arc<RwLock<Value>>,
-    proxies: &Arc<
-        RwLock<std::collections::HashMap<String, pingclair_proxy::server::PingclairProxy>>,
-    >,
+    ctx: &ApplyContext<'_>,
     value: Value,
-    autosave: Option<&Path>,
-    listeners: Option<&dyn pingclair_proxy::server::DynamicListeners>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    match commit_document(&value, proxies, listeners) {
+    match commit_document(&value, ctx.proxies, ctx.listeners) {
         Ok(()) => {
-            *document.write() = value;
-            if let Some(path) = autosave {
-                autosave_document(document, path);
+            ctx.changed.store(true, Ordering::SeqCst);
+            *ctx.document.write() = value;
+            if let Some(path) = ctx.autosave {
+                autosave_document(ctx.document, path);
             }
             Ok(response(StatusCode::OK, "Config loaded"))
         }
@@ -533,36 +468,23 @@ fn normalize_config_segments(segments: Vec<String>) -> Vec<String> {
 /// the clone only when the whole document still parses, validates, and
 /// applies. A failed commit leaves the active tree untouched.
 async fn apply_config_traversal(
-    document: &Arc<RwLock<Value>>,
-    proxies: &Arc<
-        RwLock<std::collections::HashMap<String, pingclair_proxy::server::PingclairProxy>>,
-    >,
+    ctx: &ApplyContext<'_>,
     method: Method,
     path: &str,
     body: Option<Value>,
-    autosave: Option<&Path>,
-    listeners: Option<&dyn pingclair_proxy::server::DynamicListeners>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let raw = path.strip_prefix("/config").unwrap_or(path);
     let segments = normalize_config_segments(config_tree::segments_from_path(raw));
-    apply_segments(
-        document, proxies, method, segments, body, autosave, listeners,
-    )
-    .await
+    apply_segments(ctx, method, segments, body).await
 }
 
 /// 🏷️ Resolves `/id/<name>[/<tail...>]` to the tagged object's path and
 /// applies the requested method there, exactly like a traversal on that path.
 async fn apply_id_request(
-    document: &Arc<RwLock<Value>>,
-    proxies: &Arc<
-        RwLock<std::collections::HashMap<String, pingclair_proxy::server::PingclairProxy>>,
-    >,
+    ctx: &ApplyContext<'_>,
     method: Method,
     path: &str,
     body: Option<Value>,
-    autosave: Option<&Path>,
-    listeners: Option<&dyn pingclair_proxy::server::DynamicListeners>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let rest = &path["/id/".len()..];
     let mut parts = rest.splitn(2, '/');
@@ -575,7 +497,7 @@ async fn apply_id_request(
     let tail = parts.next().unwrap_or("");
 
     let base = {
-        let guard = document.read();
+        let guard = ctx.document.read();
         match config_tree::find_id_path(&guard, name) {
             Some(segments) => segments,
             None => {
@@ -589,7 +511,7 @@ async fn apply_id_request(
     let mut segments = base;
     segments.extend(config_tree::segments_from_path(tail));
     if method == Method::GET {
-        let guard = document.read();
+        let guard = ctx.document.read();
         return match config_tree::get(&guard, &segments) {
             Ok(node) => {
                 let json = serde_json::to_string_pretty(node).unwrap_or_default();
@@ -601,24 +523,16 @@ async fn apply_id_request(
             )),
         };
     }
-    apply_segments(
-        document, proxies, method, segments, body, autosave, listeners,
-    )
-    .await
+    apply_segments(ctx, method, segments, body).await
 }
 
 async fn apply_segments(
-    document: &Arc<RwLock<Value>>,
-    proxies: &Arc<
-        RwLock<std::collections::HashMap<String, pingclair_proxy::server::PingclairProxy>>,
-    >,
+    ctx: &ApplyContext<'_>,
     method: Method,
     mut segments: Vec<String>,
     body: Option<Value>,
-    autosave: Option<&Path>,
-    listeners: Option<&dyn pingclair_proxy::server::DynamicListeners>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let mut next = document.read().clone();
+    let mut next = ctx.document.read().clone();
     let expand = segments.last().is_some_and(|segment| segment == "...");
     if expand {
         segments.pop();
@@ -658,11 +572,12 @@ async fn apply_segments(
             StatusCode::BAD_REQUEST,
             &format!(r#"{{"error":"{}"}}"#, TreeError::Invalid(reason).message()),
         )),
-        Ok(()) => match commit_document(&next, proxies, listeners) {
+        Ok(()) => match commit_document(&next, ctx.proxies, ctx.listeners) {
             Ok(()) => {
-                *document.write() = next;
-                if let Some(path) = autosave {
-                    autosave_document(document, path);
+                ctx.changed.store(true, Ordering::SeqCst);
+                *ctx.document.write() = next;
+                if let Some(path) = ctx.autosave {
+                    autosave_document(ctx.document, path);
                 }
                 Ok(response(StatusCode::OK, "OK"))
             }
