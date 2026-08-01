@@ -1777,6 +1777,13 @@ async fn handle_request_inner(
                 .serve_auto(effective_path, range_header, accept_encoding)
                 .await
             {
+                Ok(Some(ServedResponse::Redirect(location))) => {
+                    let mut hdrs = vec![quiche::h3::Header::new(b":status", b"308")];
+                    hdrs.push(quiche::h3::Header::new(b"location", location.as_bytes()));
+                    apply_h3_response_policy(&mut hdrs, response_policy, request_id, Some(&state));
+                    send_headers(resp_tx, stream_id, hdrs, true).await;
+                    Ok(())
+                }
                 Ok(Some(ServedResponse::Stream(mut stream))) => {
                     let mut hdrs = vec![
                         quiche::h3::Header::new(b":status", b"200"),

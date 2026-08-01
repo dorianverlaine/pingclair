@@ -2774,6 +2774,81 @@ async fn test_hostname_tls_site_derives_https_and_http_companion() {
     );
 }
 
+/// 🔁 The file server canonicalizes trailing slashes like Caddy: a directory
+/// request without one gets a 308 adding it, and a file request with one gets
+/// a 308 removing it.
+#[tokio::test]
+async fn test_file_server_trailing_slash_redirects() {
+    // 📄 Fixture: one directory and one file under a temp root.
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let dir_path = tmp_dir.path().join("folder");
+    std::fs::create_dir(&dir_path).unwrap();
+    std::fs::write(dir_path.join("index.html"), "folder index").unwrap();
+    std::fs::write(tmp_dir.path().join("plain.txt"), "plain file").unwrap();
+    let root_path = tmp_dir.path().to_str().unwrap().replace("\\", "/");
+
+    let config = format!(
+        r#"{{
+        "servers": [
+            {{
+                "listen": ["127.0.0.1:0"],
+                "routes": [
+                    {{
+                        "path": "/*",
+                        "handler": {{
+                            "type": "file_server",
+                            "root": "{root_path}"
+                        }}
+                    }}
+                ]
+            }}
+        ]
+    }}"#
+    );
+    let mut server = TestServer::new(&config);
+    assert!(server.wait_until_ready().await, "Server failed to start");
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    // 📂 A directory without a trailing slash must be redirected to it.
+    let response = client.get(server.url(0, "/folder")).send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::PERMANENT_REDIRECT);
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .expect("directory redirect must carry a Location");
+    assert!(location.ends_with("/folder/"), "got {location}");
+
+    // 📄 A file with a trailing slash must be redirected without it.
+    let response = client
+        .get(server.url(0, "/plain.txt/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::PERMANENT_REDIRECT);
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .expect("file redirect must carry a Location");
+    assert!(location.ends_with("/plain.txt"), "got {location}");
+
+    // ✅ The canonical forms serve directly.
+    let response = client.get(server.url(0, "/folder/")).send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let response = client
+        .get(server.url(0, "/plain.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+}
+
 /// 🛠️ Starts a server with the Admin API enabled and one readiness route.
 ///
 /// These tests drive the real Admin socket rather than calling

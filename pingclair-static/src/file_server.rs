@@ -157,6 +157,9 @@ pub struct ServedFile {
 pub enum ServedResponse {
     Buffered(ServedFile),
     Stream(StreamingFile),
+    /// 🔁 A canonical-URL redirect: directories get a trailing slash and
+    /// files lose one, matching Caddy's file_server behavior.
+    Redirect(String),
 }
 
 /// Streaming file response for zero-copy large file transfer
@@ -436,6 +439,20 @@ impl FileServer {
             Err(_) => return Ok(None),
         };
 
+        // 🔁 Canonicalize the URL shape before serving: Caddy redirects a
+        // directory request without a trailing slash to the slashed form, and
+        // a file request with a trailing slash to the bare form.
+        let needs_directory_slash = metadata.is_dir() && !path.ends_with('/');
+        let needs_file_slash_removal = metadata.is_file() && path.ends_with('/');
+        if needs_directory_slash {
+            return Ok(Some(ServedResponse::Redirect(format!("{path}/"))));
+        }
+        if needs_file_slash_removal {
+            return Ok(Some(ServedResponse::Redirect(
+                path.trim_end_matches('/').to_string(),
+            )));
+        }
+
         // Handle directory
         if metadata.is_dir() {
             // Try index files
@@ -691,6 +708,7 @@ impl FileServer {
     ) -> Result<Option<ServedFile>> {
         match self.serve_auto(path, range_header, accept_encoding).await? {
             Some(ServedResponse::Buffered(file)) => Ok(Some(file)),
+            Some(ServedResponse::Redirect(_)) => Ok(None),
             Some(ServedResponse::Stream(mut stream)) => {
                 let mut content = Vec::with_capacity(stream.file_size as usize);
                 while let Some(chunk) = stream.read_chunk()? {
@@ -1195,6 +1213,7 @@ mod serve_auto_tests {
                 assert_eq!(got, body, "streamed bytes must equal the file");
             }
             ServedResponse::Buffered(_) => panic!("6MB uncompressed response must stream"),
+            ServedResponse::Redirect(_) => panic!("a regular file must not redirect"),
         }
     }
 
@@ -1218,6 +1237,7 @@ mod serve_auto_tests {
             ServedResponse::Stream(_) => {
                 panic!("compressed responses must stay buffered for the cache")
             }
+            ServedResponse::Redirect(_) => panic!("a regular file must not redirect"),
         }
     }
 

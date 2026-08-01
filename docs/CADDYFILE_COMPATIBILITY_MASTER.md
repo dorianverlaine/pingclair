@@ -52,12 +52,12 @@
 | S-1 | 單站無大括號簡寫：第一個 token 是 site 位址，後續行屬該 site（U1，Tutorial 第一步） | 🔴 |
 | S-2 | 環境變數 parse 前展開：`{$VAR}`／`{$VAR:default}`、多 token、可空（U3） | 🔴 |
 | S-3 | `{placeholder}` 與相鄰文字保持同一 token（P2：`redir https://www.{host}{uri}`） | 🔴 |
-| S-4 | `root` directive：site block 內 `root <path>`／`root * <path>`，接入 file_server（P1，官方首頁與 patterns 的基礎） | 🔴 |
-| S-5 | `file_server browse` inline 旗標（U2）；`file_server` 其他 Caddy 子指令（`index`、`root`、`browse`、`precompressed` 等） | 🟠 |
-| S-6 | `try_files`（SPA 核心，P8） | 🟠 |
-| S-7 | `templates` directive（U5、C4 旗標） | 🟡（v0.3） |
-| S-8 | 完整 duration：`ns/us/ms/s/m/h/d`、小數、組合；裸數字拒絕（V3） | 🟠 |
-| S-9 | placeholder 生態：`{labels.*}`、`{query}`、`{scheme}` 等官方縮寫表；未支援者編譯期警告（V4、P6） | 🟠 |
+| S-4 | `root` directive：site block 內 `root <path>`／`root * <path>`，接入 file_server（P1，官方首頁與 patterns 的基礎） ✅ P3 已修 | 🔴 |
+| S-5 | `file_server browse` inline 旗標（U2）；`file_server` 其他 Caddy 子指令（`index`、`root`、`browse`、`precompressed` 等） ✅ P3 已修（browse/root/index；precompressed 標 TODO v0.3） | 🟠 |
+| S-6 | `try_files`（SPA 核心，P8） 🟠 標 TODO（v0.3） | 🟠 |
+| S-7 | `templates` directive（U5、C4 旗標） 🟡 標 TODO（v0.3） | 🟡（v0.3） |
+| S-8 | 完整 duration：`ns/us/ms/s/m/h/d`、小數、組合；裸數字拒絕（V3） ✅ P3 已修 | 🟠 |
+| S-9 | placeholder 生態：`{labels.*}`、`{query}`、`{scheme}` 等官方縮寫表；未支援者編譯期警告（V4、P6） ✅ P3 已修（labels/query/hostport/port；scheme 標 TODO v0.3） | 🟠 |
 | S-10 | 預設檔名認 `Caddyfile`（C7）；`run` 無 config 時錯誤訊息提示 ✅ P2 已修 | 🟡 |
 | S-11 | TLS store 路徑文件/實作一致＋持久性警示（V5） | 🟡 |
 
@@ -65,14 +65,14 @@
 
 | 項 | 需求 | 級別 |
 |---|---|---|
-| M-1 | multi-path matcher 全部 pattern 生效：route path 表示多值，或路由層完整評估 matcher（M1，目前只註冊第一條） | 🔴 |
+| M-1 | multi-path matcher 全部 pattern 生效：route path 表示多值，或路由層完整評估 matcher（M1，目前只註冊第一條） ✅ P3 已修（每 pattern 一條 route） | 🔴 |
 | M-2 | Query matcher runtime 不再 fail-open：`?q=1` 命中、其他不命中；非法 query 不匹配（M6，安全） ✅ P1 已修 | 🔴 |
 | M-3 | `method` 支援全部標準 verb（HEAD/PATCH/OPTIONS…），未知 verb 報錯（M2） ✅ P1 已修 | 🔴 |
-| M-4 | `header` matcher：`!` 不存在、`*suffix`、`prefix*`、兩側 `*`；多值 OR（M3、M8） | 🟠 |
-| M-5 | path matcher 四種 wildcard 位置＋case-insensitive＋dot-segment 清理＋多 slash 合併＋URI-decode 正規化（M4） | 🟠 |
-| M-6 | DSL 支援 `host`／`query`／`protocol`／`remote_ip`／`client_ip`（M5；core 已有型別） | 🟠 |
-| M-7 | matcher set 依型別合併：同欄位 header／同鍵 query／path／method／host 多值 OR，不同欄位 AND（M8） | 🟠 |
-| M-8 | `not` 的 inline 多值與 block 語意加測試鎖定（M7） | 🟡 |
+| M-4 | `header` matcher：`!` 不存在、`*suffix`、`prefix*`、兩側 `*`；多值 OR（M3、M8） ✅ P3 已修 | 🟠 |
+| M-5 | path matcher 四種 wildcard 位置＋case-insensitive＋dot-segment 清理＋多 slash 合併＋URI-decode 正規化（M4） ✅ P3 已修（glob 全位置＋正規化；URI-decode 標 TODO v0.3） | 🟠 |
+| M-6 | DSL 支援 `host`／`query`／`protocol`／`remote_ip`／`client_ip`（M5；core 已有型別） ✅ P3 已修 | 🟠 |
+| M-7 | matcher set 依型別合併：同欄位 header／同鍵 query／path／method／host 多值 OR，不同欄位 AND（M8） ✅ P3 已修 | 🟠 |
+| M-8 | `not` 的 inline 多值與 block 語意加測試鎖定（M7） ✅ P3 已修 | 🟡 |
 
 ## 4. Directives（來源：DIRECTIVES）
 

@@ -280,19 +280,38 @@ pub fn tokenize(source: &str) -> LexResult {
         let start = pos;
         while pos < chars.len() {
             let wc = chars[pos];
-            if wc == ' '
-                || wc == '\t'
-                || wc == '\r'
-                || wc == '\n'
-                || wc == '\x0C'
-                || wc == '{'
-                || wc == '}'
-                || wc == '#'
-                || wc == '"'
-            {
-                break;
+            match wc {
+                ' ' | '\t' | '\r' | '\n' | '\x0C' | '}' | '#' | '"' => break,
+                '{' => {
+                    // 🧭 A placeholder (`{host}`, `{http.request.uri}`) glued
+                    // to a word belongs to that word, so `https://www.{host}`
+                    // stays ONE token like it does in Caddy. A `{$VAR}` stays
+                    // independent so the EnvVar branch handles it, and a bare
+                    // `{` (block open) ends the word.
+                    if pos + 1 < chars.len() && chars[pos + 1] == '$' {
+                        break;
+                    }
+                    let mut j = pos + 1;
+                    let mut found_close = false;
+                    while j < chars.len() {
+                        let pc = chars[j];
+                        if pc == '}' {
+                            found_close = true;
+                            break;
+                        }
+                        if matches!(pc, ' ' | '\t' | '\r' | '\n' | '\x0C') {
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if found_close {
+                        pos = j + 1;
+                        continue;
+                    }
+                    break;
+                }
+                _ => pos += 1,
             }
-            pos += 1;
         }
         if pos > start {
             let word: String = chars[start..pos].iter().collect();

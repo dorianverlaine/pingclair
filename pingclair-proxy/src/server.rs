@@ -2431,6 +2431,15 @@ impl PingclairProxy {
                         .serve_auto(path, range_header, accept_encoding)
                         .await
                     {
+                        Ok(Some(pingclair_static::ServedResponse::Redirect(location))) => {
+                            let mut header = ResponseHeader::build(308, Some(2)).unwrap();
+                            header.insert_header("Location", location.as_str()).unwrap();
+                            Self::apply_local_response_headers(&mut header, ctx)?;
+                            session
+                                .write_response_header(Box::new(header), false)
+                                .await?;
+                            return Ok(true);
+                        }
                         Ok(Some(pingclair_static::ServedResponse::Stream(mut stream))) => {
                             let mut header = ResponseHeader::build(200, Some(3)).unwrap();
                             header
@@ -2962,6 +2971,53 @@ fn resolve_single_placeholder(
                 .unwrap_or("");
             host_without_port(host)
         }
+        "hostport" | "http.request.hostport" => req
+            .headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string(),
+        "port" | "http.request.port" => req
+            .headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|host| host.rsplit_once(':'))
+            .map(|(_, port)| port.to_string())
+            .unwrap_or_default(),
+        // 🧭 `{query}` is the bare query string; `{?query}` keeps the leading
+        // `?` (Caddy's prefixed_query shorthand).
+        "query" | "http.request.uri.query" => req
+            .uri
+            .to_string()
+            .split_once('?')
+            .map(|(_, query)| query.to_string())
+            .unwrap_or_default(),
+        "?query" => req
+            .uri
+            .to_string()
+            .split_once('?')
+            .map(|(_, query)| format!("?{query}"))
+            .unwrap_or_default(),
+        // 🧭 `{labels.N}` is the hostname split on dots, indexed from the
+        // right: `{labels.0}` is the TLD, `{labels.1}` the registrable label.
+        _label if name.starts_with("labels.") || name.starts_with("http.request.host.labels.") => {
+            let raw = name
+                .strip_prefix("http.request.host.labels.")
+                .or_else(|| name.strip_prefix("labels."))
+                .unwrap_or("");
+            let host = req
+                .headers
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .map(host_without_port)
+                .unwrap_or_default();
+            let labels: Vec<&str> = host.split('.').collect();
+            raw.parse::<usize>()
+                .ok()
+                .and_then(|index| labels.get(labels.len() - 1 - index))
+                .unwrap_or(&"")
+                .to_string()
+        }
         "remote_ip" | "http.request.remote.host" => verified_client_ip.unwrap_or("").to_string(),
         "http.request.method" => req.method.as_str().to_string(),
         // 🧭 `{uri}` is Caddy's shorthand for the full request target, and it is
@@ -2969,6 +3025,8 @@ fn resolve_single_placeholder(
         "uri" | "http.request.uri" => req.uri.to_string(),
         "path" | "http.request.uri.path" => req.uri.path().to_string(),
         _ => {
+            // TODO(v0.3): implement the remaining Caddy placeholder shorthands
+            // ({scheme}, {dir}, {file.*}, {method}, {re.*}, {env.*}, ...).
             tracing::debug!("⚠️ Unresolved Caddy placeholder: {{{}}}", name);
             String::new()
         }

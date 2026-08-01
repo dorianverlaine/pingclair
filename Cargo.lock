@@ -2682,6 +2682,7 @@ dependencies = [
  "bytes",
  "criterion",
  "http",
+ "ipnet",
  "matchit",
  "pingclair-tls",
  "pingora",

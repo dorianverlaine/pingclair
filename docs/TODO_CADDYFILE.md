@@ -143,44 +143,50 @@ Location 指向 https_port）；四項 gate 全綠。
 
 ### P3.1 基礎語法
 
-- [ ] 單站無大括號簡寫（U1）：第一個 token 是 site 位址，後續行
+- [x] 單站無大括號簡寫（U1）：第一個 token 是 site 位址，後續行
   屬於該 site
-- [ ] 環境變數 parse 前展開：`{$VAR}`／`{$VAR:default}`、多 token、
+- [x] 環境變數 parse 前展開：`{$VAR}`／`{$VAR:default}`、多 token、
   可空值（U3）
-- [ ] `{placeholder}` 與相鄰文字保持同一 token（P2：
+- [x] `{placeholder}` 與相鄰文字保持同一 token（P2：
   `redir https://www.{host}{uri}`）
-- [ ] duration 完整語法：`ns/us/ms/s/m/h/d`、小數（`1.5h`）、組合
+- [x] duration 完整語法：`ns/us/ms/s/m/h/d`、小數（`1.5h`）、組合
   （`2h45m`）；裸數字拒絕（V3）
-- [ ] placeholder 縮寫表補齊或編譯期警告：`{labels.*}`、`{query}`、
-  `{scheme}`、`{port}`、`{hostport}` 等（V4、P6）
+- [x] placeholder 縮寫表補齊或編譯期警告：`{labels.*}`、`{query}`、
+  `{?query}`、`{port}`、`{hostport}` 已補；`{scheme}` 等標 TODO
+  （V4、P6）
 
 ### P3.2 `root` 與 `file_server`
 
-- [ ] `root <path>`／`root * <path>` directive（P1）：接入
+- [x] `root <path>`／`root * <path>` directive（P1）：接入
   `file_server` 根目錄
-- [ ] `file_server browse` inline 旗標（U2）
-- [ ] `file_server /path/*` inline path matcher（E-2）
-- [ ] `file_server` block：`root`、`index`、`browse`、`precompressed`
-  子指令正確語義（E-1；`precompressed <formats>` 列 P7）
-- [ ] trailing-slash 自動轉跳（目錄加斜線、檔案去斜線）（P5）
+- [x] `file_server browse` inline 旗標（U2）
+- [x] `file_server /path/*` inline path matcher（E-2）
+- [x] `file_server` block：`root`、`index`、`browse` 正確語義；
+  `precompressed`/`fs` fail closed 並標 TODO（E-1；實作列 P7）
+- [x] trailing-slash 自動轉跳（目錄加斜線、檔案去斜線）（P5）
 
 ### P3.3 Matcher 全語義
 
-- [ ] multi-path matcher 全部 pattern 生效（M1：route path 多值或
+- [x] multi-path matcher 全部 pattern 生效（M1：route path 多值或
   matcher 完整評估）
-- [ ] `header` matcher：`!` 不存在、`*suffix`、`prefix*`、兩側 `*`
+- [x] `header` matcher：`!` 不存在、`*suffix`、`prefix*`、兩側 `*`
   （M3）
-- [ ] matcher set 同型別合併：同欄位 header／path／method／host
+- [x] matcher set 同型別合併：同欄位 header／path／method／host
   多值 OR、不同欄位 AND（M7/M8）
-- [ ] path matcher 四種 wildcard 位置（M4）
-- [ ] path 匹配前正規化：case-insensitive、dot-segment、多 slash、
+- [x] path matcher 四種 wildcard 位置（M4）
+- [x] path 匹配前正規化：case-insensitive、dot-segment、多 slash、
   URI-decode（M4）
-- [ ] DSL 支援 `host`／`query`／`protocol`／`remote_ip`／`client_ip`
+- [x] DSL 支援 `host`／`query`／`protocol`／`remote_ip`／`client_ip`
   matcher（M5）
-- [ ] `not` 的 inline 多值與 block 語意測試鎖定（M7）
+- [x] `not` 的 inline 多值與 block 語意測試鎖定（M7）
 
 **P3 收工**：官方 tutorial + patterns + examples 頁的原文範例
 （扣除標記 v0.3+ 的）全部能編譯；matcher 每個語意有 runtime 測試。
+✅ **2026-08-01 完成**：`p3_syntax_tests` 18 項單元測試 + router
+matcher runtime 測試 5 項（glob 四位置、正規化、CIDR、negated header）
++ 真 binary 集成測試 `test_file_server_trailing_slash_redirects`；
+官方範例探針全部編譯（含 `redir` matcher 形式）；四項 gate 全綠。
+`redir /a /b` 的 inline path matcher 提前實作（P4 D-4 一部分）。
 
 ---
 
@@ -233,6 +239,7 @@ quiche-client smoke 按 AGENTS.md。
 > 後 handler 順序一致）。
 
 ### P6.1 Admin API 與 reload
+
 - [ ] SIGHUP reload 偵測 global 差異並警告「需要重啟」（A1）
 - [ ] `POST /load` 整包替換（完整 `PingclairConfig`、失敗 rollback、
   相同 config 不 reload）（A2/A8）
@@ -242,6 +249,7 @@ quiche-client smoke 按 AGENTS.md。
 - [ ] `POST /adapt`（A9）
 
 ### P6.2 CLI
+
 - [ ] `pingclair adapt [--pretty] [--validate]`（C1）
 - [ ] `pingclair fmt [--overwrite] [--diff]`（C1）
 - [ ] `validate` 走 provisioning 層（cert 檔存在性等）（C2）
@@ -253,11 +261,13 @@ quiche-client smoke 按 AGENTS.md。
 - [ ] `hash-password`（bcrypt）（C8）
 
 ### P6.3 Logging
+
 - [ ] per-server/global `level` 支援（L2；死欄位接上或刪除）
 - [ ] global `log` option（多 log 管道）（L3）
 - [ ] access log 補 request/response headers、TLS 資訊（L4）
 
 ### P6.4 Metrics
+
 - [ ] `{ metrics }`／`{ metrics { per_host } }` 開關（MT-1）
 - [ ] runtime/process 指標（MT-2）
 - [ ] admin API 指標（MT-3）
@@ -267,6 +277,7 @@ quiche-client smoke 按 AGENTS.md。
 - [ ] `active_connections` 改 gauge 並打點或刪除（MT-6）
 
 ### P6.5 部署
+
 - [ ] systemd unit 單一來源 + `Restart=on-failure` +
   `RestartPreventExitStatus=1`（K-1/K-2）
 - [ ] README 補 production compose 與 `tls internal` trust 安裝

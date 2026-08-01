@@ -143,6 +143,10 @@ pub struct ServerBlock {
     /// Bind address
     pub bind: Option<String>,
 
+    /// 📂 Site root set by the `root` directive; `file_server` handlers that
+    /// do not name their own root inherit this path.
+    pub root: Option<String>,
+
     /// Content codings from the `encode` directive, in the order written —
     /// that order is the server's preference when negotiating.
     ///
@@ -838,6 +842,7 @@ impl ServerBlock {
             names: Vec::new(),
             listens: Vec::new(),
             bind: None,
+            root: None,
             compress: None,
             gzip_types: Vec::new(),
             log: None,
