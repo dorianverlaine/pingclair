@@ -1711,6 +1711,9 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
         upstreams.push(arg.clone());
     }
 
+    // 🌐 Caddy expands `to :9000-9003` into one upstream per port; do the
+    // same before the AST is compiled so JSON and runtime see the peers.
+    let upstreams = super::expand_upstream_port_ranges(upstreams);
     let mut proxy = ProxyConfig::new(upstreams);
 
     // Parse sub-block if present
@@ -1896,51 +1899,53 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
                                 "a block form takes exactly one upstream address".into(),
                             ));
                         }
-                        let mut upstream = ProxyUpstreamConfig {
-                            address: address.clone(),
-                            weight: 1,
-                            backup: false,
-                        };
-                        for option in to_block.directives {
-                            match option.name.as_str() {
-                                "weight" => {
-                                    let raw = option.args.first().ok_or_else(|| {
-                                        AdapterError::ArgumentCount(
-                                            "reverse_proxy to weight".into(),
-                                            1,
-                                            0,
-                                        )
-                                    })?;
-                                    upstream.weight = raw.parse().map_err(|_| {
-                                        AdapterError::InvalidArgument(
-                                            "reverse_proxy to weight".into(),
-                                            raw.clone(),
-                                        )
-                                    })?;
-                                    if upstream.weight == 0 {
-                                        return Err(AdapterError::InvalidArgument(
-                                            "reverse_proxy to weight".into(),
-                                            "weight must be greater than zero".into(),
-                                        ));
+                        for address in super::expand_upstream_port_ranges([address.clone()]) {
+                            let mut upstream = ProxyUpstreamConfig {
+                                address: address.clone(),
+                                weight: 1,
+                                backup: false,
+                            };
+                            for option in &to_block.directives {
+                                match option.name.as_str() {
+                                    "weight" => {
+                                        let raw = option.args.first().ok_or_else(|| {
+                                            AdapterError::ArgumentCount(
+                                                "reverse_proxy to weight".into(),
+                                                1,
+                                                0,
+                                            )
+                                        })?;
+                                        upstream.weight = raw.parse().map_err(|_| {
+                                            AdapterError::InvalidArgument(
+                                                "reverse_proxy to weight".into(),
+                                                raw.clone(),
+                                            )
+                                        })?;
+                                        if upstream.weight == 0 {
+                                            return Err(AdapterError::InvalidArgument(
+                                                "reverse_proxy to weight".into(),
+                                                "weight must be greater than zero".into(),
+                                            ));
+                                        }
+                                    }
+                                    "backup" => {
+                                        upstream.backup = option
+                                            .args
+                                            .first()
+                                            .map(|value| value != "false" && value != "off")
+                                            .unwrap_or(true);
+                                    }
+                                    _ => {
+                                        return Err(AdapterError::UnknownDirective(format!(
+                                            "reverse_proxy to: {}",
+                                            option.name
+                                        )));
                                     }
                                 }
-                                "backup" => {
-                                    upstream.backup = option
-                                        .args
-                                        .first()
-                                        .map(|value| value != "false" && value != "off")
-                                        .unwrap_or(true);
-                                }
-                                _ => {
-                                    return Err(AdapterError::UnknownDirective(format!(
-                                        "reverse_proxy to: {}",
-                                        option.name
-                                    )));
-                                }
                             }
+                            proxy.upstreams.push(address.clone());
+                            proxy.upstream_options.push(upstream);
                         }
-                        proxy.upstreams.push(address.clone());
-                        proxy.upstream_options.push(upstream);
                     } else {
                         if sub.args.is_empty() {
                             return Err(AdapterError::ArgumentCount(
@@ -1949,7 +1954,8 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
                                 0,
                             ));
                         }
-                        for address in &sub.args {
+                        for address in super::expand_upstream_port_ranges(sub.args.iter().cloned())
+                        {
                             proxy.upstreams.push(address.clone());
                             proxy.upstream_options.push(ProxyUpstreamConfig {
                                 address: address.clone(),
@@ -4655,6 +4661,30 @@ mod directive_order_tests {
                         "10.0.1.3:80".to_string()
                     ]
                 );
+            }
+            other => panic!("expected reverse proxy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upstream_port_ranges_expand_like_caddy() {
+        // 🌐 `:9000-9002` is Caddy shorthand for three peers; a bare `:9000`
+        // stays hostless in the adapted JSON and the runtime dials loopback.
+        let config = compile("example.com {\n    reverse_proxy :9000\n}\n")
+            .expect("bare-port upstream compiles");
+        match &config.servers[0].routes[0].handler {
+            HandlerConfig::ReverseProxy(proxy) => {
+                assert_eq!(proxy.upstreams, vec![":9000".to_string()]);
+            }
+            other => panic!("expected reverse proxy, got {other:?}"),
+        }
+
+        let ranged =
+            compile("example.com {\n    reverse_proxy {\n        to :9000-9002\n    }\n}\n")
+                .expect("port range compiles");
+        match &ranged.servers[0].routes[0].handler {
+            HandlerConfig::ReverseProxy(proxy) => {
+                assert_eq!(proxy.upstreams, [":9000", ":9001", ":9002"]);
             }
             other => panic!("expected reverse proxy, got {other:?}"),
         }

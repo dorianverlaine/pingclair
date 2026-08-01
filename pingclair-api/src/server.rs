@@ -14,11 +14,13 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use parking_lot::RwLock;
+use serde_json::Value;
 use tokio::net::TcpListener;
 
-use pingclair_core::config::{PingclairConfig, ServerConfig};
+use pingclair_core::config::PingclairConfig;
 
 use crate::auth::{ApiKeyAuth, AuthDecision, authorize};
+use crate::config_tree::{self, Mode, TreeError};
 
 /// Run the admin server
 pub async fn run_admin_server(
@@ -26,6 +28,7 @@ pub async fn run_admin_server(
     proxies: Arc<
         RwLock<std::collections::HashMap<String, pingclair_proxy::server::PingclairProxy>>,
     >,
+    document: Arc<RwLock<Value>>,
     api_key: Option<String>,
 ) -> pingclair_core::Result<()> {
     let listener = TcpListener::bind(addr)
@@ -53,6 +56,7 @@ pub async fn run_admin_server(
 
         let io = TokioIo::new(stream);
         let proxies = proxies.clone();
+        let document = document.clone();
         let auth = auth.clone();
 
         tokio::task::spawn(async move {
@@ -60,7 +64,13 @@ pub async fn run_admin_server(
                 .serve_connection(
                     io,
                     service_fn(move |req| {
-                        handle_request(req, proxies.clone(), auth.clone(), peer_addr)
+                        handle_request(
+                            req,
+                            proxies.clone(),
+                            document.clone(),
+                            auth.clone(),
+                            peer_addr,
+                        )
                     }),
                 )
                 .await
@@ -76,12 +86,13 @@ async fn handle_request(
     proxies: Arc<
         RwLock<std::collections::HashMap<String, pingclair_proxy::server::PingclairProxy>>,
     >,
+    document: Arc<RwLock<Value>>,
     auth: Option<Arc<ApiKeyAuth>>,
     peer_addr: SocketAddr,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
-    let response = handle_request_inner(req, proxies, auth, peer_addr).await?;
+    let response = handle_request_inner(req, proxies, document, auth, peer_addr).await?;
     // 📊 Count every admin request by endpoint and status (MT-3).
     let status = response.status().as_u16().to_string();
     pingclair_proxy::metrics::ADMIN_REQUESTS_TOTAL
@@ -95,6 +106,7 @@ async fn handle_request_inner(
     proxies: Arc<
         RwLock<std::collections::HashMap<String, pingclair_proxy::server::PingclairProxy>>,
     >,
+    document: Arc<RwLock<Value>>,
     auth: Option<Arc<ApiKeyAuth>>,
     peer_addr: SocketAddr,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
@@ -116,7 +128,8 @@ async fn handle_request_inner(
         }
     }
 
-    match (req.method(), req.uri().path()) {
+    let request_path = req.uri().path().to_string();
+    match (req.method(), request_path.as_str()) {
         (&Method::GET, "/health") => Ok(Response::new(Full::new(Bytes::from(
             r#"{"status":"healthy"}"#,
         )))),
@@ -128,37 +141,28 @@ async fn handle_request_inner(
                 .body(Full::new(Bytes::from(buffer)))
                 .unwrap())
         }
-        (&Method::GET, "/config") => {
-            // 🧭 Exports a document shaped like the config file: one `servers`
-            // list, deduplicated, so the output can be POSTed back to /load.
-            let mut servers = Vec::new();
-            let proxies_guard = proxies.read();
-            for proxy in proxies_guard.values() {
-                let mut host_configs = Vec::new();
-                for host_state in proxy.hosts.load().values() {
-                    host_configs.push(host_state.config.as_ref().clone());
-                }
-                if let Some(def) = (**proxy.default.load()).as_ref() {
-                    host_configs.push(def.config.as_ref().clone());
-                }
-                for config in host_configs {
-                    // 🧭 Deduplicate by name + listener set; ServerConfig does
-                    // not implement PartialEq.
-                    let already_present = servers.iter().any(|existing: &ServerConfig| {
-                        existing.name == config.name && existing.listen == config.listen
-                    });
-                    if !already_present {
-                        servers.push(config);
-                    }
-                }
-            }
-
-            let document = PingclairConfig {
-                servers,
-                ..Default::default()
-            };
-            let json = serde_json::to_string_pretty(&document).unwrap_or_default();
+        (&Method::GET, path) if path == "/config" || path == "/config/" => {
+            // 🧭 Exports the active document so the output can be POSTed back
+            // to /load or traversed with /config/<path>.
+            let guard = document.read();
+            let json = serde_json::to_string_pretty(&*guard).unwrap_or_default();
             Ok(Response::new(Full::new(Bytes::from(json))))
+        }
+        (&Method::GET, path) if path.starts_with("/config/") => {
+            let segments = normalize_config_segments(config_tree::segments_from_path(
+                &path["/config/".len()..],
+            ));
+            let guard = document.read();
+            match config_tree::get(&guard, &segments) {
+                Ok(node) => {
+                    let json = serde_json::to_string_pretty(node).unwrap_or_default();
+                    Ok(Response::new(Full::new(Bytes::from(json))))
+                }
+                Err(error) => Ok(response(
+                    StatusCode::NOT_FOUND,
+                    &format!(r#"{{"error":"{}"}}"#, error.message()),
+                )),
+            }
         }
         (&Method::POST, "/load") => {
             let body_bytes = match read_bounded_body(req).await {
@@ -228,6 +232,11 @@ async fn handle_request_inner(
                 proxy.add_server(server.clone());
                 tracing::info!(listener = %addr, "📤 Loaded server config");
             }
+            // 🧭 The traversal endpoints operate on this document, so a
+            // successful full replacement must be reflected there too.
+            if let Ok(value) = serde_json::to_value(&config) {
+                *document.write() = value;
+            }
             Ok(response(StatusCode::OK, "Config loaded"))
         }
         (&Method::POST, "/adapt") => {
@@ -284,85 +293,205 @@ async fn handle_request_inner(
             // supervisor; a hard exit is correct enough for now.
             std::process::exit(0);
         }
-        (&Method::POST, path) if path.starts_with("/config") => {
-            let body_bytes = match read_bounded_body(req).await {
-                Ok(bytes) => bytes,
-                Err(BodyError::TooLarge) => {
-                    return Ok(response(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        &format!(
-                            r#"{{"error":"config body exceeds {MAX_CONFIG_BODY_BYTES} bytes"}}"#
-                        ),
-                    ));
-                }
-                Err(BodyError::Incomplete) => {
-                    return Ok(response(
-                        StatusCode::BAD_REQUEST,
-                        r#"{"error":"could not read the request body"}"#,
-                    ));
-                }
+        (&Method::POST, path) if path == "/config" || path == "/config/" => {
+            // 📤 POST to the root upserts the whole document, like Caddy.
+            let value = match read_json_body(req).await {
+                Ok(value) => value,
+                Err(error_response) => return Ok(error_response),
             };
-
-            let config: ServerConfig = match serde_json::from_slice(&body_bytes) {
-                Ok(c) => c,
-                Err(e) => {
-                    return Ok(response(
-                        StatusCode::BAD_REQUEST,
-                        &format!("Invalid config: {e}"),
-                    ));
-                }
+            apply_full_document(&document, &proxies, value).await
+        }
+        (&Method::POST, path) if path.starts_with("/config/") => {
+            // 🧭 POST traverses into the document: create or replace at the
+            // target, append to arrays, and `...` expands array bodies.
+            let value = match read_json_body(req).await {
+                Ok(value) => value,
+                Err(error_response) => return Ok(error_response),
             };
-
-            // 🛡️ The same validator the Pingclairfile path runs. Deserializing
-            // into the core types only proves the JSON has the right shape; it
-            // says nothing about whether the settings are safe or even
-            // implemented. Skipping this is how `plugin` handlers and unsafe
-            // retry policies used to enter through the Admin door only.
-            if let Err(error) = validate_incoming_server(&config) {
-                return Ok(response(
-                    StatusCode::BAD_REQUEST,
-                    &format!("Invalid config: {error}"),
-                ));
-            }
-
-            let proxies_guard = proxies.read();
-
-            // 🧭 Resolve every target before touching any of them. Applying
-            // inside the loop meant a config naming two listeners where only
-            // the first exists left that one live on the new settings and the
-            // other on the old — a half-applied state nobody asked for and
-            // nothing reported.
-            let mut targets = Vec::with_capacity(config.listen.len());
-            for addr in &config.listen {
-                match proxies_guard.get(addr) {
-                    Some(proxy) => targets.push((addr, proxy)),
-                    None => {
-                        return Ok(response(
-                            StatusCode::NOT_FOUND,
-                            &format!(
-                                r#"{{"error":"no listener is bound to {addr}; nothing was applied"}}"#
-                            ),
-                        ));
-                    }
-                }
-            }
-
-            if targets.is_empty() {
-                return Ok(response(
-                    StatusCode::BAD_REQUEST,
-                    r#"{"error":"config declares no listen address"}"#,
-                ));
-            }
-
-            for (addr, proxy) in targets {
-                proxy.add_server(config.clone());
-                tracing::info!(listener = %addr, "♻️ Hot reloaded config");
-            }
-
-            Ok(response(StatusCode::OK, "Config updated"))
+            apply_config_traversal(&document, &proxies, Method::POST, path, Some(value)).await
+        }
+        (&Method::PUT, path) if path.starts_with("/config") => {
+            let value = match read_json_body(req).await {
+                Ok(value) => value,
+                Err(error_response) => return Ok(error_response),
+            };
+            apply_config_traversal(&document, &proxies, Method::PUT, path, Some(value)).await
+        }
+        (&Method::PATCH, path) if path.starts_with("/config") => {
+            let value = match read_json_body(req).await {
+                Ok(value) => value,
+                Err(error_response) => return Ok(error_response),
+            };
+            apply_config_traversal(&document, &proxies, Method::PATCH, path, Some(value)).await
+        }
+        (&Method::DELETE, path) if path.starts_with("/config") => {
+            apply_config_traversal(&document, &proxies, Method::DELETE, path, None).await
         }
         _ => Ok(response(StatusCode::NOT_FOUND, "Not Found")),
     }
+}
+
+/// 📥 Reads a bounded request body and parses it as a JSON config node.
+async fn read_json_body(
+    req: Request<hyper::body::Incoming>,
+) -> Result<Value, Response<Full<Bytes>>> {
+    let body_bytes = match read_bounded_body(req).await {
+        Ok(bytes) => bytes,
+        Err(BodyError::TooLarge) => {
+            return Err(response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                &format!(r#"{{"error":"config body exceeds {MAX_CONFIG_BODY_BYTES} bytes"}}"#),
+            ));
+        }
+        Err(BodyError::Incomplete) => {
+            return Err(response(
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"could not read the request body"}"#,
+            ));
+        }
+    };
+    serde_json::from_slice(&body_bytes)
+        .map_err(|error| response(StatusCode::BAD_REQUEST, &format!("Invalid JSON: {error}")))
+}
+
+/// 📤 Applies a full replacement document and commits it as the active tree.
+async fn apply_full_document(
+    document: &Arc<RwLock<Value>>,
+    proxies: &Arc<
+        RwLock<std::collections::HashMap<String, pingclair_proxy::server::PingclairProxy>>,
+    >,
+    value: Value,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    match commit_document(&value, proxies) {
+        Ok(()) => {
+            *document.write() = value;
+            Ok(response(StatusCode::OK, "Config loaded"))
+        }
+        Err((status, message)) => Ok(response(status, &message)),
+    }
+}
+
+/// 🧭 Applies one Caddy-style traversal mutation on a clone, then commits
+/// the clone only when the whole document still parses, validates, and
+/// applies. A failed commit leaves the active tree untouched.
+/// 🧭 A single numeric segment keeps the legacy `/config/<index>` meaning
+/// (`servers[index]`, used by the pre-traversal admin API); deeper paths
+/// follow the document tree exactly like Caddy.
+fn normalize_config_segments(segments: Vec<String>) -> Vec<String> {
+    if segments.len() == 1 && segments[0].parse::<usize>().is_ok() {
+        vec!["servers".to_string(), segments[0].clone()]
+    } else {
+        segments
+    }
+}
+
+async fn apply_config_traversal(
+    document: &Arc<RwLock<Value>>,
+    proxies: &Arc<
+        RwLock<std::collections::HashMap<String, pingclair_proxy::server::PingclairProxy>>,
+    >,
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    let mut next = document.read().clone();
+    let raw = path.strip_prefix("/config").unwrap_or(path);
+    let mut segments = normalize_config_segments(config_tree::segments_from_path(raw));
+    let expand = segments.last().is_some_and(|segment| segment == "...");
+    if expand {
+        segments.pop();
+    }
+
+    let mutation = if method == Method::DELETE {
+        config_tree::remove(&mut next, &segments).map(|_| ())
+    } else {
+        let Some(body) = body else {
+            return Ok(response(
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"this method requires a JSON body"}"#,
+            ));
+        };
+        if expand {
+            config_tree::expand_append(&mut next, &segments, &body)
+        } else {
+            let mode = match method {
+                Method::POST => Mode::Upsert,
+                Method::PUT => Mode::Create,
+                _ => Mode::Replace,
+            };
+            config_tree::set(&mut next, &segments, body, mode)
+        }
+    };
+
+    match mutation {
+        Err(TreeError::NotFound) => Ok(response(
+            StatusCode::NOT_FOUND,
+            &format!(r#"{{"error":"{}"}}"#, TreeError::NotFound.message()),
+        )),
+        Err(TreeError::Conflict) => Ok(response(
+            StatusCode::CONFLICT,
+            &format!(r#"{{"error":"{}"}}"#, TreeError::Conflict.message()),
+        )),
+        Err(TreeError::Invalid(reason)) => Ok(response(
+            StatusCode::BAD_REQUEST,
+            &format!(r#"{{"error":"{}"}}"#, TreeError::Invalid(reason).message()),
+        )),
+        Ok(()) => match commit_document(&next, proxies) {
+            Ok(()) => {
+                *document.write() = next;
+                Ok(response(StatusCode::OK, "OK"))
+            }
+            Err((status, message)) => Ok(response(status, &message)),
+        },
+    }
+}
+
+/// 🛡️ Parses, validates, and applies a document to the bound listeners.
+///
+/// Every server's listen address must already be bound; a document that
+/// introduces a new listener is refused wholesale so nothing is half-applied
+/// (creating listeners is the `/load` milestone in the Caddy parity plan).
+fn commit_document(
+    next: &Value,
+    proxies: &Arc<
+        RwLock<std::collections::HashMap<String, pingclair_proxy::server::PingclairProxy>>,
+    >,
+) -> Result<(), (StatusCode, String)> {
+    let config: PingclairConfig = serde_json::from_value(next.clone())
+        .map_err(|error| (StatusCode::BAD_REQUEST, format!("Invalid config: {error}")))?;
+    if let Err(error) = pingclair_config::compiler::validate_config(&config) {
+        return Err((StatusCode::BAD_REQUEST, format!("Invalid config: {error}")));
+    }
+
+    let proxies_guard = proxies.read();
+    let mut targets = Vec::new();
+    for server in &config.servers {
+        if server.listen.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"a server declares no listen address"}"#.to_string(),
+            ));
+        }
+        for addr in &server.listen {
+            match proxies_guard.get(addr) {
+                Some(proxy) => targets.push((addr, server, proxy)),
+                None => {
+                    return Err((
+                        StatusCode::NOT_FOUND,
+                        format!(
+                            r#"{{"error":"no listener is bound to {addr}; nothing was applied"}}"#
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    for (addr, server, proxy) in targets {
+        proxy.add_server(server.clone());
+        tracing::info!(listener = %addr, "♻️ Applied config document");
+    }
+    Ok(())
 }
 
 /// 🧱 Largest configuration document the Admin API will read into memory.
@@ -453,29 +582,6 @@ async fn read_bounded_body(req: Request<hyper::body::Incoming>) -> Result<Bytes,
     }
 
     Ok(Bytes::from(collected))
-}
-
-/// 🛡️ Runs one posted server through the canonical validator.
-///
-/// The validator's subject is a whole `PingclairConfig`, so the incoming
-/// server is wrapped in one. Per-server rules — limits, TLS coherence,
-/// retry and circuit policy, unimplemented handlers — all apply exactly as
-/// they do to a Pingclairfile.
-///
-/// What this deliberately does not cover: rules that compare servers against
-/// each other, such as two listeners disagreeing about PROXY protocol. Those
-/// need the live configuration as context, which the Admin API does not
-/// currently assemble. Stated here rather than left to be discovered, because
-/// the last time this gap was undocumented it was described as closed for a
-/// week while it was open.
-fn validate_incoming_server(
-    config: &ServerConfig,
-) -> Result<(), pingclair_config::compiler::CompileError> {
-    let document = pingclair_core::config::PingclairConfig {
-        servers: vec![config.clone()],
-        ..Default::default()
-    };
-    pingclair_config::compiler::validate_config(&document)
 }
 
 fn response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
