@@ -475,6 +475,10 @@ happens to recycle its address pool.
   同條件 37,307 / 21,735 / 38,973。對 nginx 的佔比從 60% / 75% / 55%
   升到 63% / 79% / 58%——LSE atomics 有實質但小幅的幫助，主體差距仍是
   Pingora 的 task/分配模型在小核上的固定成本，不是單一 CPU 旗標能補的。
+- **H3 loopback 複測**（LSE build vs nginx，aioquic 同機、每請求新
+  QUIC 連線）：30 並發 ×10 pingclair 83.4 req/s vs nginx 97.2；
+  100 並發 ×10 96.2 vs 116.4（佔比 ~85%）。H3 差距明顯小於 H1/H2，
+  兩邊全 200 零錯誤。
 
 **壓測發現的兩個 bug（已修，commit `21a113b`，待香港機重驗）**
 
