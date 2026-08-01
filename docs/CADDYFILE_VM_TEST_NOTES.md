@@ -701,7 +701,11 @@ bcrypt cost 14，輸出 `$2a$14$`（Caddy）與 `$2b$14$`（Pingclair），
   F-04（`/stop` 回 200 後 graceful）、`@id` 與 autosave/`--resume`；
   FX-C（本 commit）：F-14（reload 換 handler/browse 生效）、F-09
   （reload 新 listener 動態開啟＋詳細警告）、F-32（SIGQUIT exit 2、
-  SIGHUP ignored、API 變更後 SIGUSR1 失效）。
+  SIGHUP ignored、API 變更後 SIGUSR1 失效）；
+  FX-D（本 commit）：F-08（`reload`/`start`/`stop` CLI）、F-30
+  （`respond` CLI）、F-25（`run --watch`）、F-21（`--from` HTTPS 路徑）、
+  F-13（file-server `--domain`/bare port）、F-18/F-19（預設
+  `--from localhost`、`--change-host-header`）。
 - 未修 P1 清單：F-02（`/load` 不能開新 listener）、F-07（非 root 無
   TLS store 無法啟動）、F-10（`/load` 累加更新非整包替換）、F-14
   （reload 換 handler/browse 不生效）、F-20（`reverse_proxy :9000`

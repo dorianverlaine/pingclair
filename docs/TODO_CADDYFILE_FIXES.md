@@ -144,49 +144,44 @@ FX-A ──> FX-B ──> FX-C
 
 ### FX-D1（F-08，P2）`reload`／`start`／`stop` 子命令
 
-- [ ] `pingclair reload`：等同 API `/load`（`--config`/`--adapter`/
-      `--address`/`--force`，Caddy 語義）。
-- [ ] `pingclair start`：背景啟動（`--config`/`--adapter`/`--envfile`/
-      `--pidfile`/`--watch`）。
-- [ ] `pingclair stop`：透過 admin `/stop` graceful 停止
-      （`--address`）。
-- 驗證：Getting Started 的 start/stop/reload 步驟兩邊一致。
+- [x] `reload`（`--config`/`--address`，Content-Type 依副檔名）、
+      `start`（背景 spawn）、`stop`（`--address`，走 admin `/stop`）。
+- 驗證：`test_cli_reload_uses_admin_api`、`test_cli_start_and_stop`
+      + 香港機實測 v1→v2 reload、stop 後 port 關閉。
 
 ### FX-D2（F-30，P2）`respond` CLI 子命令
 
-- [ ] 實作 `pingclair respond`：`--status`/`--header`/`--body`/
-      `--listen`（含 port range 多 server）、body 模板
-      （`.N`/`.Port`/`.Address`）、stdin body、無參數隨機 port 200。
-- 驗證：`caddy respond` 文檔範例（port range + 模板）對照。
+- [x] `respond`：`--status`/`--header`/`--body`/`--listen`
+      （單 listener；port range 與 body 模板列 v0.3）。
+- 驗證：`test_cli_respond_serves_body` + 香港機實測
+      （202 + header + body）。
 
 ### FX-D3（F-25，P3）`run --watch`
 
-- [ ] 監看設定檔變更自動 reload（本地開發用途；與 Caddy 同旗標）。
-- 驗證：改檔後不需 signal 即生效（Caddyfile Tutorial A/B 步）。
+- [x] `run --watch`：mtime polling + 自動 SIGUSR1。
+- 驗證：`test_cli_run_watch_reloads`（v1→v2 自動生效）。
 
 ### FX-D4（F-21，P1）`reverse-proxy --from` HTTPS 路徑
 
-- [ ] `--from localhost` 展開成 443（H3 listener 位址修正，不再
-      panic）；`--from example.com:8443 --internal-certs` 的 domain
-      只取 host 部分簽發。
-- 驗證：兩條路徑真 binary 200（`--resolve` SNI 正確）；香港機重跑
-      Reverse proxy HTTPS 組。
+- [x] hostname `--from` 展開成 `0.0.0.0:443`（vhost 語義，不再 panic）；
+      `--internal-certs` 只取 host 部分簽發；localhost 用 internal CA。
+- 驗證：香港機 `--from localhost` 預設 443 200、
+      `--from example.com:8443 --internal-certs` 200。
 
 ### FX-D5（F-13，P2）`file-server --domain` 與 bare port
 
-- [ ] `--domain` 觸發 internal/ACME 簽發（現況 `NO_CERTIFICATE_SET`）；
-      `--listen` 接受 bare port（現況 panic）；補 `--templates`、
-      `--precompressed`、`--reveal-symlinks`。
-- 驗證：`--domain localhost --listen :2118` `curl -k` 200；香港機重跑
-      Static files 組。
+- [x] `--domain` 觸發簽發（localhost → internal CA）；`--listen`
+      接受 bare port。
+- [ ] `--templates`／`--precompressed`／`--reveal-symlinks`：`--templates`
+      併入 FX-E3（templates 引擎）；其餘兩項列 v0.3。
+- 驗證：香港機 `--domain localhost --listen :2118` 與 bare port 皆 200。
 
 ### FX-D6（F-18 + F-19，P2）`reverse-proxy` 預設與 Host 旗標
 
-- [ ] 預設 `--from` 對齊 Caddy（hostname → 443 HTTPS）；
-      `-c/--change-host-header` 實作（`--header-up "Host:
-      {http.reverse_proxy.upstream.hostport}"` shortcut）。
-- 驗證：`reverse-proxy --to 127.0.0.1:9000` 預設 HTTPS；
-      `--change-host-header` 讓 backend 收到 upstream host。
+- [x] 預設 `--from localhost`（HTTPS 443，internal CA）；
+      `-c/--change-host-header` 實作（Host = upstream hostport）。
+- 驗證：`test_cli_site_addresses_derive_like_caddy` + 香港機
+      `--change-host-header` backend 收到 `Host: 127.0.0.1:9000`。
 
 ---
 

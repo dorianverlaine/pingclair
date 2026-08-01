@@ -265,6 +265,120 @@ fn parse_header_pair(raw: &str) -> Result<(String, String), String> {
     Ok((name.trim().to_string(), value.trim().to_string()))
 }
 
+/// 📡 Minimal HTTP/1.1 client for the Admin API (`reload`/`stop`).
+///
+/// The production binary has no HTTP client dependency; a tiny request is
+/// enough for these two commands and keeps the dependency tree unchanged.
+fn admin_request(
+    method: &str,
+    path: &str,
+    content_type: Option<&str>,
+    body: Option<&str>,
+    address: &str,
+) -> anyhow::Result<(u16, String)> {
+    use std::io::{Read, Write};
+
+    let body_bytes = body.unwrap_or("");
+    let mut stream = std::net::TcpStream::connect(address)
+        .map_err(|error| anyhow::anyhow!("❌ Cannot reach admin API at {address}: {error}"))?;
+    let mut request =
+        format!("{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n");
+    if let Some(content_type) = content_type {
+        request.push_str(&format!("Content-Type: {content_type}\r\n"));
+    }
+    request.push_str(&format!("Content-Length: {}\r\n\r\n", body_bytes.len()));
+    stream.write_all(request.as_bytes())?;
+    if !body_bytes.is_empty() {
+        stream.write_all(body_bytes.as_bytes())?;
+    }
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let status = response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    Ok((status, response))
+}
+
+/// 🌐 Splits `host:port` into (host, port), honoring bracketed IPv6.
+fn host_and_port(address: &str) -> (&str, Option<u16>) {
+    let trimmed = address
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    match trimmed.rfind(']') {
+        Some(bracket) => match trimmed[bracket..].rfind(':') {
+            Some(offset) => (
+                &trimmed[..bracket + 1],
+                trimmed[bracket + offset + 1..].parse::<u16>().ok(),
+            ),
+            None => (trimmed, None),
+        },
+        None => match trimmed.rfind(':') {
+            // 🧭 The last colon separates host and port when the tail parses
+            // as a port; a bare `:9000` yields an empty host (loopback).
+            Some(index) => (&trimmed[..index], trimmed[index + 1..].parse::<u16>().ok()),
+            None => (trimmed, None),
+        },
+    }
+}
+
+/// 🧭 Derives a concrete listen address from a Caddy-style `--from`/site
+/// address: a bare hostname gets the scheme's default port, a bare `:port`
+/// binds the wildcard, and an explicit host:port passes through.
+fn listen_for_site(address: &str, https: bool) -> String {
+    let default_port = if https { 443 } else { 80 };
+    match host_and_port(address) {
+        ("", Some(port)) => format!("0.0.0.0:{port}"),
+        ("", None) => format!("0.0.0.0:{default_port}"),
+        (host, port) => {
+            // 🌐 A hostname is a virtual host, not a bind address: Caddy
+            // binds every interface and routes by Host/SNI. Only an IP
+            // literal pins the socket to one interface.
+            if host.parse::<std::net::IpAddr>().is_ok() {
+                match port {
+                    Some(port) => format!("{host}:{port}"),
+                    None => format!("{host}:{default_port}"),
+                }
+            } else {
+                format!("0.0.0.0:{}", port.unwrap_or(default_port))
+            }
+        }
+    }
+}
+
+/// 🏷️ Returns the hostname portion of an address (`example.com:8443` → `example.com`).
+fn host_only(address: &str) -> &str {
+    let (host, _) = host_and_port(address);
+    host
+}
+
+/// 🧭 Renders an upstream address as a Host header value, like Caddy's
+/// `--change-host-header` shortcut.
+fn upstream_hostport(address: &str) -> String {
+    let (scheme, rest) = if let Some(rest) = address.strip_prefix("https://") {
+        (true, rest)
+    } else if let Some(rest) = address.strip_prefix("h2://") {
+        (true, rest)
+    } else {
+        (
+            false,
+            address
+                .strip_prefix("http://")
+                .or_else(|| address.strip_prefix("h2c://"))
+                .unwrap_or(address),
+        )
+    };
+    match host_and_port(rest) {
+        ("", Some(port)) => format!("127.0.0.1:{port}"),
+        ("", None) => format!("127.0.0.1:{}", if scheme { 443 } else { 80 }),
+        (host, Some(port)) => format!("{host}:{port}"),
+        (host, None) => format!("{host}:{}", if scheme { 443 } else { 80 }),
+    }
+}
+
 /// ✍️ Renders parsed directives back to canonical Pingclairfile text: two
 /// spaces per block level, one directive per line, arguments re-quoted only
 /// when whitespace or a comment marker demands it.
@@ -368,13 +482,62 @@ enum Commands {
         /// --resume` (overrides the config path when present)
         #[arg(short, long)]
         resume: bool,
+
+        /// Watch the config file and reload automatically after changes
+        /// (local development only, like `caddy run --watch`)
+        #[arg(short, long)]
+        watch: bool,
+    },
+
+    /// Reload the running server through the Admin API, like `caddy reload`
+    Reload {
+        /// Config file to apply (defaults to Pingclairfile/Caddyfile)
+        #[arg(short, long)]
+        config: Option<String>,
+
+        /// Admin API address
+        #[arg(long, default_value = "127.0.0.1:2019")]
+        address: String,
+    },
+
+    /// Start the server in the background, like `caddy start`
+    Start {
+        /// Config file to load
+        #[arg(short, long)]
+        config: Option<String>,
+    },
+
+    /// Stop the running server through the Admin API, like `caddy stop`
+    Stop {
+        /// Admin API address
+        #[arg(long, default_value = "127.0.0.1:2019")]
+        address: String,
+    },
+
+    /// Start one or more simple hard-coded HTTP servers for development
+    Respond {
+        /// HTTP status code to return
+        #[arg(short, long)]
+        status: Option<u16>,
+
+        /// Response header (`Field: value`), repeatable
+        #[arg(short = 'H', long = "header", value_parser = parse_header_pair)]
+        headers: Vec<(String, String)>,
+
+        /// Response body
+        #[arg(short, long)]
+        body: Option<String>,
+
+        /// Listener address (defaults to a random loopback port)
+        #[arg(short, long)]
+        listen: Option<String>,
     },
 
     /// Start a quick reverse proxy
     #[command(name = "reverse-proxy")]
     ReverseProxy {
         /// Address to listen on
-        #[arg(long, default_value = ":8080")]
+        #[arg(long, default_value = "localhost")]
         from: String,
 
         /// Upstream address to proxy to (repeatable)
@@ -400,6 +563,10 @@ enum Commands {
         /// Do not provision the automatic HTTP redirect listener
         #[arg(long)]
         disable_redirects: bool,
+
+        /// Set the upstream Host header to the upstream address, like Caddy
+        #[arg(short = 'c', long)]
+        change_host_header: bool,
     },
 
     /// Start a quick file server
@@ -529,6 +696,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Run {
             config: config_path,
             resume,
+            watch,
         } => {
             let mut config_path = resolve_config_path(config_path.as_deref());
             if resume {
@@ -569,7 +737,115 @@ fn main() -> anyhow::Result<()> {
                 }
             };
 
+            if watch {
+                // 👀 `--watch` reloads the config file after every change,
+                // like Caddy's local-development flag. Polling the mtime is
+                // deliberately simple: correctness matters, latency does not.
+                let watch_path = config_path.clone();
+                std::thread::spawn(move || {
+                    let mut last_modified = std::fs::metadata(&watch_path)
+                        .and_then(|meta| meta.modified())
+                        .ok();
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        let modified = std::fs::metadata(&watch_path)
+                            .and_then(|meta| meta.modified())
+                            .ok();
+                        if modified.is_some() && modified != last_modified {
+                            last_modified = modified;
+                            let _ = std::process::Command::new("kill")
+                                .args(["-USR1", &std::process::id().to_string()])
+                                .status();
+                        }
+                    }
+                });
+            }
+
             run_server(config_path.clone(), config)?;
+        }
+
+        Commands::Reload { config, address } => {
+            let path = resolve_config_path(config.as_deref());
+            let source = std::fs::read_to_string(&path)
+                .map_err(|error| anyhow::anyhow!("❌ Failed to read {path}: {error}"))?;
+            let (content_type, body) = if path.ends_with(".json") {
+                ("application/json".to_string(), source)
+            } else {
+                ("text/caddyfile".to_string(), source)
+            };
+            let (status, response) =
+                admin_request("POST", "/load", Some(&content_type), Some(&body), &address)?;
+            if status != 200 {
+                let detail = response.lines().next().unwrap_or("").to_string();
+                anyhow::bail!("❌ Reload failed ({status}): {detail}");
+            }
+            println!("✅ Configuration reloaded successfully");
+        }
+
+        Commands::Start { config } => {
+            let path = resolve_config_path(config.as_deref());
+            let executable = std::env::current_exe()?;
+            let mut command = std::process::Command::new(executable);
+            command
+                .arg("run")
+                .arg(&path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                command.process_group(0);
+            }
+            let child = command.spawn()?;
+            println!(
+                "✅ Pingclair started in the background (pid {})",
+                child.id()
+            );
+        }
+
+        Commands::Stop { address } => {
+            let (status, response) = admin_request("POST", "/stop", None, None, &address)?;
+            if status != 200 {
+                let detail = response.lines().next().unwrap_or("").to_string();
+                anyhow::bail!("❌ Stop failed ({status}): {detail}");
+            }
+            println!("✅ Pingclair stopped");
+        }
+
+        Commands::Respond {
+            status,
+            headers,
+            body,
+            listen,
+        } => {
+            use pingclair_core::config::{HandlerConfig, RouteConfig, ServerConfig};
+
+            let listen_addr =
+                listen_for_site(&listen.unwrap_or_else(|| "127.0.0.1:0".to_string()), false);
+            let probe = std::net::TcpListener::bind(&listen_addr)?;
+            let bound = probe.local_addr()?;
+            drop(probe);
+            println!("Server address: {bound}");
+
+            let server = ServerConfig {
+                name: Some("_".to_string()),
+                listen: vec![bound.to_string()],
+                routes: vec![RouteConfig {
+                    path: "/*".to_string(),
+                    handler: HandlerConfig::Respond {
+                        status: status.unwrap_or(200),
+                        body,
+                        headers: headers.into_iter().collect(),
+                    },
+                    methods: None,
+                    matcher: None,
+                }],
+                ..Default::default()
+            };
+            let mut config = pingclair_core::config::PingclairConfig::default();
+            config.servers.push(server);
+            run_server(String::new(), config)?;
         }
 
         Commands::ReverseProxy {
@@ -580,6 +856,7 @@ fn main() -> anyhow::Result<()> {
             insecure,
             internal_certs,
             disable_redirects,
+            change_host_header,
         } => {
             // 🌐 Caddy expands `--to :9000-9003` into one peer per port; the
             // CLI must not ship an address the runtime cannot dial.
@@ -591,19 +868,15 @@ fn main() -> anyhow::Result<()> {
                 config.global.auto_https = pingclair_core::config::AutoHttpsMode::DisableRedirects;
             }
 
-            // Parse listen address
-            let listen = if from.starts_with(':') {
-                format!("0.0.0.0{from}")
-            } else {
-                from.clone()
-            };
-
             // 🌐 A hostname `--from` names a virtual host and asks for HTTPS,
             // like Caddy's reverse-proxy command.
-            let name = if from.starts_with(':') || from.starts_with("http://") {
+            let https = !from.starts_with(':') && !from.starts_with("http://");
+            let listen = listen_for_site(&from, https);
+            let host = host_only(&from);
+            let name = if host.is_empty() {
                 "_".to_string()
             } else {
-                from.trim_start_matches("https://").to_string()
+                host.to_string()
             };
             let tls = if internal_certs {
                 Some(pingclair_core::config::TlsConfig {
@@ -611,8 +884,10 @@ fn main() -> anyhow::Result<()> {
                     ..Default::default()
                 })
             } else if name != "_" {
+                let internal = name == "localhost" || name.ends_with(".localhost");
                 Some(pingclair_core::config::TlsConfig {
-                    auto: true,
+                    auto: !internal,
+                    internal,
                     ..Default::default()
                 })
             } else {
@@ -645,6 +920,10 @@ fn main() -> anyhow::Result<()> {
                 upstream_tls.enable = true;
                 upstream_tls.insecure_skip_verify = true;
             }
+            let mut headers_up: HashMap<String, String> = headers_up.into_iter().collect();
+            if change_host_header && let Some(upstream) = to.first() {
+                headers_up.insert("Host".to_string(), upstream_hostport(upstream));
+            }
             let handler = HandlerConfig::ReverseProxy(ReverseProxyConfig {
                 upstreams: to,
                 upstream_options: Vec::new(),
@@ -653,7 +932,7 @@ fn main() -> anyhow::Result<()> {
                 cache: None,
                 load_balance: LoadBalanceConfig::default(),
                 health_check: None,
-                headers_up: headers_up.into_iter().collect(),
+                headers_up,
                 headers_down: headers_down.into_iter().collect(),
                 flush_interval: None,
                 read_timeout: None,
@@ -702,30 +981,42 @@ fn main() -> anyhow::Result<()> {
             // Create dynamic config
             let mut config = pingclair_core::config::PingclairConfig::default();
 
-            // 🌐 `--domain` names a virtual host and moves the default
-            // listener to the HTTPS port, like Caddy's file-server command.
-            let explicit_listen = listen != ":8080";
-            let listen_addr = if domain.is_some() && !explicit_listen {
-                "0.0.0.0:443".to_string()
+            // 🌐 `--domain` names a virtual host and serves HTTPS (internal
+            // CA for localhost), like Caddy's file-server command.
+            let listen_addr = if let Some(domain) = &domain {
+                let base = if listen == ":8080" {
+                    format!("{domain}:443")
+                } else {
+                    listen.clone()
+                };
+                listen_for_site(&base, true)
             } else if listen.starts_with(':') {
                 format!("0.0.0.0{listen}")
+            } else if listen.parse::<u16>().is_ok() {
+                format!("0.0.0.0:{listen}")
             } else {
                 listen.clone()
             };
+            let domain_name = domain.clone().unwrap_or_else(|| "_".to_string());
+            let tls = domain.as_ref().map(|domain| {
+                let internal = domain == "localhost" || domain.ends_with(".localhost");
+                pingclair_core::config::TlsConfig {
+                    auto: !internal,
+                    internal,
+                    ..Default::default()
+                }
+            });
 
             use pingclair_core::config::{HandlerConfig, RouteConfig, ServerConfig};
 
             let mut server = ServerConfig {
-                name: Some(domain.clone().unwrap_or_else(|| "_".to_string())),
+                name: Some(domain_name.clone()),
                 names: domain.clone().map_or_else(Vec::new, |d| vec![d]),
                 bind: None,
                 proxy_protocol_listen: Vec::new(),
                 listen: vec![listen_addr],
                 routes: Vec::new(),
-                tls: domain.as_ref().map(|_| pingclair_core::config::TlsConfig {
-                    auto: true,
-                    ..Default::default()
-                }),
+                tls,
                 log: access_log.then(|| pingclair_core::config::LogConfig {
                     output: pingclair_core::config::LogOutput::Stdout,
                     format: pingclair_core::config::LogFormat::Text,
@@ -2178,6 +2469,24 @@ mod tests {
                 .parse::<std::net::SocketAddr>()
                 .is_ok()
         );
+    }
+
+    /// 🧭 Caddy-style address derivation used by the quick commands.
+    #[test]
+    fn cli_site_addresses_derive_like_caddy() {
+        assert_eq!(listen_for_site(":2080", false), "0.0.0.0:2080");
+        assert_eq!(listen_for_site("localhost", true), "0.0.0.0:443");
+        assert_eq!(listen_for_site("example.com:8443", true), "0.0.0.0:8443");
+        assert_eq!(listen_for_site("http://example.com", false), "0.0.0.0:80");
+        assert_eq!(listen_for_site("127.0.0.1:9000", false), "127.0.0.1:9000");
+        assert_eq!(host_only("example.com:8443"), "example.com");
+        assert_eq!(host_only(":9000"), "");
+        assert_eq!(
+            upstream_hostport("https://localhost:9443"),
+            "localhost:9443"
+        );
+        assert_eq!(upstream_hostport(":9000"), "127.0.0.1:9000");
+        assert_eq!(upstream_hostport("backend.internal"), "backend.internal:80");
     }
 
     #[test]

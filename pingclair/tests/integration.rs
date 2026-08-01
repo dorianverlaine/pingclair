@@ -3318,6 +3318,226 @@ fn cli_adapt_and_validate_read_stdin() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("is valid"));
 }
 
+/// 🧪 `pingclair respond` serves a hard-coded response like `caddy respond`.
+#[tokio::test]
+async fn test_cli_respond_serves_body() {
+    use std::process::{Command, Stdio};
+
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+    let tls = tempfile::tempdir().unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pingclair"))
+        .args([
+            "respond",
+            "--listen",
+            &addr.to_string(),
+            "--status",
+            "201",
+            "--header",
+            "X-Test: yes",
+            "--body",
+            "hello-respond",
+        ])
+        .env("PINGCLAIR_TLS_STORE", tls.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn respond");
+
+    let client = no_proxy_client();
+    let url = format!("http://{addr}/");
+    let mut ready = false;
+    for _ in 0..40 {
+        if client
+            .get(&url)
+            .send()
+            .await
+            .map(|response| response.status() == reqwest::StatusCode::CREATED)
+            .unwrap_or(false)
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ready, "respond server did not come up");
+
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(resp.headers()["x-test"], "yes");
+    assert_eq!(resp.text().await.unwrap(), "hello-respond");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// 🧪 `pingclair reload` pushes a config through the Admin API.
+#[tokio::test]
+async fn test_cli_reload_uses_admin_api() {
+    use std::process::Command;
+
+    let mut server = TestServer::new(&admin_test_config("/__ready_cli_reload", "before"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let dir = tempfile::tempdir().unwrap();
+    let caddyfile = dir.path().join("Caddyfile");
+    std::fs::write(
+        &caddyfile,
+        format!("{} {{\n    respond \"after-cli\"\n}}\n", server.address(0)),
+    )
+    .unwrap();
+    let admin = server.admin_address.unwrap();
+    let status = Command::new(env!("CARGO_BIN_EXE_pingclair"))
+        .args([
+            "reload",
+            "--config",
+            caddyfile.to_str().unwrap(),
+            "--address",
+            &admin.to_string(),
+        ])
+        .status()
+        .expect("reload must run");
+    assert!(status.success());
+
+    let client = no_proxy_client();
+    let resp = client.get(server.url(0, "/anything")).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(resp.text().await.unwrap(), "after-cli");
+}
+
+/// 🧪 `pingclair start` and `stop` manage a background process.
+#[tokio::test]
+async fn test_cli_start_and_stop() {
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().unwrap();
+    let site_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let site_addr = site_probe.local_addr().unwrap();
+    let admin_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let admin_addr = admin_probe.local_addr().unwrap();
+    drop(site_probe);
+    drop(admin_probe);
+
+    let config_path = dir.path().join("Pingclairfile");
+    std::fs::write(
+        &config_path,
+        format!(
+            "{{\n    admin {admin_addr}\n}}\n:{} {{\n    respond \"started\"\n}}\n",
+            site_addr.port()
+        ),
+    )
+    .unwrap();
+    let tls = dir.path().join("tls");
+    std::fs::create_dir_all(&tls).unwrap();
+
+    let status = Command::new(env!("CARGO_BIN_EXE_pingclair"))
+        .args(["start", "--config", config_path.to_str().unwrap()])
+        .env("PINGCLAIR_TLS_STORE", &tls)
+        .status()
+        .expect("start must run");
+    assert!(status.success());
+
+    let client = no_proxy_client();
+    let url = format!("http://{site_addr}/");
+    let mut started = false;
+    for _ in 0..50 {
+        if client
+            .get(&url)
+            .send()
+            .await
+            .map(|response| response.status() == reqwest::StatusCode::OK)
+            .unwrap_or(false)
+        {
+            started = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(started, "background server did not come up");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_pingclair"))
+        .args(["stop", "--address", &admin_addr.to_string()])
+        .env("PINGCLAIR_TLS_STORE", &tls)
+        .status()
+        .expect("stop must run");
+    assert!(status.success());
+
+    let mut stopped = false;
+    for _ in 0..30 {
+        if client.get(&url).send().await.is_err() {
+            stopped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(stopped, "background server must stop");
+}
+
+/// 👀 `run --watch` reloads after the config file changes.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_cli_run_watch_reloads() {
+    use std::process::{Command, Stdio};
+
+    let dir = tempfile::tempdir().unwrap();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let site_addr = probe.local_addr().unwrap();
+    drop(probe);
+    let config_path = dir.path().join("Pingclairfile");
+    let write_config = |body: &str| {
+        std::fs::write(
+            &config_path,
+            format!(":{} {{\n    respond \"{body}\"\n}}\n", site_addr.port()),
+        )
+        .unwrap();
+    };
+    write_config("v1");
+    let tls = dir.path().join("tls");
+    std::fs::create_dir_all(&tls).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pingclair"))
+        .args(["run", "--watch", config_path.to_str().unwrap()])
+        .env("PINGCLAIR_TLS_STORE", &tls)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn run --watch");
+
+    let client = no_proxy_client();
+    let url = format!("http://{site_addr}/");
+    let mut v1 = false;
+    for _ in 0..50 {
+        if let Ok(response) = client.get(&url).send().await
+            && response.status() == reqwest::StatusCode::OK
+            && response.text().await.ok().as_deref() == Some("v1")
+        {
+            v1 = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(v1, "watched server did not come up");
+
+    write_config("v2");
+    let mut v2 = false;
+    for _ in 0..60 {
+        if let Ok(response) = client.get(&url).send().await
+            && response.status() == reqwest::StatusCode::OK
+            && response.text().await.ok().as_deref() == Some("v2")
+        {
+            v2 = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(v2, "--watch must reload the config automatically");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// 🧭 `/load` accepts a Caddyfile when the client sends `text/caddyfile`.
 #[tokio::test]
 async fn test_admin_load_accepts_caddyfile_content_type() {
