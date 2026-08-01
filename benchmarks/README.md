@@ -430,3 +430,53 @@ keeps the last known address serving, that an upstream absent at boot is
 adopted later, and that `dns_refresh off` pins the startup address. Container
 addresses are pinned with `--ip` so the result never depends on how the daemon
 happens to recycle its address pool.
+
+## 2026-08-02 香港機三邊對比（nginx vs caddy vs pingclair release）
+
+**場景**：三種伺服器在同一台 AWS 香港 `t4g.micro`（Ubuntu 26.04 arm64，
+2 vCPU / 1GB）上**輪流**跑，壓測客戶端是同一 VPC 內的 `t4g.small`
+（內網，非 loopback）。三邊共用同一份 1KB 檔、同一張 Let's Encrypt 憑證、
+同埠位（明文 8080、TLS/H2/H3 8443、proxy 8082、WS 8083），避免設定差異。
+
+- 伺服器：nginx 1.28.3（Ubuntu 套件，`worker_processes auto`）、
+  Caddy 2.11.4（官方 binary）、Pingclair release（fat-LTO，
+  commit `796581c`，aarch64）。
+- 工具：wrk（H1，`-t2 -c100 -d10s`）、h2load（H2，30k requests、
+  `-c100 -m100`）、aioquic 自寫 client（H3，30 並發 × 10 requests、
+  每請求一條新 QUIC 連線）、websockets（WS，50 連線 × 5 訊息）。
+- 後端：同一支單執行緒 python echo server（9001 WS / 9002 HTTP）。
+
+| 場景 | Pingclair release | Nginx 1.28.3 | Caddy 2.11.4 |
+| --- | ---: | ---: | ---: |
+| H1 明文 1KB | 29,422 req/s | 45,131 | 16,367 |
+| H1 TLS 1KB | 24,683 req/s | 34,448 | 17,394 |
+| H1 20MB 大檔 | 589 MB/s | 592 MB/s | 591 MB/s |
+| H2 1KB | 26,365 req/s，0 failed | 51,156，0 failed | 12,804，0 failed |
+| H3 1KB | 88.6 req/s | 113.5 | 119.8 |
+| Reverse proxy（H1） | 3,875 req/s | 3,517 | 2,856 |
+| WebSocket echo | 225.6 msg/s | 225.0 | 234.8 |
+
+**解讀**
+
+- 20MB、proxy、WS 三項三家幾乎相同：瓶頸分別是 t4g.micro 的網路上限
+  （~590 MB/s）與單執行緒 python 後端，無法區分伺服器。
+- 小檔靜態是真正分高下的場景：nginx 45k > pingclair 29.4k（65%）>
+  caddy 16.4k；H2 差距最大（nginx 51k > pingclair 26.4k（52%）>
+  caddy 12.8k）。H3 三家同級（caddy 119.8 ≈ nginx 113.5 >
+  pingclair 88.6）。
+- 與本文件舊數據的差距主因：舊表（50,145 vs 53,579）是 x86 VPS +
+  release + loopback；本次是 debug build 起測（HTTPS 靜態只有 ~2.5k
+  req/s，比 release 慢約 10 倍）與 t4g.micro（Graviton2）組合所致。
+  同機 loopback 對比（wrk 在 t4g.micro 上、與伺服器搶 CPU）：nginx
+  35,485 vs pingclair 22,065，比率與內網測試一致，差距是伺服器本體。
+- 已知未解：aarch64 release 未開 `-C target-cpu=neoverse-n1`（LSE
+  atomics），高併發下可能放大 Pingora 的鎖/原子開銷；待實驗驗證。
+
+**壓測發現的兩個 bug（已修，commit `21a113b`，待香港機重驗）**
+
+1. `CertStore` 冷啟動 cache 未水合（`load_all()` 從未執行），auto-HTTPS
+   主站每次重啟都重新跑 ACME（撞 LE 每週 5 張 rate limit），TLS 握手回
+   `NO_CERTIFICATE_SET`。修復：`TlsManager` 建構時 `store.init()`。
+2. 自訂 `error_while_proxy` 未呼叫 `decide_reuse`，upstream 高壓 read
+   error 時 Pingora retry 迴圈 panic（`Retry is not decided`）。修復：
+   套用 reuse 安全規則 + 路由 retry 預算後才讓迴圈讀取。

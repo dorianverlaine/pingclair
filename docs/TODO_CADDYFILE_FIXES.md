@@ -292,3 +292,35 @@ FX-A ──> FX-B ──> FX-C
       `rust:1.88-bookworm`）實測：`/`、`/style.css`、`/app.js`
       H1/H2/H3 全 200，`/ws` WebSocket 101 + 雙向 echo，`/ws/foo`
       404（精確匹配），`/api/echo` 200，`http→https` 308。
+
+---
+
+## 🔧 FX-I — 2026-08-02 香港機壓測發現
+
+### FX-I1（P0）：CertStore 冷啟動未水合 → auto-HTTPS 主站 NO_CERTIFICATE_SET
+
+- [x] `TlsManager` 建立 `CertStore` 後從未呼叫 `load_all()`，記憶體 cache
+      永遠是空的：每次冷啟動都把已存在的有效憑證當成「沒有」，白跑 ACME
+      簽發並撞 LE rate limit（too many certificates），H1/H2 握手回
+      `NO_CERTIFICATE_SET`（H3 表也拿不到憑證）。
+- 修復：`TlsManager::new`／`new_with_custom_challenge_path` 建構時
+      `store.init().await`；`TlsManager::init()` 不再空轉；`load_all`
+      跳過 `acme-challenges.json`（避免每次啟動的假警告）。
+- 測試：`startup_hydrates_persisted_certificates_into_the_cache`。
+
+### FX-I2（P0）：proxy 高壓時 `Retry is not decided` panic
+
+- [x] 自訂 `error_while_proxy` 覆寫後沒有呼叫 Pingora 預設的
+      `decide_reuse`，upstream 讀取錯誤（ReusedOnly）進 retry 迴圈時
+      `error.retry()` 直接 panic（`pingora-error` lib.rs:77）；proxy
+      服務執行緒死掉後整條 proxy 路徑長時間 502。
+- 修復：新增 `decide_upstream_error_retry`：先 `decide_reuse`
+      （client 連線重用且 retry buffer 未截斷才允許），再套用路由 retry
+      預算（attempt 上限/總時限），最後寫回 Decided 結果；`ctx.retry_pending`
+      同步，讓下次 upstream 選擇套用 backoff 與 deadline。
+- 測試：`upstream_error_retry_tests` 4 項（reuse 允許、fresh 拒絕、
+      budget 封頂、buffer 截斷拒絕）。
+
+> 兩項均已 commit（`21a113b`）並通過本機四 gate；香港機重驗與
+> `docs/CADDYFILE_VM_TEST_NOTES.md`／`benchmarks/README.md` 更新見
+> 2026-08-02 紀錄。

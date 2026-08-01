@@ -434,6 +434,23 @@ matcher token 規則解析為**精確** path matcher，不再被塞進 upstreams
 
 ---
 
+### 2026-08-02 壓測修復（`21a113b`，香港機）
+
+香港機三邊壓測（nginx 1.28.3 / Caddy 2.11.4 / Pingclair release，
+`benchmarks/README.md` 2026-08-02 節）發現兩個 P0：
+
+- **CertStore 冷啟動未水合**：`load_all()` 從未執行，auto-HTTPS 主站每次
+  重啟都白跑 ACME、撞 LE rate limit、握手回 `NO_CERTIFICATE_SET`。修復後
+  香港機冷啟動 log 顯示 `Hydrated 2 certificate(s)`，1 秒內 443 回 200。
+- **proxy 高壓 `Retry is not decided` panic**：自訂 `error_while_proxy`
+  未呼叫 `decide_reuse`。修復後 wrk c300 × 20s 打 `/api/echo` **0 panic**、
+  0 個 502/504，retry 判定 `retry: false` 正常輸出。
+
+兩項均有單元測試（`startup_hydrates_persisted_certificates_into_the_cache`、
+`upstream_error_retry_tests` ×4），四 gate 全綠。
+
+---
+
 ## 🧪 已實作，待乾淨遠端驗證
 
 > 這些是 v0.2 驗證日（TODO 的 Day 7／15／19／22／23）要清掉的積欠。
