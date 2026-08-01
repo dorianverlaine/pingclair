@@ -80,3 +80,8 @@ bench_*
 
 # Stray test output
 **/test_output.txt
+
+# 🔒 Local Caddy reference and audit docs — kept on disk for the audit
+# session but not part of the shipped repository.
+docs/CADDYFILE*.md
+vendor/
