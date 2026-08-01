@@ -150,6 +150,45 @@ instantanés destinés aux tests de déploiement — **pas des versions stables*
 Chaque version de développement est un instantané d'un arbre en mouvement —
 vérifiez-la avant de déployer.
 
+### Déploiement de production avec Docker Compose
+
+Pour un déploiement conteneurisé, lancez le mode fichier de configuration et
+conservez le magasin TLS sur un volume persistant (certificats, comptes ACME
+et CA interne y sont stockés) :
+
+```yaml
+services:
+  pingclair:
+    image: ghcr.io/dorianverlaine/pingclair:dev
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    volumes:
+      - ./conf:/etc/pingclair:ro
+      - ./site:/srv
+      - pingclair_tls:/var/lib/pingclair/certs
+    command: ["pingclair", "run", "/etc/pingclair/Pingclairfile"]
+
+volumes:
+  pingclair_tls:
+```
+
+Placez votre `Pingclairfile` dans `./conf/` et vos fichiers statiques dans
+`./site/` (référencez-les avec `root /srv`). HTTPS, redirection HTTP et
+HTTP/3 se comportent comme sur un hôte.
+
+### Faire confiance à la racine `tls internal`
+
+La CA locale persistante publie sa racine dans
+`$PINGCLAIR_TLS_STORE/internal/root.crt` (dans un conteneur :
+`docker compose cp pingclair:/var/lib/pingclair/certs/internal/root.crt
+./root.crt`). Installez-la dans le magasin de confiance système (Linux :
+`update-ca-certificates` ; macOS : `security add-trusted-cert`) ou importez-la
+manuellement dans les navigateurs à magasin propre (Firefox, Chrome). À ne
+faire que pour des origines que vous contrôlez.
+
 ## 🏃 Démarrage rapide
 
 Pingclair propose deux modes d'exécution : le **mode CLI**, pratique pour les tests rapides, et le **mode fichier de configuration**, destiné à la production.

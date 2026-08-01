@@ -150,8 +150,8 @@
 | CLI-2 | `pingclair fmt [--overwrite] [--diff]`（C1） ✅ P6 已修 | 🔴 |
 | CLI-3 | `validate` 走 provisioning 層（cert 檔存在性、upstream TLS 素材）（C2） ✅ P6 已修（cert 存在性；upstream 素材待 v0.3） | 🔴 |
 | CLI-4 | SIGUSR1 reload（C3；SIGHUP 相容保留） ✅ P6 已修（macOS 實測） | 🟠 |
-| CLI-5 | `file-server` 旗標：`--browse`、`--domain`、`--templates`、`--access-log`、`--no-compress`、`--file-limit`（C4） | 🟠 |
-| CLI-6 | `reverse-proxy` 旗標：多 `--to`、`--header-up/down`、`--insecure`、`--internal-certs`、`--disable-redirects`（C5） | 🟠 |
+| CLI-5 | `file-server` 旗標：`--browse`、`--domain`、`--templates`、`--access-log`、`--no-compress`、`--file-limit`（C4） ✅ P6 已修（browse/domain/access-log/no-compress；templates 標 TODO v0.3） | 🟠 |
+| CLI-6 | `reverse-proxy` 旗標：多 `--to`、`--header-up/down`、`--insecure`、`--internal-certs`、`--disable-redirects`（C5） ✅ P6 已修 | 🟠 |
 | CLI-7 | `hash-password`（bcrypt；C8） ✅ P6 已修 | 🟡 |
 | CLI-8 | `run --watch`／`--pidfile`／`--envfile`（C6） | 🟡 |
 | CLI-9 | `reload`／`start`／`stop` 子命令（配合 API-2/API-4） | 🟡（v0.3） |
@@ -162,7 +162,7 @@
 | 項 | 需求 | 級別 |
 |---|---|---|
 | LOG-1 | `log` block 未知子指令 fail closed（L1） ✅ P1 已修 | 🔴 |
-| LOG-2 | per-server/global `level` 支援（L2；`LoggingConfig.level` 死欄位接上或刪除） | 🟠 |
+| LOG-2 | per-server/global `level` 支援（L2；`LoggingConfig.level` 死欄位接上或刪除） ✅ P6 已修（per-server；global 標 TODO v0.3） | 🟠 |
 | LOG-3 | global `log` option（多 log 管道）（L3） | 🟡（v0.3） |
 | LOG-4 | access log 補 request/response headers、TLS 資訊（L4） | 🟡 |
 | LOG-5 | sampling 與 logger include/exclude（L5） | 🟡（v0.3） |
@@ -173,10 +173,10 @@
 | 項 | 需求 | 級別 |
 |---|---|---|
 | MT-1 | `{ metrics }`／`{ metrics { per_host ... } }` global option；預設關閉或文件化恆開 ✅ P6 已修（per_host 標 TODO v0.3） | 🟠 |
-| MT-2 | runtime/process 指標（`go_*`/`process_*` 對應物） | 🟠 |
-| MT-3 | admin API 指標（request/error counter per endpoint） | 🟠 |
-| MT-4 | HTTP 指標補齊：request/response size、TTFB、errors、in_flight；labels 對齊 Caddy（server/handler/code/method）或文件化映射 | 🟠 |
-| MT-5 | `upstream_healthy` 0/1 gauge（接 `BackendHealth`，與 API-10 同源） | 🟠 |
+| MT-2 | runtime/process 指標（`go_*`/`process_*` 對應物） ✅ P6 已修（跨平台 getrusage） | 🟠 |
+| MT-3 | admin API 指標（request/error counter per endpoint） ✅ P6 已修 | 🟠 |
+| MT-4 | HTTP 指標補齊：request/response size、TTFB、errors、in_flight；labels 對齊 Caddy（server/handler/code/method）或文件化映射 ✅ P6 已修（size/ttfb/errors；in_flight 用 active_connections） | 🟠 |
+| MT-5 | `upstream_healthy` 0/1 gauge（接 `BackendHealth`，與 API-10 同源） ✅ P6 已修 | 🟠 |
 | MT-6 | `active_connections` 改 gauge 並打點，或刪除 ✅ P6 已修 | 🟡 |
 | MT-7 | OpenMetrics 協商；OTLP push（v0.3） | 🟡 |
 
@@ -187,9 +187,9 @@
 | K-1 | systemd unit：`Restart=on-failure`＋`RestartPreventExitStatus=1`（config 壞不無限重啟） ✅ P6 已修 | 🟠 |
 | K-2 | 兩份 unit（scripts/ vs deployment/）合併為單一來源 ✅ P6 已修（canonical 標 scripts/） | 🟠 |
 | K-3 | API 工作流 service variant（配 `--resume`，API-8 一起） | 🟡 |
-| K-4 | production Docker Compose 範例（80/443/443-udp、TLS store volume） | 🟡 |
-| K-5 | 容器執行 `pingclair run` 的完整 README 範例（root Dockerfile CMD 只是 demo） | 🟡 |
-| K-6 | `tls internal` root.crt 的 trust 安裝流程文件化（systemd/Docker/browser） | 🟡 |
+| K-4 | production Docker Compose 範例（80/443/443-udp、TLS store volume） ✅ P6 已修（三語 README） | 🟡 |
+| K-5 | 容器執行 `pingclair run` 的完整 README 範例（root Dockerfile CMD 只是 demo） ✅ P6 已修 | 🟡 |
+| K-6 | `tls internal` root.crt 的 trust 安裝流程文件化（systemd/Docker/browser） ✅ P6 已修 | 🟡 |
 | K-7 | reload 訊號文件化（承接 CLI C3） | 🟡 |
 
 ## 10c. 官方 Examples 頁（來源：EXAMPLES）

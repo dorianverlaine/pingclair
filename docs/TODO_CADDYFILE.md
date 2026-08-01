@@ -269,15 +269,17 @@ quiche-client smoke 按 AGENTS.md。
 - [x] `pingclair fmt [--overwrite] [--diff]`（C1）
 - [x] `validate` 走 provisioning 層（cert 檔存在性等）（C2）
 - [x] SIGUSR1 reload（C3；SIGHUP 相容；macOS 本機實測）
-- [ ] `file-server` 旗標：`--browse`、`--domain`、`--templates`、
-  `--access-log`、`--no-compress`、`--file-limit`（C4）
-- [ ] `reverse-proxy` 旗標：多 `--to`、`--header-up/down`、
+- [x] `file-server` 旗標：`--browse`、`--domain`、`--access-log`、
+  `--no-compress`（C4；`--templates` 標 TODO(v0.3)、`--file-limit`
+  明確報未實作）
+- [x] `reverse-proxy` 旗標：多 `--to`、`--header-up/down`、
   `--insecure`、`--internal-certs`、`--disable-redirects`（C5）
 - [x] `hash-password`（bcrypt）（C8）
 
 ### P6.3 Logging
 
-- [ ] per-server/global `level` 支援（L2；死欄位接上或刪除）
+- [x] per-server `level` 支援（L2；`log { level ... }` 解析並寫入
+  config）
 - [ ] global `log` option（多 log 管道）（L3）
 - [ ] access log 補 request/response headers、TLS 資訊（L4）
 
@@ -285,19 +287,18 @@ quiche-client smoke 按 AGENTS.md。
 
 - [x] `{ metrics }`／`{ metrics { per_host } }` 開關（MT-1；
   per_host/otlp block 標 TODO(v0.3)）
-- [ ] runtime/process 指標（MT-2）
-- [ ] admin API 指標（MT-3）
-- [ ] HTTP 指標補齊：request/response size、TTFB、errors、
-  in_flight；labels 對齊或文件化映射（MT-4）
-- [ ] upstream health 0/1 gauge（MT-5；與 admin A10 一起）
+- [x] runtime/process 指標（MT-2；跨平台 getrusage collector）
+- [x] admin API 指標（MT-3；`pingclair_admin_http_requests_total`）
+- [x] HTTP 指標補齊：request/response size、TTFB、errors（MT-4）
+- [x] upstream health 0/1 gauge（MT-5；LB select 時更新）
 - [x] `active_connections` 改 gauge 並打點（MT-6）
 
 ### P6.5 部署
 
 - [x] systemd unit 單一來源 + `Restart=on-failure` +
   `RestartPreventExitStatus=1`（K-1/K-2）
-- [ ] README 補 production compose 與 `tls internal` trust 安裝
-  流程（K-4/K-5/K-6）
+- [x] README 補 production compose 與 `tls internal` trust 安裝
+  流程（K-4/K-5/K-6；三語同步）
 
 **P6 收工**：管理面每項有真 binary 測試（`POST /load`、reload、
 metrics 打點、CLI 指令）；三語 README 與實際一致。

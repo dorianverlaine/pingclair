@@ -79,6 +79,25 @@ async fn handle_request(
     auth: Option<Arc<ApiKeyAuth>>,
     peer_addr: SocketAddr,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let response = handle_request_inner(req, proxies, auth, peer_addr).await?;
+    // 📊 Count every admin request by endpoint and status (MT-3).
+    let status = response.status().as_u16().to_string();
+    pingclair_proxy::metrics::ADMIN_REQUESTS_TOTAL
+        .with_label_values(&[&method, &path, &status])
+        .inc();
+    Ok(response)
+}
+
+async fn handle_request_inner(
+    req: Request<hyper::body::Incoming>,
+    proxies: Arc<
+        RwLock<std::collections::HashMap<String, pingclair_proxy::server::PingclairProxy>>,
+    >,
+    auth: Option<Arc<ApiKeyAuth>>,
+    peer_addr: SocketAddr,
+) -> Result<Response<Full<Bytes>>, Infallible> {
     let authorization = req
         .headers()
         .get(hyper::header::AUTHORIZATION)

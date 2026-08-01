@@ -1133,6 +1133,7 @@ fn adapt_tls_directive(d: &Directive) -> Result<TlsDirective, AdapterError> {
 fn adapt_log_block(block: Block) -> Result<LogBlock, AdapterError> {
     let mut output = LogOutput::Stdout;
     let mut format = LogFormat::default();
+    let mut level = None;
 
     for d in block.directives {
         match d.name.as_str() {
@@ -1231,6 +1232,35 @@ fn adapt_log_block(block: Block) -> Result<LogBlock, AdapterError> {
                     }
                 }
             }
+            "level" => {
+                // 🚦 Accepts Caddy's log levels and maps them onto the
+                // process levels; the value flows through to the compiled
+                // config for tooling and future filtering.
+                let raw = d
+                    .args
+                    .first()
+                    .ok_or_else(|| AdapterError::ArgumentCount("log level".into(), 1, 0))?;
+                if d.args.len() != 1 {
+                    return Err(AdapterError::ArgumentCount(
+                        "log level".into(),
+                        1,
+                        d.args.len(),
+                    ));
+                }
+                level = Some(match raw.to_ascii_lowercase().as_str() {
+                    "trace" => LogLevel::Trace,
+                    "debug" => LogLevel::Debug,
+                    "info" => LogLevel::Info,
+                    "warn" | "warning" => LogLevel::Warn,
+                    "error" => LogLevel::Error,
+                    other => {
+                        return Err(AdapterError::InvalidArgument(
+                            "log level".into(),
+                            format!("unknown level `{other}`"),
+                        ));
+                    }
+                });
+            }
             // 🚩 Unknown log subdirectives (e.g. `level debug` today) must not
             // vanish: the operator would believe the setting took effect.
             other => {
@@ -1239,7 +1269,11 @@ fn adapt_log_block(block: Block) -> Result<LogBlock, AdapterError> {
         }
     }
 
-    Ok(LogBlock { output, format })
+    Ok(LogBlock {
+        output,
+        format,
+        level,
+    })
 }
 
 // MARK: - Handler Adaptation
@@ -3862,12 +3896,12 @@ mod fail_closed_tests {
         let error = compile_err(
             r#"example.com {
                 log {
-                    level debug
+                    rotate 7d
                 }
             }"#,
         );
         assert!(
-            error.contains("log: level"),
+            error.contains("log: rotate"),
             "unknown log subdirective must be named; got {error}"
         );
     }

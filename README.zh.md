@@ -134,6 +134,50 @@ curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scrip
 
 每個開發版都是移動中的樹的快照，部署到重要環境前請自行驗證。
 
+### 以 Docker Compose 做正式部署
+
+正式部署建議跑 config-file 模式，並把 TLS store 放在持久 volume（裡面有
+憑證、ACME 帳戶金鑰與 internal CA——刪掉等於全部重新簽發）：
+
+```yaml
+services:
+  pingclair:
+    image: ghcr.io/dorianverlaine/pingclair:dev
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    volumes:
+      - ./conf:/etc/pingclair:ro
+      - ./site:/srv
+      - pingclair_tls:/var/lib/pingclair/certs
+    command: ["pingclair", "run", "/etc/pingclair/Pingclairfile"]
+
+volumes:
+  pingclair_tls:
+```
+
+把 `Pingclairfile` 放 `./conf/`、靜態檔放 `./site/`（設定裡用
+`root /srv` 指到它）。容器以 config 檔啟動，HTTPS、自動 80 轉跳與
+HTTP/3 的行為與主機部署完全一致。
+
+### 信任 `tls internal` 的根憑證
+
+`tls internal` 用持久本機 CA 簽發 leaf。要驗證憑證的用戶端必須信任其根，
+位置在 `$PINGCLAIR_TLS_STORE/internal/root.crt`（容器內：
+`docker compose cp pingclair:/var/lib/pingclair/certs/internal/root.crt
+./root.crt`）。安裝到系統信任庫：
+
+- Linux：複製到 `/usr/local/share/ca-certificates/root.crt` 後執行
+  `sudo update-ca-certificates`。
+- macOS：`sudo security add-trusted-cert -d -r trustRoot -k
+  /Library/Keychains/System.keychain root.crt`。
+- 自帶信任庫的瀏覽器（Firefox、部分平台的 Chrome）需在憑證管理員手動匯入
+  根憑證。
+
+只對你控制的來源做這件事；internal CA 不是公開憑證機構。
+
 ## 🏃 快速上手
 
 Pingclair 提供兩種執行模式：**CLI 命令列模式**（適合快速測試）與**設定檔模式**（適合正式環境）。
