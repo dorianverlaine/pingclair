@@ -18,6 +18,12 @@ pub enum AdapterError {
     #[error("Unknown directive '{0}'")]
     UnknownDirective(String),
 
+    /// 🚫 A Caddy-compatible feature that Pingclair deliberately does not
+    /// implement yet. Failing loudly here beats compiling a config that
+    /// silently ignores half of what the operator asked for.
+    #[error("Caddy-compatible directive '{0}' is not supported by Pingclair yet: {1}")]
+    UnsupportedFeature(String, String),
+
     #[error("Directive '{0}' expects {1} arguments, got {2}")]
     ArgumentCount(String, usize, usize),
 
@@ -148,29 +154,61 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
         for sub in directives {
             match sub.name.as_str() {
                 "debug" => {
-                    global.debug = Some(sub.args.first().map(|s| s == "true").unwrap_or(true));
+                    // 🚩 `debug fales` used to parse as "debug off": a typo
+                    // silently disabled the very diagnostics being asked for.
+                    // Caddy's `debug` is a bare flag, so any argument is a
+                    // mistake worth rejecting.
+                    if !sub.args.is_empty() {
+                        return Err(AdapterError::ArgumentCount(
+                            "debug".into(),
+                            0,
+                            sub.args.len(),
+                        ));
+                    }
+                    global.debug = Some(true);
                 }
                 "email" => {
                     global.email = sub.args.first().cloned();
                 }
                 "auto_https" => {
-                    if let Some(arg) = sub.args.first() {
-                        match arg.as_str() {
-                            "on" => global.auto_https = Some(AutoHttpsMode::On),
-                            "off" => global.auto_https = Some(AutoHttpsMode::Off),
-                            "disable_redirects" => {
-                                global.auto_https = Some(AutoHttpsMode::DisableRedirects)
-                            }
-                            _ => {
-                                return Err(AdapterError::InvalidArgument(
-                                    "auto_https".into(),
-                                    arg.clone(),
-                                ));
-                            }
+                    let arg = sub
+                        .args
+                        .first()
+                        .ok_or_else(|| AdapterError::ArgumentCount("auto_https".into(), 1, 0))?;
+                    match arg.as_str() {
+                        "on" => global.auto_https = Some(AutoHttpsMode::On),
+                        "off" => global.auto_https = Some(AutoHttpsMode::Off),
+                        "disable_redirects" => {
+                            global.auto_https = Some(AutoHttpsMode::DisableRedirects)
+                        }
+                        // 🚫 Caddy's `disable_certs` and `ignore_loaded_certs`
+                        // modes are real syntax; name them explicitly instead
+                        // of reporting a bare invalid argument.
+                        "disable_certs" | "ignore_loaded_certs" => {
+                            return Err(AdapterError::UnsupportedFeature(
+                                format!("auto_https {arg}"),
+                                "only on, off and disable_redirects are implemented".into(),
+                            ));
+                        }
+                        _ => {
+                            return Err(AdapterError::InvalidArgument(
+                                "auto_https".into(),
+                                arg.clone(),
+                            ));
                         }
                     }
                 }
                 "admin" => {
+                    // 🚫 Caddy's `admin <addr> { origins ...; enforce_origin }`
+                    // block form used to compile with the block silently
+                    // dropped, leaving the endpoint without the origin checks
+                    // the operator asked for.
+                    if sub.block.is_some() {
+                        return Err(AdapterError::UnsupportedFeature(
+                            "admin block".into(),
+                            "admin origins/enforce_origin are not implemented yet".into(),
+                        ));
+                    }
                     match sub.args.first() {
                         // `admin off` explicitly disables the admin API
                         Some(arg) if arg == "off" => {
@@ -235,13 +273,65 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                 // like the opposite — the same shape as `encode gzipp` and
                 // `listen :443 proxy_protocol`, both of which were fixed for
                 // exactly this reason.
+                //
+                // 🚫 Options that are real Caddy syntax but not implemented
+                // here get a distinct message so a migrating Caddyfile is not
+                // mistaken for a typo.
                 other => {
+                    if is_known_caddy_global_option(other) {
+                        return Err(AdapterError::UnsupportedFeature(
+                            format!("global: {other}"),
+                            "this Caddy global option is not implemented yet".into(),
+                        ));
+                    }
                     return Err(AdapterError::UnknownDirective(format!("global: {other}")));
                 }
             }
         }
     }
     Ok(global)
+}
+
+/// 🧾 Whether a global-block name is documented Caddy syntax rather than a
+/// likely typo. The list mirrors `vendor/caddy-docs/markdown/caddyfile/options.md`.
+fn is_known_caddy_global_option(name: &str) -> bool {
+    matches!(
+        name,
+        "http_port"
+            | "https_port"
+            | "default_bind"
+            | "order"
+            | "storage"
+            | "storage_clean_interval"
+            | "persist_config"
+            | "log"
+            | "grace_period"
+            | "shutdown_delay"
+            | "metrics"
+            | "default_sni"
+            | "fallback_sni"
+            | "local_certs"
+            | "skip_install_trust"
+            | "acme_ca"
+            | "acme_ca_root"
+            | "acme_eab"
+            | "acme_dns"
+            | "dns"
+            | "ech"
+            | "on_demand_tls"
+            | "key_type"
+            | "cert_issuer"
+            | "renew_interval"
+            | "cert_lifetime"
+            | "ocsp_interval"
+            | "ocsp_stapling"
+            | "renewal_window_ratio"
+            | "preferred_chains"
+            | "filesystem"
+            | "pki"
+            | "events"
+            | "frankenphp"
+    )
 }
 
 /// Flatten Caddy's nested `servers { ... }` block.
@@ -310,6 +400,14 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
             if !parsed.hostname.is_empty() && parsed.hostname != "0.0.0.0" {
                 server.name = parsed.hostname;
             }
+        } else if looks_like_unsupported_address(name) {
+            return Err(AdapterError::UnsupportedFeature(
+                "site address".into(),
+                format!(
+                    "`{name}` uses a network prefix, a port range or a Unix socket, \
+                     none of which Pingclair supports yet"
+                ),
+            ));
         }
     }
 
@@ -550,6 +648,37 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
     Ok(server)
 }
 
+/// 🚫 Whether an address string uses Caddy syntax that Pingclair cannot
+/// honor yet: a network prefix (`tcp/`, `unix/`), a Unix socket path
+/// (`unix//...`), or a port range (`:8080-8085`).
+fn looks_like_unsupported_address(addr: &str) -> bool {
+    let bare = addr
+        .strip_prefix("https://")
+        .or_else(|| addr.strip_prefix("http://"))
+        .unwrap_or(addr);
+    let has_network_prefix = bare.split('/').next().is_some_and(|head| {
+        matches!(
+            head,
+            "tcp"
+                | "tcp4"
+                | "tcp6"
+                | "udp"
+                | "udp4"
+                | "udp6"
+                | "ip"
+                | "ip4"
+                | "ip6"
+                | "unix"
+                | "unixgram"
+                | "unixpacket"
+        )
+    });
+    let has_port_range = bare
+        .rsplit_once(':')
+        .is_some_and(|(_, port)| port.contains('-'));
+    has_network_prefix || has_port_range
+}
+
 // MARK: - URL Address Parsing
 
 struct ParsedAddress {
@@ -560,6 +689,30 @@ struct ParsedAddress {
 /// Parse a Caddy server address like `http://ai.408timeout.com:20615`
 /// or `:8080` or `example.com`.
 fn parse_server_address(addr: &str) -> Option<ParsedAddress> {
+    // 🚫 Caddy network addresses may carry a network prefix (`tcp/`,
+    // `unix/`, ...) or a port range (`:8080-8085`). Neither has a runtime
+    // equivalent here, and treating them as hostnames silently produces a
+    // listener that serves the wrong thing.
+    if addr.split('/').next().is_some_and(|head| {
+        matches!(
+            head,
+            "tcp"
+                | "tcp4"
+                | "tcp6"
+                | "udp"
+                | "udp4"
+                | "udp6"
+                | "ip"
+                | "ip4"
+                | "ip6"
+                | "unix"
+                | "unixgram"
+                | "unixpacket"
+        )
+    }) {
+        return None;
+    }
+
     let (scheme, rest) = if let Some(stripped) = addr.strip_prefix("https://") {
         (Scheme::Https, stripped)
     } else if let Some(stripped) = addr.strip_prefix("http://") {
@@ -575,13 +728,13 @@ fn parse_server_address(addr: &str) -> Option<ParsedAddress> {
 
     let (hostname, port) = if let Some(port) = rest.strip_prefix(':') {
         // :port
-        let p = port.parse::<u16>().ok();
-        ("0.0.0.0".to_string(), p)
+        let p = port.parse::<u16>().ok()?;
+        ("0.0.0.0".to_string(), Some(p))
     } else if let Some(colon_pos) = rest.rfind(':') {
         // host:port
         let h = &rest[..colon_pos];
-        let p = rest[colon_pos + 1..].parse::<u16>().ok();
-        (h.to_string(), p)
+        let p = rest[colon_pos + 1..].parse::<u16>().ok()?;
+        (h.to_string(), Some(p))
     } else {
         // host only (default port based on scheme)
         let p = match scheme {
@@ -705,68 +858,105 @@ fn adapt_log_block(block: Block) -> Result<LogBlock, AdapterError> {
     for d in block.directives {
         match d.name.as_str() {
             "output" => {
-                if let Some(kind) = d.args.first() {
-                    match kind.as_str() {
-                        "file" => {
-                            if let Some(path) = d.args.get(1) {
-                                output = LogOutput::File(path.clone());
-                            }
-                        }
-                        "stdout" => output = LogOutput::Stdout,
-                        "stderr" => output = LogOutput::Stderr,
-                        _ => {}
+                let kind = d
+                    .args
+                    .first()
+                    .ok_or_else(|| AdapterError::ArgumentCount("log output".into(), 1, 0))?;
+                match kind.as_str() {
+                    "file" => {
+                        let path = d.args.get(1).ok_or_else(|| {
+                            AdapterError::ArgumentCount("log output file".into(), 2, 1)
+                        })?;
+                        output = LogOutput::File(path.clone());
+                    }
+                    "stdout" => output = LogOutput::Stdout,
+                    "stderr" => output = LogOutput::Stderr,
+                    // 🚩 A typo in the log destination used to fall through to
+                    // the default sink, so `output stdoutd` wrote to stderr and
+                    // nobody could tell why the line went missing.
+                    other => {
+                        return Err(AdapterError::InvalidArgument(
+                            "log output".into(),
+                            format!("unknown output `{other}` (expected file, stdout or stderr)"),
+                        ));
                     }
                 }
             }
             "format" => {
-                if let Some(kind) = d.args.first() {
-                    match kind.as_str() {
-                        "json" => format.format_type = LogFormatType::Json,
-                        "text" => format.format_type = LogFormatType::Text,
-                        "filter" => {
-                            // `format filter { wrap <json|text> ... }`.
-                            // JSON is the default here because a filter block
-                            // exists to drop fields, which only structured
-                            // output makes meaningful — but an explicit
-                            // `wrap text` must still win. This previously
-                            // pinned Json before reading `wrap` at all, so
-                            // `wrap text` was impossible to express.
-                            format.format_type = LogFormatType::Json;
-                            if let Some(filter_block) = d.block {
-                                let mut filter = LogFilter::default();
-                                for fb_d in filter_block.directives {
-                                    if fb_d.name == "wrap" {
-                                        match fb_d.args.first().map(|s| s.as_str()) {
-                                            Some("json") => {
-                                                format.format_type = LogFormatType::Json
-                                            }
-                                            Some("text") | Some("console") => {
-                                                format.format_type = LogFormatType::Text
-                                            }
-                                            _ => {}
+                let kind = d
+                    .args
+                    .first()
+                    .ok_or_else(|| AdapterError::ArgumentCount("log format".into(), 1, 0))?;
+                match kind.as_str() {
+                    "json" => format.format_type = LogFormatType::Json,
+                    "text" => format.format_type = LogFormatType::Text,
+                    "filter" => {
+                        // `format filter { wrap <json|text> ... }`.
+                        // JSON is the default here because a filter block
+                        // exists to drop fields, which only structured
+                        // output makes meaningful — but an explicit
+                        // `wrap text` must still win. This previously
+                        // pinned Json before reading `wrap` at all, so
+                        // `wrap text` was impossible to express.
+                        format.format_type = LogFormatType::Json;
+                        if let Some(filter_block) = d.block {
+                            let mut filter = LogFilter::default();
+                            for fb_d in filter_block.directives {
+                                if fb_d.name == "wrap" {
+                                    match fb_d.args.first().map(|s| s.as_str()) {
+                                        Some("json") => format.format_type = LogFormatType::Json,
+                                        Some("text") | Some("console") => {
+                                            format.format_type = LogFormatType::Text
+                                        }
+                                        // 🚩 `wrap` with an unknown encoder or
+                                        // no encoder is a config error, not a
+                                        // reason to silently pick JSON.
+                                        _ => {
+                                            return Err(AdapterError::InvalidArgument(
+                                                "log format filter wrap".into(),
+                                                format!(
+                                                    "expected json, text or console, got {:?}",
+                                                    fb_d.args.first()
+                                                ),
+                                            ));
                                         }
                                     }
-                                    if fb_d.name == "fields"
-                                        && let Some(fields_block) = fb_d.block
-                                    {
-                                        for field_d in fields_block.directives {
-                                            // field_name "delete" → exclude field
-                                            if field_d.args.first().map(|a| a.as_str())
-                                                == Some("delete")
-                                            {
-                                                filter.exclude.push(field_d.name);
-                                            }
+                                } else if fb_d.name == "fields"
+                                    && let Some(fields_block) = fb_d.block
+                                {
+                                    for field_d in fields_block.directives {
+                                        // field_name "delete" → exclude field
+                                        if field_d.args.first().map(|a| a.as_str())
+                                            == Some("delete")
+                                        {
+                                            filter.exclude.push(field_d.name);
                                         }
                                     }
+                                } else {
+                                    return Err(AdapterError::UnknownDirective(format!(
+                                        "log format filter: {}",
+                                        fb_d.name
+                                    )));
                                 }
-                                format.filter = Some(filter);
                             }
+                            format.filter = Some(filter);
                         }
-                        _ => format.format_type = LogFormatType::Text,
+                    }
+                    // 🚩 `format jsno` used to fall back to text encoding and
+                    // hide the typo behind a working-looking log line.
+                    other => {
+                        return Err(AdapterError::InvalidArgument(
+                            "log format".into(),
+                            format!("unknown format `{other}` (expected json, text or filter)"),
+                        ));
                     }
                 }
             }
-            _ => {}
+            // 🚩 Unknown log subdirectives (e.g. `level debug` today) must not
+            // vanish: the operator would believe the setting took effect.
+            other => {
+                return Err(AdapterError::UnknownDirective(format!("log: {other}")));
+            }
         }
     }
 
@@ -807,7 +997,21 @@ fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
                         "browse" => {
                             config.browse = sub.args.first().map(|s| s == "true").unwrap_or(true)
                         }
-                        _ => {}
+                        // 🚩 Caddy's `precompressed` and `fs` subdirectives
+                        // used to compile into a file server that quietly
+                        // served without either behavior. Rejecting them is
+                        // the only honest option until they are implemented.
+                        "precompressed" | "fs" => {
+                            return Err(AdapterError::UnsupportedFeature(
+                                format!("file_server {}", sub.name),
+                                "Pingclair does not implement this subdirective yet".into(),
+                            ));
+                        }
+                        other => {
+                            return Err(AdapterError::UnknownDirective(format!(
+                                "file_server: {other}"
+                            )));
+                        }
                     }
                 }
             }
@@ -829,8 +1033,52 @@ fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
         "rewrite" => adapt_rewrite(d),
         "cors" => adapt_cors(d),
         "access_control" => adapt_access_control(d),
-        _ => Err(AdapterError::UnknownDirective(d.name)),
+        // 🚫 A directive that exists in Caddy's standard set but has no
+        // implementation here gets a message that says so, instead of being
+        // indistinguishable from a typo.
+        other => Err(if is_known_caddy_directive(other) {
+            AdapterError::UnsupportedFeature(
+                other.to_string(),
+                "this Caddy directive is not implemented yet".into(),
+            )
+        } else {
+            AdapterError::UnknownDirective(other.to_string())
+        }),
     }
+}
+
+/// 🧾 Whether a handler-directive name is documented Caddy syntax rather
+/// than a likely typo. The list mirrors
+/// `vendor/caddy-docs/markdown/caddyfile/directives.md`.
+fn is_known_caddy_directive(name: &str) -> bool {
+    matches!(
+        name,
+        "abort"
+            | "acme_server"
+            | "error"
+            | "forward_auth"
+            | "fs"
+            | "handle_errors"
+            | "handle_path"
+            | "intercept"
+            | "invoke"
+            | "log_append"
+            | "log_skip"
+            | "log_name"
+            | "map"
+            | "method"
+            | "metrics"
+            | "php_fastcgi"
+            | "push"
+            | "request_body"
+            | "request_header"
+            | "root"
+            | "templates"
+            | "tracing"
+            | "try_files"
+            | "uri"
+            | "vars"
+    )
 }
 
 /// 🚦 Adapts an exact local rate-limit policy and rejects ambiguous options.
@@ -1108,12 +1356,25 @@ fn adapt_basic_auth(d: Directive) -> Result<Handler, AdapterError> {
 /// - `reverse_proxy host:port { header_up K V; flush_interval -1; transport http { ... } }`
 fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
     // Collect upstreams from args (filter out matcher @names)
-    let upstreams: Vec<String> = d
-        .args
-        .iter()
-        .filter(|a| !a.starts_with('@'))
-        .cloned()
-        .collect();
+    let mut upstreams = Vec::with_capacity(d.args.len());
+    for arg in &d.args {
+        if arg.starts_with('@') {
+            continue;
+        }
+        // 🚫 A Unix-socket upstream (`unix//run/php.sock`) used to compile
+        // into a bogus hostname that could never dial. Refuse it here instead
+        // of shipping a proxy whose upstream silently never comes up.
+        if arg.starts_with("unix") {
+            return Err(AdapterError::UnsupportedFeature(
+                "reverse_proxy".into(),
+                format!(
+                    "`{arg}` is a Unix-socket upstream address; Pingclair does not \
+                     support Unix-socket upstreams yet"
+                ),
+            ));
+        }
+        upstreams.push(arg.clone());
+    }
 
     let mut proxy = ProxyConfig::new(upstreams);
 
@@ -1124,15 +1385,41 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
                 "header_up" => {
                     // header_up Key Value
                     // Value may be a {placeholder} → preserved as-is for runtime resolution
-                    if sub.args.len() >= 2 {
-                        let key = sub.args[0].clone();
-                        let value = sub.args[1].clone();
-                        proxy.header_up.insert(key, Expr::String(value));
+                    match sub.args.as_slice() {
+                        [key, value] => {
+                            proxy
+                                .header_up
+                                .insert(key.clone(), Expr::String(value.clone()));
+                        }
+                        // 🚩 A third argument used to be silently dropped, so
+                        // `header_up X-Foo a b` sent only `a` upstream while
+                        // looking like it sent both.
+                        _ => {
+                            return Err(AdapterError::ArgumentCount(
+                                "header_up".into(),
+                                2,
+                                sub.args.len(),
+                            ));
+                        }
                     }
                 }
                 "header_down" => {
-                    // 🐛 TODO: header_down is not yet tracked in ProxyConfig AST.
-                    // For now, silently ignore.
+                    // 🚫 Caddy's `header_down` used to be silently dropped,
+                    // leaving the operator certain a response header was being
+                    // rewritten while the proxy forwarded it untouched.
+                    return Err(AdapterError::UnsupportedFeature(
+                        "reverse_proxy header_down".into(),
+                        "response header rewriting is not implemented yet".into(),
+                    ));
+                }
+                "dynamic" => {
+                    // 🚫 SRV-based dynamic upstream discovery is a Caddy
+                    // feature with no runtime equivalent here yet; a config
+                    // naming it must not silently degrade to static upstreams.
+                    return Err(AdapterError::UnsupportedFeature(
+                        "reverse_proxy dynamic".into(),
+                        "dynamic upstream discovery is not implemented yet".into(),
+                    ));
                 }
                 "flush_interval" => {
                     if let Some(val) = sub.args.first() {
@@ -1320,7 +1607,15 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
                     proxy.upstreams.push(address);
                     proxy.upstream_options.push(upstream);
                 }
-                _ => {}
+                // 🚩 `lb_try_duration`, `fail_duration` and any other
+                // unrecognised subdirective used to vanish here. A config
+                // that names a tuning knob the runtime does not honor must
+                // fail load, or the operator will tune a phantom.
+                other => {
+                    return Err(AdapterError::UnknownDirective(format!(
+                        "reverse_proxy: {other}"
+                    )));
+                }
             }
         }
     }
@@ -1992,6 +2287,12 @@ fn adapt_header_directive(d: &Directive) -> Result<Handler, AdapterError> {
                 config.remove.push(stripped.to_string());
             } else if let Some(val) = args.get(1) {
                 config.set.insert((*key).clone(), (*val).clone());
+            } else {
+                // 🚩 `header X-Only` used to compile into an empty header
+                // operation: no set, no remove, no add. A header key without
+                // a value is either a typo or a request to remove — make the
+                // author say which.
+                return Err(AdapterError::ArgumentCount("header".into(), 2, args.len()));
             }
         }
     }
@@ -2132,17 +2433,29 @@ fn parse_single_matcher_at(d: &Directive, depth: usize) -> Result<Matcher, Adapt
             Ok(Matcher::Not(Box::new(inner)))
         }
         "method" => {
-            let methods = d
-                .args
-                .iter()
-                .filter_map(|m| match m.to_uppercase().as_str() {
-                    "GET" => Some(HttpMethod::Get),
-                    "POST" => Some(HttpMethod::Post),
-                    "PUT" => Some(HttpMethod::Put),
-                    "DELETE" => Some(HttpMethod::Delete),
-                    _ => None,
-                })
-                .collect();
+            // 🚫 Unknown verbs used to be filtered out silently, so
+            // `method HEAD` produced a matcher that could never match while
+            // `method GET FOO` quietly matched only GET. Every standard verb
+            // is supported and anything else is a config error.
+            let mut methods = Vec::with_capacity(d.args.len());
+            for m in &d.args {
+                let method = match m.to_uppercase().as_str() {
+                    "GET" => HttpMethod::Get,
+                    "POST" => HttpMethod::Post,
+                    "PUT" => HttpMethod::Put,
+                    "DELETE" => HttpMethod::Delete,
+                    "PATCH" => HttpMethod::Patch,
+                    "HEAD" => HttpMethod::Head,
+                    "OPTIONS" => HttpMethod::Options,
+                    other => {
+                        return Err(AdapterError::InvalidArgument(
+                            "method".into(),
+                            format!("unknown HTTP method `{other}`"),
+                        ));
+                    }
+                };
+                methods.push(method);
+            }
             Ok(Matcher::Method(methods))
         }
         "header" => {
@@ -2150,6 +2463,17 @@ fn parse_single_matcher_at(d: &Directive, depth: usize) -> Result<Matcher, Adapt
                 return Err(AdapterError::ArgumentCount(
                     "header".into(),
                     1,
+                    d.args.len(),
+                ));
+            }
+            // 🚫 A third argument used to be silently dropped, so
+            // `header Foo bar baz` matched only `bar`. Caddy matches one
+            // field with one value per matcher line; write a second line for
+            // an OR'ed value.
+            if d.args.len() > 2 {
+                return Err(AdapterError::ArgumentCount(
+                    "header".into(),
+                    2,
                     d.args.len(),
                 ));
             }
@@ -2240,7 +2564,7 @@ mod global_tests {
         let source = r#"{
             email admin@example.com
             auto_https off
-            debug true
+            debug
         }"#;
         let directives = parse(source).unwrap();
         let ast = adapt(directives).unwrap();
@@ -3005,5 +3329,300 @@ mod log_format_tests {
             CoreLogOutput::File(p) => assert_eq!(p, "/var/log/x.log"),
             other => panic!("expected file output, got {other:?}"),
         }
+    }
+}
+
+// MARK: - P1 Fail-Closed Tests
+
+/// 🛡️ Every P1 regression: a config that used to compile while silently
+/// dropping part of what the operator asked for must now fail loudly.
+#[cfg(test)]
+mod fail_closed_tests {
+    fn compile_err(source: &str) -> String {
+        match crate::compile(source) {
+            Ok(_) => panic!("config unexpectedly compiled:\n{source}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn log_block_rejects_unknown_subdirectives() {
+        let error = compile_err(
+            r#"example.com {
+                log {
+                    level debug
+                }
+            }"#,
+        );
+        assert!(
+            error.contains("log: level"),
+            "unknown log subdirective must be named; got {error}"
+        );
+    }
+
+    #[test]
+    fn log_block_rejects_unknown_format() {
+        let error = compile_err(
+            r#"example.com {
+                log {
+                    format jsno
+                }
+            }"#,
+        );
+        assert!(
+            error.contains("jsno"),
+            "`format jsno` must name the unknown format; got {error}"
+        );
+    }
+
+    #[test]
+    fn log_block_rejects_output_file_without_path() {
+        let error = compile_err(
+            r#"example.com {
+                log {
+                    output file
+                }
+            }"#,
+        );
+        assert!(
+            error.contains("log output file"),
+            "`output file` without a path must fail; got {error}"
+        );
+    }
+
+    #[test]
+    fn file_server_rejects_precompressed_as_unsupported() {
+        let error = compile_err(
+            r#"example.com {
+                file_server /downloads/* {
+                    precompressed
+                }
+            }"#,
+        );
+        assert!(
+            error.contains("not supported by Pingclair"),
+            "precompressed must be reported as unsupported Caddy syntax; got {error}"
+        );
+    }
+
+    #[test]
+    fn file_server_rejects_fs_as_unsupported() {
+        let error = compile_err(
+            r#"example.com {
+                file_server /database/* {
+                    fs sqlite data.sql
+                }
+            }"#,
+        );
+        assert!(
+            error.contains("not supported by Pingclair"),
+            "fs must be reported as unsupported Caddy syntax; got {error}"
+        );
+    }
+
+    #[test]
+    fn reverse_proxy_rejects_header_down_as_unsupported() {
+        let error = compile_err(
+            r#"example.com {
+                reverse_proxy localhost:8080 {
+                    header_down X-Foo bar
+                }
+            }"#,
+        );
+        assert!(
+            error.contains("header_down") && error.contains("not supported"),
+            "header_down must fail with a named unsupported error; got {error}"
+        );
+    }
+
+    #[test]
+    fn reverse_proxy_rejects_dynamic_as_unsupported() {
+        let error = compile_err(
+            r#"example.com {
+                reverse_proxy /api/* {
+                    dynamic srv _api._tcp.example.com
+                }
+            }"#,
+        );
+        assert!(
+            error.contains("dynamic") && error.contains("not supported"),
+            "dynamic must fail with a named unsupported error; got {error}"
+        );
+    }
+
+    #[test]
+    fn reverse_proxy_rejects_unknown_subdirectives() {
+        let error = compile_err(
+            r#"example.com {
+                reverse_proxy localhost:8080 {
+                    lb_try_duration 10s
+                }
+            }"#,
+        );
+        assert!(
+            error.contains("lb_try_duration"),
+            "unknown reverse_proxy subdirective must be named; got {error}"
+        );
+    }
+
+    #[test]
+    fn reverse_proxy_rejects_header_up_with_extra_arguments() {
+        let error = compile_err(
+            r#"example.com {
+                reverse_proxy localhost:8080 {
+                    header_up X-Foo a b
+                }
+            }"#,
+        );
+        assert!(
+            error.contains("header_up"),
+            "a third header_up argument must fail; got {error}"
+        );
+    }
+
+    #[test]
+    fn reverse_proxy_rejects_unix_socket_upstream() {
+        let error = compile_err(
+            r#"example.com {
+                reverse_proxy unix//run/php/php.sock
+            }"#,
+        );
+        assert!(
+            error.contains("Unix-socket"),
+            "unix// upstream must be refused with a clear message; got {error}"
+        );
+    }
+
+    #[test]
+    fn site_address_rejects_port_range() {
+        let error = compile_err("localhost:8080-8085 {\n    respond \"x\"\n}");
+        assert!(
+            error.contains("port range") || error.contains("not supported"),
+            "a port-range site address must fail; got {error}"
+        );
+    }
+
+    #[test]
+    fn site_address_rejects_network_prefix() {
+        let error = compile_err("tcp/localhost:8080 {\n    respond \"x\"\n}");
+        assert!(
+            error.contains("network prefix") || error.contains("not supported"),
+            "a tcp/ site address must fail; got {error}"
+        );
+    }
+
+    #[test]
+    fn debug_rejects_arguments() {
+        let error = compile_err("{\n    debug fales\n}\nexample.com {\n    respond \"x\"\n}");
+        assert!(
+            error.contains("debug"),
+            "`debug fales` must fail; got {error}"
+        );
+    }
+
+    #[test]
+    fn auto_https_requires_an_argument() {
+        let error = compile_err("{\n    auto_https\n}\nexample.com {\n    respond \"x\"\n}");
+        assert!(
+            error.contains("auto_https"),
+            "bare auto_https must fail; got {error}"
+        );
+    }
+
+    #[test]
+    fn auto_https_disable_certs_is_reported_as_unsupported() {
+        let error =
+            compile_err("{\n    auto_https disable_certs\n}\nexample.com {\n    respond \"x\"\n}");
+        assert!(
+            error.contains("not supported by Pingclair"),
+            "disable_certs must be reported as unsupported Caddy syntax; got {error}"
+        );
+    }
+
+    #[test]
+    fn method_matcher_rejects_unknown_verbs() {
+        let error =
+            compile_err("example.com {\n    @x method FOO\n    handle @x { respond \"x\" }\n}");
+        assert!(
+            error.contains("FOO"),
+            "unknown method must be named; got {error}"
+        );
+    }
+
+    #[test]
+    fn method_matcher_accepts_every_standard_verb() {
+        let config = crate::compile(
+            r#"example.com {
+                @x method GET POST PUT DELETE PATCH HEAD OPTIONS
+                handle @x { respond "x" }
+            }"#,
+        )
+        .expect("all standard verbs must compile");
+        assert_eq!(config.servers[0].routes.len(), 1);
+    }
+
+    #[test]
+    fn header_matcher_rejects_extra_arguments() {
+        let error = compile_err(
+            "example.com {\n    @x header Foo bar baz\n    handle @x { respond \"x\" }\n}",
+        );
+        assert!(
+            error.contains("header"),
+            "a third header-matcher argument must fail; got {error}"
+        );
+    }
+
+    #[test]
+    fn header_directive_rejects_key_without_value() {
+        let error = compile_err("example.com {\n    header X-Only\n}");
+        assert!(
+            error.contains("header"),
+            "`header X-Only` without a value must fail; got {error}"
+        );
+    }
+
+    #[test]
+    fn admin_block_is_reported_as_unsupported() {
+        let error = compile_err(
+            r#"{
+                admin :2019 {
+                    origins http://localhost:2019
+                }
+            }
+            example.com {
+                respond "x"
+            }"#,
+        );
+        assert!(
+            error.contains("admin") && error.contains("not supported"),
+            "admin block must fail with a named unsupported error; got {error}"
+        );
+    }
+
+    #[test]
+    fn known_caddy_global_options_are_reported_as_unsupported() {
+        let error = compile_err("{\n    http_port 8080\n}\nexample.com {\n    respond \"x\"\n}");
+        assert!(
+            error.contains("not supported by Pingclair"),
+            "http_port must be reported as unsupported Caddy syntax; got {error}"
+        );
+    }
+
+    #[test]
+    fn known_caddy_directives_are_reported_as_unsupported() {
+        let error = compile_err("example.com {\n    templates\n    file_server\n}");
+        assert!(
+            error.contains("not supported by Pingclair"),
+            "templates must be reported as unsupported Caddy syntax; got {error}"
+        );
+    }
+
+    #[test]
+    fn typo_directives_stay_unknown_directive_errors() {
+        let error = compile_err("example.com {\n    respnd \"x\"\n}");
+        assert!(
+            error.contains("Unknown directive 'respnd'"),
+            "a typo must remain an unknown-directive error; got {error}"
+        );
     }
 }

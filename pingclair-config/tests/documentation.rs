@@ -110,11 +110,18 @@ fn every_documented_configuration_still_compiles() {
                 .is_some_and(|name| name.starts_with("README") && name.ends_with(".md"))
         })
         .collect();
-    documents.extend(
-        files_in(&root.join("docs"))
-            .into_iter()
-            .filter(|path| path.extension().is_some_and(|ext| ext == "md")),
-    );
+    documents.extend(files_in(&root.join("docs")).into_iter().filter(|path| {
+        // 🚫 The Caddyfile audit documents are deliberately full of
+        // configs that must NOT compile: every block there is either a
+        // reproduction of a rejected Caddy feature or a red-flag
+        // example. Only the user-facing manual (READMEs plus the
+        // shipped STATUS/GUARDRAILS prose) is covered here.
+        path.extension().is_some_and(|ext| ext == "md")
+            && !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("CADDYFILE"))
+    }));
 
     // Verification
     let mut broken = Vec::new();
