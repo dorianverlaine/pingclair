@@ -3380,6 +3380,39 @@ fn cli_adapt_and_validate_read_stdin() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("is valid"));
 }
 
+/// 🧪 `hash-password --algorithm argon2id` emits a Caddy-compatible hash.
+#[test]
+fn cli_hash_password_argon2id() {
+    use std::process::Command;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pingclair"))
+        .args([
+            "hash-password",
+            "--algorithm",
+            "argon2id",
+            "--plaintext",
+            "secret",
+            "--argon2id-time",
+            "1",
+            "--argon2id-memory",
+            "19456",
+            "--argon2id-threads",
+            "1",
+        ])
+        .output()
+        .expect("hash-password must run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let hash = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        hash.starts_with("$argon2id$"),
+        "expected an argon2id PHC string, got: {hash}"
+    );
+}
+
 /// 🧪 `pingclair respond` serves a hard-coded response like `caddy respond`.
 #[tokio::test]
 async fn test_cli_respond_serves_body() {
@@ -3747,8 +3780,7 @@ async fn test_file_server_charset_and_vary() {
     }
     let headers = headers.expect("file server did not come up");
     assert_eq!(
-        headers["content-type"],
-        "text/html; charset=utf-8",
+        headers["content-type"], "text/html; charset=utf-8",
         "file_server must send a charset like Caddy"
     );
 

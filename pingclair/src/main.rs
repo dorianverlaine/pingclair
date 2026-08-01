@@ -675,6 +675,30 @@ enum Commands {
         /// Password to hash; read from stdin if omitted
         #[arg(short, long)]
         plaintext: Option<String>,
+
+        /// Hashing algorithm: `bcrypt` (default) or `argon2id`
+        #[arg(long, default_value = "bcrypt")]
+        algorithm: String,
+
+        /// bcrypt cost (4..=31); default 14
+        #[arg(long)]
+        bcrypt_cost: Option<u32>,
+
+        /// argon2id time cost (iterations); default 1
+        #[arg(long)]
+        argon2id_time: Option<u32>,
+
+        /// argon2id memory cost in KiB; default 65536
+        #[arg(long)]
+        argon2id_memory: Option<u32>,
+
+        /// argon2id parallelism (threads); default 4
+        #[arg(long)]
+        argon2id_threads: Option<u32>,
+
+        /// argon2id output key length in bytes; default 32
+        #[arg(long)]
+        argon2id_keylen: Option<usize>,
     },
 
     /// Show version information
@@ -1012,11 +1036,6 @@ fn main() -> anyhow::Result<()> {
                 root,
                 browse
             );
-            if file_limit.is_some() {
-                // TODO(v0.3): bound directory listings by file count.
-                anyhow::bail!("--file-limit is not implemented yet");
-            }
-
             // Create dynamic config
             let mut config = pingclair_core::config::PingclairConfig::default();
 
@@ -1084,6 +1103,7 @@ fn main() -> anyhow::Result<()> {
                 root: root_path,
                 index: vec!["index.html".to_string()],
                 browse,
+                browse_limit: file_limit,
                 compress: !no_compress,
             };
             let handler = if templates {
@@ -1235,7 +1255,15 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::HashPassword { plaintext } => {
+        Commands::HashPassword {
+            plaintext,
+            algorithm,
+            bcrypt_cost,
+            argon2id_time,
+            argon2id_memory,
+            argon2id_threads,
+            argon2id_keylen,
+        } => {
             use std::io::IsTerminal;
             let password = match plaintext {
                 Some(password) => password,
@@ -1257,10 +1285,41 @@ fn main() -> anyhow::Result<()> {
                     buffer.trim_end_matches(['\r', '\n']).to_string()
                 }
             };
-            let cost = pingclair_core::server::MAX_BCRYPT_COST;
-            let hash = bcrypt::hash(password, cost)
-                .map_err(|error| anyhow::anyhow!("❌ Failed to hash password: {error}"))?;
-            println!("{hash}");
+
+            match algorithm.as_str() {
+                "bcrypt" => {
+                    let cost = bcrypt_cost.unwrap_or(pingclair_core::server::MAX_BCRYPT_COST);
+                    if !(4..=31).contains(&cost) {
+                        anyhow::bail!("❌ bcrypt cost must be between 4 and 31");
+                    }
+                    let hash = bcrypt::hash(password, cost)
+                        .map_err(|error| anyhow::anyhow!("❌ Failed to hash password: {error}"))?;
+                    println!("{hash}");
+                }
+                "argon2id" => {
+                    use argon2::password_hash::rand_core::OsRng;
+                    use argon2::password_hash::{PasswordHasher, SaltString};
+                    use argon2::{Argon2, Params};
+
+                    let params = Params::new(
+                        argon2id_memory.unwrap_or(64 * 1024),
+                        argon2id_time.unwrap_or(1),
+                        argon2id_threads.unwrap_or(4),
+                        Some(argon2id_keylen.unwrap_or(32)),
+                    )
+                    .map_err(|error| anyhow::anyhow!("❌ Invalid argon2id parameters: {error}"))?;
+                    let argon = Argon2::new(Default::default(), Default::default(), params);
+                    let salt = SaltString::generate(&mut OsRng);
+                    let hash = argon
+                        .hash_password(password.as_bytes(), &salt)
+                        .map_err(|error| anyhow::anyhow!("❌ Failed to hash password: {error}"))?
+                        .to_string();
+                    println!("{hash}");
+                }
+                other => {
+                    anyhow::bail!("❌ Unknown algorithm `{other}` (expected bcrypt or argon2id)")
+                }
+            }
         }
 
         Commands::Version => {

@@ -40,6 +40,8 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 bcrypt.workspace = true
+argon2 = { version = "0.5", features = ["rand"] }
+password-hash = { version = "0.5", features = ["std", "getrandom"] }
 parking_lot = "0.12"
 futures = "0.3"
 
