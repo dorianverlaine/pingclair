@@ -1493,7 +1493,22 @@ impl PingclairProxy {
 
     /// Add a server configuration to this proxy
     pub fn add_server(&self, config: ServerConfig) {
-        if let Some(domain) = &config.name {
+        // 🏠 A site may carry several hostnames (`example.com, www.example.com`);
+        // each one is a virtual host for the same configuration. Fall back to
+        // the legacy single-name field so JSON documents written before `names`
+        // existed still register exactly as before.
+        let domains: Vec<&str> = if config.names.is_empty() {
+            config.name.iter().map(String::as_str).collect()
+        } else {
+            config.names.iter().map(String::as_str).collect()
+        };
+        if domains.is_empty() {
+            let current = self.default.load();
+            let state = ProxyState::new_with_previous(config.clone(), current.as_ref().as_ref());
+            self.default.store(Arc::new(Some(state)));
+            return;
+        }
+        for domain in domains {
             if domain == "_" || domain == "*" || domain.starts_with(':') {
                 let current = self.default.load();
                 let state =
@@ -1508,14 +1523,10 @@ impl PingclairProxy {
                 // fair trade for wait-free reads on the request hot path.
                 self.hosts.rcu(|current| {
                     let mut next = (**current).clone();
-                    next.insert(domain.clone(), state.clone());
+                    next.insert(domain.to_string(), state.clone());
                     next
                 });
             }
-        } else {
-            let current = self.default.load();
-            let state = ProxyState::new_with_previous(config.clone(), current.as_ref().as_ref());
-            self.default.store(Arc::new(Some(state)));
         }
     }
 
@@ -1560,7 +1571,18 @@ impl PingclairProxy {
         let old_default = self.default.load();
 
         for config in servers {
-            if let Some(domain) = &config.name {
+            let domains: Vec<&str> = if config.names.is_empty() {
+                config.name.iter().map(String::as_str).collect()
+            } else {
+                config.names.iter().map(String::as_str).collect()
+            };
+            if domains.is_empty() {
+                let state =
+                    ProxyState::new_with_previous(config.clone(), old_default.as_ref().as_ref());
+                new_default = Some(state);
+                continue;
+            }
+            for domain in domains {
                 if domain == "_" || domain == "*" || domain.starts_with(':') {
                     let state = ProxyState::new_with_previous(
                         config.clone(),
@@ -1570,12 +1592,8 @@ impl PingclairProxy {
                 } else {
                     let state =
                         ProxyState::new_with_previous(config.clone(), old_hosts.get(domain));
-                    new_hosts.insert(domain.clone(), state);
+                    new_hosts.insert(domain.to_string(), state);
                 }
-            } else {
-                let state =
-                    ProxyState::new_with_previous(config.clone(), old_default.as_ref().as_ref());
-                new_default = Some(state);
             }
         }
 
@@ -2923,20 +2941,27 @@ fn resolve_single_placeholder(
             .to_string();
     }
 
-    // Common shortcuts
+    // 🧭 Caddy's `{host}` shorthand is the hostname without the port; the
+    // port lives in `{hostport}` instead. Stripping it here keeps
+    // `redir https://{host}{uri}` correct on non-standard ports.
+    let host_without_port = |host: &str| -> String {
+        if let Some((name, _)) = host.rsplit_once(':')
+            && !host.starts_with('[')
+        {
+            name.to_string()
+        } else {
+            host.to_string()
+        }
+    };
     match name {
-        "host" => req
-            .headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string(),
-        "http.request.host" => req
-            .headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string(),
+        "host" | "http.request.host" => {
+            let host = req
+                .headers
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            host_without_port(host)
+        }
         "remote_ip" | "http.request.remote.host" => verified_client_ip.unwrap_or("").to_string(),
         "http.request.method" => req.method.as_str().to_string(),
         // 🧭 `{uri}` is Caddy's shorthand for the full request target, and it is

@@ -35,14 +35,14 @@
 |---|---|---|
 | A-1 | 修 `tls auto` 自動 443：site 位址推導的隱式 listen 不塞進 `listen`，只有顯式 port/scheme 才 push；main.rs `listen.is_empty()` 分支要能走（B0/B1 根因，方案 A/B 見 ADDRESS §2.4） | 🔴 |
 | A-2 | 多 listener 不塌 vhost name（`_` 只留給裸 port/catch-all）；`_` 目前會變 catch-all（B3） | 🔴 |
-| A-3 | `listen` 去重：site 隱式 + 顯式 `listen :80` 不得重複（B1） | 🔴 |
-| A-4 | 純 hostname 不加隱式 80（B2：`listen :8443` 被偷加 80） | 🔴 |
-| A-5 | 裸 `:443` 預設 TLS；`:8443` 慣例寫成 core 層規則（B4） | 🟠 |
-| A-6 | `localhost`／IP site 依 TLS 推導 443（B5、T6） | 🟠 |
-| A-7 | 多位址 block（`example.com, www.example.com`）單一 site 共用設定（B9） | 🟠 |
-| A-8 | site 位址帶 path（`example.com/app`）實作或明確拒絕（B8） | 🟡 |
+| A-3 | `listen` 去重：site 隱式 + 顯式 `listen :80` 不得重複（B1） ✅ P2 已修 | 🔴 |
+| A-4 | 純 hostname 不加隱式 80（B2：`listen :8443` 被偷加 80） ✅ P2 已修 | 🔴 |
+| A-5 | 裸 `:443` 預設 TLS；`:8443` 慣例寫成 core 層規則（B4） ✅ P2 已修 | 🟠 |
+| A-6 | `localhost`／IP site 依 TLS 推導 443（B5、T6） 🟠 部分：`localhost` 已可推導；自動本機 CA 待 T7 | 🟠 |
+| A-7 | 多位址 block（`example.com, www.example.com`）單一 site 共用設定（B9） ✅ P2 已修（`ServerConfig.names`） | 🟠 |
+| A-8 | site 位址帶 path（`example.com/app`）實作或明確拒絕（B8） 🟡 部分：明確拒絕已涵蓋；path matcher 待 P3 | 🟡 |
 | A-9 | `auto_https off` 不改變預設 protocol 的語義分離（B6，需產品決策） | 🟡 |
-| A-10 | 位址解析支援 `tcp/` 前綴、port range（展開或拒絕）、IPv6 zone（V1/V2） ✅ P1 已修（前綴/range 拒絕；IPv6 zone 待 P2） | 🔴 |
+| A-10 | 位址解析支援 `tcp/` 前綴、port range（展開或拒絕）、IPv6 zone（V1/V2） ✅ P1/P2 已修（前綴/range/zone 拒絕） | 🔴 |
 | A-11 | `unix//` socket 位址實作或明確拒絕（H1，含 `\|0200` 權限） ✅ P1 已修（拒絕） | 🔴 |
 
 ## 2. 設定語法與解析（來源：TUTORIAL、PATTERNS、CONVENTIONS、HOMEPAGE）
@@ -58,7 +58,7 @@
 | S-7 | `templates` directive（U5、C4 旗標） | 🟡（v0.3） |
 | S-8 | 完整 duration：`ns/us/ms/s/m/h/d`、小數、組合；裸數字拒絕（V3） | 🟠 |
 | S-9 | placeholder 生態：`{labels.*}`、`{query}`、`{scheme}` 等官方縮寫表；未支援者編譯期警告（V4、P6） | 🟠 |
-| S-10 | 預設檔名認 `Caddyfile`（C7）；`run` 無 config 時錯誤訊息提示 | 🟡 |
+| S-10 | 預設檔名認 `Caddyfile`（C7）；`run` 無 config 時錯誤訊息提示 ✅ P2 已修 | 🟡 |
 | S-11 | TLS store 路徑文件/實作一致＋持久性警示（V5） | 🟡 |
 
 ## 3. Matcher（來源：MATCHERS）
@@ -96,7 +96,7 @@
 | G-3 | `trusted_proxies static [private_ranges] <ranges...>` 語法（G3） | 🟠 |
 | G-4 | `debug` 只收無參數（G4） ✅ P1 已修 | 🟠 |
 | G-5 | `auto_https` 四模式（`disable_certs`／`ignore_loaded_certs`）＋無參數報錯（G5） ✅ P1 已修（無參數報錯；兩模式標 unsupported） | 🟠 |
-| G-6 | `http_port`／`https_port`（A 系列位址修復的前置，B7/G6） | 🔴 |
+| G-6 | `http_port`／`https_port`（A 系列位址修復的前置，B7/G6） ✅ P2 已修 | 🔴 |
 | G-7 | `default_bind`（B7） | 🟡 |
 | G-8 | global block 必須檔首（G7） | 🟡 |
 | G-9 | `grace_period`／`shutdown_delay`（G8，配 shutdown 協調） | 🟡 |

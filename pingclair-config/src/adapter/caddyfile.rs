@@ -170,6 +170,18 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                 "email" => {
                     global.email = sub.args.first().cloned();
                 }
+                "http_port" => {
+                    let value = expect_one_argument(&sub)?;
+                    global.http_port = Some(value.parse::<u16>().map_err(|_| {
+                        AdapterError::InvalidArgument("http_port".into(), value.to_string())
+                    })?);
+                }
+                "https_port" => {
+                    let value = expect_one_argument(&sub)?;
+                    global.https_port = Some(value.parse::<u16>().map_err(|_| {
+                        AdapterError::InvalidArgument("https_port".into(), value.to_string())
+                    })?);
+                }
                 "auto_https" => {
                     let arg = sub
                         .args
@@ -297,9 +309,7 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
 fn is_known_caddy_global_option(name: &str) -> bool {
     matches!(
         name,
-        "http_port"
-            | "https_port"
-            | "default_bind"
+        "default_bind"
             | "order"
             | "storage"
             | "storage_clean_interval"
@@ -383,22 +393,52 @@ fn is_valid_mime_pattern(pattern: &str) -> bool {
 }
 
 fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
-    let mut server = ServerBlock::new(d.name.clone());
-
-    // Parse server address(es) — support schemes like http://host:port
-    let mut names = vec![d.name.clone()];
+    // 🏷️ Caddy separates multiple site addresses with commas; the lexer keeps
+    // the comma attached to the token, so strip it before parsing.
+    let strip_comma = |addr: &str| addr.trim_end_matches(',').to_string();
+    let mut server = ServerBlock::new(strip_comma(&d.name));
+    let mut names = vec![strip_comma(&d.name)];
     for arg in &d.args {
         if arg.starts_with(':') || arg.contains(':') || arg.contains('.') || *arg == "localhost" {
-            names.push(arg.clone());
+            names.push(strip_comma(arg));
         }
     }
 
     for name in &names {
+        // 🌐 A catch-all scheme address (`http://`, `https://`) has no host;
+        // it still names a listener (80 or 443) even though no Host header
+        // will ever match it.
+        if matches!(name.as_str(), "http://" | "https://") {
+            let is_https = name == "https://";
+            server.listens.push(ListenAddr {
+                scheme: if is_https {
+                    Scheme::Https
+                } else {
+                    Scheme::Http
+                },
+                host: "0.0.0.0".to_string(),
+                port: Some(if is_https { 443 } else { 80 }),
+                proxy_protocol: false,
+            });
+            continue;
+        }
         if let Some(parsed) = parse_server_address(name) {
-            server.listens.push(parsed.listen);
-            // Use the bare hostname (not the URL) as server name
-            if !parsed.hostname.is_empty() && parsed.hostname != "0.0.0.0" {
-                server.name = parsed.hostname;
+            // 📍 A bare hostname site address selects the virtual host; the
+            // listener is derived later from whether TLS is configured.
+            // Only explicit ports, schemes and IP literals create listeners
+            // here — that is what lets `example.com { tls auto }` reach the
+            // runtime's automatic-443 branch instead of being pinned to :80.
+            if parsed.explicit {
+                server.listens.push(parsed.listen);
+            }
+            // 🏠 Collect every hostname the site serves. The first one is the
+            // primary name; the rest are additional virtual hosts sharing the
+            // same configuration (Caddy's `example.com, www.example.com`).
+            if !parsed.hostname.is_empty()
+                && parsed.hostname != "0.0.0.0"
+                && !server.names.contains(&parsed.hostname)
+            {
+                server.names.push(parsed.hostname);
             }
         } else if looks_like_unsupported_address(name) {
             return Err(AdapterError::UnsupportedFeature(
@@ -418,7 +458,20 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
         server.name = parsed.hostname;
     }
 
-    if server.listens.len() > 1 || server.name.starts_with(':') {
+    // 🏠 The primary name is the first hostname collected (or the raw address
+    // when the site has none). It stays the hostname no matter how many
+    // listeners the site carries; collapsing it to `_` turned every
+    // multi-listener site into a catch-all that matched any Host header. Only
+    // addresses without a hostname (bare `:port` and catch-all schemes) are
+    // truly anonymous.
+    if let Some(first) = server.names.first() {
+        server.name = first.clone();
+    }
+    if server.name.starts_with(':')
+        || server.name == "http://"
+        || server.name == "https://"
+        || server.name.contains("://")
+    {
         server.name = "_".to_string();
     }
 
@@ -656,6 +709,12 @@ fn looks_like_unsupported_address(addr: &str) -> bool {
         .strip_prefix("https://")
         .or_else(|| addr.strip_prefix("http://"))
         .unwrap_or(addr);
+    // 🔧 IPv6 zone identifiers (`fe80::1%eth0`) are valid Caddy syntax but
+    // need socket-address parsing this codebase does not do yet. Reject them
+    // instead of treating the zone as part of a hostname.
+    if bare.contains('[') && bare.contains('%') {
+        return true;
+    }
     let has_network_prefix = bare.split('/').next().is_some_and(|head| {
         matches!(
             head,
@@ -684,6 +743,10 @@ fn looks_like_unsupported_address(addr: &str) -> bool {
 struct ParsedAddress {
     hostname: String,
     listen: ListenAddr,
+    /// 📍 Whether the address itself named a port or a scheme. A bare
+    /// hostname (`example.com`) is a virtual-host selector, not a listener:
+    /// the runtime derives 443/80 from TLS later, exactly like Caddy.
+    explicit: bool,
 }
 
 /// Parse a Caddy server address like `http://ai.408timeout.com:20615`
@@ -720,28 +783,29 @@ fn parse_server_address(addr: &str) -> Option<ParsedAddress> {
     } else {
         (Scheme::Http, addr)
     };
+    let explicit_scheme = addr.contains("://");
 
     // rest is either: "host:port", ":port", "host", ""
     if rest.is_empty() {
         return None;
     }
 
-    let (hostname, port) = if let Some(port) = rest.strip_prefix(':') {
+    let (hostname, port, explicit_port) = if let Some(port) = rest.strip_prefix(':') {
         // :port
         let p = port.parse::<u16>().ok()?;
-        ("0.0.0.0".to_string(), Some(p))
+        ("0.0.0.0".to_string(), Some(p), true)
     } else if let Some(colon_pos) = rest.rfind(':') {
         // host:port
         let h = &rest[..colon_pos];
         let p = rest[colon_pos + 1..].parse::<u16>().ok()?;
-        (h.to_string(), Some(p))
+        (h.to_string(), Some(p), true)
     } else {
         // host only (default port based on scheme)
         let p = match scheme {
             Scheme::Https => Some(443),
             Scheme::Http => Some(80),
         };
-        (rest.to_string(), p)
+        (rest.to_string(), p, false)
     };
 
     // Caddy/nginx semantics: only an IP literal in the site address is a
@@ -758,14 +822,24 @@ fn parse_server_address(addr: &str) -> Option<ParsedAddress> {
     };
 
     Some(ParsedAddress {
-        hostname,
+        hostname: hostname.clone(),
         listen: ListenAddr {
             scheme,
             host: bind_host,
             port,
-            // 🧭 A site address carries no listener flags; `listen` does.
+            // 📍 A site address carries no listener flags; `listen` does.
             proxy_protocol: false,
         },
+        // ⚙️ A bare hostname with neither scheme nor port is implicit; the
+        // runtime decides the listener from TLS. Everything else (an IP
+        // literal, `host:port`, `:port`, `http://`/`https://`) names a
+        // listener explicitly.
+        // 📍 Explicit means the address itself named a listener: an explicit
+        // scheme (`http://`, `https://`), an explicit port (`:8080`,
+        // `host:8080`) or an IP literal (which binds by definition). A bare
+        // hostname carries only a default port for scheme inference and must
+        // not create a listener on its own.
+        explicit: explicit_scheme || explicit_port || is_ip_literal(&hostname),
     })
 }
 
@@ -3601,10 +3675,11 @@ mod fail_closed_tests {
 
     #[test]
     fn known_caddy_global_options_are_reported_as_unsupported() {
-        let error = compile_err("{\n    http_port 8080\n}\nexample.com {\n    respond \"x\"\n}");
+        let error =
+            compile_err("{\n    default_bind 127.0.0.1\n}\nexample.com {\n    respond \"x\"\n}");
         assert!(
             error.contains("not supported by Pingclair"),
-            "http_port must be reported as unsupported Caddy syntax; got {error}"
+            "default_bind must be reported as unsupported Caddy syntax; got {error}"
         );
     }
 
@@ -3623,6 +3698,145 @@ mod fail_closed_tests {
         assert!(
             error.contains("Unknown directive 'respnd'"),
             "a typo must remain an unknown-directive error; got {error}"
+        );
+    }
+}
+
+// MARK: - P2 Address Semantics Tests
+
+/// 📍 P2 regressions: a bare hostname site must not create an implicit
+/// listener, a multi-listener site must keep its virtual-host name, and
+/// Caddy's address forms must derive the expected listeners.
+#[cfg(test)]
+mod address_semantics_tests {
+    use crate::compile;
+
+    fn first_server(source: &str) -> pingclair_core::config::ServerConfig {
+        compile(source)
+            .expect("config must compile")
+            .servers
+            .into_iter()
+            .next()
+            .expect("at least one server")
+    }
+
+    #[test]
+    fn bare_hostname_with_tls_derives_no_listener() {
+        let server = first_server("example.com {\n    tls auto\n    file_server ./public\n}");
+        assert!(
+            server.listen.is_empty(),
+            "a bare hostname must not pin a listener; got {:?}",
+            server.listen
+        );
+        assert!(server.tls.is_some(), "tls auto must survive compilation");
+        assert_eq!(server.name.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn bare_hostname_without_tls_derives_no_listener() {
+        let server = first_server("example.com {\n    file_server ./public\n}");
+        assert!(
+            server.listen.is_empty(),
+            "a bare hostname without TLS must leave the listener to the runtime"
+        );
+    }
+
+    #[test]
+    fn explicit_schemes_still_create_listeners() {
+        let https = first_server("https://example.com {\n    respond \"x\"\n}");
+        assert_eq!(https.listen, vec!["0.0.0.0:443".to_string()]);
+        assert!(https.tls.is_some(), "https:// must imply TLS");
+
+        let http = first_server("http://example.com {\n    respond \"x\"\n}");
+        assert_eq!(http.listen, vec!["0.0.0.0:80".to_string()]);
+        assert!(http.tls.is_none(), "http:// must stay plaintext");
+    }
+
+    #[test]
+    fn explicit_listen_is_not_duplicated_or_augmented() {
+        let server = first_server("example.com {\n    listen :80\n    tls auto\n}");
+        assert_eq!(
+            server.listen,
+            vec!["0.0.0.0:80".to_string()],
+            "the explicit listener must appear exactly once"
+        );
+
+        let server = first_server("example.com {\n    listen :8443\n    tls auto\n}");
+        assert_eq!(
+            server.listen,
+            vec!["0.0.0.0:8443".to_string()],
+            "an explicit non-standard port must not gain an implicit :80"
+        );
+    }
+
+    #[test]
+    fn multi_listener_site_keeps_its_hostname() {
+        let server =
+            first_server("example.com {\n    listen :80\n    listen :443\n    tls auto\n}");
+        assert_eq!(
+            server.name.as_deref(),
+            Some("example.com"),
+            "a multi-listener site must stay a named virtual host"
+        );
+        assert_eq!(server.names, vec!["example.com".to_string()]);
+    }
+
+    #[test]
+    fn bare_https_port_implies_tls() {
+        let server = first_server(":443 {\n    respond \"x\"\n}");
+        assert_eq!(server.name.as_deref(), Some("_"));
+        assert_eq!(server.listen, vec!["0.0.0.0:443".to_string()]);
+        assert!(server.tls.is_some(), ":443 must imply TLS");
+    }
+
+    #[test]
+    fn multi_address_block_registers_every_hostname() {
+        let server = first_server("example.com, www.example.com {\n    respond \"shared\"\n}");
+        assert_eq!(
+            server.name.as_deref(),
+            Some("example.com"),
+            "the first address is the primary name"
+        );
+        assert_eq!(
+            server.names,
+            vec!["example.com".to_string(), "www.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn catch_all_schemes_get_the_conventional_listener() {
+        let https = first_server("https:// {\n    respond \"x\"\n}");
+        assert_eq!(https.listen, vec!["0.0.0.0:443".to_string()]);
+        assert!(https.tls.is_some());
+
+        let http = first_server("http:// {\n    respond \"x\"\n}");
+        assert_eq!(http.listen, vec!["0.0.0.0:80".to_string()]);
+        assert!(http.tls.is_none());
+    }
+
+    #[test]
+    fn global_http_and_https_ports_parse() {
+        let config = compile(
+            "{\n    http_port 8080\n    https_port 8443\n}\nlocalhost {\n    respond \"x\"\n}",
+        )
+        .expect("port overrides must compile");
+        assert_eq!(config.global.http_port, 8080);
+        assert_eq!(config.global.https_port, 8443);
+    }
+
+    #[test]
+    fn ip_literal_site_binds_to_the_literal() {
+        let server = first_server("127.0.0.1 {\n    respond \"x\"\n}");
+        assert_eq!(server.listen, vec!["127.0.0.1:80".to_string()]);
+    }
+
+    #[test]
+    fn bind_directive_is_carried_separately() {
+        let server = first_server("example.com {\n    bind 127.0.0.1\n    tls auto\n}");
+        assert_eq!(server.bind.as_deref(), Some("127.0.0.1"));
+        assert!(
+            server.listen.is_empty(),
+            "bind names an interface, not a listener"
         );
     }
 }

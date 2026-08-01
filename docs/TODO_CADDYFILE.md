@@ -92,41 +92,50 @@ P1 ──> P2 ──> P3 ──> P4 ──> P6
 
 ### P2.1 隱式 listen 語義（B0/B1/B2 根因）
 
-- [ ] `parse_server_address`：純 hostname（無顯式 scheme/port）不再
+- [x] `parse_server_address`：純 hostname（無顯式 scheme/port）不再
   預設 `0.0.0.0:80` 並 push 進 `server.listens`；只有顯式
   `http://`／`https://`／`:port` 才產生 listen（方案 A/B 見
   `CADDYFILE_ADDRESS_SEMANTICS.md` §2.4）
-- [ ] site 隱式 listen 與顯式 `listen` 去重（B1：
+- [x] site 隱式 listen 與顯式 `listen` 去重（B1：
   `listen :80` 不再出現兩次）
-- [ ] `listen :8443` + hostname site 不再被偷加隱式 80（B2）
-- [ ] `compiler.rs` 的 bind 預填不會把 listen 塞回非空（:201）
-- [ ] 驗證：`example.com { tls auto }` 編譯後 `listen` 為空（或
+- [x] `listen :8443` + hostname site 不再被偷加隱式 80（B2）
+- [x] `compiler.rs` 的 bind 預填不會把 listen 塞回非空（:201；
+  `ServerConfig` 新增 `bind` 欄位，bind 只命名介面）
+- [x] 驗證：`example.com { tls auto }` 編譯後 `listen` 為空（或
   「無顯式 listen」旗標），main.rs 走 443 分支
 
 ### P2.2 vhost 語義
 
-- [ ] 多 listener 不再塌 `server.name` 成 `_`（B3）；`_` 只留給
+- [x] 多 listener 不再塌 `server.name` 成 `_`（B3）；`_` 只留給
   裸 port／catch-all 位址
-- [ ] `localhost` 與 `http://localhost` 可共存（E-3）
-- [ ] 裸 `:443` 預設 TLS；`:8443` 慣例寫成 core 層規則（B4）
-- [ ] 多位址 block（`example.com, www.example.com`）單一 site
-  共用設定（B9）
-- [ ] `example.com/app`（位址帶 path）：實作預設 path matcher 或
-  明確拒絕（B8）
-- [ ] `https://`／`http://` catch-all 位址語義（443/80、無 Host
+- [x] `localhost` 與 `http://localhost` 可共存（E-3）
+- [x] 裸 `:443` 預設 TLS；`:8443` 慣例寫成 core 層規則（B4）
+- [x] 多位址 block（`example.com, www.example.com`）單一 site
+  共用設定（B9；`ServerConfig.names` + `add_server` 逐名註冊）
+- [x] `example.com/app`（位址帶 path）：待 P3 處理（B8，明確拒絕
+  已由 P1 的 unsupported 路徑涵蓋）
+- [x] `https://`／`http://` catch-all 位址語義（443/80、無 Host
   matcher、name 不含字面 scheme）（E-4）
 
 ### P2.3 port 設定與檔名
 
-- [ ] global `http_port`／`https_port`（G6）：影響隱式 443/80、
+- [x] global `http_port`／`https_port`（G6）：影響隱式 443/80、
   `AUTOMATIC_HTTP_LISTEN`、`server_requires_tls` 的 443/8443 判斷
-- [ ] `run`／`validate` 預設檔名認 `Caddyfile`（C7）
-- [ ] 位址解析支援 IPv6 zone（`[fe80::1%eth0]:8080`）或明確拒絕
+- [x] `run`／`validate` 預設檔名認 `Caddyfile`（C7）
+- [x] 位址解析支援 IPv6 zone（`[fe80::1%eth0]:8080`）或明確拒絕
   （V2 延伸）
+
+> 額外修正（P2 過程中發現）：`{host}` placeholder 改為 Caddy 語義
+> （不含 port）；companion redirect 在非標準 `https_port` 時帶正確
+> 端口。
 
 **P2 收工**：真 binary 測 `tls auto` 開 443 + 80 companion；多
 listener site 的 Host header 路由精確；官方位址表格每個 case 有
 compile 測試。
+✅ **2026-08-01 完成**：`address_semantics_tests` 11 項單元測試 +
+集成測試 `test_hostname_tls_site_derives_https_and_http_companion`
+（真 binary：自動 https_port TLS 監聽 + http_port companion 308，
+Location 指向 https_port）；四項 gate 全綠。
 
 ---
 
