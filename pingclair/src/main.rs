@@ -329,6 +329,96 @@ fn admin_request(
     Ok((status, response))
 }
 
+/// 🔐 Installs or removes the internal CA root from the system trust store.
+///
+/// Caddy's `trust`/`untrust` do the same for its local CA. Linux needs the
+/// root CA copied under `/usr/local/share/ca-certificates` (hence sudo) and
+/// `update-ca-certificates`; macOS uses the `security` tool.
+fn trust_internal_ca(trust: bool) -> anyhow::Result<()> {
+    let root = tls_store_dir().join("internal/root.crt");
+    if !root.is_file() {
+        anyhow::bail!(
+            "❌ No internal CA root at {} (start a localhost site first)",
+            root.display()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let action = if trust {
+            "add-trusted-cert"
+        } else {
+            "remove-trusted-cert"
+        };
+        let status = std::process::Command::new("security")
+            .args([action, "-d", "-r", "trustRoot", root.to_str().unwrap()])
+            .status()
+            .map_err(|error| anyhow::anyhow!("❌ Failed to run security: {error}"))?;
+        if !status.success() {
+            anyhow::bail!("❌ `security {action}` failed (exit {status})");
+        }
+        println!(
+            "✅ Internal CA root {} the macOS trust store",
+            if trust { "added to" } else { "removed from" }
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let destination = "/usr/local/share/ca-certificates/pingclair-root.crt";
+        if trust {
+            let status = std::process::Command::new("sudo")
+                .args(["install", "-m", "644", root.to_str().unwrap(), destination])
+                .status()
+                .map_err(|error| anyhow::anyhow!("❌ Failed to run sudo install: {error}"))?;
+            if !status.success() {
+                anyhow::bail!(
+                    "❌ Failed to install the root certificate (exit {status}); \
+                     run with sudo"
+                );
+            }
+            let status = std::process::Command::new("sudo")
+                .args(["update-ca-certificates"])
+                .status()
+                .map_err(|error| {
+                    anyhow::anyhow!("❌ Failed to run update-ca-certificates: {error}")
+                })?;
+            if !status.success() {
+                anyhow::bail!("❌ update-ca-certificates failed (exit {status})");
+            }
+            println!("✅ Internal CA root installed into the system trust store");
+        } else {
+            let status = std::process::Command::new("sudo")
+                .args(["rm", "-f", destination])
+                .status()
+                .map_err(|error| {
+                    anyhow::anyhow!("❌ Failed to remove the root certificate: {error}")
+                })?;
+            if !status.success() {
+                anyhow::bail!("❌ Failed to remove the root certificate (exit {status})");
+            }
+            let status = std::process::Command::new("sudo")
+                .args(["update-ca-certificates", "--fresh"])
+                .status()
+                .map_err(|error| {
+                    anyhow::anyhow!("❌ Failed to run update-ca-certificates: {error}")
+                })?;
+            if !status.success() {
+                anyhow::bail!("❌ update-ca-certificates failed (exit {status})");
+            }
+            println!("✅ Internal CA root removed from the system trust store");
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (trust, root);
+        anyhow::bail!("❌ System trust management is only supported on macOS and Linux");
+    }
+}
+
 /// 🌐 Splits `host:port` into (host, port), honoring bracketed IPv6.
 fn host_and_port(address: &str) -> (&str, Option<u16>) {
     let trimmed = address
@@ -539,6 +629,56 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:2019")]
         address: String,
     },
+
+    /// Generate shell completion scripts, like `caddy completion`
+    Completion {
+        /// Shell: bash, zsh, fish, powershell, elvish
+        shell: String,
+    },
+
+    /// Print the environment as seen by Pingclair, like `caddy environ`
+    Environ,
+
+    /// List compiled-in modules and features, like `caddy list-modules`
+    #[command(name = "list-modules")]
+    ListModules {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Print build information, like `caddy build-info`
+    #[command(name = "build-info")]
+    BuildInfo,
+
+    /// Generate man pages, like `caddy manpage`
+    Manpage {
+        /// Directory to write the man pages into
+        #[arg(short, long)]
+        directory: String,
+    },
+
+    /// Export the TLS/config store to a tarball, like `caddy storage export`
+    #[command(name = "storage-export")]
+    StorageExport {
+        /// Output tarball path (`-` for stdout)
+        #[arg(short, long)]
+        output: String,
+    },
+
+    /// Import a previously exported store tarball, like `caddy storage import`
+    #[command(name = "storage-import")]
+    StorageImport {
+        /// Input tarball path (`-` for stdin)
+        #[arg(short, long)]
+        input: String,
+    },
+
+    /// Install the internal CA root certificate into the system trust store
+    Trust,
+
+    /// Remove the internal CA root certificate from the system trust store
+    Untrust,
 
     /// Start one or more simple hard-coded HTTP servers for development
     Respond {
@@ -874,6 +1014,143 @@ fn main() -> anyhow::Result<()> {
             }
             println!("✅ Pingclair stopped");
         }
+
+        Commands::Completion { shell } => {
+            use clap::CommandFactory;
+            use clap_complete::generate;
+            use clap_complete::shells::Shell;
+            let shell: Shell = shell
+                .parse()
+                .map_err(|_| anyhow::anyhow!("❌ Unknown shell `{shell}`"))?;
+            let mut command = Cli::command();
+            generate(shell, &mut command, "pingclair", &mut std::io::stdout());
+        }
+
+        Commands::Environ => {
+            for (key, value) in std::env::vars() {
+                println!("{key}={value}");
+            }
+        }
+
+        Commands::ListModules { json } => {
+            let modules = [
+                "respond",
+                "file_server",
+                "reverse_proxy",
+                "templates",
+                "redirect",
+                "headers",
+                "basic_auth",
+                "rate_limit",
+                "rewrite",
+                "cors",
+                "access_control",
+                "try_files",
+            ];
+            let features = [
+                "http/1.1",
+                "http/2",
+                "http/3",
+                "tls",
+                "acme",
+                "internal-ca",
+                "admin-api",
+                "metrics",
+                "proxy-protocol",
+                "templates",
+            ];
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "modules": modules, "features": features })
+                );
+            } else {
+                for module in modules {
+                    println!("http.handlers.{module}");
+                }
+                for feature in features {
+                    println!("{feature}");
+                }
+            }
+        }
+
+        Commands::BuildInfo => {
+            println!("pingclair v{}", env!("CARGO_PKG_VERSION"));
+            println!("rust edition 2024");
+            println!(
+                "profile: {}",
+                if cfg!(debug_assertions) {
+                    "debug"
+                } else {
+                    "release"
+                }
+            );
+            println!("features: http/3, tls, acme, admin-api, metrics, templates");
+        }
+
+        Commands::Manpage { directory } => {
+            use clap::CommandFactory;
+            std::fs::create_dir_all(&directory)
+                .map_err(|error| anyhow::anyhow!("❌ Cannot create {directory}: {error}"))?;
+            let man = clap_mangen::Man::new(Cli::command());
+            let mut buffer = Vec::new();
+            man.render(&mut buffer)
+                .map_err(|error| anyhow::anyhow!("❌ Failed to render man page: {error}"))?;
+            let path = std::path::Path::new(&directory).join("pingclair.1");
+            std::fs::write(&path, buffer)
+                .map_err(|error| anyhow::anyhow!("❌ Failed to write {path:?}: {error}"))?;
+            println!("✅ Man page written to {}", path.display());
+        }
+
+        Commands::StorageExport { output } => {
+            let dir = tls_store_dir();
+            if !dir.is_dir() {
+                anyhow::bail!("❌ No store found at {}", dir.display());
+            }
+            if output == "-" {
+                let stdout = std::io::stdout();
+                let mut builder = tar::Builder::new(stdout);
+                builder
+                    .append_dir_all("pingclair", &dir)
+                    .map_err(|error| anyhow::anyhow!("❌ Export failed: {error}"))?;
+                builder
+                    .finish()
+                    .map_err(|error| anyhow::anyhow!("❌ Export failed: {error}"))?;
+            } else {
+                let file = std::fs::File::create(&output)
+                    .map_err(|error| anyhow::anyhow!("❌ Cannot create {output}: {error}"))?;
+                let mut builder = tar::Builder::new(file);
+                builder
+                    .append_dir_all("pingclair", &dir)
+                    .map_err(|error| anyhow::anyhow!("❌ Export failed: {error}"))?;
+                builder
+                    .finish()
+                    .map_err(|error| anyhow::anyhow!("❌ Export failed: {error}"))?;
+                println!("✅ Store exported to {output}");
+            }
+        }
+
+        Commands::StorageImport { input } => {
+            let dir = tls_store_dir();
+            std::fs::create_dir_all(&dir)
+                .map_err(|error| anyhow::anyhow!("❌ Cannot create {}: {error}", dir.display()))?;
+            let file: Box<dyn std::io::Read> = if input == "-" {
+                Box::new(std::io::stdin())
+            } else {
+                Box::new(
+                    std::fs::File::open(&input)
+                        .map_err(|error| anyhow::anyhow!("❌ Cannot open {input}: {error}"))?,
+                )
+            };
+            let mut archive = tar::Archive::new(file);
+            archive
+                .unpack(&dir)
+                .map_err(|error| anyhow::anyhow!("❌ Import failed: {error}"))?;
+            println!("✅ Store imported into {}", dir.display());
+        }
+
+        Commands::Trust => trust_internal_ca(true)?,
+        Commands::Untrust => trust_internal_ca(false)?,
 
         Commands::Respond {
             status,
