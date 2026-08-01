@@ -3361,7 +3361,7 @@ fn cli_adapt_and_validate_read_stdin() {
         String::from_utf8_lossy(&output.stderr)
     );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["servers"][0]["listen"][0], "0.0.0.0:8080");
+    assert_eq!(json["servers"][0]["listen"][0], "[::]:8080");
 
     let mut child = Command::new(bin)
         .args(["validate", "-"])

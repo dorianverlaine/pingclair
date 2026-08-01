@@ -357,8 +357,8 @@ fn host_and_port(address: &str) -> (&str, Option<u16>) {
 fn listen_for_site(address: &str, https: bool) -> String {
     let default_port = if https { 443 } else { 80 };
     match host_and_port(address) {
-        ("", Some(port)) => format!("0.0.0.0:{port}"),
-        ("", None) => format!("0.0.0.0:{default_port}"),
+        ("", Some(port)) => format!("[::]:{port}"),
+        ("", None) => format!("[::]:{default_port}"),
         (host, port) => {
             // 🌐 A hostname is a virtual host, not a bind address: Caddy
             // binds every interface and routes by Host/SNI. Only an IP
@@ -369,7 +369,7 @@ fn listen_for_site(address: &str, https: bool) -> String {
                     None => format!("{host}:{default_port}"),
                 }
             } else {
-                format!("0.0.0.0:{}", port.unwrap_or(default_port))
+                format!("[::]:{}", port.unwrap_or(default_port))
             }
         }
     }
@@ -1049,9 +1049,9 @@ fn main() -> anyhow::Result<()> {
                 };
                 listen_for_site(&base, true)
             } else if listen.starts_with(':') {
-                format!("0.0.0.0{listen}")
+                format!("[::]{listen}")
             } else if listen.parse::<u16>().is_ok() {
-                format!("0.0.0.0:{listen}")
+                format!("[::]:{listen}")
             } else {
                 listen.clone()
             };
@@ -1359,7 +1359,7 @@ async fn refresh_h3_cert_table(
 /// address, so JSON configurations match the Pingclair DSL adapter's behavior.
 fn normalize_listen_addr(addr: &str) -> String {
     match addr.strip_prefix(':') {
-        Some(port) => format!("0.0.0.0:{port}"),
+        Some(port) => format!("[::]:{port}"),
         None => addr.to_string(),
     }
 }
@@ -1449,7 +1449,7 @@ fn automatic_http_companion(
 
     Some(pingclair_core::config::ServerConfig {
         name: server_config.name.clone(),
-        listen: vec![format!("0.0.0.0:{http_port}")],
+        listen: vec![format!("[::]:{http_port}")],
         proxy_protocol_listen: Vec::new(),
         tls: None,
         routes,
@@ -1619,7 +1619,7 @@ fn servers_by_bind_address(
                 .bind
                 .as_deref()
                 .filter(|host| !host.is_empty())
-                .unwrap_or("0.0.0.0");
+                .unwrap_or("[::]");
             let port = if server.tls.is_some() {
                 https_port
             } else {
@@ -1646,7 +1646,7 @@ fn servers_by_bind_address(
             http_port,
             https_port,
         ) {
-            let addr = format!("0.0.0.0:{http_port}");
+            let addr = format!("[::]:{http_port}");
             by_port.entry(addr).or_default().push(companion);
         }
     }
@@ -1929,7 +1929,7 @@ fn run_server(
                 .bind
                 .as_deref()
                 .filter(|h| !h.is_empty())
-                .unwrap_or("0.0.0.0");
+                .unwrap_or("[::]");
             if server_config.tls.is_some() {
                 vec![format!("{host}:{https_port}")]
             } else {
@@ -1961,7 +1961,7 @@ fn run_server(
                      redirects and ACME HTTP-01 validation are unavailable. \
                      Free the port, run with CAP_NET_BIND_SERVICE, or add an \
                      explicit `listen` for the plaintext port.",
-                    format!("0.0.0.0:{http_port}"),
+                    format!("[::]:{http_port}"),
                     server_config.name
                 );
                 false
@@ -1995,7 +1995,7 @@ fn run_server(
         }
 
         if let Some(companion) = companion {
-            let addr = format!("0.0.0.0:{http_port}");
+            let addr = format!("[::]:{http_port}");
             let mut proxies_guard = port_proxies.write();
             let proxy = proxies_guard.entry(addr.clone()).or_insert_with(|| {
                 pingclair_proxy::server::PingclairProxy::with_tls_and_trusted_proxies(
@@ -2578,11 +2578,11 @@ mod tests {
 
     #[test]
     fn normalize_listen_addr_expands_bare_port() {
-        assert_eq!(normalize_listen_addr(":8443"), "0.0.0.0:8443");
-        assert_eq!(normalize_listen_addr(":80"), "0.0.0.0:80");
+        assert_eq!(normalize_listen_addr(":8443"), "[::]:8443");
+        assert_eq!(normalize_listen_addr(":80"), "[::]:80");
         // Full socket addresses pass through untouched.
         assert_eq!(normalize_listen_addr("127.0.0.1:9000"), "127.0.0.1:9000");
-        assert_eq!(normalize_listen_addr("0.0.0.0:443"), "0.0.0.0:443");
+        assert_eq!(normalize_listen_addr("[::]:443"), "[::]:443");
         // The normalized form must parse as a SocketAddr (Pingora + H3 both
         // require this).
         assert!(
@@ -2595,10 +2595,10 @@ mod tests {
     /// 🧭 Caddy-style address derivation used by the quick commands.
     #[test]
     fn cli_site_addresses_derive_like_caddy() {
-        assert_eq!(listen_for_site(":2080", false), "0.0.0.0:2080");
-        assert_eq!(listen_for_site("localhost", true), "0.0.0.0:443");
-        assert_eq!(listen_for_site("example.com:8443", true), "0.0.0.0:8443");
-        assert_eq!(listen_for_site("http://example.com", false), "0.0.0.0:80");
+        assert_eq!(listen_for_site(":2080", false), "[::]:2080");
+        assert_eq!(listen_for_site("localhost", true), "[::]:443");
+        assert_eq!(listen_for_site("example.com:8443", true), "[::]:8443");
+        assert_eq!(listen_for_site("http://example.com", false), "[::]:80");
         assert_eq!(listen_for_site("127.0.0.1:9000", false), "127.0.0.1:9000");
         assert_eq!(host_only("example.com:8443"), "example.com");
         assert_eq!(host_only(":9000"), "");
@@ -2621,7 +2621,7 @@ mod tests {
 
         let plain = pingclair_core::config::ServerConfig::default();
         assert!(!server_requires_tls(&plain, "127.0.0.1:21209", 80, 443));
-        assert!(server_requires_tls(&plain, "0.0.0.0:443", 80, 443));
+        assert!(server_requires_tls(&plain, "[::]:443", 80, 443));
         assert!(server_requires_tls(&plain, "[::]:8443", 80, 443));
     }
 
@@ -2635,17 +2635,17 @@ mod tests {
     #[test]
     fn port_80_stays_plaintext_even_with_an_explicit_tls_block() {
         let config = pingclair_core::config::ServerConfig {
-            listen: vec!["0.0.0.0:80".to_string(), "0.0.0.0:443".to_string()],
+            listen: vec!["[::]:80".to_string(), "[::]:443".to_string()],
             tls: Some(Default::default()),
             ..Default::default()
         };
 
         assert!(
-            !server_requires_tls(&config, "0.0.0.0:80", 80, 443),
+            !server_requires_tls(&config, "[::]:80", 80, 443),
             "ACME HTTP-01 validation is plaintext on port 80 and must reach the proxy"
         );
         assert!(
-            server_requires_tls(&config, "0.0.0.0:443", 80, 443),
+            server_requires_tls(&config, "[::]:443", 80, 443),
             "the TLS block must still apply to the HTTPS listener"
         );
     }
@@ -2679,21 +2679,16 @@ mod tests {
 
         let site = pingclair_core::config::ServerConfig {
             name: Some("example.com".to_string()),
-            listen: vec!["0.0.0.0:443".to_string()],
+            listen: vec!["[::]:443".to_string()],
             tls: Some(Default::default()),
             ..Default::default()
         };
 
-        let companion = automatic_http_companion(
-            &site,
-            AutoHttpsMode::On,
-            &["0.0.0.0:443".to_string()],
-            80,
-            443,
-        )
-        .expect("an HTTPS site needs its plaintext companion");
+        let companion =
+            automatic_http_companion(&site, AutoHttpsMode::On, &["[::]:443".to_string()], 80, 443)
+                .expect("an HTTPS site needs its plaintext companion");
 
-        assert_eq!(companion.listen, vec!["0.0.0.0:80".to_string()]);
+        assert_eq!(companion.listen, vec!["[::]:80".to_string()]);
         assert!(
             companion.tls.is_none(),
             "the companion carries ACME validation traffic and must stay plaintext"
@@ -2717,11 +2712,11 @@ mod tests {
 
         let https = |name: Option<&str>| pingclair_core::config::ServerConfig {
             name: name.map(str::to_string),
-            listen: vec!["0.0.0.0:443".to_string()],
+            listen: vec!["[::]:443".to_string()],
             tls: Some(Default::default()),
             ..Default::default()
         };
-        let ports = vec!["0.0.0.0:443".to_string()];
+        let ports = vec!["[::]:443".to_string()];
 
         assert!(
             automatic_http_companion(
@@ -2772,7 +2767,7 @@ mod tests {
             automatic_http_companion(
                 &https(Some("example.com")),
                 AutoHttpsMode::On,
-                &["0.0.0.0:80".to_string(), "0.0.0.0:443".to_string()],
+                &["[::]:80".to_string(), "[::]:443".to_string()],
                 80,
                 443,
             )
@@ -2791,7 +2786,7 @@ mod tests {
 
         let site = pingclair_core::config::ServerConfig {
             name: Some("example.com".to_string()),
-            listen: vec!["0.0.0.0:443".to_string()],
+            listen: vec!["[::]:443".to_string()],
             tls: Some(Default::default()),
             ..Default::default()
         };
@@ -2799,13 +2794,13 @@ mod tests {
         let companion = automatic_http_companion(
             &site,
             AutoHttpsMode::DisableRedirects,
-            &["0.0.0.0:443".to_string()],
+            &["[::]:443".to_string()],
             80,
             443,
         )
         .expect("ACME still needs to be reachable on port 80");
 
-        assert_eq!(companion.listen, vec!["0.0.0.0:80".to_string()]);
+        assert_eq!(companion.listen, vec!["[::]:80".to_string()]);
         assert!(
             companion.routes.is_empty(),
             "the challenge path is answered before routing, so no route means no redirect"
