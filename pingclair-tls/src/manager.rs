@@ -58,6 +58,11 @@ impl TlsManager {
 
         let auto_https = if let Some(config) = config {
             let store = Arc::new(CertStore::new(store_path));
+            // 📁 A fresh process must see certificates persisted by earlier
+            // runs; without this the in-memory cache stays empty, eager
+            // issuance re-requests every domain, and the first TLS handshakes
+            // fail with NO_CERTIFICATE_SET until a new issuance completes.
+            store.init().await?;
             Some(Arc::new(AutoHttps::new(config, store)))
         } else {
             None
@@ -110,6 +115,10 @@ impl TlsManager {
 
         let auto_https = if let Some(config) = config {
             let store = Arc::new(CertStore::new(store_path));
+            // 📁 Hydrate the persisted certificate cache like the main
+            // constructor does; a custom challenge path must not change
+            // certificate discovery semantics.
+            store.init().await?;
             Some(Arc::new(AutoHttps::new(config, store)))
         } else {
             None
@@ -128,10 +137,10 @@ impl TlsManager {
 
     /// Initializes the manager (async steps)
     pub async fn init(&self) -> Result<(), crate::AutoHttpsError> {
-        if let Some(_auto) = &self.auto_https {
-            // We can access the store via internal field if we exposed it, or we just trust it works lazy
-            // But actually CertStore::init creates directories, which is good to do early.
-            // For this MVP, we will rely on AutoHttps lazily using it or simple directory creation.
+        if let Some(auto) = &self.auto_https {
+            // 📁 The constructors already hydrate the store; this entry point
+            // keeps the manager usable when it is built step by step.
+            auto.init_store().await?;
         }
         Ok(())
     }
@@ -457,6 +466,33 @@ mod tests {
 
         // Unknown domains fall through to ACME (disabled here) and return None.
         assert!(manager.resolve_pem("other.example.com").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn startup_hydrates_persisted_certificates_into_the_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = serde_json::json!({
+            "cert_pem": "LEAF_CERT_PEM",
+            "key_pem": "LEAF_KEY_PEM",
+            "domains": ["example.com"],
+            "expires_at": 4_102_444_800_i64,
+        });
+        std::fs::write(
+            directory.path().join("example_com.json"),
+            serde_json::to_vec(&data).unwrap(),
+        )
+        .unwrap();
+
+        let manager = TlsManager::new(Some(AutoHttpsConfig::default()), directory.path())
+            .await
+            .unwrap();
+
+        // 🗃️ A cold start must see the persisted bundle immediately, so the
+        // first handshake does not trigger a pointless ACME re-issuance.
+        assert_eq!(
+            manager.peek_pem("example.com").await,
+            Some(("LEAF_CERT_PEM".to_string(), "LEAF_KEY_PEM".to_string()))
+        );
     }
 
     #[tokio::test]

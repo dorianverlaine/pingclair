@@ -100,6 +100,12 @@ impl CertStore {
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
             if path.extension().map(|e| e == "json").unwrap_or(false) {
+                // 📄 The persistent challenge journal lives in the store root
+                // but is not a certificate bundle; loading it as one would
+                // emit a misleading "corrupt cert" warning on every start.
+                if path.file_name().and_then(|name| name.to_str()) == Some("acme-challenges.json") {
+                    continue;
+                }
                 // Try processing the file
                 match tokio::fs::read_to_string(&path).await {
                     Ok(content) => {

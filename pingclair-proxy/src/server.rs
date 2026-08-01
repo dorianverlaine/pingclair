@@ -6,8 +6,8 @@
 //! 🌐 This module implements the core reverse proxy using Pingora's ProxyHttp trait.
 
 use pingclair_core::config::{
-    AccessControlConfig, CacheConfig, HandlerConfig, ResourceLimitsConfig, ReverseProxyConfig,
-    ServerConfig,
+    AccessControlConfig, CacheConfig, HandlerConfig, ResourceLimitsConfig, RetryConfig,
+    ReverseProxyConfig, ServerConfig,
 };
 use pingclair_core::server::Router;
 
@@ -3129,6 +3129,31 @@ fn resolve_single_placeholder(
 
 // MARK: - ProxyHttp Trait
 
+/// 🔁 Applies Pingora's reuse-safety rule and the route retry budget to an
+/// upstream error before the retry loop reads it.
+///
+/// Pingora marks response-phase errors `ReusedOnly`; the default
+/// `error_while_proxy` resolves that marker with `decide_reuse`, and the
+/// retry loop panics ("Retry is not decided") when a custom override returns
+/// the error unchanged. This helper restores that contract, then caps the
+/// final decision with the configured attempt budget.
+fn decide_upstream_error_retry(
+    e: &mut pingora_core::Error,
+    client_reused: bool,
+    retry_buffer_truncated: bool,
+    retry_policy: &RetryConfig,
+    attempts: usize,
+    retry_deadline: Option<std::time::Instant>,
+) -> bool {
+    e.retry
+        .decide_reuse(client_reused && !retry_buffer_truncated);
+    let budget_allows =
+        crate::retry::permits_another_attempt(retry_policy, attempts, retry_deadline);
+    let retry = budget_allows && e.retry();
+    e.retry = retry.into();
+    retry
+}
+
 #[async_trait]
 impl ProxyHttp for PingclairProxy {
     type CTX = RequestContext;
@@ -4399,10 +4424,10 @@ impl ProxyHttp for PingclairProxy {
     fn error_while_proxy(
         &self,
         peer: &HttpPeer,
-        _session: &mut Session,
-        e: Box<pingora_core::Error>,
+        session: &mut Session,
+        mut e: Box<pingora_core::Error>,
         ctx: &mut Self::CTX,
-        _client_reused: bool,
+        client_reused: bool,
     ) -> Box<pingora_core::Error> {
         if let Some(mut admission) = ctx.upstream_admission.take() {
             admission.report_failure();
@@ -4414,6 +4439,23 @@ impl ProxyHttp for PingclairProxy {
             error = %e,
             "❌ Proxy error"
         );
+
+        let retry_policy = ctx
+            .state
+            .as_ref()
+            .zip(ctx.route_index)
+            .and_then(|(state, route_index)| self.get_proxy_config(state, route_index))
+            .map(|config| config.retry)
+            .unwrap_or_default();
+        let retry = decide_upstream_error_retry(
+            &mut e,
+            client_reused,
+            session.as_ref().retry_buffer_truncated(),
+            &retry_policy,
+            ctx.retry_attempts,
+            ctx.retry_deadline,
+        );
+        ctx.retry_pending = retry;
         e
     }
 
@@ -6056,5 +6098,67 @@ mod template_tests {
                 .unwrap()
                 .contains("{{")
         );
+    }
+}
+
+#[cfg(test)]
+mod upstream_error_retry_tests {
+    use super::*;
+
+    fn reused_only_error() -> Box<pingora_core::Error> {
+        let mut error =
+            pingora_core::Error::explain(pingora_core::ErrorType::ReadError, "upstream read error");
+        error.retry = pingora_core::RetryType::ReusedOnly;
+        error
+    }
+
+    #[test]
+    fn reused_connection_within_budget_is_decided_and_retryable() {
+        let policy = RetryConfig::default();
+        let mut error = reused_only_error();
+        let retry = decide_upstream_error_retry(&mut error, true, false, &policy, 0, None);
+
+        assert!(retry, "a reused connection within budget must retry");
+        assert!(
+            error.retry(),
+            "the retry marker must be decided before the loop reads it"
+        );
+    }
+
+    #[test]
+    fn fresh_connection_never_retries_a_response_phase_error() {
+        let policy = RetryConfig::default();
+        let mut error = reused_only_error();
+        let retry = decide_upstream_error_retry(&mut error, false, false, &policy, 0, None);
+
+        assert!(!retry, "a fresh connection must not retry");
+        assert!(!error.retry());
+    }
+
+    #[test]
+    fn exhausted_retry_budget_caps_the_decision() {
+        let policy = RetryConfig::default();
+        let mut error = reused_only_error();
+        let retry = decide_upstream_error_retry(
+            &mut error,
+            true,
+            false,
+            &policy,
+            policy.max_attempts,
+            None,
+        );
+
+        assert!(!retry, "the attempt cap must win over a reused connection");
+        assert!(!error.retry());
+    }
+
+    #[test]
+    fn truncated_retry_buffer_disables_reuse_retries() {
+        let policy = RetryConfig::default();
+        let mut error = reused_only_error();
+        let retry = decide_upstream_error_retry(&mut error, true, true, &policy, 0, None);
+
+        assert!(!retry, "a truncated retry buffer must disable retry");
+        assert!(!error.retry());
     }
 }
