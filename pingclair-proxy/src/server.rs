@@ -2394,6 +2394,16 @@ impl PingclairProxy {
                         response.insert_header(name, value).unwrap();
                     }
                 }
+                // 🧭 Caddy's `respond` defaults to `text/plain; charset=utf-8`
+                // unless the config names a Content-Type explicitly.
+                if !headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case("content-type"))
+                {
+                    response
+                        .insert_header("Content-Type", "text/plain; charset=utf-8")
+                        .unwrap();
+                }
                 let body_bytes = body.as_deref().unwrap_or("").as_bytes();
                 response
                     .insert_header("Content-Length", body_bytes.len().to_string())
@@ -2566,6 +2576,7 @@ impl PingclairProxy {
                                 header
                                     .insert_header("Content-Encoding", encoding.as_str())
                                     .unwrap();
+                                header.insert_header("Vary", "Accept-Encoding").unwrap();
                             }
                             header.insert_header("Accept-Ranges", "bytes").unwrap();
                             Self::apply_local_response_headers(&mut header, ctx)?;

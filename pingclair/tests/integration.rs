@@ -3429,6 +3429,11 @@ async fn test_cli_respond_serves_body() {
     let resp = client.get(&url).send().await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
     assert_eq!(resp.headers()["x-test"], "yes");
+    assert_eq!(
+        resp.headers()["content-type"],
+        "text/plain; charset=utf-8",
+        "respond must default to a text/plain charset like Caddy"
+    );
     assert_eq!(resp.text().await.unwrap(), "hello-respond");
 
     let _ = child.kill();
@@ -3698,6 +3703,54 @@ async fn test_cli_file_server_templates() {
     assert!(!body.is_empty(), "file-server --templates did not come up");
     assert!(!body.contains("{{"), "got: {body}");
     assert!(body.starts_with("T: "), "got: {body}");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// 🧭 file_server sends `text/html; charset=utf-8` and a Vary header when it
+/// compresses, like Caddy.
+#[tokio::test]
+async fn test_file_server_charset_and_vary() {
+    let site = tempfile::tempdir().unwrap();
+    std::fs::write(site.path().join("index.html"), "<h1>charset</h1>").unwrap();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+    let tls = tempfile::tempdir().unwrap();
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pingclair"))
+        .args([
+            "file-server",
+            "--listen",
+            &addr.to_string(),
+            "--root",
+            site.path().to_str().unwrap(),
+        ])
+        .env("PINGCLAIR_TLS_STORE", tls.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn file-server");
+
+    let client = no_proxy_client();
+    let url = format!("http://{addr}/index.html");
+    let mut headers = None;
+    for _ in 0..40 {
+        if let Ok(response) = client.get(&url).send().await
+            && response.status() == reqwest::StatusCode::OK
+        {
+            headers = Some(response.headers().clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let headers = headers.expect("file server did not come up");
+    assert_eq!(
+        headers["content-type"],
+        "text/html; charset=utf-8",
+        "file_server must send a charset like Caddy"
+    );
 
     let _ = child.kill();
     let _ = child.wait();
