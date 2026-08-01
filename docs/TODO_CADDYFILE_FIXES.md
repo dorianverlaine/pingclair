@@ -73,44 +73,41 @@ FX-A ──> FX-B ──> FX-C
 
 ### FX-B1（F-02 + F-10，P1）`/load` 開新 listener 且整包替換
 
-- [ ] 現況：`/load` 只更新已綁定 listener；新 listener 404；累加更新。
-- 修法：啟動時建立 listener 註冊表，`/load` 可建立/停止 listener；
-      先解析全部目標、失敗 rollback 舊 config；document 未提及的
-      server 一律移除。
-- 驗證：integration：空 listener 建新 port 200、載入單站文件後另一站
-      停止；香港機重跑 API Quick-start。
+- [x] RuntimeListeners：`/load` 與 traversal 遇到未綁定 listener 時以
+      Pingora `Service::start_service` 動態建立（先同步 probe bind，
+      失敗 rollback）；整包替換時 document 未提及的 dynamic listener
+      停止、啟動時 listener 清空內容（socket 需重啟才關閉，已 log）。
+- 驗證：`test_admin_load_creates_and_removes_listeners`、
+      `test_admin_config_traversal_unbindable_listener_rolls_back`；
+      香港機實測新 listener 服務、整包替換後 socket 關閉。
 
 ### FX-B2（F-11，P1）`/load` 支援 config adapter
 
-- [ ] 現況：`Content-Type: text/caddyfile` 回 `400 expected value`。
-- 修法：`/load` 依 Content-Type 選擇 adapter（`text/caddyfile` 先編譯
-      再載入），與 Caddy 一致。
-- 驗證：`POST /load -H "Content-Type: text/caddyfile" --data-binary
-      @Caddyfile` 200 並生效；香港機重跑 Caddyfile Quick-start。
+- [x] `/load` 依 Content-Type 選擇 adapter：`text/caddyfile` 先編譯
+      再載入。
+- 驗證：`test_admin_load_accepts_caddyfile_content_type` + 香港機實測。
 
 ### FX-B3（F-03，P1）`GET /config/` 與完整文件匯出
 
-- [ ] 現況：`/config/` 404；`GET /config` 輸出失真（`admin: null`、
-      global 只有預設值）。
-- 修法：`/config/` 與 `/config` 同義；保留啟動/載入時的
-      `admin`/`global`/`logging` 實際值；匯出文件可直接回 POST。
-- 驗證：`GET /config/` 200；輸出 POST 回 `/load` 200 且行為一致。
+- [x] `/config/` 與 `/config` 同義；document 保留啟動/載入時的
+      `admin`/`global`/`logging` 實際值，匯出文件可直接回 POST。
+- 驗證：香港機 `GET /config/` 顯示 admin/global；既有
+      `test_admin_adapt_export_and_load` 仍綠。
 
 ### FX-B4（F-04，P2）`POST /stop` 先回應再 graceful shutdown
 
-- [ ] 現況：`std::process::exit(0)` 在 handler 內執行，curl 收到
-      empty reply。
-- 修法：handler 回 200 後由 supervisor 觸發 graceful shutdown
-      （drain 既有連線，與 SIGTERM 同一路徑）。
-- 驗證：`curl -X POST /stop` 收到 200 且 process 正常退出。
+- [x] `/stop` 回 200 後透過 Notify 觸發主程序的 SIGTERM graceful 路徑。
+- 驗證：`test_admin_stop_returns_response_then_exits` + 香港機實測
+      （200 回應、process 退出）。
 
 ### FX-B5（API Tutorial：traversal + `@id`）
 
-- [ ] `@id` 支援：任何 JSON 物件可標 `"@id"`，`/id/<name>` 直接存取
-      （Caddy 語義）；配合 FX-A1 的 path traversal。
-- [ ] config persistence／`--resume`：API 每次變更 autosave；`run
-      --resume` 優先載入 autosave（Caddy 語義）。
-- 驗證：API Tutorial 全流程（traversal、`@id`、`--resume`）。
+- [x] `@id`：任何 JSON 物件可標 `"@id"`，`/id/<name>[/<path>]`
+      GET/POST/PUT/PATCH/DELETE（與 FX-A1 traversal 共用）。
+- [x] config persistence：`/load`／traversal 成功後寫
+      `$PINGCLAIR_TLS_STORE/autosave.json`；`run --resume` 優先載入。
+- 驗證：`test_admin_id_tags_end_to_end`、`test_admin_autosave_and_resume`
+      + 香港機實測（`--resume` 恢復 `id-ok`）。
 
 ---
 

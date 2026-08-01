@@ -695,7 +695,10 @@ bcrypt cost 14，輸出 `$2a$14$`（Caddy）與 `$2b$14$`（Pingclair），
 - 已修復：F-01（`/load` 靜默載入空配置 → 400，commit `70d0fb0`）；
   FX-A（本 commit）：F-20（`reverse_proxy :9000` 不再 502）、F-24
   （`/config/<path>` 實作 Caddy traversal，不再把 body 當 ServerConfig）、
-  F-31（`adapt -c -`／`validate -` 支援 stdin）。
+  F-31（`adapt -c -`／`validate -` 支援 stdin）；
+  FX-B（本 commit）：F-02/F-10（`/load` 動態開新 listener＋整包替換）、
+  F-11（`/load` 支援 `text/caddyfile`）、F-03（`GET /config/` 完整匯出）、
+  F-04（`/stop` 回 200 後 graceful）、`@id` 與 autosave/`--resume`。
 - 未修 P1 清單：F-02（`/load` 不能開新 listener）、F-07（非 root 無
   TLS store 無法啟動）、F-10（`/load` 累加更新非整包替換）、F-14
   （reload 換 handler/browse 不生效）、F-20（`reverse_proxy :9000`

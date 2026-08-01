@@ -2958,7 +2958,8 @@ async fn test_admin_adapt_export_and_load() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(response.text().await.unwrap(), "loaded-ok");
 
-    // 🛡️ A document referencing a missing listener must be refused wholesale.
+    // 🛡️ A document referencing an unbindable listener must be refused
+    // wholesale (runtime listener creation probes the bind synchronously).
     let bad = serde_json::json!({
         "servers": [{
             "name": "bad",
@@ -2972,7 +2973,7 @@ async fn test_admin_adapt_export_and_load() {
         .send()
         .await
         .unwrap();
-    assert_eq!(refused.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
     // 🧭 The previous config must still be live.
     let response = client.get(server.url(0, "/")).send().await.unwrap();
     assert_eq!(response.text().await.unwrap(), "loaded-ok");
@@ -3160,11 +3161,13 @@ async fn test_admin_config_traversal_expand_appends() {
 
 /// 🚫 A traversal that introduces an unbound listener is refused wholesale.
 #[tokio::test]
-async fn test_admin_config_traversal_new_listener_is_refused() {
+async fn test_admin_config_traversal_unbindable_listener_rolls_back() {
     let mut server = TestServer::new(&admin_test_config("/__ready_rb", "rb"));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
+    // 🚫 Port 1 cannot be bound by an unprivileged test process; the failure
+    // must surface to the caller and roll the document back.
     let new_server = serde_json::json!({"listen": ["127.0.0.1:1"], "routes": []});
     let resp = client
         .post(server.admin_url("/config/servers/..."))
@@ -3172,7 +3175,7 @@ async fn test_admin_config_traversal_new_listener_is_refused() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 
     // 🧭 The document and the running server are both unchanged.
     let resp = client
@@ -3188,6 +3191,88 @@ async fn test_admin_config_traversal_new_listener_is_refused() {
         .await
         .unwrap();
     assert_eq!(resp.text().await.unwrap(), "rb");
+}
+
+/// 🧭 `/load` creates listeners at runtime and whole-document replacement
+/// removes them again, like Caddy.
+#[tokio::test]
+async fn test_admin_load_creates_and_removes_listeners() {
+    let mut server = TestServer::new(&admin_test_config("/__ready_dyn", "dyn"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    // 🔓 Find a free port for the runtime-created listener.
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let new_addr = probe.local_addr().unwrap();
+    drop(probe);
+    let admin_listen = server.admin_address.unwrap().to_string();
+
+    let document = serde_json::json!({
+        "admin": {"enabled": true, "listen": admin_listen},
+        "servers": [
+            {"listen": [server.address(0).to_string()],
+             "routes": [{"path": "/*", "handler": {"type": "respond", "status": 200, "body": "old"}}]},
+            {"listen": [new_addr.to_string()],
+             "routes": [{"path": "/*", "handler": {"type": "respond", "status": 200, "body": "new"}}]}
+        ]
+    });
+    let resp = client
+        .post(server.admin_url("/load"))
+        .json(&document)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 🧭 The new listener serves before we assert, since the accept task
+    // binds asynchronously after the response.
+    let new_url = format!("http://{new_addr}/");
+    let mut ready = false;
+    for _ in 0..30 {
+        if client
+            .get(&new_url)
+            .send()
+            .await
+            .map(|response| response.status() == reqwest::StatusCode::OK)
+            .unwrap_or(false)
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ready, "runtime-created listener did not come up");
+    let resp = client.get(&new_url).send().await.unwrap();
+    assert_eq!(resp.text().await.unwrap(), "new");
+
+    // 📤 Whole-document replacement without the second server closes it.
+    let document = serde_json::json!({
+        "admin": {"enabled": true, "listen": admin_listen},
+        "servers": [{
+            "listen": [server.address(0).to_string()],
+            "routes": [{"path": "/*", "handler": {"type": "respond", "status": 200, "body": "only"}}]
+        }]
+    });
+    let resp = client
+        .post(server.admin_url("/load"))
+        .json(&document)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 🧭 Existing keep-alive connections may drain (Caddy does the same), so
+    // prove the *socket* is gone with a fresh TCP connect instead.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut closed = false;
+    for _ in 0..10 {
+        if std::net::TcpStream::connect(new_addr).is_err() {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(closed, "removed runtime listener socket must close");
 }
 
 /// 🧭 `adapt -c -` and `validate -` read the config from stdin, like Caddy.
@@ -3231,6 +3316,174 @@ fn cli_adapt_and_validate_read_stdin() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("is valid"));
+}
+
+/// 🧭 `/load` accepts a Caddyfile when the client sends `text/caddyfile`.
+#[tokio::test]
+async fn test_admin_load_accepts_caddyfile_content_type() {
+    let mut server = TestServer::new(&admin_test_config("/__ready_adapter", "adapter"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let listen = server.address(0).to_string();
+    let caddyfile = format!("{listen} {{\n    respond \"adapted-ok\"\n}}\n");
+    let resp = client
+        .post(server.admin_url("/load"))
+        .header("Content-Type", "text/caddyfile")
+        .body(caddyfile)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let resp = client.get(server.url(0, "/anything")).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(resp.text().await.unwrap(), "adapted-ok");
+}
+
+/// 🏷️ `@id` tags turn long traversal paths into `/id/<name>` shortcuts.
+#[tokio::test]
+async fn test_admin_id_tags_end_to_end() {
+    let mut server = TestServer::new(&admin_test_config("/__ready_id", "id"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    // 🏷️ Tag the readiness handler object.
+    let resp = client
+        .post(server.admin_url("/config/servers/0/routes/0/handler/@id"))
+        .json(&serde_json::json!("msg"))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    println!("TAG POST status={status} body={body}");
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+
+    // 📖 Read the whole object through the tag.
+    let resp = client
+        .get(server.admin_url("/id/msg"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let node = resp.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(node["type"], "respond");
+
+    // ✍️ Mutate a nested field through the tag.
+    let resp = client
+        .post(server.admin_url("/id/msg/body"))
+        .json(&serde_json::json!("id-ok"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let resp = client
+        .get(server.url(0, &server.readiness_path))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.text().await.unwrap(), "id-ok");
+
+    // 🗑️ Removing the tag makes `/id/msg` 404 while the handler survives.
+    let resp = client
+        .delete(server.admin_url("/id/msg/@id"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let resp = client
+        .get(server.admin_url("/id/msg"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+/// 💾 API changes autosave; `run --resume` restores them after a restart.
+#[tokio::test]
+async fn test_admin_autosave_and_resume() {
+    let mut server = TestServer::new(&admin_test_config("/__ready_save", "save"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let document = serde_json::json!({
+        "admin": {"enabled": true, "listen": server.admin_address.unwrap().to_string()},
+        "servers": [{
+            "listen": [server.address(0).to_string()],
+            "routes": [{
+                "path": "/__resumed",
+                "handler": {"type": "respond", "status": 200, "body": "resumed-ok"}
+            }]
+        }]
+    });
+    let resp = client
+        .post(server.admin_url("/load"))
+        .json(&document)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let autosave = server._temp_dir.path().join("tls/autosave.json");
+    assert!(autosave.is_file(), "autosave must exist after /load");
+    let listen_addr = server.address(0);
+    let tls_dir = server._temp_dir.path().join("tls");
+    server.stop();
+
+    // 🚀 A nonexistent config path proves `--resume` wins over the file.
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pingclair"))
+        .args(["run", "--resume", "does-not-exist.conf"])
+        .env("PINGCLAIR_TLS_STORE", &tls_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn resumed server");
+
+    let url = format!("http://{listen_addr}/__resumed");
+    let client = no_proxy_client();
+    let mut ready = false;
+    for _ in 0..50 {
+        if client
+            .get(&url)
+            .send()
+            .await
+            .map(|response| response.status() == reqwest::StatusCode::OK)
+            .unwrap_or(false)
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(ready, "resumed server did not come up");
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(resp.text().await.unwrap(), "resumed-ok");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// 🛑 `POST /stop` answers 200 first, then the process exits gracefully.
+#[tokio::test]
+async fn test_admin_stop_returns_response_then_exits() {
+    let mut server = TestServer::new(&admin_test_config("/__ready_stop", "stop"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let resp = client.post(server.admin_url("/stop")).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let mut exited = false;
+    for _ in 0..30 {
+        if server.process.try_wait().unwrap().is_some() {
+            exited = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(exited, "server did not exit after /stop");
 }
 
 /// 🔔 SIGHUP/SIGUSR1 reload the running server from its config file — on any
@@ -3490,7 +3743,9 @@ async fn test_admin_config_for_an_unknown_listener_applies_nothing() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 404);
+    // 🚫 The unbindable second listener fails synchronously now (runtime
+    // listener creation probes the bind); nothing may be half-applied.
+    assert_eq!(response.status(), 400);
 
     // 🛡️ The live listener named first must not have been rewritten.
     let untouched = client
