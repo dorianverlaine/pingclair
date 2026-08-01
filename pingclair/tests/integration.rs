@@ -3486,7 +3486,8 @@ async fn test_admin_stop_returns_response_then_exits() {
     assert!(exited, "server did not exit after /stop");
 }
 
-/// 🔔 SIGHUP/SIGUSR1 reload the running server from its config file — on any
+/// 🔔 SIGUSR1 reloads the running server from its config file, SIGHUP is
+/// ignored (Caddy semantics) — on any Unix, including macOS dev machines.
 /// Unix, including the macOS dev machines this suite runs on. The test edits
 /// the Pingclairfile, signals the real binary, and checks that the new route
 /// answers and that a global change is reported as requiring a restart.
@@ -3519,9 +3520,23 @@ async fn test_signal_reload_applies_config_and_warns_on_global_changes() {
         .replace("before-reload", "after-reload");
     std::fs::write(&config_path, updated).unwrap();
 
-    // 🔔 SIGHUP is the historical reload signal.
+    // 🔔 SIGHUP must be ignored, like Caddy's signal table.
     let status = std::process::Command::new("kill")
         .args(["-HUP", &server.process.id().to_string()])
+        .status()
+        .expect("kill must run");
+    assert!(status.success());
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let response = client.get(server.url(0, "/")).send().await.unwrap();
+    assert_eq!(
+        response.text().await.unwrap(),
+        "before-reload",
+        "SIGHUP must be ignored"
+    );
+
+    // 🚦 SIGUSR1 (Caddy's reload signal) applies the edited config.
+    let status = std::process::Command::new("kill")
+        .args(["-USR1", &server.process.id().to_string()])
         .status()
         .expect("kill must run");
     assert!(status.success());
@@ -3547,7 +3562,7 @@ async fn test_signal_reload_applies_config_and_warns_on_global_changes() {
         "the reload must warn that global settings need a restart:\n{stderr}"
     );
 
-    // 🚦 SIGUSR1 (Caddy's reload signal) must also work.
+    // 🚦 A second SIGUSR1 applies the next edit.
     std::fs::write(
         &config_path,
         std::fs::read_to_string(&config_path)
@@ -3572,6 +3587,127 @@ async fn test_signal_reload_applies_config_and_warns_on_global_changes() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(usr1_reloaded, "SIGUSR1 must reload the configuration");
+}
+
+/// 🏃 SIGQUIT forces an immediate exit with code 2, like Caddy.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_sigquit_exits_with_code_2() {
+    let mut server = TestServer::new(&admin_test_config("/__ready_quit", "quit"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let status = std::process::Command::new("kill")
+        .args(["-QUIT", &server.process.id().to_string()])
+        .status()
+        .expect("kill must run");
+    assert!(status.success());
+
+    let mut exit = None;
+    for _ in 0..30 {
+        if let Some(code) = server.process.try_wait().unwrap() {
+            exit = Some(code);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let exit = exit.expect("process must exit on SIGQUIT");
+    assert_eq!(exit.code(), Some(2));
+}
+
+/// 🚫 After an Admin API change, SIGUSR1 reloads are disabled (Caddy).
+#[cfg(unix)]
+#[tokio::test]
+async fn test_api_change_disables_signal_reload() {
+    let mut server = TestServer::new(&admin_test_config("/__ready_apichange", "api"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    // ✍️ Change the body through the Admin API.
+    let resp = client
+        .post(server.admin_url("/config/servers/0/routes/0/handler/body"))
+        .json(&serde_json::json!("api-changed"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // ✍️ Edit the config file so a (wrongly allowed) reload would be visible.
+    let config_path = server._temp_dir.path().join("config.json");
+    let updated = std::fs::read_to_string(&config_path)
+        .unwrap()
+        .replace(&server.readiness_token, "file-changed");
+    std::fs::write(&config_path, updated).unwrap();
+
+    let status = std::process::Command::new("kill")
+        .args(["-USR1", &server.process.id().to_string()])
+        .status()
+        .expect("kill must run");
+    assert!(status.success());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let resp = client
+        .get(server.url(0, &server.readiness_path))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.text().await.unwrap(),
+        "api-changed",
+        "signal reload must be disabled after API changes"
+    );
+}
+
+/// 🔁 SIGUSR1 replaces a respond route with a file_server route; the reload
+/// must rebuild handlers so the new handler type actually answers.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_signal_reload_switches_handler_types() {
+    let config = r#"
+        {
+            admin off
+        }
+        :__PINGCLAIR_TEST_PORT__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "respond-body"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+    let response = client.get(server.url(0, "/")).send().await.unwrap();
+    assert_eq!(response.text().await.unwrap(), "respond-body");
+
+    // 📄 Prepare a real file for the file_server route.
+    let root = server._temp_dir.path().join("site");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("index.html"), "<h1>file-ok</h1>").unwrap();
+
+    let config_path = server._temp_dir.path().join("Pingclairfile");
+    let updated = format!(
+        "{{\n    admin off\n}}\n:{} {{\n    root \"{}\"\n    file_server\n}}\n",
+        server.address(0).port(),
+        root.display()
+    );
+    std::fs::write(&config_path, updated).unwrap();
+
+    let status = std::process::Command::new("kill")
+        .args(["-USR1", &server.process.id().to_string()])
+        .status()
+        .expect("kill must run");
+    assert!(status.success());
+
+    let mut switched = false;
+    for _ in 0..50 {
+        if let Ok(response) = client.get(server.url(0, "/")).send().await
+            && response.text().await.ok().as_deref() == Some("<h1>file-ok</h1>")
+        {
+            switched = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(switched, "reload must switch the handler type");
 }
 
 /// 🔎 Starts a TLS-ready test server and returns (status, x-order, body).
