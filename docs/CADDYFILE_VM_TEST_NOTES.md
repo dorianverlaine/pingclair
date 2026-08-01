@@ -709,7 +709,11 @@ bcrypt cost 14，輸出 `$2a$14$`（Caddy）與 `$2b$14$`（Pingclair），
   FX-E（本 commit）：F-22（bare hostname 預設自動 HTTPS，真域名
   `pingclair-test.aqeo.dev` production ACME 簽發成功）、F-28（無 matcher
   時 proxy 勝過 file_server）、F-26（`templates` directive 渲染）、
-  F-23（JSON `names` 觸發 eager issuance）。
+  F-23（JSON `names` 觸發 eager issuance）；
+  FX-F 第一批（本 commit）：F-05/F-15/F-27（respond Content-Type、
+  file_server charset、Vary）、F-16（file-server 預設 `:80`）、F-07
+  （TLS store 預設改使用者目錄，非 root 首跑成功）、exit code 0、
+  `version` 單行格式。
 - 未修 P1 清單：F-02（`/load` 不能開新 listener）、F-07（非 root 無
   TLS store 無法啟動）、F-10（`/load` 累加更新非整包替換）、F-14
   （reload 換 handler/browse 不生效）、F-20（`reverse_proxy :9000`

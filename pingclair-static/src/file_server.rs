@@ -375,9 +375,12 @@ impl FileServer {
         let file = std::fs::File::open(&file_path)?;
 
         // Guess MIME type
-        let mime_type = mime_guess::from_path(&file_path)
-            .first_or_octet_stream()
-            .to_string();
+        #[allow(clippy::unnecessary_to_owned)] // mime::Mime is not &str
+        let mime_type = crate::mime::with_charset(
+            &mime_guess::from_path(&file_path)
+                .first_or_octet_stream()
+                .to_string(),
+        );
 
         // Calculate Last-Modified and ETag
         let last_modified = metadata.modified().ok().map(httpdate::fmt_http_date);
@@ -530,9 +533,12 @@ impl FileServer {
 
         // MIME type is path-based (no I/O) and needed by both the cache fast
         // path and every response below — compute it once, up front.
-        let mime_type = mime_guess::from_path(&file_path)
-            .first_or_octet_stream()
-            .to_string();
+        #[allow(clippy::unnecessary_to_owned)] // mime::Mime is not &str
+        let mime_type = crate::mime::with_charset(
+            &mime_guess::from_path(&file_path)
+                .first_or_octet_stream()
+                .to_string(),
+        );
 
         // Streaming branch: large, complete, uncompressed responses are
         // handed back as an open file for chunked writing — the body is

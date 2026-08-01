@@ -231,9 +231,27 @@ fn resolve_config_path(explicit: Option<&str>) -> String {
 /// The Admin API autosaves the active document under this directory so
 /// `--resume` can restore an API-driven configuration after a restart.
 fn tls_store_dir() -> std::path::PathBuf {
-    std::env::var("PINGCLAIR_TLS_STORE")
+    if let Ok(path) = std::env::var("PINGCLAIR_TLS_STORE") {
+        return std::path::PathBuf::from(path);
+    }
+    // 🧭 Caddy stores data under the user's data directory; a hard-coded
+    // `/var/lib/pingclair/certs` made an unprivileged first run impossible.
+    let data_home = std::env::var("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/pingclair/certs"))
+        .or_else(|_| {
+            std::env::var("HOME").map(|home| {
+                #[cfg(target_os = "macos")]
+                {
+                    std::path::PathBuf::from(home).join("Library/Application Support")
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    std::path::PathBuf::from(home).join(".local/share")
+                }
+            })
+        })
+        .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/pingclair"));
+    data_home.join("pingclair")
 }
 
 /// 🚀 Collects the hostnames that need eager ACME issuance: `tls auto` sites
@@ -581,7 +599,7 @@ enum Commands {
     #[command(name = "file-server")]
     FileServer {
         /// Address to listen on
-        #[arg(long, default_value = ":8080")]
+        #[arg(long, default_value = ":80")]
         listen: String,
 
         /// Root directory to serve
@@ -684,6 +702,14 @@ enum ServiceAction {
 }
 
 fn main() -> anyhow::Result<()> {
+    // 🧭 `pingclair` with no subcommand prints help and exits 0, like Caddy.
+    if std::env::args().len() <= 1 {
+        use clap::CommandFactory;
+        Cli::command().print_help().ok();
+        println!();
+        return Ok(());
+    }
+
     // Install a process-level rustls CryptoProvider before any TLS code runs.
     // Both the `aws-lc-rs` and `ring` features end up enabled through the
     // workspace dependency graph, so rustls cannot pick one automatically and
@@ -997,7 +1023,7 @@ fn main() -> anyhow::Result<()> {
             // 🌐 `--domain` names a virtual host and serves HTTPS (internal
             // CA for localhost), like Caddy's file-server command.
             let listen_addr = if let Some(domain) = &domain {
-                let base = if listen == ":8080" {
+                let base = if listen == ":80" {
                     format!("{domain}:443")
                 } else {
                     listen.clone()
@@ -1238,8 +1264,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         Commands::Version => {
-            println!("Pingclair v{}", env!("CARGO_PKG_VERSION"));
-            println!("Built with ❤️ in Rust");
+            println!("v{}", env!("CARGO_PKG_VERSION"));
         }
 
         Commands::Service { action } => manage_system_service(action)?,
@@ -1677,8 +1702,7 @@ fn run_server(
     ));
 
     // 🔐 Initialize every certificate source below one configurable persistent store.
-    let tls_store_path_str = std::env::var("PINGCLAIR_TLS_STORE")
-        .unwrap_or_else(|_| "/var/lib/pingclair/certs".to_string());
+    let tls_store_path_str = tls_store_dir().to_string_lossy().to_string();
     let tls_store_path = std::path::Path::new(&tls_store_path_str);
     if !tls_store_path.exists() {
         std::fs::create_dir_all(tls_store_path).map_err(|error| {

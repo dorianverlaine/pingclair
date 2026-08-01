@@ -223,24 +223,27 @@ FX-A ──> FX-B ──> FX-C
 
 ## 🔧 FX-F — headers／網路／小語意
 
-- [ ] FX-F1（F-05/F-15/F-27，P2/P3）：`respond` 預設
-      `Content-Type: text/plain; charset=utf-8`；file_server 補
-      charset；`encode` 補 `Vary: Accept-Encoding`。
+- [x] FX-F1（F-05/F-15/F-27，P2/P3）：`respond` 預設
+      `Content-Type: text/plain; charset=utf-8`；file_server 的 text/*
+      補 charset；本機壓縮回應補 `Vary: Accept-Encoding`。
 - [ ] FX-F2（F-06，P2）：listen 雙棧（`:port` 同時 IPv4+IPv6，
       對齊 Caddy）。
-- [ ] FX-F3（F-16，P3）：`file-server` 預設 `:80`、`reverse-proxy`
-      預設 `localhost:443`（對齊 Caddy）。
+- [x] FX-F3（F-16，P3）：`file-server` 預設 `:80`（reverse-proxy 預設
+      `localhost:443` 已在 FX-D）。
 - [ ] FX-F4（F-17，P3）：`--file-limit` 語意對齊（Caddy：browse 讀取
       目錄數上限，預設 10000）。
 - [ ] FX-F5（F-29，P3）：`hash-password` 支援 `--algorithm argon2id`
       （time/memory/threads/keylen）。
-- [ ] FX-F6（F-07，P1）：TLS store 對齊 Caddy——預設路徑改使用者可寫
-      目錄（如 `~/.local/share/pingclair/`，`PINGCLAIR_TLS_STORE`
-      覆寫）；純 HTTP（無 TLS/ACME 需求）不初始化 store。
-- [ ] FX-F7（exit code，P3）：無子命令印 help 回 0（Caddy）；保留
-      啟動失敗 1；SIGQUIT 對應 2（FX-C3）。
+- [x] FX-F6（F-07，P1）：TLS store 預設改使用者資料目錄
+      （Linux `~/.local/share/pingclair`、macOS
+      `~/Library/Application Support/pingclair`），
+      `PINGCLAIR_TLS_STORE` 覆寫；香港機非 root 無 env 首跑成功。
+- [x] FX-F7（exit code，P3）：無子命令印 help 回 0。
 - [ ] FX-F8（fmt 引號，P3）：fmt 保留原始引號（與 Caddy 一致）。
-- [ ] FX-F9（version，P3）：`version` 輸出格式對齊（單行版本號）。
+- [x] FX-F9（version，P3）：單行 `v<version>`。
+
+> 剩餘（續批次/v0.3）：F2（IPv6 雙棧 listen）、F4（`--file-limit`
+> 語意）、F5（argon2id）、F8（fmt 保留引號）。
 
 ---
 
