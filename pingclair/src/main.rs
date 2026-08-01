@@ -243,6 +243,17 @@ fn eager_issuance_domains(config: &pingclair_core::config::PingclairConfig) -> V
         .collect()
 }
 
+/// 🧾 Parses a `Field: value` CLI argument into a header pair, like Caddy's
+/// `--header-up "X-Foo: bar"`.
+fn parse_header_pair(raw: &str) -> Result<(String, String), String> {
+    let Some((name, value)) = raw.split_once(':') else {
+        return Err(format!(
+            "expected `Field: value`, got `{raw}` (the colon is required)"
+        ));
+    };
+    Ok((name.trim().to_string(), value.trim().to_string()))
+}
+
 /// ✍️ Renders parsed directives back to canonical Pingclairfile text: two
 /// spaces per block level, one directive per line, arguments re-quoted only
 /// when whitespace or a comment marker demands it.
@@ -350,9 +361,29 @@ enum Commands {
         #[arg(long, default_value = ":8080")]
         from: String,
 
-        /// Upstream address to proxy to
+        /// Upstream address to proxy to (repeatable)
+        #[arg(long, required = true)]
+        to: Vec<String>,
+
+        /// Set a request header to send upstream (Field: value)
+        #[arg(long = "header-up", value_parser = parse_header_pair)]
+        headers_up: Vec<(String, String)>,
+
+        /// Set a response header to send downstream (Field: value)
+        #[arg(long = "header-down", value_parser = parse_header_pair)]
+        headers_down: Vec<(String, String)>,
+
+        /// Disable TLS verification with the upstream
         #[arg(long)]
-        to: String,
+        insecure: bool,
+
+        /// Use the internal CA instead of attempting public certificates
+        #[arg(long)]
+        internal_certs: bool,
+
+        /// Do not provision the automatic HTTP redirect listener
+        #[arg(long)]
+        disable_redirects: bool,
     },
 
     /// Start a quick file server
@@ -365,6 +396,26 @@ enum Commands {
         /// Root directory to serve
         #[arg(long, default_value = ".")]
         root: String,
+
+        /// Enable directory listings
+        #[arg(short, long)]
+        browse: bool,
+
+        /// Serve this domain over HTTPS (requires --listen to be a port)
+        #[arg(short, long)]
+        domain: Option<String>,
+
+        /// Enable the access log
+        #[arg(long)]
+        access_log: bool,
+
+        /// Disable response compression
+        #[arg(long)]
+        no_compress: bool,
+
+        /// Maximum files shown in a directory listing
+        #[arg(long)]
+        file_limit: Option<usize>,
     },
 
     /// Validate a configuration file
@@ -488,10 +539,21 @@ fn main() -> anyhow::Result<()> {
             run_server(config_path.clone(), config)?;
         }
 
-        Commands::ReverseProxy { from, to } => {
-            tracing::info!("Starting reverse proxy: {} -> {}", from, to);
+        Commands::ReverseProxy {
+            from,
+            to,
+            headers_up,
+            headers_down,
+            insecure,
+            internal_certs,
+            disable_redirects,
+        } => {
+            tracing::info!("Starting reverse proxy: {} -> {:?}", from, to);
             // Create dynamic config
             let mut config = pingclair_core::config::PingclairConfig::default();
+            if disable_redirects {
+                config.global.auto_https = pingclair_core::config::AutoHttpsMode::DisableRedirects;
+            }
 
             // Parse listen address
             let listen = if from.starts_with(':') {
@@ -500,18 +562,39 @@ fn main() -> anyhow::Result<()> {
                 from.clone()
             };
 
+            // 🌐 A hostname `--from` names a virtual host and asks for HTTPS,
+            // like Caddy's reverse-proxy command.
+            let name = if from.starts_with(':') || from.starts_with("http://") {
+                "_".to_string()
+            } else {
+                from.trim_start_matches("https://").to_string()
+            };
+            let tls = if internal_certs {
+                Some(pingclair_core::config::TlsConfig {
+                    internal: true,
+                    ..Default::default()
+                })
+            } else if name != "_" {
+                Some(pingclair_core::config::TlsConfig {
+                    auto: true,
+                    ..Default::default()
+                })
+            } else {
+                None
+            };
+
             use pingclair_core::config::{
                 HandlerConfig, LoadBalanceConfig, ReverseProxyConfig, RouteConfig, ServerConfig,
             };
 
             let mut server = ServerConfig {
-                name: Some("_".to_string()),
-                names: Vec::new(),
+                name: Some(name.clone()),
+                names: if name == "_" { Vec::new() } else { vec![name] },
                 bind: None,
                 proxy_protocol_listen: Vec::new(),
                 listen: vec![listen],
                 routes: Vec::new(),
-                tls: None,
+                tls,
                 log: None,
                 client_max_body_size: 10 * 1024 * 1024, // 10MB
                 limits: Default::default(),
@@ -521,16 +604,21 @@ fn main() -> anyhow::Result<()> {
                 error_pages: Default::default(),
             };
 
+            let mut upstream_tls = pingclair_core::config::UpstreamTlsConfig::default();
+            if insecure {
+                upstream_tls.enable = true;
+                upstream_tls.insecure_skip_verify = true;
+            }
             let handler = HandlerConfig::ReverseProxy(ReverseProxyConfig {
-                upstreams: vec![to.clone()],
+                upstreams: to.clone(),
                 upstream_options: Vec::new(),
                 // 🗄️ `pingclair reverse-proxy` is a throwaway one-liner; caching
                 // is a deliberate per-route decision, so it stays off here.
                 cache: None,
                 load_balance: LoadBalanceConfig::default(),
                 health_check: None,
-                headers_up: std::collections::HashMap::new(),
-                headers_down: std::collections::HashMap::new(),
+                headers_up: headers_up.into_iter().collect(),
+                headers_down: headers_down.into_iter().collect(),
                 flush_interval: None,
                 read_timeout: None,
                 write_timeout: None,
@@ -540,7 +628,7 @@ fn main() -> anyhow::Result<()> {
                 retry: Default::default(),
                 overload: Default::default(),
                 circuit_breaker: Default::default(),
-                upstream_tls: Default::default(),
+                upstream_tls: Box::new(upstream_tls),
             });
 
             server.routes.push(RouteConfig {
@@ -555,14 +643,35 @@ fn main() -> anyhow::Result<()> {
             run_server("".to_string(), config)?;
         }
 
-        Commands::FileServer { listen, root } => {
-            tracing::info!("Starting file server on {} serving {}", listen, root);
+        Commands::FileServer {
+            listen,
+            root,
+            browse,
+            domain,
+            access_log,
+            no_compress,
+            file_limit,
+        } => {
+            tracing::info!(
+                "Starting file server on {} serving {} (browse: {})",
+                listen,
+                root,
+                browse
+            );
+            if file_limit.is_some() {
+                // TODO(v0.3): bound directory listings by file count.
+                anyhow::bail!("--file-limit is not implemented yet");
+            }
 
             // Create dynamic config
             let mut config = pingclair_core::config::PingclairConfig::default();
 
-            // Parse listen address
-            let listen_addr = if listen.starts_with(':') {
+            // 🌐 `--domain` names a virtual host and moves the default
+            // listener to the HTTPS port, like Caddy's file-server command.
+            let explicit_listen = listen != ":8080";
+            let listen_addr = if domain.is_some() && !explicit_listen {
+                "0.0.0.0:443".to_string()
+            } else if listen.starts_with(':') {
                 format!("0.0.0.0{listen}")
             } else {
                 listen.clone()
@@ -571,19 +680,31 @@ fn main() -> anyhow::Result<()> {
             use pingclair_core::config::{HandlerConfig, RouteConfig, ServerConfig};
 
             let mut server = ServerConfig {
-                name: Some("_".to_string()),
-                names: Vec::new(),
+                name: Some(domain.clone().unwrap_or_else(|| "_".to_string())),
+                names: domain.clone().map_or_else(Vec::new, |d| vec![d]),
                 bind: None,
                 proxy_protocol_listen: Vec::new(),
                 listen: vec![listen_addr],
                 routes: Vec::new(),
-                tls: None,
-                log: None,
+                tls: domain.as_ref().map(|_| pingclair_core::config::TlsConfig {
+                    auto: true,
+                    ..Default::default()
+                }),
+                log: access_log.then(|| pingclair_core::config::LogConfig {
+                    output: pingclair_core::config::LogOutput::Stdout,
+                    format: pingclair_core::config::LogFormat::Text,
+                    level: None,
+                    exclude_fields: Vec::new(),
+                }),
                 client_max_body_size: 10 * 1024 * 1024,
                 limits: Default::default(),
                 security: Default::default(),
                 gzip_types: pingclair_core::config::default_gzip_types(),
-                encodings: pingclair_core::config::default_encodings(),
+                encodings: if no_compress {
+                    Vec::new()
+                } else {
+                    pingclair_core::config::default_encodings()
+                },
                 error_pages: Default::default(),
             };
 
@@ -595,8 +716,8 @@ fn main() -> anyhow::Result<()> {
             let handler = HandlerConfig::FileServer {
                 root: root_path,
                 index: vec!["index.html".to_string()],
-                browse: true,
-                compress: true,
+                browse,
+                compress: !no_compress,
             };
 
             server.routes.push(RouteConfig {

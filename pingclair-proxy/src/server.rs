@@ -4443,6 +4443,30 @@ impl ProxyHttp for PingclairProxy {
             .with_label_values(&[method, &response_code.to_string(), host])
             .observe(elapsed.as_secs_f64());
 
+        // 📏 Size, TTFB and error histograms complete the HTTP metric set.
+        let request_size = req_header
+            .headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        metrics::REQUEST_SIZE_BYTES
+            .with_label_values(&[method, &response_code.to_string(), host])
+            .observe(request_size);
+        metrics::RESPONSE_SIZE_BYTES
+            .with_label_values(&[method, &response_code.to_string(), host])
+            .observe(ctx.response_bytes as f64);
+        if let Some(first_byte_at) = ctx.first_byte_at {
+            metrics::RESPONSE_DURATION_SECONDS
+                .with_label_values(&[method, &response_code.to_string(), host])
+                .observe(first_byte_at.duration_since(ctx.start_time).as_secs_f64());
+        }
+        if e.is_some() {
+            metrics::REQUEST_ERRORS_TOTAL
+                .with_label_values(&[method, host])
+                .inc();
+        }
+
         // 📝 Prefer this server's configured access logger. Only when the
         // server has no `log` block do we fall back to the process-wide
         // tracing output, so existing configs keep their current behavior.

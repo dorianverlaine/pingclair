@@ -952,7 +952,13 @@ fn compile_log(log: &LogBlock) -> CompileResult<LogConfig> {
     Ok(LogConfig {
         output,
         format,
-        level: None, // Use global level
+        level: log.level.map(|level| match level {
+            crate::parser::ast::LogLevel::Trace => "trace".to_string(),
+            crate::parser::ast::LogLevel::Debug => "debug".to_string(),
+            crate::parser::ast::LogLevel::Info => "info".to_string(),
+            crate::parser::ast::LogLevel::Warn => "warn".to_string(),
+            crate::parser::ast::LogLevel::Error => "error".to_string(),
+        }),
         exclude_fields,
     })
 }

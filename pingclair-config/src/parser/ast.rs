@@ -283,6 +283,8 @@ pub enum LogLevel {
 pub struct LogBlock {
     pub output: LogOutput,
     pub format: LogFormat,
+    /// 🚦 Minimum level for this server's access log, when configured.
+    pub level: Option<LogLevel>,
 }
 
 /// Log output destination

@@ -90,6 +90,7 @@ bytes = "1"
 h2 = "0.4"
 mime_guess = "2"
 ipnet = "2"
+libc = "0.2"
 
 # Logging and metrics
 tracing = "0.1"

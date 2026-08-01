@@ -144,6 +144,54 @@ snapshots for deployment testing — **not** stable releases:
 Treat every development build as a snapshot of a moving tree — verify it
 before deploying anywhere that matters.
 
+### Production deployment with Docker Compose
+
+For a production-style container deployment, run the config-file mode and
+keep the TLS store on a persistent volume (it holds certificates, ACME
+account keys, and the internal CA — deleting it means re-issuing everything):
+
+```yaml
+services:
+  pingclair:
+    image: ghcr.io/dorianverlaine/pingclair:dev
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    volumes:
+      - ./conf:/etc/pingclair:ro
+      - ./site:/srv
+      - pingclair_tls:/var/lib/pingclair/certs
+    command: ["pingclair", "run", "/etc/pingclair/Pingclairfile"]
+
+volumes:
+  pingclair_tls:
+```
+
+Place your `Pingclairfile` in `./conf/`, static files under `./site/`, and
+reference them with `root /srv` in the config. The container runs Pingclair
+with the configuration file, so HTTPS, automatic port-80 redirects and
+HTTP/3 all behave exactly like a host deployment.
+
+### Trusting `tls internal` roots
+
+`tls internal` signs leaves with a persistent local CA. Clients that verify
+certificates must trust its root, published at
+`$PINGCLAIR_TLS_STORE/internal/root.crt` (inside a container:
+`docker compose cp pingclair:/var/lib/pingclair/certs/internal/root.crt
+./root.crt`). Install it into the system trust store:
+
+- Linux: copy to `/usr/local/share/ca-certificates/root.crt` and run
+  `sudo update-ca-certificates`.
+- macOS: `sudo security add-trusted-cert -d -r trustRoot -k
+  /Library/Keychains/System.keychain root.crt`.
+- Browsers that keep their own trust store (Firefox, Chrome on some
+  platforms) need the root imported manually under Authorities.
+
+Only do this for origins you control; the internal CA is not a public
+authority.
+
 ## 🏃 Quick start
 
 Pingclair runs in two modes: **CLI mode** for quick tests, and **config-file mode** for production.
