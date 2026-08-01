@@ -101,6 +101,9 @@ pub struct FileServerConfig {
     pub index: Vec<String>,
     /// Enable directory browsing
     pub browse: bool,
+    /// Cap on directory entries read for a browse listing (Caddy
+    /// `--file-limit` semantics).
+    pub browse_limit: Option<usize>,
     /// Enable compression
     pub compress: bool,
     /// Check for pre-compressed files (.br, .gz, .zst)
@@ -113,6 +116,7 @@ impl Default for FileServerConfig {
             root: PathBuf::from("."),
             index: vec!["index.html".to_string(), "index.htm".to_string()],
             browse: false,
+            browse_limit: None,
             compress: true,
             precompressed: true, // Default to checking for pre-compressed files
         }
@@ -905,7 +909,7 @@ impl FileServer {
             html.push_str("<a href=\"..\">../</a>\n");
         }
 
-        for entry in entries {
+        for entry in entries.take(self.config.browse_limit.unwrap_or(usize::MAX)) {
             let entry = entry?;
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
@@ -1078,6 +1082,7 @@ mod traversal_tests {
             root: root.to_path_buf(),
             index: vec!["index.html".to_string()],
             browse: false,
+            browse_limit: None,
             compress: false,
             precompressed: false,
         })
@@ -1188,6 +1193,7 @@ mod serve_auto_tests {
             root: root.to_path_buf(),
             index: vec![],
             browse: false,
+            browse_limit: None,
             compress,
             precompressed: false,
         })
@@ -1328,6 +1334,7 @@ mod serve_cache_tests {
             root: dir.path().to_path_buf(),
             index: vec![],
             browse: false,
+            browse_limit: None,
             compress: true,
             precompressed: false, // force the on-the-fly path we're testing
         });
@@ -1376,6 +1383,7 @@ mod serve_cache_tests {
             root: dir.path().to_path_buf(),
             index: vec![],
             browse: false,
+            browse_limit: None,
             compress: true,
             precompressed: false,
         });
@@ -1438,6 +1446,7 @@ mod serve_cache_tests {
             root: dir.path().to_path_buf(),
             index: vec![],
             browse: false,
+            browse_limit: None,
             compress: true,
             precompressed: false,
         }));
@@ -1506,6 +1515,31 @@ mod serve_cache_tests {
         assert!(
             fs.in_flight.lock().unwrap().is_empty(),
             "in-flight entry must be removed after use"
+        );
+    }
+}
+
+#[cfg(test)]
+mod browse_limit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn browse_listing_honors_the_entry_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..5 {
+            std::fs::write(dir.path().join(format!("f{index}.txt")), "x").unwrap();
+        }
+        let fs = FileServer::new(FileServerConfig {
+            root: dir.path().to_path_buf(),
+            browse: true,
+            browse_limit: Some(2),
+            ..Default::default()
+        });
+        let listing = fs.generate_listing(dir.path(), "/").await.unwrap();
+        assert_eq!(
+            listing.matches("<a href=").count(),
+            2,
+            "listing must be capped at the configured limit: {listing}"
         );
     }
 }

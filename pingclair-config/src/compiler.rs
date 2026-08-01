@@ -1296,6 +1296,7 @@ fn compile_handler(handler: &Handler, root: Option<&str>) -> CompileResult<Handl
             root: fs.root.clone(),
             index: fs.index.clone(),
             browse: fs.browse,
+            browse_limit: None,
             compress: fs.compress,
         }),
 

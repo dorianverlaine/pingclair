@@ -599,6 +599,8 @@ pub enum HandlerConfig {
         index: Vec<String>,
         #[serde(default)]
         browse: bool,
+        #[serde(default)]
+        browse_limit: Option<usize>,
         #[serde(default = "default_bool_true")]
         compress: bool,
     },

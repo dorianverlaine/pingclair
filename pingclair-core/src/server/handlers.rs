@@ -148,6 +148,7 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             root,
             index,
             browse: _,
+            browse_limit: _,
             compress: _,
         } => {
             // File server would need async file reading

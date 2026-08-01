@@ -1187,6 +1187,7 @@ impl ProxyState {
                 root,
                 index,
                 browse,
+                browse_limit,
                 compress,
             }) = find_file_server_config(&route.handler)
             {
@@ -1198,6 +1199,7 @@ impl ProxyState {
                         index.clone()
                     },
                     browse: *browse,
+                    browse_limit: *browse_limit,
                     compress: *compress,
                     precompressed: true, // Enable pre-compressed file detection by default
                 };
@@ -2833,6 +2835,7 @@ impl PingclairProxy {
                             root: parent,
                             index: vec![],
                             browse: false,
+                            browse_limit: None,
                             compress: true,
                         };
                         return self
