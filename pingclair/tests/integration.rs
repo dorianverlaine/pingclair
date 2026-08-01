@@ -2241,6 +2241,68 @@ async fn test_compression() {
     }
 }
 
+/// 🧭 Without a matcher, `reverse_proxy` beats `file_server` (Caddy order).
+#[tokio::test]
+async fn test_proxy_beats_file_server_without_matcher() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let upstream = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut [0u8; 1024]).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nproxied-ok",
+                    )
+                    .await;
+            });
+        }
+    });
+
+    let site = tempfile::tempdir().unwrap();
+    std::fs::write(site.path().join("index.html"), "<h1>file</h1>").unwrap();
+    let config = format!(
+        r#"{{
+        "global": {{ "http3": false }},
+        "servers": [{{
+            "listen": ["127.0.0.1:0"],
+            "routes": [{{
+                "path": "/*",
+                "handler": {{
+                    "type": "pipeline",
+                    "handlers": [
+                        {{ "type": "file_server", "root": "{}", "index": ["index.html"], "browse": false, "compress": false }},
+                        {{ "type": "reverse_proxy", "upstreams": ["{}"], "load_balance": {{ "strategy": "round_robin" }}, "headers_up": {{}}, "headers_down": {{}} }}
+                    ]
+                }}
+            }}]
+        }}]
+    }}"#,
+        site.path().display(),
+        upstream
+    );
+    let mut server = TestServer::new(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    let resp = client
+        .get(server.url(0, "/index.html"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.text().await.unwrap(),
+        "proxied-ok",
+        "reverse_proxy must win over file_server without a matcher"
+    );
+    task.abort();
+}
+
 #[tokio::test]
 async fn test_reverse_proxy_custom_gzip_types() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3533,6 +3595,109 @@ async fn test_cli_run_watch_reloads() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(v2, "--watch must reload the config automatically");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// 🧭 The `templates` directive renders Caddy-style templates before the
+/// file server serves them.
+#[tokio::test]
+async fn test_templates_directive_renders_caddy_templates() {
+    let site = tempfile::tempdir().unwrap();
+    std::fs::write(
+        site.path().join("caddy.html"),
+        "Page loaded at: {{now | date \"Mon Jan 2 15:04:05 MST 2006\"}}\n",
+    )
+    .unwrap();
+    std::fs::write(site.path().join("index.html"), "<h1>plain</h1>").unwrap();
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+        :__PINGCLAIR_TEST_PORT__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            root "{}"
+            templates
+            file_server
+        }}
+        "#,
+        site.path().display()
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let rendered = client
+        .get(server.url(0, "/caddy.html"))
+        .send()
+        .await
+        .unwrap();
+    let body = rendered.text().await.unwrap();
+    assert!(
+        !body.contains("{{"),
+        "template must be rendered, got: {body}"
+    );
+    assert!(body.contains("Page loaded at:"), "got: {body}");
+
+    let plain = client
+        .get(server.url(0, "/index.html"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(plain.text().await.unwrap(), "<h1>plain</h1>");
+}
+
+/// 🧭 `file-server --templates` renders templates like `caddy file-server
+/// --templates`.
+#[tokio::test]
+async fn test_cli_file_server_templates() {
+    use std::process::{Command, Stdio};
+
+    let site = tempfile::tempdir().unwrap();
+    std::fs::write(
+        site.path().join("caddy.html"),
+        "T: {{now | date \"2006-01-02\"}}\n",
+    )
+    .unwrap();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+    let tls = tempfile::tempdir().unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pingclair"))
+        .args([
+            "file-server",
+            "--templates",
+            "--listen",
+            &addr.to_string(),
+            "--root",
+            site.path().to_str().unwrap(),
+        ])
+        .env("PINGCLAIR_TLS_STORE", tls.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn file-server --templates");
+
+    let client = no_proxy_client();
+    let url = format!("http://{addr}/caddy.html");
+    let mut body = String::new();
+    for _ in 0..40 {
+        if let Ok(response) = client.get(&url).send().await
+            && response.status() == reqwest::StatusCode::OK
+        {
+            body = response.text().await.unwrap();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!body.is_empty(), "file-server --templates did not come up");
+    assert!(!body.contains("{{"), "got: {body}");
+    assert!(body.starts_with("T: "), "got: {body}");
 
     let _ = child.kill();
     let _ = child.wait();

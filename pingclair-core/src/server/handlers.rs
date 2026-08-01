@@ -123,6 +123,10 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
 
         HandlerConfig::Redirect { to, code } => Ok(HandlerResponse::redirect(to, *code)),
 
+        // 🧭 Templates render in the proxy pipeline where file access and
+        // response writing live; the pure core handler has nothing to do.
+        HandlerConfig::Templates { .. } => Ok(HandlerResponse::status(200)),
+
         HandlerConfig::Headers {
             set,
             add,

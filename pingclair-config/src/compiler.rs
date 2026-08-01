@@ -253,9 +253,11 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
     // Routes
     if let Some(routes) = &server.routes {
         for arm in &routes.inner.arms {
-            config
-                .routes
-                .extend(compile_route_arm(&arm.inner, &server.matchers)?);
+            config.routes.extend(compile_route_arm(
+                &arm.inner,
+                &server.matchers,
+                server.root.as_deref(),
+            )?);
         }
     }
 
@@ -466,6 +468,7 @@ fn reject_unimplemented_handler(handler: &HandlerConfig) -> CompileResult<()> {
                  silently do nothing; the plugin system is planned but unwired"
             ),
         }),
+        HandlerConfig::Templates { .. } => Ok(()),
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::Handle { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
@@ -1000,6 +1003,7 @@ const MAX_MATCHER_DEPTH: usize = 32;
 fn compile_route_arm(
     arm: &RouteArm,
     matchers: &HashMap<String, Matcher>,
+    root: Option<&str>,
 ) -> CompileResult<Vec<RouteConfig>> {
     // 🧭 A matcher may carry several path patterns (`path /js/* /css/*`).
     // Each pattern becomes its own router entry so every one of them routes;
@@ -1018,7 +1022,7 @@ fn compile_route_arm(
         .transpose()?;
 
     // Compile handler
-    let handler = compile_handler(&arm.handler)?;
+    let handler = compile_handler(&arm.handler, root)?;
 
     if patterns.is_empty() {
         return Ok(vec![RouteConfig {
@@ -1144,7 +1148,7 @@ fn compile_matcher(
     })
 }
 
-fn compile_handler(handler: &Handler) -> CompileResult<HandlerConfig> {
+fn compile_handler(handler: &Handler, root: Option<&str>) -> CompileResult<HandlerConfig> {
     match handler {
         Handler::Proxy(proxy) => {
             let mut config = ReverseProxyConfig {
@@ -1279,7 +1283,10 @@ fn compile_handler(handler: &Handler) -> CompileResult<HandlerConfig> {
         }),
 
         Handler::Pipeline(handlers) => {
-            let compiled: Result<Vec<_>, _> = handlers.iter().map(compile_handler).collect();
+            let compiled: Result<Vec<_>, _> = handlers
+                .iter()
+                .map(|handler| compile_handler(handler, root))
+                .collect();
             Ok(HandlerConfig::Pipeline {
                 handlers: compiled?,
             })
@@ -1292,11 +1299,15 @@ fn compile_handler(handler: &Handler) -> CompileResult<HandlerConfig> {
             compress: fs.compress,
         }),
 
+        Handler::Templates => Ok(HandlerConfig::Templates {
+            root: root.map(str::to_string),
+        }),
+
         Handler::Handle(sub_handlers) => {
             // Recursively compile each sub-handler in the Handle block
             let mut compiled = Vec::new();
             for h in sub_handlers {
-                compiled.push(compile_handler(h)?);
+                compiled.push(compile_handler(h, root)?);
             }
             Ok(HandlerConfig::Handle { handlers: compiled })
         }

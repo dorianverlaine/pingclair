@@ -205,11 +205,12 @@ FX-A ──> FX-B ──> FX-C
 
 ### FX-E3（F-26，P1）`templates` directive 實作
 
-- [ ] 實作 templates handler：支援 Caddy 常用模板語法與函數
-      （`now`/`date`/`include`/`subrequest`/`header`/`env` 等，以
-      官方 templates 文檔為準）；`file-server --templates` 同步。
-- 驗證：`caddy.html`（`{{now | date "Mon Jan 2 15:04:05 MST 2006"}}`）
-      渲染日期；Caddyfile Tutorial Templates 節重跑。
+- [x] `templates` directive（minijinja）：`now`＋`date`（Go layout）、
+      `include`；pipeline 中 file_server 前執行，只攔截含 `{{` 的檔案；
+      H1/H2/H3 都接；`file-server --templates` 同步。
+- 驗證：`test_templates_directive_renders_caddy_templates`、
+      `test_cli_file_server_templates`、`template_tests`；香港機
+      `caddy.html` 渲染日期、`index.html` 原樣。
 
 ### FX-E4（F-23，P2）JSON 路徑自動 HTTPS 觸發
 

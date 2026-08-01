@@ -44,6 +44,8 @@ quiche.workspace = true
 tokio-quiche.workspace = true
 boring.workspace = true
 thiserror.workspace = true
+minijinja = "2"
+chrono = "0.4"
 
 [dev-dependencies]
 serde_json.workspace = true

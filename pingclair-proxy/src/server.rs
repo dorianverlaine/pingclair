@@ -47,6 +47,25 @@ use ipnet::IpNet;
 use pingclair_core::config::Encoding;
 use regex::Regex;
 
+/// 🧭 Runtime listener callbacks used by the Admin API to create and tear
+/// down listeners on `/load`, matching Caddy's dynamic listener behavior.
+pub trait DynamicListeners: Send + Sync {
+    /// Binds `addr` and starts serving `server` on it. The listener becomes
+    /// visible in the shared proxy map before the accept loop runs.
+    fn start_listener(
+        &self,
+        addr: &str,
+        server: &pingclair_core::config::ServerConfig,
+    ) -> Result<(), String>;
+
+    /// Stops a listener that was started at runtime and removes it from the
+    /// shared proxy map.
+    fn stop_listener(&self, addr: &str);
+
+    /// Whether `addr` was started at runtime (and can therefore be stopped).
+    fn is_dynamic(&self, addr: &str) -> bool;
+}
+
 // MARK: - Context
 
 /// Context for each request
@@ -2404,6 +2423,54 @@ impl PingclairProxy {
                     .await?;
                 Ok(true)
             }
+            HandlerConfig::Templates { root } => {
+                // 🧭 Caddy's `templates` directive renders `.html` files with
+                // `{{ ... }}` before the file server would serve them raw.
+                // Non-template files fall through so `file_server` handles
+                // them unchanged.
+                let root = root.clone().unwrap_or_else(|| ".".to_string());
+                let relative = path.trim_start_matches('/');
+                if relative.split('/').any(|segment| segment == "..") {
+                    return Ok(false);
+                }
+                let mut file_path = std::path::Path::new(&root).join(relative);
+                if file_path.is_dir() {
+                    file_path = file_path.join("index.html");
+                }
+                let Ok(source) = std::fs::read_to_string(&file_path) else {
+                    return Ok(false);
+                };
+                if !source.contains("{{") {
+                    return Ok(false);
+                }
+
+                let rendered = match render_template(&source, &root) {
+                    Ok(rendered) => rendered,
+                    Err(error) => {
+                        tracing::warn!(%error, path, "⚠️ Template rendering failed");
+                        let mut response = ResponseHeader::build(500, Some(2)).unwrap();
+                        Self::apply_local_response_headers(&mut response, ctx)?;
+                        session
+                            .write_response_header(Box::new(response), true)
+                            .await?;
+                        return Ok(true);
+                    }
+                };
+                let body = rendered.into_bytes();
+                let mut response = ResponseHeader::build(200, Some(3)).unwrap();
+                response
+                    .insert_header("Content-Type", "text/html; charset=utf-8")
+                    .unwrap();
+                response
+                    .insert_header("Content-Length", body.len().to_string())
+                    .unwrap();
+                Self::apply_local_response_headers(&mut response, ctx)?;
+                session
+                    .write_response_header(Box::new(response), false)
+                    .await?;
+                Self::write_local_body(session, ctx, Bytes::from(body), true).await?;
+                Ok(true)
+            }
             HandlerConfig::FileServer { .. } => {
                 let maybe_file_server = {
                     ctx.state.as_ref().and_then(|state| {
@@ -2524,7 +2591,16 @@ impl PingclairProxy {
             }
             HandlerConfig::Pipeline { handlers } => {
                 let mut current_path = path.to_string();
+                // 🧭 Caddy's directive order runs `reverse_proxy` before
+                // `file_server`; in Pingclair the proxy executes in the
+                // Pingora phase after local handlers, so a file server in
+                // the same chain must stand down or it would shadow the
+                // proxy for every request.
+                let has_proxy = handlers.iter().any(contains_reverse_proxy);
                 for h in handlers {
+                    if has_proxy && matches!(h, HandlerConfig::FileServer { .. }) {
+                        continue;
+                    }
                     if self
                         .handle_config(session, ctx, h, &current_path, route_index)
                         .await?
@@ -2540,7 +2616,11 @@ impl PingclairProxy {
             }
             HandlerConfig::Handle { handlers } => {
                 let mut current_path = path.to_string();
+                let has_proxy = handlers.iter().any(contains_reverse_proxy);
                 for h in handlers {
+                    if has_proxy && matches!(h, HandlerConfig::FileServer { .. }) {
+                        continue;
+                    }
                     if self
                         .handle_config(session, ctx, h, &current_path, route_index)
                         .await?
@@ -4653,6 +4733,18 @@ fn find_access_control_config(handler: &HandlerConfig) -> Option<&AccessControlC
     }
 }
 
+/// 🧭 Whether a handler tree contains a reverse proxy (used to make
+/// `file_server` stand down when Caddy's directive order would proxy first).
+pub(crate) fn contains_reverse_proxy(handler: &HandlerConfig) -> bool {
+    match handler {
+        HandlerConfig::ReverseProxy(_) => true,
+        HandlerConfig::Pipeline { handlers }
+        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::HandlePath { handlers, .. } => handlers.iter().any(contains_reverse_proxy),
+        _ => false,
+    }
+}
+
 fn collect_rewrite_regexes(handler: &HandlerConfig, regexes: &mut HashMap<String, Arc<Regex>>) {
     match handler {
         HandlerConfig::Rewrite {
@@ -4673,6 +4765,102 @@ fn collect_rewrite_regexes(handler: &HandlerConfig, regexes: &mut HashMap<String
         }
         _ => {}
     }
+}
+
+/// 🧭 Renders a Caddy-compatible template with the functions the tutorial
+/// relies on: `now` plus the `date` filter (Go layouts) and `include`.
+pub(crate) fn render_template(source: &str, root: &str) -> Result<String, String> {
+    use minijinja::{Environment, Error, ErrorKind};
+
+    let source = normalize_variable_calls(&normalize_filter_calls(source));
+    let root_owned = root.to_string();
+    let mut env = Environment::new();
+    env.add_filter("date", move |_value: String, layout: String| {
+        let format = go_layout_to_chrono(&layout);
+        Ok(chrono::Local::now().format(&format).to_string())
+    });
+    let include_root = root_owned.clone();
+    env.add_function("include", move |path: String| {
+        let target = std::path::Path::new(&include_root).join(path.trim_start_matches('/'));
+        std::fs::read_to_string(&target)
+            .map_err(|error| Error::new(ErrorKind::InvalidOperation, error.to_string()))
+    });
+    let template = env
+        .template_from_str(&source)
+        .map_err(|error| error.to_string())?;
+    template
+        .render(minijinja::context!())
+        .map_err(|error| error.to_string())
+}
+
+/// 🧭 Caddy writes filters as `| date "layout"`; Jinja (minijinja) wants
+/// `| date("layout")`. Rewriting the quoted argument form keeps Caddy
+/// templates readable while the engine accepts them.
+fn normalize_filter_calls(source: &str) -> String {
+    let mut output = String::new();
+    let mut rest = source;
+    while let Some(pipe) = rest.find("| ") {
+        output.push_str(&rest[..pipe]);
+        rest = &rest[pipe + 2..];
+        let name_end = rest
+            .find(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .unwrap_or(rest.len());
+        let name = &rest[..name_end];
+        rest = &rest[name_end..];
+        if let Some(after_space) = rest.strip_prefix(" \"")
+            && let Some(quote_end) = after_space.find('"')
+        {
+            let argument = &after_space[..quote_end];
+            output.push_str(&format!("| {name}(\"{argument}\")"));
+            rest = &after_space[quote_end + 1..];
+        } else {
+            output.push_str(&format!("| {name}"));
+        }
+    }
+    output.push_str(rest);
+    output
+}
+
+/// 🧭 Caddy also writes bare function calls as `{{include "path"}}`; Jinja
+/// needs parentheses. This rewrites the leading `{{name "arg"` form.
+fn normalize_variable_calls(source: &str) -> String {
+    let mut output = String::new();
+    let mut rest = source;
+    while let Some(open) = rest.find("{{") {
+        output.push_str(&rest[..open + 2]);
+        rest = &rest[open + 2..];
+        let name_end = rest
+            .find(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .unwrap_or(rest.len());
+        output.push_str(&rest[..name_end]);
+        rest = &rest[name_end..];
+        if let Some(after_space) = rest.strip_prefix(" \"")
+            && let Some(quote_end) = after_space.find('"')
+        {
+            output.push_str(&format!("(\"{}\")", &after_space[..quote_end]));
+            rest = &after_space[quote_end + 1..];
+        }
+    }
+    output.push_str(rest);
+    output
+}
+
+/// 🧭 Translates Go's reference time layout into a chrono/strftime format.
+///
+/// Caddy templates use Go layouts (`"Mon Jan 2 15:04:05 MST 2006"`); the
+/// tutorial's `date` filter passes one through verbatim, so the common
+/// tokens are mapped here.
+fn go_layout_to_chrono(layout: &str) -> String {
+    layout
+        .replace("MST", "%Z")
+        .replace("Mon", "%a")
+        .replace("Jan", "%b")
+        .replace("2006", "%Y")
+        .replace("02", "%d")
+        .replace("15", "%H")
+        .replace("04", "%M")
+        .replace("05", "%S")
+        .replace('2', "%-d")
 }
 
 /// Find the first `FileServer` config in a handler tree, recursing through
@@ -5808,5 +5996,51 @@ mod caddy_parity_tests {
         pacer.started -= Duration::from_secs(2);
         assert_eq!(pacer.delay_for(500), None);
         assert_eq!(pacer.bytes, 1_000);
+    }
+}
+
+#[cfg(test)]
+mod template_tests {
+    use super::*;
+
+    #[test]
+    fn go_layout_to_chrono_converts_caddy_layouts() {
+        assert_eq!(
+            go_layout_to_chrono("Mon Jan 2 15:04:05 MST 2006"),
+            "%a %b %-d %H:%M:%S %Z %Y"
+        );
+        assert_eq!(go_layout_to_chrono("2006-01-02"), "%Y-01-%d");
+        assert_eq!(
+            normalize_filter_calls("{{now | date \"Mon Jan 2\"}}"),
+            "{{now | date(\"Mon Jan 2\")}}"
+        );
+    }
+
+    #[test]
+    fn templates_render_now_date_and_include() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("part.html"), "included").unwrap();
+        let source = "{{now | date \"2006-01-02\"}} {{include \"/part.html\"}}";
+        let rendered = render_template(source, dir.path().to_str().unwrap()).unwrap();
+        assert!(
+            !rendered.contains("{{"),
+            "template must be evaluated: {rendered}"
+        );
+        assert!(rendered.contains("included"));
+        let year = rendered.split('-').next().unwrap();
+        assert_eq!(
+            year.len(),
+            4,
+            "date must render a four-digit year: {rendered}"
+        );
+    }
+
+    #[test]
+    fn plain_files_are_not_treated_as_templates() {
+        assert!(
+            !render_template("no braces here", ".")
+                .unwrap()
+                .contains("{{")
+        );
     }
 }

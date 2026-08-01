@@ -607,6 +607,10 @@ enum Commands {
         /// Maximum files shown in a directory listing
         #[arg(long)]
         file_limit: Option<usize>,
+
+        /// Enable template rendering for `.html` files, like Caddy
+        #[arg(long)]
+        templates: bool,
     },
 
     /// Validate a configuration file
@@ -974,6 +978,7 @@ fn main() -> anyhow::Result<()> {
             access_log,
             no_compress,
             file_limit,
+            templates,
         } => {
             tracing::info!(
                 "Starting file server on {} serving {} (browse: {})",
@@ -1048,11 +1053,24 @@ fn main() -> anyhow::Result<()> {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or(root.clone());
 
-            let handler = HandlerConfig::FileServer {
+            let template_root = root_path.clone();
+            let file_handler = HandlerConfig::FileServer {
                 root: root_path,
                 index: vec!["index.html".to_string()],
                 browse,
                 compress: !no_compress,
+            };
+            let handler = if templates {
+                HandlerConfig::Pipeline {
+                    handlers: vec![
+                        HandlerConfig::Templates {
+                            root: Some(template_root),
+                        },
+                        file_handler,
+                    ],
+                }
+            } else {
+                file_handler
             };
 
             server.routes.push(RouteConfig {

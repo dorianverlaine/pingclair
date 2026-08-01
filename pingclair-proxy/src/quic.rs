@@ -1282,6 +1282,9 @@ enum H3Terminal {
         to: String,
         code: u16,
     },
+    Templates {
+        root: Option<String>,
+    },
     FileServer,
     ReverseProxy,
 }
@@ -1305,7 +1308,11 @@ async fn plan_h3_handler(
 ) -> Result<H3Plan, HandlerError> {
     match handler {
         HandlerConfig::Pipeline { handlers } | HandlerConfig::Handle { handlers } => {
+            let has_proxy = handlers.iter().any(crate::server::contains_reverse_proxy);
             for handler in handlers {
+                if has_proxy && matches!(handler, HandlerConfig::FileServer { .. }) {
+                    continue;
+                }
                 match plan_h3_handler(
                     handler,
                     state,
@@ -1335,6 +1342,11 @@ async fn plan_h3_handler(
                     .map_err(|_| (500, "Rewrite Failed"))?;
             }
             for handler in handlers {
+                if handlers.iter().any(crate::server::contains_reverse_proxy)
+                    && matches!(handler, HandlerConfig::FileServer { .. })
+                {
+                    continue;
+                }
                 match plan_h3_handler(
                     handler,
                     state,
@@ -1456,6 +1468,31 @@ async fn plan_h3_handler(
             to: resolve_caddy_placeholders(to, request_header, None),
             code: *code,
         })),
+        HandlerConfig::Templates { root } => {
+            // 🧭 Only files that actually contain template syntax are
+            // intercepted; everything else falls through to FileServer.
+            let root = root.clone().unwrap_or_else(|| ".".to_string());
+            let relative = effective_uri
+                .split('?')
+                .next()
+                .unwrap_or("/")
+                .trim_start_matches('/');
+            if relative.split('/').any(|segment| segment == "..") {
+                return Ok(H3Plan::Continue);
+            }
+            let mut file_path = std::path::Path::new(&root).join(relative);
+            if file_path.is_dir() {
+                file_path = file_path.join("index.html");
+            }
+            let is_template = std::fs::read_to_string(&file_path)
+                .map(|source| source.contains("{{"))
+                .unwrap_or(false);
+            if is_template {
+                Ok(H3Plan::Terminal(H3Terminal::Templates { root: Some(root) }))
+            } else {
+                Ok(H3Plan::Continue)
+            }
+        }
         HandlerConfig::FileServer { .. } => Ok(H3Plan::Terminal(H3Terminal::FileServer)),
         HandlerConfig::ReverseProxy(_) => Ok(H3Plan::Terminal(H3Terminal::ReverseProxy)),
         HandlerConfig::TryFiles { .. } => Err((501, "Try Files Not Supported Over HTTP/3")),
@@ -1757,6 +1794,31 @@ async fn handle_request_inner(
             ];
             apply_h3_response_policy(&mut hdrs, response_policy, request_id, Some(&state));
             send_headers(resp_tx, stream_id, hdrs, true).await;
+            Ok(())
+        }
+
+        H3Terminal::Templates { root } => {
+            let root = root.unwrap_or_else(|| ".".to_string());
+            let relative = effective_uri
+                .split('?')
+                .next()
+                .unwrap_or("/")
+                .trim_start_matches('/');
+            let mut file_path = std::path::Path::new(&root).join(relative);
+            if file_path.is_dir() {
+                file_path = file_path.join("index.html");
+            }
+            let source = std::fs::read_to_string(&file_path).map_err(|_| (404, "Not Found"))?;
+            let body = crate::server::render_template(&source, &root)
+                .map_err(|_| (500, "Template Rendering Failed"))?;
+            let mut hdrs = vec![
+                quiche::h3::Header::new(b":status", b"200"),
+                quiche::h3::Header::new(b"content-type", b"text/html; charset=utf-8"),
+                quiche::h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
+            ];
+            apply_h3_response_policy(&mut hdrs, response_policy, request_id, Some(&state));
+            send_headers(resp_tx, stream_id, hdrs, false).await;
+            send_body(resp_tx, stream_id, body.into_bytes(), true).await;
             Ok(())
         }
 
