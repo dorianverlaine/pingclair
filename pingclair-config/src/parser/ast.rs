@@ -45,6 +45,10 @@ pub struct GlobalBlock {
     pub debug: Option<bool>,
     pub logging: Option<LoggingConfig>,
     pub email: Option<String>,
+    /// 🌐 Plaintext HTTP port override (Caddy `http_port`).
+    pub http_port: Option<u16>,
+    /// 🔐 HTTPS port override (Caddy `https_port`).
+    pub https_port: Option<u16>,
     pub auto_https: Option<AutoHttpsMode>,
     pub admin: Option<AdminDirective>,
     /// 🛡️ Proxy IP or CIDR ranges allowed to supply client identity headers.
@@ -127,6 +131,11 @@ pub struct MacroCall {
 pub struct ServerBlock {
     /// Server name / hostname
     pub name: String,
+
+    /// 🏠 Every hostname this site serves. A Caddy site block may list
+    /// several addresses (`example.com, www.example.com`) that share one
+    /// configuration; the runtime registers each name as a virtual host.
+    pub names: Vec<String>,
 
     /// Listen addresses
     pub listens: Vec<ListenAddr>,
@@ -826,6 +835,7 @@ impl ServerBlock {
     pub fn new(name: String) -> Self {
         Self {
             name,
+            names: Vec::new(),
             listens: Vec::new(),
             bind: None,
             compress: None,

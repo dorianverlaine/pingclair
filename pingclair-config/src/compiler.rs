@@ -62,6 +62,15 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
         config.global.email = Some(email.clone());
     }
 
+    // 🌐 Port overrides flow straight into the runtime config; every
+    // hard-coded 80/443 derivation consults these instead.
+    if let Some(port) = global.http_port {
+        config.global.http_port = port;
+    }
+    if let Some(port) = global.https_port {
+        config.global.https_port = port;
+    }
+
     // Set global auto-HTTPS mode
     if let Some(mode) = global.auto_https {
         // Map AST AutoHttpsMode to Core AutoHttpsMode
@@ -123,6 +132,8 @@ fn compile_encodings(server: &ServerBlock) -> CompileResult<Vec<CoreEncoding>> {
 fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
     let mut config = ServerConfig {
         name: Some(server.name.clone()),
+        names: server.names.clone(),
+        bind: server.bind.clone(),
         listen: Vec::new(),
         proxy_protocol_listen: Vec::new(),
         routes: Vec::new(),
@@ -166,8 +177,11 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         }
         config.listen.push(addr);
 
-        // Set TLS based on scheme
-        if listen.scheme == Scheme::Https {
+        // 🔐 Set TLS based on scheme or the conventional HTTPS ports. A bare
+        // `:443`/`:8443` listener is HTTPS in Caddy (and in this runtime's
+        // `server_requires_tls`), so the compiled config must say so too;
+        // otherwise ACME provisioning and the port-80 companion never start.
+        if listen.scheme == Scheme::Https || listen.port.is_some_and(|p| matches!(p, 443 | 8443)) {
             config.tls = Some(TlsConfig::default());
         }
     }
@@ -196,12 +210,11 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         }
     }
 
-    // Bind address (add as first listen if no explicit listens)
-    if let Some(bind) = &server.bind
-        && config.listen.is_empty()
-    {
-        config.listen.push(bind.clone());
-    }
+    // 📍 The `bind` directive names the interface, not a listener. Keeping it
+    // separate from `listen` lets the runtime derive 443/80 for a hostname
+    // site (e.g. `example.com { bind 127.0.0.1; tls auto }`) instead of a
+    // bare `127.0.0.1` being mistaken for a complete listen address.
+    config.bind = server.bind.clone();
 
     // Log configuration
     if let Some(log) = &server.log {

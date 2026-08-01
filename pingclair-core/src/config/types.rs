@@ -38,6 +38,18 @@ pub struct GlobalConfig {
     /// Global ACME email
     pub email: Option<String>,
 
+    /// 🌐 Port the server uses for plaintext HTTP, matching Caddy's
+    /// `http_port` option. The automatic port-80 companion and the default
+    /// listener for non-TLS hostname sites honor this.
+    #[serde(default = "default_http_port")]
+    pub http_port: u16,
+
+    /// 🔐 Port the server uses for HTTPS, matching Caddy's `https_port`
+    /// option. The automatic-443 derivation and `server_requires_tls`
+    /// conventions use this instead of a hard-coded 443.
+    #[serde(default = "default_https_port")]
+    pub https_port: u16,
+
     /// Global auto-HTTPS setting
     #[serde(default)]
     pub auto_https: AutoHttpsMode,
@@ -76,6 +88,16 @@ pub struct GlobalConfig {
     pub dns_refresh_secs: u64,
 }
 
+/// 🌐 Default plaintext HTTP port, matching Caddy's default.
+fn default_http_port() -> u16 {
+    80
+}
+
+/// 🔐 Default HTTPS port, matching Caddy's default.
+fn default_https_port() -> u16 {
+    443
+}
+
 /// Default upstream re-resolution interval (seconds).
 pub fn default_dns_refresh_secs() -> u64 {
     30
@@ -85,6 +107,8 @@ impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
             email: None,
+            http_port: default_http_port(),
+            https_port: default_https_port(),
             auto_https: AutoHttpsMode::default(),
             blocked_ips: Vec::new(),
             trusted_proxies: Vec::new(),
@@ -181,6 +205,18 @@ pub struct ServerConfig {
     /// Server name / hostname
     pub name: Option<String>,
 
+    /// 🏠 Every hostname this site serves. The primary name is also kept in
+    /// [`Self::name`] for backward compatibility; the runtime registers each
+    /// entry as a virtual host pointing at the same configuration.
+    #[serde(default)]
+    pub names: Vec<String>,
+
+    /// 📍 Optional interface to bind the site's listener to (`bind` directive).
+    /// When the site has no explicit `listen`, the runtime uses this as the
+    /// host for the automatically derived 443/80 address.
+    #[serde(default)]
+    pub bind: Option<String>,
+
     /// Listen addresses
     #[serde(default)]
     pub listen: Vec<String>,
@@ -251,6 +287,8 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             name: None,
+            names: Vec::new(),
+            bind: None,
             listen: Vec::new(),
             proxy_protocol_listen: Vec::new(),
             tls: None,
@@ -1404,6 +1442,8 @@ mod tests {
     fn test_server_config() {
         let config = ServerConfig {
             name: Some("example.com".to_string()),
+            names: vec!["example.com".to_string()],
+            bind: None,
             listen: vec!["127.0.0.1:8080".to_string()],
             proxy_protocol_listen: Vec::new(),
             tls: None,

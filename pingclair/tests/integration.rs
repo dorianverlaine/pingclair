@@ -64,9 +64,22 @@ impl TestServer {
         let readiness_token = format!("pingclair-ready-{readiness_id}");
         let mut reservations = Vec::new();
         let address = reserve_loopback_listener(&mut reservations);
+        // 🌐 A hostname-only site has no explicit `listen`; the runtime derives
+        // the HTTPS port and provisions an HTTP companion. Tests that exercise
+        // that path reserve a second loopback port for the companion.
+        let http_companion_address = config_template
+            .contains("__PINGCLAIR_TEST_HTTP_PORT__")
+            .then(|| reserve_loopback_listener(&mut reservations));
         let config = config_template
             .replace("__PINGCLAIR_TEST_LISTEN__", &address.to_string())
             .replace("__PINGCLAIR_TEST_PORT__", &address.port().to_string())
+            .replace(
+                "__PINGCLAIR_TEST_HTTP_PORT__",
+                &http_companion_address
+                    .map(|a| a.port().to_string())
+                    .unwrap_or_else(|| "80".to_string()),
+            )
+            .replace("__PINGCLAIR_TEST_HTTPS_PORT__", &address.port().to_string())
             .replace("__PINGCLAIR_TEST_READINESS_PATH__", &readiness_path)
             .replace("__PINGCLAIR_TEST_READINESS_TOKEN__", &readiness_token);
         assert!(
@@ -77,10 +90,16 @@ impl TestServer {
         let mut file = std::fs::File::create(&config_path).unwrap();
         file.write_all(config.as_bytes()).unwrap();
 
+        let server_addresses = if let Some(companion) = http_companion_address {
+            vec![vec![address, companion]]
+        } else {
+            vec![vec![address]]
+        };
+
         Self::start(
             temp_dir,
             config_path,
-            vec![vec![address]],
+            server_addresses,
             None,
             readiness_path,
             readiness_token,
@@ -2664,6 +2683,97 @@ async fn test_pingclairfile_internal_tls_serves_trusted_h1_and_h2() {
     );
 }
 
+/// 🔐 A hostname-only site with TLS must derive the HTTPS listener from
+/// `https_port` and gain an automatic plaintext companion on `http_port`,
+/// exactly like Caddy's `example.com { tls auto }` shape — no `listen`
+/// directive anywhere.
+#[tokio::test]
+async fn test_hostname_tls_site_derives_https_and_http_companion() {
+    let config = r#"
+        {
+            admin off
+            http_port __PINGCLAIR_TEST_HTTP_PORT__
+            https_port __PINGCLAIR_TEST_HTTPS_PORT__
+        }
+
+        example.com {
+            tls internal
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "derived-https-ok"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(
+        server.wait_until_tls_ready("example.com").await,
+        "hostname-only TLS site did not come up on the derived HTTPS port"
+    );
+
+    // 🔐 The derived HTTPS listener serves the site with the internal CA.
+    let root_path = server._temp_dir.path().join("tls/internal/root.crt");
+    let root = reqwest::Certificate::from_pem(&std::fs::read(&root_path).unwrap()).unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .add_root_certificate(root)
+        .resolve("example.com", server.address(0))
+        .build()
+        .unwrap();
+    let response = client
+        .get(server.tls_url(0, "example.com", "/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "derived-https-ok");
+
+    // 🔁 The automatic plaintext companion on `http_port` redirects to HTTPS.
+    // The redirect route belongs to the site's virtual host, so the request
+    // must carry the site's Host header — exactly what a browser sends.
+    // A raw TCP exchange keeps the test independent of the resolver.
+    let companion_addr = server.listener_address(0, 1);
+    let mut stream = tokio::net::TcpStream::connect(companion_addr)
+        .await
+        .expect("the companion listener must accept connections");
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: example.com:{}\r\nConnection: close\r\n\r\n",
+        companion_addr.port()
+    );
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    let status_line = response.lines().next().unwrap_or_default();
+    assert!(
+        status_line.contains("308"),
+        "companion must redirect with 308, got `{status_line}` in:\n{response}"
+    );
+    let location = response
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("location:"))
+        .map(|line| {
+            line.split_once(':')
+                .map(|(_, value)| value.trim())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    assert!(
+        location.starts_with("https://example.com:") && location.ends_with('/'),
+        "companion must redirect to HTTPS with the configured https_port, got {location}"
+    );
+    // 🧭 The redirect must target the HTTPS port, never the plaintext one the
+    // request arrived on.
+    let https_port = server.address(0).port();
+    let redirect_port = location
+        .trim_start_matches("https://example.com:")
+        .trim_end_matches('/');
+    assert_eq!(
+        redirect_port,
+        https_port.to_string(),
+        "companion redirect must use https_port {https_port}, got {location}"
+    );
+}
+
 /// 🛠️ Starts a server with the Admin API enabled and one readiness route.
 ///
 /// These tests drive the real Admin socket rather than calling
@@ -2964,9 +3074,12 @@ async fn test_redirect_expands_host_and_uri_placeholders() {
         .get("location")
         .and_then(|v| v.to_str().ok())
         .expect("a redirect must carry a Location");
+    // 🧭 `{host}` is the hostname without the port, matching Caddy. The
+    // non-standard test port therefore disappears from the redirect target;
+    // `{hostport}` is the placeholder that preserves it.
     assert_eq!(
         location,
-        format!("https://{}/deep/path?q=1", server.address(0))
+        format!("https://{}/deep/path?q=1", server.address(0).ip())
     );
 }
 

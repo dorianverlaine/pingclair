@@ -210,13 +210,28 @@ struct Cli {
     command: Commands,
 }
 
+/// 📂 Resolves the default configuration path the way Caddy does: prefer the
+/// project's own `Pingclairfile`, then fall back to a conventional
+/// `Caddyfile` so a migrated config works without flags.
+fn resolve_config_path(explicit: Option<&str>) -> String {
+    if let Some(path) = explicit.filter(|p| !p.is_empty()) {
+        return path.to_string();
+    }
+    for candidate in ["Pingclairfile", "Caddyfile"] {
+        if std::path::Path::new(candidate).exists() {
+            return candidate.to_string();
+        }
+    }
+    "Pingclairfile".to_string()
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Run the server with a configuration file
     Run {
-        /// Path to the Pingclairfile
-        #[arg(default_value = "Pingclairfile")]
-        config: String,
+        /// Path to the configuration file (defaults to Pingclairfile or
+        /// Caddyfile in the current directory)
+        config: Option<String>,
     },
 
     /// Start a quick reverse proxy
@@ -245,9 +260,9 @@ enum Commands {
 
     /// Validate a configuration file
     Validate {
-        /// Path to the Pingclairfile
-        #[arg(default_value = "Pingclairfile")]
-        config: String,
+        /// Path to the configuration file (defaults to Pingclairfile or
+        /// Caddyfile in the current directory)
+        config: Option<String>,
     },
 
     /// Show version information
@@ -299,6 +314,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Run {
             config: config_path,
         } => {
+            let config_path = resolve_config_path(config_path.as_deref());
             tracing::info!("Starting Pingclair with config: {}", config_path);
 
             // Load configuration - support both single file and directory
@@ -342,6 +358,8 @@ fn main() -> anyhow::Result<()> {
 
             let mut server = ServerConfig {
                 name: Some("_".to_string()),
+                names: Vec::new(),
+                bind: None,
                 proxy_protocol_listen: Vec::new(),
                 listen: vec![listen],
                 routes: Vec::new(),
@@ -406,6 +424,8 @@ fn main() -> anyhow::Result<()> {
 
             let mut server = ServerConfig {
                 name: Some("_".to_string()),
+                names: Vec::new(),
+                bind: None,
                 proxy_protocol_listen: Vec::new(),
                 listen: vec![listen_addr],
                 routes: Vec::new(),
@@ -446,6 +466,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         Commands::Validate { config } => {
+            let config = resolve_config_path(config.as_deref());
             tracing::info!("Validating config: {}", config);
 
             // Support both file and directory validation
@@ -568,17 +589,7 @@ fn reserve_private_listener_address()
 
 /// 🚫 Port 80 is plaintext HTTP and never carries TLS, whatever the block says.
 ///
-/// RFC 8555 §8.3 has the ACME server fetch the HTTP-01 token over **cleartext**
-/// HTTP on port 80. So the moment a `tls` block also wraps port 80, the CA's
-/// plaintext probe hits a TLS listener, the handshake is rejected as
-/// `[HTTP_REQUEST]`, and the order fails validation — automatic HTTPS can never
-/// obtain the certificate it is trying to install.
-const PLAINTEXT_ONLY_PORT: u16 = 80;
-
-/// 🔁 The plaintext HTTP address Automatic HTTPS provisions for an HTTPS site.
-const AUTOMATIC_HTTP_LISTEN: &str = "0.0.0.0:80";
-
-/// 🔁 Builds the port-80 companion site for an HTTPS site, as Caddy does.
+/// 🔁 Builds the plaintext-HTTP companion site for an HTTPS site, as Caddy does.
 ///
 /// The idea in one sentence: a visitor who types `example.com` without a scheme
 /// arrives over plain HTTP, so something has to be listening there to send them
@@ -592,7 +603,7 @@ const AUTOMATIC_HTTP_LISTEN: &str = "0.0.0.0:80";
 /// - the site serves no TLS, so there is no HTTPS to redirect to.
 /// - the site has no concrete name; a redirect needs a host to send them to,
 ///   and a wildcard would guess wrong.
-/// - the site already listens on port 80, meaning the operator has said what
+/// - the site already listens on the HTTP port, meaning the operator has said what
 ///   they want served there and we must not overrule it.
 ///
 /// Under `auto_https disable_redirects` the listener is still provisioned but
@@ -603,6 +614,8 @@ fn automatic_http_companion(
     server_config: &pingclair_core::config::ServerConfig,
     mode: pingclair_core::config::AutoHttpsMode,
     listen_addrs: &[String],
+    http_port: u16,
+    https_port: u16,
 ) -> Option<pingclair_core::config::ServerConfig> {
     use pingclair_core::config::AutoHttpsMode;
 
@@ -618,7 +631,7 @@ fn automatic_http_companion(
     let already_serving_http = listen_addrs.iter().any(|addr| {
         addr.rsplit_once(':')
             .and_then(|(_, port)| port.parse::<u16>().ok())
-            == Some(PLAINTEXT_ONLY_PORT)
+            == Some(http_port)
     });
     if already_serving_http {
         return None;
@@ -627,13 +640,21 @@ fn automatic_http_companion(
     let routes = if mode == AutoHttpsMode::DisableRedirects {
         Vec::new()
     } else {
+        // 🧭 The redirect target must land on the HTTPS port, not whatever
+        // port the client used for plaintext HTTP. The default 443 needs no
+        // suffix; a custom `https_port` does.
+        let redirect_target = if https_port == 443 {
+            "https://{host}{uri}".to_string()
+        } else {
+            format!("https://{{host}}:{https_port}{{uri}}")
+        };
         vec![pingclair_core::config::RouteConfig {
             path: "/*".to_string(),
             // 🧭 308 rather than 302: the redirect is permanent, and unlike 301
             // it forbids a client from rewriting POST into GET, so a form
             // submitted over HTTP survives the hop to HTTPS.
             handler: pingclair_core::config::HandlerConfig::Redirect {
-                to: "https://{host}{uri}".to_string(),
+                to: redirect_target,
                 code: 308,
             },
             methods: None,
@@ -643,7 +664,7 @@ fn automatic_http_companion(
 
     Some(pingclair_core::config::ServerConfig {
         name: server_config.name.clone(),
-        listen: vec![AUTOMATIC_HTTP_LISTEN.to_string()],
+        listen: vec![format!("0.0.0.0:{http_port}")],
         proxy_protocol_listen: Vec::new(),
         tls: None,
         routes,
@@ -657,24 +678,33 @@ fn automatic_http_companion(
 /// its listeners far later — at which point a failure aborts a server that was
 /// otherwise ready to serve HTTPS perfectly well. Probing first lets the
 /// automatic listener be skipped with an explanation instead.
-fn can_bind_automatic_http_port() -> bool {
-    std::net::TcpListener::bind(AUTOMATIC_HTTP_LISTEN).is_ok()
+fn can_bind_automatic_http_port(http_port: u16) -> bool {
+    std::net::TcpListener::bind(("0.0.0.0", http_port)).is_ok()
 }
 
-/// 🔐 Treats explicit TLS configuration as authoritative, except on port 80.
+/// 🔐 Treats explicit TLS configuration as authoritative, except on the
+/// plaintext HTTP port.
 ///
-/// Everything except port 80 keeps the previous rule: an explicit `tls` block
-/// enables TLS anywhere, and 443/8443 imply it even without one.
-fn server_requires_tls(config: &pingclair_core::config::ServerConfig, addr: &str) -> bool {
+/// Everything except the HTTP port keeps the previous rule: an explicit `tls`
+/// block enables TLS anywhere, and the HTTPS port (plus 8443, the legacy
+/// convention) implies it even without one.
+fn server_requires_tls(
+    config: &pingclair_core::config::ServerConfig,
+    addr: &str,
+    http_port: u16,
+    https_port: u16,
+) -> bool {
     let port = addr
         .rsplit_once(':')
         .and_then(|(_, port)| port.parse::<u16>().ok());
 
-    if port == Some(PLAINTEXT_ONLY_PORT) {
+    // 🛡️ The plaintext HTTP port must never become a TLS listener: ACME's
+    // HTTP-01 probe arrives in the clear and would fail a TLS handshake.
+    if port == Some(http_port) {
         return false;
     }
 
-    config.tls.is_some() || port.is_some_and(|port| matches!(port, 443 | 8443))
+    config.tls.is_some() || port.is_some_and(|port| port == https_port || port == 8443)
 }
 
 fn run_server(
@@ -903,9 +933,11 @@ fn run_server(
     // port-80 companion is even possible here. Doing it per site would probe a
     // privileged port repeatedly for one unchanging answer.
     let auto_https_mode = config.global.auto_https.clone();
+    let http_port = config.global.http_port;
+    let https_port = config.global.https_port;
     let automatic_http_available = auto_https_mode != pingclair_core::config::AutoHttpsMode::Off
         && config.servers.iter().any(|server| server.tls.is_some())
-        && can_bind_automatic_http_port();
+        && can_bind_automatic_http_port(http_port);
 
     for server_config in config.servers {
         tracing::debug!(
@@ -918,10 +950,15 @@ fn run_server(
             // 🔐 A site that configures TLS but no port means HTTPS, so it
             // belongs on 443. Defaulting it to 80 would quietly serve a site
             // the operator asked to encrypt on the plaintext port instead.
+            let host = server_config
+                .bind
+                .as_deref()
+                .filter(|h| !h.is_empty())
+                .unwrap_or("0.0.0.0");
             if server_config.tls.is_some() {
-                vec!["0.0.0.0:443".to_string()]
+                vec![format!("{host}:{https_port}")]
             } else {
-                vec![AUTOMATIC_HTTP_LISTEN.to_string()]
+                vec![format!("{host}:{http_port}")]
             }
         } else {
             server_config
@@ -933,26 +970,31 @@ fn run_server(
 
         // 🔁 Automatic HTTPS: give an HTTPS site its plaintext port-80 companion
         // so ACME validation and the HTTP→HTTPS redirect both work unattended.
-        let companion =
-            automatic_http_companion(&server_config, auto_https_mode.clone(), &listen_addrs)
-                .filter(|_| {
-                    if automatic_http_available {
-                        true
-                    } else {
-                        tracing::warn!(
-                            "🚫 Automatic HTTPS could not take {} for {:?}: HTTP→HTTPS \
+        let companion = automatic_http_companion(
+            &server_config,
+            auto_https_mode.clone(),
+            &listen_addrs,
+            http_port,
+            https_port,
+        )
+        .filter(|_| {
+            if automatic_http_available {
+                true
+            } else {
+                tracing::warn!(
+                    "🚫 Automatic HTTPS could not take {} for {:?}: HTTP→HTTPS \
                      redirects and ACME HTTP-01 validation are unavailable. \
                      Free the port, run with CAP_NET_BIND_SERVICE, or add an \
                      explicit `listen` for the plaintext port.",
-                            AUTOMATIC_HTTP_LISTEN,
-                            server_config.name
-                        );
-                        false
-                    }
-                });
+                    format!("0.0.0.0:{http_port}"),
+                    server_config.name
+                );
+                false
+            }
+        });
 
         for addr in listen_addrs {
-            if server_requires_tls(&server_config, &addr) {
+            if server_requires_tls(&server_config, &addr, http_port, https_port) {
                 tls_listeners.insert(addr.clone());
             }
             let mut proxies_guard = port_proxies.write();
@@ -978,7 +1020,7 @@ fn run_server(
         }
 
         if let Some(companion) = companion {
-            let addr = AUTOMATIC_HTTP_LISTEN.to_string();
+            let addr = format!("0.0.0.0:{http_port}");
             let mut proxies_guard = port_proxies.write();
             let proxy = proxies_guard.entry(addr.clone()).or_insert_with(|| {
                 pingclair_proxy::server::PingclairProxy::with_tls_and_trusted_proxies(
@@ -1384,12 +1426,12 @@ mod tests {
             tls: Some(Default::default()),
             ..Default::default()
         };
-        assert!(server_requires_tls(&config, "127.0.0.1:21209"));
+        assert!(server_requires_tls(&config, "127.0.0.1:21209", 80, 443));
 
         let plain = pingclair_core::config::ServerConfig::default();
-        assert!(!server_requires_tls(&plain, "127.0.0.1:21209"));
-        assert!(server_requires_tls(&plain, "0.0.0.0:443"));
-        assert!(server_requires_tls(&plain, "[::]:8443"));
+        assert!(!server_requires_tls(&plain, "127.0.0.1:21209", 80, 443));
+        assert!(server_requires_tls(&plain, "0.0.0.0:443", 80, 443));
+        assert!(server_requires_tls(&plain, "[::]:8443", 80, 443));
     }
 
     /// 🚫 A `tls` block must not drag port 80 into TLS along with it.
@@ -1408,11 +1450,11 @@ mod tests {
         };
 
         assert!(
-            !server_requires_tls(&config, "0.0.0.0:80"),
+            !server_requires_tls(&config, "0.0.0.0:80", 80, 443),
             "ACME HTTP-01 validation is plaintext on port 80 and must reach the proxy"
         );
         assert!(
-            server_requires_tls(&config, "0.0.0.0:443"),
+            server_requires_tls(&config, "0.0.0.0:443", 80, 443),
             "the TLS block must still apply to the HTTPS listener"
         );
     }
@@ -1451,11 +1493,16 @@ mod tests {
             ..Default::default()
         };
 
-        let companion =
-            automatic_http_companion(&site, AutoHttpsMode::On, &["0.0.0.0:443".to_string()])
-                .expect("an HTTPS site needs its plaintext companion");
+        let companion = automatic_http_companion(
+            &site,
+            AutoHttpsMode::On,
+            &["0.0.0.0:443".to_string()],
+            80,
+            443,
+        )
+        .expect("an HTTPS site needs its plaintext companion");
 
-        assert_eq!(companion.listen, vec![AUTOMATIC_HTTP_LISTEN.to_string()]);
+        assert_eq!(companion.listen, vec!["0.0.0.0:80".to_string()]);
         assert!(
             companion.tls.is_none(),
             "the companion carries ACME validation traffic and must stay plaintext"
@@ -1486,17 +1533,29 @@ mod tests {
         let ports = vec!["0.0.0.0:443".to_string()];
 
         assert!(
-            automatic_http_companion(&https(Some("example.com")), AutoHttpsMode::Off, &ports)
-                .is_none(),
+            automatic_http_companion(
+                &https(Some("example.com")),
+                AutoHttpsMode::Off,
+                &ports,
+                80,
+                443,
+            )
+            .is_none(),
             "`auto_https off` opts out of all of this"
         );
         assert!(
-            automatic_http_companion(&https(None), AutoHttpsMode::On, &ports).is_none(),
+            automatic_http_companion(&https(None), AutoHttpsMode::On, &ports, 80, 443).is_none(),
             "a redirect needs a concrete host to send the client to"
         );
         assert!(
-            automatic_http_companion(&https(Some("*.example.com")), AutoHttpsMode::On, &ports)
-                .is_none(),
+            automatic_http_companion(
+                &https(Some("*.example.com")),
+                AutoHttpsMode::On,
+                &ports,
+                80,
+                443,
+            )
+            .is_none(),
             "a wildcard would have to guess which host to redirect to"
         );
 
@@ -1506,8 +1565,14 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            automatic_http_companion(&plaintext, AutoHttpsMode::On, &["0.0.0.0:8080".to_string()])
-                .is_none(),
+            automatic_http_companion(
+                &plaintext,
+                AutoHttpsMode::On,
+                &["0.0.0.0:8080".to_string()],
+                80,
+                443,
+            )
+            .is_none(),
             "there is no HTTPS to redirect to"
         );
 
@@ -1516,7 +1581,9 @@ mod tests {
             automatic_http_companion(
                 &https(Some("example.com")),
                 AutoHttpsMode::On,
-                &["0.0.0.0:80".to_string(), "0.0.0.0:443".to_string()]
+                &["0.0.0.0:80".to_string(), "0.0.0.0:443".to_string()],
+                80,
+                443,
             )
             .is_none(),
             "an explicit port 80 listener must not be overruled"
@@ -1542,10 +1609,12 @@ mod tests {
             &site,
             AutoHttpsMode::DisableRedirects,
             &["0.0.0.0:443".to_string()],
+            80,
+            443,
         )
         .expect("ACME still needs to be reachable on port 80");
 
-        assert_eq!(companion.listen, vec![AUTOMATIC_HTTP_LISTEN.to_string()]);
+        assert_eq!(companion.listen, vec!["0.0.0.0:80".to_string()]);
         assert!(
             companion.routes.is_empty(),
             "the challenge path is answered before routing, so no route means no redirect"

@@ -61,14 +61,32 @@ impl SemanticAnalyzer {
                 .insert(macro_def.name.clone(), macro_def.clone());
         }
 
-        // Phase 2: Check for duplicate servers
-        let mut server_names = HashMap::new();
+        // Phase 2: Check for duplicate servers. Two sites may share a hostname
+        // when their listeners differ — `localhost` (implicit HTTPS :443) and
+        // `http://localhost` (explicit plaintext :80) are both valid Caddy
+        // sites and must coexist. Identical name AND identical listeners is
+        // the real mistake.
+        let mut server_signatures = HashMap::new();
         for server_node in &ast.servers {
             let name = &server_node.inner.name;
-            if server_names.contains_key(name) {
+            let mut listens: Vec<String> = server_node
+                .inner
+                .listens
+                .iter()
+                .map(|l| {
+                    format!(
+                        "{}:{}",
+                        l.host,
+                        l.port.map_or_else(|| "?".to_string(), |p| p.to_string())
+                    )
+                })
+                .collect();
+            listens.sort();
+            let signature = (name.clone(), listens);
+            if server_signatures.contains_key(&signature) {
                 return Err(SemanticError::DuplicateServer { name: name.clone() });
             }
-            server_names.insert(name.clone(), ());
+            server_signatures.insert(signature, ());
         }
 
         // Phase 3: Expand macros in servers
@@ -291,11 +309,20 @@ impl SemanticAnalyzer {
         for server_node in &ast.servers {
             let server = &server_node.inner;
 
-            // Check that server has at least listens or routes
-            if server.listens.is_empty() && server.routes.is_none() {
+            // 📍 A bare hostname site (`example.com { ... }`) legitimately has
+            // no listen: the runtime derives 443/80 from TLS. Such a site is
+            // still valid when it has a name and some content. An unnamed or
+            // empty server is a mistake.
+            let named_site = server.name != "_" && !server.name.is_empty();
+            let has_content = server.listens.is_empty()
+                && server.routes.is_none()
+                && !named_site
+                && server.bind.is_none();
+            if has_content {
                 return Err(SemanticError::InvalidConfig {
                     message: format!(
-                        "Server '{}' needs at least 'listen' or 'route' block",
+                        "Server '{}' needs at least 'listen' or 'route' block \
+                         (or a hostname so the runtime can derive the listener)",
                         server.name
                     ),
                 });
@@ -337,13 +364,14 @@ mod tests {
 
     #[test]
     fn test_duplicate_server_detection() {
-        // We use two separate blocks with same name
+        // Two blocks with the same name and the SAME listener are the real
+        // mistake: they would fight over one socket.
         let source = r#"
             example.com {
                 listen :80
             }
             example.com {
-                listen :8080
+                listen :80
             }
         "#;
 
@@ -357,6 +385,28 @@ mod tests {
         let result = analyzer.analyze(ast);
 
         assert!(matches!(result, Err(SemanticError::DuplicateServer { .. })));
+    }
+
+    #[test]
+    fn same_host_on_different_listeners_coexists() {
+        // `localhost` (implicit HTTPS) and `http://localhost` (explicit
+        // plaintext) are two valid Caddy sites sharing one hostname.
+        let source = r#"
+            localhost {
+                respond "https"
+            }
+            http://localhost {
+                respond "http"
+            }
+        "#;
+        let directives = crate::parser::parse(source).unwrap();
+        let ast = crate::adapter::caddyfile::adapt(directives).unwrap();
+        let mut analyzer = SemanticAnalyzer::new();
+        let result = analyzer.analyze(ast);
+        assert!(
+            result.is_ok(),
+            "different listeners must allow the same hostname: {result:?}"
+        );
     }
 
     #[test]
