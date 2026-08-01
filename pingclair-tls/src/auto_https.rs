@@ -152,6 +152,11 @@ impl AutoHttps {
         }
     }
 
+    /// 📁 Hydrates the persistent certificate cache before any handshake.
+    pub(crate) async fn init_store(&self) -> Result<(), CertStoreError> {
+        self.store.init().await
+    }
+
     /// Retrieves a valid certificate for the given domain.
     ///
     /// **Logic Flow:**
