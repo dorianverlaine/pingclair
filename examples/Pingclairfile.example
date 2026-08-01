@@ -3,7 +3,8 @@
 # Global options
 global {
     protocols H1 H2 H3
-    debug false
+    # 🚩 `debug` is a bare flag, matching Caddy's global option syntax.
+    debug
 }
 
 # Simple reverse proxy

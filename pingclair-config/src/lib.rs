@@ -185,7 +185,7 @@ mod tests {
         let source = r#"
             global {
                 protocols H1 H2
-                debug false
+                debug
             }
 
             ai.408timeout.com {

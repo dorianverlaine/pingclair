@@ -233,12 +233,8 @@ impl Router {
             Matcher::Method { methods } => methods
                 .iter()
                 .any(|method| method.eq_ignore_ascii_case(request.method)),
-            Matcher::Query {
-                name: _,
-                condition: _,
-            } => {
-                // Query matching would need query string parsing
-                true
+            Matcher::Query { name, condition } => {
+                Self::query_matches(request.path, name, condition, compiled)
             }
             Matcher::Host(hosts) => hosts
                 .iter()
@@ -257,6 +253,31 @@ impl Router {
             }
             Matcher::Not(inner) => !Self::evaluate_matcher_inner(inner, compiled, request),
         }
+    }
+
+    /// 🔎 Evaluates one query-parameter condition against the request's query
+    /// string. A key with several repeated values matches when any one value
+    /// satisfies the condition; a key that is absent never matches, even for
+    /// `Exists`. This replaces the old unconditional `true`, which turned any
+    /// query matcher into a match-all rule.
+    fn query_matches(
+        path: &str,
+        name: &str,
+        condition: &MatcherCondition,
+        compiled: &CompiledMatcher,
+    ) -> bool {
+        let Some(query) = path.split_once('?').map(|(_, q)| q) else {
+            return false;
+        };
+        query.split('&').any(|pair| {
+            let Some((key, value)) = pair.split_once('=') else {
+                return false;
+            };
+            if key != name {
+                return false;
+            }
+            Self::evaluate_condition(Some(value), condition, compiled)
+        })
     }
 
     /// Evaluate a condition against a value (using pre-compiled regex)
@@ -360,6 +381,7 @@ impl Default for Router {
 mod tests {
     use super::*;
     use crate::config::HandlerConfig;
+    use http::HeaderMap;
 
     fn make_route(path: &str) -> RouteConfig {
         RouteConfig {
@@ -507,5 +529,47 @@ mod tests {
         assert!(matches("/a/one"));
         assert!(matches("/b/two"));
         assert!(!matches("/c/three"));
+    }
+
+    /// 🛡️ A query matcher must actually evaluate the query string. The old
+    /// implementation returned `true` unconditionally, so any JSON/Admin
+    /// config carrying a query condition silently matched every request.
+    #[test]
+    fn a_query_matcher_matches_only_matching_query_strings() {
+        use crate::config::{Matcher, MatcherCondition};
+        let route = RouteConfig {
+            path: "/*".to_string(),
+            handler: HandlerConfig::Respond {
+                status: 200,
+                body: None,
+                headers: HashMap::new(),
+            },
+            methods: None,
+            matcher: Some(Matcher::Query {
+                name: "admin".to_string(),
+                condition: MatcherCondition::Equals("1".to_string()),
+            }),
+        };
+        let router = Router::new(vec![route]);
+        let headers = HeaderMap::new();
+
+        let matches = |path: &str| {
+            router
+                .match_request(path, "GET", &headers, "example.com", "10.0.0.1", "https")
+                .is_some()
+        };
+
+        assert!(matches("/?admin=1"), "the configured value must match");
+        assert!(!matches("/?admin=2"), "a different value must not match");
+        assert!(!matches("/?other=1"), "a different key must not match");
+        assert!(
+            !matches("/"),
+            "a request without a query string must not match"
+        );
+        assert!(!matches("/?admin"), "a key without '=' must not match");
+        assert!(
+            matches("/?admin=1&admin=2"),
+            "a repeated key matches when any value matches"
+        );
     }
 }
