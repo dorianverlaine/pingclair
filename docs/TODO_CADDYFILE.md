@@ -1,0 +1,304 @@
+# 🎯 Caddyfile 相容性專項執行計畫（獨立 TODO）
+
+> 📌 本文件是**獨立的工作計畫**，只處理 Caddyfile 相容性補齊。
+> `docs/TODO.md`（v0.2 主計畫）目前**暫停**，不與本文件混排。
+> 完整需求清單與來源 → `docs/CADDYFILE_COMPATIBILITY_MASTER.md`
+> （95+ 項）；各專項細節 → `docs/CADDYFILE_*.md`；官方文檔快照 →
+> `vendor/caddy-docs/`。
+
+## 工作節奏
+
+- 一次只做一個 Part；Part 內可以拆多次 commit。
+- 每個 Part 結束時跑完「Part 收工條件」（見 §3），再進下一個。
+- 一個 Part 內不混「修 bug」與「加新功能」以外的類型；驗證與修復
+  在同一個 Part 內完成（本專項是逐項補齊，不採 v0.2 的
+  「寫程式日／驗證日」分離制）。
+
+## Part 總覽（依賴順序）
+
+| Part | 名稱 | 核心內容 | 依賴 |
+|---|---|---|---|
+| P1 | 止血與 fail-closed | 所有靜默吞錯改明確拒絕 | — |
+| P2 | 位址與 vhost 基礎 | 解鎖 `tls auto`、vhost 語義 | P1 |
+| P3 | 語法與 matcher | 簡寫、env、placeholder、matcher 全語義 | P2 |
+| P4 | directive 順序與 middleware | Caddy 排序、middleware chain | P3 |
+| P5 | Automatic HTTPS 完整化 | eager issuance、challenge、fallback | P2 |
+| P6 | API／CLI／Logging／Metrics／部署 | 管理面補齊 | P2、P4 |
+| P7 | 進階（v0.3+） | 已列不排期的項目 | 全部 |
+
+```
+P1 ──> P2 ──> P3 ──> P4 ──> P6
+              └────> P5 ────┘
+                              └──> P7
+```
+
+---
+
+## 🔧 P1 — 止血與 fail-closed
+
+> 原則：**未實作的功能一律編譯期明確拒絕**；錯誤訊息能與一般 typo
+> 區分。本 Part 不改語義，只消滅「編譯過但行為錯／沒有行為」。
+
+### P1.1 所有 catch-all 靜默吞錯 → 明確錯誤
+
+- [x] `adapt_reverse_proxy` 未知子指令（現況 `_ => {}`）→ 報錯。
+  影響：`handle_response`、`replace_status`、`copy_response_headers`、
+  `dynamic`、`lb_try_duration`、`fail_duration` 等（R1、E-5）
+- [x] `file_server` block 未知子指令（`precompressed`、`fs`）→ 報錯
+  （E-1）
+- [x] `adapt_log_block` 未知子指令／未知參數（`format jsno`、
+  `output stdoutd`、`output file` 缺路徑）→ 報錯（L1）
+- [x] `adapt_global` 已列不支援選項的錯誤訊息加「Caddy 相容但
+  不支援」提示（G8）：`http_port`、`https_port`、`default_bind`、
+  `order`、`grace_period`、`storage`、`metrics`、`local_certs`、
+  `acme_*`、`pki`、`on_demand_tls`、`frankenphp`、`filesystem`、
+  `events`、`log`
+- [x] 不支援 directive 的錯誤訊息加提示：`acme_server`、
+  `templates`、`try_files`、`php_fastcgi`、`abort`、`handle_path`、
+  `handle_errors`、`uri`、`vars`、`request_header`、`method`、
+  `fs`、`push`、`intercept` 等（D6、U5、E-7）
+- [x] 同類靜默吞錯一併處理：`header_up` 第三參數、inline
+  `header X-Only` 無值（審查時發現的額外兩處）
+
+### P1.2 已知錯的輸入 → 編譯期拒絕（不再放任 runtime 壞）
+
+- [x] `unix//` upstream 位址：實作或明確拒絕（H1）
+- [x] port range（`localhost:8080-8085`）：展開或明確拒絕（V1）
+- [x] `tcp/`／`tcp4/`／`tcp6/` network 前綴：剝離或明確拒絕（V2）
+- [x] `debug` 只收無參數（`debug fales` 報錯）（G4）
+- [x] `auto_https` 無參數報錯（G5）
+- [x] `method` matcher 未知 verb 報錯（`method HEAD` 要支援；
+  `method FOO` 要報錯）（M2）
+- [x] `header` matcher 第三個以上參數報錯或實作多值 OR（M8）
+
+### P1.3 安全相關 fail-open 修正
+
+- [x] Query matcher runtime 不再 `true`：實作 query string 評估
+  （`?q=1` 命中、其他不命中、非法 query 不匹配）（M6）
+- [x] `admin <addr> { origins ... }` block 不再靜默丟棄：
+  實作 origins/enforce_origin 或 fail closed（G2）
+
+**P1 收工**：以上每項都有「編譯失敗 + 錯誤訊息」的負面測試；
+`docs/CADDYFILE_COMPATIBILITY_MASTER.md` 對應項改 ✅。
+✅ **2026-08-01 完成**：`fail_closed_tests` 模組 24 個負面測試
+（含 Query matcher runtime 測試）；四項 gate 全綠（fmt、clippy
+`-D warnings`、`cargo build --workspace`、`cargo test --workspace`）。
+
+---
+
+## 🔧 P2 — 位址與 vhost 基礎
+
+> 本 Part 修完後，`example.com { tls auto }` 才能自動開 443。
+
+### P2.1 隱式 listen 語義（B0/B1/B2 根因）
+
+- [ ] `parse_server_address`：純 hostname（無顯式 scheme/port）不再
+  預設 `0.0.0.0:80` 並 push 進 `server.listens`；只有顯式
+  `http://`／`https://`／`:port` 才產生 listen（方案 A/B 見
+  `CADDYFILE_ADDRESS_SEMANTICS.md` §2.4）
+- [ ] site 隱式 listen 與顯式 `listen` 去重（B1：
+  `listen :80` 不再出現兩次）
+- [ ] `listen :8443` + hostname site 不再被偷加隱式 80（B2）
+- [ ] `compiler.rs` 的 bind 預填不會把 listen 塞回非空（:201）
+- [ ] 驗證：`example.com { tls auto }` 編譯後 `listen` 為空（或
+  「無顯式 listen」旗標），main.rs 走 443 分支
+
+### P2.2 vhost 語義
+
+- [ ] 多 listener 不再塌 `server.name` 成 `_`（B3）；`_` 只留給
+  裸 port／catch-all 位址
+- [ ] `localhost` 與 `http://localhost` 可共存（E-3）
+- [ ] 裸 `:443` 預設 TLS；`:8443` 慣例寫成 core 層規則（B4）
+- [ ] 多位址 block（`example.com, www.example.com`）單一 site
+  共用設定（B9）
+- [ ] `example.com/app`（位址帶 path）：實作預設 path matcher 或
+  明確拒絕（B8）
+- [ ] `https://`／`http://` catch-all 位址語義（443/80、無 Host
+  matcher、name 不含字面 scheme）（E-4）
+
+### P2.3 port 設定與檔名
+
+- [ ] global `http_port`／`https_port`（G6）：影響隱式 443/80、
+  `AUTOMATIC_HTTP_LISTEN`、`server_requires_tls` 的 443/8443 判斷
+- [ ] `run`／`validate` 預設檔名認 `Caddyfile`（C7）
+- [ ] 位址解析支援 IPv6 zone（`[fe80::1%eth0]:8080`）或明確拒絕
+  （V2 延伸）
+
+**P2 收工**：真 binary 測 `tls auto` 開 443 + 80 companion；多
+listener site 的 Host header 路由精確；官方位址表格每個 case 有
+compile 測試。
+
+---
+
+## 🔧 P3 — 語法與 matcher
+
+### P3.1 基礎語法
+
+- [ ] 單站無大括號簡寫（U1）：第一個 token 是 site 位址，後續行
+  屬於該 site
+- [ ] 環境變數 parse 前展開：`{$VAR}`／`{$VAR:default}`、多 token、
+  可空值（U3）
+- [ ] `{placeholder}` 與相鄰文字保持同一 token（P2：
+  `redir https://www.{host}{uri}`）
+- [ ] duration 完整語法：`ns/us/ms/s/m/h/d`、小數（`1.5h`）、組合
+  （`2h45m`）；裸數字拒絕（V3）
+- [ ] placeholder 縮寫表補齊或編譯期警告：`{labels.*}`、`{query}`、
+  `{scheme}`、`{port}`、`{hostport}` 等（V4、P6）
+
+### P3.2 `root` 與 `file_server`
+
+- [ ] `root <path>`／`root * <path>` directive（P1）：接入
+  `file_server` 根目錄
+- [ ] `file_server browse` inline 旗標（U2）
+- [ ] `file_server /path/*` inline path matcher（E-2）
+- [ ] `file_server` block：`root`、`index`、`browse`、`precompressed`
+  子指令正確語義（E-1；`precompressed <formats>` 列 P7）
+- [ ] trailing-slash 自動轉跳（目錄加斜線、檔案去斜線）（P5）
+
+### P3.3 Matcher 全語義
+
+- [ ] multi-path matcher 全部 pattern 生效（M1：route path 多值或
+  matcher 完整評估）
+- [ ] `header` matcher：`!` 不存在、`*suffix`、`prefix*`、兩側 `*`
+  （M3）
+- [ ] matcher set 同型別合併：同欄位 header／path／method／host
+  多值 OR、不同欄位 AND（M7/M8）
+- [ ] path matcher 四種 wildcard 位置（M4）
+- [ ] path 匹配前正規化：case-insensitive、dot-segment、多 slash、
+  URI-decode（M4）
+- [ ] DSL 支援 `host`／`query`／`protocol`／`remote_ip`／`client_ip`
+  matcher（M5）
+- [ ] `not` 的 inline 多值與 block 語意測試鎖定（M7）
+
+**P3 收工**：官方 tutorial + patterns + examples 頁的原文範例
+（扣除標記 v0.3+ 的）全部能編譯；matcher 每個語意有 runtime 測試。
+
+---
+
+## 🔧 P4 — directive 順序與 middleware chain
+
+- [ ] 已支援 directive 依 Caddy 預設順序執行（header 在 respond 前、
+  basic_auth 在 file_server 前…）（D1）
+- [ ] middleware（header/rewrite/basic_auth/rate_limit…）成為包住
+  routing 的 chain，不再被 terminal route 遮蔽（D2）
+- [ ] 同名 `handle` 依 matcher specificity 排序（D3）
+- [ ] directive 第一參數 `/`-path 解析為 matcher（`reverse_proxy
+  /api/*`、`redir /a /b`…）（D4）
+- [ ] `rewrite`：Caddy path 語意與 Pingclair regex 語意明確區分
+  （D5/P4）
+- [ ] `route` block 保留字面順序、支援內層 matcher token（D5）
+- [ ] `to` 單行多 upstream（E-6）
+- [ ] `order` global option（D8）
+
+**P4 收工**：同一份設定只改 directive 排列順序，HTTP 行為完全一致
+（真 binary 差分測試）。
+
+---
+
+## 🔧 P5 — Automatic HTTPS 完整化
+
+> 依賴 P2（位址修復）——443 開不起來，本 Part 全部無意義。
+
+- [ ] 背景 eager issuance：啟動時為所有 `tls auto` 具名網域發起
+  簽發；首次 handshake 不阻塞（T2）
+- [ ] 失敗重試與指數退避（最長 1 天、30 天內持續；失敗訊息可觀測）
+  （T5）
+- [ ] TLS-ALPN-01 challenge（T3；GUARDRAILS 級別，改動前必讀）
+- [ ] DNS-01 challenge + wildcard 憑證（T4；含 `tls { dns }` 語法；
+  與 `abort` directive、`host` matcher 一起）
+- [ ] issuer fallback（LE → ZeroSSL）（T6）
+- [ ] localhost／本機 IP 自動本機 CA HTTPS（T7：預設走 `tls
+  internal` 能力）
+- [ ] reload 時中止 in-flight ACME（T8）
+- [ ] storage 可寫性預檢與文件（T9）
+
+**P5 收工**：本機 staging 全流程（不需手動觸發 handshake 就簽到）；
+`tls auto`／`tls internal`／manual cert 三路回歸；Linux release +
+quiche-client smoke 按 AGENTS.md。
+
+---
+
+## 🔧 P6 — API／CLI／Logging／Metrics／部署
+
+> 本 Part 是管理面補齊，依賴 P2（reload 位址語義）與 P4（reload
+> 後 handler 順序一致）。
+
+### P6.1 Admin API 與 reload
+- [ ] SIGHUP reload 偵測 global 差異並警告「需要重啟」（A1）
+- [ ] `POST /load` 整包替換（完整 `PingclairConfig`、失敗 rollback、
+  相同 config 不 reload）（A2/A8）
+- [ ] `GET /config` 回傳可重新 POST 的 config 文件（A7）
+- [ ] `POST /stop`（A 系列）
+- [ ] admin `origins`／`enforce_origin`（P1.3 的 runtime 半）
+- [ ] `POST /adapt`（A9）
+
+### P6.2 CLI
+- [ ] `pingclair adapt [--pretty] [--validate]`（C1）
+- [ ] `pingclair fmt [--overwrite] [--diff]`（C1）
+- [ ] `validate` 走 provisioning 層（cert 檔存在性等）（C2）
+- [ ] SIGUSR1 reload（C3；SIGHUP 相容）
+- [ ] `file-server` 旗標：`--browse`、`--domain`、`--templates`、
+  `--access-log`、`--no-compress`、`--file-limit`（C4）
+- [ ] `reverse-proxy` 旗標：多 `--to`、`--header-up/down`、
+  `--insecure`、`--internal-certs`、`--disable-redirects`（C5）
+- [ ] `hash-password`（bcrypt）（C8）
+
+### P6.3 Logging
+- [ ] per-server/global `level` 支援（L2；死欄位接上或刪除）
+- [ ] global `log` option（多 log 管道）（L3）
+- [ ] access log 補 request/response headers、TLS 資訊（L4）
+
+### P6.4 Metrics
+- [ ] `{ metrics }`／`{ metrics { per_host } }` 開關（MT-1）
+- [ ] runtime/process 指標（MT-2）
+- [ ] admin API 指標（MT-3）
+- [ ] HTTP 指標補齊：request/response size、TTFB、errors、
+  in_flight；labels 對齊或文件化映射（MT-4）
+- [ ] upstream health 0/1 gauge（MT-5；與 admin A10 一起）
+- [ ] `active_connections` 改 gauge 並打點或刪除（MT-6）
+
+### P6.5 部署
+- [ ] systemd unit 單一來源 + `Restart=on-failure` +
+  `RestartPreventExitStatus=1`（K-1/K-2）
+- [ ] README 補 production compose 與 `tls internal` trust 安裝
+  流程（K-4/K-5/K-6）
+
+**P6 收工**：管理面每項有真 binary 測試（`POST /load`、reload、
+metrics 打點、CLI 指令）；三語 README 與實際一致。
+
+---
+
+## 🗄️ P7 — 進階（v0.3+，只列不排期）
+
+- config path traversal（`/config/<path>`）、`@id`、Etag/If-Match
+  （A3/A4/A11）
+- config persistence + `--resume`（A5）
+- `handle_response` 完整實作（status class、header 條件、
+  replace/copy/fallback）（R3）
+- `try_files`、`templates`、`handle_path`、`handle_errors`（S6/S7、
+  D7）
+- `pki`／`acme_server`（自建 CA + 內嵌 ACME server）（E-7）
+- on-demand TLS、ECH（automatic-https 文檔 §5）
+- FrankenPHP／`php_fastcgi`（patterns 文檔）
+- `fs` 模組（sqlite/embedded）（E-1 延伸）
+- `dynamic srv` SRV 後端（E-5 延伸）
+- OTLP metrics push、OpenMetrics 協商（MT-7）
+- `completion`／`manpage`／`storage export|import`（CLI 對照表）
+- `default_bind`、`grace_period`／`shutdown_delay`（G7/G9）
+- Unix socket `|0200` 權限模式（V 系列延伸）
+
+---
+
+## 收工條件（每個 Part）
+
+1. 該 Part 涉及的所有官方原文範例能編譯（compile fixture，
+   `pingclair-config/tests/` 或 documentation 測試）；
+2. `cargo +1.88.0 fmt --all -- --check`、
+   `cargo +1.88.0 clippy --locked --workspace --all-targets -- -D warnings`、
+   `cargo +1.88.0 build --locked --workspace`、
+   `cargo +1.88.0 test --locked --workspace`（AGENTS.md 四項 gate）；
+3. 真 binary 整合測試覆蓋該 Part 的 runtime 行為
+   （`pingclair/tests/integration.rs`）；
+4. 每項「未支援」的錯誤訊息通過「能與 typo 區分」的測試；
+5. `docs/STATUS.md` 更新；三語 README 的 Caddyfile 宣稱與實際一致；
+6. `docs/CADDYFILE_COMPATIBILITY_MASTER.md` 對應項目打 ✅。
