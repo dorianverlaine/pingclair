@@ -469,8 +469,12 @@ happens to recycle its address pool.
   req/s，比 release 慢約 10 倍）與 t4g.micro（Graviton2）組合所致。
   同機 loopback 對比（wrk 在 t4g.micro 上、與伺服器搶 CPU）：nginx
   35,485 vs pingclair 22,065，比率與內網測試一致，差距是伺服器本體。
-- 已知未解：aarch64 release 未開 `-C target-cpu=neoverse-n1`（LSE
-  atomics），高併發下可能放大 Pingora 的鎖/原子開銷；待實驗驗證。
+- **LSE 實驗**（`-C target-cpu=neoverse-n1` 重編，同機 loopback、
+  與伺服器搶 CPU）：H1 明文 22,369 → 23,595（+5.5%）、H1 TLS
+  16,285 → 17,251（+5.9%）、H2 21,383 → 22,557（+5.5%）；nginx
+  同條件 37,307 / 21,735 / 38,973。對 nginx 的佔比從 60% / 75% / 55%
+  升到 63% / 79% / 58%——LSE atomics 有實質但小幅的幫助，主體差距仍是
+  Pingora 的 task/分配模型在小核上的固定成本，不是單一 CPU 旗標能補的。
 
 **壓測發現的兩個 bug（已修，commit `21a113b`，待香港機重驗）**
 
