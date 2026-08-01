@@ -3020,6 +3020,219 @@ async fn test_admin_load_rejects_caddy_json() {
     assert_eq!(response.text().await.unwrap(), "still-ready");
 }
 
+/// 🧭 Caddy-style config traversal: GET/POST/PUT/PATCH/DELETE on
+/// `/config/<path>` mutate the active document and the running listener.
+#[tokio::test]
+async fn test_admin_config_traversal_end_to_end() {
+    let mut server = TestServer::new(&admin_test_config("/__ready_traversal", "initial"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+    let readiness_path = server.readiness_path.clone();
+    let readiness_token = server.readiness_token.clone();
+    let body_path = "/config/servers/0/routes/0/handler/body";
+
+    // 📖 GET resolves a node through object keys and array indices.
+    let resp = client
+        .get(server.admin_url(body_path))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap(),
+        serde_json::Value::String(readiness_token.clone())
+    );
+
+    // 📤 POST upserts the body and the running server answers it.
+    let resp = client
+        .post(server.admin_url(body_path))
+        .json(&serde_json::json!("traversed"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let resp = client
+        .get(server.url(0, &readiness_path))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.text().await.unwrap(), "traversed");
+
+    // 🔁 PATCH replaces an existing node.
+    let resp = client
+        .patch(server.admin_url(body_path))
+        .json(&serde_json::json!("patched"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let resp = client
+        .get(server.url(0, &readiness_path))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.text().await.unwrap(), "patched");
+
+    // 🚫 PUT refuses an existing node and creates a missing one.
+    let resp = client
+        .put(server.admin_url(body_path))
+        .json(&serde_json::json!("nope"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let resp = client
+        .put(server.admin_url("/config/servers/0/extra"))
+        .json(&serde_json::json!(true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let resp = client
+        .get(server.admin_url("/config/servers/0/extra"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!(true)
+    );
+
+    // 🗑️ DELETE removes it; unknown paths are 404.
+    let resp = client
+        .delete(server.admin_url("/config/servers/0/extra"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let resp = client
+        .get(server.admin_url("/config/servers/0/extra"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let resp = client
+        .get(server.admin_url("/config/servers/0/nope"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // 🛡️ A malformed mutation rolls back; the running server stays patched.
+    let resp = client
+        .post(server.admin_url(body_path))
+        .json(&serde_json::json!({"not": "a string"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let resp = client
+        .get(server.url(0, &readiness_path))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.text().await.unwrap(), "patched");
+}
+
+/// 🧭 POST with a trailing `...` appends every element of an array body.
+#[tokio::test]
+async fn test_admin_config_traversal_expand_appends() {
+    let mut server = TestServer::new(&admin_test_config("/__ready_expand", "expand"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let route = serde_json::json!({
+        "path": "/extra",
+        "handler": {"type": "respond", "status": 200, "body": "extra"}
+    });
+    let resp = client
+        .post(server.admin_url("/config/servers/0/routes/..."))
+        .json(&serde_json::json!([route]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let resp = client.get(server.url(0, "/extra")).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(resp.text().await.unwrap(), "extra");
+}
+
+/// 🚫 A traversal that introduces an unbound listener is refused wholesale.
+#[tokio::test]
+async fn test_admin_config_traversal_new_listener_is_refused() {
+    let mut server = TestServer::new(&admin_test_config("/__ready_rb", "rb"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let new_server = serde_json::json!({"listen": ["127.0.0.1:1"], "routes": []});
+    let resp = client
+        .post(server.admin_url("/config/servers/..."))
+        .json(&serde_json::json!([new_server]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // 🧭 The document and the running server are both unchanged.
+    let resp = client
+        .get(server.admin_url("/config/servers"))
+        .send()
+        .await
+        .unwrap();
+    let servers = resp.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(servers.as_array().unwrap().len(), 1);
+    let resp = client
+        .get(server.url(0, "/__ready_rb"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.text().await.unwrap(), "rb");
+}
+
+/// 🧭 `adapt -c -` and `validate -` read the config from stdin, like Caddy.
+#[test]
+fn cli_adapt_and_validate_read_stdin() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let bin = env!("CARGO_BIN_EXE_pingclair");
+    let source = b":8080 {\n    respond \"hi\"\n}\n";
+
+    let mut child = Command::new(bin)
+        .args(["adapt", "-c", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn adapt");
+    child.stdin.as_mut().unwrap().write_all(source).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "adapt stdin failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["servers"][0]["listen"][0], "0.0.0.0:8080");
+
+    let mut child = Command::new(bin)
+        .args(["validate", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn validate");
+    child.stdin.as_mut().unwrap().write_all(source).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "validate stdin failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("is valid"));
+}
+
 /// 🔔 SIGHUP/SIGUSR1 reload the running server from its config file — on any
 /// Unix, including the macOS dev machines this suite runs on. The test edits
 /// the Pingclairfile, signals the real binary, and checks that the new route

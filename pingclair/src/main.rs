@@ -548,6 +548,9 @@ fn main() -> anyhow::Result<()> {
             internal_certs,
             disable_redirects,
         } => {
+            // 🌐 Caddy expands `--to :9000-9003` into one peer per port; the
+            // CLI must not ship an address the runtime cannot dial.
+            let to = pingclair_config::adapter::expand_upstream_port_ranges(to);
             tracing::info!("Starting reverse proxy: {} -> {:?}", from, to);
             // Create dynamic config
             let mut config = pingclair_core::config::PingclairConfig::default();
@@ -610,7 +613,7 @@ fn main() -> anyhow::Result<()> {
                 upstream_tls.insecure_skip_verify = true;
             }
             let handler = HandlerConfig::ReverseProxy(ReverseProxyConfig {
-                upstreams: to.clone(),
+                upstreams: to,
                 upstream_options: Vec::new(),
                 // 🗄️ `pingclair reverse-proxy` is a throwaway one-liner; caching
                 // is a deliberate per-route decision, so it stays off here.
@@ -735,42 +738,51 @@ fn main() -> anyhow::Result<()> {
         }
 
         Commands::Validate { config } => {
-            let config = resolve_config_path(config.as_deref());
-            tracing::info!("Validating config: {}", config);
-
-            // Support both file and directory validation
-            let result = if std::path::Path::new(&config).is_dir() {
-                tracing::info!("📁 Validating configuration directory: {}", config);
-                pingclair_config::compile_directory(&config)
+            // 🧭 Caddy reads a config from stdin when the path is `-`; do the
+            // same so scripts can validate generated Caddyfiles.
+            let (compiled, label) = if config.as_deref() == Some("-") {
+                use std::io::Read;
+                let mut source = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut source)
+                    .map_err(|error| anyhow::anyhow!("❌ Failed to read stdin: {error}"))?;
+                (
+                    pingclair_config::compile(&source)
+                        .map_err(|error| anyhow::anyhow!("❌ Configuration Error: {error}"))?,
+                    "<stdin>".to_string(),
+                )
             } else {
-                pingclair_config::compile_file(&config)
+                let config = resolve_config_path(config.as_deref());
+                tracing::info!("Validating config: {}", config);
+                let result = if std::path::Path::new(&config).is_dir() {
+                    tracing::info!("📁 Validating configuration directory: {}", config);
+                    pingclair_config::compile_directory(&config)
+                } else {
+                    pingclair_config::compile_file(&config)
+                };
+                (
+                    result.map_err(|error| anyhow::anyhow!("❌ Configuration Error: {error}"))?,
+                    config,
+                )
             };
 
-            match result {
-                Ok(compiled) => {
-                    // 🛡️ Provisioning checks: files the server will need at
-                    // startup must exist now, not fail mid-flight later.
-                    for server in &compiled.servers {
-                        let Some(tls) = &server.tls else {
-                            continue;
-                        };
-                        let (Some(cert), Some(key)) = (&tls.cert, &tls.key) else {
-                            continue;
-                        };
-                        for (label, path) in [("certificate", cert), ("key", key)] {
-                            if !std::path::Path::new(path).is_file() {
-                                eprintln!("❌ TLS {label} file does not exist: {path}");
-                                std::process::exit(1);
-                            }
-                        }
+            // 🛡️ Provisioning checks: files the server will need at startup
+            // must exist now, not fail mid-flight later.
+            for server in &compiled.servers {
+                let Some(tls) = &server.tls else {
+                    continue;
+                };
+                let (Some(cert), Some(key)) = (&tls.cert, &tls.key) else {
+                    continue;
+                };
+                for (kind, path) in [("certificate", cert), ("key", key)] {
+                    if !std::path::Path::new(path).is_file() {
+                        eprintln!("❌ TLS {kind} file does not exist: {path}");
+                        std::process::exit(1);
                     }
-                    println!("✅ Configuration '{config}' is valid!");
-                }
-                Err(e) => {
-                    eprintln!("❌ Configuration Error: {e}");
-                    std::process::exit(1);
                 }
             }
+            println!("✅ Configuration '{label}' is valid!");
         }
 
         Commands::Adapt {
@@ -778,13 +790,25 @@ fn main() -> anyhow::Result<()> {
             pretty,
             validate,
         } => {
-            let config_path = resolve_config_path(config.as_deref());
-            let config = if std::path::Path::new(&config_path).is_dir() {
-                pingclair_config::compile_directory(&config_path)
+            // 🧭 Caddy reads a config from stdin when the path is `-`; keep
+            // `pingclair adapt -c -` usable in the same pipelines.
+            let config = if config.as_deref() == Some("-") {
+                use std::io::Read;
+                let mut source = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut source)
+                    .map_err(|error| anyhow::anyhow!("❌ Failed to read stdin: {error}"))?;
+                pingclair_config::compile(&source)
+                    .map_err(|error| anyhow::anyhow!("❌ Failed to adapt <stdin>: {error}"))?
             } else {
-                pingclair_config::compile_file(&config_path)
-            }
-            .map_err(|error| anyhow::anyhow!("❌ Failed to adapt {config_path}: {error}"))?;
+                let config_path = resolve_config_path(config.as_deref());
+                (if std::path::Path::new(&config_path).is_dir() {
+                    pingclair_config::compile_directory(&config_path)
+                } else {
+                    pingclair_config::compile_file(&config_path)
+                })
+                .map_err(|error| anyhow::anyhow!("❌ Failed to adapt {config_path}: {error}"))?
+            };
             if validate {
                 pingclair_config::compiler::validate_config(&config)
                     .map_err(|error| anyhow::anyhow!("❌ Validation failed: {error}"))?;
@@ -1295,7 +1319,7 @@ fn run_server(
         && config.servers.iter().any(|server| server.tls.is_some())
         && can_bind_automatic_http_port(http_port);
 
-    for server_config in config.servers {
+    for server_config in &config.servers {
         tracing::debug!(
             "🚀 Processing ServerConfig: name={:?}, listens={:?}",
             server_config.name,
@@ -1327,7 +1351,7 @@ fn run_server(
         // 🔁 Automatic HTTPS: give an HTTPS site its plaintext port-80 companion
         // so ACME validation and the HTTP→HTTPS redirect both work unattended.
         let companion = automatic_http_companion(
-            &server_config,
+            server_config,
             auto_https_mode.clone(),
             &listen_addrs,
             http_port,
@@ -1350,7 +1374,7 @@ fn run_server(
         });
 
         for addr in listen_addrs {
-            if server_requires_tls(&server_config, &addr, http_port, https_port) {
+            if server_requires_tls(server_config, &addr, http_port, https_port) {
                 tls_listeners.insert(addr.clone());
             }
             let mut proxies_guard = port_proxies.write();
@@ -1578,18 +1602,26 @@ fn run_server(
     }
 
     // Start Admin API if enabled
-    if let Some(admin_config) = config.admin
+    if let Some(admin_config) = &config.admin
         && admin_config.enabled
     {
         let listen = admin_config.listen.clone();
         let api_key = admin_config.api_key.clone();
         let proxies = port_proxies.clone();
+        // 🧭 The admin traversal endpoints read and write one shared config
+        // document; it starts as the exact configuration that was loaded.
+        let document = Arc::new(RwLock::new(
+            serde_json::to_value(config.clone())
+                .unwrap_or_else(|_| serde_json::Value::Object(Default::default())),
+        ));
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create admin runtime");
             rt.block_on(async {
                 let addr = listen.parse().expect("Invalid admin listen address");
-                if let Err(e) = pingclair_api::run_admin_server(addr, proxies, api_key).await {
+                if let Err(e) =
+                    pingclair_api::run_admin_server(addr, proxies, document, api_key).await
+                {
                     tracing::error!("Admin server error: {}", e);
                 }
             });

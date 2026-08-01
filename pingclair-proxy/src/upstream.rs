@@ -113,9 +113,10 @@ impl UpstreamSpec {
             }
         };
 
-        if host.is_empty() {
-            return None;
-        }
+        // 🧭 Caddy treats a bare `:9000` upstream as `127.0.0.1:9000`;
+        // an empty host must not silently vanish into a peer that can
+        // never be dialed.
+        let host = if host.is_empty() { "127.0.0.1" } else { host };
 
         Some(Self {
             host: host.to_string(),
@@ -245,6 +246,23 @@ mod tests {
                 port,
                 "{address}"
             );
+        }
+    }
+
+    #[test]
+    fn bare_port_upstreams_default_to_loopback_like_caddy() {
+        // 🧭 `reverse_proxy :9000` must dial 127.0.0.1:9000, not vanish into
+        // an empty host that can never be resolved.
+        for (address, expected_host, expected_port) in [
+            (":9000", "127.0.0.1", 9000),
+            ("https://:8443", "127.0.0.1", 8443),
+            ("h2c://:3000", "127.0.0.1", 3000),
+        ] {
+            let spec =
+                UpstreamSpec::parse(address).unwrap_or_else(|| panic!("{address} must parse"));
+            assert_eq!(spec.host, expected_host, "{address}");
+            assert_eq!(spec.port, expected_port, "{address}");
+            assert!(!spec.needs_dns(), "{address} must be a loopback literal");
         }
     }
 
