@@ -60,8 +60,12 @@ pub enum ChallengeType {
     /// 🌐 HTTP-01: Validates control via file serving on port 80.
     Http01,
     /// 📡 DNS-01: Validates control via DNS TXT records (Wildcards supported).
+    // TODO(v0.3): implement a DNS provider abstraction and TXT-record
+    // deployment; wildcard certificates depend on this.
     Dns01,
     /// 🔒 TLS-ALPN-01: Validates via TLS handshake on port 443.
+    // TODO(v0.3): implement the acme-tls/1 ALPN responder in the TLS
+    // acceptor; requires coordinated H1/H2/H3 changes.
     TlsAlpn01,
 }
 

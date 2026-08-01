@@ -382,6 +382,34 @@ impl TlsManager {
         self.challenge_handler.clone()
     }
 
+    /// 🚀 Starts the background certificate machinery: the renewal daemon
+    /// (once) plus eager issuance for every `tls auto` hostname, so the first
+    /// handshake never blocks on ACME.
+    pub fn start_background_issuance(&self, domains: Vec<String>) {
+        use std::sync::OnceLock;
+
+        // 🔁 The renewal daemon is process-wide; guard against duplicate
+        // spawns if a future reload path calls this again.
+        static RENEWAL_STARTED: OnceLock<()> = OnceLock::new();
+        let Some(auto) = &self.auto_https else {
+            return;
+        };
+        let handler = self.challenge_handler.clone();
+        if RENEWAL_STARTED.set(()).is_ok() {
+            let renewal = auto.clone();
+            renewal.start_renewal_task(handler.clone());
+        }
+        auto.clone().start_eager_issuance(domains, handler);
+    }
+
+    /// 🛑 Clears in-flight ACME markers so a reloaded configuration can begin
+    /// issuing immediately.
+    pub async fn cancel_pending_issuance(&self) {
+        if let Some(auto) = &self.auto_https {
+            auto.cancel_pending_issuance().await;
+        }
+    }
+
     /// 🧹 Removes expired parsed certificate cache entries.
     pub fn cleanup_expired_cache(&self) {
         let current_time = SystemTime::now()

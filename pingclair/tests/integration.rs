@@ -2849,6 +2849,87 @@ async fn test_file_server_trailing_slash_redirects() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 }
 
+/// 🧭 Caddy's directive order makes file order irrelevant: `header` after
+/// `respond` must behave identically to `header` before `respond`. This test
+/// runs two real binaries with reversed directive order and compares the
+/// HTTP behavior.
+#[tokio::test]
+async fn test_directive_order_does_not_change_behavior() {
+    let config_template = |body: &str| {
+        format!(
+            r#"
+            {{
+                admin off
+                http_port __PINGCLAIR_TEST_HTTP_PORT__
+                https_port __PINGCLAIR_TEST_HTTPS_PORT__
+            }}
+
+            example.com {{
+                tls internal
+                @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+                respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+                {body}
+            }}
+        "#
+        )
+    };
+    let body_a = r#"
+            respond "ordered-ok"
+            header X-Order "reversed"
+    "#;
+    let body_b = r#"
+            header X-Order "reversed"
+            respond "ordered-ok"
+    "#;
+
+    let mut server_a = TestServer::new_pingclairfile(&config_template(body_a));
+    let result_a = fetch_ordered_response(&mut server_a).await;
+    server_a.stop();
+
+    let mut server_b = TestServer::new_pingclairfile(&config_template(body_b));
+    let result_b = fetch_ordered_response(&mut server_b).await;
+    server_b.stop();
+
+    assert_eq!(
+        result_a, result_b,
+        "reversing directive order must not change the response"
+    );
+    assert_eq!(result_a.0, reqwest::StatusCode::OK);
+    assert_eq!(result_a.1, "reversed");
+    assert_eq!(result_a.2, "ordered-ok");
+}
+
+/// 🔎 Starts a TLS-ready test server and returns (status, x-order, body).
+async fn fetch_ordered_response(server: &mut TestServer) -> (reqwest::StatusCode, String, String) {
+    assert!(
+        server.wait_until_tls_ready("example.com").await,
+        "server failed to start"
+    );
+    let root_path = server._temp_dir.path().join("tls/internal/root.crt");
+    let root = reqwest::Certificate::from_pem(&std::fs::read(&root_path).unwrap()).unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .add_root_certificate(root)
+        .resolve("example.com", server.address(0))
+        .build()
+        .unwrap();
+    let response = client
+        .get(server.tls_url(0, "example.com", "/"))
+        .send()
+        .await
+        .unwrap();
+    (
+        response.status(),
+        response
+            .headers()
+            .get("x-order")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .unwrap_or_default(),
+        response.text().await.unwrap(),
+    )
+}
+
 /// 🛠️ Starts a server with the Admin API enabled and one readiness route.
 ///
 /// These tests drive the real Admin socket rather than calling

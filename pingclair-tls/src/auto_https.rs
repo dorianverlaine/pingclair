@@ -8,8 +8,9 @@
 
 use crate::acme::{AcmeClient, AcmeError, Certificate, ChallengeHandler};
 use crate::cert_store::{CertStore, CertStoreError};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
@@ -121,6 +122,8 @@ impl AutoHttps {
         tracing::info!("🔐 Initializing AutoHTTPS Manager");
 
         // Initialize ACME Client
+        // TODO(v0.3): try a fallback issuer (ZeroSSL) after Let's Encrypt
+        // fails; requires external-account-binding support.
         let acme = if config.staging {
             tracing::info!("🧪 ACME Environment: Staging");
             AcmeClient::staging()
@@ -229,6 +232,11 @@ impl AutoHttps {
         tracing::info!("🔄 Starting Renewal Daemon (Interval: {:?})", interval);
 
         tokio::spawn(async move {
+            // 🕰️ Consecutive failures back off exponentially so a down CA or a
+            // broken DNS record does not hammer the ACME endpoint every
+            // interval. Each domain records the earliest instant it may be
+            // retried; success removes the entry.
+            let mut next_attempt: HashMap<String, (u32, Instant)> = HashMap::new();
             loop {
                 tokio::time::sleep(interval).await;
 
@@ -248,16 +256,64 @@ impl AutoHttps {
 
                 for cert in renewal_candidates {
                     if let Some(domain) = cert.domains.first() {
+                        if next_attempt
+                            .get(domain)
+                            .is_some_and(|(_, until)| Instant::now() < *until)
+                        {
+                            tracing::debug!("⏳ {} is in backoff; skipping this scan", domain);
+                            continue;
+                        }
                         tracing::info!("🔄 Renewing {}...", domain);
 
                         match self.get_certificate(domain, handler.as_ref()).await {
                             Ok(_) => {
                                 tracing::info!("✅ Renewed successfully: {}", domain);
+                                next_attempt.remove(domain);
                             }
                             Err(e) => {
                                 tracing::error!("❌ Renew failed for {}: {}", domain, e);
+                                let failures = next_attempt
+                                    .get(domain)
+                                    .map_or(0, |(failures, _)| *failures + 1);
+                                let backoff = interval
+                                    .saturating_mul(2u32.saturating_pow(failures.min(10)))
+                                    .min(Duration::from_secs(24 * 60 * 60));
+                                next_attempt
+                                    .insert(domain.clone(), (failures, Instant::now() + backoff));
+                                tracing::warn!("⏳ Backing off {} for {:?}", domain, backoff);
                             }
                         }
+                    }
+                }
+            }
+        });
+    }
+
+    /// 🚀 Eagerly obtains certificates for every configured `tls auto`
+    /// hostname at startup, so the first TLS handshake never blocks on ACME.
+    /// Domains that already have a valid certificate are skipped.
+    pub fn start_eager_issuance(
+        self: Arc<Self>,
+        domains: Vec<String>,
+        handler: Arc<dyn ChallengeHandler>,
+    ) {
+        if domains.is_empty() {
+            return;
+        }
+        tracing::info!("🚀 Eager issuance for {} hostname(s)", domains.len());
+        tokio::spawn(async move {
+            for domain in domains {
+                if self.has_certificate(&domain).await {
+                    tracing::debug!("✅ {} already has a valid certificate", domain);
+                    continue;
+                }
+                match self.get_certificate(&domain, handler.as_ref()).await {
+                    Ok(_) => tracing::info!("🎉 Eager issuance complete for {}", domain),
+                    Err(e) => {
+                        // ⚠️ Failure is not fatal: the lazy handshake path will
+                        // retry, and the renewal daemon keeps trying with
+                        // backoff.
+                        tracing::warn!("⚠️ Eager issuance failed for {}: {}", domain, e);
                     }
                 }
             }
@@ -267,6 +323,15 @@ impl AutoHttps {
     /// Checks if a valid certificate currently exists for a domain.
     pub async fn has_certificate(&self, domain: &str) -> bool {
         self.store.has_valid(domain).await
+    }
+
+    /// 🛑 Drops every in-flight issuance marker. Called on configuration
+    /// reload so a new config can immediately start its own issuance instead
+    /// of waiting for the previous config's ACME transaction to finish. The
+    /// abandoned task still completes and stores its certificate, which is
+    /// harmless.
+    pub async fn cancel_pending_issuance(&self) {
+        self.processing.write().await.clear();
     }
 
     /// Returns an already-issued certificate from the store's cache, if any.

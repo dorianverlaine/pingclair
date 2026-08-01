@@ -225,6 +225,24 @@ fn resolve_config_path(explicit: Option<&str>) -> String {
     "Pingclairfile".to_string()
 }
 
+/// 🚀 Collects the hostnames that need eager ACME issuance: `tls auto` sites
+/// that are not covered by the internal authority or manual certificates, are
+/// concretely named, and are not wildcards (which would need DNS-01).
+fn eager_issuance_domains(config: &pingclair_core::config::PingclairConfig) -> Vec<String> {
+    config
+        .servers
+        .iter()
+        .filter(|server| {
+            server
+                .tls
+                .as_ref()
+                .is_some_and(|tls| tls.auto && !tls.internal && tls.cert.is_none())
+        })
+        .filter_map(|server| server.name.clone())
+        .filter(|name| !name.is_empty() && name != "_" && !name.contains('*'))
+        .collect()
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Run the server with a configuration file
@@ -817,8 +835,24 @@ fn run_server(
         .unwrap_or_else(|_| "/var/lib/pingclair/certs".to_string());
     let tls_store_path = std::path::Path::new(&tls_store_path_str);
     if !tls_store_path.exists() {
-        let _ = std::fs::create_dir_all(tls_store_path);
+        std::fs::create_dir_all(tls_store_path).map_err(|error| {
+            anyhow::anyhow!(
+                "🔐 TLS store {tls_store_path_str} cannot be created: {error} \
+                 (set PINGCLAIR_TLS_STORE to a writable, persistent directory)"
+            )
+        })?;
     }
+    // 💾 Probe writeability before any ACME or internal-CA work: a store that
+    // cannot persist certificates must fail startup with a clear message, not
+    // a confusing mid-flight error later.
+    let probe = tls_store_path.join(format!(".write-probe-{}", std::process::id()));
+    std::fs::write(&probe, b"ok").map_err(|error| {
+        anyhow::anyhow!(
+            "🔐 TLS store {tls_store_path_str} is not writable: {error} \
+             (set PINGCLAIR_TLS_STORE to a writable, persistent directory)"
+        )
+    })?;
+    let _ = std::fs::remove_file(&probe);
 
     let mut auto_https_config = pingclair_tls::auto_https::AutoHttpsConfig::default();
     if let Some(email) = &config.global.email {
@@ -893,6 +927,18 @@ fn run_server(
         tls_manager.add_manual_cert(name, cert_pem, key_pem);
         tracing::info!("🔐 Loaded manual TLS certificate for {}", name);
     }
+
+    // 🚀 Kick off the background certificate machinery: renewals plus eager
+    // issuance for every `tls auto` hostname. Domains already covered by
+    // internal or manual certificates are excluded — those paths are eager
+    // already, and ACME must never race a local authority.
+    let eager_domains = eager_issuance_domains(&config);
+    // 🚀 The background tasks need a Tokio reactor; the dedicated background
+    // runtime already exists for H3 and SIGHUP work.
+    let tls_manager_for_tasks = tls_manager.clone();
+    bg_handle.spawn(async move {
+        tls_manager_for_tasks.start_background_issuance(eager_domains);
+    });
 
     // Group servers by listen address
     let port_proxies = std::collections::HashMap::new();
@@ -1264,6 +1310,10 @@ fn run_server(
             while let Some(()) = stream.recv().await {
                 let reload_start = std::time::Instant::now();
                 tracing::info!("🔔 Received SIGHUP, reloading configuration from: {}", config_path);
+                // 🛑 Let the new configuration start its own ACME transactions
+                // immediately instead of waiting on the old config's in-flight
+                // issuance markers.
+                tls_manager.cancel_pending_issuance().await;
 
                 // Step 1: Validate and load new configuration
                 tracing::info!("📋 Step 1/3: Validating configuration...");
@@ -1401,6 +1451,60 @@ mod tests {
     fn verify_cli() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    /// 🚀 Only `tls auto` hostnames qualify for eager issuance; internal,
+    /// manual and wildcard sites are excluded.
+    #[test]
+    fn eager_issuance_domains_excludes_internal_manual_and_wildcards() {
+        use pingclair_core::config::{ServerConfig, TlsConfig};
+
+        let auto = ServerConfig {
+            name: Some("auto.example".to_string()),
+            tls: Some(TlsConfig {
+                auto: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let internal = ServerConfig {
+            name: Some("internal.example".to_string()),
+            tls: Some(TlsConfig {
+                auto: true,
+                internal: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let manual = ServerConfig {
+            name: Some("manual.example".to_string()),
+            tls: Some(TlsConfig {
+                auto: true,
+                cert: Some("/certs/fullchain.pem".to_string()),
+                key: Some("/certs/key.pem".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let wildcard = ServerConfig {
+            name: Some("*.example.com".to_string()),
+            tls: Some(TlsConfig {
+                auto: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let plain = ServerConfig {
+            name: Some("plain.example".to_string()),
+            tls: None,
+            ..Default::default()
+        };
+
+        let config = pingclair_core::config::PingclairConfig {
+            servers: vec![auto, internal, manual, wildcard, plain],
+            ..Default::default()
+        };
+        assert_eq!(eager_issuance_domains(&config), vec!["auto.example"]);
     }
 
     #[test]
