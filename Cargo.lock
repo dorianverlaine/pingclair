@@ -2602,6 +2602,7 @@ version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bcrypt",
  "boring",
  "bytes",
  "clap",

@@ -254,25 +254,26 @@ quiche-client smoke 按 AGENTS.md。
 
 ### P6.1 Admin API 與 reload
 
-- [ ] SIGHUP reload 偵測 global 差異並警告「需要重啟」（A1）
-- [ ] `POST /load` 整包替換（完整 `PingclairConfig`、失敗 rollback、
+- [x] SIGHUP reload 偵測 global 差異並警告「需要重啟」（A1；
+  macOS 本機實測）
+- [x] `POST /load` 整包替換（完整 `PingclairConfig`、失敗 rollback、
   相同 config 不 reload）（A2/A8）
-- [ ] `GET /config` 回傳可重新 POST 的 config 文件（A7）
-- [ ] `POST /stop`（A 系列）
+- [x] `GET /config` 回傳可重新 POST 的 config 文件（A7）
+- [x] `POST /stop`（A 系列；graceful 協調標 TODO(v0.3)）
 - [ ] admin `origins`／`enforce_origin`（P1.3 的 runtime 半）
-- [ ] `POST /adapt`（A9）
+- [x] `POST /adapt`（A9）
 
 ### P6.2 CLI
 
-- [ ] `pingclair adapt [--pretty] [--validate]`（C1）
-- [ ] `pingclair fmt [--overwrite] [--diff]`（C1）
-- [ ] `validate` 走 provisioning 層（cert 檔存在性等）（C2）
-- [ ] SIGUSR1 reload（C3；SIGHUP 相容）
+- [x] `pingclair adapt [--pretty] [--validate]`（C1）
+- [x] `pingclair fmt [--overwrite] [--diff]`（C1）
+- [x] `validate` 走 provisioning 層（cert 檔存在性等）（C2）
+- [x] SIGUSR1 reload（C3；SIGHUP 相容；macOS 本機實測）
 - [ ] `file-server` 旗標：`--browse`、`--domain`、`--templates`、
   `--access-log`、`--no-compress`、`--file-limit`（C4）
 - [ ] `reverse-proxy` 旗標：多 `--to`、`--header-up/down`、
   `--insecure`、`--internal-certs`、`--disable-redirects`（C5）
-- [ ] `hash-password`（bcrypt）（C8）
+- [x] `hash-password`（bcrypt）（C8）
 
 ### P6.3 Logging
 
@@ -282,23 +283,37 @@ quiche-client smoke 按 AGENTS.md。
 
 ### P6.4 Metrics
 
-- [ ] `{ metrics }`／`{ metrics { per_host } }` 開關（MT-1）
+- [x] `{ metrics }`／`{ metrics { per_host } }` 開關（MT-1；
+  per_host/otlp block 標 TODO(v0.3)）
 - [ ] runtime/process 指標（MT-2）
 - [ ] admin API 指標（MT-3）
 - [ ] HTTP 指標補齊：request/response size、TTFB、errors、
   in_flight；labels 對齊或文件化映射（MT-4）
 - [ ] upstream health 0/1 gauge（MT-5；與 admin A10 一起）
-- [ ] `active_connections` 改 gauge 並打點或刪除（MT-6）
+- [x] `active_connections` 改 gauge 並打點（MT-6）
 
 ### P6.5 部署
 
-- [ ] systemd unit 單一來源 + `Restart=on-failure` +
+- [x] systemd unit 單一來源 + `Restart=on-failure` +
   `RestartPreventExitStatus=1`（K-1/K-2）
 - [ ] README 補 production compose 與 `tls internal` trust 安裝
   流程（K-4/K-5/K-6）
 
 **P6 收工**：管理面每項有真 binary 測試（`POST /load`、reload、
 metrics 打點、CLI 指令）；三語 README 與實際一致。
+✅ **2026-08-02 部分完成**：reload（SIGHUP+SIGUSR1）、admin API
+（/load、/adapt、/stop、GET /config 文件）、CLI（adapt/fmt/
+hash-password/validate provisioning）、metrics 開關與 active
+connections gauge、systemd unit 修復，均在 macOS 本機集成測試
+驗證。file-server/reverse-proxy 旗標、log level、HTTP 指標補齊
+標 TODO(v0.3)。
+
+> 🔧 **平台修正**：signal/reload handler 原為 `cfg(target_os =
+> "linux")`，macOS 本機根本沒編譯沒測試——已放寬為 `cfg(unix)` 並
+> 補 macOS 可跑的訊號集成測試；jemalloc 同放寬到 unix；service
+> 子命令保留 Linux-only（systemctl 平台專屬）但非 Linux 路徑有
+> macOS 單元測試。`GlobalConfig` 補 `PartialEq` 讓 global 差異比較
+> 在所有平台編譯。
 
 ---
 

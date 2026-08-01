@@ -229,6 +229,25 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                         AdapterError::InvalidArgument("https_port".into(), value.to_string())
                     })?);
                 }
+                "metrics" => {
+                    // 📊 `metrics` is a bare toggle; the block form
+                    // (`per_host`, `otlp`) is deferred.
+                    if sub.block.is_some() {
+                        // TODO(v0.3): implement metrics { per_host; otlp }.
+                        return Err(AdapterError::UnsupportedFeature(
+                            "metrics block".into(),
+                            "metrics per_host/otlp options are not implemented yet".into(),
+                        ));
+                    }
+                    if !sub.args.is_empty() {
+                        return Err(AdapterError::ArgumentCount(
+                            "metrics".into(),
+                            0,
+                            sub.args.len(),
+                        ));
+                    }
+                    global.metrics = Some(true);
+                }
                 "auto_https" => {
                     let arg = sub
                         .args
@@ -369,7 +388,6 @@ fn is_known_caddy_global_option(name: &str) -> bool {
             | "log"
             | "grace_period"
             | "shutdown_delay"
-            | "metrics"
             | "default_sni"
             | "fallback_sni"
             | "local_certs"

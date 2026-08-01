@@ -129,15 +129,15 @@
 
 | 項 | 需求 | 級別 |
 |---|---|---|
-| API-1 | SIGHUP reload 偵測並警告 global 差異（A1，最便宜止血） | 🔴 |
-| API-2 | `POST /load` 整包替換（完整 `PingclairConfig`，失敗 rollback、相同 config 不 reload）（A2/A8） | 🔴 |
-| API-3 | `GET /config` 回傳可重新 POST 的 config 文件（A7） | 🟠 |
-| API-4 | `POST /stop`（A 系列） | 🟠 |
+| API-1 | SIGHUP reload 偵測並警告 global 差異（A1） ✅ P6 已修（macOS 實測） | 🔴 |
+| API-2 | `POST /load` 整包替換（完整 `PingclairConfig`，失敗 rollback、相同 config 不 reload）（A2/A8） ✅ P6 已修 | 🔴 |
+| API-3 | `GET /config` 回傳可重新 POST 的 config 文件（A7） ✅ P6 已修 | 🟠 |
+| API-4 | `POST /stop`（A 系列） ✅ P6 已修（graceful 協調待 v0.3） | 🟠 |
 | API-5 | config path traversal（GET/POST/PUT/PATCH/DELETE `/config/<path>`、陣列 `/...` 展開）（A3） | 🟡（v0.3） |
 | API-6 | `@id` 支援（A4） | 🟡（v0.3） |
 | API-7 | Etag／If-Match 樂觀並行（A11） | 🟡（v0.3） |
 | API-8 | config persistence＋`--resume`（A5、C6） | 🟡（v0.3） |
-| API-9 | `POST /adapt`（A9） | 🟡 |
+| API-9 | `POST /adapt`（A9） ✅ P6 已修 | 🟡 |
 | API-10 | `GET /reverse_proxy/upstreams`（A10，BackendHealth 快照） | 🟡 |
 | API-11 | `GET /pki/ca/<id>`（A 系列） | 🟡（v0.3） |
 | API-12 | admin 預設值／origins 保護與 README 一致（A6、G-2） | 🟠 |
@@ -146,13 +146,13 @@
 
 | 項 | 需求 | 級別 |
 |---|---|---|
-| CLI-1 | `pingclair adapt [--pretty] [--validate]`（C1） | 🔴 |
-| CLI-2 | `pingclair fmt [--overwrite] [--diff]`（C1） | 🔴 |
-| CLI-3 | `validate` 走 provisioning 層（cert 檔存在性、upstream TLS 素材）（C2） | 🔴 |
-| CLI-4 | SIGUSR1 reload（C3；SIGHUP 相容保留） | 🟠 |
+| CLI-1 | `pingclair adapt [--pretty] [--validate]`（C1） ✅ P6 已修 | 🔴 |
+| CLI-2 | `pingclair fmt [--overwrite] [--diff]`（C1） ✅ P6 已修 | 🔴 |
+| CLI-3 | `validate` 走 provisioning 層（cert 檔存在性、upstream TLS 素材）（C2） ✅ P6 已修（cert 存在性；upstream 素材待 v0.3） | 🔴 |
+| CLI-4 | SIGUSR1 reload（C3；SIGHUP 相容保留） ✅ P6 已修（macOS 實測） | 🟠 |
 | CLI-5 | `file-server` 旗標：`--browse`、`--domain`、`--templates`、`--access-log`、`--no-compress`、`--file-limit`（C4） | 🟠 |
 | CLI-6 | `reverse-proxy` 旗標：多 `--to`、`--header-up/down`、`--insecure`、`--internal-certs`、`--disable-redirects`（C5） | 🟠 |
-| CLI-7 | `hash-password`（bcrypt；C8） | 🟡 |
+| CLI-7 | `hash-password`（bcrypt；C8） ✅ P6 已修 | 🟡 |
 | CLI-8 | `run --watch`／`--pidfile`／`--envfile`（C6） | 🟡 |
 | CLI-9 | `reload`／`start`／`stop` 子命令（配合 API-2/API-4） | 🟡（v0.3） |
 | CLI-10 | exit code 語意文件化（C8） | 🟡 |
@@ -172,20 +172,20 @@
 
 | 項 | 需求 | 級別 |
 |---|---|---|
-| MT-1 | `{ metrics }`／`{ metrics { per_host ... } }` global option；預設關閉或文件化恆開 | 🟠 |
+| MT-1 | `{ metrics }`／`{ metrics { per_host ... } }` global option；預設關閉或文件化恆開 ✅ P6 已修（per_host 標 TODO v0.3） | 🟠 |
 | MT-2 | runtime/process 指標（`go_*`/`process_*` 對應物） | 🟠 |
 | MT-3 | admin API 指標（request/error counter per endpoint） | 🟠 |
 | MT-4 | HTTP 指標補齊：request/response size、TTFB、errors、in_flight；labels 對齊 Caddy（server/handler/code/method）或文件化映射 | 🟠 |
 | MT-5 | `upstream_healthy` 0/1 gauge（接 `BackendHealth`，與 API-10 同源） | 🟠 |
-| MT-6 | `active_connections` 改 gauge 並打點，或刪除 | 🟡 |
+| MT-6 | `active_connections` 改 gauge 並打點，或刪除 ✅ P6 已修 | 🟡 |
 | MT-7 | OpenMetrics 協商；OTLP push（v0.3） | 🟡 |
 
 ## 10b. 服務管理與部署（來源：KEEP_RUNNING）
 
 | 項 | 需求 | 級別 |
 |---|---|---|
-| K-1 | systemd unit：`Restart=on-failure`＋`RestartPreventExitStatus=1`（config 壞不無限重啟） | 🟠 |
-| K-2 | 兩份 unit（scripts/ vs deployment/）合併為單一來源 | 🟠 |
+| K-1 | systemd unit：`Restart=on-failure`＋`RestartPreventExitStatus=1`（config 壞不無限重啟） ✅ P6 已修 | 🟠 |
+| K-2 | 兩份 unit（scripts/ vs deployment/）合併為單一來源 ✅ P6 已修（canonical 標 scripts/） | 🟠 |
 | K-3 | API 工作流 service variant（配 `--resume`，API-8 一起） | 🟡 |
 | K-4 | production Docker Compose 範例（80/443/443-udp、TLS store volume） | 🟡 |
 | K-5 | 容器執行 `pingclair run` 的完整 README 範例（root Dockerfile CMD 只是 demo） | 🟡 |

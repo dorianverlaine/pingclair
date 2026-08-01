@@ -20,7 +20,11 @@ ExecReload=/bin/kill -HUP $MAINPID
 WorkingDirectory=/var/lib/pingclair
 
 # Restart Policy
-Restart=always
+# 🛡️ Exit code 1 means failed startup (bad config, missing cert files, ...).
+# Do not restart automatically in that case — the process will only fail
+# again; an operator must fix the configuration first.
+Restart=on-failure
+RestartPreventExitStatus=1
 RestartSec=5s
 
 # Performance

@@ -21,7 +21,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod resource_guard;
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -243,6 +243,97 @@ fn eager_issuance_domains(config: &pingclair_core::config::PingclairConfig) -> V
         .collect()
 }
 
+/// ✍️ Renders parsed directives back to canonical Pingclairfile text: two
+/// spaces per block level, one directive per line, arguments re-quoted only
+/// when whitespace or a comment marker demands it.
+fn format_directives(directives: &[pingclair_config::parser::caddy_ast::Directive]) -> String {
+    fn quote_argument(argument: &str) -> String {
+        if argument.contains([' ', '\t', '#', '"']) {
+            format!("\"{}\"", argument.replace('"', "\\\""))
+        } else {
+            argument.to_string()
+        }
+    }
+
+    fn format_block(
+        directives: &[pingclair_config::parser::caddy_ast::Directive],
+        indent: usize,
+        out: &mut String,
+    ) {
+        let padding = " ".repeat(indent);
+        for directive in directives {
+            out.push_str(&padding);
+            out.push_str(&directive.name);
+            for argument in &directive.args {
+                out.push(' ');
+                out.push_str(&quote_argument(argument));
+            }
+            if let Some(block) = &directive.block {
+                out.push_str(" {\n");
+                format_block(&block.directives, indent + 2, out);
+                out.push_str(&padding);
+                out.push_str("}\n");
+            } else {
+                out.push('\n');
+            }
+        }
+    }
+
+    let mut out = String::new();
+    format_block(directives, 0, &mut out);
+    out
+}
+
+/// 🛠️ Manages the systemd unit (Linux) or explains that service management is
+/// unavailable (other platforms). systemctl itself is Linux-only, so the
+/// non-Linux branch is the one local macOS tests exercise.
+fn manage_system_service(action: ServiceAction) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let cmd = match action {
+            ServiceAction::Start => "start",
+            ServiceAction::Stop => "stop",
+            ServiceAction::Restart => "restart",
+            ServiceAction::Reload => "reload",
+            ServiceAction::Status => "status",
+        };
+
+        tracing::info!("🛠️ Managing service: {}", cmd);
+        let status = std::process::Command::new("systemctl")
+            .arg(cmd)
+            .arg("pingclair")
+            .status();
+
+        match status {
+            Ok(s) if s.success() => {
+                let past_tense = match action {
+                    ServiceAction::Start => "started",
+                    ServiceAction::Stop => "stopped",
+                    ServiceAction::Restart => "restarted",
+                    ServiceAction::Reload => "reloaded",
+                    ServiceAction::Status => "queried",
+                };
+                println!("✅ Service {past_tense} successfully");
+            }
+            Ok(s) => {
+                anyhow::bail!("❌ Failed to {cmd} service (exit code: {s})");
+            }
+            Err(e) => {
+                anyhow::bail!("❌ Failed to execute systemctl: {e}");
+            }
+        }
+        return Ok(());
+    }
+
+    // 🚫 macOS and other non-Linux platforms have no systemctl; the systemd
+    // unit shipped in scripts/ is the deployment contract instead.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = action;
+        anyhow::bail!("❌ Service management is only supported on Linux (systemd).");
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Run the server with a configuration file
@@ -281,6 +372,45 @@ enum Commands {
         /// Path to the configuration file (defaults to Pingclairfile or
         /// Caddyfile in the current directory)
         config: Option<String>,
+    },
+
+    /// Adapt a Pingclairfile to JSON and print it, like `caddy adapt`
+    Adapt {
+        /// Path to the configuration file (defaults to Pingclairfile or
+        /// Caddyfile in the current directory)
+        #[arg(short, long)]
+        config: Option<String>,
+
+        /// Format the JSON output with indentation
+        #[arg(short, long)]
+        pretty: bool,
+
+        /// Validate the adapted configuration (certificate files etc.)
+        #[arg(long)]
+        validate: bool,
+    },
+
+    /// Format a Pingclairfile and print the result, like `caddy fmt`
+    Fmt {
+        /// Path to the configuration file (`-` reads stdin)
+        #[arg(default_value = "Pingclairfile")]
+        path: String,
+
+        /// Overwrite the input file instead of printing
+        #[arg(short, long)]
+        overwrite: bool,
+
+        /// Print a visual diff instead of the formatted output
+        #[arg(short, long)]
+        diff: bool,
+    },
+
+    /// Hash a password for basic_auth (bcrypt)
+    #[command(name = "hash-password")]
+    HashPassword {
+        /// Password to hash; read from stdin if omitted
+        #[arg(short, long)]
+        plaintext: Option<String>,
     },
 
     /// Show version information
@@ -496,7 +626,23 @@ fn main() -> anyhow::Result<()> {
             };
 
             match result {
-                Ok(_) => {
+                Ok(compiled) => {
+                    // 🛡️ Provisioning checks: files the server will need at
+                    // startup must exist now, not fail mid-flight later.
+                    for server in &compiled.servers {
+                        let Some(tls) = &server.tls else {
+                            continue;
+                        };
+                        let (Some(cert), Some(key)) = (&tls.cert, &tls.key) else {
+                            continue;
+                        };
+                        for (label, path) in [("certificate", cert), ("key", key)] {
+                            if !std::path::Path::new(path).is_file() {
+                                eprintln!("❌ TLS {label} file does not exist: {path}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
                     println!("✅ Configuration '{config}' is valid!");
                 }
                 Err(e) => {
@@ -506,60 +652,102 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        Commands::Adapt {
+            config,
+            pretty,
+            validate,
+        } => {
+            let config_path = resolve_config_path(config.as_deref());
+            let config = if std::path::Path::new(&config_path).is_dir() {
+                pingclair_config::compile_directory(&config_path)
+            } else {
+                pingclair_config::compile_file(&config_path)
+            }
+            .map_err(|error| anyhow::anyhow!("❌ Failed to adapt {config_path}: {error}"))?;
+            if validate {
+                pingclair_config::compiler::validate_config(&config)
+                    .map_err(|error| anyhow::anyhow!("❌ Validation failed: {error}"))?;
+            }
+            let json = if pretty {
+                serde_json::to_string_pretty(&config)
+            } else {
+                serde_json::to_string(&config)
+            }
+            .map_err(|error| anyhow::anyhow!("❌ Failed to serialize config: {error}"))?;
+            println!("{json}");
+        }
+
+        Commands::Fmt {
+            path,
+            overwrite,
+            diff,
+        } => {
+            let source = if path == "-" {
+                use std::io::Read;
+                let mut buffer = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buffer)
+                    .map_err(|error| anyhow::anyhow!("❌ Failed to read stdin: {error}"))?;
+                buffer
+            } else {
+                std::fs::read_to_string(&path)
+                    .map_err(|error| anyhow::anyhow!("❌ Failed to read {path}: {error}"))?
+            };
+            let directives = pingclair_config::parser::parse(&source)
+                .map_err(|error| anyhow::anyhow!("❌ Failed to parse {path}: {error}"))?;
+            let formatted = format_directives(&directives);
+            if overwrite {
+                if path == "-" {
+                    anyhow::bail!("❌ --overwrite cannot be used with stdin");
+                }
+                std::fs::write(&path, formatted)
+                    .map_err(|error| anyhow::anyhow!("❌ Failed to write {path}: {error}"))?;
+            } else if diff {
+                for (left, right) in source.lines().zip(formatted.lines()) {
+                    if left != right {
+                        println!("-{left}");
+                        println!("+{right}");
+                    }
+                }
+            } else {
+                print!("{formatted}");
+            }
+        }
+
+        Commands::HashPassword { plaintext } => {
+            use std::io::IsTerminal;
+            let password = match plaintext {
+                Some(password) => password,
+                None if std::io::stdin().is_terminal() => {
+                    eprint!("Password: ");
+                    use std::io::Read;
+                    let mut buffer = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut buffer)
+                        .map_err(|error| anyhow::anyhow!("❌ Failed to read password: {error}"))?;
+                    buffer.trim_end_matches(['\r', '\n']).to_string()
+                }
+                None => {
+                    use std::io::Read;
+                    let mut buffer = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut buffer)
+                        .map_err(|error| anyhow::anyhow!("❌ Failed to read password: {error}"))?;
+                    buffer.trim_end_matches(['\r', '\n']).to_string()
+                }
+            };
+            let cost = pingclair_core::server::MAX_BCRYPT_COST;
+            let hash = bcrypt::hash(password, cost)
+                .map_err(|error| anyhow::anyhow!("❌ Failed to hash password: {error}"))?;
+            println!("{hash}");
+        }
+
         Commands::Version => {
             println!("Pingclair v{}", env!("CARGO_PKG_VERSION"));
             println!("Built with ❤️ in Rust");
         }
 
-        Commands::Service { action } => {
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = action;
-                eprintln!("❌ Service management is only supported on Linux.");
-            }
-
-            #[cfg(target_os = "linux")]
-            {
-                let cmd = match action {
-                    ServiceAction::Start => "start",
-                    ServiceAction::Stop => "stop",
-                    ServiceAction::Restart => "restart",
-                    ServiceAction::Reload => "reload",
-                    ServiceAction::Status => "status",
-                };
-
-                tracing::info!("🛠️ Managing service: {}", cmd);
-                let status = std::process::Command::new("systemctl")
-                    .arg(cmd)
-                    .arg("pingclair")
-                    .status();
-
-                match status {
-                    Ok(s) if s.success() => {
-                        let past_tense = match action {
-                            ServiceAction::Start => "started",
-                            ServiceAction::Stop => "stopped",
-                            ServiceAction::Restart => "restarted",
-                            ServiceAction::Reload => "reloaded",
-                            ServiceAction::Status => "queried",
-                        };
-                        println!("✅ Service {past_tense} successfully");
-                    }
-                    Ok(s) => {
-                        eprintln!("❌ Failed to {cmd} service (exit code: {s})");
-                    }
-                    Err(e) => {
-                        eprintln!("❌ Failed to execute systemctl: {e}");
-                    }
-                }
-            }
-
-            #[cfg(not(target_os = "linux"))]
-            {
-                eprintln!("❌ Service management is only supported on Linux.");
-                std::process::exit(1);
-            }
-        }
+        Commands::Service { action } => manage_system_service(action)?,
     }
 
     Ok(())
@@ -729,8 +917,6 @@ fn run_server(
     config_path: String,
     config: pingclair_core::config::PingclairConfig,
 ) -> anyhow::Result<()> {
-    #[cfg(not(target_os = "linux"))]
-    let _ = config_path;
     // Create a background Tokio runtime for async tasks (HTTP/3, SIGHUP, etc.)
     // We do this in a separate thread to avoid conflicts with Pingora's runtime.
     let bg_runtime = tokio::runtime::Runtime::new().expect("Failed to create background runtime");
@@ -748,9 +934,12 @@ fn run_server(
     tracing::info!("📄 Loaded configuration from: {}", config_path);
     tracing::info!("🔧 Configured {} server(s)", config.servers.len());
 
-    // Register Prometheus metrics with the global registry so the admin
-    // /metrics endpoint has data to expose.
-    pingclair_proxy::metrics::init();
+    // 📊 Register Prometheus metrics with the global registry so the admin
+    // /metrics endpoint has data to expose. `{ metrics }` can turn collection
+    // on explicitly; it stays on by default for existing deployments.
+    if config.global.metrics {
+        pingclair_proxy::metrics::init();
+    }
 
     if config.global.auto_https != pingclair_core::config::AutoHttpsMode::Off {
         tracing::info!("🔐 Auto HTTPS: enabled");
@@ -1287,29 +1476,46 @@ fn run_server(
     }
 
     // ========================================
-    // 🔔 Signal Handling for SIGHUP (Reload)
+    // 🔔 Signal Handling for SIGHUP/SIGUSR1 (Reload)
     // ========================================
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     if !config_path.is_empty() {
         let config_path = config_path.clone();
         let port_proxies = port_proxies.clone();
+        // 🧭 Snapshot the global settings the process started with, so a
+        // reload that changes them can say so instead of silently ignoring
+        // the difference.
+        let original_global = config.global.clone();
 
         bg_handle.spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
 
-            let mut stream = match signal(SignalKind::hangup()) {
+            let mut hup_stream = match signal(SignalKind::hangup()) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("❌ Failed to create SIGHUP listener: {}", e);
                     return;
                 }
             };
+            // 🚦 SIGUSR1 is Caddy's reload signal; keep SIGHUP working for
+            // deployments that already use it.
+            let mut usr1_stream = match signal(SignalKind::user_defined1()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("❌ Failed to create SIGUSR1 listener: {}", e);
+                    return;
+                }
+            };
 
-            tracing::info!("📡 SIGHUP listener active (Config: {})", config_path);
+            tracing::info!("📡 Reload listeners active (SIGHUP/SIGUSR1, Config: {})", config_path);
 
-            while let Some(()) = stream.recv().await {
+            loop {
+                let signal_name = tokio::select! {
+                    _ = hup_stream.recv() => "SIGHUP",
+                    _ = usr1_stream.recv() => "SIGUSR1",
+                };
                 let reload_start = std::time::Instant::now();
-                tracing::info!("🔔 Received SIGHUP, reloading configuration from: {}", config_path);
+                tracing::info!("🔔 Received {signal_name}, reloading configuration from: {}", config_path);
                 // 🛑 Let the new configuration start its own ACME transactions
                 // immediately instead of waiting on the old config's in-flight
                 // issuance markers.
@@ -1325,6 +1531,20 @@ fn run_server(
 
                 match result {
                     Ok(new_config) => {
+                        // 🚩 Global options (email, auto_https, trusted
+                        // proxies, ports, ...) only take effect at startup.
+                        // Detecting the difference here keeps a reload from
+                        // looking successful while the operator's global
+                        // change silently never happened.
+                        if new_config.global != original_global {
+                            tracing::warn!(
+                                "🚫 Reloaded configuration changes global options; \
+                                 global settings only take effect after a restart \
+                                 (old={:?}, new={:?})",
+                                original_global,
+                                new_config.global
+                            );
+                        }
                         tracing::info!("✅ Step 1/3: Configuration validation successful");
                         tracing::info!("📋 Step 2/3: Preparing configuration update...");
 
@@ -1451,6 +1671,20 @@ mod tests {
     fn verify_cli() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    /// 🚫 On non-Linux platforms (including local macOS), the service
+    /// subcommand must fail with a clear message instead of pretending to run
+    /// systemctl.
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn service_management_reports_linux_only() {
+        let error = manage_system_service(ServiceAction::Start)
+            .expect_err("service management must fail outside Linux");
+        assert!(
+            error.to_string().contains("Linux"),
+            "the message must explain the platform limit: {error}"
+        );
     }
 
     /// 🚀 Only `tls auto` hostnames qualify for eager issuance; internal,

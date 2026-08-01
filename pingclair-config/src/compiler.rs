@@ -70,6 +70,9 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
     if let Some(port) = global.https_port {
         config.global.https_port = port;
     }
+    if let Some(enabled) = global.metrics {
+        config.global.metrics = enabled;
+    }
 
     // Set global auto-HTTPS mode
     if let Some(mode) = global.auto_https {

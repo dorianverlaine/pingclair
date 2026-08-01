@@ -49,6 +49,8 @@ pub struct GlobalBlock {
     pub http_port: Option<u16>,
     /// 🔐 HTTPS port override (Caddy `https_port`).
     pub https_port: Option<u16>,
+    /// 📊 Metrics toggle (Caddy `metrics`).
+    pub metrics: Option<bool>,
     pub auto_https: Option<AutoHttpsMode>,
     pub admin: Option<AdminDirective>,
     /// 🛡️ Proxy IP or CIDR ranges allowed to supply client identity headers.

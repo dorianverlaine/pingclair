@@ -1,6 +1,8 @@
 [Unit]
 Description=Pingclair Modern Web Server
 After=network.target
+# 🧭 Deployment copy. The canonical unit lives at scripts/pingclair.service;
+# keep this in sync or delete it.
 
 [Service]
 Type=simple
@@ -8,7 +10,8 @@ User=pingclair
 Group=pingclair
 WorkingDirectory=/var/lib/pingclair
 ExecStart=/usr/local/bin/pingclair run /etc/pingclair/Pingclairfile
-Restart=always
+Restart=on-failure
+RestartPreventExitStatus=1
 RestartSec=5
 LimitNOFILE=65535
 
