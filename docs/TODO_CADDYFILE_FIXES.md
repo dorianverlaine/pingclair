@@ -226,14 +226,14 @@ FX-A ──> FX-B ──> FX-C
 - [x] FX-F1（F-05/F-15/F-27，P2/P3）：`respond` 預設
       `Content-Type: text/plain; charset=utf-8`；file_server 的 text/*
       補 charset；本機壓縮回應補 `Vary: Accept-Encoding`。
-- [ ] FX-F2（F-06，P2）：listen 雙棧（`:port` 同時 IPv4+IPv6，
-      對齊 Caddy）。
+- [x] FX-F2（F-06，P2）：wildcard listen 改 `[::]:port`（IPv4+IPv6
+      雙棧，對齊 Caddy）；香港機 IPv4/IPv6 同時 200。
 - [x] FX-F3（F-16，P3）：`file-server` 預設 `:80`（reverse-proxy 預設
       `localhost:443` 已在 FX-D）。
-- [ ] FX-F4（F-17，P3）：`--file-limit` 語意對齊（Caddy：browse 讀取
-      目錄數上限，預設 10000）。
-- [ ] FX-F5（F-29，P3）：`hash-password` 支援 `--algorithm argon2id`
-      （time/memory/threads/keylen）。
+- [x] FX-F4（F-17，P3）：`--file-limit` 截斷 browse listing（香港機
+      limit=2 → 2 links）。
+- [x] FX-F5（F-29，P3）：`hash-password --algorithm argon2id`
+      （time/memory/threads/keylen；輸出 PHC `$argon2id$...`）。
 - [x] FX-F6（F-07，P1）：TLS store 預設改使用者資料目錄
       （Linux `~/.local/share/pingclair`、macOS
       `~/Library/Application Support/pingclair`），
@@ -242,8 +242,7 @@ FX-A ──> FX-B ──> FX-C
 - [ ] FX-F8（fmt 引號，P3）：fmt 保留原始引號（與 Caddy 一致）。
 - [x] FX-F9（version，P3）：單行 `v<version>`。
 
-> 剩餘（續批次/v0.3）：F2（IPv6 雙棧 listen）、F4（`--file-limit`
-> 語意）、F5（argon2id）、F8（fmt 保留引號）。
+> 剩餘（v0.3）：F8（fmt 保留原始引號，需 lexer 保留 quoted token）。
 
 ---
 

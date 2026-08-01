@@ -486,7 +486,7 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                 } else {
                     Scheme::Http
                 },
-                host: "0.0.0.0".to_string(),
+                host: "[::]".to_string(),
                 port: Some(if is_https { 443 } else { 80 }),
                 proxy_protocol: false,
             });
@@ -505,7 +505,7 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
             // primary name; the rest are additional virtual hosts sharing the
             // same configuration (Caddy's `example.com, www.example.com`).
             if !parsed.hostname.is_empty()
-                && parsed.hostname != "0.0.0.0"
+                && parsed.hostname != "[::]"
                 && !server.names.contains(&parsed.hostname)
             {
                 server.names.push(parsed.hostname);
@@ -585,7 +585,7 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                         } else {
                             Scheme::Http
                         },
-                        host: "0.0.0.0".to_string(),
+                        host: "[::]".to_string(),
                         port: addr.split(':').next_back().and_then(|p| p.parse().ok()),
                         proxy_protocol,
                     });
@@ -1002,7 +1002,7 @@ fn parse_server_address(addr: &str) -> Option<ParsedAddress> {
     let (hostname, port, explicit_port) = if let Some(port) = rest.strip_prefix(':') {
         // :port
         let p = port.parse::<u16>().ok()?;
-        ("0.0.0.0".to_string(), Some(p), true)
+        ("[::]".to_string(), Some(p), true)
     } else if let Some(colon_pos) = rest.rfind(':') {
         // host:port
         let h = &rest[..colon_pos];
@@ -1027,7 +1027,7 @@ fn parse_server_address(addr: &str) -> Option<ParsedAddress> {
     let bind_host = if is_ip_literal(&hostname) {
         hostname.clone()
     } else {
-        "0.0.0.0".to_string()
+        "[::]".to_string()
     };
 
     Some(ParsedAddress {
@@ -3430,7 +3430,7 @@ mod global_tests {
         let server = &ast.servers[0].inner;
         assert_eq!(server.name, "bench.local");
         assert_eq!(server.listens.len(), 1);
-        assert_eq!(server.listens[0].host, "0.0.0.0");
+        assert_eq!(server.listens[0].host, "[::]");
         assert_eq!(server.listens[0].port, Some(8080));
     }
 
@@ -4247,11 +4247,11 @@ mod address_semantics_tests {
     #[test]
     fn explicit_schemes_still_create_listeners() {
         let https = first_server("https://example.com {\n    respond \"x\"\n}");
-        assert_eq!(https.listen, vec!["0.0.0.0:443".to_string()]);
+        assert_eq!(https.listen, vec!["[::]:443".to_string()]);
         assert!(https.tls.is_some(), "https:// must imply TLS");
 
         let http = first_server("http://example.com {\n    respond \"x\"\n}");
-        assert_eq!(http.listen, vec!["0.0.0.0:80".to_string()]);
+        assert_eq!(http.listen, vec!["[::]:80".to_string()]);
         assert!(http.tls.is_none(), "http:// must stay plaintext");
     }
 
@@ -4260,14 +4260,14 @@ mod address_semantics_tests {
         let server = first_server("example.com {\n    listen :80\n    tls auto\n}");
         assert_eq!(
             server.listen,
-            vec!["0.0.0.0:80".to_string()],
+            vec!["[::]:80".to_string()],
             "the explicit listener must appear exactly once"
         );
 
         let server = first_server("example.com {\n    listen :8443\n    tls auto\n}");
         assert_eq!(
             server.listen,
-            vec!["0.0.0.0:8443".to_string()],
+            vec!["[::]:8443".to_string()],
             "an explicit non-standard port must not gain an implicit :80"
         );
     }
@@ -4288,7 +4288,7 @@ mod address_semantics_tests {
     fn bare_https_port_implies_tls() {
         let server = first_server(":443 {\n    respond \"x\"\n}");
         assert_eq!(server.name.as_deref(), Some("_"));
-        assert_eq!(server.listen, vec!["0.0.0.0:443".to_string()]);
+        assert_eq!(server.listen, vec!["[::]:443".to_string()]);
         assert!(server.tls.is_some(), ":443 must imply TLS");
     }
 
@@ -4309,11 +4309,11 @@ mod address_semantics_tests {
     #[test]
     fn catch_all_schemes_get_the_conventional_listener() {
         let https = first_server("https:// {\n    respond \"x\"\n}");
-        assert_eq!(https.listen, vec!["0.0.0.0:443".to_string()]);
+        assert_eq!(https.listen, vec!["[::]:443".to_string()]);
         assert!(https.tls.is_some());
 
         let http = first_server("http:// {\n    respond \"x\"\n}");
-        assert_eq!(http.listen, vec!["0.0.0.0:80".to_string()]);
+        assert_eq!(http.listen, vec!["[::]:80".to_string()]);
         assert!(http.tls.is_none());
     }
 

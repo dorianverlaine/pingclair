@@ -177,7 +177,7 @@ mod tests {
         let config = compile(source).unwrap();
         assert_eq!(config.servers.len(), 1);
         assert_eq!(config.servers[0].name, Some("bench.local".to_string()));
-        assert_eq!(config.servers[0].listen, vec!["0.0.0.0:8080".to_string()]);
+        assert_eq!(config.servers[0].listen, vec!["[::]:8080".to_string()]);
     }
 
     #[test]
@@ -811,7 +811,7 @@ mod tests {
             config.global.trusted_proxies,
             ["127.0.0.1", "10.0.0.0/8", "2001:db8::/32"]
         );
-        assert_eq!(config.servers[0].proxy_protocol_listen, ["0.0.0.0:80"]);
+        assert_eq!(config.servers[0].proxy_protocol_listen, ["[::]:80"]);
     }
 
     #[test]
@@ -837,11 +837,11 @@ mod tests {
 
         // Verification
         let server = &config.servers[0];
-        assert!(server.listen.contains(&"0.0.0.0:80".to_string()));
-        assert!(server.listen.contains(&"0.0.0.0:8443".to_string()));
+        assert!(server.listen.contains(&"[::]:80".to_string()));
+        assert!(server.listen.contains(&"[::]:8443".to_string()));
         assert_eq!(
             server.proxy_protocol_listen,
-            ["0.0.0.0:8443"],
+            ["[::]:8443"],
             "only the declared listener may require the header"
         );
     }
@@ -874,7 +874,7 @@ mod tests {
         // A document written before this field existed loads as "no listener
         // requires the header" rather than failing.
         let legacy: PingclairConfig = serde_json::from_value(serde_json::json!({
-            "servers": [{ "listen": ["0.0.0.0:8443"], "routes": [] }]
+            "servers": [{ "listen": ["[::]:8443"], "routes": [] }]
         }))
         .expect("legacy document loads");
         assert!(legacy.servers[0].proxy_protocol_listen.is_empty());
@@ -1518,7 +1518,7 @@ mod tests {
         }
 
         let server = &config.servers[0];
-        assert_eq!(server.listen, ["0.0.0.0:6688"]);
+        assert_eq!(server.listen, ["[::]:6688"]);
         assert!(matches!(
             server.log.as_ref(),
             Some(log)
