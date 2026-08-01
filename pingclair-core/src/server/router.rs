@@ -180,9 +180,10 @@ impl Router {
         remote_ip: &str,
         protocol: &str,
     ) -> Option<&CompiledRoute> {
-        let candidates = self.match_path(path);
+        let normalized_path = Self::normalize_request_path(path);
+        let candidates = self.match_path(&normalized_path);
         let request = MatcherRequest {
-            path,
+            path: &normalized_path,
             method,
             headers,
             host,
@@ -239,7 +240,7 @@ impl Router {
             Matcher::Host(hosts) => hosts
                 .iter()
                 .any(|host| host.eq_ignore_ascii_case(request.host)),
-            Matcher::RemoteIp(ips) => ips.iter().any(|ip| request.remote_ip == ip),
+            Matcher::RemoteIp(ips) => Self::remote_ip_matches(ips, request.remote_ip),
             Matcher::Protocol(protocols) => protocols
                 .iter()
                 .any(|protocol| protocol.eq_ignore_ascii_case(request.protocol)),
@@ -310,14 +311,94 @@ impl Router {
         }
     }
 
+    /// 🌐 Matches the remote/client IP against exact literals and CIDR
+    /// ranges, as Caddy's `remote_ip`/`client_ip` matchers do.
+    fn remote_ip_matches(patterns: &[String], remote_ip: &str) -> bool {
+        let Ok(remote) = remote_ip.parse::<std::net::IpAddr>() else {
+            return false;
+        };
+        patterns.iter().any(|pattern| {
+            if let Ok(net) = pattern.parse::<ipnet::IpNet>() {
+                net.contains(&remote)
+            } else {
+                pattern.parse::<std::net::IpAddr>().ok() == Some(remote)
+            }
+        })
+    }
+
     /// Check if path matches a glob pattern
     fn path_matches(path: &str, pattern: &str) -> bool {
-        if let Some(prefix) = pattern.strip_suffix("/*") {
-            path.starts_with(prefix)
-        } else if let Some(prefix) = pattern.strip_suffix('*') {
-            path.starts_with(prefix)
-        } else {
-            path == pattern
+        Self::glob_match(pattern, path)
+    }
+
+    /// 🧭 Classic glob matching with `*` as a wildcard, compared
+    /// case-insensitively like Caddy. Matching is byte-based (ASCII case
+    /// folding) to stay allocation-free on the request hot path.
+    fn glob_match(pattern: &str, text: &str) -> bool {
+        let pattern = pattern.as_bytes();
+        let text = text.as_bytes();
+        let mut p = 0usize;
+        let mut t = 0usize;
+        let mut star_p: Option<usize> = None;
+        let mut star_t = 0usize;
+        let ascii_eq = |a: u8, b: u8| a.eq_ignore_ascii_case(&b);
+
+        while t < text.len() {
+            if p < pattern.len() && ascii_eq(pattern[p], text[t]) {
+                p += 1;
+                t += 1;
+            } else if p < pattern.len() && pattern[p] == b'*' {
+                star_p = Some(p);
+                star_t = t;
+                p += 1;
+            } else if let Some(sp) = star_p {
+                p = sp + 1;
+                star_t += 1;
+                t = star_t;
+            } else {
+                return false;
+            }
+        }
+        while p < pattern.len() && pattern[p] == b'*' {
+            p += 1;
+        }
+        p == pattern.len()
+    }
+
+    /// 🧹 Cleans a request path before matching: merges repeated slashes and
+    /// resolves `.`/`..` segments, mirroring Caddy's pre-match normalization.
+    /// The query string is preserved so query matchers still see it.
+    fn normalize_request_path(path: &str) -> String {
+        let (path, query) = match path.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (path, None),
+        };
+        let mut segments: Vec<&str> = Vec::new();
+        for segment in path.split('/') {
+            match segment {
+                "" | "." => {
+                    // 🧹 Empty segments come from repeated slashes; collapse
+                    // them unless this is the root's leading slash.
+                    if segments.is_empty() && path.starts_with('/') {
+                        segments.push("");
+                    }
+                }
+                ".." => {
+                    segments.pop();
+                }
+                other => segments.push(other),
+            }
+        }
+        if segments.is_empty() {
+            return query.map_or_else(|| "/".to_string(), |q| format!("/?{q}"));
+        }
+        let mut normalized = segments.join("/");
+        if !normalized.starts_with('/') {
+            normalized.insert(0, '/');
+        }
+        match query {
+            Some(query) => format!("{normalized}?{query}"),
+            None => normalized,
         }
     }
 
@@ -536,7 +617,7 @@ mod tests {
     /// config carrying a query condition silently matched every request.
     #[test]
     fn a_query_matcher_matches_only_matching_query_strings() {
-        use crate::config::{Matcher, MatcherCondition};
+        use crate::config::Matcher;
         let route = RouteConfig {
             path: "/*".to_string(),
             handler: HandlerConfig::Respond {
@@ -570,6 +651,198 @@ mod tests {
         assert!(
             matches("/?admin=1&admin=2"),
             "a repeated key matches when any value matches"
+        );
+    }
+
+    /// 🧭 Caddy's path globs support suffix, prefix, substring and mid-path
+    /// wildcards, not just the trailing `/*` form.
+    #[test]
+    fn path_globs_match_all_four_wildcard_positions() {
+        use crate::config::Matcher;
+        let route_for = |pattern: &str| RouteConfig {
+            path: "/*".to_string(),
+            handler: HandlerConfig::Respond {
+                status: 200,
+                body: None,
+                headers: HashMap::new(),
+            },
+            methods: None,
+            matcher: Some(Matcher::Path {
+                patterns: vec![pattern.to_string()],
+            }),
+        };
+        let headers = HeaderMap::new();
+
+        let suffix = Router::new(vec![route_for("*.css")]);
+        assert!(
+            suffix
+                .match_request(
+                    "/assets/site.css",
+                    "GET",
+                    &headers,
+                    "e.com",
+                    "10.0.0.1",
+                    "https"
+                )
+                .is_some()
+        );
+        assert!(
+            suffix
+                .match_request("/site.js", "GET", &headers, "e.com", "10.0.0.1", "https")
+                .is_none()
+        );
+
+        let prefix = Router::new(vec![route_for("/api/*")]);
+        assert!(
+            prefix
+                .match_request("/api/users", "GET", &headers, "e.com", "10.0.0.1", "https")
+                .is_some()
+        );
+
+        let contains = Router::new(vec![route_for("*/download/*")]);
+        assert!(
+            contains
+                .match_request(
+                    "/x/download/y",
+                    "GET",
+                    &headers,
+                    "e.com",
+                    "10.0.0.1",
+                    "https"
+                )
+                .is_some()
+        );
+
+        let middle = Router::new(vec![route_for("/accounts/*/info")]);
+        assert!(
+            middle
+                .match_request(
+                    "/accounts/42/info",
+                    "GET",
+                    &headers,
+                    "e.com",
+                    "10.0.0.1",
+                    "https"
+                )
+                .is_some()
+        );
+        assert!(
+            middle
+                .match_request(
+                    "/accounts/42/other",
+                    "GET",
+                    &headers,
+                    "e.com",
+                    "10.0.0.1",
+                    "https"
+                )
+                .is_none()
+        );
+    }
+
+    /// 🧹 Dot segments and repeated slashes are normalized before matching.
+    #[test]
+    fn path_matching_normalizes_dots_and_slashes() {
+        use crate::config::Matcher;
+        let route = RouteConfig {
+            path: "/*".to_string(),
+            handler: HandlerConfig::Respond {
+                status: 200,
+                body: None,
+                headers: HashMap::new(),
+            },
+            methods: None,
+            matcher: Some(Matcher::Path {
+                patterns: vec!["/admin/*".to_string()],
+            }),
+        };
+        let router = Router::new(vec![route]);
+        let headers = HeaderMap::new();
+
+        assert!(
+            router
+                .match_request(
+                    "/public/../admin/users",
+                    "GET",
+                    &headers,
+                    "e.com",
+                    "10.0.0.1",
+                    "https"
+                )
+                .is_some()
+        );
+        assert!(
+            router
+                .match_request(
+                    "//admin//users",
+                    "GET",
+                    &headers,
+                    "e.com",
+                    "10.0.0.1",
+                    "https"
+                )
+                .is_some()
+        );
+    }
+
+    /// 🌐 remote_ip accepts CIDR ranges, not just exact literals.
+    #[test]
+    fn remote_ip_matcher_accepts_cidr_ranges() {
+        use crate::config::Matcher;
+        let route = RouteConfig {
+            path: "/*".to_string(),
+            handler: HandlerConfig::Respond {
+                status: 200,
+                body: None,
+                headers: HashMap::new(),
+            },
+            methods: None,
+            matcher: Some(Matcher::RemoteIp(vec!["10.0.0.0/8".to_string()])),
+        };
+        let router = Router::new(vec![route]);
+        let headers = HeaderMap::new();
+
+        assert!(
+            router
+                .match_request("/", "GET", &headers, "e.com", "10.1.2.3", "https")
+                .is_some()
+        );
+        assert!(
+            router
+                .match_request("/", "GET", &headers, "e.com", "192.168.1.1", "https")
+                .is_none()
+        );
+    }
+
+    /// 🚫 A `header !Foo` matcher must exclude requests that HAVE the header.
+    #[test]
+    fn negated_header_matcher_requires_absence() {
+        use crate::config::{Matcher, MatcherCondition};
+        let route = RouteConfig {
+            path: "/*".to_string(),
+            handler: HandlerConfig::Respond {
+                status: 200,
+                body: None,
+                headers: HashMap::new(),
+            },
+            methods: None,
+            matcher: Some(Matcher::Not(Box::new(Matcher::Header {
+                name: "Foo".to_string(),
+                condition: MatcherCondition::Exists,
+            }))),
+        };
+        let router = Router::new(vec![route]);
+        let mut headers = HeaderMap::new();
+        assert!(
+            router
+                .match_request("/", "GET", &headers, "e.com", "10.0.0.1", "https")
+                .is_some()
+        );
+        headers.insert("Foo", "bar".parse().unwrap());
+        assert!(
+            router
+                .match_request("/", "GET", &headers, "e.com", "10.0.0.1", "https")
+                .is_none()
         );
     }
 }

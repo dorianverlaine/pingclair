@@ -224,8 +224,18 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
     // Routes
     if let Some(routes) = &server.routes {
         for arm in &routes.inner.arms {
-            let route_config = compile_route_arm(&arm.inner, &server.matchers)?;
-            config.routes.push(route_config);
+            config
+                .routes
+                .extend(compile_route_arm(&arm.inner, &server.matchers)?);
+        }
+    }
+
+    // 📂 Hand the `root` directive to every file server that did not name its
+    // own root. Caddy's `file_server` takes no root argument; the site root
+    // comes from `root`, so a bare `file_server` must inherit it.
+    if let Some(site_root) = &server.root {
+        for route in &mut config.routes {
+            apply_site_root(&mut route.handler, site_root);
         }
     }
 
@@ -277,6 +287,25 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
     }
 
     Ok(config)
+}
+
+/// 📂 Recursively replaces a file server's default root with the site root.
+fn apply_site_root(handler: &mut pingclair_core::config::HandlerConfig, site_root: &str) {
+    match handler {
+        pingclair_core::config::HandlerConfig::FileServer { root, .. } => {
+            if root == "." {
+                *root = site_root.to_string();
+            }
+        }
+        pingclair_core::config::HandlerConfig::Pipeline { handlers }
+        | pingclair_core::config::HandlerConfig::Handle { handlers }
+        | pingclair_core::config::HandlerConfig::HandlePath { handlers, .. } => {
+            for inner in handlers {
+                apply_site_root(inner, site_root);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 🛡️ Rejects TLS combinations that cannot have deterministic runtime behavior.
@@ -933,37 +962,18 @@ fn compile_log(log: &LogBlock) -> CompileResult<LogConfig> {
 /// Nothing legitimate nests matchers more than a handful deep.
 const MAX_MATCHER_DEPTH: usize = 32;
 
-fn find_path_pattern(
-    matcher: &Matcher,
-    matchers: &HashMap<String, Matcher>,
-    depth: usize,
-) -> Option<String> {
-    if depth > MAX_MATCHER_DEPTH {
-        return None;
-    }
-    match matcher {
-        Matcher::Path(pm) => pm.patterns.first().cloned(),
-        Matcher::Named(name) => matchers
-            .get(name)
-            .and_then(|m| find_path_pattern(m, matchers, depth + 1)),
-        Matcher::And(left, right) | Matcher::Or(left, right) => {
-            find_path_pattern(left, matchers, depth + 1)
-                .or_else(|| find_path_pattern(right, matchers, depth + 1))
-        }
-        _ => None,
-    }
-}
-
 fn compile_route_arm(
     arm: &RouteArm,
     matchers: &HashMap<String, Matcher>,
-) -> CompileResult<RouteConfig> {
-    // Compile matcher to path pattern
-    let path = arm
+) -> CompileResult<Vec<RouteConfig>> {
+    // 🧭 A matcher may carry several path patterns (`path /js/* /css/*`).
+    // Each pattern becomes its own router entry so every one of them routes;
+    // the compiled matcher stays attached so non-path conditions still apply.
+    let patterns = arm
         .matcher
         .as_ref()
-        .and_then(|m| find_path_pattern(m, matchers, 0))
-        .unwrap_or_else(|| "/*".to_string());
+        .map(|m| path_patterns(m, matchers, 0))
+        .unwrap_or_default();
 
     // Compile matcher conditions
     let matcher = arm
@@ -975,12 +985,48 @@ fn compile_route_arm(
     // Compile handler
     let handler = compile_handler(&arm.handler)?;
 
-    Ok(RouteConfig {
-        path,
-        handler,
-        methods: None,
-        matcher,
-    })
+    if patterns.is_empty() {
+        return Ok(vec![RouteConfig {
+            path: "/*".to_string(),
+            handler,
+            methods: None,
+            matcher,
+        }]);
+    }
+    Ok(patterns
+        .into_iter()
+        .map(|path| RouteConfig {
+            path,
+            handler: handler.clone(),
+            methods: None,
+            matcher: matcher.clone(),
+        })
+        .collect())
+}
+
+/// 🧭 Collects every path pattern reachable from a matcher, following named
+/// references and both sides of `and`/`or` combinations.
+fn path_patterns(
+    matcher: &Matcher,
+    matchers: &HashMap<String, Matcher>,
+    depth: usize,
+) -> Vec<String> {
+    if depth > MAX_MATCHER_DEPTH {
+        return Vec::new();
+    }
+    match matcher {
+        Matcher::Path(pm) => pm.patterns.clone(),
+        Matcher::Named(name) => matchers
+            .get(name)
+            .map(|m| path_patterns(m, matchers, depth + 1))
+            .unwrap_or_default(),
+        Matcher::And(left, right) | Matcher::Or(left, right) => {
+            let mut patterns = path_patterns(left, matchers, depth + 1);
+            patterns.extend(path_patterns(right, matchers, depth + 1));
+            patterns
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn compile_matcher(

@@ -242,9 +242,43 @@ impl<'a> Parser<'a> {
 }
 
 pub fn parse(source: &str) -> Result<Vec<Directive>, ParseError> {
-    let tokens = tokenize(source)?;
+    // 🌐 Caddy substitutes `{$VAR}` (with an optional `:default`) before
+    // tokenizing, so a variable may expand to several tokens or to nothing.
+    // Doing it here keeps the lexer dumb and the substitution lossless.
+    let expanded = expand_env_vars(source);
+    let tokens = tokenize(&expanded)?;
     let mut parser = Parser::new(&tokens);
     parser.parse_config()
+}
+
+/// 🌐 Replaces every `{$NAME}` or `{$NAME:default}` with the environment
+/// variable's value. An unset variable without a default expands to the empty
+/// string, exactly like Caddy; the result is re-tokenized, so whitespace in
+/// the value produces several tokens.
+fn expand_env_vars(source: &str) -> String {
+    let mut result = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(start) = rest.find("{$") {
+        result.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            // 📝 A dangling `{$` is left untouched; the lexer will reject it.
+            result.push_str(&rest[start..]);
+            return result;
+        };
+        let spec = &after[..end];
+        let (name, default) = spec
+            .split_once(':')
+            .map_or((spec, None), |(name, default)| (name, Some(default)));
+        let value = std::env::var(name)
+            .ok()
+            .or_else(|| default.map(str::to_string))
+            .unwrap_or_default();
+        result.push_str(&value);
+        rest = &after[end + 1..];
+    }
+    result.push_str(rest);
+    result
 }
 
 #[cfg(test)]

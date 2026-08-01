@@ -119,6 +119,7 @@ pub fn adapt(directives: Vec<Directive>) -> Result<Ast, AdapterError> {
     // Pass 1: Snippet collection + import expansion
     let (snippets, remaining) = collect_snippets(directives)?;
     let expanded = expand_imports(remaining, &snippets, 0)?;
+    let expanded = coalesce_bare_single_site(expanded)?;
 
     // Pass 2: Convert to typed AST
     let mut ast = Ast::default();
@@ -140,6 +141,52 @@ pub fn adapt(directives: Vec<Directive>) -> Result<Ast, AdapterError> {
     }
 
     Ok(ast)
+}
+
+/// 🏠 Caddy lets a single-site file omit its curly braces: the first line is
+/// the site address and every following directive belongs to that site.
+/// `localhost\n\nrespond "Hello"` must parse as `localhost { respond ... }`.
+///
+/// The shorthand is only legal when no other braced site exists — with two
+/// sites the file must use explicit braces, otherwise the bare directives
+/// have no unambiguous home.
+fn coalesce_bare_single_site(directives: Vec<Directive>) -> Result<Vec<Directive>, AdapterError> {
+    let mut globals = Vec::new();
+    let mut bare = Vec::new();
+    let mut braced_sites = Vec::new();
+
+    for d in directives {
+        if d.name.is_empty() || d.name == "global" || d.name == "options" {
+            globals.push(d);
+        } else if d.block.is_some() {
+            braced_sites.push(d);
+        } else {
+            bare.push(d);
+        }
+    }
+
+    if bare.is_empty() {
+        globals.extend(braced_sites);
+        return Ok(globals);
+    }
+
+    if !braced_sites.is_empty() {
+        return Err(AdapterError::InvalidArgument(
+            "site address".into(),
+            "bare (unbraced) directives cannot be mixed with braced site blocks; \
+             wrap every site in { } when there is more than one"
+                .into(),
+        ));
+    }
+
+    // 🏠 The first bare directive is the site address; everything after it is
+    // the site's content. A lone bare directive is an empty site.
+    let mut site = bare.remove(0);
+    if !bare.is_empty() {
+        site.block = Some(Block { directives: bare });
+    }
+    globals.push(site);
+    Ok(globals)
 }
 
 // MARK: - Global Block
@@ -197,6 +244,8 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                         // modes are real syntax; name them explicitly instead
                         // of reporting a bare invalid argument.
                         "disable_certs" | "ignore_loaded_certs" => {
+                            // TODO(v0.3): implement certificate-only and
+                            // ignore-loaded-certificates automation modes.
                             return Err(AdapterError::UnsupportedFeature(
                                 format!("auto_https {arg}"),
                                 "only on, off and disable_redirects are implemented".into(),
@@ -216,6 +265,7 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                     // dropped, leaving the endpoint without the origin checks
                     // the operator asked for.
                     if sub.block.is_some() {
+                        // TODO(v0.3): implement admin origins/enforce_origin.
                         return Err(AdapterError::UnsupportedFeature(
                             "admin block".into(),
                             "admin origins/enforce_origin are not implemented yet".into(),
@@ -291,6 +341,8 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                 // mistaken for a typo.
                 other => {
                     if is_known_caddy_global_option(other) {
+                        // TODO(v0.3): implement the remaining Caddy global
+                        // options (default_bind, grace_period, storage, ...).
                         return Err(AdapterError::UnsupportedFeature(
                             format!("global: {other}"),
                             "this Caddy global option is not implemented yet".into(),
@@ -441,6 +493,8 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                 server.names.push(parsed.hostname);
             }
         } else if looks_like_unsupported_address(name) {
+            // TODO(v0.3): support network prefixes, port ranges and Unix
+            // sockets in site addresses.
             return Err(AdapterError::UnsupportedFeature(
                 "site address".into(),
                 format!(
@@ -517,6 +571,23 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                         port: addr.split(':').next_back().and_then(|p| p.parse().ok()),
                         proxy_protocol,
                     });
+                }
+                "root" => {
+                    // 📂 `root /var/www` or `root * /var/www`: the optional
+                    // `*` matcher token is accepted and ignored, matching
+                    // Caddy's disambiguation syntax.
+                    let args = if sub_d.args.first().is_some_and(|a| a == "*") {
+                        &sub_d.args[1..]
+                    } else {
+                        &sub_d.args[..]
+                    };
+                    let path = args.first().ok_or_else(|| {
+                        AdapterError::ArgumentCount("root".into(), 1, sub_d.args.len())
+                    })?;
+                    if args.len() != 1 {
+                        return Err(AdapterError::ArgumentCount("root".into(), 1, args.len()));
+                    }
+                    server.root = Some(path.clone());
                 }
                 "compress" | "encode" => {
                     // Caddy spells this `encode zstd gzip`, and argument order
@@ -659,6 +730,29 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                     // Try to extract matcher and adapt as handler
                     let (matcher, _) = parse_matcher_and_block(&sub_d)?;
                     let mut handler_d = sub_d.clone();
+                    // 🔁 Caddy's `redir /old.html /new.html` carries an inline
+                    // path matcher whose first argument does not end in `*`.
+                    // Detect that shape so official trailing-slash examples
+                    // compile; the second argument must look like a location.
+                    let redir_inline_matcher =
+                        if handler_d.name == "redir" || handler_d.name == "redirect" {
+                            handler_d.args.len() >= 2
+                                && handler_d.args[0].starts_with('/')
+                                && (handler_d.args[1].starts_with('/')
+                                    || handler_d.args[1].contains("://"))
+                                && !handler_d.args[1].parse::<u16>().is_ok()
+                        } else {
+                            false
+                        };
+                    if redir_inline_matcher {
+                        let path = handler_d.args.remove(0);
+                        let route_matcher = Matcher::Path(PathMatcher {
+                            patterns: vec![path.clone()],
+                        });
+                        let handler = adapt_handler(handler_d)?;
+                        add_route(&mut server, Some(route_matcher), handler);
+                        continue;
+                    }
                     if matcher.is_some() {
                         if handler_d.args.is_empty() {
                             return Err(AdapterError::ArgumentCount(sub_d.name, 1, 0));
@@ -1046,16 +1140,21 @@ fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
         "redir" | "redirect" => adapt_redirect(d),
         "file_server" => {
             let mut root = ".".to_string();
-            if let Some(arg) = d.args.first()
-                && !arg.starts_with('@')
-            {
-                root = arg.clone();
+            let mut browse = false;
+            if let Some(arg) = d.args.first() {
+                if arg == "browse" {
+                    // 🧭 Caddy's `file_server browse` enables directory
+                    // listings without opening a block.
+                    browse = true;
+                } else if !arg.starts_with('@') {
+                    root = arg.clone();
+                }
             }
 
             let mut config = FileServerConfig {
                 root,
                 index: vec!["index.html".into()],
-                browse: false,
+                browse,
                 compress: true,
             };
 
@@ -1069,13 +1168,16 @@ fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
                         }
                         "index" => config.index = sub.args.clone(),
                         "browse" => {
-                            config.browse = sub.args.first().map(|s| s == "true").unwrap_or(true)
+                            config.browse =
+                                browse || sub.args.first().map(|s| s == "true").unwrap_or(true)
                         }
                         // 🚩 Caddy's `precompressed` and `fs` subdirectives
                         // used to compile into a file server that quietly
                         // served without either behavior. Rejecting them is
                         // the only honest option until they are implemented.
                         "precompressed" | "fs" => {
+                            // TODO(v0.3): implement precompressed sidecar
+                            // lookup and custom file-system modules.
                             return Err(AdapterError::UnsupportedFeature(
                                 format!("file_server {}", sub.name),
                                 "Pingclair does not implement this subdirective yet".into(),
@@ -1111,6 +1213,8 @@ fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
         // implementation here gets a message that says so, instead of being
         // indistinguishable from a typo.
         other => Err(if is_known_caddy_directive(other) {
+            // TODO(v0.3): implement the remaining standard Caddy directives
+            // (templates, try_files, php_fastcgi, handle_path, ...).
             AdapterError::UnsupportedFeature(
                 other.to_string(),
                 "this Caddy directive is not implemented yet".into(),
@@ -1439,6 +1543,7 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
         // into a bogus hostname that could never dial. Refuse it here instead
         // of shipping a proxy whose upstream silently never comes up.
         if arg.starts_with("unix") {
+            // TODO(v0.3): support Unix-socket upstreams (unix//path).
             return Err(AdapterError::UnsupportedFeature(
                 "reverse_proxy".into(),
                 format!(
@@ -1481,6 +1586,7 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
                     // 🚫 Caddy's `header_down` used to be silently dropped,
                     // leaving the operator certain a response header was being
                     // rewritten while the proxy forwarded it untouched.
+                    // TODO(v0.3): implement response header rewriting.
                     return Err(AdapterError::UnsupportedFeature(
                         "reverse_proxy header_down".into(),
                         "response header rewriting is not implemented yet".into(),
@@ -1490,6 +1596,7 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
                     // 🚫 SRV-based dynamic upstream discovery is a Caddy
                     // feature with no runtime equivalent here yet; a config
                     // naming it must not silently degrade to static upstreams.
+                    // TODO(v0.3): implement SRV/dynamic upstream discovery.
                     return Err(AdapterError::UnsupportedFeature(
                         "reverse_proxy dynamic".into(),
                         "dynamic upstream discovery is not implemented yet".into(),
@@ -2249,26 +2356,59 @@ fn parse_positive_u64(directive: &Directive) -> Result<u64, AdapterError> {
         .ok_or_else(|| AdapterError::InvalidArgument(directive.name.clone(), value.clone()))
 }
 
-/// ⏱️ Parses Caddy durations without overflowing unit conversion.
+/// ⏱️ Parses Caddy durations into milliseconds.
+///
+/// Accepts the full Go-style unit set (`ns`, `us`/`µs`, `ms`, `s`, `m`,
+/// `h`, `d`), fractional values (`1.5h`) and compound values (`2h45m`).
+/// A bare number is rejected: `30` would silently mean 30 ms instead of the
+/// 30 seconds the operator almost certainly meant.
 fn parse_duration_ms(s: &str) -> Option<u64> {
-    if let Some(secs) = s.strip_suffix('s') {
-        if let Some(ms) = secs.strip_suffix('m') {
-            // "100ms" → strip 's' first gets "100m", then strip 'm' gets "100"
-            return ms.parse::<u64>().ok();
+    const UNITS: [(&str, f64); 8] = [
+        ("ns", 1e-6),
+        ("us", 1e-3),
+        ("µs", 1e-3),
+        ("ms", 1.0),
+        ("s", 1e3),
+        ("m", 6e4),
+        ("h", 3.6e6),
+        ("d", 8.64e7),
+    ];
+
+    let mut rest = s.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let mut total_ms = 0.0f64;
+    let mut consumed_any = false;
+    while !rest.is_empty() {
+        // 🧮 Read the numeric part (integer or decimal fraction).
+        let number_end = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        if number_end == 0 {
+            return None;
         }
-        return secs
-            .parse::<u64>()
-            .ok()
-            .and_then(|value| value.checked_mul(1_000));
+        let number: f64 = rest[..number_end].parse().ok()?;
+        rest = &rest[number_end..];
+
+        // 🧮 Read the unit that follows; without one the input is malformed.
+        let unit = UNITS
+            .iter()
+            .find(|(name, _)| rest.starts_with(name))
+            .map(|(name, multiplier)| (*name, *multiplier))?;
+        total_ms += number * unit.1;
+        rest = &rest[unit.0.len()..];
+        consumed_any = true;
     }
-    if let Some(mins) = s.strip_suffix('m') {
-        return mins
-            .parse::<u64>()
-            .ok()
-            .and_then(|value| value.checked_mul(60_000));
+    if !consumed_any {
+        return None;
     }
-    // Plain number → milliseconds
-    s.parse::<u64>().ok()
+    // ⚙️ Sub-millisecond durations cannot be represented in the internal
+    // millisecond fields, so refuse them instead of silently truncating.
+    if total_ms < 1.0 {
+        return None;
+    }
+    Some(total_ms.round() as u64)
 }
 
 // MARK: - respond Full Parsing
@@ -2383,10 +2523,18 @@ fn parse_matcher_and_block(
     let block = d.block.as_ref();
 
     // Check first arg for @name
-    if let Some(arg) = d.args.first()
-        && arg.starts_with('@')
-    {
-        matcher = Some(Matcher::Named(arg.clone()));
+    if let Some(arg) = d.args.first() {
+        if arg.starts_with('@') {
+            matcher = Some(Matcher::Named(arg.clone()));
+        } else if arg.starts_with('/') && arg.contains('*') {
+            // 🧭 Caddy's inline path matcher: `reverse_proxy /api/* ...` and
+            // `file_server /downloads/* { ... }` scope the directive to the
+            // glob. A leading slash without a glob stays a plain argument
+            // (e.g. `file_server /var/www/html` is a root).
+            matcher = Some(Matcher::Path(PathMatcher {
+                patterns: vec![arg.clone()],
+            }));
+        }
     }
 
     Ok((matcher, block))
@@ -2434,11 +2582,7 @@ fn parse_matcher_definition(d: &Directive) -> Result<Matcher, AdapterError> {
             ));
         }
 
-        let mut combined = matchers.remove(0);
-        for m in matchers {
-            combined = Matcher::And(Box::new(combined), Box::new(m));
-        }
-        Ok(combined)
+        Ok(merge_matcher_set(matchers))
     } else {
         // Inline matcher: @api path /v1/*
         if d.args.is_empty() {
@@ -2451,6 +2595,82 @@ fn parse_matcher_definition(d: &Directive) -> Result<Matcher, AdapterError> {
         };
         parse_single_matcher(&sub_directive)
     }
+}
+
+/// 🧩 Merges a named matcher set the way Caddy does: matchers of the same
+/// kind are OR'ed (path values, method verbs, host names, header fields of
+/// the same name, query keys of the same name, remote-IP ranges) while
+/// different kinds are AND'ed. The old code AND'ed everything, which made
+/// `@foo { header Foo bar; header Foo baz }` impossible to satisfy.
+fn merge_matcher_set(matchers: Vec<Matcher>) -> Matcher {
+    use std::collections::HashMap;
+
+    let mut header_groups: HashMap<String, Vec<HeaderMatcher>> = HashMap::new();
+    let mut query_groups: HashMap<String, Vec<QueryMatcher>> = HashMap::new();
+    let mut paths: Vec<String> = Vec::new();
+    let mut methods: Vec<HttpMethod> = Vec::new();
+    let mut hosts: Vec<String> = Vec::new();
+    let mut remote_ips: Vec<String> = Vec::new();
+    let mut others: Vec<Matcher> = Vec::new();
+
+    for matcher in matchers {
+        match matcher {
+            Matcher::Header(header) => {
+                header_groups
+                    .entry(header.name.clone())
+                    .or_default()
+                    .push(header);
+            }
+            Matcher::Query(query) => {
+                query_groups
+                    .entry(query.name.clone())
+                    .or_default()
+                    .push(query);
+            }
+            Matcher::Path(path) => paths.extend(path.patterns),
+            Matcher::Method(m) => methods.extend(m),
+            Matcher::Host(h) => hosts.extend(h),
+            Matcher::RemoteIp(ips) => remote_ips.extend(ips),
+            other => others.push(other),
+        }
+    }
+
+    let mut parts: Vec<Matcher> = Vec::new();
+    for headers in header_groups.into_values() {
+        let group = headers
+            .into_iter()
+            .map(Matcher::Header)
+            .reduce(|left, right| Matcher::Or(Box::new(left), Box::new(right)))
+            .expect("a header group is never empty");
+        parts.push(group);
+    }
+    for queries in query_groups.into_values() {
+        let group = queries
+            .into_iter()
+            .map(Matcher::Query)
+            .reduce(|left, right| Matcher::Or(Box::new(left), Box::new(right)))
+            .expect("a query group is never empty");
+        parts.push(group);
+    }
+    if !paths.is_empty() {
+        parts.push(Matcher::Path(PathMatcher { patterns: paths }));
+    }
+    if !methods.is_empty() {
+        parts.push(Matcher::Method(methods));
+    }
+    if !hosts.is_empty() {
+        parts.push(Matcher::Host(hosts));
+    }
+    if !remote_ips.is_empty() {
+        parts.push(Matcher::RemoteIp(remote_ips));
+    }
+    parts.extend(others);
+
+    let mut combined = parts.remove(0);
+    for part in parts {
+        combined = Matcher::And(Box::new(combined), Box::new(part));
+    }
+    combined
 }
 
 /// 🕳️ Maximum matcher nesting accepted from a Pingclairfile.
@@ -2532,6 +2752,71 @@ fn parse_single_matcher_at(d: &Directive, depth: usize) -> Result<Matcher, Adapt
             }
             Ok(Matcher::Method(methods))
         }
+        "host" => {
+            if d.args.is_empty() {
+                return Err(AdapterError::ArgumentCount("host".into(), 1, 0));
+            }
+            Ok(Matcher::Host(d.args.clone()))
+        }
+        "query" => {
+            // 🧭 `query q=1` / `query q=*`; several lines for the same key are
+            // OR'ed by the set merge, different keys are AND'ed. The bare
+            // `query ""` (no query string at all) is deferred to v0.3.
+            let Some(spec) = d.args.first() else {
+                return Err(AdapterError::ArgumentCount("query".into(), 1, 0));
+            };
+            if d.args.len() != 1 {
+                return Err(AdapterError::ArgumentCount("query".into(), 1, d.args.len()));
+            }
+            if spec.is_empty() {
+                // TODO(v0.3): support `query ""` (requests with no query
+                // string) via a dedicated condition.
+                return Err(AdapterError::UnsupportedFeature(
+                    "query".into(),
+                    "the empty-query matcher (`query \"\"`) is not implemented yet".into(),
+                ));
+            }
+            let Some((name, value)) = spec.split_once('=') else {
+                return Err(AdapterError::InvalidArgument(
+                    "query".into(),
+                    format!("expected `key=value`, got `{spec}`"),
+                ));
+            };
+            let condition = if value == "*" {
+                HeaderCondition::Exists
+            } else {
+                HeaderCondition::Equals(value.to_string())
+            };
+            Ok(Matcher::Query(QueryMatcher {
+                name: name.to_string(),
+                condition,
+            }))
+        }
+        "protocol" => {
+            if d.args.is_empty() {
+                return Err(AdapterError::ArgumentCount("protocol".into(), 1, 0));
+            }
+            // 🚫 Versioned forms like `http/2+` need range comparison that the
+            // runtime does not implement yet; refuse them instead of treating
+            // them as an exact protocol string.
+            if d.args.iter().any(|p| p.contains('/')) {
+                // TODO(v0.3): implement versioned protocol matchers.
+                return Err(AdapterError::UnsupportedFeature(
+                    "protocol".into(),
+                    "versioned protocol matchers (http/2+, grpc) are not implemented yet".into(),
+                ));
+            }
+            Ok(Matcher::Protocol(d.args.clone()))
+        }
+        "remote_ip" | "client_ip" => {
+            if d.args.is_empty() {
+                return Err(AdapterError::ArgumentCount(d.name.clone(), 1, 0));
+            }
+            // 🧭 `client_ip` matches the verified client address; Pingclair
+            // resolves that before routing, so both spellings share the same
+            // remote-address evaluation for now.
+            Ok(Matcher::RemoteIp(d.args.clone()))
+        }
         "header" => {
             if d.args.is_empty() {
                 return Err(AdapterError::ArgumentCount(
@@ -2552,12 +2837,23 @@ fn parse_single_matcher_at(d: &Directive, depth: usize) -> Result<Matcher, Adapt
                 ));
             }
 
+            // 🚫 A `!` prefix means the field must NOT exist (`header !Foo`).
+            let raw_name = &d.args[0];
+            let negated = raw_name.starts_with('!');
+            let name = raw_name.strip_prefix('!').unwrap_or(raw_name);
+
             let condition = if d.args.len() >= 2 {
                 let val = &d.args[1];
                 if val == "*" {
                     HeaderCondition::Exists
-                } else if val.starts_with("*") && val.ends_with("*") {
+                } else if val.starts_with('*') && val.ends_with('*') && val.len() >= 2 {
                     HeaderCondition::Contains(val[1..val.len() - 1].to_string())
+                } else if val.starts_with('*') {
+                    // `*suffix` matches values ending with the rest.
+                    HeaderCondition::EndsWith(val.strip_prefix('*').unwrap_or(val).to_string())
+                } else if val.ends_with('*') {
+                    // `prefix*` matches values starting with the rest.
+                    HeaderCondition::StartsWith(val.strip_suffix('*').unwrap_or(val).to_string())
                 } else {
                     HeaderCondition::Equals(val.clone())
                 }
@@ -2566,10 +2862,15 @@ fn parse_single_matcher_at(d: &Directive, depth: usize) -> Result<Matcher, Adapt
                 HeaderCondition::Exists
             };
 
-            Ok(Matcher::Header(HeaderMatcher {
-                name: d.args[0].clone(),
+            let header = Matcher::Header(HeaderMatcher {
+                name: name.to_string(),
                 condition,
-            }))
+            });
+            Ok(if negated {
+                Matcher::Not(Box::new(header))
+            } else {
+                header
+            })
         }
         _ => Err(AdapterError::UnknownDirective(format!(
             "matcher: {}",
@@ -3838,5 +4139,251 @@ mod address_semantics_tests {
             server.listen.is_empty(),
             "bind names an interface, not a listener"
         );
+    }
+}
+
+// MARK: - P3 Syntax Tests
+
+/// ✍️ P3 regressions: Caddy's single-site shorthand, environment-variable
+/// expansion, glued placeholders, full durations, `root`, inline matchers
+/// and the extended matcher vocabulary.
+#[cfg(test)]
+mod p3_syntax_tests {
+    use crate::compile;
+    use crate::parser::{parse, tokenize};
+    use pingclair_core::config::HandlerConfig;
+
+    fn routes(source: &str) -> Vec<pingclair_core::config::RouteConfig> {
+        compile(source)
+            .expect("config must compile")
+            .servers
+            .into_iter()
+            .next()
+            .expect("at least one server")
+            .routes
+    }
+
+    #[test]
+    fn single_site_shorthand_collects_following_directives() {
+        let config = compile("localhost\n\nrespond \"Hello, world!\"").expect("shorthand compiles");
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers[0].name.as_deref(), Some("localhost"));
+        assert_eq!(config.servers[0].routes.len(), 1);
+    }
+
+    #[test]
+    fn shorthand_supports_snippets() {
+        let config =
+            compile("(common) {\n    header X-A b\n}\nlocalhost\n\nimport common\nrespond \"ok\"")
+                .expect("snippet + shorthand compiles");
+        assert_eq!(config.servers.len(), 1);
+        let route = &config.servers[0].routes[0];
+        match &route.handler {
+            HandlerConfig::Pipeline { handlers } => {
+                assert!(
+                    handlers
+                        .iter()
+                        .any(|h| matches!(h, HandlerConfig::Headers { .. }))
+                );
+                assert!(
+                    handlers
+                        .iter()
+                        .any(|h| matches!(h, HandlerConfig::Respond { .. }))
+                );
+            }
+            other => panic!("expected a pipeline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shorthand_cannot_mix_with_braced_sites() {
+        let error = compile("localhost\n\nrespond \"x\"\nexample.com {\n    respond \"y\"\n}")
+            .expect_err("mixed shorthand and braced sites must fail");
+        assert!(error.to_string().contains("bare (unbraced)"));
+    }
+
+    #[test]
+    fn env_vars_expand_before_parsing() {
+        // 🛡️ These tests run single-threaded; env mutation is sound here.
+        unsafe {
+            std::env::set_var("PINGCLAIR_TEST_SITE", "env.example");
+            std::env::set_var("PINGCLAIR_TEST_UPSTREAMS", "127.0.0.1:9001 127.0.0.1:9002");
+        }
+        let config = compile("{$PINGCLAIR_TEST_SITE}\n\nrespond \"env\"").expect("env site");
+        assert_eq!(config.servers[0].name.as_deref(), Some("env.example"));
+
+        let config = compile("localhost {\n    reverse_proxy {$PINGCLAIR_TEST_UPSTREAMS}\n}")
+            .expect("env upstreams");
+        match &config.servers[0].routes[0].handler {
+            HandlerConfig::ReverseProxy(proxy) => {
+                assert_eq!(
+                    proxy.upstreams,
+                    vec!["127.0.0.1:9001".to_string(), "127.0.0.1:9002".to_string()]
+                );
+            }
+            other => panic!("expected reverse proxy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn env_vars_support_defaults() {
+        // 🛡️ Single-threaded test; see env_vars_expand_before_parsing.
+        unsafe {
+            std::env::remove_var("PINGCLAIR_TEST_ABSENT_VAR");
+        }
+        let config =
+            compile("{$PINGCLAIR_TEST_ABSENT_VAR:fallback.example} {\n    respond \"d\"\n}")
+                .expect("default value expands");
+        assert_eq!(config.servers[0].name.as_deref(), Some("fallback.example"));
+    }
+
+    #[test]
+    fn placeholders_glued_to_words_stay_one_token() {
+        let tokens = tokenize("redir https://www.{host}{uri}").unwrap();
+        let words: Vec<String> = tokens
+            .iter()
+            .filter_map(|t| match &t.value {
+                crate::parser::Token::Word(w) => Some(w.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(words, vec!["redir", "https://www.{host}{uri}"]);
+    }
+
+    #[test]
+    fn glued_placeholder_redirect_compiles() {
+        let config = compile("example.com {\n    redir https://www.{host}{uri}\n}")
+            .expect("glued placeholders compile");
+        match &config.servers[0].routes[0].handler {
+            HandlerConfig::Redirect { to, .. } => {
+                assert_eq!(to, "https://www.{host}{uri}");
+            }
+            other => panic!("expected redirect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn full_duration_units_parse() {
+        let config = compile(
+            "example.com {\n    limits {\n        header_timeout 1.5h\n        body_timeout 2h45m\n        idle_timeout 90d\n    }\n}",
+        )
+        .expect("compound and fractional durations compile");
+        let limits = &config.servers[0].limits;
+        assert_eq!(limits.header_timeout_ms, Some(5_400_000));
+        assert_eq!(limits.body_timeout_ms, Some(9_900_000));
+        assert_eq!(limits.idle_timeout_ms, Some(7_776_000_000));
+    }
+
+    #[test]
+    fn bare_duration_numbers_are_rejected() {
+        let error = compile("example.com {\n    limits {\n        header_timeout 30\n    }\n}")
+            .expect_err("a bare number must not silently mean milliseconds");
+        assert!(error.to_string().contains("30"));
+    }
+
+    #[test]
+    fn root_directive_reaches_bare_file_server() {
+        let config = compile("example.com {\n    root /var/www\n    file_server\n}")
+            .expect("root + file_server compile");
+        match &config.servers[0].routes[0].handler {
+            HandlerConfig::FileServer { root, .. } => {
+                assert_eq!(root, "/var/www");
+            }
+            other => panic!("expected file server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_server_browse_inline_enables_listings() {
+        let config =
+            compile("example.com {\n    file_server browse\n}").expect("inline browse compiles");
+        match &config.servers[0].routes[0].handler {
+            HandlerConfig::FileServer { browse, root, .. } => {
+                assert!(*browse, "inline browse must enable directory listings");
+                assert_eq!(root, ".", "browse must not be mistaken for a root");
+            }
+            other => panic!("expected file server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_server_glob_argument_becomes_a_path_matcher() {
+        let routes =
+            routes("example.com {\n    file_server /downloads/* {\n        browse\n    }\n}");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].path, "/downloads/*");
+    }
+
+    #[test]
+    fn header_matcher_understands_negation_and_single_stars() {
+        let config = compile(
+            "example.com {\n    @a header !Foo\n    @b header Foo *.example\n    @c header Foo example*\n    @d header Foo *bar*\n    handle @a { respond \"a\" }\n    handle @b { respond \"b\" }\n    handle @c { respond \"c\" }\n    handle @d { respond \"d\" }\n}",
+        )
+        .expect("header matcher forms compile");
+        let routes = &config.servers[0].routes;
+        assert_eq!(routes.len(), 4);
+    }
+
+    #[test]
+    fn same_field_header_matchers_are_ored() {
+        let config = compile(
+            "example.com {\n    @foo {\n        header Foo bar\n        header Foo baz\n    }\n    handle @foo { respond \"hit\" }\n}",
+        )
+        .expect("same-field header matchers compile");
+        let matcher = config.servers[0].routes[0]
+            .matcher
+            .as_ref()
+            .expect("matcher must survive");
+        let matcher = format!("{matcher:?}");
+        assert!(
+            matcher.contains("Or"),
+            "same-field header matchers must be OR'ed, got {matcher}"
+        );
+    }
+
+    #[test]
+    fn multi_path_matcher_creates_one_route_per_pattern() {
+        let routes = routes(
+            "example.com {\n    @assets path /js/* /css/* /images/*\n    handle @assets { respond \"asset\" }\n}",
+        );
+        let paths: Vec<&str> = routes.iter().map(|r| r.path.as_str()).collect();
+        assert!(paths.contains(&"/js/*"), "got {paths:?}");
+        assert!(paths.contains(&"/css/*"), "got {paths:?}");
+        assert!(paths.contains(&"/images/*"), "got {paths:?}");
+    }
+
+    #[test]
+    fn extended_matcher_vocabulary_compiles() {
+        let config = compile(
+            "example.com {\n    @h host sub.example.com\n    @q query q=1\n    @p protocol https\n    @r remote_ip 10.0.0.0/8\n    @c client_ip 192.168.0.0/16\n    handle @h { respond \"h\" }\n    handle @q { respond \"q\" }\n    handle @p { respond \"p\" }\n    handle @r { respond \"r\" }\n    handle @c { respond \"c\" }\n}",
+        )
+        .expect("host/query/protocol/remote_ip/client_ip compile");
+        assert_eq!(config.servers[0].routes.len(), 5);
+    }
+
+    #[test]
+    fn not_inline_multi_value_is_negated_or() {
+        // `not path /css/* /js/*` must mean NOT(/css/* OR /js/*).
+        let config = compile(
+            "example.com {\n    @na {\n        not path /css/* /js/*\n    }\n    handle @na { respond \"ok\" }\n}",
+        )
+        .expect("not path compiles");
+        let matcher = format!(
+            "{:?}",
+            config.servers[0].routes[0]
+                .matcher
+                .as_ref()
+                .expect("matcher")
+        );
+        assert!(
+            matcher.contains("Not") && matcher.contains("Path"),
+            "expected Not(Path[..]) semantics, got {matcher}"
+        );
+    }
+
+    #[test]
+    fn shorthand_parses_via_public_api() {
+        let directives = parse("localhost\n\nrespond \"ok\"").expect("parse shorthand");
+        assert_eq!(directives.len(), 2);
     }
 }

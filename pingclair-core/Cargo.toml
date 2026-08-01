@@ -9,6 +9,7 @@ rust-version.workspace = true
 description = "Core library for Pingclair web server"
 
 [dependencies]
+ipnet.workspace = true
 pingora.workspace = true
 pingora-core.workspace = true
 pingora-proxy.workspace = true
