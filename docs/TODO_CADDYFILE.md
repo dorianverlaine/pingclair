@@ -198,7 +198,8 @@ matcher runtime 測試 5 項（glob 四位置、正規化、CIDR、negated heade
   routing 的 chain，不再被 terminal route 遮蔽（D2）
 - [x] 同名 `handle` 依 matcher specificity 排序（D3）
 - [x] directive 第一參數 `/`-path 解析為 matcher（`reverse_proxy
-  /api/*`、`redir /a /b`…）（D4）
+  /api/*`、`reverse_proxy /ws`（無 `*` 的精確匹配）、`redir /a /b`…）
+  （D4）
 - [x] `rewrite`：Caddy path 語意與 Pingclair regex 語意明確區分
   （D5/P4）
 - [x] `route` block 保留字面順序（既有）；內層 matcher token fail

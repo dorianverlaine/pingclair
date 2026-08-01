@@ -274,3 +274,21 @@ FX-A ──> FX-B ──> FX-C
   `docs/CADDYFILE_VM_TEST_NOTES.md`（標記已修復）。
 - `docs/STATUS.md` 同步該項目狀態；使用者可見行為變化同步
   README 三語。
+
+---
+
+## 🔧 FX-H — reverse_proxy matcher token 對齊
+
+- [x] FX-H1（D4 延伸）：`reverse_proxy /ws 127.0.0.1:9001` 的裸 `/`
+      路徑（無 `*`）依 Caddy matcher token 規則解析為**精確** path
+      matcher，不再被塞進 upstreams；`reverse_proxy * 127.0.0.1:9000`
+      的 `*` 剝離為 catch-all。`route`/`handle` 內層 matcher token
+      維持 fail-closed（TODO v0.3）。
+- 驗證：`reverse_proxy_bare_path_is_a_matcher_not_an_upstream`、
+      `reverse_proxy_bare_path_matcher_works_with_to_block`、
+      `reverse_proxy_wildcard_token_stays_a_matcher`、
+      `reverse_proxy_path_matcher_inside_handle_fails_closed`；四 gate
+      全綠；香港機 `e0a61bf`（aarch64 debug，本機 Docker
+      `rust:1.88-bookworm`）實測：`/`、`/style.css`、`/app.js`
+      H1/H2/H3 全 200，`/ws` WebSocket 101 + 雙向 echo，`/ws/foo`
+      404（精確匹配），`/api/echo` 200，`http→https` 308。

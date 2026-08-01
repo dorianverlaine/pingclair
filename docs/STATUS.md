@@ -420,6 +420,20 @@ health-check driver **不論有沒有配置探測都每 100ms 醒一次**。小,
 
 ---
 
+### 2026-08-02 Caddyfile matcher 專項（`e0a61bf`，香港機）
+
+`reverse_proxy /ws 127.0.0.1:9001` 的裸 `/` 路徑（無 `*`）依 Caddy
+matcher token 規則解析為**精確** path matcher，不再被塞進 upstreams；
+`reverse_proxy * 127.0.0.1:9000` 的 `*` 剝離為 catch-all。adapt 輸出
+`/ws` → `["127.0.0.1:9001"]`；香港機真 binary（aarch64 debug，Docker
+`rust:1.88-bookworm`）實測 `/`、`/style.css`、`/app.js` H1/H2/H3 全
+200，`/ws` WebSocket 101 + 雙向 echo，`/ws/foo` 404（精確匹配），
+`/api/echo` 200，`http→https` 308。四 gate 全綠（fmt、clippy
+`-D warnings`、build、`cargo test --workspace`）。詳見
+`docs/CADDYFILE_VM_TEST_NOTES.md` FX-H 節。
+
+---
+
 ## 🧪 已實作，待乾淨遠端驗證
 
 > 這些是 v0.2 驗證日（TODO 的 Day 7／15／19／22／23）要清掉的積欠。

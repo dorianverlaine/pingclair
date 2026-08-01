@@ -755,3 +755,37 @@ Caddy v2.11.4 vs 修復後 Pingclair（`360e21c`）在同一台機器對跑核�
   `--watch`）、F-27（encode 缺 Vary）、F-29/F-31、fmt 引號風格、
   exit code/help 語意。
 - 所有組別測試期間僅修過 F-01 與 FX-A 三項；其餘只記錄，未改碼。
+
+## FX-H 驗證：`reverse_proxy` 裸路徑 matcher（2026-08-02，香港機）
+
+Pingclair `e0a61bf`（aarch64 debug，本機 Docker `rust:1.88-bookworm`
+編譯，`~/pingclair-test/pingclair-fxh`，`cap_net_bind_service=ep`）。
+設定檔 `Pingclairfile`：
+
+```caddy
+pingclair-test.aqeo.dev {
+    root /home/ubuntu/pingclair-test/site
+    encode
+    templates
+    file_server
+    reverse_proxy /api/* 127.0.0.1:9002
+    reverse_proxy /ws 127.0.0.1:9001
+}
+```
+
+`adapt` 輸出：`"path":"/ws"` → `"upstreams":["127.0.0.1:9001"]`、
+`"path":"/api/*"` → `"upstreams":["127.0.0.1:9002"]`、catch-all `/*`
+（templates + file_server）。修復前 `/ws` 被當 upstream，整個 catch-all
+被 proxy 到 WS 後端，`/style.css`、`/app.js` 卡 101 pending。
+
+| 測試 | 結果 |
+| --- | --- |
+| `/`、`/style.css`、`/app.js`（H1/H2/H3，brew curl 直連） | 全 200，content-type 正確 |
+| `/ws` WebSocket（RFC6455 純 stdlib client） | 101，雙向 echo `hello` / `second message 🚀` |
+| `/ws/foo`（精確匹配，非前綴） | 404（落回 file_server，不再被 proxy） |
+| `/api/echo?hello=world` | 200，headers 正常透傳 |
+| `http://` → `https://` | 308 轉跳 |
+
+結論：與 Caddy matcher token 語意一致（`/path` 精確匹配、`/path*`
+前綴、`*` catch-all）；`route`/`handle` 內層 matcher token 仍
+fail-closed（TODO v0.3）。
