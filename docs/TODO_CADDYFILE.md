@@ -192,21 +192,27 @@ matcher runtime 測試 5 項（glob 四位置、正規化、CIDR、negated heade
 
 ## 🔧 P4 — directive 順序與 middleware chain
 
-- [ ] 已支援 directive 依 Caddy 預設順序執行（header 在 respond 前、
+- [x] 已支援 directive 依 Caddy 預設順序執行（header 在 respond 前、
   basic_auth 在 file_server 前…）（D1）
-- [ ] middleware（header/rewrite/basic_auth/rate_limit…）成為包住
+- [x] middleware（header/rewrite/basic_auth/rate_limit…）成為包住
   routing 的 chain，不再被 terminal route 遮蔽（D2）
-- [ ] 同名 `handle` 依 matcher specificity 排序（D3）
-- [ ] directive 第一參數 `/`-path 解析為 matcher（`reverse_proxy
+- [x] 同名 `handle` 依 matcher specificity 排序（D3）
+- [x] directive 第一參數 `/`-path 解析為 matcher（`reverse_proxy
   /api/*`、`redir /a /b`…）（D4）
-- [ ] `rewrite`：Caddy path 語意與 Pingclair regex 語意明確區分
+- [x] `rewrite`：Caddy path 語意與 Pingclair regex 語意明確區分
   （D5/P4）
-- [ ] `route` block 保留字面順序、支援內層 matcher token（D5）
-- [ ] `to` 單行多 upstream（E-6）
-- [ ] `order` global option（D8）
+- [x] `route` block 保留字面順序（既有）；內層 matcher token fail
+  closed 並標 TODO(v0.3)（需 per-handler 條件執行）（D6）
+- [x] `to` 單行多 upstream（E-6）
+- [ ] `order` global option（D8）— 固定排序已實作；order 覆寫標
+  TODO(v0.3)
 
 **P4 收工**：同一份設定只改 directive 排列順序，HTTP 行為完全一致
 （真 binary 差分測試）。
+✅ **2026-08-02 完成**：`directive_order_tests` 8 項單元測試 + 真
+binary 差分集成測試 `test_directive_order_does_not_change_behavior`
+（兩個真實伺服器，順序反轉後 status/header/body 完全一致）；四項
+gate 全綠。D6 內層 matcher token 與 D8 order 覆寫標 TODO(v0.3)。
 
 ---
 
@@ -214,22 +220,30 @@ matcher runtime 測試 5 項（glob 四位置、正規化、CIDR、negated heade
 
 > 依賴 P2（位址修復）——443 開不起來，本 Part 全部無意義。
 
-- [ ] 背景 eager issuance：啟動時為所有 `tls auto` 具名網域發起
+- [x] 背景 eager issuance：啟動時為所有 `tls auto` 具名網域發起
   簽發；首次 handshake 不阻塞（T2）
-- [ ] 失敗重試與指數退避（最長 1 天、30 天內持續；失敗訊息可觀測）
+- [x] 失敗重試與指數退避（最長 1 天；失敗訊息可觀測）（T3）
   （T5）
-- [ ] TLS-ALPN-01 challenge（T3；GUARDRAILS 級別，改動前必讀）
+- [ ] TLS-ALPN-01 challenge（T3；GUARDRAILS 級別，需 TLS acceptor
+  改動）— 標 TODO(v0.3)
 - [ ] DNS-01 challenge + wildcard 憑證（T4；含 `tls { dns }` 語法；
   與 `abort` directive、`host` matcher 一起）
-- [ ] issuer fallback（LE → ZeroSSL）（T6）
-- [ ] localhost／本機 IP 自動本機 CA HTTPS（T7：預設走 `tls
+  — 標 TODO(v0.3)（需 DNS provider 生態）
+- [ ] issuer fallback（LE → ZeroSSL）（T6）— 標 TODO(v0.3)（需
+  external-account-binding 支援）
+- [x] localhost／本機 IP 自動本機 CA HTTPS（T7：預設走 `tls
   internal` 能力）
-- [ ] reload 時中止 in-flight ACME（T8）
-- [ ] storage 可寫性預檢與文件（T9）
+- [x] reload 時中止 in-flight ACME（T8：reload 清除 pending markers）
+- [x] storage 可寫性預檢與文件（T9：啟動時 probe，不可寫即 fail）
 
 **P5 收工**：本機 staging 全流程（不需手動觸發 handshake 就簽到）；
 `tls auto`／`tls internal`／manual cert 三路回歸；Linux release +
 quiche-client smoke 按 AGENTS.md。
+✅ **2026-08-02 部分完成**：T-2/T-3/T-7/T-8/T-9 已實作；eager domain
+收集有單元測試、renewal daemon 首次接線。T-4（TLS-ALPN-01）、T-5
+（DNS-01/wildcard）、T-6（issuer fallback）為 GUARDRAILS 級改動或
+需外部生態（DNS provider、ZeroSSL EAB），已標 TODO(v0.3) 並在程式
+碼註解；公網 staging 全流程驗證需 Linux/VPS 環境（AGENTS.md）。
 
 ---
 

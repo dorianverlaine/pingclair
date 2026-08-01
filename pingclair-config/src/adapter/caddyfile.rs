@@ -730,21 +730,27 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                     // Try to extract matcher and adapt as handler
                     let (matcher, _) = parse_matcher_and_block(&sub_d)?;
                     let mut handler_d = sub_d.clone();
-                    // 🔁 Caddy's `redir /old.html /new.html` carries an inline
-                    // path matcher whose first argument does not end in `*`.
-                    // Detect that shape so official trailing-slash examples
-                    // compile; the second argument must look like a location.
-                    let redir_inline_matcher =
-                        if handler_d.name == "redir" || handler_d.name == "redirect" {
+                    // 🔁 Caddy's `redir /old.html /new.html` and
+                    // `rewrite /old /new` carry an inline path matcher whose
+                    // first argument does not end in `*`. Detect that shape so
+                    // official examples compile.
+                    let inline_path_matcher = if handler_d.name == "redir"
+                        || handler_d.name == "redirect"
+                        || handler_d.name == "rewrite"
+                    {
+                        if handler_d.name == "rewrite" {
+                            handler_d.args.len() >= 2 && handler_d.args[0].starts_with('/')
+                        } else {
                             handler_d.args.len() >= 2
                                 && handler_d.args[0].starts_with('/')
                                 && (handler_d.args[1].starts_with('/')
                                     || handler_d.args[1].contains("://"))
                                 && !handler_d.args[1].parse::<u16>().is_ok()
-                        } else {
-                            false
-                        };
-                    if redir_inline_matcher {
+                        }
+                    } else {
+                        false
+                    };
+                    if inline_path_matcher {
                         let path = handler_d.args.remove(0);
                         let route_matcher = Matcher::Path(PathMatcher {
                             patterns: vec![path.clone()],
@@ -770,29 +776,116 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
             }
         }
 
-        if !default_handlers.is_empty() {
-            let final_handler = if default_handlers.len() == 1 {
-                default_handlers[0].clone()
-            } else {
-                Handler::Pipeline(default_handlers.clone())
-            };
+        // 🧭 Caddy sorts handler directives into a fixed chain so the file
+        // order does not change behavior: `header` always runs before
+        // `respond`, `basic_auth` before `file_server`, and so on. Sorting
+        // the default pipeline here reproduces that guarantee.
+        default_handlers.sort_by_key(caddy_handler_rank);
 
-            if let Some(routes) = server.routes.as_mut() {
-                for arm in &mut routes.inner.arms {
-                    if !handler_has_terminal(&arm.inner.handler) {
-                        arm.inner.handler = compose_with_default_handlers(
-                            arm.inner.handler.clone(),
-                            &default_handlers,
-                        );
-                    }
+        let final_handler = if default_handlers.len() == 1 {
+            default_handlers[0].clone()
+        } else {
+            Handler::Pipeline(default_handlers.clone())
+        };
+
+        if let Some(routes) = server.routes.as_mut() {
+            // 🧭 Matched routes sort the same way, with middleware first: a
+            // non-terminal route must run before a terminal route that would
+            // otherwise shadow it, and equally ranked routes order by matcher
+            // specificity (exact before glob, longer before shorter) like
+            // Caddy's sorting algorithm.
+            routes.inner.arms.sort_by(|left, right| {
+                let left_terminal = handler_has_terminal(&left.inner.handler);
+                let right_terminal = handler_has_terminal(&right.inner.handler);
+                left_terminal.cmp(&right_terminal).then_with(|| {
+                    let left_specificity = route_specificity(&left.inner.matcher);
+                    let right_specificity = route_specificity(&right.inner.matcher);
+                    // 🧭 Exact patterns (no `*`) first; within the same
+                    // kind the longer pattern wins.
+                    left_specificity
+                        .0
+                        .cmp(&right_specificity.0)
+                        .then_with(|| right_specificity.1.cmp(&left_specificity.1))
+                })
+            });
+            for arm in &mut routes.inner.arms {
+                if !handler_has_terminal(&arm.inner.handler) {
+                    arm.inner.handler =
+                        compose_with_default_handlers(arm.inner.handler.clone(), &default_handlers);
                 }
             }
+        }
 
+        if !default_handlers.is_empty() {
             add_route(&mut server, None, final_handler);
         }
     }
 
+    // 🏠 Caddy serves localhost and IP-literal sites over HTTPS with its local
+    // CA by default. Mirror that: a site with no explicit TLS and no `http://`
+    // scheme gets the internal authority, so `localhost { ... }` is HTTPS
+    // without the operator having to ask.
+    if server.tls.is_none()
+        && !d.name.starts_with("http://")
+        && is_local_https_default(&server.name)
+    {
+        server.tls = Some(TlsDirective {
+            off: false,
+            auto: false,
+            internal: true,
+            cert: None,
+            key: None,
+            acme_email: None,
+            http3: None,
+        });
+    }
+
     Ok(server)
+}
+
+/// 🏠 Whether a site name is a localhost-style host or an IP literal, which
+/// Caddy serves over HTTPS with a locally-trusted certificate by default.
+fn is_local_https_default(name: &str) -> bool {
+    name == "localhost"
+        || name.ends_with(".localhost")
+        || name.ends_with(".local")
+        || name.ends_with(".internal")
+        || name.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// 🧭 Maps a handler to its position in Caddy's default directive order.
+/// Handlers that only modify the request/response run early; handlers that
+/// write a terminal response run late.
+fn caddy_handler_rank(handler: &Handler) -> usize {
+    match handler {
+        Handler::Headers(_) => 0,
+        Handler::Redirect(_) => 1,
+        Handler::Rewrite(_) => 2,
+        Handler::BasicAuth(_) => 3,
+        Handler::RateLimit(_) | Handler::Cors(_) | Handler::AccessControl(_) => 4,
+        Handler::Pipeline(_) | Handler::Handle(_) => 5,
+        Handler::Respond(_) => 6,
+        Handler::Proxy(_) => 7,
+        Handler::FileServer(_) => 8,
+        Handler::Plugin { .. } => 9,
+    }
+}
+
+/// 🧭 Matcher specificity for same-name route ordering: longer path patterns
+/// win, and an exact pattern beats a glob of the same length.
+fn route_specificity(matcher: &Option<Matcher>) -> (usize, usize) {
+    let Some(matcher) = matcher else {
+        return (0, 0);
+    };
+    match matcher {
+        Matcher::Path(path) => {
+            let pattern = path.patterns.first().map_or("", |p| p.as_str());
+            // 🧭 Exact patterns outrank globs of any length; between two
+            // patterns of the same kind the longer one wins.
+            (pattern.contains('*') as usize, pattern.len())
+        }
+        _ => (0, 0),
+    }
 }
 
 /// 🚫 Whether an address string uses Caddy syntax that Pingclair cannot
@@ -1199,6 +1292,17 @@ fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
             let mut handlers = Vec::new();
             if let Some(block) = d.block {
                 for inner_d in block.directives {
+                    if inner_d.name.starts_with('@') {
+                        // TODO(v0.3): support matcher tokens on directives
+                        // inside route/handle blocks (needs per-handler
+                        // conditional execution in the runtime chain).
+                        return Err(AdapterError::UnsupportedFeature(
+                            "route/handle matcher token".into(),
+                            "matcher tokens inside route/handle blocks are not \
+                             implemented yet"
+                                .into(),
+                        ));
+                    }
                     handlers.push(adapt_handler(inner_d)?);
                 }
             }
@@ -1727,25 +1831,24 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
                     }
                 }
                 "to" => {
-                    let address = sub
-                        .args
-                        .first()
-                        .ok_or_else(|| {
-                            AdapterError::ArgumentCount("reverse_proxy to".into(), 1, 0)
-                        })?
-                        .clone();
-                    if sub.args.len() != 1 {
-                        return Err(AdapterError::InvalidArgument(
-                            "reverse_proxy to".into(),
-                            "expected exactly one upstream address".into(),
-                        ));
-                    }
-                    let mut upstream = ProxyUpstreamConfig {
-                        address: address.clone(),
-                        weight: 1,
-                        backup: false,
-                    };
+                    // 🧭 Caddy's `to` accepts several upstreams on one line
+                    // (`to 10.0.1.1:80 10.0.1.2:80`). A block (`to host {
+                    // weight 3 }`) configures exactly one upstream.
                     if let Some(to_block) = sub.block {
+                        let address = sub.args.first().ok_or_else(|| {
+                            AdapterError::ArgumentCount("reverse_proxy to".into(), 1, 0)
+                        })?;
+                        if sub.args.len() != 1 {
+                            return Err(AdapterError::InvalidArgument(
+                                "reverse_proxy to".into(),
+                                "a block form takes exactly one upstream address".into(),
+                            ));
+                        }
+                        let mut upstream = ProxyUpstreamConfig {
+                            address: address.clone(),
+                            weight: 1,
+                            backup: false,
+                        };
                         for option in to_block.directives {
                             match option.name.as_str() {
                                 "weight" => {
@@ -1784,9 +1887,25 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
                                 }
                             }
                         }
+                        proxy.upstreams.push(address.clone());
+                        proxy.upstream_options.push(upstream);
+                    } else {
+                        if sub.args.is_empty() {
+                            return Err(AdapterError::ArgumentCount(
+                                "reverse_proxy to".into(),
+                                1,
+                                0,
+                            ));
+                        }
+                        for address in &sub.args {
+                            proxy.upstreams.push(address.clone());
+                            proxy.upstream_options.push(ProxyUpstreamConfig {
+                                address: address.clone(),
+                                weight: 1,
+                                backup: false,
+                            });
+                        }
                     }
-                    proxy.upstreams.push(address);
-                    proxy.upstream_options.push(upstream);
                 }
                 // 🚩 `lb_try_duration`, `fail_duration` and any other
                 // unrecognised subdirective used to vanish here. A config
@@ -4385,5 +4504,142 @@ mod p3_syntax_tests {
     fn shorthand_parses_via_public_api() {
         let directives = parse("localhost\n\nrespond \"ok\"").expect("parse shorthand");
         assert_eq!(directives.len(), 2);
+    }
+}
+
+// MARK: - P4 Directive Order Tests
+
+/// 🧭 P4 regressions: Caddy's directive order must make file order
+/// irrelevant, middleware must not be shadowed by terminal routes, and
+/// same-name routes must sort by matcher specificity.
+#[cfg(test)]
+mod directive_order_tests {
+    use crate::compile;
+    use pingclair_core::config::HandlerConfig;
+
+    #[test]
+    fn header_runs_before_respond_regardless_of_file_order() {
+        let reversed =
+            compile("example.com {\n    respond \"ok\"\n    header X-A b\n}").expect("compile");
+        let normal =
+            compile("example.com {\n    header X-A b\n    respond \"ok\"\n}").expect("compile");
+
+        let pipeline = |config: &pingclair_core::config::PingclairConfig| match &config.servers[0]
+            .routes[0]
+            .handler
+        {
+            HandlerConfig::Pipeline { handlers } => {
+                let kinds: Vec<&str> = handlers
+                    .iter()
+                    .map(|h| match h {
+                        HandlerConfig::Headers { .. } => "headers",
+                        HandlerConfig::Respond { .. } => "respond",
+                        other => panic!("unexpected handler {other:?}"),
+                    })
+                    .collect();
+                kinds
+            }
+            other => panic!("expected pipeline, got {other:?}"),
+        };
+        assert_eq!(pipeline(&reversed), vec!["headers", "respond"]);
+        assert_eq!(pipeline(&normal), vec!["headers", "respond"]);
+    }
+
+    #[test]
+    fn basic_auth_runs_before_file_server() {
+        let config =
+            compile("example.com {\n    file_server ./public\n    basic_auth user pass\n}")
+                .expect("compile");
+        match &config.servers[0].routes[0].handler {
+            HandlerConfig::Pipeline { handlers } => {
+                assert!(matches!(handlers[0], HandlerConfig::BasicAuth { .. }));
+                assert!(matches!(handlers[1], HandlerConfig::FileServer { .. }));
+            }
+            other => panic!("expected pipeline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exact_handle_precedes_glob_handle() {
+        let config = compile(
+            "example.com {\n    handle /foo* { respond \"glob\" }\n    handle /foo { respond \"exact\" }\n}",
+        )
+        .expect("compile");
+        assert_eq!(config.servers[0].routes[0].path, "/foo");
+        assert_eq!(config.servers[0].routes[1].path, "/foo*");
+    }
+
+    #[test]
+    fn middleware_route_precedes_terminal_route_with_same_matcher() {
+        let config = compile(
+            "example.com {\n    @api path /api/*\n    handle /api/* { respond \"api\" }\n    header @api X-A b\n}",
+        )
+        .expect("compile");
+        let routes = &config.servers[0].routes;
+        assert!(
+            matches!(&routes[0].handler, HandlerConfig::Headers { .. })
+                || matches!(
+                    &routes[0].handler,
+                    HandlerConfig::Pipeline { handlers } if handlers.iter().any(|h| matches!(h, HandlerConfig::Headers { .. }))
+                ),
+            "the middleware route must come first, got {:?}",
+            routes[0].handler
+        );
+    }
+
+    #[test]
+    fn to_accepts_multiple_upstreams_on_one_line() {
+        let config = compile(
+            "example.com {\n    reverse_proxy /service/* {\n        to 10.0.1.1:80 10.0.1.2:80 10.0.1.3:80\n    }\n}",
+        )
+        .expect("multiple `to` upstreams compile");
+        match &config.servers[0].routes[0].handler {
+            HandlerConfig::ReverseProxy(proxy) => {
+                assert_eq!(
+                    proxy.upstreams,
+                    vec![
+                        "10.0.1.1:80".to_string(),
+                        "10.0.1.2:80".to_string(),
+                        "10.0.1.3:80".to_string()
+                    ]
+                );
+            }
+            other => panic!("expected reverse proxy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_with_path_matcher_uses_caddy_semantics() {
+        let config =
+            compile("example.com {\n    rewrite /old /new\n}").expect("path rewrite compiles");
+        let routes = &config.servers[0].routes;
+        assert_eq!(
+            routes[0].path, "/old",
+            "the rewrite matcher must become the route path"
+        );
+    }
+
+    #[test]
+    fn regex_rewrite_still_compiles() {
+        let config = compile("example.com {\n    rewrite \"^/api/(.*)$\" \"/v1/$1\"\n}")
+            .expect("regex rewrite compiles");
+        let routes = &config.servers[0].routes;
+        assert_eq!(routes[0].path, "/*", "a regex rewrite stays a catch-all");
+    }
+
+    #[test]
+    fn localhost_defaults_to_internal_tls() {
+        let config = compile("localhost {\n    respond \"ok\"\n}").expect("localhost compiles");
+        assert!(
+            config.servers[0]
+                .tls
+                .as_ref()
+                .is_some_and(|tls| tls.internal),
+            "localhost must default to the internal CA"
+        );
+
+        let plain = compile("http://localhost {\n    respond \"ok\"\n}")
+            .expect("explicit http stays plaintext");
+        assert!(plain.servers[0].tls.is_none());
     }
 }

@@ -78,14 +78,14 @@
 
 | 項 | 需求 | 級別 |
 |---|---|---|
-| D-1 | 已支援 directive 依 Caddy 預設順序固定執行（header 在 respond 前等；D1） | 🔴 |
-| D-2 | middleware（header/rewrite/basic_auth…）是包住 routing 的 chain，不是 route arm；不被 terminal route 遮蔽（D2） | 🔴 |
-| D-3 | 同名 `handle` 依 matcher specificity 排序（D3） | 🟠 |
-| D-4 | directive 第一參數 `/`-path 解析為 matcher（`reverse_proxy /api/*`、`redir /a /b` 等；P3、P4） | 🟠 |
-| D-5 | `rewrite` 的 path 語意與 regex 語意明確區分（P4） | 🟠 |
-| D-6 | `route` block 保留字面順序、支援內層 matcher token（D5） | 🟠 |
+| D-1 | 已支援 directive 依 Caddy 預設順序固定執行（header 在 respond 前等；D1） ✅ P4 已修 | 🔴 |
+| D-2 | middleware（header/rewrite/basic_auth…）是包住 routing 的 chain，不是 route arm；不被 terminal route 遮蔽（D2） ✅ P4 已修（middleware route 前置 + compose） | 🔴 |
+| D-3 | 同名 `handle` 依 matcher specificity 排序（D3） ✅ P4 已修 | 🟠 |
+| D-4 | directive 第一參數 `/`-path 解析為 matcher（`reverse_proxy /api/*`、`redir /a /b` 等；P3、P4） ✅ P3/P4 已修 | 🟠 |
+| D-5 | `rewrite` 的 path 語意與 regex 語意明確區分（P4） ✅ P4 已修（`/` 開頭兩參數為 path matcher；regex 保留） | 🟠 |
+| D-6 | `route` block 保留字面順序、支援內層 matcher token（D5） 🟠 部分：字面順序既有；內層 token 標 TODO(v0.3) | 🟠 |
 | D-7 | directive 覆蓋度補齊：`abort`、`error`、`handle_errors`、`handle_path`、`request_header`、`uri`、`vars`、`method`（D6 清單，分批） | 🟡 |
-| D-8 | `order` global option（配 D-1 一起） | 🟡 |
+| D-8 | `order` global option（配 D-1 一起） 🟡 固定排序已實作；order 覆寫標 TODO(v0.3) | 🟡 |
 
 ## 5. Global Options（來源：GLOBAL_OPTIONS）
 
@@ -108,14 +108,14 @@
 | 項 | 需求 | 級別 |
 |---|---|---|
 | T-1 | 修 A-1 後，`tls auto` 簽發路徑才通；驗證「不需手動 handshake 就簽到」 | 🔴 |
-| T-2 | 背景 eager issuance：啟動時為所有 `tls auto` 具名網域發起簽發；handshake 不再阻塞（T2） | 🔴 |
-| T-3 | 失敗重試與退避（指數退避、最長 1 天、30 天內持續）（T5） | 🟠 |
-| T-4 | TLS-ALPN-01 challenge（T3，GUARDRAILS 級別） | 🟠 |
-| T-5 | DNS-01 + wildcard 憑證（T4，含 `tls { dns }` 語法） | 🟠 |
-| T-6 | issuer fallback（LE→ZeroSSL）（T5） | 🟡 |
-| T-7 | localhost/本機 IP 自動本機 CA HTTPS（T6、A-6） | 🟠 |
-| T-8 | reload 中止 in-flight ACME（T8、A-1） | 🟡 |
-| T-9 | storage 預檢／叢集協調說明（T7） | 🟡 |
+| T-2 | 背景 eager issuance：啟動時為所有 `tls auto` 具名網域發起簽發；handshake 不再阻塞（T2） ✅ P5 已修 | 🔴 |
+| T-3 | 失敗重試與退避（指數退避、最長 1 天、30 天內持續）（T5） ✅ P5 已修 | 🟠 |
+| T-4 | TLS-ALPN-01 challenge（T3，GUARDRAILS 級別） 🟠 標 TODO(v0.3) | 🟠 |
+| T-5 | DNS-01 + wildcard 憑證（T4，含 `tls { dns }` 語法） 🟠 標 TODO(v0.3) | 🟠 |
+| T-6 | issuer fallback（LE→ZeroSSL）（T5） 🟡 標 TODO(v0.3) | 🟡 |
+| T-7 | localhost/本機 IP 自動本機 CA HTTPS（T6、A-6） ✅ P5 已修 | 🟠 |
+| T-8 | reload 中止 in-flight ACME（T8、A-1） ✅ P5 已修（清 pending markers） | 🟡 |
+| T-9 | storage 預檢／叢集協調說明（T7） ✅ P5 已修（可寫 probe） | 🟡 |
 
 ## 7. Response Matcher / 攔截（來源：RESPONSE_MATCHERS）
 
