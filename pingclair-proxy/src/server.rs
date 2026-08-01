@@ -3272,6 +3272,11 @@ impl ProxyHttp for PingclairProxy {
             return Ok(true);
         }
 
+        // 📊 Track in-flight requests per virtual host; released in `logging`.
+        let host = request_authority(session.req_header());
+        let host = if host.is_empty() { "-" } else { host };
+        metrics::ACTIVE_CONNECTIONS.with_label_values(&[host]).inc();
+
         // 🛡️ Framing is settled before anything else reads the request, because
         // a message whose length two parsers can read differently must not be
         // routed, logged as a normal request, or forwarded at all.
@@ -4425,6 +4430,9 @@ impl ProxyHttp for PingclairProxy {
             .unwrap_or_else(|| session_peer_ip(session))
             .to_string();
         let elapsed = ctx.start_time.elapsed();
+
+        // 📊 The request is complete: release its active-connection slot.
+        metrics::ACTIVE_CONNECTIONS.with_label_values(&[host]).dec();
 
         // Update Prometheus metrics
         metrics::REQUESTS_TOTAL

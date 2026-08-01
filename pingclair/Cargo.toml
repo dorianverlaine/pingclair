@@ -38,15 +38,16 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+serde_json.workspace = true
+bcrypt.workspace = true
 parking_lot = "0.12"
 futures = "0.3"
 
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 tikv-jemallocator = "0.6"
 
 [dev-dependencies]
-serde_json.workspace = true
 # default-features = false: reqwest's default-tls (native-tls) pulls in
 # openssl-sys on Linux, whose OpenSSL symbols collide with quiche's statically
 # linked BoringSSL at link time (undefined SSL_CTX_ctrl etc. in CI). rustls is

@@ -16,7 +16,7 @@ use hyper_util::rt::TokioIo;
 use parking_lot::RwLock;
 use tokio::net::TcpListener;
 
-use pingclair_core::config::ServerConfig;
+use pingclair_core::config::{PingclairConfig, ServerConfig};
 
 use crate::auth::{ApiKeyAuth, AuthDecision, authorize};
 
@@ -110,9 +110,11 @@ async fn handle_request(
                 .unwrap())
         }
         (&Method::GET, "/config") => {
-            let mut configs = std::collections::HashMap::new();
+            // 🧭 Exports a document shaped like the config file: one `servers`
+            // list, deduplicated, so the output can be POSTed back to /load.
+            let mut servers = Vec::new();
             let proxies_guard = proxies.read();
-            for (addr, proxy) in proxies_guard.iter() {
+            for proxy in proxies_guard.values() {
                 let mut host_configs = Vec::new();
                 for host_state in proxy.hosts.load().values() {
                     host_configs.push(host_state.config.as_ref().clone());
@@ -120,11 +122,148 @@ async fn handle_request(
                 if let Some(def) = (**proxy.default.load()).as_ref() {
                     host_configs.push(def.config.as_ref().clone());
                 }
-                configs.insert(addr.clone(), host_configs);
+                for config in host_configs {
+                    // 🧭 Deduplicate by name + listener set; ServerConfig does
+                    // not implement PartialEq.
+                    let already_present = servers.iter().any(|existing: &ServerConfig| {
+                        existing.name == config.name && existing.listen == config.listen
+                    });
+                    if !already_present {
+                        servers.push(config);
+                    }
+                }
             }
 
-            let json = serde_json::to_string_pretty(&configs).unwrap_or_default();
+            let document = PingclairConfig {
+                servers,
+                ..Default::default()
+            };
+            let json = serde_json::to_string_pretty(&document).unwrap_or_default();
             Ok(Response::new(Full::new(Bytes::from(json))))
+        }
+        (&Method::POST, "/load") => {
+            let body_bytes = match read_bounded_body(req).await {
+                Ok(bytes) => bytes,
+                Err(BodyError::TooLarge) => {
+                    return Ok(response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        &format!(
+                            r#"{{"error":"config body exceeds {MAX_CONFIG_BODY_BYTES} bytes"}}"#
+                        ),
+                    ));
+                }
+                Err(BodyError::Incomplete) => {
+                    return Ok(response(
+                        StatusCode::BAD_REQUEST,
+                        r#"{"error":"could not read the request body"}"#,
+                    ));
+                }
+            };
+
+            // 🛡️ Full-document replacement: parse AND validate everything
+            // before touching a single proxy, so a bad document rolls back by
+            // never being applied at all.
+            let config: PingclairConfig = match serde_json::from_slice(&body_bytes) {
+                Ok(c) => c,
+                Err(e) => {
+                    return Ok(response(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Invalid config: {e}"),
+                    ));
+                }
+            };
+            if let Err(error) = pingclair_config::compiler::validate_config(&config) {
+                return Ok(response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid config: {error}"),
+                ));
+            }
+
+            let proxies_guard = proxies.read();
+            // 🧭 Resolve every target first: applying inside the loop left a
+            // half-updated state when one listener did not exist.
+            let mut targets = Vec::new();
+            for server in &config.servers {
+                if server.listen.is_empty() {
+                    return Ok(response(
+                        StatusCode::BAD_REQUEST,
+                        r#"{"error":"a server declares no listen address"}"#,
+                    ));
+                }
+                for addr in &server.listen {
+                    match proxies_guard.get(addr) {
+                        Some(proxy) => targets.push((addr, server, proxy)),
+                        None => {
+                            return Ok(response(
+                                StatusCode::NOT_FOUND,
+                                &format!(
+                                    r#"{{"error":"no listener is bound to {addr}; nothing was applied"}}"#
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            for (addr, server, proxy) in targets {
+                proxy.add_server(server.clone());
+                tracing::info!(listener = %addr, "📤 Loaded server config");
+            }
+            Ok(response(StatusCode::OK, "Config loaded"))
+        }
+        (&Method::POST, "/adapt") => {
+            let body_bytes = match read_bounded_body(req).await {
+                Ok(bytes) => bytes,
+                Err(BodyError::TooLarge) => {
+                    return Ok(response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        &format!(
+                            r#"{{"error":"config body exceeds {MAX_CONFIG_BODY_BYTES} bytes"}}"#
+                        ),
+                    ));
+                }
+                Err(BodyError::Incomplete) => {
+                    return Ok(response(
+                        StatusCode::BAD_REQUEST,
+                        r#"{"error":"could not read the request body"}"#,
+                    ));
+                }
+            };
+            let source = match std::str::from_utf8(&body_bytes) {
+                Ok(source) => source,
+                Err(_) => {
+                    return Ok(response(
+                        StatusCode::BAD_REQUEST,
+                        r#"{"error":"config body is not UTF-8 text"}"#,
+                    ));
+                }
+            };
+            let config = match pingclair_config::compile(source) {
+                Ok(config) => config,
+                Err(error) => {
+                    return Ok(response(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Adapt error: {error}"),
+                    ));
+                }
+            };
+            match serde_json::to_string_pretty(&config) {
+                Ok(json) => Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/json")
+                    .body(Full::new(Bytes::from(json)))
+                    .unwrap()),
+                Err(error) => Ok(response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Serialization error: {error}"),
+                )),
+            }
+        }
+        (&Method::POST, "/stop") => {
+            tracing::info!("🛑 Admin API received /stop, shutting down");
+            // TODO(v0.3): coordinate a graceful shutdown through the process
+            // supervisor; a hard exit is correct enough for now.
+            std::process::exit(0);
         }
         (&Method::POST, path) if path.starts_with("/config") => {
             let body_bytes = match read_bounded_body(req).await {

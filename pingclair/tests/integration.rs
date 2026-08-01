@@ -2899,6 +2899,173 @@ async fn test_directive_order_does_not_change_behavior() {
     assert_eq!(result_a.2, "ordered-ok");
 }
 
+/// 📤 The admin API adapts a Pingclairfile, exports a re-loadable config
+/// document, and replaces a server via POST /load.
+#[tokio::test]
+async fn test_admin_adapt_export_and_load() {
+    let mut server = TestServer::new(&admin_test_config("/ready-a", "ready-a"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    // 🧭 POST /adapt turns Pingclairfile text into the native JSON document.
+    let adapted = client
+        .post(server.admin_url("/adapt"))
+        .header("Content-Type", "text/caddyfile")
+        .body(":8080 {\n    respond \"adapted-ok\"\n}\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(adapted.status(), reqwest::StatusCode::OK);
+    let adapted_json: serde_json::Value = adapted.json().await.unwrap();
+    assert_eq!(adapted_json["servers"][0]["name"], "_");
+
+    // 🧭 GET /config exports a document shaped like the config file.
+    let exported = client
+        .get(server.admin_url("/config"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(exported.status(), reqwest::StatusCode::OK);
+    let exported_json: serde_json::Value = exported.json().await.unwrap();
+    assert!(
+        exported_json["servers"].is_array(),
+        "GET /config must return a servers array"
+    );
+
+    // 📤 POST /load replaces a server with a full document.
+    let document = serde_json::json!({
+        "servers": [{
+            "name": "_",
+            "names": [],
+            "listen": [server.address(0).to_string()],
+            "routes": [{
+                "path": "/*",
+                "handler": {"type": "respond", "status": 200, "body": "loaded-ok"}
+            }]
+        }]
+    });
+    let loaded = client
+        .post(server.admin_url("/load"))
+        .json(&document)
+        .send()
+        .await
+        .unwrap();
+    let loaded_status = loaded.status();
+    let _ = loaded.text().await;
+    assert_eq!(loaded_status, reqwest::StatusCode::OK);
+
+    let response = client.get(server.url(0, "/")).send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "loaded-ok");
+
+    // 🛡️ A document referencing a missing listener must be refused wholesale.
+    let bad = serde_json::json!({
+        "servers": [{
+            "name": "bad",
+            "listen": ["127.0.0.1:1"],
+            "routes": []
+        }]
+    });
+    let refused = client
+        .post(server.admin_url("/load"))
+        .json(&bad)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::NOT_FOUND);
+    // 🧭 The previous config must still be live.
+    let response = client.get(server.url(0, "/")).send().await.unwrap();
+    assert_eq!(response.text().await.unwrap(), "loaded-ok");
+}
+
+/// 🔔 SIGHUP/SIGUSR1 reload the running server from its config file — on any
+/// Unix, including the macOS dev machines this suite runs on. The test edits
+/// the Pingclairfile, signals the real binary, and checks that the new route
+/// answers and that a global change is reported as requiring a restart.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_signal_reload_applies_config_and_warns_on_global_changes() {
+    let config = r#"
+        {
+            admin off
+            email before@example.com
+        }
+
+        :__PINGCLAIR_TEST_PORT__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "before-reload"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+    let response = client.get(server.url(0, "/")).send().await.unwrap();
+    assert_eq!(response.text().await.unwrap(), "before-reload");
+
+    // ✍️ Edit the config: new body plus a global option change.
+    let config_path = server._temp_dir.path().join("Pingclairfile");
+    let updated = std::fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("before@example.com", "after@example.com")
+        .replace("before-reload", "after-reload");
+    std::fs::write(&config_path, updated).unwrap();
+
+    // 🔔 SIGHUP is the historical reload signal.
+    let status = std::process::Command::new("kill")
+        .args(["-HUP", &server.process.id().to_string()])
+        .status()
+        .expect("kill must run");
+    assert!(status.success());
+
+    // ⏳ Wait for the reloaded route to answer.
+    let mut reloaded = false;
+    for _ in 0..50 {
+        if let Ok(response) = client.get(server.url(0, "/")).send().await
+            && response.text().await.ok().as_deref() == Some("after-reload")
+        {
+            reloaded = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(reloaded, "the server must answer with the reloaded body");
+
+    // 🚩 The global email change must be reported as restart-only.
+    // 🧭 tracing writes to stdout by default in this test harness.
+    let stderr = std::fs::read_to_string(&server.stdout_path).unwrap_or_default();
+    assert!(
+        stderr.contains("global options"),
+        "the reload must warn that global settings need a restart:\n{stderr}"
+    );
+
+    // 🚦 SIGUSR1 (Caddy's reload signal) must also work.
+    std::fs::write(
+        &config_path,
+        std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("after-reload", "usr1-reload"),
+    )
+    .unwrap();
+    let status = std::process::Command::new("kill")
+        .args(["-USR1", &server.process.id().to_string()])
+        .status()
+        .expect("kill must run");
+    assert!(status.success());
+
+    let mut usr1_reloaded = false;
+    for _ in 0..50 {
+        if let Ok(response) = client.get(server.url(0, "/")).send().await
+            && response.text().await.ok().as_deref() == Some("usr1-reload")
+        {
+            usr1_reloaded = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(usr1_reloaded, "SIGUSR1 must reload the configuration");
+}
+
 /// 🔎 Starts a TLS-ready test server and returns (status, x-order, body).
 async fn fetch_ordered_response(server: &mut TestServer) -> (reqwest::StatusCode, String, String) {
     assert!(

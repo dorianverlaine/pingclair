@@ -37,8 +37,8 @@ pub static REQUEST_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
 });
 
 /// Active connections
-pub static ACTIVE_CONNECTIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    IntCounterVec::new(
+pub static ACTIVE_CONNECTIONS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
         Opts::new(
             "pingclair_active_connections",
             "Number of active connections",

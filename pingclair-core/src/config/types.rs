@@ -33,7 +33,7 @@ pub struct PingclairConfig {
 }
 
 /// Global configuration options
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GlobalConfig {
     /// Global ACME email
     pub email: Option<String>,
@@ -49,6 +49,12 @@ pub struct GlobalConfig {
     /// conventions use this instead of a hard-coded 443.
     #[serde(default = "default_https_port")]
     pub https_port: u16,
+
+    /// 📊 Whether Prometheus metrics are collected and served. Enabled by
+    /// default to preserve existing deployments; `{ metrics }` in a
+    /// Pingclairfile enables it explicitly.
+    #[serde(default = "default_bool_true")]
+    pub metrics: bool,
 
     /// Global auto-HTTPS setting
     #[serde(default)]
@@ -109,6 +115,7 @@ impl Default for GlobalConfig {
             email: None,
             http_port: default_http_port(),
             https_port: default_https_port(),
+            metrics: default_bool_true(),
             auto_https: AutoHttpsMode::default(),
             blocked_ips: Vec::new(),
             trusted_proxies: Vec::new(),
