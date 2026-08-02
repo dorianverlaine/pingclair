@@ -1,12 +1,123 @@
 # Pingclair benchmarks
 
-The current public benchmark is the 2026-08-02 AWS x86 run, measured
-at Pingclair commit `ca773affad998eb6439319236dd904fc20b4785f` (raw per-run
-evidence is kept locally and is not part of the repository).
+The current public benchmark is the 2026-08-03 AWS Oregon matrix, measured on
+the optimized HTTP/3 branch at commit `36bf860`. The reusable harness lives
+in `benchmarks/aws-h3/`; raw per-run evidence is kept locally under
+`benchmarks/results/` and is not part of the repository.
 
-## Current results
+## Current results (2026-08-03)
 
-Each value is the median of three recorded rounds. Higher is better.
+Medians of valid rounds. Higher is better. Environment: two AWS Oregon
+`t3.small` instances in one subnet (private IPv4), Ubuntu 26.04, candidates
+run one at a time as containers sharing the same files, backend, certificate,
+ports, and client. H1S/H2/H3 all use the same h2load; H1 uses wrk.
+
+### 1 KiB static files
+
+| Protocol | Pingclair | nginx 1.31.3 | Caddy 2.11.4 |
+| --- | ---: | ---: | ---: |
+| H1 (wrk) | 33,920 | 43,971 | 14,252 |
+| HTTPS/H1 | 23,533 | 22,538 | 15,384 |
+| H2 | 26,638 | 42,332 | 10,394 |
+| H3 | 28,448 | 39,683* | 12,304 |
+
+### 1 KiB reverse proxy (nginx backend on :9000)
+
+| Protocol | Pingclair | nginx 1.31.3 | Caddy 2.11.4 | pingap |
+| --- | ---: | ---: | ---: | ---: |
+| H1 (wrk) | 10,979 | 18,734 | 6,794 | 13,028 |
+| HTTPS/H1 | 9,691 | 15,230 | 6,297 | 9,776 |
+| H2 | 9,649 | 14,892 | 4,102 | 10,484 |
+| H3 | 9,939 | 16,376 | 3,871 | n/a |
+
+Pingap has no HTTP/3 listener and no native static file server, so its rows
+are proxy-only and its H3 cells are skipped.
+
+### 1 MiB files (clean round-1 values)
+
+| Mode | Protocol | Pingclair | nginx | Caddy | pingap |
+| --- | --- | ---: | ---: | ---: | ---: |
+| static | HTTPS/H1 | 589 | 589 | 543 | — |
+| static | H2 | 578 | 573 | 529 | — |
+| static | H3 | 218 | 250 | 245 | — |
+| proxy | HTTPS/H1 | 533 | 588 | 575 | 522 |
+| proxy | H2 | 560 | 557 | 418 | 523 |
+| proxy | H3 | 217 | 238 | 242 | n/a |
+
+### aioquic parity rows (1 KiB static, client-bound)
+
+Pingclair 2,330 req/s (reused connections) and 1,778 (pipelined); nginx 2,243
+and a client timeout; Caddy 2,053 and 1,574. The aioquic client is
+single-threaded and caps around 2k req/s on this hardware, so these rows
+verify correctness more than throughput.
+
+\* nginx H3 was 55,423 req/s in the clean round and 23,853 after the network
+degradation described below; Pingclair was stable across rounds. The
+large-file rows come from round 1 only: round 2 was invalidated by exhausted
+burstable-network capacity on both hosts after roughly two hours of sustained
+traffic (cwnd collapse with ~25% retransmission while both hosts were idle).
+Single-connection transfers remained fast throughout.
+
+## Test topology and workloads (2026-08-03)
+
+- AWS Oregon (`us-west-2a`), one x86 `t3.small` client and one x86 `t3.small`
+  server, same subnet, private IPv4 traffic, Ubuntu 26.04, 2 vCPU / 2 GiB
+  each, `unlimited` CPU credit mode.
+- Pingclair: production Dockerfile (Rust 1.97.1, locked dependencies,
+  fat-LTO release), `linux/amd64` via OrbStack; x86-64 ELF SHA-256
+  `a09d7d033a3a35981ebc1efa9c7b0a64065330b9ebdac1bdfe9c0d6f445f86d8`.
+- nginx 1.31.3 (alpine) and Caddy 2.11.4 (alpine) official images; pingap
+  `latest`. All candidates pinned to 2 worker threads/processes.
+- H1: `wrk -t2 -c100 -d30s` on :8080. H1S/H2: host `h2load` 1.68.0 on :8443
+  with SNI `h3.local`, 100 connections × 20 streams for 1 KiB and 50 × 4 for
+  1 MiB. H3: `goodideal/nghttp2` 1.64.0-DEV h2load (ngtcp2) with the same
+  concurrency. Two interleaved rounds per candidate/mode.
+- The reverse-proxy backend is a dedicated nginx container on :9000 serving
+  the same payloads. All recorded rounds completed with zero failed, errored
+  or timed-out requests except the rows flagged above.
+- Configs and orchestration: `benchmarks/aws-h3/` (`run-aws-matrix.sh`,
+  `summarize-matrix.py`, candidate configs under `configs/`). The harness
+  parameterizes host addresses and SSH key via environment variables.
+
+## Findings from this run
+
+- **Pingclair buffers static files below 5 MiB in memory.** 2,000 in-flight
+  1 MiB responses OOM-killed the 2 GiB host (RSS 1.47 GB). Large-file
+  concurrency was capped to keep every candidate alive; removing this
+  buffering is the top next-optimization candidate.
+- **Containers default to `nofile` 1024**, which wedged the reverse-proxy
+  path at ~1,000 upstream connections with 502s until the harness added
+  `--ulimit nofile=65535:65535`. Worth documenting as a deployment default.
+- **Caddy with `auto_https off` rejects IP-based TLS connects** because its
+  certificate is bound to a hostname SNI; TLS loads must keep `h3.local` as
+  the SNI.
+- **Burstable instances are not sustained-throughput benches.** The t3.small
+  network token bucket ran out after ~420 GB of server TX (~470 Mbps average);
+  subsequent multi-connection large transfers collapsed while single
+  connections stayed fast.
+
+## Local H3 optimization A/B (2026-08-03)
+
+An OrbStack optimization pass (branch `codex/h3-perf`) recorded interleaved
+h2load/HTTP-3 measurements against the baseline and the optimized binary;
+evidence lives under `benchmarks/results/20260803_h3perf_opt/` (not
+committed). The optimizations — a 16 KiB per-connection GSO send buffer,
+response-event batching in the H3 worker, and a HeaderMap-free H3 framing
+check — measured about +14–16% on the 1 KiB static workload at 500–2000
+concurrent streams and about +61% on the 1 MiB static workload, inside
+OrbStack Linux containers (2 vCPU each). The AWS rows above are the remote
+confirmation of that binary against other servers.
+
+## Historical baseline (2026-08-02)
+
+The previously published rows were measured at commit
+`ca773affad998eb6439319236dd904fc20b4785f` with a different methodology and
+are kept for reference only. They are not directly comparable with the
+2026-08-03 rows: the binary changed (baseline vs optimized H3 branch), H3
+used the single-threaded aioquic client instead of ngtcp2 h2load, and the
+nginx reverse-proxy configuration used plain `proxy_pass` (HTTP/1.0, no
+upstream keepalive), which understates nginx in proxy scenarios. Evidence:
+`benchmarks/results/20260802_aws_x86_ca773af/` (not committed).
 
 | Scenario | Unit | Pingclair | nginx 1.28.3 | Caddy 2.11.4 |
 | --- | --- | ---: | ---: | ---: |
@@ -22,155 +133,8 @@ Each value is the median of three recorded rounds. Higher is better.
 | H1 warm gzip, 1 MiB compressible | req/s | 44,966.58 | 833.18 | 2,374.64 |
 | WSS echo, 50 connections × 64 B | msg/s | 14,029.97 | 14,937.19 | 13,461.07 |
 
-## Test topology
-
-- AWS Oregon (`us-west-2a`), with one x86 `t3.small` client and one x86
-  `t3.small` server in the same subnet. All load used private IPv4 traffic.
-- Ubuntu 26.04 on both hosts, with 2 vCPU and 2 GiB RAM each. Both instances
-  reported an Intel Xeon Platinum 8259CL.
-- Pingclair, nginx, and Caddy ran one at a time on the server. They shared the
-  same files, backend, short-lived ECDSA P-256 certificate, ports and client.
-- Pingclair was built locally through OrbStack as `linux/amd64`, using the
-  production Dockerfile's Rust 1.97, locked dependencies and fat-LTO release
-  profile. The x86-64 ELF SHA-256 was
-  `0e27a136a037ba2cd9564f94abf12227187b584b7baddc71f4a976309aa9b5ec`.
-- nginx was Ubuntu 1.28.3 with HTTP/3 enabled; Caddy was the official 2.11.4
-  linux-amd64 release.
-
-## Workloads
-
-### H1, HTTPS and reverse proxy
-
-wrk used 2 threads and 100 connections. A 2-second warm-up preceded three
-8-second recorded rounds. Large-file and gzip tests used 32 connections.
-
-The reverse-proxy backend was a separate nginx listener returning the same
-verified 1 KiB body. Its direct private-network preflight reached 63,314.27
-req/s, well above all proxy results.
-
-### H2
-
-h2load 1.68.0 used 2 threads, 50 clients and 10 concurrent streams per
-connection. Each candidate received a 10,000-request warm-up, followed by
-three fixed-count rounds: 300,000 requests for static serving and 100,000 for
-reverse proxying.
-
-nginx's `keepalive_requests` was set to 1,000,000. Its default of 1,000 closes
-each H2 connection after exactly 50,000 aggregate successes in this topology,
-which would make the remaining requests client errors rather than measure
-steady-state throughput. The published rounds all completed with zero failed,
-errored or timed-out requests.
-
-### H3
-
-The client used aioquic 1.3.0. The fresh-connection workload made 300 requests
-at concurrency 30 with one request per QUIC connection. Reuse workloads made
-3,000 requests over 30 persistent connections. Each scenario had a separate
-100-request warm-up and three recorded rounds. Every published response had
-status 200, the expected 1 KiB body, and zero failures.
-
-### Static files and gzip
-
-The large static fixture was an incompressible 1 MiB file. All three servers
-clustered at about 591 MiB/s, indicating the instance network ceiling.
-
-The gzip fixture was a 1 MiB compressible file requested with an explicit
-`Accept-Encoding: gzip`. This is deliberately a warm-serving workload:
-Pingclair caches the compressed static representation, while the tested nginx
-and Caddy configurations compress on every request. The row compares those
-serving strategies, not raw compression-codec speed.
-
-### WebSocket
-
-A native amd64 Go tool ran both the echo backend and the client. The backend's
-direct median was 27,364.98 msg/s. Published WSS rounds used 50 persistent
-connections, synchronous 64-byte binary echoes, a 2-second warm-up and three
-8-second measurements. All three candidates completed with zero client errors.
-
-Representative recorded commands (repeated three times after warm-up) were:
-
-```bash
-wrk -t2 -c100 -d8s http://bench.local:8080/small.txt
-wrk -t2 -c100 -d8s https://bench.local:8443/small.txt
-h2load -t2 -c50 -m10 -n300000 https://bench.local:8443/small.txt
-h2load -t2 -c50 -m10 -n100000 https://bench.local:8443/proxy/bench
-python h3_bench.py --host SERVER_PRIVATE_IP --mode fresh --requests 300 --concurrency 30 --expect-bytes 1024
-python h3_bench.py --host SERVER_PRIVATE_IP --mode reuse --requests 3000 --concurrency 30 --expect-bytes 1024
-wsbench client --url wss://bench.local:8443/ws --connections 50 --duration 8s --payload-bytes 64 --insecure
-```
-
-## Correctness and evidence
-
-Before load, curl verified H1, HTTPS/H1 and H2 negotiation. Static and proxy
-bodies matched SHA-256
-`5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef`;
-decompressed gzip matched
-`30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58`.
-
-The result directory publishes:
-
-- `RESULT.md`: complete environment, method, medians and interpretation;
-- `commit.txt`: the full Pingclair commit under test;
-- `SHA256SUMS`: hashes for every privately archived raw round, configuration,
-  payload check and harness source.
-
-Raw output stays out of Git to avoid republishing incidental infrastructure
-details. The checksum ledger allows the private archive to be verified later.
-
-These are comparative results on small burstable instances, not universal
-product limits. In particular, the aioquic client contributes to absolute H3
-throughput and the 1 MiB result is network-bound.
-
-## Local H3 optimization A/B (2026-08-03, not remote-verified)
-
-A local OrbStack optimization pass (branch `codex/h3-perf`) recorded
-interleaved h2load/HTTP-3 measurements against the baseline commit and the
-optimized binary; full evidence and methodology live in the local ledger
-under `benchmarks/results/20260803_h3perf_opt/` (not committed). The
-optimizations — a 16 KiB per-connection GSO send buffer, response-event
-batching in the H3 worker, and a HeaderMap-free H3 framing check — measured
-about +14–16% on the 1 KiB static workload at 500–2000 concurrent streams,
-and about +61% on the 1 MiB static workload, both inside OrbStack Linux
-containers (2 vCPU each). These numbers are local evidence only: they have
-not been reproduced on the Linux VPS and do not update the published rows
-above.
-
-## AWS Oregon matrix on the optimized branch (2026-08-03)
-
-The same optimized binary was measured on two AWS Oregon `t3.small`
-instances (private subnet, Ubuntu 26.04) against nginx 1.31.3 (alpine),
-Caddy 2.11.4 (alpine) and pingap, over H1/H2/H3 and HTTPS, for static and
-reverse-proxy workloads. Full evidence and methodology live in the local
-ledger under `benchmarks/results/20260803_aws_h3perf/` (not committed).
-
-| 1 KiB static | pingclair | nginx | caddy |
-| --- | ---: | ---: | ---: |
-| H1 (wrk) | 33,920 | 43,971 | 14,252 |
-| HTTPS/H1 | 23,533 | 22,538 | 15,384 |
-| H2 | 26,638 | 42,332 | 10,394 |
-| H3 | 28,448 | 39,683* | 12,304 |
-
-| 1 KiB reverse proxy | pingclair | nginx | caddy | pingap |
-| --- | ---: | ---: | ---: | ---: |
-| H1 (wrk) | 10,979 | 18,734 | 6,794 | 13,028 |
-| HTTPS/H1 | 9,691 | 15,230 | 6,297 | 9,776 |
-| H2 | 9,649 | 14,892 | 4,102 | 10,484 |
-| H3 | 9,939 | 16,376 | 3,871 | n/a |
-
-\* nginx H3 was 55,423 in the clean round and 23,853 after the network
-degradation described in the ledger; pingclair was stable across rounds.
-Large-file rows (1 MiB) were parity on H1S/H2 (≈530–590 req/s for all
-candidates) and H3 (pingclair 218 vs nginx 250 / caddy 245), but round-2
-large-file rows on both t3.small instances were invalidated by exhausted
-burstable-network capacity after roughly two hours of sustained traffic
-(cwnd collapse with ~25% retransmission while both hosts were idle).
-
-The run also surfaced three operational findings recorded in the ledger:
-pingclair buffers static files below 5 MiB in memory (an OOM risk at high
-concurrency, and the top next-optimization candidate), containers default to
-`nofile` 1024 which wedges the reverse-proxy path around 1,000 upstream
-connections (fixed in the harness with `--ulimit nofile=65535:65535`), and
-Caddy with `auto_https off` rejects IP-based TLS connects because its
-certificate is bound to a hostname SNI. These rows do not update the
-published 2026-08-02 baseline above; they are comparative evidence for the
-optimized branch.
+That run used wrk `-t2 -c100` with a 2-second warm-up and three 8-second
+rounds, h2load `-t2 -c50 -m10` with a 10,000-request warm-up and three
+fixed-count rounds, and aioquic 1.3.0 with three recorded rounds. All
+published rounds completed with zero failures. These are comparative results
+on small burstable instances, not universal product limits.
