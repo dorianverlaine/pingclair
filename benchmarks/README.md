@@ -134,3 +134,43 @@ and about +61% on the 1 MiB static workload, both inside OrbStack Linux
 containers (2 vCPU each). These numbers are local evidence only: they have
 not been reproduced on the Linux VPS and do not update the published rows
 above.
+
+## AWS Oregon matrix on the optimized branch (2026-08-03)
+
+The same optimized binary was measured on two AWS Oregon `t3.small`
+instances (private subnet, Ubuntu 26.04) against nginx 1.31.3 (alpine),
+Caddy 2.11.4 (alpine) and pingap, over H1/H2/H3 and HTTPS, for static and
+reverse-proxy workloads. Full evidence and methodology live in the local
+ledger under `benchmarks/results/20260803_aws_h3perf/` (not committed).
+
+| 1 KiB static | pingclair | nginx | caddy |
+| --- | ---: | ---: | ---: |
+| H1 (wrk) | 33,920 | 43,971 | 14,252 |
+| HTTPS/H1 | 23,533 | 22,538 | 15,384 |
+| H2 | 26,638 | 42,332 | 10,394 |
+| H3 | 28,448 | 39,683* | 12,304 |
+
+| 1 KiB reverse proxy | pingclair | nginx | caddy | pingap |
+| --- | ---: | ---: | ---: | ---: |
+| H1 (wrk) | 10,979 | 18,734 | 6,794 | 13,028 |
+| HTTPS/H1 | 9,691 | 15,230 | 6,297 | 9,776 |
+| H2 | 9,649 | 14,892 | 4,102 | 10,484 |
+| H3 | 9,939 | 16,376 | 3,871 | n/a |
+
+\* nginx H3 was 55,423 in the clean round and 23,853 after the network
+degradation described in the ledger; pingclair was stable across rounds.
+Large-file rows (1 MiB) were parity on H1S/H2 (≈530–590 req/s for all
+candidates) and H3 (pingclair 218 vs nginx 250 / caddy 245), but round-2
+large-file rows on both t3.small instances were invalidated by exhausted
+burstable-network capacity after roughly two hours of sustained traffic
+(cwnd collapse with ~25% retransmission while both hosts were idle).
+
+The run also surfaced three operational findings recorded in the ledger:
+pingclair buffers static files below 5 MiB in memory (an OOM risk at high
+concurrency, and the top next-optimization candidate), containers default to
+`nofile` 1024 which wedges the reverse-proxy path around 1,000 upstream
+connections (fixed in the harness with `--ulimit nofile=65535:65535`), and
+Caddy with `auto_https off` rejects IP-based TLS connects because its
+certificate is bound to a hostname SNI. These rows do not update the
+published 2026-08-02 baseline above; they are comparative evidence for the
+optimized branch.
