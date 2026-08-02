@@ -1,0 +1,28 @@
+[basic]
+threads = 2
+
+[servers.http]
+addr = "0.0.0.0:8080"
+locations = ["static", "proxy"]
+
+[servers.https]
+addr = "0.0.0.0:8443"
+enabled_h2 = true
+global_certificates = true
+locations = ["static", "proxy"]
+
+[certificates.bench]
+tls_cert = "/tmp/bench.crt"
+tls_key = "/tmp/bench.key"
+is_default = true
+
+[locations.static]
+path = "/"
+upstream = "fileUpstream"
+
+[locations.proxy]
+path = "/proxy"
+upstream = "fileUpstream"
+
+[upstreams.fileUpstream]
+addrs = ["127.0.0.1:9000"]
