@@ -50,7 +50,15 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install Rust 1.97
+        # 🧰 dtolnay's action defaults to the minimal profile — no rustfmt,
+        # no clippy — so the components this job actually runs must be named
+        # explicitly. The old monolithic workflow's fmt/clippy steps only
+        # passed because they lived in the test job, which installed via
+        # rustup's default profile; moving them here surfaced the gap on the
+        # first run of this workflow.
         uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt, clippy
 
       - name: Cache cargo registry and build artifacts
         uses: actions/cache@v4
