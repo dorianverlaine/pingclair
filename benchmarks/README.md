@@ -31,7 +31,7 @@ Each value is the median of three recorded rounds. Higher is better.
 - Pingclair, nginx, and Caddy ran one at a time on the server. They shared the
   same files, backend, short-lived ECDSA P-256 certificate, ports and client.
 - Pingclair was built locally through OrbStack as `linux/amd64`, using the
-  production Dockerfile's Rust 1.88, locked dependencies and fat-LTO release
+  production Dockerfile's Rust 1.97, locked dependencies and fat-LTO release
   profile. The x86-64 ELF SHA-256 was
   `0e27a136a037ba2cd9564f94abf12227187b584b7baddc71f4a976309aa9b5ec`.
 - nginx was Ubuntu 1.28.3 with HTTP/3 enabled; Caddy was the official 2.11.4

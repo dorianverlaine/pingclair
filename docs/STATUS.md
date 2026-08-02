@@ -713,7 +713,7 @@ H1/H2/H3 均驗證 `200`、1024 bytes 與相同 SHA-256；H2/H3 零失敗。
   Cargo 依風險分組——quiche／boring／tokio-quiche／pingora*／rustls 等
   H3/TLS 依賴單獨成組，該組 PR 必須先過 GUARDRAILS 的 Linux release＋
   quiche client 驗證關卡才能合併。
-- CI 新增每 push 的開發產物：`rust.yml` 在 test 全綠後於原生 **Ubuntu**
+- CI 新增每 push 的開發產物：`ci.yml` 的 test 全綠後於原生 **Ubuntu**
   runner 上構建 Linux x86_64（`ubuntu-latest`）／aarch64
   （`ubuntu-24.04-arm`）dev binary——不做交叉編譯，冒煙測試直接執行
   剛建好的二進位檔（artifact 保留 14 天），並把同一個 Dockerfile 在
@@ -724,13 +724,13 @@ H1/H2/H3 均驗證 `200`、1024 bytes 與相同 SHA-256；H2/H3 零失敗。
   安裝。這些不是發布，Day 33 的正式產物流程不受影響。
 - 三份 README 新增「開發版建置」小節：GHCR `dev` image 的 docker run
   用法、Actions artifact 下載方式，並標明每次建置皆非穩定版。
-- `rust.yml` 的 `Run tests` 步驟針對已知上游 flaky 的
+- `ci.yml` 的 `Run tests` 步驟針對已知上游 flaky 的
   `test_websocket_upgrade_tunnels_bytes_in_both_directions` 自動重跑
   （最多三次，僅限該測試為唯一失敗項）。
 - `scripts/install.sh` 新增 Fedora 支援（apt 優先，dnf 保留給 Fedora）
   與 `--dev`／`--main` 旗標：`--dev` 從 rolling `dev`
   release 安裝最新 main 快照並驗證 SHA-256，`--main` 本機 clone main
-  編譯（需 Rust 1.88+，會補裝 BoringSSL 建置套件）。三份 README 的安裝
+  編譯（需 Rust 1.97+，會補裝 BoringSSL 建置套件）。三份 README 的安裝
   段合併為單一 Linux 段落，並補旗標用法。
 - 刪除未使用的 `pingclair-api/src/handlers.rs` 與 `mod handlers;`。
 - 修正 `pingclair-core/src/config/loader.rs` 過時 TODO。

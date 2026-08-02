@@ -6,7 +6,7 @@
 *結合 Cloudflare Pingora 的極致效能與 Caddy 的極簡開發體驗*
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.97%2B-orange.svg)](https://www.rust-lang.org/)
 [![Status](https://img.shields.io/badge/status-active-green.svg)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/dorianverlaine/pingclair/pulls)
 
@@ -71,7 +71,7 @@ Caddy 設定則會逐次壓縮。
 
 ### 前置需求
 
-*   **Rust 工具鏈** — 需要 Rust 1.88 或更新的版本。
+*   **Rust 工具鏈** — 需要 Rust 1.97 或更新的版本。
 
 ### 從原始碼編譯安裝
 
@@ -105,7 +105,7 @@ curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scrip
 curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --dev
 ```
 
-Clone main 並在本機編譯（需要 Rust 1.88+）：
+Clone main 並在本機編譯（需要 Rust 1.97+）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --main

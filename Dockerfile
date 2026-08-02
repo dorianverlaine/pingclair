@@ -1,7 +1,7 @@
 # Build Stage
 #
 # Stable, not nightly: the workspace has no nightly-only feature gates
-# (edition 2024 plus quiche needs Rust 1.88+, which stable has had for a
+# (edition 2024 plus quiche needs Rust 1.97+, which stable has had since
 # 2025), and nightly's codegen backend has a known internal-compiler-error
 # on aarch64 under this crate's release profile (panic="abort" + fat LTO +
 # codegen-units=1) — it ICEs partway through compiling `tokio` itself.

@@ -6,7 +6,7 @@
 > - 接下來要做什麼 → `docs/TODO.md`（🔒 維護者本機文件，未進倉庫）
 > - 已完成與驗證證據 → `docs/STATUS.md`
 >
-> 最後整理：2026-07-30
+> 最後整理：2026-08-02
 
 ---
 
@@ -45,27 +45,29 @@
   被測程式的問題。測試腳本改用明確參數的 function。
 - **壓縮測試的 payload 必須逐 chunk 唯一且不可壓縮**。重複同一塊資料會被
   zstd 的 window 去重（64MiB → 15KB），讓「輸出有在流動」這類斷言**假性失敗**。
-- **本機 gate 必須用 `cargo +1.88.0`,不是預設工具鏈**。CI 釘 `1.88.0`
-  （`.github/workflows/rust.yml`），workspace 也宣告 `rust-version = "1.88"`,
-  但本機預設可能新上好幾個版本。新編譯器的型別推論更寬鬆——`&[&String, &String,
-  &str]` 這種混型陣列在 1.97 過、在 1.88 是 `E0308`。本機四項全綠然後 CI 全紅,
-  就是這樣來的（2026-07-29）。`rustfmt` 的換行決策也隨版本變,所以 fmt 也要用
-  同一個工具鏈跑。
-- 🎩 **2026-08-01 起 `rust.yml` 的 `test` job 跑在 `ubuntu-latest` runner 上**,
-  跟 `deployment/Dockerfile` 同一個 base（Ubuntu）、同一份 rustup 釘版
-  1.88.0、同一份 `apt` 套件清單。這條規則源自 2026-07-31 的事故：那份
+- **本機 gate 必須用 `cargo +1.97.1`,不是預設工具鏈**。CI 釘 `1.97.1`
+  （2026-08-02 拆分前是單一 `rust.yml`,現在分散在 `ci.yml`、`lint.yml`
+  等六個 workflow），workspace 也宣告 `rust-version = "1.97"`。工具鏈版本
+  一不對,型別推論與 rustfmt 換行決策就不同,本機四項全綠然後 CI 全紅——這個
+  坑兩個方向都踩過：2026-07-29 是本機比 CI 新（混型陣列 `&[&String, &String,
+  &str]` 在 1.88 是 `E0308`）；2026-08-02 反過來,release image 還釘 1.88.0
+  而 lockfile 已需要 ≥1.97（`rustc 1.88.0 is not supported`）。
+- 🎩 **2026-08-01 起 CI 的 `test` job 跑在 `ubuntu-latest` runner 上**（當天
+  在 `rust.yml`；2026-08-02 拆成六個 workflow 後在 `ci.yml`,`lint.yml`
+  環境相同）,跟 `deployment/Dockerfile` 同一個 base（Ubuntu）、同一份 rustup
+  釘版 1.97.1、同一份 `apt` 套件清單。這條規則源自 2026-07-31 的事故：那份
   Dockerfile 從 H3 換 tokio-quiche 之後**從沒被建過**,線上跑的 image 是
   依賴樹改變前建的,Rust 版本也早就跟 `Cargo.toml` 的宣告不一致。CI 跑在
   別的發行版上會完全遮住這件事。**兩份套件清單必須手動保持同步**——CI 的
   `apt-get install` 跟 Dockerfile builder stage 那份改一邊就要改另一邊,
   目前沒有機制強制同步,這條本身就是下一個可能重犯的坑。
-- 🐳 **`rust.yml` 新增 `docker-image` job,真的建 `deployment/Dockerfile`
-  並開機驗證**（`docker run ... version`、`docker run ... validate` 一份真
-  Pingclairfile）。這是「一份沒人跑的建置腳本等於沒測試過的程式碼」這句話
-  的直接對策——上面那次 Dockerfile 漂移,如果這個 job 當時存在,第一次
-  push 就會紅。
+- 🐳 **CI 新增 `docker-image` job（拆分後在 `ci.yml`）,真的建
+  `deployment/Dockerfile` 並開機驗證**（`docker run ... version`、
+  `docker run ... validate` 一份真 Pingclairfile）。這是「一份沒人跑的建置
+  腳本等於沒測試過的程式碼」這句話的直接對策——上面那次 Dockerfile 漂移,
+  如果這個 job 當時存在,第一次 push 就會紅。
 - 🎲 **`test_websocket_upgrade_tunnels_bytes_in_both_directions` 是已知的
-  上游（Pingora）flaky**。`rust.yml` 的 `Run tests` 步驟會重跑整輪測試
+  上游（Pingora）flaky**。`ci.yml` 的 `Run tests` 步驟會重跑整輪測試
   （最多三次），但**僅限**該測試是唯一失敗項；其他測試失敗或三次都失敗
   仍然直接紅。**不要為了這個 flake 改測試代碼**——它偶發失敗不代表有
   回歸，用 retry 消掉雜訊就好。
@@ -208,7 +210,7 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
 
 - 跑這一關用 `scripts/test-h3-day28-local.sh`（功能矩陣，需要支援 HTTP/3 的
   curl）與 `scripts/test-h3-cancellation-local.sh`（SSE／取消／trailer）。
-  Linux 那一半用 docker `rust:1.88-bookworm`。
+  Linux 那一半用 docker `rust:1.97-bookworm`。
 
 > ✅ **`561d802` 的遷移已通過這一關**（2026-07-30，證據在
 > `benchmarks/results/20260730_day28_f26d0a1/`）：Linux release build、
@@ -216,7 +218,7 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
 > 與 quiche 0.18 的 curl 跨版本互通、功能矩陣 14/14。
 
 > ⚠️ **在 Linux 上建置需要 `cmake`（BoringSSL）與 `clang`／`libclang-dev`
-> （bindgen）**。乾淨的 `rust:1.88-bookworm` 兩者都沒有，缺了會在
+> （bindgen）**。乾淨的 `rust:1.97-bookworm` 兩者都沒有，缺了會在
 > `boring-sys` 的 build script 失敗。發布產物與 CI 環境都要帶上。
 >
 > 🐛 **還缺第三樣：`git`（2026-07-31 第一次真的建 production image 時撞到）。**
@@ -233,18 +235,9 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
 > 📌 **這個坑之所以拖到現在才現形**：`deployment/Dockerfile` 自從 H3 換成
 > tokio-quiche（`561d802`）之後**從來沒有人真的建過**。線上跑的
 > `rc-a554477` image 是在依賴樹改變之前建的。一份不會被 CI 執行的建置腳本
-> 就是一份沒有測試的程式碼。
+> 就是一份沒有測試的程式碼。（當時 Dockerfile 基底是 slim bookworm 變體,
+> 連 `git` 都沒有；現已改為 ubuntu:latest ＋ rustup,套件清單見上方。）
 >
-> 🐛 **`-slim` 變體還缺第三樣：`git`（2026-07-31 首次建置 production image 時
-> 撞到）。** `boring-sys` 的 build script 在沒有 `BORING_BSSL_ASSUME_PATCHED`
-> 時，會對 vendored BoringSSL 原始碼跑 `git init` 再套用 patch
-> （`ensure_patches_applied` → `Command::new("git")`）；沒有 `git` 執行檔會
-> 直接 panic 成 `Os { code: 2, kind: NotFound }`，訊息完全看不出跟 git 有關。
-> `deployment/Dockerfile` 用 `rust:1.88-slim-bookworm`（不是上面驗證過的
-> 完整版 `rust:1.88-bookworm`），slim 版連 `git` 都沒有——這也是為什麼這個
-> 問題直到現在才第一次出現：`561d802` 之後從沒有人真的建過這份 production
-> Dockerfile。三個都要裝：`cmake g++ pkg-config clang libclang-dev git`。
-
 > 📌 **端對端測試（`pingclair-proxy/tests/h3_end_to_end.rs`）用的是手寫 quiche
 > client**，它證明的是我們的事件迴圈對 quiche 協定實作正確，**不證明互通性**。
 > 互通性要靠上面那兩支腳本裡的真 curl，而且刻意用不同的 QUIC 實作
