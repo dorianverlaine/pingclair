@@ -185,6 +185,13 @@ jobs:
         # 🧭 Exercises the same binary, the same libc, the same BoringSSL build
         # that will actually run in production — `cargo test` on the host
         # proves the logic is right, this proves the *artifact* is right.
+        # 🛡️ full_featured's manual-TLS block names /etc/pingclair/certs, and
+        # `validate` fails closed when those files are missing (by design);
+        # the check is existence only, so mounted placeholders suffice.
         run: |
-          docker run --rm -v "$PWD/examples:/examples:ro" \
+          mkdir -p /tmp/pingclair-certs
+          touch /tmp/pingclair-certs/example.com.pem /tmp/pingclair-certs/example.com.key
+          docker run --rm \
+            -v "$PWD/examples:/examples:ro" \
+            -v /tmp/pingclair-certs:/etc/pingclair/certs:ro \
             pingclair:ci validate /examples/full_featured.pingclair

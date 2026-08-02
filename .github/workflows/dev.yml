@@ -97,6 +97,11 @@ jobs:
           version_output="$("$binary" version)"
           echo "$version_output"
           echo "$version_output" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'
+          # 🛡️ full_featured's manual-TLS block names /etc/pingclair/certs,
+          # and `validate` fails closed when those files are missing (by
+          # design); the check is existence only, so placeholders suffice.
+          sudo mkdir -p /etc/pingclair/certs
+          sudo touch /etc/pingclair/certs/example.com.pem /etc/pingclair/certs/example.com.key
           "$binary" validate examples/full_featured.pingclair
 
       - name: Package and checksum
