@@ -1,365 +1,720 @@
-<!DOCTYPE html>
-<html lang="zh-TW">
-
+<!doctype html>
+<html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>⚡️ Pingclair | 極致效能,觸手可及 | Peak Performance, Within Reach 🚀</title>
-    <link rel="icon"
-        href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🦀</text></svg>">
-    <style>
-        :root {
-            --primary: #FF4D4D;
-            --primary-glow: rgba(255, 77, 77, 0.4);
-            --bg: #0a0a0c;
-            --card-bg: rgba(255, 255, 255, 0.05);
-            --text: #f0f0f5;
-            --text-dim: #9494a1;
-            --glass: rgba(255, 255, 255, 0.03);
-            --glass-border: rgba(255, 255, 255, 0.1);
-        }
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Welcome to Pingclair</title>
+  <link rel="icon" href="data:,">
+  <style>
+    :root {
+      --ink: #111111;
+      --muted: #6d6d6d;
+      --soft-ink: #2a2a2a;
+      --line: #dfdfdf;
+      --line-strong: #bfbfbf;
+      --soft: #f7f7f5;
+      --paper: #ffffff;
+      --max-width: 1120px;
+    }
 
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }
+    * {
+      box-sizing: border-box;
+    }
 
-        body {
-            background-color: var(--bg);
-            background-image:
-                radial-gradient(circle at 10% 20%, rgba(255, 77, 77, 0.1) 0%, transparent 40%),
-                radial-gradient(circle at 90% 80%, rgba(77, 121, 255, 0.1) 0%, transparent 40%);
-            color: var(--text);
-            font-family: 'Inter', 'PingFang TC', 'Microsoft JhengHei', sans-serif;
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            overflow-x: hidden;
-            line-height: 1.6;
-            padding: 20px 0;
-        }
+    html {
+      background: var(--paper);
+      color: var(--ink);
+      font-family: "JetBrains Mono", "SF Mono", "Cascadia Code", "IBM Plex Mono",
+        "Fira Code", Menlo, Monaco, Consolas, "Liberation Mono",
+        "Noto Sans Mono CJK TC", monospace;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+      font-feature-settings: "liga" 1, "calt" 1;
+    }
 
-        .container {
-            max-width: 900px;
-            width: 95%;
-            padding: 40px 30px;
-            background: var(--card-bg);
-            backdrop-filter: blur(20px);
-            -webkit-backdrop-filter: blur(20px);
-            border: 1px solid var(--glass-border);
-            border-radius: 24px;
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-            position: relative;
-            animation: fadeIn 0.8s ease-out;
-            overflow: hidden;
-        }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--paper);
+    }
 
-        @keyframes fadeIn {
-            from {
-                opacity: 0;
-                transform: translateY(20px) scale(0.98);
-            }
+    button,
+    code,
+    input,
+    textarea {
+      font: inherit;
+    }
 
-            to {
-                opacity: 1;
-                transform: translateY(0) scale(1);
-            }
-        }
+    .page {
+      width: min(calc(100% - 56px), var(--max-width));
+      min-height: 100vh;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+    }
 
-        .hero {
-            text-align: center;
-            margin-bottom: 40px;
-        }
+    header {
+      min-height: 88px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      border-bottom: 1px solid var(--line);
+    }
 
-        .logo-wrap {
-            font-size: 4.5rem;
-            margin-bottom: 12px;
-            display: inline-block;
-            filter: drop-shadow(0 0 20px var(--primary-glow));
-            animation: float 4s ease-in-out infinite;
-        }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
 
-        @keyframes float {
+    .brand-mark {
+      width: 10px;
+      height: 10px;
+      background: var(--ink);
+      border-radius: 50%;
+      flex: 0 0 auto;
+    }
 
-            0%,
-            100% {
-                transform: translateY(0) rotate(0);
-            }
+    .language-switcher {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
 
-            50% {
-                transform: translateY(-10px) rotate(5deg);
-            }
-        }
+    .language-switcher button {
+      appearance: none;
+      border: 0;
+      border-bottom: 1px solid transparent;
+      padding: 6px 8px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 11px;
+      letter-spacing: 0.08em;
+    }
 
-        h1 {
-            font-size: clamp(1.8rem, 6vw, 3rem);
-            font-weight: 800;
-            background: linear-gradient(135deg, #fff 0%, #a5a5b1 100%);
-            -webkit-background-clip: text;
-            background-clip: text;
-            -webkit-text-fill-color: transparent;
-            margin-bottom: 8px;
-            letter-spacing: -0.5px;
-            word-break: keep-all;
-        }
+    .language-switcher button:hover,
+    .language-switcher button:focus-visible {
+      color: var(--ink);
+      outline: none;
+    }
 
-        .hero-sub {
-            color: var(--text-dim);
-            font-size: clamp(0.9rem, 3vw, 1.1rem);
-            margin-bottom: 4px;
-        }
+    .language-switcher button[aria-pressed="true"] {
+      color: var(--ink);
+      border-color: var(--ink);
+    }
 
-        .status {
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            background: rgba(46, 213, 115, 0.1);
-            color: #2ed573;
-            padding: 6px 16px;
-            border-radius: 100px;
-            font-size: 0.85rem;
-            font-weight: 600;
-            border: 1px solid rgba(46, 213, 115, 0.2);
-            margin-top: 12px;
-        }
+    main {
+      flex: 1;
+    }
 
-        .status::before {
-            content: "";
-            width: 8px;
-            height: 8px;
-            background: #2ed573;
-            border-radius: 50%;
-            box-shadow: 0 0 10px #2ed573;
-            animation: pulse 2s infinite;
-        }
+    .hero {
+      min-height: 560px;
+      padding: 104px 0 84px;
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.65fr);
+      align-items: end;
+      gap: 72px;
+      border-bottom: 1px solid var(--line);
+    }
 
-        @keyframes pulse {
-            0% {
-                transform: scale(1);
-                opacity: 1;
-            }
+    .hero-copy {
+      max-width: 760px;
+    }
 
-            50% {
-                transform: scale(1.4);
-                opacity: 0.5;
-            }
+    .kicker {
+      margin: 0 0 24px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+    }
 
-            100% {
-                transform: scale(1);
-                opacity: 1;
-            }
-        }
+    h1 {
+      margin: 0;
+      font-size: clamp(64px, 9.6vw, 126px);
+      font-weight: 600;
+      letter-spacing: -0.055em;
+      line-height: 0.92;
+    }
 
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-            gap: 16px;
-            margin-top: 32px;
-        }
+    .headline {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
 
-        .card {
-            background: var(--glass);
-            border: 1px solid var(--glass-border);
-            padding: 24px;
-            border-radius: 16px;
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            word-wrap: break-word;
-        }
+    .intro {
+      max-width: 620px;
+      margin: 34px 0 0;
+      color: var(--soft-ink);
+      font-size: clamp(18px, 1.9vw, 22px);
+      font-weight: 400;
+      letter-spacing: -0.015em;
+      line-height: 1.72;
+    }
 
-        .card:hover {
-            background: rgba(255, 255, 255, 0.06);
-            border-color: var(--primary);
-            transform: translateY(-5px);
-            box-shadow: 0 10px 30px -10px var(--primary-glow);
-        }
+    .hero-note {
+      margin: 30px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: 0.04em;
+    }
 
-        .card h3 {
-            margin-bottom: 8px;
-            color: #fff;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-size: 1.1rem;
-        }
+    .hero-note code {
+      margin-top: 0;
+    }
 
-        .card p {
-            font-size: 0.9rem;
-            color: var(--text-dim);
-            margin-bottom: 4px;
-        }
+    .hero-side {
+      display: grid;
+      gap: 20px;
+      align-self: stretch;
+      align-content: end;
+    }
 
-        .en-small {
-            font-size: 0.75rem !important;
-            opacity: 0.7;
-            display: block;
-            margin-top: 2px;
-        }
+    .status {
+      padding: 18px 0 0;
+      border-top: 1px solid var(--ink);
+    }
 
-        .code-block {
-            background: #000;
-            border-radius: 12px;
-            padding: 18px;
-            margin: 24px 0;
-            font-family: 'Fira Code', 'Cascadia Code', monospace;
-            font-size: 0.85rem;
-            border: 1px solid rgba(255, 255, 255, 0.05);
-            position: relative;
-            overflow-x: auto;
-            white-space: pre-wrap;
-            word-break: break-all;
-        }
+    .status-label,
+    .terminal-label {
+      margin: 0 0 10px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
 
-        .code-block::after {
-            content: "Pingclairfile";
-            position: absolute;
-            top: 0;
-            right: 0;
-            background: rgba(255, 255, 255, 0.1);
-            padding: 4px 10px;
-            font-size: 0.65rem;
-            border-radius: 0 12px 0 12px;
-            color: var(--text-dim);
-        }
+    .status-value {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 0;
+      font-size: 16px;
+      font-weight: 500;
+      letter-spacing: -0.015em;
+    }
 
-        .keyword {
-            color: #ff79c6;
-        }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--ink);
+      flex: 0 0 auto;
+    }
 
-        .string {
-            color: #f1fa8c;
-        }
+    .terminal {
+      border: 1px solid var(--line);
+      background: #fff;
+    }
 
-        .comment {
-            color: #6272a4;
-        }
+    .terminal-topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      font-size: 10px;
+      color: var(--muted);
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
 
-        .number {
-            color: #bd93f9;
-        }
+    .terminal-dots {
+      display: inline-flex;
+      gap: 6px;
+    }
 
-        .links {
-            display: flex;
-            flex-wrap: wrap;
-            justify-content: center;
-            gap: 20px;
-            margin-top: 40px;
-            padding-top: 24px;
-            border-top: 1px solid var(--glass-border);
-        }
+    .terminal-dots span {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--line-strong);
+      display: inline-block;
+    }
 
-        .link-btn {
-            color: var(--text);
-            text-decoration: none;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 2px;
-            font-weight: 500;
-            transition: all 0.2s;
-        }
+    .terminal-screen {
+      padding: 16px 16px 18px;
+      font-size: 13px;
+      line-height: 1.75;
+    }
 
-        .link-btn:hover {
-            color: var(--primary);
-            transform: scale(1.05);
-        }
+    .terminal-line {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      min-height: 1.75em;
+      color: var(--ink);
+      overflow-wrap: anywhere;
+    }
 
-        .link-en {
-            font-size: 0.7rem;
-            opacity: 0.6;
-        }
+    .terminal-line + .terminal-line {
+      margin-top: 2px;
+    }
 
-        footer {
-            margin-top: 32px;
-            text-align: center;
-            color: var(--text-dim);
-            font-size: 0.8rem;
-        }
+    .prompt {
+      color: var(--muted);
+      flex: 0 0 auto;
+    }
 
-        /* Ambient Glows */
-        .glow {
-            position: fixed;
-            width: 350px;
-            height: 350px;
-            filter: blur(80px);
-            z-index: -1;
-            opacity: 0.25;
-        }
-    </style>
+    .output {
+      color: var(--soft-ink);
+      padding-left: 19px;
+    }
+
+    .cursor {
+      display: inline-block;
+      width: 0.62em;
+      height: 1.05em;
+      margin-left: 4px;
+      vertical-align: -0.16em;
+      background: var(--ink);
+      animation: blink 1.05s steps(1) infinite;
+    }
+
+    @keyframes blink {
+      0%, 49% { opacity: 1; }
+      50%, 100% { opacity: 0; }
+    }
+
+    .details {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      border-bottom: 1px solid var(--line);
+    }
+
+    .section {
+      min-height: 272px;
+      padding: 38px 32px 46px 0;
+    }
+
+    .section + .section {
+      padding-left: 32px;
+      border-left: 1px solid var(--line);
+    }
+
+    .section-number {
+      margin: 0 0 42px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.14em;
+      font-variant-numeric: tabular-nums;
+    }
+
+    h2 {
+      margin: 0 0 16px;
+      font-size: 18px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      line-height: 1.35;
+    }
+
+    .section p,
+    .section ol,
+    .section ul {
+      margin: 0;
+      padding: 0;
+      color: #444444;
+      font-size: 14px;
+      line-height: 1.82;
+      letter-spacing: -0.01em;
+    }
+
+    .section ol,
+    .section ul {
+      padding-left: 1.25em;
+    }
+
+    .section li + li,
+    .section p + p {
+      margin-top: 10px;
+    }
+
+    code {
+      display: inline-block;
+      margin-top: 6px;
+      padding: 3px 8px;
+      border: 1px solid #e6e6e6;
+      border-radius: 2px;
+      background: var(--soft);
+      color: var(--ink);
+      font-size: 0.88em;
+      white-space: nowrap;
+    }
+
+    footer {
+      min-height: 96px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: 0.04em;
+    }
+
+    footer a {
+      color: var(--ink);
+      text-decoration: none;
+      border-bottom: 1px solid var(--line);
+    }
+
+    footer a:hover,
+    footer a:focus-visible {
+      border-color: var(--ink);
+      outline: none;
+    }
+
+    .noscript {
+      width: min(calc(100% - 56px), var(--max-width));
+      margin: 20px auto;
+      padding: 12px 16px;
+      border: 1px solid var(--line);
+      font-size: 13px;
+    }
+
+    @media (max-width: 900px) {
+      .hero {
+        min-height: auto;
+        padding: 76px 0 62px;
+        grid-template-columns: 1fr;
+        gap: 48px;
+      }
+
+      .hero-side {
+        max-width: 480px;
+      }
+
+      h1 {
+        font-size: clamp(56px, 15vw, 92px);
+      }
+
+      .details {
+        grid-template-columns: 1fr;
+      }
+
+      .section,
+      .section + .section {
+        min-height: auto;
+        padding: 32px 0 38px;
+        border-left: 0;
+      }
+
+      .section + .section {
+        border-top: 1px solid var(--line);
+      }
+
+      .section-number {
+        margin-bottom: 24px;
+      }
+    }
+
+    @media (max-width: 560px) {
+      .page,
+      .noscript {
+        width: min(calc(100% - 32px), var(--max-width));
+      }
+
+      header {
+        min-height: 74px;
+      }
+
+      .brand span:last-child {
+        display: none;
+      }
+
+      .headline {
+        gap: 8px;
+      }
+
+      .language-switcher button {
+        padding-inline: 5px;
+      }
+
+      .terminal-screen {
+        font-size: 12px;
+      }
+
+      footer {
+        align-items: flex-start;
+        flex-direction: column;
+        justify-content: center;
+        padding: 24px 0;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .cursor {
+        animation: none;
+        opacity: 1;
+      }
+    }
+  </style>
 </head>
-
 <body>
-    <div class="glow" style="top: -100px; left: -100px; background: var(--primary);"></div>
-    <div class="glow" style="bottom: -100px; right: -100px; background: #4D79FF;"></div>
+  <noscript>
+    <div class="noscript">Pingclair is running. JavaScript is disabled, so this page remains in English.</div>
+  </noscript>
 
-    <div class="container">
-        <div class="hero">
-            <div class="logo-wrap">🦀</div>
-            <h1>運作正常 | 效能全開</h1>
-            <h2 style="font-size: 1.4rem; color: #fff; margin-bottom: 8px;">System Online | Peak Performance</h2>
-            <p class="hero-sub">您的 <strong>Pingclair</strong> 已經成功部署在極速網路引擎之上</p>
-            <p class="hero-sub en-small">Your Pingclair instance is successfully running on a high-speed engine.</p>
-            <div class="status">⚡️ 線上 (Powered by Pingora) | Active</div>
+  <div class="page">
+    <header>
+      <div class="brand" aria-label="Pingclair">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span>Pingclair</span>
+      </div>
+
+      <nav class="language-switcher" aria-label="Language">
+        <button type="button" data-language="en" aria-pressed="true">EN</button>
+        <button type="button" data-language="zh" aria-pressed="false">中文</button>
+        <button type="button" data-language="fr" aria-pressed="false">FR</button>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="kicker" data-i18n="kicker">Default server page</p>
+          <h1>
+            <span class="headline">
+              <span data-i18n="welcome">Welcome.</span>
+            </span>
+          </h1>
+          <p class="intro" data-i18n="intro">
+            Pingclair is running correctly. Replace this page with your website when you are ready.
+          </p>
+          <p class="hero-note">
+            <span data-i18n="heroNote">Serve your site from</span>
+            <code>/var/www/html</code>
+          </p>
         </div>
 
-        <div class="grid">
-            <div class="card">
-                <h3>📝 設定 | Config</h3>
-                <p>編輯 <code>/etc/Pingclair/Pingclairfile</code> 快速定義路由。</p>
-                <p class="en-small">Edit Pingclairfile to define routes and upstreams.</p>
+        <aside class="hero-side">
+          <div class="status" aria-live="polite">
+            <p class="status-label" data-i18n="statusLabel">System status</p>
+            <p class="status-value">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span data-i18n="statusValue">Listening on 80 / 443</span>
+            </p>
+          </div>
+
+          <section class="terminal" aria-label="Terminal preview">
+            <div class="terminal-topbar">
+              <span data-i18n="terminalLabel">Terminal</span>
+              <span class="terminal-dots" aria-hidden="true"><span></span><span></span><span></span></span>
             </div>
-            <div class="card">
-                <h3>🔐 自動 HTTPS</h3>
-                <p>只需 <code>tls auto;</code>,全自動管理憑證。</p>
-                <p class="en-small">Issue and renew certificates automatically with 'tls auto'.</p>
+            <div class="terminal-screen">
+              <div class="terminal-line"><span class="prompt">$</span><span>systemctl status pingclair</span></div>
+              <div class="terminal-line output"><span data-i18n="terminalState">active (running)</span></div>
+              <div class="terminal-line"><span class="prompt">$</span><span>pingclair validate</span></div>
+              <div class="terminal-line output"><span data-i18n="terminalConfig">configuration ok</span></div>
+              <div class="terminal-line"><span class="prompt">$</span><span data-i18n="terminalReady">ready to serve</span><span class="cursor" aria-hidden="true"></span></div>
             </div>
-            <div class="card">
-                <h3>🧪 原生效能 | Native</h3>
-                <p>基於 Rust 零成本抽象,工業級負載平衡。</p>
-                <p class="en-small">Zero-cost abstractions with industrial-grade load balancing.</p>
-            </div>
-        </div>
+          </section>
+        </aside>
+      </section>
 
-        <div class="code-block">
-            <span class="comment"># 現代化設定範例 | Modern Configuration</span><br>
-            <span class="keyword">server</span> <span class="string">"example.com"</span> {<br>
-            &nbsp;&nbsp;&nbsp;&nbsp;<span class="keyword">listen:</span> <span class="string">"0.0.0.0:443"</span>;<br>
-            &nbsp;&nbsp;&nbsp;&nbsp;<span class="keyword">tls</span> <span class="keyword">auto</span>;<br>
-            &nbsp;&nbsp;&nbsp;&nbsp;<span class="keyword">route</span> {<br>
-            &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="keyword">match</span> <span
-                class="keyword">path</span>(<span class="string">"/api/*"</span>) => {<br>
-            &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="keyword">proxy</span> {
-            <span class="keyword">to</span> <span class="string">"localhost:8080"</span>; }<br>
-            &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}<br>
-            &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="keyword">_</span> => {<br>
-            &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span
-                class="keyword">file_server</span> <span class="string">"/var/www/html"</span>;<br>
-            &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}<br>
-            &nbsp;&nbsp;&nbsp;&nbsp;}<br>
-            }
-        </div>
+      <section class="details">
+        <article class="section">
+          <p class="section-number">01</p>
+          <h2 data-i18n="startTitle">Start</h2>
+          <ol>
+            <li data-i18n="startOne">Point your domain to this server.</li>
+            <li data-i18n="startTwo">Deploy your website or application.</li>
+            <li>
+              <span data-i18n="startThree">Reload Pingclair.</span><br>
+              <code>systemctl reload pingclair</code>
+            </li>
+          </ol>
+        </article>
 
-        <div class="links">
-            <a href="https://github.com/dorianverlaine/pingclair" target="_blank" class="link-btn">
-                <span>🐙 GitHub</span>
-                <span class="link-en">Repository</span>
-            </a>
-            <a href="https://github.com/dorianverlaine/pingclair/issues" target="_blank" class="link-btn">
-                <span>🐞 回報問題</span>
-                <span class="link-en">Report Issues</span>
-            </a>
-            <a href="#" class="link-btn">
-                <span>📖 文件</span>
-                <span class="link-en">Documentation</span>
-            </a>
-        </div>
+        <article class="section">
+          <p class="section-number">02</p>
+          <h2 data-i18n="pathsTitle">Paths</h2>
+          <p>
+            <span data-i18n="configLabel">Configuration</span><br>
+            <code>/etc/pingclair/</code>
+          </p>
+          <p style="margin-top: 18px">
+            <span data-i18n="siteLabel">Website files</span><br>
+            <code>/var/www/html</code>
+          </p>
+        </article>
 
-        <footer>
-            &copy; 2026 Dorian Verlaine.<br>
-            Built with ❤️ using Rust & Pingora ⚡️
-        </footer>
-    </div>
+        <article class="section">
+          <p class="section-number">03</p>
+          <h2 data-i18n="checkTitle">Check</h2>
+          <ul>
+            <li>
+              <span data-i18n="serviceLabel">Service status</span><br>
+              <code>systemctl status pingclair</code>
+            </li>
+            <li>
+              <span data-i18n="logsLabel">System logs</span><br>
+              <code>journalctl -u pingclair --no-pager</code>
+            </li>
+            <li>
+              <span data-i18n="validateLabel">Configuration</span><br>
+              <code>pingclair validate</code>
+            </li>
+          </ul>
+        </article>
+      </section>
+    </main>
+
+    <footer>
+      <span>Pingclair / Default Page</span>
+      <span data-i18n="footer">Fast, quiet, and ready.</span>
+    </footer>
+  </div>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const translations = {
+        en: {
+          title: "Welcome to Pingclair",
+          kicker: "Default server page",
+          welcome: "Welcome.",
+          intro: "Pingclair is running correctly. Replace this page with your website when you are ready.",
+          heroNote: "Serve your site from",
+          statusLabel: "System status",
+          statusValue: "Listening on 80 / 443",
+          terminalLabel: "Terminal",
+          terminalState: "active (running)",
+          terminalConfig: "configuration ok",
+          terminalReady: "ready to serve",
+          startTitle: "Start",
+          startOne: "Point your domain to this server.",
+          startTwo: "Deploy your website or application.",
+          startThree: "Reload Pingclair.",
+          pathsTitle: "Paths",
+          configLabel: "Configuration",
+          siteLabel: "Website files",
+          checkTitle: "Check",
+          serviceLabel: "Service status",
+          logsLabel: "System logs",
+          validateLabel: "Configuration",
+          footer: "Fast, quiet, and ready."
+        },
+        zh: {
+          title: "歡迎使用 Pingclair",
+          kicker: "預設伺服器頁面",
+          welcome: "歡迎。",
+          intro: "Pingclair 正在正常運作。準備完成後，請以您的網站取代此頁面。",
+          heroNote: "請將您的網站放在",
+          statusLabel: "系統狀態",
+          statusValue: "正在監聽 80 / 443",
+          terminalLabel: "終端",
+          terminalState: "執行中",
+          terminalConfig: "設定正常",
+          terminalReady: "準備提供服務",
+          startTitle: "開始",
+          startOne: "將您的網域指向這台伺服器。",
+          startTwo: "部署您的網站或應用程式。",
+          startThree: "重新載入 Pingclair。",
+          pathsTitle: "路徑",
+          configLabel: "設定檔",
+          siteLabel: "網站檔案",
+          checkTitle: "檢查",
+          serviceLabel: "服務狀態",
+          logsLabel: "系統日誌",
+          validateLabel: "設定驗證",
+          footer: "快速、安靜，隨時就緒。"
+        },
+        fr: {
+          title: "Bienvenue sur Pingclair",
+          kicker: "Page serveur par défaut",
+          welcome: "Bienvenue.",
+          intro: "Pingclair fonctionne correctement. Remplacez cette page par votre site lorsque vous êtes prêt.",
+          heroNote: "Servez votre site depuis",
+          statusLabel: "État du système",
+          statusValue: "À l'écoute sur 80 / 443",
+          terminalLabel: "Terminal",
+          terminalState: "actif (en cours d'exécution)",
+          terminalConfig: "configuration valide",
+          terminalReady: "prêt à servir",
+          startTitle: "Démarrer",
+          startOne: "Faites pointer votre domaine vers ce serveur.",
+          startTwo: "Déployez votre site ou votre application.",
+          startThree: "Rechargez Pingclair.",
+          pathsTitle: "Chemins",
+          configLabel: "Configuration",
+          siteLabel: "Fichiers du site",
+          checkTitle: "Vérifier",
+          serviceLabel: "État du service",
+          logsLabel: "Journaux système",
+          validateLabel: "Configuration",
+          footer: "Rapide, discret et prêt."
+        }
+      };
+
+      const languageMeta = {
+        en: { htmlLang: "en", locale: "en-US" },
+        zh: { htmlLang: "zh-Hant", locale: "zh-TW" },
+        fr: { htmlLang: "fr", locale: "fr-FR" }
+      };
+
+      const normalizeLanguage = (language) => {
+        const value = String(language || "").toLowerCase();
+        if (value.startsWith("fr")) return "fr";
+        if (value.startsWith("zh")) return "zh";
+        return "en";
+      };
+
+      const detectLanguage = () => {
+        const candidates = Array.isArray(navigator.languages) && navigator.languages.length
+          ? navigator.languages
+          : [navigator.language];
+
+        for (const candidate of candidates) {
+          const normalized = normalizeLanguage(candidate);
+          if (normalized !== "en" || String(candidate).toLowerCase().startsWith("en")) {
+            return normalized;
+          }
+        }
+
+        return "en";
+      };
+
+      const applyLanguage = (language) => {
+        const selected = translations[language] ? language : "en";
+        const copy = translations[selected];
+        const meta = languageMeta[selected];
+
+        document.documentElement.lang = meta.htmlLang;
+        document.title = copy.title;
+
+        document.querySelectorAll("[data-i18n]").forEach((element) => {
+          const key = element.dataset.i18n;
+          if (Object.prototype.hasOwnProperty.call(copy, key)) {
+            element.textContent = copy[key];
+          }
+        });
+
+        document.querySelectorAll("[data-language]").forEach((button) => {
+          button.setAttribute("aria-pressed", String(button.dataset.language === selected));
+        });
+      };
+
+      document.querySelectorAll("[data-language]").forEach((button) => {
+        button.addEventListener("click", () => applyLanguage(button.dataset.language));
+      });
+
+      applyLanguage(detectLanguage());
+    })();
+  </script>
 </body>
-
 </html>
