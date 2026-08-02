@@ -19,7 +19,7 @@ jobs:
   # job below builds and boots that exact Dockerfile, so packaging mistakes
   # are still caught in CI.
   test:
-    name: Build & test (Ubuntu, Rust 1.88)
+    name: Build & test (Ubuntu, Rust 1.97)
     runs-on: ubuntu-latest
 
     steps:
@@ -40,7 +40,7 @@ jobs:
 
       - uses: actions/checkout@v5
 
-      - name: Install Rust 1.88
+      - name: Install Rust 1.97
         # 🎯 Downloaded to a file and run as a second, separate command —
         # never `curl | sh`. A pipe's exit status is the last command's only,
         # so a transient `curl: (35) Recv failure: Connection reset by peer`
@@ -53,7 +53,7 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 --retry 3 --retry-connrefused -sSf \
             https://sh.rustup.rs -o /tmp/rustup-init.sh
-          sh /tmp/rustup-init.sh -y --profile default --default-toolchain 1.88.0
+          sh /tmp/rustup-init.sh -y --profile default --default-toolchain 1.97.1
           rm -f /tmp/rustup-init.sh
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           "$HOME/.cargo/bin/cargo" --version
@@ -189,7 +189,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.97.1
 
       - name: Cache cargo-audit and the advisory database
         uses: actions/cache@v4
@@ -250,8 +250,8 @@ jobs:
             git \
             curl
 
-      - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Install Rust 1.97
+        uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: ${{ matrix.platform.target }}
 
