@@ -17,7 +17,7 @@ edition = "2024"
 authors = ["Dorian Verlaine <dorianverlaine@icloud.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/dorianverlaine/pingclair"
-rust-version = "1.88"
+rust-version = "1.97"
 
 [workspace.dependencies]
 # Pingora core
