@@ -574,7 +574,7 @@ fn manage_system_service(action: ServiceAction) -> anyhow::Result<()> {
                 anyhow::bail!("❌ Failed to execute systemctl: {e}");
             }
         }
-        return Ok(());
+        Ok(())
     }
 
     // 🚫 macOS and other non-Linux platforms have no systemctl; the systemd
