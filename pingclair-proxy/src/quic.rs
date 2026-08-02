@@ -68,6 +68,16 @@ use crate::server::{is_streaming_content_type, wants_immediate_flush};
 /// Maximum UDP payload we ask quiche to send (standard Ethernet MTU-safe).
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
+/// Size of the per-connection outbound packet buffer lent to tokio-quiche.
+///
+/// The worker writes as many QUIC packets as fit and flushes them in one
+/// GSO-backed `sendmsg` on Linux. A 1350-byte buffer caps every flush at one
+/// datagram, turning each packet into its own syscall. 16 KiB was measured
+/// against 64 KiB (tokio-quiche's `BufFactory::MAX_BUF_SIZE` and the kernel
+/// GSO ceiling): the large-file and small-file gains were identical, so the
+/// smaller fixed per-connection cost wins.
+const OUT_BUF_SIZE: usize = 16 * 1024;
+
 /// Bound for the per-stream request-body channel between the event loop
 /// and a handler task. When full, the event loop stops draining quiche so
 /// QUIC flow control pushes back on the client.
@@ -588,6 +598,17 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
         &mut self,
         _qconn: &mut tokio_quiche::quic::QuicheConnection,
     ) -> tokio_quiche::QuicResult<()> {
+        // 🧲 Drains whatever handler events are already queued before waiting,
+        // so a burst of response chunks is applied in one worker iteration
+        // instead of waking once per event.
+        let mut applied = false;
+        while let Ok(event) = self.resp_rx.try_recv() {
+            self.apply_resp_event(event);
+            applied = true;
+        }
+        if applied {
+            return Ok(());
+        }
         tokio::select! {
             event = self.resp_rx.recv() => {
                 // 🧯 The sender is held by this app, so the channel outlives
@@ -600,6 +621,10 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
                 // A handler freed request-body channel capacity; the deferred
                 // drains are retried in `process_reads`.
             }
+        }
+        // 🧲 Drains events that queued behind the one that woke this worker.
+        while let Ok(event) = self.resp_rx.try_recv() {
+            self.apply_resp_event(event);
         }
         Ok(())
     }
@@ -875,12 +900,12 @@ impl QuicServer {
                 h3_config: Arc::clone(&h3_config),
                 h3: None,
                 remote_addr,
-                streams: HashMap::new(),
+                streams: HashMap::with_capacity(32),
                 resp_tx,
                 resp_rx,
                 body_notify: Arc::new(Notify::new()),
                 _slot: ConnectionSlot(Arc::clone(&live_connections)),
-                out: vec![0u8; MAX_DATAGRAM_SIZE],
+                out: vec![0u8; OUT_BUF_SIZE],
             });
         }
 
@@ -975,27 +1000,16 @@ impl H3App {
 
         // 🛡️ HTTP/3 carries its own framing, so `Transfer-Encoding` is forbidden
         // outright here rather than merely discouraged, and `Content-Length`
-        // still has to be `1*DIGIT`. Same rule set as H1/H2, one implementation.
-        {
-            let mut headers = http::HeaderMap::new();
-            for (name, value) in &req.headers {
-                if let (Ok(name), Ok(value)) = (
-                    http::header::HeaderName::from_bytes(name.as_bytes()),
-                    http::HeaderValue::from_str(value),
-                ) {
-                    headers.append(name, value);
-                }
-            }
-            if let Err(rejection) =
-                crate::http_policy::check_request_framing(http::Version::HTTP_3, &headers)
-            {
-                tracing::warn!(
-                    "🚫 H3: rejected a request with untrustworthy message framing: {}",
-                    rejection.reason()
-                );
-                self.queue_simple_response(qconn, stream_id, 400, rejection.reason());
-                return;
-            }
+        // still has to be `1*DIGIT`. Same rule set as H1/H2, one implementation
+        // — validated over the raw header list so the request is not parsed
+        // into a throwaway `HeaderMap` before the handler needs it.
+        if let Err(rejection) = crate::http_policy::check_h3_request_framing(&req.headers) {
+            tracing::warn!(
+                "🚫 H3: rejected a request with untrustworthy message framing: {}",
+                rejection.reason()
+            );
+            self.queue_simple_response(qconn, stream_id, 400, rejection.reason());
+            return;
         }
 
         // 🧭 Same resolution as H1/H2, from the same function, so the two
@@ -1021,7 +1035,7 @@ impl H3App {
         let connector = self.connector.clone();
         let resp_tx = self.resp_tx.clone();
         let notify = Arc::clone(&self.body_notify);
-        let remote_ip = self.remote_addr.ip().to_string();
+        let remote_ip = self.remote_addr.ip();
 
         tokio::spawn(async move {
             handle_request(
@@ -1536,7 +1550,7 @@ async fn handle_request(
     proxy: Arc<PingclairProxy>,
     connector: Arc<pingora_core::connectors::http::Connector>,
     req: H3Request,
-    remote_ip: String,
+    remote_ip: IpAddr,
     stream_id: u64,
     mut body_rx: mpsc::Receiver<Vec<u8>>,
     resp_tx: RespSender,
@@ -1557,7 +1571,7 @@ async fn handle_request(
             &proxy,
             &connector,
             &req,
-            &remote_ip,
+            remote_ip,
             stream_id,
             &mut body_rx,
             &resp_tx,
@@ -1606,7 +1620,7 @@ async fn handle_request_inner(
     proxy: &PingclairProxy,
     connector: &pingora_core::connectors::http::Connector,
     req: &H3Request,
-    peer_ip: &str,
+    peer_ip: IpAddr,
     stream_id: u64,
     body_rx: &mut mpsc::Receiver<Vec<u8>>,
     resp_tx: &RespSender,
@@ -1631,9 +1645,7 @@ async fn handle_request_inner(
     }
 
     // 🛡️ QUIC uses the same trusted-proxy identity policy as H1 and H2.
-    let peer_address = peer_ip
-        .parse::<IpAddr>()
-        .map_err(|_| (400, "Invalid Peer Address"))?;
+    let peer_address = peer_ip;
     let verified_client_ip = proxy.verified_client_ip(peer_address, &header.headers);
     let verified_client_ip_text = verified_client_ip.to_string();
 
@@ -1978,7 +1990,7 @@ async fn reverse_proxy_upstream(
     req: &H3Request,
     client_header: &RequestHeader,
     effective_uri: &str,
-    peer_ip: &str,
+    peer_ip: IpAddr,
     verified_client_ip: &str,
     request_id: &str,
     response_policy: &ResponseHeaderPolicy,
@@ -2231,14 +2243,12 @@ async fn reverse_proxy_upstream(
                 .insert_header("X-Forwarded-Host", req.authority.as_str())
                 .ok();
         }
-        if !has_header_up("X-Forwarded-For")
-            && let Ok(peer_address) = peer_ip.parse::<IpAddr>()
-        {
+        if !has_header_up("X-Forwarded-For") {
             up_req
                 .insert_header(
                     "X-Forwarded-For",
                     proxy
-                        .forwarded_for(peer_address, &client_header.headers)
+                        .forwarded_for(peer_ip, &client_header.headers)
                         .as_str(),
                 )
                 .ok();
@@ -3026,7 +3036,7 @@ mod tests {
             &request,
             &client_header,
             &request.path,
-            "127.0.0.1",
+            "127.0.0.1".parse().unwrap(),
             "127.0.0.1",
             "retry-request-id",
             &ResponseHeaderPolicy::default(),
@@ -3118,7 +3128,7 @@ mod tests {
             &request,
             &client_header,
             &request.path,
-            "127.0.0.1",
+            "127.0.0.1".parse().unwrap(),
             "127.0.0.1",
             "circuit-request-id",
             &ResponseHeaderPolicy::default(),
@@ -3144,7 +3154,7 @@ mod tests {
             &request,
             &client_header,
             &request.path,
-            "127.0.0.1",
+            "127.0.0.1".parse().unwrap(),
             "127.0.0.1",
             "circuit-request-id",
             &ResponseHeaderPolicy::default(),
@@ -3232,7 +3242,7 @@ mod tests {
             &request,
             &client_header,
             &request.path,
-            "127.0.0.1",
+            "127.0.0.1".parse().unwrap(),
             "127.0.0.1",
             "test-request-id",
             &ResponseHeaderPolicy::default(),

@@ -120,3 +120,17 @@ details. The checksum ledger allows the private archive to be verified later.
 These are comparative results on small burstable instances, not universal
 product limits. In particular, the aioquic client contributes to absolute H3
 throughput and the 1 MiB result is network-bound.
+
+## Local H3 optimization A/B (2026-08-03, not remote-verified)
+
+A local OrbStack optimization pass (branch `codex/h3-perf`) recorded
+interleaved h2load/HTTP-3 measurements against the baseline commit and the
+optimized binary; full evidence and methodology live in the local ledger
+under `benchmarks/results/20260803_h3perf_opt/` (not committed). The
+optimizations — a 16 KiB per-connection GSO send buffer, response-event
+batching in the H3 worker, and a HeaderMap-free H3 framing check — measured
+about +14–16% on the 1 KiB static workload at 500–2000 concurrent streams,
+and about +61% on the 1 MiB static workload, both inside OrbStack Linux
+containers (2 vCPU each). These numbers are local evidence only: they have
+not been reproduced on the Linux VPS and do not update the published rows
+above.

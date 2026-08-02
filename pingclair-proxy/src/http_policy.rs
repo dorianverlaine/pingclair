@@ -441,6 +441,7 @@ impl FramingRejection {
 /// like `+5` is the ideal smuggling primitive: lenient parsers read five bytes
 /// and strict ones reject, so the two ends of a chain disagree about how much
 /// body they just consumed.
+/// 🛡️ Rejects requests whose length is open to more than one reading.
 pub(crate) fn check_request_framing(
     version: http::Version,
     headers: &HeaderMap,
@@ -462,11 +463,44 @@ pub(crate) fn check_request_framing(
     // a lenient reader might take the first and a strict one the last.
     for value in headers.get_all(http::header::CONTENT_LENGTH) {
         let raw = value.as_bytes();
-        if raw.is_empty() || !raw.iter().all(u8::is_ascii_digit) {
+        if content_length_value_invalid(raw) {
             return Err(FramingRejection::MalformedContentLength);
         }
     }
 
+    Ok(())
+}
+
+/// 🔢 True when a `Content-Length` field value violates RFC 9110 §8.6's
+/// `1*DIGIT` grammar (empty, signed, whitespace-padded, or non-digit bytes).
+fn content_length_value_invalid(raw: &[u8]) -> bool {
+    raw.is_empty() || !raw.iter().all(u8::is_ascii_digit)
+}
+
+/// 🛡️ Rejects an HTTP/3 request whose raw header list carries untrustworthy
+/// framing, without materializing an [`http::HeaderMap`] just to validate it.
+///
+/// `quiche` already enforces H3's wire framing, so the only fields this proxy
+/// still has to police are `Transfer-Encoding` (forbidden outright) and
+/// `Content-Length` (`1*DIGIT`, every duplicate). This is the same rule set as
+/// [`check_request_framing`], expressed over the header list `parse_h3_request`
+/// already owns, so the H3 event loop does not parse each header twice.
+pub(crate) fn check_h3_request_framing(
+    headers: &[(String, String)],
+) -> Result<(), FramingRejection> {
+    let has_transfer_encoding = headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"));
+    if has_transfer_encoding {
+        return Err(FramingRejection::TransferEncodingForbidden);
+    }
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-length")
+            && content_length_value_invalid(value.as_bytes())
+        {
+            return Err(FramingRejection::MalformedContentLength);
+        }
+    }
     Ok(())
 }
 
@@ -843,6 +877,57 @@ mod tests {
                 "Transfer-Encoding must be refused on {version:?}"
             );
         }
+    }
+
+    #[test]
+    fn h3_framing_matches_the_shared_rule_set() {
+        // 📋 The raw-list variant must reach the same verdict as the
+        // HeaderMap variant for every framing decision the H3 event loop can
+        // produce.
+        for headers in [
+            vec![],
+            vec![("content-length", "5")],
+            vec![("Content-Length", "5")],
+            vec![("content-length", "5"), ("content-length", "5")],
+            vec![("transfer-encoding", "chunked")],
+            vec![("Transfer-Encoding", "chunked"), ("content-length", "6")],
+            vec![("content-length", "")],
+            vec![("content-length", "5 ")],
+            vec![("content-length", "-5")],
+            vec![("content-length", "5"), ("content-length", "x")],
+            vec![("content-length", "5"), ("Content-Length", "6")],
+        ] {
+            let list: Vec<(String, String)> = headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+            let mut map = http::HeaderMap::new();
+            for (name, value) in &list {
+                if let (Ok(name), Ok(value)) = (
+                    http::header::HeaderName::from_bytes(name.as_bytes()),
+                    http::HeaderValue::from_str(value),
+                ) {
+                    map.append(name, value);
+                }
+            }
+            assert_eq!(
+                check_h3_request_framing(&list),
+                check_request_framing(http::Version::HTTP_3, &map),
+                "H3 list framing diverged from the shared rule for {headers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn h3_framing_fails_closed_on_values_the_header_map_cannot_carry() {
+        // 🚨 A value that cannot become an `http::HeaderValue` was silently
+        // dropped by the old H3 path, which then accepted the request. The
+        // raw-list variant rejects it instead, matching the H1/H2 rule that
+        // a declared `Content-Length` must be `1*DIGIT`.
+        assert_eq!(
+            check_h3_request_framing(&[("content-length".to_string(), "5\x01".to_string())]),
+            Err(FramingRejection::MalformedContentLength)
+        );
     }
 
     #[test]
