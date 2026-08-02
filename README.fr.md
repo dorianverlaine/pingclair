@@ -70,9 +70,8 @@ requête.
 
 La méthodologie complète, les checksums des passes brutes, les configurations,
 les commandes et les empreintes des binaires se trouvent dans
-[`benchmarks/README.md`](benchmarks/README.md) et le
-[`résultat du 2026-08-02`](benchmarks/results/20260802_aws_x86_ca773af/RESULT.md)
-(en anglais).
+[`benchmarks/README.md`](benchmarks/README.md). Les preuves brutes de chaque
+exécution restent en local et ne font pas partie du dépôt.
 
 ## 📦 Installation
 

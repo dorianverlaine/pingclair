@@ -73,8 +73,9 @@ body?"*
 - **A regression fix needs a test that fails without the fix.** Write the test
   first and watch it fail; a test that passes both ways proves nothing.
 - **Preserve failing evidence.** Verification output goes in
-  `benchmarks/results/<date>_<commit-prefix>/`. When something is fixed, add a
-  new directory — never overwrite the record of the failure.
+  `benchmarks/results/<date>_<commit-prefix>/` — kept locally, never committed
+  to the repository. When something is fixed, add a new directory — never
+  overwrite the record of the failure.
 
 `docs/GUARDRAILS.md` lists environment traps that have already cost someone a
 debugging session (a local proxy that intercepts test requests, ghost processes
@@ -128,10 +129,8 @@ misleading.
 | File | Owns |
 |---|---|
 | `docs/TODO.md` | The v0.2.0 execution plan, day by day. 🔒 Maintainer-local, not in this repository — it lists unfixed weaknesses, and publishing that queue would just hand out a target list. Ask if you need the current plan. |
-| `docs/STATUS.md` | Canonical status and verification ledger, v0.3+ backlog. |
 | `docs/GUARDRAILS.md` | Environment constraints and implementation rules. |
-| `docs/AUDIT_NGINX_PARITY.md` | nginx/Caddy parity and production-risk audit. |
-| `benchmarks/README.md` | Performance claims, methodology, bugs found under load. |
+| `benchmarks/README.md` | Performance claims, methodology, bugs found under load. Raw per-run evidence stays local under `benchmarks/results/`, never committed. |
 | `README.md` / `.zh.md` / `.fr.md` | **Shipped** user-facing behavior only — update all three together. |
 
 Never move an item to "verified" without leaving enough evidence for someone

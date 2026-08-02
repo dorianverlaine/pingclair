@@ -66,10 +66,9 @@ the network ceiling. Pingclair's warm gzip row benefits from its compressed
 static-response cache, while the tested nginx and Caddy configurations
 compress each request.
 
-See [`benchmarks/README.md`](benchmarks/README.md) and the
-[`2026-08-02 result`](benchmarks/results/20260802_aws_x86_ca773af/RESULT.md)
-for the exact environment, commands, raw-round checksums, configurations, and
-binary hashes.
+See [`benchmarks/README.md`](benchmarks/README.md) for the exact environment,
+commands, checksums, configurations, and binary hashes. Raw per-run evidence
+is kept locally and is not part of the repository.
 
 ## 📦 Installation
 

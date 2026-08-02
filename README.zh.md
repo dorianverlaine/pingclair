@@ -64,8 +64,8 @@ HTTP 版本、gzip 解壓結果與 SHA-256，公開的 H2、H3、WSS 輪次皆�
 Caddy 設定則會逐次壓縮。
 
 完整環境、命令、原始輪次 checksum、設定與 binary hash 見
-[`benchmarks/README.md`](benchmarks/README.md) 與
-[`2026-08-02 結果`](benchmarks/results/20260802_aws_x86_ca773af/RESULT.md)。
+[`benchmarks/README.md`](benchmarks/README.md)。逐次執行的原始證據保留在
+本機，不在倉庫內。
 
 ## 📦 安裝指南
 

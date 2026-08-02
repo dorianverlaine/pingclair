@@ -10,19 +10,19 @@ style, emoji conventions, commit subjects), architecture constraints per
 subsystem, and documentation ownership. This file adds the command details and
 the cross-crate picture that only emerge from reading several files at once.
 
-Four documents own distinct things, and the project treats mixing them as a
+Three documents own distinct things, and the project treats mixing them as a
 defect:
 
 | Document | Owns |
 | --- | --- |
 | `docs/TODO.md` | The v0.2.0 plan, one Day per sitting. What to work on. 🔒 Local only — not committed, see `AGENTS.md`. |
-| `docs/STATUS.md` | What is done and **how far it was verified**. Evidence ledger. |
 | `docs/GUARDRAILS.md` | Environment constraints and implementation rules. Every entry is a failure that already happened. |
-| `benchmarks/README.md` | Performance claims and methodology. |
+| `benchmarks/README.md` | Performance claims and methodology. Raw per-run evidence stays local under `benchmarks/results/`, never committed. |
 
-Implemented is not verified. `docs/STATUS.md` deliberately separates "code
-exists", "local tests pass", and "verified on Linux/VPS"; never promote an item
-between those without evidence under `benchmarks/results/<date>_<commit>/`.
+Implemented is not verified. The verification ledger deliberately separates
+"code exists", "local tests pass", and "verified on Linux/VPS"; never promote
+an item between those without evidence under
+`benchmarks/results/<date>_<commit>/` (kept locally, not committed).
 
 ## Commands
 
@@ -217,5 +217,6 @@ Code, identifiers, commit messages, and log strings stay English.
   blocks in READMEs and `docs/` are compiled by
   `pingclair-config/tests/documentation.rs`, so a stale config block fails tests
   — but stale prose does not, and has gone unnoticed for days.
-- Verification evidence goes in `benchmarks/results/<date>_<commit-prefix>/` with
-  the full commit SHA recorded. Failed evidence is never overwritten.
+- Verification evidence goes in `benchmarks/results/<date>_<commit-prefix>/` —
+  kept locally, not committed — with the full commit SHA recorded. Failed
+  evidence is never overwritten.

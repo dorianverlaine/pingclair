@@ -25,26 +25,16 @@ Thumbs.db
 *.log
 logs/
 
-# 🗂️ Verification evidence: the conclusion is published, the process is not.
+# 🗂️ Verification evidence stays local, period.
 #
-# Every run under benchmarks/results/ used to be committed whole — raw tool
-# output, config copies, environment dumps. That was thousands of files nobody
-# reads, and it is where incidental personal detail kept turning up (an ACME
-# account address, EC2 instance ids). It was also already broken: the `*.log`
-# rule above silently dropped exactly the log a RESULT.md cited as proof, so
-# the repository advertised an audit trail it did not contain.
-#
-# What stays: the summary (RESULT.md / README.md / result.txt), the integrity
-# ledger (SHA256SUMS), and the commit under test (commit.txt). SHA256SUMS is
-# what makes this safe — a privately archived raw tree can still be verified
-# byte-for-byte against the published hashes.
-benchmarks/results/**
-!benchmarks/results/*/
-!benchmarks/results/**/RESULT.md
-!benchmarks/results/**/README.md
-!benchmarks/results/**/SHA256SUMS
-!benchmarks/results/**/commit.txt
-!benchmarks/results/**/result.txt
+# Every run under benchmarks/results/ used to be committed — raw tool output,
+# config copies, environment dumps, and later the summaries themselves. That
+# is where incidental personal detail kept turning up (an ACME account
+# address, EC2 instance ids, hostnames of the owner's machines), so as of
+# 2026-08-03 the whole tree is excluded from the repository. The SHA256SUMS
+# in each directory still lets a privately archived raw tree be verified
+# byte-for-byte, and the conclusions are published in benchmarks/README.md.
+benchmarks/results/
 
 # 📋 Planning documents are working material, kept local.
 #

@@ -1,8 +1,8 @@
 # Pingclair benchmarks
 
-The current public benchmark is the
-[`2026-08-02 AWS x86 run`](results/20260802_aws_x86_ca773af/RESULT.md), measured
-at Pingclair commit `ca773affad998eb6439319236dd904fc20b4785f`.
+The current public benchmark is the 2026-08-02 AWS x86 run, measured
+at Pingclair commit `ca773affad998eb6439319236dd904fc20b4785f` (raw per-run
+evidence is kept locally and is not part of the repository).
 
 ## Current results
 

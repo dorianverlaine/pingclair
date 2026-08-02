@@ -4963,9 +4963,9 @@ fn find_rate_limit_config(
 
 // MARK: - P0 Regression Tests
 //
-// Targeted tests for the 4 P0 issues fixed per docs/AUDIT_NGINX_PARITY.md:
-// gzip OOM risk, request ID syscall overhead, hosts lock contention, and
-// upstream connection pool sizing.
+// Targeted tests for the 4 P0 issues fixed in the 2026-07-26 nginx-parity
+// production-risk audit: gzip OOM risk, request ID syscall overhead, hosts
+// lock contention, and upstream connection pool sizing.
 #[cfg(test)]
 mod forwarded_headers_tests {
     use super::*;

@@ -909,8 +909,8 @@ mod tests {
         // `compile_matcher` used to resolve an unknown name to `path /*`, so one
         // typo turned a restricted route into an open one — and the config
         // validated cleanly. Found 2026-07-30 while searching the parser on
-        // purpose rather than bumping into it; evidence in
-        // benchmarks/results/20260730_day16_failed_matcher_fail_open/.
+        // purpose rather than bumping into it; evidence kept locally under
+        // benchmarks/results/ (never committed to the repository).
         let source = r#"
             :8080 {
                 @admin_only path /admin/*

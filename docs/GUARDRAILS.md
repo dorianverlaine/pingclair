@@ -4,7 +4,7 @@
 > 不是理論建議——每一條後面都有一次實際失敗。
 >
 > - 接下來要做什麼 → `docs/TODO.md`（🔒 維護者本機文件，未進倉庫）
-> - 已完成與驗證證據 → `docs/STATUS.md`
+> - 已完成與驗證證據 → 本機 `benchmarks/results/`（不入倉庫）
 >
 > 最後整理：2026-08-03
 
@@ -78,7 +78,7 @@
 - 🔒 **新增 `security-audit` job（`cargo audit`）,每次 push 都跑**,不只在
   發布前跑一次。RustSec 公告的時間不受這個專案控制,一個已合併但後來被公告
   漏洞的依賴,只有持續跑才抓得到。真的出現 finding 時的例外處理是**書面風險
-  接受**（`docs/STATUS.md` Day 30 的既有規則),不是把這個 job 改成
+  接受**（既有的書面風險接受規則),不是把這個 job 改成
   `continue-on-error`。
 - **要在容器 log 裡看到 ERROR 以下的內容必須設 `RUST_LOG`**。subscriber 是
   `EnvFilter::from_default_env()` 建的，沒設等於只留 ERROR——症狀是功能明明
@@ -337,6 +337,6 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
 
 ## 📁 驗證證據
 
-- 結果寫進 `benchmarks/results/<date>_<commit-prefix>/`。
+- 結果寫進本機 `benchmarks/results/<date>_<commit-prefix>/`（**不入倉庫**）。
 - **失敗的證據不可覆寫**。修好之後另開目錄，保留舊的失敗紀錄作為對照。
 - 驗證必須記錄**完整 commit SHA**，不能只寫「最新版」。
