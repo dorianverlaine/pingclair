@@ -221,12 +221,14 @@ impl LeastConnTracker {
         recovery_slots: &HashMap<SocketAddr, Arc<AtomicU64>>,
         slow_start: Duration,
     ) -> Option<(Upstream, Arc<AtomicUsize>)> {
-        // 🩺 Publish the passive health state for every backend so
-        // /metrics can answer `is this upstream healthy?` (MT-5).
-        for (addr, _) in &self.counters {
-            crate::metrics::UPSTREAM_HEALTHY
-                .with_label_values(&[&addr.to_string()])
-                .set(if self.health.is_up(addr) { 1 } else { 0 });
+        if crate::metrics::enabled() {
+            // 🩺 Publish the passive health state for every backend so
+            // /metrics can answer `is this upstream healthy?` (MT-5).
+            for (addr, _) in &self.counters {
+                crate::metrics::UPSTREAM_HEALTHY
+                    .with_label_values(&[&addr.to_string()])
+                    .set(if self.health.is_up(addr) { 1 } else { 0 });
+            }
         }
 
         // ⚡ OPTIMIZATION: Linear scan is acceptable — backend counts are typically

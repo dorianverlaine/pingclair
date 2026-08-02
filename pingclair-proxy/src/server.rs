@@ -71,7 +71,7 @@ pub trait DynamicListeners: Send + Sync {
 /// Context for each request
 pub struct RequestContext {
     /// Matched server state
-    pub state: Option<ProxyState>,
+    pub state: Option<Arc<ProxyState>>,
     /// Matched route index
     pub route_index: Option<usize>,
     /// Selected upstream (kept for connection tracking)
@@ -92,16 +92,10 @@ pub struct RequestContext {
     /// Streaming encoder for the response body, created in `response_filter`
     /// once the upstream content type proves the body is worth compressing.
     pub response_encoder: Option<ResponseEncoder>,
-    /// Request method (for access log)
-    pub request_method: String,
-    /// Request path (for access log)
-    pub request_path: String,
-    /// Request host (for access log)
-    pub request_host: String,
     /// 🛡️ Client IP resolved through the trusted-proxy policy.
     pub verified_client_ip: Option<IpAddr>,
     /// 🌐 Verified downstream request scheme forwarded to the upstream.
-    pub request_scheme: String,
+    pub request_scheme: &'static str,
     /// Upstream response status (for access log)
     pub response_status: u16,
     /// Response body bytes written (for access log)
@@ -118,6 +112,8 @@ pub struct RequestContext {
     /// ⏱️ When the first response byte was handed downstream, for TTFB.
     /// `None` when the response failed before producing any byte.
     pub first_byte_at: Option<std::time::Instant>,
+    /// 📊 Resolved active-request gauge retained so completion needs no label lookup.
+    active_connection_metric: Option<prometheus::IntGauge>,
     /// Path produced by the most recent rewrite handler. Pipelines consume
     /// this before invoking the next local handler.
     pub rewritten_path: Option<String>,
@@ -162,16 +158,14 @@ impl Default for RequestContext {
             negotiated_encoding: None,
             streaming_response: false,
             response_encoder: None,
-            request_method: String::new(),
-            request_path: String::new(),
-            request_host: String::new(),
             verified_client_ip: None,
-            request_scheme: "http".to_string(),
+            request_scheme: "http",
             response_status: 0,
             response_bytes: 0,
             request_id: generate_request_id(),
             start_time: std::time::Instant::now(),
             first_byte_at: None,
+            active_connection_metric: None,
             rewritten_path: None,
             request_body_bytes: 0,
             request_deadline: None,
@@ -1371,9 +1365,9 @@ pub(crate) fn error_reason(status: u16) -> &'static str {
 #[derive(Clone)]
 pub struct PingclairProxy {
     /// Map of hostname -> server state
-    pub hosts: Arc<ArcSwap<HashMap<String, ProxyState>>>,
+    pub hosts: Arc<ArcSwap<HashMap<String, Arc<ProxyState>>>>,
     /// Default server state (catch-all)
-    pub default: Arc<ArcSwap<Option<ProxyState>>>,
+    pub default: Arc<ArcSwap<Option<Arc<ProxyState>>>>,
     /// TLS Manager for certificate resolution
     pub tls_manager: Option<Arc<pingclair_tls::manager::TlsManager>>,
     /// Alt-Svc value advertised on this listener's responses when HTTP/3 is
@@ -1525,19 +1519,27 @@ impl PingclairProxy {
         };
         if domains.is_empty() {
             let current = self.default.load();
-            let state = ProxyState::new_with_previous(config.clone(), current.as_ref().as_ref());
+            let state = Arc::new(ProxyState::new_with_previous(
+                config.clone(),
+                current.as_ref().as_deref(),
+            ));
             self.default.store(Arc::new(Some(state)));
             return;
         }
         for domain in domains {
             if domain == "_" || domain == "*" || domain.starts_with(':') {
                 let current = self.default.load();
-                let state =
-                    ProxyState::new_with_previous(config.clone(), current.as_ref().as_ref());
+                let state = Arc::new(ProxyState::new_with_previous(
+                    config.clone(),
+                    current.as_ref().as_deref(),
+                ));
                 self.default.store(Arc::new(Some(state)));
             } else {
                 let current = self.hosts.load();
-                let state = ProxyState::new_with_previous(config.clone(), current.get(domain));
+                let state = Arc::new(ProxyState::new_with_previous(
+                    config.clone(),
+                    current.get(domain).map(Arc::as_ref),
+                ));
                 // Read-Copy-Update: clone the current map, insert into the
                 // copy, then publish it atomically. add_server is a rare,
                 // low-frequency admin operation, so an O(n) copy here is a
@@ -1598,21 +1600,25 @@ impl PingclairProxy {
                 config.names.iter().map(String::as_str).collect()
             };
             if domains.is_empty() {
-                let state =
-                    ProxyState::new_with_previous(config.clone(), old_default.as_ref().as_ref());
+                let state = Arc::new(ProxyState::new_with_previous(
+                    config.clone(),
+                    old_default.as_ref().as_deref(),
+                ));
                 new_default = Some(state);
                 continue;
             }
             for domain in domains {
                 if domain == "_" || domain == "*" || domain.starts_with(':') {
-                    let state = ProxyState::new_with_previous(
+                    let state = Arc::new(ProxyState::new_with_previous(
                         config.clone(),
-                        old_default.as_ref().as_ref(),
-                    );
+                        old_default.as_ref().as_deref(),
+                    ));
                     new_default = Some(state);
                 } else {
-                    let state =
-                        ProxyState::new_with_previous(config.clone(), old_hosts.get(domain));
+                    let state = Arc::new(ProxyState::new_with_previous(
+                        config.clone(),
+                        old_hosts.get(domain).map(Arc::as_ref),
+                    ));
                     new_hosts.insert(domain.to_string(), state);
                 }
             }
@@ -1636,7 +1642,7 @@ impl PingclairProxy {
         method: &str,
         headers: &pingora_http::RequestHeader,
         remote_ip: &str,
-    ) -> Option<(ProxyState, Option<usize>, Option<HandlerConfig>)> {
+    ) -> Option<(Arc<ProxyState>, Option<usize>, Option<HandlerConfig>)> {
         self.match_route_index(host, path, method, headers, remote_ip)
             .map(|(state, route_index)| {
                 let handler = route_index
@@ -1654,7 +1660,7 @@ impl PingclairProxy {
         method: &str,
         headers: &pingora_http::RequestHeader,
         remote_ip: &str,
-    ) -> Option<(ProxyState, Option<usize>)> {
+    ) -> Option<(Arc<ProxyState>, Option<usize>)> {
         // 🏠 Resolves the immutable state published for this virtual host.
         let state = self.get_state(host)?;
 
@@ -1663,7 +1669,7 @@ impl PingclairProxy {
 
         let route_index = state
             .router
-            .match_request(path, method, &headers.headers, host, remote_ip, protocol)
+            .match_normalized_request(path, method, &headers.headers, host, remote_ip, protocol)
             .map(|route| route.index);
         Some((state, route_index))
     }
@@ -1676,7 +1682,7 @@ impl PingclairProxy {
     /// 1. Exact hostname match (`api.example.com`)
     /// 2. Wildcard match (`*.example.com`) — checks all registered wildcard hosts
     /// 3. Default catch-all server
-    fn get_state(&self, host: &str) -> Option<ProxyState> {
+    fn get_state(&self, host: &str) -> Option<Arc<ProxyState>> {
         let hosts = self.hosts.load();
 
         // 1. Exact match (fast path)
@@ -1697,10 +1703,8 @@ impl PingclairProxy {
         }
 
         // 3. Default catch-all
-        // Explicit double-deref: `Guard` and `Arc` both implement `Clone`
-        // themselves, so a bare `.load().clone()` would clone the guard
-        // (cheap, but the wrong type) instead of the `Option<ProxyState>`
-        // it points to.
+        // 🍃 Explicit double-deref clones only the published state Arc, not
+        // the guard or the complete configuration snapshot.
         (**self.default.load()).clone()
     }
 
@@ -3394,7 +3398,7 @@ impl ProxyHttp for PingclairProxy {
         // 📊 Track in-flight requests per virtual host; released in `logging`.
         let host = request_authority(session.req_header());
         let host = if host.is_empty() { "-" } else { host };
-        metrics::ACTIVE_CONNECTIONS.with_label_values(&[host]).inc();
+        ctx.active_connection_metric = metrics::request_started(host);
 
         // 🛡️ Framing is settled before anything else reads the request, because
         // a message whose length two parsers can read differently must not be
@@ -3513,15 +3517,7 @@ impl ProxyHttp for PingclairProxy {
         }
 
         // Match route in a scope to release borrow of session
-        let (
-            path_str,
-            route_index,
-            handler,
-            remote_ip,
-            request_host,
-            request_method,
-            request_scheme,
-        ) = {
+        let (path_str, route_index, remote_ip, verified_client_ip, request_scheme) = {
             let request_header = session.req_header();
             let path = request_header.uri.path();
             let method = request_header.method.as_str();
@@ -3576,7 +3572,7 @@ impl ProxyHttp for PingclairProxy {
                 }
             };
 
-            if let Some(route) = state.router.match_request(
+            if let Some(route) = state.router.match_normalized_request(
                 path,
                 method,
                 &request_header.headers,
@@ -3585,34 +3581,28 @@ impl ProxyHttp for PingclairProxy {
                 protocol,
             ) {
                 let index = route.index;
-                let handler = state.config.routes.get(index).map(|r| r.handler.clone());
                 (
                     path.to_string(),
                     Some(index),
-                    handler,
                     remote_ip,
-                    host.to_string(),
-                    method.to_string(),
-                    protocol.to_string(),
+                    verified_client_ip,
+                    protocol,
                 )
             } else {
                 (
                     path.to_string(),
                     None,
-                    None,
                     remote_ip,
-                    host.to_string(),
-                    method.to_string(),
-                    protocol.to_string(),
+                    verified_client_ip,
+                    protocol,
                 )
             }
         };
 
-        // Capture request metadata for access log
-        ctx.request_path = path_str.clone();
-        ctx.request_host = request_host;
-        ctx.request_method = request_method;
-        ctx.verified_client_ip = remote_ip.parse().ok();
+        // 🛡️ Retain the parsed address and static scheme directly; converting
+        // them to owned text and then parsing the address again added work to
+        // every request without changing any policy decision.
+        ctx.verified_client_ip = Some(verified_client_ip);
         ctx.request_scheme = request_scheme;
 
         if let Some(state) = ctx.state.clone() {
@@ -3671,23 +3661,27 @@ impl ProxyHttp for PingclairProxy {
 
         if let Some(index) = route_index {
             ctx.route_index = Some(index);
+            // 🍃 Keep one published snapshot alive and borrow its handler tree.
+            // Cloning `HandlerConfig` here copied nested vectors, maps, and
+            // strings on every request even though configuration is immutable.
+            let Some(state) = ctx.state.clone() else {
+                self.serve_error_page(session, ctx, 500).await?;
+                return Ok(true);
+            };
+            let handler = state.config.routes.get(index).map(|route| &route.handler);
 
-            if let Some(state) = ctx.state.clone() {
-                let immediate_flush = self
-                    .get_proxy_config(&state, index)
-                    .is_some_and(|config| wants_immediate_flush(config.flush_interval));
-                if immediate_flush || is_websocket_upgrade(&session.req_header().headers) {
-                    Self::activate_long_connection(session, ctx, &state);
-                }
+            let immediate_flush = self
+                .get_proxy_config(&state, index)
+                .is_some_and(|config| wants_immediate_flush(config.flush_interval));
+            if immediate_flush || is_websocket_upgrade(&session.req_header().headers) {
+                Self::activate_long_connection(session, ctx, &state);
             }
 
             // Access rules run before authentication, static-file lookup, or
             // an upstream connection. This keeps denied traffic out of every
             // later request path and makes the policy apply uniformly to all
             // terminal handler types.
-            if let Some(state) = &ctx.state
-                && !state.allows_access(index, &remote_ip, &session.req_header().headers)
-            {
+            if !state.allows_access(index, &remote_ip, &session.req_header().headers) {
                 Self::write_simple_response(session, ctx, 403, "Forbidden").await?;
                 return Ok(true);
             }
@@ -3701,9 +3695,7 @@ impl ProxyHttp for PingclairProxy {
             }
 
             // 🚦 Charges the configured exact token bucket before handler dispatch.
-            if let Some(state) = &ctx.state
-                && let Some(limiter) = state.rate_limiters.get(index).and_then(|l| l.as_ref())
-            {
+            if let Some(limiter) = state.rate_limiters.get(index).and_then(|l| l.as_ref()) {
                 let decision =
                     limiter.check_request(remote_ip.as_str(), &session.req_header().headers);
                 for (name, value) in decision.info.to_headers() {
@@ -3719,11 +3711,7 @@ impl ProxyHttp for PingclairProxy {
                 }
             }
 
-            if handler
-                .as_ref()
-                .is_some_and(|handler| find_reverse_proxy_config(handler).is_some())
-                && let Some(state) = ctx.state.clone()
-            {
+            if handler.is_some_and(|handler| find_reverse_proxy_config(handler).is_some()) {
                 match self.admit_route(&state, index).await {
                     Ok(admission) => ctx.route_admission = Some(admission),
                     Err(AdmissionError::QueueFull) => {
@@ -3744,11 +3732,11 @@ impl ProxyHttp for PingclairProxy {
             }
 
             if let Some(h) = handler {
-                if find_reverse_proxy_config(&h).is_none() {
+                if find_reverse_proxy_config(h).is_none() {
                     Self::drain_local_request_body(session, ctx).await?;
                 }
                 if self
-                    .handle_config(session, ctx, &h, &path_str, index)
+                    .handle_config(session, ctx, h, &path_str, index)
                     .await?
                 {
                     // ⏱️ A locally produced response never reaches `response_filter`.
@@ -4095,7 +4083,7 @@ impl ProxyHttp for PingclairProxy {
 
         // Add standard proxy headers (only if not already configured by user)
         if !has_header_up("X-Forwarded-Proto") {
-            upstream_request.insert_header("X-Forwarded-Proto", &ctx.request_scheme)?;
+            upstream_request.insert_header("X-Forwarded-Proto", ctx.request_scheme)?;
         }
         if !has_header_up("X-Forwarded-Host") {
             upstream_request
@@ -4567,40 +4555,41 @@ impl ProxyHttp for PingclairProxy {
             .to_string();
         let elapsed = ctx.start_time.elapsed();
 
-        // 📊 The request is complete: release its active-connection slot.
-        metrics::ACTIVE_CONNECTIONS.with_label_values(&[host]).dec();
-
-        // Update Prometheus metrics
-        metrics::REQUESTS_TOTAL
-            .with_label_values(&[method, &response_code.to_string(), host])
-            .inc();
-
-        metrics::REQUEST_DURATION_SECONDS
-            .with_label_values(&[method, &response_code.to_string(), host])
-            .observe(elapsed.as_secs_f64());
-
-        // 📏 Size, TTFB and error histograms complete the HTTP metric set.
-        let request_size = req_header
-            .headers
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.0);
-        metrics::REQUEST_SIZE_BYTES
-            .with_label_values(&[method, &response_code.to_string(), host])
-            .observe(request_size);
-        metrics::RESPONSE_SIZE_BYTES
-            .with_label_values(&[method, &response_code.to_string(), host])
-            .observe(ctx.response_bytes as f64);
-        if let Some(first_byte_at) = ctx.first_byte_at {
-            metrics::RESPONSE_DURATION_SECONDS
-                .with_label_values(&[method, &response_code.to_string(), host])
-                .observe(first_byte_at.duration_since(ctx.start_time).as_secs_f64());
+        // 📊 Release exactly the gauge incremented at request entry, without
+        // resolving the host label through Prometheus a second time.
+        if let Some(active) = ctx.active_connection_metric.take() {
+            active.dec();
         }
-        if e.is_some() {
-            metrics::REQUEST_ERRORS_TOTAL
-                .with_label_values(&[method, host])
-                .inc();
+
+        if metrics::enabled() {
+            let status = response_code.to_string();
+            let labels = [method, status.as_str(), host];
+            let request_size = req_header
+                .headers
+                .get("content-length")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            metrics::REQUESTS_TOTAL.with_label_values(&labels).inc();
+            metrics::REQUEST_DURATION_SECONDS
+                .with_label_values(&labels)
+                .observe(elapsed.as_secs_f64());
+            metrics::REQUEST_SIZE_BYTES
+                .with_label_values(&labels)
+                .observe(request_size);
+            metrics::RESPONSE_SIZE_BYTES
+                .with_label_values(&labels)
+                .observe(ctx.response_bytes as f64);
+            if let Some(first_byte_at) = ctx.first_byte_at {
+                metrics::RESPONSE_DURATION_SECONDS
+                    .with_label_values(&labels)
+                    .observe(first_byte_at.duration_since(ctx.start_time).as_secs_f64());
+            }
+            if e.is_some() {
+                metrics::REQUEST_ERRORS_TOTAL
+                    .with_label_values(&[method, host])
+                    .inc();
+            }
         }
 
         // 📝 Prefer this server's configured access logger. Only when the
@@ -5359,6 +5348,17 @@ mod p0_regression_tests {
         proxy.add_server(minimal_server_config("api.example.com"));
         assert!(proxy.get_state("api.example.com").is_some());
         assert!(proxy.get_state("other.example.com").is_none());
+    }
+
+    #[test]
+    fn get_state_reuses_the_published_snapshot() {
+        let proxy = PingclairProxy::new();
+        proxy.add_server(minimal_server_config("api.example.com"));
+
+        let first = proxy.get_state("api.example.com").unwrap();
+        let second = proxy.get_state("api.example.com").unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]

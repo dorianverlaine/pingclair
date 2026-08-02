@@ -451,6 +451,63 @@ matcher token 規則解析為**精確** path matcher，不再被塞進 upstreams
 
 ---
 
+### 2026-08-02 效能回歸修復（Oregon 同 AZ 私網）
+
+依香港拓撲重建 `t4g.micro` server + `t4g.small` client，兩台均在
+`us-west-2a` 且只走 VPC 私網。比較 `main` (`f888938`)、修復前 HEAD
+(`0e40372`)、修復後 working tree、nginx 1.28.3 與 Caddy 2.11.4；全部使用
+aarch64 fat-LTO release binary、同一份 1 KiB payload 與憑證。
+
+- **H1**：重複 path 正規化／candidate 配置與停用後仍執行的 metrics 工作已
+  移出熱路徑。metrics on 由 30,965.66 升至 31,756.65 req/s（+2.6%）；
+  metrics off 為 32,221.17，只比 `main` 的 32,483.31 低 0.8%。
+- **H3 新連線**：取消 tokio-quiche 預設的 mandatory stateless Retry，採用與
+  nginx/Caddy 相同的預設延遲取捨。30 concurrency／300 requests 中位數由
+  96.27 升至 110.87 req/s（+15.2%）；對 nginx 的差距 28.6% → 17.8%，
+  對 Caddy 26.4% → 15.3%。pcap 證明修復前 `Initial -> 95 B Retry -> Initial`，
+  修復後第一個 server packet 直接進 handshake。
+- **H3 長連線**：20 條連線／10,000 requests 為 1,646.12 → 1,647.33
+  req/s（+0.1%），確認 middleware、streaming、取消處理與 Caddy 相容行為
+  全數保留。0-RTT 仍禁用，pre-validation amplification limit 與 listener
+  connection limit 仍有效。
+
+H1 每次起測前均驗證 `200`、1024 bytes 與 SHA-256；H3 各輪全部 request
+均為 `200`／1024 bytes。完整原始輸出、命令、版本、設定、binary hash 與
+兩份 pcap：`benchmarks/results/20260802_oregon_perf_recovery_0e40372/`。
+
+效能量測完成後，Day 28 真實 H3 matrix 在 5 MiB POST 的提早 `413` 路徑抓到
+bounded body receiver 關閉後沒有喚醒 event loop 的既有死鎖。最終 working
+tree 已補上關閉後喚醒，14/14 matrix 與 cancellation／trailer 測試均通過。
+效能表仍以 artifacts 內的 binary hash 為準；這項後續正確性修補未混入已保存
+的遠端量測結果。最終 source 另在 ARM Linux／Rust 1.88 完成 fat-LTO release
+build，binary SHA-256 為 `73c1dca958b831d6...047a1beac0e47e1`。
+
+---
+
+### 2026-08-02 immutable state 熱路徑修復（本機 OrbStack）
+
+後續 syscall profile 發現修復前每個 request 會深複製完整 `ProxyState`，並在
+dispatch 再複製 route 的 `HandlerConfig` tree；一般靜態檔案路徑亦對同一檔案
+做兩次 metadata syscall。host/default 表現在發佈 `Arc<ProxyState>`，request
+保留一份 immutable snapshot 並借用 handler；scheme、verified client IP 與
+regular-file metadata 也直接沿用。Caddy matcher、middleware、streaming、
+body limit、檔案更新可見性與 H3 cancellation 均未停用。
+
+OrbStack 隔離 bridge 內每個 client/server 容器限制 2 vCPU／512 MiB，使用
+ARM Linux fat-LTO release、1 KiB payload，三輪中位數如下：H1
+55,207.20 → 56,965.75 req/s（+3.2%，nginx 的 88.0%）；H2
+45,099.76 → 48,779.06（+8.2%，nginx 的 98.5%）；H3 新連線
+190.66 → 247.34（+29.7%，與 nginx 相差 0.8%）；H3 20 條重用連線
+5,164.49 → 5,304.48（+2.7%，nginx 的 88.1%）。四項均快於 Caddy。
+H1/H2/H3 均驗證 `200`、1024 bytes 與相同 SHA-256；H2/H3 零失敗。
+
+本機 ARM Linux／Rust 1.88 fat-LTO release binary SHA-256 為
+`90dc1be028739ce9e8194c0c7e15565b06cd6be438994940f25dcf7a08cbbc89`。
+這是本機 Linux 驗證，不標記為遠端驗證。完整證據：
+`benchmarks/results/20260802_orbstack_hot_state_0e40372/`。
+
+---
+
 ## 🧪 已實作，待乾淨遠端驗證
 
 > 這些是 v0.2 驗證日（TODO 的 Day 7／15／19／22／23）要清掉的積欠。

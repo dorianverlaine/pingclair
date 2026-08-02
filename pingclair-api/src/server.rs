@@ -118,14 +118,17 @@ async fn handle_request(
     state: Arc<AdminState>,
     peer_addr: SocketAddr,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let method = req.method().to_string();
-    let path = req.uri().path().to_string();
+    // 🍃 Avoid allocating metric labels when collection is disabled.
+    let metric_labels = pingclair_proxy::metrics::enabled()
+        .then(|| (req.method().to_string(), req.uri().path().to_string()));
     let response = handle_request_inner(req, &state, peer_addr).await?;
-    // 📊 Count every admin request by endpoint and status (MT-3).
-    let status = response.status().as_u16().to_string();
-    pingclair_proxy::metrics::ADMIN_REQUESTS_TOTAL
-        .with_label_values(&[&method, &path, &status])
-        .inc();
+    if let Some((method, path)) = metric_labels {
+        // 📊 Count every admin request by endpoint and status (MT-3).
+        let status = response.status().as_u16().to_string();
+        pingclair_proxy::metrics::ADMIN_REQUESTS_TOTAL
+            .with_label_values(&[&method, &path, &status])
+            .inc();
+    }
     Ok(response)
 }
 
