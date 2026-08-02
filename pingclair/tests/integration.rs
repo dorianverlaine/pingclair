@@ -131,6 +131,10 @@ impl TestServer {
         command
             .arg("run")
             .arg(&config_path)
+            // 🧭 The server's tracing subscriber defaults to ERROR when
+            // RUST_LOG is unset, which would swallow the reload and
+            // TLS warnings that tests assert on by reading this file.
+            .env("RUST_LOG", "info")
             .env("PINGCLAIR_TLS_STORE", &tls_store_path)
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
@@ -4097,7 +4101,7 @@ async fn test_signal_reload_applies_config_and_warns_on_global_changes() {
     assert!(reloaded, "the server must answer with the reloaded body");
 
     // 🚩 The global email change must be reported as restart-only.
-    // 🧭 tracing writes to stdout by default in this test harness.
+    // 🧭 TestServer sets RUST_LOG=info, so the warning lands in this file.
     let stderr = std::fs::read_to_string(&server.stdout_path).unwrap_or_default();
     assert!(
         stderr.contains("global options"),
