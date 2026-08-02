@@ -37,21 +37,42 @@ Que vous ayez besoin d'un simple serveur de fichiers statiques ou d'une passerel
 
 ## ⚡ Benchmarks
 
-Pingclair, nginx et Caddy ont été exécutés à tour de rôle sur un bridge
-OrbStack isolé. Les conteneurs ARM64 client et serveur étaient limités à
-2 vCPU / 512 Mio ; chaque protocole a renvoyé le même corps vérifié de
-1 Kio, sans échec H2/H3.
+Pingclair au commit `ca773af`, nginx et Caddy ont été exécutés à tour de rôle
+sur un `t3.small` x86 dans AWS Oregon. Un second `t3.small`, dans la même zone
+de disponibilité, a généré la charge sur le réseau privé. Le tableau donne la
+médiane de trois passes enregistrées.
 
-| Scénario | Pingclair | nginx 1.31.3 | Caddy 2.11.4 |
+| Scénario | Pingclair | nginx 1.28.3 | Caddy 2.11.4 |
 | --- | ---: | ---: | ---: |
-| H1 | 56 965,75 req/s | 64 719,17 | 25 464,92 |
-| H2 | 48 779,06 req/s | 49 499,64 | 18 829,32 |
-| H3, nouvelle connexion/requête | 247,34 req/s | 249,26 | 234,90 |
-| H3, 20 connexions réutilisées | 5 304,48 req/s | 6 020,13 | 4 108,13 |
+| H1 statique, 1 Kio | 38 862,71 req/s | 61 178,61 | 14 442,93 |
+| HTTPS/H1 statique, 1 Kio | 31 018,40 req/s | 43 806,16 | 14 617,83 |
+| H2 statique, 1 Kio | 33 004,03 req/s | 57 487,59 | 10 212,16 |
+| Reverse proxy H1, 1 Kio | 11 474,42 req/s | 11 876,71 | 6 998,97 |
+| Reverse proxy H2, 1 Kio | 10 471,76 req/s | 10 537,69 | 4 300,58 |
+| H3, nouvelle connexion et statique 1 Kio | 128,93 req/s | 143,14 | 151,84 |
+| H3, connexions réutilisées et statique 1 Kio | 1 550,21 req/s | 1 694,08 | 1 834,92 |
+| H3, connexions réutilisées et reverse proxy | 1 396,32 req/s | 1 447,61 | 1 914,65 |
+| H1 statique, fichier aléatoire de 1 Mio | 590,91 Mio/s | 590,62 | 590,74 |
+| H1 gzip chaud, fichier compressible de 1 Mio | 44 966,58 req/s | 833,18 | 2 374,64 |
+| Écho WSS, 50 connexions | 14 029,97 msg/s | 14 937,19 | 13 461,07 |
 
-La méthodologie, les passes brutes, les configurations, les commandes et les
-empreintes des binaires se trouvent dans
-[`benchmarks/README.md`](benchmarks/README.md) (en anglais).
+H1 utilise wrk avec 2 threads et 100 connexions ; H2 utilise h2load avec 50
+clients et 10 flux par connexion ; aioquic utilise une concurrence H3 de 30 ;
+et le client WebSocket amd64 natif maintient 50 connexions. Chaque charge a
+été préchauffée puis exécutée trois fois. Les corps, versions HTTP, données
+gzip décompressées et SHA-256 ont été vérifiés ; toutes les passes H2, H3 et
+WSS publiées n'ont signalé aucune erreur côté client. Le backend partagé a
+atteint directement 63,3 kreq/s et n'a donc pas plafonné les tests de proxy.
+Le fichier statique de 1 Mio a atteint la limite du réseau. Le résultat gzip
+chaud de Pingclair profite de son cache de réponses statiques compressées,
+tandis que les configurations nginx et Caddy testées compressent à chaque
+requête.
+
+La méthodologie complète, les checksums des passes brutes, les configurations,
+les commandes et les empreintes des binaires se trouvent dans
+[`benchmarks/README.md`](benchmarks/README.md) et le
+[`résultat du 2026-08-02`](benchmarks/results/20260802_aws_x86_ca773af/RESULT.md)
+(en anglais).
 
 ## 📦 Installation
 

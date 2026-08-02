@@ -1,592 +1,122 @@
-# Pingclair vs Nginx vs Caddy — Benchmark Notes
+# Pingclair benchmarks
 
-This directory replaces the (unverified) numbers in the main `README.md`'s
-benchmark table. The original figures were produced before a round of bug
-fixes in this session; several of those bugs would have directly distorted
-a load test, so the old numbers should not be trusted.
+The current public benchmark is the
+[`2026-08-02 AWS x86 run`](results/20260802_aws_x86_ca773af/RESULT.md), measured
+at Pingclair commit `ca773affad998eb6439319236dd904fc20b4785f`.
 
-## Bugs found while building and running this harness
+## Current results
 
-Preparing to load-test surfaced 8 real bugs, none of which were about the
-benchmark itself — they were pre-existing defects the benchmark happened to
-exercise. All 8 are fixed and covered by regression tests on `main`. A 9th
-was found by the benchmark *run itself* and has since been fixed too (see
-"Large body" results below); #10 and #11 were found during that re-run and
-its follow-up analysis, and are fixed as well:
+Each value is the median of three recorded rounds. Higher is better.
 
-1. **Gzip full-body buffering (OOM risk)** — `upstream_response_body_filter`
-   buffered an entire proxied response before emitting anything. Fixed to
-   stream: flush + drain after every chunk, memory bounded regardless of
-   body size. (`a24db16`)
-2. **Request ID generation did a syscall per request** — replaced
-   `SystemTime::now()` with a process epoch + atomic counter. (`a24db16`)
-3. **`hosts`/`default` used `RwLock`** on the per-request hot path — moved
-   to `ArcSwap` for lock-free reads. (`a24db16`)
-4. **Upstream connection pool size was implicit** (`conf: None`) — now
-   explicit and configurable. (`a24db16`)
-5. **Config adapter dropped inline path matchers.** `handle /api/*` and
-   `route "/api/*"` lost their path entirely and collapsed into the
-   server's catch-all — every request matched them regardless of URL. This
-   also silently broke `examples/full_featured.pingclair`. (`1fd6767`)
-6. **Nested handlers were never wired up.** A `reverse_proxy`/`file_server`
-   inside a `handle {}` block got no load balancer / no file-server
-   instance and 500'd with `ConnectNoRoute`. Rate limiting already
-   recursed into these blocks; proxying and file-serving didn't — the
-   nesting support was half-finished. (`1fd6767`)
-7. **Glob routes didn't match their own bare prefix.** `/proxy/*` failed
-   to match the bare `/proxy/` or `/proxy` (matchit's wildcard needs ≥1
-   char after the prefix). Nginx and Caddy both match the bare directory
-   for the equivalent construct; pingclair didn't. This is what first
-   looked like "the proxy collapses under concurrency" in an early run of
-   this benchmark — it wasn't load, every single request to that exact
-   path failed, at any concurrency. (`e35e067`)
-8. **Dockerfile pinned nightly Rust** for no reason (no nightly-only
-   features anywhere in the workspace) and nightly's codegen ICEs on
-   aarch64 under this crate's release profile (`panic="abort"` + fat LTO +
-   `codegen-units=1`), failing the image build partway through compiling
-   `tokio`. Pinned to stable. (commit adjacent to the above)
-9. **FIXED: static-file gzip compression had the same full-buffer bug as
-   #1, in a different crate.** `pingclair-static::FileServer::
-   compress_content` fully buffered the input file *and* the compressed
-   output on *every* request, with no cache — fix #1 only covered the
-   reverse-proxy response path, and this static-file path wasn't touched.
-   Under sustained concurrent load against a large file, this turned a
-   20-second benchmark into 16 minutes (see "Large body" results below).
-   Fixed by adding a byte-bounded LRU cache of compressed bodies keyed on
-   `(path, mtime, encoding)` — a hit skips the disk read and the
-   compression entirely; editing a file (new mtime) transparently
-   invalidates its stale entry. Verified with a repeat of the exact same
-   benchmark: 16 minutes → 20.09s, 54 requests → 21,684, 0.06 req/s →
-   1,079 req/s (~400x more requests served). See "Large body" results
-   below for the full before/after and an important residual caveat about
-   cold-start memory. (`240399c`)
-10. **Named site addresses were bound literally.** `bench.local:8080 { }`
-    passed `bench.local` straight to Pingora as the bind host instead of
-    binding `0.0.0.0` and routing by the Host header (Caddy/nginx
-    semantics), so startup crashed with a BindError unless the hostname
-    happened to resolve to a local interface — this is why both benchmark
-    Pingclairfiles were originally forced to use a bare `:8080` block.
-    Fixed in `parse_server_address` (pingclair-config): IP literals still
-    bind to that address; hostnames now bind the wildcard and match via
-    the Host header, and the benchmark configs use `bench.local:8080`
-    like the nginx/caddy configs.
-11. **Cold-cache compression stampede.** A follow-up to #9: the compressed
-    body cache fixed steady-state, but on a cold cache N concurrent
-    requests for the same file each read and compressed it independently
-    before the first one populated the cache (the cold-start memory spike
-    in the "Large body" re-run). Fixed with in-flight request coalescing:
-    the first request per (path, mtime, encoding) compresses under a
-    per-key async lock and the rest wait, then serve the shared result.
+| Scenario | Unit | Pingclair | nginx 1.28.3 | Caddy 2.11.4 |
+| --- | --- | ---: | ---: | ---: |
+| H1 static, 1 KiB | req/s | 38,862.71 | 61,178.61 | 14,442.93 |
+| HTTPS/H1 static, 1 KiB | req/s | 31,018.40 | 43,806.16 | 14,617.83 |
+| H2 static, 1 KiB | req/s | 33,004.03 | 57,487.59 | 10,212.16 |
+| H1 reverse proxy, 1 KiB | req/s | 11,474.42 | 11,876.71 | 6,998.97 |
+| H2 reverse proxy, 1 KiB | req/s | 10,471.76 | 10,537.69 | 4,300.58 |
+| H3 fresh connection, 1 KiB static | req/s | 128.93 | 143.14 | 151.84 |
+| H3 reused connections, 1 KiB static | req/s | 1,550.21 | 1,694.08 | 1,834.92 |
+| H3 reused connections, reverse proxy | req/s | 1,396.32 | 1,447.61 | 1,914.65 |
+| H1 static, 1 MiB random | MiB/s | 590.91 | 590.62 | 590.74 |
+| H1 warm gzip, 1 MiB compressible | req/s | 44,966.58 | 833.18 | 2,374.64 |
+| WSS echo, 50 connections × 64 B | msg/s | 14,029.97 | 14,937.19 | 13,461.07 |
 
-## Bugs found by the VPS production test (July 2026)
+## Test topology
 
-A dedicated production-readiness run on the Aliyun Shenzhen VPS (2 vCPU /
-1.6GB) — named vhosts, static + compression + range, reverse proxy with
-two upstreams, admin API, TLS, wrk load — surfaced another batch. All
-fixed and verified end-to-end on the same box:
+- AWS Oregon (`us-west-2a`), with one x86 `t3.small` client and one x86
+  `t3.small` server in the same subnet. All load used private IPv4 traffic.
+- Ubuntu 26.04 on both hosts, with 2 vCPU and 2 GiB RAM each. Both instances
+  reported an Intel Xeon Platinum 8259CL.
+- Pingclair, nginx, and Caddy ran one at a time on the server. They shared the
+  same files, backend, short-lived ECDSA P-256 certificate, ports and client.
+- Pingclair was built locally through OrbStack as `linux/amd64`, using the
+  production Dockerfile's Rust 1.88, locked dependencies and fat-LTO release
+  profile. The x86-64 ELF SHA-256 was
+  `0e27a136a037ba2cd9564f94abf12227187b584b7baddc71f4a976309aa9b5ec`.
+- nginx was Ubuntu 1.28.3 with HTTP/3 enabled; Caddy was the official 2.11.4
+  linux-amd64 release.
 
-12. **Path traversal read files outside the docroot.** `GET /../x` passed a
-    lexical `starts_with(root)` check. Confinement is now lexical
-    dot-segment normalization (zero syscalls, nginx/Caddy model).
-13. **Any TLS handshake panicked the whole process** (`panic=abort`):
-    rustls could not auto-select a CryptoProvider (both `aws-lc-rs` and
-    `ring` enabled). An explicit provider is installed at startup.
-14. **Manual TLS certificates were silently ignored** — `tls cert key` in
-    config was never loaded; manual certs now take precedence over ACME in
-    SNI resolution.
-15. **Missing files / unknown vhosts / unmatched routes returned 500**
-    (fell through to `upstream_peer`'s ConnectNoRoute) instead of 404.
-16. **No upstream failover**: with two upstreams and one dead, ~50% of
-    requests 502'd. Passive health marks (nginx max_fails/fail_timeout
-    semantics) plus a same-request retry fixed this — 20/20 requests
-    succeed with one upstream down, and the dead one rejoins after its
-    cooldown.
-17. **Large uncompressed static files were fully buffered in memory** (the
-    `StreamingFile` path was dead code): 20MB × 20 conns drove RSS 24→236
-    MiB. `FileServer::serve_auto` now returns Buffered/Stream after one
-    resolve + stat; streaming RSS stays ~35 MiB with no throughput
-    regression (plain static 17.1k rps vs 17.5k baseline, gzip 25.2k vs
-    23.9k).
-18. **SIGTERM/SIGINT never stopped the process** (systemd stop hung until
-    SIGKILL). Explicit shutdown handlers added.
-19. **Admin `/metrics` returned an empty body** — `metrics::init()` was
-    never called. **X-Forwarded-For/X-Real-IP were not set** on proxied
-    requests. Both fixed.
-20. **The DSL had no `tls` or `admin` directives** (JSON-only). Both are
-    now supported in the Caddyfile syntax, including `tls { cert/key/
-    acme_email/http3 }` block form and `admin off`.
+## Workloads
 
-## Bugs found by the HTTP/3 (quiche) VPS run (July 2026)
+### H1, HTTPS and reverse proxy
 
-After the HTTP/3 stack was rewritten on quiche, the Linux smoke run
-surfaced one more startup crasher:
+wrk used 2 threads and 100 connections. A 2-second warm-up preceded three
+8-second recorded rounds. Large-file and gzip tests used 32 connections.
 
-21. **Bare `:port` listen addresses in JSON configs crashed startup.**
-    Pingora requires a full `IP:port` socket address; a JSON config with
-    `"listen": [":8443"]` died with `Name or service not known` (and the
-    QUIC socket parse failed the same way). Only DSL configs worked,
-    because the Caddyfile adapter already normalized to `0.0.0.0`. Both
-    the initial bind path and the SIGHUP reload path in `main.rs` now
-    normalize `:port` → `0.0.0.0:port` (`normalize_listen_addr`, with a
-    unit test).
+The reverse-proxy backend was a separate nginx listener returning the same
+verified 1 KiB body. Its direct private-network preflight reached 63,314.27
+req/s, well above all proxy results.
 
-## The static-throughput root cause (July 2026, same-day follow-up)
+### H2
 
-The 18.8k vs 55.2k req/s static gap to nginx above turned out to be two
-stacked configuration/code defects, not a fundamental runtime tax:
+h2load 1.68.0 used 2 threads, 50 clients and 10 concurrent streams per
+connection. Each candidate received a 10,000-request warm-up, followed by
+three fixed-count rounds: 300,000 requests for static serving and 100,000 for
+reverse proxying.
 
-22. **Pingora's `ServerConf.threads` defaults to 1** — every benchmark
-    in this document before this fix ran pingclair on a *single* worker
-    thread while nginx ran `worker_processes auto` (2 on this box).
-    `main.rs` now scales `threads` to `available_parallelism()`
-    (overridable via `global.worker_threads`).
-23. **`tokio::fs` in the static hot path was the real killer.** Every
-    `tokio::fs` call (metadata/open/read) is a `spawn_blocking`
-    cross-thread round-trip: strace showed **8 futex wake/waits per
-    request** (nginx: 0) and pidstat showed 89% of CPU in kernel time.
-    Fixing threads alone changed nothing (18.7k req/s, 154% CPU).
-    Converting the static request path to synchronous `std::fs` — the
-    nginx model, local file reads from page cache don't meaningfully
-    block — took futex to ~50 calls total per 17.7k requests and roughly
-    **2.6x'd throughput**.
+nginx's `keepalive_requests` was set to 1,000,000. Its default of 1,000 closes
+each H2 connection after exactly 50,000 aggregate successes in this topology,
+which would make the remaining requests client errors rather than measure
+steady-state throughput. The published rounds all completed with zero failed,
+errored or timed-out requests.
 
-Same-box numbers after the fix (wrk -t2 -c100 -d10s, loopback):
+### H3
 
-| Scenario | Pingclair (before) | Pingclair (after) | Nginx | Caddy |
-|----------|--------------------|-------------------|-------|-------|
-| Static 1KB, plain | ~18,700 req/s | 50,145 req/s | 53,579 req/s | 17,337 req/s |
-| Static 1KB, gzip | ~27,500 req/s | 42,982 req/s | 42,510 req/s | 15,302 req/s |
-| Reverse proxy | ~17,700 req/s | 20,154 req/s | 21,961 req/s | 9,870 req/s |
+The client used aioquic 1.3.0. The fresh-connection workload made 300 requests
+at concurrency 30 with one request per QUIC connection. Reuse workloads made
+3,000 requests over 30 persistent connections. Each scenario had a separate
+100-request warm-up and three recorded rounds. Every published response had
+status 200, the expected 1 KiB body, and zero failures.
 
-20MB uncompressed streaming stays healthy: 1.42 GB/s with 17.7 MiB RSS.
+### Static files and gzip
 
-Lesson, now recorded in AGENTS.md: never use `tokio::fs` on a per-request
-hot path — its spawn_blocking tax dominates at small response sizes;
-and any framework default that decides runtime topology (threads, pool
-sizes, timeouts) must be set explicitly and logged at startup.
+The large static fixture was an incompressible 1 MiB file. All three servers
+clustered at about 591 MiB/s, indicating the instance network ceiling.
 
-Workspace tests: 65 → 129, all passing, across all 20 fixes. (Later: 148
-with the HTTP/3-on-quiche rewrite and fix #21; the H3 stack was verified
-end-to-end on the same VPS — 10MB static and proxied bodies byte-identical
-over QUIC, streamed POSTs with and without Content-Length, 413 on
-oversize, and Alt-Svc advertised on H1.1 TLS responses.)
+The gzip fixture was a 1 MiB compressible file requested with an explicit
+`Accept-Encoding: gzip`. This is deliberately a warm-serving workload:
+Pingclair caches the compressed static representation, while the tested nginx
+and Caddy configurations compress on every request. The row compares those
+serving strategies, not raw compression-codec speed.
 
-Also deleted a `strict-tests/` directory that had been added by another
-tool: 16 of its 26 tests failed against the real compiler because it
-tested invented Caddyfile syntax (`tls { }` blocks, bare `redirect`,
-`rate_limit`, `cors`, `headers{}` directives) that isn't wired into the
-adapter, despite the underlying Rust types existing for all of it — a real
-gap worth tracking separately, but not something that test suite was
-useful for catching correctly.
+### WebSocket
 
-## Methodology
+A native amd64 Go tool ran both the echo backend and the client. The backend's
+direct median was 27,364.98 msg/s. Published WSS rounds used 50 persistent
+connections, synchronous 64-byte binary echoes, a 2-second warm-up and three
+8-second measurements. All three candidates completed with zero client errors.
 
-**Local (Docker bridge)**: pingclair, nginx, and caddy each run in their
-own container on an isolated bridge network, capped at 2 CPUs / 512MB
-(`docker-compose.yml`). `wrk` runs on the host (Apple M2, 8 cores) against
-each container's published port **in turn** — never more than one server
-under test at a time, so there's no cross-server CPU contention on the
-host. `scripts/run_local_matrix.sh` runs the full matrix and tears the
-stack down when finished.
-
-Test matrix per server:
-- Static file (1KB), no compression requested — concurrency 50/200/500
-- Static file (1KB), gzip requested — concurrency 50/200/500
-- Reverse proxy passthrough to a shared, unmeasured backend — concurrency
-  50/200/500
-- Large body (20MB, gzip) at modest concurrency, with container memory
-  sampled throughout — this is the direct regression check for bug #1
-  above: does memory stay bounded, does the server survive, no 5xx.
-
-Compression levels are **not** perfectly matched across engines (each
-uses its own default/fastest setting — see `configs/*/nginx.conf`'s
-comment on `gzip_comp_level`), so gzip numbers are informative but not a
-precise apples-to-apples compression-speed comparison.
-
-**Remote (bare-metal VPS)**: a 2 vCPU / 1.6GB Aliyun Shenzhen box. An
-earlier attempt (wrk driven from a laptop over a tunnel) was abandoned —
-both network-bound and blocked by the release build thrashing on 1.6GB.
-The completed run instead uses `scripts/run_onbox_matrix.sh`: everything
-on the box itself, each candidate on `127.0.0.1:8080` in turn, wrk over
-loopback (`-t2 -d15s`; the 2 vCPU are shared with the server under test).
-Raw output: `results/20260725_vps_onbox/`. The release build links fine
-with the box's 2GB of swap added.
-
-### VPS on-box results (2026-07-25 19:14 — ⚠️ PRE-perf-fix, superseded)
-
-> **These numbers are stale and were mislabeled "all fixes in".** This run
-> completed at 19:14; the static perf fix (`2fc8a0d` — `worker_threads` +
-> sync `std::fs`) landed at 23:48 the same night and **2.6x'd static
-> throughput**. Pingclair ran single-threaded here against nginx's
-> `worker_processes auto`.
->
-> **For current numbers use the post-fix table above** (Static 1KB plain:
-> pingclair 50,145 vs nginx 53,579 — not the 3x gap this table shows).
-> Kept as the before-side of the comparison, not as a current result.
-
-Static file (1KB), plain:
-
-| Concurrency | Pingclair | Nginx | Caddy |
-|---|---|---|---|
-| 50  | 20,022 req/s | 51,904 req/s | 17,772 req/s |
-| 200 | 18,795 req/s | 55,236 req/s | 17,413 req/s |
-| 500 | 17,797 req/s | 53,508 req/s | 16,229 req/s |
-
-Static file (1KB), gzip requested:
-
-| Concurrency | Pingclair | Nginx | Caddy |
-|---|---|---|---|
-| 50  | 29,606 req/s | 44,050 req/s | 14,922 req/s |
-| 200 | 27,459 req/s | 44,268 req/s | 15,412 req/s |
-| 500 | 25,642 req/s | 42,913 req/s | 13,984 req/s |
-
-Reverse proxy passthrough (shared nginx backend on :9000):
-
-| Concurrency | Pingclair | Nginx | Caddy |
-|---|---|---|---|
-| 50  | 20,507 req/s | 20,713 req/s | 11,189 req/s |
-| 200 | 17,716 req/s | 20,778 req/s | 9,168 req/s |
-| 500 | 15,861 req/s | 18,823 req/s | 8,041 req/s |
-
-Large body (20MB), gzip, `-c20 -d20s`, memory sampled:
-
-| Server | Requests completed | Throughput | Timeouts | Peak RSS |
-|---|---|---|---|---|
-| **Pingclair** | **14,070 (703 req/s)** | **2.17 GB/s** | **0** | 74 MiB |
-| Nginx | 183 (9.1 req/s) | 41 MB/s | 110 | 21 MiB |
-| Caddy | 204 (10.1 req/s) | 39 MB/s | 65 | 117 MiB |
-
-Readings:
-
-> ⚠️ The static and gzip readings below describe the **pre-fix** run above.
-> They are kept to document what the single-threaded + `tokio::fs` build
-> looked like. **Post-fix, the static gap to nginx is ~6%, not ~3x** — see
-> the corrected summary after this list.
-
-- ~~**Nginx is ~2.6-2.9x pingclair on plain 1KB static**~~ — this was the
-  symptom that led to fix #22/#23. Root cause was pingclair running
-  single-threaded plus `tokio::fs` spawn_blocking churn, **not** an
-  inherent sendfile/tuning gap. After the fix: 50,145 vs nginx 53,579.
-- ~~**gzip static narrows the gap** (pingclair ~60-67% of nginx)~~ —
-  post-fix pingclair is **slightly ahead** of nginx here
-  (42,982 vs 42,510).
-- **Proxying is essentially tied with nginx** (~84-99%) and ~1.8-2x
-  caddy — this reading still holds post-fix (20,154 vs 21,961). The
-  container-run anomaly (pingclair "winning" at c500) did not reproduce
-  on bare metal, as expected; see the caveat below the container proxy
-  table.
-- **Large compressible bodies are the compressed-body cache's home
-  turf**: ~70x nginx/caddy throughput, 0 timeouts, because repeat hits
-  skip compression entirely while nginx/caddy re-compress on every
-  request (their per-request CPU cost at gzip on a 20MB file on 2 shared
-  vCPU is brutal). The price of the cache is the 64MB compressed-body
-  budget, visible in the 74 MiB peak RSS vs nginx's 21 MiB. Still valid.
-- Compression levels are not perfectly matched (nginx
-  `gzip_comp_level 1` vs each engine's own default), so treat gzip
-  numbers as informative, not exact.
-
-**Corrected same-box summary (post-`2fc8a0d`, wrk -t2 -c100 -d10s):**
-
-| Scenario | Pingclair | vs Nginx | vs Caddy |
-|---|---|---|---|
-| Static 1KB plain | 50,145 req/s | 0.94x | **2.9x** |
-| Static 1KB gzip | 42,982 req/s | **1.01x** | **2.8x** |
-| Reverse proxy | 20,154 req/s | 0.92x | **2.0x** |
-| 20MB gzip | 703 req/s, 0 timeouts | **~70x** | **~70x** |
-
-## Results (Docker bridge, July 2026)
-
-Full run: `results/20260724_203009/` (33 files, one per server × test ×
-concurrency, plus memory timelines for the large-body test). All numbers
-below are `wrk -t4 -d15s --latency` (large-body test: `-t2 -d20s -c20`),
-Docker bridge, 2 vCPU / 512MB per container.
-
-### Static file (1KB), plain
-
-| Concurrency | Pingclair | Nginx | Caddy |
-|---|---|---|---|
-| 50  | 22,942 req/s | 28,801 req/s | 18,309 req/s |
-| 200 | 21,547 req/s | 25,806 req/s | 17,043 req/s |
-| 500 | 21,162 req/s | 27,853 req/s | 18,448 req/s |
-
-Nginx leads throughout; pingclair and caddy are close, roughly
-75-80% of nginx's throughput. No errors on any server at this size.
-
-### Static file (1KB), gzip requested
-
-| Concurrency | Pingclair | Nginx | Caddy |
-|---|---|---|---|
-| 50  | 15,668 req/s | 23,495 req/s | 20,222 req/s |
-| 200 | 15,108 req/s | 23,589 req/s | 19,933 req/s |
-| 500 | 14,220 req/s | 23,250 req/s | 19,305 req/s |
-
-Pingclair drops noticeably more than nginx/caddy when gzip is requested
-even for a 1KB file — worth a closer look at whether the compression-
-eligibility check (content-type / size threshold logic in
-`upstream_response_body_filter` and `FileServer::compress_content`) is
-doing more work than necessary on the hot path.
-
-### Reverse proxy passthrough
-
-| Concurrency | Pingclair | Nginx | Caddy |
-|---|---|---|---|
-| 50  | 29,268 req/s (0 errors) | 23,339 req/s (0 errors) | 23,174 req/s (0 errors) |
-| 200 | 38,437 req/s (0 errors) | 8,288 req/s (0 errors) | 6,963 req/s (350 non-2xx) |
-| 500 | 25,906 req/s (0 errors) | 507 req/s (986 timeouts, 5,204 non-2xx) | 682 req/s (266 timeouts) |
-
-This is a genuinely surprising result and **should not be taken as "pingclair
-is faster than nginx at proxying" in general** — it needs corroboration on
-uncapped hardware (the pending remote VPS run) before trusting it as
-anything more than "interesting, under these specific container CPU caps."
-Plausible explanations worth checking before believing the headline number:
-the shared backend container runs `nginx worker_processes 1;` (a single-
-worker bottleneck all three proxies share equally, which shouldn't by
-itself explain nginx/caddy specifically falling over while pingclair
-doesn't); Docker's bridge network/NAT conntrack behavior under this many
-parallel connections; and each engine's own default keep-alive / worker
-connection tuning in a 2-vCPU container, which none of these configs
-custom-tuned beyond the basics in `configs/*/`.
-
-### Large body (20MB), gzip, sustained concurrent load — the important one
-
-**Before the fix (bug #9, `pingclair_static_plain_c500.txt` era, commit
-`e35e067` and earlier):**
-
-| Server | Requests completed | Wall time (nominal 20s) | Timeouts | Peak container memory | Peak CPU |
-|---|---|---|---|---|---|
-| **Pingclair** | 54 | **16m 1s** | 48 | 367.9 MiB / 512 MiB | ~101% (1 core) |
-| Nginx | 150 | 20.1s | 126 | 22.2 MiB / 512 MiB | ~211% (2 cores) |
-| Caddy | 374 | 20.0s | 0 | 73.0 MiB / 512 MiB | ~201% (2 cores) |
-
-Root cause, confirmed by isolated reproduction (not speculation):
-`/large.html` is served by `pingclair-static`'s `FileServer`, **not** the
-reverse-proxy path, so P0 fix #1's streaming gzip didn't apply to it.
-`FileServer::compress_content` fully buffered the input file *and* the
-compressed output on every single request, with no cache. A single
-request was fast (0.4s); 5 concurrent requests were fine (0.7-1.75s). The
-problem was **sustained** load: `wrk -c20 -d20s` keeps 20 connections
-firing repeated requests for the full window, each one re-compressing the
-same 20MB file from scratch — under the container's 2-vCPU cap that
-backlog compounded into a 16-minute grind. Not an OOM (memory stayed
-under the cap, no crash) — an unbounded-latency/queuing problem.
-
-**After the fix (`240399c`, compressed-body LRU cache), same test,
-repeated exactly:**
-
-| Server | Requests completed | Wall time (nominal 20s) | Timeouts | Peak container memory |
-|---|---|---|---|---|
-| **Pingclair** | **21,684** | **20.09s** | 21 | 373.6 MiB / 512 MiB (transient — settles to 17.5 MiB within ~10s) |
-| Nginx | 129 | 20.03s | 107 | — |
-| Caddy | 401 | 20.02s | 0 | — |
-
-- **54 → 21,684 requests (~400x), 16m1s → 20.09s, 0.06 → 1,079 req/s.**
-  Error rate dropped from ~47% of attempts timing out to ~0.1%.
-- Pingclair now serves **more total requests than nginx and caddy
-  combined** on this exact test, because after the first request the file
-  is cached compressed — every subsequent hit skips compression
-  entirely, while nginx and caddy (no compressed-response cache
-  configured) pay the full compression cost on every request, every time.
-- **Cold-start caveat — since fixed**: peak memory during the *cold start*
-  was essentially unchanged in that run (373.6 MiB vs. 367.9 MiB before).
-  The cache started empty, so with `-c20` all 20 connections raced in and
-  missed simultaneously — each independently compressed the full file
-  before any of them finished and populated the cache (a classic "cache
-  stampede"). This was later fixed with **in-flight request coalescing**
-  (`pingclair-static/src/file_server.rs`): the first request for a given
-  (path, mtime, encoding) takes a per-key async lock and does the read +
-  compression, and concurrent requests for the same key wait on that lock
-  and then serve the shared cached result — one compression pass total.
-  See the `concurrent_cold_cache_requests_are_coalesced` test.
-
-## Remote VPS run
-
-Completed July 2026 — see "VPS on-box results" above. The earlier failure
-mode (release link thrashing on 1.6GB) went away once the box had 2GB of
-swap; the full release profile (`lto = "fat"`, `codegen-units = 1`) now
-builds in ~2.5 minutes on the box.
-
-## Reproducing
+Representative recorded commands (repeated three times after warm-up) were:
 
 ```bash
-cd benchmarks
-./scripts/run_local_matrix.sh          # local, Docker bridge
-./scripts/provision_remote.sh          # remote, one-time setup (VPS)
-./scripts/run_remote_matrix.sh         # remote, wrk driven from your laptop
-./scripts/run_onbox_matrix.sh          # remote, everything on the VPS itself
-                                       # (the methodology used for the VPS
-                                       # results above — no network in the way)
+wrk -t2 -c100 -d8s http://bench.local:8080/small.txt
+wrk -t2 -c100 -d8s https://bench.local:8443/small.txt
+h2load -t2 -c50 -m10 -n300000 https://bench.local:8443/small.txt
+h2load -t2 -c50 -m10 -n100000 https://bench.local:8443/proxy/bench
+python h3_bench.py --host SERVER_PRIVATE_IP --mode fresh --requests 300 --concurrency 30 --expect-bytes 1024
+python h3_bench.py --host SERVER_PRIVATE_IP --mode reuse --requests 3000 --concurrency 30 --expect-bytes 1024
+wsbench client --url wss://bench.local:8443/ws --connections 50 --duration 8s --payload-bytes 64 --insecure
 ```
 
-Not a benchmark, but it lives here because it needs the same Docker image:
+## Correctness and evidence
 
-```bash
-docker build -t pingclair:dns-e2e ..
-./scripts/run_dns_refresh_e2e.sh       # upstream DNS re-resolution E2E
-```
+Before load, curl verified H1, HTTPS/H1 and H2 negotiation. Static and proxy
+bodies matched SHA-256
+`5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef`;
+decompressed gzip matched
+`30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58`.
 
-It runs the real release image against Docker's own embedded resolver and
-checks that the backend follows a container to a new IP, that a failed lookup
-keeps the last known address serving, that an upstream absent at boot is
-adopted later, and that `dns_refresh off` pins the startup address. Container
-addresses are pinned with `--ip` so the result never depends on how the daemon
-happens to recycle its address pool.
+The result directory publishes:
 
-## 2026-08-02 香港機三邊對比（nginx vs caddy vs pingclair release）
+- `RESULT.md`: complete environment, method, medians and interpretation;
+- `commit.txt`: the full Pingclair commit under test;
+- `SHA256SUMS`: hashes for every privately archived raw round, configuration,
+  payload check and harness source.
 
-**場景**：三種伺服器在同一台 AWS 香港 `t4g.micro`（Ubuntu 26.04 arm64，
-2 vCPU / 1GB）上**輪流**跑，壓測客戶端是同一 VPC 內的 `t4g.small`
-（內網，非 loopback）。三邊共用同一份 1KB 檔、同一張 Let's Encrypt 憑證、
-同埠位（明文 8080、TLS/H2/H3 8443、proxy 8082、WS 8083），避免設定差異。
+Raw output stays out of Git to avoid republishing incidental infrastructure
+details. The checksum ledger allows the private archive to be verified later.
 
-- 伺服器：nginx 1.28.3（Ubuntu 套件，`worker_processes auto`）、
-  Caddy 2.11.4（官方 binary）、Pingclair release（fat-LTO，
-  commit `796581c`，aarch64）。
-- 工具：wrk（H1，`-t2 -c100 -d10s`）、h2load（H2，30k requests、
-  `-c100 -m100`）、aioquic 自寫 client（H3，30 並發 × 10 requests、
-  每請求一條新 QUIC 連線）、websockets（WS，50 連線 × 5 訊息）。
-- 後端：同一支單執行緒 python echo server（9001 WS / 9002 HTTP）。
-
-| 場景 | Pingclair release | Nginx 1.28.3 | Caddy 2.11.4 |
-| --- | ---: | ---: | ---: |
-| H1 明文 1KB | 29,422 req/s | 45,131 | 16,367 |
-| H1 TLS 1KB | 24,683 req/s | 34,448 | 17,394 |
-| H1 20MB 大檔 | 589 MB/s | 592 MB/s | 591 MB/s |
-| H2 1KB | 26,365 req/s，0 failed | 51,156，0 failed | 12,804，0 failed |
-| H3 1KB | 88.6 req/s | 113.5 | 119.8 |
-| Reverse proxy（H1） | 3,875 req/s | 3,517 | 2,856 |
-| WebSocket echo | 225.6 msg/s | 225.0 | 234.8 |
-
-**解讀**
-
-- 20MB、proxy、WS 三項三家幾乎相同：瓶頸分別是 t4g.micro 的網路上限
-  （~590 MB/s）與單執行緒 python 後端，無法區分伺服器。
-- 小檔靜態是真正分高下的場景：nginx 45k > pingclair 29.4k（65%）>
-  caddy 16.4k；H2 差距最大（nginx 51k > pingclair 26.4k（52%）>
-  caddy 12.8k）。H3 三家同級（caddy 119.8 ≈ nginx 113.5 >
-  pingclair 88.6）。
-- 與本文件舊數據的差距主因：舊表（50,145 vs 53,579）是 x86 VPS +
-  release + loopback；本次是 debug build 起測（HTTPS 靜態只有 ~2.5k
-  req/s，比 release 慢約 10 倍）與 t4g.micro（Graviton2）組合所致。
-  同機 loopback 對比（wrk 在 t4g.micro 上、與伺服器搶 CPU）：nginx
-  35,485 vs pingclair 22,065，比率與內網測試一致，差距是伺服器本體。
-- **LSE 實驗**（`-C target-cpu=neoverse-n1` 重編，同機 loopback、
-  與伺服器搶 CPU）：H1 明文 22,369 → 23,595（+5.5%）、H1 TLS
-  16,285 → 17,251（+5.9%）、H2 21,383 → 22,557（+5.5%）；nginx
-  同條件 37,307 / 21,735 / 38,973。對 nginx 的佔比從 60% / 75% / 55%
-  升到 63% / 79% / 58%——LSE atomics 有實質但小幅的幫助，主體差距仍是
-  Pingora 的 task/分配模型在小核上的固定成本，不是單一 CPU 旗標能補的。
-- **H3 loopback 複測**（LSE build vs nginx，aioquic 同機、每請求新
-  QUIC 連線）：30 並發 ×10 pingclair 83.4 / nginx 97.2 / caddy 112.4；
-  100 並發 ×10 96.2 / 116.4 / 132.4（pingclair 約為 nginx 的 85%、
-  caddy 的 72%）。caddy 的 quic-go 握手最快，H3 差距明顯小於 H1/H2，
-  三家全 200 零錯誤。
-
-**壓測發現的兩個 bug（已修並於香港機驗證，commit `21a113b`）**
-
-1. `CertStore` 冷啟動 cache 未水合（`load_all()` 從未執行），auto-HTTPS
-   主站每次重啟都重新跑 ACME（撞 LE 每週 5 張 rate limit），TLS 握手回
-   `NO_CERTIFICATE_SET`。修復：`TlsManager` 建構時 `store.init()`。
-2. 自訂 `error_while_proxy` 未呼叫 `decide_reuse`，upstream 高壓 read
-   error 時 Pingora retry 迴圈 panic（`Retry is not decided`）。修復：
-   套用 reuse 安全規則 + 路由 retry 預算後才讓迴圈讀取。
-
-## 2026-08-02 Oregon 效能回歸修復（main / HEAD / nginx / Caddy）
-
-這一輪專門回答「Caddy 相容分支為何比 `main` 慢」以及「H3 為何在短連線
-壓測特別吃虧」。拓撲依香港測試方式重建：同一個 `us-west-2a` subnet 內，
-server 是 `t4g.micro`，client 是 `t4g.small`，只走內網。所有 candidate 在
-server 上輪流跑；共用 1 KiB payload、ECDSA P-256 憑證與 release fat-LTO
-aarch64 build。
-
-H1 每個 candidate 先驗證 `Host: bench.local` 回 `200`、1024 bytes 及相同
-SHA-256，再以 `wrk -t2 -c100 -d10s` 跑三輪。H3 client 只把 `200` 且 body
-恰為 1024 bytes 的 request 算作成功；各輪均全數通過。
-
-| 場景 | main `f888938` | 修復前 `0e40372` | 修復後 | nginx 1.28.3 | Caddy 2.11.4 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| H1 1 KiB，metrics on | 32,483.31 | 30,965.66 | 31,756.65 | 64,790.20 | 16,503.92 |
-| H1 1 KiB，metrics off | — | — | 32,221.17 | — | — |
-| H3，每 request 新連線 | 94.76 | 96.27 | 110.87 | 134.90 | 130.84 |
-| H3，20 條長連線／10,000 requests | 1,601.99 | 1,646.12 | 1,647.33 | 2,069.43 | 1,955.73 |
-
-單位均為 requests/second，表格取三輪中位數。H3 新連線為 30 concurrency／
-300 requests；長連線為 20 connections／10,000 requests，刻意把 handshake
-與穩態吞吐分開。
-
-**根因與修復**
-
-1. Caddy matcher 支援加入 request path 正規化後，H1/H2/H3 ingress 已整理過的
-   path 又在 Router 配置一次 segment `Vec` 和 `String`；`match_path` 還配置
-   candidate `Vec`。新增已正規化的借用式入口並直接遍歷 radix/default routes，
-   direct caller 仍走原入口，所以 dot segment、重複 slash、query、glob 與 CIDR
-   語意不變。
-2. `{ metrics off }` 只是不註冊 collector，request、Admin 與 least-conn 路徑
-   仍然建立 label、做 Prometheus lookup 和 backend health 掃描。現在以 atomic
-   開關完全略過；metrics on 時保留 active gauge handle，避免結束時再查一次。
-3. tokio-quiche 預設要求每條新連線先完成 stateless Retry。封包顯示修復前為
-   `Initial 1200 B -> Retry 95 B -> Initial 1200 B`；修復後第一個 server packet
-   直接是 handshake response。Pingclair 現在採用 nginx `quic_retry off` 的預設
-   延遲取捨，也與 Caddy 未啟用 source-address validation callback 的預設一致；
-   QUIC pre-validation amplification limit、listener connection limit、0-RTT 禁用
-   與所有 middleware 都保留。
-
-結果是 H1 預設快 2.6%；metrics off 快 4.1%，只比 `main` 慢 0.8%。H3
-新連線快 15.2%，對 nginx 的差距由 28.6% 收窄到 17.8%，對 Caddy 由
-26.4% 收窄到 15.3%。長連線修復前後只差 0.1%，證明改善集中在 handshake，
-沒有以移除 Caddy 相容行為或 streaming 功能換取數字。
-
-效能量測後的真實 H3 功能閘另發現：提早回覆 `413` 時，如果 bounded body
-channel 已滿，丟棄 receiver 後沒有喚醒 QUIC event loop，client 會等不到回應。
-最終 working tree 已補上關閉後的喚醒；這個窄修補不改 matcher、middleware 或
-一般 GET 熱路徑。修補後 Day 28 的 14/14 H3 matrix 與 cancellation／trailer
-測試全部通過。下表仍精確對應 metadata 所列的效能量測 binary；不要把後續的
-正確性修補誤記成當時已量測的內容。最終 working tree 另以 Rust 1.88 在
-ARM Linux 完成 fat-LTO release build，binary SHA-256 為
-`73c1dca958b831d6...047a1beac0e47e1`。
-
-完整原始輸出、命令、版本、binary hash、設定、client 與修復前後 pcap：
-[`results/20260802_oregon_perf_recovery_0e40372/`](results/20260802_oregon_perf_recovery_0e40372/)。
-
-## 2026-08-02 OrbStack immutable-state 熱路徑修復
-
-Oregon 數據顯示新連線 H3 已改善，但 H1 與 H3 長連線仍有明顯固定成本。後續
-只在本機 OrbStack 2.2.1 的隔離 bridge 內測試；client 與每個 server candidate
-各限制 2 vCPU／512 MiB，沒有經過 macOS published-port NAT。候選為修復前
-`0e40372`、同一 working tree 的 ARM Linux fat-LTO release、nginx 1.31.3 與
-Caddy 2.11.4。所有伺服器輪流執行並共用同一份 1 KiB payload 與 TLS 憑證。
-
-H1 使用 `wrk -t2 -c100 -d10s`，H2 使用 `h2load -n30000 -c100 -m100`；
-H3 分為每 request 建立新連線，以及 20 條連線重用 10,000 requests。表格均取
-三輪中位數。H1/H2 起測前驗證 `200`、1024 bytes 與 SHA-256；H2 每輪
-30,000 requests 全數成功，H3 各輪全部 request 均通過相同 body 驗證。
-
-| 場景 | 修復前 `0e40372` | 修復後 | nginx 1.31.3 | Caddy 2.11.4 |
-| --- | ---: | ---: | ---: | ---: |
-| H1 1 KiB | 55,207.20 | 56,965.75 | 64,719.17 | 25,464.92 |
-| H2 1 KiB | 45,099.76 | 48,779.06 | 49,499.64 | 18,829.32 |
-| H3，每 request 新連線 | 190.66 | 247.34 | 249.26 | 234.90 |
-| H3，20 條重用連線 | 5,164.49 | 5,304.48 | 6,020.13 | 4,108.13 |
-
-Linux syscall profile 先找到直接根因：`get_state()` 每次 request 都深複製
-`ProxyState` 及其 route、middleware、file-server 等 `Vec`；dispatch 隨後又
-clone 完整 `HandlerConfig` tree。靜態檔案一般路徑還對同一檔案做兩次
-`statx`。修復後 host map 發佈 `Arc<ProxyState>`，request 保留一份 immutable
-snapshot 並直接借用 handler；scheme 與 verified client IP 不再做多餘的
-配置、字串化與重新解析；regular-file path 沿用第一次 metadata。這些改動
-沒有刪除 matcher、middleware、streaming、body limit 或 Caddy 相容行為。
-
-結果是 H1 +3.2%（nginx 的 88.0%）、H2 +8.2%（nginx 的 98.5%）、H3
-新連線 +29.7%（與 nginx 相差 0.8%），H3 重用連線 +2.7%（nginx 的
-88.1%）；四項均快於 Caddy。Native macOS debug A/B 由 18,369.08 升至
-21,590.54 req/s（+17.5%），也確認最佳化方向，而 release 容器間的提升較小。
-
-目前約 12% 的 H1／H3 長連線差距與 nginx 的 `sendfile` 路徑一致；Pingclair
-仍透過 Pingora userspace body API 傳送。沒有用整檔快取或降低檔案更新可見性
-追數字。若要再縮小這段差距，應先實作並驗證等價的 zero-copy response API。
-
-完整原始輪次、工具與映像版本、binary hash、設定與命令：
-[`results/20260802_orbstack_hot_state_0e40372/`](results/20260802_orbstack_hot_state_0e40372/)。
-量測後只修正三處 clippy 指出的等價借用寫法並新增 Arc identity regression
-test；最終 source 已用 Rust 1.88 重新完成 ARM Linux fat-LTO release build，
-SHA-256 為 `90dc1be028739ce9e...25dcf7a08cbbc89`。數字仍明確對應 artifact
-內的量測 binary hash，沒有把未重跑的 binary 重新貼標。
+These are comparative results on small burstable instances, not universal
+product limits. In particular, the aioquic client contributes to absolute H3
+throughput and the 1 MiB result is network-bound.
