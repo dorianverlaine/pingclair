@@ -170,7 +170,7 @@ impl Router {
         matches
     }
 
-    /// Match request with full context (path, headers, method)
+    /// 🧭 Matches a request after normalizing paths supplied by direct callers.
     pub fn match_request(
         &self,
         path: &str,
@@ -181,9 +181,26 @@ impl Router {
         protocol: &str,
     ) -> Option<&CompiledRoute> {
         let normalized_path = Self::normalize_request_path(path);
-        let candidates = self.match_path(&normalized_path);
+        self.match_normalized_request(&normalized_path, method, headers, host, remote_ip, protocol)
+    }
+
+    /// 🍃 Matches a path already normalized by the protocol ingress.
+    ///
+    /// H1, H2, and H3 all resolve dot segments before routing so security
+    /// policy and the origin see the same resource. Repeating that work here
+    /// allocated both a segment vector and a new string on every ordinary
+    /// request. Direct callers can continue to use [`Self::match_request`].
+    pub fn match_normalized_request(
+        &self,
+        path: &str,
+        method: &str,
+        headers: &http::HeaderMap,
+        host: &str,
+        remote_ip: &str,
+        protocol: &str,
+    ) -> Option<&CompiledRoute> {
         let request = MatcherRequest {
-            path: &normalized_path,
+            path,
             method,
             headers,
             host,
@@ -191,25 +208,34 @@ impl Router {
             protocol,
         };
 
-        for route in candidates {
-            // Check method constraint
-            if let Some(methods) = &route.config.methods
-                && !methods.iter().any(|m| m.eq_ignore_ascii_case(method))
-            {
-                continue;
+        // 🌲 Consult the radix match before catch-all routes while borrowing
+        // both collections directly; the old candidate Vec allocated once per
+        // request only to iterate it immediately.
+        if let Ok(matched) = self.path_router.at(path) {
+            for route in matched.value {
+                if Self::route_matches(route, &request) {
+                    return Some(route);
+                }
             }
-
-            // Check additional matchers (using pre-compiled version)
-            if let Some(compiled) = &route.compiled_matcher
-                && !Self::evaluate_matcher_compiled(compiled, &request)
-            {
-                continue;
-            }
-
-            return Some(route);
         }
+        self.default_routes
+            .iter()
+            .find(|route| Self::route_matches(route, &request))
+    }
 
-        None
+    /// 🔎 Evaluates the constraints attached to one precompiled route.
+    fn route_matches(route: &CompiledRoute, request: &MatcherRequest<'_>) -> bool {
+        if let Some(methods) = &route.config.methods
+            && !methods
+                .iter()
+                .any(|method| method.eq_ignore_ascii_case(request.method))
+        {
+            return false;
+        }
+        route
+            .compiled_matcher
+            .as_ref()
+            .is_none_or(|compiled| Self::evaluate_matcher_compiled(compiled, request))
     }
 
     /// Evaluate a pre-compiled matcher against request context
@@ -783,6 +809,51 @@ mod tests {
                 )
                 .is_some()
         );
+    }
+
+    /// 🍃 The ingress fast path must select the same route as the public
+    /// normalizing entry after the protocol layer has cleaned the URI.
+    #[test]
+    fn normalized_fast_path_preserves_route_selection() {
+        use crate::config::Matcher;
+        let route = RouteConfig {
+            path: "/*".to_string(),
+            handler: HandlerConfig::Respond {
+                status: 200,
+                body: None,
+                headers: HashMap::new(),
+            },
+            methods: Some(vec!["GET".to_string()]),
+            matcher: Some(Matcher::Path {
+                patterns: vec!["/admin/*".to_string()],
+            }),
+        };
+        let router = Router::new(vec![route]);
+        let headers = HeaderMap::new();
+
+        let direct = router
+            .match_request(
+                "/public/../admin/users",
+                "GET",
+                &headers,
+                "e.com",
+                "10.0.0.1",
+                "https",
+            )
+            .map(|route| route.index);
+        let normalized = router
+            .match_normalized_request(
+                "/admin/users",
+                "GET",
+                &headers,
+                "e.com",
+                "10.0.0.1",
+                "https",
+            )
+            .map(|route| route.index);
+
+        assert_eq!(direct, normalized);
+        assert_eq!(normalized, Some(0));
     }
 
     /// 🌐 remote_ip accepts CIDR ranges, not just exact literals.

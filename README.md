@@ -37,47 +37,19 @@ Whether you need a simple static file server or an enterprise gateway with load 
 
 ## ⚡ Benchmarks
 
-Full methodology, raw results, and — importantly — the bugs this process
-found and fixed live in [`benchmarks/README.md`](benchmarks/README.md).
-Read the full writeup before drawing conclusions.
+Pingclair, nginx, and Caddy ran one at a time on an isolated OrbStack bridge.
+The ARM64 client and server containers were each limited to 2 vCPU / 512 MiB;
+every protocol returned the same verified 1 KiB body with zero H2/H3 failures.
 
-**Test environment**: bare-metal VPS (Aliyun, 2 vCPU / 1.6GB, Ubuntu
-24.04), each server on `127.0.0.1:8080` in turn, `wrk -t2 -d15s` over
-loopback (`results/20260725_vps_onbox/`).
+| Scenario | Pingclair | nginx 1.31.3 | Caddy 2.11.4 |
+| --- | ---: | ---: | ---: |
+| H1 | 56,965.75 req/s | 64,719.17 | 25,464.92 |
+| H2 | 48,779.06 req/s | 49,499.64 | 18,829.32 |
+| H3, new connection/request | 247.34 req/s | 249.26 | 234.90 |
+| H3, 20 reused connections | 5,304.48 req/s | 6,020.13 | 4,108.13 |
 
-| Scenario | Pingclair | Nginx | Caddy |
-|----------|-----------|-------|-------|
-| Static 1KB, plain (c100) | 50,145 req/s | **53,579 req/s** | 17,337 req/s |
-| Static 1KB, gzip (c100) | **42,982 req/s** | 42,510 req/s | 15,302 req/s |
-| Reverse proxy (c100) | 20,154 req/s | **21,961 req/s** | 9,870 req/s |
-| Large 20MB, gzip (c20) | **703 req/s, 0 timeouts** | 9.1 req/s, 110 timeouts | 10.1 req/s, 65 timeouts |
-
-**How to read this**
-
-- Small-file static is now essentially tied with nginx (94% plain, 101%
-  gzip) and ~2.9x Caddy. This was not always so: earlier runs showed a
-  ~2.9x gap to nginx, root-caused to `tokio::fs` — every `tokio::fs`
-  call is a `spawn_blocking` cross-thread round-trip, so each request
-  paid ~8 futex wake/waits. The static hot path now uses synchronous
-  `std::fs` (the nginx model: local file reads don't meaningfully
-  block), which took futex from 8/request to ~0 and throughput from
-  18.7k to 50k req/s. Full story in `benchmarks/README.md`.
-- Reverse proxying is ~92% of nginx and ~2x Caddy, with zero errors on
-  all three.
-- Large compressible bodies are the compressed-body cache's home turf:
-  pingclair serves ~70x nginx/caddy's throughput with **0 timeouts**
-  because repeat hits skip compression entirely, while nginx and caddy
-  re-compress the 20MB file on every request. The cache costs memory by
-  design (74 MiB peak RSS vs nginx's 21 MiB — a bounded 64MB budget).
-- Compression levels aren't perfectly matched across engines (nginx
-  `gzip_comp_level 1` vs defaults elsewhere), so gzip comparisons are
-  informative, not exact.
-
-An earlier Docker-bridge run (2 vCPU / 512MB containers, Apple M2) with
-the full matrix and the complete list of **20 bugs found and fixed
-through benchmarking** — including a static-compression bug that turned
-a 20-second test into 16 minutes — is documented in
-[`benchmarks/README.md`](benchmarks/README.md).
+See [`benchmarks/README.md`](benchmarks/README.md) for the methodology, raw
+rounds, configurations, commands, and binary hashes.
 
 ## 📦 Installation
 

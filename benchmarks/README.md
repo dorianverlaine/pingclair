@@ -481,7 +481,7 @@ happens to recycle its address pool.
   caddy 的 72%）。caddy 的 quic-go 握手最快，H3 差距明顯小於 H1/H2，
   三家全 200 零錯誤。
 
-**壓測發現的兩個 bug（已修，commit `21a113b`，待香港機重驗）**
+**壓測發現的兩個 bug（已修並於香港機驗證，commit `21a113b`）**
 
 1. `CertStore` 冷啟動 cache 未水合（`load_all()` 從未執行），auto-HTTPS
    主站每次重啟都重新跑 ACME（撞 LE 每週 5 張 rate limit），TLS 握手回
@@ -489,3 +489,104 @@ happens to recycle its address pool.
 2. 自訂 `error_while_proxy` 未呼叫 `decide_reuse`，upstream 高壓 read
    error 時 Pingora retry 迴圈 panic（`Retry is not decided`）。修復：
    套用 reuse 安全規則 + 路由 retry 預算後才讓迴圈讀取。
+
+## 2026-08-02 Oregon 效能回歸修復（main / HEAD / nginx / Caddy）
+
+這一輪專門回答「Caddy 相容分支為何比 `main` 慢」以及「H3 為何在短連線
+壓測特別吃虧」。拓撲依香港測試方式重建：同一個 `us-west-2a` subnet 內，
+server 是 `t4g.micro`，client 是 `t4g.small`，只走內網。所有 candidate 在
+server 上輪流跑；共用 1 KiB payload、ECDSA P-256 憑證與 release fat-LTO
+aarch64 build。
+
+H1 每個 candidate 先驗證 `Host: bench.local` 回 `200`、1024 bytes 及相同
+SHA-256，再以 `wrk -t2 -c100 -d10s` 跑三輪。H3 client 只把 `200` 且 body
+恰為 1024 bytes 的 request 算作成功；各輪均全數通過。
+
+| 場景 | main `f888938` | 修復前 `0e40372` | 修復後 | nginx 1.28.3 | Caddy 2.11.4 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| H1 1 KiB，metrics on | 32,483.31 | 30,965.66 | 31,756.65 | 64,790.20 | 16,503.92 |
+| H1 1 KiB，metrics off | — | — | 32,221.17 | — | — |
+| H3，每 request 新連線 | 94.76 | 96.27 | 110.87 | 134.90 | 130.84 |
+| H3，20 條長連線／10,000 requests | 1,601.99 | 1,646.12 | 1,647.33 | 2,069.43 | 1,955.73 |
+
+單位均為 requests/second，表格取三輪中位數。H3 新連線為 30 concurrency／
+300 requests；長連線為 20 connections／10,000 requests，刻意把 handshake
+與穩態吞吐分開。
+
+**根因與修復**
+
+1. Caddy matcher 支援加入 request path 正規化後，H1/H2/H3 ingress 已整理過的
+   path 又在 Router 配置一次 segment `Vec` 和 `String`；`match_path` 還配置
+   candidate `Vec`。新增已正規化的借用式入口並直接遍歷 radix/default routes，
+   direct caller 仍走原入口，所以 dot segment、重複 slash、query、glob 與 CIDR
+   語意不變。
+2. `{ metrics off }` 只是不註冊 collector，request、Admin 與 least-conn 路徑
+   仍然建立 label、做 Prometheus lookup 和 backend health 掃描。現在以 atomic
+   開關完全略過；metrics on 時保留 active gauge handle，避免結束時再查一次。
+3. tokio-quiche 預設要求每條新連線先完成 stateless Retry。封包顯示修復前為
+   `Initial 1200 B -> Retry 95 B -> Initial 1200 B`；修復後第一個 server packet
+   直接是 handshake response。Pingclair 現在採用 nginx `quic_retry off` 的預設
+   延遲取捨，也與 Caddy 未啟用 source-address validation callback 的預設一致；
+   QUIC pre-validation amplification limit、listener connection limit、0-RTT 禁用
+   與所有 middleware 都保留。
+
+結果是 H1 預設快 2.6%；metrics off 快 4.1%，只比 `main` 慢 0.8%。H3
+新連線快 15.2%，對 nginx 的差距由 28.6% 收窄到 17.8%，對 Caddy 由
+26.4% 收窄到 15.3%。長連線修復前後只差 0.1%，證明改善集中在 handshake，
+沒有以移除 Caddy 相容行為或 streaming 功能換取數字。
+
+效能量測後的真實 H3 功能閘另發現：提早回覆 `413` 時，如果 bounded body
+channel 已滿，丟棄 receiver 後沒有喚醒 QUIC event loop，client 會等不到回應。
+最終 working tree 已補上關閉後的喚醒；這個窄修補不改 matcher、middleware 或
+一般 GET 熱路徑。修補後 Day 28 的 14/14 H3 matrix 與 cancellation／trailer
+測試全部通過。下表仍精確對應 metadata 所列的效能量測 binary；不要把後續的
+正確性修補誤記成當時已量測的內容。最終 working tree 另以 Rust 1.88 在
+ARM Linux 完成 fat-LTO release build，binary SHA-256 為
+`73c1dca958b831d6...047a1beac0e47e1`。
+
+完整原始輸出、命令、版本、binary hash、設定、client 與修復前後 pcap：
+[`results/20260802_oregon_perf_recovery_0e40372/`](results/20260802_oregon_perf_recovery_0e40372/)。
+
+## 2026-08-02 OrbStack immutable-state 熱路徑修復
+
+Oregon 數據顯示新連線 H3 已改善，但 H1 與 H3 長連線仍有明顯固定成本。後續
+只在本機 OrbStack 2.2.1 的隔離 bridge 內測試；client 與每個 server candidate
+各限制 2 vCPU／512 MiB，沒有經過 macOS published-port NAT。候選為修復前
+`0e40372`、同一 working tree 的 ARM Linux fat-LTO release、nginx 1.31.3 與
+Caddy 2.11.4。所有伺服器輪流執行並共用同一份 1 KiB payload 與 TLS 憑證。
+
+H1 使用 `wrk -t2 -c100 -d10s`，H2 使用 `h2load -n30000 -c100 -m100`；
+H3 分為每 request 建立新連線，以及 20 條連線重用 10,000 requests。表格均取
+三輪中位數。H1/H2 起測前驗證 `200`、1024 bytes 與 SHA-256；H2 每輪
+30,000 requests 全數成功，H3 各輪全部 request 均通過相同 body 驗證。
+
+| 場景 | 修復前 `0e40372` | 修復後 | nginx 1.31.3 | Caddy 2.11.4 |
+| --- | ---: | ---: | ---: | ---: |
+| H1 1 KiB | 55,207.20 | 56,965.75 | 64,719.17 | 25,464.92 |
+| H2 1 KiB | 45,099.76 | 48,779.06 | 49,499.64 | 18,829.32 |
+| H3，每 request 新連線 | 190.66 | 247.34 | 249.26 | 234.90 |
+| H3，20 條重用連線 | 5,164.49 | 5,304.48 | 6,020.13 | 4,108.13 |
+
+Linux syscall profile 先找到直接根因：`get_state()` 每次 request 都深複製
+`ProxyState` 及其 route、middleware、file-server 等 `Vec`；dispatch 隨後又
+clone 完整 `HandlerConfig` tree。靜態檔案一般路徑還對同一檔案做兩次
+`statx`。修復後 host map 發佈 `Arc<ProxyState>`，request 保留一份 immutable
+snapshot 並直接借用 handler；scheme 與 verified client IP 不再做多餘的
+配置、字串化與重新解析；regular-file path 沿用第一次 metadata。這些改動
+沒有刪除 matcher、middleware、streaming、body limit 或 Caddy 相容行為。
+
+結果是 H1 +3.2%（nginx 的 88.0%）、H2 +8.2%（nginx 的 98.5%）、H3
+新連線 +29.7%（與 nginx 相差 0.8%），H3 重用連線 +2.7%（nginx 的
+88.1%）；四項均快於 Caddy。Native macOS debug A/B 由 18,369.08 升至
+21,590.54 req/s（+17.5%），也確認最佳化方向，而 release 容器間的提升較小。
+
+目前約 12% 的 H1／H3 長連線差距與 nginx 的 `sendfile` 路徑一致；Pingclair
+仍透過 Pingora userspace body API 傳送。沒有用整檔快取或降低檔案更新可見性
+追數字。若要再縮小這段差距，應先實作並驗證等價的 zero-copy response API。
+
+完整原始輪次、工具與映像版本、binary hash、設定與命令：
+[`results/20260802_orbstack_hot_state_0e40372/`](results/20260802_orbstack_hot_state_0e40372/)。
+量測後只修正三處 clippy 指出的等價借用寫法並新增 Arc identity regression
+test；最終 source 已用 Rust 1.88 重新完成 ARM Linux fat-LTO release build，
+SHA-256 為 `90dc1be028739ce9e...25dcf7a08cbbc89`。數字仍明確對應 artifact
+內的量測 binary hash，沒有把未重跑的 binary 重新貼標。

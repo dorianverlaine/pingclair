@@ -5,13 +5,22 @@
 //!
 //! Provides metrics collection for requests, errors, and latency.
 
-use prometheus::{Encoder, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder};
-use std::sync::LazyLock;
+use prometheus::{
+    Encoder, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
+};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Once};
 
 // MARK: - Global Registry
 
 /// Global metrics registry
 pub static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
+
+/// 📊 Whether the running configuration asked to collect metrics.
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// 🧩 Registers collectors only once even when several server paths initialize metrics.
+static REGISTER: Once = Once::new();
 
 // MARK: - Metrics Definitions
 
@@ -219,27 +228,46 @@ pub static UPSTREAM_HEALTHY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 /// Registers all defined metrics with the global registry.
 /// Should be called once at application startup.
 pub fn init() {
-    // Register metrics
-    // We ignore errors in case they are already registered (though typically init is called once)
-    let _ = REGISTRY.register(Box::new(REQUESTS_TOTAL.clone()));
-    let _ = REGISTRY.register(Box::new(REQUEST_DURATION_SECONDS.clone()));
-    let _ = REGISTRY.register(Box::new(REQUEST_SIZE_BYTES.clone()));
-    let _ = REGISTRY.register(Box::new(RESPONSE_SIZE_BYTES.clone()));
-    let _ = REGISTRY.register(Box::new(RESPONSE_DURATION_SECONDS.clone()));
-    let _ = REGISTRY.register(Box::new(REQUEST_ERRORS_TOTAL.clone()));
-    let _ = REGISTRY.register(Box::new(ACTIVE_CONNECTIONS.clone()));
-    let _ = REGISTRY.register(Box::new(OVERLOAD_REJECTIONS_TOTAL.clone()));
-    let _ = REGISTRY.register(Box::new(ROUTE_IN_FLIGHT.clone()));
-    let _ = REGISTRY.register(Box::new(ROUTE_PENDING.clone()));
-    let _ = REGISTRY.register(Box::new(UPSTREAM_IN_FLIGHT.clone()));
-    let _ = REGISTRY.register(Box::new(CIRCUIT_TRANSITIONS_TOTAL.clone()));
-    let _ = REGISTRY.register(Box::new(CIRCUIT_STATE.clone()));
-    let _ = REGISTRY.register(Box::new(ADMIN_REQUESTS_TOTAL.clone()));
-    let _ = REGISTRY.register(Box::new(UPSTREAM_HEALTHY.clone()));
-    // 🧑‍💻 Process metrics (RSS, CPU time) come from a hand-rolled collector
-    // built on getrusage, which exists on both Linux and macOS — so the local
-    // dev loop actually exercises this code instead of cfg-ing it away.
-    let _ = REGISTRY.register(Box::new(ProcessCollector::new()));
+    ENABLED.store(true, Ordering::Release);
+    REGISTER.call_once(|| {
+        // 📚 Registering is process-global; duplicate initialization must not
+        // rebuild collectors or make a second copy visible at scrape time.
+        let _ = REGISTRY.register(Box::new(REQUESTS_TOTAL.clone()));
+        let _ = REGISTRY.register(Box::new(REQUEST_DURATION_SECONDS.clone()));
+        let _ = REGISTRY.register(Box::new(REQUEST_SIZE_BYTES.clone()));
+        let _ = REGISTRY.register(Box::new(RESPONSE_SIZE_BYTES.clone()));
+        let _ = REGISTRY.register(Box::new(RESPONSE_DURATION_SECONDS.clone()));
+        let _ = REGISTRY.register(Box::new(REQUEST_ERRORS_TOTAL.clone()));
+        let _ = REGISTRY.register(Box::new(ACTIVE_CONNECTIONS.clone()));
+        let _ = REGISTRY.register(Box::new(OVERLOAD_REJECTIONS_TOTAL.clone()));
+        let _ = REGISTRY.register(Box::new(ROUTE_IN_FLIGHT.clone()));
+        let _ = REGISTRY.register(Box::new(ROUTE_PENDING.clone()));
+        let _ = REGISTRY.register(Box::new(UPSTREAM_IN_FLIGHT.clone()));
+        let _ = REGISTRY.register(Box::new(CIRCUIT_TRANSITIONS_TOTAL.clone()));
+        let _ = REGISTRY.register(Box::new(CIRCUIT_STATE.clone()));
+        let _ = REGISTRY.register(Box::new(ADMIN_REQUESTS_TOTAL.clone()));
+        let _ = REGISTRY.register(Box::new(UPSTREAM_HEALTHY.clone()));
+        // 🧑‍💻 Process metrics (RSS, CPU time) come from a hand-rolled collector
+        // built on getrusage, which exists on both Linux and macOS — so the local
+        // dev loop actually exercises this code instead of cfg-ing it away.
+        let _ = REGISTRY.register(Box::new(ProcessCollector::new()));
+    });
+}
+
+/// 🍃 Reports whether request paths should perform any metric work.
+#[inline]
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::Acquire)
+}
+
+/// 📥 Increments and returns the active-request gauge used by this request.
+pub fn request_started(host: &str) -> Option<IntGauge> {
+    if !enabled() {
+        return None;
+    }
+    let metric = ACTIVE_CONNECTIONS.with_label_values(&[host]);
+    metric.inc();
+    Some(metric)
 }
 
 /// 🧑‍💻 Cross-platform process metrics collected from `getrusage`.

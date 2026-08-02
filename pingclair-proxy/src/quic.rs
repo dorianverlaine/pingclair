@@ -792,6 +792,12 @@ impl QuicServer {
         quic_settings.initial_max_streams_bidi = 100;
         quic_settings.initial_max_streams_uni = 100;
         quic_settings.disable_active_migration = true;
+        // 🚀 Accept a valid Initial without adding a mandatory stateless Retry
+        // round trip. nginx and Caddy use the same default latency tradeoff,
+        // while QUIC's pre-validation amplification limit still bounds bytes
+        // sent to a spoofed address. Deployment connection limits remain
+        // independent of this transport address-validation policy.
+        quic_settings.disable_client_ip_validation = true;
         // 🛡️ Two 2^16-entry DATAGRAM queues per connection buy nothing without
         // MASQUE or WebTransport, and quiche turns them on by default — so this
         // must be set, not left alone.
@@ -1532,7 +1538,7 @@ async fn handle_request(
     req: H3Request,
     remote_ip: String,
     stream_id: u64,
-    body_rx: mpsc::Receiver<Vec<u8>>,
+    mut body_rx: mpsc::Receiver<Vec<u8>>,
     resp_tx: RespSender,
     body_notify: Arc<Notify>,
     mut cancel_rx: watch::Receiver<bool>,
@@ -1553,7 +1559,7 @@ async fn handle_request(
             &req,
             &remote_ip,
             stream_id,
-            body_rx,
+            &mut body_rx,
             &resp_tx,
             &body_notify,
             &request_id,
@@ -1562,6 +1568,15 @@ async fn handle_request(
         ),
     )
     .await;
+    let body_drain_blocked = !body_rx.is_empty();
+    drop(body_rx);
+    if body_drain_blocked {
+        // 🔔 An early response can drop a full body channel before consuming
+        // it. Wake the event loop so it observes the closed receiver and
+        // resumes discarding bytes instead of leaving the client flow-control
+        // blocked forever.
+        body_notify.notify_one();
+    }
     let Some(Err(e)) = result else {
         return;
     };
@@ -1575,7 +1590,7 @@ async fn handle_request(
             stream_id,
             status,
             msg,
-            error_state.as_ref(),
+            error_state.as_deref(),
             &response_policy,
             &request_id,
         ),
@@ -1593,11 +1608,11 @@ async fn handle_request_inner(
     req: &H3Request,
     peer_ip: &str,
     stream_id: u64,
-    mut body_rx: mpsc::Receiver<Vec<u8>>,
+    body_rx: &mut mpsc::Receiver<Vec<u8>>,
     resp_tx: &RespSender,
     body_notify: &Arc<Notify>,
     request_id: &str,
-    error_state: &mut Option<ProxyState>,
+    error_state: &mut Option<Arc<ProxyState>>,
     response_policy: &mut ResponseHeaderPolicy,
 ) -> Result<(), HandlerError> {
     let request_started = Instant::now();
@@ -1749,7 +1764,7 @@ async fn handle_request_inner(
 
     if !matches!(&handler, H3Terminal::ReverseProxy) {
         drain_local_h3_body(
-            &mut body_rx,
+            body_rx,
             body_notify,
             body_limit,
             state.config.limits.body_timeout_ms,
@@ -1942,7 +1957,7 @@ async fn handle_request_inner(
                 response_policy,
                 body_limit,
                 stream_id,
-                &mut body_rx,
+                body_rx,
                 resp_tx,
                 body_notify,
                 request_started,

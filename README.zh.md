@@ -37,37 +37,18 @@
 
 ## ⚡ 效能基準測試
 
-完整方法論、原始數據，以及——更重要的——這次測試過程中揪出並修好的臭蟲都寫在
-[`benchmarks/README.md`](benchmarks/README.md)（英文）。下結論前請務必先讀完整版。
+Pingclair、nginx 與 Caddy 輪流在 OrbStack 隔離 bridge 內執行。ARM64 client
+與 server 容器各限制為 2 vCPU／512 MiB；每個協定都回傳相同且經驗證的
+1 KiB body，H2/H3 零失敗。
 
-**測試環境**：裸機 VPS（阿里雲，2 vCPU／1.6GB，Ubuntu 24.04），每台伺服器輪流監聽
-`127.0.0.1:8080`，`wrk -t2 -d15s` 走 loopback（原始數據見 `results/20260725_vps_onbox/`）。
+| 場景 | Pingclair | nginx 1.31.3 | Caddy 2.11.4 |
+| --- | ---: | ---: | ---: |
+| H1 | 56,965.75 req/s | 64,719.17 | 25,464.92 |
+| H2 | 48,779.06 req/s | 49,499.64 | 18,829.32 |
+| H3、每 request 新連線 | 247.34 req/s | 249.26 | 234.90 |
+| H3、20 條重用連線 | 5,304.48 req/s | 6,020.13 | 4,108.13 |
 
-| 場景 | Pingclair | Nginx | Caddy |
-|------|-----------|-------|-------|
-| 靜態 1KB、純文字（c100） | 50,145 req/s | **53,579 req/s** | 17,337 req/s |
-| 靜態 1KB、gzip（c100） | **42,982 req/s** | 42,510 req/s | 15,302 req/s |
-| 反向代理（c100） | 20,154 req/s | **21,961 req/s** | 9,870 req/s |
-| 大檔案 20MB、gzip（c20） | **703 req/s、0 逾時** | 9.1 req/s、110 逾時 | 10.1 req/s、65 逾時 |
-
-**如何解讀**
-
-- 小檔案靜態服務現在與 nginx 基本打平（純文字 94%、gzip 101%），約為 Caddy 的 2.9 倍。
-  早期測試曾落後 nginx 約 2.9 倍，根因是 `tokio::fs`：每次調用都是一次
-  `spawn_blocking` 跨執行緒往返，每個請求要付出約 8 次 futex 喚醒/等待。
-  靜態熱路徑現已改為同步 `std::fs`（與 nginx 同模型：本地檔案讀取實際不阻塞），
-  futex 從每請求 8 次降到約 0，吞吐從 18.7k 提升到 50k req/s。
-  完整過程見 `benchmarks/README.md`。
-- 反向代理約為 nginx 的 92%、Caddy 的 2 倍，三者均零錯誤。
-- 大型可壓縮檔案是壓縮快取的主場：pingclair 吞吐量約為 nginx/caddy 的 70 倍且
-  **零逾時**，因為重複命中完全跳過壓縮，而 nginx 和 caddy 每次都重新壓縮 20MB 檔案。
-  快取的代價是設計上的記憶體預算（峰值 RSS 74 MiB，nginx 為 21 MiB——上限 64MB）。
-- 各引擎的壓縮等級並未完全對齊（nginx 用 `gzip_comp_level 1`，其他用各自預設值），
-  所以 gzip 數字僅供參考，不是精確的同比。
-
-另有一次較早的 Docker bridge 測試（2 vCPU／512MB 容器，Apple M2），完整矩陣以及
-**透過基準測試發現並修復的 20 個臭蟲** 的完整清單——包括一個讓 20 秒測試跑成
-16 分鐘的靜態壓縮臭蟲——都記錄在
+完整方法、原始輪次、設定、命令與 binary hash 見
 [`benchmarks/README.md`](benchmarks/README.md)。
 
 ## 📦 安裝指南

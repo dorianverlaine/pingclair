@@ -379,11 +379,10 @@ impl FileServer {
         let file = std::fs::File::open(&file_path)?;
 
         // Guess MIME type
-        #[allow(clippy::unnecessary_to_owned)] // mime::Mime is not &str
         let mime_type = crate::mime::with_charset(
-            &mime_guess::from_path(&file_path)
-                .first_or_octet_stream()
-                .to_string(),
+            mime_guess::from_path(&file_path)
+                .first_raw()
+                .unwrap_or("application/octet-stream"),
         );
 
         // Calculate Last-Modified and ETag
@@ -460,8 +459,10 @@ impl FileServer {
             )));
         }
 
-        // Handle directory
-        if metadata.is_dir() {
+        // 📁 Resolve an index only for directories. A regular file keeps the
+        // metadata already fetched above, avoiding a duplicate `statx` on the
+        // dominant static-file path.
+        let metadata = if metadata.is_dir() {
             // Try index files
             let mut index_found = false;
             for index in &self.config.index {
@@ -499,12 +500,12 @@ impl FileServer {
                     return Ok(None);
                 }
             }
-        }
-
-        // Get updated metadata for file (size, modified)
-        let metadata = match std::fs::metadata(&file_path) {
-            Ok(m) => m,
-            Err(_) => return Ok(None),
+            match std::fs::metadata(&file_path) {
+                Ok(metadata) => metadata,
+                Err(_) => return Ok(None),
+            }
+        } else {
+            metadata
         };
         let file_size = metadata.len();
 
@@ -537,11 +538,10 @@ impl FileServer {
 
         // MIME type is path-based (no I/O) and needed by both the cache fast
         // path and every response below — compute it once, up front.
-        #[allow(clippy::unnecessary_to_owned)] // mime::Mime is not &str
         let mime_type = crate::mime::with_charset(
-            &mime_guess::from_path(&file_path)
-                .first_or_octet_stream()
-                .to_string(),
+            mime_guess::from_path(&file_path)
+                .first_raw()
+                .unwrap_or("application/octet-stream"),
         );
 
         // Streaming branch: large, complete, uncompressed responses are

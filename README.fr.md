@@ -37,51 +37,21 @@ Que vous ayez besoin d'un simple serveur de fichiers statiques ou d'une passerel
 
 ## ⚡ Benchmarks
 
-La méthodologie complète, les résultats bruts et — surtout — les bugs mis au
-jour et corrigés par ce processus se trouvent dans
-[`benchmarks/README.md`](benchmarks/README.md) (en anglais). Lisez l'analyse
-complète avant d'en tirer des conclusions.
+Pingclair, nginx et Caddy ont été exécutés à tour de rôle sur un bridge
+OrbStack isolé. Les conteneurs ARM64 client et serveur étaient limités à
+2 vCPU / 512 Mio ; chaque protocole a renvoyé le même corps vérifié de
+1 Kio, sans échec H2/H3.
 
-**Environnement de test** : VPS bare-metal (Aliyun, 2 vCPU / 1,6 Go,
-Ubuntu 24.04), chaque serveur à tour de rôle sur `127.0.0.1:8080`,
-`wrk -t2 -d15s` en loopback (`results/20260725_vps_onbox/`).
+| Scénario | Pingclair | nginx 1.31.3 | Caddy 2.11.4 |
+| --- | ---: | ---: | ---: |
+| H1 | 56 965,75 req/s | 64 719,17 | 25 464,92 |
+| H2 | 48 779,06 req/s | 49 499,64 | 18 829,32 |
+| H3, nouvelle connexion/requête | 247,34 req/s | 249,26 | 234,90 |
+| H3, 20 connexions réutilisées | 5 304,48 req/s | 6 020,13 | 4 108,13 |
 
-| Scénario | Pingclair | Nginx | Caddy |
-|----------|-----------|-------|-------|
-| Statique 1 Ko, brut (c100) | 50 145 req/s | **53 579 req/s** | 17 337 req/s |
-| Statique 1 Ko, gzip (c100) | **42 982 req/s** | 42 510 req/s | 15 302 req/s |
-| Reverse proxy (c100) | 20 154 req/s | **21 961 req/s** | 9 870 req/s |
-| Gros fichier 20 Mo, gzip (c20) | **703 req/s, 0 timeout** | 9,1 req/s, 110 timeouts | 10,1 req/s, 65 timeouts |
-
-**Comment lire ces chiffres**
-
-- Le petit fichier statique est désormais quasiment à égalité avec nginx
-  (94 % en brut, 101 % en gzip) et ~2,9x devant Caddy. Il n'en a pas
-  toujours été ainsi : les mesures précédentes montraient un écart de
-  ~2,9x avec nginx, dont la cause était `tokio::fs` — chaque appel est
-  un aller-retour inter-threads `spawn_blocking`, soit ~8 futex par
-  requête. Le chemin chaud statique utilise maintenant `std::fs`
-  synchrone (le modèle nginx : les lectures de fichiers locaux ne
-  bloquent pas vraiment), ce qui a fait passer les futex de 8/requête à
-  ~0 et le débit de 18,7k à 50k req/s. Détails dans
-  `benchmarks/README.md`.
-- Le reverse proxy atteint ~92 % de nginx et ~2x Caddy, sans aucune
-  erreur pour les trois.
-- Les gros fichiers compressibles sont le terrain de prédilection du
-  cache de corps compressés : ~70x le débit de nginx/caddy avec **0
-  timeout**, car les accès répétés sautent entièrement la compression
-  alors que nginx et caddy recompressent le fichier de 20 Mo à chaque
-  requête. Ce cache coûte de la mémoire par conception (pic RSS de 74
-  Mio contre 21 Mio pour nginx — budget borné à 64 Mo).
-- Les niveaux de compression ne sont pas parfaitement alignés entre
-  moteurs (`gzip_comp_level 1` pour nginx, défauts ailleurs) : les
-  comparaisons gzip sont indicatives, pas exactes.
-
-Un run Docker bridge plus ancien (conteneurs 2 vCPU / 512 Mo, Apple M2),
-avec la matrice complète et la liste des **20 bugs trouvés et corrigés
-grâce aux benchmarks** — dont un bug de compression statique qui
-transformait un test de 20 secondes en 16 minutes — est documenté dans
-[`benchmarks/README.md`](benchmarks/README.md).
+La méthodologie, les passes brutes, les configurations, les commandes et les
+empreintes des binaires se trouvent dans
+[`benchmarks/README.md`](benchmarks/README.md) (en anglais).
 
 ## 📦 Installation
 

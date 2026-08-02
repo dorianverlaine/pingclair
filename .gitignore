@@ -57,6 +57,7 @@ benchmarks/results/**
 # promise is worse than no plan. Publish the site, not the sketch of it.
 docs/TODO.md
 docs/SITE.md
+docs/TODO_CADDYFILE*.md
 
 # Test coverage
 *.profraw

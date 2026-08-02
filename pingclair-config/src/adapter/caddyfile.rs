@@ -760,7 +760,7 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                                 && handler_d.args[0].starts_with('/')
                                 && (handler_d.args[1].starts_with('/')
                                     || handler_d.args[1].contains("://"))
-                                && !handler_d.args[1].parse::<u16>().is_ok()
+                                && handler_d.args[1].parse::<u16>().is_err()
                         }
                         "rewrite" => {
                             handler_d.args.len() >= 2 && handler_d.args[0].starts_with('/')
