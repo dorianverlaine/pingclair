@@ -1,5 +1,6 @@
 # 🔒 `cargo audit` exceptions — each entry here is a written risk acceptance
-# (docs/STATUS.md Day 30's rule), not a silent suppression. An ignored ID
+# (the Day 30 rule from the retired local ledger, docs/STATUS.md), not a
+# silent suppression. An ignored ID
 # below must name the dependency chain, why it is currently out of our hands,
 # and what reachability we have actually checked — "vendored, therefore
 # irrelevant" is exactly the kind of unverified claim this repository has
