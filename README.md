@@ -37,19 +37,39 @@ Whether you need a simple static file server or an enterprise gateway with load 
 
 ## ⚡ Benchmarks
 
-Pingclair, nginx, and Caddy ran one at a time on an isolated OrbStack bridge.
-The ARM64 client and server containers were each limited to 2 vCPU / 512 MiB;
-every protocol returned the same verified 1 KiB body with zero H2/H3 failures.
+Pingclair commit `ca773af`, nginx, and Caddy ran one at a time on an x86
+`t3.small` in AWS Oregon. A second same-AZ `t3.small` generated load over the
+private network. The table reports the median of three recorded rounds.
 
-| Scenario | Pingclair | nginx 1.31.3 | Caddy 2.11.4 |
+| Scenario | Pingclair | nginx 1.28.3 | Caddy 2.11.4 |
 | --- | ---: | ---: | ---: |
-| H1 | 56,965.75 req/s | 64,719.17 | 25,464.92 |
-| H2 | 48,779.06 req/s | 49,499.64 | 18,829.32 |
-| H3, new connection/request | 247.34 req/s | 249.26 | 234.90 |
-| H3, 20 reused connections | 5,304.48 req/s | 6,020.13 | 4,108.13 |
+| H1 static, 1 KiB | 38,862.71 req/s | 61,178.61 | 14,442.93 |
+| HTTPS/H1 static, 1 KiB | 31,018.40 req/s | 43,806.16 | 14,617.83 |
+| H2 static, 1 KiB | 33,004.03 req/s | 57,487.59 | 10,212.16 |
+| H1 reverse proxy, 1 KiB | 11,474.42 req/s | 11,876.71 | 6,998.97 |
+| H2 reverse proxy, 1 KiB | 10,471.76 req/s | 10,537.69 | 4,300.58 |
+| H3, fresh connection + 1 KiB static | 128.93 req/s | 143.14 | 151.84 |
+| H3, reused connections + 1 KiB static | 1,550.21 req/s | 1,694.08 | 1,834.92 |
+| H3, reused connections + reverse proxy | 1,396.32 req/s | 1,447.61 | 1,914.65 |
+| H1 static, 1 MiB random | 590.91 MiB/s | 590.62 | 590.74 |
+| H1 warm gzip, 1 MiB compressible | 44,966.58 req/s | 833.18 | 2,374.64 |
+| WSS echo, 50 connections | 14,029.97 msg/s | 14,937.19 | 13,461.07 |
 
-See [`benchmarks/README.md`](benchmarks/README.md) for the methodology, raw
-rounds, configurations, commands, and binary hashes.
+wrk used 2 threads and 100 connections for H1; h2load used 50 clients and 10
+streams per connection; aioquic used 30-way H3 concurrency; and the native
+amd64 WebSocket client used 50 persistent connections. Each workload had a
+warm-up followed by three rounds. Bodies, HTTP versions, decompressed gzip,
+and response hashes were verified before load; all published H2, H3, and WSS
+rounds had zero client-reported failures. The shared backend reached 63.3k
+req/s directly, so it did not cap the proxy rows. The 1 MiB static row reached
+the network ceiling. Pingclair's warm gzip row benefits from its compressed
+static-response cache, while the tested nginx and Caddy configurations
+compress each request.
+
+See [`benchmarks/README.md`](benchmarks/README.md) and the
+[`2026-08-02 result`](benchmarks/results/20260802_aws_x86_ca773af/RESULT.md)
+for the exact environment, commands, raw-round checksums, configurations, and
+binary hashes.
 
 ## 📦 Installation
 

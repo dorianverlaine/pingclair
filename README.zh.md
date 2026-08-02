@@ -37,19 +37,35 @@
 
 ## ⚡ 效能基準測試
 
-Pingclair、nginx 與 Caddy 輪流在 OrbStack 隔離 bridge 內執行。ARM64 client
-與 server 容器各限制為 2 vCPU／512 MiB；每個協定都回傳相同且經驗證的
-1 KiB body，H2/H3 零失敗。
+Pingclair commit `ca773af`、nginx 與 Caddy 輪流在 AWS Oregon 的 x86
+`t3.small` 執行；另一台同可用區的 `t3.small` 透過內網產生負載。下表為三輪
+正式測試的中位數。
 
-| 場景 | Pingclair | nginx 1.31.3 | Caddy 2.11.4 |
+| 場景 | Pingclair | nginx 1.28.3 | Caddy 2.11.4 |
 | --- | ---: | ---: | ---: |
-| H1 | 56,965.75 req/s | 64,719.17 | 25,464.92 |
-| H2 | 48,779.06 req/s | 49,499.64 | 18,829.32 |
-| H3、每 request 新連線 | 247.34 req/s | 249.26 | 234.90 |
-| H3、20 條重用連線 | 5,304.48 req/s | 6,020.13 | 4,108.13 |
+| H1 靜態 1 KiB | 38,862.71 req/s | 61,178.61 | 14,442.93 |
+| HTTPS/H1 靜態 1 KiB | 31,018.40 req/s | 43,806.16 | 14,617.83 |
+| H2 靜態 1 KiB | 33,004.03 req/s | 57,487.59 | 10,212.16 |
+| H1 反向代理 1 KiB | 11,474.42 req/s | 11,876.71 | 6,998.97 |
+| H2 反向代理 1 KiB | 10,471.76 req/s | 10,537.69 | 4,300.58 |
+| H3、新連線加 1 KiB 靜態檔 | 128.93 req/s | 143.14 | 151.84 |
+| H3、重用連線加 1 KiB 靜態檔 | 1,550.21 req/s | 1,694.08 | 1,834.92 |
+| H3、重用連線加反向代理 | 1,396.32 req/s | 1,447.61 | 1,914.65 |
+| H1 靜態 1 MiB 隨機檔 | 590.91 MiB/s | 590.62 | 590.74 |
+| H1 暖快取 gzip、1 MiB 可壓縮檔 | 44,966.58 req/s | 833.18 | 2,374.64 |
+| WSS echo、50 條連線 | 14,029.97 msg/s | 14,937.19 | 13,461.07 |
 
-完整方法、原始輪次、設定、命令與 binary hash 見
-[`benchmarks/README.md`](benchmarks/README.md)。
+H1 使用 wrk（2 threads／100 connections），H2 使用 h2load（50 clients、
+每連線 10 streams），H3 使用 aioquic（30 並發），WSS 則使用原生 amd64
+client（50 條持久連線）。每個場景先暖機，再正式測三輪；加壓前會驗證 body、
+HTTP 版本、gzip 解壓結果與 SHA-256，公開的 H2、H3、WSS 輪次皆為零失敗。
+共享後端內網直連可達 63.3k req/s，未限制代理結果；1 MiB 靜態檔已碰到網路
+上限。Pingclair 的暖 gzip 結果會命中壓縮後靜態回應快取，這份 nginx 與
+Caddy 設定則會逐次壓縮。
+
+完整環境、命令、原始輪次 checksum、設定與 binary hash 見
+[`benchmarks/README.md`](benchmarks/README.md) 與
+[`2026-08-02 結果`](benchmarks/results/20260802_aws_x86_ca773af/RESULT.md)。
 
 ## 📦 安裝指南
 
