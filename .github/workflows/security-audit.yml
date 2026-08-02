@@ -1,0 +1,40 @@
+name: Security
+
+on:
+  push:
+    branches: [ "main" ]
+  schedule:
+    # 🕒 Nightly audit: new RustSec advisories land on a schedule this
+    # repo does not control, so the audit runs on a schedule too, not
+    # only when someone happens to push. Per docs/GUARDRAILS.md, an
+    # exception to a real finding needs a written risk acceptance —
+    # this job is what makes silently living with one impossible.
+    - cron: '23 2 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  security-audit:
+    name: Dependency security audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+
+      - name: Cache cargo-audit and the advisory database
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/advisory-db
+          key: cargo-audit-${{ runner.os }}
+
+      - name: Install cargo-audit
+        run: command -v cargo-audit || cargo install cargo-audit --locked
+
+      - name: Audit dependencies
+        run: cargo audit

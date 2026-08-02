@@ -1,0 +1,71 @@
+name: Commit checks
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================
+  # 🪞 Commit hygiene — small checks that fail a PR on the commit
+  # itself, modelled on nginx's check-whitespace.yaml and
+  # check-commit-message.yaml jobs.
+  # ============================================================
+  check-whitespace:
+    name: Check whitespace (git log --check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: git log --check
+        # 🪞 Same idea as nginx's check-whitespace.yaml: whitespace errors
+        # in the new commits are reported per commit on the PR, before
+        # they land in history. On push to main only the newest commit is
+        # checked; on PR every commit in the range.
+        run: |
+          if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+            range="${{ github.event.pull_request.base.sha }}..HEAD"
+          else
+            range="HEAD~1..HEAD"
+          fi
+          if ! git log --check --format='%h %s' "$range"; then
+            echo "::error::whitespace errors found in commits $range"
+            exit 1
+          fi
+          echo "✅ no whitespace errors in $range"
+
+  check-commit-subjects:
+    name: Check commit subjects (emoji + conventional)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Check commit subjects
+        # 🪞 House style: every subject opens with an emoji
+        # followed by a conventional imperative summary (`type(scope):`).
+        run: |
+          if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+            range="${{ github.event.pull_request.base.sha }}..HEAD"
+          else
+            range="HEAD~1..HEAD"
+          fi
+          err=0
+          while read -r hash; do
+            subject="$(git log -1 --format=%s "$hash")"
+            if ! printf '%s' "$subject" | grep -qP '^[^\x00-\x7F]+ [a-z]+(\([a-z0-9_, -]+\))?: '; then
+              echo "::error::$hash subject does not start with an emoji and a conventional type: \"$subject\""
+              err=1
+            fi
+          done < <(git rev-list "$range")
+          if [ "$err" -ne 0 ]; then
+            exit 1
+          fi
+          echo "✅ all commit subjects open with emoji + conventional type"
