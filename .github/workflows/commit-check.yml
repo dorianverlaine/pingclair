@@ -28,13 +28,16 @@ jobs:
         # in the new commits are reported per commit on the PR, before
         # they land in history. On push to main only the newest commit is
         # checked; on PR every commit in the range.
+        # 🧩 `--no-merges`: a PR run checks out the auto-generated merge ref,
+        # whose "Merge X into Y" commit is GitHub's, not a developer's — it
+        # must not be judged by the house style.
         run: |
           if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
             range="${{ github.event.pull_request.base.sha }}..HEAD"
           else
             range="HEAD~1..HEAD"
           fi
-          if ! git log --check --format='%h %s' "$range"; then
+          if ! git log --check --no-merges --format='%h %s' "$range"; then
             echo "::error::whitespace errors found in commits $range"
             exit 1
           fi
@@ -58,13 +61,16 @@ jobs:
             range="HEAD~1..HEAD"
           fi
           err=0
+          # 🧩 `--no-merges` for the same reason as the whitespace check:
+          # the merge ref's auto-generated "Merge X into Y" commit has no
+          # developer subject to hold to the house style.
           while read -r hash; do
             subject="$(git log -1 --format=%s "$hash")"
             if ! printf '%s' "$subject" | grep -qP '^[^\x00-\x7F]+ [a-z]+(\([a-z0-9_, -]+\))?: '; then
               echo "::error::$hash subject does not start with an emoji and a conventional type: \"$subject\""
               err=1
             fi
-          done < <(git rev-list "$range")
+          done < <(git rev-list --no-merges "$range")
           if [ "$err" -ne 0 ]; then
             exit 1
           fi
