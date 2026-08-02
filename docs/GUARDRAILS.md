@@ -6,7 +6,7 @@
 > - 接下來要做什麼 → `docs/TODO.md`（🔒 維護者本機文件，未進倉庫）
 > - 已完成與驗證證據 → `docs/STATUS.md`
 >
-> 最後整理：2026-08-02
+> 最後整理：2026-08-03
 
 ---
 
@@ -38,8 +38,12 @@
 - 真 binary 測試一律用**動態 port**與**唯一 readiness token**。固定 port 會讓
   舊程序被誤判為 ready，測試看似通過實則測到別的東西。
 - **真 binary drill 必須設 `PINGCLAIR_TLS_STORE` 指向可寫目錄**，即使配置裡
-  完全沒有 TLS。TLS manager 在讀配置前就無條件初始化，預設路徑不可寫時
-  直接 panic（`PermissionDenied`），而 log 只有一行看不出跟 TLS store 有關。
+  完全沒有 TLS。TLS manager 在讀配置前就無條件初始化 store。預設路徑現在是
+  每使用者可寫的 `$XDG_DATA_HOME/pingclair`（`~/.local/share/pingclair`），
+  不可建立或不可寫時會在啟動時以**指名路徑的明確錯誤**失敗（write-probe，
+  見 `pingclair/src/main.rs`），不再是看不出來歷的一行 `PermissionDenied`
+  panic——但 drill 仍要設變數：CA、ACME 帳號金鑰與 autosave 文件才不會掉進
+  CI runner 的 HOME，測試之間也不會互相污染。
 - **`zsh` 不會對未加引號的變數做 word splitting**。`for x in "a 1" ...; set -- $x`
   在 bash 能拆成兩個參數，在 zsh 只會得到一個——症狀是 `$2` 空白，很容易誤讀成
   被測程式的問題。測試腳本改用明確參數的 function。

@@ -63,6 +63,12 @@ RUN apt-get update \
 
 COPY --from=builder /usr/src/pingclair/target/release/pingclair /usr/local/bin/pingclair
 
+# 📂 Same convention as caddy's official image: bake a stable data path into
+# the image so the store lands on the declared volume and survives container
+# recreation. Without this, HOME=/root sends it to the container's writable
+# layer, which `docker compose up --force-recreate` silently drops.
+ENV PINGCLAIR_TLS_STORE=/var/lib/pingclair/certs
+
 WORKDIR /var/lib/pingclair
 VOLUME ["/etc/pingclair", "/var/lib/pingclair"]
 

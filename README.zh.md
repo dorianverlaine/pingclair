@@ -286,9 +286,10 @@ https://origin.example.test:6688 {
 }
 ```
 
-Pingclair 會在 `PINGCLAIR_TLS_STORE`（預設
-`/var/lib/pingclair/certs`）下持久化一個有效十年的本機 CA，以及可續期的
-90 天 leaf 憑證。需要驗證源站的 client 應信任
+Pingclair 會在 `PINGCLAIR_TLS_STORE` 下持久化一個有效十年的本機 CA，以及
+可續期的 90 天 leaf 憑證——裸二進位預設 `$XDG_DATA_HOME/pingclair`
+（即 `~/.local/share/pingclair`），容器映像則為 `/var/lib/pingclair/certs`。
+需要驗證源站的 client 應信任
 `$PINGCLAIR_TLS_STORE/internal/root.crt`；CA 私鑰則保存在僅 owner 可讀的
 `authority.json`。H1/H2 與 H3 共用同一份持久化 leaf。`tls internal`
 必須搭配明確站台名稱，且不可和 `tls auto`、ACME email 或手動憑證路徑混用。

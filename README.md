@@ -300,8 +300,9 @@ https://origin.example.test:6688 {
 ```
 
 Pingclair persists one ten-year local authority and renewable 90-day leaf
-certificates below `PINGCLAIR_TLS_STORE` (default:
-`/var/lib/pingclair/certs`). Install
+certificates below `PINGCLAIR_TLS_STORE` — a bare binary defaults to
+`$XDG_DATA_HOME/pingclair` (`~/.local/share/pingclair`), the container image
+to `/var/lib/pingclair/certs`. Install
 `$PINGCLAIR_TLS_STORE/internal/root.crt` in clients that verify the origin;
 the authority private key remains in the owner-only `authority.json`.
 H1/H2 and H3 use the same persisted leaf. `tls internal` requires a concrete

@@ -298,8 +298,10 @@ https://origin.example.test:6688 {
 ```
 
 Pingclair conserve une autorité locale valable dix ans et des certificats
-leaf renouvelables de 90 jours sous `PINGCLAIR_TLS_STORE` (par défaut
-`/var/lib/pingclair/certs`). Les clients qui vérifient l'origine doivent faire
+leaf renouvelables de 90 jours sous `PINGCLAIR_TLS_STORE` — un binaire nu
+utilise `$XDG_DATA_HOME/pingclair` (`~/.local/share/pingclair`), l'image
+conteneur `/var/lib/pingclair/certs`. Les clients qui vérifient l'origine
+doivent faire
 confiance à `$PINGCLAIR_TLS_STORE/internal/root.crt` ; la clé privée de
 l'autorité reste dans `authority.json`, lisible uniquement par son
 propriétaire. H1/H2 et H3 utilisent le même certificat leaf persistant.
