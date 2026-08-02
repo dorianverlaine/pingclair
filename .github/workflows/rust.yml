@@ -159,10 +159,12 @@ jobs:
         run: docker build -f deployment/Dockerfile -t pingclair:ci .
 
       - name: Version must be reported and match the crate
+        # 🏷️ `version` prints the bare semver (v0.1.7) since ca104ea, so
+        # scripts can consume it without parsing a banner line.
         run: |
           version_output="$(docker run --rm pingclair:ci version)"
           echo "$version_output"
-          echo "$version_output" | grep -q "Pingclair v" || {
+          echo "$version_output" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+' || {
             echo "::error::unexpected 'pingclair version' output"
             exit 1
           }
@@ -272,11 +274,12 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.platform.target }}
 
       - name: Smoke test the binary
+        # 🏷️ Match the bare semver form printed by `version` since ca104ea.
         run: |
           binary="target/${{ matrix.platform.target }}/release/pingclair"
           version_output="$("$binary" version)"
           echo "$version_output"
-          echo "$version_output" | grep -q "Pingclair v"
+          echo "$version_output" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'
           "$binary" validate examples/full_featured.pingclair
 
       - name: Package and checksum
