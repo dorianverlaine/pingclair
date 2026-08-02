@@ -376,7 +376,8 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
 }
 
 /// 🧾 Whether a global-block name is documented Caddy syntax rather than a
-/// likely typo. The list mirrors `vendor/caddy-docs/markdown/caddyfile/options.md`.
+/// likely typo. The list mirrors caddy's own documentation (kept locally by
+/// the maintainer as reference material; not part of this repository).
 fn is_known_caddy_global_option(name: &str) -> bool {
     matches!(
         name,
@@ -1397,8 +1398,8 @@ fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
 }
 
 /// 🧾 Whether a handler-directive name is documented Caddy syntax rather
-/// than a likely typo. The list mirrors
-/// `vendor/caddy-docs/markdown/caddyfile/directives.md`.
+/// than a likely typo. The list mirrors caddy's own documentation (kept
+/// locally by the maintainer; not part of this repository).
 fn is_known_caddy_directive(name: &str) -> bool {
     matches!(
         name,
