@@ -1,7 +1,7 @@
 # 🏗️ Build Stage
 #
 # Ubuntu rather than Fedora, with the toolchain from rustup rather than the
-# distribution: `rust-version = "1.88"` is pinned in Cargo.toml and CI verifies
+# distribution: `rust-version = "1.97"` is pinned in Cargo.toml and CI verifies
 # exactly that, so whatever Rust Ubuntu happens to ship is the wrong one.
 # Building a release image with a compiler the tests never ran under is the
 # "green locally, red in CI" trap one layer further out.
@@ -43,7 +43,7 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 # can build against a toolchain that silently never arrived.
 RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-connrefused -sSf \
         https://sh.rustup.rs -o /tmp/rustup-init.sh \
-    && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.88.0 \
+    && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.97.1 \
     && rm -f /tmp/rustup-init.sh \
     && cargo --version
 

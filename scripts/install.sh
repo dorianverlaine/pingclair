@@ -20,7 +20,7 @@ while [ $# -gt 0 ]; do
             echo "Usage: $0 [--dev|--main]"
             echo "  (default)  Install the latest stable release binary."
             echo "  --dev      Install the latest development build of main."
-            echo "  --main     Clone main and compile it locally (requires Rust 1.88+)."
+            echo "  --main     Clone main and compile it locally (requires Rust 1.97+)."
             exit 0
             ;;
         *)
@@ -87,7 +87,7 @@ if [ "$INSTALL_MODE" = "main" ]; then
     # 🧭 Local build of the latest main; `--locked` pins the resolved
     # versions the tests ran against.
     if ! command -v cargo >/dev/null 2>&1; then
-        echo -e "${RED}Error: --main builds from source and requires Rust 1.88 or newer.${NC}"
+        echo -e "${RED}Error: --main builds from source and requires Rust 1.97 or newer.${NC}"
         echo "Install Rust first (https://rustup.rs) or use --dev for a prebuilt binary."
         exit 1
     fi
@@ -95,8 +95,8 @@ if [ "$INSTALL_MODE" = "main" ]; then
     RUST_MAJOR=${RUST_VERSION%%.*}
     RUST_MINOR=${RUST_VERSION#*.}
     RUST_MINOR=${RUST_MINOR%%.*}
-    if [ "${RUST_MAJOR:-0}" -lt 1 ] || { [ "${RUST_MAJOR:-0}" -eq 1 ] && [ "${RUST_MINOR:-0}" -lt 88 ]; }; then
-        echo -e "${RED}Error: --main requires Rust 1.88 or newer (found ${RUST_VERSION:-unknown}).${NC}"
+    if [ "${RUST_MAJOR:-0}" -lt 1 ] || { [ "${RUST_MAJOR:-0}" -eq 1 ] && [ "${RUST_MINOR:-0}" -lt 97 ]; }; then
+        echo -e "${RED}Error: --main requires Rust 1.97 or newer (found ${RUST_VERSION:-unknown}).${NC}"
         exit 1
     fi
     echo "Cloning latest main from $REPO..."

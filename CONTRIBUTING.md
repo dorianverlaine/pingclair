@@ -33,23 +33,23 @@ is a real contribution and needs no agreement.
 
 ## 🚦 The gate
 
-Every commit on `main` passes all four. CI runs them on Rust 1.88; run them
+Every commit on `main` passes all four. CI runs them on Rust 1.97; run them
 locally before pushing so you find failures faster than the runner does.
 
 ```bash
-cargo +1.88.0 fmt --all -- --check
+cargo +1.97.1 fmt --all -- --check
 ```
 
 ```bash
-cargo +1.88.0 clippy --locked --workspace --all-targets -- -D warnings
+cargo +1.97.1 clippy --locked --workspace --all-targets -- -D warnings
 ```
 
 ```bash
-cargo +1.88.0 build --locked --workspace
+cargo +1.97.1 build --locked --workspace
 ```
 
 ```bash
-cargo +1.88.0 test --locked --workspace
+cargo +1.97.1 test --locked --workspace
 ```
 
 Warnings are errors. **Never silence one with a broad `allow` attribute** — if

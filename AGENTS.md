@@ -24,7 +24,7 @@ an admin API with hot reload.
 
 - Workspace version: `0.1.7`
 - Rust edition: 2024
-- Minimum Rust: **1.88**
+- Minimum Rust: **1.97**
 - Upstream repository: `https://github.com/dorianverlaine/pingclair`
 
 The workspace has eight crates:
@@ -71,7 +71,7 @@ cargo test -p pingclair --test integration -- --nocapture
 scripts/test-h3-cancellation-local.sh
 ```
 
-CI pins Rust 1.88 and runs `cargo fmt --all -- --check`,
+CI pins Rust 1.97 and runs `cargo fmt --all -- --check`,
 `cargo clippy --locked --workspace --all-targets -- -D warnings`,
 `cargo build --locked --workspace --verbose`, and
 `cargo test --locked --workspace --verbose`.

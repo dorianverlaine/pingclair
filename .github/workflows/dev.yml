@@ -1,0 +1,294 @@
+name: Dev builds
+
+# 🧪 Per-push development artifacts. Triggered by the CI workflow
+# completing successfully on main (workflow_run), so a red test run
+# never ships a dev snapshot — the same gate the old monolithic
+# workflow expressed with `needs: test`, expressed across files. PR
+# runs of CI do not trigger this workflow.
+on:
+  workflow_run:
+    workflows: [ "CI" ]
+    types: [ completed ]
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ============================================================
+  # 🏗️ Development binaries: the current main testable sooner, as a
+  # native per-architecture build (x86_64 and arm64 runners), so the
+  # smoke tests execute the artifact they just built — a
+  # cross-compiled arm64 binary cannot run on an x86_64 host (hit on
+  # the ubuntu-26.04 attempt: "Exec format error"). The artifacts are
+  # named "-dev" and never represent a stable release — treat every
+  # run as a snapshot of a moving tree.
+  # ============================================================
+  dev-binaries:
+    name: Dev binaries - ${{ matrix.platform.name }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' }}
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: Linux x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            key: x86_64
+          - name: Linux aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            key: aarch64
+
+    steps:
+      # 🧭 workflow_run runs with the workflow file's SHA, not the commit
+      # that triggered CI — always check out the triggering commit.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Install build dependencies
+        # 🧱 boring-sys needs cmake + g++ for BoringSSL,
+        # clang/libclang-dev for bindgen and perl for its scripts. Keep
+        # in sync with deployment/Dockerfile, see docs/GUARDRAILS.md.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake \
+            g++ \
+            perl \
+            pkg-config \
+            clang \
+            libclang-dev \
+            git \
+            curl
+
+      - name: Install Rust 1.97
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: ${{ matrix.platform.target }}
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # 🔑 Keyed on Cargo.lock so a dependency bump invalidates it, with
+          # the matrix leg appended so each target keeps its own entry. The
+          # shared `ubuntu-cargo-` namespace lets the dev binaries warm from
+          # the CI job's cache on the same architecture.
+          key: ubuntu-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.platform.target }}
+          restore-keys: |
+            ubuntu-cargo-
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.platform.target }}
+
+      - name: Smoke test the binary
+        # 🏷️ Match the bare semver form printed by `version` since ca104ea.
+        run: |
+          binary="target/${{ matrix.platform.target }}/release/pingclair"
+          version_output="$("$binary" version)"
+          echo "$version_output"
+          echo "$version_output" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'
+          # 🛡️ full_featured's manual-TLS block names /etc/pingclair/certs,
+          # and `validate` fails closed when those files are missing (by
+          # design); the check is existence only, so placeholders suffice.
+          sudo mkdir -p /etc/pingclair/certs
+          sudo touch /etc/pingclair/certs/example.com.pem /etc/pingclair/certs/example.com.key
+          "$binary" validate examples/full_featured.pingclair
+
+      - name: Package and checksum
+        run: |
+          cd target/${{ matrix.platform.target }}/release
+          tar -czf pingclair-linux-${{ matrix.platform.key }}-dev.tar.gz pingclair
+          shasum -a 256 pingclair-linux-${{ matrix.platform.key }}-dev.tar.gz > SHA256SUMS-dev-${{ matrix.platform.key }}.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pingclair-linux-${{ matrix.platform.key }}-dev
+          path: |
+            target/${{ matrix.platform.target }}/release/pingclair-linux-${{ matrix.platform.key }}-dev.tar.gz
+            target/${{ matrix.platform.target }}/release/SHA256SUMS-dev-${{ matrix.platform.key }}.txt
+          retention-days: 14
+
+  # ============================================================
+  # 🚀 Rolling `dev` release. `install.sh --dev` downloads from here, so
+  # the per-push binaries need a stable public URL even though they are
+  # never a stable release. The `dev` tag is force-moved on every push —
+  # last writer wins, which is acceptable for a solo iteration loop and
+  # is exactly why the tag is named "dev".
+  # ============================================================
+  publish-dev-release:
+    name: Publish rolling dev release
+    needs: dev-binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download dev binaries
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Verify the checksums
+        # 🔒 A release page is a trust boundary even for machine-built
+        # snapshots: refuse to publish a tarball whose checksum does not
+        # match what the build produced. Each arch ships its own sums file,
+        # so verify both against their tarball before anything goes live.
+        run: |
+          shasum -a 256 -c SHA256SUMS-dev-x86_64.txt
+          shasum -a 256 -c SHA256SUMS-dev-aarch64.txt
+
+      - name: Write the release notes
+        run: |
+          {
+            echo "Snapshot of \`main\` at [\`${{ github.event.workflow_run.head_sha }}\`](https://github.com/${{ github.repository }}/commit/${{ github.event.workflow_run.head_sha }}), built by [CI run #${{ github.event.workflow_run.run_number }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }})."
+            echo
+            echo "**Not a stable release.** The \`dev\` tag is a moving target: it is force-replaced on every push while the project is in rapid iteration, so the binary you install today will not be the same one you install next week."
+            echo
+            echo "## Install"
+            echo
+            echo '```bash'
+            echo 'curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/scripts/install.sh | sudo bash -s -- --dev'
+            echo '```'
+            echo
+            echo "## Assets"
+            ls -lh pingclair-linux-*-dev.tar.gz SHA256SUMS-dev-*.txt | sed 's/^/- /'
+          } > /tmp/dev-release-notes.md
+
+      - name: Replace the rolling dev release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 🗑️ Only delete what actually exists; the first push of the day
+          # has no `dev` release yet, and a delete that fails for a real
+          # reason must not be swallowed by `|| true`.
+          if gh release view dev >/dev/null 2>&1; then
+            gh release delete dev --yes --cleanup-tag
+          fi
+          gh release create dev \
+            pingclair-linux-x86_64-dev.tar.gz \
+            pingclair-linux-aarch64-dev.tar.gz \
+            SHA256SUMS-dev-x86_64.txt \
+            SHA256SUMS-dev-aarch64.txt \
+            --title "Development builds (unstable)" \
+            --notes-file /tmp/dev-release-notes.md
+
+  # ============================================================
+  # 🐳 Rolling development image. The docker-image job in ci.yml proves
+  # the artifact boots on the native runner; this job publishes the same
+  # Dockerfile as a mutable `dev` tag plus an immutable commit-SHA tag,
+  # so a test deployment can either follow the latest snapshot or pin
+  # one build. Each architecture is built natively on its own runner
+  # (x86_64 and arm64) instead of emulating the arm64 leg with QEMU —
+  # the emulated build ran past an hour; native builds finish in
+  # minutes. A final job merges the two images into a single multi-arch
+  # manifest.
+  # Explicitly not a release: the `dev` tag is a moving target by design
+  # while the project is in rapid iteration.
+  # ============================================================
+  publish-dev-image:
+    name: Publish dev image (${{ matrix.platform.name }})
+    needs: dev-binaries
+    runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+            tag: amd64
+          - name: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            tag: arm64
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the ${{ matrix.platform.name }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deployment/Dockerfile
+          platforms: ${{ matrix.platform.platform }}
+          push: true
+          tags: |
+            ghcr.io/dorianverlaine/pingclair:dev-${{ matrix.platform.tag }}
+
+      - name: Smoke the ${{ matrix.platform.name }} image
+        # 🧭 Runs the published per-architecture image natively on its own
+        # runner, so each arch is verified before the manifest merge.
+        # 🏷️ Match the bare semver printed by `version` since ca104ea —
+        # the old "Pingclair v" grep was stale and made this step red on
+        # every push from 2026-08-02.
+        run: |
+          image="ghcr.io/dorianverlaine/pingclair:dev-${{ matrix.platform.tag }}"
+          version_output="$(docker run --rm "$image" version)"
+          echo "$version_output"
+          echo "$version_output" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'
+          docker run --rm -v "$PWD/examples:/examples:ro" \
+            "$image" validate /examples/full_featured.pingclair
+
+  # ============================================================
+  # 🧩 Merges the per-architecture images above into a single multi-arch
+  # manifest. `imagetools create` only writes manifest metadata and
+  # never copies layers, so this step finishes in seconds.
+  # ============================================================
+  publish-dev-manifest:
+    name: Publish multi-arch dev manifest
+    needs: publish-dev-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create the multi-arch manifest
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/dorianverlaine/pingclair:dev \
+            -t ghcr.io/dorianverlaine/pingclair:${{ github.event.workflow_run.head_sha }} \
+            ghcr.io/dorianverlaine/pingclair:dev-amd64 \
+            ghcr.io/dorianverlaine/pingclair:dev-arm64

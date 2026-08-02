@@ -26,25 +26,27 @@ between those without evidence under `benchmarks/results/<date>_<commit>/`.
 
 ## Commands
 
-The local gate is four commands, and **`+1.88.0` is not decoration** — CI pins
-that toolchain and the workspace declares `rust-version = "1.88"`. A newer local
-compiler has looser inference and different rustfmt line breaking; all-green
-locally followed by all-red in CI has already happened.
+The local gate is four commands, and **`+1.97.1` is not decoration** — CI pins
+that exact toolchain and the workspace declares `rust-version = "1.97"`. A
+different local compiler — newer or older — has different inference and
+rustfmt line breaking; all-green locally followed by all-red in CI has already
+happened in both directions (newer-than-CI on 2026-07-29, an older toolchain
+in the release image on 2026-08-02).
 
 ```bash
-cargo +1.88.0 fmt --all -- --check
-cargo +1.88.0 clippy --locked --workspace --all-targets -- -D warnings
-cargo +1.88.0 build --locked --workspace
-cargo +1.88.0 test --locked --workspace
+cargo +1.97.1 fmt --all -- --check
+cargo +1.97.1 clippy --locked --workspace --all-targets -- -D warnings
+cargo +1.97.1 build --locked --workspace
+cargo +1.97.1 test --locked --workspace
 ```
 
 Narrower runs:
 
 ```bash
-cargo +1.88.0 test -p pingclair-proxy                      # one crate
-cargo +1.88.0 test -p pingclair --test integration          # one test binary
-cargo +1.88.0 test -p pingclair --test integration test_name -- --nocapture
-cargo +1.88.0 test -p pingclair-proxy --test h3_end_to_end  # H3 against a real QuicServer
+cargo +1.97.1 test -p pingclair-proxy                      # one crate
+cargo +1.97.1 test -p pingclair --test integration          # one test binary
+cargo +1.97.1 test -p pingclair --test integration test_name -- --nocapture
+cargo +1.97.1 test -p pingclair-proxy --test h3_end_to_end  # H3 against a real QuicServer
 ```
 
 `pingclair/tests/integration.rs` spawns the real compiled binary and makes real
@@ -57,7 +59,7 @@ Some integration tests are load-sensitive rather than flaky in isolation.
 Reproduce with several concurrent full suites, not repeated single runs:
 
 ```bash
-cargo +1.88.0 build --tests -p pingclair
+cargo +1.97.1 build --tests -p pingclair
 BIN=$(find target/debug/deps -maxdepth 1 -name 'integration-*' -type f -perm -u+x ! -name '*.d' -exec ls -t {} + | head -1)
 for i in $(seq 1 6); do "$BIN" > /tmp/full_$i.log 2>&1 & done; wait
 ```
@@ -73,7 +75,7 @@ scripts/test-h3-cancellation-local.sh       # SSE, downstream cancellation, trai
 ```
 
 Both need a curl built with HTTP/3 (`brew install curl` provides one; the system
-curl does not). Linux runs in `rust:1.88-bookworm`, which needs `cmake` for
+curl does not). Linux runs in `rust:1.97-bookworm`, which needs `cmake` for
 BoringSSL and `clang`/`libclang-dev` for bindgen — without them `boring-sys`
 fails in its build script.
 

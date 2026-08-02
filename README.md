@@ -6,7 +6,7 @@
 *Cloudflare Pingora's raw performance, wrapped in Caddy's minimalist developer experience*
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.97%2B-orange.svg)](https://www.rust-lang.org/)
 [![Status](https://img.shields.io/badge/status-active-green.svg)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/dorianverlaine/pingclair/pulls)
 
@@ -75,7 +75,7 @@ binary hashes.
 
 ### Prerequisites
 
-*   **Rust toolchain** — Rust 1.88 or newer.
+*   **Rust toolchain** — Rust 1.97 or newer.
 
 ### Build from source
 
@@ -108,7 +108,7 @@ Install the latest development build of main (prebuilt binary):
 curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --dev
 ```
 
-Clone main and compile it locally (requires Rust 1.88+):
+Clone main and compile it locally (requires Rust 1.97+):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --main
