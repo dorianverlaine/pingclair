@@ -58,39 +58,49 @@ burstable-network capacity on both hosts after roughly two hours of sustained
 traffic (cwnd collapse with ~25% retransmission while both hosts were idle).
 Single-connection transfers remained fast throughout.
 
-## t4g follow-up (2026-08-03, `codex/h3-perf`)
+## 2026-08-03 allocation-pass follow-up (retracted tables, see correction)
 
-After the allocation pass on this branch (static header-value reuse,
-no-case H2 response headers, precompiled header policies, a vendored h2
-HPACK scratch buffer — `67466ae`…`3586884`) the small-file and reverse-proxy
-gaps were re-measured on two fresh `t4g.small` instances (same VPC subnet,
-private traffic, 1 KiB files, two interleaved rounds, zero failed requests;
-raw evidence in `benchmarks/results/20260803_t4g_matrix/`, not committed):
+⚠️ **Correction**: the first t4g matrix measured with the host-process harness
+on this branch was invalidated by a harness bug. The patched
+`start-candidate.sh` only killed a leftover host-process pingclair when
+switching *to* pingclair; every nginx/caddy/pingap segment that followed
+therefore measured the stale pingclair process (container candidates exited
+on `Address already in use` while readiness still answered from the old
+listener). The earlier "static parity" and "beats pingap on every proxy row"
+tables were retracted. What remains valid from that session:
 
-| Scenario | Pingclair HEAD | nginx 1.31.3 | Caddy 2.11.4 | pingap |
-| --- | ---: | ---: | ---: | ---: |
-| Static H1 (wrk) | 27,788 | 27,876 | 27,502 | — |
-| Static H2 (h2load) | **31,891** | 31,202 | 30,699 | — |
-| Static H1S (h2load) | 21,168 | 22,290 | 22,334 | — |
-| Proxy H1 (wrk) | **8,620** | 8,389 | 8,352 | 8,351 |
-| Proxy H2 (h2load) | 8,701 | **8,802** | 8,464 | 8,616 |
-| Proxy H1S (h2load) | **7,673** | 7,539 | 7,422 | 7,430 |
+- The upstream keepalive-pool scan (pool 128 → 256 → 512 → 768 → 1024 =
+  8,118 → 8,549 → 8,924 → 8,205 → 8,565 req/s, t4g, proxy H2 100×20,
+  explicit kill between runs) — this moved the product default from 128 to
+  512 (`3586884`).
+- A standalone nginx repro run (13,136 req/s, proxy H2 100×20, pingclair
+  killed first) and pingclair's own rows (8,123–8,701 req/s).
+- Host-process `nofile` 1024 wedges the reverse-proxy path at ~1,000
+  upstream connections (5xx after ~900 requests); raise the FD limit.
+- The t4g profile run (before this branch): pingclair baseline 29,054 req/s
+  at 126.6k cycles/request vs nginx 39,900 at 92.8k — a real server-side
+  per-request gap of ~36 %.
 
-Conclusions:
+### t3.small x86 re-check (50×10 + perf, after the harness fix)
 
-- The static small-file gap to nginx is closed on t4g (H1 parity, H2 ahead).
-- The reverse proxy now beats pingap on every measured row and beats nginx
-  on H1/H1S; proxy H2 trails nginx by ~1 %.
-- Proxy H2 is +10.5 % over the pre-pass baseline (`e995118`): the
-  allocation pass contributed ~+3 %, and an upstream keepalive-pool scan
-  (128 → 256 → 512 → 768 → 1024 = 8,118 → 8,549 → 8,924 → 8,205 → 8,565
-  req/s) moved the default pool size from 128 to 512.
-- Running pingclair as a bare host process with the default `nofile` 1024
-  wedges the reverse-proxy path at ~1,000 upstream connections (5xx after
-  ~900 requests); containers and production deployments must raise the FD
-  limit (the harness already does `--ulimit nofile=65535:65535`).
+A fresh-pair t3.small run with 50×10 concurrency (client headroom) measured
+the H2 static per-request cost with `perf stat` (t3 exposes no hardware PMU
+events, so task-clock/request stands in for cycles/request):
 
-These rows are remote-verified on t4g-class hardware for H1/H2; the H3 rows
+| Candidate | path | req/s | task-clock/req |
+| --- | --- | ---: | ---: |
+| Pingclair HEAD `3586884` | H2 static | 29,659 | **52.1 µs** |
+| nginx 1.31.3 | H2 static | 42,999 | **36.6 µs** |
+| Pingclair HEAD | H2 proxy | 9,798 | **109.2 µs** |
+
+The server-side per-request cost gap to nginx is real and still ~+42 % on
+static H2 at low concurrency, consistent with the t4g cycles profile. Proxy
+H2 at 50×10 was a three-way tie (pingclair ≈9.8k ≈ nginx 9.4k ≈ pingap 9.6k,
+single sample). t3.small shared-CPU noise and burst-credit exhaustion make
+single-round throughput comparisons unreliable (see
+`benchmarks/results/20260803_t3_lowconc/RESULT.md`); the published t3 matrix
+above remains the primary cross-server reference, and the t4g
+cycles/request method remains the better server-side metric. The H3 rows
 from the earlier t3 matrix remain the current published H3 evidence.
 
 ## Test topology and workloads (2026-08-03)
