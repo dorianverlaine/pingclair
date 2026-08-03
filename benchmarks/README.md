@@ -81,10 +81,12 @@ Single-connection transfers remained fast throughout.
 
 ## Findings from this run
 
-- **Pingclair buffers static files below 5 MiB in memory.** 2,000 in-flight
-  1 MiB responses OOM-killed the 2 GiB host (RSS 1.47 GB). Large-file
-  concurrency was capped to keep every candidate alive; removing this
-  buffering is the top next-optimization candidate.
+- **Pingclair buffered static files below 5 MiB in memory** (2,000 in-flight
+  1 MiB responses OOM-killed the 2 GiB host, RSS 1.47 GB). Fixed on this
+  branch by lowering the streaming threshold to 256 KiB; local A/B shows no
+  throughput change and a ~200 MiB peak-RSS reduction at 500 in-flight
+  requests (evidence in `benchmarks/results/20260803_h3perf_streaming/`,
+  not committed).
 - **Containers default to `nofile` 1024**, which wedged the reverse-proxy
   path at ~1,000 upstream connections with 502s until the harness added
   `--ulimit nofile=65535:65535`. Worth documenting as a deployment default.

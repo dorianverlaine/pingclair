@@ -476,6 +476,11 @@ enum RespMsg {
     Body(Vec<u8>, bool),
     /// 🧾 Carries response trailers that end the stream.
     Trailers(Vec<quiche::h3::Header>),
+    /// 🏁 Marks that the handler task finished and dropped its request-body
+    /// receiver. Waking the worker on this ordered event lets a deferred
+    /// drain observe the closed channel even when the client is blocked by
+    /// QUIC flow control and sends no packets.
+    HandlerDone,
 }
 
 /// One handler task's output, on this connection's own channel.
@@ -641,15 +646,7 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
         // 🔁 Retries drains that stopped on a full handler channel before
         // polling, so the Finished event that ends a request body is not
         // observed until its bytes have been handed over.
-        let pending_reads: Vec<u64> = self
-            .streams
-            .iter()
-            .filter(|(_, s)| s.body_read_pending)
-            .map(|(id, _)| *id)
-            .collect();
-        for stream_id in pending_reads {
-            self.drain_request_body(qconn, stream_id);
-        }
+        self.retry_pending_body_drains(qconn);
 
         self.pump_h3_events(qconn);
         Ok(())
@@ -666,6 +663,14 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
         if self.h3.is_none() {
             return Ok(());
         }
+
+        // 🧲 Retries deferred body drains on every worker iteration, not
+        // only when a packet arrived: tokio-quiche calls `process_reads`
+        // solely on inbound packets, while handler events resolve
+        // `wait_for_data`. A client whose upload is blocked by flow control
+        // stops sending, so without this the drain (and its WINDOW_UPDATE)
+        // would wait for the next packet or PTO and hang the request.
+        self.retry_pending_body_drains(qconn);
 
         let dirty: Vec<u64> = self
             .streams
@@ -810,6 +815,12 @@ impl QuicServer {
         quic_settings.max_idle_timeout = Some(Duration::from_millis(transport_idle_ms));
         quic_settings.max_recv_udp_payload_size = MAX_DATAGRAM_SIZE;
         quic_settings.max_send_udp_payload_size = MAX_DATAGRAM_SIZE;
+        // ⚡ Acknowledges every inbound packet immediately. The 25 ms default
+        // delayed-ACK batches replies, which is fine for downloads but makes
+        // an upload the server keeps draining (for example an oversized body
+        // answered with 413) trickle at one packet per 25 ms round trip —
+        // nginx drains the same body at full speed.
+        quic_settings.max_ack_delay = 0;
         quic_settings.initial_max_data = 10_000_000;
         quic_settings.initial_max_stream_data_bidi_local = 1_000_000;
         quic_settings.initial_max_stream_data_bidi_remote = 1_000_000;
@@ -911,6 +922,32 @@ impl QuicServer {
 
         Ok(())
     }
+}
+
+/// 🧯 Drops a request-body channel whose handler task has ended.
+///
+/// A handler that finished early (for example the 413 answer for an
+/// oversized body) may leave its channel full and its receiver dropped.
+/// A full channel alone would defer the drain forever — nobody can free
+/// capacity once the receiver is gone — so the drain loop clears the
+/// channel and discards the remaining bytes to keep QUIC flow control
+/// moving. Returns true when the channel was cleared.
+fn drop_closed_handler_channel(tx: &mut Option<mpsc::Sender<Vec<u8>>>) -> bool {
+    if tx.as_ref().is_some_and(|sender| sender.is_closed()) {
+        *tx = None;
+        true
+    } else {
+        false
+    }
+}
+
+/// 🔁 Returns the stream ids whose request-body drains are deferred.
+fn pending_body_drain_ids(streams: &HashMap<u64, StreamState>) -> Vec<u64> {
+    streams
+        .iter()
+        .filter(|(_, s)| s.body_read_pending)
+        .map(|(id, _)| *id)
+        .collect()
 }
 
 impl H3App {
@@ -1034,6 +1071,7 @@ impl H3App {
         let proxy = self.proxy.clone();
         let connector = self.connector.clone();
         let resp_tx = self.resp_tx.clone();
+        let done_tx = resp_tx.clone();
         let notify = Arc::clone(&self.body_notify);
         let remote_ip = self.remote_addr.ip();
 
@@ -1050,6 +1088,18 @@ impl H3App {
                 cancel_rx,
             )
             .await;
+            // 🧲 The request-body receiver is dropped here. Queue an ordered
+            // completion event so the worker wakes up even when no packet
+            // arrives — a client blocked by QUIC flow control sends nothing
+            // — and a deferred drain can observe the closed channel. A
+            // bare `Notify` would be lost when the worker is between
+            // wakeups, which is exactly the race that hung 413 uploads.
+            let _ = done_tx
+                .send(RespEvent {
+                    stream_id,
+                    msg: RespMsg::HandlerDone,
+                })
+                .await;
         });
     }
 
@@ -1100,6 +1150,8 @@ impl H3App {
         let mut tmp = [0u8; BODY_CHUNK_SIZE];
 
         loop {
+            drop_closed_handler_channel(&mut ss.req_body_tx);
+
             if let Some(tx) = &ss.req_body_tx
                 && tx.capacity() == 0
             {
@@ -1142,6 +1194,20 @@ impl H3App {
         }
     }
 
+    /// 🔁 Resumes every request-body drain that stopped on a full or closed
+    /// handler channel.
+    ///
+    /// Shared by [`Self::process_reads`] (packet wakeups) and
+    /// [`Self::process_writes`] (event wakeups) so the retry cannot depend
+    /// on the client sending more data — which a flow-control-blocked
+    /// upload will not do.
+    fn retry_pending_body_drains(&mut self, qconn: &mut tokio_quiche::quic::QuicheConnection) {
+        let pending_reads = pending_body_drain_ids(&self.streams);
+        for stream_id in pending_reads {
+            self.drain_request_body(qconn, stream_id);
+        }
+    }
+
     /// Apply one response message from a handler task and try to flush it.
     ///
     /// The write itself waits for `process_writes`, which the worker calls on
@@ -1170,6 +1236,7 @@ impl H3App {
                 RespMsg::Trailers(headers) => {
                     ss.pending_trailers = Some(headers);
                 }
+                RespMsg::HandlerDone => {}
             }
         }
     }
@@ -1194,6 +1261,22 @@ impl H3App {
             let Some((headers, fin)) = ss.pending_headers.take() else {
                 return;
             };
+            // 🛑 An error response ends the exchange while the client may
+            // still be uploading. Tell it to stop sending with H3_NO_ERROR —
+            // ngtcp2/curl treat a `RequestRejected` STOP_SENDING as a
+            // transport failure (exit 56), while `NoError` lets it conclude
+            // the aborted upload cleanly, matching nginx's behavior.
+            let is_error_response = headers.iter().any(|header| {
+                header.name() == b":status"
+                    && (header.value().starts_with(b"4") || header.value().starts_with(b"5"))
+            });
+            if is_error_response && !ss.req_stream_finished {
+                let _ = conn.stream_shutdown(
+                    stream_id,
+                    quiche::Shutdown::Read,
+                    quiche::h3::WireErrorCode::NoError as u64,
+                );
+            }
             match h3.send_response(conn, stream_id, &headers, fin) {
                 Ok(()) => {
                     ss.headers_sent = true;
@@ -2928,6 +3011,72 @@ mod tests {
                 .iter()
                 .any(|header| header.name() == b":status" && header.value() == b"501")
         );
+    }
+
+    #[test]
+    fn full_closed_body_channel_switches_to_discard_mode() {
+        // 🧠 Regression: a handler that answered 413 for an oversized body can
+        // leave its request-body channel full with its receiver dropped. The
+        // drain loop must detect the closed channel and clear it even when
+        // `capacity() == 0`, or the deferred drain never resumes and the
+        // client's upload hangs forever on closed QUIC flow control.
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
+        tx.try_send(vec![0x42]).unwrap();
+        drop(rx);
+
+        let mut stream = StreamState {
+            req_body_tx: Some(tx),
+            body_read_pending: true,
+            ..Default::default()
+        };
+
+        assert!(drop_closed_handler_channel(&mut stream.req_body_tx));
+        assert!(stream.req_body_tx.is_none());
+        assert!(stream.body_read_pending, "cleared by the next drain pass");
+    }
+
+    #[test]
+    fn alive_full_body_channel_is_not_dropped() {
+        // 🧠 A live handler may still be draining: dropping its channel now
+        // would discard bytes the handler still needs. Only a closed
+        // receiver may be cleared.
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(1);
+        tx.try_send(vec![0x42]).unwrap();
+
+        let mut stream = StreamState {
+            req_body_tx: Some(tx),
+            ..Default::default()
+        };
+
+        assert!(!drop_closed_handler_channel(&mut stream.req_body_tx));
+        assert!(stream.req_body_tx.is_some());
+    }
+
+    #[test]
+    fn pending_drain_ids_only_include_deferred_streams() {
+        // 🧠 The retry pass must resume exactly the streams whose drain
+        // stopped on a full channel, leaving healthy streams untouched.
+        let mut streams = HashMap::new();
+        streams.insert(0, StreamState::default());
+        streams.insert(
+            4,
+            StreamState {
+                body_read_pending: true,
+                ..Default::default()
+            },
+        );
+        streams.insert(
+            8,
+            StreamState {
+                body_read_pending: true,
+                req_stream_finished: true,
+                ..Default::default()
+            },
+        );
+
+        let mut pending = pending_body_drain_ids(&streams);
+        pending.sort_unstable();
+        assert_eq!(pending, vec![4, 8]);
     }
 
     #[test]

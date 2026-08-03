@@ -285,8 +285,17 @@ impl FileServer {
         Ok(None)
     }
 
-    /// THRESHOLD for using streaming vs in-memory (5MB)
-    const STREAMING_THRESHOLD: u64 = 5 * 1024 * 1024;
+    /// 🧵 Size above which complete, uncompressed responses stream from disk.
+    ///
+    /// Files at or below this bound stay on the buffered fast path, where one
+    /// read plus one write serves the body; anything larger streams in 64 KiB
+    /// chunks so per-request memory stays bounded. The bound is deliberately
+    /// small (256 KiB, four chunks): a 5 MiB bound meant 2,000 in-flight 1 MiB
+    /// responses could buffer ~2 GiB and OOM a small host (observed on
+    /// t3.small, see benchmarks/results/20260803_aws_h3perf/). Streaming
+    /// never applies to Range or negotiated-compression responses, so the
+    /// compression cache and byte-range behavior are unchanged.
+    const STREAMING_THRESHOLD: u64 = 256 * 1024;
 
     /// Resolve a request path to an on-disk path that is verifiably inside
     /// the document root — purely lexically, with no filesystem syscalls
@@ -335,11 +344,11 @@ impl FileServer {
             && !(self.config.compress && Self::negotiate_encoding(accept_encoding).is_some())
     }
 
-    /// Whether a request for a file of `file_size` bytes should be answered
-    /// by chunked streaming instead of the buffered+cached path: only
-    /// complete (non-Range), uncompressed responses above
+    /// 🧭 Whether a request for a file of `file_size` bytes should be
+    /// answered by chunked streaming instead of the buffered+cached path:
+    /// only complete (non-Range), uncompressed responses above
     /// [`Self::STREAMING_THRESHOLD`]. Compressed responses stay buffered so
-    /// the compression cache keeps working.
+    /// the compression cache keeps working regardless of file size.
     pub fn should_stream_response(
         &self,
         file_size: u64,
@@ -349,9 +358,11 @@ impl FileServer {
         self.could_stream(range, accept_encoding) && file_size > Self::STREAMING_THRESHOLD
     }
 
-    /// Serve a large file using zero-copy streaming
-    /// Returns a StreamingFile that can be used for chunked transfer
-    /// Use this for files larger than 5MB to avoid memory pressure
+    /// 🌊 Serve a large file using zero-copy streaming.
+    ///
+    /// Returns a [`StreamingFile`] that can be used for chunked transfer.
+    /// Use this for files above [`Self::STREAMING_THRESHOLD`] to keep
+    /// per-request memory bounded under concurrency.
     pub async fn serve_streaming(&self, path: &str) -> Result<Option<StreamingFile>> {
         // Lexical docroot check (rejects `..` traversal; no syscalls)
         let file_path = match self.resolve_path(path) {
@@ -409,7 +420,7 @@ impl FileServer {
         })
     }
 
-    /// Check if a file should be served with streaming (based on size)
+    /// 📏 Check if a file should be served with streaming (based on size).
     pub async fn should_stream(&self, path: &str) -> Result<bool> {
         let file_path = self.config.root.join(path.trim_start_matches('/'));
         match std::fs::metadata(&file_path) {
@@ -1202,7 +1213,7 @@ mod serve_auto_tests {
     #[tokio::test]
     async fn large_uncompressed_file_streams_and_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        // 6MB, over the 5MB streaming threshold; non-repeating so gzip
+        // 6MB, well over the streaming threshold; non-repeating so gzip
         // wouldn't trivially shrink it (not used here anyway).
         let body: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
         tokio::fs::write(dir.path().join("big.bin"), &body)
@@ -1225,6 +1236,37 @@ mod serve_auto_tests {
                 assert_eq!(got, body, "streamed bytes must equal the file");
             }
             ServedResponse::Buffered(_) => panic!("6MB uncompressed response must stream"),
+            ServedResponse::Redirect(_) => panic!("a regular file must not redirect"),
+        }
+    }
+
+    #[tokio::test]
+    async fn one_mib_file_streams_so_concurrency_cannot_buffer_gibibytes() {
+        // 🧠 Regression for the AWS run: with a 5 MiB threshold, 2,000
+        // in-flight 1 MiB responses buffered ~2 GiB and OOM-killed the host.
+        // A 1 MiB file must now take the streaming path.
+        let dir = tempfile::tempdir().unwrap();
+        let body = vec![0x5au8; 1024 * 1024];
+        tokio::fs::write(dir.path().join("one.bin"), &body)
+            .await
+            .unwrap();
+
+        let fs = server(dir.path(), false);
+        match fs
+            .serve_auto("/one.bin", None, None)
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            ServedResponse::Stream(mut stream) => {
+                assert_eq!(stream.file_size, body.len() as u64);
+                let mut got = Vec::new();
+                while let Some(chunk) = stream.read_chunk().unwrap() {
+                    got.extend_from_slice(&chunk);
+                }
+                assert_eq!(got, body, "streamed bytes must equal the file");
+            }
+            ServedResponse::Buffered(_) => panic!("1 MiB uncompressed response must stream"),
             ServedResponse::Redirect(_) => panic!("a regular file must not redirect"),
         }
     }
@@ -1281,13 +1323,26 @@ mod stream_decision_tests {
         })
     }
 
-    const BIG: u64 = 6 * 1024 * 1024; // over the 5MB threshold
+    const BIG: u64 = 6 * 1024 * 1024; // well over the streaming threshold
+    const ONE_MIB: u64 = 1024 * 1024; // the OOM regression size from the AWS run
+    const THRESHOLD: u64 = 256 * 1024; // exactly at the streaming boundary
     const SMALL: u64 = 1024;
 
     #[test]
     fn large_plain_response_streams() {
         assert!(server(true).should_stream_response(BIG, None, None));
         assert!(server(false).should_stream_response(BIG, None, None));
+        assert!(
+            server(false).should_stream_response(ONE_MIB, None, None),
+            "1 MiB files must stream so high concurrency cannot buffer GiB"
+        );
+    }
+
+    #[test]
+    fn threshold_boundary_is_strictly_greater() {
+        let fs = server(false);
+        assert!(!fs.should_stream_response(THRESHOLD, None, None));
+        assert!(fs.should_stream_response(THRESHOLD + 1, None, None));
     }
 
     #[test]
