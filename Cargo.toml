@@ -10,6 +10,7 @@ members = [
     "pingclair-api",
     "pingclair-plugin",
 ]
+exclude = ["vendor/h2"]
 
 [workspace.package]
 version = "0.1.7"
@@ -118,6 +119,44 @@ bcrypt = "0.19"
 
 # Lock-free reads on hot paths
 arc-swap = "1"
+
+# ⚡ Performance fork (Pingclair-local, tracked under `vendor/`)
+#
+# `h2 0.4.15` is forked with one change: the HPACK encoder reuses a
+# per-connection scratch buffer for the encoded header block instead of
+# allocating a fresh `BytesMut` (with several capacity doublings) plus a
+# `Bytes` refcount header on every HEADERS frame. The common
+# no-continuation path now performs zero header-block allocations per
+# request. See `vendor/h2/PINGCLAIR_PATCH.md` for the exact diff.
+#
+# 🎯 This is the last fork standing, and it is the only one that was ever
+# measured against the upstream project's own benchmark rather than ours:
+# +3.8 % on h2's multi-threaded 100k-request bench, faster in 24 of 25
+# pairwise comparisons (exact permutation test, p = 0.016). It is submitted
+# upstream as hyperium/h2#929; when that lands, delete `vendor/h2` and this
+# `[patch]` section rather than carrying the fork forward.
+#
+# 🚫 Two other forks were evaluated and removed on 2026-08-04, both for the
+# same reason — a plausible mechanism that never showed up in a measurement
+# where the proxy was provably the bottleneck:
+#
+#   - `pingora-http` (titled-header map plus `drop_case()`): no isolated
+#     A/B ever existed, and the c7i-flex run that shipped with it concluded
+#     the remaining proxy gap is "framework-level H1 handling, not
+#     header-case allocation". It also silently lowercased `Authorization`,
+#     `Cookie` and `User-Agent` on the upstream wire.
+#   - `pingora-core` (H1 `BodyReader` buffer reuse): cut cumulative
+#     allocations 86 % and moved nothing else. Three independent attempts
+#     agree — local profile CPU/request 51.6 vs 49.3 µs (noise), OrbStack
+#     A/B +0.9 % throughput with RSS ranges fully overlapping, and the
+#     published c7i-flex table still 55 % behind nginx on H1 proxy.
+#
+# The standing rule this leaves behind: a fork needs a number from a run
+# where the thing it patches is the saturated resource, or it does not go
+# in. Vendoring also removes `source`/`checksum` from the lockfile entry,
+# which makes the crate invisible to `cargo audit` — verified directly.
+[patch.crates-io]
+h2 = { path = "vendor/h2" }
 
 [profile.release]
 lto = "fat"

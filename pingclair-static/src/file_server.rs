@@ -3,12 +3,15 @@
 
 //! File server implementation
 
+use arc_swap::ArcSwap;
 use pingclair_core::error::Result;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read as _, Seek as _, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
+
+use http::HeaderValue;
 
 /// Key for a cached compressed response: a file identity (path + mtime) plus
 /// the content encoding. mtime is part of the key so editing a file naturally
@@ -18,6 +21,29 @@ struct CompressKey {
     path: PathBuf,
     mtime_ns: u128,
     encoding: &'static str,
+}
+
+/// Prebuilt response metadata for one file identity: path, mtime, and size.
+///
+/// Every static response repeats the same header values (Content-Type,
+/// Last-Modified, ETag, Content-Length) for the same file. Building them as
+/// `HeaderValue`s once per file identity lets hot paths clone them for one
+/// atomic reference-count increment instead of reformatting and copying
+/// strings on every request — the dominant per-request header allocation on
+/// the small-file benchmark path.
+struct FileMeta {
+    content_type: HeaderValue,
+    last_modified: Option<HeaderValue>,
+    etag: HeaderValue,
+    content_length: HeaderValue,
+}
+
+/// Identity of one file's metadata, derived from a single `stat` per request.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MetaKey {
+    path: PathBuf,
+    mtime_ns: u128,
+    size: u64,
 }
 
 /// A small, byte-bounded LRU cache of already-compressed file bodies.
@@ -126,6 +152,14 @@ impl Default for FileServerConfig {
 /// Static file server
 pub struct FileServer {
     config: FileServerConfig,
+    /// Prebuilt response metadata per file identity (path, mtime, size).
+    /// The values themselves are immutable `Arc`s, so a hit clones one
+    /// pointer and a few `HeaderValue`s instead of reformatting dates,
+    /// ETags, and content lengths on every request. Read via `ArcSwap` so a
+    /// hit is one atomic load and never takes a lock; the write mutex is
+    /// only contended on a cache miss. Bounded by a hard entry cap.
+    meta_cache: ArcSwap<HashMap<MetaKey, Arc<FileMeta>>>,
+    meta_write: Mutex<()>,
     /// Cache of already-compressed file bodies (see [`CompressCache`]).
     /// Behind a `Mutex` because `FileServer` is shared (`Arc`) across all
     /// worker threads; the lock is only ever held for a tiny map operation,
@@ -144,12 +178,15 @@ pub struct FileServer {
 /// Response from file server
 pub struct ServedFile {
     pub content: Vec<u8>,
-    pub mime_type: String,
+    /// Prebuilt Content-Type header value (clone is a shared-bytes bump).
+    pub content_type: HeaderValue,
+    /// Prebuilt Content-Length header value for the full response body.
+    pub content_length: HeaderValue,
     pub path: PathBuf,
     pub status: u16,
     pub content_range: Option<String>,
-    pub last_modified: Option<String>,
-    pub etag: Option<String>,
+    pub last_modified: Option<HeaderValue>,
+    pub etag: Option<HeaderValue>,
     pub content_encoding: Option<String>,
 }
 
@@ -180,14 +217,16 @@ pub struct StreamingFile {
     pub file_size: u64,
     /// Chunk size for streaming (default 64KB)
     pub chunk_size: usize,
-    /// MIME type of the file
-    pub mime_type: String,
+    /// Prebuilt Content-Type header value (clone is a shared-bytes bump).
+    pub content_type: HeaderValue,
+    /// Prebuilt Content-Length header value.
+    pub content_length: HeaderValue,
     /// Path to the file
     pub path: PathBuf,
     /// Last-Modified header value
-    pub last_modified: Option<String>,
+    pub last_modified: Option<HeaderValue>,
     /// ETag header value
-    pub etag: Option<String>,
+    pub etag: Option<HeaderValue>,
     /// Bytes read so far
     bytes_read: u64,
 }
@@ -245,8 +284,79 @@ impl FileServer {
     pub fn new(config: FileServerConfig) -> Self {
         Self {
             config,
+            meta_cache: ArcSwap::from_pointee(HashMap::new()),
+            meta_write: Mutex::new(()),
             compress_cache: Mutex::new(CompressCache::new(Self::COMPRESS_CACHE_BUDGET)),
             in_flight: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Maximum number of file identities whose response metadata is cached.
+    /// Each entry holds a handful of small `HeaderValue`s, so even a busy
+    /// site with thousands of files stays well under a megabyte.
+    const META_CACHE_CAP: usize = 4096;
+
+    /// Return the prebuilt response metadata for `file_path`, building and
+    /// caching it on the first request and on every mtime/size change.
+    fn file_meta(&self, file_path: &Path, metadata: &std::fs::Metadata) -> Result<Arc<FileMeta>> {
+        let size = metadata.len();
+        let mtime_ns = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos());
+
+        // Files without a usable mtime are rebuilt per request: caching by
+        // size alone could serve stale headers after a same-size overwrite.
+        let Some(mtime_ns) = mtime_ns else {
+            return Ok(Arc::new(Self::build_meta(file_path, metadata, size)));
+        };
+
+        let key = MetaKey {
+            path: file_path.to_path_buf(),
+            mtime_ns,
+            size,
+        };
+        if let Some(meta) = self.meta_cache.load().get(&key) {
+            return Ok(meta.clone());
+        }
+
+        let meta = Arc::new(Self::build_meta(file_path, metadata, size));
+        let _guard = self.meta_write.lock().unwrap();
+        // Whoever published first wins; the double-check avoids rebuilding
+        // the map after a concurrent miss already inserted the entry.
+        if let Some(meta) = self.meta_cache.load().get(&key) {
+            return Ok(meta.clone());
+        }
+        let mut cache = (**self.meta_cache.load()).clone();
+        if cache.len() >= Self::META_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, meta.clone());
+        self.meta_cache.store(Arc::new(cache));
+        Ok(meta)
+    }
+
+    /// Format one file's response metadata into reusable header values.
+    fn build_meta(file_path: &Path, metadata: &std::fs::Metadata, size: u64) -> FileMeta {
+        let mime_type = crate::mime::with_charset(
+            mime_guess::from_path(file_path)
+                .first_raw()
+                .unwrap_or("application/octet-stream"),
+        );
+        let last_modified = metadata.modified().ok().map(httpdate::fmt_http_date);
+        let modified_secs = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+        let etag = format!("\"{size:x}-{modified_secs:x}\"");
+
+        FileMeta {
+            content_type: HeaderValue::from_str(&mime_type).unwrap(),
+            last_modified: last_modified.map(|v| HeaderValue::from_str(&v).unwrap()),
+            etag: HeaderValue::from_str(&etag).unwrap(),
+            content_length: HeaderValue::from(size),
         }
     }
 
@@ -285,8 +395,17 @@ impl FileServer {
         Ok(None)
     }
 
-    /// THRESHOLD for using streaming vs in-memory (5MB)
-    const STREAMING_THRESHOLD: u64 = 5 * 1024 * 1024;
+    /// 🧵 Size above which complete, uncompressed responses stream from disk.
+    ///
+    /// Files at or below this bound stay on the buffered fast path, where one
+    /// read plus one write serves the body; anything larger streams in 64 KiB
+    /// chunks so per-request memory stays bounded. The bound is deliberately
+    /// small (256 KiB, four chunks): a 5 MiB bound meant 2,000 in-flight 1 MiB
+    /// responses could buffer ~2 GiB and OOM a small host (observed on
+    /// t3.small, see benchmarks/results/20260803_aws_h3perf/). Streaming
+    /// never applies to Range or negotiated-compression responses, so the
+    /// compression cache and byte-range behavior are unchanged.
+    const STREAMING_THRESHOLD: u64 = 256 * 1024;
 
     /// Resolve a request path to an on-disk path that is verifiably inside
     /// the document root — purely lexically, with no filesystem syscalls
@@ -335,11 +454,11 @@ impl FileServer {
             && !(self.config.compress && Self::negotiate_encoding(accept_encoding).is_some())
     }
 
-    /// Whether a request for a file of `file_size` bytes should be answered
-    /// by chunked streaming instead of the buffered+cached path: only
-    /// complete (non-Range), uncompressed responses above
+    /// 🧭 Whether a request for a file of `file_size` bytes should be
+    /// answered by chunked streaming instead of the buffered+cached path:
+    /// only complete (non-Range), uncompressed responses above
     /// [`Self::STREAMING_THRESHOLD`]. Compressed responses stay buffered so
-    /// the compression cache keeps working.
+    /// the compression cache keeps working regardless of file size.
     pub fn should_stream_response(
         &self,
         file_size: u64,
@@ -349,9 +468,11 @@ impl FileServer {
         self.could_stream(range, accept_encoding) && file_size > Self::STREAMING_THRESHOLD
     }
 
-    /// Serve a large file using zero-copy streaming
-    /// Returns a StreamingFile that can be used for chunked transfer
-    /// Use this for files larger than 5MB to avoid memory pressure
+    /// 🌊 Serve a large file using zero-copy streaming.
+    ///
+    /// Returns a [`StreamingFile`] that can be used for chunked transfer.
+    /// Use this for files above [`Self::STREAMING_THRESHOLD`] to keep
+    /// per-request memory bounded under concurrency.
     pub async fn serve_streaming(&self, path: &str) -> Result<Option<StreamingFile>> {
         // Lexical docroot check (rejects `..` traversal; no syscalls)
         let file_path = match self.resolve_path(path) {
@@ -367,49 +488,36 @@ impl FileServer {
             _ => return Ok(None),
         };
 
-        Ok(Some(Self::open_stream(file_path, &metadata)?))
+        Ok(Some(Self::open_stream(self, file_path, &metadata)?))
     }
 
     /// Open `file_path` for chunked streaming, computing the response
     /// metadata (MIME, Last-Modified, ETag) from the already-fetched stat.
-    fn open_stream(file_path: PathBuf, metadata: &std::fs::Metadata) -> Result<StreamingFile> {
+    fn open_stream(
+        server: &FileServer,
+        file_path: PathBuf,
+        metadata: &std::fs::Metadata,
+    ) -> Result<StreamingFile> {
         let file_size = metadata.len();
 
         // Open file handle (no reading yet - zero-copy preparation)
         let file = std::fs::File::open(&file_path)?;
-
-        // Guess MIME type
-        let mime_type = crate::mime::with_charset(
-            mime_guess::from_path(&file_path)
-                .first_raw()
-                .unwrap_or("application/octet-stream"),
-        );
-
-        // Calculate Last-Modified and ETag
-        let last_modified = metadata.modified().ok().map(httpdate::fmt_http_date);
-
-        let etag = format!(
-            "\"{:x}-{:x}\"",
-            file_size,
-            metadata
-                .modified()
-                .map(|t| t.elapsed().unwrap_or_default().as_secs())
-                .unwrap_or(0)
-        );
+        let meta = server.file_meta(&file_path, metadata)?;
 
         Ok(StreamingFile {
             file,
             file_size,
             chunk_size: 64 * 1024, // 64KB chunks
-            mime_type,
+            content_type: meta.content_type.clone(),
+            content_length: meta.content_length.clone(),
             path: file_path,
-            last_modified,
-            etag: Some(etag),
+            last_modified: meta.last_modified.clone(),
+            etag: Some(meta.etag.clone()),
             bytes_read: 0,
         })
     }
 
-    /// Check if a file should be served with streaming (based on size)
+    /// 📏 Check if a file should be served with streaming (based on size).
     pub async fn should_stream(&self, path: &str) -> Result<bool> {
         let file_path = self.config.root.join(path.trim_start_matches('/'));
         match std::fs::metadata(&file_path) {
@@ -485,10 +593,12 @@ impl FileServer {
                     } else {
                         (listing.into_bytes(), None)
                     };
+                    let listing_len = content.len() as u64;
 
                     return Ok(Some(ServedResponse::Buffered(ServedFile {
                         content,
-                        mime_type: "text/html; charset=utf-8".to_string(),
+                        content_type: HeaderValue::from_static("text/html; charset=utf-8"),
+                        content_length: HeaderValue::from(listing_len),
                         path: file_path,
                         status: 200,
                         content_range: None,
@@ -509,17 +619,10 @@ impl FileServer {
         };
         let file_size = metadata.len();
 
-        // Calculate Last-Modified and ETag
-        let last_modified = metadata.modified().ok().map(httpdate::fmt_http_date);
-
-        let etag = format!(
-            "\"{:x}-{:x}\"",
-            file_size,
-            metadata
-                .modified()
-                .map(|t| t.elapsed().unwrap_or_default().as_secs())
-                .unwrap_or(0)
-        );
+        // Reuse prebuilt response metadata (MIME, Last-Modified, ETag,
+        // Content-Length) so repeated requests for the same file clone a few
+        // shared `HeaderValue`s instead of reformatting strings each time.
+        let meta = self.file_meta(&file_path, &metadata)?;
 
         // Handle Range Request
         let mut status = 200;
@@ -536,21 +639,13 @@ impl FileServer {
             content_range = Some(format!("bytes {s}-{e}/{file_size}"));
         }
 
-        // MIME type is path-based (no I/O) and needed by both the cache fast
-        // path and every response below — compute it once, up front.
-        let mime_type = crate::mime::with_charset(
-            mime_guess::from_path(&file_path)
-                .first_raw()
-                .unwrap_or("application/octet-stream"),
-        );
-
         // Streaming branch: large, complete, uncompressed responses are
         // handed back as an open file for chunked writing — the body is
         // never held in memory. Checked before the compression cache path,
         // which only ever applies to buffered responses.
         if self.should_stream_response(file_size, range_header, accept_encoding) {
             return Ok(Some(ServedResponse::Stream(Self::open_stream(
-                file_path, &metadata,
+                self, file_path, &metadata,
             )?)));
         }
 
@@ -586,12 +681,13 @@ impl FileServer {
                 );
                 return Ok(Some(ServedResponse::Buffered(ServedFile {
                     content: (*cached).clone(),
-                    mime_type,
+                    content_type: meta.content_type.clone(),
+                    content_length: HeaderValue::from((*cached).len() as u64),
                     path: file_path,
                     status,
                     content_range,
-                    last_modified,
-                    etag: Some(etag),
+                    last_modified: meta.last_modified.clone(),
+                    etag: Some(meta.etag.clone()),
                     content_encoding: Some(enc.to_string()),
                 })));
             }
@@ -607,6 +703,7 @@ impl FileServer {
             && let Some((precompressed_content, encoding)) =
                 self.try_precompressed(&file_path, accept_encoding).await
         {
+            let precompressed_len = precompressed_content.len() as u64;
             tracing::debug!(
                 "✅ Using pre-compressed file: {} ({})",
                 file_path.display(),
@@ -614,12 +711,13 @@ impl FileServer {
             );
             return Ok(Some(ServedResponse::Buffered(ServedFile {
                 content: precompressed_content,
-                mime_type,
+                content_type: meta.content_type.clone(),
+                content_length: HeaderValue::from(precompressed_len),
                 path: file_path,
                 status,
                 content_range,
-                last_modified,
-                etag: Some(etag),
+                last_modified: meta.last_modified.clone(),
+                etag: Some(meta.etag.clone()),
                 content_encoding: Some(encoding.to_string()),
             })));
         }
@@ -658,12 +756,13 @@ impl FileServer {
                 );
                 return Ok(Some(ServedResponse::Buffered(ServedFile {
                     content: (*cached).clone(),
-                    mime_type,
+                    content_type: meta.content_type.clone(),
+                    content_length: HeaderValue::from((*cached).len() as u64),
                     path: file_path,
                     status,
                     content_range,
-                    last_modified,
-                    etag: Some(etag),
+                    last_modified: meta.last_modified.clone(),
+                    etag: Some(meta.etag.clone()),
                     content_encoding: Some(enc.to_string()),
                 })));
             }
@@ -690,15 +789,17 @@ impl FileServer {
         }
 
         let (content, content_encoding) = result?;
+        let content_length = content.len() as u64;
 
         Ok(Some(ServedResponse::Buffered(ServedFile {
             content,
-            mime_type,
+            content_type: meta.content_type.clone(),
+            content_length: HeaderValue::from(content_length),
             path: file_path,
             status,
             content_range,
-            last_modified,
-            etag: Some(etag),
+            last_modified: meta.last_modified.clone(),
+            etag: Some(meta.etag.clone()),
             content_encoding,
         })))
     }
@@ -726,7 +827,8 @@ impl FileServer {
                 }
                 Ok(Some(ServedFile {
                     content,
-                    mime_type: stream.mime_type,
+                    content_type: stream.content_type,
+                    content_length: stream.content_length,
                     path: stream.path,
                     status: 200,
                     content_range: None,
@@ -1202,7 +1304,7 @@ mod serve_auto_tests {
     #[tokio::test]
     async fn large_uncompressed_file_streams_and_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        // 6MB, over the 5MB streaming threshold; non-repeating so gzip
+        // 6MB, well over the streaming threshold; non-repeating so gzip
         // wouldn't trivially shrink it (not used here anyway).
         let body: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
         tokio::fs::write(dir.path().join("big.bin"), &body)
@@ -1225,6 +1327,37 @@ mod serve_auto_tests {
                 assert_eq!(got, body, "streamed bytes must equal the file");
             }
             ServedResponse::Buffered(_) => panic!("6MB uncompressed response must stream"),
+            ServedResponse::Redirect(_) => panic!("a regular file must not redirect"),
+        }
+    }
+
+    #[tokio::test]
+    async fn one_mib_file_streams_so_concurrency_cannot_buffer_gibibytes() {
+        // 🧠 Regression for the AWS run: with a 5 MiB threshold, 2,000
+        // in-flight 1 MiB responses buffered ~2 GiB and OOM-killed the host.
+        // A 1 MiB file must now take the streaming path.
+        let dir = tempfile::tempdir().unwrap();
+        let body = vec![0x5au8; 1024 * 1024];
+        tokio::fs::write(dir.path().join("one.bin"), &body)
+            .await
+            .unwrap();
+
+        let fs = server(dir.path(), false);
+        match fs
+            .serve_auto("/one.bin", None, None)
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            ServedResponse::Stream(mut stream) => {
+                assert_eq!(stream.file_size, body.len() as u64);
+                let mut got = Vec::new();
+                while let Some(chunk) = stream.read_chunk().unwrap() {
+                    got.extend_from_slice(&chunk);
+                }
+                assert_eq!(got, body, "streamed bytes must equal the file");
+            }
+            ServedResponse::Buffered(_) => panic!("1 MiB uncompressed response must stream"),
             ServedResponse::Redirect(_) => panic!("a regular file must not redirect"),
         }
     }
@@ -1281,13 +1414,26 @@ mod stream_decision_tests {
         })
     }
 
-    const BIG: u64 = 6 * 1024 * 1024; // over the 5MB threshold
+    const BIG: u64 = 6 * 1024 * 1024; // well over the streaming threshold
+    const ONE_MIB: u64 = 1024 * 1024; // the OOM regression size from the AWS run
+    const THRESHOLD: u64 = 256 * 1024; // exactly at the streaming boundary
     const SMALL: u64 = 1024;
 
     #[test]
     fn large_plain_response_streams() {
         assert!(server(true).should_stream_response(BIG, None, None));
         assert!(server(false).should_stream_response(BIG, None, None));
+        assert!(
+            server(false).should_stream_response(ONE_MIB, None, None),
+            "1 MiB files must stream so high concurrency cannot buffer GiB"
+        );
+    }
+
+    #[test]
+    fn threshold_boundary_is_strictly_greater() {
+        let fs = server(false);
+        assert!(!fs.should_stream_response(THRESHOLD, None, None));
+        assert!(fs.should_stream_response(THRESHOLD + 1, None, None));
     }
 
     #[test]

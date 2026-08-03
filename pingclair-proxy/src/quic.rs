@@ -68,13 +68,29 @@ use crate::server::{is_streaming_content_type, wants_immediate_flush};
 /// Maximum UDP payload we ask quiche to send (standard Ethernet MTU-safe).
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
+/// Size of the per-connection outbound packet buffer lent to tokio-quiche.
+///
+/// The worker writes as many QUIC packets as fit and flushes them in one
+/// GSO-backed `sendmsg` on Linux. A 1350-byte buffer caps every flush at one
+/// datagram, turning each packet into its own syscall. 16 KiB was measured
+/// against 64 KiB (tokio-quiche's `BufFactory::MAX_BUF_SIZE` and the kernel
+/// GSO ceiling): the large-file and small-file gains were identical, so the
+/// smaller fixed per-connection cost wins.
+const OUT_BUF_SIZE: usize = 16 * 1024;
+
 /// Bound for the per-stream request-body channel between the event loop
 /// and a handler task. When full, the event loop stops draining quiche so
 /// QUIC flow control pushes back on the client.
 const REQ_BODY_CHANNEL_CAPACITY: usize = 16;
 
 /// Bound for the global response channel shared by all handler tasks.
-const RESP_CHANNEL_CAPACITY: usize = 256;
+///
+/// Each slot can hold a 64 KiB body chunk, so 256 slots meant a connection
+/// could buffer 16 MiB of handler output while the worker paced it into
+/// quiche — 100 connections × 20 streams measured ~1.6 GiB RSS. With the
+/// worker's per-stream queue cap, 32 slots (2 MiB per connection) keep
+/// handler backpressure tight without stalling the pipeline.
+const RESP_CHANNEL_CAPACITY: usize = 32;
 
 /// Read size for draining request bodies out of quiche.
 const BODY_CHUNK_SIZE: usize = 16 * 1024;
@@ -466,6 +482,11 @@ enum RespMsg {
     Body(Vec<u8>, bool),
     /// 🧾 Carries response trailers that end the stream.
     Trailers(Vec<quiche::h3::Header>),
+    /// 🏁 Marks that the handler task finished and dropped its request-body
+    /// receiver. Waking the worker on this ordered event lets a deferred
+    /// drain observe the closed channel even when the client is blocked by
+    /// QUIC flow control and sends no packets.
+    HandlerDone,
 }
 
 /// One handler task's output, on this connection's own channel.
@@ -476,6 +497,16 @@ struct RespEvent {
 
 type RespSender = mpsc::Sender<RespEvent>;
 
+/// 🌊 Per-stream cap on response bytes waiting to enter quiche.
+///
+/// Without a bound, a handler that produces a 1 MiB body hands the whole
+/// body to quiche before the client acknowledges it; 2,000 concurrent
+/// streams then hold ~2 GiB of QUIC send buffers (measured 1.63 GiB vs
+/// nginx's 0.4 GiB on the same 100×20 workload). Two 64 KiB chunks per
+/// stream bound the same workload near nginx's footprint while flow control
+/// still paces the actual wire rate.
+const BODY_QUEUE_CAP: usize = 128 * 1024;
+
 // MARK: - Connection / stream state
 
 /// Per-stream state owned by the event loop.
@@ -484,8 +515,17 @@ struct StreamState {
     /// 📤 Holds response headers until QUIC flow control accepts them.
     pending_headers: Option<(Vec<quiche::h3::Header>, bool)>,
     headers_sent: bool,
-    /// 🌊 Holds bounded response bytes that quiche has not accepted yet.
-    pending_body: VecDeque<u8>,
+    /// 🌊 Holds response chunks that quiche has not accepted yet.
+    ///
+    /// Chunks keep the event loop from copying a 1 MiB body byte-by-byte
+    /// through a `VecDeque<u8>` ring: the handler's `Vec<u8>` moves in, and
+    /// `flush_stream` hands the front slice to quiche. `pending_body_head`
+    /// tracks partial progress through the front chunk.
+    pending_body: VecDeque<Vec<u8>>,
+    /// 🌊 Total unconsumed bytes across all queued chunks.
+    pending_body_bytes: usize,
+    /// 🌊 Bytes already handed to quiche from the front chunk.
+    pending_body_head: usize,
     /// 🧾 Holds response trailers until body bytes and QUIC capacity are ready.
     pending_trailers: Option<Vec<quiche::h3::Header>>,
     /// 🏁 Records that the handler signaled the end of the response body.
@@ -523,6 +563,13 @@ struct H3App {
     streams: HashMap<u64, StreamState>,
     resp_tx: RespSender,
     resp_rx: mpsc::Receiver<RespEvent>,
+    /// 🧮 The channel head that did not fit its stream's body cap.
+    ///
+    /// Only this single event may be held back: everything behind it stays
+    /// in the bounded `resp_rx`, whose capacity is the real backpressure —
+    /// a handler whose stream is over [`BODY_QUEUE_CAP`] blocks on send
+    /// instead of letting the worker buffer the whole body out of order.
+    deferred: Option<RespEvent>,
     body_notify: Arc<Notify>,
     /// 🔢 Releases this connection's slot against `limits.max_connections`.
     _slot: ConnectionSlot,
@@ -588,12 +635,30 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
         &mut self,
         _qconn: &mut tokio_quiche::quic::QuicheConnection,
     ) -> tokio_quiche::QuicResult<()> {
+        // 🧲 Applies deferred or channel-head events first: a previous
+        // iteration may have parked one while its stream was over the body
+        // cap, and capacity may have opened since.
+        if self.apply_available_events() {
+            return Ok(());
+        }
+        // 🛑 A parked event means the channel head cannot be applied yet.
+        // Receiving anything else would violate ordering, so wait for the
+        // next worker iteration (an inbound packet) instead; `process_writes`
+        // frees capacity and retries the parked event there.
+        if self.deferred.is_some() {
+            std::future::pending::<()>().await;
+            return Ok(());
+        }
         tokio::select! {
             event = self.resp_rx.recv() => {
                 // 🧯 The sender is held by this app, so the channel outlives
                 // every handler; `None` cannot mean "no more work".
                 if let Some(event) = event {
-                    self.apply_resp_event(event);
+                    if Self::event_fits(&self.streams, &event) {
+                        self.apply_resp_event(event);
+                    } else {
+                        self.deferred = Some(event);
+                    }
                 }
             }
             _ = self.body_notify.notified() => {
@@ -601,6 +666,8 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
                 // drains are retried in `process_reads`.
             }
         }
+        // 🧲 Applies anything that queued behind the event that woke us.
+        self.apply_available_events();
         Ok(())
     }
 
@@ -616,15 +683,7 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
         // 🔁 Retries drains that stopped on a full handler channel before
         // polling, so the Finished event that ends a request body is not
         // observed until its bytes have been handed over.
-        let pending_reads: Vec<u64> = self
-            .streams
-            .iter()
-            .filter(|(_, s)| s.body_read_pending)
-            .map(|(id, _)| *id)
-            .collect();
-        for stream_id in pending_reads {
-            self.drain_request_body(qconn, stream_id);
-        }
+        self.retry_pending_body_drains(qconn);
 
         self.pump_h3_events(qconn);
         Ok(())
@@ -642,13 +701,24 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
             return Ok(());
         }
 
+        // 🧲 Retries deferred body drains on every worker iteration, not
+        // only when a packet arrived: tokio-quiche calls `process_reads`
+        // solely on inbound packets, while handler events resolve
+        // `wait_for_data`. A client whose upload is blocked by flow control
+        // stops sending, so without this the drain (and its WINDOW_UPDATE)
+        // would wait for the next packet or PTO and hang the request.
+        self.retry_pending_body_drains(qconn);
+
+        // 🧮 Applies deferred events whose streams may have room again.
+        self.apply_available_events();
+
         let dirty: Vec<u64> = self
             .streams
             .iter()
             .filter(|(_, s)| {
                 !s.dead
                     && (s.pending_headers.is_some()
-                        || !s.pending_body.is_empty()
+                        || s.pending_body_bytes > 0
                         || s.pending_trailers.is_some()
                         || (s.body_fin && !s.fin_sent))
             })
@@ -664,6 +734,10 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
         for stream_id in writable {
             self.flush_stream(qconn, stream_id);
         }
+
+        // 🧮 Handing chunks to quiche frees per-stream capacity, so apply
+        // deferred events again before the worker goes back to waiting.
+        self.apply_available_events();
 
         self.streams.retain(|_, s| !s.dead);
         Ok(())
@@ -706,7 +780,8 @@ fn reject_request_trailers(stream: &mut StreamState) -> TrailerRejection {
         ],
         false,
     ));
-    stream.pending_body = body.iter().copied().collect();
+    stream.pending_body = VecDeque::from([body.to_vec()]);
+    stream.pending_body_bytes = body.len();
     stream.body_fin = true;
     stream.fin_sent = false;
     stream.dead = false;
@@ -785,6 +860,12 @@ impl QuicServer {
         quic_settings.max_idle_timeout = Some(Duration::from_millis(transport_idle_ms));
         quic_settings.max_recv_udp_payload_size = MAX_DATAGRAM_SIZE;
         quic_settings.max_send_udp_payload_size = MAX_DATAGRAM_SIZE;
+        // ⚡ Acknowledges every inbound packet immediately. The 25 ms default
+        // delayed-ACK batches replies, which is fine for downloads but makes
+        // an upload the server keeps draining (for example an oversized body
+        // answered with 413) trickle at one packet per 25 ms round trip —
+        // nginx drains the same body at full speed.
+        quic_settings.max_ack_delay = 0;
         quic_settings.initial_max_data = 10_000_000;
         quic_settings.initial_max_stream_data_bidi_local = 1_000_000;
         quic_settings.initial_max_stream_data_bidi_remote = 1_000_000;
@@ -875,17 +956,44 @@ impl QuicServer {
                 h3_config: Arc::clone(&h3_config),
                 h3: None,
                 remote_addr,
-                streams: HashMap::new(),
+                streams: HashMap::with_capacity(32),
                 resp_tx,
                 resp_rx,
+                deferred: None,
                 body_notify: Arc::new(Notify::new()),
                 _slot: ConnectionSlot(Arc::clone(&live_connections)),
-                out: vec![0u8; MAX_DATAGRAM_SIZE],
+                out: vec![0u8; OUT_BUF_SIZE],
             });
         }
 
         Ok(())
     }
+}
+
+/// 🧯 Drops a request-body channel whose handler task has ended.
+///
+/// A handler that finished early (for example the 413 answer for an
+/// oversized body) may leave its channel full and its receiver dropped.
+/// A full channel alone would defer the drain forever — nobody can free
+/// capacity once the receiver is gone — so the drain loop clears the
+/// channel and discards the remaining bytes to keep QUIC flow control
+/// moving. Returns true when the channel was cleared.
+fn drop_closed_handler_channel(tx: &mut Option<mpsc::Sender<Vec<u8>>>) -> bool {
+    if tx.as_ref().is_some_and(|sender| sender.is_closed()) {
+        *tx = None;
+        true
+    } else {
+        false
+    }
+}
+
+/// 🔁 Returns the stream ids whose request-body drains are deferred.
+fn pending_body_drain_ids(streams: &HashMap<u64, StreamState>) -> Vec<u64> {
+    streams
+        .iter()
+        .filter(|(_, s)| s.body_read_pending)
+        .map(|(id, _)| *id)
+        .collect()
 }
 
 impl H3App {
@@ -975,27 +1083,16 @@ impl H3App {
 
         // 🛡️ HTTP/3 carries its own framing, so `Transfer-Encoding` is forbidden
         // outright here rather than merely discouraged, and `Content-Length`
-        // still has to be `1*DIGIT`. Same rule set as H1/H2, one implementation.
-        {
-            let mut headers = http::HeaderMap::new();
-            for (name, value) in &req.headers {
-                if let (Ok(name), Ok(value)) = (
-                    http::header::HeaderName::from_bytes(name.as_bytes()),
-                    http::HeaderValue::from_str(value),
-                ) {
-                    headers.append(name, value);
-                }
-            }
-            if let Err(rejection) =
-                crate::http_policy::check_request_framing(http::Version::HTTP_3, &headers)
-            {
-                tracing::warn!(
-                    "🚫 H3: rejected a request with untrustworthy message framing: {}",
-                    rejection.reason()
-                );
-                self.queue_simple_response(qconn, stream_id, 400, rejection.reason());
-                return;
-            }
+        // still has to be `1*DIGIT`. Same rule set as H1/H2, one implementation
+        // — validated over the raw header list so the request is not parsed
+        // into a throwaway `HeaderMap` before the handler needs it.
+        if let Err(rejection) = crate::http_policy::check_h3_request_framing(&req.headers) {
+            tracing::warn!(
+                "🚫 H3: rejected a request with untrustworthy message framing: {}",
+                rejection.reason()
+            );
+            self.queue_simple_response(qconn, stream_id, 400, rejection.reason());
+            return;
         }
 
         // 🧭 Same resolution as H1/H2, from the same function, so the two
@@ -1020,8 +1117,9 @@ impl H3App {
         let proxy = self.proxy.clone();
         let connector = self.connector.clone();
         let resp_tx = self.resp_tx.clone();
+        let done_tx = resp_tx.clone();
         let notify = Arc::clone(&self.body_notify);
-        let remote_ip = self.remote_addr.ip().to_string();
+        let remote_ip = self.remote_addr.ip();
 
         tokio::spawn(async move {
             handle_request(
@@ -1036,6 +1134,18 @@ impl H3App {
                 cancel_rx,
             )
             .await;
+            // 🧲 The request-body receiver is dropped here. Queue an ordered
+            // completion event so the worker wakes up even when no packet
+            // arrives — a client blocked by QUIC flow control sends nothing
+            // — and a deferred drain can observe the closed channel. A
+            // bare `Notify` would be lost when the worker is between
+            // wakeups, which is exactly the race that hung 413 uploads.
+            let _ = done_tx
+                .send(RespEvent {
+                    stream_id,
+                    msg: RespMsg::HandlerDone,
+                })
+                .await;
         });
     }
 
@@ -1057,7 +1167,8 @@ impl H3App {
             stream_id,
             StreamState {
                 pending_headers: Some((headers, false)),
-                pending_body: body.as_bytes().iter().copied().collect(),
+                pending_body: VecDeque::from([body.as_bytes().to_vec()]),
+                pending_body_bytes: body.len(),
                 body_fin: true,
                 ..Default::default()
             },
@@ -1086,6 +1197,8 @@ impl H3App {
         let mut tmp = [0u8; BODY_CHUNK_SIZE];
 
         loop {
+            drop_closed_handler_channel(&mut ss.req_body_tx);
+
             if let Some(tx) = &ss.req_body_tx
                 && tx.capacity() == 0
             {
@@ -1128,6 +1241,20 @@ impl H3App {
         }
     }
 
+    /// 🔁 Resumes every request-body drain that stopped on a full or closed
+    /// handler channel.
+    ///
+    /// Shared by [`Self::process_reads`] (packet wakeups) and
+    /// [`Self::process_writes`] (event wakeups) so the retry cannot depend
+    /// on the client sending more data — which a flow-control-blocked
+    /// upload will not do.
+    fn retry_pending_body_drains(&mut self, qconn: &mut tokio_quiche::quic::QuicheConnection) {
+        let pending_reads = pending_body_drain_ids(&self.streams);
+        for stream_id in pending_reads {
+            self.drain_request_body(qconn, stream_id);
+        }
+    }
+
     /// Apply one response message from a handler task and try to flush it.
     ///
     /// The write itself waits for `process_writes`, which the worker calls on
@@ -1148,7 +1275,8 @@ impl H3App {
                     ss.pending_headers = Some((headers, fin));
                 }
                 RespMsg::Body(bytes, fin) => {
-                    ss.pending_body.extend(bytes);
+                    ss.pending_body_bytes += bytes.len();
+                    ss.pending_body.push_back(bytes);
                     if fin {
                         ss.body_fin = true;
                     }
@@ -1156,8 +1284,67 @@ impl H3App {
                 RespMsg::Trailers(headers) => {
                     ss.pending_trailers = Some(headers);
                 }
+                RespMsg::HandlerDone => {}
             }
         }
+    }
+
+    /// 🧮 Applies handler events up to each stream's body cap.
+    ///
+    /// Events stay FIFO: the loop stops at the first event whose stream is
+    /// over [`BODY_QUEUE_CAP`] (that event becomes `deferred` and everything
+    /// behind it stays in the bounded channel), so a later event never
+    /// overtakes an earlier one. Returns whether anything was applied, which
+    /// the caller uses to avoid sleeping while work is still possible.
+    fn apply_available_events(&mut self) -> bool {
+        let mut applied = false;
+        while let Some(event) = self.take_appliable_event() {
+            self.apply_resp_event(event);
+            applied = true;
+        }
+        applied
+    }
+
+    /// 🧮 Returns the next response event that can be applied right now.
+    ///
+    /// The deferred slot is consulted first; when it is empty, exactly one
+    /// event is pulled from the channel and either returned or parked in the
+    /// slot. Later events stay in the channel, so the channel's bounded
+    /// capacity (not an unbounded worker buffer) applies backpressure.
+    fn take_appliable_event(&mut self) -> Option<RespEvent> {
+        if let Some(event) = self.deferred.take() {
+            if Self::event_fits(&self.streams, &event) {
+                return Some(event);
+            }
+            self.deferred = Some(event);
+            return None;
+        }
+        let event = self.resp_rx.try_recv().ok()?;
+        if Self::event_fits(&self.streams, &event) {
+            Some(event)
+        } else {
+            self.deferred = Some(event);
+            None
+        }
+    }
+
+    /// 🧮 Whether a response event fits its stream's body-queue cap.
+    fn event_fits(streams: &HashMap<u64, StreamState>, event: &RespEvent) -> bool {
+        match &event.msg {
+            RespMsg::Body(bytes, _) => Self::body_event_fits(streams, event.stream_id, bytes.len()),
+            _ => true,
+        }
+    }
+
+    /// 🧮 Whether a response chunk fits the stream's body-queue cap.
+    fn body_event_fits(streams: &HashMap<u64, StreamState>, stream_id: u64, bytes: usize) -> bool {
+        streams.get(&stream_id).is_none_or(|ss| {
+            // 🌊 An empty queue accepts any single chunk (a handler may
+            // legitimately produce one 512 KiB body event); the cap only
+            // gates appending more while bytes are already queued.
+            ss.pending_body_bytes == 0
+                || ss.pending_body_bytes.saturating_add(bytes) <= BODY_QUEUE_CAP
+        })
     }
 
     /// Write as much of a stream's pending response as quiche currently
@@ -1180,6 +1367,22 @@ impl H3App {
             let Some((headers, fin)) = ss.pending_headers.take() else {
                 return;
             };
+            // 🛑 An error response ends the exchange while the client may
+            // still be uploading. Tell it to stop sending with H3_NO_ERROR —
+            // ngtcp2/curl treat a `RequestRejected` STOP_SENDING as a
+            // transport failure (exit 56), while `NoError` lets it conclude
+            // the aborted upload cleanly, matching nginx's behavior.
+            let is_error_response = headers.iter().any(|header| {
+                header.name() == b":status"
+                    && (header.value().starts_with(b"4") || header.value().starts_with(b"5"))
+            });
+            if is_error_response && !ss.req_stream_finished {
+                let _ = conn.stream_shutdown(
+                    stream_id,
+                    quiche::Shutdown::Read,
+                    quiche::h3::WireErrorCode::NoError as u64,
+                );
+            }
             match h3.send_response(conn, stream_id, &headers, fin) {
                 Ok(()) => {
                     ss.headers_sent = true;
@@ -1204,12 +1407,24 @@ impl H3App {
             }
         }
 
-        while !ss.pending_body.is_empty() {
-            let (front, _) = ss.pending_body.as_slices();
-            match h3.send_body(conn, stream_id, front, false) {
+        while ss.pending_body_bytes > 0 {
+            let chunk_len = ss.pending_body.front().map_or(0, Vec::len);
+            let head = ss.pending_body_head;
+            let sent = {
+                let Some(chunk) = ss.pending_body.front() else {
+                    break;
+                };
+                h3.send_body(conn, stream_id, &chunk[head..], false)
+            };
+            match sent {
                 Ok(0) => break,
                 Ok(n) => {
-                    ss.pending_body.drain(..n);
+                    ss.pending_body_bytes -= n;
+                    ss.pending_body_head += n;
+                    if ss.pending_body_head == chunk_len {
+                        ss.pending_body.pop_front();
+                        ss.pending_body_head = 0;
+                    }
                 }
                 Err(quiche::h3::Error::Done) => break,
                 Err(e) => {
@@ -1225,7 +1440,7 @@ impl H3App {
             }
         }
 
-        if ss.pending_body.is_empty()
+        if ss.pending_body_bytes == 0
             && !ss.fin_sent
             && let Some(trailers) = ss.pending_trailers.take()
         {
@@ -1248,7 +1463,7 @@ impl H3App {
             }
         }
 
-        if ss.body_fin && ss.pending_body.is_empty() && !ss.fin_sent {
+        if ss.body_fin && ss.pending_body_bytes == 0 && !ss.fin_sent {
             match h3.send_body(conn, stream_id, b"", true) {
                 Ok(_) => ss.fin_sent = true,
                 Err(quiche::h3::Error::Done) => {}
@@ -1471,7 +1686,7 @@ async fn plan_h3_handler(
         // same templates from the same request; a redirect that only works on
         // one transport is the parity gap this crate keeps having to fix.
         HandlerConfig::Redirect { to, code } => Ok(H3Plan::Terminal(H3Terminal::Redirect {
-            to: resolve_caddy_placeholders(to, request_header, None),
+            to: resolve_caddy_placeholders(to, request_header, None).into_owned(),
             code: *code,
         })),
         HandlerConfig::Templates { root } => {
@@ -1536,7 +1751,7 @@ async fn handle_request(
     proxy: Arc<PingclairProxy>,
     connector: Arc<pingora_core::connectors::http::Connector>,
     req: H3Request,
-    remote_ip: String,
+    remote_ip: IpAddr,
     stream_id: u64,
     mut body_rx: mpsc::Receiver<Vec<u8>>,
     resp_tx: RespSender,
@@ -1557,7 +1772,7 @@ async fn handle_request(
             &proxy,
             &connector,
             &req,
-            &remote_ip,
+            remote_ip,
             stream_id,
             &mut body_rx,
             &resp_tx,
@@ -1606,7 +1821,7 @@ async fn handle_request_inner(
     proxy: &PingclairProxy,
     connector: &pingora_core::connectors::http::Connector,
     req: &H3Request,
-    peer_ip: &str,
+    peer_ip: IpAddr,
     stream_id: u64,
     body_rx: &mut mpsc::Receiver<Vec<u8>>,
     resp_tx: &RespSender,
@@ -1631,9 +1846,7 @@ async fn handle_request_inner(
     }
 
     // 🛡️ QUIC uses the same trusted-proxy identity policy as H1 and H2.
-    let peer_address = peer_ip
-        .parse::<IpAddr>()
-        .map_err(|_| (400, "Invalid Peer Address"))?;
+    let peer_address = peer_ip;
     let verified_client_ip = proxy.verified_client_ip(peer_address, &header.headers);
     let verified_client_ip_text = verified_client_ip.to_string();
 
@@ -1864,10 +2077,10 @@ async fn handle_request_inner(
                 Ok(Some(ServedResponse::Stream(mut stream))) => {
                     let mut hdrs = vec![
                         quiche::h3::Header::new(b":status", b"200"),
-                        quiche::h3::Header::new(b"content-type", stream.mime_type.as_bytes()),
+                        quiche::h3::Header::new(b"content-type", stream.content_type.as_bytes()),
                         quiche::h3::Header::new(
                             b"content-length",
-                            stream.file_size.to_string().as_bytes(),
+                            stream.content_length.as_bytes(),
                         ),
                         quiche::h3::Header::new(b"accept-ranges", b"bytes"),
                     ];
@@ -1906,11 +2119,8 @@ async fn handle_request_inner(
                 Ok(Some(ServedResponse::Buffered(file))) => {
                     let mut hdrs = vec![
                         quiche::h3::Header::new(b":status", file.status.to_string().as_bytes()),
-                        quiche::h3::Header::new(b"content-type", file.mime_type.as_bytes()),
-                        quiche::h3::Header::new(
-                            b"content-length",
-                            file.content.len().to_string().as_bytes(),
-                        ),
+                        quiche::h3::Header::new(b"content-type", file.content_type.as_bytes()),
+                        quiche::h3::Header::new(b"content-length", file.content_length.as_bytes()),
                         quiche::h3::Header::new(b"accept-ranges", b"bytes"),
                     ];
                     if let Some(range) = &file.content_range {
@@ -1978,7 +2188,7 @@ async fn reverse_proxy_upstream(
     req: &H3Request,
     client_header: &RequestHeader,
     effective_uri: &str,
-    peer_ip: &str,
+    peer_ip: IpAddr,
     verified_client_ip: &str,
     request_id: &str,
     response_policy: &ResponseHeaderPolicy,
@@ -2207,7 +2417,7 @@ async fn reverse_proxy_upstream(
             for (key, template) in &config.headers_up {
                 let resolved =
                     resolve_caddy_placeholders(template, client_header, Some(verified_client_ip));
-                up_req.insert_header(key.clone(), resolved.as_str()).ok();
+                up_req.insert_header(key.clone(), resolved.as_ref()).ok();
             }
         }
 
@@ -2231,14 +2441,12 @@ async fn reverse_proxy_upstream(
                 .insert_header("X-Forwarded-Host", req.authority.as_str())
                 .ok();
         }
-        if !has_header_up("X-Forwarded-For")
-            && let Ok(peer_address) = peer_ip.parse::<IpAddr>()
-        {
+        if !has_header_up("X-Forwarded-For") {
             up_req
                 .insert_header(
                     "X-Forwarded-For",
                     proxy
-                        .forwarded_for(peer_address, &client_header.headers)
+                        .forwarded_for(peer_ip, &client_header.headers)
                         .as_str(),
                 )
                 .ok();
@@ -2895,7 +3103,8 @@ mod tests {
         let mut stream = StreamState {
             cancel_tx: Some(cancel_tx),
             req_body_tx: Some(mpsc::channel(1).0),
-            pending_body: VecDeque::from(b"stale".to_vec()),
+            pending_body: VecDeque::from([b"stale".to_vec()]),
+            pending_body_bytes: 5,
             ..Default::default()
         };
 
@@ -2908,8 +3117,17 @@ mod tests {
         assert!(stream.req_stream_finished);
         assert!(stream.req_body_tx.is_none());
         assert_eq!(
-            stream.pending_body.iter().copied().collect::<Vec<_>>(),
+            stream
+                .pending_body
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
             b"Request Trailers Not Supported"
+        );
+        assert_eq!(
+            stream.pending_body_bytes,
+            b"Request Trailers Not Supported".len()
         );
         let (headers, fin) = stream.pending_headers.as_ref().unwrap();
         assert!(!fin);
@@ -2918,6 +3136,103 @@ mod tests {
                 .iter()
                 .any(|header| header.name() == b":status" && header.value() == b"501")
         );
+    }
+
+    #[test]
+    fn full_closed_body_channel_switches_to_discard_mode() {
+        // 🧠 Regression: a handler that answered 413 for an oversized body can
+        // leave its request-body channel full with its receiver dropped. The
+        // drain loop must detect the closed channel and clear it even when
+        // `capacity() == 0`, or the deferred drain never resumes and the
+        // client's upload hangs forever on closed QUIC flow control.
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
+        tx.try_send(vec![0x42]).unwrap();
+        drop(rx);
+
+        let mut stream = StreamState {
+            req_body_tx: Some(tx),
+            body_read_pending: true,
+            ..Default::default()
+        };
+
+        assert!(drop_closed_handler_channel(&mut stream.req_body_tx));
+        assert!(stream.req_body_tx.is_none());
+        assert!(stream.body_read_pending, "cleared by the next drain pass");
+    }
+
+    #[test]
+    fn alive_full_body_channel_is_not_dropped() {
+        // 🧠 A live handler may still be draining: dropping its channel now
+        // would discard bytes the handler still needs. Only a closed
+        // receiver may be cleared.
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(1);
+        tx.try_send(vec![0x42]).unwrap();
+
+        let mut stream = StreamState {
+            req_body_tx: Some(tx),
+            ..Default::default()
+        };
+
+        assert!(!drop_closed_handler_channel(&mut stream.req_body_tx));
+        assert!(stream.req_body_tx.is_some());
+    }
+
+    #[test]
+    fn pending_drain_ids_only_include_deferred_streams() {
+        // 🧠 The retry pass must resume exactly the streams whose drain
+        // stopped on a full channel, leaving healthy streams untouched.
+        let mut streams = HashMap::new();
+        streams.insert(0, StreamState::default());
+        streams.insert(
+            4,
+            StreamState {
+                body_read_pending: true,
+                ..Default::default()
+            },
+        );
+        streams.insert(
+            8,
+            StreamState {
+                body_read_pending: true,
+                req_stream_finished: true,
+                ..Default::default()
+            },
+        );
+
+        let mut pending = pending_body_drain_ids(&streams);
+        pending.sort_unstable();
+        assert_eq!(pending, vec![4, 8]);
+    }
+
+    #[test]
+    fn body_event_fits_respects_the_per_stream_cap() {
+        // 🧠 The backlog must defer body chunks that would push a stream over
+        // `BODY_QUEUE_CAP`; unknown streams are treated as fitting so their
+        // events drain to a harmless no-op. An empty queue always fits so a
+        // single oversized chunk (e.g. one 512 KiB handler body) cannot be
+        // stranded in the backlog forever.
+        let mut streams = HashMap::new();
+        streams.insert(
+            0,
+            StreamState {
+                pending_body_bytes: BODY_QUEUE_CAP,
+                ..Default::default()
+            },
+        );
+        streams.insert(
+            4,
+            StreamState {
+                pending_body_bytes: BODY_QUEUE_CAP - 1,
+                ..Default::default()
+            },
+        );
+        streams.insert(12, StreamState::default());
+
+        assert!(!H3App::body_event_fits(&streams, 0, 1));
+        assert!(H3App::body_event_fits(&streams, 4, 1));
+        assert!(!H3App::body_event_fits(&streams, 4, BODY_QUEUE_CAP));
+        assert!(H3App::body_event_fits(&streams, 8, usize::MAX / 2));
+        assert!(H3App::body_event_fits(&streams, 12, BODY_QUEUE_CAP * 4));
     }
 
     #[test]
@@ -3026,7 +3341,7 @@ mod tests {
             &request,
             &client_header,
             &request.path,
-            "127.0.0.1",
+            "127.0.0.1".parse().unwrap(),
             "127.0.0.1",
             "retry-request-id",
             &ResponseHeaderPolicy::default(),
@@ -3118,7 +3433,7 @@ mod tests {
             &request,
             &client_header,
             &request.path,
-            "127.0.0.1",
+            "127.0.0.1".parse().unwrap(),
             "127.0.0.1",
             "circuit-request-id",
             &ResponseHeaderPolicy::default(),
@@ -3144,7 +3459,7 @@ mod tests {
             &request,
             &client_header,
             &request.path,
-            "127.0.0.1",
+            "127.0.0.1".parse().unwrap(),
             "127.0.0.1",
             "circuit-request-id",
             &ResponseHeaderPolicy::default(),
@@ -3232,7 +3547,7 @@ mod tests {
             &request,
             &client_header,
             &request.path,
-            "127.0.0.1",
+            "127.0.0.1".parse().unwrap(),
             "127.0.0.1",
             "test-request-id",
             &ResponseHeaderPolicy::default(),

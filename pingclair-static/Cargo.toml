@@ -15,6 +15,7 @@ async-trait.workspace = true
 tracing.workspace = true
 http.workspace = true
 bytes.workspace = true
+arc-swap.workspace = true
 mime_guess.workspace = true
 httpdate = "1.0"
 anyhow.workspace = true

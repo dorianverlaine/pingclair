@@ -75,4 +75,10 @@ bench_*
 # 🔒 Local Caddy reference and audit docs — kept on disk for the audit
 # session but not part of the shipped repository.
 docs/CADDYFILE*.md
-vendor/
+
+# ⚡ Vendored crates: the h2 performance fork ships with the repository
+# (see vendor/h2/PINGCLAIR_PATCH.md); anything else under vendor/ is local
+# scratch space.
+vendor/*
+!vendor/h2/
+vendor/h2/Cargo.lock

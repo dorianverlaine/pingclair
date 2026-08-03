@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use http::{HeaderMap, Method};
 use pingora_core::Result as PingoraResult;
 use pingora_http::ResponseHeader;
@@ -27,9 +28,6 @@ pub(crate) fn authority_host(authority: &str) -> &str {
         .map_or(authority, |(host, _)| host)
 }
 
-/// 🔀 The pseudonym this proxy identifies itself by in `Via`.
-pub(crate) const VIA_PSEUDONYM: &str = "Pingclair";
-
 /// 🔀 The `Via` protocol-version token for one hop, per RFC 9110 §7.6.3.
 ///
 /// The token describes the protocol the message was **received** over, not the
@@ -50,15 +48,61 @@ pub(crate) fn via_version(version: http::Version) -> &'static str {
 }
 
 /// 🔀 This hop's `Via` field value, e.g. `1.1 Pingclair`.
-pub(crate) fn via_value(version: http::Version) -> String {
-    format!("{} {VIA_PSEUDONYM}", via_version(version))
+///
+/// The token only depends on the protocol version, so the five possible
+/// values are `'static` — building a `String` per proxied request was pure
+/// per-request allocation on the hot path.
+pub(crate) fn via_value(version: http::Version) -> &'static str {
+    match via_version(version) {
+        "0.9" => "0.9 Pingclair",
+        "1.0" => "1.0 Pingclair",
+        "1.1" => "1.1 Pingclair",
+        "2.0" => "2.0 Pingclair",
+        "3.0" => "3.0 Pingclair",
+        // `via_version` returns "1.1" for anything else; keep them in lockstep.
+        _ => "1.1 Pingclair",
+    }
+}
+
+/// ➕ One appended header, with its wire-ready forms built once.
+///
+/// The precomputed name and value used to live in two `Vec`s running
+/// alongside the name/value pair, indexed in lockstep. They did not stay in
+/// lockstep: the value was looked up by name rather than by position, so two
+/// appends of the same field name both emitted the first one's value —
+/// `header +Vary Accept-Encoding` on a CORS route silently dropped
+/// `Vary: Origin`, which is how a shared cache ends up serving one origin's
+/// response to another. Keeping the four fields in one record makes that
+/// class of drift unrepresentable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AddedHeader {
+    /// Lowercased field name, as protocol adapters and merges see it.
+    name: String,
+    /// The configured value verbatim, kept for the invalid-value error path.
+    value: String,
+    /// Precompiled name bytes: `Bytes` is the cheapest `IntoCaseHeaderName`
+    /// input, since cloning one is a shared-bytes reference bump.
+    name_bytes: Bytes,
+    /// Precompiled value. `None` means the configured string is not a valid
+    /// header value, which preserves the request-time error path.
+    header_value: Option<http::HeaderValue>,
 }
 
 /// 🧭 Stores transport-neutral downstream header mutations in execution order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ResponseHeaderPolicy {
     set: HashMap<String, String>,
-    add: Vec<(String, String)>,
+    /// Precompiled header-name bytes for `set`: `Bytes` is the cheapest
+    /// `IntoCaseHeaderName` input (clone is a shared-bytes reference bump),
+    /// and building it once here keeps the per-request name path free of
+    /// `String` clones and re-parses.
+    set_names: HashMap<String, Bytes>,
+    /// Precompiled `HeaderValue`s for `set`: cloning one is a shared-bytes
+    /// reference bump, while re-parsing the stored string on every request
+    /// copies the bytes. `None` means the configured value was not a valid
+    /// header value, in which case the request-time error path is preserved.
+    set_values: HashMap<String, Option<http::HeaderValue>>,
+    add: Vec<AddedHeader>,
     remove: Vec<String>,
     suppress_server: bool,
     suppress_via: bool,
@@ -67,14 +111,25 @@ pub(crate) struct ResponseHeaderPolicy {
 impl ResponseHeaderPolicy {
     /// 📝 Replaces a downstream header with one normalized value.
     pub(crate) fn set(&mut self, name: impl AsRef<str>, value: impl Into<String>) {
-        self.set
-            .insert(name.as_ref().to_ascii_lowercase(), value.into());
+        let name = name.as_ref().to_ascii_lowercase();
+        let value = value.into();
+        self.set_names
+            .insert(name.clone(), Bytes::copy_from_slice(name.as_bytes()));
+        self.set_values
+            .insert(name.clone(), http::HeaderValue::from_str(&value).ok());
+        self.set.insert(name, value);
     }
 
     /// ➕ Appends one downstream header value after replacement mutations.
     pub(crate) fn add(&mut self, name: impl AsRef<str>, value: impl Into<String>) {
-        self.add
-            .push((name.as_ref().to_ascii_lowercase(), value.into()));
+        let name = name.as_ref().to_ascii_lowercase();
+        let value = value.into();
+        self.add.push(AddedHeader {
+            name_bytes: Bytes::copy_from_slice(name.as_bytes()),
+            header_value: http::HeaderValue::from_str(&value).ok(),
+            name,
+            value,
+        });
     }
 
     /// 🧹 Removes a downstream header after every set and append mutation.
@@ -94,15 +149,22 @@ impl ResponseHeaderPolicy {
     /// 🧩 Adds proxy-owned replacements without overriding outer middleware.
     pub(crate) fn merge_proxy_set(&mut self, headers: &HashMap<String, String>) {
         for (name, value) in headers {
-            self.set
-                .entry(name.to_ascii_lowercase())
-                .or_insert_with(|| value.clone());
+            let name = name.to_ascii_lowercase();
+            if !self.set.contains_key(&name) {
+                self.set_names
+                    .insert(name.clone(), Bytes::copy_from_slice(name.as_bytes()));
+                self.set_values
+                    .insert(name.clone(), http::HeaderValue::from_str(value).ok());
+                self.set.insert(name, value.clone());
+            }
         }
     }
 
     /// 🔗 Merges a middleware decision into the active response policy.
     pub(crate) fn merge(&mut self, other: ResponseHeaderPolicy) {
         self.set.extend(other.set);
+        self.set_names.extend(other.set_names);
+        self.set_values.extend(other.set_values);
         self.add.extend(other.add);
         for name in other.remove {
             self.remove(name);
@@ -115,14 +177,29 @@ impl ResponseHeaderPolicy {
     pub(crate) fn apply_pingora(
         &self,
         response: &mut ResponseHeader,
-        request_id: &str,
+        request_id: &http::HeaderValue,
         via_hop: Option<http::Version>,
     ) -> PingoraResult<()> {
         for (name, value) in &self.set {
-            response.insert_header(name.clone(), value.as_str())?;
+            let name_bytes = &self.set_names[name];
+            match self.set_values.get(name).and_then(|v| v.clone()) {
+                Some(header_value) => {
+                    response.insert_header(name_bytes.clone(), header_value)?;
+                }
+                None => {
+                    response.insert_header(name_bytes.clone(), value.as_str())?;
+                }
+            }
         }
-        for (name, value) in &self.add {
-            response.append_header(name.clone(), value.as_str())?;
+        for added in &self.add {
+            match &added.header_value {
+                Some(header_value) => {
+                    response.append_header(added.name_bytes.clone(), header_value.clone())?;
+                }
+                None => {
+                    response.append_header(added.name_bytes.clone(), added.value.as_str())?;
+                }
+            }
         }
         for name in &self.remove {
             let _ = response.remove_header(name);
@@ -141,7 +218,7 @@ impl ResponseHeaderPolicy {
             response.append_header("via", via_value(version))?;
         }
 
-        response.insert_header("x-request-id", request_id)?;
+        response.insert_header("x-request-id", request_id.clone())?;
         Ok(())
     }
 
@@ -161,7 +238,7 @@ impl ResponseHeaderPolicy {
     pub(crate) fn add_headers(&self) -> impl Iterator<Item = (&str, &str)> {
         self.add
             .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .map(|added| (added.name.as_str(), added.value.as_str()))
     }
 
     /// 🌐 Exposes normalized removals to protocol adapters.
@@ -441,6 +518,7 @@ impl FramingRejection {
 /// like `+5` is the ideal smuggling primitive: lenient parsers read five bytes
 /// and strict ones reject, so the two ends of a chain disagree about how much
 /// body they just consumed.
+/// 🛡️ Rejects requests whose length is open to more than one reading.
 pub(crate) fn check_request_framing(
     version: http::Version,
     headers: &HeaderMap,
@@ -462,11 +540,44 @@ pub(crate) fn check_request_framing(
     // a lenient reader might take the first and a strict one the last.
     for value in headers.get_all(http::header::CONTENT_LENGTH) {
         let raw = value.as_bytes();
-        if raw.is_empty() || !raw.iter().all(u8::is_ascii_digit) {
+        if content_length_value_invalid(raw) {
             return Err(FramingRejection::MalformedContentLength);
         }
     }
 
+    Ok(())
+}
+
+/// 🔢 True when a `Content-Length` field value violates RFC 9110 §8.6's
+/// `1*DIGIT` grammar (empty, signed, whitespace-padded, or non-digit bytes).
+fn content_length_value_invalid(raw: &[u8]) -> bool {
+    raw.is_empty() || !raw.iter().all(u8::is_ascii_digit)
+}
+
+/// 🛡️ Rejects an HTTP/3 request whose raw header list carries untrustworthy
+/// framing, without materializing an [`http::HeaderMap`] just to validate it.
+///
+/// `quiche` already enforces H3's wire framing, so the only fields this proxy
+/// still has to police are `Transfer-Encoding` (forbidden outright) and
+/// `Content-Length` (`1*DIGIT`, every duplicate). This is the same rule set as
+/// [`check_request_framing`], expressed over the header list `parse_h3_request`
+/// already owns, so the H3 event loop does not parse each header twice.
+pub(crate) fn check_h3_request_framing(
+    headers: &[(String, String)],
+) -> Result<(), FramingRejection> {
+    let has_transfer_encoding = headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"));
+    if has_transfer_encoding {
+        return Err(FramingRejection::TransferEncodingForbidden);
+    }
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-length")
+            && content_length_value_invalid(value.as_bytes())
+        {
+            return Err(FramingRejection::MalformedContentLength);
+        }
+    }
     Ok(())
 }
 
@@ -846,6 +957,57 @@ mod tests {
     }
 
     #[test]
+    fn h3_framing_matches_the_shared_rule_set() {
+        // 📋 The raw-list variant must reach the same verdict as the
+        // HeaderMap variant for every framing decision the H3 event loop can
+        // produce.
+        for headers in [
+            vec![],
+            vec![("content-length", "5")],
+            vec![("Content-Length", "5")],
+            vec![("content-length", "5"), ("content-length", "5")],
+            vec![("transfer-encoding", "chunked")],
+            vec![("Transfer-Encoding", "chunked"), ("content-length", "6")],
+            vec![("content-length", "")],
+            vec![("content-length", "5 ")],
+            vec![("content-length", "-5")],
+            vec![("content-length", "5"), ("content-length", "x")],
+            vec![("content-length", "5"), ("Content-Length", "6")],
+        ] {
+            let list: Vec<(String, String)> = headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+            let mut map = http::HeaderMap::new();
+            for (name, value) in &list {
+                if let (Ok(name), Ok(value)) = (
+                    http::header::HeaderName::from_bytes(name.as_bytes()),
+                    http::HeaderValue::from_str(value),
+                ) {
+                    map.append(name, value);
+                }
+            }
+            assert_eq!(
+                check_h3_request_framing(&list),
+                check_request_framing(http::Version::HTTP_3, &map),
+                "H3 list framing diverged from the shared rule for {headers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn h3_framing_fails_closed_on_values_the_header_map_cannot_carry() {
+        // 🚨 A value that cannot become an `http::HeaderValue` was silently
+        // dropped by the old H3 path, which then accepted the request. The
+        // raw-list variant rejects it instead, matching the H1/H2 rule that
+        // a declared `Content-Length` must be `1*DIGIT`.
+        assert_eq!(
+            check_h3_request_framing(&[("content-length".to_string(), "5\x01".to_string())]),
+            Err(FramingRejection::MalformedContentLength)
+        );
+    }
+
+    #[test]
     fn framing_rejects_content_length_that_is_not_all_digits() {
         for bad in ["+5", " 5", "5 ", "", "5,5", "0x5", "-1", "५"] {
             assert_eq!(
@@ -962,9 +1124,70 @@ mod tests {
 
     // ---- Via (RFC 9110 §7.6.3) ----
 
+    #[test]
+    fn repeated_append_of_one_name_keeps_each_value() {
+        // 🚨 Two appends of the same field name must emit both values. The
+        // precomputed value used to be looked up by name, so the second
+        // append re-emitted the first one's value.
+        let mut policy = ResponseHeaderPolicy::default();
+        policy.add("link", "</a.css>; rel=preload");
+        policy.add("link", "</b.js>; rel=preload");
+        assert_eq!(
+            header_values(&applied(&policy, None), "link"),
+            vec!["</a.css>; rel=preload", "</b.js>; rel=preload"]
+        );
+    }
+
+    #[test]
+    fn merged_cors_vary_survives_a_route_that_appends_its_own_vary() {
+        // 🚨 The reachable form of the same defect: a route configured with
+        // `header +Vary Accept-Encoding` merged with the CORS decision's own
+        // `Vary: Origin`. Losing `Origin` lets a shared cache serve one
+        // origin's CORS response to a different origin.
+        let mut route = ResponseHeaderPolicy::default();
+        route.add("vary", "Accept-Encoding");
+        let mut cors = ResponseHeaderPolicy::default();
+        cors.add("vary", "Origin");
+        route.merge(cors);
+        assert_eq!(
+            header_values(&applied(&route, None), "vary"),
+            vec!["Accept-Encoding", "Origin"]
+        );
+    }
+
+    #[test]
+    fn an_invalid_appended_value_still_reaches_its_own_error_path() {
+        // 🛡️ A value that cannot become a `HeaderValue` falls back to the
+        // string path, and must not borrow a neighbour's precompiled value.
+        let mut policy = ResponseHeaderPolicy::default();
+        policy.add("x-test", "fine");
+        policy.add("x-test", "bad\u{0}value");
+        let mut response = ResponseHeader::build(200, None).unwrap();
+        let result = policy.apply_pingora(
+            &mut response,
+            &http::HeaderValue::from_static("req-1"),
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "an invalid header value must not be silently accepted"
+        );
+    }
+
+    fn header_values(response: &ResponseHeader, name: &str) -> Vec<String> {
+        response
+            .headers
+            .get_all(name)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect()
+    }
+
     fn applied(policy: &ResponseHeaderPolicy, hop: Option<http::Version>) -> ResponseHeader {
         let mut response = ResponseHeader::build(200, None).unwrap();
-        policy.apply_pingora(&mut response, "req-1", hop).unwrap();
+        policy
+            .apply_pingora(&mut response, &http::HeaderValue::from_static("req-1"), hop)
+            .unwrap();
         response
     }
 
@@ -1009,7 +1232,11 @@ mod tests {
         let mut response = ResponseHeader::build(200, None).unwrap();
         response.insert_header("via", "1.1 upstream-cache").unwrap();
         ResponseHeaderPolicy::default()
-            .apply_pingora(&mut response, "req-1", Some(http::Version::HTTP_11))
+            .apply_pingora(
+                &mut response,
+                &http::HeaderValue::from_static("req-1"),
+                Some(http::Version::HTTP_11),
+            )
             .unwrap();
 
         assert_eq!(
@@ -1029,7 +1256,11 @@ mod tests {
         let mut response = ResponseHeader::build(200, None).unwrap();
         response.insert_header("via", "1.1 upstream-cache").unwrap();
         policy
-            .apply_pingora(&mut response, "req-1", Some(http::Version::HTTP_11))
+            .apply_pingora(
+                &mut response,
+                &http::HeaderValue::from_static("req-1"),
+                Some(http::Version::HTTP_11),
+            )
             .unwrap();
 
         assert!(via_values(&response).is_empty());

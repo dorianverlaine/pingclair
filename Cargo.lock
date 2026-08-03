@@ -1588,8 +1588,6 @@ dependencies = [
 [[package]]
 name = "h2"
 version = "0.4.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cb093c84e8bd9b188d4c4a8cb6579fc016968d14c99882163cd3ff402a4f155"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -2837,6 +2835,7 @@ name = "pingclair-static"
 version = "0.1.7"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-compression",
  "async-trait",
  "bytes",

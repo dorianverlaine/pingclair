@@ -1,0 +1,25 @@
+{
+    auto_https off
+    admin off
+}
+
+http://bench.local:8080 {
+    handle /proxy/* {
+        reverse_proxy 127.0.0.1:9000
+    }
+    handle {
+        root * /var/www/html
+        file_server
+    }
+}
+
+https://h3.local:8443 {
+    tls /tmp/bench.crt /tmp/bench.key
+    handle /proxy/* {
+        reverse_proxy 127.0.0.1:9000
+    }
+    handle {
+        root * /var/www/html
+        file_server
+    }
+}
