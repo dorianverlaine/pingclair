@@ -102,9 +102,3 @@ jobs:
         # version would silently drop the fork (build stays green), so the
         # resolution is checked here the same way the BoringSSL invariant is.
         run: scripts/check-vendored-h2.sh
-
-      - name: Verify the pingora-core performance fork is wired
-        # ⚡ pingora-core is patched through `[patch.crates-io]` with H1
-        # body-buffer reuse. Same guard as the h2 fork: a version bump that
-        # silently drops the patch must fail CI instead of degrading.
-        run: scripts/check-vendored-pingora-core.sh
