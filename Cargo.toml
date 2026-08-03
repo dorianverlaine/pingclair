@@ -10,7 +10,7 @@ members = [
     "pingclair-api",
     "pingclair-plugin",
 ]
-exclude = ["vendor/h2"]
+exclude = ["vendor/h2", "vendor/pingora-core"]
 
 [workspace.package]
 version = "0.1.7"
@@ -128,8 +128,15 @@ arc-swap = "1"
 # `Bytes` refcount header on every HEADERS frame. The common
 # no-continuation path now performs zero header-block allocations per
 # request. See `vendor/h2/PINGCLAIR_PATCH.md` for the exact diff.
+#
+# `pingora-core 0.8.1` is forked with one change: the H1 `BodyReader`
+# reuses its 64 KiB read buffer across keepalive requests instead of
+# allocating a fresh buffer per message body — the dominant allocation in
+# the proxy-path profile (~91 % of cumulative bytes). See
+# `vendor/pingora-core/PINGCLAIR_PATCH.md` for the exact diff.
 [patch.crates-io]
 h2 = { path = "vendor/h2" }
+pingora-core = { path = "vendor/pingora-core" }
 
 [profile.release]
 lto = "fat"
