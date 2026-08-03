@@ -66,7 +66,12 @@ jobs:
           # developer subject to hold to the house style.
           while read -r hash; do
             subject="$(git log -1 --format=%s "$hash")"
-            if ! printf '%s' "$subject" | grep -qP '^[^\x00-\x7F]+ [a-z]+(\([a-z0-9_, -]+\))?: '; then
+            # 🧩 `/` is allowed in a scope alongside `,`: the repository
+            # spells multi-subsystem scopes both ways (`proxy,signal,api`
+            # and `h1/h2`), and rewriting an already-pushed subject to
+            # satisfy the narrower charset would cost a force-push over a
+            # cosmetic difference.
+            if ! printf '%s' "$subject" | grep -qP '^[^\x00-\x7F]+ [a-z]+(\([a-z0-9_,/ -]+\))?: '; then
               echo "::error::$hash subject does not start with an emoji and a conventional type: \"$subject\""
               err=1
             fi
