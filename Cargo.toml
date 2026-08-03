@@ -129,12 +129,23 @@ arc-swap = "1"
 # no-continuation path now performs zero header-block allocations per
 # request. See `vendor/h2/PINGCLAIR_PATCH.md` for the exact diff.
 #
-# 🎯 This is the last fork standing, and it is the only one that was ever
-# measured against the upstream project's own benchmark rather than ours:
-# +3.8 % on h2's multi-threaded 100k-request bench, faster in 24 of 25
-# pairwise comparisons (exact permutation test, p = 0.016). It is submitted
-# upstream as hyperium/h2#929; when that lands, delete `vendor/h2` and this
-# `[patch]` section rather than carrying the fork forward.
+# 🎯 This is the last fork standing, and the only one ever measured against
+# the upstream project's own benchmark rather than ours: +3.8 % on h2's
+# multi-threaded 100k-request bench, faster in 24 of 25 pairwise comparisons
+# (exact permutation test, p = 0.016).
+#
+# ✅ Upstream accepted it. hyperium/h2#929 was merged on 2026-08-03 as
+# `27b730ee2b10617bc79c4588b05e64afe2d1a432`, verbatim — `git diff` between
+# the submitted commit and h2 master is empty for both patched files. So this
+# directory is not a divergence from upstream any more; it is upstream, early.
+#
+# ⏳ Merged is not released. The newest h2 release is still `0.4.15`
+# (2026-06-15), which predates the merge, so deleting `vendor/h2` today would
+# give the optimization back until h2 cuts its next release. Keep the patch
+# until an h2 release contains the commit above, then delete `vendor/h2`,
+# this `[patch]` section, `scripts/check-vendored-h2.sh`, its `lint.yml` step,
+# and the second audit pass in `security-audit.yml` — the whole apparatus
+# exists only to hold this one fork safely.
 #
 # 🚫 Two other forks were evaluated and removed on 2026-08-04, both for the
 # same reason — a plausible mechanism that never showed up in a measurement
