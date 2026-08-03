@@ -37,38 +37,26 @@ Whether you need a simple static file server or an enterprise gateway with load 
 
 ## ⚡ Benchmarks
 
-Pingclair commit `ca773af`, nginx, and Caddy ran one at a time on an x86
-`t3.small` in AWS Oregon. A second same-AZ `t3.small` generated load over the
-private network. The table reports the median of three recorded rounds.
+Latest comparison: Pingclair HEAD `43ec589` vs nginx 1.31.3, measured on
+three `c7i-flex.large` instances (2 vCPU each, non-burstable) in AWS
+`us-west-2a`, with the reverse-proxy backend on a dedicated host. 1 KiB
+file; H1 via `wrk -t2 -c100`, H2/H1S via `h2load -t2 -c50`; all recorded
+rounds had zero failures.
 
-| Scenario | Pingclair | nginx 1.28.3 | Caddy 2.11.4 |
-| --- | ---: | ---: | ---: |
-| H1 static, 1 KiB | 38,862.71 req/s | 61,178.61 | 14,442.93 |
-| HTTPS/H1 static, 1 KiB | 31,018.40 req/s | 43,806.16 | 14,617.83 |
-| H2 static, 1 KiB | 33,004.03 req/s | 57,487.59 | 10,212.16 |
-| H1 reverse proxy, 1 KiB | 11,474.42 req/s | 11,876.71 | 6,998.97 |
-| H2 reverse proxy, 1 KiB | 10,471.76 req/s | 10,537.69 | 4,300.58 |
-| H3, fresh connection + 1 KiB static | 128.93 req/s | 143.14 | 151.84 |
-| H3, reused connections + 1 KiB static | 1,550.21 req/s | 1,694.08 | 1,834.92 |
-| H3, reused connections + reverse proxy | 1,396.32 req/s | 1,447.61 | 1,914.65 |
-| H1 static, 1 MiB random | 590.91 MiB/s | 590.62 | 590.74 |
-| H1 warm gzip, 1 MiB compressible | 44,966.58 req/s | 833.18 | 2,374.64 |
-| WSS echo, 50 connections | 14,029.97 msg/s | 14,937.19 | 13,461.07 |
+| Scenario | Pingclair | nginx 1.31.3 |
+| --- | ---: | ---: |
+| H1 static | 84,208 | 105,588 |
+| H2 static (50×10) | 74,587 | 94,712 |
+| H1S static | 70,004 | 55,304 |
+| H1 reverse proxy | 38,938 | 85,744 |
+| H2 reverse proxy (50×10) | 33,516 | 45,872 |
+| H1S reverse proxy | 34,418 | 55,894 |
 
-wrk used 2 threads and 100 connections for H1; h2load used 50 clients and 10
-streams per connection; aioquic used 30-way H3 concurrency; and the native
-amd64 WebSocket client used 50 persistent connections. Each workload had a
-warm-up followed by three rounds. Bodies, HTTP versions, decompressed gzip,
-and response hashes were verified before load; all published H2, H3, and WSS
-rounds had zero client-reported failures. The shared backend reached 63.3k
-req/s directly, so it did not cap the proxy rows. The 1 MiB static row reached
-the network ceiling. Pingclair's warm gzip row benefits from its compressed
-static-response cache, while the tested nginx and Caddy configurations
-compress each request.
-
-See [`benchmarks/README.md`](benchmarks/README.md) for the exact environment,
-commands, checksums, configurations, and binary hashes. Raw per-run evidence
-is kept locally and is not part of the repository.
+Pingclair leads on H1S static (+27 %). Static H1/H2 trail about 20 %;
+reverse-proxy H1/H1S remain the largest gaps, with H2 proxy trailing about
+27 %. Raw per-run evidence is kept locally under
+`benchmarks/results/20260803_c7iflex_nocase/` and is not part of the
+repository.
 
 ## 📦 Installation
 
