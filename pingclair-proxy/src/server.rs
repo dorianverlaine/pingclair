@@ -4150,6 +4150,12 @@ impl ProxyHttp for PingclairProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // ⚡ Field names are case-insensitive; release the parsed case map
+        // so hop-by-hop stripping, our inserts, and the upstream write all
+        // skip it (the HTTP/1 wire keeps conventional casing via the titled
+        // map).
+        upstream_request.drop_case();
+
         // 🧹 Hop-by-hop fields stop here, before anything of ours is added.
         //
         // Doing this first matters twice over: a client naming our own fields in
@@ -4262,6 +4268,9 @@ impl ProxyHttp for PingclairProxy {
         Self::CTX: Send + Sync,
     {
         Self::enforce_retry_deadline(ctx)?;
+        // ⚡ Release the parsed case map before any insert or the downstream
+        // write — same reasoning as `upstream_request_filter`.
+        upstream_response.drop_case();
         if upstream_response.headers.contains_key("trailer") {
             tracing::warn!(
                 "🚫 Rejecting an upstream response that requires unsupported trailer forwarding"

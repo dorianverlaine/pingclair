@@ -100,6 +100,17 @@ impl DerefMut for RequestHeader {
 }
 
 impl RequestHeader {
+    /// ⚡ Drop the case-preserving name map (Pingclair fork).
+    ///
+    /// HTTP field names are case-insensitive; once request processing no
+    /// longer needs the original casing (for example after hop-by-hop
+    /// stripping), releasing the map frees its per-header allocations and
+    /// later inserts skip it entirely. The HTTP/1 wire serializer falls
+    /// back to the conventional titled map.
+    pub fn drop_case(&mut self) {
+        self.header_name_map = None;
+    }
+
     fn new_no_case(size_hint: Option<usize>) -> Self {
         let mut base = ReqBuilder::new().body(()).unwrap().into_parts().0;
         base.headers.reserve(http_header_map_upper_bound(size_hint));
@@ -428,6 +439,16 @@ impl From<Box<ResponseHeader>> for Box<RespParts> {
 }
 
 impl ResponseHeader {
+    /// ⚡ Drop the case-preserving name map (Pingclair fork).
+    ///
+    /// See [`RequestHeader::drop_case`]. Responses parsed from upstream keep
+    /// a case map that is only needed for transparent wire casing; dropping
+    /// it before forwarding saves per-header allocations on every proxied
+    /// response.
+    pub fn drop_case(&mut self) {
+        self.header_name_map = None;
+    }
+
     fn new(size_hint: Option<usize>) -> Self {
         let mut resp_header = Self::new_no_case(size_hint);
         resp_header.header_name_map = Some(CaseMap::with_capacity(http_header_map_upper_bound(

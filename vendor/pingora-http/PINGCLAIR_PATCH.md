@@ -21,13 +21,21 @@ X-Request-Id, the X-Forwarded-* family, security-policy headers, etc.), so
 no-case responses still hit the wire with conventional casing
 (RFC 9110 §5.1 makes field names case-insensitive either way).
 
+It also adds `RequestHeader::drop_case()` / `ResponseHeader::drop_case()`:
+the case-preserving map is only needed while the original wire casing is
+still wanted. Pingclair releases it on the proxy path once hop-by-hop
+processing is done, so upstream requests and downstream responses skip the
+per-header `CaseMap` allocations entirely (casing stays conventional via
+the same titled map).
+
 ## Upgrading
 
 ```bash
 rm -rf vendor/pingora-http
 cp -R ~/.cargo/registry/src/index.crates.io-*/pingora-http-<version> vendor/pingora-http
 rm -f vendor/pingora-http/.cargo-ok vendor/pingora-http/.cargo_vcs_info.json
-# Re-apply the titled_header_name_str hunk, then run the workspace gates.
+# Re-apply the titled_header_name_str and drop_case hunks, then run the
+# workspace gates.
 ```
 
 Verify with `cargo tree -i pingora-http` (must show the `vendor/` path).
