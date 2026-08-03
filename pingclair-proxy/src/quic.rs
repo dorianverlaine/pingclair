@@ -3765,4 +3765,138 @@ mod tests {
             header.name() == b"x-request-id" && header.value() == b"request-123"
         }));
     }
+
+    // MARK: - Cross-transport policy parity
+
+    /// 🔀 Renders a policy the way the HTTP/1.1 and HTTP/2 path renders it.
+    ///
+    /// `via_hop` is `None` on purpose: H3 appends `Via` at its own call sites
+    /// rather than inside [`apply_h3_response_policy`], so including it here
+    /// would compare two things that were never meant to line up. Everything
+    /// else in the shared policy — replacements, appends, removals, the
+    /// `Server` decision and the request id — is common ground.
+    fn rendered_by_pingora(policy: &ResponseHeaderPolicy) -> Vec<(String, String)> {
+        let mut response = pingora_http::ResponseHeader::build(200, None).unwrap();
+        policy
+            .apply_pingora(
+                &mut response,
+                &http::HeaderValue::from_static("request-123"),
+                None,
+            )
+            .expect("the policy must apply cleanly");
+        let mut rendered: Vec<(String, String)> = response
+            .headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_ascii_lowercase(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        rendered.sort();
+        rendered
+    }
+
+    /// 🔀 Renders the same policy the way the HTTP/3 path renders it.
+    fn rendered_by_h3(policy: &ResponseHeaderPolicy) -> Vec<(String, String)> {
+        let mut headers = vec![quiche::h3::Header::new(b":status", b"200")];
+        apply_h3_response_policy(&mut headers, policy, "request-123", None);
+        let mut rendered: Vec<(String, String)> = headers
+            .iter()
+            // 🚫 `:status` has no HeaderMap counterpart; it is framing, not a field.
+            .filter(|header| !header.name().starts_with(b":"))
+            .map(|header| {
+                (
+                    String::from_utf8_lossy(header.name()).to_ascii_lowercase(),
+                    String::from_utf8_lossy(header.value()).into_owned(),
+                )
+            })
+            .collect();
+        rendered.sort();
+        rendered
+    }
+
+    /// 🛡️ The shared policy layer must mean the same thing on both transports.
+    ///
+    /// This exists because it keeps not being true. The most recent instance:
+    /// `apply_pingora` looked an appended header's precomputed value up by
+    /// name instead of by position, so a route with `header +Vary
+    /// Accept-Encoding` merged with CORS emitted `Vary: Accept-Encoding`
+    /// twice and dropped `Vary: Origin` — while H3, which reads the pairs
+    /// directly, stayed correct. Both transports had their own passing tests;
+    /// nothing compared them to each other.
+    ///
+    /// Comparison is over the sorted multiset rather than the sequence,
+    /// because `set` is a `HashMap` and its iteration order is not stable.
+    /// A multiset still distinguishes the failure above: emitting one value
+    /// twice is not the same bag as emitting two different values once each.
+    #[test]
+    fn both_transports_render_the_same_policy_identically() {
+        let cases: Vec<(&str, ResponseHeaderPolicy)> = vec![
+            ("empty", ResponseHeaderPolicy::default()),
+            ("one replacement", {
+                let mut policy = ResponseHeaderPolicy::default();
+                policy.set("x-set", "value");
+                policy
+            }),
+            ("one append", {
+                let mut policy = ResponseHeaderPolicy::default();
+                policy.add("vary", "Origin");
+                policy
+            }),
+            // 🚨 The regression that motivated this test.
+            ("the same name appended twice", {
+                let mut policy = ResponseHeaderPolicy::default();
+                policy.add("vary", "Accept-Encoding");
+                policy.add("vary", "Origin");
+                policy
+            }),
+            ("the same name appended three times", {
+                let mut policy = ResponseHeaderPolicy::default();
+                policy.add("link", "</a.css>; rel=preload");
+                policy.add("link", "</b.js>; rel=preload");
+                policy.add("link", "</c.png>; rel=preload");
+                policy
+            }),
+            // 🔗 The reachable shape: a route policy merged with a CORS decision.
+            ("a merged route and CORS policy", {
+                let mut route = ResponseHeaderPolicy::default();
+                route.add("vary", "Accept-Encoding");
+                route.set("cache-control", "public, max-age=60");
+                let mut cors = ResponseHeaderPolicy::default();
+                cors.add("vary", "Origin");
+                cors.set("access-control-allow-origin", "https://example.test");
+                route.merge(cors);
+                route
+            }),
+            ("a replacement that is also removed", {
+                let mut policy = ResponseHeaderPolicy::default();
+                policy.set("x-temp", "value");
+                policy.remove("x-temp");
+                policy
+            }),
+            ("a suppressed Server header", {
+                let mut policy = ResponseHeaderPolicy::default();
+                policy.remove("server");
+                policy
+            }),
+            ("appends and removals of unrelated names", {
+                let mut policy = ResponseHeaderPolicy::default();
+                policy.add("x-keep", "one");
+                policy.add("x-keep", "two");
+                policy.remove("x-gone");
+                policy.set("x-set", "final");
+                policy
+            }),
+        ];
+
+        for (description, policy) in cases {
+            assert_eq!(
+                rendered_by_pingora(&policy),
+                rendered_by_h3(&policy),
+                "H1/H2 and H3 disagreed on the policy for: {description}"
+            );
+        }
+    }
 }

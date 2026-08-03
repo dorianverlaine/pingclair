@@ -1689,3 +1689,167 @@ mod browse_limit_tests {
         );
     }
 }
+
+// MARK: - Response metadata cache
+
+/// 🗂️ The per-file response metadata cache: what it must reuse, and what it
+/// must never reuse. Every entry keys on path + mtime + size, so the
+/// interesting cases are the ones where one of those changes underneath a
+/// warm entry.
+#[cfg(test)]
+mod meta_cache_tests {
+    use super::*;
+
+    fn server(root: &std::path::Path) -> FileServer {
+        FileServer::new(FileServerConfig {
+            root: root.to_path_buf(),
+            ..Default::default()
+        })
+    }
+
+    fn meta_for(fs: &FileServer, path: &std::path::Path) -> Arc<FileMeta> {
+        let metadata = std::fs::metadata(path).unwrap();
+        fs.file_meta(path, &metadata).unwrap()
+    }
+
+    fn header_text(value: &HeaderValue) -> String {
+        value.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn a_repeat_request_reuses_the_same_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, b"hello").unwrap();
+
+        let fs = server(dir.path());
+        let first = meta_for(&fs, &path);
+        let second = meta_for(&fs, &path);
+
+        // 🎯 The point of the cache: the second request must not rebuild the
+        // values, so both handles are the same allocation.
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an unchanged file must be served from one cached FileMeta"
+        );
+    }
+
+    #[test]
+    fn editing_a_file_invalidates_its_cached_etag_and_last_modified() {
+        // 🚨 The correctness property. If the key missed a change, the server
+        // would keep answering with the old ETag, and a client holding it
+        // would be told 304 Not Modified for content that did change.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, b"first").unwrap();
+
+        let fs = server(dir.path());
+        let before = meta_for(&fs, &path);
+        let before_etag = header_text(&before.etag);
+
+        // 🕰️ Filesystem timestamps are coarse enough that an immediate
+        // rewrite can land on the same mtime; a longer body changes the size
+        // too, so the key moves either way.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, b"second body, definitely longer").unwrap();
+
+        let after = meta_for(&fs, &path);
+        assert_ne!(
+            before_etag,
+            header_text(&after.etag),
+            "an edited file must not keep its old ETag"
+        );
+        assert_eq!(
+            header_text(&after.content_length),
+            "30",
+            "Content-Length must describe the new body"
+        );
+    }
+
+    #[test]
+    fn two_files_do_not_share_one_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.html");
+        std::fs::write(&a, b"aaaa").unwrap();
+        std::fs::write(&b, b"bb").unwrap();
+
+        let fs = server(dir.path());
+        let meta_a = meta_for(&fs, &a);
+        let meta_b = meta_for(&fs, &b);
+
+        assert_ne!(header_text(&meta_a.etag), header_text(&meta_b.etag));
+        assert_eq!(header_text(&meta_a.content_length), "4");
+        assert_eq!(header_text(&meta_b.content_length), "2");
+        // 📄 Content-Type is derived per path, so the extension must survive.
+        assert!(
+            header_text(&meta_b.content_type).starts_with("text/html"),
+            "expected text/html for .html, got {}",
+            header_text(&meta_b.content_type)
+        );
+    }
+
+    #[test]
+    fn the_cache_stays_bounded_and_still_answers_correctly_after_eviction() {
+        // 🧹 Eviction here is a whole-map `clear()`, not an LRU: once the cap
+        // is reached every entry goes. That is a deliberate simplicity
+        // trade-off, but it must never turn into a wrong answer — a request
+        // arriving right after a wipe has to rebuild, not serve nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = server(dir.path());
+
+        let mut paths = Vec::new();
+        for index in 0..(FileServer::META_CACHE_CAP + 8) {
+            let path = dir.path().join(format!("f{index}.txt"));
+            std::fs::write(&path, format!("body-{index}")).unwrap();
+            let _ = meta_for(&fs, &path);
+            paths.push(path);
+        }
+
+        assert!(
+            fs.meta_cache.load().len() <= FileServer::META_CACHE_CAP,
+            "the cache grew past its cap: {}",
+            fs.meta_cache.load().len()
+        );
+
+        // 🔁 Every file must still resolve to metadata that matches the file
+        // on disk, whether or not its entry survived the wipe.
+        for (index, path) in paths.iter().enumerate() {
+            let expected = format!("body-{index}").len().to_string();
+            assert_eq!(
+                header_text(&meta_for(&fs, path).content_length),
+                expected,
+                "{path:?} reported the wrong length after eviction"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rebuilt_entry_matches_what_the_cache_would_have_returned() {
+        // 🧭 The uncached path (a file whose mtime cannot be read) must not be
+        // a different answer, only a slower one. `build_meta` is what that
+        // path calls, so it has to agree with a cache hit.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.json");
+        std::fs::write(&path, b"{}").unwrap();
+
+        let fs = server(dir.path());
+        let metadata = std::fs::metadata(&path).unwrap();
+        let cached = meta_for(&fs, &path);
+        let rebuilt = FileServer::build_meta(&path, &metadata, metadata.len());
+
+        assert_eq!(header_text(&cached.etag), header_text(&rebuilt.etag));
+        assert_eq!(
+            header_text(&cached.content_type),
+            header_text(&rebuilt.content_type)
+        );
+        assert_eq!(
+            header_text(&cached.content_length),
+            header_text(&rebuilt.content_length)
+        );
+        assert_eq!(
+            cached.last_modified.as_ref().map(header_text),
+            rebuilt.last_modified.as_ref().map(header_text)
+        );
+    }
+}

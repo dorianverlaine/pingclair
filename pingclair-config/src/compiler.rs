@@ -1687,3 +1687,162 @@ mod tests {
         }
     }
 }
+
+// MARK: - Fail-closed handler validation
+
+/// 🚫 The `plugin` handler is parsed but not wired to anything, so a route
+/// using it would accept traffic and silently do nothing. These tests pin the
+/// rejection to `validate_config` — the single validation path — rather than
+/// to the Caddyfile adapter, because a JSON config reaches the same structs
+/// without ever touching the DSL. A guard that only lives in the adapter is
+/// not a guard.
+#[cfg(test)]
+mod fail_closed_handler_tests {
+    use super::*;
+    use pingclair_core::config::{HandlerConfig, PingclairConfig, RouteConfig, ServerConfig};
+
+    fn plugin() -> HandlerConfig {
+        HandlerConfig::Plugin {
+            name: "not-a-real-plugin".to_string(),
+            args: vec![],
+        }
+    }
+
+    fn harmless() -> HandlerConfig {
+        HandlerConfig::Respond {
+            status: 200,
+            body: Some("ok".to_string()),
+            headers: std::collections::HashMap::new(),
+        }
+    }
+
+    fn config_with(handler: HandlerConfig) -> PingclairConfig {
+        PingclairConfig {
+            servers: vec![ServerConfig {
+                listen: vec!["0.0.0.0:8080".to_string()],
+                routes: vec![RouteConfig {
+                    path: "/*".to_string(),
+                    handler,
+                    methods: None,
+                    matcher: None,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn rejection_for(handler: HandlerConfig) -> String {
+        match validate_config(&config_with(handler)) {
+            Ok(()) => panic!("an unimplemented handler was accepted"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_bare_plugin_route_is_rejected_by_name() {
+        let message = rejection_for(plugin());
+        assert!(
+            message.contains("not-a-real-plugin"),
+            "the rejection must name the offending route: {message}"
+        );
+        assert!(
+            message.contains("plugin"),
+            "the rejection must name the handler: {message}"
+        );
+    }
+
+    #[test]
+    fn a_plugin_nested_in_any_container_is_still_rejected() {
+        // 🪆 Each of these wraps other handlers, so the guard has to recurse.
+        // A container that forgets to recurse turns the fail-closed rule into
+        // "fails closed only at the top level", which is the same as off for
+        // any real configuration.
+        let containers: Vec<(&str, HandlerConfig)> = vec![
+            (
+                "pipeline",
+                HandlerConfig::Pipeline {
+                    handlers: vec![harmless(), plugin()],
+                },
+            ),
+            (
+                "handle",
+                HandlerConfig::Handle {
+                    handlers: vec![plugin()],
+                },
+            ),
+            (
+                "handle_path",
+                HandlerConfig::HandlePath {
+                    prefix: "/api".to_string(),
+                    handlers: vec![harmless(), plugin()],
+                },
+            ),
+            (
+                "try_files fallback",
+                HandlerConfig::TryFiles {
+                    files: vec!["{path}".to_string()],
+                    fallback: Some(Box::new(plugin())),
+                },
+            ),
+            (
+                "handle_errors",
+                HandlerConfig::HandleErrors {
+                    errors: [(404u16, vec![plugin()])].into_iter().collect(),
+                },
+            ),
+            (
+                "two containers deep",
+                HandlerConfig::Handle {
+                    handlers: vec![HandlerConfig::Pipeline {
+                        handlers: vec![harmless(), plugin()],
+                    }],
+                },
+            ),
+            (
+                "a try_files fallback inside a pipeline",
+                HandlerConfig::Pipeline {
+                    handlers: vec![HandlerConfig::TryFiles {
+                        files: vec!["{path}".to_string()],
+                        fallback: Some(Box::new(plugin())),
+                    }],
+                },
+            ),
+        ];
+
+        for (description, handler) in containers {
+            let message = rejection_for(handler);
+            assert!(
+                message.contains("not-a-real-plugin"),
+                "a plugin nested in {description} was not reported: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn implemented_handlers_are_left_alone() {
+        // 🛡️ Fail-closed is only useful if it does not also reject working
+        // configurations; otherwise the pressure is to remove the guard.
+        let allowed = vec![
+            harmless(),
+            HandlerConfig::Pipeline {
+                handlers: vec![harmless(), harmless()],
+            },
+            HandlerConfig::TryFiles {
+                files: vec!["{path}".to_string()],
+                fallback: None,
+            },
+            HandlerConfig::TryFiles {
+                files: vec!["{path}".to_string()],
+                fallback: Some(Box::new(harmless())),
+            },
+            HandlerConfig::HandleErrors {
+                errors: [(404u16, vec![harmless()])].into_iter().collect(),
+            },
+        ];
+        for handler in allowed {
+            validate_config(&config_with(handler))
+                .expect("an implemented handler must still compile");
+        }
+    }
+}
