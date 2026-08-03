@@ -2835,6 +2835,7 @@ name = "pingclair-static"
 version = "0.1.7"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-compression",
  "async-trait",
  "bytes",

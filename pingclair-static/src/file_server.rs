@@ -3,6 +3,7 @@
 
 //! File server implementation
 
+use arc_swap::ArcSwap;
 use pingclair_core::error::Result;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read as _, Seek as _, SeekFrom};
@@ -154,10 +155,11 @@ pub struct FileServer {
     /// Prebuilt response metadata per file identity (path, mtime, size).
     /// The values themselves are immutable `Arc`s, so a hit clones one
     /// pointer and a few `HeaderValue`s instead of reformatting dates,
-    /// ETags, and content lengths on every request. Bounded by a hard entry
-    /// cap; the lock is only held for a tiny map operation, never across an
-    /// `.await`.
-    meta_cache: Mutex<HashMap<MetaKey, Arc<FileMeta>>>,
+    /// ETags, and content lengths on every request. Read via `ArcSwap` so a
+    /// hit is one atomic load and never takes a lock; the write mutex is
+    /// only contended on a cache miss. Bounded by a hard entry cap.
+    meta_cache: ArcSwap<HashMap<MetaKey, Arc<FileMeta>>>,
+    meta_write: Mutex<()>,
     /// Cache of already-compressed file bodies (see [`CompressCache`]).
     /// Behind a `Mutex` because `FileServer` is shared (`Arc`) across all
     /// worker threads; the lock is only ever held for a tiny map operation,
@@ -282,7 +284,8 @@ impl FileServer {
     pub fn new(config: FileServerConfig) -> Self {
         Self {
             config,
-            meta_cache: Mutex::new(HashMap::new()),
+            meta_cache: ArcSwap::from_pointee(HashMap::new()),
+            meta_write: Mutex::new(()),
             compress_cache: Mutex::new(CompressCache::new(Self::COMPRESS_CACHE_BUDGET)),
             in_flight: Mutex::new(HashMap::new()),
         }
@@ -314,16 +317,23 @@ impl FileServer {
             mtime_ns,
             size,
         };
-        if let Some(meta) = self.meta_cache.lock().unwrap().get(&key) {
+        if let Some(meta) = self.meta_cache.load().get(&key) {
             return Ok(meta.clone());
         }
 
         let meta = Arc::new(Self::build_meta(file_path, metadata, size));
-        let mut cache = self.meta_cache.lock().unwrap();
+        let _guard = self.meta_write.lock().unwrap();
+        // Whoever published first wins; the double-check avoids rebuilding
+        // the map after a concurrent miss already inserted the entry.
+        if let Some(meta) = self.meta_cache.load().get(&key) {
+            return Ok(meta.clone());
+        }
+        let mut cache = (**self.meta_cache.load()).clone();
         if cache.len() >= Self::META_CACHE_CAP {
             cache.clear();
         }
         cache.insert(key, meta.clone());
+        self.meta_cache.store(Arc::new(cache));
         Ok(meta)
     }
 
