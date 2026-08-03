@@ -10,7 +10,7 @@ members = [
     "pingclair-api",
     "pingclair-plugin",
 ]
-exclude = ["vendor/h2", "vendor/pingora-core"]
+exclude = ["vendor/h2", "vendor/pingora-core", "vendor/pingora-http"]
 
 [workspace.package]
 version = "0.1.7"
@@ -134,9 +134,15 @@ arc-swap = "1"
 # allocating a fresh buffer per message body — the dominant allocation in
 # the proxy-path profile (~91 % of cumulative bytes). See
 # `vendor/pingora-core/PINGCLAIR_PATCH.md` for the exact diff.
+#
+# `pingora-http 0.8.1` is forked so the titled-header map covers the custom
+# headers Pingclair emits, letting HTTP/1 responses use the no-case header
+# builder (no per-request case map) while keeping conventional wire casing.
+# See `vendor/pingora-http/PINGCLAIR_PATCH.md` for the exact diff.
 [patch.crates-io]
 h2 = { path = "vendor/h2" }
 pingora-core = { path = "vendor/pingora-core" }
+pingora-http = { path = "vendor/pingora-http" }
 
 [profile.release]
 lto = "fat"

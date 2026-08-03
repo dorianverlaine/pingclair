@@ -108,3 +108,9 @@ jobs:
         # body-buffer reuse. Same guard as the h2 fork: a version bump that
         # silently drops the patch must fail CI instead of degrading.
         run: scripts/check-vendored-pingora-core.sh
+
+      - name: Verify the pingora-http performance fork is wired
+        # ⚡ pingora-http is patched through `[patch.crates-io]` with the
+        # extended titled-header map that makes HTTP/1 no-case responses
+        # keep conventional casing.
+        run: scripts/check-vendored-pingora-http.sh

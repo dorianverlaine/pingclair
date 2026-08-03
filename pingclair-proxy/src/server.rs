@@ -2243,19 +2243,17 @@ impl PingclairProxy {
 
     /// Build a downstream response header using the cheapest case strategy.
     ///
-    /// HTTP/2 header names are case-insensitive on the wire, so Pingora's
-    /// case-preserving map is pure per-header allocation overhead there;
-    /// HTTP/1.1 callers still need the original casing for the wire bytes.
+    /// Always the no-case variant: HTTP/1.1 and HTTP/2 field names are
+    /// case-insensitive (RFC 9110 §5.1), and Pingora's titled-header map
+    /// keeps conventional casing on the HTTP/1 wire (see the vendored
+    /// pingora-http fork) while skipping the per-request case-preserving
+    /// map entirely.
     fn build_downstream_header(
-        session: &Session,
+        _session: &Session,
         status: u16,
         size_hint: Option<usize>,
     ) -> pingora_core::Result<ResponseHeader> {
-        if session.req_header().version == http::Version::HTTP_2 {
-            ResponseHeader::build_no_case(status, size_hint)
-        } else {
-            ResponseHeader::build(status, size_hint)
-        }
+        ResponseHeader::build_no_case(status, size_hint)
     }
 
     /// Apply response directives accumulated by handlers such as `header`
