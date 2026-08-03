@@ -64,6 +64,30 @@ pub(crate) fn via_value(version: http::Version) -> &'static str {
     }
 }
 
+/// ➕ One appended header, with its wire-ready forms built once.
+///
+/// The precomputed name and value used to live in two `Vec`s running
+/// alongside the name/value pair, indexed in lockstep. They did not stay in
+/// lockstep: the value was looked up by name rather than by position, so two
+/// appends of the same field name both emitted the first one's value —
+/// `header +Vary Accept-Encoding` on a CORS route silently dropped
+/// `Vary: Origin`, which is how a shared cache ends up serving one origin's
+/// response to another. Keeping the four fields in one record makes that
+/// class of drift unrepresentable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AddedHeader {
+    /// Lowercased field name, as protocol adapters and merges see it.
+    name: String,
+    /// The configured value verbatim, kept for the invalid-value error path.
+    value: String,
+    /// Precompiled name bytes: `Bytes` is the cheapest `IntoCaseHeaderName`
+    /// input, since cloning one is a shared-bytes reference bump.
+    name_bytes: Bytes,
+    /// Precompiled value. `None` means the configured string is not a valid
+    /// header value, which preserves the request-time error path.
+    header_value: Option<http::HeaderValue>,
+}
+
 /// 🧭 Stores transport-neutral downstream header mutations in execution order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ResponseHeaderPolicy {
@@ -78,11 +102,7 @@ pub(crate) struct ResponseHeaderPolicy {
     /// copies the bytes. `None` means the configured value was not a valid
     /// header value, in which case the request-time error path is preserved.
     set_values: HashMap<String, Option<http::HeaderValue>>,
-    add: Vec<(String, String)>,
-    /// Precompiled header-name bytes for `add`, mirroring `set_names`.
-    add_names: Vec<Bytes>,
-    /// Precompiled `HeaderValue`s for `add`, mirroring `set_values`.
-    add_values: Vec<(String, Option<http::HeaderValue>)>,
+    add: Vec<AddedHeader>,
     remove: Vec<String>,
     suppress_server: bool,
     suppress_via: bool,
@@ -104,10 +124,12 @@ impl ResponseHeaderPolicy {
     pub(crate) fn add(&mut self, name: impl AsRef<str>, value: impl Into<String>) {
         let name = name.as_ref().to_ascii_lowercase();
         let value = value.into();
-        self.add_names.push(Bytes::copy_from_slice(name.as_bytes()));
-        self.add_values
-            .push((name.clone(), http::HeaderValue::from_str(&value).ok()));
-        self.add.push((name, value));
+        self.add.push(AddedHeader {
+            name_bytes: Bytes::copy_from_slice(name.as_bytes()),
+            header_value: http::HeaderValue::from_str(&value).ok(),
+            name,
+            value,
+        });
     }
 
     /// 🧹 Removes a downstream header after every set and append mutation.
@@ -144,8 +166,6 @@ impl ResponseHeaderPolicy {
         self.set_names.extend(other.set_names);
         self.set_values.extend(other.set_values);
         self.add.extend(other.add);
-        self.add_names.extend(other.add_names);
-        self.add_values.extend(other.add_values);
         for name in other.remove {
             self.remove(name);
         }
@@ -171,18 +191,13 @@ impl ResponseHeaderPolicy {
                 }
             }
         }
-        for ((name, value), name_bytes) in self.add.iter().zip(&self.add_names) {
-            let header_value = self
-                .add_values
-                .iter()
-                .find(|(n, _)| n == name)
-                .and_then(|(_, v)| v.clone());
-            match header_value {
+        for added in &self.add {
+            match &added.header_value {
                 Some(header_value) => {
-                    response.append_header(name_bytes.clone(), header_value)?;
+                    response.append_header(added.name_bytes.clone(), header_value.clone())?;
                 }
                 None => {
-                    response.append_header(name_bytes.clone(), value.as_str())?;
+                    response.append_header(added.name_bytes.clone(), added.value.as_str())?;
                 }
             }
         }
@@ -223,7 +238,7 @@ impl ResponseHeaderPolicy {
     pub(crate) fn add_headers(&self) -> impl Iterator<Item = (&str, &str)> {
         self.add
             .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .map(|added| (added.name.as_str(), added.value.as_str()))
     }
 
     /// 🌐 Exposes normalized removals to protocol adapters.
@@ -1108,6 +1123,65 @@ mod tests {
     }
 
     // ---- Via (RFC 9110 §7.6.3) ----
+
+    #[test]
+    fn repeated_append_of_one_name_keeps_each_value() {
+        // 🚨 Two appends of the same field name must emit both values. The
+        // precomputed value used to be looked up by name, so the second
+        // append re-emitted the first one's value.
+        let mut policy = ResponseHeaderPolicy::default();
+        policy.add("link", "</a.css>; rel=preload");
+        policy.add("link", "</b.js>; rel=preload");
+        assert_eq!(
+            header_values(&applied(&policy, None), "link"),
+            vec!["</a.css>; rel=preload", "</b.js>; rel=preload"]
+        );
+    }
+
+    #[test]
+    fn merged_cors_vary_survives_a_route_that_appends_its_own_vary() {
+        // 🚨 The reachable form of the same defect: a route configured with
+        // `header +Vary Accept-Encoding` merged with the CORS decision's own
+        // `Vary: Origin`. Losing `Origin` lets a shared cache serve one
+        // origin's CORS response to a different origin.
+        let mut route = ResponseHeaderPolicy::default();
+        route.add("vary", "Accept-Encoding");
+        let mut cors = ResponseHeaderPolicy::default();
+        cors.add("vary", "Origin");
+        route.merge(cors);
+        assert_eq!(
+            header_values(&applied(&route, None), "vary"),
+            vec!["Accept-Encoding", "Origin"]
+        );
+    }
+
+    #[test]
+    fn an_invalid_appended_value_still_reaches_its_own_error_path() {
+        // 🛡️ A value that cannot become a `HeaderValue` falls back to the
+        // string path, and must not borrow a neighbour's precompiled value.
+        let mut policy = ResponseHeaderPolicy::default();
+        policy.add("x-test", "fine");
+        policy.add("x-test", "bad\u{0}value");
+        let mut response = ResponseHeader::build(200, None).unwrap();
+        let result = policy.apply_pingora(
+            &mut response,
+            &http::HeaderValue::from_static("req-1"),
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "an invalid header value must not be silently accepted"
+        );
+    }
+
+    fn header_values(response: &ResponseHeader, name: &str) -> Vec<String> {
+        response
+            .headers
+            .get_all(name)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect()
+    }
 
     fn applied(policy: &ResponseHeaderPolicy, hop: Option<http::Version>) -> ResponseHeader {
         let mut response = ResponseHeader::build(200, None).unwrap();
