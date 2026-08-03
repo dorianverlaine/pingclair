@@ -28,9 +28,6 @@ pub(crate) fn authority_host(authority: &str) -> &str {
         .map_or(authority, |(host, _)| host)
 }
 
-/// 🔀 The pseudonym this proxy identifies itself by in `Via`.
-pub(crate) const VIA_PSEUDONYM: &str = "Pingclair";
-
 /// 🔀 The `Via` protocol-version token for one hop, per RFC 9110 §7.6.3.
 ///
 /// The token describes the protocol the message was **received** over, not the
@@ -51,8 +48,20 @@ pub(crate) fn via_version(version: http::Version) -> &'static str {
 }
 
 /// 🔀 This hop's `Via` field value, e.g. `1.1 Pingclair`.
-pub(crate) fn via_value(version: http::Version) -> String {
-    format!("{} {VIA_PSEUDONYM}", via_version(version))
+///
+/// The token only depends on the protocol version, so the five possible
+/// values are `'static` — building a `String` per proxied request was pure
+/// per-request allocation on the hot path.
+pub(crate) fn via_value(version: http::Version) -> &'static str {
+    match via_version(version) {
+        "0.9" => "0.9 Pingclair",
+        "1.0" => "1.0 Pingclair",
+        "1.1" => "1.1 Pingclair",
+        "2.0" => "2.0 Pingclair",
+        "3.0" => "3.0 Pingclair",
+        // `via_version` returns "1.1" for anything else; keep them in lockstep.
+        _ => "1.1 Pingclair",
+    }
 }
 
 /// 🧭 Stores transport-neutral downstream header mutations in execution order.
@@ -148,7 +157,7 @@ impl ResponseHeaderPolicy {
     pub(crate) fn apply_pingora(
         &self,
         response: &mut ResponseHeader,
-        request_id: &str,
+        request_id: &http::HeaderValue,
         via_hop: Option<http::Version>,
     ) -> PingoraResult<()> {
         for (name, value) in &self.set {
@@ -194,7 +203,7 @@ impl ResponseHeaderPolicy {
             response.append_header("via", via_value(version))?;
         }
 
-        response.insert_header("x-request-id", request_id)?;
+        response.insert_header("x-request-id", request_id.clone())?;
         Ok(())
     }
 
@@ -1102,7 +1111,9 @@ mod tests {
 
     fn applied(policy: &ResponseHeaderPolicy, hop: Option<http::Version>) -> ResponseHeader {
         let mut response = ResponseHeader::build(200, None).unwrap();
-        policy.apply_pingora(&mut response, "req-1", hop).unwrap();
+        policy
+            .apply_pingora(&mut response, &http::HeaderValue::from_static("req-1"), hop)
+            .unwrap();
         response
     }
 
@@ -1147,7 +1158,11 @@ mod tests {
         let mut response = ResponseHeader::build(200, None).unwrap();
         response.insert_header("via", "1.1 upstream-cache").unwrap();
         ResponseHeaderPolicy::default()
-            .apply_pingora(&mut response, "req-1", Some(http::Version::HTTP_11))
+            .apply_pingora(
+                &mut response,
+                &http::HeaderValue::from_static("req-1"),
+                Some(http::Version::HTTP_11),
+            )
             .unwrap();
 
         assert_eq!(
@@ -1167,7 +1182,11 @@ mod tests {
         let mut response = ResponseHeader::build(200, None).unwrap();
         response.insert_header("via", "1.1 upstream-cache").unwrap();
         policy
-            .apply_pingora(&mut response, "req-1", Some(http::Version::HTTP_11))
+            .apply_pingora(
+                &mut response,
+                &http::HeaderValue::from_static("req-1"),
+                Some(http::Version::HTTP_11),
+            )
             .unwrap();
 
         assert!(via_values(&response).is_empty());

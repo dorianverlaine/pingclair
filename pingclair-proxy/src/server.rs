@@ -28,6 +28,7 @@ use pingora_cache::{CacheMeta, MemCache, NoCacheReason, RespCacheable, VarianceB
 use arc_swap::ArcSwap;
 use async_recursion::async_recursion;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -107,6 +108,10 @@ pub struct RequestContext {
     pub cache_ttl_secs: Option<u64>,
     /// Unique request ID
     pub request_id: String,
+    /// Prebuilt `HeaderValue` for the request ID, so downstream and upstream
+    /// header inserts clone a shared-bytes reference instead of re-copying
+    /// the string into a new value on every request.
+    pub request_id_value: http::HeaderValue,
     /// Start time for logging
     pub start_time: std::time::Instant,
     /// ⏱️ When the first response byte was handed downstream, for TTFB.
@@ -148,6 +153,9 @@ pub struct RequestContext {
 
 impl Default for RequestContext {
     fn default() -> Self {
+        let request_id = generate_request_id();
+        let request_id_value = http::HeaderValue::from_str(&request_id)
+            .expect("generated request id is valid header bytes");
         Self {
             state: None,
             route_index: None,
@@ -162,7 +170,8 @@ impl Default for RequestContext {
             request_scheme: "http",
             response_status: 0,
             response_bytes: 0,
-            request_id: generate_request_id(),
+            request_id,
+            request_id_value,
             start_time: std::time::Instant::now(),
             first_byte_at: None,
             active_connection_metric: None,
@@ -2257,7 +2266,7 @@ impl PingclairProxy {
         ctx: &RequestContext,
     ) -> PingoraResult<()> {
         ctx.response_headers
-            .apply_pingora(response, &ctx.request_id, None)?;
+            .apply_pingora(response, &ctx.request_id_value, None)?;
         if let Some(state) = &ctx.state {
             Self::apply_security_response_headers(response, state)?;
         }
@@ -3059,6 +3068,68 @@ pub(crate) fn resolve_caddy_placeholders<'a>(
     std::borrow::Cow::Owned(result)
 }
 
+/// 🧱 `fmt::Write` target backed by a fixed stack buffer, so short header
+/// values (IP addresses and `Forwarded` fields) are formatted without a
+/// per-request heap allocation.
+struct StackBuf<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl std::fmt::Write for StackBuf<'_> {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        let end = self.len + text.len();
+        if end > self.buf.len() {
+            return Err(std::fmt::Error);
+        }
+        self.buf[self.len..end].copy_from_slice(text.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+/// 🌐 Formats one client IP into a reusable `HeaderValue`.
+///
+/// Every standard forwarding header starts from the same address; building
+/// the value once means X-Real-IP and X-Forwarded-For clone a shared-bytes
+/// reference (one atomic increment) instead of each formatting and copying
+/// its own string.
+fn ip_header_value(ip: IpAddr) -> http::HeaderValue {
+    let mut buf = [0u8; 64];
+    let len = {
+        let mut out = StackBuf {
+            buf: &mut buf,
+            len: 0,
+        };
+        write!(out, "{ip}").expect("IPv4/IPv6 addresses fit a 64-byte buffer");
+        out.len
+    };
+    http::HeaderValue::from_str(std::str::from_utf8(&buf[..len]).expect("ASCII address"))
+        .expect("formatted address is a valid header value")
+}
+
+/// 🔀 Formats the `Forwarded` `for=` parameter for one client IP.
+fn forwarded_header_value(ip: IpAddr) -> http::HeaderValue {
+    let mut buf = [0u8; 96];
+    let len = {
+        let mut out = StackBuf {
+            buf: &mut buf,
+            len: 0,
+        };
+        match ip {
+            IpAddr::V4(address) => {
+                write!(out, "for={address}").expect("IPv4 Forwarded fits a 96-byte buffer");
+            }
+            IpAddr::V6(address) => {
+                write!(out, "for=\"[{address}]\"").expect("IPv6 Forwarded fits a 96-byte buffer");
+            }
+        }
+        out.len
+    };
+    http::HeaderValue::from_str(std::str::from_utf8(&buf[..len]).expect("ASCII address"))
+        .expect("formatted Forwarded is a valid header value")
+}
+
 /// Resolve a single Caddy placeholder name to its value.
 fn resolve_single_placeholder(
     name: &str,
@@ -3646,6 +3717,8 @@ impl ProxyHttp for PingclairProxy {
             .and_then(|v| v.to_str().ok())
             .and_then(sanitize_request_id)
         {
+            ctx.request_id_value = http::HeaderValue::from_str(&client_id)
+                .expect("sanitized request id is valid header bytes");
             ctx.request_id = client_id;
         }
 
@@ -4129,31 +4202,42 @@ impl ProxyHttp for PingclairProxy {
         let (transport_peer_ip, transport_client_ip, resolved_client_ip) =
             self.downstream_identity(session, &downstream_headers.headers);
         let client_ip = ctx.verified_client_ip.unwrap_or(resolved_client_ip);
+
+        // 🌐 Every forwarding header below starts from the same address;
+        // format it once and clone the `HeaderValue` (a shared-bytes
+        // reference bump) instead of rebuilding a string per header.
+        let client_ip_value = ip_header_value(client_ip);
         if !has_header_up("X-Forwarded-For") {
-            upstream_request.insert_header(
-                "X-Forwarded-For",
-                self.trusted_proxies.forwarded_for_with_fallback(
+            let xff = if self.trusted_proxies.contains(transport_peer_ip) {
+                let value = self.trusted_proxies.forwarded_for_with_fallback(
                     transport_peer_ip,
                     transport_client_ip,
                     &downstream_headers.headers,
-                ),
-            )?;
+                );
+                http::HeaderValue::from_str(&value).map_err(|_| {
+                    pingora_core::Error::explain(
+                        pingora_core::ErrorType::InvalidHTTPHeader,
+                        "invalid X-Forwarded-For value",
+                    )
+                })?
+            } else {
+                // An untrusted peer's chain is just the direct peer, which is
+                // exactly `client_ip` in this branch.
+                client_ip_value.clone()
+            };
+            upstream_request.insert_header("X-Forwarded-For", xff)?;
         }
         if !has_header_up("X-Real-IP") {
-            upstream_request.insert_header("X-Real-IP", client_ip.to_string())?;
+            upstream_request.insert_header("X-Real-IP", client_ip_value.clone())?;
         }
         if !has_header_up("Forwarded") {
-            let value = match client_ip {
-                IpAddr::V4(address) => format!("for={address}"),
-                IpAddr::V6(address) => format!("for=\"[{address}]\""),
-            };
-            upstream_request.insert_header("Forwarded", value)?;
+            upstream_request.insert_header("Forwarded", forwarded_header_value(client_ip))?;
         }
 
         // Forward the request ID so upstream services can correlate their
         // logs with ours; a user-configured `header_up X-Request-Id` wins.
         if !has_header_up("X-Request-Id") {
-            upstream_request.insert_header("X-Request-Id", &ctx.request_id)?;
+            upstream_request.insert_header("X-Request-Id", ctx.request_id_value.clone())?;
         }
 
         // 🔀 RFC 9110 §7.6.3: a gateway MUST announce itself in `Via` on every
@@ -4277,7 +4361,7 @@ impl ProxyHttp for PingclairProxy {
 
         ctx.response_headers.apply_pingora(
             upstream_response,
-            &ctx.request_id,
+            &ctx.request_id_value,
             Some(upstream_response.version),
         )?;
 
