@@ -1686,7 +1686,7 @@ async fn plan_h3_handler(
         // same templates from the same request; a redirect that only works on
         // one transport is the parity gap this crate keeps having to fix.
         HandlerConfig::Redirect { to, code } => Ok(H3Plan::Terminal(H3Terminal::Redirect {
-            to: resolve_caddy_placeholders(to, request_header, None),
+            to: resolve_caddy_placeholders(to, request_header, None).into_owned(),
             code: *code,
         })),
         HandlerConfig::Templates { root } => {
@@ -2417,7 +2417,7 @@ async fn reverse_proxy_upstream(
             for (key, template) in &config.headers_up {
                 let resolved =
                     resolve_caddy_placeholders(template, client_header, Some(verified_client_ip));
-                up_req.insert_header(key.clone(), resolved.as_str()).ok();
+                up_req.insert_header(key.clone(), resolved.as_ref()).ok();
             }
         }
 

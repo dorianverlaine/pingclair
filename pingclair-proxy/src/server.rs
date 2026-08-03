@@ -2442,14 +2442,20 @@ impl PingclairProxy {
             HandlerConfig::Redirect { to, code } => {
                 // 🧭 A redirect target is a template, so `redir https://{host}{uri}`
                 // can send a client to the same resource over another scheme.
-                let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
+                let verified_client_ip = if to.contains('{') {
+                    ctx.verified_client_ip.map(|ip| ip.to_string())
+                } else {
+                    None
+                };
                 let location = resolve_caddy_placeholders(
                     to,
                     session.req_header(),
                     verified_client_ip.as_deref(),
                 );
                 let mut response = ResponseHeader::build(*code, Some(3)).unwrap();
-                response.insert_header("Location", location).unwrap();
+                response
+                    .insert_header("Location", location.as_ref())
+                    .unwrap();
                 Self::apply_local_response_headers(&mut response, ctx)?;
                 session
                     .write_response_header(Box::new(response), true)
@@ -3017,14 +3023,14 @@ fn origin_stated_its_own_freshness(
 ///
 /// If a placeholder references a header that doesn't exist, it resolves to
 /// an empty string (matching Caddy's behavior).
-pub(crate) fn resolve_caddy_placeholders(
-    template: &str,
-    req: &RequestHeader,
-    verified_client_ip: Option<&str>,
-) -> String {
+pub(crate) fn resolve_caddy_placeholders<'a>(
+    template: &'a str,
+    req: &'a RequestHeader,
+    verified_client_ip: Option<&'a str>,
+) -> std::borrow::Cow<'a, str> {
     if !template.contains('{') {
         // ⚡ OPTIMIZATION: Fast path — no placeholders, return as-is.
-        return template.to_string();
+        return std::borrow::Cow::Borrowed(template);
     }
 
     let mut result = String::with_capacity(template.len());
@@ -3050,7 +3056,7 @@ pub(crate) fn resolve_caddy_placeholders(
         }
     }
 
-    result
+    std::borrow::Cow::Owned(result)
 }
 
 /// Resolve a single Caddy placeholder name to its value.
@@ -4092,14 +4098,22 @@ impl ProxyHttp for PingclairProxy {
         };
 
         // Add configured upstream headers with variable resolution
-        let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
+        let needs_placeholder = ctx
+            .headers_upstream
+            .values()
+            .any(|template| template.contains('{'));
+        let verified_client_ip = if needs_placeholder {
+            ctx.verified_client_ip.map(|ip| ip.to_string())
+        } else {
+            None
+        };
         for (key, value_template) in &ctx.headers_upstream {
             let resolved = resolve_caddy_placeholders(
                 value_template,
                 downstream_headers,
                 verified_client_ip.as_deref(),
             );
-            upstream_request.insert_header(key.clone(), resolved.as_str())?;
+            upstream_request.insert_header(key.clone(), resolved.as_ref())?;
         }
 
         // Add standard proxy headers (only if not already configured by user)
