@@ -3472,7 +3472,7 @@ impl ProxyHttp for PingclairProxy {
                 .path_and_query()
                 .map(|value| value.as_str());
             if let Some(current) = path_and_query
-                && let Some(normalized) = crate::http_policy::normalize_request_path(&current)
+                && let Some(normalized) = crate::http_policy::normalize_request_path(current)
             {
                 let mut parts = session.req_header().uri.clone().into_parts();
                 match normalized.parse::<http::uri::PathAndQuery>() {
