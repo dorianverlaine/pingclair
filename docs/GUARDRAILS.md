@@ -116,6 +116,28 @@
   鏈結設計；過去曾因 OpenSSL／BoringSSL 符號衝突造成**啟動 SIGBUS 與 Linux link error**。
   這三條不是偏好而是 H3 的前提，理由見下方「為什麼 H3 釘在 quiche／BoringSSL」。
 
+- **fork 上游 crate 前，先量到數字，而且要量在它是瓶頸的環境。**
+  2026-08-04 一次砍掉兩個 fork（`pingora-core`、`pingora-http`，共 38,532 行）。
+  兩者機制論證都成立，但都沒有一次「被 patch 的東西是飽和資源」的量測撐著：
+  `pingora-core` 把累計配置砍掉 86 %，吞吐 +0.9 %（雜訊內）、RSS 區間完全重疊。
+  第一版壓測甚至是無效的——nginx 打滿 200 % 配額而 Pingclair 還有餘裕，量到的
+  是後端。**現在的規則：A/B 每輪都要記錄三方 CPU，proxy 不是飽和的那層就丟掉該輪。**
+
+- **`[patch.crates-io]` 會讓 crate 對 `cargo audit` 隱形。**
+  patch 之後 lockfile 條目失去 `source` 與 `checksum`，而 cargo-audit 只回報
+  能追回 crates.io 的套件。2026-08-04 直接驗證過：`atty 0.2.14` 專案會報
+  RUSTSEC-2021-0145 與 RUSTSEC-2024-0375，同一個專案把 `atty` path-patch 之後
+  **什麼都不報、乾淨退出**。`security-audit.yml` 因此多跑一次「剝掉 patch
+  區塊、重產 lockfile、再 audit」——任何新的 `[patch]` 都必須同時確認這條路徑
+  仍然涵蓋它。
+
+- **`target/` 會無聲長到吃光磁碟；cargo 從不回收舊產物。**
+  2026-08-04 量到 77 GB（`incremental` 41 GB、`deps` 44 GB／252,603 個檔案），
+  當時整顆磁碟只剩 12 GiB 可用。`cargo clean` 一次回收 113 GB。
+  **例行處置：`cargo sweep --time 7`**（已安裝 `cargo-sweep`），砍掉七天以上
+  沒被碰過的產物又不影響日常迭代；磁碟吃緊時才用 `cargo clean`。
+  注意 `target/integration-linux` 是 pingora#946 的重現 binary，clean 前要留。
+
 ---
 
 ## 🚀 HTTP/3 實作護欄

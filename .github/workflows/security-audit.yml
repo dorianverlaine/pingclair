@@ -38,3 +38,38 @@ jobs:
 
       - name: Audit dependencies
         run: cargo audit
+
+      - name: Audit the crates hidden behind [patch.crates-io]
+        # 🕳️ `[patch.crates-io]` strips `source` and `checksum` from the
+        # lockfile entry, and cargo-audit only reports on crates it can trace
+        # back to crates.io — so a patched crate is silently exempt from the
+        # step above. Verified directly on 2026-08-04: a project depending on
+        # `atty 0.2.14` reports RUSTSEC-2021-0145 and RUSTSEC-2024-0375, and
+        # the same project with `atty` path-patched reports nothing and exits
+        # clean.
+        #
+        # That is the wrong way round for `h2` in particular, which is the one
+        # crate currently patched here: the HPACK denial-of-service
+        # (RUSTSEC-2023-0034) and the 2024 CONTINUATION-flood class were both
+        # h2 advisories, and the Pingclair patch is *in* the HPACK encoder.
+        #
+        # So the audit is repeated against a lockfile resolved without the
+        # patch section. The vendored fork tracks a specific upstream release,
+        # so an advisory against that release applies to us whether or not the
+        # source tree is local. This step becomes unnecessary the moment
+        # hyperium/h2#929 lands and `vendor/h2` goes away.
+        run: |
+          set -Eeuo pipefail
+          python3 -c 'import io,sys; p="Cargo.toml"; m=open(p).read(); s=m.index("[patch.crates-io]"); e=m.index("[profile.release]"); open(p,"w").write(m[:s]+m[e:])'
+          if grep -q '^\[patch.crates-io\]' Cargo.toml; then
+              echo "::error::failed to strip the patch section; the audit below would be a no-op" >&2
+              exit 1
+          fi
+          cargo generate-lockfile
+          # 🛡️ If h2 still resolves to a path, the strip did not take and this
+          # audit would be inspecting nothing — fail loudly rather than pass.
+          if ! grep -A3 'name = "h2"' Cargo.lock | grep -q 'registry+'; then
+              echo "::error::h2 did not resolve to the registry after stripping the patch" >&2
+              exit 1
+          fi
+          cargo audit
