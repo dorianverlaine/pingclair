@@ -10,7 +10,7 @@ members = [
     "pingclair-api",
     "pingclair-plugin",
 ]
-exclude = ["vendor/h2", "vendor/pingora-core", "vendor/pingora-http"]
+exclude = ["vendor/h2", "vendor/pingora-core"]
 
 [workspace.package]
 version = "0.1.7"
@@ -135,14 +135,17 @@ arc-swap = "1"
 # the proxy-path profile (~91 % of cumulative bytes). See
 # `vendor/pingora-core/PINGCLAIR_PATCH.md` for the exact diff.
 #
-# `pingora-http 0.8.1` is forked so the titled-header map covers the custom
-# headers Pingclair emits, letting HTTP/1 responses use the no-case header
-# builder (no per-request case map) while keeping conventional wire casing.
-# See `vendor/pingora-http/PINGCLAIR_PATCH.md` for the exact diff.
+# 🚫 A third fork of `pingora-http` (extended titled-header map plus
+# `drop_case()`) was evaluated and removed on 2026-08-04. It bought no
+# measured throughput — the 2026-08-03 c7i-flex run concluded the remaining
+# proxy gap is "framework-level H1 handling, not header-case allocation" —
+# while costing a hand-synchronised lookup table that silently lowercases
+# any header Pingclair later emits but forgets to add, and changing what
+# clients and upstreams see on the wire (`Authorization`, `Cookie` and
+# `User-Agent` all left as lowercase).
 [patch.crates-io]
 h2 = { path = "vendor/h2" }
 pingora-core = { path = "vendor/pingora-core" }
-pingora-http = { path = "vendor/pingora-http" }
 
 [profile.release]
 lto = "fat"

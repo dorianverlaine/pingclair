@@ -2243,17 +2243,19 @@ impl PingclairProxy {
 
     /// Build a downstream response header using the cheapest case strategy.
     ///
-    /// Always the no-case variant: HTTP/1.1 and HTTP/2 field names are
-    /// case-insensitive (RFC 9110 §5.1), and Pingora's titled-header map
-    /// keeps conventional casing on the HTTP/1 wire (see the vendored
-    /// pingora-http fork) while skipping the per-request case-preserving
-    /// map entirely.
+    /// HTTP/2 header names are case-insensitive on the wire, so Pingora's
+    /// case-preserving map is pure per-header allocation overhead there;
+    /// HTTP/1.1 callers still need the original casing for the wire bytes.
     fn build_downstream_header(
-        _session: &Session,
+        session: &Session,
         status: u16,
         size_hint: Option<usize>,
     ) -> pingora_core::Result<ResponseHeader> {
-        ResponseHeader::build_no_case(status, size_hint)
+        if session.req_header().version == http::Version::HTTP_2 {
+            ResponseHeader::build_no_case(status, size_hint)
+        } else {
+            ResponseHeader::build(status, size_hint)
+        }
     }
 
     /// Apply response directives accumulated by handlers such as `header`
@@ -4150,12 +4152,6 @@ impl ProxyHttp for PingclairProxy {
     where
         Self::CTX: Send + Sync,
     {
-        // ⚡ Field names are case-insensitive; release the parsed case map
-        // so hop-by-hop stripping, our inserts, and the upstream write all
-        // skip it (the HTTP/1 wire keeps conventional casing via the titled
-        // map).
-        upstream_request.drop_case();
-
         // 🧹 Hop-by-hop fields stop here, before anything of ours is added.
         //
         // Doing this first matters twice over: a client naming our own fields in
@@ -4268,9 +4264,6 @@ impl ProxyHttp for PingclairProxy {
         Self::CTX: Send + Sync,
     {
         Self::enforce_retry_deadline(ctx)?;
-        // ⚡ Release the parsed case map before any insert or the downstream
-        // write — same reasoning as `upstream_request_filter`.
-        upstream_response.drop_case();
         if upstream_response.headers.contains_key("trailer") {
             tracing::warn!(
                 "🚫 Rejecting an upstream response that requires unsupported trailer forwarding"
