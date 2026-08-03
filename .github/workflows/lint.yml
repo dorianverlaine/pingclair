@@ -95,3 +95,10 @@ jobs:
             exit 1
           fi
           echo "✅ no openssl-sys in the dependency tree"
+
+      - name: Verify the h2 performance fork is wired
+        # ⚡ h2 is patched through `[patch.crates-io]` with a per-connection
+        # HPACK scratch buffer. A Pingora upgrade that moves to a newer h2
+        # version would silently drop the fork (build stays green), so the
+        # resolution is checked here the same way the BoringSSL invariant is.
+        run: scripts/check-vendored-h2.sh

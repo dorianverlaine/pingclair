@@ -10,6 +10,7 @@ members = [
     "pingclair-api",
     "pingclair-plugin",
 ]
+exclude = ["vendor/h2"]
 
 [workspace.package]
 version = "0.1.7"
@@ -118,6 +119,17 @@ bcrypt = "0.19"
 
 # Lock-free reads on hot paths
 arc-swap = "1"
+
+# ⚡ Performance forks (Pingclair-local, tracked under `vendor/`)
+#
+# `h2 0.4.15` is forked with one change: the HPACK encoder reuses a
+# per-connection scratch buffer for the encoded header block instead of
+# allocating a fresh `BytesMut` (with several capacity doublings) plus a
+# `Bytes` refcount header on every HEADERS frame. The common
+# no-continuation path now performs zero header-block allocations per
+# request. See `vendor/h2/PINGCLAIR_PATCH.md` for the exact diff.
+[patch.crates-io]
+h2 = { path = "vendor/h2" }
 
 [profile.release]
 lto = "fat"
