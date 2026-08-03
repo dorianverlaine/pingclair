@@ -107,7 +107,7 @@ pub struct HttpSession {
     send_response: SendResponse<Bytes>,
     send_response_body: Option<SendStream<Bytes>>,
     // Remember what has been written
-    response_written: Option<Box<ResponseHeader>>,
+    response_written: Option<ResponseHeader>,
     // Indicate that whether a END_STREAM is already sent
     // in order to tell whether needs to send one extra FRAME when this response finishes
     ended: bool,
@@ -317,14 +317,23 @@ impl HttpSession {
         header.remove_header(&HeaderName::from_static("keep-alive"));
         header.remove_header(&HeaderName::from_static("proxy-connection"));
 
-        let resp = Response::from_parts(header.as_owned_parts(), ());
+        // ⚡ Consume the header instead of cloning it: `send_response` owns
+        // the parts, and `response_written()` callers only read `.status`
+        // (informational guard + access logging). Cloning the whole header
+        // map per H2 response was pure per-request cost; a status-only
+        // record keeps the public API intact (Pingclair perf fork).
+        let status = header.status;
+        let resp = Response::from_parts((*header).into(), ());
 
         let body_writer = self.send_response.send_response(resp, end).or_err(
             ErrorType::WriteError,
             "while writing h2 response to downstream",
         )?;
 
-        self.response_written = Some(header);
+        self.response_written = Some(
+            ResponseHeader::build_no_case(status, Some(0))
+                .expect("status code is a valid response header"),
+        );
         self.send_response_body = Some(body_writer);
         self.ended = self.ended || end;
         Ok(())
@@ -488,7 +497,7 @@ impl HttpSession {
 
     /// Return the written response header. `None` if it is not written yet.
     pub fn response_written(&self) -> Option<&ResponseHeader> {
-        self.response_written.as_deref()
+        self.response_written.as_ref()
     }
 
     /// Give up the stream abruptly.
