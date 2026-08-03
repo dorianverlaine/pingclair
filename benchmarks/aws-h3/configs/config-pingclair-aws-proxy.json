@@ -3,18 +3,23 @@
     "auto_https": "off",
     "http3": true,
     "metrics": false,
-    "worker_threads": 2
+    "worker_threads": 2,
+    "upstream_keepalive_pool_size": 512
   },
   "servers": [
     {
       "name": "bench.local",
-      "listen": ["0.0.0.0:8080"],
+      "listen": [
+        "0.0.0.0:8080"
+      ],
       "routes": [
         {
           "path": "/proxy/*",
           "handler": {
             "type": "reverse_proxy",
-            "upstreams": ["http://127.0.0.1:9000"],
+            "upstreams": [
+              "http://127.0.0.1:9000"
+            ],
             "flush_interval": -1
           }
         },
@@ -32,7 +37,9 @@
     },
     {
       "name": "h3.local",
-      "listen": ["0.0.0.0:8443"],
+      "listen": [
+        "0.0.0.0:8443"
+      ],
       "tls": {
         "cert": "/tmp/bench.crt",
         "key": "/tmp/bench.key",
@@ -43,7 +50,9 @@
           "path": "/proxy/*",
           "handler": {
             "type": "reverse_proxy",
-            "upstreams": ["http://127.0.0.1:9000"],
+            "upstreams": [
+              "http://127.0.0.1:9000"
+            ],
             "flush_interval": -1
           }
         },
