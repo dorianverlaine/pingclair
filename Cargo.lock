@@ -2670,7 +2670,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pingclair"
-version = "0.1.7"
+version = "0.2.0-dev"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2713,7 +2713,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-api"
-version = "0.1.7"
+version = "0.2.0-dev"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2733,7 +2733,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-config"
-version = "0.1.7"
+version = "0.2.0-dev"
 dependencies = [
  "ariadne",
  "criterion",
@@ -2752,7 +2752,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-core"
-version = "0.1.7"
+version = "0.2.0-dev"
 dependencies = [
  "async-trait",
  "base64",
@@ -2781,7 +2781,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-plugin"
-version = "0.1.7"
+version = "0.2.0-dev"
 dependencies = [
  "async-trait",
  "pingclair-core",
@@ -2791,7 +2791,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-proxy"
-version = "0.1.7"
+version = "0.2.0-dev"
 dependencies = [
  "arc-swap",
  "async-recursion",
@@ -2832,7 +2832,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-static"
-version = "0.1.7"
+version = "0.2.0-dev"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2851,7 +2851,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-tls"
-version = "0.1.7"
+version = "0.2.0-dev"
 dependencies = [
  "async-trait",
  "bytes",

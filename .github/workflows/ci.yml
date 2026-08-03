@@ -171,7 +171,7 @@ jobs:
         run: docker build -f deployment/Dockerfile -t pingclair:ci .
 
       - name: Version must be reported and match the crate
-        # 🏷️ `version` prints the bare semver (v0.1.7) since ca104ea, so
+        # 🏷️ `version` prints the bare semver (v0.2.0-dev) since ca104ea, so
         # scripts can consume it without parsing a banner line.
         run: |
           version_output="$(docker run --rm pingclair:ci version)"

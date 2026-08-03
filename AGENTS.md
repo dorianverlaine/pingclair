@@ -23,7 +23,7 @@ Pingclair is a Rust web server and reverse proxy built on Cloudflare Pingora
 proxying, load balancing, automatic HTTPS, HTTP/3 through quiche, metrics, and
 an admin API with hot reload.
 
-- Workspace version: `0.1.7`
+- Workspace version: `0.2.0-dev` (unreleased; the newest release tag is `v0.1.7`)
 - Rust edition: 2024
 - Minimum Rust: **1.97**
 - Upstream repository: `https://github.com/dorianverlaine/pingclair`

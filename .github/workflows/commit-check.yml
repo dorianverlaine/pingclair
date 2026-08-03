@@ -80,3 +80,56 @@ jobs:
             exit 1
           fi
           echo "✅ all commit subjects open with emoji + conventional type"
+
+  # ============================================================
+  # 🏷️ Version drift — the counterpart to release.yml's verify-tag.
+  # verify-tag guards the moment of release (the tag must match the
+  # tree). This guards every moment in between: once v0.1.7 was tagged,
+  # nothing forced the workspace off 0.1.7, and main drifted 173 commits
+  # while `pingclair --version` kept answering v0.1.7. A user pasting
+  # that into a bug report was naming two entirely different trees.
+  # Modelled on nginx's check-version-bump.yaml, which release.yml
+  # already cites but nothing implemented.
+  # ============================================================
+  check-version-bump:
+    name: Workspace version is ahead of the newest release tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Compare the workspace version against the newest release tag
+        run: |
+          set -Eeuo pipefail
+          crate_version="$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"/\1/')"
+          git fetch --quiet --tags --force
+          latest_tag="$(git tag -l 'v*.*.*' | sed 's/^v//' | sort -V | tail -1)"
+          if [ -z "${latest_tag}" ]; then
+            echo "✅ no release tag yet; nothing to be ahead of"
+            exit 0
+          fi
+          echo "workspace: ${crate_version}    newest release tag: v${latest_tag}"
+
+          # 🧭 The rule is simply that the release part of the workspace
+          # version must be strictly greater than the newest release tag.
+          # Stripping any pre-release suffix first is what makes `0.1.7-dev`
+          # fail correctly: SemVer orders it *before* the released `0.1.7`,
+          # so a tree carrying it is behind, not ahead.
+          #
+          # This also nags in the right place straight after a release. Tag
+          # v0.2.0 on a tree that says 0.2.0 and the tag becomes the newest;
+          # the next push then fails until the version moves to 0.2.1-dev.
+          # That is the whole point — the bump is what stops the tree from
+          # claiming to be a release it has already moved past.
+          release_part="${crate_version%%-*}"
+          if [ "${release_part}" = "${latest_tag}" ]; then
+            echo "::error::the workspace release version ${release_part} is the newest release tag v${latest_tag}; bump it so a source build is distinguishable from the release"
+            exit 1
+          fi
+          newest="$(printf '%s\n%s\n' "${release_part}" "${latest_tag}" | sort -V | tail -1)"
+          if [ "${newest}" != "${release_part}" ]; then
+            echo "::error::the workspace version ${crate_version} is behind the newest release tag v${latest_tag}"
+            exit 1
+          fi
+          echo "✅ ${crate_version} is ahead of the newest release tag v${latest_tag}"
