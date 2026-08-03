@@ -2077,10 +2077,10 @@ async fn handle_request_inner(
                 Ok(Some(ServedResponse::Stream(mut stream))) => {
                     let mut hdrs = vec![
                         quiche::h3::Header::new(b":status", b"200"),
-                        quiche::h3::Header::new(b"content-type", stream.mime_type.as_bytes()),
+                        quiche::h3::Header::new(b"content-type", stream.content_type.as_bytes()),
                         quiche::h3::Header::new(
                             b"content-length",
-                            stream.file_size.to_string().as_bytes(),
+                            stream.content_length.as_bytes(),
                         ),
                         quiche::h3::Header::new(b"accept-ranges", b"bytes"),
                     ];
@@ -2119,11 +2119,8 @@ async fn handle_request_inner(
                 Ok(Some(ServedResponse::Buffered(file))) => {
                     let mut hdrs = vec![
                         quiche::h3::Header::new(b":status", file.status.to_string().as_bytes()),
-                        quiche::h3::Header::new(b"content-type", file.mime_type.as_bytes()),
-                        quiche::h3::Header::new(
-                            b"content-length",
-                            file.content.len().to_string().as_bytes(),
-                        ),
+                        quiche::h3::Header::new(b"content-type", file.content_type.as_bytes()),
+                        quiche::h3::Header::new(b"content-length", file.content_length.as_bytes()),
                         quiche::h3::Header::new(b"accept-ranges", b"bytes"),
                     ];
                     if let Some(range) = &file.content_range {

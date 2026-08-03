@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use http::{HeaderMap, Method};
 use pingora_core::Result as PingoraResult;
 use pingora_http::ResponseHeader;
@@ -58,7 +59,21 @@ pub(crate) fn via_value(version: http::Version) -> String {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ResponseHeaderPolicy {
     set: HashMap<String, String>,
+    /// Precompiled header-name bytes for `set`: `Bytes` is the cheapest
+    /// `IntoCaseHeaderName` input (clone is a shared-bytes reference bump),
+    /// and building it once here keeps the per-request name path free of
+    /// `String` clones and re-parses.
+    set_names: HashMap<String, Bytes>,
+    /// Precompiled `HeaderValue`s for `set`: cloning one is a shared-bytes
+    /// reference bump, while re-parsing the stored string on every request
+    /// copies the bytes. `None` means the configured value was not a valid
+    /// header value, in which case the request-time error path is preserved.
+    set_values: HashMap<String, Option<http::HeaderValue>>,
     add: Vec<(String, String)>,
+    /// Precompiled header-name bytes for `add`, mirroring `set_names`.
+    add_names: Vec<Bytes>,
+    /// Precompiled `HeaderValue`s for `add`, mirroring `set_values`.
+    add_values: Vec<(String, Option<http::HeaderValue>)>,
     remove: Vec<String>,
     suppress_server: bool,
     suppress_via: bool,
@@ -67,14 +82,23 @@ pub(crate) struct ResponseHeaderPolicy {
 impl ResponseHeaderPolicy {
     /// 📝 Replaces a downstream header with one normalized value.
     pub(crate) fn set(&mut self, name: impl AsRef<str>, value: impl Into<String>) {
-        self.set
-            .insert(name.as_ref().to_ascii_lowercase(), value.into());
+        let name = name.as_ref().to_ascii_lowercase();
+        let value = value.into();
+        self.set_names
+            .insert(name.clone(), Bytes::copy_from_slice(name.as_bytes()));
+        self.set_values
+            .insert(name.clone(), http::HeaderValue::from_str(&value).ok());
+        self.set.insert(name, value);
     }
 
     /// ➕ Appends one downstream header value after replacement mutations.
     pub(crate) fn add(&mut self, name: impl AsRef<str>, value: impl Into<String>) {
-        self.add
-            .push((name.as_ref().to_ascii_lowercase(), value.into()));
+        let name = name.as_ref().to_ascii_lowercase();
+        let value = value.into();
+        self.add_names.push(Bytes::copy_from_slice(name.as_bytes()));
+        self.add_values
+            .push((name.clone(), http::HeaderValue::from_str(&value).ok()));
+        self.add.push((name, value));
     }
 
     /// 🧹 Removes a downstream header after every set and append mutation.
@@ -94,16 +118,25 @@ impl ResponseHeaderPolicy {
     /// 🧩 Adds proxy-owned replacements without overriding outer middleware.
     pub(crate) fn merge_proxy_set(&mut self, headers: &HashMap<String, String>) {
         for (name, value) in headers {
-            self.set
-                .entry(name.to_ascii_lowercase())
-                .or_insert_with(|| value.clone());
+            let name = name.to_ascii_lowercase();
+            if !self.set.contains_key(&name) {
+                self.set_names
+                    .insert(name.clone(), Bytes::copy_from_slice(name.as_bytes()));
+                self.set_values
+                    .insert(name.clone(), http::HeaderValue::from_str(value).ok());
+                self.set.insert(name, value.clone());
+            }
         }
     }
 
     /// 🔗 Merges a middleware decision into the active response policy.
     pub(crate) fn merge(&mut self, other: ResponseHeaderPolicy) {
         self.set.extend(other.set);
+        self.set_names.extend(other.set_names);
+        self.set_values.extend(other.set_values);
         self.add.extend(other.add);
+        self.add_names.extend(other.add_names);
+        self.add_values.extend(other.add_values);
         for name in other.remove {
             self.remove(name);
         }
@@ -119,10 +152,30 @@ impl ResponseHeaderPolicy {
         via_hop: Option<http::Version>,
     ) -> PingoraResult<()> {
         for (name, value) in &self.set {
-            response.insert_header(name.clone(), value.as_str())?;
+            let name_bytes = &self.set_names[name];
+            match self.set_values.get(name).and_then(|v| v.clone()) {
+                Some(header_value) => {
+                    response.insert_header(name_bytes.clone(), header_value)?;
+                }
+                None => {
+                    response.insert_header(name_bytes.clone(), value.as_str())?;
+                }
+            }
         }
-        for (name, value) in &self.add {
-            response.append_header(name.clone(), value.as_str())?;
+        for ((name, value), name_bytes) in self.add.iter().zip(&self.add_names) {
+            let header_value = self
+                .add_values
+                .iter()
+                .find(|(n, _)| n == name)
+                .and_then(|(_, v)| v.clone());
+            match header_value {
+                Some(header_value) => {
+                    response.append_header(name_bytes.clone(), header_value)?;
+                }
+                None => {
+                    response.append_header(name_bytes.clone(), value.as_str())?;
+                }
+            }
         }
         for name in &self.remove {
             let _ = response.remove_header(name);

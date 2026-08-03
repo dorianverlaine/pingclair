@@ -2217,7 +2217,7 @@ impl PingclairProxy {
         status: u16,
         body: &str,
     ) -> PingoraResult<()> {
-        let mut response = ResponseHeader::build(status, Some(3)).unwrap();
+        let mut response = Self::build_downstream_header(session, status, Some(3)).unwrap();
         response
             .insert_header("Content-Type", "text/plain")
             .unwrap();
@@ -2230,6 +2230,23 @@ impl PingclairProxy {
             .await?;
         Self::write_local_body(session, ctx, Bytes::copy_from_slice(body.as_bytes()), true).await?;
         Ok(())
+    }
+
+    /// Build a downstream response header using the cheapest case strategy.
+    ///
+    /// HTTP/2 header names are case-insensitive on the wire, so Pingora's
+    /// case-preserving map is pure per-header allocation overhead there;
+    /// HTTP/1.1 callers still need the original casing for the wire bytes.
+    fn build_downstream_header(
+        session: &Session,
+        status: u16,
+        size_hint: Option<usize>,
+    ) -> pingora_core::Result<ResponseHeader> {
+        if session.req_header().version == http::Version::HTTP_2 {
+            ResponseHeader::build_no_case(status, size_hint)
+        } else {
+            ResponseHeader::build(status, size_hint)
+        }
     }
 
     /// Apply response directives accumulated by handlers such as `header`
@@ -2515,7 +2532,8 @@ impl PingclairProxy {
                         .await
                     {
                         Ok(Some(pingclair_static::ServedResponse::Redirect(location))) => {
-                            let mut header = ResponseHeader::build(308, Some(2)).unwrap();
+                            let mut header =
+                                Self::build_downstream_header(session, 308, Some(2)).unwrap();
                             header.insert_header("Location", location.as_str()).unwrap();
                             Self::apply_local_response_headers(&mut header, ctx)?;
                             session
@@ -2524,18 +2542,19 @@ impl PingclairProxy {
                             return Ok(true);
                         }
                         Ok(Some(pingclair_static::ServedResponse::Stream(mut stream))) => {
-                            let mut header = ResponseHeader::build(200, Some(3)).unwrap();
+                            let mut header =
+                                Self::build_downstream_header(session, 200, Some(5)).unwrap();
                             header
-                                .insert_header("Content-Type", stream.mime_type.as_str())
+                                .insert_header("Content-Type", stream.content_type.clone())
                                 .unwrap();
                             header
-                                .insert_header("Content-Length", stream.file_size.to_string())
+                                .insert_header("Content-Length", stream.content_length.clone())
                                 .unwrap();
                             if let Some(lm) = &stream.last_modified {
-                                header.insert_header("Last-Modified", lm.as_str()).unwrap();
+                                header.insert_header("Last-Modified", lm.clone()).unwrap();
                             }
                             if let Some(etag) = &stream.etag {
-                                header.insert_header("ETag", etag.as_str()).unwrap();
+                                header.insert_header("ETag", etag.clone()).unwrap();
                             }
                             header.insert_header("Accept-Ranges", "bytes").unwrap();
                             Self::apply_local_response_headers(&mut header, ctx)?;
@@ -2559,12 +2578,14 @@ impl PingclairProxy {
                             return Ok(true);
                         }
                         Ok(Some(pingclair_static::ServedResponse::Buffered(file))) => {
-                            let mut header = ResponseHeader::build(file.status, Some(3)).unwrap();
+                            let mut header =
+                                Self::build_downstream_header(session, file.status, Some(6))
+                                    .unwrap();
                             header
-                                .insert_header("Content-Type", file.mime_type.as_str())
+                                .insert_header("Content-Type", file.content_type.clone())
                                 .unwrap();
                             header
-                                .insert_header("Content-Length", file.content.len().to_string())
+                                .insert_header("Content-Length", file.content_length.clone())
                                 .unwrap();
 
                             if let Some(range) = file.content_range {
@@ -2573,10 +2594,10 @@ impl PingclairProxy {
                                     .unwrap();
                             }
                             if let Some(lm) = file.last_modified {
-                                header.insert_header("Last-Modified", lm.as_str()).unwrap();
+                                header.insert_header("Last-Modified", lm).unwrap();
                             }
                             if let Some(etag) = file.etag {
-                                header.insert_header("ETag", etag.as_str()).unwrap();
+                                header.insert_header("ETag", etag).unwrap();
                             }
                             if let Some(encoding) = file.content_encoding {
                                 header
@@ -3449,7 +3470,7 @@ impl ProxyHttp for PingclairProxy {
                 .req_header()
                 .uri
                 .path_and_query()
-                .map(|value| value.as_str().to_string());
+                .map(|value| value.as_str());
             if let Some(current) = path_and_query
                 && let Some(normalized) = crate::http_policy::normalize_request_path(&current)
             {
