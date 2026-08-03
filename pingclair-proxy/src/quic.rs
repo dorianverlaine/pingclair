@@ -84,7 +84,13 @@ const OUT_BUF_SIZE: usize = 16 * 1024;
 const REQ_BODY_CHANNEL_CAPACITY: usize = 16;
 
 /// Bound for the global response channel shared by all handler tasks.
-const RESP_CHANNEL_CAPACITY: usize = 256;
+///
+/// Each slot can hold a 64 KiB body chunk, so 256 slots meant a connection
+/// could buffer 16 MiB of handler output while the worker paced it into
+/// quiche — 100 connections × 20 streams measured ~1.6 GiB RSS. With the
+/// worker's per-stream queue cap, 32 slots (2 MiB per connection) keep
+/// handler backpressure tight without stalling the pipeline.
+const RESP_CHANNEL_CAPACITY: usize = 32;
 
 /// Read size for draining request bodies out of quiche.
 const BODY_CHUNK_SIZE: usize = 16 * 1024;
@@ -491,6 +497,16 @@ struct RespEvent {
 
 type RespSender = mpsc::Sender<RespEvent>;
 
+/// 🌊 Per-stream cap on response bytes waiting to enter quiche.
+///
+/// Without a bound, a handler that produces a 1 MiB body hands the whole
+/// body to quiche before the client acknowledges it; 2,000 concurrent
+/// streams then hold ~2 GiB of QUIC send buffers (measured 1.63 GiB vs
+/// nginx's 0.4 GiB on the same 100×20 workload). Two 64 KiB chunks per
+/// stream bound the same workload near nginx's footprint while flow control
+/// still paces the actual wire rate.
+const BODY_QUEUE_CAP: usize = 128 * 1024;
+
 // MARK: - Connection / stream state
 
 /// Per-stream state owned by the event loop.
@@ -499,8 +515,17 @@ struct StreamState {
     /// 📤 Holds response headers until QUIC flow control accepts them.
     pending_headers: Option<(Vec<quiche::h3::Header>, bool)>,
     headers_sent: bool,
-    /// 🌊 Holds bounded response bytes that quiche has not accepted yet.
-    pending_body: VecDeque<u8>,
+    /// 🌊 Holds response chunks that quiche has not accepted yet.
+    ///
+    /// Chunks keep the event loop from copying a 1 MiB body byte-by-byte
+    /// through a `VecDeque<u8>` ring: the handler's `Vec<u8>` moves in, and
+    /// `flush_stream` hands the front slice to quiche. `pending_body_head`
+    /// tracks partial progress through the front chunk.
+    pending_body: VecDeque<Vec<u8>>,
+    /// 🌊 Total unconsumed bytes across all queued chunks.
+    pending_body_bytes: usize,
+    /// 🌊 Bytes already handed to quiche from the front chunk.
+    pending_body_head: usize,
     /// 🧾 Holds response trailers until body bytes and QUIC capacity are ready.
     pending_trailers: Option<Vec<quiche::h3::Header>>,
     /// 🏁 Records that the handler signaled the end of the response body.
@@ -538,6 +563,13 @@ struct H3App {
     streams: HashMap<u64, StreamState>,
     resp_tx: RespSender,
     resp_rx: mpsc::Receiver<RespEvent>,
+    /// 🧮 The channel head that did not fit its stream's body cap.
+    ///
+    /// Only this single event may be held back: everything behind it stays
+    /// in the bounded `resp_rx`, whose capacity is the real backpressure —
+    /// a handler whose stream is over [`BODY_QUEUE_CAP`] blocks on send
+    /// instead of letting the worker buffer the whole body out of order.
+    deferred: Option<RespEvent>,
     body_notify: Arc<Notify>,
     /// 🔢 Releases this connection's slot against `limits.max_connections`.
     _slot: ConnectionSlot,
@@ -603,15 +635,18 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
         &mut self,
         _qconn: &mut tokio_quiche::quic::QuicheConnection,
     ) -> tokio_quiche::QuicResult<()> {
-        // 🧲 Drains whatever handler events are already queued before waiting,
-        // so a burst of response chunks is applied in one worker iteration
-        // instead of waking once per event.
-        let mut applied = false;
-        while let Ok(event) = self.resp_rx.try_recv() {
-            self.apply_resp_event(event);
-            applied = true;
+        // 🧲 Applies deferred or channel-head events first: a previous
+        // iteration may have parked one while its stream was over the body
+        // cap, and capacity may have opened since.
+        if self.apply_available_events() {
+            return Ok(());
         }
-        if applied {
+        // 🛑 A parked event means the channel head cannot be applied yet.
+        // Receiving anything else would violate ordering, so wait for the
+        // next worker iteration (an inbound packet) instead; `process_writes`
+        // frees capacity and retries the parked event there.
+        if self.deferred.is_some() {
+            std::future::pending::<()>().await;
             return Ok(());
         }
         tokio::select! {
@@ -619,7 +654,11 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
                 // 🧯 The sender is held by this app, so the channel outlives
                 // every handler; `None` cannot mean "no more work".
                 if let Some(event) = event {
-                    self.apply_resp_event(event);
+                    if Self::event_fits(&self.streams, &event) {
+                        self.apply_resp_event(event);
+                    } else {
+                        self.deferred = Some(event);
+                    }
                 }
             }
             _ = self.body_notify.notified() => {
@@ -627,10 +666,8 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
                 // drains are retried in `process_reads`.
             }
         }
-        // 🧲 Drains events that queued behind the one that woke this worker.
-        while let Ok(event) = self.resp_rx.try_recv() {
-            self.apply_resp_event(event);
-        }
+        // 🧲 Applies anything that queued behind the event that woke us.
+        self.apply_available_events();
         Ok(())
     }
 
@@ -672,13 +709,16 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
         // would wait for the next packet or PTO and hang the request.
         self.retry_pending_body_drains(qconn);
 
+        // 🧮 Applies deferred events whose streams may have room again.
+        self.apply_available_events();
+
         let dirty: Vec<u64> = self
             .streams
             .iter()
             .filter(|(_, s)| {
                 !s.dead
                     && (s.pending_headers.is_some()
-                        || !s.pending_body.is_empty()
+                        || s.pending_body_bytes > 0
                         || s.pending_trailers.is_some()
                         || (s.body_fin && !s.fin_sent))
             })
@@ -694,6 +734,10 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
         for stream_id in writable {
             self.flush_stream(qconn, stream_id);
         }
+
+        // 🧮 Handing chunks to quiche frees per-stream capacity, so apply
+        // deferred events again before the worker goes back to waiting.
+        self.apply_available_events();
 
         self.streams.retain(|_, s| !s.dead);
         Ok(())
@@ -736,7 +780,8 @@ fn reject_request_trailers(stream: &mut StreamState) -> TrailerRejection {
         ],
         false,
     ));
-    stream.pending_body = body.iter().copied().collect();
+    stream.pending_body = VecDeque::from([body.to_vec()]);
+    stream.pending_body_bytes = body.len();
     stream.body_fin = true;
     stream.fin_sent = false;
     stream.dead = false;
@@ -914,6 +959,7 @@ impl QuicServer {
                 streams: HashMap::with_capacity(32),
                 resp_tx,
                 resp_rx,
+                deferred: None,
                 body_notify: Arc::new(Notify::new()),
                 _slot: ConnectionSlot(Arc::clone(&live_connections)),
                 out: vec![0u8; OUT_BUF_SIZE],
@@ -1121,7 +1167,8 @@ impl H3App {
             stream_id,
             StreamState {
                 pending_headers: Some((headers, false)),
-                pending_body: body.as_bytes().iter().copied().collect(),
+                pending_body: VecDeque::from([body.as_bytes().to_vec()]),
+                pending_body_bytes: body.len(),
                 body_fin: true,
                 ..Default::default()
             },
@@ -1228,7 +1275,8 @@ impl H3App {
                     ss.pending_headers = Some((headers, fin));
                 }
                 RespMsg::Body(bytes, fin) => {
-                    ss.pending_body.extend(bytes);
+                    ss.pending_body_bytes += bytes.len();
+                    ss.pending_body.push_back(bytes);
                     if fin {
                         ss.body_fin = true;
                     }
@@ -1239,6 +1287,64 @@ impl H3App {
                 RespMsg::HandlerDone => {}
             }
         }
+    }
+
+    /// 🧮 Applies handler events up to each stream's body cap.
+    ///
+    /// Events stay FIFO: the loop stops at the first event whose stream is
+    /// over [`BODY_QUEUE_CAP`] (that event becomes `deferred` and everything
+    /// behind it stays in the bounded channel), so a later event never
+    /// overtakes an earlier one. Returns whether anything was applied, which
+    /// the caller uses to avoid sleeping while work is still possible.
+    fn apply_available_events(&mut self) -> bool {
+        let mut applied = false;
+        while let Some(event) = self.take_appliable_event() {
+            self.apply_resp_event(event);
+            applied = true;
+        }
+        applied
+    }
+
+    /// 🧮 Returns the next response event that can be applied right now.
+    ///
+    /// The deferred slot is consulted first; when it is empty, exactly one
+    /// event is pulled from the channel and either returned or parked in the
+    /// slot. Later events stay in the channel, so the channel's bounded
+    /// capacity (not an unbounded worker buffer) applies backpressure.
+    fn take_appliable_event(&mut self) -> Option<RespEvent> {
+        if let Some(event) = self.deferred.take() {
+            if Self::event_fits(&self.streams, &event) {
+                return Some(event);
+            }
+            self.deferred = Some(event);
+            return None;
+        }
+        let event = self.resp_rx.try_recv().ok()?;
+        if Self::event_fits(&self.streams, &event) {
+            Some(event)
+        } else {
+            self.deferred = Some(event);
+            None
+        }
+    }
+
+    /// 🧮 Whether a response event fits its stream's body-queue cap.
+    fn event_fits(streams: &HashMap<u64, StreamState>, event: &RespEvent) -> bool {
+        match &event.msg {
+            RespMsg::Body(bytes, _) => Self::body_event_fits(streams, event.stream_id, bytes.len()),
+            _ => true,
+        }
+    }
+
+    /// 🧮 Whether a response chunk fits the stream's body-queue cap.
+    fn body_event_fits(streams: &HashMap<u64, StreamState>, stream_id: u64, bytes: usize) -> bool {
+        streams.get(&stream_id).is_none_or(|ss| {
+            // 🌊 An empty queue accepts any single chunk (a handler may
+            // legitimately produce one 512 KiB body event); the cap only
+            // gates appending more while bytes are already queued.
+            ss.pending_body_bytes == 0
+                || ss.pending_body_bytes.saturating_add(bytes) <= BODY_QUEUE_CAP
+        })
     }
 
     /// Write as much of a stream's pending response as quiche currently
@@ -1301,12 +1407,24 @@ impl H3App {
             }
         }
 
-        while !ss.pending_body.is_empty() {
-            let (front, _) = ss.pending_body.as_slices();
-            match h3.send_body(conn, stream_id, front, false) {
+        while ss.pending_body_bytes > 0 {
+            let chunk_len = ss.pending_body.front().map_or(0, Vec::len);
+            let head = ss.pending_body_head;
+            let sent = {
+                let Some(chunk) = ss.pending_body.front() else {
+                    break;
+                };
+                h3.send_body(conn, stream_id, &chunk[head..], false)
+            };
+            match sent {
                 Ok(0) => break,
                 Ok(n) => {
-                    ss.pending_body.drain(..n);
+                    ss.pending_body_bytes -= n;
+                    ss.pending_body_head += n;
+                    if ss.pending_body_head == chunk_len {
+                        ss.pending_body.pop_front();
+                        ss.pending_body_head = 0;
+                    }
                 }
                 Err(quiche::h3::Error::Done) => break,
                 Err(e) => {
@@ -1322,7 +1440,7 @@ impl H3App {
             }
         }
 
-        if ss.pending_body.is_empty()
+        if ss.pending_body_bytes == 0
             && !ss.fin_sent
             && let Some(trailers) = ss.pending_trailers.take()
         {
@@ -1345,7 +1463,7 @@ impl H3App {
             }
         }
 
-        if ss.body_fin && ss.pending_body.is_empty() && !ss.fin_sent {
+        if ss.body_fin && ss.pending_body_bytes == 0 && !ss.fin_sent {
             match h3.send_body(conn, stream_id, b"", true) {
                 Ok(_) => ss.fin_sent = true,
                 Err(quiche::h3::Error::Done) => {}
@@ -2988,7 +3106,8 @@ mod tests {
         let mut stream = StreamState {
             cancel_tx: Some(cancel_tx),
             req_body_tx: Some(mpsc::channel(1).0),
-            pending_body: VecDeque::from(b"stale".to_vec()),
+            pending_body: VecDeque::from([b"stale".to_vec()]),
+            pending_body_bytes: 5,
             ..Default::default()
         };
 
@@ -3001,8 +3120,17 @@ mod tests {
         assert!(stream.req_stream_finished);
         assert!(stream.req_body_tx.is_none());
         assert_eq!(
-            stream.pending_body.iter().copied().collect::<Vec<_>>(),
+            stream
+                .pending_body
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
             b"Request Trailers Not Supported"
+        );
+        assert_eq!(
+            stream.pending_body_bytes,
+            b"Request Trailers Not Supported".len()
         );
         let (headers, fin) = stream.pending_headers.as_ref().unwrap();
         assert!(!fin);
@@ -3077,6 +3205,37 @@ mod tests {
         let mut pending = pending_body_drain_ids(&streams);
         pending.sort_unstable();
         assert_eq!(pending, vec![4, 8]);
+    }
+
+    #[test]
+    fn body_event_fits_respects_the_per_stream_cap() {
+        // 🧠 The backlog must defer body chunks that would push a stream over
+        // `BODY_QUEUE_CAP`; unknown streams are treated as fitting so their
+        // events drain to a harmless no-op. An empty queue always fits so a
+        // single oversized chunk (e.g. one 512 KiB handler body) cannot be
+        // stranded in the backlog forever.
+        let mut streams = HashMap::new();
+        streams.insert(
+            0,
+            StreamState {
+                pending_body_bytes: BODY_QUEUE_CAP,
+                ..Default::default()
+            },
+        );
+        streams.insert(
+            4,
+            StreamState {
+                pending_body_bytes: BODY_QUEUE_CAP - 1,
+                ..Default::default()
+            },
+        );
+        streams.insert(12, StreamState::default());
+
+        assert!(!H3App::body_event_fits(&streams, 0, 1));
+        assert!(H3App::body_event_fits(&streams, 4, 1));
+        assert!(!H3App::body_event_fits(&streams, 4, BODY_QUEUE_CAP));
+        assert!(H3App::body_event_fits(&streams, 8, usize::MAX / 2));
+        assert!(H3App::body_event_fits(&streams, 12, BODY_QUEUE_CAP * 4));
     }
 
     #[test]
