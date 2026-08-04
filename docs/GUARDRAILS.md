@@ -202,7 +202,7 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
 >
 > **代價已經付掉了**:那句話的存在讓這個專案手寫並維護了一整套 QUIC 傳輸層
 > ——socket 迴圈、connection map、計時器、版本協商、stateless retry 與 token
-> 驗證,約 500 行。2026-07-30 全部刪除,換成 `tokio-quiche`（`561d802`）。
+> 驗證,約 500 行。2026-07-30 全部刪除,換成 `tokio-quiche`（`ba37ffc`）。
 >
 > **寫否決註解的規則**:必須寫下「哪一版、看了哪個符號、什麼日期」。
 > 只寫結論的否決註解會變成一道沒人敢推的門。
@@ -213,7 +213,7 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
 
 ### 架構
 
-> 📌 **2026-07-30（`561d802`）換掉了傳輸層。** 以下描述的是換完之後的樣子；
+> 📌 **2026-07-30（`ba37ffc`）換掉了傳輸層。** 以下描述的是換完之後的樣子；
 > 手寫的 UDP 迴圈與無鎖 connection map 已經不存在。
 
 - **分界線是傳輸／應用。** `tokio-quiche` 擁有 UDP socket、封包解析、版本協商、
@@ -270,7 +270,7 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
   curl）與 `scripts/test-h3-cancellation-local.sh`（SSE／取消／trailer）。
   Linux 那一半用 docker `rust:1.97-bookworm`。
 
-> ✅ **`561d802` 的遷移已通過這一關**（2026-07-30，證據在
+> ✅ **`ba37ffc` 的遷移已通過這一關**（2026-07-30，證據在
 > `benchmarks/results/20260730_day28_f26d0a1/`）：Linux release build、
 > 無 `openssl-sys`、無動態 `libssl`／`libcrypto`、Linux 454 測試全綠、
 > 與 quiche 0.18 的 curl 跨版本互通、功能矩陣 14/14。
@@ -291,7 +291,7 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
 > pkg-config clang libclang-dev git`。
 >
 > 📌 **這個坑之所以拖到現在才現形**：`deployment/Dockerfile` 自從 H3 換成
-> tokio-quiche（`561d802`）之後**從來沒有人真的建過**。線上跑的
+> tokio-quiche（`ba37ffc`）之後**從來沒有人真的建過**。線上跑的
 > `rc-a554477` image 是在依賴樹改變之前建的。一份不會被 CI 執行的建置腳本
 > 就是一份沒有測試的程式碼。（當時 Dockerfile 基底是 slim bookworm 變體,
 > 連 `git` 都沒有；現已改為 ubuntu:latest ＋ rustup,套件清單見上方。）
