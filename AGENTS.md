@@ -308,6 +308,17 @@ configuration load or hot reload. Invalid security policy should fail closed.
 - 🪵 Runtime log messages must include an appropriate, stable emoji that
   communicates the event category without replacing structured log fields.
   Keep the wording in English.
+- 🧾 **Configure test servers with a Pingclairfile, not JSON.** When a test,
+  a verification run, or a reproduction needs a running server, write the
+  configuration in the DSL and let the adapter compile it. JSON bypasses the
+  Caddyfile adapter entirely, so a JSON-configured test exercises roughly half
+  the path a user's configuration takes and cannot catch a directive that
+  parses into the wrong shape.
+
+  This is also how DSL defects get found. A verification run that has to
+  reach for JSON because the DSL cannot express what it needs has discovered
+  something — write down which directive was missing or wrong, then fix it.
+  Reach for JSON only where the DSL genuinely has no equivalent, and say so.
 - ⚡ **Fix performance problems you walk past.** When you are already editing a
   function and notice per-request work that belongs at configuration time, an
   allocation in a hot loop, a clone of something you could borrow, or a lock

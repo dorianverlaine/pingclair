@@ -170,6 +170,19 @@ imperative summary.
 Exempt: shebangs, license headers, generated files, and machine-required
 directives.
 
+### 🧾 Test with a Pingclairfile
+
+Whenever a test, verification run, or reproduction needs a live server, write
+its configuration in the DSL. A JSON-configured server skips `adapter/caddyfile.rs`
+completely, so it exercises about half the path a real user's configuration
+takes — and every directive that parses into the wrong shape lives in exactly
+the half that was skipped.
+
+Treat "I had to use JSON here" as a finding rather than a workaround: the DSL
+could not express something a user will eventually want to express. Note which
+directive was missing or misbehaving, then fix it. Use JSON only where there is
+genuinely no DSL equivalent, and say which case that was.
+
 ### ⚡ Fix performance problems you walk past
 
 While you are already in a function, treat per-request work that configuration
