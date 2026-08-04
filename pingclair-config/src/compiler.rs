@@ -1279,6 +1279,7 @@ fn compile_handler(handler: &Handler, root: Option<&str>) -> CompileResult<Handl
             if let Some(policy) = &proxy.lb_policy {
                 config.load_balance.strategy = policy.clone();
             }
+            config.load_balance.hash_key = proxy.lb_hash_key.clone();
 
             // Flush interval
             if let Some(fi) = &proxy.flush_interval {

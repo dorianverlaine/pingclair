@@ -510,6 +510,9 @@ pub struct ProxyConfig {
     /// Load-balancing strategy selected by `lb_policy`.
     pub lb_policy: Option<String>,
 
+    /// 🔑 Field name hashed by the `header`／`cookie`／`query` strategies.
+    pub lb_hash_key: Option<String>,
+
     /// 🩺 Active health-check policy for this upstream pool.
     pub health_check: Option<HealthCheckConfig>,
 
@@ -878,6 +881,7 @@ impl ProxyConfig {
                 .collect(),
             upstreams,
             lb_policy: None,
+            lb_hash_key: None,
             health_check: None,
             flush_interval: None,
             header_up: HashMap::new(),

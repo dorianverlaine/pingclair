@@ -1139,9 +1139,19 @@ impl UpstreamTlsConfig {
 /// Load balancing configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LoadBalanceConfig {
-    /// Strategy: round_robin, random, least_conn, ip_hash, first
+    /// Strategy: round_robin, random, least_conn, ip_hash, header, cookie,
+    /// query, first
     #[serde(default = "default_lb_strategy")]
     pub strategy: String,
+    /// 🔑 Which request field supplies the consistent-hash key, for the
+    /// strategies that hash something other than the client address.
+    ///
+    /// `None` for `ip_hash` and for every non-hashing strategy. The field is
+    /// the header name, cookie name, or query parameter name depending on the
+    /// strategy, which is why one field serves all three: they differ only in
+    /// where the value is read from, never in what is done with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_key: Option<String>,
 }
 
 /// An upstream's selection properties.

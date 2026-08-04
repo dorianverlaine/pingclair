@@ -50,6 +50,14 @@ Everything below is on `main` and unreleased; the workspace reports
 - **Command line.** `reload`, `start`, `stop`, `respond`, `run --watch`,
   HTTPS quick commands, shell completion, `environ`, `list-modules`,
   `build-info`, `manpage`, `storage` and `trust`.
+- **Session affinity by header, cookie, or query parameter.**
+  `lb_policy header X-Session`, `lb_policy cookie sid` and
+  `lb_policy query user` route requests carrying the same value to the same
+  backend, over the same consistent-hash ring `ip_hash` already used — so
+  adding a backend moves about one backend's share of traffic rather than
+  reshuffling everyone. A request that does not carry the named field falls
+  back to normal selection instead of hashing an empty value, which would pin
+  every such client to one backend.
 - **Reverse proxy.** Active health checks, circuit breakers, exact local rate
   limiting, bounded idempotent redispatch, per-request resource bounds,
   upstream authentication, gRPC parity, h2c, hostname re-resolution while the

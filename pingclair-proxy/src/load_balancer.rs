@@ -1496,3 +1496,92 @@ mod tests {
         assert_eq!(light, 10);
     }
 }
+
+#[cfg(test)]
+mod consistent_hash_tests {
+    use super::*;
+
+    fn pool_of(count: usize) -> LoadBalancer {
+        let upstreams = (0..count)
+            .map(|i| Upstream::new(&format!("127.0.0.1:{}", 9000 + i)).unwrap())
+            .collect();
+        LoadBalancer::new(upstreams, Strategy::IpHash)
+    }
+
+    /// 📐 The property that makes consistent hashing worth having.
+    ///
+    /// Adding a backend to a pool of N must move roughly 1/(N+1) of the keys —
+    /// only the share the newcomer takes over. A plain `hash % n` would move
+    /// almost all of them, which for a session-affinity policy means logging
+    /// nearly every user out at once. Asserting "the same key maps to the same
+    /// backend" would pass just as happily for `hash % n`, so it proves nothing
+    /// about the choice actually made here.
+    ///
+    /// The bound is loose (25 %) because ketama distributes by weight over a
+    /// ring of virtual nodes rather than exactly; the point is the order of
+    /// magnitude. `hash % n` would land near 100 % and fail this by a mile.
+    #[test]
+    fn growing_the_pool_remaps_only_a_small_share_of_keys() {
+        let keys: Vec<String> = (0..2_000).map(|i| format!("session-{i}")).collect();
+
+        let before = pool_of(4);
+        let after = pool_of(5);
+
+        let mut placed = 0usize;
+        let mut moved = 0usize;
+        for key in &keys {
+            let (Some(a), Some(b)) = (
+                before.select(Some(key.as_bytes())),
+                after.select(Some(key.as_bytes())),
+            ) else {
+                continue;
+            };
+            placed += 1;
+            if a.addr != b.addr {
+                moved += 1;
+            }
+        }
+
+        assert!(placed > 1_000, "the pools placed too few keys to judge");
+        let share = moved as f64 / placed as f64;
+        assert!(
+            share < 0.25,
+            "adding one backend to a pool of four moved {:.1}% of keys; consistent hashing \
+             should move roughly 1/5, and a modulo scheme would move nearly all of them",
+            share * 100.0
+        );
+    }
+
+    /// 🎯 The mirror property: the same key must reach the same backend while
+    /// the pool is unchanged, or "consistent" means nothing.
+    #[test]
+    fn the_same_key_reaches_the_same_backend() {
+        let pool = pool_of(4);
+        let first = pool.select(Some(b"session-abc")).map(|u| u.addr);
+        for _ in 0..50 {
+            assert_eq!(
+                pool.select(Some(b"session-abc")).map(|u| u.addr),
+                first,
+                "an unchanged pool must place a key identically every time"
+            );
+        }
+    }
+
+    /// 🌊 Different keys must actually spread. A ring that sent everything to
+    /// one backend would pass both tests above.
+    #[test]
+    fn different_keys_spread_across_the_pool() {
+        let pool = pool_of(4);
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..500 {
+            if let Some(upstream) = pool.select(Some(format!("session-{i}").as_bytes())) {
+                seen.insert(upstream.addr);
+            }
+        }
+        assert!(
+            seen.len() >= 3,
+            "500 distinct keys reached only {} of 4 backends",
+            seen.len()
+        );
+    }
+}

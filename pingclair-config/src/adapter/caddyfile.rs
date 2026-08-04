@@ -1905,7 +1905,41 @@ fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError> {
                         .ok_or_else(|| AdapterError::ArgumentCount("lb_policy".into(), 1, 0))?;
                     match policy.as_str() {
                         "round_robin" | "random" | "least_conn" | "ip_hash" | "first" => {
+                            // 🚫 These take no argument. Accepting a stray one
+                            // would let `lb_policy ip_hash X-User` read as
+                            // "hash on X-User" when it does nothing of the sort.
+                            if sub.args.len() > 1 {
+                                return Err(AdapterError::ArgumentCount(
+                                    format!("lb_policy {policy}"),
+                                    1,
+                                    sub.args.len(),
+                                ));
+                            }
                             proxy.lb_policy = Some(policy.clone());
+                        }
+                        // 🔑 Caddy's hashing policies name the field they hash.
+                        // The name is mandatory: `lb_policy cookie` with no
+                        // cookie named would hash the same empty string for
+                        // every client and quietly pin the whole site to one
+                        // backend.
+                        "header" | "cookie" | "query" => {
+                            let Some(field) = sub.args.get(1) else {
+                                return Err(AdapterError::InvalidArgument(
+                                    format!("lb_policy {policy}"),
+                                    format!(
+                                        "`{policy}` needs the name to hash, e.g. `lb_policy {policy} X-Session`"
+                                    ),
+                                ));
+                            };
+                            if sub.args.len() > 2 {
+                                return Err(AdapterError::ArgumentCount(
+                                    format!("lb_policy {policy}"),
+                                    2,
+                                    sub.args.len(),
+                                ));
+                            }
+                            proxy.lb_policy = Some(policy.clone());
+                            proxy.lb_hash_key = Some(field.clone());
                         }
                         _ => {
                             return Err(AdapterError::InvalidArgument(

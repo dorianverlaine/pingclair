@@ -734,6 +734,10 @@ pub struct ProxyState {
     pub rate_limiters: Vec<Option<Arc<crate::rate_limit::RateLimiter>>>,
     /// 🚦 Admission and circuit state per reverse-proxy route.
     pub(crate) route_protections: Vec<Option<Arc<RouteProtection>>>,
+
+    /// 🔑 Per-route consistent-hash key source, parallel to `load_balancers`.
+    /// `None` means the route hashes the client address, or does not hash.
+    pub(crate) hash_key_sources: Vec<Option<HashKeySource>>,
     /// 🔐 Compiled upstream TLS trust and identity per reverse-proxy route.
     pub(crate) upstream_tls: Vec<RouteUpstreamTls>,
     /// Pre-compiled per-route access policies.
@@ -1035,6 +1039,7 @@ impl ProxyState {
         let mut file_servers = Vec::new();
         let mut rate_limiters = Vec::new();
         let mut route_protections = Vec::new();
+        let mut hash_key_sources = Vec::new();
         let mut upstream_tls = Vec::new();
         let mut access_controls = Vec::new();
         let mut rewrite_regexes = Vec::new();
@@ -1064,7 +1069,10 @@ impl ProxyState {
                 let strategy = match proxy_config.load_balance.strategy.as_str() {
                     "random" => Strategy::Random,
                     "least_conn" => Strategy::LeastConn,
-                    "ip_hash" => Strategy::IpHash,
+                    // 🔑 Every hashing policy uses the same consistent-hash
+                    // ring; they differ only in what gets hashed, which the
+                    // request path resolves through `hash_key_sources`.
+                    "ip_hash" | "header" | "cookie" | "query" => Strategy::IpHash,
                     "first" => Strategy::RoundRobin,
                     _ => Strategy::RoundRobin,
                 };
@@ -1146,6 +1154,19 @@ impl ProxyState {
                 crate::dns::register(&load_balancer);
 
                 load_balancers.push(Some(load_balancer));
+                // 🔑 Resolve the hash-key source once, here, so the request
+                // path never re-reads the strategy string. A named field with
+                // no strategy that hashes it is dropped rather than kept: the
+                // adapter only sets one alongside the other, so reaching this
+                // with a mismatch means the two drifted apart.
+                hash_key_sources.push(proxy_config.load_balance.hash_key.as_ref().and_then(
+                    |field| match proxy_config.load_balance.strategy.as_str() {
+                        "header" => Some(HashKeySource::Header(field.clone())),
+                        "cookie" => Some(HashKeySource::Cookie(field.clone())),
+                        "query" => Some(HashKeySource::Query(field.clone())),
+                        _ => None,
+                    },
+                ));
                 tracing::info!(
                     "⚖️ Initialized load balancer for route {} with strategy {:?}",
                     route.path,
@@ -1181,6 +1202,7 @@ impl ProxyState {
             } else {
                 load_balancers.push(None);
                 route_protections.push(None);
+                hash_key_sources.push(None);
                 upstream_tls.push(RouteUpstreamTls::Default);
             }
 
@@ -1258,6 +1280,7 @@ impl ProxyState {
             file_servers,
             rate_limiters,
             route_protections,
+            hash_key_sources,
             upstream_tls,
             access_controls,
             rewrite_regexes,
@@ -1753,6 +1776,19 @@ impl PingclairProxy {
 
     /// ⚖️ Returns the identity IP-hash balancing uses, matching request policy.
     fn balancing_identity(&self, session: &mut Session, ctx: &RequestContext) -> Option<Vec<u8>> {
+        // 🔑 A route may hash something other than the client address — a
+        // session header, a cookie, a query parameter. The source was decided
+        // at configuration time and precomputed into `ProxyState`, so this is a
+        // lookup rather than a per-request parse of the strategy string.
+        if let Some(source) = ctx
+            .state
+            .as_ref()
+            .and_then(|state| state.hash_key_sources.get(ctx.route_index?))
+            .and_then(|source| source.as_ref())
+        {
+            return extract_hash_key(session.req_header(), source);
+        }
+
         ctx.verified_client_ip
             .or_else(|| {
                 Some(
@@ -2964,6 +3000,61 @@ fn response_cache_eviction(limit_bytes: usize) -> &'static simple_lru::Manager {
         metrics::CACHE_LIMIT_BYTES.set(limit_bytes as i64);
         Box::leak(Box::new(simple_lru::Manager::new(limit_bytes)))
     })
+}
+
+/// 🔑 Where a route's consistent-hash key is read from.
+///
+/// Resolved once at configuration time — the strategy name and the field name
+/// never change per request, so parsing them per request would be work the
+/// configuration already settled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HashKeySource {
+    Header(String),
+    Cookie(String),
+    Query(String),
+}
+
+/// 🔑 Reads the value a route hashes on, or `None` when the request does not
+/// carry it.
+///
+/// Returning `None` is deliberate and matters: it makes the balancer fall back
+/// to its default selection for that request rather than hashing an empty
+/// string. Hashing `""` would send every client that omits the header to the
+/// same backend — a hot spot that looks like a load-balancing bug and is
+/// really a configuration one.
+fn extract_hash_key(request: &RequestHeader, source: &HashKeySource) -> Option<Vec<u8>> {
+    let value = match source {
+        HashKeySource::Header(name) => request
+            .headers
+            .get(name.as_str())
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string),
+
+        // 🍪 `Cookie` arrives as one field of `name=value` pairs. Splitting on
+        // `;` and then on the first `=` keeps values that themselves contain
+        // `=`, which base64-encoded session identifiers routinely do.
+        HashKeySource::Cookie(name) => request
+            .headers
+            .get(http::header::COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|cookies| {
+                cookies.split(';').find_map(|pair| {
+                    let (key, value) = pair.split_once('=')?;
+                    (key.trim() == name).then(|| value.trim().to_string())
+                })
+            }),
+
+        HashKeySource::Query(name) => request.uri.query().and_then(|query| {
+            query.split('&').find_map(|pair| {
+                let (key, value) = pair.split_once('=')?;
+                (key == name).then(|| value.to_string())
+            })
+        }),
+    }?;
+
+    // 🚫 A present-but-empty value is the same hot-spot problem as an absent
+    // one, so it is treated the same way.
+    (!value.is_empty()).then(|| value.into_bytes())
 }
 
 /// 🗄️ A read-only snapshot of the shared response store, for the admin API.
@@ -6721,5 +6812,82 @@ mod response_cache_tests {
         let from_purge =
             CacheKey::new("EXAMPLE.com".to_ascii_lowercase(), "/a?b=1", "").to_compact();
         assert_eq!(from_request, from_purge);
+    }
+}
+
+#[cfg(test)]
+mod hash_key_tests {
+    use super::*;
+
+    fn request(build: impl FnOnce(&mut RequestHeader)) -> RequestHeader {
+        let mut header = RequestHeader::build("GET", b"/shop?sid=abc&other=1", None).unwrap();
+        build(&mut header);
+        header
+    }
+
+    #[test]
+    fn a_header_key_is_read_from_the_named_field() {
+        let header = request(|h| h.insert_header("X-Session", "s-42").unwrap());
+        let key = extract_hash_key(&header, &HashKeySource::Header("X-Session".into()));
+        assert_eq!(key.as_deref(), Some(&b"s-42"[..]));
+    }
+
+    /// 🍪 Session identifiers are routinely base64, which contains `=` padding.
+    /// Splitting on every `=` instead of the first would truncate the value and
+    /// send the same client to different backends as the padding changed.
+    #[test]
+    fn a_cookie_value_keeps_its_own_equals_signs() {
+        let header = request(|h| {
+            h.insert_header("Cookie", "theme=dark; sid=YWJjZA==; other=1")
+                .unwrap()
+        });
+        let key = extract_hash_key(&header, &HashKeySource::Cookie("sid".into()));
+        assert_eq!(key.as_deref(), Some(&b"YWJjZA=="[..]));
+    }
+
+    #[test]
+    fn a_cookie_name_is_matched_whole_not_by_prefix() {
+        let header = request(|h| h.insert_header("Cookie", "sidecar=no; sid=yes").unwrap());
+        let key = extract_hash_key(&header, &HashKeySource::Cookie("sid".into()));
+        assert_eq!(
+            key.as_deref(),
+            Some(&b"yes"[..]),
+            "`sidecar` must not satisfy a request for `sid`"
+        );
+    }
+
+    #[test]
+    fn a_query_key_is_read_from_the_query_string() {
+        let header = request(|_| {});
+        let key = extract_hash_key(&header, &HashKeySource::Query("sid".into()));
+        assert_eq!(key.as_deref(), Some(&b"abc"[..]));
+    }
+
+    /// 🚫 A missing or empty value must not hash — it must fall back.
+    ///
+    /// Hashing `""` would map every client that omits the field onto the same
+    /// backend. That is a hot spot which looks like a load-balancer defect and
+    /// is really a configuration one, so it is worth its own test rather than
+    /// being left to the reader of `extract_hash_key`.
+    #[test]
+    fn an_absent_or_empty_value_yields_no_key() {
+        let missing = request(|_| {});
+        assert_eq!(
+            extract_hash_key(&missing, &HashKeySource::Header("X-Session".into())),
+            None
+        );
+
+        let empty = request(|h| h.insert_header("X-Session", "").unwrap());
+        assert_eq!(
+            extract_hash_key(&empty, &HashKeySource::Header("X-Session".into())),
+            None,
+            "an empty value is the same hot spot as an absent one"
+        );
+
+        let empty_cookie = request(|h| h.insert_header("Cookie", "sid=").unwrap());
+        assert_eq!(
+            extract_hash_key(&empty_cookie, &HashKeySource::Cookie("sid".into())),
+            None
+        );
     }
 }
