@@ -12,6 +12,20 @@
 
 ## 🧪 測試與除錯
 
+- **同一件事不要有兩份建置設定。** 2026-08-05 的 Day 22 發現：倉庫根目錄有一份
+  `Dockerfile`，`docker build .` —— 從乾淨 checkout 最顯然的那條命令 ——
+  **會失敗**，因為它逐項列出要 COPY 的 crate 而漏了 `[patch.crates-io]` 需要的
+  `vendor/`。CI 建的是 `deployment/Dockerfile`（`COPY . .`），所以根目錄那份
+  **從來沒有被任何工作流建過**，而 `benchmarks/docker-compose.yml` 正指著它。
+
+  更早的 2026-07-31 事故已經記過同一個形狀（見下方鏈結一節：Dockerfile 漂移
+  導致線上 image 與 CI 不同）。當時的結論是「改一邊就要改另一邊」，
+  **那個結論不夠**——需要人記得的一致性，遲早會有人不記得。
+
+  > 🎯 **可操作的規則**：重複的建置設定要**刪掉**，不是靠紀律同步。
+  > 根目錄那份已於 2026-08-05 移除，`deployment/Dockerfile` 是唯一一份，
+  > 而 `ci.yml` 的 `docker-image` job 每次都建它。
+
 - **一個綠燈的單元測試，可能檢查的是對的東西、錯的層級。**
   2026-08-04 加 `lb_policy header X-Session` 時，同時寫了
   `an_absent_or_empty_value_yields_no_key`：請求沒帶那個 header 時，
