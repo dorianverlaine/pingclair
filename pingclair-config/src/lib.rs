@@ -66,38 +66,172 @@ pub fn compile_file(path: impl AsRef<Path>) -> Result<PingclairConfig, FullCompi
 }
 
 /// Load and merge multiple configuration files
+///
+/// 🗂️ **Validation runs on the merged result, not on each file.** A directory
+/// configuration is one configuration split across files, so a file is not
+/// required to be independently valid: a site in `10-site.pingclair` may
+/// reference a log channel declared in `00-logging.pingclair`, and checking
+/// them separately would reject that with an error naming the wrong file.
 pub fn compile_multiple_files(
     paths: &[impl AsRef<Path>],
 ) -> Result<PingclairConfig, FullCompileError> {
     let mut final_config = pingclair_core::config::PingclairConfig::default();
 
     for path in paths {
-        let config = compile_file(path.as_ref())?;
+        let config = compile_file_unvalidated(path.as_ref())?;
 
-        // Merge configurations
         final_config.debug = final_config.debug || config.debug;
         final_config.servers.extend(config.servers);
 
-        // Merge admin config (use the last one if multiple exist)
+        // 🗂️ The last file naming an admin block wins. Two admin listeners is
+        // not a shape the runtime has, so merging them would have to invent an
+        // answer.
         if let Some(admin) = config.admin {
             final_config.admin = Some(admin);
         }
 
-        // Merge global config
-        if let Some(email) = config.global.email {
-            final_config.global.email = Some(email);
-        }
-        if config.global.auto_https != pingclair_core::config::AutoHttpsMode::On {
-            final_config.global.auto_https = config.global.auto_https;
-        }
-
-        // Merge logging config (use the last one if multiple exist)
-        if !config.logging.level.is_empty() {
-            final_config.logging = config.logging;
-        }
+        merge_globals(&mut final_config.global, config.global);
+        merge_logging(&mut final_config.logging, config.logging, path.as_ref())?;
     }
 
+    // 🛡️ One validation pass, on what the runtime will actually receive.
+    compiler::validate_config(&final_config)?;
     Ok(final_config)
+}
+
+/// 🧩 Compiles one file without the whole-configuration checks.
+///
+/// Only for the directory path, where the checks belong on the merged result.
+/// Everything else must keep using [`compile_file`].
+fn compile_file_unvalidated(path: &Path) -> Result<PingclairConfig, FullCompileError> {
+    let source = std::fs::read_to_string(path).map_err(|e| FullCompileError::Io(e.to_string()))?;
+    if path.extension().is_some_and(|ext| ext == "json") {
+        serde_json::from_str(&source)
+            .map_err(|e| FullCompileError::Io(format!("JSON parse error: {e}")))
+    } else {
+        Ok(compiler::compile_ast(&parser::compile(&source)?)?)
+    }
+}
+
+/// 🗂️ Folds one file's global options into the accumulated set.
+///
+/// **Every field is bound by name and there is no `..` rest pattern.** That is
+/// deliberate and it is the whole design: adding a field to `GlobalConfig` now
+/// fails to compile until someone writes down how it merges. The previous
+/// version named a handful of fields by hand and silently dropped the other
+/// nine — a `blocked_ips` list that blocked nothing, a `metrics` toggle that
+/// did nothing, an `http_port` override ignored — while reporting success.
+///
+/// A comment asking the next developer to remember is not a mechanism. This is.
+fn merge_globals(
+    into: &mut pingclair_core::config::GlobalConfig,
+    from: pingclair_core::config::GlobalConfig,
+) {
+    let default = pingclair_core::config::GlobalConfig::default();
+    let pingclair_core::config::GlobalConfig {
+        email,
+        http_port,
+        https_port,
+        metrics,
+        auto_https,
+        blocked_ips,
+        trusted_proxies,
+        upstream_keepalive_pool_size,
+        http3,
+        worker_threads,
+        dns_refresh_secs,
+    } = from;
+
+    // 📝 Scalars: a file that said something overrides one that did not. The
+    // comparison against the default is how "said something" is detected for
+    // the fields that are not `Option`.
+    if email.is_some() {
+        into.email = email;
+    }
+    if http_port != default.http_port {
+        into.http_port = http_port;
+    }
+    if https_port != default.https_port {
+        into.https_port = https_port;
+    }
+    if metrics != default.metrics {
+        into.metrics = metrics;
+    }
+    if auto_https != default.auto_https {
+        into.auto_https = auto_https;
+    }
+    if upstream_keepalive_pool_size.is_some() {
+        into.upstream_keepalive_pool_size = upstream_keepalive_pool_size;
+    }
+    if worker_threads.is_some() {
+        into.worker_threads = worker_threads;
+    }
+    if dns_refresh_secs != default.dns_refresh_secs {
+        into.dns_refresh_secs = dns_refresh_secs;
+    }
+
+    // 🛡️ A restriction wins over permission. `protocols h1 h2` in any file
+    // disables HTTP/3 for the whole configuration, because the operator asking
+    // for a protocol to be off in one file and getting it on is the failure
+    // that matters; the reverse is merely surprising.
+    if !http3 {
+        into.http3 = false;
+    }
+
+    // 🧩 Lists accumulate rather than replace. Two files each adding blocked
+    // ranges must end up blocking both sets — last-one-wins would turn a split
+    // configuration into a blocklist that silently forgot half its entries.
+    into.blocked_ips.extend(blocked_ips);
+    into.trusted_proxies.extend(trusted_proxies);
+    into.blocked_ips.dedup();
+    into.trusted_proxies.dedup();
+}
+
+/// 🪵 Folds one file's logging configuration into the accumulated set.
+///
+/// Channels accumulate; a name declared in two files is refused for the same
+/// reason it is refused twice in one file — the second declaration would
+/// silently win and the first output would vanish, and across files that is
+/// even harder to see.
+fn merge_logging(
+    into: &mut pingclair_core::config::LoggingConfig,
+    from: pingclair_core::config::LoggingConfig,
+    path: &Path,
+) -> Result<(), FullCompileError> {
+    let default = pingclair_core::config::LoggingConfig::default();
+    let pingclair_core::config::LoggingConfig {
+        level,
+        format,
+        file,
+        channels,
+    } = from;
+
+    if level != default.level {
+        into.level = level;
+    }
+    if format != default.format {
+        into.format = format;
+    }
+    if file.is_some() {
+        into.file = file;
+    }
+    for (name, channel) in channels {
+        if into.channels.contains_key(&name) {
+            return Err(FullCompileError::Compile(pingclair_config_compile_error(
+                format!(
+                    "log channel `{name}` is declared in more than one file (seen again in {})",
+                    path.display()
+                ),
+            )));
+        }
+        into.channels.insert(name, channel);
+    }
+    Ok(())
+}
+
+/// 🧾 Builds a compile error carrying a plain message.
+fn pingclair_config_compile_error(message: String) -> crate::compiler::CompileError {
+    crate::compiler::CompileError::InvalidServer { message }
 }
 
 /// Load and merge configuration from directory (all .pingclair files)
@@ -1633,5 +1767,87 @@ mod tests {
         assert!(compile("example.com { redir /target 200 }").is_err());
         assert!(compile("example.com { redir /target forever }").is_err());
         assert!(compile("example.com { redir /target { respond 200 } }").is_err());
+    }
+}
+
+#[cfg(test)]
+mod directory_merge_tests {
+    use super::*;
+
+    fn write(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("write fixture");
+        path
+    }
+
+    /// 🗂️ **Every global option a file sets must survive the merge.**
+    ///
+    /// The merge used to name a handful of fields by hand, so the other nine
+    /// were silently dropped — a `blocked_ips` list that blocked nothing, a
+    /// `metrics` toggle that did nothing, an `http_port` override ignored. The
+    /// configuration compiled and reported success either way, which is the
+    /// shape this project fails closed on everywhere else.
+    #[test]
+    fn every_global_option_survives_a_directory_merge() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let globals = write(
+            dir.path(),
+            "00-globals.pingclair",
+            "{\n    http_port 8080\n    https_port 8443\n    metrics\n\
+             \x20   trusted_proxies 10.0.0.0/8\n    dns_refresh 90s\n\
+             \x20   servers {\n        protocols h1 h2\n    }\n}\n",
+        );
+        let site = write(
+            dir.path(),
+            "10-site.pingclair",
+            "http://:9000 {\n    respond \"ok\"\n}\n",
+        );
+
+        let merged = compile_multiple_files(&[globals, site]).expect("merges");
+
+        assert_eq!(merged.global.http_port, 8080, "http_port was dropped");
+        assert_eq!(merged.global.https_port, 8443, "https_port was dropped");
+        assert_eq!(
+            merged.global.trusted_proxies,
+            vec!["10.0.0.0/8".to_string()],
+            "trusted_proxies was dropped"
+        );
+        assert_eq!(
+            merged.global.dns_refresh_secs, 90,
+            "dns_refresh was dropped"
+        );
+        assert!(
+            !merged.global.http3,
+            "`protocols h1 h2` was dropped, so HTTP/3 stayed on"
+        );
+    }
+
+    /// 🪵 A log channel declared in one file must still exist after another
+    /// file is merged in.
+    ///
+    /// The logging config was replaced wholesale whenever a later file had a
+    /// non-empty level — and the level defaults to `info`, so *every* file
+    /// replaced it. A channel declared in `00-logging.pingclair` vanished the
+    /// moment a second file existed, and the site referencing it then failed
+    /// validation for a reason that pointed at the wrong file.
+    #[test]
+    fn a_channel_declared_in_one_file_survives_another() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let channels = write(
+            dir.path(),
+            "00-logging.pingclair",
+            "{\n    log audit {\n        output stderr\n    }\n}\n",
+        );
+        let site = write(
+            dir.path(),
+            "10-site.pingclair",
+            "http://:9000 {\n    log audit\n    respond \"ok\"\n}\n",
+        );
+
+        let merged = compile_multiple_files(&[channels, site]).expect("merges");
+        assert!(
+            merged.logging.channels.contains_key("audit"),
+            "the channel was wiped by the second file"
+        );
     }
 }

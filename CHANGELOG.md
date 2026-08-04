@@ -175,6 +175,14 @@ Everything below is on `main` and unreleased; the workspace reports
   volume. Values beyond a fixed ceiling now collapse into `other`, which keeps
   the totals correct. A host already seen keeps its own series, so a flood of
   junk cannot displace real traffic.
+- **A directory configuration silently dropped most global options.** Merging
+  several `.pingclair` files named a handful of fields by hand and ignored the
+  other nine, so `blocked_ips` blocked nothing, `metrics` did nothing, and
+  `http_port`/`https_port`/`trusted_proxies`/`dns_refresh`/`protocols` were
+  discarded — while the configuration compiled and reported success. Lists now
+  accumulate across files instead of the last file winning, and validation
+  runs once on the merged result, so a site may reference a log channel
+  declared in another file.
 - Foreign JSON documents are rejected fail-closed rather than partially
   applied.
 - The admin API enforces the rules it was assumed to already have.
