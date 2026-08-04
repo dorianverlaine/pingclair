@@ -375,6 +375,15 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
     Ok(global)
 }
 
+/// 🏠 Whether a host is a bind wildcard rather than a name a client can send.
+///
+/// These are the addresses that mean "every interface". A request's `Host`
+/// header never carries one, so a site registered under one is unreachable —
+/// which is why they must collapse to the catch-all name instead.
+fn is_wildcard_host(host: &str) -> bool {
+    matches!(host, "[::]" | "::" | "0.0.0.0" | "[::0]")
+}
+
 /// 🧾 Whether a global-block name is documented Caddy syntax rather than a
 /// likely typo. The list mirrors caddy's own documentation (kept locally by
 /// the maintainer as reference material; not part of this repository).
@@ -544,6 +553,17 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
         || server.name == "http://"
         || server.name == "https://"
         || server.name.contains("://")
+        // 🏠 A wildcard bind address is not a hostname anybody can send.
+        //
+        // `http://:8080` reaches here already rewritten to `[::]` by the
+        // URL-stripping fallback above, and `[::]` matches none of the tests
+        // before this one: it starts with `[`, and `::` is not `://`. The site
+        // then ended up registered under a virtual host name no request could
+        // carry, so **every request to it returned 404** — the plainest
+        // Caddyfile there is, `http://:8080 { reverse_proxy … }`, served
+        // nothing at all. Found on 2026-08-04 by configuring a real server
+        // from a Pingclairfile rather than from JSON.
+        || is_wildcard_host(&server.name)
     {
         server.name = "_".to_string();
     }
@@ -4973,5 +4993,40 @@ mod directive_order_tests {
         let plain = compile("http://localhost {\n    respond \"ok\"\n}")
             .expect("explicit http stays plaintext");
         assert!(plain.servers[0].tls.is_none());
+    }
+}
+
+#[cfg(test)]
+mod wildcard_site_tests {
+    use crate::compile;
+
+    /// 🏠 `http://:8080` is Caddy's plainest plaintext site and must serve
+    /// every Host, exactly like a bare `:8080`.
+    ///
+    /// Until 2026-08-04 the explicit scheme changed the outcome: the address
+    /// was rewritten to the bind wildcard `[::]` and registered as a virtual
+    /// host under that name, so no request could ever match it and the site
+    /// returned 404 for everything. The bare form worked, which is why unit
+    /// tests never noticed — they used the bare form.
+    #[test]
+    fn an_explicit_scheme_on_a_bare_port_is_still_a_catch_all() {
+        for address in ["http://:8080", "https://:8443", ":8080", "_:8080"] {
+            let config = compile(&format!("{address} {{\n    respond \"ok\"\n}}\n"))
+                .unwrap_or_else(|error| panic!("`{address}` must compile: {error}"));
+            assert_eq!(
+                config.servers[0].name.as_deref(),
+                Some("_"),
+                "`{address}` names no host, so it must be the catch-all site — \
+                 a site named after a bind wildcard is one no request can reach"
+            );
+        }
+    }
+
+    /// 🎯 The mirror case: a real hostname must keep its name, or every site
+    /// becomes a catch-all and virtual hosting stops working.
+    #[test]
+    fn a_named_site_keeps_its_hostname() {
+        let config = compile("http://example.com:8080 {\n    respond \"ok\"\n}\n").unwrap();
+        assert_eq!(config.servers[0].name.as_deref(), Some("example.com"));
     }
 }
