@@ -109,6 +109,11 @@ pub struct RequestContext {
     /// Carried on the context because `response_cache_filter` runs long after
     /// the route was matched and has no other way back to its configuration.
     pub cache_ttl_secs: Option<u64>,
+
+    /// 📏 Whether this request's cache has a per-response ceiling that still
+    /// needs body chunks fed to it. Cleared once the limit is exceeded, so the
+    /// rest of the body streams without touching the tracker again.
+    pub cache_size_tracked: bool,
     /// Unique request ID
     pub request_id: String,
     /// Prebuilt `HeaderValue` for the request ID, so downstream and upstream
@@ -163,6 +168,7 @@ impl Default for RequestContext {
             state: None,
             route_index: None,
             cache_ttl_secs: None,
+            cache_size_tracked: false,
             upstream: None,
             headers_upstream: HashMap::new(),
             response_headers: ResponseHeaderPolicy::default(),
@@ -3653,6 +3659,7 @@ impl ProxyHttp for PingclairProxy {
         }
 
         ctx.cache_ttl_secs = Some(cache.ttl_secs);
+
         session.cache.enable(
             response_cache_storage(),
             Some(response_cache_eviction(cache.max_size_bytes)),
@@ -3660,6 +3667,21 @@ impl ProxyHttp for PingclairProxy {
             Some(response_cache_lock()),
             None,
         );
+
+        // 📏 A ceiling on the *store* is not a ceiling on one response.
+        //
+        // Without this, a body far larger than the whole budget still streams
+        // into the store, consuming memory the entire way, and is only evicted
+        // once it has finished arriving and the eviction manager finally sees
+        // its size. Day 22 measured it: one 20 MiB response through a cache
+        // configured with a 64 KiB ceiling cost 7.6 MiB of resident memory
+        // more than the same response with caching off — for an entry that was
+        // then thrown away immediately.
+        //
+        // ⚠️ Must come after `enable`: the setter panics while the cache is
+        // still in the `Disabled` phase.
+        session.cache.set_max_file_size_bytes(cache.max_size_bytes);
+        ctx.cache_size_tracked = true;
         Ok(())
     }
 
@@ -4766,6 +4788,21 @@ impl ProxyHttp for PingclairProxy {
         // Track response bytes for access log
         if let Some(b) = body.as_ref() {
             ctx.response_bytes += b.len() as u64;
+        }
+
+        // 📏 Pingora tracks the per-response cache ceiling only if we hand it
+        // each chunk. Once the body passes the limit the tracker says so, and
+        // the response finishes as an ordinary uncached stream — which is the
+        // whole point: the alternative is buffering a body we have already
+        // decided not to keep.
+        if ctx.cache_size_tracked
+            && let Some(chunk) = body.as_ref()
+            && !_session
+                .cache
+                .track_body_bytes_for_max_file_size(chunk.len())
+        {
+            _session.cache.disable(NoCacheReason::ResponseTooLarge);
+            ctx.cache_size_tracked = false;
         }
 
         stream_chunk(&mut ctx.response_encoder, body, end_of_stream);
