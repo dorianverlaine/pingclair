@@ -205,6 +205,65 @@ async fn handle_request_inner(
                 )),
             }
         }
+        // 🗄️ Read-only view of the shared response store. Answers the two
+        // questions an operator has when caching misbehaves: how full is it,
+        // and against what ceiling.
+        (&Method::GET, path) if path == "/cache" || path == "/cache/" => {
+            let json = serde_json::to_string_pretty(&pingclair_proxy::server::cache_status())
+                .unwrap_or_default();
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .body(Full::new(Bytes::from(json)))
+                .unwrap())
+        }
+        // 🧹 Drops one stored response, addressed by the same host and target
+        // the request path uses. Deliberately not a "purge everything" button:
+        // an operator purges because one page changed, and dumping every other
+        // route's warm entries turns that into an origin traffic spike.
+        //
+        // 🔐 Authentication is the gate above this match, so this endpoint is
+        // protected on the same terms as `/load` — an unauthenticated purge is
+        // a free cache-busting denial-of-service against the origin.
+        (&Method::POST, "/cache/purge") => {
+            let body_bytes = match read_bounded_body(req).await {
+                Ok(bytes) => bytes,
+                Err(BodyError::TooLarge) => {
+                    return Ok(response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        r#"{"error":"request body too large"}"#,
+                    ));
+                }
+                Err(BodyError::Incomplete) => {
+                    return Ok(response(
+                        StatusCode::BAD_REQUEST,
+                        r#"{"error":"could not read request body"}"#,
+                    ));
+                }
+            };
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct PurgeRequest {
+                host: String,
+                path: String,
+            }
+            let Ok(purge) = serde_json::from_slice::<PurgeRequest>(&body_bytes) else {
+                return Ok(response(
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":"expected {\"host\":\"...\",\"path\":\"...\"}"}"#,
+                ));
+            };
+            // 📢 The boolean is reported rather than swallowed. "Purged
+            // nothing" and "purged something" look identical from the outside,
+            // and an operator who cannot tell them apart cannot tell a working
+            // purge from a key that no longer matches.
+            let purged =
+                pingclair_proxy::server::purge_cached_response(&purge.host, &purge.path).await;
+            Ok(response(
+                StatusCode::OK,
+                &format!(r#"{{"purged":{purged}}}"#),
+            ))
+        }
         (&Method::POST, "/load") => {
             // 🧭 Like Caddy, the endpoint accepts a Caddyfile when the client
             // says so with Content-Type; capture it before the body consumes

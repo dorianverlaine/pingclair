@@ -2139,12 +2139,23 @@ fn adapt_cache_policy(directive: &Directive) -> Result<CacheConfig, AdapterError
         .ok_or_else(|| AdapterError::InvalidArgument("cache".into(), "block required".into()))?;
 
     let mut ttl_secs = None;
+    let mut max_size_bytes = None;
     for sub in &block.directives {
         match sub.name.as_str() {
             "ttl" => {
                 // ⏳ Durations arrive in milliseconds; caching reasons in seconds.
                 let ms = parse_required_duration(sub)?;
                 ttl_secs = Some(ms / 1000);
+            }
+            // 📏 The ceiling on stored bytes, written as a plain integer to
+            // match every other byte limit in this grammar (`max_response_body`,
+            // the `limits` block). Zero is rejected by `parse_positive_usize`
+            // rather than read as "unlimited": an operator who writes
+            // `max_size 0` far more likely meant "off", and guessing between
+            // the two is the silent-misconfiguration shape this project
+            // fails closed on. To disable caching, remove the `cache` block.
+            "max_size" => {
+                max_size_bytes = Some(parse_positive_usize(sub)?);
             }
             other => {
                 return Err(AdapterError::UnknownDirective(other.to_string()));
@@ -2154,7 +2165,13 @@ fn adapt_cache_policy(directive: &Directive) -> Result<CacheConfig, AdapterError
 
     let ttl_secs = ttl_secs
         .ok_or_else(|| AdapterError::InvalidArgument("cache".into(), "ttl is required".into()))?;
-    Ok(CacheConfig { ttl_secs })
+    Ok(CacheConfig {
+        ttl_secs,
+        // 📏 The default lives in `pingclair-core` so the DSL and a
+        // hand-written JSON document cannot drift to different ceilings.
+        max_size_bytes: max_size_bytes
+            .unwrap_or_else(pingclair_core::config::default_cache_max_size_bytes),
+    })
 }
 
 fn adapt_retry_policy(directive: &Directive) -> Result<RetryConfig, AdapterError> {

@@ -55,7 +55,17 @@ Everything below is on `main` and unreleased; the workspace reports
   upstream authentication, gRPC parity, h2c, hostname re-resolution while the
   server runs, and a `Via` header per RFC 9110.
 - **Response caching.** RFC 9111 decides what may be stored, and a second
-  identical request is served without asking the origin.
+  identical request is served without asking the origin. The store is bounded
+  by `max_size` (128 MiB unless you say otherwise) and evicts least-recently-
+  used entries at the ceiling, so switching caching on cannot by itself be
+  what exhausts a machine's memory. Concurrent misses for the same URL
+  collapse into one upstream request rather than a burst of them.
+  `pingclair_cache_requests_total` reports hit/miss/stale/bypass;
+  `GET /cache` on the admin API reports size against the ceiling, and
+  `POST /cache/purge` drops a single URL.
+  > The ceiling is process-wide because the store is. A configuration whose
+  > routes ask for different `max_size` values is refused at startup, naming
+  > both, rather than one of them quietly losing.
 - **HTTP/3.** Unified middleware execution with the other transports, route
   access controls, and certificates delivered to the QUIC stack from memory
   rather than through temporary files.

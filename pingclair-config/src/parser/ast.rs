@@ -661,6 +661,8 @@ pub struct UpstreamTlsConfig {
 pub struct CacheConfig {
     /// ⏳ How long a stored response stays fresh, in seconds.
     pub ttl_secs: u64,
+    /// 📏 Hard ceiling on stored response bytes, process-wide.
+    pub max_size_bytes: usize,
 }
 
 /// 🔁 Typed retry policy produced by the Pingclairfile adapter.

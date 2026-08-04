@@ -896,6 +896,25 @@ pub struct CacheConfig {
     /// Required rather than defaulted: picking a lifetime for someone else's
     /// content is exactly the decision an operator has to make deliberately.
     pub ttl_secs: u64,
+    /// 📏 Hard ceiling on stored response bytes, process-wide.
+    ///
+    /// Unlike `ttl_secs` this one *is* defaulted, because the two questions are
+    /// different. A wrong TTL serves stale content and only the operator knows
+    /// the right answer; an absent ceiling lets the process grow until the box
+    /// dies, and "some limit" beats "no limit" whatever the number is. The
+    /// default is deliberately modest so that turning caching on cannot, by
+    /// itself, be the thing that gets a server OOM-killed.
+    ///
+    /// The store is shared, so this bounds the whole process rather than one
+    /// route: two routes with caching enabled draw on the same budget.
+    #[serde(default = "default_cache_max_size_bytes")]
+    pub max_size_bytes: usize,
+}
+
+/// 📏 128 MiB, the same order as nginx's `keys_zone` examples and small enough
+/// to be survivable on the 512 MiB-class hosts this project benchmarks on.
+pub fn default_cache_max_size_bytes() -> usize {
+    128 * 1024 * 1024
 }
 
 /// 🔁 Controls safe, request-local upstream redispatch.

@@ -353,6 +353,47 @@ fn apply_site_root(handler: &mut pingclair_core::config::HandlerConfig, site_roo
 }
 
 /// 🛡️ Rejects TLS combinations that cannot have deterministic runtime behavior.
+/// 📏 Refuses a configuration whose routes disagree about the cache ceiling.
+///
+/// The response store is process-wide — one memory budget shared by every route
+/// that enables caching — so there is exactly one ceiling no matter how many
+/// places name it. `max_size` nonetheless lives inside the per-route `cache`
+/// block, because that is where an operator looks for it.
+///
+/// That combination has one bad outcome: two routes asking for different
+/// ceilings, one of them silently losing. Whichever we picked — first, last,
+/// largest — the other operator would have written a number, seen it accepted,
+/// and got something else. So the configuration is refused instead, naming both
+/// values. A single `cache` block, or several that agree, is unaffected.
+fn validate_cache_ceiling_agrees(config: &PingclairConfig) -> CompileResult<()> {
+    let mut agreed: Option<(usize, String)> = None;
+    for server in &config.servers {
+        for route in &server.routes {
+            let HandlerConfig::ReverseProxy(proxy) = &route.handler else {
+                continue;
+            };
+            let Some(cache) = &proxy.cache else { continue };
+            let here = route.path.clone();
+            match &agreed {
+                None => agreed = Some((cache.max_size_bytes, here)),
+                Some((size, first)) if *size != cache.max_size_bytes => {
+                    return Err(CompileError::InvalidServer {
+                        message: format!(
+                            "cache max_size disagrees between routes: `{first}` asks for {size} \
+                             bytes and `{here}` asks for {}. The response cache is one shared \
+                             store, so it has one ceiling — make them equal, or omit max_size to \
+                             use the default.",
+                            cache.max_size_bytes
+                        ),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
     for rule in &config.global.trusted_proxies {
         if rule.parse::<ipnet::IpNet>().is_err() && rule.parse::<std::net::IpAddr>().is_err() {
@@ -362,6 +403,7 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
         }
     }
     validate_proxy_protocol_listeners(config)?;
+    validate_cache_ceiling_agrees(config)?;
 
     for server in &config.servers {
         let limits = &server.limits;
@@ -1206,6 +1248,7 @@ fn compile_handler(handler: &Handler, root: Option<&str>) -> CompileResult<Handl
                 cache: proxy.cache.as_ref().map(|cache| {
                     Box::new(pingclair_core::config::CacheConfig {
                         ttl_secs: cache.ttl_secs,
+                        max_size_bytes: cache.max_size_bytes,
                     })
                 }),
                 retry: Box::new(pingclair_core::config::RetryConfig {
@@ -1784,6 +1827,62 @@ mod fail_closed_handler_tests {
             }],
             ..Default::default()
         }
+    }
+
+    /// 🗄️ Builds a config whose two routes each enable caching with the given
+    /// ceilings, which is the only way the shared-store conflict can arise.
+    fn config_with_two_cache_ceilings(first: usize, second: usize) -> PingclairConfig {
+        let route = |path: &str, max_size_bytes: usize| RouteConfig {
+            path: path.to_string(),
+            handler: HandlerConfig::ReverseProxy(pingclair_core::config::ReverseProxyConfig {
+                upstreams: vec!["127.0.0.1:9000".to_string()],
+                cache: Some(Box::new(pingclair_core::config::CacheConfig {
+                    ttl_secs: 60,
+                    max_size_bytes,
+                })),
+                ..Default::default()
+            }),
+            methods: None,
+            matcher: None,
+        };
+        PingclairConfig {
+            servers: vec![ServerConfig {
+                listen: vec!["0.0.0.0:8080".to_string()],
+                routes: vec![route("/a", first), route("/b", second)],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// 📏 Two routes asking for different ceilings must be refused, not
+    /// silently resolved.
+    ///
+    /// The response store is process-wide, so one of the two numbers can never
+    /// take effect. Whichever we picked, an operator would have written a value,
+    /// seen it accepted and got something else — the silent-misconfiguration
+    /// shape this project fails closed on.
+    #[test]
+    fn disagreeing_cache_ceilings_are_rejected_by_value() {
+        let error = validate_config(&config_with_two_cache_ceilings(1_000, 2_000))
+            .expect_err("a config that cannot be honoured must not compile");
+        let message = error.to_string();
+        assert!(
+            message.contains("1000") && message.contains("2000"),
+            "the rejection must name both values so the operator can see the conflict: {message}"
+        );
+        assert!(
+            message.contains("/a") && message.contains("/b"),
+            "and both routes: {message}"
+        );
+    }
+
+    /// 🎯 The mirror case, so the rule cannot degrade into "caching on two
+    /// routes is an error".
+    #[test]
+    fn agreeing_cache_ceilings_compile() {
+        validate_config(&config_with_two_cache_ceilings(4_096, 4_096))
+            .expect("routes that agree about the ceiling are fine");
     }
 
     fn rejection_for(handler: HandlerConfig) -> String {

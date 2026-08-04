@@ -46,6 +46,9 @@ boring.workspace = true
 thiserror.workspace = true
 minijinja = "2"
 chrono = "0.4"
+# 📤 Derives the admin API's cache-status payload; the endpoint lives in
+# pingclair-api but the accounting it reports lives here.
+serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -137,6 +137,66 @@ pub static OVERLOAD_REJECTIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(||
     .expect("metric can be created")
 });
 
+/// 🗄️ How each cacheable request resolved against the response cache.
+///
+/// One counter with an outcome label rather than four counters, because the
+/// question an operator actually asks is a ratio — "what share of these were
+/// hits" — and a ratio across separate metric names is easy to get wrong when
+/// one of them has never been incremented and so is absent from the scrape.
+///
+/// Outcomes: `hit` (served from the store), `miss` (went to the origin and was
+/// eligible to be stored), `stale` (a stored copy was revalidated), `bypass`
+/// (the request or response was refused storage on purpose — see
+/// `uncacheable_response_reason`).
+pub static CACHE_REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "pingclair_cache_requests_total",
+            "Cacheable requests by how they resolved against the response cache",
+        ),
+        &["host", "route", "outcome"],
+    )
+    .expect("metric can be created")
+});
+
+/// 🗄️ Bytes currently held by the shared response store.
+///
+/// Paired with [`CACHE_LIMIT_BYTES`] this answers the only question that
+/// matters when caching is on: how close is the store to its ceiling. A gauge
+/// sitting at the limit means entries are being evicted to make room, which is
+/// working as designed but is also the signal that the ceiling is too low for
+/// the working set.
+pub static CACHE_SIZE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "pingclair_cache_size_bytes",
+        "Bytes currently stored in the shared response cache",
+    )
+    .expect("metric can be created")
+});
+
+/// 📏 The configured ceiling, exported so a dashboard does not have to be told
+/// separately what the limit is.
+pub static CACHE_LIMIT_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "pingclair_cache_limit_bytes",
+        "Configured ceiling on shared response cache bytes",
+    )
+    .expect("metric can be created")
+});
+
+/// 🧹 Bytes reclaimed by evicting least-recently-used entries.
+///
+/// Monotonic. A flat line with a full [`CACHE_SIZE_BYTES`] means the working
+/// set fits; a climbing line means entries are being evicted and re-fetched,
+/// so the cache is doing work without saving any.
+pub static CACHE_EVICTED_BYTES_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "pingclair_cache_evicted_bytes_total",
+        "Bytes reclaimed from the response cache by eviction",
+    )
+    .expect("metric can be created")
+});
+
 /// 🧱 Requests currently executing inside a protected route.
 pub static ROUTE_IN_FLIGHT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     IntGaugeVec::new(
@@ -240,6 +300,10 @@ pub fn init() {
         let _ = REGISTRY.register(Box::new(REQUEST_ERRORS_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(ACTIVE_CONNECTIONS.clone()));
         let _ = REGISTRY.register(Box::new(OVERLOAD_REJECTIONS_TOTAL.clone()));
+        let _ = REGISTRY.register(Box::new(CACHE_REQUESTS_TOTAL.clone()));
+        let _ = REGISTRY.register(Box::new(CACHE_SIZE_BYTES.clone()));
+        let _ = REGISTRY.register(Box::new(CACHE_LIMIT_BYTES.clone()));
+        let _ = REGISTRY.register(Box::new(CACHE_EVICTED_BYTES_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(ROUTE_IN_FLIGHT.clone()));
         let _ = REGISTRY.register(Box::new(ROUTE_PENDING.clone()));
         let _ = REGISTRY.register(Box::new(UPSTREAM_IN_FLIGHT.clone()));

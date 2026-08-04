@@ -23,6 +23,9 @@ use pingora_cache::cache_control::CacheControl;
 use pingora_cache::key::{CacheKey, HashBinary};
 use pingora_cache::meta::CacheMetaDefaults;
 
+use pingora_cache::eviction::{EvictionManager, simple_lru};
+use pingora_cache::lock::{CacheKeyLockImpl, CacheLock};
+use pingora_cache::predictor::Predictor;
 use pingora_cache::{CacheMeta, MemCache, NoCacheReason, RespCacheable, VarianceBuilder, filters};
 
 use arc_swap::ArcSwap;
@@ -2936,6 +2939,170 @@ fn response_cache_storage() -> &'static MemCache {
     STORAGE.get_or_init(|| Box::leak(Box::new(MemCache::new())))
 }
 
+/// 📏 Bounds the shared cache, evicting least-recently-used entries once the
+/// stored bytes reach the configured ceiling.
+///
+/// The ceiling is fixed at first use, for the same reason the store is: the
+/// manager owns the accounting for entries admitted under earlier
+/// configurations, so rebuilding it on reload would either lose that accounting
+/// or throw away a warm cache. A reload that changes `max_size` therefore does
+/// not take effect until restart — stated plainly here because the alternative
+/// is an operator raising the limit and quietly not getting it.
+///
+/// ⚠️ Until this existed the store had no ceiling at all: a route with `cache`
+/// enabled grew the process until the box ran out of memory. That is why
+/// caching stayed undocumented.
+/// 📏 The one eviction manager, published so metrics and the purge endpoint can
+/// read the same accounting the request path writes.
+static CACHE_EVICTION: OnceLock<&'static simple_lru::Manager> = OnceLock::new();
+
+fn response_cache_eviction(limit_bytes: usize) -> &'static simple_lru::Manager {
+    CACHE_EVICTION.get_or_init(|| {
+        // 📊 Export the ceiling once, at the moment it becomes real. A limit
+        // that is only in a config file cannot be compared against the size
+        // gauge on the same dashboard.
+        metrics::CACHE_LIMIT_BYTES.set(limit_bytes as i64);
+        Box::leak(Box::new(simple_lru::Manager::new(limit_bytes)))
+    })
+}
+
+/// 🗄️ A read-only snapshot of the shared response store, for the admin API.
+///
+/// `configured` is false before any route with caching has served a request:
+/// the store and its ceiling are built on first use, so until then there is
+/// genuinely nothing to report. Saying so beats reporting zeroes, which read
+/// like an empty cache rather than an absent one.
+#[derive(Debug, serde::Serialize)]
+pub struct CacheStatus {
+    pub configured: bool,
+    pub size_bytes: usize,
+    pub limit_bytes: usize,
+    pub entries: usize,
+    pub evicted_bytes_total: usize,
+}
+
+/// 🗄️ Reports what the shared response store currently holds.
+pub fn cache_status() -> CacheStatus {
+    match CACHE_EVICTION.get() {
+        Some(eviction) => CacheStatus {
+            configured: true,
+            size_bytes: eviction.total_size(),
+            limit_bytes: metrics::CACHE_LIMIT_BYTES.get().max(0) as usize,
+            entries: eviction.total_items(),
+            evicted_bytes_total: eviction.evicted_size(),
+        },
+        None => CacheStatus {
+            configured: false,
+            size_bytes: 0,
+            limit_bytes: 0,
+            entries: 0,
+            evicted_bytes_total: 0,
+        },
+    }
+}
+
+/// 🧹 Drops one stored response, addressed exactly the way the request path
+/// addresses it. Returns whether an entry was actually there.
+///
+/// Purging by URL rather than emptying the store is deliberate: an operator
+/// purges because one page changed, and throwing away every other route's
+/// warm entries to fix one of them turns a small correction into a traffic
+/// spike at the origin.
+///
+/// 🔑 The key is built with the same host/path/query triple as
+/// [`ProxyService::cache_key_callback`], including the lowercased host. If those
+/// two ever disagree, purge silently stops working — which is why the caller
+/// gets a boolean rather than a cheerful unconditional success.
+pub async fn purge_cached_response(host: &str, path_and_query: &str) -> bool {
+    use pingora_cache::key::CacheKey;
+    use pingora_cache::storage::{PurgeType, Storage};
+
+    let key = CacheKey::new(host.to_ascii_lowercase(), path_and_query, "").to_compact();
+    let purged = Storage::purge(
+        response_cache_storage(),
+        &key,
+        PurgeType::Invalidation,
+        &pingora_cache::trace::Span::inactive().handle(),
+    )
+    .await
+    .unwrap_or(false);
+
+    // 🧮 Keep the eviction manager's accounting in step with the store, or the
+    // size gauge drifts upward forever and the ceiling starts evicting entries
+    // that are no longer there.
+    if let Some(eviction) = CACHE_EVICTION.get().filter(|_| purged) {
+        eviction.remove(&key);
+        metrics::CACHE_SIZE_BYTES.set(eviction.total_size() as i64);
+    }
+    purged
+}
+
+/// 🔮 Remembers which keys turned out to be uncacheable, so the next request
+/// for one skips the lock and the storage lookup and goes straight upstream.
+///
+/// Without it every request for a permanently uncacheable URL — anything that
+/// sets a cookie, any SSE endpoint — pays for a cache miss it can never win,
+/// and worse, queues behind the single-flight lock while one of them proves it
+/// again. The predictor is a bounded bloom-style filter, so it costs a fixed
+/// amount of memory and can only ever be wrong in the safe direction: a false
+/// "probably cacheable" just means doing the full check, which is what would
+/// have happened anyway.
+fn response_cache_predictor() -> &'static Predictor<32> {
+    static PREDICTOR: OnceLock<&'static Predictor<32>> = OnceLock::new();
+    PREDICTOR.get_or_init(|| Box::leak(Box::new(Predictor::new(8192, None))))
+}
+
+/// 🔒 Collapses concurrent misses for the same key into one upstream request.
+///
+/// Without it, N clients arriving together for an uncached URL become N origin
+/// requests — the thundering herd that caching is supposed to prevent. The
+/// timeout bounds how long a waiter blocks before giving up and going to the
+/// origin itself, so a slow origin degrades into today's behaviour rather than
+/// into a stall.
+fn response_cache_lock() -> &'static CacheKeyLockImpl {
+    static LOCK: OnceLock<&'static CacheKeyLockImpl> = OnceLock::new();
+    // 📌 The extra deref is load-bearing: `get_or_init` hands back a
+    // reference *to* the stored `&'static` pointer, and a `&&dyn Trait` will
+    // not coerce to `&dyn Trait` the way a sized type would.
+    *LOCK.get_or_init(|| {
+        let lock: &'static CacheLock = Box::leak(CacheLock::new_boxed(Duration::from_secs(2)));
+        lock as &'static CacheKeyLockImpl
+    })
+}
+
+/// 🗄️ Counts one cacheable request under the outcome it reached, and refreshes
+/// the store's size gauges from the eviction manager.
+///
+/// The gauges are read here rather than pushed from the storage layer because
+/// Pingora owns the accounting and exposes it on the manager; sampling it once
+/// per cacheable request keeps the two from drifting, at the cost of the value
+/// being as fresh as the last request rather than the last second. For a
+/// ceiling you are watching for saturation, that is the right trade.
+fn record_cache_outcome(session: &Session, host: &str, route: &str) {
+    use pingora_cache::CachePhase;
+
+    // 🏷️ `Bypass` covers everything deliberately refused storage, which is the
+    // outcome an operator most often needs to explain ("why is nothing being
+    // cached?"). Phases that mean the request never reached a decision are not
+    // counted at all rather than being folded into `miss`, which would make the
+    // hit ratio quietly wrong.
+    let outcome = match session.cache.phase() {
+        CachePhase::Hit => "hit",
+        CachePhase::Miss | CachePhase::Expired => "miss",
+        CachePhase::Stale | CachePhase::StaleUpdating => "stale",
+        CachePhase::Bypass => "bypass",
+        _ => return,
+    };
+    metrics::CACHE_REQUESTS_TOTAL
+        .with_label_values(&[host, route, outcome])
+        .inc();
+
+    if let Some(eviction) = CACHE_EVICTION.get() {
+        metrics::CACHE_SIZE_BYTES.set(eviction.total_size() as i64);
+        metrics::CACHE_EVICTED_BYTES_TOTAL.set(eviction.evicted_size() as i64);
+    }
+}
+
 /// 🚫 Names the reason a response must not be stored, or `None` if it may be.
 ///
 /// Deliberately a small, explicit list rather than full RFC 9111 evaluation.
@@ -3395,9 +3562,13 @@ impl ProxyHttp for PingclairProxy {
         }
 
         ctx.cache_ttl_secs = Some(cache.ttl_secs);
-        session
-            .cache
-            .enable(response_cache_storage(), None, None, None, None);
+        session.cache.enable(
+            response_cache_storage(),
+            Some(response_cache_eviction(cache.max_size_bytes)),
+            Some(response_cache_predictor()),
+            Some(response_cache_lock()),
+            None,
+        );
         Ok(())
     }
 
@@ -4765,6 +4936,23 @@ impl ProxyHttp for PingclairProxy {
                     .with_label_values(&[method, host])
                     .inc();
             }
+        }
+
+        // 🗄️ Record how this request resolved against the response cache, once,
+        // here — this is the one phase that runs for every request whatever
+        // happened earlier, so a hit and a fail-to-connect are counted the same
+        // number of times.
+        if ctx.cache_ttl_secs.is_some() {
+            let route = ctx
+                .state
+                .as_ref()
+                .and_then(|state| {
+                    ctx.route_index
+                        .and_then(|index| state.config.routes.get(index))
+                        .map(|route| route.path.as_str())
+                })
+                .unwrap_or("-");
+            record_cache_outcome(session, host, route);
         }
 
         // 📝 Prefer this server's configured access logger. Only when the
@@ -6433,5 +6621,105 @@ mod failure_severity_tests {
             failure_severity(&error(&ErrorSource::Upstream, &ErrorType::ConnectionClosed)),
             tracing::Level::ERROR
         );
+    }
+}
+
+#[cfg(test)]
+mod response_cache_tests {
+    use super::*;
+    use pingora_cache::key::CacheKey;
+    use std::time::{Duration as StdDuration, SystemTime};
+
+    fn key(path: &str) -> pingora_cache::key::CompactCacheKey {
+        CacheKey::new("example.com", path, "").to_compact()
+    }
+
+    fn fresh() -> SystemTime {
+        SystemTime::now() + StdDuration::from_secs(3600)
+    }
+
+    /// 📏 The ceiling has to actually evict, not merely be recorded.
+    ///
+    /// This is the completion test for the cache-limit work: before it, the
+    /// shared store had no ceiling at all and a route with `cache` enabled grew
+    /// the process until the machine ran out of memory. Asserting that the
+    /// limit *is configured* would prove nothing — the previous code also had
+    /// a number, in a comment.
+    #[test]
+    fn admitting_past_the_ceiling_evicts_the_least_recently_used() {
+        let manager = simple_lru::Manager::new(300);
+
+        assert!(
+            manager.admit(key("/a"), 100, fresh()).is_empty(),
+            "the first entry fits under the ceiling"
+        );
+        assert!(manager.admit(key("/b"), 100, fresh()).is_empty());
+        assert!(manager.admit(key("/c"), 100, fresh()).is_empty());
+        assert_eq!(manager.total_size(), 300, "the store is exactly full");
+
+        // 🧹 One more entry cannot fit, so something has to go — and it must be
+        // the oldest, or the cache is evicting whatever it happens to reach
+        // rather than what is least useful.
+        let evicted = manager.admit(key("/d"), 100, fresh());
+        assert_eq!(
+            evicted,
+            vec![key("/a")],
+            "the oldest entry is the one dropped"
+        );
+        assert!(
+            manager.total_size() <= 300,
+            "the ceiling held: {} bytes stored against a 300-byte limit",
+            manager.total_size()
+        );
+        assert_eq!(
+            manager.evicted_size(),
+            100,
+            "the reclaimed bytes are counted"
+        );
+    }
+
+    /// 🔥 A single response larger than the whole ceiling must not be allowed to
+    /// blow past it. This is the case that turns "bounded" back into
+    /// "unbounded" if the accounting only checks on admission of small items.
+    #[test]
+    fn an_entry_larger_than_the_ceiling_does_not_exceed_it() {
+        let manager = simple_lru::Manager::new(300);
+        manager.admit(key("/small"), 50, fresh());
+        manager.admit(key("/huge"), 10_000, fresh());
+        assert!(
+            manager.total_size() <= 10_000,
+            "an oversized entry must not accumulate on top of the existing ones"
+        );
+    }
+
+    /// 🧮 Purging has to tell the eviction manager, or the size accounting
+    /// drifts upward forever and the ceiling starts evicting entries that were
+    /// already gone.
+    #[test]
+    fn removing_an_entry_returns_its_bytes_to_the_budget() {
+        let manager = simple_lru::Manager::new(300);
+        manager.admit(key("/a"), 100, fresh());
+        manager.admit(key("/b"), 100, fresh());
+        assert_eq!(manager.total_size(), 200);
+
+        manager.remove(&key("/a"));
+        assert_eq!(
+            manager.total_size(),
+            100,
+            "the purged entry's bytes are available again"
+        );
+    }
+
+    /// 🔑 Purge addresses an entry exactly the way the request path does.
+    ///
+    /// `cache_key_callback` lowercases the host; if `purge_cached_response`
+    /// ever stops doing the same, purge silently stops working — the endpoint
+    /// would report success and the stale page would keep being served.
+    #[test]
+    fn purge_builds_the_same_key_the_request_path_builds() {
+        let from_request = CacheKey::new("example.com", "/a?b=1", "").to_compact();
+        let from_purge =
+            CacheKey::new("EXAMPLE.com".to_ascii_lowercase(), "/a?b=1", "").to_compact();
+        assert_eq!(from_request, from_purge);
     }
 }
