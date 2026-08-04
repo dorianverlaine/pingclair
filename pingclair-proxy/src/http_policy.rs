@@ -88,20 +88,29 @@ struct AddedHeader {
     header_value: Option<http::HeaderValue>,
 }
 
+/// 📝 One replaced header, with its wire-ready forms built once.
+///
+/// Only the field name lives outside this record, because it is the map key.
+/// Everything that has to stay aligned with that key is in here — the same
+/// arrangement [`AddedHeader`] uses, and for the same reason: these three
+/// pieces previously sat in three `HashMap`s that were only kept in step by
+/// every mutation remembering to touch all of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SetHeader {
+    /// The configured value verbatim, kept for the invalid-value error path.
+    value: String,
+    /// Precompiled name bytes: `Bytes` is the cheapest `IntoCaseHeaderName`
+    /// input, since cloning one is a shared-bytes reference bump.
+    name_bytes: Bytes,
+    /// Precompiled value. `None` means the configured string is not a valid
+    /// header value, which preserves the request-time error path.
+    header_value: Option<http::HeaderValue>,
+}
+
 /// 🧭 Stores transport-neutral downstream header mutations in execution order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ResponseHeaderPolicy {
-    set: HashMap<String, String>,
-    /// Precompiled header-name bytes for `set`: `Bytes` is the cheapest
-    /// `IntoCaseHeaderName` input (clone is a shared-bytes reference bump),
-    /// and building it once here keeps the per-request name path free of
-    /// `String` clones and re-parses.
-    set_names: HashMap<String, Bytes>,
-    /// Precompiled `HeaderValue`s for `set`: cloning one is a shared-bytes
-    /// reference bump, while re-parsing the stored string on every request
-    /// copies the bytes. `None` means the configured value was not a valid
-    /// header value, in which case the request-time error path is preserved.
-    set_values: HashMap<String, Option<http::HeaderValue>>,
+    set: HashMap<String, SetHeader>,
     add: Vec<AddedHeader>,
     remove: Vec<String>,
     suppress_server: bool,
@@ -113,11 +122,12 @@ impl ResponseHeaderPolicy {
     pub(crate) fn set(&mut self, name: impl AsRef<str>, value: impl Into<String>) {
         let name = name.as_ref().to_ascii_lowercase();
         let value = value.into();
-        self.set_names
-            .insert(name.clone(), Bytes::copy_from_slice(name.as_bytes()));
-        self.set_values
-            .insert(name.clone(), http::HeaderValue::from_str(&value).ok());
-        self.set.insert(name, value);
+        let entry = SetHeader {
+            name_bytes: Bytes::copy_from_slice(name.as_bytes()),
+            header_value: http::HeaderValue::from_str(&value).ok(),
+            value,
+        };
+        self.set.insert(name, entry);
     }
 
     /// ➕ Appends one downstream header value after replacement mutations.
@@ -150,21 +160,19 @@ impl ResponseHeaderPolicy {
     pub(crate) fn merge_proxy_set(&mut self, headers: &HashMap<String, String>) {
         for (name, value) in headers {
             let name = name.to_ascii_lowercase();
-            if !self.set.contains_key(&name) {
-                self.set_names
-                    .insert(name.clone(), Bytes::copy_from_slice(name.as_bytes()));
-                self.set_values
-                    .insert(name.clone(), http::HeaderValue::from_str(value).ok());
-                self.set.insert(name, value.clone());
-            }
+            // 🧩 `or_insert_with` is the whole rule: an entry the outer
+            // middleware already decided is never overwritten here.
+            self.set.entry(name).or_insert_with_key(|name| SetHeader {
+                name_bytes: Bytes::copy_from_slice(name.as_bytes()),
+                header_value: http::HeaderValue::from_str(value).ok(),
+                value: value.clone(),
+            });
         }
     }
 
     /// 🔗 Merges a middleware decision into the active response policy.
     pub(crate) fn merge(&mut self, other: ResponseHeaderPolicy) {
         self.set.extend(other.set);
-        self.set_names.extend(other.set_names);
-        self.set_values.extend(other.set_values);
         self.add.extend(other.add);
         for name in other.remove {
             self.remove(name);
@@ -180,14 +188,13 @@ impl ResponseHeaderPolicy {
         request_id: &http::HeaderValue,
         via_hop: Option<http::Version>,
     ) -> PingoraResult<()> {
-        for (name, value) in &self.set {
-            let name_bytes = &self.set_names[name];
-            match self.set_values.get(name).and_then(|v| v.clone()) {
+        for entry in self.set.values() {
+            match &entry.header_value {
                 Some(header_value) => {
-                    response.insert_header(name_bytes.clone(), header_value)?;
+                    response.insert_header(entry.name_bytes.clone(), header_value.clone())?;
                 }
                 None => {
-                    response.insert_header(name_bytes.clone(), value.as_str())?;
+                    response.insert_header(entry.name_bytes.clone(), entry.value.as_str())?;
                 }
             }
         }
@@ -231,7 +238,7 @@ impl ResponseHeaderPolicy {
     pub(crate) fn set_headers(&self) -> impl Iterator<Item = (&str, &str)> {
         self.set
             .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .map(|(name, entry)| (name.as_str(), entry.value.as_str()))
     }
 
     /// 🌐 Exposes normalized append mutations to protocol adapters.
@@ -1123,6 +1130,49 @@ mod tests {
     }
 
     // ---- Via (RFC 9110 §7.6.3) ----
+
+    #[test]
+    fn proxy_owned_headers_never_override_an_outer_decision() {
+        // 🧩 `headers_down` on a reverse_proxy route fills gaps; it does not
+        // get to overrule a `header` directive the operator wrote. Both
+        // transports rely on this (server.rs and quic.rs both call it), and
+        // the rule is one `or_insert` away from silently inverting.
+        let mut policy = ResponseHeaderPolicy::default();
+        policy.set("x-owner", "outer-middleware");
+
+        let proxy_headers: HashMap<String, String> = [
+            ("X-Owner".to_string(), "proxy-config".to_string()),
+            ("x-only-proxy".to_string(), "proxy-config".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        policy.merge_proxy_set(&proxy_headers);
+
+        let response = applied(&policy, None);
+        assert_eq!(
+            header_values(&response, "x-owner"),
+            vec!["outer-middleware"],
+            "a proxy-owned header must not overwrite one the outer policy set"
+        );
+        assert_eq!(
+            header_values(&response, "x-only-proxy"),
+            vec!["proxy-config"],
+            "a name the outer policy never set must still be filled in"
+        );
+    }
+
+    #[test]
+    fn a_replacement_keeps_only_its_latest_value() {
+        // 📝 `set` replaces rather than appends, however many times it runs.
+        let mut policy = ResponseHeaderPolicy::default();
+        policy.set("x-set", "first");
+        policy.set("X-Set", "second");
+        assert_eq!(
+            header_values(&applied(&policy, None), "x-set"),
+            vec!["second"],
+            "set must replace, and must be case-insensitive about the name"
+        );
+    }
 
     #[test]
     fn repeated_append_of_one_name_keeps_each_value() {
