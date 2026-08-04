@@ -110,7 +110,10 @@ Everything below is on `main` and unreleased; the workspace reports
   can really serve, rather than returning the moment the process forks.
   `pingclair_ready` and `pingclair_config_version` export the same facts to
   Prometheus — two instances reporting different config versions means a
-  reload reached one and not the other.
+  reload reached one and not the other. New metrics cover upstream latency
+  and errors separately from client-visible ones, retries, keepalive
+  connection reuse, TLS handshakes by version, and HTTP/3 connections and
+  cancellations.
 - **The admin API enforces an origin allow list.**
   `admin :2019 { origins https://admin.example.com; enforce_origin }`. Without
   it a page on any website could `fetch()` a new configuration into a
@@ -165,6 +168,13 @@ Everything below is on `main` and unreleased; the workspace reports
 
 ### Security
 
+- **Metric labels taken from client input are capped.** The `host` label came
+  straight from the `Host` header, and Prometheus keeps a separate time series
+  per distinct value, so varied headers grew the process without bound — a
+  remote memory exhaustion needing no authentication and no unusual traffic
+  volume. Values beyond a fixed ceiling now collapse into `other`, which keeps
+  the totals correct. A host already seen keeps its own series, so a flood of
+  junk cannot displace real traffic.
 - Foreign JSON documents are rejected fail-closed rather than partially
   applied.
 - The admin API enforces the rules it was assumed to already have.

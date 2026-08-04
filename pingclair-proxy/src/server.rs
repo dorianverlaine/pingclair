@@ -3206,8 +3206,10 @@ fn record_cache_outcome(session: &Session, host: &str, route: &str) {
         CachePhase::Bypass => "bypass",
         _ => return,
     };
+    // 🛡️ Same reasoning as the request metrics: `host` comes from the client.
+    let host = metrics::capped_label("host", host);
     metrics::CACHE_REQUESTS_TOTAL
-        .with_label_values(&[host, route, outcome])
+        .with_label_values(&[host.as_str(), route, outcome])
         .inc();
 
     if let Some(eviction) = CACHE_EVICTION.get() {
@@ -4398,6 +4400,23 @@ impl ProxyHttp for PingclairProxy {
         }
 
         if let Ok((upstream, admission)) = selected {
+            // 🔁 Attempts beyond the first. A rising retry rate against a flat
+            // error rate is a backend degrading while the proxy hides it —
+            // users are fine, the origin is not, and nothing else says so.
+            if metrics::enabled() && ctx.retry_attempts > 0 {
+                let route = ctx
+                    .state
+                    .as_ref()
+                    .and_then(|state| {
+                        ctx.route_index
+                            .and_then(|index| state.config.routes.get(index))
+                            .map(|route| route.path.as_str())
+                    })
+                    .unwrap_or("-");
+                metrics::UPSTREAM_RETRIES_TOTAL
+                    .with_label_values(&[route, "dispatched"])
+                    .inc();
+            }
             ctx.retry_attempts += 1;
             ctx.upstream = Some(upstream.clone());
             ctx.upstream_admission = admission;
@@ -4457,7 +4476,7 @@ impl ProxyHttp for PingclairProxy {
     async fn connected_to_upstream(
         &self,
         _session: &mut Session,
-        _reused: bool,
+        reused: bool,
         peer: &HttpPeer,
         #[cfg(unix)] _fd: std::os::unix::io::RawFd,
         #[cfg(windows)] _sock: std::os::windows::io::RawSocket,
@@ -4467,6 +4486,16 @@ impl ProxyHttp for PingclairProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // 🔗 Every `new` is a TCP handshake, plus a TLS negotiation for
+        // secure upstreams. The ratio against `reused` shows a keepalive pool
+        // that is too small long before it shows up as latency. A fixed
+        // two-value label, so no cardinality cap is needed.
+        if metrics::enabled() {
+            metrics::UPSTREAM_CONNECTIONS_TOTAL
+                .with_label_values(&[if reused { "reused" } else { "new" }])
+                .inc();
+        }
+
         if !peer_requires_h2_alpn(peer) {
             return Ok(());
         }
@@ -4711,8 +4740,31 @@ impl ProxyHttp for PingclairProxy {
         // ⏱️ TTFB is measured at the response header, which is the first byte
         // the client can actually observe. Recorded once — a retry or an
         // interceptor running this filter again must not reset it.
-        ctx.first_byte_at
+        let first_byte = *ctx
+            .first_byte_at
             .get_or_insert_with(std::time::Instant::now);
+
+        // ⏱️ Upstream time separately from total request time. Total latency
+        // rising says something is slow; this says whether it is the origin or
+        // this proxy, which is the difference between the two useful actions.
+        // Both labels come from configuration, so no cardinality cap applies.
+        if metrics::enabled()
+            && let Some(upstream) = &ctx.upstream
+        {
+            let route = ctx
+                .state
+                .as_ref()
+                .and_then(|state| {
+                    ctx.route_index
+                        .and_then(|index| state.config.routes.get(index))
+                        .map(|route| route.path.as_str())
+                })
+                .unwrap_or("-");
+            let elapsed = first_byte.saturating_duration_since(ctx.start_time);
+            metrics::UPSTREAM_DURATION_SECONDS
+                .with_label_values(&[route, &upstream.addr.to_string()])
+                .observe(elapsed.as_secs_f64());
+        }
 
         ctx.response_headers.apply_pingora(
             upstream_response,
@@ -4955,6 +5007,35 @@ impl ProxyHttp for PingclairProxy {
         Self::CTX: Send + Sync,
     {
         use pingora_core::{ErrorSource, ErrorType};
+
+        // 💥 Count upstream and internal failures as *attempts*, which is a
+        // different number from requests the client saw fail: a request retried
+        // twice and then served contributes two here and none to
+        // `pingclair_request_errors_total`. That gap is exactly the degradation
+        // a proxy hides, so it is worth its own metric.
+        if metrics::enabled() && !matches!(e.esource(), ErrorSource::Downstream) {
+            let route = ctx
+                .state
+                .as_ref()
+                .and_then(|state| {
+                    ctx.route_index
+                        .and_then(|index| state.config.routes.get(index))
+                        .map(|route| route.path.as_str())
+                })
+                .unwrap_or("-");
+            let upstream = ctx
+                .upstream
+                .as_ref()
+                .map(|upstream| upstream.addr.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            // 🏷️ `ErrorType`'s Debug output is a fixed enum, so the reason
+            // label is bounded by the library rather than by traffic.
+            let reason = format!("{:?}", e.etype());
+            metrics::UPSTREAM_ERRORS_TOTAL
+                .with_label_values(&[route, &upstream, &reason])
+                .inc();
+        }
+
         // 🧾 A response already on the wire means the error page cannot own the
         // framing, so the connection is no longer in a state anyone can reuse.
         let already_responded = session.response_written().is_some();
@@ -5053,6 +5134,14 @@ impl ProxyHttp for PingclairProxy {
 
         if metrics::enabled() {
             let status = response_code.to_string();
+            // 🛡️ `host` is the request's `Host`/`:authority`, so it is entirely
+            // client-controlled. Prometheus keeps one time series per label
+            // combination, so feeding it raw would let anyone grow this
+            // process without bound by varying the header. Values beyond the
+            // ceiling collapse to `other`, which keeps the totals right while
+            // fixing the memory.
+            let capped_host = metrics::capped_label("host", host);
+            let host = capped_host.as_str();
             let labels = [method, status.as_str(), host];
             let request_size = req_header
                 .headers

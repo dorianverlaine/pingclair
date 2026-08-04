@@ -583,6 +583,17 @@ impl Drop for H3App {
         for stream in self.streams.values_mut() {
             cancel_stream_handler(stream);
         }
+        // 🚀 Paired with the increment in `on_conn_established`. Decrementing
+        // on drop rather than at an explicit close covers every way a
+        // connection ends — idle timeout, client GOAWAY, worker panic — which
+        // an explicit path would have to enumerate and would eventually miss,
+        // leaving the gauge drifting upward forever.
+        //
+        // 📌 Guarded on `h3`, so a connection dropped before the handshake
+        // completed does not decrement a count it never incremented.
+        if self.h3.is_some() {
+            crate::metrics::H3_CONNECTIONS.dec();
+        }
     }
 }
 
@@ -609,6 +620,10 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
             qconn,
             &self.h3_config,
         )?);
+        // 🚀 Tracked here rather than at socket accept: a QUIC connection that
+        // never completes its handshake is not one this server is serving, and
+        // counting it would make the gauge drift upward on scanning traffic.
+        crate::metrics::H3_CONNECTIONS.inc();
         Ok(())
     }
 
@@ -763,6 +778,12 @@ fn cancel_stream_handler(stream: &mut StreamState) {
 fn reject_request_trailers(stream: &mut StreamState) -> TrailerRejection {
     cancel_stream_handler(stream);
     stream.handler_cancelled = true;
+    // 🚀 A client abandoning a stream is normal in small numbers; in large ones
+    // it means responses are arriving too slowly to be worth waiting for, which
+    // no other metric here would show.
+    crate::metrics::H3_REQUESTS_TOTAL
+        .with_label_values(&["cancelled"])
+        .inc();
     stream.req_stream_finished = true;
 
     if stream.headers_sent {

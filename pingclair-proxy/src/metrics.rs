@@ -9,6 +9,7 @@ use prometheus::{
     Encoder, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
     TextEncoder,
 };
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Once};
 
@@ -22,6 +23,71 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// 🧩 Registers collectors only once even when several server paths initialize metrics.
 static REGISTER: Once = Once::new();
+
+// MARK: - Label Cardinality
+
+/// 🛡️ Ceiling on distinct values any one label may take.
+///
+/// Prometheus keeps a separate time series per label combination, each holding
+/// a counter and its label strings. A label fed from client input therefore
+/// turns a stream of requests into unbounded memory growth — and the `host`
+/// label comes straight from the `Host` header, so anyone can drive it.
+///
+/// 1024 is comfortably more virtual hosts than a single instance serves while
+/// still being a fixed, small amount of memory.
+const MAX_LABEL_VALUES: usize = 1024;
+
+/// 🏷️ Replacement for values beyond the ceiling.
+///
+/// Collapsing rather than dropping keeps the totals correct: requests to
+/// unrecognised hosts still get counted, just not individually. A dashboard
+/// that suddenly shows most traffic under `other` is itself the signal that
+/// something is sending junk.
+const OVERFLOW_LABEL: &str = "other";
+
+/// 🛡️ Distinct values already admitted, per label name.
+static LABEL_VALUES: LazyLock<std::sync::RwLock<HashMap<&'static str, HashSet<String>>>> =
+    LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
+
+/// 🛡️ Caps a client-controlled label value.
+///
+/// Returns the value itself while the label is under its ceiling, and
+/// [`OVERFLOW_LABEL`] once it is not. The set only grows, deliberately: a
+/// value that has been admitted keeps its own series, so a host that was busy
+/// yesterday does not start folding into `other` because a burst of junk
+/// arrived today.
+///
+/// 🚫 **Never label a metric with a raw path, a user identifier, or anything
+/// else per-request without passing it through here.** Configured values —
+/// route patterns, upstream addresses — are already bounded by the
+/// configuration and do not need it.
+pub fn capped_label(label: &'static str, value: &str) -> String {
+    {
+        let seen = LABEL_VALUES.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(values) = seen.get(label) {
+            if values.contains(value) {
+                return value.to_string();
+            }
+            if values.len() >= MAX_LABEL_VALUES {
+                return OVERFLOW_LABEL.to_string();
+            }
+        }
+    }
+
+    let mut seen = LABEL_VALUES.write().unwrap_or_else(|e| e.into_inner());
+    let values = seen.entry(label).or_default();
+    if values.contains(value) {
+        return value.to_string();
+    }
+    // 🏁 Re-check under the write lock: two threads can both pass the read
+    // check on the last free slot, and without this one of them would push the
+    // set one over its ceiling.
+    if values.len() >= MAX_LABEL_VALUES {
+        return OVERFLOW_LABEL.to_string();
+    }
+    values.insert(value.to_string());
+    value.to_string()
+}
 
 // MARK: - Metrics Definitions
 
@@ -212,6 +278,113 @@ pub static ACCESS_LOG_DROPPED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("metric can be created")
 });
 
+/// ⏱️ Time spent waiting on the upstream, separately from total request time.
+///
+/// The distinction is what makes it actionable: total latency rising tells you
+/// something is slow, this tells you whether it is the origin or this proxy.
+/// Labels come from configuration, so they need no cardinality cap.
+pub static UPSTREAM_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    HistogramVec::new(
+        prometheus::HistogramOpts::new(
+            "pingclair_upstream_duration_seconds",
+            "Time from dispatching upstream to its response header",
+        ),
+        &["route", "upstream"],
+    )
+    .expect("metric can be created")
+});
+
+/// 💥 Upstream attempts that failed, by why.
+///
+/// Split from `pingclair_request_errors_total` because they answer different
+/// questions: that one counts requests the client saw fail, this one counts
+/// attempts — a request retried twice and then served successfully contributes
+/// two failures here and none there, which is precisely the invisible
+/// degradation worth alerting on.
+pub static UPSTREAM_ERRORS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "pingclair_upstream_errors_total",
+            "Failed upstream attempts by route, upstream and reason",
+        ),
+        &["route", "upstream", "reason"],
+    )
+    .expect("metric can be created")
+});
+
+/// 🔁 Upstream attempts made beyond the first.
+///
+/// A rising retry rate with a flat error rate is the signature of a backend
+/// degrading while the proxy hides it — the users are fine and the origin is
+/// not, and nothing else in the metric set says so.
+pub static UPSTREAM_RETRIES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "pingclair_upstream_retries_total",
+            "Upstream attempts beyond the first, by route and outcome",
+        ),
+        &["route", "outcome"],
+    )
+    .expect("metric can be created")
+});
+
+/// 🔗 Upstream connections established, versus reused from the keepalive pool.
+///
+/// The ratio is the point. Every `new` is a TCP handshake and, for TLS
+/// upstreams, a full negotiation; a pool that is too small shows up here long
+/// before it shows up as latency.
+pub static UPSTREAM_CONNECTIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "pingclair_upstream_connections_total",
+            "Upstream connections by whether they were newly established or reused",
+        ),
+        &["disposition"],
+    )
+    .expect("metric can be created")
+});
+
+/// 🔐 Completed downstream TLS handshakes, by negotiated version and ALPN.
+///
+/// Both labels come from a fixed set the TLS stack can produce, so they are
+/// bounded without a cap. Useful for answering "can we drop TLS 1.2 yet"
+/// with data rather than a guess.
+pub static TLS_HANDSHAKES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "pingclair_tls_handshakes_total",
+            "Completed downstream TLS handshakes by version and negotiated protocol",
+        ),
+        &["version", "alpn"],
+    )
+    .expect("metric can be created")
+});
+
+/// 🚀 HTTP/3 connections currently open.
+pub static H3_CONNECTIONS: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "pingclair_h3_connections",
+        "HTTP/3 connections currently open",
+    )
+    .expect("metric can be created")
+});
+
+/// 🚀 HTTP/3 requests, by how the stream ended.
+///
+/// `cancelled` is the one to watch: a client abandoning a stream is normal in
+/// small numbers and, in large ones, means responses are arriving too slowly
+/// to be worth waiting for.
+pub static H3_REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "pingclair_h3_requests_total",
+            "HTTP/3 requests by how the stream ended",
+        ),
+        &["outcome"],
+    )
+    .expect("metric can be created")
+});
+
 /// 🚦 Whether this instance is currently accepting traffic (1) or not (0).
 ///
 /// Deliberately a gauge rather than something derived from request counts: an
@@ -343,6 +516,13 @@ pub fn init() {
         let _ = REGISTRY.register(Box::new(ACTIVE_CONNECTIONS.clone()));
         let _ = REGISTRY.register(Box::new(OVERLOAD_REJECTIONS_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(ACCESS_LOG_DROPPED_TOTAL.clone()));
+        let _ = REGISTRY.register(Box::new(UPSTREAM_DURATION_SECONDS.clone()));
+        let _ = REGISTRY.register(Box::new(UPSTREAM_ERRORS_TOTAL.clone()));
+        let _ = REGISTRY.register(Box::new(UPSTREAM_RETRIES_TOTAL.clone()));
+        let _ = REGISTRY.register(Box::new(UPSTREAM_CONNECTIONS_TOTAL.clone()));
+        let _ = REGISTRY.register(Box::new(TLS_HANDSHAKES_TOTAL.clone()));
+        let _ = REGISTRY.register(Box::new(H3_CONNECTIONS.clone()));
+        let _ = REGISTRY.register(Box::new(H3_REQUESTS_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(READY.clone()));
         let _ = REGISTRY.register(Box::new(CONFIG_VERSION.clone()));
         let _ = REGISTRY.register(Box::new(CACHE_REQUESTS_TOTAL.clone()));
@@ -458,4 +638,73 @@ pub fn gather() -> String {
     let metric_families = REGISTRY.gather();
     encoder.encode(&metric_families, &mut buffer).unwrap();
     String::from_utf8(buffer).unwrap()
+}
+
+#[cfg(test)]
+mod cardinality_tests {
+    use super::*;
+
+    /// 🛡️ **The property that makes a client-controlled label safe.**
+    ///
+    /// `host` is the request's `Host` header, so anyone can vary it. Without a
+    /// ceiling, Prometheus allocates a fresh time series per distinct value and
+    /// the process grows for as long as requests keep arriving — a remote
+    /// memory exhaustion that needs no authentication and no unusual traffic
+    /// volume, just varied headers.
+    #[test]
+    fn a_flood_of_distinct_values_collapses_to_one_series() {
+        let mut distinct = HashSet::new();
+        for i in 0..(MAX_LABEL_VALUES * 4) {
+            distinct.insert(capped_label("flood-test", &format!("host-{i}.example")));
+        }
+        assert!(
+            distinct.len() <= MAX_LABEL_VALUES + 1,
+            "{} distinct label values survived a ceiling of {}",
+            distinct.len(),
+            MAX_LABEL_VALUES
+        );
+        assert!(
+            distinct.contains(OVERFLOW_LABEL),
+            "values beyond the ceiling must collapse to `{OVERFLOW_LABEL}`, not be dropped"
+        );
+    }
+
+    /// 🎯 The mirror case. A cap that folded everything into `other` would pass
+    /// the test above while making the metric useless — an ordinary deployment
+    /// serves a handful of hosts and every one of them must keep its own series.
+    #[test]
+    fn ordinary_values_keep_their_own_series() {
+        for host in ["a.example", "b.example", "c.example"] {
+            assert_eq!(capped_label("small-test", host), host);
+        }
+    }
+
+    /// ♻️ A value already admitted keeps its series forever, so a host that was
+    /// busy yesterday does not start folding into `other` because a burst of
+    /// junk arrived today.
+    #[test]
+    fn an_admitted_value_survives_a_later_flood() {
+        let kept = capped_label("survive-test", "real.example");
+        assert_eq!(kept, "real.example");
+
+        for i in 0..(MAX_LABEL_VALUES * 2) {
+            let _ = capped_label("survive-test", &format!("junk-{i}.example"));
+        }
+
+        assert_eq!(
+            capped_label("survive-test", "real.example"),
+            "real.example",
+            "a real host lost its series to a flood of junk"
+        );
+    }
+
+    /// 🏷️ Ceilings are per label name, so a flood on one cannot silence
+    /// another.
+    #[test]
+    fn labels_have_independent_ceilings() {
+        for i in 0..(MAX_LABEL_VALUES * 2) {
+            let _ = capped_label("noisy-test", &format!("v{i}"));
+        }
+        assert_eq!(capped_label("quiet-test", "only-value"), "only-value");
+    }
 }
