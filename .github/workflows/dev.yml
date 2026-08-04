@@ -250,11 +250,24 @@ jobs:
         # the old "Pingclair v" grep was stale and made this step red on
         # every push from 2026-08-02.
         run: |
+          set -Eeuo pipefail
           image="ghcr.io/dorianverlaine/pingclair:dev-${{ matrix.platform.tag }}"
           version_output="$(docker run --rm "$image" version)"
           echo "$version_output"
           echo "$version_output" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'
-          docker run --rm -v "$PWD/examples:/examples:ro" \
+
+          # 🔐 `full_featured.pingclair` names TLS material, and Pingclair
+          # fails closed when a configured certificate is missing rather than
+          # starting without the TLS the operator asked for. The dev-binaries
+          # job already creates placeholders on the runner for exactly this
+          # reason; the image runs in its own filesystem, so it needs its own
+          # copy mounted in. Validation checks existence only, so empty files
+          # are enough. Without this the job has been red since 2026-08-02.
+          certs="$(mktemp -d)"
+          touch "$certs/example.com.pem" "$certs/example.com.key"
+          docker run --rm \
+            -v "$PWD/examples:/examples:ro" \
+            -v "$certs:/etc/pingclair/certs:ro" \
             "$image" validate /examples/full_featured.pingclair
 
   # ============================================================
