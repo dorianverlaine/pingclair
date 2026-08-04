@@ -99,6 +99,12 @@ Everything below is on `main` and unreleased; the workspace reports
 - **A fail-fast rejection tore down the client's whole connection.**
 - **Circuit-breaker state leaked** for backends removed from the pool.
 - **Health checks probed every backend under one name.**
+- **`protocols` was parsed and then ignored.** A global
+  `servers { protocols h1 h2 }` block — Caddy's way of saying "do not serve
+  HTTP/3" — compiled cleanly and changed nothing, so QUIC kept listening
+  while the operator believed it had been switched off. The list now decides
+  whether HTTP/3 runs. Writing no `protocols` directive at all still means
+  "leave the defaults alone", which is not the same as an empty allow list.
 - **A client hanging up was logged as a server error, twice.** Browsers
   navigating away, users pressing stop and load balancers recycling idle
   connections all produced ERROR lines: one `wrk -c200` run closing its

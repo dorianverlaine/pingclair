@@ -126,6 +126,19 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
         config.global.dns_refresh_secs = secs;
     }
 
+    // 🚫 An operator who writes `servers { protocols h1 h2 }` is asking for
+    // HTTP/3 to be switched off. Until 2026-08-04 this list was parsed into
+    // the AST and then dropped on the floor here, so the request compiled
+    // cleanly and QUIC kept serving — the operator believed a protocol was
+    // disabled when it was not. That is worse than an unimplemented feature,
+    // because the failure is silent and it points the wrong way.
+    //
+    // 📌 An empty list means the directive was never written, which is not
+    // the same as "no protocols allowed"; only an explicit list decides.
+    if !global.protocols.is_empty() {
+        config.global.http3 = global.protocols.contains(&Protocol::H3);
+    }
+
     Ok(())
 }
 
@@ -1446,6 +1459,47 @@ fn compile_basic_auth_credential(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🚫 `protocols` without `h3` must actually switch HTTP/3 off.
+    ///
+    /// Before 2026-08-04 the list was parsed and then ignored, so this
+    /// configuration compiled and QUIC kept listening. The operator asked for
+    /// a protocol to be disabled and was told, silently, that it was.
+    #[test]
+    fn protocols_without_h3_disables_http3() {
+        let ast = crate::parser::compile(
+            "{\n    servers {\n        protocols h1 h2\n    }\n}\nexample.com {\n    listen :8080\n}\n",
+        )
+        .expect("`protocols h1 h2` is valid Caddy syntax");
+        let config = compile_ast(&ast).expect("compiles");
+        assert!(
+            !config.global.http3,
+            "`protocols h1 h2` asked for HTTP/3 to be off, but it stayed on"
+        );
+    }
+
+    /// 🎯 The mirror case, so the fix cannot be "always off".
+    #[test]
+    fn protocols_listing_h3_keeps_http3_on() {
+        let ast = crate::parser::compile(
+            "{\n    servers {\n        protocols h1 h2 h3\n    }\n}\nexample.com {\n    listen :8080\n}\n",
+        )
+        .expect("compiles");
+        let config = compile_ast(&ast).expect("compiles");
+        assert!(config.global.http3, "`h3` was listed, so it must stay on");
+    }
+
+    /// 📌 No `protocols` directive at all is not the same as an empty allow
+    /// list — the default (HTTP/3 on) must survive.
+    #[test]
+    fn absent_protocols_directive_leaves_http3_default() {
+        let ast = crate::parser::compile("example.com {\n    listen :8080\n}\n").expect("compiles");
+        let config = compile_ast(&ast).expect("compiles");
+        assert!(
+            config.global.http3,
+            "an unwritten directive must not disable anything"
+        );
+    }
 
     #[test]
     fn test_compile_simple_server() {
