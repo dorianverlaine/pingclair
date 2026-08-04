@@ -3231,6 +3231,61 @@ fn resolve_single_placeholder(
 
 // MARK: - ProxyHttp Trait
 
+/// 📉 The severity a request failure deserves in the log.
+///
+/// A client that goes away mid-request is *routine*: a browser navigating
+/// away, a user pressing stop, a phone changing cell, a load balancer
+/// recycling idle connections. Reporting that at ERROR buries the failures an
+/// operator can actually act on. One `wrk -c200` run closing its connections
+/// produced 225 ERROR lines in a single second here, none of which described
+/// anything wrong with the server — and 727,414 requests had just succeeded.
+///
+/// The classification follows the error's *source*, which is the only thing
+/// that answers "whose fault is this":
+///
+/// - **Downstream** means Pingora attributes the failure to the remote
+///   client. A closed connection or a failed read/write on that connection is
+///   the client leaving, so it is DEBUG. Anything else the client did wrong —
+///   malformed framing, a bad request line — is nameable and worth WARN, but
+///   it is still not a server error.
+/// - **Upstream, Internal and Unset** are ours or the origin's, and stay at
+///   ERROR.
+///
+/// nginx logs a prematurely closed client connection at `info`, and Caddy at
+/// `debug`; neither treats it as an error.
+fn failure_severity(error: &pingora_core::Error) -> tracing::Level {
+    use pingora_core::{ErrorSource, ErrorType};
+
+    match error.esource() {
+        ErrorSource::Downstream => match error.etype() {
+            // 🔌 The client's connection ended. Nothing here is actionable.
+            ErrorType::ConnectionClosed | ErrorType::ReadError | ErrorType::WriteError => {
+                tracing::Level::DEBUG
+            }
+            // 🚫 The client did something specific and wrong. Visible, but
+            // still not a fault of this server.
+            _ => tracing::Level::WARN,
+        },
+        _ => tracing::Level::ERROR,
+    }
+}
+
+/// 🔊 Emits one event at a level chosen at runtime.
+///
+/// `tracing`'s macros need the level as a compile-time constant, so a
+/// runtime decision has to fan out into one arm per level. Keeping that in a
+/// macro means the call sites read as a single log statement instead of
+/// repeating every structured field three times.
+macro_rules! log_at_level {
+    ($level:expr, $($field:tt)*) => {
+        match $level {
+            tracing::Level::DEBUG => tracing::debug!($($field)*),
+            tracing::Level::WARN => tracing::warn!($($field)*),
+            _ => tracing::error!($($field)*),
+        }
+    };
+}
+
 /// 🔁 Applies Pingora's reuse-safety rule and the route retry budget to an
 /// upstream error before the retry loop reads it.
 ///
@@ -4540,7 +4595,8 @@ impl ProxyHttp for PingclairProxy {
             admission.report_failure();
         }
         let elapsed = ctx.start_time.elapsed();
-        tracing::error!(
+        log_at_level!(
+            failure_severity(&e),
             peer = %peer,
             elapsed_ms = elapsed.as_millis(),
             error = %e,
@@ -4784,7 +4840,13 @@ impl ProxyHttp for PingclairProxy {
 
         // Structured access log
         if let Some(err) = e {
-            tracing::error!(
+            // 📉 The access record for a failed request follows the same
+            // severity rule as the error above, so a client that hung up does
+            // not produce two ERROR lines for something nobody can fix. The
+            // `error` field still carries the reason at whatever level it
+            // lands on, so nothing is lost — only the volume changes.
+            log_at_level!(
+                failure_severity(err),
                 request_id = %ctx.request_id,
                 method = method,
                 host = host,
@@ -6279,5 +6341,97 @@ mod upstream_error_retry_tests {
 
         assert!(!retry, "a truncated retry buffer must disable retry");
         assert!(!error.retry());
+    }
+}
+
+// MARK: - Log severity for request failures
+
+/// 📉 Which failures are worth an operator's attention, and which are just
+/// clients being clients.
+#[cfg(test)]
+mod failure_severity_tests {
+    use super::*;
+    use pingora_core::{ErrorSource, ErrorType};
+
+    fn error(source: &ErrorSource, etype: &ErrorType) -> Box<pingora_core::Error> {
+        let mut error = pingora_core::Error::new(etype.clone());
+        error.esource = source.clone();
+        error
+    }
+
+    #[test]
+    fn a_client_that_hangs_up_is_not_an_error() {
+        // 🚨 The regression this exists for. A `wrk -c200` run closing its
+        // connections produced 225 ERROR lines in one second, describing
+        // nothing an operator could fix, immediately after 727,414 requests
+        // had succeeded. At the default filter those lines were the *only*
+        // thing visible, because the successful access log sits at INFO.
+        for etype in [
+            ErrorType::ConnectionClosed,
+            ErrorType::ReadError,
+            ErrorType::WriteError,
+        ] {
+            assert_eq!(
+                failure_severity(&error(&ErrorSource::Downstream, &etype)),
+                tracing::Level::DEBUG,
+                "a downstream {etype:?} is the client leaving, not a server error"
+            );
+        }
+    }
+
+    #[test]
+    fn a_client_sending_something_invalid_is_visible_but_not_an_error() {
+        // 🚫 Nameable client misbehaviour stays reportable — an operator
+        // chasing a broken integration wants to see it — without claiming the
+        // server failed.
+        for etype in [ErrorType::InvalidHTTPHeader, ErrorType::ConnectProxyFailure] {
+            assert_eq!(
+                failure_severity(&error(&ErrorSource::Downstream, &etype)),
+                tracing::Level::WARN,
+                "a downstream {etype:?} is the client's doing, so it is not ERROR"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_and_internal_failures_stay_at_error() {
+        // 🛡️ The point of quieting client disconnects is that these become
+        // findable again. If this test ever fails, the fix has gone too far.
+        for source in [
+            ErrorSource::Upstream,
+            ErrorSource::Internal,
+            ErrorSource::Unset,
+        ] {
+            for etype in [
+                ErrorType::ConnectionClosed,
+                ErrorType::ReadError,
+                ErrorType::ConnectTimedout,
+                ErrorType::InternalError,
+            ] {
+                assert_eq!(
+                    failure_severity(&error(&source, &etype)),
+                    tracing::Level::ERROR,
+                    "a {source:?} {etype:?} is ours or the origin's and must stay ERROR"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_same_error_type_is_judged_by_its_source() {
+        // 🧭 `ConnectionClosed` is the case that makes source-based
+        // classification necessary rather than a type allowlist: the client
+        // closing is routine, the origin closing mid-response is not.
+        assert_eq!(
+            failure_severity(&error(
+                &ErrorSource::Downstream,
+                &ErrorType::ConnectionClosed
+            )),
+            tracing::Level::DEBUG
+        );
+        assert_eq!(
+            failure_severity(&error(&ErrorSource::Upstream, &ErrorType::ConnectionClosed)),
+            tracing::Level::ERROR
+        );
     }
 }
