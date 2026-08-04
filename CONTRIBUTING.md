@@ -132,6 +132,20 @@ misleading.
 | `docs/GUARDRAILS.md` | Environment constraints and implementation rules. |
 | `benchmarks/README.md` | Performance claims, methodology, bugs found under load. Raw per-run evidence stays local under `benchmarks/results/`, never committed. |
 | `README.md` / `.zh.md` / `.fr.md` | **Shipped** user-facing behavior only — update all three together. |
+| `CHANGELOG.md` | What changed between releases, from the point of view of someone upgrading. |
+
+If your change is visible to someone running Pingclair — behavior, defaults,
+configuration, a fixed bug — add a line to the `[Unreleased]` section of
+`CHANGELOG.md` in the same commit. Write what an operator has to *do* about
+it, not which function you edited; if the answer is "nothing", it probably
+belongs in the commit message instead. Purely internal work (refactors, test
+scaffolding, CI) does not need an entry.
+
+The reason it goes in the same commit is arithmetic: `v0.1.7` was tagged and
+then 173 commits landed before anyone wrote a changelog, and reconstructing
+them afterwards meant reading every subject line and checking half of them
+against the code. Two of those checks turned up claims that were simply wrong.
+An entry written while the change is fresh costs a minute.
 
 Never move an item to "verified" without leaving enough evidence for someone
 else to reproduce the claim.

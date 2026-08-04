@@ -582,6 +582,8 @@ Pingclair 採用模組化的 Cargo Workspace 結構管理程式碼：
 
 請先閱讀 **[CONTRIBUTING.md](CONTRIBUTING.md)**。裡面說明了每個 commit 都必須通過的四道 gate、對一個 Web 伺服器而言什麼才算測試充分，以及從程式碼本身看不出來的架構限制（BoringSSL 鏈結、HTTP/3 路徑、bounded memory）。
 
+各版本之間改了什麼——以及哪些已經在 `main` 上但尚未發布——記在 **[CHANGELOG.md](CHANGELOG.md)**。
+
 首次貢獻者需簽署一次性的 [CLA](CLA.md)。**你的著作權仍屬於你自己。**
 
 ## 📄 授權條款

@@ -607,6 +607,8 @@ Contributions are very welcome — whether you're fixing a bug, adding a feature
 
 Read **[CONTRIBUTING.md](CONTRIBUTING.md)** first. It covers the four-command gate every commit has to pass, what counts as adequately tested for a web server, and the architecture constraints that are not obvious from the code (BoringSSL linking, the HTTP/3 path, bounded memory).
 
+What changed between releases — and what is on `main` but not released yet — is in **[CHANGELOG.md](CHANGELOG.md)**.
+
 First-time contributors sign a one-time [CLA](CLA.md). You keep the copyright to your work.
 
 ## 📄 License

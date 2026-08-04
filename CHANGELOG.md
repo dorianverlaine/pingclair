@@ -99,6 +99,14 @@ Everything below is on `main` and unreleased; the workspace reports
 - **A fail-fast rejection tore down the client's whole connection.**
 - **Circuit-breaker state leaked** for backends removed from the pool.
 - **Health checks probed every backend under one name.**
+- **A client hanging up was logged as a server error, twice.** Browsers
+  navigating away, users pressing stop and load balancers recycling idle
+  connections all produced ERROR lines: one `wrk -c200` run closing its
+  connections emitted 153 in a second, right after half a million requests had
+  succeeded. Because the default log filter passes ERROR only, that flood was
+  the *only* thing visible on a stock deployment. Failures attributed to the
+  client are now DEBUG (or WARN when the client did something specific and
+  wrong); upstream and internal failures are untouched and still ERROR.
 
 ### Security
 

@@ -608,6 +608,8 @@ Les contributions sont les bienvenues — qu'il s'agisse de corriger un bug, d'a
 
 Commencez par lire **[CONTRIBUTING.md](CONTRIBUTING.md)**. Il décrit les quatre commandes que chaque commit doit passer, ce qui constitue une couverture de tests suffisante pour un serveur web, et les contraintes d'architecture que le code seul ne révèle pas (édition de liens BoringSSL, chemin HTTP/3, mémoire bornée).
 
+Ce qui a changé d'une version à l'autre — et ce qui se trouve sur `main` sans être encore publié — est consigné dans **[CHANGELOG.md](CHANGELOG.md)**.
+
 Les nouveaux contributeurs signent un [CLA](CLA.md) une seule fois. **Vous conservez le droit d'auteur sur votre travail.**
 
 ## 📄 Licence
