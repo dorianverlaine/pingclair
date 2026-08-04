@@ -10,14 +10,23 @@ style, emoji conventions, commit subjects), architecture constraints per
 subsystem, and documentation ownership. This file adds the command details and
 the cross-crate picture that only emerge from reading several files at once.
 
-Three documents own distinct things, and the project treats mixing them as a
+These documents own distinct things, and the project treats mixing them as a
 defect:
 
 | Document | Owns |
 | --- | --- |
-| `docs/TODO.md` | The v0.2.0 plan, one Day per sitting. What to work on. 🔒 Local only — not committed, see `AGENTS.md`. |
+| `docs/TODO.md` | The v0.2.0 plan, one Day per sitting. What to work on — **all of it**, including Caddyfile compatibility, which stopped being a separate track on 2026-08-04. 🔒 Local only. |
+| `docs/STATUS.md` | Which public claim has evidence behind it, and where. Three levels: code exists, local tests pass, verified on clean Linux. 🔒 Local only. |
 | `docs/GUARDRAILS.md` | Environment constraints and implementation rules. Every entry is a failure that already happened. |
 | `benchmarks/README.md` | Performance claims and methodology. Raw per-run evidence stays local under `benchmarks/results/`, never committed. |
+| `CHANGELOG.md` | What changed between releases, for someone upgrading. Written the same day as the change. |
+
+Two more are 🔒 local reference rather than working documents:
+`docs/CADDYFILE_COMPATIBILITY_MASTER.md` answers "does Pingclair support this
+Caddy directive"; the other `docs/CADDYFILE_*.md` files are frozen 2026-08-01
+audit records, deliberately excluded from `documentation.rs` because they are
+full of configurations that must *not* compile. Do not read any of them as
+current behavior — check the code.
 
 Implemented is not verified. The verification ledger deliberately separates
 "code exists", "local tests pass", and "verified on Linux/VPS"; never promote
@@ -160,6 +169,19 @@ imperative summary.
 
 Exempt: shebangs, license headers, generated files, and machine-required
 directives.
+
+**`✅` is reserved for completed work.** It is the one emoji in this repository
+with a fixed, countable meaning: this is done, ideally naming the commit or the
+test that finished it. Do not use it for "good", "correct", "recommended", or
+"this rule holds" — reach for `👍`, `📌`, or `🎯` instead. In planning documents
+the same discipline applies to checkboxes: `- [x]` is shipped, `- [ ]` is
+outstanding.
+
+> 🤡 The cost of getting this wrong, 2026-08-04: a sweep counted `✅` to work
+> out which Caddyfile tracking documents were still current, found none in
+> `docs/TODO_CADDYFILE_FIXES.md`, and reported it as abandoned. It was
+> 43-of-46 complete and tracked with `- [x]`; its `✅` characters meant
+> something else entirely. A marker that means two things cannot be counted.
 
 ### 🍎 Apple-style comments
 

@@ -45,8 +45,14 @@ benchmarks/results/
 # SITE.md is the website plan. Same shelf for the same reason plans belong
 # there: they contradict themselves as facts arrive, and a plan read as a
 # promise is worse than no plan. Publish the site, not the sketch of it.
+#
+# STATUS.md is the verification ledger: which public claim has evidence
+# behind it and which does not. The second half of that sentence is the
+# problem — a list of the claims we cannot currently back is a list of the
+# places to push on. Publish the verified claim, not the ledger.
 docs/TODO.md
 docs/SITE.md
+docs/STATUS.md
 docs/TODO_CADDYFILE*.md
 
 # Test coverage

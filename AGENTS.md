@@ -308,6 +308,20 @@ configuration load or hot reload. Invalid security policy should fail closed.
 - 🪵 Runtime log messages must include an appropriate, stable emoji that
   communicates the event category without replacing structured log fields.
   Keep the wording in English.
+- ✅ **`✅` marks completed work and nothing else.** Not "good", not
+  "correct", not "this is the recommended way" — done, and ideally with the
+  commit or test that finished it. Use another emoji for approval (`👍`),
+  for a rule that holds (`📌`), or for a passing property (`🎯`). The same
+  applies to a planning document's own checkboxes: `- [x]` means shipped,
+  `- [ ]` means outstanding, and neither is decoration.
+
+  > 🤡 Why this is a rule: on 2026-08-04 a status sweep counted `✅` to
+  > decide which Caddyfile tracking documents were current, concluded that
+  > `docs/TODO_CADDYFILE_FIXES.md` had **zero** completed items, and
+  > reported that upstream. The document was in fact 43-of-46 done — it
+  > tracked completion with `- [x]`, while its `✅` characters meant other
+  > things. **A marker that means two things cannot be counted**, and a
+  > status document whose status cannot be counted is decoration.
 - 📝 Git commit subjects must begin with an appropriate emoji, followed by a
   conventional, imperative summary; for example,
   `✨ feat(proxy): add weighted backup pools` or
