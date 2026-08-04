@@ -308,6 +308,24 @@ configuration load or hot reload. Invalid security policy should fail closed.
 - 🪵 Runtime log messages must include an appropriate, stable emoji that
   communicates the event category without replacing structured log fields.
   Keep the wording in English.
+- ⚡ **Fix performance problems you walk past.** When you are already editing a
+  function and notice per-request work that belongs at configuration time, an
+  allocation in a hot loop, a clone of something you could borrow, or a lock
+  held across an await — fix it in the same change. The cost of a separate
+  pass is finding the code again and re-deriving why it is shaped that way,
+  which is most of the work.
+
+  The limits: keep the fix inside what you are already touching, and keep it
+  provable. A change that alters behaviour is not a performance fix, it is a
+  behaviour change and needs its own reasoning. Anything whose payoff you
+  cannot demonstrate — a rewrite, a new dependency, a data-structure swap
+  across a module boundary — is a measurement task, not a drive-by; note it
+  and move on. This repository has already deleted 38,532 lines of vendored
+  forks that were plausible and never measured.
+
+  🌊 Two shapes are always worth stopping for, because both have shipped here
+  twice: a response body that gets buffered whole instead of streamed, and
+  work repeated per request that the configuration already determined.
 - ✅ **`✅` marks completed work and nothing else.** Not "good", not
   "correct", not "this is the recommended way" — done, and ideally with the
   commit or test that finished it. Use another emoji for approval (`👍`),

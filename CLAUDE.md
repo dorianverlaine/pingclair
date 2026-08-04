@@ -170,6 +170,24 @@ imperative summary.
 Exempt: shebangs, license headers, generated files, and machine-required
 directives.
 
+### ⚡ Fix performance problems you walk past
+
+While you are already in a function, treat per-request work that configuration
+already determined, allocations in a hot loop, an avoidable clone, or a lock
+held across an await as part of the change you are making. Coming back later
+costs more than the fix does: you have to find the code again and rebuild your
+understanding of why it looks that way.
+
+Two limits keep this from becoming scope creep. Stay inside the code you are
+already editing. And keep the payoff obvious — if you would need a benchmark to
+know whether it helped, it is a measurement task, not a drive-by; say so and
+move on. The 38,532 lines of vendored forks this repository deleted were all
+plausible and none were measured where the patched component was saturated.
+
+The two shapes worth stopping for either way, because both have shipped here
+twice: a response body buffered whole instead of streamed, and work repeated
+per request that `ProxyState` could have precomputed.
+
 **`✅` is reserved for completed work.** It is the one emoji in this repository
 with a fixed, countable meaning: this is done, ideally naming the commit or the
 test that finished it. Do not use it for "good", "correct", "recommended", or
