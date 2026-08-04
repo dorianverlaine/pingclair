@@ -4256,6 +4256,206 @@ async fn test_signal_reload_switches_handler_types() {
     assert!(switched, "reload must switch the handler type");
 }
 
+/// 🧱 **Day 25's atomicity property.**
+///
+/// A reload whose new configuration names a port something else already holds
+/// must change *nothing*. Before this, ports were published one at a time
+/// inside the apply loop, so the addresses handled before the failure were
+/// already serving the new configuration and the reload announced itself as
+/// "partially reloaded" — a state no operator asked for and none can reason
+/// about afterwards.
+#[tokio::test]
+async fn test_signal_reload_is_rejected_whole_when_a_new_listener_cannot_bind() {
+    let config = r#"
+        {
+            admin off
+        }
+        :__PINGCLAIR_TEST_PORT__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "original"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+    assert_eq!(
+        client
+            .get(server.url(0, "/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "original"
+    );
+
+    // 🧱 Hold a port so the reload's second site cannot bind it.
+    //
+    // 📌 The blocker binds the wildcard, because a bare `:port` site derives a
+    // wildcard listener — holding only `127.0.0.1:port` would leave `[::]:port`
+    // bindable on a dual-stack host and the test would prove nothing.
+    let blocker = std::net::TcpListener::bind("[::]:0").expect("bind blocker");
+    let taken = blocker.local_addr().unwrap().port();
+
+    // 📝 The new configuration changes the existing site *and* adds one on the
+    // occupied port. If the reload were not atomic, the first change would
+    // land and the second would fail.
+    let config_path = server._temp_dir.path().join("Pingclairfile");
+    let updated = format!(
+        "{{\n    admin off\n}}\n:{} {{\n    respond \"CHANGED\"\n}}\n:{} {{\n    respond \"second\"\n}}\n",
+        server.address(0).port(),
+        taken
+    );
+    std::fs::write(&config_path, updated).unwrap();
+
+    let status = std::process::Command::new("kill")
+        .args(["-USR1", &server.process.id().to_string()])
+        .status()
+        .expect("kill must run");
+    assert!(status.success());
+
+    // ⏳ Give the reload time to run and, if it were going to, to apply half.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let body = client
+        .get(server.url(0, "/"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        body, "original",
+        "the reload could not bind one listener, so it must have changed nothing — \
+         instead the first site was already updated"
+    );
+    drop(blocker);
+}
+
+/// 🧹 A site removed from the configuration must stop answering.
+///
+/// The old reload only ever added and updated, so a bind address that
+/// disappeared kept serving its previous configuration until the process
+/// restarted. Deleting a site and having it stay reachable is the most
+/// dangerous direction for this to fail in.
+#[tokio::test]
+async fn test_signal_reload_stops_a_listener_that_left_the_configuration() {
+    let config = r#"
+        {
+            admin off
+        }
+        :__PINGCLAIR_TEST_PORT__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "kept"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    // ➕ Add a second site by reload, so it is a *dynamic* listener — the kind
+    // this process bound itself and can therefore release.
+    let extra = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        port
+    };
+    let config_path = server._temp_dir.path().join("Pingclairfile");
+    let with_extra = format!(
+        "{{\n    admin off\n}}\n:{} {{\n    respond \"kept\"\n}}\n:{} {{\n    respond \"temporary\"\n}}\n",
+        server.address(0).port(),
+        extra
+    );
+    std::fs::write(&config_path, with_extra).unwrap();
+    let _ = std::process::Command::new("kill")
+        .args(["-USR1", &server.process.id().to_string()])
+        .status();
+
+    let mut serving = false;
+    for _ in 0..50 {
+        if let Ok(response) = client
+            .get(format!("http://127.0.0.1:{extra}/"))
+            .send()
+            .await
+            && response.text().await.ok().as_deref() == Some("temporary")
+        {
+            serving = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(serving, "the added listener never started serving");
+
+    // ➖ Now remove it again.
+    let without_extra = format!(
+        "{{\n    admin off\n}}\n:{} {{\n    respond \"kept\"\n}}\n",
+        server.address(0).port()
+    );
+    std::fs::write(&config_path, without_extra).unwrap();
+    let _ = std::process::Command::new("kill")
+        .args(["-USR1", &server.process.id().to_string()])
+        .status();
+
+    let mut observed = String::new();
+    let mut stopped = false;
+    for _ in 0..50 {
+        // 🔌 A fresh client each time. The pooled one would keep reusing the
+        // connection it opened while the listener was up, which proves nothing
+        // about whether the listener is still accepting.
+        let probe = reqwest::Client::builder()
+            .no_proxy()
+            .pool_max_idle_per_host(0)
+            .build()
+            .unwrap();
+        match probe
+            .get(format!("http://127.0.0.1:{extra}/"))
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await
+        {
+            Err(_) => {
+                stopped = true;
+                break;
+            }
+            Ok(response) => {
+                observed = format!(
+                    "{} {}",
+                    response.status(),
+                    response.text().await.unwrap_or_default()
+                );
+                if !observed.contains("temporary") {
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        stopped,
+        "the removed site is still serving its old configuration on :{extra} \
+         after the reload (last response: {observed})"
+    );
+
+    // 🎯 The site that stayed must be untouched.
+    assert_eq!(
+        client
+            .get(server.url(0, "/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "kept"
+    );
+}
+
 /// 🔎 Starts a TLS-ready test server and returns (status, x-order, body).
 async fn fetch_ordered_response(server: &mut TestServer) -> (reqwest::StatusCode, String, String) {
     assert!(

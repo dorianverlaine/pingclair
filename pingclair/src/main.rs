@@ -1885,6 +1885,16 @@ impl pingclair_proxy::server::DynamicListeners for RuntimeListeners {
     fn is_dynamic(&self, addr: &str) -> bool {
         self.dynamic_addrs.read().contains(addr)
     }
+
+    fn probe_listener(&self, addr: &str) -> Result<(), String> {
+        // 🔎 Bind and drop. There is an unavoidable gap between this check and
+        // the real bind, so another process could still take the port in
+        // between — but the failure this prevents is the common one: a reload
+        // whose own configuration names a port something else already holds.
+        std::net::TcpListener::bind(addr)
+            .map(|_| ())
+            .map_err(|error| format!("cannot bind {addr}: {error}"))
+    }
 }
 
 /// 🧭 Maps every server (and its automatic HTTP companion) to the concrete
@@ -2709,35 +2719,116 @@ fn run_server(
                         // a phantom `:80` entry.
                         let new_config_by_port = servers_by_bind_address(&new_config);
 
-                        tracing::info!("📋 Step 3/3: Applying configuration to {} port(s)...", new_config_by_port.len());
+                        // 🧭 Phase 1 — prepare. Work out what each bind
+                        // address needs and prove every fallible step can
+                        // succeed, touching nothing.
+                        //
+                        // The old loop published each port as it went, so a
+                        // port that could not be bound left the earlier ones
+                        // already serving the new configuration and the
+                        // reload reported "partially reloaded" — a state no
+                        // operator asked for and none can reason about. Now
+                        // the only fallible step (binding) happens for all
+                        // new addresses first, and a single failure means
+                        // nothing changed at all.
+                        let existing: std::collections::HashSet<String> =
+                            port_proxies.read().keys().cloned().collect();
+                        let mut to_update: Vec<(String, Vec<pingclair_core::config::ServerConfig>)> =
+                            Vec::new();
+                        let mut to_start: Vec<(String, Vec<pingclair_core::config::ServerConfig>)> =
+                            Vec::new();
+                        let mut rejected: Vec<String> = Vec::new();
+
+                        for (addr, servers) in new_config_by_port {
+                            if existing.contains(&addr) {
+                                to_update.push((addr, servers));
+                            } else {
+                                match dynamic_listeners_for_reload.probe_listener(&addr) {
+                                    Ok(()) => to_start.push((addr, servers)),
+                                    Err(error) => rejected.push(format!("{addr}: {error}")),
+                                }
+                            }
+                        }
+
+                        if !rejected.is_empty() {
+                            let reload_duration = reload_start.elapsed();
+                            for reason in &rejected {
+                                tracing::error!("❌ Reload rejected: {reason}");
+                            }
+                            tracing::error!(
+                                "❌ Configuration reload rejected after {:?}: {} listener(s) \
+                                 could not be bound",
+                                reload_duration,
+                                rejected.len()
+                            );
+                            tracing::error!("   💡 Previous configuration remains active, unchanged");
+                            eprintln!(
+                                "❌ Configuration reload rejected: {}",
+                                rejected.join("; ")
+                            );
+                            eprintln!("   💡 Previous configuration remains active, unchanged");
+                            continue;
+                        }
+
+                        // 🧭 Phase 2 — publish. Nothing below can fail, so the
+                        // configuration lands whole.
+                        tracing::info!(
+                            "📋 Step 3/3: Applying configuration to {} port(s)...",
+                            to_update.len() + to_start.len()
+                        );
                         let mut success_count = 0;
                         let mut warnings: Vec<String> = Vec::new();
 
-                        for (addr, servers) in new_config_by_port {
-                            let proxy = port_proxies.read().get(&addr).cloned();
-                            if let Some(proxy) = proxy {
+                        // 🔄 Updates are an ArcSwap store each, so an in-flight
+                        // request sees either the old snapshot or the new one
+                        // and never a mixture.
+                        let mut published: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+                        for (addr, servers) in to_update {
+                            if let Some(proxy) = port_proxies.read().get(&addr).cloned() {
                                 proxy.update_config(servers);
                                 success_count += 1;
+                                published.insert(addr.clone());
                                 tracing::debug!("   ✓ Updated configuration for {}", addr);
-                            } else {
-                                // 🧭 Caddy's reload applies new listeners too;
-                                // the runtime listener manager makes that true
-                                // here instead of demanding a restart.
-                                match dynamic_listeners_for_reload.start_listener(&addr, &servers[0]) {
-                                    Ok(()) => {
-                                        for extra in &servers[1..] {
-                                            if let Some(proxy) =
-                                                port_proxies.read().get(&addr)
-                                            {
-                                                proxy.add_server(extra.clone());
-                                            }
+                            }
+                        }
+
+                        for (addr, servers) in to_start {
+                            match dynamic_listeners_for_reload.start_listener(&addr, &servers[0]) {
+                                Ok(()) => {
+                                    for extra in &servers[1..] {
+                                        if let Some(proxy) = port_proxies.read().get(&addr) {
+                                            proxy.add_server(extra.clone());
                                         }
-                                        success_count += 1;
                                     }
-                                    Err(error) => {
-                                        warnings.push(format!("{addr}: {error}"));
-                                    }
+                                    success_count += 1;
+                                    published.insert(addr.clone());
                                 }
+                                // 🚩 The probe passed and the real bind still
+                                // failed: something else took the port in the
+                                // gap. Rare, and reported rather than hidden.
+                                Err(error) => warnings.push(format!("{addr}: {error}")),
+                            }
+                        }
+
+                        // 🧹 Addresses the new configuration no longer names.
+                        // Without this the old configuration kept serving on
+                        // them forever — a site deleted from the Pingclairfile
+                        // stayed reachable until the next restart, which is the
+                        // most dangerous direction for this bug to fail in.
+                        for stale in existing.difference(&published) {
+                            if dynamic_listeners_for_reload.is_dynamic(stale) {
+                                tracing::info!("🧹 Stopping listener {stale}: no longer configured");
+                                dynamic_listeners_for_reload.stop_listener(stale);
+                            } else {
+                                // 📌 A listener created at startup cannot be
+                                // unbound without a restart, so say so rather
+                                // than leaving the operator to discover that
+                                // the deleted site still answers.
+                                warnings.push(format!(
+                                    "{stale}: no longer in the configuration, but it was bound at \
+                                     startup and needs a restart to release"
+                                ));
                             }
                         }
 

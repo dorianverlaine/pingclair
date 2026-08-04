@@ -68,6 +68,15 @@ pub trait DynamicListeners: Send + Sync {
 
     /// Whether `addr` was started at runtime (and can therefore be stopped).
     fn is_dynamic(&self, addr: &str) -> bool;
+
+    /// 🔎 Checks that `addr` could be bound, without starting anything.
+    ///
+    /// Exists so a reload can find out whether *every* new listener is
+    /// bindable before it publishes *any* of them. Without it the only way to
+    /// discover that port 8443 is taken is to try it — by which point the
+    /// earlier ports are already serving the new configuration and the reload
+    /// has produced a half-applied state nobody asked for.
+    fn probe_listener(&self, addr: &str) -> Result<(), String>;
 }
 
 // MARK: - Context

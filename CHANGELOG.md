@@ -175,6 +175,14 @@ Everything below is on `main` and unreleased; the workspace reports
   volume. Values beyond a fixed ceiling now collapse into `other`, which keeps
   the totals correct. A host already seen keeps its own series, so a flood of
   junk cannot displace real traffic.
+- **A reload could apply half a configuration.** Bind addresses were published
+  one at a time, so a new listener that could not be bound left the addresses
+  handled before it already serving the new configuration — the reload
+  reported itself "partially reloaded" and left a state nobody had asked for.
+  Every new listener is now probed before anything is published, and a single
+  failure rejects the whole reload with the previous configuration untouched.
+  A site removed from the configuration also stops serving, instead of staying
+  reachable on its old listener until the next restart.
 - **A directory configuration silently dropped most global options.** Merging
   several `.pingclair` files named a handful of fields by hand and ignored the
   other nine, so `blocked_ips` blocked nothing, `metrics` did nothing, and
