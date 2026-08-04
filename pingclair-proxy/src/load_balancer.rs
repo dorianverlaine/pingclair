@@ -759,6 +759,23 @@ impl LoadBalancer {
                         .map(|(upstream, _guard)| upstream)
                 })
             }
+            // 🔑 No key means there is nothing to be consistent about.
+            //
+            // Hashing an absent key as `b""` looks harmless and is not: every
+            // request without the field hashes identically, so they all land on
+            // one backend. With `lb_policy header X-Session` that is every
+            // client which has not logged in yet — a hot spot that reads like a
+            // load-balancer defect and is really a configuration one. Falling
+            // through to round-robin spreads them, and costs nothing for the
+            // requests that *do* carry a key.
+            //
+            // 🤡 Found on 2026-08-04 in the Day 22 run, after unit tests had
+            // already confirmed the extractor returns `None` here. The tests
+            // checked the right thing one layer too high: nobody had asked what
+            // the balancer does when handed that `None`.
+            Strategy::IpHash if key.is_none_or(<[u8]>::is_empty) => {
+                Self::select_round_robin(&pool, excluded)
+            }
             Strategy::IpHash => {
                 let hash_key = key.unwrap_or(b"");
                 // select_with keeps Pingora's own health verdict (`ready`,
@@ -790,32 +807,42 @@ impl LoadBalancer {
                         })
                 })
             }
-            Strategy::RoundRobin | Strategy::Random => pool.native_rr.as_ref().and_then(|native| {
-                native
-                    .select_with(b"", 256, |b, ready| {
-                        ready
-                            && active_ready(pool.active_health.as_ref(), b)
-                            && pool.health.is_up_backend(b)
-                            && inet_address(b).is_none_or(|address| {
-                                slow_start_ready(&address, &pool.recovery_slots, pool.slow_start)
-                            })
-                            && inet_address(b).is_none_or(|address| !excluded.contains(&address))
-                    })
-                    .or_else(|| {
-                        native.select_with(b"", 256, |b, ready| {
-                            ready
-                                && active_ready(pool.active_health.as_ref(), b)
-                                && pool.health.is_up_backend(b)
-                                && inet_address(b)
-                                    .is_none_or(|address| !excluded.contains(&address))
-                        })
-                    })
-            }),
+            Strategy::RoundRobin | Strategy::Random => Self::select_round_robin(&pool, excluded),
         };
         primary.or_else(|| {
             self.backup
                 .as_ref()
                 .and_then(|backup| backup.select_excluding(key, excluded))
+        })
+    }
+
+    /// 🔁 Plain round-robin selection over the healthy, non-excluded backends.
+    ///
+    /// Extracted because it is now two callers: the round-robin and random
+    /// strategies, and a hashing strategy whose key is missing for this
+    /// request. The second caller is the reason the first fallback pass
+    /// (which also honours slow-start) is followed by a second that does not:
+    /// a pool entirely inside its slow-start window must still serve someone.
+    fn select_round_robin(pool: &Pool, excluded: &HashSet<SocketAddr>) -> Option<Upstream> {
+        pool.native_rr.as_ref().and_then(|native| {
+            native
+                .select_with(b"", 256, |b, ready| {
+                    ready
+                        && active_ready(pool.active_health.as_ref(), b)
+                        && pool.health.is_up_backend(b)
+                        && inet_address(b).is_none_or(|address| {
+                            slow_start_ready(&address, &pool.recovery_slots, pool.slow_start)
+                        })
+                        && inet_address(b).is_none_or(|address| !excluded.contains(&address))
+                })
+                .or_else(|| {
+                    native.select_with(b"", 256, |b, ready| {
+                        ready
+                            && active_ready(pool.active_health.as_ref(), b)
+                            && pool.health.is_up_backend(b)
+                            && inet_address(b).is_none_or(|address| !excluded.contains(&address))
+                    })
+                })
         })
     }
 
@@ -938,7 +965,12 @@ fn build_pool(
             health,
         },
         Strategy::IpHash => Pool {
-            native_rr: None,
+            // 🔁 A hashing pool still needs a round-robin selector, for the
+            // requests that arrive without the field it hashes on. Building it
+            // here costs one selector at configuration time and keeps the
+            // fallback off the request path's critical section; leaving it
+            // `None` meant a keyless request selected nothing at all.
+            native_rr: Some(Arc::new(build_native_load_balancer(backends.clone()))),
             native_ketama: Some(Arc::new(build_native_load_balancer(backends))),
             least_conn: None,
             active_health,
@@ -1549,6 +1581,51 @@ mod consistent_hash_tests {
             "adding one backend to a pool of four moved {:.1}% of keys; consistent hashing \
              should move roughly 1/5, and a modulo scheme would move nearly all of them",
             share * 100.0
+        );
+    }
+
+    /// 🚫 A hashing pool handed no key must still spread the load.
+    ///
+    /// This is the defect the Day 22 run found on 2026-08-04. The extractor
+    /// correctly returned `None` for a request missing its header — and a unit
+    /// test confirmed exactly that — but the balancer turned `None` into `b""`
+    /// and hashed it, so every keyless request landed on one backend. With
+    /// `lb_policy header X-Session` that is every client not yet logged in.
+    ///
+    /// **The earlier test checked the right thing one layer too high.** Nobody
+    /// had asked what the balancer does with the `None` it was handed, so this
+    /// one asks the balancer directly.
+    #[test]
+    fn a_hashing_pool_without_a_key_falls_back_to_spreading() {
+        let pool = pool_of(4);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..80 {
+            if let Some(upstream) = pool.select(None) {
+                seen.insert(upstream.addr);
+            }
+        }
+        assert!(
+            seen.len() >= 3,
+            "80 keyless requests reached only {} of 4 backends — hashing an absent \
+             key pins every such client to one upstream",
+            seen.len()
+        );
+    }
+
+    /// 🚫 An empty key is the same hot spot as an absent one.
+    #[test]
+    fn a_hashing_pool_with_an_empty_key_also_spreads() {
+        let pool = pool_of(4);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..80 {
+            if let Some(upstream) = pool.select(Some(b"")) {
+                seen.insert(upstream.addr);
+            }
+        }
+        assert!(
+            seen.len() >= 3,
+            "an empty key reached only {} backends",
+            seen.len()
         );
     }
 
