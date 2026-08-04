@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::metrics;
 
-use pingclair_core::config::{LogConfig, LogFormat, LogOutput};
+use pingclair_core::config::{LogConfig, LogFormat, LogOutput, LogRotation};
 
 /// 🖊️ Where a formatted access line is written.
 ///
@@ -112,6 +112,29 @@ fn open_shared_file(path: &str) -> std::io::Result<Arc<Mutex<File>>> {
     Ok(handle)
 }
 
+/// 🔄 Points an already-shared handle at a freshly created file.
+///
+/// Rotation renames the active file aside, which leaves every holder of the
+/// shared handle writing into a file that no longer has that name — the bytes
+/// go to the renamed inode and the new `access.log` is never created.
+///
+/// The fix has to swap the `File` *inside* the mutex rather than hand back a
+/// new `Arc`, because the sharing is the point: two servers configured with the
+/// same path hold the same handle precisely so their writes cannot interleave.
+/// Replacing the Arc would rotate one of them and leave the other writing to
+/// the rotated file forever.
+fn reopen_shared_file(handle: &Arc<Mutex<File>>, path: &Path) -> std::io::Result<()> {
+    let fresh = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut guard = handle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // 🚿 Flush what the old handle still holds before dropping it, or the tail
+    // of the rotated file is lost.
+    let _ = guard.flush();
+    *guard = fresh;
+    Ok(())
+}
+
 /// 📋 One access-log record.
 ///
 /// Borrowed rather than owned so the hot path does not allocate a copy of
@@ -138,6 +161,44 @@ pub struct AccessEntry<'a> {
     pub referer: &'a str,
     pub protocol: &'a str,
     pub error: Option<&'a str>,
+
+    /// 🏷️ Selected request and response headers, already lowercased and
+    /// already masked where required. Empty unless the server asked for them.
+    ///
+    /// Masking happens at collection rather than here so this type cannot be
+    /// handed an unmasked secret in the first place — a log formatter that
+    /// *could* print a credential is one refactor away from doing it.
+    pub request_headers: &'a [(String, String)],
+    pub response_headers: &'a [(String, String)],
+
+    /// 🔐 Negotiated TLS version and cipher, when the server asked for them
+    /// and the connection had any.
+    pub tls_version: Option<&'a str>,
+    pub tls_cipher: Option<&'a str>,
+}
+
+/// 🙈 Collects the named headers, masking the ones that carry secrets.
+///
+/// Naming `authorization` here is deliberately safe: the field appears in the
+/// log so an operator can see the request was authenticated, and the value is
+/// replaced. That is the whole reason `is_sensitive_header` was written back on
+/// Day 3 — this is its first caller.
+pub fn collect_headers(wanted: &[String], headers: &http::HeaderMap) -> Vec<(String, String)> {
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    wanted
+        .iter()
+        .filter_map(|name| {
+            let value = headers.get(name.as_str())?;
+            let rendered = if crate::redaction::is_sensitive_header(name) {
+                crate::redaction::REDACTED.to_string()
+            } else {
+                value.to_str().unwrap_or("<binary>").to_string()
+            };
+            Some((name.clone(), rendered))
+        })
+        .collect()
 }
 
 /// 🧾 A configured per-server access logger.
@@ -149,6 +210,12 @@ pub struct AccessLogger {
     ///
     /// Bounded and never blocking. See [`LogWriter`] for why both matter.
     writer: Arc<LogWriter>,
+    /// 🏷️ Header names to record, lowercased. Empty is the common case and
+    /// costs nothing.
+    request_headers: Vec<String>,
+    response_headers: Vec<String>,
+    /// 🔐 Whether to record the negotiated TLS version and cipher.
+    include_tls: bool,
 }
 
 /// 🚚 Owns the sink and drains a bounded queue from a dedicated thread.
@@ -179,12 +246,149 @@ enum WriterMessage {
     Flush(std::sync::mpsc::SyncSender<()>),
 }
 
+/// 📏 Current size of the active log file, or `None` if it cannot be read.
+fn current_size(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|m| m.len())
+}
+
+/// 🔄 Whether the active file has hit either rotation trigger.
+fn should_rotate(rotation: &LogRotation, written: u64, opened_at: std::time::SystemTime) -> bool {
+    let by_size = rotation
+        .max_size_bytes
+        .is_some_and(|limit| written >= limit);
+    let by_age = rotation.max_age_secs.is_some_and(|max| {
+        opened_at
+            .elapsed()
+            .is_ok_and(|elapsed| elapsed.as_secs() >= max)
+    });
+    by_size || by_age
+}
+
+/// 🔄 Renames the active file aside, reopens it, and applies retention.
+///
+/// Returns the fresh handle, or `None` when anything failed — in which case the
+/// caller keeps writing to the file it already has. **Failing to rotate must
+/// never mean failing to log**: a permission problem on the directory is not a
+/// reason to start dropping lines.
+fn rotate(handle: &Arc<Mutex<File>>, path: &Path, rotation: &LogRotation) -> Option<()> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let rotated = path.with_extension(format!(
+        "{}.{stamp}",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("log")
+    ));
+
+    if let Err(error) = std::fs::rename(path, &rotated) {
+        tracing::warn!(error = %error, path = %path.display(), "⚠️ Could not rotate access log");
+        return None;
+    }
+
+    if rotation.compress {
+        compress_rotated(&rotated);
+    }
+    apply_retention(path, rotation.keep);
+
+    match reopen_shared_file(handle, path) {
+        Ok(()) => Some(()),
+        Err(error) => {
+            tracing::error!(error = %error, "❌ Could not reopen access log after rotation");
+            None
+        }
+    }
+}
+
+/// 🗜️ Gzips a rotated file in place, replacing it with a `.gz`.
+///
+/// Best effort: a failure leaves the uncompressed file, which is strictly
+/// better than losing it.
+fn compress_rotated(rotated: &Path) {
+    let Ok(raw) = std::fs::read(rotated) else {
+        return;
+    };
+    let target = rotated.with_extension(format!(
+        "{}.gz",
+        rotated
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("log")
+    ));
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    if encoder.write_all(&raw).is_err() {
+        return;
+    }
+    let Ok(compressed) = encoder.finish() else {
+        return;
+    };
+    if std::fs::write(&target, compressed).is_ok() {
+        let _ = std::fs::remove_file(rotated);
+    }
+}
+
+/// 🗃️ Deletes the oldest rotated files beyond `keep`.
+///
+/// Rotation without retention only slows the disk filling up; this is the half
+/// that actually prevents it. `None` keeps everything, deliberately — an
+/// operator shipping logs off the box elsewhere may want exactly that.
+fn apply_retention(active: &Path, keep: Option<usize>) {
+    let Some(keep) = keep else { return };
+    let Some(dir) = active.parent() else { return };
+    let Some(stem) = active.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+
+    let mut rotated: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                .and_then(|n| n.to_str())
+                // 🎯 A rotated sibling starts with the active name and has more
+                // after it; the active file itself must never be a candidate.
+                .is_some_and(|name| name.starts_with(stem) && name != stem)
+        })
+        .collect();
+
+    if rotated.len() <= keep {
+        return;
+    }
+    // 🕰️ Names carry a unix timestamp, so lexical order is chronological.
+    rotated.sort();
+    let excess = rotated.len() - keep;
+    for stale in rotated.into_iter().take(excess) {
+        if let Err(error) = std::fs::remove_file(&stale) {
+            tracing::warn!(error = %error, path = %stale.display(), "⚠️ Could not remove rotated log");
+        }
+    }
+}
+
 impl LogWriter {
     /// Spawns the writer thread for one sink.
     ///
     /// `capacity` is in lines, not bytes: the queue holds already-formatted
     /// strings, so a line is the unit an operator can reason about.
+    #[cfg(test)]
     fn spawn(sink: LogSink, capacity: usize) -> Arc<Self> {
+        Self::spawn_with_rotation(sink, capacity, LogRotation::default(), None)
+    }
+
+    /// Spawns the writer thread, optionally rotating a file sink.
+    ///
+    /// Rotation happens **on the writer thread**, between lines. That is the
+    /// only place it can happen safely: renaming and reopening the file while a
+    /// request thread held the handle would interleave a rename with a write,
+    /// and gzipping a rotated file on the request path would be the same
+    /// mistake as writing to it there.
+    fn spawn_with_rotation(
+        sink: LogSink,
+        capacity: usize,
+        rotation: LogRotation,
+        path: Option<PathBuf>,
+    ) -> Arc<Self> {
         let (queue, receiver) = std::sync::mpsc::sync_channel::<WriterMessage>(capacity);
         let dropped = Arc::new(AtomicU64::new(0));
 
@@ -195,9 +399,29 @@ impl LogWriter {
         std::thread::Builder::new()
             .name("pingclair-access-log".into())
             .spawn(move || {
+                // 🔄 `sink` is rebound on rotation, so the loop keeps writing
+                // to whichever file is current without any shared state.
+                // 🔄 Rotation state lives here, on the writer thread, so no
+                // lock is needed to consult it.
+                let mut written = if rotation.is_enabled() {
+                    path.as_ref().and_then(|p| current_size(p)).unwrap_or(0)
+                } else {
+                    0
+                };
+                let mut opened_at = std::time::SystemTime::now();
+
                 for message in receiver {
                     match message {
                         WriterMessage::Line(line) => {
+                            if let (Some(path), LogSink::File(handle), true) =
+                                (path.as_ref(), &sink, rotation.is_enabled())
+                                && should_rotate(&rotation, written, opened_at)
+                                && rotate(handle, path, &rotation).is_some()
+                            {
+                                written = 0;
+                                opened_at = std::time::SystemTime::now();
+                            }
+                            written += line.len() as u64 + 1;
                             if let Err(error) = sink.write_line(&line) {
                                 // 🚫 Reported once per failure and then
                                 // dropped. Retrying a broken sink here would
@@ -260,6 +484,12 @@ impl AccessLogger {
             LogOutput::Stderr => LogSink::Stderr,
             LogOutput::File(path) => LogSink::File(open_shared_file(path)?),
         };
+        // 🔄 Rotation only applies to a file we own. Rotating stdout would mean
+        // renaming whatever the service manager pointed it at.
+        let rotate_path = match &config.output {
+            LogOutput::File(path) if config.rotation.is_enabled() => Some(PathBuf::from(path)),
+            _ => None,
+        };
 
         Ok(Some(Self {
             format: config.format.clone(),
@@ -267,8 +497,30 @@ impl AccessLogger {
             // 📏 1024 lines. Big enough to absorb a burst that a healthy sink
             // drains in milliseconds, small enough that a stalled sink costs
             // bounded memory rather than growing until the box dies.
-            writer: LogWriter::spawn(sink, 1024),
+            writer: LogWriter::spawn_with_rotation(
+                sink,
+                1024,
+                config.rotation.clone(),
+                rotate_path,
+            ),
+            request_headers: config.request_headers.clone(),
+            response_headers: config.response_headers.clone(),
+            include_tls: config.include_tls,
         }))
+    }
+
+    /// 🏷️ Header names this server asked to record, if any.
+    pub fn wanted_request_headers(&self) -> &[String] {
+        &self.request_headers
+    }
+
+    pub fn wanted_response_headers(&self) -> &[String] {
+        &self.response_headers
+    }
+
+    /// 🔐 Whether this server asked for TLS details in its access log.
+    pub fn wants_tls(&self) -> bool {
+        self.include_tls
     }
 
     fn included(&self, field: &str) -> bool {
@@ -362,6 +614,44 @@ impl AccessLogger {
         if let Some(error) = entry.error {
             str_field!("error", error);
         }
+        // 🔐 TLS details go in as ordinary fields; they are already strings
+        // from the handshake and carry nothing client-controlled.
+        if let Some(version) = entry.tls_version {
+            str_field!("tls_version", version);
+        }
+        if let Some(cipher) = entry.tls_cipher {
+            str_field!("tls_cipher", cipher);
+        }
+
+        // 🏷️ Headers are nested under one object per direction rather than
+        // flattened, so a header called `status` cannot collide with the
+        // status field and quietly overwrite it.
+        for (label, headers) in [
+            ("request_headers", entry.request_headers),
+            ("response_headers", entry.response_headers),
+        ] {
+            if headers.is_empty() || !self.included(label) {
+                continue;
+            }
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            out.push('"');
+            out.push_str(label);
+            out.push_str("\":{");
+            for (i, (name, value)) in headers.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push('"');
+                escape_json_into(&mut out, name);
+                out.push_str("\":\"");
+                escape_json_into(&mut out, value);
+                out.push('"');
+            }
+            out.push('}');
+        }
 
         out.push('}');
         out
@@ -454,7 +744,7 @@ fn escape_json_into(out: &mut String, value: &str) {
 mod tests {
     use super::*;
 
-    fn entry<'a>() -> AccessEntry<'a> {
+    pub(super) fn entry<'a>() -> AccessEntry<'a> {
         AccessEntry {
             request_id: "abc-1",
             method: "GET",
@@ -471,14 +761,21 @@ mod tests {
             referer: "-",
             protocol: "HTTP/1.1",
             error: None,
+            request_headers: &[],
+            response_headers: &[],
+            tls_version: None,
+            tls_cipher: None,
         }
     }
 
-    fn logger(format: LogFormat, exclude: Vec<String>) -> AccessLogger {
+    pub(super) fn logger(format: LogFormat, exclude: Vec<String>) -> AccessLogger {
         AccessLogger {
             format,
             exclude: exclude.into_iter().collect(),
             writer: LogWriter::spawn(LogSink::Stdout, 1024),
+            request_headers: Vec::new(),
+            response_headers: Vec::new(),
+            include_tls: false,
         }
     }
 
@@ -578,6 +875,10 @@ mod tests {
             format: LogFormat::Json,
             level: None,
             exclude_fields: vec![],
+            rotation: Default::default(),
+            request_headers: vec![],
+            response_headers: vec![],
+            include_tls: false,
         };
 
         // 🗂️ Two servers configured with the same path must share one handle,
@@ -623,6 +924,10 @@ mod tests {
             format: LogFormat::Json,
             level: None,
             exclude_fields: vec![],
+            rotation: Default::default(),
+            request_headers: vec![],
+            response_headers: vec![],
+            include_tls: false,
         };
         let logger = AccessLogger::from_config(Some(&cfg)).unwrap().unwrap();
         logger.log(&entry());
@@ -724,5 +1029,241 @@ mod writer_backpressure_tests {
             500,
             "every submitted line must reach the file"
         );
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+
+    fn rotating_logger(dir: &Path, rotation: LogRotation) -> AccessLogger {
+        let path = dir.join("access.log");
+        let cfg = LogConfig {
+            output: LogOutput::File(path.to_str().unwrap().to_string()),
+            format: LogFormat::Json,
+            level: None,
+            exclude_fields: vec![],
+            rotation,
+            request_headers: vec![],
+            response_headers: vec![],
+            include_tls: false,
+        };
+        AccessLogger::from_config(Some(&cfg)).unwrap().unwrap()
+    }
+
+    fn siblings(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "access.log")
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// 🔄 A file that reaches the size trigger must be rolled aside, and the
+    /// active file must start again from empty.
+    ///
+    /// Without this, "rotation is configured" and "rotation happens" are the
+    /// same untested distinction that let the cache ceiling look enforced while
+    /// 20 MiB streamed straight past it.
+    #[test]
+    fn reaching_the_size_limit_rolls_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = rotating_logger(
+            dir.path(),
+            LogRotation {
+                max_size_bytes: Some(512),
+                ..Default::default()
+            },
+        );
+
+        for _ in 0..200 {
+            logger.log(&super::tests::entry());
+        }
+        logger.flush();
+
+        assert!(
+            !siblings(dir.path()).is_empty(),
+            "200 JSON lines against a 512-byte limit produced no rotated file"
+        );
+        let active = std::fs::metadata(dir.path().join("access.log"))
+            .unwrap()
+            .len();
+        assert!(
+            active < 200 * 100,
+            "the active file still holds everything ({active} bytes) — it was never rolled"
+        );
+    }
+
+    /// 🗃️ Retention is the half that actually stops the disk filling. Rotation
+    /// alone only slows it down.
+    #[test]
+    fn retention_deletes_the_oldest_rotated_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = rotating_logger(
+            dir.path(),
+            LogRotation {
+                max_size_bytes: Some(256),
+                keep: Some(2),
+                ..Default::default()
+            },
+        );
+
+        for _ in 0..400 {
+            logger.log(&super::tests::entry());
+        }
+        logger.flush();
+
+        let kept = siblings(dir.path());
+        assert!(
+            kept.len() <= 2,
+            "keep=2 left {} rotated files behind: {kept:?}",
+            kept.len()
+        );
+        assert!(
+            !kept.is_empty(),
+            "retention deleted everything, including what it should keep"
+        );
+    }
+
+    /// 🗜️ Compressed rotation must produce `.gz` and remove the plain file,
+    /// or the disk saving is imaginary.
+    #[test]
+    fn compressed_rotation_leaves_only_gzip() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = rotating_logger(
+            dir.path(),
+            LogRotation {
+                max_size_bytes: Some(256),
+                compress: true,
+                ..Default::default()
+            },
+        );
+
+        for _ in 0..300 {
+            logger.log(&super::tests::entry());
+        }
+        logger.flush();
+
+        let kept = siblings(dir.path());
+        assert!(!kept.is_empty(), "nothing was rotated");
+        assert!(
+            kept.iter().all(|n| n.ends_with(".gz")),
+            "compression left uncompressed files behind: {kept:?}"
+        );
+    }
+
+    /// 🚫 A logger with no rotation configured must never touch the directory.
+    /// This is the control: without it, a bug that rotated unconditionally
+    /// would still satisfy every test above.
+    #[test]
+    fn without_a_trigger_nothing_is_rotated() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = rotating_logger(dir.path(), LogRotation::default());
+        for _ in 0..500 {
+            logger.log(&super::tests::entry());
+        }
+        logger.flush();
+        assert!(
+            siblings(dir.path()).is_empty(),
+            "rotation happened without a trigger: {:?}",
+            siblings(dir.path())
+        );
+    }
+}
+
+#[cfg(test)]
+mod header_logging_tests {
+    use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> http::HeaderMap {
+        let mut map = http::HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                http::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    /// 🙈 **The property that makes header logging safe to offer at all.**
+    ///
+    /// An operator naming `authorization` wants to know the request was
+    /// authenticated, not to copy the credential into a file that gets shipped
+    /// to a log aggregator. The field appears; the secret does not.
+    #[test]
+    fn sensitive_headers_are_recorded_as_present_but_masked() {
+        let collected = collect_headers(
+            &["authorization".to_string(), "cookie".to_string()],
+            &headers(&[
+                ("authorization", "Bearer super-secret-token"),
+                ("cookie", "session=abc123"),
+            ]),
+        );
+
+        assert_eq!(collected.len(), 2, "both headers must appear");
+        for (name, value) in &collected {
+            assert_eq!(value, crate::redaction::REDACTED, "{name} leaked its value");
+        }
+        let rendered = format!("{collected:?}");
+        assert!(
+            !rendered.contains("super-secret-token") && !rendered.contains("abc123"),
+            "a secret survived masking: {rendered}"
+        );
+    }
+
+    /// 🎯 The mirror case. Without it, a `collect_headers` that masked
+    /// everything would pass the test above and make the feature useless.
+    #[test]
+    fn ordinary_headers_keep_their_values() {
+        let collected = collect_headers(
+            &["x-request-id".to_string()],
+            &headers(&[("x-request-id", "abc-123")]),
+        );
+        assert_eq!(
+            collected,
+            vec![("x-request-id".to_string(), "abc-123".to_string())]
+        );
+    }
+
+    /// 🚫 A header the server did not ask for must never be recorded, however
+    /// harmless it looks — the allow list is the privacy boundary.
+    #[test]
+    fn unrequested_headers_are_not_recorded() {
+        let collected = collect_headers(
+            &["x-request-id".to_string()],
+            &headers(&[("x-request-id", "abc"), ("x-secret-internal", "leak")]),
+        );
+        assert_eq!(collected.len(), 1);
+        assert!(!format!("{collected:?}").contains("leak"));
+    }
+
+    /// 📭 Naming a header the request did not carry produces no field, rather
+    /// than an empty one that reads as "the client sent nothing".
+    #[test]
+    fn absent_headers_produce_no_field() {
+        let collected = collect_headers(&["x-missing".to_string()], &headers(&[]));
+        assert!(collected.is_empty());
+    }
+
+    /// 🏷️ Headers are nested, so a header named after a log field cannot
+    /// overwrite it.
+    #[test]
+    fn a_header_cannot_collide_with_a_log_field() {
+        let logger = super::tests::logger(LogFormat::Json, vec![]);
+        let request_headers = vec![("status".to_string(), "not-a-status".to_string())];
+        let mut entry = super::tests::entry();
+        entry.request_headers = &request_headers;
+
+        let line = logger.format_json(&entry);
+        let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+        assert_eq!(
+            parsed["status"], 200,
+            "a header called `status` overwrote the real status field: {line}"
+        );
+        assert_eq!(parsed["request_headers"]["status"], "not-a-status");
     }
 }

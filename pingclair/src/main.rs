@@ -1357,6 +1357,13 @@ fn main() -> anyhow::Result<()> {
                     format: pingclair_core::config::LogFormat::Text,
                     level: None,
                     exclude_fields: Vec::new(),
+                    // 🖥️ The CLI quick-commands log to stdout, which the shell
+                    // or the service manager owns; rotating it here would be
+                    // rotating somebody else's file.
+                    rotation: Default::default(),
+                    request_headers: Vec::new(),
+                    response_headers: Vec::new(),
+                    include_tls: false,
                 }),
                 client_max_body_size: 10 * 1024 * 1024,
                 limits: Default::default(),

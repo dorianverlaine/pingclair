@@ -1044,6 +1044,15 @@ fn compile_log(log: &LogBlock) -> CompileResult<LogConfig> {
             crate::parser::ast::LogLevel::Error => "error".to_string(),
         }),
         exclude_fields,
+        rotation: pingclair_core::config::LogRotation {
+            max_size_bytes: log.rotation.max_size_bytes,
+            max_age_secs: log.rotation.max_age_secs,
+            keep: log.rotation.keep,
+            compress: log.rotation.compress,
+        },
+        request_headers: log.request_headers.clone(),
+        response_headers: log.response_headers.clone(),
+        include_tls: log.include_tls,
     })
 }
 

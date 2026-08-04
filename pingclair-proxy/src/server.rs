@@ -5111,7 +5111,42 @@ impl ProxyHttp for PingclairProxy {
             // token this request never contained.
             let redacted_referer = crate::redaction::redact_referer(referer);
 
+            // 🏷️ Only collected when the server named headers, so the common
+            // configuration allocates nothing. Sensitive names are masked
+            // inside `collect_headers` rather than here — this is the first
+            // caller of `is_sensitive_header`, which has been waiting since
+            // Day 3 for a feature that actually logs headers.
+            let logged_request_headers = crate::access_log::collect_headers(
+                logger.wanted_request_headers(),
+                &req_header.headers,
+            );
+            let logged_response_headers = session
+                .response_written()
+                .map(|response| {
+                    crate::access_log::collect_headers(
+                        logger.wanted_response_headers(),
+                        &response.headers,
+                    )
+                })
+                .unwrap_or_default();
+            // 🔐 `digest` carries the handshake result; a plaintext listener
+            // simply has none, which is why both fields are optional rather
+            // than empty strings.
+            let (tls_version, tls_cipher) = if logger.wants_tls() {
+                session
+                    .digest()
+                    .and_then(|digest| digest.ssl_digest.as_ref())
+                    .map(|ssl| (Some(ssl.version.clone()), Some(ssl.cipher.clone())))
+                    .unwrap_or((None, None))
+            } else {
+                (None, None)
+            };
+
             logger.log(&crate::access_log::AccessEntry {
+                request_headers: &logged_request_headers,
+                response_headers: &logged_response_headers,
+                tls_version: tls_version.as_deref(),
+                tls_cipher: tls_cipher.as_deref(),
                 request_id: &ctx.request_id,
                 method,
                 host,

@@ -281,10 +281,33 @@ pub enum LogLevel {
 /// Log block (per-server)
 #[derive(Debug, Clone)]
 pub struct LogBlock {
+    /// 🔄 File rotation policy from `roll { … }`.
+    pub rotation: LogRotationBlock,
+    /// 🏷️ Header names to record, from `format filter { headers { … } }`.
+    pub request_headers: Vec<String>,
+    pub response_headers: Vec<String>,
+    /// 🔐 Record negotiated TLS version and cipher.
+    pub include_tls: bool,
     pub output: LogOutput,
     pub format: LogFormat,
     /// 🚦 Minimum level for this server's access log, when configured.
     pub level: Option<LogLevel>,
+}
+
+/// 🔄 Typed `roll` policy produced by the adapter.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogRotationBlock {
+    pub max_size_bytes: Option<u64>,
+    pub max_age_secs: Option<u64>,
+    pub keep: Option<usize>,
+    pub compress: bool,
+}
+
+impl LogRotationBlock {
+    /// Whether any rotation trigger was written.
+    pub fn is_enabled_block(&self) -> bool {
+        self.max_size_bytes.is_some() || self.max_age_secs.is_some()
+    }
 }
 
 /// Log output destination

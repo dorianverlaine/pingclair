@@ -1446,6 +1446,60 @@ pub struct LogConfig {
     /// still load.
     #[serde(default)]
     pub exclude_fields: Vec<String>,
+
+    /// 🔄 File rotation policy. Ignored for stdout and stderr, which are
+    /// somebody else's problem to rotate.
+    #[serde(default)]
+    pub rotation: LogRotation,
+
+    /// 🏷️ Request and response header names to record, lowercased.
+    ///
+    /// Values are masked when [`crate::server::is_sensitive_header`] says so,
+    /// which is why an operator can safely name `authorization` here: the
+    /// field appears, the secret does not.
+    #[serde(default)]
+    pub request_headers: Vec<String>,
+    #[serde(default)]
+    pub response_headers: Vec<String>,
+
+    /// 🔐 Whether to record the negotiated TLS version and cipher.
+    #[serde(default)]
+    pub include_tls: bool,
+}
+
+/// 🔄 When to start a new log file, and how many old ones to keep.
+///
+/// Rotation exists for one reason: a log that only grows eventually fills the
+/// device, and a full device is precisely the failure the bounded writer was
+/// built to survive. Surviving it is better than causing it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct LogRotation {
+    /// 📏 Roll over once the active file reaches this many bytes. `None`
+    /// disables size-based rotation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_size_bytes: Option<u64>,
+
+    /// ⏳ Roll over when the active file is this old, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age_secs: Option<u64>,
+
+    /// 🗃️ How many rotated files to keep. `None` keeps them all, which is
+    /// rotation without retention — it slows the disk filling up rather than
+    /// preventing it, so it is worth saying out loud.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<usize>,
+
+    /// 🗜️ Gzip rotated files. Costs CPU once per rotation and typically wins
+    /// an order of magnitude on text logs.
+    #[serde(default)]
+    pub compress: bool,
+}
+
+impl LogRotation {
+    /// Whether any rotation trigger is configured at all.
+    pub fn is_enabled(&self) -> bool {
+        self.max_size_bytes.is_some() || self.max_age_secs.is_some()
+    }
 }
 
 /// Log output destination

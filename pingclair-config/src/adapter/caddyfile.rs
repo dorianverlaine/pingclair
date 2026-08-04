@@ -1169,6 +1169,10 @@ fn adapt_log_block(block: Block) -> Result<LogBlock, AdapterError> {
     let mut output = LogOutput::Stdout;
     let mut format = LogFormat::default();
     let mut level = None;
+    let mut rotation = LogRotationBlock::default();
+    let mut request_headers = Vec::new();
+    let mut response_headers = Vec::new();
+    let mut include_tls = false;
 
     for d in block.directives {
         match d.name.as_str() {
@@ -1194,6 +1198,64 @@ fn adapt_log_block(block: Block) -> Result<LogBlock, AdapterError> {
                             "log output".into(),
                             format!("unknown output `{other}` (expected file, stdout or stderr)"),
                         ));
+                    }
+                }
+            }
+            // 🔄 `roll { size 100mb; age 24h; keep 7; compress }` — a log that
+            // only grows eventually fills the device, which is exactly the
+            // failure the bounded writer exists to survive. Better not to
+            // cause it.
+            "roll" => {
+                let Some(roll) = d.block else {
+                    return Err(AdapterError::InvalidArgument(
+                        "log roll".into(),
+                        "block required, e.g. `roll { size 100mb }`".into(),
+                    ));
+                };
+                for r in roll.directives {
+                    match r.name.as_str() {
+                        "size" => rotation.max_size_bytes = Some(parse_byte_size(&r)?),
+                        "age" => rotation.max_age_secs = Some(parse_required_duration(&r)? / 1000),
+                        "keep" => rotation.keep = Some(parse_positive_usize(&r)?),
+                        "compress" => rotation.compress = true,
+                        other => {
+                            return Err(AdapterError::UnknownDirective(format!("roll: {other}")));
+                        }
+                    }
+                }
+                if !rotation.compress && rotation.keep.is_some() && !rotation.is_enabled_block() {
+                    return Err(AdapterError::InvalidArgument(
+                        "log roll".into(),
+                        "`keep` needs a rotation trigger — add `size` or `age`, or nothing \
+                         will ever be rotated to keep"
+                            .into(),
+                    ));
+                }
+            }
+            // 🏷️ `headers { request X-Foo; response Y-Bar; tls }`. Sensitive
+            // names are still masked at write time, so naming `authorization`
+            // here records that it was present without recording the secret.
+            "headers" => {
+                let Some(hdrs) = d.block else {
+                    return Err(AdapterError::InvalidArgument(
+                        "log headers".into(),
+                        "block required, e.g. `headers { request X-Request-Id }`".into(),
+                    ));
+                };
+                for h in hdrs.directives {
+                    match h.name.as_str() {
+                        "request" => {
+                            request_headers.extend(h.args.iter().map(|a| a.to_ascii_lowercase()))
+                        }
+                        "response" => {
+                            response_headers.extend(h.args.iter().map(|a| a.to_ascii_lowercase()))
+                        }
+                        "tls" => include_tls = true,
+                        other => {
+                            return Err(AdapterError::UnknownDirective(format!(
+                                "headers: {other}"
+                            )));
+                        }
                     }
                 }
             }
@@ -1308,6 +1370,50 @@ fn adapt_log_block(block: Block) -> Result<LogBlock, AdapterError> {
         output,
         format,
         level,
+        rotation,
+        request_headers,
+        response_headers,
+        include_tls,
+    })
+}
+
+/// 📏 Parses a byte size with an optional unit suffix (`100mb`, `4KiB`, `512`).
+///
+/// Sizes are the one place where a bare number is genuinely unambiguous —
+/// it means bytes — so unlike durations it is accepted. What is *not*
+/// accepted is an unrecognised suffix: `100mbb` must fail loudly rather than
+/// silently parse as 100.
+fn parse_byte_size(directive: &Directive) -> Result<u64, AdapterError> {
+    let raw = directive.args.first().ok_or_else(|| {
+        AdapterError::ArgumentCount(directive.name.clone(), 1, directive.args.len())
+    })?;
+    if directive.args.len() != 1 {
+        return Err(AdapterError::ArgumentCount(
+            directive.name.clone(),
+            1,
+            directive.args.len(),
+        ));
+    }
+    let lower = raw.to_ascii_lowercase();
+    let digits = lower.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let suffix = &lower[digits.len()..];
+    let value: u64 = digits.parse().map_err(|_| {
+        AdapterError::InvalidArgument(directive.name.clone(), format!("`{raw}` is not a size"))
+    })?;
+    let multiplier: u64 = match suffix {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        other => {
+            return Err(AdapterError::InvalidArgument(
+                directive.name.clone(),
+                format!("unknown size unit `{other}` (expected b, kb, mb or gb)"),
+            ));
+        }
+    };
+    value.checked_mul(multiplier).ok_or_else(|| {
+        AdapterError::InvalidArgument(directive.name.clone(), format!("`{raw}` overflows"))
     })
 }
 

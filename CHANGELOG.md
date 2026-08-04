@@ -90,7 +90,12 @@ Everything below is on `main` and unreleased; the workspace reports
   mount can no longer slow down request handling: when the queue fills, lines
   are dropped and counted in `pingclair_access_log_dropped_total` rather than
   the proxy being held up. Any non-zero value there means the log has a gap
-  for that period.
+  for that period. `log { roll { size 100mb; age 24h; keep 7; compress } }`
+  rotates the file, keeps a fixed number of old ones and gzips them, all on
+  the writer thread. `log { headers { request X-Request-Id; response
+  X-Cache; tls } }` records named headers and the negotiated TLS version and
+  cipher — naming `authorization` is safe, since sensitive headers are
+  written as present with their values masked.
 - **Response compression is negotiable.** An `encode` directive selects zstd
   and gzip per `Accept-Encoding`, with configurable MIME types. A config that
   never mentions `encode` keeps compressing exactly as 0.1.7 did — gzip only —
