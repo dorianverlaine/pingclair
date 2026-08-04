@@ -1312,6 +1312,23 @@ pub struct AdminConfig {
 
     /// API key for authentication
     pub api_key: Option<String>,
+
+    /// 🌐 `Origin`/`Host` values allowed to reach the admin API.
+    ///
+    /// Empty means Caddy's default: the listen address itself, plus loopback.
+    /// The check exists because the admin API can rewrite the whole
+    /// configuration, so a browser page on any origin being able to POST to it
+    /// would be a full compromise via a single visited link.
+    #[serde(default)]
+    pub origins: Vec<String>,
+
+    /// 🛡️ Whether to enforce the origin check even on loopback.
+    ///
+    /// Off by default, matching Caddy: a developer curling their own admin
+    /// endpoint sends no `Origin` at all, and refusing that would make the API
+    /// unusable from the command line for no security gain.
+    #[serde(default)]
+    pub enforce_origin: bool,
 }
 
 fn default_admin_enabled() -> bool {

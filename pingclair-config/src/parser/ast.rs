@@ -72,6 +72,12 @@ pub struct AdminDirective {
 
     /// Bearer token required for admin API requests
     pub api_key: Option<String>,
+
+    /// 🌐 Origins allowed to reach the admin API.
+    pub origins: Vec<String>,
+
+    /// 🛡️ Enforce the origin check even for loopback callers.
+    pub enforce_origin: bool,
 }
 
 /// Auto-HTTPS modes

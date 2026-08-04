@@ -101,6 +101,22 @@ Everything below is on `main` and unreleased; the workspace reports
   `log { … }` at the same time, so "everything to stdout, an audit copy to a
   file" needs no duplication. Referencing a channel that was never declared
   is refused at startup, listing the names that do exist.
+- **Readiness and liveness endpoints.** `GET /ready` on the admin API answers
+  503 until every listener is bound, and again as soon as shutdown begins, so
+  a rolling deploy stops sending traffic to an instance that cannot yet answer
+  or is draining. `GET /live` stays 200 throughout, because a process
+  finishing the connections it already accepted should not be restarted. The
+  systemd unit is now `Type=notify`: `systemctl start` blocks until the proxy
+  can really serve, rather than returning the moment the process forks.
+  `pingclair_ready` and `pingclair_config_version` export the same facts to
+  Prometheus — two instances reporting different config versions means a
+  reload reached one and not the other.
+- **The admin API enforces an origin allow list.**
+  `admin :2019 { origins https://admin.example.com; enforce_origin }`. Without
+  it a page on any website could `fetch()` a new configuration into a
+  locally-bound admin endpoint. Requests carrying no `Origin` at all — curl,
+  systemctl — keep working unless `enforce_origin` is set, since the attack
+  being prevented is specifically a browser one.
 - **Response compression is negotiable.** An `encode` directive selects zstd
   and gzip per `Accept-Encoding`, with configurable MIME types. A config that
   never mentions `encode` keeps compressing exactly as 0.1.7 did — gzip only —

@@ -1939,6 +1939,56 @@ fn servers_by_bind_address(
     by_port
 }
 
+/// 📣 Tells systemd this unit has finished starting.
+///
+/// Written by hand against the `sd_notify` protocol rather than pulling in a
+/// crate: the protocol is one datagram to one socket, and the dependency would
+/// be larger than the code. `NOTIFY_SOCKET` is unset unless the unit declares
+/// `Type=notify`, so on every other platform and every other launch method
+/// this is a no-op.
+///
+/// **Why it matters**: with `Type=simple` systemd considers the unit started
+/// the moment the process is forked, so anything ordered `After=pingclair`
+/// races against the listeners being bound. With `Type=notify` the unit is not
+/// started until this datagram arrives — which happens after the listeners are
+/// added, not after the config is parsed.
+#[cfg(unix)]
+fn notify_systemd(state: &str) {
+    use std::os::unix::net::UnixDatagram;
+
+    let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") else {
+        return;
+    };
+    if socket_path.is_empty() {
+        return;
+    }
+    // 🔌 A leading `@` means an abstract socket, which Rust spells with a NUL.
+    let addr = if let Some(rest) = socket_path.strip_prefix('@') {
+        format!("\0{rest}")
+    } else {
+        socket_path
+    };
+
+    match UnixDatagram::unbound().and_then(|socket| socket.send_to(state.as_bytes(), &addr)) {
+        Ok(_) => tracing::debug!(state = %state, "📣 Notified systemd"),
+        // 🚫 Never fatal. Failing to talk to systemd is not a reason to refuse
+        // to serve traffic; the worst case is a unit that looks slower to
+        // start than it is.
+        Err(error) => tracing::debug!(error = %error, "📣 Could not notify systemd"),
+    }
+}
+
+#[cfg(not(unix))]
+fn notify_systemd(_state: &str) {}
+
+fn notify_systemd_ready() {
+    notify_systemd("READY=1\nSTATUS=Serving\n");
+}
+
+fn notify_systemd_stopping() {
+    notify_systemd("STOPPING=1\nSTATUS=Draining\n");
+}
+
 fn run_server(
     config_path: String,
     config: pingclair_core::config::PingclairConfig,
@@ -1972,6 +2022,12 @@ fn run_server(
     // channel keeps its writer thread and its queue rather than spawning a
     // second writer onto the same file.
     pingclair_proxy::access_log::register_channels(&config.logging.channels);
+
+    // 🔢 The startup configuration is version 1. The number itself is
+    // meaningless; two instances behind one balancer reporting *different*
+    // versions is the signal — it means a reload reached one and not the other,
+    // which is otherwise invisible until they start behaving differently.
+    pingclair_proxy::metrics::CONFIG_VERSION.set(1);
 
     if config.global.auto_https != pingclair_core::config::AutoHttpsMode::Off {
         tracing::info!("🔐 Auto HTTPS: enabled");
@@ -2518,6 +2574,8 @@ fn run_server(
         && admin_config.enabled
     {
         let listen = admin_config.listen.clone();
+        let admin_origins = admin_config.origins.clone();
+        let admin_enforce_origin = admin_config.enforce_origin;
         let api_key = admin_config.api_key.clone();
         let proxies = port_proxies.clone();
         let shutdown_for_admin = admin_shutdown.clone();
@@ -2543,6 +2601,8 @@ fn run_server(
                     listeners: Some(dynamic_listeners_for_admin),
                     api_changed: api_changed_for_admin,
                     api_key,
+                    origins: admin_origins,
+                    enforce_origin: admin_enforce_origin,
                 };
                 if let Err(e) = pingclair_api::run_admin_server(addr, options).await {
                     tracing::error!("Admin server error: {}", e);
@@ -2641,6 +2701,7 @@ fn run_server(
                         pingclair_proxy::access_log::register_channels(
                             &new_config.logging.channels,
                         );
+                        pingclair_proxy::metrics::CONFIG_VERSION.inc();
 
                         // 🧭 Derive every bind address the same way startup
                         // does (including the automatic HTTP companion), so a
@@ -2760,9 +2821,18 @@ fn run_server(
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("🛑 Received SIGINT, shutting down");
+                    // 🚰 Stop being sent new traffic before the process starts
+                    // going away. A load balancer polling /ready gets a 503 on
+                    // its next check and routes around, so the connections
+                    // still in flight are the last ones this instance has to
+                    // finish rather than the first of a fresh wave.
+                    pingclair_proxy::readiness::mark_draining();
+                    notify_systemd_stopping();
                 }
                 _ = sigterm.recv() => {
                     tracing::info!("🛑 Received SIGTERM, shutting down");
+                    pingclair_proxy::readiness::mark_draining();
+                    notify_systemd_stopping();
                 }
                 _ = sigquit.recv() => {
                     // 🏃 Caddy exits immediately on SIGQUIT (code 2) after
@@ -2789,6 +2859,22 @@ fn run_server(
     println!("🚀 Pingclair running...");
     // 🔓 Releases every unique private address immediately before Pingora binds it.
     drop(private_listener_reservations);
+
+    // 🚦 Ready only now. Every listener has been added to the server and the
+    // reservations are released, so the next thing that happens is Pingora
+    // binding them. Announcing readiness any earlier — right after parsing the
+    // config, say — is what makes a rolling deploy drop requests: the
+    // orchestrator believes the instance is serving and sends it traffic while
+    // the sockets are still being created.
+    //
+    // 📣 systemd learns the same fact at the same moment. With `Type=notify`
+    // the unit is not considered started until this arrives, so `systemctl
+    // start` blocks until the process can actually answer, and anything
+    // ordered `After=` it starts against a working proxy rather than a
+    // half-open one.
+    pingclair_proxy::readiness::mark_ready();
+    notify_systemd_ready();
+
     server.run_forever();
 }
 

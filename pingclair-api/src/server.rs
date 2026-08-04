@@ -23,7 +23,7 @@ use tokio::sync::Notify;
 
 use pingclair_core::config::PingclairConfig;
 
-use crate::auth::{ApiKeyAuth, AuthDecision, authorize};
+use crate::auth::{ApiKeyAuth, AuthDecision, OriginPolicy, authorize, origin_allowed};
 use crate::config_tree::{self, Mode, TreeError};
 
 /// 🧭 Shared state for one admin server connection.
@@ -36,6 +36,7 @@ struct AdminState {
     listeners: Option<Arc<dyn pingclair_proxy::server::DynamicListeners>>,
     api_changed: Arc<AtomicBool>,
     auth: Option<Arc<ApiKeyAuth>>,
+    origins: Arc<OriginPolicy>,
 }
 
 /// 🧭 Everything the admin server needs beyond its socket address.
@@ -48,6 +49,8 @@ pub struct AdminServerOptions {
     pub listeners: Option<Arc<dyn pingclair_proxy::server::DynamicListeners>>,
     pub api_changed: Arc<AtomicBool>,
     pub api_key: Option<String>,
+    pub origins: Vec<String>,
+    pub enforce_origin: bool,
 }
 
 /// 🧭 Read-only context threaded through the config mutation helpers.
@@ -69,6 +72,11 @@ pub async fn run_admin_server(
         .await
         .map_err(|e| pingclair_core::Error::Server(format!("Failed to bind admin API: {e}")))?;
 
+    let origins = Arc::new(OriginPolicy {
+        allowed: options.origins,
+        enforce: options.enforce_origin,
+        listen: addr.to_string(),
+    });
     let auth = options.api_key.map(|key| Arc::new(ApiKeyAuth::new(key)));
     if auth.is_none() {
         tracing::warn!(
@@ -97,6 +105,7 @@ pub async fn run_admin_server(
             listeners: options.listeners.clone(),
             api_changed: options.api_changed.clone(),
             auth: auth.clone(),
+            origins: origins.clone(),
         });
 
         tokio::task::spawn(async move {
@@ -156,6 +165,21 @@ async fn handle_request_inner(
         .get(hyper::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
 
+    // 🛡️ The origin check runs before authentication, because it answers a
+    // different question: not "who is this" but "should a browser be able to
+    // make this request at all". A valid API key embedded in a page on another
+    // site is still a cross-site request.
+    let origin = req
+        .headers()
+        .get(hyper::header::ORIGIN)
+        .and_then(|v| v.to_str().ok());
+    if !origin_allowed(&state.origins, origin, peer_addr.ip()) {
+        return Ok(response(
+            StatusCode::FORBIDDEN,
+            r#"{"error":"origin not allowed"}"#,
+        ));
+    }
+
     match authorize(auth, authorization, peer_addr.ip()) {
         AuthDecision::Allowed => {}
         AuthDecision::Unauthorized => {
@@ -174,6 +198,37 @@ async fn handle_request_inner(
         (&Method::GET, "/health") => Ok(Response::new(Full::new(Bytes::from(
             r#"{"status":"healthy"}"#,
         )))),
+        // 🩺 Liveness: is this process worth keeping? A `no` means restart.
+        // It stays true while draining, because a process finishing the
+        // connections it already accepted is doing the right thing and killing
+        // it would cut them.
+        (&Method::GET, "/live") => {
+            let phase = pingclair_proxy::readiness::phase();
+            Ok(response(
+                StatusCode::OK,
+                &format!(r#"{{"status":"live","phase":"{}"}}"#, phase.as_str()),
+            ))
+        }
+        // 🚦 Readiness: should traffic come here *now*? A `no` means route
+        // around and retry. 503 rather than 200-with-a-body, because every
+        // orchestrator and load balancer already understands the status code
+        // and most of them never read the body.
+        (&Method::GET, "/ready") => {
+            let phase = pingclair_proxy::readiness::phase();
+            let status = if phase.is_ready() {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            Ok(response(
+                status,
+                &format!(
+                    r#"{{"ready":{},"phase":"{}"}}"#,
+                    phase.is_ready(),
+                    phase.as_str()
+                ),
+            ))
+        }
         (&Method::GET, "/metrics") => {
             let buffer = pingclair_proxy::metrics::gather();
             Ok(Response::builder()

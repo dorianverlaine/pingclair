@@ -5,7 +5,14 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# 📣 `notify` rather than `simple`: with `simple`, systemd considers the unit
+# started the instant the process is forked, so anything ordered `After=` races
+# against the listeners actually being bound. Pingclair sends READY=1 only after
+# every listener has been added, so `systemctl start` blocks until the proxy can
+# really answer — and STOPPING=1 on shutdown, so `systemctl stop` knows the
+# drain has begun rather than guessing from the process still being alive.
+Type=notify
+NotifyAccess=main
 User=pingclair
 Group=pingclair
 # Allow binding ports < 1024

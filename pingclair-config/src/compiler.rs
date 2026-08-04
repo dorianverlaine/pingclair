@@ -117,6 +117,8 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
             listen: admin.listen.clone(),
             enabled: admin.enabled,
             api_key: admin.api_key.clone(),
+            origins: admin.origins.clone(),
+            enforce_origin: admin.enforce_origin,
         });
     }
 

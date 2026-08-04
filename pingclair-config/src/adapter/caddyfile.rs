@@ -311,16 +311,42 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                     }
                 }
                 "admin" => {
-                    // 🚫 Caddy's `admin <addr> { origins ...; enforce_origin }`
-                    // block form used to compile with the block silently
-                    // dropped, leaving the endpoint without the origin checks
-                    // the operator asked for.
-                    if sub.block.is_some() {
-                        // TODO(v0.3): implement admin origins/enforce_origin.
-                        return Err(AdapterError::UnsupportedFeature(
-                            "admin block".into(),
-                            "admin origins/enforce_origin are not implemented yet".into(),
-                        ));
+                    // 🌐 `admin <addr> { origins …; enforce_origin }`. The
+                    // block used to compile with its contents silently dropped,
+                    // leaving the endpoint without the origin checks the
+                    // operator had written down — then it was made a hard
+                    // rejection, and now it is implemented.
+                    let mut origins = Vec::new();
+                    let mut enforce_origin = false;
+                    if let Some(block) = sub.block.clone() {
+                        for entry in block.directives {
+                            match entry.name.as_str() {
+                                "origins" => {
+                                    if entry.args.is_empty() {
+                                        return Err(AdapterError::InvalidArgument(
+                                            "admin origins".into(),
+                                            "list at least one allowed origin".into(),
+                                        ));
+                                    }
+                                    origins.extend(entry.args.iter().cloned());
+                                }
+                                "enforce_origin" => {
+                                    if !entry.args.is_empty() {
+                                        return Err(AdapterError::ArgumentCount(
+                                            "enforce_origin".into(),
+                                            0,
+                                            entry.args.len(),
+                                        ));
+                                    }
+                                    enforce_origin = true;
+                                }
+                                other => {
+                                    return Err(AdapterError::UnknownDirective(format!(
+                                        "admin: {other}"
+                                    )));
+                                }
+                            }
+                        }
                     }
                     match sub.args.first() {
                         // `admin off` explicitly disables the admin API
@@ -329,6 +355,8 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                                 listen: String::new(),
                                 enabled: false,
                                 api_key: None,
+                                origins: Vec::new(),
+                                enforce_origin: false,
                             });
                         }
                         // `admin <listen> [api_key]` — the optional second
@@ -338,6 +366,8 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                                 listen: arg.clone(),
                                 enabled: true,
                                 api_key: sub.args.get(1).cloned(),
+                                origins,
+                                enforce_origin,
                             });
                         }
                         None => return Err(AdapterError::ArgumentCount("admin".into(), 1, 0)),
@@ -4502,11 +4532,16 @@ mod fail_closed_tests {
     }
 
     #[test]
-    fn admin_block_is_reported_as_unsupported() {
+    fn admin_block_rejects_unknown_subdirectives() {
+        // 🌐 `origins` and `enforce_origin` are implemented as of Day 24, so
+        // this test no longer asserts the whole block is refused — it asserts
+        // the fail-closed property that *survives* implementation: a
+        // subdirective nobody implemented must still be named, not dropped.
         let error = compile_err(
             r#"{
                 admin :2019 {
                     origins http://localhost:2019
+                    orgins http://typo.example
                 }
             }
             example.com {
@@ -4514,8 +4549,8 @@ mod fail_closed_tests {
             }"#,
         );
         assert!(
-            error.contains("admin") && error.contains("not supported"),
-            "admin block must fail with a named unsupported error; got {error}"
+            error.contains("orgins"),
+            "an unknown admin subdirective must be named; got {error}"
         );
     }
 
@@ -5261,5 +5296,45 @@ mod log_channel_tests {
         .expect("a site may have both");
         assert!(config.servers[0].log.is_some(), "the inline sink survives");
         assert_eq!(config.servers[0].log_channels, vec!["audit".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod admin_origin_tests {
+    use crate::compile;
+
+    /// 🌐 The block that used to be refused now configures the endpoint.
+    #[test]
+    fn origins_and_enforce_origin_reach_the_config() {
+        let config = compile(
+            "{\n    admin :2019 {\n        origins http://admin.example.com\n        enforce_origin\n    }\n}\n\
+             http://:8080 {\n    respond \"ok\"\n}\n",
+        )
+        .expect("the admin block compiles");
+        let admin = config.admin.expect("admin configured");
+        assert_eq!(admin.origins, vec!["http://admin.example.com".to_string()]);
+        assert!(admin.enforce_origin);
+    }
+
+    /// 🎯 An admin directive with no block keeps working and enforces nothing,
+    /// so adding the feature did not tighten anyone's existing config.
+    #[test]
+    fn a_bare_admin_directive_enforces_nothing() {
+        let config = compile("{\n    admin :2019\n}\nhttp://:8080 {\n    respond \"ok\"\n}\n")
+            .expect("compiles");
+        let admin = config.admin.expect("admin configured");
+        assert!(admin.origins.is_empty());
+        assert!(!admin.enforce_origin);
+    }
+
+    /// 🚫 `origins` with nothing after it is a mistake — it reads as "allow
+    /// these" while allowing none, which would silently lock the operator out.
+    #[test]
+    fn empty_origins_is_rejected() {
+        let error = compile(
+            "{\n    admin :2019 {\n        origins\n    }\n}\nhttp://:8080 {\n    respond \"ok\"\n}\n",
+        )
+        .expect_err("an empty allow list must not compile");
+        assert!(error.to_string().contains("origin"));
     }
 }

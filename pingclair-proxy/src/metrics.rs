@@ -212,6 +212,33 @@ pub static ACCESS_LOG_DROPPED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("metric can be created")
 });
 
+/// 🚦 Whether this instance is currently accepting traffic (1) or not (0).
+///
+/// Deliberately a gauge rather than something derived from request counts: an
+/// instance that is draining still serves the connections it already has, so
+/// "requests are flowing" and "send it more" are different facts.
+pub static READY: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "pingclair_ready",
+        "1 when the instance is accepting new traffic, 0 while starting or draining",
+    )
+    .expect("metric can be created")
+});
+
+/// 🔢 Increments every time a configuration is successfully applied.
+///
+/// The number itself means nothing; the *change* is the signal. Two instances
+/// behind one balancer reporting different versions means a reload reached one
+/// and not the other, which is otherwise invisible until they behave
+/// differently under traffic.
+pub static CONFIG_VERSION: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "pingclair_config_version",
+        "Increments on every successfully applied configuration",
+    )
+    .expect("metric can be created")
+});
+
 /// 🧱 Requests currently executing inside a protected route.
 pub static ROUTE_IN_FLIGHT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     IntGaugeVec::new(
@@ -316,6 +343,8 @@ pub fn init() {
         let _ = REGISTRY.register(Box::new(ACTIVE_CONNECTIONS.clone()));
         let _ = REGISTRY.register(Box::new(OVERLOAD_REJECTIONS_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(ACCESS_LOG_DROPPED_TOTAL.clone()));
+        let _ = REGISTRY.register(Box::new(READY.clone()));
+        let _ = REGISTRY.register(Box::new(CONFIG_VERSION.clone()));
         let _ = REGISTRY.register(Box::new(CACHE_REQUESTS_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(CACHE_SIZE_BYTES.clone()));
         let _ = REGISTRY.register(Box::new(CACHE_LIMIT_BYTES.clone()));

@@ -215,7 +215,9 @@ Description=Pingclair High-Performance Web Server
 After=network-online.target
 
 [Service]
-Type=simple
+# 📣 Matches scripts/pingclair.service — see the comment there.
+Type=notify
+NotifyAccess=main
 User=pingclair
 Group=pingclair
 AmbientCapabilities=CAP_NET_BIND_SERVICE
