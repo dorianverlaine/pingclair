@@ -1246,6 +1246,7 @@ fn main() -> anyhow::Result<()> {
                 routes: Vec::new(),
                 tls,
                 log: None,
+                log_channels: Vec::new(),
                 client_max_body_size: 10 * 1024 * 1024, // 10MB
                 limits: Default::default(),
                 security: Default::default(),
@@ -1365,6 +1366,7 @@ fn main() -> anyhow::Result<()> {
                     response_headers: Vec::new(),
                     include_tls: false,
                 }),
+                log_channels: Vec::new(),
                 client_max_body_size: 10 * 1024 * 1024,
                 limits: Default::default(),
                 security: Default::default(),
@@ -1964,6 +1966,12 @@ fn run_server(
     if config.global.metrics {
         pingclair_proxy::metrics::init();
     }
+
+    // 🪵 Named log channels must exist before any ProxyState resolves a
+    // reference to one. Registration is idempotent, so a reload that keeps a
+    // channel keeps its writer thread and its queue rather than spawning a
+    // second writer onto the same file.
+    pingclair_proxy::access_log::register_channels(&config.logging.channels);
 
     if config.global.auto_https != pingclair_core::config::AutoHttpsMode::Off {
         tracing::info!("🔐 Auto HTTPS: enabled");
@@ -2625,6 +2633,14 @@ fn run_server(
                         }
                         tracing::info!("✅ Step 1/3: Configuration validation successful");
                         tracing::info!("📋 Step 2/3: Preparing configuration update...");
+
+                        // 🪵 Register any channel the reload introduced before
+                        // the servers that reference it are published, or the
+                        // first requests after a reload would resolve to no
+                        // channel and their lines would go nowhere.
+                        pingclair_proxy::access_log::register_channels(
+                            &new_config.logging.channels,
+                        );
 
                         // 🧭 Derive every bind address the same way startup
                         // does (including the automatic HTTP companion), so a

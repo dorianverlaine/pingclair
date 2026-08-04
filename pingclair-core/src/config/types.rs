@@ -257,6 +257,15 @@ pub struct ServerConfig {
     #[serde(default)]
     pub log: Option<LogConfig>,
 
+    /// 🪵 Names of global channels this server also writes to.
+    ///
+    /// Additive rather than exclusive: a server may keep its inline `log`
+    /// block *and* fan out to a shared channel, which is how "everything to
+    /// stdout, errors also to a file" is expressed without duplicating the
+    /// whole block.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub log_channels: Vec<String>,
+
     /// Maximum request body size in bytes (default: 1MB)
     #[serde(default = "default_body_limit")]
     pub client_max_body_size: u64,
@@ -305,6 +314,7 @@ impl Default for ServerConfig {
             tls: None,
             routes: Vec::new(),
             log: None,
+            log_channels: Vec::new(),
             client_max_body_size: default_body_limit(),
             limits: ResourceLimitsConfig::default(),
             security: SecurityConfig::default(),
@@ -1321,6 +1331,19 @@ pub struct LoggingConfig {
 
     /// Log file path
     pub file: Option<String>,
+
+    /// 🪵 Named access-log channels declared in the global block.
+    ///
+    /// A channel is a sink plus its format, rotation and header policy. Servers
+    /// reference channels by name, and several servers referencing one channel
+    /// share a single writer — which is the point: two writers on one file
+    /// would interleave, so "the same channel" has to mean the same queue.
+    ///
+    /// The common case is an empty map and a per-server inline `log` block;
+    /// channels exist for the shapes an inline block cannot express, such as
+    /// sending 4xx/5xx somewhere separate from the ordinary access log.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub channels: HashMap<String, LogConfig>,
 }
 
 /// Security headers configuration
@@ -1552,6 +1575,7 @@ mod tests {
             tls: None,
             routes: vec![],
             log: None,
+            log_channels: Vec::new(),
             client_max_body_size: 1024 * 1024,
             limits: ResourceLimitsConfig::default(),
             security: Default::default(),

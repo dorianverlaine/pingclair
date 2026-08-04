@@ -753,6 +753,11 @@ pub struct ProxyState {
     /// 📝 Per-server access logger built from this server's `log` block.
     /// `None` keeps the previous process-wide `tracing` output.
     access_logger: Option<Arc<crate::access_log::AccessLogger>>,
+
+    /// 🪵 Shared channels this server also writes to, resolved once at
+    /// configuration time. Empty in the common case, so the fan-out loop below
+    /// costs nothing for servers that do not use channels.
+    log_channels: Vec<Arc<crate::access_log::AccessLogger>>,
 }
 
 /// 🔐 A route's upstream TLS posture, resolved once per configuration load.
@@ -1265,6 +1270,16 @@ impl ProxyState {
 
         // A misconfigured log sink must not take the whole server down at
         // boot: fall back to tracing and say so loudly.
+        // 🪵 Resolve channel references to shared loggers. A name that does
+        // not resolve was already rejected by `validate_config`, so a failure
+        // here is an I/O problem — reported and skipped rather than fatal,
+        // since losing one log destination must not stop the server starting.
+        let log_channels: Vec<Arc<crate::access_log::AccessLogger>> = config
+            .log_channels
+            .iter()
+            .filter_map(|name| crate::access_log::channel_logger(name))
+            .collect();
+
         let access_logger = match crate::access_log::AccessLogger::from_config(config.log.as_ref())
         {
             Ok(logger) => logger.map(Arc::new),
@@ -1291,6 +1306,7 @@ impl ProxyState {
             access_controls,
             rewrite_regexes,
             access_logger,
+            log_channels,
         }
     }
 
@@ -5142,7 +5158,7 @@ impl ProxyHttp for PingclairProxy {
                 (None, None)
             };
 
-            logger.log(&crate::access_log::AccessEntry {
+            let entry = crate::access_log::AccessEntry {
                 request_headers: &logged_request_headers,
                 response_headers: &logged_response_headers,
                 tls_version: tls_version.as_deref(),
@@ -5185,7 +5201,20 @@ impl ProxyHttp for PingclairProxy {
                     _ => "-",
                 },
                 error: error_text.as_deref(),
-            });
+            };
+
+            // 🪵 The server's own sink first, then any shared channels. One
+            // entry, formatted separately per destination, because channels
+            // may differ in format and in which fields they drop.
+            logger.log(&entry);
+            for channel in ctx
+                .state
+                .as_ref()
+                .map(|state| state.log_channels.as_slice())
+                .unwrap_or_default()
+            {
+                channel.log(&entry);
+            }
             return;
         }
 

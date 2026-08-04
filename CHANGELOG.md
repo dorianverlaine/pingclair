@@ -95,7 +95,12 @@ Everything below is on `main` and unreleased; the workspace reports
   the writer thread. `log { headers { request X-Request-Id; response
   X-Cache; tls } }` records named headers and the negotiated TLS version and
   cipher — naming `authorization` is safe, since sensitive headers are
-  written as present with their values masked.
+  written as present with their values masked. Named channels declared in
+  the global block (`log audit { … }`) can be referenced from several sites
+  with `log audit`, which share one writer; a site keeps its own inline
+  `log { … }` at the same time, so "everything to stdout, an audit copy to a
+  file" needs no duplication. Referencing a channel that was never declared
+  is refused at startup, listing the names that do exist.
 - **Response compression is negotiable.** An `encode` directive selects zstd
   and gzip per `Accept-Encoding`, with configurable MIME types. A config that
   never mentions `encode` keeps compressing exactly as 0.1.7 did — gzip only —

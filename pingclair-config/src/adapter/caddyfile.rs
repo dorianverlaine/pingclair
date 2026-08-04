@@ -200,6 +200,38 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
 
         for sub in directives {
             match sub.name.as_str() {
+                // 🪵 `log <name> { … }` declares a named channel. Several
+                // servers may reference one channel, and they share a single
+                // writer — two writers on one file would interleave, so "the
+                // same channel" has to mean the same queue.
+                "log" => {
+                    let Some(name) = sub.args.first().cloned() else {
+                        return Err(AdapterError::InvalidArgument(
+                            "log".into(),
+                            "a global log channel needs a name, e.g. `log errors { … }`".into(),
+                        ));
+                    };
+                    if sub.args.len() > 1 {
+                        return Err(AdapterError::ArgumentCount("log".into(), 1, sub.args.len()));
+                    }
+                    let Some(channel_block) = sub.block else {
+                        return Err(AdapterError::InvalidArgument(
+                            "log".into(),
+                            format!("channel `{name}` needs a block describing its output"),
+                        ));
+                    };
+                    let channel = adapt_log_block(channel_block)?;
+                    let logging = global.logging.get_or_insert_with(Default::default);
+                    // 🚫 A redeclared channel is a mistake, not a merge: the
+                    // second block would silently win and the first one's
+                    // output would vanish.
+                    if logging.channels.insert(name.clone(), channel).is_some() {
+                        return Err(AdapterError::InvalidArgument(
+                            "log".into(),
+                            format!("channel `{name}` is declared twice"),
+                        ));
+                    }
+                }
                 "debug" => {
                     // 🚩 `debug fales` used to parse as "debug off": a typo
                     // silently disabled the very diagnostics being asked for.
@@ -698,12 +730,32 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                     }
                     server.gzip_types = sub_d.args;
                 }
-                "log" => {
-                    if let Some(log_block) = sub_d.block {
+                // 🪵 Two shapes. `log { … }` configures this server's own
+                // sink; `log <name>` also fans out to a channel declared in the
+                // global block. Both may appear, which is how "everything to
+                // stdout, errors also to a shared file" is written without
+                // repeating the whole block.
+                "log" => match (sub_d.args.first(), sub_d.block) {
+                    (None, Some(log_block)) => {
                         let log = adapt_log_block(log_block)?;
                         server.log = Some(Node::new(log, Location { start: 0, end: 0 }));
                     }
-                }
+                    (Some(name), None) => server.log_channels.push(name.clone()),
+                    (Some(_), Some(_)) => {
+                        return Err(AdapterError::InvalidArgument(
+                            "log".into(),
+                            "name a channel or open a block, not both — `log errors` \
+                                 references a global channel, `log { … }` configures this site"
+                                .into(),
+                        ));
+                    }
+                    (None, None) => {
+                        return Err(AdapterError::InvalidArgument(
+                            "log".into(),
+                            "expected a channel name or a block".into(),
+                        ));
+                    }
+                },
                 "tls" => {
                     server.tls = Some(adapt_tls_directive(&sub_d)?);
                 }
@@ -5134,5 +5186,80 @@ mod wildcard_site_tests {
     fn a_named_site_keeps_its_hostname() {
         let config = compile("http://example.com:8080 {\n    respond \"ok\"\n}\n").unwrap();
         assert_eq!(config.servers[0].name.as_deref(), Some("example.com"));
+    }
+}
+
+#[cfg(test)]
+mod log_channel_tests {
+    use crate::compile;
+
+    /// 🪵 A global channel is declared once and referenced by name.
+    #[test]
+    fn a_server_can_reference_a_declared_channel() {
+        let config = compile(
+            "{\n    log errors {\n        output stderr\n        format json\n    }\n}\n\
+             http://:8080 {\n    log errors\n    respond \"ok\"\n}\n",
+        )
+        .expect("a declared channel resolves");
+        assert!(config.logging.channels.contains_key("errors"));
+        assert_eq!(config.servers[0].log_channels, vec!["errors".to_string()]);
+    }
+
+    /// 🚫 A typo must fail closed and say what the real names are.
+    ///
+    /// The alternative is a site that writes to no channel at all — and the
+    /// missing output is exactly what an operator would have used to notice.
+    #[test]
+    fn referencing_an_undeclared_channel_is_rejected_with_the_known_names() {
+        let error = compile(
+            "{\n    log errors {\n        output stderr\n    }\n}\n\
+             http://:8080 {\n    log erors\n    respond \"ok\"\n}\n",
+        )
+        .expect_err("a typo must not compile");
+        let message = error.to_string();
+        assert!(
+            message.contains("erors"),
+            "name the bad reference: {message}"
+        );
+        assert!(
+            message.contains("errors"),
+            "list the declared channels so the typo is obvious: {message}"
+        );
+    }
+
+    /// 🚫 Declaring one name twice is a mistake, not a merge — the second
+    /// block would silently win and the first output would vanish.
+    #[test]
+    fn a_channel_declared_twice_is_rejected() {
+        let error = compile(
+            "{\n    log dup {\n        output stderr\n    }\n    log dup {\n        output stdout\n    }\n}\n\
+             http://:8080 {\n    respond \"ok\"\n}\n",
+        )
+        .expect_err("a redeclared channel must not compile");
+        assert!(error.to_string().contains("dup"));
+    }
+
+    /// 🧾 The inline block and a channel reference are different shapes and
+    /// must not be written together, since one configures this site and the
+    /// other points elsewhere.
+    #[test]
+    fn a_name_and_a_block_together_are_rejected() {
+        let error = compile(
+            "http://:8080 {\n    log errors {\n        output stderr\n    }\n    respond \"ok\"\n}\n",
+        )
+        .expect_err("naming a channel and opening a block is ambiguous");
+        assert!(error.to_string().to_lowercase().contains("log"));
+    }
+
+    /// 🎯 A site keeps its own inline log while also fanning out to a channel.
+    #[test]
+    fn an_inline_block_and_a_channel_coexist() {
+        let config = compile(
+            "{\n    log audit {\n        output stderr\n    }\n}\n\
+             http://:8080 {\n    log {\n        output stdout\n    }\n    log audit\n    respond \"ok\"\n}\n",
+        )
+        .expect("a site may have both");
+        assert!(config.servers[0].log.is_some(), "the inline sink survives");
+        assert_eq!(config.servers[0].log_channels, vec!["audit".to_string()]);
     }
 }

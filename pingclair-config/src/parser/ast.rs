@@ -162,6 +162,9 @@ pub struct ServerBlock {
     /// Log configuration
     pub log: Option<Node<LogBlock>>,
 
+    /// 🪵 Global channel names this server also writes to (`log <name>`).
+    pub log_channels: Vec<String>,
+
     /// TLS configuration (from the `tls` directive)
     pub tls: Option<TlsDirective>,
 
@@ -261,10 +264,12 @@ pub enum CompressionAlgo {
 // ============================================================
 
 /// Logging configuration (global)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LoggingConfig {
     pub level: LogLevel,
     pub format: LogFormat,
+    /// 🪵 Named channels from `log <name> { … }` in the global block.
+    pub channels: HashMap<String, LogBlock>,
 }
 
 /// Log level
@@ -881,6 +886,7 @@ impl ServerBlock {
             compress: None,
             gzip_types: Vec::new(),
             log: None,
+            log_channels: Vec::new(),
             tls: None,
             routes: None,
             matchers: HashMap::new(),

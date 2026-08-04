@@ -246,6 +246,57 @@ enum WriterMessage {
     Flush(std::sync::mpsc::SyncSender<()>),
 }
 
+/// 🪵 Process-wide registry of named channels, so several servers referencing
+/// one channel share a single writer.
+///
+/// Sharing is the whole point. Two `AccessLogger`s on one file would each have
+/// their own queue and their own thread; the file mutex would keep individual
+/// lines intact, but the two queues would drain independently and a burst on
+/// one server could sit behind a stall on the other. One channel, one queue.
+fn channel_registry() -> &'static Mutex<HashMap<String, Arc<AccessLogger>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<AccessLogger>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 🪵 Returns the shared logger for a named channel, building it once.
+///
+/// A reload that reuses the same channel name keeps the existing writer rather
+/// than spawning a second one — otherwise every reload would leak a thread and
+/// leave the old queue draining into the same file.
+pub fn register_channels(channels: &HashMap<String, LogConfig>) {
+    let mut registry = channel_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (name, config) in channels {
+        // ♻️ A reload that names the same channel keeps the existing writer.
+        // Rebuilding it would spawn a second thread writing the same file and
+        // leak the first one, every reload, forever.
+        if registry.contains_key(name) {
+            continue;
+        }
+        match AccessLogger::from_config(Some(config)) {
+            Ok(Some(logger)) => {
+                registry.insert(name.clone(), Arc::new(logger));
+            }
+            Ok(None) => unreachable!("a channel always carries a config"),
+            Err(error) => {
+                // 🚫 Reported, not fatal. Losing one log destination must not
+                // stop the server from starting and serving traffic.
+                tracing::error!(error = %error, channel = %name, "❌ Could not open log channel");
+            }
+        }
+    }
+}
+
+/// 🪵 Looks up an already-registered channel.
+pub fn channel_logger(name: &str) -> Option<Arc<AccessLogger>> {
+    channel_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(name)
+        .cloned()
+}
+
 /// 📏 Current size of the active log file, or `None` if it cannot be read.
 fn current_size(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|m| m.len())
@@ -1265,5 +1316,95 @@ mod header_logging_tests {
             "a header called `status` overwrote the real status field: {line}"
         );
         assert_eq!(parsed["request_headers"]["status"], "not-a-status");
+    }
+}
+
+#[cfg(test)]
+mod channel_sharing_tests {
+    use super::*;
+
+    fn channel_config(path: &Path) -> LogConfig {
+        LogConfig {
+            output: LogOutput::File(path.to_str().unwrap().to_string()),
+            format: LogFormat::Json,
+            level: None,
+            exclude_fields: vec![],
+            rotation: Default::default(),
+            request_headers: vec![],
+            response_headers: vec![],
+            include_tls: false,
+        }
+    }
+
+    /// 🪵 **The reason named channels exist.**
+    ///
+    /// Two servers referencing one channel must share one writer — one queue,
+    /// one thread. Give them a writer each and the file mutex still keeps
+    /// individual lines intact, but the two queues drain independently, so a
+    /// stall on one server can hold up lines the other already handed over.
+    /// "The same channel" has to mean the same queue.
+    #[test]
+    fn one_channel_name_yields_one_shared_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.log");
+        let mut channels = HashMap::new();
+        channels.insert("shared".to_string(), channel_config(&path));
+
+        register_channels(&channels);
+        let first = channel_logger("shared").expect("registered");
+        let second = channel_logger("shared").expect("still registered");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two lookups of one channel produced two writers"
+        );
+    }
+
+    /// ♻️ Re-registering the same name — which is what a reload does — must
+    /// keep the existing writer rather than spawning a second thread onto the
+    /// same file and leaking the first.
+    #[test]
+    fn re_registering_keeps_the_existing_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reload.log");
+        let mut channels = HashMap::new();
+        channels.insert("reload".to_string(), channel_config(&path));
+
+        register_channels(&channels);
+        let before = channel_logger("reload").expect("registered");
+        register_channels(&channels);
+        let after = channel_logger("reload").expect("still registered");
+
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "a reload replaced the writer, leaking the previous thread"
+        );
+    }
+
+    /// 📭 An unregistered name resolves to nothing rather than to a default
+    /// sink — a reference that silently logged somewhere else would be worse
+    /// than one that logs nowhere, and `validate_config` already refuses it.
+    #[test]
+    fn an_unknown_channel_resolves_to_nothing() {
+        assert!(channel_logger("never-declared-anywhere").is_none());
+    }
+
+    /// ✍️ Lines written through a channel actually reach its file.
+    #[test]
+    fn a_channel_writes_to_its_own_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("written.log");
+        let mut channels = HashMap::new();
+        channels.insert("written".to_string(), channel_config(&path));
+
+        register_channels(&channels);
+        let logger = channel_logger("written").expect("registered");
+        logger.log(&super::tests::entry());
+        logger.flush();
+
+        let contents = std::fs::read_to_string(&path).expect("channel file exists");
+        assert_eq!(contents.lines().count(), 1);
+        serde_json::from_str::<serde_json::Value>(contents.lines().next().unwrap())
+            .expect("the channel wrote valid JSON");
     }
 }

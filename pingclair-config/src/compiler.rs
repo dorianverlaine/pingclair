@@ -135,6 +135,18 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
     //
     // 📌 An empty list means the directive was never written, which is not
     // the same as "no protocols allowed"; only an explicit list decides.
+    // 🪵 Named channels compile through the same path as an inline `log`
+    // block, so a channel cannot drift into supporting a different subset of
+    // the log grammar than a site's own block does.
+    if let Some(logging) = &global.logging {
+        for (name, block) in &logging.channels {
+            config
+                .logging
+                .channels
+                .insert(name.clone(), compile_log(block)?);
+        }
+    }
+
     if !global.protocols.is_empty() {
         config.global.http3 = global.protocols.contains(&Protocol::H3);
     }
@@ -181,6 +193,7 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         routes: Vec::new(),
         tls: None,
         log: None,
+        log_channels: server.log_channels.clone(),
         client_max_body_size: 1024 * 1024, // 1MB default
         limits: pingclair_core::config::ResourceLimitsConfig {
             header_timeout_ms: server.limits.header_timeout_ms,
@@ -353,6 +366,38 @@ fn apply_site_root(handler: &mut pingclair_core::config::HandlerConfig, site_roo
 }
 
 /// 🛡️ Rejects TLS combinations that cannot have deterministic runtime behavior.
+/// 🪵 Refuses a server that writes to a log channel nobody declared.
+///
+/// A typo in `log erors` would otherwise mean the site quietly writes to no
+/// channel at all — the shape this project fails closed on everywhere else,
+/// and a particularly bad one here: the missing output is the very thing an
+/// operator would use to notice something is missing.
+fn validate_log_channels_exist(config: &PingclairConfig) -> CompileResult<()> {
+    for server in &config.servers {
+        for channel in &server.log_channels {
+            if !config.logging.channels.contains_key(channel) {
+                let mut known: Vec<&str> =
+                    config.logging.channels.keys().map(String::as_str).collect();
+                known.sort_unstable();
+                let hint = if known.is_empty() {
+                    "no channels are declared; add `log <name> { … }` to the global block"
+                        .to_string()
+                } else {
+                    format!("declared channels are: {}", known.join(", "))
+                };
+                return Err(CompileError::InvalidServer {
+                    message: format!(
+                        "server `{}` writes to log channel `{channel}`, which is not declared — \
+                         {hint}",
+                        server.name.as_deref().unwrap_or("_")
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 📏 Refuses a configuration whose routes disagree about the cache ceiling.
 ///
 /// The response store is process-wide — one memory budget shared by every route
@@ -404,6 +449,7 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
     }
     validate_proxy_protocol_listeners(config)?;
     validate_cache_ceiling_agrees(config)?;
+    validate_log_channels_exist(config)?;
 
     for server in &config.servers {
         let limits = &server.limits;
