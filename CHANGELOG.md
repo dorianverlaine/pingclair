@@ -85,7 +85,12 @@ Everything below is on `main` and unreleased; the workspace reports
 - **Authentication.** bcrypt and argon2id credentials, `basic_auth` in the
   DSL, and an admin API key.
 - **Logging.** Per-server log configuration that actually drives access-log
-  output, and secrets redacted by default.
+  output, and secrets redacted by default. Lines are now handed to a
+  background writer through a bounded queue, so a full disk or a stalled
+  mount can no longer slow down request handling: when the queue fills, lines
+  are dropped and counted in `pingclair_access_log_dropped_total` rather than
+  the proxy being held up. Any non-zero value there means the log has a gap
+  for that period.
 - **Response compression is negotiable.** An `encode` directive selects zstd
   and gzip per `Accept-Encoding`, with configurable MIME types. A config that
   never mentions `encode` keeps compressing exactly as 0.1.7 did — gzip only —

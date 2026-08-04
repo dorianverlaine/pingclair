@@ -19,7 +19,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, OnceLock};
+
+use crate::metrics;
 
 use pingclair_core::config::{LogConfig, LogFormat, LogOutput};
 
@@ -33,6 +37,35 @@ enum LogSink {
     Stdout,
     Stderr,
     File(Arc<Mutex<File>>),
+}
+
+impl LogSink {
+    /// ✍️ Writes one line to the underlying sink. Called only from the
+    /// writer thread, never from a request.
+    fn write_line(&self, line: &str) -> std::io::Result<()> {
+        match self {
+            LogSink::Stdout => {
+                let stdout = std::io::stdout();
+                let mut handle = stdout.lock();
+                handle.write_all(line.as_bytes())?;
+                handle.write_all(b"\n")?;
+                handle.flush()
+            }
+            LogSink::Stderr => {
+                let stderr = std::io::stderr();
+                let mut handle = stderr.lock();
+                handle.write_all(line.as_bytes())?;
+                handle.write_all(b"\n")?;
+                handle.flush()
+            }
+            LogSink::File(file) => {
+                let mut guard = file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.write_all(line.as_bytes())?;
+                guard.write_all(b"\n")?;
+                guard.flush()
+            }
+        }
+    }
 }
 
 /// 🗂️ Process-wide registry of open log files, keyed by canonical path.
@@ -109,10 +142,106 @@ pub struct AccessEntry<'a> {
 
 /// 🧾 A configured per-server access logger.
 pub struct AccessLogger {
-    sink: LogSink,
     format: LogFormat,
     /// Field names the config asked to drop (`format filter { fields { x delete } }`).
     exclude: HashSet<String>,
+    /// 🚚 Hands finished lines to the writer thread.
+    ///
+    /// Bounded and never blocking. See [`LogWriter`] for why both matter.
+    writer: Arc<LogWriter>,
+}
+
+/// 🚚 Owns the sink and drains a bounded queue from a dedicated thread.
+///
+/// **Why the request path must not write the line itself.** Before this, every
+/// access-log line was written and flushed inline, holding the sink's lock. A
+/// full disk, an NFS mount that stalls, a log file on a device doing GC — any
+/// of those blocked the thread that was serving a request, and a proxy that
+/// stops proxying because logging is slow has failed at its actual job.
+///
+/// **Why the queue is bounded.** An unbounded queue does not remove the
+/// problem, it converts it: instead of stalling, the process grows until it is
+/// killed. A bound turns "we cannot keep up" into a decision — and the decision
+/// this project makes is to drop the line and count it, because a proxy that
+/// keeps serving with a gap in its logs is better than one that stops.
+/// [`metrics::ACCESS_LOG_DROPPED_TOTAL`] is how an operator finds out.
+pub struct LogWriter {
+    queue: SyncSender<WriterMessage>,
+    /// 🧮 Lines the queue could not accept. Mirrored into a metric, and kept
+    /// here so a test can read it without scraping Prometheus.
+    dropped: Arc<AtomicU64>,
+}
+
+enum WriterMessage {
+    Line(String),
+    /// 🚿 Drain everything queued and acknowledge, so a test (or a shutdown)
+    /// can wait for the sink to catch up without sleeping and hoping.
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
+impl LogWriter {
+    /// Spawns the writer thread for one sink.
+    ///
+    /// `capacity` is in lines, not bytes: the queue holds already-formatted
+    /// strings, so a line is the unit an operator can reason about.
+    fn spawn(sink: LogSink, capacity: usize) -> Arc<Self> {
+        let (queue, receiver) = std::sync::mpsc::sync_channel::<WriterMessage>(capacity);
+        let dropped = Arc::new(AtomicU64::new(0));
+
+        // 🧵 A plain OS thread rather than a Tokio task: the work is blocking
+        // file I/O, and putting it on the runtime would occupy a worker that
+        // requests need. It also keeps logging alive during shutdown, after
+        // the runtime has stopped accepting new tasks.
+        std::thread::Builder::new()
+            .name("pingclair-access-log".into())
+            .spawn(move || {
+                for message in receiver {
+                    match message {
+                        WriterMessage::Line(line) => {
+                            if let Err(error) = sink.write_line(&line) {
+                                // 🚫 Reported once per failure and then
+                                // dropped. Retrying a broken sink here would
+                                // block the queue behind a device that is not
+                                // coming back.
+                                tracing::warn!(error = %error, "⚠️ Failed to write access log line");
+                            }
+                        }
+                        WriterMessage::Flush(ack) => {
+                            let _ = ack.send(());
+                        }
+                    }
+                }
+            })
+            .expect("access log writer thread can be spawned");
+
+        Arc::new(Self { queue, dropped })
+    }
+
+    /// 📤 Queues a line, or drops it. **Never blocks.**
+    ///
+    /// `try_send` is the whole point: `send` would block once the queue filled,
+    /// which is exactly the stall this type exists to prevent.
+    fn submit(&self, line: String) {
+        if self.queue.try_send(WriterMessage::Line(line)).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            metrics::ACCESS_LOG_DROPPED_TOTAL.inc();
+        }
+    }
+
+    /// 🧮 How many lines have been dropped since start.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// 🚿 Blocks until everything queued so far has been written.
+    ///
+    /// For shutdown and for tests. Never called from the request path.
+    pub fn flush(&self) {
+        let (ack, wait) = std::sync::mpsc::sync_channel(0);
+        if self.queue.send(WriterMessage::Flush(ack)).is_ok() {
+            let _ = wait.recv();
+        }
+    }
 }
 
 impl AccessLogger {
@@ -133,9 +262,12 @@ impl AccessLogger {
         };
 
         Ok(Some(Self {
-            sink,
             format: config.format.clone(),
             exclude: config.exclude_fields.iter().cloned().collect(),
+            // 📏 1024 lines. Big enough to absorb a burst that a healthy sink
+            // drains in milliseconds, small enough that a stalled sink costs
+            // bounded memory rather than growing until the box dies.
+            writer: LogWriter::spawn(sink, 1024),
         }))
     }
 
@@ -154,34 +286,19 @@ impl AccessLogger {
             LogFormat::Text => self.format_text(entry),
         };
 
-        if let Err(e) = self.write_line(&line) {
-            tracing::warn!(error = %e, "⚠️ Failed to write access log line");
-        }
+        // 🚦 Hand off and return. Whether the line reaches the disk is the
+        // writer thread's problem; whether the request finishes is not.
+        self.writer.submit(line);
     }
 
-    fn write_line(&self, line: &str) -> std::io::Result<()> {
-        match &self.sink {
-            LogSink::Stdout => {
-                let stdout = std::io::stdout();
-                let mut handle = stdout.lock();
-                handle.write_all(line.as_bytes())?;
-                handle.write_all(b"\n")?;
-                handle.flush()
-            }
-            LogSink::Stderr => {
-                let stderr = std::io::stderr();
-                let mut handle = stderr.lock();
-                handle.write_all(line.as_bytes())?;
-                handle.write_all(b"\n")?;
-                handle.flush()
-            }
-            LogSink::File(file) => {
-                let mut guard = file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                guard.write_all(line.as_bytes())?;
-                guard.write_all(b"\n")?;
-                guard.flush()
-            }
-        }
+    /// 🚿 Blocks until queued lines have been written. Shutdown and tests only.
+    pub fn flush(&self) {
+        self.writer.flush();
+    }
+
+    /// 🧮 Lines dropped because the queue was full.
+    pub fn dropped(&self) -> u64 {
+        self.writer.dropped()
     }
 
     // The last field's macro expansion writes `first` without reading it
@@ -359,9 +476,9 @@ mod tests {
 
     fn logger(format: LogFormat, exclude: Vec<String>) -> AccessLogger {
         AccessLogger {
-            sink: LogSink::Stdout,
             format,
             exclude: exclude.into_iter().collect(),
+            writer: LogWriter::spawn(LogSink::Stdout, 1024),
         }
     }
 
@@ -463,21 +580,31 @@ mod tests {
             exclude_fields: vec![],
         };
 
+        // 🗂️ Two servers configured with the same path must share one handle,
+        // otherwise their writes can interleave mid-line. The registry is the
+        // mechanism, so the assertion goes there directly — since the writer
+        // thread took ownership of the sink, reaching through a built logger
+        // would only re-test the plumbing that hands it over.
+        let LogOutput::File(path) = &cfg.output else {
+            panic!("expected a file output");
+        };
+        let first = open_shared_file(path).expect("open");
+        let second = open_shared_file(path).expect("open again");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "same path must share one handle"
+        );
+
         let a = AccessLogger::from_config(Some(&cfg)).unwrap().unwrap();
         let b = AccessLogger::from_config(Some(&cfg)).unwrap().unwrap();
 
-        // Two servers configured with the same path must share one handle,
-        // otherwise their writes can interleave mid-line.
-        match (&a.sink, &b.sink) {
-            (LogSink::File(fa), LogSink::File(fb)) => {
-                assert!(Arc::ptr_eq(fa, fb), "same path must share one handle");
-            }
-            _ => panic!("expected file sinks"),
-        }
-
         a.log(&entry());
         b.log(&entry());
-        let contents = std::fs::read_to_string(&path).unwrap();
+        // 🚿 Writes are queued to a background thread since Day 23, so a test
+        // that reads the file back has to wait for the sink to catch up.
+        a.flush();
+        b.flush();
+        let contents = std::fs::read_to_string(path).unwrap();
         assert_eq!(contents.lines().count(), 2, "both lines should land");
         for line in contents.lines() {
             serde_json::from_str::<serde_json::Value>(line)
@@ -497,10 +624,10 @@ mod tests {
             level: None,
             exclude_fields: vec![],
         };
-        AccessLogger::from_config(Some(&cfg))
-            .unwrap()
-            .unwrap()
-            .log(&entry());
+        let logger = AccessLogger::from_config(Some(&cfg)).unwrap().unwrap();
+        logger.log(&entry());
+        // 🚿 Same reason as above: the line is queued, not yet written.
+        logger.flush();
 
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(
@@ -508,5 +635,94 @@ mod tests {
             "must not truncate an existing log: {contents}"
         );
         assert_eq!(contents.lines().count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod writer_backpressure_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// 🧱 A sink that stops accepting writes, standing in for a full disk or a
+    /// stalled network mount.
+    ///
+    /// A pipe whose read end is never drained: once the kernel buffer fills,
+    /// `write` blocks. That is a real stall rather than a simulated one, and it
+    /// needs no sleeps — the reader is simply held open and ignored.
+    fn wedged_sink() -> (LogSink, std::io::PipeReader) {
+        use std::os::fd::OwnedFd;
+        let (reader, writer) = std::io::pipe().expect("pipe");
+        let file = File::from(OwnedFd::from(writer));
+        (LogSink::File(Arc::new(Mutex::new(file))), reader)
+    }
+
+    /// 🚦 **Day 23's completion criterion.**
+    ///
+    /// A writer that cannot keep up must not slow the caller down. The bound is
+    /// deliberately generous — the assertion is not "logging is fast", it is
+    /// "logging cannot hold a request hostage". Before the queue existed, this
+    /// loop would have blocked on the first line and never returned.
+    #[test]
+    fn a_wedged_sink_does_not_block_the_caller() {
+        // 🧊 `_reader` stays alive and unread for the whole test; dropping it
+        // would turn the stall into EPIPE and quietly test nothing.
+        let (sink, _reader) = wedged_sink();
+        let writer = LogWriter::spawn(sink, 8);
+
+        let started = Instant::now();
+        for i in 0..10_000 {
+            writer.submit(format!("line {i}"));
+        }
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "10,000 submissions against a wedged sink took {elapsed:?}; the request \
+             path is waiting on the log writer"
+        );
+    }
+
+    /// 🧮 The lines that could not be queued must be counted, not silently
+    /// discarded. A gap in the log that nobody can detect is worse than a gap
+    /// an operator can see and act on.
+    #[test]
+    fn dropped_lines_are_counted() {
+        let (sink, _reader) = wedged_sink();
+        let writer = LogWriter::spawn(sink, 8);
+        for i in 0..5_000 {
+            writer.submit(format!("line {i}"));
+        }
+        assert!(
+            writer.dropped() > 0,
+            "a queue of 8 accepted 5,000 lines against a wedged sink without \
+             dropping any — the bound is not being enforced"
+        );
+    }
+
+    /// 🎯 The mirror case: a healthy sink must lose nothing. Without this, a
+    /// writer that dropped every line would pass both tests above.
+    #[test]
+    fn a_healthy_sink_loses_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("access.log");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("open");
+        let writer = LogWriter::spawn(LogSink::File(Arc::new(Mutex::new(file))), 1024);
+
+        for i in 0..500 {
+            writer.submit(format!("line {i}"));
+        }
+        writer.flush();
+
+        assert_eq!(writer.dropped(), 0, "a healthy sink must drop nothing");
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(
+            written.lines().count(),
+            500,
+            "every submitted line must reach the file"
+        );
     }
 }

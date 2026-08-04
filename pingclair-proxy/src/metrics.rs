@@ -6,7 +6,8 @@
 //! Provides metrics collection for requests, errors, and latency.
 
 use prometheus::{
-    Encoder, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
+    Encoder, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+    TextEncoder,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Once};
@@ -197,6 +198,20 @@ pub static CACHE_EVICTED_BYTES_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("metric can be created")
 });
 
+/// 🪵 Access-log lines dropped because the writer could not keep up.
+///
+/// The only signal that a gap exists. A bounded queue turns "the disk is slow"
+/// into "some lines are missing" rather than "the proxy stopped"; this counter
+/// is what stops the second outcome from being silent. Any non-zero value means
+/// the log is incomplete for that period — alert on the rate, not the total.
+pub static ACCESS_LOG_DROPPED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "pingclair_access_log_dropped_total",
+        "Access log lines dropped because the writer queue was full",
+    )
+    .expect("metric can be created")
+});
+
 /// 🧱 Requests currently executing inside a protected route.
 pub static ROUTE_IN_FLIGHT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     IntGaugeVec::new(
@@ -300,6 +315,7 @@ pub fn init() {
         let _ = REGISTRY.register(Box::new(REQUEST_ERRORS_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(ACTIVE_CONNECTIONS.clone()));
         let _ = REGISTRY.register(Box::new(OVERLOAD_REJECTIONS_TOTAL.clone()));
+        let _ = REGISTRY.register(Box::new(ACCESS_LOG_DROPPED_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(CACHE_REQUESTS_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(CACHE_SIZE_BYTES.clone()));
         let _ = REGISTRY.register(Box::new(CACHE_LIMIT_BYTES.clone()));
