@@ -152,6 +152,69 @@ impl TlsManager {
             .insert(domain.to_string(), (cert_pem, key_pem));
     }
 
+    /// 📜 Replaces the whole manual certificate table, or leaves it untouched.
+    ///
+    /// **Why the whole table and not one domain at a time.** Certificates are
+    /// rotated by writing files, and writing is not atomic: a cert can land
+    /// before its key, or a copy can be interrupted halfway. Loading them
+    /// one at a time means a partial rotation gets partially applied — some
+    /// domains on the new certificate, some on the old, and one domain on a
+    /// cert whose key has not arrived yet. That last one is the bad case,
+    /// because it does not fail here; it fails at handshake time, to a real
+    /// client, on a site that was working a second ago.
+    ///
+    /// So every pair is read and parsed first. If any of them is unusable the
+    /// table is not touched at all and the errors are returned together, naming
+    /// each file — an operator mid-rotation gets told what is wrong while the
+    /// previous certificates keep serving.
+    ///
+    /// 🔐 Validation is deliberately more than "the file exists": the PEM has
+    /// to contain at least one certificate, the key has to parse, and the key
+    /// has to be one the TLS provider can actually sign with. A half-written
+    /// file usually fails exactly one of those.
+    pub fn refresh_manual_certs(
+        &self,
+        entries: &[(String, String, String)],
+    ) -> Result<usize, Vec<String>> {
+        let mut prepared: HashMap<String, (String, String)> = HashMap::new();
+        let mut problems = Vec::new();
+
+        for (domain, cert_path, key_path) in entries {
+            let cert_pem = match std::fs::read_to_string(cert_path) {
+                Ok(pem) => pem,
+                Err(error) => {
+                    problems.push(format!("{domain}: cannot read {cert_path}: {error}"));
+                    continue;
+                }
+            };
+            let key_pem = match std::fs::read_to_string(key_path) {
+                Ok(pem) => pem,
+                Err(error) => {
+                    problems.push(format!("{domain}: cannot read {key_path}: {error}"));
+                    continue;
+                }
+            };
+            if let Err(reason) = validate_pem_pair(&cert_pem, &key_pem) {
+                problems.push(format!("{domain}: {reason} ({cert_path}, {key_path})"));
+                continue;
+            }
+            prepared.insert(domain.clone(), (cert_pem, key_pem));
+        }
+
+        if !problems.is_empty() {
+            return Err(problems);
+        }
+
+        let count = prepared.len();
+        *self.manual_pem_certs.write() = prepared;
+        Ok(count)
+    }
+
+    /// 📜 Whether a manual certificate is installed for `domain`.
+    pub fn has_manual_cert(&self, domain: &str) -> bool {
+        self.manual_pem_certs.read().contains_key(domain)
+    }
+
     /// 🏛️ Enables local issuance for one configured domain and eagerly prepares its leaf.
     pub async fn enable_internal_domain(
         &self,
@@ -386,6 +449,29 @@ impl TlsManager {
         Ok(rustls::sign::CertifiedKey::new(certs, signing_key))
     }
 
+    /// 🔐 Checks that a PEM pair is usable before it is allowed to serve.
+    ///
+    /// Kept next to the code that later builds a `CertifiedKey` from the same
+    /// bytes, so the two cannot drift into accepting different things.
+    fn validate_pem_pair_impl(cert_pem: &str, key_pem: &str) -> Result<(), String> {
+        let mut reader = std::io::Cursor::new(cert_pem.as_bytes());
+        let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("certificate PEM is malformed: {error}"))?;
+        if certs.is_empty() {
+            return Err("certificate PEM contains no certificate".to_string());
+        }
+
+        let mut reader = std::io::Cursor::new(key_pem.as_bytes());
+        let key = rustls_pemfile::private_key(&mut reader)
+            .map_err(|error| format!("private key PEM is malformed: {error}"))?
+            .ok_or_else(|| "private key PEM contains no key".to_string())?;
+
+        rustls::crypto::ring::sign::any_supported_type(&key)
+            .map_err(|_| "private key type is not supported".to_string())?;
+        Ok(())
+    }
+
     /// 🚦 Returns the configured HTTP-01 challenge handler.
     pub fn challenge_handler(&self) -> Arc<dyn ChallengeHandler> {
         self.challenge_handler.clone()
@@ -572,6 +658,110 @@ mod tests {
         assert_eq!(
             manager.resolve_pem("origin.example.test").await,
             Some(("MANUAL_CERT".to_string(), "MANUAL_KEY".to_string()))
+        );
+    }
+}
+
+/// 🔐 Free-function wrapper so the validator can be unit-tested directly.
+fn validate_pem_pair(cert_pem: &str, key_pem: &str) -> Result<(), String> {
+    TlsManager::validate_pem_pair_impl(cert_pem, key_pem)
+}
+
+#[cfg(test)]
+mod manual_cert_refresh_tests {
+    use super::*;
+
+    fn real_pair() -> (String, String) {
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["example.com".to_string()]).expect("generate");
+        (cert.cert.pem(), cert.signing_key.serialize_pem())
+    }
+
+    /// 🔐 A usable pair passes.
+    #[test]
+    fn a_well_formed_pair_validates() {
+        let (cert, key) = real_pair();
+        assert!(validate_pem_pair(&cert, &key).is_ok());
+    }
+
+    /// ✂️ **The half-written file.** A copy interrupted partway leaves a cert
+    /// whose PEM never closes, and the naive check — "the file exists" — is
+    /// perfectly happy with it. The failure then arrives at handshake time, to
+    /// a real client, on a site that worked a second ago.
+    #[test]
+    fn a_truncated_certificate_is_rejected() {
+        let (cert, key) = real_pair();
+        let truncated = &cert[..cert.len() / 2];
+        let error = validate_pem_pair(truncated, &key)
+            .expect_err("a truncated certificate must not be accepted");
+        assert!(
+            error.contains("certificate"),
+            "the diagnosis must name the certificate, not the key: {error}"
+        );
+    }
+
+    /// ✂️ The mirror case: the cert landed and the key is still arriving.
+    #[test]
+    fn a_missing_key_is_rejected_by_name() {
+        let (cert, _) = real_pair();
+        let error = validate_pem_pair(&cert, "").expect_err("an empty key must not be accepted");
+        assert!(
+            error.contains("key"),
+            "the diagnosis must name the key: {error}"
+        );
+    }
+
+    /// 🧱 **The atomicity property.** One bad pair must leave the table
+    /// untouched, not install the good ones and skip the bad one — a partial
+    /// rotation is how some domains end up on the new certificate and one ends
+    /// up on a cert whose key has not arrived.
+    #[test]
+    fn one_bad_pair_leaves_the_previous_table_intact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert, key) = real_pair();
+        let good_cert = dir.path().join("good.crt");
+        let good_key = dir.path().join("good.key");
+        std::fs::write(&good_cert, &cert).unwrap();
+        std::fs::write(&good_key, &key).unwrap();
+
+        let manager = TlsManager::new_with_memory_challenges(None, dir.path());
+        let good = vec![(
+            "a.example".to_string(),
+            good_cert.to_string_lossy().into_owned(),
+            good_key.to_string_lossy().into_owned(),
+        )];
+        assert_eq!(manager.refresh_manual_certs(&good).unwrap(), 1);
+
+        // 🩹 Now attempt a rotation where one domain's certificate is truncated.
+        let bad_cert = dir.path().join("bad.crt");
+        std::fs::write(&bad_cert, &cert[..cert.len() / 2]).unwrap();
+        let mixed = vec![
+            good[0].clone(),
+            (
+                "b.example".to_string(),
+                bad_cert.to_string_lossy().into_owned(),
+                good_key.to_string_lossy().into_owned(),
+            ),
+        ];
+        let problems = manager
+            .refresh_manual_certs(&mixed)
+            .expect_err("a bad pair must reject the whole refresh");
+        assert_eq!(problems.len(), 1);
+        assert!(
+            problems[0].contains("b.example"),
+            "the failing domain must be named: {:?}",
+            problems
+        );
+
+        // 🎯 The domain that was already serving must be untouched — and
+        // crucially `b.example` must NOT have been installed.
+        assert!(
+            manager.has_manual_cert("a.example"),
+            "the working certificate was dropped by a failed refresh"
+        );
+        assert!(
+            !manager.has_manual_cert("b.example"),
+            "a certificate that failed validation was installed anyway"
         );
     }
 }

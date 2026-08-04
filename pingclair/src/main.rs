@@ -2165,6 +2165,7 @@ fn run_server(
     }));
 
     // 🔐 Prepare configured certificate sources before any listener can accept a handshake.
+    let mut manual_certs: Vec<(String, String, String)> = Vec::new();
     for server_config in &config.servers {
         let Some(tls) = &server_config.tls else {
             continue;
@@ -2202,23 +2203,29 @@ fn run_server(
             continue;
         }
 
-        let cert_pem = match std::fs::read_to_string(cert_path) {
-            Ok(pem) => pem,
-            Err(e) => {
-                tracing::error!("❌ Failed to read TLS cert file {}: {}", cert_path, e);
-                continue;
-            }
-        };
-        let key_pem = match std::fs::read_to_string(key_path) {
-            Ok(pem) => pem,
-            Err(e) => {
-                tracing::error!("❌ Failed to read TLS key file {}: {}", key_path, e);
-                continue;
-            }
-        };
+        // 🔐 Collected rather than loaded here. Reading them one at a time
+        // meant a half-written pair could be installed on its own, and the
+        // failure would surface at handshake time to a real client rather than
+        // at load time to the operator. `refresh_manual_certs` reads and
+        // validates the whole set, then publishes it or nothing.
+        manual_certs.push((name.to_string(), cert_path.clone(), key_path.clone()));
+    }
 
-        tls_manager.add_manual_cert(name, cert_pem, key_pem);
-        tracing::info!("🔐 Loaded manual TLS certificate for {}", name);
+    match tls_manager.refresh_manual_certs(&manual_certs) {
+        Ok(count) if count > 0 => {
+            tracing::info!("🔐 Loaded {count} manual TLS certificate(s)");
+        }
+        Ok(_) => {}
+        Err(problems) => {
+            for problem in &problems {
+                tracing::error!("❌ Manual TLS certificate rejected: {problem}");
+            }
+            anyhow::bail!(
+                "{} manual TLS certificate(s) could not be loaded; refusing to start with \
+                 certificates the operator asked for but that cannot serve",
+                problems.len()
+            );
+        }
     }
 
     // 🚀 Kick off the background certificate machinery: renewals plus eager
@@ -2750,14 +2757,50 @@ fn run_server(
                             }
                         }
 
+                        // 🔐 Certificates are part of the configuration, so a
+                        // reload must pick up a rotation on disk — before this
+                        // they were read once at startup and swapping a cert
+                        // needed a restart that nothing told the operator
+                        // about. Collected here so a bad pair joins the same
+                        // rejection set as an unbindable listener: either the
+                        // whole reload lands or none of it does.
+                        let mut reloaded_certs: Vec<(String, String, String)> = Vec::new();
+                        for server in &new_config.servers {
+                            let (Some(tls), Some(name)) =
+                                (server.tls.as_ref(), server.name.as_deref())
+                            else {
+                                continue;
+                            };
+                            if let (Some(cert), Some(key)) = (&tls.cert, &tls.key)
+                                && !name.is_empty()
+                                && name != "_"
+                            {
+                                reloaded_certs.push((
+                                    name.to_string(),
+                                    cert.clone(),
+                                    key.clone(),
+                                ));
+                            }
+                        }
+                        if let Err(problems) = tls_manager.refresh_manual_certs(&reloaded_certs) {
+                            // 🛡️ The previous certificates keep serving. An
+                            // operator halfway through copying a new pair sees
+                            // exactly which file is wrong instead of a site
+                            // that starts failing handshakes.
+                            rejected.extend(
+                                problems
+                                    .into_iter()
+                                    .map(|problem| format!("certificate: {problem}")),
+                            );
+                        }
+
                         if !rejected.is_empty() {
                             let reload_duration = reload_start.elapsed();
                             for reason in &rejected {
                                 tracing::error!("❌ Reload rejected: {reason}");
                             }
                             tracing::error!(
-                                "❌ Configuration reload rejected after {:?}: {} listener(s) \
-                                 could not be bound",
+                                "❌ Configuration reload rejected after {:?}: {} problem(s)",
                                 reload_duration,
                                 rejected.len()
                             );

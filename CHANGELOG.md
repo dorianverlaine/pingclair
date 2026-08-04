@@ -183,6 +183,15 @@ Everything below is on `main` and unreleased; the workspace reports
   failure rejects the whole reload with the previous configuration untouched.
   A site removed from the configuration also stops serving, instead of staying
   reachable on its old listener until the next restart.
+- **Rotating a manual certificate needed a restart, and nothing said so.**
+  Certificate files were read once at startup, so writing a new pair on disk
+  changed nothing until the process was restarted. A reload now re-reads them.
+  The whole set is validated first — the PEM must contain a certificate, the
+  key must parse, and the key type must be one the TLS stack can sign with —
+  and a single unusable pair rejects the refresh with the previous
+  certificates still serving, naming the file at fault. Previously a
+  half-written file was accepted and failed later at handshake time, to a real
+  client, on a site that had been working.
 - **A directory configuration silently dropped most global options.** Merging
   several `.pingclair` files named a handful of fields by hand and ignored the
   other nine, so `blocked_ips` blocked nothing, `metrics` did nothing, and
