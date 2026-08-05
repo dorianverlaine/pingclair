@@ -1140,7 +1140,12 @@ impl H3App {
         let resp_tx = self.resp_tx.clone();
         let done_tx = resp_tx.clone();
         let notify = Arc::clone(&self.body_notify);
-        let remote_ip = self.remote_addr.ip();
+        // 🛡️ Same canonicalisation the H1/H2 path applies: a QUIC socket bound
+        // dual-stack reports an IPv4 client as `::ffff:…`, and an IPv4 CIDR does
+        // not contain an IPv6 address. Parity matters here specifically because
+        // `remote_ip` is an access-control matcher — a rule that holds on
+        // HTTP/1.1 and not on HTTP/3 is worse than one that fails everywhere.
+        let remote_ip = crate::server::canonical_client_ip(self.remote_addr.ip());
 
         tokio::spawn(async move {
             handle_request(

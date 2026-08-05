@@ -987,12 +987,40 @@ fn request_authority(request: &RequestHeader) -> &str {
         .unwrap_or("")
 }
 
+/// 🌐 Canonicalises an IPv4-mapped IPv6 address into plain IPv4.
+///
+/// 🛡️ This is a security fix, not cosmetics. A dual-stack listener — which is
+/// what `:8080` becomes — reports an IPv4 client as `::ffff:127.0.0.1`, and an
+/// IPv4 CIDR does not contain an IPv6 address. Day 26 measured what that costs:
+/// with `@blocked remote_ip 127.0.0.0/8` and `respond @blocked 403`, Caddy
+/// answered 403 and we answered **200**. Every deny rule written with an IPv4
+/// range silently did nothing.
+///
+/// Normalising here, where the address is first read, means the matcher, the
+/// access log, `X-Forwarded-For` and `{remote_host}` all see one canonical form
+/// instead of each having to remember this.
+///
+/// `to_ipv4_mapped` is deliberately narrower than `to_ipv4`: the latter also
+/// converts deprecated IPv4-compatible addresses (`::127.0.0.1`), which are not
+/// the same thing and which no listener produces.
+pub(crate) fn canonical_client_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        other => other,
+    }
+}
+
 /// 🌐 Extracts the immediate network peer without consulting request headers.
 fn session_peer_ip(session: &Session) -> IpAddr {
     session
         .client_addr()
         .map(|addr| match addr {
-            pingora_core::protocols::l4::socket::SocketAddr::Inet(inet) => inet.ip(),
+            pingora_core::protocols::l4::socket::SocketAddr::Inet(inet) => {
+                canonical_client_ip(inet.ip())
+            }
             pingora_core::protocols::l4::socket::SocketAddr::Unix(_) => {
                 IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
             }
@@ -1000,9 +1028,63 @@ fn session_peer_ip(session: &Session) -> IpAddr {
         .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
 }
 
+#[cfg(test)]
+mod canonical_client_ip_tests {
+    use super::canonical_client_ip;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// 🛡️ The measured failure: a dual-stack listener reports an IPv4 client as
+    /// `::ffff:a.b.c.d`, and an IPv4 CIDR does not contain an IPv6 address, so
+    /// `@blocked remote_ip 127.0.0.0/8` matched nothing and a deny rule became a
+    /// no-op. Caddy answered 403 to the same configuration; we answered 200.
+    #[test]
+    fn an_ipv4_mapped_address_becomes_plain_ipv4() {
+        let mapped = IpAddr::V6("::ffff:127.0.0.1".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(
+            canonical_client_ip(mapped),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))
+        );
+        let mapped = IpAddr::V6("::ffff:10.1.2.3".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(
+            canonical_client_ip(mapped),
+            IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))
+        );
+    }
+
+    /// 📌 A real IPv6 client must stay IPv6. Rewriting it would break IPv6 CIDRs
+    /// in the other direction, which is the same defect with the sign flipped.
+    #[test]
+    fn a_genuine_ipv6_address_is_untouched() {
+        for text in ["2001:db8::1", "::1", "fe80::1"] {
+            let ip = IpAddr::V6(text.parse::<Ipv6Addr>().unwrap());
+            assert_eq!(canonical_client_ip(ip), ip, "{text} must not be rewritten");
+        }
+    }
+
+    #[test]
+    fn an_ipv4_address_passes_through() {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5));
+        assert_eq!(canonical_client_ip(ip), ip);
+    }
+
+    /// 🚫 IPv4-*compatible* addresses (`::a.b.c.d`) are deprecated and no
+    /// listener produces them. Converting them would silently widen what an
+    /// IPv4 rule matches, so `to_ipv4_mapped` is used rather than `to_ipv4`.
+    #[test]
+    fn deprecated_ipv4_compatible_addresses_are_not_converted() {
+        let compat = IpAddr::V6("::127.0.0.1".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(canonical_client_ip(compat), compat);
+    }
+}
+
 fn session_inet_addresses(session: &Session) -> Option<(SocketAddr, SocketAddr)> {
     let peer = match session.client_addr()? {
-        pingora_core::protocols::l4::socket::SocketAddr::Inet(address) => *address,
+        // 🛡️ Same canonicalisation as `session_peer_ip`: the PROXY-protocol and
+        // forwarded-identity logic compares this against configured IPv4
+        // networks too.
+        pingora_core::protocols::l4::socket::SocketAddr::Inet(address) => {
+            SocketAddr::new(canonical_client_ip(address.ip()), address.port())
+        }
         pingora_core::protocols::l4::socket::SocketAddr::Unix(_) => return None,
     };
     let listener = match session.server_addr()? {
