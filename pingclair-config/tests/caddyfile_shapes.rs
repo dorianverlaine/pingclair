@@ -196,3 +196,22 @@ fn an_unterminated_heredoc_names_the_marker() {
 fn a_space_after_the_angles_is_not_a_heredoc() {
     assert!(compiles("example.com {\n\trespond \"<< notaheredoc\"\n}\n"));
 }
+
+/// 🚫 `{}` on one line is refused; an empty block over two lines is not.
+///
+/// The distinction reads as arbitrary until you notice what `{}` on one line
+/// usually is — an operator reaching for a value, `respond {}`, and getting a
+/// block instead, silently, with the directive left holding no arguments.
+///
+/// 📌 Measured on 2026-08-05: the flat-segment parser added in this milestone
+/// already refused this shape while the tree parser accepted it. Two parsers
+/// disagreeing about the same file is the thing to fix, whichever one is right.
+#[test]
+fn an_empty_block_on_one_line_is_refused() {
+    assert!(!compiles("example.com {\n\tfile_server {}\n}\n"));
+    assert!(!compiles("example.com {\n\troute {}\n}\n"));
+    assert!(!compiles("example.com {\n\theader {}\n}\n"));
+
+    // 👍 Spread over two lines it is an ordinary empty block.
+    assert!(compiles("example.com {\n\tfile_server {\n\t}\n}\n"));
+}

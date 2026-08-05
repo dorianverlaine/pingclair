@@ -228,6 +228,26 @@ impl Parser {
             });
         }
 
+        // 🚫 `{}` written on one line is refused, while an empty block spread
+        // over two lines is fine.
+        //
+        // The difference looks arbitrary until you notice what `{}` on one line
+        // usually is: an operator reaching for a value — `respond {}` — and
+        // getting a block instead, silently, with the directive left holding no
+        // arguments. The format refuses it for that reason, and we accepted it,
+        // which is why `file_server {}` and `route {}` compiled here into
+        // something nobody asked for.
+        if let Some(t) = self.peek()
+            && matches!(t.value, Token::BlockClose)
+        {
+            return Err(ParseError::UnexpectedToken {
+                token: "{}".into(),
+                location: t.span,
+                expected: "a block opening at the end of a line; write `{` then a                            newline, or drop the empty block"
+                    .into(),
+            });
+        }
+
         // Skip potential newline after {
         if let Some(t) = self.peek()
             && matches!(t.value, Token::Newline)
