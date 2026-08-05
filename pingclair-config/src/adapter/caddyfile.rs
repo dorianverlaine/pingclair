@@ -675,6 +675,34 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                     server.root = Some(path.clone());
                 }
                 "compress" | "encode" => {
+                    // 🚫 A matcher token here asks for compression on some
+                    // requests and not others, and compression is a property of
+                    // the whole server: there is nowhere to record "gzip, but
+                    // only under /assets". Say that. Left to fall through, the
+                    // matcher reaches the coding loop below and is reported as
+                    // an unknown coding, which sends the operator looking for a
+                    // typo in a token that is spelled exactly right.
+                    if let Some(first) = sub_d.args.first()
+                        && (first.starts_with('/') || first.starts_with('@'))
+                    {
+                        return Err(AdapterError::UnsupportedFeature(
+                            format!("{} with a matcher", sub_d.name),
+                            format!(
+                                "`{first}` limits compression to part of the site, but \
+                                 compression is configured per server rather than per \
+                                 route; drop the matcher, or move those paths into their \
+                                 own site block"
+                            ),
+                        ));
+                    }
+                    // 🌐 `encode * gzip` names the matcher that matches
+                    // everything, which is the same as naming none. Accept and
+                    // drop it, exactly as `root * /srv` does above.
+                    let args = if sub_d.args.first().is_some_and(|a| a == "*") {
+                        &sub_d.args[1..]
+                    } else {
+                        &sub_d.args[..]
+                    };
                     // Caddy spells this `encode zstd gzip`, and argument order
                     // is meaningful: it is the server's preference order when
                     // several codings are acceptable to the client.
@@ -683,14 +711,14 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                     // old loop ignored them, so `encode gzipp` silently gave a
                     // server that still compressed (via the unconditional
                     // gzip path) and looked like it had honored the typo.
-                    let mut algos = Vec::with_capacity(sub_d.args.len());
-                    for arg in &sub_d.args {
+                    let mut algos = Vec::with_capacity(args.len());
+                    for arg in args {
                         let algo = match arg.to_lowercase().as_str() {
                             // `off`/`none` is the only way to opt a server out
                             // of response compression, so it may not be mixed
                             // with codings.
                             "off" | "none" => {
-                                if sub_d.args.len() > 1 {
+                                if args.len() > 1 {
                                     return Err(AdapterError::InvalidArgument(
                                         sub_d.name.clone(),
                                         "`off` cannot be combined with other codings".into(),
@@ -718,7 +746,7 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                         }
                     }
                     // Bare `encode` with no arguments means gzip, as before.
-                    if sub_d.args.is_empty() {
+                    if args.is_empty() {
                         algos.push(CompressionAlgo::Gzip);
                     }
                     if !algos.is_empty() {
@@ -867,50 +895,13 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                     // Try to extract matcher and adapt as handler
                     let (matcher, _) = parse_matcher_and_block(&sub_d)?;
                     let mut handler_d = sub_d.clone();
-                    // 🔁 Caddy's `redir /old.html /new.html`,
-                    // `rewrite /old /new` and `reverse_proxy /ws
-                    // 127.0.0.1:9001` all carry an inline path matcher in
-                    // their first argument even when it does not end in
-                    // `*`. Detect that shape so official examples compile
-                    // and a bare path never becomes an upstream address.
-                    let inline_path_matcher = match handler_d.name.as_str() {
-                        "redir" | "redirect" => {
-                            handler_d.args.len() >= 2
-                                && handler_d.args[0].starts_with('/')
-                                && (handler_d.args[1].starts_with('/')
-                                    || handler_d.args[1].contains("://"))
-                                && handler_d.args[1].parse::<u16>().is_err()
-                        }
-                        "rewrite" => {
-                            handler_d.args.len() >= 2 && handler_d.args[0].starts_with('/')
-                        }
-                        "reverse_proxy" => {
-                            handler_d.args.first().is_some_and(|a| a.starts_with('/'))
-                        }
-                        // 🎯 `respond /admin "nope" 403` — the same shape, and the
-                        // one where getting it wrong is worst. Without this the
-                        // path became the response *body*, so
-                        // `respond /first "first wins"` answered every request
-                        // with the string `/first`, and a later
-                        // `respond "catch all"` was unreachable. Day 26 measured
-                        // it: the correct answer is `first wins`.
-                        // A glob was already handled; an exact path was not, which
-                        // is why this looked like it worked.
-                        //
-                        // 📌 Two arguments minimum, deliberately. Quoting is lost
-                        // by the time we see the tokens, so a lone
-                        // `respond /health` is ambiguous between "match /health,
-                        // empty 200" and "the body is the text /health". The
-                        // narrow reading only reinterprets the form where a body
-                        // is present, which cannot silently change an existing
-                        // configuration's response text.
-                        "respond" => {
-                            handler_d.args.len() >= 2
-                                && handler_d.args[0].starts_with('/')
-                                && handler_d.args[0].parse::<u16>().is_err()
-                        }
-                        _ => false,
-                    };
+                    // 🧹 The per-directive allowlist that used to live here is
+                    // gone: `matcher_token` reads the first argument the same way
+                    // for every directive, so `redir`, `rewrite`, `reverse_proxy`
+                    // and `respond` no longer need naming — and neither do the
+                    // ones nobody had thought of.
+                    let inline_path_matcher = matcher.is_some()
+                        && matches!(handler_d.args.first(), Some(arg) if arg.starts_with('/'));
                     if inline_path_matcher {
                         let path = handler_d.args.remove(0);
                         let route_matcher = Matcher::Path(PathMatcher {
@@ -3101,25 +3092,88 @@ fn adapt_header_directive(d: &Directive) -> Result<Handler, AdapterError> {
 fn parse_matcher_and_block(
     d: &Directive,
 ) -> Result<(Option<Matcher>, Option<&Block>), AdapterError> {
-    let mut matcher = None;
-    let block = d.block.as_ref();
+    Ok((matcher_token(d), d.block.as_ref()))
+}
 
-    // Check first arg for @name
-    if let Some(arg) = d.args.first() {
-        if arg.starts_with('@') {
-            matcher = Some(Matcher::Named(arg.clone()));
-        } else if arg.starts_with('/') && arg.contains('*') {
-            // 🧭 Caddy's inline path matcher: `reverse_proxy /api/* ...` and
-            // `file_server /downloads/* { ... }` scope the directive to the
-            // glob. A leading slash without a glob stays a plain argument
-            // (e.g. `file_server /var/www/html` is a root).
-            matcher = Some(Matcher::Path(PathMatcher {
-                patterns: vec![arg.clone()],
-            }));
-        }
+/// 🎯 Reads the optional matcher token in a directive's first argument.
+///
+/// There is one rule, and it applies to every directive:
+///
+/// | first argument | meaning |
+/// | --- | --- |
+/// | `*` | every request, which is the same as no matcher |
+/// | starts with `/` | a path matcher |
+/// | starts with `@` | a matcher defined elsewhere by that name |
+/// | anything else | not a matcher; it is this directive's own data |
+///
+/// **No wildcard is required and no argument count is involved.** Both of those
+/// were invented here, and both were wrong: until 2026-08-05 a leading slash
+/// only counted as a matcher when it also carried a `*`, and only for the four
+/// directives someone had remembered to list. The other four measured that day
+/// each failed differently — `respond /first "x"` answered every request with
+/// the text `/first`, `header /exact X-Test y` compiled a header named `/exact`,
+/// and `encode` and `basic_auth` refused to load. One rule, so a directive
+/// nobody thought about behaves like the rest.
+///
+/// 🧭 The single exception is named in [`takes_path_as_data`], with its reason.
+fn matcher_token(d: &Directive) -> Option<Matcher> {
+    let arg = d.args.first()?;
+    if first_argument_is_data(d) {
+        return None;
     }
+    match arg.chars().next()? {
+        // 🌐 `*` exists only to say "this argument is not a matcher" for
+        // directives whose data could otherwise be mistaken for one.
+        '*' if arg.len() == 1 => None,
+        '@' => Some(Matcher::Named(arg.clone())),
+        '/' => Some(Matcher::Path(PathMatcher {
+            patterns: vec![arg.clone()],
+        })),
+        _ => None,
+    }
+}
 
-    Ok((matcher, block))
+/// 🧭 Whether a directive's first argument is its own data despite looking like
+/// a matcher.
+///
+/// A handful of directives take a path as their first *argument*, so for those
+/// the argument count decides — which is how the format itself disambiguates,
+/// inside each directive rather than in one global table.
+///
+/// 📌 What this is **not**: the old allowlist inverted for convenience. That one
+/// had to name every directive wanting *normal* behaviour, so forgetting one
+/// produced a silent misparse — `respond /first "x"` answering every request
+/// with the text `/first`. This names the few that want *abnormal* behaviour, so
+/// forgetting an entry produces ordinary matcher behaviour: the safe direction.
+fn first_argument_is_data(d: &Directive) -> bool {
+    let Some(first) = d.args.first() else {
+        return false;
+    };
+    match d.name.as_str() {
+        // 🎯 `redir <target>` and `redir <target> <status>` put the target
+        // first; `redir <matcher> <target>` puts a matcher there. The second
+        // argument tells them apart: a redirect target is a path or carries a
+        // scheme, and is never a status code.
+        "redir" | "redirect" => {
+            let target_follows = d.args.get(1).is_some_and(|next| {
+                (next.starts_with('/') || next.contains("://")) && next.parse::<u16>().is_err()
+            });
+            !target_follows
+        }
+        // 📂 `root <path>` with one argument is the document root. The optional
+        // `*` form (`root * /srv`) is how an operator says so explicitly.
+        "root" => d.args.len() == 1,
+        // 🚧 A conflict rather than a rule. `file_server /var/www` setting the
+        // document root is an extension of ours, while the format it extends
+        // reads that argument as a path matcher. Both cannot be true.
+        //
+        // Narrowed to the non-glob form, because `file_server /downloads/*` has
+        // always been a matcher here and still is — so only the shape that is
+        // genuinely ambiguous stays on the extension's side. Until the conflict
+        // is decided, this is the place that records it.
+        "file_server" => !first.contains('*'),
+        _ => false,
+    }
 }
 
 /// Parse the matcher for a `route`/`handle` directive.
@@ -4783,6 +4837,51 @@ mod fail_closed_tests {
         assert!(
             error.contains("Unknown directive 'respnd'"),
             "a typo must remain an unknown-directive error; got {error}"
+        );
+    }
+
+    /// 🎯 A matcher on `encode` must be refused for the reason it is actually
+    /// refused for.
+    ///
+    /// Compression here belongs to the server, so "compress only under this
+    /// path" has nowhere to go. The failure was already correct; the *message*
+    /// was not. It read `unknown coding /exact`, which points at the one thing
+    /// in the line that is spelled exactly right and sends the operator hunting
+    /// for a typo instead of restructuring the site.
+    #[test]
+    fn encode_with_a_matcher_explains_that_compression_is_per_server() {
+        for source in [
+            "example.com {\n    encode /exact gzip\n}",
+            "example.com {\n    encode /assets/* gzip\n}",
+            "example.com {\n    @static path /static/*\n    encode @static gzip\n}",
+        ] {
+            let error = compile_err(source);
+            assert!(
+                !error.contains("unknown coding"),
+                "the matcher must not be reported as a coding; got {error}"
+            );
+            assert!(
+                error.contains("per server"),
+                "the error must say compression is a server property; got {error}"
+            );
+        }
+    }
+
+    /// 🌐 `*` is the matcher that matches everything, so it says nothing that
+    /// the absence of a matcher does not already say. It compiles, and the
+    /// codings after it are still read.
+    #[test]
+    fn encode_accepts_the_match_everything_token() {
+        let config = crate::compile("example.com {\n    encode * zstd gzip\n}")
+            .expect("`encode * zstd gzip` must compile");
+        let encodings = &config.servers[0].encodings;
+        assert_eq!(
+            encodings,
+            &[
+                pingclair_core::config::Encoding::Zstd,
+                pingclair_core::config::Encoding::Gzip
+            ],
+            "the codings after `*` must survive, in order"
         );
     }
 }
