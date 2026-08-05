@@ -15,6 +15,9 @@ pub mod server_block;
 // 🎯 The token cursor the directive parsers move onto, one at a time. It reads
 // segments, so it sits above `server_block` and below the adapter.
 pub mod dispenser;
+// 🌉 Segments become the directive tree the adapter consumes. This is what
+// replaced the tree parser's guessing at every brace.
+pub mod segment_tree;
 // 🧩 The nested name preserves the crate's existing public parser API.
 #[allow(clippy::module_inception)]
 pub mod parser;
@@ -23,7 +26,7 @@ pub mod variables;
 
 pub use ast::*;
 pub use lexer::{LexError, Location, Spanned, Token, tokenize};
-pub use parser::{ParseError, Parser, parse};
+pub use parser::{ParseError, parse};
 pub use semantic::{SemanticAnalyzer, SemanticError};
 pub use variables::{ResolvedVariable, VariableResolver};
 

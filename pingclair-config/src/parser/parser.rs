@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dorian Verlaine
 
-//! Recursive Descent Parser for Caddyfile syntax
+//! 🚪 The crate's parsing entry point, and the errors it reports.
 //!
-//! Consumes tokens and produces a Generic Directive AST.
+//! The recursive-descent parser this module was named for is gone. It had to
+//! decide, at every `{`, whether the brace opened a directive's block or a new
+//! site — a question it could not answer, because answering it means knowing
+//! which words are directives and this layer deliberately does not. It guessed,
+//! and the guess was wrong for a quarter of the format's own test corpus.
+//!
+//! [`parse`] now runs the flat-segment parser and assembles the directive tree
+//! from segments, where the question does not arise: a directive's braces are
+//! ordinary members of its token run and depth is a counter.
 
-use crate::parser::caddy_ast::{Block, Directive, TokenRun};
+use crate::parser::caddy_ast::Directive;
 #[allow(unused_imports)]
 use crate::parser::lexer::LexResult;
-use crate::parser::lexer::{LexError, Location, Spanned, Token, tokenize};
-use std::sync::Arc;
+use crate::parser::lexer::{LexError, Location};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -30,261 +37,13 @@ pub enum ParseError {
     #[error("Unexpected end of file, expected {expected}")]
     UnexpectedEof { expected: String },
 
+    // 📍 A structural error from the block parser, with the position it
+    // recorded. Rendering the position is the reason tokens carry one.
+    #[error("{message} at line {location}")]
+    Syntax { message: String, location: Location },
+
     #[error("Nesting too deep")]
     RecursionLimitExceeded,
-}
-
-pub struct Parser {
-    /// 📎 Shared so every directive can hold a window onto it without copying.
-    /// One reference count per directive replaces one `Vec` per directive.
-    tokens: Arc<[Spanned<Token>]>,
-    position: usize,
-    depth: usize,
-}
-
-impl Parser {
-    pub fn new(tokens: &[Spanned<Token>]) -> Self {
-        Self {
-            tokens: tokens.into(),
-            position: 0,
-            depth: 0,
-        }
-    }
-
-    /// 📎 The window from `start` to the cursor, with any trailing newline
-    /// trimmed — a directive ends at its last real token, not at the line
-    /// break that happens to follow it.
-    fn run_since(&self, start: usize) -> TokenRun {
-        let mut end = self.position.min(self.tokens.len());
-        while end > start && matches!(self.tokens[end - 1].value, Token::Newline) {
-            end -= 1;
-        }
-        TokenRun::new(Arc::clone(&self.tokens), start, end)
-    }
-
-    /// Peek current token
-    fn peek(&self) -> Option<&Spanned<Token>> {
-        self.tokens.get(self.position)
-    }
-
-    fn is_eof(&self) -> bool {
-        self.position >= self.tokens.len()
-    }
-
-    /// Consume current token if matches expectation
-    fn consume(&mut self) -> Option<&Spanned<Token>> {
-        if self.position < self.tokens.len() {
-            let t = &self.tokens[self.position];
-            self.position += 1;
-            Some(t)
-        } else {
-            None
-        }
-    }
-
-    /// Parse the entire config
-    pub fn parse_config(&mut self) -> Result<Vec<Directive>, ParseError> {
-        let mut directives = Vec::new();
-
-        while !self.is_eof() {
-            // Skip top-level newlines
-            let Some(token) = self.peek() else {
-                break;
-            };
-            if matches!(token.value, Token::Newline) {
-                self.consume();
-                continue;
-            }
-
-            directives.push(self.parse_directive()?);
-        }
-
-        Ok(directives)
-    }
-
-    /// Parse a single directive: Name [Args...] [Block]
-    fn parse_directive(&mut self) -> Result<Directive, ParseError> {
-        let start = self.position;
-
-        // 1. Check for global block start {
-        if let Some(token) = self.peek()
-            && matches!(token.value, Token::BlockOpen)
-        {
-            let block = Some(self.parse_block()?);
-            return Ok(Directive {
-                name: "".to_string(),
-                args: Vec::new(),
-                block,
-                tokens: self.run_since(start),
-            });
-        }
-
-        // 2. Normal directive name
-        let name_token = self.consume().ok_or(ParseError::UnexpectedEof {
-            expected: "directive name".to_string(),
-        })?;
-
-        let name = match &name_token.value {
-            Token::Word(s) | Token::QuotedString(s) | Token::EnvVar(s) => s.clone(),
-            other => {
-                return Err(ParseError::UnexpectedToken {
-                    token: format!("{other}"),
-                    location: name_token.span,
-                    expected: "directive name or global block".into(),
-                });
-            }
-        };
-
-        let mut args = Vec::new();
-        let mut block = None;
-
-        // 2. Loop args
-        while let Some(token) = self.peek() {
-            match &token.value {
-                Token::Newline => {
-                    self.consume();
-                    break; // End of directive
-                }
-                Token::BlockOpen => {
-                    // Start of block
-                    block = Some(self.parse_block()?);
-                    // After block, optional newline?
-                    // Caddyfile directives end after the block close } usually?
-                    // Or explicit newline.
-                    // Usually: directive { ... } \n directive2
-                    // block consumes closing }. Peek next.
-                    // If next is Newline, consume it.
-                    if let Some(next) = self.peek()
-                        && matches!(next.value, Token::Newline)
-                    {
-                        self.consume();
-                    }
-                    break;
-                }
-                Token::BlockClose => {
-                    // Should be handled by parse_block calling us.
-                    // If we see it here, it means this directive ends (and enclosing block closes).
-                    // We DO NOT consume it. Let parent handle.
-                    break;
-                }
-                Token::Word(s) => {
-                    args.push(s.clone());
-                    self.consume();
-                }
-                Token::QuotedString(s) => {
-                    args.push(s.clone());
-                    self.consume();
-                }
-                Token::EnvVar(s) => {
-                    // Preserve ${VAR} syntax for later expansion
-                    args.push(format!("${{{s}}}"));
-                    self.consume();
-                }
-                Token::Placeholder(s) => {
-                    // Preserve Caddy placeholder syntax {http.request.header.X}
-                    // The adapter / runtime will resolve these at request time.
-                    args.push(format!("{{{s}}}"));
-                    self.consume();
-                }
-                _ => {
-                    // Unexpected (e.g. Comment should keep going? Wait comment is skipped by Lexer)
-                    // If we encounter other tokens?
-                    // Current lexer only has these variants.
-                    // Whitespace/Comment skipped.
-                    // So unlikely to hit _ unless I missed something.
-                    return Err(ParseError::UnexpectedToken {
-                        token: format!("{}", token.value),
-                        location: token.span,
-                        expected: "argument, newline, or block".into(),
-                    });
-                }
-            }
-        }
-
-        Ok(Directive {
-            name,
-            args,
-            block,
-            tokens: self.run_since(start),
-        })
-    }
-
-    /// Parse a block: { directives... }
-    fn parse_block(&mut self) -> Result<Block, ParseError> {
-        if self.depth > 100 {
-            return Err(ParseError::RecursionLimitExceeded);
-        }
-        self.depth += 1;
-
-        // Consume {
-        let open_token = self.consume().ok_or(ParseError::UnexpectedEof {
-            expected: "{".to_string(),
-        })?;
-        if !matches!(open_token.value, Token::BlockOpen) {
-            return Err(ParseError::UnexpectedToken {
-                token: format!("{}", open_token.value),
-                location: open_token.span,
-                expected: "{".into(),
-            });
-        }
-
-        // 🚫 `{}` written on one line is refused, while an empty block spread
-        // over two lines is fine.
-        //
-        // The difference looks arbitrary until you notice what `{}` on one line
-        // usually is: an operator reaching for a value — `respond {}` — and
-        // getting a block instead, silently, with the directive left holding no
-        // arguments. The format refuses it for that reason, and we accepted it,
-        // which is why `file_server {}` and `route {}` compiled here into
-        // something nobody asked for.
-        if let Some(t) = self.peek()
-            && matches!(t.value, Token::BlockClose)
-        {
-            return Err(ParseError::UnexpectedToken {
-                token: "{}".into(),
-                location: t.span,
-                expected: "a block opening at the end of a line; write `{` then a                            newline, or drop the empty block"
-                    .into(),
-            });
-        }
-
-        // Skip potential newline after {
-        if let Some(t) = self.peek()
-            && matches!(t.value, Token::Newline)
-        {
-            self.consume();
-        }
-
-        let mut directives = Vec::new();
-
-        loop {
-            let token = match self.peek() {
-                Some(t) => t,
-                None => {
-                    return Err(ParseError::UnexpectedEof {
-                        expected: "}".to_string(),
-                    });
-                } // Missing }
-            };
-
-            match token.value {
-                Token::BlockClose => {
-                    self.consume(); // Consume }
-                    break;
-                }
-                Token::Newline => {
-                    self.consume(); // Skip empty lines
-                    continue;
-                }
-                _ => {
-                    directives.push(self.parse_directive()?);
-                }
-            }
-        }
-
-        self.depth -= 1;
-        Ok(Block { directives })
-    }
 }
 
 pub fn parse(source: &str) -> Result<Vec<Directive>, ParseError> {
@@ -292,9 +51,11 @@ pub fn parse(source: &str) -> Result<Vec<Directive>, ParseError> {
     // tokenizing, so a variable may expand to several tokens or to nothing.
     // Doing it here keeps the lexer dumb and the substitution lossless.
     let expanded = expand_env_vars(source);
-    let tokens = tokenize(&expanded)?;
-    let mut parser = Parser::new(&tokens);
-    parser.parse_config()
+    // 🌉 The directive tree is assembled from flat segments now. The recursive
+    // parser this function used to call had to decide, at every `{`, whether
+    // the brace opened a directive's block or a new site — and could not, for
+    // want of knowing which words are directives.
+    crate::parser::segment_tree::parse_into_tree(&expanded)
 }
 
 /// 🌐 Replaces every `{$NAME}` or `{$NAME:default}` with the environment
@@ -332,13 +93,23 @@ mod tests {
     use super::*;
 
     #[test]
+    /// 🧭 The braceless shorthand is one site, not a run of loose directives.
+    ///
+    /// This used to come back as two top-level directives, which the adapter
+    /// then merged into a site. The result was the same; the intermediate shape
+    /// was a guess the parser had no business making, and it is gone.
     fn test_parse_simple_directive() {
         let source = "debug\nroot /var/www";
         let directives = parse(source).unwrap();
-        assert_eq!(directives.len(), 2);
+        assert_eq!(directives.len(), 1, "one site: {directives:#?}");
         assert_eq!(directives[0].name, "debug");
-        assert_eq!(directives[1].name, "root");
-        assert_eq!(directives[1].args[0], "/var/www");
+        let inner = &directives[0]
+            .block
+            .as_ref()
+            .expect("its contents")
+            .directives;
+        assert_eq!(inner[0].name, "root");
+        assert_eq!(inner[0].args[0], "/var/www");
     }
 
     #[test]

@@ -87,6 +87,11 @@ pub enum BlockParseError {
     #[error("Lexer error: {0}")]
     Lex(#[from] LexError),
 
+    /// 🧭 Reserved: the format requires a block to open at the end of a line,
+    /// and this parser used to enforce it. Enforcing it here would have made
+    /// swapping the front end also change what compiles — including two of this
+    /// repository's own README examples — so the rule moved to its own change
+    /// rather than riding along inside a refactor.
     #[error("unexpected token after '{{' on line {location}; a block must open at end of line")]
     TokenAfterOpenBrace { location: Location },
 
@@ -99,11 +104,33 @@ pub enum BlockParseError {
     #[error("unexpected '}}' on line {location} with no matching '{{'")]
     UnmatchedCloseBrace { location: Location },
 
+    #[error(
+        "unexpected '{{}}' on line {location}; write '{{' then a newline, or drop the empty block"
+    )]
+    EmptyBraces { location: Location },
+
     #[error("unterminated block opened on line {location}; expected '}}'")]
     UnterminatedBlock { location: Location },
 
     #[error("expected '{{' on line {location} after the site address")]
     ExpectedOpenBrace { location: Location },
+}
+
+impl BlockParseError {
+    /// 📍 Where the error is, for a caller that renders positions.
+    ///
+    /// Every variant carries one except a lexer error, which reports its own.
+    pub fn location(&self) -> Option<Location> {
+        match self {
+            Self::Lex(_) => None,
+            Self::TokenAfterOpenBrace { location }
+            | Self::OpenBraceOnOwnLine { location }
+            | Self::UnmatchedCloseBrace { location }
+            | Self::EmptyBraces { location }
+            | Self::UnterminatedBlock { location }
+            | Self::ExpectedOpenBrace { location } => Some(*location),
+        }
+    }
 }
 
 /// 🧱 Parses a configuration into site blocks of flat segments.
@@ -144,6 +171,16 @@ impl<'a> Parser<'a> {
         while let Some(token) = self.peek() {
             match &token.value {
                 Token::BlockOpen | Token::Newline => break,
+                // 🚫 A closing brace cannot be part of an address. Collecting it
+                // as one would push the complaint to whatever came next, and an
+                // error that names the wrong brace is worse than one that names
+                // no brace at all: `}}}` on a line has three candidates and only
+                // the first unmatched one is the operator's mistake.
+                Token::BlockClose => {
+                    return Err(BlockParseError::UnmatchedCloseBrace {
+                        location: token.span,
+                    });
+                }
                 _ => {
                     keys.push(token.clone());
                     self.cursor += 1;
@@ -160,11 +197,8 @@ impl<'a> Parser<'a> {
             Some(Token::BlockOpen) => {
                 let open = self.here();
                 self.cursor += 1;
-                // 🧭 A block opens at end of line. Anything else on the line means
-                // the operator meant something the format cannot express, and
-                // saying so beats parsing an arrangement nobody wrote on purpose.
-                if !matches!(self.peek().map(|t| &t.value), Some(Token::Newline) | None) {
-                    return Err(BlockParseError::TokenAfterOpenBrace { location: open });
+                if matches!(self.peek().map(|t| &t.value), Some(Token::BlockClose)) {
+                    return Err(BlockParseError::EmptyBraces { location: open });
                 }
                 let segments = self.parse_segments(open)?;
                 Ok(ServerBlock {
@@ -254,8 +288,13 @@ impl<'a> Parser<'a> {
                     depth += 1;
                     segment.push(token.clone());
                     self.cursor += 1;
-                    if !matches!(self.peek().map(|t| &t.value), Some(Token::Newline) | None) {
-                        return Err(BlockParseError::TokenAfterOpenBrace { location: open });
+                    // 🚫 `{}` written together is refused, while an empty block
+                    // spread over two lines is fine. `{}` on one line is
+                    // usually someone reaching for a *value* — `respond {}` —
+                    // and getting a block, silently, with the directive left
+                    // holding no arguments.
+                    if matches!(self.peek().map(|t| &t.value), Some(Token::BlockClose)) {
+                        return Err(BlockParseError::EmptyBraces { location: open });
                     }
                 }
                 Token::BlockClose => {
@@ -386,9 +425,19 @@ mod tests {
 
     // MARK: - Refusals
 
+    /// 🧭 A block opening with something after it on the same line is accepted
+    /// here, and the format does not accept it.
+    ///
+    /// The divergence is deliberate and temporary. This parser replaced one
+    /// that allowed the shape, and enforcing the rule in the same change would
+    /// have meant a front-end swap that also changed what compiles — including
+    /// two README examples in this repository. Tightening it is its own change,
+    /// with its own documentation updates.
     #[test]
-    fn a_token_after_the_opening_brace_is_refused() {
-        assert!(parse_server_blocks("a.example { respond \"x\"\n}\n").is_err());
+    fn a_token_after_the_opening_brace_is_accepted_for_now() {
+        let parsed = blocks("a.example { respond \"x\"\n}\n");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(texts(&parsed[0].segments[0]), vec!["respond", "\"x\""]);
     }
 
     #[test]

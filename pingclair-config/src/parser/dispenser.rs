@@ -82,8 +82,13 @@ impl<'a> Dispenser<'a> {
     }
 
     /// The current token's text, with quotes already removed.
-    pub fn val(&self) -> Option<&'a str> {
+    pub fn val(&self) -> Option<std::borrow::Cow<'a, str>> {
         self.token().map(|t| token_text(&t.value))
+    }
+
+    /// The tokens this cursor walks, for a caller building something from them.
+    pub fn tokens(&self) -> &'a [Spanned<Token>] {
+        self.tokens
     }
 
     /// Where the current token is, for an error that names a place.
@@ -174,7 +179,7 @@ impl<'a> Dispenser<'a> {
     pub fn remaining_arg_texts(&mut self) -> Vec<String> {
         self.remaining_args()
             .into_iter()
-            .map(|t| token_text(&t.value).to_string())
+            .map(|t| token_text(&t.value).into_owned())
             .collect()
     }
 
@@ -314,13 +319,20 @@ impl<'a> From<&'a Segment> for Dispenser<'a> {
 /// Placeholders and environment variables keep their braces because the value
 /// downstream is the whole `{host}`, not the name inside it; a quoted string
 /// loses its quotes because those were syntax, not content.
-fn token_text(token: &Token) -> &str {
+fn token_text(token: &Token) -> std::borrow::Cow<'_, str> {
     match token {
-        Token::Word(s) | Token::QuotedString(s) | Token::EnvVar(s) | Token::Placeholder(s) => s,
-        Token::BlockOpen => "{",
-        Token::BlockClose => "}",
-        Token::Newline => "\n",
-        Token::Whitespace | Token::Comment => "",
+        Token::Word(s) | Token::QuotedString(s) => std::borrow::Cow::Borrowed(s),
+        // 🧭 A placeholder's value is the whole `{host}`, not the name inside
+        // it: it is resolved per request, much later, by something that has
+        // never seen this token. Handing back `host` would quietly turn a
+        // placeholder into a literal string — and `header_up X-Host {host}`
+        // would send the four characters `host` upstream forever.
+        Token::Placeholder(s) => std::borrow::Cow::Owned(format!("{{{s}}}")),
+        Token::EnvVar(s) => std::borrow::Cow::Owned(format!("${{{s}}}")),
+        Token::BlockOpen => std::borrow::Cow::Borrowed("{"),
+        Token::BlockClose => std::borrow::Cow::Borrowed("}"),
+        Token::Newline => std::borrow::Cow::Borrowed("\n"),
+        Token::Whitespace | Token::Comment => std::borrow::Cow::Borrowed(""),
     }
 }
 
@@ -346,8 +358,11 @@ mod tests {
     fn the_first_step_lands_on_the_directive_name() {
         let tokens = segment_of(":80\nrespond \"ok\" 200\n");
         let mut d = Dispenser::new(&tokens);
-        assert_eq!(d.advance().map(|t| token_text(&t.value)), Some("respond"));
-        assert_eq!(d.val(), Some("respond"));
+        assert_eq!(
+            d.advance().map(|t| token_text(&t.value)).as_deref(),
+            Some("respond")
+        );
+        assert_eq!(d.val().as_deref(), Some("respond"));
     }
 
     #[test]
@@ -501,7 +516,7 @@ mod tests {
         let mut d = Dispenser::new(&tokens);
         let mut seg = d.next_segment().expect("the whole directive");
         assert_eq!(
-            seg.advance().map(|t| token_text(&t.value)),
+            seg.advance().map(|t| token_text(&t.value)).as_deref(),
             Some("file_server")
         );
         let nesting = seg.nesting();

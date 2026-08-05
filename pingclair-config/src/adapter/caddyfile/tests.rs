@@ -1417,7 +1417,14 @@ mod p3_syntax_tests {
     fn shorthand_cannot_mix_with_braced_sites() {
         let error = compile("localhost\n\nrespond \"x\"\nexample.com {\n    respond \"y\"\n}")
             .expect_err("mixed shorthand and braced sites must fail");
-        assert!(error.to_string().contains("bare (unbraced)"));
+        // 🧭 The shorthand runs to the end of the file, so the braced site was
+        // read as a directive of the first one. The message has to name the
+        // cause — a missing pair of braces — not the symptom.
+        assert!(
+            error.to_string().contains("looks like a second site")
+                && error.to_string().contains("{ }"),
+            "got {error}"
+        );
     }
 
     #[test]
@@ -1602,6 +1609,13 @@ mod p3_syntax_tests {
     #[test]
     fn shorthand_parses_via_public_api() {
         let directives = parse("localhost\n\nrespond \"ok\"").expect("parse shorthand");
-        assert_eq!(directives.len(), 2);
+        // 🧭 One site carrying its directives, rather than a flat run the
+        // adapter had to merge afterwards.
+        assert_eq!(directives.len(), 1, "one site: {directives:#?}");
+        assert_eq!(directives[0].name, "localhost");
+        assert_eq!(
+            directives[0].block.as_ref().expect("contents").directives[0].name,
+            "respond"
+        );
     }
 }

@@ -435,6 +435,22 @@ pub(super) fn adapt_server(
                     }
                 }
                 _ => {
+                    // 🏠 A name nobody registered, carrying a block, inside the
+                    // braceless shorthand: that is a second site written after
+                    // a first one that forgot its braces. The shorthand runs to
+                    // the end of the file, so the second site was swallowed as
+                    // a directive of the first — and "unknown directive
+                    // 'example.com'" describes the symptom while hiding the
+                    // cause.
+                    if sub_d.block.is_some() && !super::registry::is_directive_name(&sub_d.name) {
+                        return Err(AdapterError::InvalidArgument(
+                            "site address".into(),
+                            format!(
+                                "`{}` looks like a second site. Bare (unbraced) directives run                                  to the end of the file, so wrap every site in {{ }} when there                                  is more than one",
+                                sub_d.name
+                            ),
+                        ));
+                    }
                     // Try to extract matcher and adapt as handler
                     let (matcher, _) = parse_matcher_and_block(&sub_d)?;
                     let mut handler_d = sub_d.clone();
