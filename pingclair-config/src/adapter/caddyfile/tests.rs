@@ -1031,6 +1031,62 @@ mod fail_closed_tests {
         );
     }
 
+    /// 🔤 `header_regexp` matches a header against a regular expression.
+    ///
+    /// Everything it needs already existed — the condition, its compilation,
+    /// and the router's compiled-regex cache. Only the adapter arm was
+    /// missing, which is why three corpus configurations failed on a feature
+    /// this crate could already execute.
+    #[test]
+    fn header_regexp_compiles_into_a_regex_condition() {
+        let config = crate::compile(
+            "example.com {\n    @mobile header_regexp User-Agent (?i)android\n                 respond @mobile \"mobile\" 200\n    respond \"desktop\"\n}",
+        )
+        .expect("header_regexp must compile");
+        let matched = config.servers[0]
+            .routes
+            .iter()
+            .find(|route| route.matcher.is_some())
+            .expect("a matched route");
+        match matched.matcher.as_ref().expect("a matcher") {
+            pingclair_core::config::Matcher::Header { name, condition } => {
+                assert_eq!(name, "User-Agent");
+                assert_eq!(
+                    condition,
+                    &pingclair_core::config::MatcherCondition::Regex("(?i)android".into())
+                );
+            }
+            other => panic!("expected a header matcher, got {other:?}"),
+        }
+    }
+
+    /// 🚫 A pattern that cannot compile is refused while the operator is still
+    /// looking at the line they wrote. Left alone it would load green and then
+    /// match nothing for the lifetime of the server — a route that silently
+    /// never fires.
+    #[test]
+    fn an_unparseable_header_regexp_is_refused() {
+        let error = compile_err(
+            "example.com {\n    @x header_regexp User-Agent \"(unclosed\"\n                 respond @x \"y\"\n}",
+        );
+        assert!(
+            error.contains("not a valid regular expression"),
+            "got {error}"
+        );
+    }
+
+    /// 🚫 The three-argument form names capture groups so they can be read back
+    /// as placeholders. We produce no placeholders from matchers, so accepting
+    /// the name would accept a configuration whose whole point is a value we
+    /// never generate.
+    #[test]
+    fn a_named_capture_group_is_refused_rather_than_ignored() {
+        let error = compile_err(
+            "example.com {\n    @x header_regexp mobile User-Agent android\n                 respond @x \"y\"\n}",
+        );
+        assert!(error.contains("capture-group name"), "got {error}");
+    }
+
     /// 🩺 Health checking spelled flat, which is how the format spells it.
     #[test]
     fn flat_health_options_configure_the_health_check() {

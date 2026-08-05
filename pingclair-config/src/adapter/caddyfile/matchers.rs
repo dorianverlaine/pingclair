@@ -433,9 +433,75 @@ pub(super) fn parse_single_matcher_at(
                 header
             })
         }
+        // 🔤 `header_regexp <field> <pattern>` matches a header against a
+        // regular expression. Everything below this line already existed —
+        // the condition, its compilation, and the router's compiled-regex
+        // cache — so this arm is the only thing that was missing.
+        "header_regexp" => {
+            let (field, pattern) = match d.args.as_slice() {
+                [field, pattern] => (field, pattern),
+                // 🚫 The three-argument form names the capture groups so they
+                // can be read back as placeholders (`{re.name.1}`). We have no
+                // placeholders from matchers, so accepting the name would mean
+                // accepting a configuration whose whole purpose is a value we
+                // will never produce.
+                [_name, _field, _pattern] => {
+                    return Err(AdapterError::UnsupportedFeature(
+                        "header_regexp with a capture-group name".into(),
+                        "the name exists to read capture groups back as placeholders, which \
+                         Pingclair does not support; drop it to match without capturing"
+                            .into(),
+                    ));
+                }
+                other => {
+                    return Err(AdapterError::ArgumentCount(
+                        "header_regexp".into(),
+                        2,
+                        other.len(),
+                    ));
+                }
+            };
+
+            // 🚫 An unparseable pattern would compile green and then match
+            // nothing, for the lifetime of the server. Refuse it here, where
+            // the operator is still looking at the line they wrote.
+            if let Err(error) = regex::Regex::new(pattern) {
+                return Err(AdapterError::InvalidArgument(
+                    "header_regexp".into(),
+                    format!("`{pattern}` is not a valid regular expression: {error}"),
+                ));
+            }
+
+            Ok(Matcher::Header(HeaderMatcher {
+                name: field.clone(),
+                condition: HeaderCondition::Regex(pattern.clone()),
+            }))
+        }
+        // 🚫 Matchers the format defines and this crate does not implement.
+        // Each needs a capability we do not have rather than an arm here:
+        // `path_regexp` a path matcher that runs a regular expression,
+        // `expression` an expression language, `vars`/`vars_regexp` the
+        // variable subsystem, `url_pattern` the URLPattern syntax, and `tls`
+        // access to the handshake from a matcher.
+        name if is_known_matcher(name) => Err(AdapterError::UnsupportedFeature(
+            format!("{name} matcher"),
+            "Pingclair does not implement this matcher yet".into(),
+        )),
         _ => Err(AdapterError::UnknownDirective(format!(
             "matcher: {}",
             d.name
         ))),
     }
+}
+
+/// 🧾 Matcher names the format defines, whether or not we implement them.
+///
+/// The point is the same as everywhere else in this adapter: an operator who
+/// wrote `path_regexp` spelled it correctly, and telling them the word is
+/// unknown sends them looking for a spelling rather than a workaround.
+fn is_known_matcher(name: &str) -> bool {
+    matches!(
+        name,
+        "expression" | "path_regexp" | "url_pattern" | "vars" | "vars_regexp" | "tls"
+    )
 }
