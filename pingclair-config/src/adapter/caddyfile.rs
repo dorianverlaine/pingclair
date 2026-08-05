@@ -310,6 +310,16 @@ fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                         }
                     }
                 }
+                // 🚰 `grace_period <duration>` — how long shutdown waits for
+                // requests already in flight. Caddy waits forever by default,
+                // and so do we; this option is how an operator trades that for
+                // a bounded restart.
+                "grace_period" => {
+                    // 🕐 Rounded up, so a sub-second grace period asks for one
+                    // second rather than for zero — `grace_period 500ms` must
+                    // not silently become "kill everything immediately".
+                    global.grace_period_secs = Some(parse_required_duration(&sub)?.div_ceil(1000));
+                }
                 "admin" => {
                     // 🌐 `admin <addr> { origins …; enforce_origin }`. The
                     // block used to compile with its contents silently dropped,
@@ -458,7 +468,6 @@ fn is_known_caddy_global_option(name: &str) -> bool {
             | "storage_clean_interval"
             | "persist_config"
             | "log"
-            | "grace_period"
             | "shutdown_delay"
             | "default_sni"
             | "fallback_sni"
@@ -1269,6 +1278,25 @@ fn adapt_log_block(block: Block) -> Result<LogBlock, AdapterError> {
                             AdapterError::ArgumentCount("log output file".into(), 2, 1)
                         })?;
                         output = LogOutput::File(path.clone());
+                        // 🔄 Caddy spells the rotation settings as a block on the
+                        // destination itself: `output file <path> { roll_size 1mb }`.
+                        // This block used to be parsed and then dropped on the
+                        // floor, so a pasted Caddy configuration validated green
+                        // and then never rotated anything — the log grew until the
+                        // device filled, which is the exact failure rotation exists
+                        // to prevent. Silence is the worst possible answer here.
+                        if let Some(roll) = d.block {
+                            parse_caddy_roll_block(roll, &mut rotation)?;
+                        }
+                    }
+                    // 🚫 Only a file has anything to roll. A block on a stream
+                    // destination is a misunderstanding worth naming, not
+                    // something to accept and ignore.
+                    "stdout" | "stderr" if d.block.is_some() => {
+                        return Err(AdapterError::InvalidArgument(
+                            "log output".into(),
+                            format!("`{kind}` takes no block; rotation applies to `output file`"),
+                        ));
                     }
                     "stdout" => output = LogOutput::Stdout,
                     "stderr" => output = LogOutput::Stderr,
@@ -1461,6 +1489,65 @@ fn adapt_log_block(block: Block) -> Result<LogBlock, AdapterError> {
 
 /// 📏 Parses a byte size with an optional unit suffix (`100mb`, `4KiB`, `512`).
 ///
+/// 🔄 Reads Caddy's rotation settings from `output file <path> { … }`.
+///
+/// Caddy puts these on the destination rather than in a sibling block, and
+/// spells them with a `roll_` prefix. Both spellings now reach the same
+/// `LogRotation`, so a configuration written either way means the same thing.
+///
+/// One difference is deliberate and worth knowing: Caddy compresses rotated
+/// files unless told not to, so a `roll_` block turns compression **on** and
+/// `roll_uncompressed` is what turns it off. Our own `roll { … }` block keeps
+/// its opt-in `compress`, because changing that would quietly alter what
+/// existing configurations do.
+fn parse_caddy_roll_block(
+    block: Block,
+    rotation: &mut LogRotationBlock,
+) -> Result<(), AdapterError> {
+    let mut uncompressed = false;
+    let mut saw_setting = false;
+
+    for r in block.directives {
+        saw_setting = true;
+        match r.name.as_str() {
+            "roll_size" => rotation.max_size_bytes = Some(parse_byte_size(&r)?),
+            "roll_keep" => rotation.keep = Some(parse_positive_usize(&r)?),
+            "roll_keep_for" => rotation.max_age_secs = Some(parse_required_duration(&r)? / 1000),
+            "roll_uncompressed" => uncompressed = true,
+            // 🚫 Named rather than swept into the generic unknown-directive
+            // error: this one is real Caddy syntax we have not implemented, and
+            // a reader deserves to know the difference between "you typed it
+            // wrong" and "we do not do that yet".
+            "roll_local_time" => {
+                return Err(AdapterError::UnsupportedFeature(
+                    "log output file roll_local_time".into(),
+                    "rotated file names always use UTC".into(),
+                ));
+            }
+            other => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "log output file: {other}"
+                )));
+            }
+        }
+    }
+
+    if saw_setting {
+        rotation.compress = !uncompressed;
+    }
+    // 📌 `roll_keep` alone would otherwise be silently inert, which is the same
+    // class of failure this whole function exists to remove.
+    if rotation.keep.is_some() && !rotation.is_enabled_block() {
+        return Err(AdapterError::InvalidArgument(
+            "log output file".into(),
+            "`roll_keep` needs a rotation trigger — add `roll_size` or \
+             `roll_keep_for`, or nothing will ever be rotated to keep"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Sizes are the one place where a bare number is genuinely unambiguous —
 /// it means bytes — so unlike durations it is accepted. What is *not*
 /// accepted is an unrecognised suffix: `100mbb` must fail loudly rather than
@@ -4292,6 +4379,58 @@ mod fail_closed_tests {
         assert!(
             error.contains("log: rotate"),
             "unknown log subdirective must be named; got {error}"
+        );
+    }
+
+    /// 🔄 Caddy puts rotation on the destination: `output file <path> { … }`.
+    ///
+    /// This block used to be parsed and discarded, so the configuration below
+    /// validated green and then never rotated anything — the log grew until
+    /// the device filled. Day 26 measured it against Caddy 2.11.4, which
+    /// compiles the same source to `roll_size_mb: 1, roll_keep: 3`.
+    #[test]
+    fn caddy_style_roll_settings_reach_the_rotation_config() {
+        let config = crate::compile(
+            r#"example.com {
+                log {
+                    output file /var/log/access.log {
+                        roll_size 1mb
+                        roll_keep 3
+                    }
+                }
+            }"#,
+        )
+        .expect("Caddy's own rotation syntax must compile");
+        let rotation = config.servers[0]
+            .log
+            .as_ref()
+            .expect("log block")
+            .rotation
+            .clone();
+        assert_eq!(rotation.max_size_bytes, Some(1024 * 1024));
+        assert_eq!(rotation.keep, Some(3));
+        // 📌 Caddy compresses rotated files unless told not to, so a `roll_`
+        // block without `roll_uncompressed` means compression on.
+        assert!(rotation.compress, "Caddy compresses unless opted out");
+    }
+
+    /// 🚫 The same block must not swallow a typo. Caddy answers
+    /// `unrecognized subdirective … at <file>:<line>`; silence here would put
+    /// the setting back in the category this whole path exists to leave.
+    #[test]
+    fn caddy_style_roll_block_rejects_unknown_subdirectives() {
+        let error = compile_err(
+            r#"example.com {
+                log {
+                    output file /var/log/access.log {
+                        roll_sizes 1mb
+                    }
+                }
+            }"#,
+        );
+        assert!(
+            error.contains("roll_sizes"),
+            "the offending subdirective must be named; got {error}"
         );
     }
 
