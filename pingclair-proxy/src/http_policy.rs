@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dorian Verlaine
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -157,7 +157,7 @@ impl ResponseHeaderPolicy {
     }
 
     /// 🧩 Adds proxy-owned replacements without overriding outer middleware.
-    pub(crate) fn merge_proxy_set(&mut self, headers: &HashMap<String, String>) {
+    pub(crate) fn merge_proxy_set(&mut self, headers: &BTreeMap<String, String>) {
         for (name, value) in headers {
             let name = name.to_ascii_lowercase();
             // 🧩 `or_insert_with` is the whole rule: an entry the outer
@@ -1140,7 +1140,7 @@ mod tests {
         let mut policy = ResponseHeaderPolicy::default();
         policy.set("x-owner", "outer-middleware");
 
-        let proxy_headers: HashMap<String, String> = [
+        let proxy_headers: BTreeMap<String, String> = [
             ("X-Owner".to_string(), "proxy-config".to_string()),
             ("x-only-proxy".to_string(), "proxy-config".to_string()),
         ]

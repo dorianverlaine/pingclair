@@ -14,7 +14,7 @@ use pingora_core::{Error, ErrorType};
 use pingora_http::RequestHeader;
 use pingora_load_balancing::Backend;
 use pingora_load_balancing::health_check::HealthCheck;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -125,7 +125,7 @@ pub struct HealthCheckConfig {
     /// 🔐 `tls_server_name` written by the operator, which outranks each
     /// backend's own name because it states what the certificate actually says.
     pub sni_override: Option<String>,
-    pub headers: HashMap<String, String>,
+    pub headers: BTreeMap<String, String>,
     pub port_override: Option<u16>,
     pub reuse_connection: bool,
     pub max_response_body_bytes: usize,
@@ -332,7 +332,7 @@ mod tests {
             host,
             host_override: None,
             sni_override: None,
-            headers: HashMap::new(),
+            headers: BTreeMap::new(),
             port_override: None,
             reuse_connection: false,
             max_response_body_bytes: 4,

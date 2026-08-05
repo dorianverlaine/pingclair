@@ -283,7 +283,7 @@ fn channel_registry() -> &'static Mutex<HashMap<String, Arc<AccessLogger>>> {
 /// A reload that reuses the same channel name keeps the existing writer rather
 /// than spawning a second one — otherwise every reload would leak a thread and
 /// leave the old queue draining into the same file.
-pub fn register_channels(channels: &HashMap<String, LogConfig>) {
+pub fn register_channels(channels: &std::collections::BTreeMap<String, LogConfig>) {
     let mut registry = channel_registry()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1367,7 +1367,7 @@ mod channel_sharing_tests {
     fn one_channel_name_yields_one_shared_writer() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shared.log");
-        let mut channels = HashMap::new();
+        let mut channels = std::collections::BTreeMap::new();
         channels.insert("shared".to_string(), channel_config(&path));
 
         register_channels(&channels);
@@ -1387,7 +1387,7 @@ mod channel_sharing_tests {
     fn re_registering_keeps_the_existing_writer() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("reload.log");
-        let mut channels = HashMap::new();
+        let mut channels = std::collections::BTreeMap::new();
         channels.insert("reload".to_string(), channel_config(&path));
 
         register_channels(&channels);
@@ -1414,7 +1414,7 @@ mod channel_sharing_tests {
     fn a_channel_writes_to_its_own_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("written.log");
-        let mut channels = HashMap::new();
+        let mut channels = std::collections::BTreeMap::new();
         channels.insert("written".to_string(), channel_config(&path));
 
         register_channels(&channels);

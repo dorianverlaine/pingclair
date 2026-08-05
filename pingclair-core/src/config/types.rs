@@ -6,7 +6,7 @@
 //! These types represent the runtime configuration for Pingclair.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// Root configuration for Pingclair
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -310,7 +310,7 @@ pub struct ServerConfig {
     /// error (404/500/502/504, ...). Falls back to the built-in plain-text
     /// response when unset or unreadable.
     #[serde(default)]
-    pub error_pages: HashMap<u16, String>,
+    pub error_pages: BTreeMap<u16, String>,
 }
 
 /// Hand-written rather than derived so `ServerConfig::default()` agrees with
@@ -335,7 +335,7 @@ impl Default for ServerConfig {
             security: SecurityConfig::default(),
             gzip_types: default_gzip_types(),
             encodings: default_encodings(),
-            error_pages: HashMap::new(),
+            error_pages: BTreeMap::new(),
         }
     }
 }
@@ -673,15 +673,15 @@ pub enum HandlerConfig {
         status: u16,
         body: Option<String>,
         #[serde(default)]
-        headers: HashMap<String, String>,
+        headers: BTreeMap<String, String>,
     },
 
     /// Headers modification
     Headers {
         #[serde(default)]
-        set: HashMap<String, String>,
+        set: BTreeMap<String, String>,
         #[serde(default)]
-        add: HashMap<String, String>,
+        add: BTreeMap<String, String>,
         #[serde(default)]
         remove: Vec<String>,
     },
@@ -732,7 +732,7 @@ pub enum HandlerConfig {
         /// Map of internal error codes to handlers
         /// Note: This is a placeholder for future implementation
         #[serde(default)]
-        errors: HashMap<u16, Vec<HandlerConfig>>,
+        errors: BTreeMap<u16, Vec<HandlerConfig>>,
     },
 
     /// Handle with path stripping
@@ -864,11 +864,11 @@ pub struct ReverseProxyConfig {
 
     /// Headers to add to upstream request
     #[serde(default)]
-    pub headers_up: HashMap<String, String>,
+    pub headers_up: BTreeMap<String, String>,
 
     /// Headers to add to downstream response
     #[serde(default)]
-    pub headers_down: HashMap<String, String>,
+    pub headers_down: BTreeMap<String, String>,
 
     /// Flush interval in milliseconds (-1 for immediate)
     pub flush_interval: Option<i64>,
@@ -1252,7 +1252,7 @@ pub struct HealthCheckConfig {
 
     /// 🧾 Additional request headers sent by the probe.
     #[serde(default)]
-    pub headers: HashMap<String, String>,
+    pub headers: BTreeMap<String, String>,
 
     /// ✅ Exact response statuses accepted as healthy.
     #[serde(default = "default_health_statuses")]
@@ -1374,8 +1374,8 @@ pub struct LoggingConfig {
     /// The common case is an empty map and a per-server inline `log` block;
     /// channels exist for the shapes an inline block cannot express, such as
     /// sending 4xx/5xx somewhere separate from the ordinary access log.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub channels: HashMap<String, LogConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub channels: BTreeMap<String, LogConfig>,
 }
 
 /// Security headers configuration
@@ -1921,7 +1921,7 @@ mod tests {
                     handler: HandlerConfig::Respond {
                         status: 200,
                         body: None,
-                        headers: HashMap::new(),
+                        headers: BTreeMap::new(),
                     },
                     methods: None,
                     matcher: Some(Matcher::Not(Box::new(path("/admin/*")))),

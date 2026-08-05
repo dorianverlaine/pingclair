@@ -211,7 +211,7 @@ async fn h3_serves_a_request_end_to_end() {
     let server = spawn_h3_server(HandlerConfig::Respond {
         status: 200,
         body: Some("hello over http/3".to_string()),
-        headers: std::collections::HashMap::new(),
+        headers: std::collections::BTreeMap::new(),
     })
     .await;
 
@@ -234,7 +234,7 @@ async fn h3_reuses_one_connection_for_several_requests() {
     let server = spawn_h3_server(HandlerConfig::Respond {
         status: 200,
         body: Some("ok".to_string()),
-        headers: std::collections::HashMap::new(),
+        headers: std::collections::BTreeMap::new(),
     })
     .await;
 
@@ -255,7 +255,7 @@ async fn h3_streams_a_body_larger_than_one_packet() {
     let server = spawn_h3_server(HandlerConfig::Respond {
         status: 200,
         body: Some(payload.clone()),
-        headers: std::collections::HashMap::new(),
+        headers: std::collections::BTreeMap::new(),
     })
     .await;
 
@@ -362,7 +362,7 @@ async fn h3_rejects_a_settings_frame_on_a_request_stream() {
     let server = spawn_h3_server(HandlerConfig::Respond {
         status: 200,
         body: Some("ok".to_string()),
-        headers: std::collections::HashMap::new(),
+        headers: std::collections::BTreeMap::new(),
     })
     .await;
 
@@ -385,7 +385,7 @@ async fn h3_rejects_a_data_frame_before_any_headers() {
     let server = spawn_h3_server(HandlerConfig::Respond {
         status: 200,
         body: Some("ok".to_string()),
-        headers: std::collections::HashMap::new(),
+        headers: std::collections::BTreeMap::new(),
     })
     .await;
 

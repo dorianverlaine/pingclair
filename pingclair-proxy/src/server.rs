@@ -30,7 +30,7 @@ use pingora_cache::{CacheMeta, MemCache, NoCacheReason, RespCacheable, VarianceB
 
 use arc_swap::ArcSwap;
 use async_recursion::async_recursion;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -90,7 +90,7 @@ pub struct RequestContext {
     /// Selected upstream (kept for connection tracking)
     pub upstream: Option<Upstream>,
     /// Extra headers to add upstream
-    pub headers_upstream: HashMap<String, String>,
+    pub headers_upstream: BTreeMap<String, String>,
     /// 🧭 Transport-neutral downstream response header mutations.
     pub(crate) response_headers: ResponseHeaderPolicy,
     /// 🗜️ Coding agreed between this client's `Accept-Encoding` and the
@@ -179,7 +179,7 @@ impl Default for RequestContext {
             cache_ttl_secs: None,
             cache_size_tracked: false,
             upstream: None,
-            headers_upstream: HashMap::new(),
+            headers_upstream: BTreeMap::new(),
             response_headers: ResponseHeaderPolicy::default(),
             negotiated_encoding: None,
             streaming_response: false,
@@ -6583,7 +6583,7 @@ mod caddy_parity_tests {
                         HandlerConfig::Respond {
                             status: 200,
                             body: Some("ok".into()),
-                            headers: HashMap::new(),
+                            headers: BTreeMap::new(),
                         },
                     ],
                 },

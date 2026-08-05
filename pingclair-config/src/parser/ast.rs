@@ -6,7 +6,7 @@
 //! This module defines every node produced by the parser.
 
 use crate::parser::lexer::Location;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// A node with source location information
 #[derive(Debug, Clone, PartialEq)]
@@ -277,7 +277,7 @@ pub struct LoggingConfig {
     pub level: LogLevel,
     pub format: LogFormat,
     /// 🪵 Named channels from `log <name> { … }` in the global block.
-    pub channels: HashMap<String, LogBlock>,
+    pub channels: BTreeMap<String, LogBlock>,
 }
 
 /// Log level
@@ -556,7 +556,7 @@ pub struct ProxyConfig {
     pub flush_interval: Option<FlushInterval>,
 
     /// Headers to add to upstream request
-    pub header_up: HashMap<String, Expr>,
+    pub header_up: BTreeMap<String, Expr>,
 
     /// Transport configuration
     pub transport: Option<TransportConfig>,
@@ -593,7 +593,7 @@ pub struct HealthCheckConfig {
     pub timeout_secs: u64,
     pub method: String,
     pub host: Option<String>,
-    pub headers: HashMap<String, String>,
+    pub headers: BTreeMap<String, String>,
     pub expected_statuses: Vec<u16>,
     pub expected_body: Option<String>,
     pub port: Option<u16>,
@@ -612,7 +612,7 @@ impl Default for HealthCheckConfig {
             timeout_secs: 5,
             method: "GET".to_string(),
             host: None,
-            headers: HashMap::new(),
+            headers: BTreeMap::new(),
             expected_statuses: vec![200],
             expected_body: None,
             port: None,
@@ -780,7 +780,7 @@ impl Default for CircuitBreakerConfig {
 pub struct ResponseConfig {
     pub status: u16,
     pub body: Option<Expr>,
-    pub headers: HashMap<String, String>,
+    pub headers: BTreeMap<String, String>,
 }
 
 /// Redirect configuration
@@ -793,8 +793,8 @@ pub struct RedirectConfig {
 /// Headers modification configuration
 #[derive(Debug, Clone, Default)]
 pub struct HeadersConfig {
-    pub set: HashMap<String, String>,
-    pub add: HashMap<String, String>,
+    pub set: BTreeMap<String, String>,
+    pub add: BTreeMap<String, String>,
     pub remove: Vec<String>,
 }
 
@@ -921,7 +921,7 @@ impl ProxyConfig {
             lb_hash_key: None,
             health_check: None,
             flush_interval: None,
-            header_up: HashMap::new(),
+            header_up: BTreeMap::new(),
             transport: None,
             cache: None,
             retry: RetryConfig::default(),

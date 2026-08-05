@@ -489,6 +489,7 @@ mod tests {
     use super::*;
     use crate::config::HandlerConfig;
     use http::HeaderMap;
+    use std::collections::BTreeMap;
 
     fn make_route(path: &str) -> RouteConfig {
         RouteConfig {
@@ -496,7 +497,7 @@ mod tests {
             handler: HandlerConfig::Respond {
                 status: 200,
                 body: None,
-                headers: HashMap::new(),
+                headers: BTreeMap::new(),
             },
             methods: None,
             matcher: None,
@@ -649,7 +650,7 @@ mod tests {
             handler: HandlerConfig::Respond {
                 status: 200,
                 body: None,
-                headers: HashMap::new(),
+                headers: BTreeMap::new(),
             },
             methods: None,
             matcher: Some(Matcher::Query {
@@ -690,7 +691,7 @@ mod tests {
             handler: HandlerConfig::Respond {
                 status: 200,
                 body: None,
-                headers: HashMap::new(),
+                headers: BTreeMap::new(),
             },
             methods: None,
             matcher: Some(Matcher::Path {
@@ -775,7 +776,7 @@ mod tests {
             handler: HandlerConfig::Respond {
                 status: 200,
                 body: None,
-                headers: HashMap::new(),
+                headers: BTreeMap::new(),
             },
             methods: None,
             matcher: Some(Matcher::Path {
@@ -821,7 +822,7 @@ mod tests {
             handler: HandlerConfig::Respond {
                 status: 200,
                 body: None,
-                headers: HashMap::new(),
+                headers: BTreeMap::new(),
             },
             methods: Some(vec!["GET".to_string()]),
             matcher: Some(Matcher::Path {
@@ -865,7 +866,7 @@ mod tests {
             handler: HandlerConfig::Respond {
                 status: 200,
                 body: None,
-                headers: HashMap::new(),
+                headers: BTreeMap::new(),
             },
             methods: None,
             matcher: Some(Matcher::RemoteIp(vec!["10.0.0.0/8".to_string()])),
@@ -894,7 +895,7 @@ mod tests {
             handler: HandlerConfig::Respond {
                 status: 200,
                 body: None,
-                headers: HashMap::new(),
+                headers: BTreeMap::new(),
             },
             methods: None,
             matcher: Some(Matcher::Not(Box::new(Matcher::Header {

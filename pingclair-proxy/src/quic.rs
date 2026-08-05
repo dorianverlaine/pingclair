@@ -38,7 +38,7 @@
 //!   keepalive connection pool, TLS-to-upstream support and timeout
 //!   semantics as the H1/H2 path.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -1523,7 +1523,7 @@ enum H3Terminal {
     Respond {
         status: u16,
         body: Option<String>,
-        headers: HashMap<String, String>,
+        headers: BTreeMap<String, String>,
     },
     Redirect {
         to: String,
@@ -3641,7 +3641,7 @@ mod tests {
                 HandlerConfig::Respond {
                     status: 200,
                     body: Some("ok".to_string()),
-                    headers: HashMap::new(),
+                    headers: BTreeMap::new(),
                 },
             ],
         };
@@ -3686,7 +3686,7 @@ mod tests {
                 HandlerConfig::Respond {
                     status: 200,
                     body: Some("must not run".to_string()),
-                    headers: HashMap::new(),
+                    headers: BTreeMap::new(),
                 },
             ],
         };
@@ -3716,8 +3716,8 @@ mod tests {
         let handler = HandlerConfig::Pipeline {
             handlers: vec![
                 HandlerConfig::Headers {
-                    set: HashMap::from([("x-policy".to_string(), "active".to_string())]),
-                    add: HashMap::new(),
+                    set: BTreeMap::from([("x-policy".to_string(), "active".to_string())]),
+                    add: BTreeMap::new(),
                     remove: Vec::new(),
                 },
                 HandlerConfig::BasicAuth {

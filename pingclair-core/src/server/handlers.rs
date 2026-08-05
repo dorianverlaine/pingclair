@@ -10,7 +10,7 @@ use base64::Engine as _;
 use bcrypt::HashParts;
 use bytes::Bytes;
 use http::StatusCode;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
@@ -33,7 +33,7 @@ pub type HandlerResult = Result<HandlerResponse, HandlerError>;
 #[derive(Debug)]
 pub struct HandlerResponse {
     pub status: StatusCode,
-    pub headers: HashMap<String, String>,
+    pub headers: BTreeMap<String, String>,
     pub body: Option<Bytes>,
 }
 
@@ -55,7 +55,7 @@ impl HandlerResponse {
     pub fn status(code: u16) -> Self {
         Self {
             status: StatusCode::from_u16(code).unwrap_or(StatusCode::OK),
-            headers: HashMap::new(),
+            headers: BTreeMap::new(),
             body: None,
         }
     }
@@ -64,7 +64,7 @@ impl HandlerResponse {
     pub fn with_body(code: u16, body: impl Into<Bytes>) -> Self {
         Self {
             status: StatusCode::from_u16(code).unwrap_or(StatusCode::OK),
-            headers: HashMap::new(),
+            headers: BTreeMap::new(),
             body: Some(body.into()),
         }
     }
@@ -78,7 +78,7 @@ impl HandlerResponse {
     /// Create redirect response
     pub fn redirect(to: &str, code: u16) -> Self {
         let status = StatusCode::from_u16(code).unwrap_or(StatusCode::FOUND);
-        let mut headers = HashMap::new();
+        let mut headers = BTreeMap::new();
         headers.insert("Location".to_string(), to.to_string());
 
         Self {
@@ -419,7 +419,7 @@ mod tests {
         let config = HandlerConfig::Respond {
             status: 200,
             body: Some("Hello, World!".to_string()),
-            headers: HashMap::new(),
+            headers: BTreeMap::new(),
         };
 
         let response = execute_handler(&config, &empty_headers()).unwrap();
@@ -444,12 +444,12 @@ mod tests {
 
     #[test]
     fn test_headers_handler() {
-        let mut headers = HashMap::new();
+        let mut headers = BTreeMap::new();
         headers.insert("X-Custom".to_string(), "value".to_string());
 
         let config = HandlerConfig::Headers {
             set: headers,
-            add: HashMap::new(),
+            add: BTreeMap::new(),
             remove: Vec::new(),
         };
 

@@ -1260,7 +1260,8 @@ fn main() -> anyhow::Result<()> {
                 upstream_tls.enable = true;
                 upstream_tls.insecure_skip_verify = true;
             }
-            let mut headers_up: HashMap<String, String> = headers_up.into_iter().collect();
+            let mut headers_up: std::collections::BTreeMap<String, String> =
+                headers_up.into_iter().collect();
             if change_host_header && let Some(upstream) = to.first() {
                 headers_up.insert("Host".to_string(), upstream_hostport(upstream));
             }

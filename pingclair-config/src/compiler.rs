@@ -16,7 +16,7 @@ use pingclair_core::config::{
     default_gzip_types,
 };
 use pingclair_core::server::{MAX_BCRYPT_COST, bcrypt_hash_cost};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use thiserror::Error;
 
 /// Compiler errors
@@ -1297,8 +1297,8 @@ fn compile_handler(handler: &Handler, root: Option<&str>) -> CompileResult<Handl
                         slow_start_ms: health.slow_start_ms,
                     })
                 }),
-                headers_up: HashMap::new(),
-                headers_down: HashMap::new(),
+                headers_up: BTreeMap::new(),
+                headers_down: BTreeMap::new(),
                 flush_interval: None,
                 read_timeout: None,
                 write_timeout: None,
@@ -1870,7 +1870,7 @@ mod fail_closed_handler_tests {
         HandlerConfig::Respond {
             status: 200,
             body: Some("ok".to_string()),
-            headers: std::collections::HashMap::new(),
+            headers: std::collections::BTreeMap::new(),
         }
     }
 

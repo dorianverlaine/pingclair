@@ -1002,6 +1002,7 @@ fn build_pool(
 mod tests {
     use super::*;
     use crate::upstream::Scheme;
+    use std::collections::BTreeMap;
     use std::collections::HashMap as StdHashMap;
 
     #[test]
@@ -1298,7 +1299,7 @@ mod tests {
                 host: "app".to_string(),
                 host_override: None,
                 sni_override: None,
-                headers: HashMap::new(),
+                headers: BTreeMap::new(),
                 port_override: None,
                 reuse_connection: false,
                 max_response_body_bytes: 1_024,
