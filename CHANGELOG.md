@@ -127,6 +127,24 @@ Everything below is on `main` and unreleased; the workspace reports
 
 ### 🐛 Fixed
 
+- 🗜️ **`Accept-Encoding: gzip;q=0` was answered with gzip.** A `q` of zero is an
+  explicit refusal, and a static file ignored it — the negotiation on that path
+  was `header.contains("gzip")`, which cannot see a quality value, matched
+  substrings so a token merely embedding a coding name selected it, and ignored
+  the order `encode` was configured with. A correct implementation existed in
+  the proxy crate and nothing in production called it. There is now one
+  implementation, shared, so a fix cannot fail to reach a served file.
+- 🧊 **`Vary: Accept-Encoding` was missing from uncompressed responses.** The
+  header was sent only when a body had actually been compressed, but it
+  describes the resource rather than the copy in hand. Without it a shared
+  cache stores the identity variant as if it were the only one and serves it to
+  a client that asked for gzip. Streamed responses — always the uncompressed
+  variant — never carried it at all.
+- 🎯 **`respond /path "body"` treated the path as the body.** An exact path in
+  the matcher position stayed an argument, so `respond /first "first wins"`
+  answered every request with the text `/first` and any later `respond` was
+  unreachable. A glob worked, which is why this stayed hidden. Routing silently
+  to the wrong handler is worse than refusing to load.
 - 🚰 **Shutdown had no configurable grace period at all.** Nothing set
   Pingora's shutdown knobs, so a `SIGTERM` truncated responses still being
   sent: a 20 MiB download over a rate-limited link arrived as 4.1 MiB with
