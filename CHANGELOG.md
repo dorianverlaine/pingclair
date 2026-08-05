@@ -19,7 +19,7 @@ Everything below is on `main` and unreleased; the workspace reports
 
 ### ⚠️ Breaking
 
-- **A bare hostname site now derives an HTTPS listener.** Writing a site
+- 🔐 **A bare hostname site now derives an HTTPS listener.** Writing a site
   address with no scheme and no port (for example `example.com { … }`) used to
   produce a plaintext listener on port 80. It now behaves the way Caddy does:
   the site is served over HTTPS on 443, and a companion listener on port 80
@@ -27,30 +27,30 @@ Everything below is on `main` and unreleased; the workspace reports
   an explicit `http://` scheme, an explicit port, or an IP literal. An address
   that already named a listener is unaffected.
 
-### Changed
+### 🔄 Changed
 
-- **Route matchers serialize in a tagged representation.** The untagged shape
+- 🏷️ **Route matchers serialize in a tagged representation.** The untagged shape
   0.1.7 wrote could not round-trip unambiguously — a `Query` matcher read back
   as a `Header`. Existing documents still load, since the deserializer accepts
   every shape 0.1.7 could produce, but configs written out now use the tagged
   form. Anything diffing exported JSON will see the change.
-- **The default upstream keepalive pool is 512 connections**, up from
+- 🔗 **The default upstream keepalive pool is 512 connections**, up from
   Pingora's 128. A proxy that reuses too few upstream connections spends the
   difference on TCP handshakes.
 
-### Added
+### ✨ Added
 
-- **Caddyfile compatibility.** Complete directive syntax and matcher
+- 📝 **Caddyfile compatibility.** Complete directive syntax and matcher
   semantics, Caddy's directive ordering, `handle`/`handle_path`/`handle_errors`
   /`try_files` containers, a redirect DSL, response templates, and dual-stack
   (IPv4 + IPv6) wildcard listeners.
-- **Admin API.** `/load`, `/adapt` and `/stop`, Caddy-style config traversal
+- 🌐 **Admin API.** `/load`, `/adapt` and `/stop`, Caddy-style config traversal
   with `@id` addressing, dynamic listeners, autosave and resume, and graceful
   stop.
-- **Command line.** `reload`, `start`, `stop`, `respond`, `run --watch`,
+- ⌨️ **Command line.** `reload`, `start`, `stop`, `respond`, `run --watch`,
   HTTPS quick commands, shell completion, `environ`, `list-modules`,
   `build-info`, `manpage`, `storage` and `trust`.
-- **Session affinity by header, cookie, or query parameter.**
+- 🎯 **Session affinity by header, cookie, or query parameter.**
   `lb_policy header X-Session`, `lb_policy cookie sid` and
   `lb_policy query user` route requests carrying the same value to the same
   backend, over the same consistent-hash ring `ip_hash` already used — so
@@ -58,11 +58,11 @@ Everything below is on `main` and unreleased; the workspace reports
   reshuffling everyone. A request that does not carry the named field falls
   back to normal selection instead of hashing an empty value, which would pin
   every such client to one backend.
-- **Reverse proxy.** Active health checks, circuit breakers, exact local rate
+- 🔀 **Reverse proxy.** Active health checks, circuit breakers, exact local rate
   limiting, bounded idempotent redispatch, per-request resource bounds,
   upstream authentication, gRPC parity, h2c, hostname re-resolution while the
   server runs, and a `Via` header per RFC 9110.
-- **Response caching.** RFC 9111 decides what may be stored, and a second
+- 📦 **Response caching.** RFC 9111 decides what may be stored, and a second
   identical request is served without asking the origin. The store is bounded
   by `max_size` (128 MiB unless you say otherwise) and evicts least-recently-
   used entries at the ceiling, so switching caching on cannot by itself be
@@ -74,17 +74,17 @@ Everything below is on `main` and unreleased; the workspace reports
   > The ceiling is process-wide because the store is. A configuration whose
   > routes ask for different `max_size` values is refused at startup, naming
   > both, rather than one of them quietly losing.
-- **HTTP/3.** Unified middleware execution with the other transports, route
+- 🚀 **HTTP/3.** Unified middleware execution with the other transports, route
   access controls, and certificates delivered to the QUIC stack from memory
   rather than through temporary files.
-- **TLS.** A persistent internal CA for private origins, and durable ACME
+- 🔐 **TLS.** A persistent internal CA for private origins, and durable ACME
   state across restarts.
-- **Identity and trust.** PROXY protocol required per listener, verified
+- 🛡️ **Identity and trust.** PROXY protocol required per listener, verified
   trusted client identity, and `CF-Connecting-IP` honored only from trusted
   peers.
-- **Authentication.** bcrypt and argon2id credentials, `basic_auth` in the
+- 🔑 **Authentication.** bcrypt and argon2id credentials, `basic_auth` in the
   DSL, and an admin API key.
-- **Logging.** Per-server log configuration that actually drives access-log
+- 🪵 **Logging.** Per-server log configuration that actually drives access-log
   output, and secrets redacted by default. Lines are now handed to a
   background writer through a bounded queue, so a full disk or a stalled
   mount can no longer slow down request handling: when the queue fills, lines
@@ -101,7 +101,7 @@ Everything below is on `main` and unreleased; the workspace reports
   `log { … }` at the same time, so "everything to stdout, an audit copy to a
   file" needs no duplication. Referencing a channel that was never declared
   is refused at startup, listing the names that do exist.
-- **Readiness and liveness endpoints.** `GET /ready` on the admin API answers
+- 🚦 **Readiness and liveness endpoints.** `GET /ready` on the admin API answers
   503 until every listener is bound, and again as soon as shutdown begins, so
   a rolling deploy stops sending traffic to an instance that cannot yet answer
   or is draining. `GET /live` stays 200 throughout, because a process
@@ -114,20 +114,20 @@ Everything below is on `main` and unreleased; the workspace reports
   and errors separately from client-visible ones, retries, keepalive
   connection reuse, TLS handshakes by version, and HTTP/3 connections and
   cancellations.
-- **The admin API enforces an origin allow list.**
+- 🚧 **The admin API enforces an origin allow list.**
   `admin :2019 { origins https://admin.example.com; enforce_origin }`. Without
   it a page on any website could `fetch()` a new configuration into a
   locally-bound admin endpoint. Requests carrying no `Origin` at all — curl,
   systemctl — keep working unless `enforce_origin` is set, since the attack
   being prevented is specifically a browser one.
-- **Response compression is negotiable.** An `encode` directive selects zstd
+- 🗜️ **Response compression is negotiable.** An `encode` directive selects zstd
   and gzip per `Accept-Encoding`, with configurable MIME types. A config that
   never mentions `encode` keeps compressing exactly as 0.1.7 did — gzip only —
   so upgrading changes nothing on its own.
 
-### Fixed
+### 🐛 Fixed
 
-- **Shutdown cut off responses that were still being sent.** A `SIGTERM`
+- 🚰 **Shutdown cut off responses that were still being sent.** A `SIGTERM`
   stopped the runtime after five seconds — Pingora's default, which nothing
   here overrode — so anything slower than that was truncated mid-body. A
   20 MiB download over a rate-limited link arrived as 4.1 MiB with status 200
@@ -136,48 +136,48 @@ Everything below is on `main` and unreleased; the workspace reports
   for requests already in flight however long they take, matching Caddy, and
   the new `grace_period` global option bounds the wait for operators who want
   a restart to finish by a deadline.
-- **Log rotation written the way Caddy writes it did nothing.** Rotation
+- 🔄 **Log rotation written the way Caddy writes it did nothing.** Rotation
   settings inside `output file <path> { … }` — `roll_size`, `roll_keep`,
   `roll_keep_for` — were parsed and discarded, so a configuration carried over
   from Caddy validated cleanly and then let the access log grow until the disk
   filled. The settings now apply, and an unrecognised name inside that block is
   an error that names it instead of silence.
-- **Access logs recorded no request headers.** Caddy's JSON log carries the
+- 🔐 **Access logs recorded no request headers.** Caddy's JSON log carries the
   whole header map with sensitive values masked; ours carried none unless a
   `headers { request … }` list named them. An empty list now means every
   header, and a named list narrows rather than enables. Masking applies on both
   paths.
-- **Only the leaf certificate was sent to clients.** Intermediates in a PEM
+- 🔗 **Only the leaf certificate was sent to clients.** Intermediates in a PEM
   bundle were parsed and discarded, so any client without the issuing CA
   cached locally failed to build a chain. Found on a public network path;
   invisible against a local trust store.
-- **`tls auto` broke the ACME HTTP-01 challenge.** Automatic HTTPS took over
+- 🔓 **`tls auto` broke the ACME HTTP-01 challenge.** Automatic HTTPS took over
   port 80, which RFC 8555 §8.3 requires to stay cleartext, so issuance could
   not complete. Port 80 now stays in the clear for the challenge.
-- **Request paths were rejected instead of normalized.** Path resolution now
+- 🧭 **Request paths were rejected instead of normalized.** Path resolution now
   matches nginx, and a path that escapes its route no longer reaches the
   origin.
-- **A repeated response header name reused the first value.** A route with
+- 🧹 **A repeated response header name reused the first value.** A route with
   `header +Vary Accept-Encoding` merged with a CORS decision emitted
   `Vary: Accept-Encoding` twice and dropped `Vary: Origin`, which would let a
   shared cache serve one origin's response to another. HTTP/3 was never
   affected.
-- **Ambiguous framing was accepted.** A `Content-Length` of `+5` and requests
+- 🧱 **Ambiguous framing was accepted.** A `Content-Length` of `+5` and requests
   carrying more than one `Host` are now refused, since a lenient reader and a
   strict one disagree about where the body ends.
-- **Hop-by-hop headers crossed the hop**, credentials included.
-- **HTTP/2**: authority routing, ALPN negotiation and upstream weights.
-- **HTTP/3**: abandoned streams are cancelled rather than left to time out.
-- **A fail-fast rejection tore down the client's whole connection.**
-- **Circuit-breaker state leaked** for backends removed from the pool.
-- **Health checks probed every backend under one name.**
-- **`protocols` was parsed and then ignored.** A global
+- 🧹 **Hop-by-hop headers crossed the hop**, credentials included.
+- 🔀 **HTTP/2**: authority routing, ALPN negotiation and upstream weights.
+- 🛑 **HTTP/3**: abandoned streams are cancelled rather than left to time out.
+- 🔁 **A fail-fast rejection tore down the client's whole connection.**
+- ♻️ **Circuit-breaker state leaked** for backends removed from the pool.
+- 🏷️ **Health checks probed every backend under one name.**
+- 🎧 **`protocols` was parsed and then ignored.** A global
   `servers { protocols h1 h2 }` block — Caddy's way of saying "do not serve
   HTTP/3" — compiled cleanly and changed nothing, so QUIC kept listening
   while the operator believed it had been switched off. The list now decides
   whether HTTP/3 runs. Writing no `protocols` directive at all still means
   "leave the defaults alone", which is not the same as an empty allow list.
-- **A client hanging up was logged as a server error, twice.** Browsers
+- 🔇 **A client hanging up was logged as a server error, twice.** Browsers
   navigating away, users pressing stop and load balancers recycling idle
   connections all produced ERROR lines: one `wrk -c200` run closing its
   connections emitted 153 in a second, right after half a million requests had
@@ -186,23 +186,23 @@ Everything below is on `main` and unreleased; the workspace reports
   client are now DEBUG (or WARN when the client did something specific and
   wrong); upstream and internal failures are untouched and still ERROR.
 
-### Security
+### 🔐 Security
 
-- **The active-connection gauge was the one metric the cap missed.** The
+- 📊 **The active-connection gauge was the one metric the cap missed.** The
   ceiling below applied to every host-labelled metric except
   `pingclair_active_connections`, which kept a series per distinct `Host`
   header. Measured with 1600 distinct headers on a clean Linux box: every other
   family stopped at 1025 series while this one reached 1600. The remote memory
   exhaustion the cap was added to close therefore remained open through this
   one metric until now.
-- **Metric labels taken from client input are capped.** The `host` label came
+- 🛡️ **Metric labels taken from client input are capped.** The `host` label came
   straight from the `Host` header, and Prometheus keeps a separate time series
   per distinct value, so varied headers grew the process without bound — a
   remote memory exhaustion needing no authentication and no unusual traffic
   volume. Values beyond a fixed ceiling now collapse into `other`, which keeps
   the totals correct. A host already seen keeps its own series, so a flood of
   junk cannot displace real traffic.
-- **A reload could apply half a configuration.** Bind addresses were published
+- 🔄 **A reload could apply half a configuration.** Bind addresses were published
   one at a time, so a new listener that could not be bound left the addresses
   handled before it already serving the new configuration — the reload
   reported itself "partially reloaded" and left a state nobody had asked for.
@@ -210,7 +210,7 @@ Everything below is on `main` and unreleased; the workspace reports
   failure rejects the whole reload with the previous configuration untouched.
   A site removed from the configuration also stops serving, instead of staying
   reachable on its old listener until the next restart.
-- **Rotating a manual certificate needed a restart, and nothing said so.**
+- 🔐 **Rotating a manual certificate needed a restart, and nothing said so.**
   Certificate files were read once at startup, so writing a new pair on disk
   changed nothing until the process was restarted. A reload now re-reads them.
   The whole set is validated first — the PEM must contain a certificate, the
@@ -219,7 +219,7 @@ Everything below is on `main` and unreleased; the workspace reports
   certificates still serving, naming the file at fault. Previously a
   half-written file was accepted and failed later at handshake time, to a real
   client, on a site that had been working.
-- **A directory configuration silently dropped most global options.** Merging
+- 🗂️ **A directory configuration silently dropped most global options.** Merging
   several `.pingclair` files named a handful of fields by hand and ignored the
   other nine, so `blocked_ips` blocked nothing, `metrics` did nothing, and
   `http_port`/`https_port`/`trusted_proxies`/`dns_refresh`/`protocols` were
@@ -227,36 +227,36 @@ Everything below is on `main` and unreleased; the workspace reports
   accumulate across files instead of the last file winning, and validation
   runs once on the merged result, so a site may reference a log channel
   declared in another file.
-- Foreign JSON documents are rejected fail-closed rather than partially
+- 🚫 Foreign JSON documents are rejected fail-closed rather than partially
   applied.
-- The admin API enforces the rules it was assumed to already have.
-- PROXY protocol ingress is bounded like every other listener.
-- Sensitive fields are masked by default in logs, metrics and admin output.
-- A `plugin` route — parsed but never implemented — is refused at compile
+- 🌐 The admin API enforces the rules it was assumed to already have.
+- 🧱 PROXY protocol ingress is bounded like every other listener.
+- 🙈 Sensitive fields are masked by default in logs, metrics and admin output.
+- 🚫 A `plugin` route — parsed but never implemented — is refused at compile
   time instead of silently accepting traffic and doing nothing.
 
-### Performance
+### ⚡ Performance
 
 Measured on AWS `c7i-flex.large` unless noted; see `benchmarks/README.md` for
 methodology and the honest comparison against nginx, including the scenarios
 where nginx is still ahead.
 
-- **HTTP/3** gained GSO-backed packet batching (the per-connection output
+- 🚀 **HTTP/3** gained GSO-backed packet batching (the per-connection output
   buffer was 1350 bytes, so every QUIC packet became its own syscall), a
   bounded per-stream chunk queue in place of a byte ring, and immediate
   acknowledgement so a body the server is draining no longer trickles at one
   packet per 25 ms.
-- **Static files** prebuild per-file response metadata behind a lock-free
+- 📁 **Static files** prebuild per-file response metadata behind a lock-free
   read, and files at or below 5 MiB stream from disk instead of buffering.
-- **The proxy hot path** stops rebuilding `Via`, request-id and forwarding
+- ⚡ **The proxy hot path** stops rebuilding `Via`, request-id and forwarding
   header values that are fully determined before a request arrives.
-- **HPACK header encoding** reuses a per-connection scratch buffer. This was
+- 🤝 **HPACK header encoding** reuses a per-connection scratch buffer. This was
   contributed upstream and merged as
   [hyperium/h2#929](https://github.com/hyperium/h2/pull/929).
 
-### Removed
+### 🗑️ Removed
 
-- Two vendored performance forks (`pingora-core`, `pingora-http`, 38,532
+- 🗑️ Two vendored performance forks (`pingora-core`, `pingora-http`, 38,532
   lines) were evaluated and removed. Both had a sound mechanism and neither
   ever produced a measurement from a run where the component it patched was
   the saturated resource.
