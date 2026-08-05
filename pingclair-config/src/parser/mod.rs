@@ -8,6 +8,10 @@
 pub mod ast;
 pub mod caddy_ast;
 pub mod lexer;
+// 🧱 The flat-segment shape the format is defined in. Additive for now: the
+// tree parser above still drives the adapter, and callers move over one at a
+// time.
+pub mod server_block;
 // 🧩 The nested name preserves the crate's existing public parser API.
 #[allow(clippy::module_inception)]
 pub mod parser;
