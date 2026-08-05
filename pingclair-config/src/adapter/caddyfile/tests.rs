@@ -1282,6 +1282,69 @@ mod fail_closed_tests {
         );
     }
 
+    /// 🎯 The braceless shorthand takes directives that carry their own block.
+    ///
+    /// This one shape was a quarter of the format's own corpus. Nothing about a
+    /// block makes something a site — the *name* does — but the classification
+    /// read `block.is_some()` and called `file_server { … }` a second site, so
+    /// the file was refused for a reason that had nothing to do with it.
+    #[test]
+    fn the_braceless_shorthand_takes_directives_with_blocks() {
+        let config = crate::compile(":80\nfile_server {\n    index a.html\n}")
+            .expect("a directive's own block is not a second site");
+        assert_eq!(config.servers.len(), 1, "one site, not two");
+
+        crate::compile(":80\nlog {\n    output stdout\n}\nfile_server {\n    index a.html\n}")
+            .expect("several block-carrying directives are still one site");
+    }
+
+    /// 🚫 The same rule with the sign reversed, and the quieter of the two: a
+    /// directive name at the top of a file is a forgotten site address, not a
+    /// site named after a directive. This used to compile into a site called
+    /// `handle` that served nothing at all.
+    #[test]
+    fn a_directive_name_is_not_a_site_address() {
+        for name in ["handle", "map", "respond", "file_server"] {
+            let error = compile_err(&format!("{name} {{\n    respond \"x\"\n}}"));
+            assert!(
+                error.contains("is a directive, not a site address"),
+                "`{name}` must not become a site; got {error}"
+            );
+        }
+        // 👍 A word that is not a directive is still an ordinary site address.
+        crate::compile("localhost {\n    respond \"x\"\n}").expect("localhost is a site");
+    }
+
+    /// 🚫 Addresses that cannot mean anything are refused.
+    ///
+    /// All three were already covered by the corpus and all three were
+    /// *passing* — the files were being rejected one layer up, by the
+    /// misclassification above, rather than by any check on the address. Fixing
+    /// that is what revealed these.
+    #[test]
+    fn impossible_site_addresses_are_refused() {
+        for (address, expected) in [
+            (":70000", "out of range"),
+            ("foo://example.com", "unsupported URL scheme"),
+            ("wss://example.com", "only exists in browsers"),
+            ("ws://example.com", "only exists in browsers"),
+        ] {
+            let error = compile_err(&format!("{address} {{\n    respond \"x\"\n}}"));
+            assert!(
+                error.contains(expected),
+                "`{address}` must be refused with `{expected}`; got {error}"
+            );
+        }
+    }
+
+    /// 📌 Port `0` means "let the operating system choose", which is a real
+    /// request — so the range check must not swallow it.
+    #[test]
+    fn port_zero_and_the_top_of_the_range_still_compile() {
+        crate::compile(":0\n    respond \"x\"").expect("port 0 is a real request");
+        crate::compile(":65535\n    respond \"x\"").expect("65535 is in range");
+    }
+
     /// 👍 The unambiguous forms still compile — an empty 200 is expressible,
     /// it just has to be asked for.
     #[test]

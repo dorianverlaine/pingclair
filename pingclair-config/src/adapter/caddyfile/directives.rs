@@ -50,13 +50,29 @@ pub(super) fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
                             config.browse =
                                 browse || sub.args.first().map(|s| s == "true").unwrap_or(true)
                         }
-                        // 🚩 Caddy's `precompressed` and `fs` subdirectives
-                        // used to compile into a file server that quietly
-                        // served without either behavior. Rejecting them is
-                        // the only honest option until they are implemented.
-                        "precompressed" | "fs" => {
+                        // 🚩 Subdirectives the format defines and this file
+                        // server does not implement. They used to compile into
+                        // a file server that quietly served without any of the
+                        // behaviour asked for; rejecting them is the only
+                        // honest option until they exist.
+                        //
+                        // 📌 They are named here rather than falling through to
+                        // "unknown" on purpose: an operator who wrote `hide`
+                        // spelled it correctly, and "unknown directive" sends
+                        // them hunting for a typo instead of telling them the
+                        // feature is missing. That distinction is the whole
+                        // difference between a wrong file and a missing
+                        // feature.
+                        "precompressed"
+                        | "fs"
+                        | "hide"
+                        | "status"
+                        | "pass_thru"
+                        | "disable_canonical_uris"
+                        | "etag_file_extensions" => {
                             // TODO(v0.3): implement precompressed sidecar
-                            // lookup and custom file-system modules.
+                            // lookup, custom file-system modules, hidden-path
+                            // filtering, and the response-shaping options.
                             return Err(AdapterError::UnsupportedFeature(
                                 format!("file_server {}", sub.name),
                                 "Pingclair does not implement this subdirective yet".into(),
@@ -147,6 +163,66 @@ pub(super) fn is_known_caddy_directive(name: &str) -> bool {
             | "uri"
             | "vars"
     )
+}
+
+/// 📇 Every name that is a directive, whether or not it is implemented.
+///
+/// This answers one question the layers below cannot: **is this word a
+/// directive, or a site address?** Nothing about the text distinguishes them —
+/// `localhost` is a perfectly good site address and `handle` is a perfectly
+/// good word — so the only way to tell is to know the names. The parser
+/// deliberately does not, because knowing them would make a format layer
+/// depend on the HTTP layer's vocabulary.
+///
+/// Getting it wrong goes both ways, and both ways were measured on 2026-08-05:
+///
+/// - `:80` followed by `file_server { … }` failed to load, because a directive
+///   carrying a block was mistaken for a second site. That one shape accounts
+///   for a quarter of the format's own test corpus.
+/// - `handle { … }` written at the top of a file loaded happily as a site named
+///   `handle`, serving nothing — the mirror image, and the quieter of the two.
+///
+/// 📌 This list is the seed of the directive registry: once directives register
+/// themselves, membership here stops being a hand-maintained list and becomes a
+/// consequence of being registered.
+pub(super) fn is_directive_name(name: &str) -> bool {
+    is_known_caddy_directive(name)
+        || matches!(
+            name,
+            // Directives handled at the site level.
+            "bind"
+                | "compress"
+                | "encode"
+                | "error_page"
+                | "gzip_types"
+                | "limits"
+                | "listen"
+                | "log"
+                | "route"
+                | "tls"
+                // Directives that adapt into a handler.
+                | "access_control"
+                | "basic_auth"
+                | "basicauth"
+                | "cors"
+                | "file_server"
+                | "handle"
+                | "header"
+                | "rate_limit"
+                | "redir"
+                | "redirect"
+                | "respond"
+                | "reverse_proxy"
+                | "rewrite"
+                | "templates"
+                // Recognised elsewhere in the registry the list above mirrors.
+                | "copy_response"
+                | "copy_response_headers"
+                | "skip_log"
+                // Expanded before adaptation, but still a directive an operator
+                // can write at the start of a line.
+                | "import"
+        )
 }
 
 /// 🚦 Adapts an exact local rate-limit policy and rejects ambiguous options.

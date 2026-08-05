@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dorian Verlaine
 
+use super::AdapterError;
 use crate::parser::ast::*;
 
 /// 🏠 Whether a site name is a localhost-style host or an IP literal, which
@@ -11,6 +12,64 @@ pub(super) fn is_local_https_default(name: &str) -> bool {
         || name.ends_with(".local")
         || name.ends_with(".internal")
         || name.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// 🚫 Rejects a site address that cannot mean anything, before it becomes a
+/// listener nobody can reach.
+///
+/// These three were accepted silently until 2026-08-05, and the reason they
+/// went unnoticed is worth keeping: the format's own corpus tests all three,
+/// and every one of those tests was **passing** — for the wrong reason. Each
+/// fixture writes the bad address in the braceless form, so the file was being
+/// refused by a misclassification one layer up rather than by any check on the
+/// address. Fixing the misclassification is what made them visible.
+///
+/// 📌 Port `0` is deliberately not rejected: it means "let the operating system
+/// choose", which is a real thing to ask for.
+pub(super) fn reject_impossible_address(addr: &str) -> Result<(), AdapterError> {
+    if let Some((scheme, _)) = addr.split_once("://") {
+        match scheme {
+            "http" | "https" => {}
+            // 🌐 A browser speaks `ws://` over an ordinary HTTP listener, so
+            // there is nothing for a server to bind: naming it here is a
+            // misunderstanding worth correcting rather than a feature to add.
+            "ws" | "wss" => {
+                return Err(AdapterError::InvalidArgument(
+                    "site address".into(),
+                    format!(
+                        "the scheme `{scheme}://` only exists in browsers; a server \
+                         listens with `http://` or `https://`"
+                    ),
+                ));
+            }
+            other => {
+                return Err(AdapterError::InvalidArgument(
+                    "site address".into(),
+                    format!("unsupported URL scheme `{other}://`"),
+                ));
+            }
+        }
+    }
+
+    // 🔢 A port above 65535 does not exist. Left alone it parsed to `None` and
+    // the site quietly became a bare hostname with no listener at all.
+    let bare = addr
+        .strip_prefix("https://")
+        .or_else(|| addr.strip_prefix("http://"))
+        .unwrap_or(addr);
+    let after_bracket = bare.rfind(']').map_or(bare, |i| &bare[i..]);
+    if let Some((_, port)) = after_bracket.rsplit_once(':')
+        && !port.is_empty()
+        && port.chars().all(|c| c.is_ascii_digit())
+        && port.parse::<u16>().is_err()
+    {
+        return Err(AdapterError::InvalidArgument(
+            "site address".into(),
+            format!("port {port} is out of range"),
+        ));
+    }
+
+    Ok(())
 }
 
 /// 🚫 Whether an address string uses Caddy syntax that Pingclair cannot

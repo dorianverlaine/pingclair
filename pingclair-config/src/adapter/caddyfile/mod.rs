@@ -47,6 +47,7 @@ mod tls;
 #[cfg(test)]
 mod tests;
 
+use directives::is_directive_name;
 use options::adapt_global;
 use sites::adapt_server;
 
@@ -176,6 +177,15 @@ fn coalesce_bare_single_site(directives: Vec<Directive>) -> Result<Vec<Directive
     for d in directives {
         if d.name.is_empty() || d.name == "global" || d.name == "options" {
             globals.push(d);
+        } else if is_directive_name(&d.name) {
+            // 🎯 A directive, whether or not it brought a block along.
+            //
+            // This used to read `d.block.is_some()`, which says "anything with
+            // a block is a site" — so `:80` followed by `file_server { … }`
+            // was read as two sites and refused. Nothing about a block makes
+            // something a site; the *name* does, and this is the layer that
+            // knows the names.
+            bare.push(d);
         } else if d.block.is_some() {
             braced_sites.push(d);
         } else {
@@ -200,6 +210,20 @@ fn coalesce_bare_single_site(directives: Vec<Directive>) -> Result<Vec<Directive
     // 🏠 The first bare directive is the site address; everything after it is
     // the site's content. A lone bare directive is an empty site.
     let mut site = bare.remove(0);
+    // 🚫 …unless that first word is a directive, in which case the operator
+    // forgot the site address rather than naming a site after a directive.
+    // Accepting it produced a site called `handle` that served nothing, which
+    // is the same defect as the one above wearing the opposite sign.
+    if is_directive_name(&site.name) {
+        return Err(AdapterError::InvalidArgument(
+            "site address".into(),
+            format!(
+                "`{}` is a directive, not a site address; directives belong inside a \
+                 site block",
+                site.name
+            ),
+        ));
+    }
     if !bare.is_empty() {
         site.block = Some(Block { directives: bare });
     }

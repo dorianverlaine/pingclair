@@ -4,6 +4,7 @@
 use super::AdapterError;
 use super::addresses::{
     is_local_https_default, looks_like_unsupported_address, parse_server_address,
+    reject_impossible_address,
 };
 use super::directives::{adapt_handler, adapt_header_directive, adapt_resource_limits};
 use super::logs::adapt_log_block;
@@ -52,6 +53,9 @@ pub(super) fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
     }
 
     for name in &names {
+        // 🚫 Refuse an address that cannot mean anything before deriving a
+        // listener from it.
+        reject_impossible_address(name)?;
         // 🌐 A catch-all scheme address (`http://`, `https://`) has no host;
         // it still names a listener (80 or 443) even though no Host header
         // will ever match it.

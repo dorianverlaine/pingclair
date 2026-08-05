@@ -17,11 +17,10 @@
 //! local measurement tool and the *shapes it revealed* are written out here, in
 //! our own words, where CI runs them on every commit.
 //!
-//! 📌 Two cases are `#[ignore]`d on purpose. They are the acceptance tests for
-//! known gaps, written now so that the fix has something to turn green rather
-//! than being declared done by inspection. Do not delete them to make the suite
-//! quiet; a red test that is honest is worth more than a green suite that is
-//! not.
+//! 📌 Two of these were `#[ignore]`d as the acceptance tests for known gaps —
+//! written before the fix so it would have something to turn green rather than
+//! being declared done by inspection. Both went green on 2026-08-05, which is
+//! the point: the criterion was fixed in advance, so passing it means something.
 
 use pingclair_config::compile;
 
@@ -79,33 +78,48 @@ fn bare_directives_may_not_be_mixed_with_braced_sites() {
 /// 🐛 A directive carrying its own block, inside the unbraced single-site
 /// shorthand.
 ///
-/// The opening brace of `file_server { … }` is currently mistaken for the start
-/// of a second site block, so this is rejected with a complaint about mixing
-/// bare directives with braced sites — while the same configuration with a
-/// block-less directive compiles. It is the single largest gap the corpus
-/// found: 58 of its 228 configurations fail on this one shape and nothing else.
+/// The opening brace of `file_server { … }` used to be mistaken for the start of
+/// a second site block, so this was rejected with a complaint about mixing bare
+/// directives with braced sites — while the same configuration with a
+/// block-less directive compiled. It was the single largest gap the corpus
+/// found: 58 of its 228 configurations failed on this one shape and nothing
+/// else.
 ///
-/// The fix is structural rather than local — the parser has no way to
-/// distinguish a directive's block from a site's block — so this test is the
-/// acceptance criterion for that work, not a reminder to patch it here.
+/// 🎯 The fix turned out to be a classification, not a parser change: nothing
+/// about carrying a block makes something a site, and the layer that knows the
+/// directive names is the one that can say so.
 #[test]
-#[ignore = "known gap: a directive's own block is read as a second site block"]
 fn the_shorthand_accepts_a_directive_with_its_own_block() {
-    assert!(compiles(":80\nfile_server {\n\thide first.txt\n}\n"));
+    assert!(compiles(":80\nfile_server {\n\tindex first.html\n}\n"));
+    assert!(compiles(
+        ":80\nlog {\n\toutput stdout\n}\nfile_server {\n\tindex a.html\n}\n"
+    ));
+
+    // 🧭 The corpus repro verbatim. It still does not compile — but for a
+    // reason about `hide`, which this file server has not implemented, rather
+    // than about site blocks. Asserting the *reason* is the point: the shape is
+    // fixed even where the feature behind it is missing, and a test that only
+    // asked "does it compile" would go green later for the wrong cause.
+    let error = compile(":80\nfile_server {\n\thide first.txt\n}\n")
+        .expect_err("`hide` is not implemented yet")
+        .to_string();
+    assert!(
+        error.contains("hide") && !error.contains("site"),
+        "the failure must be about `hide`, not about site blocks; got {error}"
+    );
 }
 
 /// 🐛 A known directive name used where a site address belongs.
 ///
-/// `handle` on its own line is accepted as a hostname today. It should be
-/// refused, saying that the name is a directive and that directives belong
-/// inside a site block — otherwise the operator gets a server listening on a
-/// site called `handle` and no hint about why nothing works.
+/// `handle` on its own line used to be accepted as a hostname, producing a
+/// server listening on a site called `handle` with no hint about why nothing
+/// worked. It is refused now, saying that the name is a directive and that
+/// directives belong inside a site block.
 ///
-/// 🚨 This one fails *open*, which is why it is written down rather than left
-/// to be noticed: a configuration that loads and then serves nothing useful
-/// gives the operator nothing to search for.
+/// 🚨 It failed *open*, which is why it was written down rather than left to be
+/// noticed: a configuration that loads and then serves nothing useful gives the
+/// operator nothing to search for. Both directions come from one rule.
 #[test]
-#[ignore = "known gap: a directive name is accepted as a site address"]
 fn a_directive_name_is_refused_as_a_site_address() {
     assert!(!compiles("handle\n\nrespond \"should not work\"\n"));
 }
