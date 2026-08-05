@@ -301,6 +301,25 @@ pub fn expand(
         };
         let args: Vec<String> = d.args[1..].to_vec();
 
+        // 🚫 `import name { … }` passes the block to the snippet, which splices
+        // it in wherever the snippet writes `{block}`. We do not implement that
+        // substitution — and until this check existed the block was simply
+        // dropped, so a snippet invocation full of nonsense compiled green and
+        // contributed nothing.
+        //
+        // 🤡 It went unnoticed because the format's own fixture for it imports
+        // a file our corpus harness could not resolve: we "correctly rejected"
+        // the case for the wrong reason, and fixing the harness is what exposed
+        // it. A test passing is not the same as a test testing something.
+        if d.block.is_some() {
+            return Err(AdapterError::UnsupportedFeature(
+                "import with a block".into(),
+                format!(
+                    "`import {pattern} {{ … }}` substitutes the block into the snippet's                      `{{block}}` placeholder, which Pingclair does not implement yet;                      move the block's contents into the snippet itself"
+                ),
+            ));
+        }
+
         // 🥇 Snippets win over files, so a snippet named like a path stays
         // reachable and no filesystem lookup happens for the common case.
         if let Some(body) = snippets.get(&pattern) {

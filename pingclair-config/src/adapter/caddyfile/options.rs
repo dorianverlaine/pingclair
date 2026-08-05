@@ -24,9 +24,27 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                 // same channel" has to mean the same queue.
                 "log" => {
                     let Some(name) = sub.args.first().cloned() else {
-                        return Err(AdapterError::InvalidArgument(
-                            "log".into(),
-                            "a global log channel needs a name, e.g. `log errors { … }`".into(),
+                        // 🚫 An unnamed global `log` configures the *default*
+                        // logger — the one the server's own runtime messages go
+                        // to. This crate has nowhere to put that: process
+                        // logging is set up from the environment at startup,
+                        // and `logging.level`/`format`/`file` are carried in the
+                        // config type without anything reading them.
+                        //
+                        // 🤡 The message used to say the channel "needs a
+                        // name", which describes neither the operator's mistake
+                        // nor ours — they wrote something the format accepts,
+                        // and we cannot honour it. Being stricter than the
+                        // format is defensible; misnaming why is not.
+                        //
+                        // TODO(v0.3): configure process logging from the global
+                        // block, then accept this form.
+                        return Err(AdapterError::UnsupportedFeature(
+                            "global log without a channel name".into(),
+                            "an unnamed `log` block configures the server's own runtime log, which \
+                             Pingclair configures from the environment instead; name the channel \
+                             (`log access { … }`) to define an access-log channel"
+                                .into(),
                         ));
                     };
                     if sub.args.len() > 1 {
