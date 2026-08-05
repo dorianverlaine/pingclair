@@ -40,6 +40,7 @@ mod directives;
 mod logs;
 mod matchers;
 mod options;
+mod order;
 mod registry;
 mod reverse_proxy;
 mod sites;
@@ -145,6 +146,21 @@ pub fn adapt_from(
     // Pass 2: Convert to typed AST
     let mut ast = Ast::default();
 
+    // 🔢 The directive order is a property of the whole configuration, and the
+    // global block can change it. So it is resolved before any site is
+    // adapted — a site cannot be ordered by a rule that has not been read yet,
+    // and the global block is not required to come first in the file.
+    let mut order = order::DirectiveOrder::default();
+    for d in &expanded {
+        if d.name.is_empty() || d.name == "global" || d.name == "options" {
+            for sub in d.block.iter().flat_map(|block| &block.directives) {
+                if sub.name == "order" {
+                    order.apply(&sub.args)?;
+                }
+            }
+        }
+    }
+
     for d in expanded {
         if d.name.is_empty() || d.name == "global" || d.name == "options" {
             if ast.global.is_some() {
@@ -155,7 +171,7 @@ pub fn adapt_from(
             // 🐛 TODO: Support macros in Caddyfile?
             // Caddy uses snippets (import), which we now handle above.
         } else {
-            let server = adapt_server(d)?;
+            let server = adapt_server(d, &order)?;
             ast.servers.push(Node::new(server, Location::synthetic()));
         }
     }

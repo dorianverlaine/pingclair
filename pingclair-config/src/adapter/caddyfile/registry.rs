@@ -142,6 +142,7 @@ pub(super) static GLOBAL_OPTIONS: &[Spec] = &[
     implemented("https_port"),
     implemented("log"),
     implemented("metrics"),
+    implemented("order"),
     implemented("protocols"),
     implemented("trusted_proxies"),
     // MARK: - Recognised, not implemented
@@ -164,7 +165,6 @@ pub(super) static GLOBAL_OPTIONS: &[Spec] = &[
     recognised("ocsp_interval"),
     recognised("ocsp_stapling"),
     recognised("on_demand_tls"),
-    recognised("order"),
     recognised("persist_config"),
     recognised("pki"),
     recognised("preferred_chains"),

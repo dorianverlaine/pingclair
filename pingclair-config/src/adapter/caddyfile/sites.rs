@@ -12,6 +12,7 @@ use super::matchers::{
     parse_matcher_and_block, parse_matcher_definition, parse_route_matcher_and_block,
 };
 use super::options::is_wildcard_host;
+use super::order::DirectiveOrder;
 use super::tls::adapt_tls_directive;
 use crate::parser::ast::*;
 use crate::parser::caddy_ast::Directive;
@@ -40,7 +41,10 @@ pub(super) fn is_valid_mime_pattern(pattern: &str) -> bool {
     }
 }
 
-pub(super) fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
+pub(super) fn adapt_server(
+    d: Directive,
+    order: &DirectiveOrder,
+) -> Result<ServerBlock, AdapterError> {
     // 🏷️ Caddy separates multiple site addresses with commas; the lexer keeps
     // the comma attached to the token, so strip it before parsing.
     let strip_comma = |addr: &str| addr.trim_end_matches(',').to_string();
@@ -479,7 +483,7 @@ pub(super) fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
         // order does not change behavior: `header` always runs before
         // `respond`, `basic_auth` before `file_server`, and so on. Sorting
         // the default pipeline here reproduces that guarantee.
-        default_handlers.sort_by_key(caddy_handler_rank);
+        default_handlers.sort_by_key(|handler| caddy_handler_rank(order, handler));
 
         let final_handler = if default_handlers.len() == 1 {
             default_handlers[0].clone()
@@ -545,27 +549,39 @@ pub(super) fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
 /// 🧭 Maps a handler to its position in Caddy's default directive order.
 /// Handlers that only modify the request/response run early; handlers that
 /// write a terminal response run late.
-pub(super) fn caddy_handler_rank(handler: &Handler) -> usize {
+/// 🏷️ The directive a compiled handler came from.
+///
+/// Ordering is defined over directive *names*, and by the time a site is
+/// assembled all that is left is the handler each one produced. This is the
+/// bridge, and it is deliberately a small, dumb mapping — the moment it starts
+/// deciding anything, the order stops being data.
+pub(super) fn handler_directive_name(handler: &Handler) -> &'static str {
     match handler {
-        Handler::Headers(_) => 0,
-        Handler::Redirect(_) => 1,
-        Handler::Rewrite(_) => 2,
-        Handler::BasicAuth(_) => 3,
-        Handler::RateLimit(_) | Handler::Cors(_) | Handler::AccessControl(_) => 4,
-        Handler::Templates => 5,
-        Handler::Pipeline(_) | Handler::Handle(_) => 6,
-        // 🧭 Caddy's directive order runs `respond` before `reverse_proxy`
-        // before `file_server`, and the pipeline stops at the first handler
-        // that answers, so the execution order is Caddy's priority order.
-        Handler::Respond(_) => 7,
-        Handler::Proxy(_) => 8,
-        Handler::FileServer(_) => 9,
-        Handler::Plugin { .. } => 10,
+        Handler::Headers(_) => "header",
+        Handler::Redirect(_) => "redir",
+        Handler::Rewrite(_) => "rewrite",
+        Handler::BasicAuth(_) => "basic_auth",
+        Handler::Templates => "templates",
+        Handler::Handle(_) => "handle",
+        Handler::Pipeline(_) => "route",
+        Handler::Respond(_) => "respond",
+        Handler::Proxy(_) => "reverse_proxy",
+        Handler::FileServer(_) => "file_server",
+        // 🧭 Three of ours with no counterpart in the shared order. They are
+        // middleware that guards what follows, so they belong with the other
+        // guards — beside `basic_auth`, which is the one they most resemble.
+        Handler::RateLimit(_) | Handler::Cors(_) | Handler::AccessControl(_) => "basic_auth",
+        // 🚫 A plugin is unranked on purpose: nothing here knows what it does,
+        // and unranked sorts last, after every handler that answers.
+        Handler::Plugin { .. } => "",
     }
 }
 
-/// 🧭 Matcher specificity for same-name route ordering: longer path patterns
-/// win, and an exact pattern beats a glob of the same length.
+/// 🔢 Where a handler sits in the chain, under the order this configuration uses.
+pub(super) fn caddy_handler_rank(order: &DirectiveOrder, handler: &Handler) -> usize {
+    order.rank(handler_directive_name(handler))
+}
+
 pub(super) fn route_specificity(matcher: &Option<Matcher>) -> (usize, usize) {
     let Some(matcher) = matcher else {
         return (0, 0);

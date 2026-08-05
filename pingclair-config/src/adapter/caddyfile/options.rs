@@ -50,6 +50,11 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                         ));
                     }
                 }
+                // 🔢 Consumed before any site is adapted, in `adapt_from`,
+                // because the order has to exist before the first site uses it.
+                // Accepted (and already validated) here so it does not fall
+                // through to the unknown-option arm.
+                "order" => {}
                 "debug" => {
                     // 🚩 `debug fales` used to parse as "debug off": a typo
                     // silently disabled the very diagnostics being asked for.
