@@ -2641,6 +2641,13 @@ impl PingclairProxy {
                             if let Some(etag) = &stream.etag {
                                 header.insert_header("ETag", etag.clone()).unwrap();
                             }
+                            // 🧊 A streamed response is the uncompressed variant of a
+                            // resource that compression could have encoded. Without this a
+                            // shared cache stores it as if it were the only variant and
+                            // then serves it to a client that asked for gzip.
+                            if stream.vary_accept_encoding {
+                                header.insert_header("Vary", "Accept-Encoding").unwrap();
+                            }
                             header.insert_header("Accept-Ranges", "bytes").unwrap();
                             Self::apply_local_response_headers(&mut header, ctx)?;
 
@@ -2688,6 +2695,12 @@ impl PingclairProxy {
                                 header
                                     .insert_header("Content-Encoding", encoding.as_str())
                                     .unwrap();
+                            }
+                            // 🧊 Announced whenever compression is enabled, not only when
+                            // this response was compressed. The header describes the
+                            // *resource*, so omitting it on the identity copy is what lets
+                            // a cache hand that copy to a client expecting gzip.
+                            if file.vary_accept_encoding {
                                 header.insert_header("Vary", "Accept-Encoding").unwrap();
                             }
                             header.insert_header("Accept-Ranges", "bytes").unwrap();
