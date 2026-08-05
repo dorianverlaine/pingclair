@@ -17,6 +17,15 @@ fact.
 Everything below is on `main` and unreleased; the workspace reports
 `0.2.0-dev`. The scope is large because it covers 173 commits since `v0.1.7`.
 
+### 🚫 Non-goals for 0.2.0
+
+What this release deliberately does **not** try to do. A release with 51
+entries and no stated non-goals has no edge: every plausible idea is still
+inside the scope, so nothing can be finished. Naming what is out is what
+lets the rest converge.
+
+- TBD — Dorian to fill in during scope cut
+
 ### ⚠️ Breaking
 
 - 🔐 **A bare hostname site now derives an HTTPS listener.** Writing a site
