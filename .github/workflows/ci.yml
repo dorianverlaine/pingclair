@@ -89,10 +89,51 @@ jobs:
         # alongside the websocket flake and the old single-name check
         # reported red without either being diagnosed). The test source is
         # never modified for this.
+        #
+        # ⏳ Every entry carries the ISO date it was admitted, and expires
+        # after 30 days. An allowlist with no expiry only ever grows: each
+        # entry is added in a hurry with a good reason, nothing ever forces
+        # anyone to revisit it, and the set of tests CI is allowed to ignore
+        # ratchets upward forever. The expiry is what makes the entry come
+        # back and ask to be justified again. Renewing an entry means
+        # changing its date deliberately, which is a decision someone makes
+        # rather than a default that holds by silence.
         run: |
+          # 🗓️ Format is "<test name> <YYYY-MM-DD admitted>", one per line.
+          # The date is when this entry was last deliberately admitted, not
+          # when the flake was first seen: renewing it is an act, and the
+          # act is editing this date.
           known_flaky=(
-            "test_websocket_upgrade_tunnels_bytes_in_both_directions"
+            "test_websocket_upgrade_tunnels_bytes_in_both_directions 2026-08-01"
           )
+
+          # ⏳ Expiry runs before the suite, not after, so a stale entry
+          # fails the job even on a fully green run. Checking it only on
+          # failure would mean the allowlist is audited exactly when nobody
+          # is looking at it.
+          max_age_days=30
+          now_epoch="$(date -u +%s)"
+          stale=0
+          for entry in "${known_flaky[@]}"; do
+            flaky_name="${entry%% *}"
+            flaky_date="${entry##* }"
+            if ! entry_epoch="$(date -u -d "${flaky_date}" +%s 2>/dev/null)"; then
+              echo "::error::known_flaky entry '${flaky_name}' has an unparseable date '${flaky_date}'; the format is '<test name> <YYYY-MM-DD>'"
+              stale=1
+              continue
+            fi
+            age_days=$(( (now_epoch - entry_epoch) / 86400 ))
+            if [ "$age_days" -gt "$max_age_days" ]; then
+              echo "::error::known_flaky entry '${flaky_name}' was admitted ${flaky_date}, ${age_days} days ago, past the ${max_age_days}-day limit. A flake that has survived 30 days is a bug, not a flake: it is reproducible enough to keep happening and nobody has found the cause. Fix it, or re-admit it deliberately by moving its date and writing down what was investigated."
+              stale=1
+            else
+              echo "🎲 known flake '${flaky_name}' admitted ${flaky_date} (${age_days}d old, expires at ${max_age_days}d)"
+            fi
+          done
+          if [ "$stale" -ne 0 ]; then
+            exit 1
+          fi
+
           max_attempts=3
           attempt=0
           log="/tmp/cargo-test.log"
@@ -112,12 +153,15 @@ jobs:
             fi
             # 🎲 The retry condition: every failed test must be in the
             # known-flaky set. Anything else is a real failure.
+            # 🧩 The entry is "<name> <date>", so the name is everything
+            # before the first space — comparing against the whole entry
+            # would match nothing and quietly turn the retry off.
             flaky_only=1
             while IFS= read -r test_name; do
               [ -z "$test_name" ] && continue
               match=0
               for known in "${known_flaky[@]}"; do
-                if [ "$test_name" = "$known" ]; then
+                if [ "$test_name" = "${known%% *}" ]; then
                   match=1
                 fi
               done
