@@ -1,0 +1,201 @@
+api.example {
+	reverse_proxy /v1/* {
+		to 10.0.1.1:8080 10.0.1.2:8080
+		lb_policy round_robin
+		header_up X-Forwarded-Host {host}
+		health_check {
+			path /healthz
+			interval 10s
+			timeout 2s
+		}
+	}
+}
+----------
+{
+  "debug": false,
+  "servers": [
+    {
+      "name": "api.example",
+      "names": [
+        "api.example"
+      ],
+      "bind": null,
+      "listen": [],
+      "proxy_protocol_listen": [],
+      "tls": {
+        "auto": true,
+        "internal": false,
+        "cert": null,
+        "key": null,
+        "acme_email": null,
+        "http3": false
+      },
+      "routes": [
+        {
+          "path": "/v1/*",
+          "handler": {
+            "type": "reverse_proxy",
+            "upstreams": [
+              "10.0.1.1:8080",
+              "10.0.1.2:8080"
+            ],
+            "upstream_options": [
+              {
+                "address": "10.0.1.1:8080",
+                "weight": 1,
+                "backup": false
+              },
+              {
+                "address": "10.0.1.2:8080",
+                "weight": 1,
+                "backup": false
+              }
+            ],
+            "load_balance": {
+              "strategy": "round_robin"
+            },
+            "health_check": {
+              "path": "/healthz",
+              "interval": 10,
+              "timeout": 2,
+              "threshold": 3,
+              "method": "GET",
+              "host": null,
+              "headers": {},
+              "expected_statuses": [
+                200
+              ],
+              "expected_body": null,
+              "port": null,
+              "consecutive_success": 1,
+              "consecutive_failure": 3,
+              "reuse_connection": false,
+              "max_response_body_bytes": 65536,
+              "slow_start_ms": 0
+            },
+            "headers_up": {
+              "X-Forwarded-Host": "{host}"
+            },
+            "headers_down": {},
+            "flush_interval": null,
+            "read_timeout": null,
+            "write_timeout": null,
+            "connect_timeout": null,
+            "first_byte_timeout": null,
+            "between_reads_timeout": null,
+            "retry": {
+              "max_attempts": 16,
+              "total_timeout_ms": null,
+              "backoff_ms": 0,
+              "status_codes": [],
+              "methods": [
+                "GET",
+                "HEAD",
+                "OPTIONS",
+                "TRACE",
+                "PUT",
+                "DELETE"
+              ]
+            },
+            "overload": {
+              "max_in_flight": null,
+              "max_pending": 0,
+              "pending_timeout_ms": 1000,
+              "upstream_max_connections": null
+            },
+            "circuit_breaker": {
+              "consecutive_failures": null,
+              "error_rate_percent": null,
+              "minimum_requests": 20,
+              "window_requests": 100,
+              "open_duration_ms": 30000,
+              "half_open_requests": 1,
+              "failure_statuses": []
+            },
+            "upstream_tls": {
+              "enable": false,
+              "server_name": null,
+              "trusted_ca_certs": [],
+              "client_cert": null,
+              "client_key": null,
+              "insecure_skip_verify": false
+            },
+            "cache": null
+          },
+          "methods": null,
+          "matcher": {
+            "path": {
+              "patterns": [
+                "/v1/*"
+              ]
+            }
+          }
+        }
+      ],
+      "log": null,
+      "client_max_body_size": 1048576,
+      "limits": {
+        "header_timeout_ms": null,
+        "body_timeout_ms": null,
+        "idle_timeout_ms": null,
+        "request_timeout_ms": null,
+        "max_header_count": null,
+        "max_header_bytes": null,
+        "max_connections": null,
+        "upload_bytes_per_sec": null,
+        "download_bytes_per_sec": null,
+        "long_connections": {
+          "idle_timeout_ms": null,
+          "request_timeout_ms": null
+        }
+      },
+      "security": {
+        "enabled": false,
+        "x_frame_options": "",
+        "x_content_type_options": "",
+        "x_xss_protection": "",
+        "x_permitted_cross_domain": "",
+        "referrer_policy": "",
+        "permissions_policy": "",
+        "hsts": null,
+        "csp": null
+      },
+      "gzip_types": [
+        "text/*",
+        "application/json",
+        "application/*+json",
+        "application/x-ndjson",
+        "application/json-seq",
+        "application/xml",
+        "application/*+xml",
+        "application/javascript",
+        "application/x-javascript",
+        "image/svg+xml"
+      ],
+      "encodings": [
+        "gzip"
+      ],
+      "error_pages": {}
+    }
+  ],
+  "admin": null,
+  "global": {
+    "email": null,
+    "http_port": 80,
+    "https_port": 443,
+    "metrics": true,
+    "auto_https": "on",
+    "blocked_ips": [],
+    "trusted_proxies": [],
+    "upstream_keepalive_pool_size": null,
+    "http3": true,
+    "worker_threads": null,
+    "dns_refresh_secs": 30,
+    "grace_period_secs": null
+  },
+  "logging": {
+    "level": "",
+    "format": "",
+    "file": null
+  }
+}
