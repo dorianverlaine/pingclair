@@ -880,6 +880,28 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                         "reverse_proxy" => {
                             handler_d.args.first().is_some_and(|a| a.starts_with('/'))
                         }
+                        // 🎯 `respond /admin "nope" 403` — the same shape, and the
+                        // one where getting it wrong is worst. Without this the
+                        // path became the response *body*, so
+                        // `respond /first "first wins"` answered every request
+                        // with the string `/first`, and a later
+                        // `respond "catch all"` was unreachable. Day 26 measured
+                        // it against Caddy 2.11.4, which answers `first wins`.
+                        // A glob was already handled; an exact path was not, which
+                        // is why this looked like it worked.
+                        //
+                        // 📌 Two arguments minimum, deliberately. Quoting is lost
+                        // by the time we see the tokens, so a lone
+                        // `respond /health` is ambiguous between "match /health,
+                        // empty 200" (Caddy) and "body is the text /health". The
+                        // narrow reading only reinterprets the form where a body
+                        // is present, which cannot silently change an existing
+                        // configuration's response text.
+                        "respond" => {
+                            handler_d.args.len() >= 2
+                                && handler_d.args[0].starts_with('/')
+                                && handler_d.args[0].parse::<u16>().is_err()
+                        }
                         _ => false,
                     };
                     if inline_path_matcher {
