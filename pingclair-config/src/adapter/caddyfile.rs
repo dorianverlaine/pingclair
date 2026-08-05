@@ -50,7 +50,9 @@ type SnippetCollection = (SnippetMap, Vec<Directive>);
 
 /// Collect snippet `(name) { ... }` definitions from top-level directives
 /// and return (snippets_map, remaining_directives).
-fn collect_snippets(directives: Vec<Directive>) -> Result<SnippetCollection, AdapterError> {
+pub(crate) fn collect_snippets(
+    directives: Vec<Directive>,
+) -> Result<SnippetCollection, AdapterError> {
     let mut snippets = SnippetMap::new();
     let mut remaining = Vec::new();
 
@@ -68,57 +70,31 @@ fn collect_snippets(directives: Vec<Directive>) -> Result<SnippetCollection, Ada
     Ok((snippets, remaining))
 }
 
-/// Recursively expand `import snippet_name` directives.
-///
-/// 🛑 SAFETY: Tracks expansion depth to prevent infinite recursion
-/// from circular snippet references (limit: 16).
-fn expand_imports(
-    directives: Vec<Directive>,
-    snippets: &HashMap<String, Vec<Directive>>,
-    depth: usize,
-) -> Result<Vec<Directive>, AdapterError> {
-    if depth > 16 {
-        return Err(AdapterError::RecursiveSnippet("nesting too deep".into()));
-    }
-
-    let mut result = Vec::new();
-    for d in directives {
-        if d.name == "import" {
-            if let Some(name) = d.args.first() {
-                let body = snippets
-                    .get(name)
-                    .ok_or_else(|| AdapterError::UndefinedSnippet(name.clone()))?;
-                // Recursively expand in case the snippet itself imports others
-                let expanded = expand_imports(body.clone(), snippets, depth + 1)?;
-                result.extend(expanded);
-            }
-        } else {
-            // Recursively expand imports inside blocks
-            let expanded_block = if let Some(block) = d.block {
-                let expanded_body = expand_imports(block.directives, snippets, depth + 1)?;
-                Some(Block {
-                    directives: expanded_body,
-                })
-            } else {
-                None
-            };
-            result.push(Directive {
-                name: d.name,
-                args: d.args,
-                block: expanded_block,
-            });
-        }
-    }
-    Ok(result)
-}
-
 // MARK: - Main Adapter (Pass 2)
 
 /// Convert generic directives to Typed AST
 pub fn adapt(directives: Vec<Directive>) -> Result<Ast, AdapterError> {
+    adapt_from(directives, None)
+}
+
+/// 📦 Adapts directives, resolving relative `import` paths against `base`.
+///
+/// `base` is the directory of the file these directives were read from. `None`
+/// means they did not come from a file, and a relative import then has nothing
+/// to be relative to — which is refused rather than quietly resolved against
+/// whatever directory the process happens to be in.
+pub fn adapt_from(
+    directives: Vec<Directive>,
+    base: Option<&std::path::Path>,
+) -> Result<Ast, AdapterError> {
     // Pass 1: Snippet collection + import expansion
     let (snippets, remaining) = collect_snippets(directives)?;
-    let expanded = expand_imports(remaining, &snippets, 0)?;
+    // 📦 Snippets, files, globs, arguments and cycle detection all live in
+    // `super::imports` now; the old expansion only knew about snippets, so
+    // `import ./part.conf` failed with "undefined snippet" — a message about the
+    // wrong concept entirely.
+    let mut context = super::imports::ImportContext::new(base);
+    let expanded = super::imports::expand(remaining, &snippets, &mut context)?;
     let expanded = coalesce_bare_single_site(expanded)?;
 
     // Pass 2: Convert to typed AST

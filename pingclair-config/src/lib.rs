@@ -57,14 +57,21 @@ pub fn compile_named(
     source: &str,
     name: Option<&Path>,
 ) -> Result<PingclairConfig, FullCompileError> {
-    // 🧩 Parse and analyze the human-readable configuration.
-    let ast = parse_and_analyze(source).map_err(|error| match name {
-        Some(path) => FullCompileError::InFile {
-            path: path.display().to_string(),
-            source: Box::new(error.into()),
-        },
-        None => error.into(),
-    })?;
+    // 🧩 Parse and analyze the human-readable configuration. The file's own
+    // directory goes with it, because a relative `import` resolves against the
+    // importing file rather than the working directory — a configuration that
+    // works when started from its own directory and fails from anywhere else is
+    // worse than one that never worked.
+    let ast =
+        parser::compile_from(source, name.and_then(|p| p.parent())).map_err(
+            |error| match name {
+                Some(path) => FullCompileError::InFile {
+                    path: path.display().to_string(),
+                    source: Box::new(error.into()),
+                },
+                None => error.into(),
+            },
+        )?;
 
     // 🏗️ Compile the typed tree and enforce cross-field invariants.
     let config = compile_ast(&ast)?;
@@ -135,9 +142,11 @@ fn compile_file_unvalidated(path: &Path) -> Result<PingclairConfig, FullCompileE
         // 📍 Named, because this is the path where the name matters most: a
         // directory configuration reports one line number out of several files,
         // and without the name the operator has to guess which.
-        let ast = parser::compile(&source).map_err(|error| FullCompileError::InFile {
-            path: path.display().to_string(),
-            source: Box::new(error.into()),
+        let ast = parser::compile_from(&source, path.parent()).map_err(|error| {
+            FullCompileError::InFile {
+                path: path.display().to_string(),
+                source: Box::new(error.into()),
+            }
         })?;
         Ok(
             compiler::compile_ast(&ast).map_err(|error| FullCompileError::InFile {

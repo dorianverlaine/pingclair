@@ -28,11 +28,19 @@ pub use crate::adapter::caddyfile::{AdapterError, adapt};
 
 /// 🔎 Parses and analyzes Pingclair DSL source text.
 pub fn compile(source: &str) -> Result<ast::Ast, CompileError> {
+    compile_from(source, None)
+}
+
+/// 📦 Compiles a source, resolving relative `import` paths against `base`.
+pub fn compile_from(
+    source: &str,
+    base: Option<&std::path::Path>,
+) -> Result<ast::Ast, CompileError> {
     // 1. Parse into generic directives (Caddyfile AST)
     let directives = parse(source)?;
 
     // 2. Adapt into intermediate Typed AST
-    let typed_ast = adapt(directives)?;
+    let typed_ast = crate::adapter::caddyfile::adapt_from(directives, base)?;
 
     // 3. Semantic analysis (validation, etc.)
     // Note: SemanticAnalyzer might need updates for new AST structure if changed

@@ -4,6 +4,9 @@
 //! Configuration adapters
 
 pub mod caddyfile;
+// 📦 `import` in its own module: a self-contained concern, and one fewer thing
+// in a file that is already too large to navigate.
+pub mod imports;
 pub mod json;
 
 pub use caddyfile::{AdapterError, adapt};
