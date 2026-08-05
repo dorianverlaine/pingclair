@@ -35,6 +35,23 @@ pub(super) fn adapt_tls_directive(d: &Directive) -> Result<TlsDirective, Adapter
                             .unwrap_or(true),
                     );
                 }
+                // 🚫 TLS options the format defines and this crate does not
+                // implement. Almost all of them belong to two subsystems we do
+                // not have — certificate issuance beyond the built-in local
+                // authority, and mutual TLS — so the honest answer is to name
+                // the feature rather than the word.
+                //
+                // 📌 Getting this wrong is worse here than elsewhere: an
+                // operator debugging why `client_auth` did nothing, told the
+                // word is unknown, will assume they misspelled a TLS setting
+                // and go looking for the right spelling of a feature that does
+                // not exist.
+                name if is_known_tls_option(name) => {
+                    return Err(AdapterError::UnsupportedFeature(
+                        format!("tls {name}"),
+                        "Pingclair does not implement this TLS option yet".into(),
+                    ));
+                }
                 _ => return Err(AdapterError::UnknownDirective(format!("tls: {}", sub.name))),
             }
         }
@@ -73,4 +90,40 @@ pub(super) fn adapt_tls_directive(d: &Directive) -> Result<TlsDirective, Adapter
     }
 
     Ok(tls)
+}
+
+/// 🧾 TLS block options the format defines, whether or not we implement them.
+///
+/// Two clusters, and neither is a small gap: certificate issuance beyond the
+/// built-in local authority (`issuer`, `ca`, `eab`, `dns` and its timers,
+/// `on_demand`, `get_certificate`), and mutual TLS (`client_auth`). Both are
+/// subsystems rather than options, which is exactly why they need to be told
+/// apart from a misspelling.
+fn is_known_tls_option(name: &str) -> bool {
+    matches!(
+        name,
+        "protocols"
+            | "ciphers"
+            | "curves"
+            | "client_auth"
+            | "alpn"
+            | "load"
+            | "ca"
+            | "ca_root"
+            | "key_type"
+            | "eab"
+            | "issuer"
+            | "get_certificate"
+            | "dns"
+            | "resolvers"
+            | "propagation_delay"
+            | "propagation_timeout"
+            | "dns_ttl"
+            | "dns_challenge_override_domain"
+            | "on_demand"
+            | "reuse_private_keys"
+            | "insecure_secrets_log"
+            | "renewal_window_ratio"
+            | "force_automate"
+    )
 }
