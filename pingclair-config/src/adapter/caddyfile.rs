@@ -847,9 +847,41 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                 "header" => {
                     // Caddy `header` directive at server level:
                     //   header @matcher Key "Value"
+                    //   header /path Key "Value"
                     //   header { -Server ... }
-                    let handler = adapt_header_directive(&sub_d)?;
-                    let (matcher, _) = parse_matcher_and_block(&sub_d)?;
+                    //
+                    // 🔴 The exact-path form used to *compile* into nonsense. The
+                    // generic matcher check only accepts a leading slash when it
+                    // also carries a glob, so `header /exact X-Test scoped` left
+                    // `/exact` in the argument list, where the field name is read
+                    // from — producing `set: { "/exact": "X-Test" }`, a header
+                    // whose name is not a legal header name, and a request that
+                    // got no response at all. The correct answer is 200 with
+                    // `x-test: scoped`.
+                    //
+                    // 🎯 No argument-count condition is needed to disambiguate: an
+                    // HTTP field name cannot contain `/`, so a leading slash in
+                    // the first position is unambiguously a matcher, which is why
+                    // the reference grammar has no such condition either.
+                    //
+                    // 🧹 Stopgap. The matcher token should be stripped generically,
+                    // before any directive's parser runs, so that this question
+                    // never reaches the directive at all. Day 26f replaces the
+                    // per-directive handling with that one rule and deletes
+                    // this branch.
+                    let mut header_d = sub_d.clone();
+                    let inline_path = header_d
+                        .args
+                        .first()
+                        .is_some_and(|a| a.starts_with('/'))
+                        .then(|| header_d.args.remove(0));
+                    let handler = adapt_header_directive(&header_d)?;
+                    let matcher = match inline_path {
+                        Some(path) => Some(Matcher::Path(PathMatcher {
+                            patterns: vec![path],
+                        })),
+                        None => parse_matcher_and_block(&sub_d)?.0,
+                    };
                     if matcher.is_some() {
                         add_route(&mut server, matcher, handler);
                     } else {
@@ -886,14 +918,14 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                         // `respond /first "first wins"` answered every request
                         // with the string `/first`, and a later
                         // `respond "catch all"` was unreachable. Day 26 measured
-                        // it against Caddy 2.11.4, which answers `first wins`.
+                        // it: the correct answer is `first wins`.
                         // A glob was already handled; an exact path was not, which
                         // is why this looked like it worked.
                         //
                         // 📌 Two arguments minimum, deliberately. Quoting is lost
                         // by the time we see the tokens, so a lone
                         // `respond /health` is ambiguous between "match /health,
-                        // empty 200" (Caddy) and "body is the text /health". The
+                        // empty 200" and "the body is the text /health". The
                         // narrow reading only reinterprets the form where a body
                         // is present, which cannot silently change an existing
                         // configuration's response text.
@@ -4453,6 +4485,42 @@ mod fail_closed_tests {
         assert!(
             error.contains("roll_sizes"),
             "the offending subdirective must be named; got {error}"
+        );
+    }
+
+    /// 🎯 `header /path Field value` scopes the header to that path.
+    ///
+    /// The exact-path form used to *compile* into nonsense: the path stayed in
+    /// the argument list, where the field name is read from, producing a header
+    /// literally named `/exact` with the field name as its value and the real
+    /// value dropped. That name is not a legal header name, so the request got
+    /// no response at all — a configuration that validated cleanly and then
+    /// could not serve.
+    ///
+    /// No argument-count condition disambiguates this, and none is needed: an
+    /// HTTP field name cannot contain `/`.
+    #[test]
+    fn header_takes_an_exact_path_matcher() {
+        let config = crate::compile(
+            r#"example.com {
+                header /exact X-Test scoped
+                respond "body"
+            }"#,
+        )
+        .expect("must compile");
+        let scoped = config.servers[0]
+            .routes
+            .iter()
+            .find(|r| r.matcher.is_some())
+            .expect("the path must become a matcher, not a field name");
+        let rendered = format!("{:?}", scoped.handler);
+        assert!(
+            rendered.contains("X-Test") && rendered.contains("scoped"),
+            "the field and its value must both survive: {rendered}"
+        );
+        assert!(
+            !rendered.contains("\"/exact\""),
+            "the path must not become a header name: {rendered}"
         );
     }
 

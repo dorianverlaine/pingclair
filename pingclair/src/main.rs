@@ -2117,12 +2117,14 @@ fn run_server(
     // So the configured grace belongs in the sleep, and the teardown budget
     // stays at Pingora's own small default.
     //
-    // 🚧 This is not yet Caddy's behaviour and must not be described as such.
-    // Caddy exits as soon as the last in-flight request finishes — bounded by
-    // work remaining, not by a clock — and neither knob expresses that. Day 26
-    // also measured that the sleep window does not by itself keep a large
-    // download alive, so something in the service layer ends the connection
-    // first. Until that is found, this bounds the damage rather than fixing it.
+    // 🚧 A bounded window is a deliberate choice, not the finished behaviour, and
+    // must not be described as "graceful shutdown works". The alternative —
+    // exiting as soon as the last in-flight request finishes, bounded by work
+    // remaining rather than by a clock — is not expressible with the knobs the
+    // transport exposes. Day 26 also measured that the sleep window does not by
+    // itself keep a large download alive, so something in the service layer ends
+    // the connection first. Until that is found, this bounds the damage rather
+    // than fixing it.
     server_conf.grace_period_seconds = Some(grace_period_secs);
     tracing::info!(
         "🚰 Shutdown grace period: {}s{}",

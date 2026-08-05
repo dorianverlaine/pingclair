@@ -6,7 +6,7 @@
 //! `pingclair-static` had its own `header.contains("gzip")`. Day 26 measured
 //! the consequence on a clean Linux box: a client sending
 //! `Accept-Encoding: gzip;q=0` — "I explicitly do not want gzip" — received a
-//! gzip-encoded response, while Caddy 2.11.4 sent the file uncompressed.
+//! gzip-encoded response, where the correct answer is the file uncompressed.
 //!
 //! Only the part that was wrong lives here: reading quality values out of the
 //! header. Each caller still owns which codings it offers and in what order,
@@ -106,7 +106,7 @@ mod tests {
 
     const BOTH: &[&str] = &["zstd", "gzip"];
 
-    /// 🚫 The case Day 26 measured against Caddy 2.11.4: `q=0` is a refusal,
+    /// 🚫 The case Day 26 measured: `q=0` is a refusal,
     /// and the old `header.contains("gzip")` answered it with gzip.
     #[test]
     fn q_zero_is_a_refusal() {

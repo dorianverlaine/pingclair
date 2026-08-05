@@ -193,9 +193,9 @@ pub struct ServedFile {
     /// True whenever compression is enabled for this file server, **not only
     /// when this particular response was compressed**. A shared cache that
     /// stores the identity copy without being told this will hand it to a
-    /// client that would have received gzip, and vice versa. Caddy sets the
-    /// header on both variants for exactly this reason; Day 26 measured that
-    /// we set it on neither of the uncompressed ones.
+    /// client that would have received gzip, and vice versa. The header belongs
+    /// on both variants for exactly this reason; Day 26 measured that we set it
+    /// on neither of the uncompressed ones.
     pub vary_accept_encoding: bool,
 }
 
@@ -971,11 +971,11 @@ impl FileServer {
     /// Picks the coding for a response, honouring the client's quality values.
     ///
     /// This used to be `header.contains("gzip")`. Day 26 measured what that
-    /// costs against Caddy 2.11.4: a client sending
-    /// `Accept-Encoding: gzip;q=0` — an explicit refusal — was answered with a
-    /// gzip body, because the refusal still contains the word. `contains` also
-    /// matched substrings, so a token merely embedding a coding name selected
-    /// it. Both are gone now that whole tokens and their `q` are read.
+    /// costs: a client sending `Accept-Encoding: gzip;q=0` — an explicit
+    /// refusal — was answered with a gzip body, because the refusal still
+    /// contains the word. `contains` also matched substrings, so a token merely
+    /// embedding a coding name selected it. Both are gone now that whole tokens
+    /// and their `q` are read.
     fn negotiate_encoding(accept_header: Option<&str>) -> Option<&'static str> {
         pingclair_core::encoding::negotiate(accept_header?, Self::OFFERED)
     }

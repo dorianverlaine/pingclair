@@ -992,9 +992,9 @@ fn request_authority(request: &RequestHeader) -> &str {
 /// 🛡️ This is a security fix, not cosmetics. A dual-stack listener — which is
 /// what `:8080` becomes — reports an IPv4 client as `::ffff:127.0.0.1`, and an
 /// IPv4 CIDR does not contain an IPv6 address. Day 26 measured what that costs:
-/// with `@blocked remote_ip 127.0.0.0/8` and `respond @blocked 403`, Caddy
-/// answered 403 and we answered **200**. Every deny rule written with an IPv4
-/// range silently did nothing.
+/// with `@blocked remote_ip 127.0.0.0/8` and `respond @blocked 403`, the
+/// correct answer is 403 and we answered **200**. Every deny rule written with
+/// an IPv4 range silently did nothing.
 ///
 /// Normalising here, where the address is first read, means the matcher, the
 /// access log, `X-Forwarded-For` and `{remote_host}` all see one canonical form
@@ -1036,7 +1036,7 @@ mod canonical_client_ip_tests {
     /// 🛡️ The measured failure: a dual-stack listener reports an IPv4 client as
     /// `::ffff:a.b.c.d`, and an IPv4 CIDR does not contain an IPv6 address, so
     /// `@blocked remote_ip 127.0.0.0/8` matched nothing and a deny rule became a
-    /// no-op. Caddy answered 403 to the same configuration; we answered 200.
+    /// no-op: the same configuration must answer 403, and we answered 200.
     #[test]
     fn an_ipv4_mapped_address_becomes_plain_ipv4() {
         let mapped = IpAddr::V6("::ffff:127.0.0.1".parse::<Ipv6Addr>().unwrap());
@@ -2589,9 +2589,9 @@ impl PingclairProxy {
                         .unwrap();
                 }
                 // 🏷️ The body is a template, exactly like a redirect target:
-                // `respond "hello {host}"` is ordinary Caddy. It used to be
+                // `respond "hello {host}"` is ordinary syntax. It used to be
                 // written out verbatim, so Day 26 measured `v={host}` reaching
-                // the client where Caddy sent `v=probe.example`.
+                // the client where the value belonged: `v=probe.example`.
                 // 🔒 Scoped so the borrow of `session` ends here: the resolved
                 // value is copied into `Bytes` (which the write needed anyway,
                 // so this costs nothing extra) and `session` is free to be
@@ -2949,9 +2949,9 @@ impl PingclairProxy {
                 }
             }
             HandlerConfig::Headers { set, add, remove } => {
-                // 🏷️ `header X-Trace {host}` is ordinary Caddy, and the value used
+                // 🏷️ `header X-Trace {host}` is ordinary syntax, and the value used
                 // to reach the client verbatim — Day 26 measured `x-probe: {host}`
-                // where Caddy sent the hostname.
+                // where the hostname belonged.
                 //
                 // Resolved here, as the value enters the request, rather than at
                 // write time: this is the one place that has both the configured
@@ -3670,9 +3670,10 @@ fn resolve_single_placeholder(
                 .unwrap_or(&"")
                 .to_string()
         }
-        // 🧭 Caddy spells the client address `{remote_host}`; `{remote_ip}` is
-        // ours. Both resolve to the *verified* address, never to the raw socket
-        // peer, so an untrusted `X-Forwarded-For` cannot forge it.
+        // 🧭 `{remote_host}` is the portable spelling of the client address and
+        // `{remote_ip}` is ours. Both resolve to the *verified* address, never
+        // to the raw socket peer, so an untrusted `X-Forwarded-For` cannot
+        // forge it.
         "remote_ip" | "remote_host" | "http.request.remote.host" => {
             verified_client_ip.unwrap_or("").to_string()
         }
