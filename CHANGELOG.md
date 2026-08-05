@@ -127,6 +127,26 @@ Everything below is on `main` and unreleased; the workspace reports
 
 ### Fixed
 
+- **Shutdown cut off responses that were still being sent.** A `SIGTERM`
+  stopped the runtime after five seconds — Pingora's default, which nothing
+  here overrode — so anything slower than that was truncated mid-body. A
+  20 MiB download over a rate-limited link arrived as 4.1 MiB with status 200
+  and no error a client could distinguish from a network fault, and every
+  rolling restart did that to every transfer in progress. Shutdown now waits
+  for requests already in flight however long they take, matching Caddy, and
+  the new `grace_period` global option bounds the wait for operators who want
+  a restart to finish by a deadline.
+- **Log rotation written the way Caddy writes it did nothing.** Rotation
+  settings inside `output file <path> { … }` — `roll_size`, `roll_keep`,
+  `roll_keep_for` — were parsed and discarded, so a configuration carried over
+  from Caddy validated cleanly and then let the access log grow until the disk
+  filled. The settings now apply, and an unrecognised name inside that block is
+  an error that names it instead of silence.
+- **Access logs recorded no request headers.** Caddy's JSON log carries the
+  whole header map with sensitive values masked; ours carried none unless a
+  `headers { request … }` list named them. An empty list now means every
+  header, and a named list narrows rather than enables. Masking applies on both
+  paths.
 - **Only the leaf certificate was sent to clients.** Intermediates in a PEM
   bundle were parsed and discarded, so any client without the issuing CA
   cached locally failed to build a chain. Found on a public network path;
@@ -168,6 +188,13 @@ Everything below is on `main` and unreleased; the workspace reports
 
 ### Security
 
+- **The active-connection gauge was the one metric the cap missed.** The
+  ceiling below applied to every host-labelled metric except
+  `pingclair_active_connections`, which kept a series per distinct `Host`
+  header. Measured with 1600 distinct headers on a clean Linux box: every other
+  family stopped at 1025 series while this one reached 1600. The remote memory
+  exhaustion the cap was added to close therefore remained open through this
+  one metric until now.
 - **Metric labels taken from client input are capped.** The `host` label came
   straight from the `Host` header, and Prometheus keeps a separate time series
   per distinct value, so varied headers grew the process without bound — a
