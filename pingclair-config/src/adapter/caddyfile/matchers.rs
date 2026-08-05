@@ -3,7 +3,7 @@
 
 use super::AdapterError;
 use crate::parser::ast::*;
-use crate::parser::caddy_ast::{Block, Directive};
+use crate::parser::caddy_ast::{Block, Directive, TokenRun};
 
 // MARK: - Matchers
 
@@ -146,6 +146,9 @@ pub(super) fn parse_matcher_definition(d: &Directive) -> Result<Matcher, Adapter
             name: d.args[0].clone(),
             args: d.args[1..].to_vec(),
             block: None,
+            // 🧪 Re-dispatching one matcher's arguments as another directive.
+            // There is no such directive in the file, so there are no tokens.
+            tokens: TokenRun::synthetic(),
         };
         parse_single_matcher(&sub_directive)
     }
@@ -278,6 +281,7 @@ pub(super) fn parse_single_matcher_at(
                     name: name.clone(),
                     args: d.args[1..].to_vec(),
                     block: None,
+                    tokens: TokenRun::synthetic(),
                 };
                 parse_single_matcher_at(&nested, depth + 1)?
             };

@@ -1260,6 +1260,28 @@ mod fail_closed_tests {
         }
     }
 
+    /// 🎯 The first cursor-driven directive must agree with the string path it
+    /// replaced, including where the two deliberately disagree.
+    ///
+    /// A snippet argument is that case. `import comp gzip` substitutes `gzip`
+    /// into the directive's *text*, so the tokens in the file still say
+    /// `{args[0]}` while `args` says `gzip`. A cursor that read the tokens here
+    /// would report an unknown coding named `{args[0]}` — so a synthesised
+    /// directive carries no token run, and the parser falls back. This test
+    /// fails if that fallback is ever dropped.
+    #[test]
+    fn a_cursor_driven_directive_falls_back_for_substituted_arguments() {
+        let config = crate::compile(
+            "(comp) {\n    encode {args[0]}\n}\nexample.com {\n    import comp gzip\n}",
+        )
+        .expect("a snippet argument must reach `encode`");
+        assert_eq!(
+            config.servers[0].encodings,
+            &[pingclair_core::config::Encoding::Gzip],
+            "the substituted value must win over the token that spelled it"
+        );
+    }
+
     /// 👍 The unambiguous forms still compile — an empty 200 is expressible,
     /// it just has to be asked for.
     #[test]

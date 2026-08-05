@@ -5,10 +5,11 @@
 //!
 //! Consumes tokens and produces a Generic Directive AST.
 
-use crate::parser::caddy_ast::{Block, Directive};
+use crate::parser::caddy_ast::{Block, Directive, TokenRun};
 #[allow(unused_imports)]
 use crate::parser::lexer::LexResult;
 use crate::parser::lexer::{LexError, Location, Spanned, Token, tokenize};
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -33,19 +34,32 @@ pub enum ParseError {
     RecursionLimitExceeded,
 }
 
-pub struct Parser<'a> {
-    tokens: &'a [Spanned<Token>],
+pub struct Parser {
+    /// 📎 Shared so every directive can hold a window onto it without copying.
+    /// One reference count per directive replaces one `Vec` per directive.
+    tokens: Arc<[Spanned<Token>]>,
     position: usize,
     depth: usize,
 }
 
-impl<'a> Parser<'a> {
-    pub fn new(tokens: &'a [Spanned<Token>]) -> Self {
+impl Parser {
+    pub fn new(tokens: &[Spanned<Token>]) -> Self {
         Self {
-            tokens,
+            tokens: tokens.into(),
             position: 0,
             depth: 0,
         }
+    }
+
+    /// 📎 The window from `start` to the cursor, with any trailing newline
+    /// trimmed — a directive ends at its last real token, not at the line
+    /// break that happens to follow it.
+    fn run_since(&self, start: usize) -> TokenRun {
+        let mut end = self.position.min(self.tokens.len());
+        while end > start && matches!(self.tokens[end - 1].value, Token::Newline) {
+            end -= 1;
+        }
+        TokenRun::new(Arc::clone(&self.tokens), start, end)
     }
 
     /// Peek current token
@@ -90,14 +104,18 @@ impl<'a> Parser<'a> {
 
     /// Parse a single directive: Name [Args...] [Block]
     fn parse_directive(&mut self) -> Result<Directive, ParseError> {
+        let start = self.position;
+
         // 1. Check for global block start {
         if let Some(token) = self.peek()
             && matches!(token.value, Token::BlockOpen)
         {
+            let block = Some(self.parse_block()?);
             return Ok(Directive {
                 name: "".to_string(),
                 args: Vec::new(),
-                block: Some(self.parse_block()?),
+                block,
+                tokens: self.run_since(start),
             });
         }
 
@@ -183,7 +201,12 @@ impl<'a> Parser<'a> {
             }
         }
 
-        Ok(Directive { name, args, block })
+        Ok(Directive {
+            name,
+            args,
+            block,
+            tokens: self.run_since(start),
+        })
     }
 
     /// Parse a block: { directives... }

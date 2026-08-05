@@ -196,6 +196,20 @@ pub(super) fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                     server.root = Some(path.clone());
                 }
                 "compress" | "encode" => {
+                    // 🎯 The first directive reading its arguments from the
+                    // token cursor rather than from `args`.
+                    //
+                    // The behaviour is identical — this is a migration step, not
+                    // a change — but the shape is the one every directive is
+                    // moving to: ask the cursor for the arguments on this line,
+                    // and let it decide where the line ends. `args` stays
+                    // populated for the directives that have not moved yet, and
+                    // for a directive this adapter synthesised, which has no
+                    // tokens at all and falls back below.
+                    let args: Vec<String> = match sub_d.tokens.args_cursor() {
+                        Some(mut cursor) => cursor.remaining_arg_texts(),
+                        None => sub_d.args.clone(),
+                    };
                     // 🚫 A matcher token here asks for compression on some
                     // requests and not others, and compression is a property of
                     // the whole server: there is nowhere to record "gzip, but
@@ -203,7 +217,7 @@ pub(super) fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                     // matcher reaches the coding loop below and is reported as
                     // an unknown coding, which sends the operator looking for a
                     // typo in a token that is spelled exactly right.
-                    if let Some(first) = sub_d.args.first()
+                    if let Some(first) = args.first()
                         && (first.starts_with('/') || first.starts_with('@'))
                     {
                         return Err(AdapterError::UnsupportedFeature(
@@ -219,10 +233,10 @@ pub(super) fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                     // 🌐 `encode * gzip` names the matcher that matches
                     // everything, which is the same as naming none. Accept and
                     // drop it, exactly as `root * /srv` does above.
-                    let args = if sub_d.args.first().is_some_and(|a| a == "*") {
-                        &sub_d.args[1..]
+                    let args = if args.first().is_some_and(|a| a == "*") {
+                        &args[1..]
                     } else {
-                        &sub_d.args[..]
+                        &args[..]
                     };
                     // Caddy spells this `encode zstd gzip`, and argument order
                     // is meaningful: it is the server's preference order when
@@ -398,7 +412,7 @@ pub(super) fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                         .args
                         .first()
                         .is_some_and(|a| a.starts_with('/'))
-                        .then(|| header_d.args.remove(0));
+                        .then(|| header_d.drop_first_arg().unwrap_or_default());
                     let handler = adapt_header_directive(&header_d)?;
                     let matcher = match inline_path {
                         Some(path) => Some(Matcher::Path(PathMatcher {
@@ -424,7 +438,7 @@ pub(super) fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                     let inline_path_matcher = matcher.is_some()
                         && matches!(handler_d.args.first(), Some(arg) if arg.starts_with('/'));
                     if inline_path_matcher {
-                        let path = handler_d.args.remove(0);
+                        let path = handler_d.drop_first_arg().unwrap_or_default();
                         let route_matcher = Matcher::Path(PathMatcher {
                             patterns: vec![path.clone()],
                         });
@@ -438,13 +452,13 @@ pub(super) fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                     let wildcard_matcher = handler_d.name == "reverse_proxy"
                         && handler_d.args.first().is_some_and(|a| a == "*");
                     if wildcard_matcher {
-                        handler_d.args.remove(0);
+                        handler_d.drop_first_arg();
                     }
                     if matcher.is_some() {
                         if handler_d.args.is_empty() {
                             return Err(AdapterError::ArgumentCount(sub_d.name, 1, 0));
                         }
-                        handler_d.args.remove(0);
+                        handler_d.drop_first_arg();
                     }
 
                     let handler = adapt_handler(handler_d)?;

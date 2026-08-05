@@ -12,6 +12,9 @@ pub mod lexer;
 // tree parser above still drives the adapter, and callers move over one at a
 // time.
 pub mod server_block;
+// 🎯 The token cursor the directive parsers move onto, one at a time. It reads
+// segments, so it sits above `server_block` and below the adapter.
+pub mod dispenser;
 // 🧩 The nested name preserves the crate's existing public parser API.
 #[allow(clippy::module_inception)]
 pub mod parser;

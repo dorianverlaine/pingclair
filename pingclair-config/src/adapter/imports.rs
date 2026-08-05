@@ -193,6 +193,11 @@ fn substitute_args(directives: Vec<Directive>, args: &[String]) -> Vec<Directive
     directives
         .into_iter()
         .map(|d| Directive {
+            // 🚫 Deliberately no token run. Snippet arguments are substituted
+            // into the *text* here, so the tokens in the file say `{args[0]}`
+            // while `args` now says what it expanded to. A parser reading the
+            // tokens would see the placeholder and undo the expansion.
+            tokens: crate::parser::caddy_ast::TokenRun::synthetic(),
             name: replace(&d.name, args),
             args: d.args.iter().map(|a| replace(a, args)).collect(),
             block: d.block.map(|b| Block {
@@ -283,6 +288,10 @@ pub fn expand(
                 name: d.name,
                 args: d.args,
                 block,
+                // 📎 Untouched apart from its block, so it keeps the tokens it
+                // was read from — an import splices directives, it does not
+                // rewrite them.
+                tokens: d.tokens,
             });
             continue;
         }
