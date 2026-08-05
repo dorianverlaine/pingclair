@@ -127,15 +127,19 @@ Everything below is on `main` and unreleased; the workspace reports
 
 ### 🐛 Fixed
 
-- 🚰 **Shutdown cut off responses that were still being sent.** A `SIGTERM`
-  stopped the runtime after five seconds — Pingora's default, which nothing
-  here overrode — so anything slower than that was truncated mid-body. A
-  20 MiB download over a rate-limited link arrived as 4.1 MiB with status 200
-  and no error a client could distinguish from a network fault, and every
-  rolling restart did that to every transfer in progress. Shutdown now waits
-  for requests already in flight however long they take, matching Caddy, and
-  the new `grace_period` global option bounds the wait for operators who want
-  a restart to finish by a deadline.
+- 🚰 **Shutdown had no configurable grace period at all.** Nothing set
+  Pingora's shutdown knobs, so a `SIGTERM` truncated responses still being
+  sent: a 20 MiB download over a rate-limited link arrived as 4.1 MiB with
+  status 200 and no error a client could distinguish from a network fault, and
+  every rolling restart did that to every transfer in progress. The new
+  `grace_period` global option now sets that window, defaulting to 30 seconds.
+  > 🚧 **This narrows the problem rather than closing it.** Caddy exits as soon
+  > as the last in-flight request finishes — bounded by the work remaining, not
+  > by a clock — and Pingora 0.8.1 exposes no knob that expresses it. Measured
+  > on a clean Linux box, a transfer longer than the grace period is still cut
+  > off, and the grace window alone does not keep a large download alive, so
+  > something below the configuration layer ends the connection first. Do not
+  > read this entry as "graceful shutdown works".
 - 🔄 **Log rotation written the way Caddy writes it did nothing.** Rotation
   settings inside `output file <path> { … }` — `roll_size`, `roll_keep`,
   `roll_keep_for` — were parsed and discarded, so a configuration carried over

@@ -2091,23 +2091,46 @@ fn run_server(
     // "eternal grace period" — so that is the default here too, expressed as
     // the largest span Pingora will accept. `grace_period` is how an operator
     // trades that for a bounded restart.
-    const EFFECTIVELY_FOREVER_SECS: u64 = 365 * 24 * 60 * 60;
+    // ⏱️ 30 seconds, not "forever". The window is an unconditional sleep, so
+    // "forever" would mean a process that never exits — and Pingora's own
+    // 300-second default means every restart waits five minutes with nothing
+    // to drain. 30s is long enough for ordinary requests to land and short
+    // enough that a rolling restart still moves.
+    const DEFAULT_GRACE_SECS: u64 = 30;
     let grace_period_secs = config
         .global
         .grace_period_secs
-        .unwrap_or(EFFECTIVELY_FOREVER_SECS);
-    // 🕐 Pingora spends this budget twice: it sleeps `grace_period_seconds`
-    // after signalling shutdown, then allows `graceful_shutdown_timeout_seconds`
-    // for the runtimes to drain. The sleep is unconditional, so a configured
-    // grace period must go to the *timeout* — putting it in the sleep would
-    // make every shutdown take exactly that long even with nothing in flight.
-    server_conf.grace_period_seconds = Some(0);
-    server_conf.graceful_shutdown_timeout_seconds = Some(grace_period_secs);
+        .unwrap_or(DEFAULT_GRACE_SECS);
+    // 🕐 Which knob does what, read off pingora-core 0.8.1 `server/mod.rs:771`
+    // rather than guessed — the first attempt at this guessed wrong in both
+    // directions and shipped a shutdown that hung:
+    //
+    //   grace_period_seconds          → `thread::sleep(...)` before teardown.
+    //                                   The window during which the runtimes
+    //                                   are still alive. Unconditional: every
+    //                                   shutdown costs exactly this.
+    //   graceful_shutdown_timeout_secs → `rt.shutdown_timeout(t)` *and then*
+    //                                   `thread::sleep(t)` again. A large value
+    //                                   here does not extend the drain; it just
+    //                                   makes the process refuse to exit.
+    //
+    // So the configured grace belongs in the sleep, and the teardown budget
+    // stays at Pingora's own small default.
+    //
+    // 🚧 This is not yet Caddy's behaviour and must not be described as such.
+    // Caddy exits as soon as the last in-flight request finishes — bounded by
+    // work remaining, not by a clock — and neither knob expresses that. Day 26
+    // also measured that the sleep window does not by itself keep a large
+    // download alive, so something in the service layer ends the connection
+    // first. Until that is found, this bounds the damage rather than fixing it.
+    server_conf.grace_period_seconds = Some(grace_period_secs);
     tracing::info!(
-        "🚰 Shutdown waits up to {} for requests already in flight",
-        match config.global.grace_period_secs {
-            Some(secs) => format!("{secs}s"),
-            None => "forever (Caddy's default; set `grace_period` to bound it)".to_string(),
+        "🚰 Shutdown grace period: {}s{}",
+        grace_period_secs,
+        if config.global.grace_period_secs.is_some() {
+            ""
+        } else {
+            " (default; set `grace_period` to change it)"
         }
     );
     tracing::info!(
