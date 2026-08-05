@@ -550,11 +550,21 @@ pub fn enabled() -> bool {
 }
 
 /// 📥 Increments and returns the active-request gauge used by this request.
+///
+/// 🛡️ The host is client-controlled, so it goes through [`capped_label`] like
+/// every other per-request label. It did not, until Day 26 measured it: with
+/// 1600 distinct `Host` headers every other host-labelled family stopped at
+/// 1025 series while this one grew to 1600, unauthenticated. Pairing is safe
+/// because the admitted set only ever grows — a value that maps to itself on
+/// the way in still maps to itself on the way out, and one that collapsed to
+/// `other` stays collapsed, so the gauge is never decremented on a different
+/// series than it was incremented on.
 pub fn request_started(host: &str) -> Option<IntGauge> {
     if !enabled() {
         return None;
     }
-    let metric = ACTIVE_CONNECTIONS.with_label_values(&[host]);
+    let host = capped_label("host", host);
+    let metric = ACTIVE_CONNECTIONS.with_label_values(&[host.as_str()]);
     metric.inc();
     Some(metric)
 }
