@@ -68,6 +68,41 @@ Do not mark an item as remotely verified because unit tests or
 - implemented and locally tested, but still awaiting remote verification;
 - not implemented.
 
+## Change budget
+
+A session has a budget, and it is much smaller than what fits in a context
+window. These are the limits:
+
+- **One theme per session.** Everything committed should be answerable by the
+  same one-sentence description of what the session was for. A session that
+  needs two sentences was two sessions.
+- **At most one change to a core abstraction per session.** `ProxyState`, the
+  router, `HandlerConfig`, the `ProxyHttp` lifecycle wiring, `H3App`,
+  `http_policy.rs`. Two at once means neither can be bisected: when something
+  breaks next week, the commit that broke it moved two foundations and you
+  cannot tell which.
+- **Newly discovered problems go to `TRIAGE.md`, never straight into the
+  current diff.** The fix will be small and obviously right and it will be
+  right there. Write the row anyway. The exceptions are a security defect
+  under active exploitation, and a problem that makes the change in hand wrong
+  regardless — nothing else.
+- **Three fix commits in one session is a stop sign.** Before attempting a
+  fourth, write down why the first fix was insufficient. Not what the fourth
+  fix will be — why the first one did not hold.
+
+  > 🤡 Why this is a rule: this repository is at 95 fixes to 57 features
+  > all-time, and 39 to 12 over the last hundred commits. The rate is
+  > climbing, which is what tells you the fixes are not landing on the cause.
+  > A fourth fix written without that sentence is a guess with three failed
+  > guesses behind it, and the reason it feels urgent is exactly the reason it
+  > is likely to be wrong.
+  >
+  > The sentence is cheap and it is the whole mechanism: it either names a
+  > cause the first three fixes missed, in which case fix that, or it cannot
+  > be written, in which case the problem is not understood yet and the next
+  > move is reading, not editing. `scripts/check-fix-ratio.sh` measures the
+  > aggregate; this is the same brake at the scale of one sitting.
+
 ## Build and test
 
 ```bash
