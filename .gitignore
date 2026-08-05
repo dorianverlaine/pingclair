@@ -88,3 +88,13 @@ docs/CADDYFILE*.md
 vendor/*
 !vendor/h2/
 vendor/h2/Cargo.lock
+
+# 🔬 Verification-day working material: the scripts a Day runs against a clean
+# Linux box, the configurations they drive, and the evidence they produce.
+# Local only, for the same reason `benchmarks/results/` is — the repository
+# publishes conclusions, not the raw process that reached them. It is also
+# actively misleading to publish, because a comparison suite is full of
+# configurations that are *supposed* to fail, and a reader who finds them
+# without that context reads them as examples. The findings land in
+# CHANGELOG.md and docs/STATUS.md instead.
+verification/
