@@ -249,9 +249,9 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                 // here get a distinct message so a migrating Caddyfile is not
                 // mistaken for a typo.
                 other => {
-                    if is_known_caddy_global_option(other) {
-                        // TODO(v0.3): implement the remaining Caddy global
-                        // options (default_bind, grace_period, storage, ...).
+                    if super::registry::global_option(other).is_some() {
+                        // TODO(v0.3): implement the remaining global options
+                        // (default_bind, storage, on_demand_tls, ...).
                         return Err(AdapterError::UnsupportedFeature(
                             format!("global: {other}"),
                             "this Caddy global option is not implemented yet".into(),
@@ -272,45 +272,6 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
 /// which is why they must collapse to the catch-all name instead.
 pub(super) fn is_wildcard_host(host: &str) -> bool {
     matches!(host, "[::]" | "::" | "0.0.0.0" | "[::0]")
-}
-
-/// 🧾 Whether a global-block name is documented Caddy syntax rather than a
-/// likely typo. The list mirrors caddy's own documentation (kept locally by
-/// the maintainer as reference material; not part of this repository).
-pub(super) fn is_known_caddy_global_option(name: &str) -> bool {
-    matches!(
-        name,
-        "default_bind"
-            | "order"
-            | "storage"
-            | "storage_clean_interval"
-            | "persist_config"
-            | "log"
-            | "shutdown_delay"
-            | "default_sni"
-            | "fallback_sni"
-            | "local_certs"
-            | "skip_install_trust"
-            | "acme_ca"
-            | "acme_ca_root"
-            | "acme_eab"
-            | "acme_dns"
-            | "dns"
-            | "ech"
-            | "on_demand_tls"
-            | "key_type"
-            | "cert_issuer"
-            | "renew_interval"
-            | "cert_lifetime"
-            | "ocsp_interval"
-            | "ocsp_stapling"
-            | "renewal_window_ratio"
-            | "preferred_chains"
-            | "filesystem"
-            | "pki"
-            | "events"
-            | "frankenphp"
-    )
 }
 
 /// Flatten Caddy's nested `servers { ... }` block.

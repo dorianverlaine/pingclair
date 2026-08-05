@@ -119,110 +119,29 @@ pub(super) fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
         // 🚫 A directive that exists in Caddy's standard set but has no
         // implementation here gets a message that says so, instead of being
         // indistinguishable from a typo.
-        other => Err(if is_known_caddy_directive(other) {
-            // TODO(v0.3): implement the remaining standard Caddy directives
-            // (templates, try_files, php_fastcgi, handle_path, ...).
-            AdapterError::UnsupportedFeature(
+        // 🚫 A name the registry knows gets a message saying the feature is
+        // missing; anything else is a typo. One table decides, so the two can
+        // never disagree about the same word.
+        //
+        // 🧭 The registry also separates "we do not have this" from "we have
+        // this, but not here" — `root` is a site-level directive and lands in
+        // this arm only when it was written inside a `route` or `handle` block.
+        // Telling an operator to go implement a directive that already exists
+        // would send them looking in the wrong place entirely.
+        other => Err(match super::registry::directive(other) {
+            Some(spec) if spec.support == super::registry::Support::Implemented => {
+                AdapterError::UnsupportedFeature(
+                    other.to_string(),
+                    "this directive is not supported inside a route or handle block yet".into(),
+                )
+            }
+            Some(_) => AdapterError::UnsupportedFeature(
                 other.to_string(),
-                "this Caddy directive is not implemented yet".into(),
-            )
-        } else {
-            AdapterError::UnknownDirective(other.to_string())
+                "this directive is not implemented yet".into(),
+            ),
+            None => AdapterError::UnknownDirective(other.to_string()),
         }),
     }
-}
-
-/// 🧾 Whether a handler-directive name is documented Caddy syntax rather
-/// than a likely typo. The list mirrors caddy's own documentation (kept
-/// locally by the maintainer; not part of this repository).
-pub(super) fn is_known_caddy_directive(name: &str) -> bool {
-    matches!(
-        name,
-        "abort"
-            | "acme_server"
-            | "error"
-            | "forward_auth"
-            | "fs"
-            | "handle_errors"
-            | "handle_path"
-            | "intercept"
-            | "invoke"
-            | "log_append"
-            | "log_skip"
-            | "log_name"
-            | "map"
-            | "method"
-            | "metrics"
-            | "php_fastcgi"
-            | "push"
-            | "request_body"
-            | "request_header"
-            | "root"
-            | "tracing"
-            | "try_files"
-            | "uri"
-            | "vars"
-    )
-}
-
-/// 📇 Every name that is a directive, whether or not it is implemented.
-///
-/// This answers one question the layers below cannot: **is this word a
-/// directive, or a site address?** Nothing about the text distinguishes them —
-/// `localhost` is a perfectly good site address and `handle` is a perfectly
-/// good word — so the only way to tell is to know the names. The parser
-/// deliberately does not, because knowing them would make a format layer
-/// depend on the HTTP layer's vocabulary.
-///
-/// Getting it wrong goes both ways, and both ways were measured on 2026-08-05:
-///
-/// - `:80` followed by `file_server { … }` failed to load, because a directive
-///   carrying a block was mistaken for a second site. That one shape accounts
-///   for a quarter of the format's own test corpus.
-/// - `handle { … }` written at the top of a file loaded happily as a site named
-///   `handle`, serving nothing — the mirror image, and the quieter of the two.
-///
-/// 📌 This list is the seed of the directive registry: once directives register
-/// themselves, membership here stops being a hand-maintained list and becomes a
-/// consequence of being registered.
-pub(super) fn is_directive_name(name: &str) -> bool {
-    is_known_caddy_directive(name)
-        || matches!(
-            name,
-            // Directives handled at the site level.
-            "bind"
-                | "compress"
-                | "encode"
-                | "error_page"
-                | "gzip_types"
-                | "limits"
-                | "listen"
-                | "log"
-                | "route"
-                | "tls"
-                // Directives that adapt into a handler.
-                | "access_control"
-                | "basic_auth"
-                | "basicauth"
-                | "cors"
-                | "file_server"
-                | "handle"
-                | "header"
-                | "rate_limit"
-                | "redir"
-                | "redirect"
-                | "respond"
-                | "reverse_proxy"
-                | "rewrite"
-                | "templates"
-                // Recognised elsewhere in the registry the list above mirrors.
-                | "copy_response"
-                | "copy_response_headers"
-                | "skip_log"
-                // Expanded before adaptation, but still a directive an operator
-                // can write at the start of a line.
-                | "import"
-        )
 }
 
 /// 🚦 Adapts an exact local rate-limit policy and rejects ambiguous options.

@@ -40,6 +40,7 @@ mod directives;
 mod logs;
 mod matchers;
 mod options;
+mod registry;
 mod reverse_proxy;
 mod sites;
 mod tls;
@@ -47,8 +48,8 @@ mod tls;
 #[cfg(test)]
 mod tests;
 
-use directives::is_directive_name;
 use options::adapt_global;
+use registry::is_directive_name;
 use sites::adapt_server;
 
 use crate::parser::ast::*;
