@@ -32,83 +32,22 @@ const ZSTD_LEVEL: i32 = 1;
 
 // MARK: - Negotiation
 
-/// One entry of a parsed `Accept-Encoding` header.
-#[derive(Debug, Clone, PartialEq)]
-struct AcceptedCoding<'a> {
-    token: &'a str,
-    /// Quality value, `0.0` meaning explicitly unacceptable.
-    q: f32,
-}
-
-/// Parses `Accept-Encoding` into codings and their quality values.
-///
-/// Malformed q-parameters are treated as `q=1` rather than rejected — RFC 9110
-/// makes this header advisory, and a client that sends junk should still get a
-/// working response instead of a 400.
-fn parse_accept_encoding(header: &str) -> Vec<AcceptedCoding<'_>> {
-    header
-        .split(',')
-        .filter_map(|part| {
-            let mut pieces = part.split(';');
-            let token = pieces.next()?.trim();
-            if token.is_empty() {
-                return None;
-            }
-            let q = pieces
-                .find_map(|param| {
-                    let (key, value) = param.split_once('=')?;
-                    key.trim().eq_ignore_ascii_case("q").then_some(value)
-                })
-                .and_then(|value| value.trim().parse::<f32>().ok())
-                .filter(|value| value.is_finite())
-                .map(|value| value.clamp(0.0, 1.0))
-                .unwrap_or(1.0);
-            Some(AcceptedCoding { token, q })
-        })
-        .collect()
-}
-
-/// Quality value the client assigned to `encoding`, if it is acceptable.
-///
-/// Returns `None` when the client excluded it — either by naming it with
-/// `q=0`, or by sending `*;q=0` without naming it. An explicit mention always
-/// beats the wildcard, even when the wildcard appears first.
-fn quality_for(accepted: &[AcceptedCoding<'_>], encoding: Encoding) -> Option<f32> {
-    let explicit = accepted
-        .iter()
-        .find(|entry| Encoding::from_token(entry.token) == Some(encoding));
-    let q = match explicit {
-        Some(entry) => entry.q,
-        None => accepted
-            .iter()
-            .find(|entry| entry.token == "*")
-            .map(|entry| entry.q)?,
-    };
-    (q > 0.0).then_some(q)
-}
-
 /// 🤝 Picks the coding to use for a response, or `None` for identity.
 ///
 /// `offered` is the server's preference order (the order `encode` listed the
-/// codings). Client quality values win first — a client that says
-/// `gzip;q=1.0, zstd;q=0.1` is expressing a real preference, often because
-/// gzip is what it can actually decode cheaply — and the server's order breaks
-/// ties. That combination is what makes `encode zstd gzip` mean "zstd when the
-/// client is happy either way" without overriding a client that isn't.
+/// codings). The quality-value reading lives in `pingclair-core` because
+/// `pingclair-static` needs exactly the same rules, and for a while the two
+/// crates each had their own: this one was correct and unreachable — nothing in
+/// production called it — while the static path used `header.contains("gzip")`
+/// and therefore compressed for a client that had sent `gzip;q=0`. One
+/// implementation, so a fix here cannot fail to reach a served file.
 pub fn negotiate(accept_encoding: &str, offered: &[Encoding]) -> Option<Encoding> {
     if offered.is_empty() {
         return None;
     }
-    let accepted = parse_accept_encoding(accept_encoding);
-    offered
-        .iter()
-        .enumerate()
-        .filter_map(|(rank, &encoding)| {
-            quality_for(&accepted, encoding).map(|q| (rank, encoding, q))
-        })
-        // Highest q wins; among equal q, the earliest configured coding wins.
-        .max_by(|(rank_a, _, q_a), (rank_b, _, q_b)| q_a.total_cmp(q_b).then(rank_b.cmp(rank_a)))
-        .map(|(_, encoding, _)| encoding)
+    let tokens: Vec<&str> = offered.iter().map(|e| e.token()).collect();
+    let chosen = pingclair_core::encoding::negotiate(accept_encoding, &tokens)?;
+    offered.iter().copied().find(|e| e.token() == chosen)
 }
 
 // MARK: - Streaming encoders

@@ -7,6 +7,9 @@
 //! including configuration management, HTTP server, and error handling.
 
 pub mod config;
+// 🗜️ Shared because two crates negotiate content coding and having two
+// implementations already shipped a defect — see the module's own header.
+pub mod encoding;
 pub mod error;
 pub mod server;
 

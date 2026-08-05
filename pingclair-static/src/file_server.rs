@@ -188,6 +188,15 @@ pub struct ServedFile {
     pub last_modified: Option<HeaderValue>,
     pub etag: Option<HeaderValue>,
     pub content_encoding: Option<String>,
+    /// 🧊 Whether this resource varies by `Accept-Encoding`.
+    ///
+    /// True whenever compression is enabled for this file server, **not only
+    /// when this particular response was compressed**. A shared cache that
+    /// stores the identity copy without being told this will hand it to a
+    /// client that would have received gzip, and vice versa. Caddy sets the
+    /// header on both variants for exactly this reason; Day 26 measured that
+    /// we set it on neither of the uncompressed ones.
+    pub vary_accept_encoding: bool,
 }
 
 /// Result of [`FileServer::serve_auto`]: either a fully buffered body
@@ -227,6 +236,10 @@ pub struct StreamingFile {
     pub last_modified: Option<HeaderValue>,
     /// ETag header value
     pub etag: Option<HeaderValue>,
+    /// 🧊 See [`ServedFile::vary_accept_encoding`]. A streamed response is by
+    /// definition the uncompressed variant, so this is exactly the case that
+    /// used to reach a shared cache with no `Vary` at all.
+    pub vary_accept_encoding: bool,
     /// Bytes read so far
     bytes_read: u64,
 }
@@ -513,6 +526,7 @@ impl FileServer {
             path: file_path,
             last_modified: meta.last_modified.clone(),
             etag: Some(meta.etag.clone()),
+            vary_accept_encoding: server.config.compress,
             bytes_read: 0,
         })
     }
@@ -605,6 +619,7 @@ impl FileServer {
                         last_modified: None,
                         etag: None,
                         content_encoding: encoding,
+                        vary_accept_encoding: self.config.compress,
                     })));
                 } else {
                     return Ok(None);
@@ -689,6 +704,7 @@ impl FileServer {
                     last_modified: meta.last_modified.clone(),
                     etag: Some(meta.etag.clone()),
                     content_encoding: Some(enc.to_string()),
+                    vary_accept_encoding: self.config.compress,
                 })));
             }
         }
@@ -719,6 +735,7 @@ impl FileServer {
                 last_modified: meta.last_modified.clone(),
                 etag: Some(meta.etag.clone()),
                 content_encoding: Some(encoding.to_string()),
+                vary_accept_encoding: self.config.compress,
             })));
         }
 
@@ -764,6 +781,7 @@ impl FileServer {
                     last_modified: meta.last_modified.clone(),
                     etag: Some(meta.etag.clone()),
                     content_encoding: Some(enc.to_string()),
+                    vary_accept_encoding: self.config.compress,
                 })));
             }
             Some((key, lock, guard))
@@ -801,6 +819,7 @@ impl FileServer {
             last_modified: meta.last_modified.clone(),
             etag: Some(meta.etag.clone()),
             content_encoding,
+            vary_accept_encoding: self.config.compress,
         })))
     }
 
@@ -835,6 +854,7 @@ impl FileServer {
                     last_modified: stream.last_modified,
                     etag: stream.etag,
                     content_encoding: None,
+                    vary_accept_encoding: self.config.compress,
                 }))
             }
             None => Ok(None),
@@ -939,17 +959,25 @@ impl FileServer {
     /// Pick a content encoding from an `Accept-Encoding` header.
     /// Priority: br > zstd > gzip. Returns `None` if the client accepts none
     /// of them (or sent no header), meaning "serve uncompressed".
+    /// 🗜️ Codings this server will produce, in preference order.
+    ///
+    /// Brotli stays in the list even though the DSL refuses `encode br`,
+    /// because a static file has been able to answer a brotli request for as
+    /// long as this code existed and dropping it is a behaviour change that
+    /// belongs in its own commit, not smuggled into a correctness fix. The
+    /// inconsistency with the proxy path is recorded rather than papered over.
+    const OFFERED: &'static [&'static str] = &["br", "zstd", "gzip"];
+
+    /// Picks the coding for a response, honouring the client's quality values.
+    ///
+    /// This used to be `header.contains("gzip")`. Day 26 measured what that
+    /// costs against Caddy 2.11.4: a client sending
+    /// `Accept-Encoding: gzip;q=0` — an explicit refusal — was answered with a
+    /// gzip body, because the refusal still contains the word. `contains` also
+    /// matched substrings, so a token merely embedding a coding name selected
+    /// it. Both are gone now that whole tokens and their `q` are read.
     fn negotiate_encoding(accept_header: Option<&str>) -> Option<&'static str> {
-        let header = accept_header?;
-        if header.contains("br") {
-            Some("br")
-        } else if header.contains("zstd") {
-            Some("zstd")
-        } else if header.contains("gzip") {
-            Some("gzip")
-        } else {
-            None
-        }
+        pingclair_core::encoding::negotiate(accept_header?, Self::OFFERED)
     }
 
     /// Compress `input` with a specific, already-negotiated encoding.
