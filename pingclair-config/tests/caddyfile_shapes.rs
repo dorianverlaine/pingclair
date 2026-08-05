@@ -109,3 +109,76 @@ fn the_shorthand_accepts_a_directive_with_its_own_block() {
 fn a_directive_name_is_refused_as_a_site_address() {
     assert!(!compiles("handle\n\nrespond \"should not work\"\n"));
 }
+
+// MARK: - Heredoc
+
+/// 📜 The whole point: multi-line text without escaping every newline. The
+/// indentation of the closing marker is stripped from every line, so a heredoc
+/// can sit at whatever depth its block does without that depth reaching the
+/// value.
+#[test]
+fn a_heredoc_strips_the_closing_markers_indentation() {
+    let config = compile("example.com {\n\trespond <<EOF\n    a\n      b\n    c\n    EOF\n}\n")
+        .expect("must compile");
+    let rendered = format!("{:?}", config.servers[0].routes[0].handler);
+    assert!(
+        rendered.contains(r"a\n  b\nc"),
+        "relative indentation must survive, absolute must not: {rendered}"
+    );
+}
+
+/// 🧭 The body ends at the first *word* that ends with the marker, not the first
+/// line — so `EOF 200` closes the body and still leaves `200` to be read as the
+/// status code. Treating it as a line would swallow the argument.
+#[test]
+fn a_heredoc_leaves_the_rest_of_the_closing_line_to_be_parsed() {
+    let config =
+        compile("example.com {\n\trespond <<EOF\n    hi\n    EOF 418\n}\n").expect("must compile");
+    let rendered = format!("{:?}", config.servers[0].routes[0].handler);
+    assert!(
+        rendered.contains("418"),
+        "the status must survive: {rendered}"
+    );
+}
+
+/// 🚫 A line that does not carry the closing marker's indentation is refused
+/// rather than stripped as best it can be. Guessing would silently rewrite the
+/// operator's text, and text is the one thing a heredoc exists to preserve.
+#[test]
+fn mismatched_indentation_is_refused() {
+    assert!(!compiles(
+        "example.com {\n\trespond <<END\n  short\n        long\n    END\n}\n"
+    ));
+}
+
+/// 🚫 The marker's spelling is constrained, so a punctuation typo is named
+/// rather than becoming a marker that never appears again.
+#[test]
+fn an_invalid_marker_is_refused() {
+    assert!(!compiles(
+        "example.com {\n\trespond <<END!\n    hi\n    END!\n}\n"
+    ));
+    assert!(!compiles("example.com {\n\trespond <<\n    hi\n}\n"));
+    assert!(!compiles(
+        "example.com {\n\trespond <<<END\n    hi\n    END\n}\n"
+    ));
+}
+
+/// 🚫 Running to end of file must say which marker was expected. Without the
+/// marker in the message the operator has to guess which of several heredocs
+/// in the file was left open.
+#[test]
+fn an_unterminated_heredoc_names_the_marker() {
+    let error = compile("example.com {\n\trespond <<NOPE\n    hi\n")
+        .expect_err("must not compile")
+        .to_string();
+    assert!(error.contains("NOPE"), "must name the marker: {error}");
+}
+
+/// 📌 `<<` with a space after it is an ordinary token. An operator writing a
+/// shell-style redirect is not opening a heredoc, and hijacking it would make
+/// the file fail somewhere far from the line they wrote.
+#[test]
+fn a_space_after_the_angles_is_not_a_heredoc() {
+    assert!(compiles("example.com {\n\trespond \"<< notaheredoc\"\n}\n"));
+}

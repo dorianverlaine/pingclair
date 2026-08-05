@@ -162,10 +162,80 @@ impl fmt::Display for Token {
 pub enum LexError {
     #[error("Unexpected character at position {position}")]
     UnexpectedChar { position: usize },
+
+    #[error(
+        "heredoc marker on line {line} must contain only letters, digits, dashes \
+         and underscores; got '{marker}'"
+    )]
+    HeredocMarkerInvalid { line: usize, marker: String },
+
+    #[error("missing heredoc marker on line {line}; write it as `<<END`")]
+    HeredocMarkerMissing { line: usize },
+
+    #[error("too many '<' for a heredoc on line {line}; use exactly two, as in `<<END`")]
+    HeredocTooManyAngles { line: usize },
+
+    #[error(
+        "unterminated heredoc <<{marker} opened on line {line}; expected a line ending with {marker}"
+    )]
+    HeredocUnterminated { line: usize, marker: String },
+
+    #[error(
+        "mismatched leading whitespace in heredoc <<{marker} on line {line}: \
+         every line must begin with the same indentation as the closing marker"
+    )]
+    HeredocIndentMismatch { line: usize, marker: String },
 }
 
 /// Lexer result type
 pub type LexResult = Result<Vec<Spanned<Token>>, LexError>;
+
+/// 📜 Turns a raw heredoc body into its final text.
+///
+/// The indentation of the **closing marker** decides how much to strip from
+/// every line, which is what lets a heredoc sit at whatever depth its
+/// surrounding block does without that depth leaking into the value. Lines
+/// indented *further* keep the difference, so the shape of the content survives.
+///
+/// A line that does not start with exactly that padding is an error rather than
+/// a best-effort strip: guessing there would silently change the operator's text.
+///
+/// `\r` is dropped throughout, so a file saved on Windows produces the same
+/// value as one saved anywhere else.
+fn finalize_heredoc(raw: &str, marker: &str, open_line: usize) -> Result<String, LexError> {
+    let last_newline = raw.rfind('\n').unwrap_or(0);
+    // 🧭 Whatever sits between that newline and the marker is the padding.
+    let padding = &raw[last_newline + 1..raw.len() - marker.len()];
+
+    let mut out = String::with_capacity(raw.len());
+    // 🧭 The slice ends with the newline that precedes the closing marker, so
+    // splitting on it yields one trailing empty element that is not a line.
+    // Counting it would add a newline the operator never wrote.
+    let body_lines = raw[..last_newline + 1].split('\n');
+    let line_count = body_lines.clone().count();
+    for (offset, line) in body_lines.take(line_count.saturating_sub(1)).enumerate() {
+        // ⏎ A blank line has no indentation to match, and demanding some would
+        // make an empty line inside a heredoc an error.
+        if line.is_empty() || line == "\r" {
+            out.push('\n');
+            continue;
+        }
+        if !line.starts_with(padding) {
+            return Err(LexError::HeredocIndentMismatch {
+                line: open_line + offset + 1,
+                marker: marker.to_string(),
+            });
+        }
+        out.push_str(&line[padding.len()..].replace('\r', ""));
+        out.push('\n');
+    }
+    // 📌 The loop adds a newline per line, including the last one, which the
+    // closing marker's own line already accounted for.
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    Ok(out)
+}
 
 /// Unescape a quoted string literal
 fn unescape_string(s: &str) -> String {
@@ -239,6 +309,109 @@ pub fn tokenize(source: &str) -> LexResult {
             while pos < chars.len() && chars[pos] != '\n' {
                 pos += 1;
             }
+            continue;
+        }
+
+        // ── Heredoc: <<MARKER … MARKER ─────────────────────────────────
+        //
+        // 📜 Lets a directive take multi-line text without escaping every
+        // newline, which is what makes an inline HTML response readable. The
+        // marker must be on its own after `<<`; `<< foo` with a space is an
+        // ordinary token, because that is a shell redirect the operator may
+        // legitimately be writing.
+        if c == '<' && pos + 1 < chars.len() && chars[pos + 1] == '<' {
+            let start = pos;
+            let open_line = lines.at(start).0;
+            let mut cursor = pos + 2;
+
+            // 🚫 Three or more is a typo worth naming: `<<<END` reads as a
+            // heredoc to a human and would otherwise become a marker of `<END`.
+            if cursor < chars.len() && chars[cursor] == '<' {
+                return Err(LexError::HeredocTooManyAngles { line: open_line });
+            }
+
+            let marker_start = cursor;
+            while cursor < chars.len() && !chars[cursor].is_whitespace() {
+                cursor += 1;
+            }
+            let marker: String = chars[marker_start..cursor].iter().collect();
+
+            if marker.is_empty() {
+                return Err(LexError::HeredocMarkerMissing { line: open_line });
+            }
+            if !marker
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                return Err(LexError::HeredocMarkerInvalid {
+                    line: open_line,
+                    marker,
+                });
+            }
+
+            // 🧭 The body starts after the newline that ends the opening line.
+            while cursor < chars.len() && chars[cursor] != '\n' {
+                cursor += 1;
+            }
+            if cursor >= chars.len() {
+                return Err(LexError::HeredocUnterminated {
+                    line: open_line,
+                    marker,
+                });
+            }
+            cursor += 1; // consume that newline
+            let body_start = cursor;
+
+            // 🔍 The heredoc ends at the first whitespace-delimited **word**
+            // that ends with the marker — not the first *line* that does.
+            // `    EOF 200` is a real closing line: the marker terminates the
+            // body and `200` goes on to be lexed as an ordinary argument, which
+            // is how `respond <<EOF … EOF 200` gets its status code.
+            //
+            // 🧭 A consequence worth knowing: inside a heredoc a `#` starts
+            // nothing, so a marker sitting in what looks like a comment still
+            // closes the body. That is deliberate — the body is literal text —
+            // and it usually surfaces as a whitespace-mismatch error, which is a
+            // far better outcome than reading to end of file.
+            let mut marker_end = None;
+            let mut scan = cursor;
+            while scan < chars.len() {
+                if chars[scan].is_whitespace() {
+                    scan += 1;
+                    continue;
+                }
+                let word_start = scan;
+                while scan < chars.len() && !chars[scan].is_whitespace() {
+                    scan += 1;
+                }
+                let word: String = chars[word_start..scan].iter().collect();
+                if word.trim_end_matches('\r').ends_with(&marker) {
+                    // 📌 The marker itself stays inside the slice: the finaliser
+                    // reads the padding in front of it to know what to strip.
+                    marker_end = Some(word_start + word.trim_end_matches('\r').chars().count());
+                    break;
+                }
+            }
+
+            let Some(marker_end) = marker_end else {
+                return Err(LexError::HeredocUnterminated {
+                    line: open_line,
+                    marker,
+                });
+            };
+
+            let raw: String = chars[body_start..marker_end].iter().collect();
+            let text = finalize_heredoc(&raw, &marker, open_line)?;
+            // ▶️ Resume immediately after the marker, so anything following it on
+            // that line is still lexed.
+            pos = marker_end;
+            // 🏷️ Emitted as a quoted string because that is exactly what it is:
+            // a single value whose contents are taken literally. Everything
+            // downstream then needs no knowledge of heredocs at all.
+            tokens.push(Spanned::new(
+                Token::QuotedString(text),
+                lines.span(start, pos),
+            ));
             continue;
         }
 
