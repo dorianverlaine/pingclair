@@ -371,6 +371,47 @@ pub(super) fn adapt_server(
                         server.error_pages.push((code, page.clone()));
                     }
                 }
+                // 🛣️ `handle_path /api/* { … }` is `handle` plus stripping the
+                // matched prefix before the inner handlers run. The runtime has
+                // done this the whole time on both transports; only this arm
+                // was missing, which is why a directive we could already
+                // execute was reported as unimplemented.
+                "handle_path" => {
+                    let (matcher, inner_block) = parse_route_matcher_and_block(&sub_d)?;
+                    let Some(Matcher::Path(path)) = matcher.clone() else {
+                        return Err(AdapterError::InvalidArgument(
+                            "handle_path".into(),
+                            "expected a path to match and strip, e.g. `handle_path /api/* { … }`"
+                                .into(),
+                        ));
+                    };
+                    // 🧭 The prefix is the pattern without its glob: matching
+                    // `/api/*` strips `/api`. Stripping the `*` as well would
+                    // leave a prefix nothing starts with.
+                    let prefix = path
+                        .patterns
+                        .first()
+                        .map(|pattern| pattern.trim_end_matches('*').trim_end_matches('/'))
+                        .unwrap_or_default()
+                        .to_string();
+                    if prefix.is_empty() {
+                        return Err(AdapterError::InvalidArgument(
+                            "handle_path".into(),
+                            "the path to strip cannot be empty; use `handle` instead".into(),
+                        ));
+                    }
+                    let mut handlers = Vec::new();
+                    if let Some(blk) = inner_block {
+                        for inner_d in &blk.directives {
+                            handlers.push(adapt_handler(inner_d.clone())?);
+                        }
+                    }
+                    add_route(
+                        &mut server,
+                        matcher,
+                        Handler::HandlePath { prefix, handlers },
+                    );
+                }
                 "route" | "handle" => {
                     let (matcher, inner_block) = parse_route_matcher_and_block(&sub_d)?;
                     if let Some(blk) = inner_block {
@@ -579,6 +620,7 @@ pub(super) fn handler_directive_name(handler: &Handler) -> &'static str {
         Handler::BasicAuth(_) => "basic_auth",
         Handler::Templates => "templates",
         Handler::Handle(_) => "handle",
+        Handler::HandlePath { .. } => "handle_path",
         Handler::Pipeline(_) => "route",
         Handler::Respond(_) => "respond",
         Handler::Proxy(_) => "reverse_proxy",
@@ -623,9 +665,9 @@ pub(super) fn handler_has_terminal(handler: &Handler) -> bool {
         | Handler::Redirect(_)
         | Handler::FileServer(_)
         | Handler::Templates => true,
-        Handler::Pipeline(handlers) | Handler::Handle(handlers) => {
-            handlers.iter().any(handler_has_terminal)
-        }
+        Handler::Pipeline(handlers)
+        | Handler::Handle(handlers)
+        | Handler::HandlePath { handlers, .. } => handlers.iter().any(handler_has_terminal),
         Handler::Headers(_)
         | Handler::BasicAuth(_)
         | Handler::RateLimit(_)

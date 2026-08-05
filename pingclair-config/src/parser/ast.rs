@@ -484,6 +484,16 @@ pub enum Handler {
     /// Exclusive routing group
     Handle(Vec<Handler>),
 
+    /// 🛣️ Exclusive routing group that strips the matched prefix first.
+    ///
+    /// The prefix is the same path the group matches on, which is why it is
+    /// stored rather than derived: by the time a handler runs, the matcher is
+    /// somewhere else entirely.
+    HandlePath {
+        prefix: String,
+        handlers: Vec<Handler>,
+    },
+
     /// HTTP Basic authentication gate
     BasicAuth(BasicAuthConfig),
 

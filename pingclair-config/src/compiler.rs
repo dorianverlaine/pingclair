@@ -1421,6 +1421,17 @@ fn compile_handler(handler: &Handler, root: Option<&str>) -> CompileResult<Handl
             root: root.map(str::to_string),
         }),
 
+        Handler::HandlePath { prefix, handlers } => {
+            let mut compiled = Vec::new();
+            for h in handlers {
+                compiled.push(compile_handler(h, root)?);
+            }
+            Ok(HandlerConfig::HandlePath {
+                prefix: prefix.clone(),
+                handlers: compiled,
+            })
+        }
+
         Handler::Handle(sub_handlers) => {
             // Recursively compile each sub-handler in the Handle block
             let mut compiled = Vec::new();
