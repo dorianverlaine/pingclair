@@ -96,6 +96,18 @@ pub struct GlobalConfig {
     /// startup. Only names are affected: IP literals never reach a resolver.
     #[serde(default = "default_dns_refresh_secs")]
     pub dns_refresh_secs: u64,
+
+    /// 🚰 How long a shutdown waits for requests already in flight, in
+    /// seconds. `None` means wait for them however long they take, which is
+    /// what Caddy does and what `grace_period` overrides.
+    ///
+    /// The default matters more than it looks. Pingora gives the runtime five
+    /// seconds unless told otherwise, so before this existed a `SIGTERM`
+    /// during a large download cut the response off mid-body: on 2026-08-05 a
+    /// 20 MiB file arrived as 4.1 MiB with no error the client could see. A
+    /// rolling restart did that to every download in progress.
+    #[serde(default)]
+    pub grace_period_secs: Option<u64>,
 }
 
 /// 🌐 Default plaintext HTTP port, matching Caddy's default.
@@ -127,6 +139,9 @@ impl Default for GlobalConfig {
             http3: true,
             worker_threads: None,
             dns_refresh_secs: default_dns_refresh_secs(),
+            // 🚰 `None` is "wait for in-flight requests however long they
+            // take", which is Caddy's behaviour rather than a missing value.
+            grace_period_secs: None,
         }
     }
 }

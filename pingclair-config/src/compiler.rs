@@ -124,6 +124,9 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
 
     config.global.trusted_proxies = global.trusted_proxies.clone();
 
+    // 🚰 Left as `None` when unset, which is not "unconfigured" but the actual
+    // Caddy behaviour: wait for in-flight requests however long they take.
+    config.global.grace_period_secs = global.grace_period_secs;
     if let Some(secs) = global.dns_refresh_secs {
         config.global.dns_refresh_secs = secs;
     }

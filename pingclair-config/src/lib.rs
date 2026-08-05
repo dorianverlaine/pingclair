@@ -140,6 +140,7 @@ fn merge_globals(
         http3,
         worker_threads,
         dns_refresh_secs,
+        grace_period_secs,
     } = from;
 
     // 📝 Scalars: a file that said something overrides one that did not. The
@@ -168,6 +169,12 @@ fn merge_globals(
     }
     if dns_refresh_secs != default.dns_refresh_secs {
         into.dns_refresh_secs = dns_refresh_secs;
+    }
+    // 🚰 `None` means "wait forever", so it is a real choice rather than an
+    // absent one — but a file that stays silent still must not overwrite a
+    // bound that another file set.
+    if grace_period_secs.is_some() {
+        into.grace_period_secs = grace_period_secs;
     }
 
     // 🛡️ A restriction wins over permission. `protocols h1 h2` in any file

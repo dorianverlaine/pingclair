@@ -2079,6 +2079,37 @@ fn run_server(
             .map(|n| n.get())
             .unwrap_or(1)
     });
+    // 🚰 What happens to a request that is still running when SIGTERM arrives.
+    //
+    // Pingora's own default gives the runtime five seconds and then stops it,
+    // which truncates anything slower than that: measured on 2026-08-05, a
+    // 20 MiB download over a rate-limited link arrived as 4.1 MiB, status 200,
+    // no error the client could distinguish from a network fault. Every
+    // rolling restart did that to every transfer in progress.
+    //
+    // Caddy waits for them however long they take — its log literally says
+    // "eternal grace period" — so that is the default here too, expressed as
+    // the largest span Pingora will accept. `grace_period` is how an operator
+    // trades that for a bounded restart.
+    const EFFECTIVELY_FOREVER_SECS: u64 = 365 * 24 * 60 * 60;
+    let grace_period_secs = config
+        .global
+        .grace_period_secs
+        .unwrap_or(EFFECTIVELY_FOREVER_SECS);
+    // 🕐 Pingora spends this budget twice: it sleeps `grace_period_seconds`
+    // after signalling shutdown, then allows `graceful_shutdown_timeout_seconds`
+    // for the runtimes to drain. The sleep is unconditional, so a configured
+    // grace period must go to the *timeout* — putting it in the sleep would
+    // make every shutdown take exactly that long even with nothing in flight.
+    server_conf.grace_period_seconds = Some(0);
+    server_conf.graceful_shutdown_timeout_seconds = Some(grace_period_secs);
+    tracing::info!(
+        "🚰 Shutdown waits up to {} for requests already in flight",
+        match config.global.grace_period_secs {
+            Some(secs) => format!("{secs}s"),
+            None => "forever (Caddy's default; set `grace_period` to bound it)".to_string(),
+        }
+    );
     tracing::info!(
         "🔗 Upstream keepalive pool size: {} connections/thread",
         server_conf.upstream_keepalive_pool_size

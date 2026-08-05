@@ -49,6 +49,8 @@ pub struct GlobalBlock {
     pub http_port: Option<u16>,
     /// 🔐 HTTPS port override (Caddy `https_port`).
     pub https_port: Option<u16>,
+    /// 🚰 How long shutdown waits for in-flight requests (Caddy `grace_period`).
+    pub grace_period_secs: Option<u64>,
     /// 📊 Metrics toggle (Caddy `metrics`).
     pub metrics: Option<bool>,
     pub auto_https: Option<AutoHttpsMode>,
