@@ -184,19 +184,39 @@ pub struct AccessEntry<'a> {
 /// replaced. That is the whole reason `is_sensitive_header` was written back on
 /// Day 3 — this is its first caller.
 pub fn collect_headers(wanted: &[String], headers: &http::HeaderMap) -> Vec<(String, String)> {
+    // 🌐 No list means every header, which is what Caddy does: its JSON access
+    // log carries the whole `request.headers` map with `Authorization` and
+    // `Cookie` replaced by `REDACTED`. Returning nothing here instead made the
+    // masking untestable — Day 26 asserted "the secret is not in the log" and
+    // it passed for the uninteresting reason that no header was there at all.
+    // A named list is therefore a *narrowing*, not a switch that turns logging
+    // on.
+    let render = |name: &str, value: &http::HeaderValue| {
+        if crate::redaction::is_sensitive_header(name) {
+            crate::redaction::REDACTED.to_string()
+        } else {
+            value.to_str().unwrap_or("<binary>").to_string()
+        }
+    };
+
     if wanted.is_empty() {
-        return Vec::new();
+        // 📌 `HeaderMap` has already lower-cased the names, so these read
+        // `authorization` where Caddy echoes the sender's own capitalisation.
+        // The set is identical; only the spelling differs.
+        return headers
+            .iter()
+            .map(|(name, value)| {
+                let name = name.as_str();
+                (name.to_string(), render(name, value))
+            })
+            .collect();
     }
+
     wanted
         .iter()
         .filter_map(|name| {
             let value = headers.get(name.as_str())?;
-            let rendered = if crate::redaction::is_sensitive_header(name) {
-                crate::redaction::REDACTED.to_string()
-            } else {
-                value.to_str().unwrap_or("<binary>").to_string()
-            };
-            Some((name.clone(), rendered))
+            Some((name.clone(), render(name, value)))
         })
         .collect()
 }
