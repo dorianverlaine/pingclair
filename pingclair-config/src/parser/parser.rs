@@ -16,7 +16,10 @@ pub enum ParseError {
     #[error("Lexer error: {0}")]
     Lex(#[from] LexError),
 
-    #[error("Unexpected token {token} at {location:?}, expected {expected}")]
+    // 📍 `line:column`, not the raw offsets. The debug form printed
+    // `Location { start: 42, end: 48 }`, which tells an operator nothing they
+    // can act on — they cannot see byte offsets in an editor.
+    #[error("Unexpected token {token} at line {location}, expected {expected}")]
     UnexpectedToken {
         token: String,
         location: Location,

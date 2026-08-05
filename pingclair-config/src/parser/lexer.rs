@@ -15,11 +15,92 @@
 
 use std::fmt;
 
-/// Source location for error reporting
+/// Source location for error reporting.
+///
+/// 📍 `start` and `end` are **character** offsets, not byte offsets: the lexer
+/// walks a `Vec<char>`, so anything slicing the original string by these needs
+/// to convert first.
+///
+/// `line` and `column` are stored rather than derived. Deriving them would save
+/// sixteen bytes per token on an input measured in kilobytes, and cost every
+/// error path a reference to the source text it does not otherwise need — the
+/// wrong side of that trade. Both are 1-based, because that is what an editor
+/// shows and what a human types into one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Location {
     pub start: usize,
     pub end: usize,
+    pub line: usize,
+    pub column: usize,
+}
+
+impl Location {
+    /// 🧪 A location for a node this compiler synthesised rather than read.
+    ///
+    /// Line zero is impossible in a real file, so it reads as "not from source"
+    /// wherever it surfaces — which is the honest answer for a directive the
+    /// adapter invented, and better than borrowing some unrelated token's
+    /// position and pointing the operator at the wrong line.
+    pub const fn synthetic() -> Self {
+        Self {
+            start: 0,
+            end: 0,
+            line: 0,
+            column: 0,
+        }
+    }
+}
+
+impl fmt::Display for Location {
+    /// 📍 `line:column`, the form every compiler and editor already agrees on.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.line, self.column)
+    }
+}
+
+/// 🗺️ Turns character offsets into line and column numbers.
+///
+/// Built once per tokenize pass and consulted per token, because the lexer
+/// advances `pos` from a dozen places and threading a running line counter
+/// through all of them is how one of them ends up forgetting.
+struct LineIndex {
+    /// Character offset of each newline, ascending.
+    newlines: Vec<usize>,
+}
+
+impl LineIndex {
+    fn new(chars: &[char]) -> Self {
+        Self {
+            newlines: chars
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c == '\n')
+                .map(|(i, _)| i)
+                .collect(),
+        }
+    }
+
+    fn at(&self, offset: usize) -> (usize, usize) {
+        // 🔍 How many newlines start before this offset: that is the 0-based line.
+        let line = self.newlines.partition_point(|&nl| nl < offset);
+        let line_start = if line == 0 {
+            0
+        } else {
+            self.newlines[line - 1] + 1
+        };
+        (line + 1, offset - line_start + 1)
+    }
+
+    /// Builds a location spanning `start..end`, positioned at `start`.
+    fn span(&self, start: usize, end: usize) -> Location {
+        let (line, column) = self.at(start);
+        Location {
+            start,
+            end,
+            line,
+            column,
+        }
+    }
 }
 
 /// A token with its location in the source
@@ -123,6 +204,7 @@ fn unescape_string(s: &str) -> String {
 pub fn tokenize(source: &str) -> LexResult {
     let mut tokens = Vec::new();
     let chars: Vec<char> = source.chars().collect();
+    let lines = LineIndex::new(&chars);
     let mut pos = 0;
 
     while pos < chars.len() {
@@ -136,13 +218,7 @@ pub fn tokenize(source: &str) -> LexResult {
 
         // ── Newlines (significant — statement terminators) ────────────
         if c == '\n' {
-            tokens.push(Spanned::new(
-                Token::Newline,
-                Location {
-                    start: pos,
-                    end: pos + 1,
-                },
-            ));
+            tokens.push(Spanned::new(Token::Newline, lines.span(pos, pos + 1)));
             pos += 1;
             continue;
         }
@@ -153,7 +229,7 @@ pub fn tokenize(source: &str) -> LexResult {
             } else {
                 pos + 1
             };
-            tokens.push(Spanned::new(Token::Newline, Location { start: pos, end }));
+            tokens.push(Spanned::new(Token::Newline, lines.span(pos, end)));
             pos = end;
             continue;
         }
@@ -186,7 +262,7 @@ pub fn tokenize(source: &str) -> LexResult {
             }
             tokens.push(Spanned::new(
                 Token::QuotedString(unescape_string(&s)),
-                Location { start, end: pos },
+                lines.span(start, pos),
             ));
             continue;
         }
@@ -212,7 +288,7 @@ pub fn tokenize(source: &str) -> LexResult {
                     pos = var_end + 1;
                     tokens.push(Spanned::new(
                         Token::EnvVar(var_name),
-                        Location { start, end: pos },
+                        lines.span(start, pos),
                     ));
                     continue;
                 }
@@ -246,31 +322,19 @@ pub fn tokenize(source: &str) -> LexResult {
                 pos = inner_end + 1;
                 tokens.push(Spanned::new(
                     Token::Placeholder(inner),
-                    Location { start, end: pos },
+                    lines.span(start, pos),
                 ));
                 continue;
             }
 
             // Plain block open
-            tokens.push(Spanned::new(
-                Token::BlockOpen,
-                Location {
-                    start,
-                    end: pos + 1,
-                },
-            ));
+            tokens.push(Spanned::new(Token::BlockOpen, lines.span(start, pos + 1)));
             pos += 1;
             continue;
         }
 
         if c == '}' {
-            tokens.push(Spanned::new(
-                Token::BlockClose,
-                Location {
-                    start: pos,
-                    end: pos + 1,
-                },
-            ));
+            tokens.push(Spanned::new(Token::BlockClose, lines.span(pos, pos + 1)));
             pos += 1;
             continue;
         }
@@ -315,10 +379,7 @@ pub fn tokenize(source: &str) -> LexResult {
         }
         if pos > start {
             let word: String = chars[start..pos].iter().collect();
-            tokens.push(Spanned::new(
-                Token::Word(word),
-                Location { start, end: pos },
-            ));
+            tokens.push(Spanned::new(Token::Word(word), lines.span(start, pos)));
         } else {
             return Err(LexError::UnexpectedChar { position: pos });
         }
@@ -406,5 +467,56 @@ mod tests {
             Token::Word("(security_headers)".to_string())
         );
         assert_eq!(tokens[1].value, Token::BlockOpen);
+    }
+}
+
+#[cfg(test)]
+mod line_index_tests {
+    use super::*;
+
+    fn loc(source: &str, needle: char) -> Location {
+        let chars: Vec<char> = source.chars().collect();
+        let index = LineIndex::new(&chars);
+        let at = chars.iter().position(|c| *c == needle).expect("needle");
+        index.span(at, at + 1)
+    }
+
+    #[test]
+    fn the_first_character_is_line_one_column_one() {
+        let l = loc("x", 'x');
+        assert_eq!((l.line, l.column), (1, 1));
+    }
+
+    #[test]
+    fn a_newline_advances_the_line_and_resets_the_column() {
+        let l = loc("ab\ncd\nX", 'X');
+        assert_eq!((l.line, l.column), (3, 1));
+        let l = loc("ab\ncXd", 'X');
+        assert_eq!((l.line, l.column), (2, 2));
+    }
+
+    /// 📍 Offsets are character-based throughout, so a line of CJK text must not
+    /// shift the columns after it — the failure this would cause is an error
+    /// message pointing at the wrong place in a configuration that has a comment
+    /// in it.
+    #[test]
+    fn multibyte_characters_do_not_shift_the_position() {
+        let l = loc("# 中文註解\nabX", 'X');
+        assert_eq!((l.line, l.column), (2, 3));
+    }
+
+    /// 🧭 `\r\n` is one line break. Counting the `\r` separately would report
+    /// every line after the first as one too many on files written on Windows.
+    #[test]
+    fn crlf_counts_as_one_line_break() {
+        let l = loc("a\r\nX", 'X');
+        assert_eq!(l.line, 2);
+    }
+
+    #[test]
+    fn a_synthetic_location_is_line_zero() {
+        // 🧪 Impossible in a real file, which is the point: it reads as
+        // "this node was invented, not read".
+        assert_eq!(Location::synthetic().line, 0);
     }
 }

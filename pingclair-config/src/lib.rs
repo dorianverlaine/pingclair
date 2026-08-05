@@ -40,8 +40,31 @@ use std::path::Path;
 
 /// Full compilation pipeline: source -> PingclairConfig
 pub fn compile(source: &str) -> Result<PingclairConfig, FullCompileError> {
+    compile_named(source, None)
+}
+
+/// 📍 Compiles a configuration, naming the file it came from in any error.
+///
+/// The name is only ever used for error messages. Without it the compiler can
+/// report `line 9:3` and nothing more, which is unhelpful the moment a
+/// configuration is split across a directory: the operator gets a line number
+/// and has to guess which of six files it belongs to.
+///
+/// `None` means the source did not come from a file — a string built by a test,
+/// or a body posted to the admin API — and the error then carries the position
+/// alone rather than inventing a filename for it.
+pub fn compile_named(
+    source: &str,
+    name: Option<&Path>,
+) -> Result<PingclairConfig, FullCompileError> {
     // 🧩 Parse and analyze the human-readable configuration.
-    let ast = parse_and_analyze(source)?;
+    let ast = parse_and_analyze(source).map_err(|error| match name {
+        Some(path) => FullCompileError::InFile {
+            path: path.display().to_string(),
+            source: Box::new(error.into()),
+        },
+        None => error.into(),
+    })?;
 
     // 🏗️ Compile the typed tree and enforce cross-field invariants.
     let config = compile_ast(&ast)?;
@@ -61,7 +84,7 @@ pub fn compile_file(path: impl AsRef<Path>) -> Result<PingclairConfig, FullCompi
         compiler::validate_config(&config)?;
         Ok(config)
     } else {
-        compile(&source)
+        compile_named(&source, Some(path))
     }
 }
 
@@ -109,7 +132,19 @@ fn compile_file_unvalidated(path: &Path) -> Result<PingclairConfig, FullCompileE
         serde_json::from_str(&source)
             .map_err(|e| FullCompileError::Io(format!("JSON parse error: {e}")))
     } else {
-        Ok(compiler::compile_ast(&parser::compile(&source)?)?)
+        // 📍 Named, because this is the path where the name matters most: a
+        // directory configuration reports one line number out of several files,
+        // and without the name the operator has to guess which.
+        let ast = parser::compile(&source).map_err(|error| FullCompileError::InFile {
+            path: path.display().to_string(),
+            source: Box::new(error.into()),
+        })?;
+        Ok(
+            compiler::compile_ast(&ast).map_err(|error| FullCompileError::InFile {
+                path: path.display().to_string(),
+                source: Box::new(error.into()),
+            })?,
+        )
     }
 }
 
@@ -278,6 +313,14 @@ pub enum FullCompileError {
 
     #[error("Compile error: {0}")]
     Compile(#[from] CompileError),
+
+    // 📍 Wraps another failure with the file it came from, so a directory
+    // configuration says *which* file the line number belongs to.
+    #[error("{path}: {source}")]
+    InFile {
+        path: String,
+        source: Box<FullCompileError>,
+    },
 }
 
 #[cfg(test)]

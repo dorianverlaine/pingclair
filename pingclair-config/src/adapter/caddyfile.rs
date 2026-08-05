@@ -129,14 +129,13 @@ pub fn adapt(directives: Vec<Directive>) -> Result<Ast, AdapterError> {
             if ast.global.is_some() {
                 return Err(AdapterError::DuplicateGlobal);
             }
-            ast.global = Some(Node::new(adapt_global(d)?, Location { start: 0, end: 0 }));
+            ast.global = Some(Node::new(adapt_global(d)?, Location::synthetic()));
         } else if d.name == "macro" {
             // 🐛 TODO: Support macros in Caddyfile?
             // Caddy uses snippets (import), which we now handle above.
         } else {
             let server = adapt_server(d)?;
-            ast.servers
-                .push(Node::new(server, Location { start: 0, end: 0 }));
+            ast.servers.push(Node::new(server, Location::synthetic()));
         }
     }
 
@@ -777,7 +776,7 @@ fn adapt_server(d: Directive) -> Result<ServerBlock, AdapterError> {
                 "log" => match (sub_d.args.first(), sub_d.block) {
                     (None, Some(log_block)) => {
                         let log = adapt_log_block(log_block)?;
-                        server.log = Some(Node::new(log, Location { start: 0, end: 0 }));
+                        server.log = Some(Node::new(log, Location::synthetic()));
                     }
                     (Some(name), None) => server.log_channels.push(name.clone()),
                     (Some(_), Some(_)) => {
@@ -3526,13 +3525,13 @@ fn add_route(server: &mut ServerBlock, matcher: Option<Matcher>, handler: Handle
     if server.routes.is_none() {
         server.routes = Some(Node::new(
             RouteBlock { arms: Vec::new() },
-            Location { start: 0, end: 0 },
+            Location::synthetic(),
         ));
     }
     let routes = server.routes.as_mut().unwrap();
     routes.inner.arms.push(Node::new(
         RouteArm { matcher, handler },
-        Location { start: 0, end: 0 },
+        Location::synthetic(),
     ));
 }
 
