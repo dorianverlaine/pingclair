@@ -3,7 +3,8 @@
 
 use super::AdapterError;
 use super::args::{
-    expect_no_arguments, expect_one_argument, parse_positive_usize, parse_required_duration,
+    expect_no_arguments, expect_one_argument, parse_positive_u64, parse_positive_usize,
+    parse_required_duration,
 };
 use crate::parser::ast::*;
 use crate::parser::caddy_ast::Directive;
@@ -211,6 +212,86 @@ pub(super) fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError>
                 "health_check" => {
                     proxy.health_check = Some(adapt_health_check(&sub)?);
                 }
+                // 🩺 The format spells health checking as flat `health_*`
+                // options rather than a block. Both reach the same
+                // configuration; refusing the flat form would mean refusing the
+                // spelling every real configuration actually uses.
+                name if name.starts_with("health_") => {
+                    let check = proxy.health_check.get_or_insert_with(Default::default);
+                    match name {
+                        // 🧭 `health_uri` carries a query string too; we keep
+                        // the whole thing, because dropping the query would
+                        // probe a different endpoint than the one written.
+                        "health_uri" | "health_path" => {
+                            check.path = expect_one_argument(&sub)?.to_string();
+                        }
+                        "health_port" => {
+                            check.port =
+                                Some(parse_positive_u64(&sub)?.try_into().map_err(|_| {
+                                    AdapterError::InvalidArgument(
+                                        name.into(),
+                                        "a port must be between 1 and 65535".into(),
+                                    )
+                                })?);
+                        }
+                        "health_method" => {
+                            check.method = expect_one_argument(&sub)?.to_ascii_uppercase();
+                        }
+                        // 🧭 Whole seconds only, exactly as the block form
+                        // requires. Two spellings of one setting must not
+                        // accept two different value ranges.
+                        "health_interval" => {
+                            check.interval_secs = whole_seconds(&sub)?;
+                        }
+                        "health_timeout" => {
+                            check.timeout_secs = whole_seconds(&sub)?;
+                        }
+                        "health_body" => {
+                            check.expected_body = Some(expect_one_argument(&sub)?.to_string());
+                        }
+                        "health_passes" => {
+                            check.consecutive_success = parse_positive_u64(&sub)? as u32;
+                        }
+                        "health_fails" => {
+                            check.consecutive_failure = parse_positive_u64(&sub)? as u32;
+                        }
+                        "health_status" => {
+                            let raw = expect_one_argument(&sub)?;
+                            // 🧭 A class such as `2xx` stands for the whole
+                            // hundred, which is how the format lets an operator
+                            // say "any success" without listing five codes.
+                            check.expected_statuses = expand_status_class(raw, name)?;
+                        }
+                        "health_headers" => {
+                            let Some(block) = sub.block.as_ref() else {
+                                return Err(AdapterError::InvalidArgument(
+                                    name.into(),
+                                    "expected a block of header names and values".into(),
+                                ));
+                            };
+                            for header in &block.directives {
+                                let value = header.args.first().cloned().unwrap_or_default();
+                                check.headers.insert(header.name.clone(), value);
+                            }
+                        }
+                        other => {
+                            return Err(AdapterError::UnsupportedFeature(
+                                format!("reverse_proxy {other}"),
+                                "Pingclair does not implement this health-check option yet".into(),
+                            ));
+                        }
+                    }
+                }
+                // 🔁 Load balancing retries, flat, for the same reason.
+                "lb_retries" => {
+                    proxy.retry.max_attempts = parse_positive_usize(&sub)?;
+                }
+                "lb_try_duration" => {
+                    proxy.retry.total_timeout_ms = Some(parse_required_duration(&sub)?);
+                }
+                "lb_try_interval" => {
+                    proxy.retry.backoff_ms = parse_required_duration(&sub)?;
+                }
                 "lb_policy" => {
                     let policy = sub
                         .args
@@ -349,6 +430,15 @@ pub(super) fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError>
                 // unrecognised subdirective used to vanish here. A config
                 // that names a tuning knob the runtime does not honor must
                 // fail load, or the operator will tune a phantom.
+                // 🚫 A name the format defines but this proxy does not
+                // implement says so, instead of reading as a typo. An operator
+                // who wrote `request_buffers` spelled it correctly.
+                other if is_known_proxy_option(other) => {
+                    return Err(AdapterError::UnsupportedFeature(
+                        format!("reverse_proxy {other}"),
+                        "Pingclair does not implement this reverse_proxy option yet".into(),
+                    ));
+                }
                 other => {
                     return Err(AdapterError::UnknownDirective(format!(
                         "reverse_proxy: {other}"
@@ -728,4 +818,75 @@ pub(super) fn validate_upstream_tls(tls: &UpstreamTlsConfig) -> Result<(), Adapt
         ));
     }
     Ok(())
+}
+
+/// 🧾 Reverse-proxy options the format defines, whether or not we implement
+/// them.
+///
+/// Separating "we do not have this" from "you misspelled that" is the whole
+/// job of this list: the two need different answers from the operator, and a
+/// message that confuses them sends people looking for a typo in a word they
+/// typed correctly.
+fn is_known_proxy_option(name: &str) -> bool {
+    matches!(
+        name,
+        "lb_retry_match"
+            | "health_upstream"
+            | "health_request_body"
+            | "health_follow_redirects"
+            | "max_fails"
+            | "fail_duration"
+            | "unhealthy_request_count"
+            | "unhealthy_status"
+            | "unhealthy_latency"
+            | "request_buffers"
+            | "response_buffers"
+            | "stream_buffer_size"
+            | "stream_timeout"
+            | "stream_close_delay"
+            | "trusted_proxies"
+            | "method"
+            | "rewrite"
+            | "handle_response"
+            | "replace_status"
+            | "verbose_logs"
+            | "proxy_protocol"
+            | "forward_proxy_url"
+            | "network_proxy"
+    )
+}
+
+/// 🔢 Expands a status class such as `2xx` into the codes it stands for.
+fn expand_status_class(raw: &str, directive: &str) -> Result<Vec<u16>, AdapterError> {
+    if let Ok(code) = raw.parse::<u16>() {
+        return Ok(vec![code]);
+    }
+    if let Some(hundreds) = raw
+        .strip_suffix("xx")
+        .and_then(|head| head.parse::<u16>().ok())
+        && (1..=5).contains(&hundreds)
+    {
+        let base = hundreds * 100;
+        return Ok((base..base + 100).collect());
+    }
+    Err(AdapterError::InvalidArgument(
+        directive.into(),
+        format!("`{raw}` is not a status code or a class such as `2xx`"),
+    ))
+}
+
+/// ⏱️ A duration the health check can express, in whole seconds.
+///
+/// The configuration carries seconds, so a value like `1500ms` cannot be
+/// represented — and rounding it would give an operator a probe interval they
+/// did not ask for, quietly.
+fn whole_seconds(directive: &Directive) -> Result<u64, AdapterError> {
+    let millis = parse_required_duration(directive)?;
+    if millis < 1_000 || millis % 1_000 != 0 {
+        return Err(AdapterError::InvalidArgument(
+            directive.name.clone(),
+            "must be a whole number of seconds".into(),
+        ));
+    }
+    Ok(millis / 1_000)
 }

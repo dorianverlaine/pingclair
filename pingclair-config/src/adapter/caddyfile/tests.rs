@@ -1000,14 +1000,71 @@ mod fail_closed_tests {
         let error = compile_err(
             r#"example.com {
                 reverse_proxy localhost:8080 {
-                    lb_try_duration 10s
+                    lb_try_duratoin 10s
                 }
             }"#,
         );
         assert!(
-            error.contains("lb_try_duration"),
-            "unknown reverse_proxy subdirective must be named; got {error}"
+            error.contains("lb_try_duratoin") && error.contains("Unknown"),
+            "a typo must be named and read as a typo; got {error}"
         );
+    }
+
+    /// 🚫 A reverse-proxy option the format defines but this proxy does not
+    /// implement must not read as a typo.
+    ///
+    /// The two need different things from the operator — one is a misspelling
+    /// to correct, the other a feature to work around — and until this
+    /// distinction existed both arrived as "unknown".
+    #[test]
+    fn reverse_proxy_names_options_it_recognises_but_lacks() {
+        let error = compile_err(
+            r#"example.com {
+                reverse_proxy localhost:8080 {
+                    request_buffers 4KB
+                }
+            }"#,
+        );
+        assert!(
+            error.contains("request_buffers") && error.contains("does not implement"),
+            "a real option must be reported as missing, not unknown; got {error}"
+        );
+    }
+
+    /// 🩺 Health checking spelled flat, which is how the format spells it.
+    #[test]
+    fn flat_health_options_configure_the_health_check() {
+        let config = crate::compile(
+            r#"example.com {
+                reverse_proxy localhost:8080 {
+                    health_uri /healthz
+                    health_interval 10s
+                    health_timeout 2s
+                    health_status 2xx
+                    health_passes 3
+                    health_fails 2
+                    lb_retries 5
+                }
+            }"#,
+        )
+        .expect("the flat spelling must compile");
+        match &config.servers[0].routes[0].handler {
+            pingclair_core::config::HandlerConfig::ReverseProxy(proxy) => {
+                let check = proxy.health_check.as_ref().expect("a health check");
+                assert_eq!(check.path, "/healthz");
+                assert_eq!(check.interval, 10);
+                assert_eq!(check.timeout, 2);
+                assert_eq!(check.consecutive_success, 3);
+                assert_eq!(check.consecutive_failure, Some(2));
+                // 🧭 `2xx` stands for the whole hundred, so an operator can say
+                // "any success" without listing five codes.
+                assert!(check.expected_statuses.contains(&200));
+                assert!(check.expected_statuses.contains(&204));
+                assert!(!check.expected_statuses.contains(&301));
+                assert_eq!(proxy.retry.max_attempts, 5);
+            }
+            other => panic!("expected a proxy handler, got {other:?}"),
+        }
     }
 
     #[test]
