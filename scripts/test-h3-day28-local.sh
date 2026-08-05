@@ -2,7 +2,8 @@
 #
 # 🛰️ Day 28 functional matrix for HTTP/3, driven by a real HTTP/3 client.
 #
-# GUARDRAILS requires this after any change to H3 or the TLS dependency tree:
+# docs/guardrails/proxy.md requires this after any change to H3 or the TLS
+# dependency tree:
 # Alt-Svc, SNI, static and proxied bodies of several sizes, POST with and
 # without Content-Length, 413, and upstream keepalive.
 #

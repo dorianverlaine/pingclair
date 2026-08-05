@@ -31,7 +31,7 @@ jobs:
         # 🧱 clippy compiles every dependency, including boring-sys, so
         # this job needs the same cmake/clang/libclang toolchain as test.
         # Keep this list in sync with deployment/Dockerfile (see
-        # docs/GUARDRAILS.md — the two drifted once and the production
+        # docs/guardrails/testing.md — the two drifted once and the production
         # image was never built again until CI caught it).
         run: |
           sudo apt-get update
@@ -84,8 +84,8 @@ jobs:
         # 🔐 quiche only runs on BoringSSL and pingora-core defaults to
         # OpenSSL; the two collide on libcrypto symbols at link time (has
         # crashed the binary at startup before). This is the same check
-        # GUARDRAILS asks a human to run by hand — it belongs in CI instead,
-        # where a stray `pingora-openssl` or `openssl-sys` dependency fails
+        # docs/guardrails/tls.md asks a human to run by hand — it belongs in CI
+        # instead, where a stray `pingora-openssl` or `openssl-sys` dependency fails
         # the build instead of waiting to be noticed. It lives in lint
         # rather than ci because `cargo tree` only needs the lockfile.
         run: |

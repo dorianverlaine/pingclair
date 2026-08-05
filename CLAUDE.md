@@ -17,7 +17,7 @@ defect:
 | --- | --- |
 | `docs/TODO.md` | The v0.2.0 plan, one Day per sitting. What to work on — **all of it**, including Caddyfile compatibility, which stopped being a separate track on 2026-08-04. 🔒 Local only. |
 | `docs/STATUS.md` | Which public claim has evidence behind it, and where. Three levels: code exists, local tests pass, verified on clean Linux. 🔒 Local only. |
-| `docs/GUARDRAILS.md` | Environment constraints and implementation rules. Every entry is a failure that already happened. |
+| `docs/guardrails/{testing,config,tls,proxy}.md` | Environment constraints and implementation rules, one file per subsystem. Every entry is a failure that already happened. `docs/GUARDRAILS.md` is the index over them, nothing more. |
 | `benchmarks/README.md` | Performance claims and methodology. Raw per-run evidence stays local under `benchmarks/results/`, never committed. |
 | `CHANGELOG.md` | What changed between releases, for someone upgrading. Written the same day as the change. |
 

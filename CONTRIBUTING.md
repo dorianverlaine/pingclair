@@ -77,10 +77,10 @@ body?"*
   to the repository. When something is fixed, add a new directory — never
   overwrite the record of the failure.
 
-`docs/GUARDRAILS.md` lists environment traps that have already cost someone a
-debugging session (a local proxy that intercepts test requests, ghost processes
-after a timeout, compression tests that fail for the wrong reason). Read it
-before writing test infrastructure.
+`docs/guardrails/testing.md` lists environment traps that have already cost
+someone a debugging session (a local proxy that intercepts test requests, ghost
+processes after a timeout, compression tests that fail for the wrong reason).
+Read it before writing test infrastructure.
 
 ---
 
@@ -129,7 +129,7 @@ misleading.
 | File | Owns |
 |---|---|
 | `docs/TODO.md` | The v0.2.0 execution plan, day by day. 🔒 Maintainer-local, not in this repository — it lists unfixed weaknesses, and publishing that queue would just hand out a target list. Ask if you need the current plan. |
-| `docs/GUARDRAILS.md` | Environment constraints and implementation rules. |
+| `docs/guardrails/{testing,config,tls,proxy}.md` | Environment constraints and implementation rules, one file per subsystem. `docs/GUARDRAILS.md` indexes them. |
 | `benchmarks/README.md` | Performance claims, methodology, bugs found under load. Raw per-run evidence stays local under `benchmarks/results/`, never committed. |
 | `README.md` / `.zh.md` / `.fr.md` | **Shipped** user-facing behavior only — update all three together. |
 | `CHANGELOG.md` | What changed between releases, from the point of view of someone upgrading. |

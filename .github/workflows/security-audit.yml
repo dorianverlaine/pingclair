@@ -6,7 +6,7 @@ on:
   schedule:
     # 🕒 Nightly audit: new RustSec advisories land on a schedule this
     # repo does not control, so the audit runs on a schedule too, not
-    # only when someone happens to push. Per docs/GUARDRAILS.md, an
+    # only when someone happens to push. Per docs/guardrails/testing.md, an
     # exception to a real finding needs a written risk acceptance —
     # this job is what makes silently living with one impossible.
     - cron: '23 2 * * *'

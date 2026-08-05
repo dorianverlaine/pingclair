@@ -13,8 +13,12 @@ Read it together with the planning documents before changing anything:
   methodology. The per-run evidence ledger lives locally under
   `benchmarks/results/`, deliberately not committed; do not infer that
   implemented code has passed Linux/VPS validation without a recorded run.
-- `docs/GUARDRAILS.md` — environment constraints and implementation rules.
-  Every entry is a real failure that already happened once. Read before coding.
+- `docs/GUARDRAILS.md` — a one-page index over `docs/guardrails/`, which holds
+  the environment constraints and implementation rules split four ways:
+  `testing.md`, `config.md`, `tls.md`, `proxy.md`. Every entry is a real
+  failure that already happened once. Read the one or two files your change
+  touches before coding — the point of the split is that you no longer have to
+  read four hundred lines to find the twelve that apply to you.
 
 ## What Pingclair is
 
@@ -45,8 +49,11 @@ The workspace has eight crates:
 
 1. Read `docs/TODO.md` and work the current Day. One Day per sitting; do not
    merge a 🔨 coding Day with a ✅ verification Day.
-2. Read the relevant section of `docs/GUARDRAILS.md` before touching H3, TLS,
-   dependencies, or anything that streams a response body.
+2. Read the relevant guardrail file before editing: `docs/guardrails/proxy.md`
+   for H3 or anything that streams a response body, `docs/guardrails/tls.md`
+   for TLS and dependencies, `docs/guardrails/config.md` for the DSL and the
+   compiler, `docs/guardrails/testing.md` for test and verification
+   infrastructure.
 3. Inspect `git status --short --branch`; preserve existing user changes.
 4. Locate the real execution path, not only the config type or AST.
 5. Decide the required verification level before editing:
@@ -369,7 +376,10 @@ configuration load or hot reload. Invalid security policy should fail closed.
 
 - `docs/TODO.md`: the v0.2.0 execution plan. Day-by-day only — no status,
   no evidence, no reference material.
-- `docs/GUARDRAILS.md`: environment constraints and implementation rules.
+- `docs/guardrails/{testing,config,tls,proxy}.md`: environment constraints and
+  implementation rules, one file per subsystem. A new rule goes in the file it
+  belongs to; `docs/GUARDRAILS.md` is only the index over them and must stay
+  that way, or it becomes a fifth file to keep in sync.
 - `benchmarks/README.md`: performance claims, methodology, and bugs discovered
   under load. The per-run evidence ledger is local (`benchmarks/results/`),
   not committed.

@@ -17,7 +17,7 @@ services:
       context: ..
       # 🐳 The one Dockerfile. There used to be a second copy at the repository
       # root that nothing built and that had drifted into being unbuildable —
-      # see the 2026-08-05 entry in docs/GUARDRAILS.md.
+      # see the 2026-08-05 entry in docs/guardrails/testing.md.
       dockerfile: deployment/Dockerfile
     command: ["pingclair", "run", "/etc/pingclair/Pingclairfile"]
     networks: [bench]

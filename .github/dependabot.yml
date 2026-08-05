@@ -4,7 +4,8 @@
 #   - github-actions: low risk, grouped into one PR per week.
 #   - cargo: grouped by risk. The H3/TLS group (quiche, boring,
 #     tokio-quiche, pingora*, rustls, rcgen, x509-parser) must not be merged
-#     without the Linux release + quiche-client gate in docs/GUARDRAILS.md —
+#     without the Linux release + quiche-client gate in
+#     docs/guardrails/proxy.md —
 #     a Dependabot PR is a reminder, not a decision.
 #
 # 🎯 `versioning-strategy: increase` is deliberate: a dependency constraint

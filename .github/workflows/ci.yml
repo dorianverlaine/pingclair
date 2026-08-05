@@ -27,7 +27,8 @@ jobs:
 
     steps:
       - name: Install build dependencies
-        # 🧱 Keep in sync with deployment/Dockerfile, see docs/GUARDRAILS.md.
+        # 🧱 Keep in sync with deployment/Dockerfile, see
+        # docs/guardrails/testing.md.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -230,7 +231,8 @@ jobs:
   # it. This is the job that would have caught the 2026-07-31 incident:
   # the Dockerfile had drifted (wrong Rust version, missing git and
   # perl) because nothing had built it since H3 moved onto
-  # tokio-quiche's dependency tree. GUARDRAILS says it plainly — "a
+  # tokio-quiche's dependency tree. docs/guardrails/testing.md says it
+  # plainly — "a
   # build script no CI job runs is code with no tests" — so this job
   # exists to make that statement false going forward.
   # ============================================================

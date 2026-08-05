@@ -4,7 +4,7 @@
 # below must name the dependency chain, why it is currently out of our hands,
 # and what reachability we have actually checked — "vendored, therefore
 # irrelevant" is exactly the kind of unverified claim this repository has
-# learned not to make (see docs/GUARDRAILS.md on rejection notes).
+# learned not to make (see docs/guardrails/proxy.md on rejection notes).
 #
 # Anything fixable in a normal dependency bump belongs in Cargo.toml, not
 # here. `reqwest` 0.11 → 0.12 (2026-07-31) removed three of these findings
@@ -16,8 +16,8 @@ ignore = [
     # decode). Reaches us via `prometheus 0.13` → `pingora-core 0.8.1`
     # (pingora-core pins `prometheus = "0.13"` with default features, which
     # includes `protobuf`). `pingora-core` is exact-pinned across this repo
-    # for the BoringSSL/H3 reasons in GUARDRAILS, so we cannot bump past it
-    # alone. `pingclair_proxy::metrics::gather()` only ever calls
+    # for the BoringSSL/H3 reasons in docs/guardrails/tls.md, so we cannot bump
+    # past it alone. `pingclair_proxy::metrics::gather()` only ever calls
     # prometheus's `TextEncoder` — nothing in this codebase decodes a
     # protobuf-format metrics payload from any input, trusted or not — so the
     # vulnerable recursion has no path from a request to reach it. That is a
@@ -37,7 +37,8 @@ ignore = [
     # via `serde_yaml 0.8` → `foundations` → `qlog` → `quiche`/`tokio-quiche`
     # — the same tracing dependency chain already documented in docs/TODO.md
     # (the tokio-quiche H3 migration pulls in `cf-rustracing` whether or not
-    # tracing is ever enabled). `tokio-quiche` is exact-pinned per GUARDRAILS.
+    # tracing is ever enabled). `tokio-quiche` is exact-pinned per
+    # docs/guardrails/proxy.md.
     "RUSTSEC-2024-0320",
 
     # rustls-pemfile 2.2.0 — RUSTSEC-2025-0134 (unmaintained, no CVE). This
