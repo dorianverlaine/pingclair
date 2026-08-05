@@ -427,8 +427,24 @@ pub(super) fn adapt_respond(d: Directive) -> Result<Handler, AdapterError> {
     let mut body: Option<Expr> = None;
 
     match d.args.len() {
+        // 🚫 Nothing left to respond with. By the time this runs any matcher
+        // token has been stripped, so this covers a bare `respond` and the
+        // matcher-only forms `respond /health` and `respond @api` alike.
+        //
+        // It used to mean "200 with an empty body", which is a guess wearing a
+        // default's clothes. `respond /health` has two readings — match
+        // `/health` and answer empty, or answer with the text `/health` — and
+        // this project has now shipped both of them. Refusing is the third
+        // answer and the only honest one: an operator who wants an empty 200
+        // says so with `respond 200`, and one who meant to type a body finds
+        // out at load instead of in production.
         0 => {
-            // respond → 200 empty
+            return Err(AdapterError::InvalidArgument(
+                d.name.clone(),
+                "needs a status code, a body, or both (`respond 200`, \
+                 `respond \"ok\"`, `respond \"nope\" 403`)"
+                    .into(),
+            ));
         }
         1 => {
             let arg = &d.args[0];

@@ -1236,6 +1236,43 @@ mod fail_closed_tests {
             "the codings after `*` must survive, in order"
         );
     }
+
+    /// 🎯 A `respond` with nothing to respond with is refused, in all three
+    /// spellings the matcher rule can produce.
+    ///
+    /// This used to compile to "200, empty body". The reason it must not is
+    /// that `respond /health` has two readings and this project has shipped
+    /// both: first the path became the response *text*, then it became a
+    /// matcher with an empty body. Neither reading is more obviously right, so
+    /// the config is ambiguous and the load is where that gets said.
+    #[test]
+    fn respond_without_a_status_or_body_is_refused() {
+        for source in [
+            "example.com {\n    respond\n}",
+            "example.com {\n    respond /health\n}",
+            "example.com {\n    @api path /api/*\n    respond @api\n}",
+        ] {
+            let error = compile_err(source);
+            assert!(
+                error.contains("status code") && error.contains("body"),
+                "the error must say what is missing; got {error}"
+            );
+        }
+    }
+
+    /// 👍 The unambiguous forms still compile — an empty 200 is expressible,
+    /// it just has to be asked for.
+    #[test]
+    fn respond_with_a_status_or_body_still_compiles() {
+        for source in [
+            "example.com {\n    respond 200\n}",
+            "example.com {\n    respond \"ok\"\n}",
+            "example.com {\n    respond /health 200\n}",
+            "example.com {\n    respond /health \"ok\" 200\n}",
+        ] {
+            crate::compile(source).unwrap_or_else(|e| panic!("must compile:\n{source}\ngot {e}"));
+        }
+    }
 }
 
 // MARK: - P3 Syntax Tests
