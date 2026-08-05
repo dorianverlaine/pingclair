@@ -2506,7 +2506,29 @@ impl PingclairProxy {
                         .insert_header("Content-Type", "text/plain; charset=utf-8")
                         .unwrap();
                 }
-                let body_bytes = body.as_deref().unwrap_or("").as_bytes();
+                // 🏷️ The body is a template, exactly like a redirect target:
+                // `respond "hello {host}"` is ordinary Caddy. It used to be
+                // written out verbatim, so Day 26 measured `v={host}` reaching
+                // the client where Caddy sent `v=probe.example`.
+                // 🔒 Scoped so the borrow of `session` ends here: the resolved
+                // value is copied into `Bytes` (which the write needed anyway,
+                // so this costs nothing extra) and `session` is free to be
+                // borrowed mutably for the write below.
+                let body_bytes = {
+                    let raw_body = body.as_deref().unwrap_or("");
+                    let verified_client_ip = if raw_body.contains('{') {
+                        ctx.verified_client_ip.map(|ip| ip.to_string())
+                    } else {
+                        None
+                    };
+                    let resolved = resolve_caddy_placeholders(
+                        raw_body,
+                        session.req_header(),
+                        verified_client_ip.as_deref(),
+                        ctx.request_scheme,
+                    );
+                    Bytes::copy_from_slice(resolved.as_bytes())
+                };
                 response
                     .insert_header("Content-Length", body_bytes.len().to_string())
                     .unwrap();
@@ -2514,8 +2536,7 @@ impl PingclairProxy {
                 session
                     .write_response_header(Box::new(response), false)
                     .await?;
-                Self::write_local_body(session, ctx, Bytes::copy_from_slice(body_bytes), true)
-                    .await?;
+                Self::write_local_body(session, ctx, body_bytes, true).await?;
                 Ok(true)
             }
             HandlerConfig::Redirect { to, code } => {
@@ -2530,6 +2551,7 @@ impl PingclairProxy {
                     to,
                     session.req_header(),
                     verified_client_ip.as_deref(),
+                    ctx.request_scheme,
                 );
                 let mut response = ResponseHeader::build(*code, Some(3)).unwrap();
                 response
@@ -2845,11 +2867,56 @@ impl PingclairProxy {
                 }
             }
             HandlerConfig::Headers { set, add, remove } => {
-                for (k, v) in set {
-                    ctx.response_headers.set(k, v.clone());
-                }
-                for (k, v) in add {
-                    ctx.response_headers.add(k, v.clone());
+                // 🏷️ `header X-Trace {host}` is ordinary Caddy, and the value used
+                // to reach the client verbatim — Day 26 measured `x-probe: {host}`
+                // where Caddy sent the hostname.
+                //
+                // Resolved here, as the value enters the request, rather than at
+                // write time: this is the one place that has both the configured
+                // template and the request, so the policy downstream stays a plain
+                // list of literal values and every response path benefits without
+                // being touched.
+                let needs_resolution = set
+                    .iter()
+                    .chain(add.iter())
+                    .any(|(_, value)| value.contains('{'));
+                let resolve = |value: &String, session: &Session, ctx: &RequestContext| {
+                    if value.contains('{') {
+                        resolve_caddy_placeholders(
+                            value,
+                            session.req_header(),
+                            ctx.verified_client_ip.map(|ip| ip.to_string()).as_deref(),
+                            ctx.request_scheme,
+                        )
+                        .into_owned()
+                    } else {
+                        value.clone()
+                    }
+                };
+                if needs_resolution {
+                    // 🔒 Collected first so `ctx` is not borrowed while it is being
+                    // written to.
+                    let resolved_set: Vec<(String, String)> = set
+                        .iter()
+                        .map(|(k, v)| (k.clone(), resolve(v, session, ctx)))
+                        .collect();
+                    let resolved_add: Vec<(String, String)> = add
+                        .iter()
+                        .map(|(k, v)| (k.clone(), resolve(v, session, ctx)))
+                        .collect();
+                    for (k, v) in resolved_set {
+                        ctx.response_headers.set(k, v);
+                    }
+                    for (k, v) in resolved_add {
+                        ctx.response_headers.add(k, v);
+                    }
+                } else {
+                    for (k, v) in set {
+                        ctx.response_headers.set(k, v.clone());
+                    }
+                    for (k, v) in add {
+                        ctx.response_headers.add(k, v.clone());
+                    }
                 }
                 for name in remove {
                     ctx.response_headers.remove(name);
@@ -3340,6 +3407,7 @@ pub(crate) fn resolve_caddy_placeholders<'a>(
     template: &'a str,
     req: &'a RequestHeader,
     verified_client_ip: Option<&'a str>,
+    scheme: &'static str,
 ) -> std::borrow::Cow<'a, str> {
     if !template.contains('{') {
         // ⚡ OPTIMIZATION: Fast path — no placeholders, return as-is.
@@ -3362,7 +3430,8 @@ pub(crate) fn resolve_caddy_placeholders<'a>(
             }
 
             // Resolve the placeholder
-            let resolved = resolve_single_placeholder(&placeholder, req, verified_client_ip);
+            let resolved =
+                resolve_single_placeholder(&placeholder, req, verified_client_ip, scheme);
             result.push_str(&resolved);
         } else {
             result.push(c);
@@ -3439,6 +3508,7 @@ fn resolve_single_placeholder(
     name: &str,
     req: &RequestHeader,
     verified_client_ip: Option<&str>,
+    scheme: &'static str,
 ) -> String {
     // {http.request.header.Header-Name}
     if let Some(header_name) = name.strip_prefix("http.request.header.") {
@@ -3518,8 +3588,18 @@ fn resolve_single_placeholder(
                 .unwrap_or(&"")
                 .to_string()
         }
-        "remote_ip" | "http.request.remote.host" => verified_client_ip.unwrap_or("").to_string(),
-        "http.request.method" => req.method.as_str().to_string(),
+        // 🧭 Caddy spells the client address `{remote_host}`; `{remote_ip}` is
+        // ours. Both resolve to the *verified* address, never to the raw socket
+        // peer, so an untrusted `X-Forwarded-For` cannot forge it.
+        "remote_ip" | "remote_host" | "http.request.remote.host" => {
+            verified_client_ip.unwrap_or("").to_string()
+        }
+        "method" | "http.request.method" => req.method.as_str().to_string(),
+        // 🧭 `{scheme}` is what the *client* used, which is why it is passed in
+        // rather than derived here: a request arriving over a plaintext
+        // listener behind a trusted proxy that terminated TLS is `https`, and
+        // the request header alone cannot say so.
+        "scheme" | "http.request.scheme" => scheme.to_string(),
         // 🧭 `{uri}` is Caddy's shorthand for the full request target, and it is
         // what `redir https://{host}{uri}` depends on.
         "uri" | "http.request.uri" => req.uri.to_string(),
@@ -4591,6 +4671,7 @@ impl ProxyHttp for PingclairProxy {
                 value_template,
                 downstream_headers,
                 verified_client_ip.as_deref(),
+                ctx.request_scheme,
             );
             upstream_request.insert_header(key.clone(), resolved.as_ref())?;
         }
