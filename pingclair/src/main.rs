@@ -26,7 +26,8 @@ mod systemd;
 use crate::addr::{host_only, listen_for_site, upstream_hostport};
 use crate::certs::{DynamicCertResolver, eager_issuance_domains, refresh_h3_cert_table};
 use crate::cli::admin::{admin_request, trust_internal_ca};
-use crate::cli::{Cli, Commands, ServiceAction};
+use crate::cli::service::manage_system_service;
+use crate::cli::{Cli, Commands};
 use crate::listen::{
     automatic_http_companion, can_bind_automatic_http_port, normalize_listen_addr,
     reserve_private_listener_address, server_requires_tls, servers_by_bind_address,
@@ -77,56 +78,6 @@ fn format_directives(directives: &[pingclair_config::parser::caddy_ast::Directiv
     let mut out = String::new();
     format_block(directives, 0, &mut out);
     out
-}
-
-/// 🛠️ Manages the systemd unit (Linux) or explains that service management is
-/// unavailable (other platforms). systemctl itself is Linux-only, so the
-/// non-Linux branch is the one local macOS tests exercise.
-fn manage_system_service(action: ServiceAction) -> anyhow::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        let cmd = match action {
-            ServiceAction::Start => "start",
-            ServiceAction::Stop => "stop",
-            ServiceAction::Restart => "restart",
-            ServiceAction::Reload => "reload",
-            ServiceAction::Status => "status",
-        };
-
-        tracing::info!("🛠️ Managing service: {}", cmd);
-        let status = std::process::Command::new("systemctl")
-            .arg(cmd)
-            .arg("pingclair")
-            .status();
-
-        match status {
-            Ok(s) if s.success() => {
-                let past_tense = match action {
-                    ServiceAction::Start => "started",
-                    ServiceAction::Stop => "stopped",
-                    ServiceAction::Restart => "restarted",
-                    ServiceAction::Reload => "reloaded",
-                    ServiceAction::Status => "queried",
-                };
-                println!("✅ Service {past_tense} successfully");
-            }
-            Ok(s) => {
-                anyhow::bail!("❌ Failed to {cmd} service (exit code: {s})");
-            }
-            Err(e) => {
-                anyhow::bail!("❌ Failed to execute systemctl: {e}");
-            }
-        }
-        Ok(())
-    }
-
-    // 🚫 macOS and other non-Linux platforms have no systemctl; the systemd
-    // unit shipped in scripts/ is the deployment contract instead.
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = action;
-        anyhow::bail!("❌ Service management is only supported on Linux (systemd).");
-    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -2069,23 +2020,4 @@ fn run_server(
     notify_systemd_ready();
 
     server.run_forever();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 🚫 On non-Linux platforms (including local macOS), the service
-    /// subcommand must fail with a clear message instead of pretending to run
-    /// systemctl.
-    #[test]
-    #[cfg(not(target_os = "linux"))]
-    fn service_management_reports_linux_only() {
-        let error = manage_system_service(ServiceAction::Start)
-            .expect_err("service management must fail outside Linux");
-        assert!(
-            error.to_string().contains("Linux"),
-            "the message must explain the platform limit: {error}"
-        );
-    }
 }
