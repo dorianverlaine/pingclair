@@ -4,6 +4,36 @@
 //! Pingclair - A modern web server built on Pingora
 //!
 //! This is the main entry point for the Pingclair CLI.
+//!
+//! # 🗺️ Why the binary is a set of modules and this file is 57 lines
+//!
+//! It was one file, and by 2026-08-06 that file was 3,404 lines. Length was
+//! not the problem. The problem was that it had no seam: a BoringSSL SNI
+//! callback, a clap subcommand definition, and a systemd datagram were
+//! neighbours, so a change to any one of them landed in the same place with
+//! nothing to check it against. Eight of the last 120 fix commits touched it.
+//!
+//! The split follows what the binary already does, in the order it does it:
+//!
+//! | Module | Owns |
+//! | --- | --- |
+//! | [`cli`] | Every flag, default, and help string — the contract with the operator. |
+//! | [`cli::dispatch`] | What each subcommand does. One arm each. |
+//! | [`cli::admin`] | The subcommands that reach outside this process: the admin client, the system trust store. |
+//! | [`cli::service`] | `pingclair service …`, a thin wrapper over `systemctl`. |
+//! | [`run`] | Everything between a compiled configuration and a serving process. |
+//! | [`listen`] | Which sockets a configuration actually needs. |
+//! | [`runtime_listeners`] | Listeners `/load` creates and destroys after startup. |
+//! | [`certs`] | Which certificate a name gets, at each of the three moments that question comes up. |
+//! | [`addr`] | What a single Caddy-style address means. |
+//! | [`paths`] | The config path and the store directory, both answered by convention. |
+//! | [`systemd`] | The two sentences this process says to systemd. |
+//! | [`resource_guard`] | Per-listener connection limits, wrapping the Pingora app. |
+//!
+//! 📌 What stays here is only what has to run before anything can read a flag:
+//! the no-argument help path, the rustls provider installed before any TLS code
+//! exists, tracing, and the parse. The allocator stays too, because a
+//! `#[global_allocator]` is only valid in the crate root.
 
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
