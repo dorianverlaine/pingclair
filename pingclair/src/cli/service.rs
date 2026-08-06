@@ -63,6 +63,10 @@ pub(crate) fn manage_system_service(action: ServiceAction) -> anyhow::Result<()>
 
 #[cfg(test)]
 mod tests {
+    // 🐧 Gated to match the single test below, which is itself non-Linux only.
+    // On Linux that test compiles away, and an import with nothing left to use
+    // it is an error under `-D warnings` — a break that no macOS run can see.
+    #[cfg(not(target_os = "linux"))]
     use super::*;
 
     /// 🚫 On non-Linux platforms (including local macOS), the service
