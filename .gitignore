@@ -50,10 +50,28 @@ benchmarks/results/
 # behind it and which does not. The second half of that sentence is the
 # problem — a list of the claims we cannot currently back is a list of the
 # places to push on. Publish the verified claim, not the ledger.
+#
+# TRIAGE.md is the same shelf for the same reason, and it is the sharpest
+# case: a triage row is at its most useful when it names the exact input
+# that breaks something, so a good row is a working reproduction for a
+# defect that is by definition still unfixed. AGENTS.md and
+# docs/GUARDRAILS.md may say the inbox exists and how to use it — the
+# method is fine to publish. The inbox is not.
+#
+# docs/refactor/ holds the split queue and the agent prompts driving it,
+# including commit-ratio and per-file defect-density figures. Working
+# material about how the work gets done, and unflattering out of context.
 docs/TODO.md
 docs/SITE.md
 docs/STATUS.md
 docs/TODO_CADDYFILE*.md
+TRIAGE.md
+docs/refactor/
+# 🧹 The same two notes also exist as loose copies at the repository root.
+# Ignored by name so a stray `git add -A` cannot publish what the entry
+# above was written to keep local.
+/pingclair-claude-code-prompts.md
+/pingclair-split-queue-and-usage.md
 
 # Test coverage
 *.profraw
