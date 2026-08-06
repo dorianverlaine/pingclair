@@ -18,6 +18,7 @@
 use clap::{Parser, Subcommand};
 
 pub(crate) mod admin;
+pub(crate) mod dispatch;
 pub(crate) mod service;
 
 // 🧾 `Field: value` arguments are parsed by the same helper the admin
