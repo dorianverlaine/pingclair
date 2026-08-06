@@ -7,9 +7,7 @@
 
 use clap::Parser;
 use parking_lot::RwLock;
-use pingclair_tls::manager::TlsManager;
 use pingora_core::listeners::tls::TlsSettings;
-use pingora_core::services::Service as PingoraService;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +19,7 @@ mod cli;
 mod listen;
 mod paths;
 mod resource_guard;
+mod runtime_listeners;
 mod systemd;
 
 use crate::addr::{host_only, listen_for_site, upstream_hostport};
@@ -33,6 +32,7 @@ use crate::listen::{
     reserve_private_listener_address, server_requires_tls, servers_by_bind_address,
 };
 use crate::paths::{resolve_config_path, tls_store_dir};
+use crate::runtime_listeners::RuntimeListeners;
 use crate::systemd::{notify_systemd_ready, notify_systemd_stopping};
 
 #[cfg(unix)]
@@ -832,125 +832,6 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-/// 🧭 Runtime listener manager: `/load` can create and tear down listeners
-/// after startup, like Caddy.
-///
-/// Pingora's `Server` cannot add services once `run_forever` has started, so
-/// every dynamically added listener runs its own `Service` accept loop on the
-/// shared background runtime. The proxy map is updated first so `/load`
-/// resolution and traffic both see the listener immediately.
-struct RuntimeListeners {
-    port_proxies: Arc<RwLock<HashMap<String, pingclair_proxy::server::PingclairProxy>>>,
-    server_conf: Arc<pingora::server::configuration::ServerConf>,
-    tls_manager: Arc<TlsManager>,
-    trusted_proxies: Vec<String>,
-    blocked_ips: Vec<String>,
-    proxy_protocol_addresses: HashSet<String>,
-    http_port: u16,
-    https_port: u16,
-    running: RwLock<HashMap<String, tokio::task::JoinHandle<()>>>,
-    shutdowns: RwLock<HashMap<String, tokio::sync::watch::Sender<bool>>>,
-    dynamic_addrs: RwLock<HashSet<String>>,
-}
-
-impl pingclair_proxy::server::DynamicListeners for RuntimeListeners {
-    fn start_listener(
-        &self,
-        addr: &str,
-        server: &pingclair_core::config::ServerConfig,
-    ) -> Result<(), String> {
-        if self.running.read().contains_key(addr) {
-            return Ok(());
-        }
-
-        let is_https = server_requires_tls(server, addr, self.http_port, self.https_port);
-        // 🚫 Bind first so permission and privileged-port failures surface
-        // synchronously to `/load` instead of panicking the accept task later
-        // (the accept loop re-binds immediately after this probe).
-        std::net::TcpListener::bind(addr)
-            .map_err(|error| format!("cannot bind {addr}: {error}"))?;
-        let proxy = {
-            let mut guard = self.port_proxies.write();
-            guard
-                .entry(addr.to_string())
-                .or_insert_with(|| {
-                    pingclair_proxy::server::PingclairProxy::with_tls_and_trusted_proxies(
-                        self.tls_manager.clone(),
-                        &self.trusted_proxies,
-                        self.proxy_protocol_addresses.contains(addr),
-                    )
-                })
-                .clone()
-        };
-        proxy.add_server(server.clone());
-
-        let listener_limits = proxy.listener_limits();
-        let http_proxy = pingora_proxy::HttpProxy::new(proxy, self.server_conf.clone());
-        let mut server_options = pingora_core::apps::HttpServerOptions::default();
-        server_options.h2c = !is_https;
-        let app =
-            resource_guard::ResourceGuardedProxy::new(http_proxy, listener_limits, server_options);
-        let mut service = pingora_core::services::listening::Service::new(
-            "Pingclair Dynamic HTTP Service".to_string(),
-            app,
-        );
-        if !self.blocked_ips.is_empty() {
-            let filter = std::sync::Arc::new(pingclair_proxy::PingclairConnectionFilter::new(
-                &self.blocked_ips,
-            ));
-            service.set_connection_filter(filter);
-        }
-        if is_https {
-            let acceptor = DynamicCertResolver::new(self.tls_manager.clone());
-            let mut tls_settings =
-                TlsSettings::with_callbacks(Box::new(acceptor)).map_err(|e| e.to_string())?;
-            tls_settings.enable_h2();
-            service.add_tls_with_settings(addr, None, tls_settings);
-        } else {
-            service.add_tcp(addr);
-        }
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let handle = tokio::runtime::Handle::current().spawn(async move {
-            #[cfg(unix)]
-            PingoraService::start_service(&mut service, None, shutdown_rx, 1).await;
-            #[cfg(not(unix))]
-            PingoraService::start_service(&mut service, shutdown_rx, 1).await;
-        });
-        self.running.write().insert(addr.to_string(), handle);
-        self.shutdowns.write().insert(addr.to_string(), shutdown_tx);
-        self.dynamic_addrs.write().insert(addr.to_string());
-        tracing::info!("🧭 Dynamically listening on {} (TLS: {})", addr, is_https);
-        Ok(())
-    }
-
-    fn stop_listener(&self, addr: &str) {
-        if let Some(tx) = self.shutdowns.write().remove(addr) {
-            let _ = tx.send(true);
-        }
-        if let Some(handle) = self.running.write().remove(addr) {
-            handle.abort();
-        }
-        self.port_proxies.write().remove(addr);
-        self.dynamic_addrs.write().remove(addr);
-        tracing::info!("🛑 Dynamically stopped listener {}", addr);
-    }
-
-    fn is_dynamic(&self, addr: &str) -> bool {
-        self.dynamic_addrs.read().contains(addr)
-    }
-
-    fn probe_listener(&self, addr: &str) -> Result<(), String> {
-        // 🔎 Bind and drop. There is an unavoidable gap between this check and
-        // the real bind, so another process could still take the port in
-        // between — but the failure this prevents is the common one: a reload
-        // whose own configuration names a port something else already holds.
-        std::net::TcpListener::bind(addr)
-            .map(|_| ())
-            .map_err(|error| format!("cannot bind {addr}: {error}"))
-    }
 }
 
 fn run_server(
