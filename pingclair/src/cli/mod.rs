@@ -17,9 +17,11 @@
 
 use clap::{Parser, Subcommand};
 
+pub(crate) mod admin;
+
 // 🧾 `Field: value` arguments are parsed by the same helper the admin
 // commands use, so `--header` and `--header-up` cannot drift apart.
-use crate::parse_header_pair;
+use self::admin::parse_header_pair;
 
 /// Pingclair - Modern web server inspired by Caddy, powered by Pingora
 #[derive(Parser)]
