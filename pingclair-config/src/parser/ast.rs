@@ -6,6 +6,7 @@
 //! This module defines every node produced by the parser.
 
 use crate::parser::lexer::Location;
+use pingclair_core::config::BasicAuthAlgorithm;
 use std::collections::{BTreeMap, HashMap};
 
 /// A node with source location information
@@ -573,7 +574,10 @@ pub struct BasicAuthConfig {
     /// 🪪 Realm shown in the `WWW-Authenticate` challenge.
     pub realm: Option<String>,
 
-    /// 🔑 Username and plain-text or bcrypt password pairs.
+    /// 🔑 Hash algorithm every credential in this block declares.
+    pub algorithm: BasicAuthAlgorithm,
+
+    /// 🔑 Username and password-hash pairs, one per block line.
     pub credentials: Vec<(String, String)>,
 }
 

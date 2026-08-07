@@ -2755,6 +2755,7 @@ dependencies = [
 name = "pingclair-core"
 version = "0.2.0-dev"
 dependencies = [
+ "argon2",
  "async-trait",
  "base64",
  "bcrypt",

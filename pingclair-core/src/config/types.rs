@@ -752,7 +752,7 @@ pub enum HandlerConfig {
         #[serde(default = "default_auth_realm")]
         realm: String,
         /// List of allowed username:password_hash pairs
-        /// Password should be bcrypt hashed for security
+        /// 🔑 Credentials, each a hash of its declared algorithm.
         credentials: Vec<BasicAuthCredential>,
     },
 
@@ -904,16 +904,70 @@ fn default_rate_limit_window() -> u64 {
     60
 }
 
+/// 🔐 Hash algorithm a `basic_auth` credential declares.
+///
+/// The algorithm is a property of the configuration, never guessed from the
+/// hash text: a `$argon2id$` string used to fall through the `$2`-prefix
+/// check and authenticate anyone who typed the hash itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BasicAuthAlgorithm {
+    /// 🔑 bcrypt, Caddy's default `basic_auth` algorithm.
+    Bcrypt,
+    /// 🔒 Argon2id, chosen with `basic_auth argon2id { … }`.
+    Argon2id,
+}
+
 /// 🔐 Basic Auth credential.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BasicAuthCredential {
     /// 👤 Username presented by the client.
     pub username: String,
-    /// 🔑 Bcrypt hash or legacy plain-text password.
+    /// 🔑 The password hash, in the declared algorithm's format.
     pub password: String,
-    /// 🛡️ Indicates that `password` contains a bcrypt hash.
-    #[serde(default)]
-    pub hashed: bool,
+    /// 🔑 Algorithm the password hash was produced with.
+    pub algorithm: BasicAuthAlgorithm,
+}
+
+impl<'de> Deserialize<'de> for BasicAuthCredential {
+    /// 🧩 Loads the current shape and the legacy one side by side.
+    ///
+    /// Documents written before the algorithm was a field said
+    /// `"hashed": true` to mean bcrypt, and the old plaintext spelling
+    /// (`"hashed": false` or absent) is refused rather than revived — a
+    /// literal password compared against itself is the exact trap this
+    /// change removes.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            username: String,
+            password: String,
+            #[serde(default)]
+            algorithm: Option<BasicAuthAlgorithm>,
+            #[serde(default)]
+            hashed: Option<bool>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let algorithm = match (raw.algorithm, raw.hashed) {
+            (Some(algorithm), _) => algorithm,
+            (None, Some(true)) => BasicAuthAlgorithm::Bcrypt,
+            (None, _) => {
+                return Err(serde::de::Error::custom(
+                    "basic_auth credentials must declare a hash algorithm; plaintext \
+                     passwords are refused (hash one with `pingclair hash-password`)",
+                ));
+            }
+        };
+        Ok(Self {
+            username: raw.username,
+            password: raw.password,
+            algorithm,
+        })
+    }
 }
 
 /// Reverse proxy configuration
@@ -1755,6 +1809,36 @@ mod tests {
         assert!(config.global.local_certs);
         let rendered = serde_json::to_string(&config).unwrap();
         assert!(rendered.contains("\"local_certs\":true"), "{rendered}");
+    }
+
+    /// 🧩 Legacy `hashed: true` credentials load as bcrypt, the current
+    /// `algorithm` shape round-trips, and the old plaintext spelling is
+    /// refused rather than revived.
+    #[test]
+    fn basic_auth_credential_serde_keeps_legacy_documents_working() {
+        let legacy: BasicAuthCredential =
+            serde_json::from_str(r#"{"username":"alice","password":"$2y$04$x","hashed":true}"#)
+                .unwrap();
+        assert_eq!(legacy.algorithm, BasicAuthAlgorithm::Bcrypt);
+
+        let current: BasicAuthCredential = serde_json::from_str(
+            r#"{"username":"alice","password":"$argon2id$v=19$m=47104,t=1,p=1$a$b","algorithm":"argon2id"}"#,
+        )
+        .unwrap();
+        assert_eq!(current.algorithm, BasicAuthAlgorithm::Argon2id);
+        let rendered = serde_json::to_string(&current).unwrap();
+        assert!(
+            rendered.contains("\"algorithm\":\"argon2id\""),
+            "{rendered}"
+        );
+
+        let plaintext = serde_json::from_str::<BasicAuthCredential>(
+            r#"{"username":"alice","password":"secret","hashed":false}"#,
+        );
+        assert!(
+            plaintext.is_err(),
+            "legacy plaintext must be refused, got {plaintext:?}"
+        );
     }
 
     #[test]

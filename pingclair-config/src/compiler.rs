@@ -9,13 +9,14 @@ use crate::parser::ast::*;
 use pingclair_core::config::Encoding as CoreEncoding;
 use pingclair_core::config::{
     AccessControlConfig as CoreAccessControlConfig, AdminConfig,
-    AutoHttpsMode as CoreAutoHttpsMode, HandlerConfig, HandlerElement as CoreHandlerElement,
-    LoadBalanceConfig, LogConfig, LogFormat as CoreLogFormat, LogOutput as CoreLogOutput,
-    Matcher as CoreMatcher, MatcherCondition, NamedLogConfig, PingclairConfig, ProxyUpstream,
+    AutoHttpsMode as CoreAutoHttpsMode, BasicAuthAlgorithm as CoreBasicAuthAlgorithm,
+    HandlerConfig, HandlerElement as CoreHandlerElement, LoadBalanceConfig, LogConfig,
+    LogFormat as CoreLogFormat, LogOutput as CoreLogOutput, Matcher as CoreMatcher,
+    MatcherCondition, NamedLogConfig, PingclairConfig, ProxyUpstream,
     RateLimitKey as CoreRateLimitKey, ReverseProxyConfig, RouteConfig, ServerConfig, TlsConfig,
     default_encodings, default_gzip_types,
 };
-use pingclair_core::server::{MAX_BCRYPT_COST, bcrypt_hash_cost};
+use pingclair_core::server::{MAX_BCRYPT_COST, argon2id_hash_valid, bcrypt_hash_cost};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use thiserror::Error;
 
@@ -584,6 +585,7 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
 
         for route in &server.routes {
             validate_proxy_protection_handler(&route.handler)?;
+            validate_basic_auth_credentials(&route.handler)?;
             reject_unimplemented_handler(&route.handler)?;
         }
 
@@ -676,6 +678,76 @@ fn reject_unimplemented_handler(handler: &HandlerConfig) -> CompileResult<()> {
         | HandlerConfig::RateLimit { .. }
         | HandlerConfig::Cors { .. }
         | HandlerConfig::AccessControl(_) => Ok(()),
+    }
+}
+
+/// 🛡️ Refuses plaintext or malformed credentials no matter where the
+/// configuration came from.
+///
+/// The DSL adapter validates while compiling, but the Admin API deserializes
+/// straight into core types — an adapter-only check is a bypass, which is why
+/// the same rules live here, on the single validation path every source goes
+/// through.
+fn validate_basic_auth_credentials(handler: &HandlerConfig) -> CompileResult<()> {
+    match handler {
+        HandlerConfig::BasicAuth { credentials, .. } => {
+            for credential in credentials {
+                let algorithm = match credential.algorithm {
+                    CoreBasicAuthAlgorithm::Bcrypt => "bcrypt",
+                    CoreBasicAuthAlgorithm::Argon2id => "argon2id",
+                };
+                let valid = match credential.algorithm {
+                    CoreBasicAuthAlgorithm::Bcrypt => bcrypt_hash_cost(&credential.password)
+                        .is_some_and(|cost| cost <= MAX_BCRYPT_COST),
+                    CoreBasicAuthAlgorithm::Argon2id => argon2id_hash_valid(&credential.password),
+                };
+                if !valid {
+                    return Err(CompileError::InvalidRoute {
+                        message: format!(
+                            "basic_auth credential `{}` is not a valid {algorithm} hash; \
+                             plaintext passwords are refused — hash one with \
+                             `pingclair hash-password`",
+                            credential.username
+                        ),
+                    });
+                }
+            }
+            Ok(())
+        }
+        HandlerConfig::Pipeline { handlers }
+        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::HandlePath { handlers, .. } => {
+            for element in handlers {
+                validate_basic_auth_credentials(&element.handler)?;
+            }
+            Ok(())
+        }
+        HandlerConfig::HandleErrors { errors } => {
+            for handlers in errors.values() {
+                for handler in handlers {
+                    validate_basic_auth_credentials(handler)?;
+                }
+            }
+            Ok(())
+        }
+        HandlerConfig::TryFiles { fallback, .. } => match fallback {
+            Some(fallback) => validate_basic_auth_credentials(fallback),
+            None => Ok(()),
+        },
+        // 🧭 Named exhaustively for the same reason `reject_unimplemented_handler`
+        // is: a new handler variant must decide whether it can hold credentials.
+        HandlerConfig::FileServer { .. }
+        | HandlerConfig::ReverseProxy(_)
+        | HandlerConfig::Redirect { .. }
+        | HandlerConfig::Rewrite { .. }
+        | HandlerConfig::Respond { .. }
+        | HandlerConfig::Headers { .. }
+        | HandlerConfig::LogSkip
+        | HandlerConfig::RateLimit { .. }
+        | HandlerConfig::Cors { .. }
+        | HandlerConfig::AccessControl(_)
+        | HandlerConfig::Plugin { .. }
+        | HandlerConfig::Templates { .. } => Ok(()),
     }
 }
 
@@ -1589,7 +1661,9 @@ fn compile_handler(
             let credentials = config
                 .credentials
                 .iter()
-                .map(|(username, password)| compile_basic_auth_credential(username, password))
+                .map(|(username, password)| {
+                    compile_basic_auth_credential(username, password, config.algorithm)
+                })
                 .collect::<CompileResult<Vec<_>>>()?;
             Ok(HandlerConfig::BasicAuth {
                 realm: config
@@ -1710,33 +1784,51 @@ fn compile_handler_element(
     })
 }
 
-/// 🔐 Compiles and bounds a Basic Auth credential's bcrypt work factor.
+/// 🔐 Compiles one Basic Auth credential against its declared algorithm.
+///
+/// The algorithm comes from the directive (`basic_auth bcrypt|argon2id`),
+/// never from the hash text: prefix-guessing is what let an `$argon2id$`
+/// string become a literal password. Anything that is not a valid hash of
+/// the declared kind is refused, so plaintext cannot be configured at all.
 fn compile_basic_auth_credential(
     username: &str,
     password: &str,
+    algorithm: CoreBasicAuthAlgorithm,
 ) -> CompileResult<pingclair_core::config::BasicAuthCredential> {
-    let hashed = if password.starts_with("$2") {
-        let Some(cost) = bcrypt_hash_cost(password) else {
-            return Err(CompileError::InvalidRoute {
-                message: format!("invalid bcrypt hash for basic_auth user `{username}`"),
-            });
-        };
-        if cost > MAX_BCRYPT_COST {
-            return Err(CompileError::InvalidRoute {
-                message: format!(
-                    "bcrypt cost {cost} for basic_auth user `{username}` exceeds the maximum {MAX_BCRYPT_COST}"
-                ),
-            });
+    match algorithm {
+        CoreBasicAuthAlgorithm::Bcrypt => {
+            let Some(cost) = bcrypt_hash_cost(password) else {
+                return Err(CompileError::InvalidRoute {
+                    message: format!(
+                        "invalid bcrypt hash for basic_auth user `{username}`; plaintext \
+                         passwords are refused — hash one with `pingclair hash-password`"
+                    ),
+                });
+            };
+            if cost > MAX_BCRYPT_COST {
+                return Err(CompileError::InvalidRoute {
+                    message: format!(
+                        "bcrypt cost {cost} for basic_auth user `{username}` exceeds the maximum {MAX_BCRYPT_COST}"
+                    ),
+                });
+            }
         }
-        true
-    } else {
-        false
-    };
+        CoreBasicAuthAlgorithm::Argon2id => {
+            if !argon2id_hash_valid(password) {
+                return Err(CompileError::InvalidRoute {
+                    message: format!(
+                        "invalid argon2id hash for basic_auth user `{username}`; plaintext \
+                         passwords are refused — hash one with `pingclair hash-password`"
+                    ),
+                });
+            }
+        }
+    }
 
     Ok(pingclair_core::config::BasicAuthCredential {
         username: username.to_string(),
         password: password.to_string(),
-        hashed,
+        algorithm,
     })
 }
 

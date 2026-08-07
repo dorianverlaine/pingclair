@@ -84,9 +84,20 @@ lets the rest converge.
   `realm "X"` is an account named `realm`. A `realm` block line is therefore
   refused with a message naming the replacement, instead of silently becoming
   a working credential nobody wrote. `basic_auth` never appeared in a release,
-  so no `0.1.7` configuration is affected. `argon2id` is refused by name: this
-  server verifies bcrypt only, and a hash it cannot verify is compared as
-  plain text.
+  so no `0.1.7` configuration is affected. `argon2id` is now verified too —
+  see the entry below.
+
+- 🔐 **`basic_auth` verifies the declared algorithm and refuses plaintext.**
+  The credential's algorithm comes from the directive
+  (`basic_auth bcrypt|argon2id`), never from guessing at the hash text, so
+  `pingclair hash-password --algorithm argon2id` output now authenticates
+  instead of creating a login whose password is the hash text. Argon2id PHC
+  strings are verified the way Caddy emits them (v=19) on the same bounded
+  blocking pool as bcrypt, for H1/H2 and H3 alike. A credential that is not a
+  valid hash of the declared algorithm — including any plaintext password —
+  is refused at load on every path, DSL and JSON. Legacy JSON documents that
+  said `"hashed": true` still load as bcrypt; the old plaintext JSON spelling
+  is refused.
 - 🗂️ **`try_files` resolves candidates under the site root and rewrites instead
   of serving.** It was previously reachable only from JSON, where it treated
   each candidate as a filesystem path and served any match itself through an

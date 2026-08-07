@@ -5,7 +5,8 @@
 //!
 //! Provides handlers for respond, redirect, and headers operations.
 
-use crate::config::{BasicAuthCredential, HandlerConfig, HandlerElement};
+use crate::config::{BasicAuthAlgorithm, BasicAuthCredential, HandlerConfig, HandlerElement};
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use base64::Engine as _;
 use bcrypt::HashParts;
 use bytes::Bytes;
@@ -17,8 +18,11 @@ use std::sync::{Arc, LazyLock};
 /// 🔐 The maximum bcrypt work factor accepted from configuration.
 pub const MAX_BCRYPT_COST: u32 = 14;
 
-/// 🚦 The semaphore bounds concurrent bcrypt work to available CPU capacity.
-static BCRYPT_WORKERS: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
+/// 🚦 The semaphore bounds concurrent password-hash verification to available
+/// CPU capacity. Both bcrypt and argon2id are expensive on purpose, and an
+/// argon2id verification allocates the hash's declared memory budget, so the
+/// two share one gate rather than each getting its own unbounded lane.
+static HASH_WORKERS: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
     let workers = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
@@ -307,10 +311,10 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
     }
 }
 
-/// 🔐 Verifies an HTTP Basic header against plain-text or bcrypt credentials.
+/// 🔐 Verifies an HTTP Basic header against the configured hash credentials.
 ///
 /// This synchronous entry point is retained for the core handler evaluator.
-/// Network dispatch paths must use [`verify_basic_auth_async`] so bcrypt work
+/// Network dispatch paths must use [`verify_basic_auth_async`] so hash work
 /// cannot block an asynchronous I/O worker.
 pub fn verify_basic_auth(headers: &http::HeaderMap, credentials: &[BasicAuthCredential]) -> bool {
     let Some((user, password)) = parse_basic_auth(headers) else {
@@ -329,15 +333,18 @@ pub async fn verify_basic_auth_async(
     };
 
     let has_matching_hash = credentials.iter().any(|credential| {
-        credential.hashed
-            && constant_time_eq(user.as_bytes(), credential.username.as_bytes())
-            && bcrypt_hash_cost(&credential.password).is_some_and(|cost| cost <= MAX_BCRYPT_COST)
+        constant_time_eq(user.as_bytes(), credential.username.as_bytes())
+            && match credential.algorithm {
+                BasicAuthAlgorithm::Bcrypt => bcrypt_hash_cost(&credential.password)
+                    .is_some_and(|cost| cost <= MAX_BCRYPT_COST),
+                BasicAuthAlgorithm::Argon2id => true,
+            }
     });
     if !has_matching_hash {
         return verify_basic_auth_pair(&user, &password, credentials);
     }
 
-    let Ok(permit) = Arc::clone(&BCRYPT_WORKERS).acquire_owned().await else {
+    let Ok(permit) = Arc::clone(&HASH_WORKERS).acquire_owned().await else {
         return false;
     };
     let credentials = credentials.to_vec();
@@ -352,6 +359,31 @@ pub async fn verify_basic_auth_async(
 /// 🧮 Returns a bcrypt hash's declared cost when its syntax is valid.
 pub fn bcrypt_hash_cost(hash: &str) -> Option<u32> {
     HashParts::from_str(hash).ok().map(|parts| parts.get_cost())
+}
+
+/// 🧮 Whether `hash` is a valid argon2id PHC string this server can verify.
+///
+/// The check is structural on purpose: parsing the parameters is cheap, and
+/// deriving a key just to test validity would spend the hash's memory budget
+/// at configuration load. Verification itself parses again and runs Argon2.
+pub fn argon2id_hash_valid(hash: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(hash) else {
+        return false;
+    };
+    // 📏 Argon2id version 0x13 (19) is the version every current generator
+    // emits, including Caddy's; an older version would fail at verification
+    // time, so it is refused here instead.
+    parsed.algorithm.as_str() == "argon2id" && parsed.version == Some(19)
+}
+
+/// 🔒 Verifies one plaintext password against an argon2id PHC hash.
+fn verify_argon2id(password: &str, hash: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(hash) else {
+        return false;
+    };
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
 }
 
 /// 🔎 Parses the Basic scheme and its base64-encoded `user:password` payload.
@@ -377,19 +409,24 @@ fn parse_basic_auth(headers: &http::HeaderMap) -> Option<(String, String)> {
     Some((user.to_string(), password.to_string()))
 }
 
-/// 🛡️ Checks a parsed credential pair and rejects unsafe bcrypt costs.
+/// 🛡️ Checks a parsed credential pair, dispatching on the declared algorithm
+/// and rejecting unsafe bcrypt costs.
 fn verify_basic_auth_pair(user: &str, password: &str, credentials: &[BasicAuthCredential]) -> bool {
     let mut matched = false;
     for credential in credentials {
         let user_ok = constant_time_eq(user.as_bytes(), credential.username.as_bytes());
-        let password_ok = if credential.hashed {
-            user_ok
-                && bcrypt_hash_cost(&credential.password)
-                    .is_some_and(|cost| cost <= MAX_BCRYPT_COST)
-                && bcrypt::verify(password, &credential.password).unwrap_or(false)
-        } else {
-            constant_time_eq(password.as_bytes(), credential.password.as_bytes())
-        };
+        let password_ok = user_ok
+            && match credential.algorithm {
+                // 🛡️ The cost ceiling is enforced here too, at the last line
+                // before a hash is spent, so a configuration that slipped
+                // past validation cannot burn minutes per attempt.
+                BasicAuthAlgorithm::Bcrypt => {
+                    bcrypt_hash_cost(&credential.password)
+                        .is_some_and(|cost| cost <= MAX_BCRYPT_COST)
+                        && bcrypt::verify(password, &credential.password).unwrap_or(false)
+                }
+                BasicAuthAlgorithm::Argon2id => verify_argon2id(password, &credential.password),
+            };
         if user_ok && password_ok {
             matched = true;
         }
@@ -466,18 +503,20 @@ mod tests {
     }
 
     fn basic_auth_config() -> HandlerConfig {
+        let alice = bcrypt::hash("s3cret", 4).unwrap();
+        let bob = bcrypt::hash("hunter2", 4).unwrap();
         HandlerConfig::BasicAuth {
             realm: "Restricted".to_string(),
             credentials: vec![
                 BasicAuthCredential {
                     username: "alice".to_string(),
-                    password: "s3cret".to_string(),
-                    hashed: false,
+                    password: alice,
+                    algorithm: BasicAuthAlgorithm::Bcrypt,
                 },
                 BasicAuthCredential {
                     username: "bob".to_string(),
-                    password: "hunter2".to_string(),
-                    hashed: false,
+                    password: bob,
+                    algorithm: BasicAuthAlgorithm::Bcrypt,
                 },
             ],
         }
@@ -546,18 +585,18 @@ mod tests {
         assert_eq!(response.status, StatusCode::UNAUTHORIZED);
     }
 
-    fn plain_credentials() -> Vec<BasicAuthCredential> {
+    fn bcrypt_credentials() -> Vec<BasicAuthCredential> {
         vec![BasicAuthCredential {
             username: "alice".to_string(),
-            password: "s3cret".to_string(),
-            hashed: false,
+            password: bcrypt::hash("s3cret", 4).unwrap(),
+            algorithm: BasicAuthAlgorithm::Bcrypt,
         }]
     }
 
     #[test]
     fn test_verify_basic_auth_accepts_valid_credentials() {
         let headers = headers_with_basic_auth("alice", "s3cret");
-        assert!(verify_basic_auth(&headers, &plain_credentials()));
+        assert!(verify_basic_auth(&headers, &bcrypt_credentials()));
     }
 
     #[test]
@@ -567,15 +606,15 @@ mod tests {
             http::header::AUTHORIZATION,
             "Bearer some-token".parse().unwrap(),
         );
-        assert!(!verify_basic_auth(&headers, &plain_credentials()));
+        assert!(!verify_basic_auth(&headers, &bcrypt_credentials()));
     }
 
     #[test]
     fn test_verify_basic_auth_password_may_contain_colon() {
         let credentials = vec![BasicAuthCredential {
             username: "alice".to_string(),
-            password: "pa:ss:word".to_string(),
-            hashed: false,
+            password: bcrypt::hash("pa:ss:word", 4).unwrap(),
+            algorithm: BasicAuthAlgorithm::Bcrypt,
         }];
         let headers = headers_with_basic_auth("alice", "pa:ss:word");
         assert!(verify_basic_auth(&headers, &credentials));
@@ -587,7 +626,7 @@ mod tests {
         let credentials = vec![BasicAuthCredential {
             username: "alice".to_string(),
             password: hash,
-            hashed: true,
+            algorithm: BasicAuthAlgorithm::Bcrypt,
         }];
         let headers = headers_with_basic_auth("alice", "s3cret");
         assert!(verify_basic_auth(&headers, &credentials));
@@ -601,7 +640,7 @@ mod tests {
         let credentials = vec![BasicAuthCredential {
             username: "alice".to_string(),
             password: "$2b$04$not-a-valid-hash".to_string(),
-            hashed: true,
+            algorithm: BasicAuthAlgorithm::Bcrypt,
         }];
         let headers = headers_with_basic_auth("alice", "s3cret");
         assert!(!verify_basic_auth(&headers, &credentials));
@@ -617,7 +656,7 @@ mod tests {
         let credentials = vec![BasicAuthCredential {
             username: "alice".to_string(),
             password: hash,
-            hashed: true,
+            algorithm: BasicAuthAlgorithm::Bcrypt,
         }];
         let headers = headers_with_basic_auth("alice", "s3cret");
         assert!(!verify_basic_auth(&headers, &credentials));
@@ -628,9 +667,60 @@ mod tests {
         let credentials = vec![BasicAuthCredential {
             username: "alice".to_string(),
             password: bcrypt::hash("s3cret", 4).unwrap(),
-            hashed: true,
+            algorithm: BasicAuthAlgorithm::Bcrypt,
         }];
         let headers = headers_with_basic_auth("alice", "s3cret");
+        assert!(verify_basic_auth_async(&headers, &credentials).await);
+    }
+
+    /// 🔒 The hash is Caddy's own argon2id fixture: `antitiming` with
+    /// m=47104, t=1, p=1 (from `modules/caddyhttp/caddyauth/argon2id.go`),
+    /// so the verifier is exercised against upstream's exact output.
+    const CADDY_ARGON2ID_HASH: &str = "$argon2id$v=19$m=47104,t=1,p=1$P2nzckEdTZ3bxCiBCkRTyA$xQL3Z32eo5jKl7u5tcIsnEKObYiyNZQQf5/4sAau6Pg";
+
+    #[test]
+    fn argon2id_hash_valid_accepts_upstream_output() {
+        assert!(argon2id_hash_valid(CADDY_ARGON2ID_HASH));
+        assert!(!argon2id_hash_valid(
+            "$2y$04$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W"
+        ));
+        assert!(!argon2id_hash_valid("$argon2id$v=18$m=47104,t=1,p=1$a$b"));
+        assert!(!argon2id_hash_valid("not a hash"));
+    }
+
+    #[test]
+    fn test_verify_basic_auth_accepts_argon2id_credentials() {
+        let credentials = vec![BasicAuthCredential {
+            username: "alice".to_string(),
+            password: CADDY_ARGON2ID_HASH.to_string(),
+            algorithm: BasicAuthAlgorithm::Argon2id,
+        }];
+        let headers = headers_with_basic_auth("alice", "antitiming");
+        assert!(verify_basic_auth(&headers, &credentials));
+
+        let wrong_headers = headers_with_basic_auth("alice", "wrong");
+        assert!(!verify_basic_auth(&wrong_headers, &credentials));
+    }
+
+    #[test]
+    fn test_verify_basic_auth_rejects_invalid_argon2id_hash() {
+        let credentials = vec![BasicAuthCredential {
+            username: "alice".to_string(),
+            password: "$argon2id$v=19$m=47104,t=1,p=1$not-a-hash".to_string(),
+            algorithm: BasicAuthAlgorithm::Argon2id,
+        }];
+        let headers = headers_with_basic_auth("alice", "antitiming");
+        assert!(!verify_basic_auth(&headers, &credentials));
+    }
+
+    #[tokio::test]
+    async fn test_verify_basic_auth_async_accepts_argon2id_credentials() {
+        let credentials = vec![BasicAuthCredential {
+            username: "alice".to_string(),
+            password: CADDY_ARGON2ID_HASH.to_string(),
+            algorithm: BasicAuthAlgorithm::Argon2id,
+        }];
+        let headers = headers_with_basic_auth("alice", "antitiming");
         assert!(verify_basic_auth_async(&headers, &credentials).await);
     }
 

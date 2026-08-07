@@ -2077,8 +2077,16 @@ mod basic_auth_grammar_tests {
 
     /// 🔑 bcrypt hash of `change-me`, cost 12.
     const HASH: &str = "$2y$12$iKzVHkDoCr2oz1DAOzX9wec0yf3A.FZM3SmsP9dYHmhE2O.3TSpSW";
+    /// 🔒 Caddy's own argon2id fixture (`antitiming`, m=47104 t=1 p=1).
+    const ARGON2ID: &str = "$argon2id$v=19$m=47104,t=1,p=1$P2nzckEdTZ3bxCiBCkRTyA$xQL3Z32eo5jKl7u5tcIsnEKObYiyNZQQf5/4sAau6Pg";
 
-    fn basic_auth_of(source: &str) -> (String, Vec<(String, String)>) {
+    fn basic_auth_of(
+        source: &str,
+    ) -> (
+        String,
+        Vec<(String, String)>,
+        pingclair_core::config::BasicAuthAlgorithm,
+    ) {
         let config = compile(source).unwrap_or_else(|error| panic!("must compile: {error}"));
         let handler = match config
             .servers
@@ -2099,22 +2107,31 @@ mod basic_auth_grammar_tests {
         let HandlerConfig::BasicAuth { realm, credentials } = handler else {
             panic!("expected basic_auth");
         };
+        let algorithm = credentials
+            .first()
+            .map(|credential| credential.algorithm)
+            .expect("a basic_auth block has at least one credential");
         (
             realm,
             credentials
                 .into_iter()
                 .map(|credential| (credential.username, credential.password))
                 .collect(),
+            algorithm,
         )
     }
 
     #[test]
     fn the_documented_form_compiles() {
-        let (realm, accounts) = basic_auth_of(&format!(
+        let (realm, accounts, algorithm) = basic_auth_of(&format!(
             "example.com {{\n\tbasic_auth bcrypt \"Admin Area\" {{\n\t\tadmin {HASH}\n\t}}\n\trespond \"ok\"\n}}"
         ));
         assert_eq!(realm, "Admin Area");
         assert_eq!(accounts, vec![("admin".to_string(), HASH.to_string())]);
+        assert_eq!(
+            algorithm,
+            pingclair_core::config::BasicAuthAlgorithm::Bcrypt
+        );
     }
 
     #[test]
@@ -2127,8 +2144,13 @@ mod basic_auth_grammar_tests {
                 "example.com {{\n\tbasic_auth bcrypt {{\n\t\tadmin {HASH}\n\t}}\n\trespond \"ok\"\n}}"
             ),
         ] {
-            let (_, accounts) = basic_auth_of(&source);
+            let (_, accounts, algorithm) = basic_auth_of(&source);
             assert_eq!(accounts.len(), 1, "{source}");
+            assert_eq!(
+                algorithm,
+                pingclair_core::config::BasicAuthAlgorithm::Bcrypt,
+                "the default algorithm is bcrypt: {source}"
+            );
         }
     }
 
@@ -2149,20 +2171,34 @@ mod basic_auth_grammar_tests {
         );
     }
 
-    /// 🚫 We verify bcrypt only. A hash we cannot verify is compared as a
-    /// literal string, so accepting the word would create a login whose
-    /// password is the hash text.
+    /// 🔒 `argon2id` is a declared algorithm, and the credential is verified
+    /// against it rather than compared as literal text.
     #[test]
-    fn argon2id_is_refused_by_name() {
-        let message = compile(
-            "example.com {\n\tbasic_auth argon2id {\n\t\tadmin $argon2id$v=19$m=65536,t=1,p=4$a$b\n\t}\n}",
-        )
-        .expect_err("argon2id must be refused")
+    fn argon2id_is_accepted_by_name() {
+        let (realm, accounts, algorithm) = basic_auth_of(&format!(
+            "example.com {{\n\tbasic_auth argon2id \"Admin Area\" {{\n\t\tadmin {ARGON2ID}\n\t}}\n\trespond \"ok\"\n}}"
+        ));
+        assert_eq!(realm, "Admin Area");
+        assert_eq!(accounts, vec![("admin".to_string(), ARGON2ID.to_string())]);
+        assert_eq!(
+            algorithm,
+            pingclair_core::config::BasicAuthAlgorithm::Argon2id
+        );
+    }
+
+    /// 🚫 A credential that is not a valid hash of the declared algorithm is
+    /// refused — including an argon2id hash under the bcrypt default, which
+    /// would otherwise authenticate anyone who typed the hash.
+    #[test]
+    fn a_hash_of_the_wrong_algorithm_is_refused() {
+        let message = compile(&format!(
+            "example.com {{\n\tbasic_auth {{\n\t\tadmin {ARGON2ID}\n\t}}\n}}"
+        ))
+        .expect_err("an argon2id hash under the bcrypt default must be refused")
         .to_string();
-        assert!(message.contains("argon2id"), "got {message}");
         assert!(
-            !message.contains("Unknown directive"),
-            "argon2id is part of the format, so it must not read as a typo: {message}"
+            message.contains("bcrypt") && message.contains("admin"),
+            "the error must name the algorithm and the account: {message}"
         );
     }
 

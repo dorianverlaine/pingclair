@@ -1349,18 +1349,22 @@ mod tests {
 
     #[test]
     fn test_compile_basic_auth_accounts_in_a_block() {
+        let alice = "$2y$04$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W";
+        let bob = "$2y$04$EBGg0.PJo2Qi2WYiMUqXsuB9orpRrMXiABirLM33AHHNb5GzEcipS";
         let source = r#"
             example.com {
                 listen :80
                 basic_auth {
-                    alice secret1
-                    bob secret2
+                    alice ALICE_HASH
+                    bob BOB_HASH
                 }
                 respond "OK"
             }
-        "#;
+        "#
+        .replace("ALICE_HASH", alice)
+        .replace("BOB_HASH", bob);
 
-        let config = compile(source).unwrap();
+        let config = compile(&source).unwrap();
         let route = &config.servers[0].routes[0];
         let HandlerConfig::Pipeline { handlers } = &route.handler else {
             panic!("expected pipeline, got {:?}", route.handler);
@@ -1375,24 +1379,29 @@ mod tests {
         assert_eq!(auth.0, "Restricted");
         assert_eq!(auth.1.len(), 2);
         assert_eq!(auth.1[0].username, "alice");
-        assert_eq!(auth.1[0].password, "secret1");
-        assert!(!auth.1[0].hashed);
+        assert_eq!(auth.1[0].password, alice);
+        assert_eq!(
+            auth.1[0].algorithm,
+            pingclair_core::config::BasicAuthAlgorithm::Bcrypt
+        );
         assert_eq!(auth.1[1].username, "bob");
     }
 
     #[test]
     fn test_compile_basic_auth_realm_is_the_second_argument() {
+        let hash = "$2y$04$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W";
         let source = r#"
             example.com {
                 listen :80
                 basic_auth bcrypt "Admin Area" {
-                    admin hunter2
+                    admin HASH
                 }
                 respond "OK"
             }
-        "#;
+        "#
+        .replace("HASH", hash);
 
-        let config = compile(source).unwrap();
+        let config = compile(&source).unwrap();
         let route = &config.servers[0].routes[0];
         let HandlerConfig::Pipeline { handlers } = &route.handler else {
             panic!("expected pipeline, got {:?}", route.handler);
@@ -1407,11 +1416,11 @@ mod tests {
         assert_eq!(auth.0, "Admin Area");
         assert_eq!(auth.1.len(), 1);
         assert_eq!(auth.1[0].username, "admin");
-        assert_eq!(auth.1[0].password, "hunter2");
+        assert_eq!(auth.1[0].password, hash);
     }
 
     #[test]
-    fn test_compile_basic_auth_detects_bcrypt_hash() {
+    fn test_compile_basic_auth_stores_the_declared_algorithm() {
         let source = r#"
             example.com {
                 listen :80
@@ -1433,7 +1442,73 @@ mod tests {
                 _ => None,
             })
             .expect("basic_auth handler");
-        assert!(credentials[0].hashed);
+        assert_eq!(
+            credentials[0].algorithm,
+            pingclair_core::config::BasicAuthAlgorithm::Bcrypt
+        );
+    }
+
+    #[test]
+    fn test_compile_basic_auth_accepts_argon2id() {
+        let hash = "$argon2id$v=19$m=47104,t=1,p=1$P2nzckEdTZ3bxCiBCkRTyA$xQL3Z32eo5jKl7u5tcIsnEKObYiyNZQQf5/4sAau6Pg";
+        let source = r#"
+            example.com {
+                listen :80
+                basic_auth argon2id "Admin Area" {
+                    alice HASH
+                }
+                respond "OK"
+            }
+        "#
+        .replace("HASH", hash);
+
+        let config = compile(&source).unwrap();
+        let HandlerConfig::Pipeline { handlers } = &config.servers[0].routes[0].handler else {
+            panic!("expected pipeline");
+        };
+        let credentials = handlers
+            .iter()
+            .find_map(|element| match &element.handler {
+                HandlerConfig::BasicAuth { credentials, .. } => Some(credentials),
+                _ => None,
+            })
+            .expect("basic_auth handler");
+        assert_eq!(
+            credentials[0].algorithm,
+            pingclair_core::config::BasicAuthAlgorithm::Argon2id
+        );
+    }
+
+    /// 🚫 A plaintext password is refused for both declared algorithms — the
+    /// configuration layer no longer has a literal-comparison branch at all.
+    #[test]
+    fn test_compile_basic_auth_rejects_plaintext_passwords() {
+        for source in [
+            r#"
+                example.com {
+                    listen :80
+                    basic_auth {
+                        alice secret1
+                    }
+                    respond "OK"
+                }
+            "#,
+            r#"
+                example.com {
+                    listen :80
+                    basic_auth argon2id {
+                        alice secret1
+                    }
+                    respond "OK"
+                }
+            "#,
+        ] {
+            let error = compile(source).expect_err("plaintext must be refused");
+            assert!(
+                error.to_string().contains("plaintext"),
+                "the error must name the refusal: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1441,7 +1516,9 @@ mod tests {
         let source = r#"
             example.com {
                 listen :80
-                basic_auth alice "$2b$04$not-a-valid-hash"
+                basic_auth {
+                    alice "$2b$04$not-a-valid-hash"
+                }
                 respond "OK"
             }
         "#;
@@ -1454,12 +1531,33 @@ mod tests {
         let source = r#"
             example.com {
                 listen :80
-                basic_auth alice "$2y$15$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W"
+                basic_auth {
+                    alice "$2y$15$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W"
+                }
                 respond "OK"
             }
         "#;
 
         assert!(compile(source).is_err());
+    }
+
+    #[test]
+    fn test_compile_basic_auth_rejects_invalid_argon2id_hash() {
+        let source = r#"
+            example.com {
+                listen :80
+                basic_auth argon2id {
+                    alice "$argon2id$v=19$m=65536,t=1,p=4$a$b"
+                }
+                respond "OK"
+            }
+        "#;
+
+        let error = compile(source).expect_err("an invalid argon2id hash must be refused");
+        assert!(
+            error.to_string().contains("argon2id"),
+            "the error must name the algorithm: {error}"
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 private.example {
-	basic_auth /admin/* {
-		alice $2a$14$Zkx19XLiW6VYouLHR5NmfOFU0z2GTNmpkT/5qqR7hx4IjWJPDhjvG
+	basic_auth /admin/* argon2id "Admin Area" {
+		alice $argon2id$v=19$m=47104,t=1,p=1$P2nzckEdTZ3bxCiBCkRTyA$xQL3Z32eo5jKl7u5tcIsnEKObYiyNZQQf5/4sAau6Pg
 	}
 	respond "private"
 }
@@ -32,12 +32,12 @@ private.example {
             "handlers": [
               {
                 "type": "basic_auth",
-                "realm": "Restricted",
+                "realm": "Admin Area",
                 "credentials": [
                   {
                     "username": "alice",
-                    "password": "$2a$14$Zkx19XLiW6VYouLHR5NmfOFU0z2GTNmpkT/5qqR7hx4IjWJPDhjvG",
-                    "algorithm": "bcrypt"
+                    "password": "$argon2id$v=19$m=47104,t=1,p=1$P2nzckEdTZ3bxCiBCkRTyA$xQL3Z32eo5jKl7u5tcIsnEKObYiyNZQQf5/4sAau6Pg",
+                    "algorithm": "argon2id"
                   }
                 ]
               },

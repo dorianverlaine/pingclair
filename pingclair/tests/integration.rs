@@ -1977,6 +1977,81 @@ async fn test_basic_auth_end_to_end() {
 }
 
 #[tokio::test]
+async fn test_basic_auth_argon2id_end_to_end() {
+    // 🔒 Generate a hash the way `pingclair hash-password --algorithm
+    // argon2id` does — same crate, same PHC spelling — and verify the server
+    // accepts it. This is the exact trap the P1 row described: the CLI used
+    // to print a hash the server compared as literal text.
+    use argon2::password_hash::{PasswordHasher, SaltString};
+    use argon2::{Argon2, Params};
+
+    let salt = SaltString::encode_b64(b"pingclair-integration").unwrap();
+    let params = Params::new(16 * 1024, 1, 1, Some(32)).unwrap();
+    let hash = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+        .hash_password(b"clihash", &salt)
+        .unwrap()
+        .to_string();
+    assert!(hash.starts_with("$argon2id$v=19$"), "{hash}");
+
+    let config = serde_json::json!({
+        "servers": [
+            {
+                "listen": ["127.0.0.1:0"],
+                "routes": [
+                    {
+                        "path": "/",
+                        "handler": {
+                            "type": "pipeline",
+                            "handlers": [
+                                {
+                                    "type": "basic_auth",
+                                    "realm": "Argon2 Realm",
+                                    "credentials": [
+                                        {
+                                            "username": "alice",
+                                            "password": hash,
+                                            "algorithm": "argon2id"
+                                        }
+                                    ]
+                                },
+                                { "type": "respond", "status": 200, "body": "welcome" }
+                            ]
+                        }
+                    }
+                ]
+            }
+        ]
+    })
+    .to_string();
+
+    let mut server = TestServer::new(&config);
+    let client = no_proxy_client();
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let url = server.url(0, "/");
+
+    // 🚫 Missing and wrong credentials must be rejected.
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+    let resp = client
+        .get(&url)
+        .basic_auth("alice", Some("wrong"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // ✅ The CLI-format hash must authenticate the real password.
+    let resp = client
+        .get(&url)
+        .basic_auth("alice", Some("clihash"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "welcome");
+}
+
+#[tokio::test]
 async fn test_custom_error_pages() {
     // 🎨 Verify custom pages for both static and upstream failures.
     let tmp_dir = tempfile::tempdir().unwrap();

@@ -3886,8 +3886,9 @@ mod tests {
                     realm: "Restricted".to_string(),
                     credentials: vec![BasicAuthCredential {
                         username: "alice".to_string(),
-                        password: "secret".to_string(),
-                        hashed: false,
+                        password: "$2y$04$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W"
+                            .to_string(),
+                        algorithm: pingclair_core::config::BasicAuthAlgorithm::Bcrypt,
                     }],
                 }),
             ],

@@ -25,6 +25,7 @@ thiserror.workspace = true
 bytes.workspace = true
 http.workspace = true
 bcrypt.workspace = true
+argon2 = "0.5"
 
 # Router
 regex = "1"

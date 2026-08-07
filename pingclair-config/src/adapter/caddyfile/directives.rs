@@ -13,6 +13,7 @@ use super::order::DirectiveOrder;
 use super::reverse_proxy::adapt_reverse_proxy;
 use crate::parser::ast::*;
 use crate::parser::caddy_ast::{Block, Directive};
+use pingclair_core::config::BasicAuthAlgorithm;
 use std::collections::HashMap;
 
 // MARK: - Handler Adaptation
@@ -609,30 +610,24 @@ pub(super) fn adapt_basic_auth(d: Directive) -> Result<Handler, AdapterError> {
         }
     };
 
-    match algorithm {
-        "bcrypt" => {}
-        // 🚫 The format also accepts argon2id. This server only verifies
-        // bcrypt, and a credential it cannot verify as a hash is compared as
-        // a literal string — so accepting the word here would produce a login
-        // whose password is the hash text. Refusing is the only honest answer
-        // until the verifier exists.
-        "argon2id" => {
-            return Err(AdapterError::UnsupportedFeature(
-                "basic_auth argon2id".into(),
-                "Pingclair verifies bcrypt hashes only; an argon2id hash would be compared as                  plain text rather than verified"
-                    .into(),
-            ));
-        }
+    // 🔑 The declared algorithm is stored, not guessed: a credential is only
+    // ever verified against the algorithm this line names, so an `$argon2id$`
+    // hash under `basic_auth argon2id` can never fall through to a literal
+    // comparison again.
+    let algorithm = match algorithm {
+        "bcrypt" => BasicAuthAlgorithm::Bcrypt,
+        "argon2id" => BasicAuthAlgorithm::Argon2id,
         other => {
             return Err(AdapterError::InvalidArgument(
                 "basic_auth".into(),
-                format!("unrecognized hash algorithm `{other}` (expected bcrypt)"),
+                format!("unrecognized hash algorithm `{other}` (expected bcrypt or argon2id)"),
             ));
         }
-    }
+    };
 
     let mut config = BasicAuthConfig {
         realm,
+        algorithm,
         credentials: Vec::new(),
     };
 
