@@ -1,5 +1,11 @@
-# Full-featured example — every directive below passes `pingclair validate`.
+# Full-featured example — every directive below compiles, and the file is a
+# valid Caddyfile: nothing here is spelled a way the format does not spell it.
 # Simpler starting points: Pingclairfile.example, basic.pingclair.
+#
+# 📌 `pingclair validate` still rejects this file, and correctly so: it checks
+# that the TLS certificate paths below exist, and they are illustrative paths
+# on a machine that is not yours. Point `tls` at real files, or switch it to
+# `tls auto`, and it validates.
 
 # Global options block
 {
@@ -18,9 +24,14 @@
     # trusted_proxies 10.0.0.0/8 2001:db8::/32
 }
 
-# Main site. A bare hostname binds 0.0.0.0 and routes by Host header.
-example.com {
-    listen :8080
+# Main site. The port belongs in the site address, exactly as upstream writes
+# it — a separate listen directive would be a second place to keep in agreement
+# with the first.
+example.com:8080 {
+    # 📂 The site root. `file_server` accepts a `root` of its own, but setting
+    # it here instead is what lets `try_files` and the file server agree about
+    # where the site lives — they both read this one.
+    root * ./public
 
     # Manual certificate + HTTP/3 (QUIC). Use `tls auto` for ACME instead.
     tls {
@@ -76,7 +87,6 @@ example.com {
 
     # Static files for everything else
     file_server {
-        root ./public
         index index.html
     }
 }
