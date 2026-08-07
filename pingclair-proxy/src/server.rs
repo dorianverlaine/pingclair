@@ -3692,8 +3692,18 @@ fn resolve_single_placeholder(
         "uri" | "http.request.uri" => req.uri.to_string(),
         "path" | "http.request.uri.path" => req.uri.path().to_string(),
         _ => {
-            // TODO(v0.3): implement the remaining Caddy placeholder shorthands
-            // ({scheme}, {dir}, {file.*}, {method}, {re.*}, {env.*}, ...).
+            // 🚧 Still missing: {dir}, {file}, {file.*}, {re.*}, {env.*},
+            // {http.vars.*}, {err.*}. An unknown name resolves to the empty
+            // string rather than being echoed back, which is what the format
+            // does — printing `{nonsense}` into a response body would turn a
+            // typo into content.
+            //
+            // 🤡 This list used to name `{scheme}` and `{method}` too, six and
+            // eleven lines above where both are handled. On 2026-08-07 a survey
+            // read the stale comment instead of the match arms and filed both
+            // as unimplemented, which put a day of planned work into the queue
+            // for features that already existed. A comment that outlives what
+            // it describes does not announce itself; it just gets believed.
             tracing::debug!("⚠️ Unresolved Caddy placeholder: {{{}}}", name);
             String::new()
         }
