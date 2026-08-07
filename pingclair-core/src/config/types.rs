@@ -595,6 +595,40 @@ pub enum MatcherCondition {
     Regex(String),
 }
 
+/// 🧭 One element of a `Pipeline`/`Handle`/`HandlePath` group.
+///
+/// The optional matcher guards the handler, matching Caddy's model of one
+/// route per subdirective. The handler is flattened into the same JSON map,
+/// so an element without a matcher keeps the exact shape a pipeline element
+/// has always had — only a matcher-guarded element gains the `matcher` key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandlerElement {
+    /// 🎯 Optional matcher; `None` runs the element for every request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<Matcher>,
+    /// 🧩 The guarded handler.
+    #[serde(flatten)]
+    pub handler: HandlerConfig,
+}
+
+impl HandlerElement {
+    /// 🧩 Builds an unconditional element.
+    pub fn plain(handler: HandlerConfig) -> Self {
+        Self {
+            matcher: None,
+            handler,
+        }
+    }
+
+    /// 🎯 Builds a matcher-guarded element.
+    pub fn with_matcher(matcher: Matcher, handler: HandlerConfig) -> Self {
+        Self {
+            matcher: Some(matcher),
+            handler,
+        }
+    }
+}
+
 /// 🔑 Selects the identity charged by one rate-limit policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -686,11 +720,11 @@ pub enum HandlerConfig {
         remove: Vec<String>,
     },
 
-    /// Pipeline of handlers
-    Pipeline { handlers: Vec<HandlerConfig> },
+    /// Pipeline of matcher-guarded elements
+    Pipeline { handlers: Vec<HandlerElement> },
 
-    /// Exclusive routing group
-    Handle { handlers: Vec<HandlerConfig> },
+    /// Exclusive routing group of matcher-guarded elements
+    Handle { handlers: Vec<HandlerElement> },
 
     /// HTTP Basic Authentication
     /// Requires valid credentials before allowing access
@@ -741,8 +775,8 @@ pub enum HandlerConfig {
     HandlePath {
         /// Prefix to strip
         prefix: String,
-        /// Handlers to execute with stripped path
-        handlers: Vec<HandlerConfig>,
+        /// Matcher-guarded elements to execute with the stripped path
+        handlers: Vec<HandlerElement>,
     },
 
     /// CORS (Cross-Origin Resource Sharing) handler
@@ -1766,6 +1800,65 @@ mod tests {
         ] {
             assert_eq!(round_trip(&matcher), matcher, "{matcher:?}");
         }
+    }
+
+    /// 🧩 A pipeline element without a matcher keeps the exact JSON shape it
+    /// has always had, so `0.1.7` documents still load unchanged.
+    #[test]
+    fn legacy_pipeline_elements_without_matcher_still_load() {
+        let json = r#"{
+            "type": "pipeline",
+            "handlers": [
+                {"type": "respond", "status": 200, "body": "ok", "headers": {}}
+            ]
+        }"#;
+        let config: HandlerConfig = serde_json::from_str(json).expect("legacy pipeline loads");
+        let HandlerConfig::Pipeline { handlers } = config else {
+            panic!("expected a pipeline");
+        };
+        assert_eq!(handlers.len(), 1);
+        assert!(handlers[0].matcher.is_none());
+        assert!(matches!(handlers[0].handler, HandlerConfig::Respond { .. }));
+
+        let serialized = serde_json::to_string(&HandlerConfig::Pipeline { handlers }).unwrap();
+        assert!(
+            !serialized.contains("\"matcher\""),
+            "an unconditional element must not gain a matcher key: {serialized}"
+        );
+    }
+
+    /// 🎯 A matcher-guarded element loads and round-trips with the matcher
+    /// externally tagged alongside the handler's own `type` tag.
+    #[test]
+    fn matcher_guarded_pipeline_elements_round_trip() {
+        let json = r#"{
+            "type": "pipeline",
+            "handlers": [
+                {
+                    "matcher": {"path": {"patterns": ["/admin/*"]}},
+                    "type": "respond",
+                    "status": 200,
+                    "body": "x",
+                    "headers": {}
+                }
+            ]
+        }"#;
+        let config: HandlerConfig = serde_json::from_str(json).expect("guarded element loads");
+        let HandlerConfig::Pipeline { handlers } = config else {
+            panic!("expected a pipeline");
+        };
+        assert_eq!(
+            handlers[0].matcher,
+            Some(path("/admin/*")),
+            "the matcher must stay on the element"
+        );
+
+        let serialized = serde_json::to_string(&HandlerConfig::Pipeline { handlers }).unwrap();
+        let again: HandlerConfig = serde_json::from_str(&serialized).expect("round trip");
+        let HandlerConfig::Pipeline { handlers } = again else {
+            panic!("expected a pipeline after round trip");
+        };
+        assert_eq!(handlers[0].matcher, Some(path("/admin/*")));
     }
 
     #[test]

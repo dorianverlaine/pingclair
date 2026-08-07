@@ -5,7 +5,7 @@
 //!
 //! Provides handlers for respond, redirect, and headers operations.
 
-use crate::config::{BasicAuthCredential, HandlerConfig};
+use crate::config::{BasicAuthCredential, HandlerConfig, HandlerElement};
 use base64::Engine as _;
 use bcrypt::HashParts;
 use bytes::Bytes;
@@ -169,8 +169,8 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             // Execute handlers in order, combining results
             let mut final_response = HandlerResponse::status(200);
 
-            for handler in handlers {
-                let response = execute_handler(handler, headers)?;
+            for element in handlers {
+                let response = execute_handler(&element.handler, headers)?;
                 final_response.status = response.status;
                 final_response.headers.extend(response.headers);
                 if response.body.is_some() {
@@ -185,7 +185,10 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             // Treat Handle as a pipeline for now
             execute_handler(
                 &HandlerConfig::Pipeline {
-                    handlers: handlers.clone(),
+                    handlers: handlers
+                        .iter()
+                        .map(|element| HandlerElement::plain(element.handler.clone()))
+                        .collect(),
                 },
                 headers,
             )
@@ -260,7 +263,10 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             // execute inner handlers
             let mut response = execute_handler(
                 &HandlerConfig::Pipeline {
-                    handlers: handlers.clone(),
+                    handlers: handlers
+                        .iter()
+                        .map(|element| HandlerElement::plain(element.handler.clone()))
+                        .collect(),
                 },
                 headers,
             )?;

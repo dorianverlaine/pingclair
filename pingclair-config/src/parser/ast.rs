@@ -457,6 +457,16 @@ pub enum HttpMethod {
 // Handlers
 // ============================================================
 
+/// 🧭 One matcher-guarded element inside a `route`/`handle`/`handle_path`
+/// block, mirroring the core config type.
+#[derive(Debug, Clone)]
+pub struct HandlerElement {
+    /// 🎯 Optional matcher; `None` runs the handler for every request.
+    pub matcher: Option<Matcher>,
+    /// 🧩 The guarded handler.
+    pub handler: Handler,
+}
+
 /// Route handler
 #[derive(Debug, Clone)]
 pub enum Handler {
@@ -472,8 +482,8 @@ pub enum Handler {
     /// Headers modification only
     Headers(HeadersConfig),
 
-    /// Multiple handlers (pipeline)
-    Pipeline(Vec<Handler>),
+    /// Multiple matcher-guarded elements (pipeline, file order preserved)
+    Pipeline(Vec<HandlerElement>),
 
     /// File server (future)
     FileServer(FileServerConfig),
@@ -481,8 +491,8 @@ pub enum Handler {
     /// Caddy-compatible template rendering
     Templates,
 
-    /// Exclusive routing group
-    Handle(Vec<Handler>),
+    /// Exclusive routing group of matcher-guarded elements (sorted)
+    Handle(Vec<HandlerElement>),
 
     /// 🛣️ Exclusive routing group that strips the matched prefix first.
     ///
@@ -491,7 +501,7 @@ pub enum Handler {
     /// somewhere else entirely.
     HandlePath {
         prefix: String,
-        handlers: Vec<Handler>,
+        handlers: Vec<HandlerElement>,
     },
 
     /// HTTP Basic authentication gate

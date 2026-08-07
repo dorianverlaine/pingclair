@@ -6,13 +6,22 @@ use super::args::{
     expect_no_arguments, expect_one_argument, parse_duration_ms, parse_positive_u64,
     parse_positive_usize, parse_required_duration,
 };
+use super::matchers::{
+    parse_matcher_definition, parse_route_matcher_and_block, resolve_matcher_token,
+};
+use super::order::DirectiveOrder;
 use super::reverse_proxy::adapt_reverse_proxy;
 use crate::parser::ast::*;
-use crate::parser::caddy_ast::Directive;
+use crate::parser::caddy_ast::{Block, Directive};
+use std::collections::HashMap;
 
 // MARK: - Handler Adaptation
 
-pub(super) fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
+pub(super) fn adapt_handler(
+    d: Directive,
+    matchers: &HashMap<String, Matcher>,
+    order: &DirectiveOrder,
+) -> Result<Handler, AdapterError> {
     match d.name.as_str() {
         "reverse_proxy" => adapt_reverse_proxy(d),
         "respond" => adapt_respond(d),
@@ -90,22 +99,9 @@ pub(super) fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
         }
         "templates" => Ok(Handler::Templates),
         "header" => adapt_header_directive(&d),
-        "handle" => {
-            // `handle { ... }` inside another handle — nested exclusive routing
-            let mut handlers = Vec::new();
-            if let Some(block) = d.block {
-                for inner_d in block.directives {
-                    // 🎯 The same guard the site level uses. This arm used to
-                    // carry its own narrower version that only looked at
-                    // `@`-prefixed *names*, so it caught a matcher definition
-                    // and missed a matcher token — the shape that actually
-                    // produced wrong responses.
-                    super::matchers::reject_matcher_inside_route_body(&inner_d)?;
-                    handlers.push(adapt_handler(inner_d)?);
-                }
-            }
-            Ok(Handler::Handle(handlers))
-        }
+        "route" => adapt_subroute_block(&d, matchers, order, false),
+        "handle" => adapt_subroute_block(&d, matchers, order, true),
+        "handle_path" => adapt_handle_path(&d, matchers, order).map(|(_, handler)| handler),
         "basic_auth" | "basicauth" => adapt_basic_auth(d),
         "rate_limit" => adapt_rate_limit(d),
         "rewrite" => adapt_rewrite(d),
@@ -139,6 +135,127 @@ pub(super) fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
             None => AdapterError::UnknownDirective(other.to_string()),
         }),
     }
+}
+
+/// 🛣️ Builds a `route` or `handle` block's elements.
+///
+/// `sorted` is the whole difference between the two directives: Caddy keeps
+/// `route` contents in file order (`buildSubroute(..., false)`) and sorts
+/// `handle` contents (`buildSubroute(..., true)`).
+pub(super) fn adapt_subroute_block(
+    d: &Directive,
+    parent_matchers: &HashMap<String, Matcher>,
+    order: &DirectiveOrder,
+    sorted: bool,
+) -> Result<Handler, AdapterError> {
+    let elements = match &d.block {
+        Some(block) => collect_subroute_elements(block, parent_matchers, order, sorted)?,
+        None => Vec::new(),
+    };
+    Ok(if sorted {
+        Handler::Handle(elements)
+    } else {
+        Handler::Pipeline(elements)
+    })
+}
+
+/// 🛣️ Builds a `handle_path` block, returning its matcher and handler so the
+/// caller can attach the matcher to the surrounding route or element.
+pub(super) fn adapt_handle_path(
+    d: &Directive,
+    parent_matchers: &HashMap<String, Matcher>,
+    order: &DirectiveOrder,
+) -> Result<(Option<Matcher>, Handler), AdapterError> {
+    let (matcher, inner_block) = parse_route_matcher_and_block(d)?;
+    let Some(Matcher::Path(path)) = matcher.clone() else {
+        return Err(AdapterError::InvalidArgument(
+            "handle_path".into(),
+            "expected a path to match and strip, e.g. `handle_path /api/* { … }`".into(),
+        ));
+    };
+    // 🧭 The prefix is the pattern without its glob: matching `/api/*`
+    // strips `/api`. Stripping the `*` as well would leave a prefix nothing
+    // starts with.
+    let prefix = path
+        .patterns
+        .first()
+        .map(|pattern| pattern.trim_end_matches('*').trim_end_matches('/'))
+        .unwrap_or_default()
+        .to_string();
+    if prefix.is_empty() {
+        return Err(AdapterError::InvalidArgument(
+            "handle_path".into(),
+            "the path to strip cannot be empty; use `handle` instead".into(),
+        ));
+    }
+    let elements = match inner_block {
+        Some(block) => collect_subroute_elements(block, parent_matchers, order, true)?,
+        None => Vec::new(),
+    };
+    Ok((
+        matcher,
+        Handler::HandlePath {
+            prefix,
+            handlers: elements,
+        },
+    ))
+}
+
+/// 🧭 Turns one block's directives into matcher-guarded elements.
+///
+/// Caddy's three scope rules live here: named matcher definitions are copied
+/// from the parent scope, additions stay local to this block, and nothing is
+/// written back to the parent.
+fn collect_subroute_elements(
+    block: &Block,
+    parent_matchers: &HashMap<String, Matcher>,
+    order: &DirectiveOrder,
+    sorted: bool,
+) -> Result<Vec<HandlerElement>, AdapterError> {
+    let mut local = parent_matchers.clone();
+    let mut elements = Vec::new();
+    for inner_d in &block.directives {
+        // 🏷️ A named matcher definition belongs to this block's scope.
+        if inner_d.name.starts_with('@') {
+            let matcher = parse_matcher_definition(inner_d)?;
+            local.insert(inner_d.name.clone(), matcher);
+            continue;
+        }
+        // 🛣️ `handle_path` owns its leading path: it is both the element's
+        // matcher and the prefix to strip, so it must not go through the
+        // generic matcher-token stripping.
+        if inner_d.name == "handle_path" {
+            let (matcher, handler) = adapt_handle_path(inner_d, &local, order)?;
+            elements.push(HandlerElement { matcher, handler });
+            continue;
+        }
+        let matcher = resolve_matcher_token(inner_d, &local)?;
+        let mut stripped = inner_d.clone();
+        if matcher.is_some() {
+            stripped.drop_first_arg();
+        }
+        let handler = adapt_handler(stripped, &local, order)?;
+        elements.push(HandlerElement { matcher, handler });
+    }
+    if sorted {
+        sort_handle_elements(&mut elements, order);
+    }
+    Ok(elements)
+}
+
+/// 🔢 Sorts `handle` elements the way Caddy's `sortRoutes` does: directive
+/// order first, then path-matcher specificity (exact before glob, longer
+/// before shorter). `route` never calls this.
+fn sort_handle_elements(elements: &mut [HandlerElement], order: &DirectiveOrder) {
+    elements.sort_by(|a, b| {
+        let rank =
+            |element: &HandlerElement| super::sites::caddy_handler_rank(order, &element.handler);
+        rank(a).cmp(&rank(b)).then_with(|| {
+            let (a_exact, a_len) = super::sites::route_specificity(&a.matcher);
+            let (b_exact, b_len) = super::sites::route_specificity(&b.matcher);
+            a_exact.cmp(&b_exact).then_with(|| b_len.cmp(&a_len))
+        })
+    });
 }
 
 /// 🚦 Adapts an exact local rate-limit policy and rejects ambiguous options.

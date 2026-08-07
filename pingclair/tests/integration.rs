@@ -2240,17 +2240,11 @@ async fn test_spa_pattern_serves_assets_and_falls_back_to_the_shell() {
     assert_eq!(with_query.text().await.unwrap(), "spa-shell");
 }
 
-/// 🚧 A matcher token inside `route` must stop the server starting, rather
-/// than serving the token as content.
-///
-/// 🤡 This configuration used to start and answer **every** request with the
-/// literal text `@admin` — the matcher was discarded and the token was read as
-/// the response body. Measured against Caddy v2.11.4 on 2026-08-07: 3 of 3
-/// requests differed. The real fix is per-handler conditional execution; until
-/// it lands, refusing to start is the honest answer, and this test is what
-/// stops the silent version coming back.
+/// 🎯 A matcher token inside `route` must compile and gate the element it
+/// guards. It used to be discarded and read as the response body; the
+/// runtime half of this regression is `test_route_element_matchers_gate_handlers`.
 #[test]
-fn test_matcher_token_inside_route_refuses_to_start() {
+fn test_matcher_token_inside_route_validates_scoped() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("Pingclairfile");
     std::fs::write(
@@ -2272,13 +2266,9 @@ fn test_matcher_token_inside_route_refuses_to_start() {
         .expect("the binary runs");
 
     assert!(
-        !output.status.success(),
-        "a matcher token inside route must be refused, not accepted"
-    );
-    let message = String::from_utf8_lossy(&output.stderr) + String::from_utf8_lossy(&output.stdout);
-    assert!(
-        message.contains("@admin"),
-        "the refusal must name the token: {message}"
+        output.status.success(),
+        "a matcher token inside route must now be accepted:\n{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -4948,6 +4938,46 @@ async fn test_redirect_expands_host_and_uri_placeholders() {
         location,
         format!("https://{}/deep/path?q=1", server.address(0).ip())
     );
+}
+
+/// 🧭 A directive inside `route` carries its own matcher, exactly as the
+/// format allows. Before C2 the matcher was read as the response body, so
+/// every request got the literal `@admin`; now the first element must gate
+/// and the second must serve everyone else.
+#[tokio::test]
+async fn test_route_element_matchers_gate_handlers() {
+    let config = r#"
+        {
+            admin off
+        }
+
+        :__PINGCLAIR_TEST_PORT__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            route {
+                @admin path /admin/*
+                respond @admin "SECRET" 200
+                respond "public" 200
+            }
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+
+    let secret = client
+        .get(server.url(0, "/admin/secrets"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(secret.status(), 200);
+    assert_eq!(secret.text().await.unwrap(), "SECRET");
+
+    let public = client.get(server.url(0, "/public")).send().await.unwrap();
+    assert_eq!(public.status(), 200);
+    assert_eq!(public.text().await.unwrap(), "public");
 }
 
 /// 🎫 Builds a real two-level trust path: root CA → intermediate CA → leaf.

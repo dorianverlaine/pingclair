@@ -166,8 +166,8 @@ impl SemanticAnalyzer {
                 proxy.header_up.extend(expanded_headers);
             }
             Handler::Pipeline(handlers) => {
-                for h in handlers {
-                    self.expand_handler(h)?;
+                for element in handlers.iter_mut() {
+                    self.expand_handler(&mut element.handler)?;
                 }
             }
             _ => {}

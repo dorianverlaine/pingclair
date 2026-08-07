@@ -64,6 +64,7 @@ use crate::http_policy::{
 };
 use crate::server::{PingclairProxy, ProxyState, error_reason, resolve_caddy_placeholders};
 use crate::server::{is_streaming_content_type, wants_immediate_flush};
+use pingclair_core::server::{MatcherPrecompile, MatcherRequest, evaluate};
 
 /// Maximum UDP payload we ask quiche to send (standard Ethernet MTU-safe).
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -1543,8 +1544,36 @@ struct H3ImmediateResponse {
     headers: Vec<(String, String)>,
 }
 
+/// 🎯 Evaluates one H3 pipeline element's precompiled matcher.
+fn h3_element_matcher_matches(
+    element_precompile: Option<&MatcherPrecompile>,
+    request_header: &RequestHeader,
+    effective_uri: &str,
+    verified_client_ip: &str,
+) -> bool {
+    let Some(compiled) = element_precompile.and_then(|node| node.element_matcher.as_ref()) else {
+        return true;
+    };
+    let host = request_header
+        .headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(authority_host)
+        .unwrap_or("");
+    let request = MatcherRequest {
+        path: effective_uri,
+        method: request_header.method.as_str(),
+        headers: &request_header.headers,
+        host,
+        remote_ip: verified_client_ip,
+        protocol: "https",
+    };
+    evaluate(compiled, &request)
+}
+
 /// 🧩 Executes non-terminal middleware before selecting an H3 terminal handler.
 #[async_recursion::async_recursion]
+#[allow(clippy::too_many_arguments)]
 async fn plan_h3_handler(
     handler: &HandlerConfig,
     state: &ProxyState,
@@ -1553,11 +1582,24 @@ async fn plan_h3_handler(
     effective_uri: &mut String,
     response_policy: &mut ResponseHeaderPolicy,
     verified_client_ip: &str,
+    precompile: Option<&MatcherPrecompile>,
 ) -> Result<H3Plan, HandlerError> {
     match handler {
-        HandlerConfig::Pipeline { handlers } | HandlerConfig::Handle { handlers } => {
-            let has_proxy = handlers.iter().any(crate::server::contains_reverse_proxy);
-            for handler in handlers {
+        HandlerConfig::Pipeline { handlers } => {
+            let has_proxy = handlers
+                .iter()
+                .any(|element| crate::server::contains_reverse_proxy(&element.handler));
+            for (index, element) in handlers.iter().enumerate() {
+                let handler = &element.handler;
+                let element_precompile = precompile.and_then(|node| node.children.get(index));
+                if !h3_element_matcher_matches(
+                    element_precompile,
+                    request_header,
+                    effective_uri,
+                    verified_client_ip,
+                ) {
+                    continue;
+                }
                 if has_proxy && matches!(handler, HandlerConfig::FileServer { .. }) {
                     continue;
                 }
@@ -1569,12 +1611,46 @@ async fn plan_h3_handler(
                     effective_uri,
                     response_policy,
                     verified_client_ip,
+                    element_precompile,
                 )
                 .await?
                 {
                     H3Plan::Continue => {}
                     completed => return Ok(completed),
                 }
+            }
+            Ok(H3Plan::Continue)
+        }
+        HandlerConfig::Handle { handlers } => {
+            let has_proxy = handlers
+                .iter()
+                .any(|element| crate::server::contains_reverse_proxy(&element.handler));
+            for (index, element) in handlers.iter().enumerate() {
+                let element_precompile = precompile.and_then(|node| node.children.get(index));
+                if !h3_element_matcher_matches(
+                    element_precompile,
+                    request_header,
+                    effective_uri,
+                    verified_client_ip,
+                ) {
+                    continue;
+                }
+                if has_proxy && matches!(&element.handler, HandlerConfig::FileServer { .. }) {
+                    continue;
+                }
+                // 🧭 A `handle` group is mutually exclusive: the first
+                // matching element owns the request.
+                return plan_h3_handler(
+                    &element.handler,
+                    state,
+                    route_index,
+                    request_header,
+                    effective_uri,
+                    response_policy,
+                    verified_client_ip,
+                    element_precompile,
+                )
+                .await;
             }
             Ok(H3Plan::Continue)
         }
@@ -1590,26 +1666,35 @@ async fn plan_h3_handler(
                     .set_raw_path(effective_uri.as_bytes())
                     .map_err(|_| (500, "Rewrite Failed"))?;
             }
-            for handler in handlers {
-                if handlers.iter().any(crate::server::contains_reverse_proxy)
-                    && matches!(handler, HandlerConfig::FileServer { .. })
-                {
+            let has_proxy = handlers
+                .iter()
+                .any(|element| crate::server::contains_reverse_proxy(&element.handler));
+            for (index, element) in handlers.iter().enumerate() {
+                let element_precompile = precompile.and_then(|node| node.children.get(index));
+                if !h3_element_matcher_matches(
+                    element_precompile,
+                    request_header,
+                    effective_uri,
+                    verified_client_ip,
+                ) {
                     continue;
                 }
-                match plan_h3_handler(
-                    handler,
+                if has_proxy && matches!(&element.handler, HandlerConfig::FileServer { .. }) {
+                    continue;
+                }
+                // 🧭 `handle_path` is a `handle` under another name: the
+                // first matching element owns the group.
+                return plan_h3_handler(
+                    &element.handler,
                     state,
                     route_index,
                     request_header,
                     effective_uri,
                     response_policy,
                     verified_client_ip,
+                    element_precompile,
                 )
-                .await?
-                {
-                    H3Plan::Continue => {}
-                    completed => return Ok(completed),
-                }
+                .await;
             }
             Ok(H3Plan::Continue)
         }
@@ -1780,6 +1865,7 @@ async fn plan_h3_handler(
             }
             None => match fallback {
                 Some(fallback) => {
+                    let fallback_precompile = precompile.and_then(|node| node.children.first());
                     plan_h3_handler(
                         fallback,
                         state,
@@ -1788,6 +1874,7 @@ async fn plan_h3_handler(
                         effective_uri,
                         response_policy,
                         verified_client_ip,
+                        fallback_precompile,
                     )
                     .await
                 }
@@ -2020,6 +2107,10 @@ async fn handle_request_inner(
     }
 
     let mut effective_uri = req.path.clone();
+    let route_precompile = state
+        .router
+        .compiled_route(route_index)
+        .map(|route| &route.matcher_precompile);
     let plan = plan_h3_handler(
         handler,
         &state,
@@ -2028,6 +2119,7 @@ async fn handle_request_inner(
         &mut effective_uri,
         response_policy,
         &verified_client_ip_text,
+        route_precompile,
     )
     .await?;
 
@@ -3030,7 +3122,8 @@ async fn send_error_response(
 mod tests {
     use super::*;
     use pingclair_core::config::{
-        BasicAuthCredential, RetryConfig, ReverseProxyConfig, RouteConfig, ServerConfig,
+        BasicAuthCredential, HandlerElement, Matcher, RetryConfig, ReverseProxyConfig, RouteConfig,
+        ServerConfig,
     };
 
     fn proxy_state(handler: HandlerConfig) -> ProxyState {
@@ -3673,26 +3766,26 @@ mod tests {
     async fn h3_pipeline_applies_cors_regex_rewrite_and_terminal_response() {
         let handler = HandlerConfig::Pipeline {
             handlers: vec![
-                HandlerConfig::Cors {
+                HandlerElement::plain(HandlerConfig::Cors {
                     allowed_origins: vec!["https://app.example".to_string()],
                     allowed_methods: vec!["GET".to_string()],
                     allowed_headers: vec!["content-type".to_string()],
                     exposed_headers: vec!["x-request-id".to_string()],
                     allow_credentials: true,
                     max_age: 600,
-                },
-                HandlerConfig::Rewrite {
+                }),
+                HandlerElement::plain(HandlerConfig::Rewrite {
                     strip_prefix: None,
                     strip_suffix: None,
                     replace: None,
                     regex: Some(r"^/old/(.*)$".to_string()),
                     regex_replace: Some("/new/$1".to_string()),
-                },
-                HandlerConfig::Respond {
+                }),
+                HandlerElement::plain(HandlerConfig::Respond {
                     status: 200,
                     body: Some("ok".to_string()),
                     headers: BTreeMap::new(),
-                },
+                }),
             ],
         };
         let state = proxy_state(handler.clone());
@@ -3711,6 +3804,7 @@ mod tests {
             &mut uri,
             &mut policy,
             "203.0.113.7",
+            None,
         )
         .await
         .unwrap();
@@ -3733,19 +3827,19 @@ mod tests {
     async fn h3_preflight_rejects_before_terminal_handler() {
         let handler = HandlerConfig::Pipeline {
             handlers: vec![
-                HandlerConfig::Cors {
+                HandlerElement::plain(HandlerConfig::Cors {
                     allowed_origins: vec!["https://app.example".to_string()],
                     allowed_methods: vec!["GET".to_string()],
                     allowed_headers: vec!["content-type".to_string()],
                     exposed_headers: Vec::new(),
                     allow_credentials: false,
                     max_age: 600,
-                },
-                HandlerConfig::Respond {
+                }),
+                HandlerElement::plain(HandlerConfig::Respond {
                     status: 200,
                     body: Some("must not run".to_string()),
                     headers: BTreeMap::new(),
-                },
+                }),
             ],
         };
         let state = proxy_state(handler.clone());
@@ -3767,6 +3861,7 @@ mod tests {
             &mut uri,
             &mut policy,
             "203.0.113.7",
+            None,
         )
         .await
         .unwrap();
@@ -3781,19 +3876,19 @@ mod tests {
     async fn h3_header_policy_survives_basic_auth_rejection() {
         let handler = HandlerConfig::Pipeline {
             handlers: vec![
-                HandlerConfig::Headers {
+                HandlerElement::plain(HandlerConfig::Headers {
                     set: BTreeMap::from([("x-policy".to_string(), "active".to_string())]),
                     add: BTreeMap::new(),
                     remove: Vec::new(),
-                },
-                HandlerConfig::BasicAuth {
+                }),
+                HandlerElement::plain(HandlerConfig::BasicAuth {
                     realm: "Restricted".to_string(),
                     credentials: vec![BasicAuthCredential {
                         username: "alice".to_string(),
                         password: "secret".to_string(),
                         hashed: false,
                     }],
-                },
+                }),
             ],
         };
         let state = proxy_state(handler.clone());
@@ -3809,6 +3904,7 @@ mod tests {
             &mut uri,
             &mut policy,
             "203.0.113.7",
+            None,
         )
         .await
         .unwrap();
@@ -3828,7 +3924,9 @@ mod tests {
     async fn h3_handle_path_rewrites_the_terminal_uri() {
         let handler = HandlerConfig::HandlePath {
             prefix: "/api".to_string(),
-            handlers: vec![HandlerConfig::ReverseProxy(Default::default())],
+            handlers: vec![HandlerElement::plain(HandlerConfig::ReverseProxy(
+                Default::default(),
+            ))],
         };
         let state = proxy_state(handler.clone());
         let mut request = RequestHeader::build(http::Method::GET, b"/api/users?q=1", None).unwrap();
@@ -3843,6 +3941,7 @@ mod tests {
             &mut uri,
             &mut policy,
             "203.0.113.7",
+            None,
         )
         .await
         .unwrap();
@@ -3872,6 +3971,7 @@ mod tests {
             &mut uri,
             &mut policy,
             "203.0.113.7",
+            None,
         )
         .await
         .unwrap();
@@ -3907,6 +4007,7 @@ mod tests {
             &mut uri,
             &mut policy,
             "203.0.113.9",
+            None,
         )
         .await
         .unwrap();
@@ -3917,6 +4018,74 @@ mod tests {
             }
             _ => panic!("expected a redirect terminal"),
         }
+    }
+
+    #[tokio::test]
+    async fn h3_pipeline_elements_respect_their_own_matchers() {
+        let handler = HandlerConfig::Pipeline {
+            handlers: vec![
+                HandlerElement::with_matcher(
+                    Matcher::Path {
+                        patterns: vec!["/admin/*".to_string()],
+                    },
+                    HandlerConfig::Respond {
+                        status: 200,
+                        body: Some("SECRET".to_string()),
+                        headers: BTreeMap::new(),
+                    },
+                ),
+                HandlerElement::plain(HandlerConfig::Respond {
+                    status: 200,
+                    body: Some("public".to_string()),
+                    headers: BTreeMap::new(),
+                }),
+            ],
+        };
+        let state = proxy_state(handler.clone());
+        let precompile = state
+            .router
+            .compiled_route(0)
+            .map(|route| &route.matcher_precompile);
+
+        let mut request = RequestHeader::build(http::Method::GET, b"/admin/secrets", None).unwrap();
+        let mut uri = "/admin/secrets".to_string();
+        let mut policy = ResponseHeaderPolicy::default();
+        let plan = plan_h3_handler(
+            &handler,
+            &state,
+            0,
+            &mut request,
+            &mut uri,
+            &mut policy,
+            "203.0.113.7",
+            precompile,
+        )
+        .await
+        .unwrap();
+        let H3Plan::Terminal(H3Terminal::Respond { body, .. }) = plan else {
+            panic!("expected a respond terminal");
+        };
+        assert_eq!(body.as_deref(), Some("SECRET"));
+
+        let mut request = RequestHeader::build(http::Method::GET, b"/public", None).unwrap();
+        let mut uri = "/public".to_string();
+        let mut policy = ResponseHeaderPolicy::default();
+        let plan = plan_h3_handler(
+            &handler,
+            &state,
+            0,
+            &mut request,
+            &mut uri,
+            &mut policy,
+            "203.0.113.7",
+            precompile,
+        )
+        .await
+        .unwrap();
+        let H3Plan::Terminal(H3Terminal::Respond { body, .. }) = plan else {
+            panic!("expected the second respond terminal");
+        };
+        assert_eq!(body.as_deref(), Some("public"));
     }
 
     #[test]

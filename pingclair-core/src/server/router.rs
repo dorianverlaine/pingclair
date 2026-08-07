@@ -5,7 +5,7 @@
 //!
 //! Provides O(log n) path matching with support for wildcards and parameters.
 
-use crate::config::{Matcher, MatcherCondition, RouteConfig};
+use crate::config::{HandlerConfig, HandlerElement, Matcher, MatcherCondition, RouteConfig};
 use matchit::Router as RadixRouter;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -77,10 +77,18 @@ pub fn evaluate(compiled: &CompiledMatcher, request: &MatcherRequest<'_>) -> boo
 
 /// 🧭 Precompiled per-route matcher state, populated by C2.
 ///
-/// Deliberately empty today: adding the container now means C2 can fill it
-/// without moving this abstraction a second time.
+/// The tree mirrors the route's handler tree: each node carries the compiled
+/// matcher of the element it belongs to and holds one child per element
+/// inside that element's container handler. Skipping an element therefore
+/// skips its whole subtree with no cursor to keep in sync.
 #[derive(Debug, Clone, Default)]
-pub struct MatcherPrecompile {}
+pub struct MatcherPrecompile {
+    /// Compiled matcher for the element owning this node; `None` at the
+    /// route root and for unconditional elements.
+    pub element_matcher: Option<CompiledMatcher>,
+    /// Children mirroring the handler tree below this node.
+    pub children: Vec<MatcherPrecompile>,
+}
 
 /// Route entry with precompiled matchers
 #[derive(Debug, Clone)]
@@ -91,7 +99,7 @@ pub struct CompiledRoute {
     pub index: usize,
     /// Pre-compiled matcher (if route has one)
     pub compiled_matcher: Option<CompiledMatcher>,
-    /// Pre-compiled per-route matcher state (empty until C2 fills it)
+    /// Pre-compiled per-element matchers for this route's handler tree.
     pub matcher_precompile: MatcherPrecompile,
 }
 
@@ -103,6 +111,8 @@ pub struct Router {
     default_routes: Vec<CompiledRoute>,
     /// All routes for iteration
     all_routes: Vec<RouteConfig>,
+    /// Compiled routes indexed the same way as `all_routes`.
+    compiled_routes: Vec<CompiledRoute>,
 }
 
 impl Router {
@@ -111,6 +121,7 @@ impl Router {
         let mut path_router = RadixRouter::new();
         let mut default_routes = Vec::new();
         let mut path_groups: HashMap<String, Vec<CompiledRoute>> = HashMap::new();
+        let mut compiled_routes = Vec::new();
 
         for (index, config) in routes.iter().enumerate() {
             // Pre-compile matcher if present
@@ -120,8 +131,9 @@ impl Router {
                 config: config.clone(),
                 index,
                 compiled_matcher,
-                matcher_precompile: MatcherPrecompile::default(),
+                matcher_precompile: precompile_handler(&config.handler),
             };
+            compiled_routes.push(compiled.clone());
 
             // Normalize path for radix tree
             let path = Self::normalize_path(&config.path);
@@ -166,7 +178,14 @@ impl Router {
             path_router,
             default_routes,
             all_routes: routes,
+            compiled_routes,
         }
+    }
+
+    /// 🔎 Returns the compiled route at `index`, matching the index the
+    /// runtime uses for its per-route tables.
+    pub fn compiled_route(&self, index: usize) -> Option<&CompiledRoute> {
+        self.compiled_routes.get(index)
     }
 
     /// Match a request path and return matching routes
@@ -340,6 +359,40 @@ impl Router {
     /// Get all routes
     pub fn routes(&self) -> &[RouteConfig] {
         &self.all_routes
+    }
+}
+
+/// 🧭 Builds the precompiled matcher tree for one handler.
+fn precompile_handler(handler: &HandlerConfig) -> MatcherPrecompile {
+    match handler {
+        HandlerConfig::Pipeline { handlers }
+        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::HandlePath { handlers, .. } => MatcherPrecompile {
+            element_matcher: None,
+            children: handlers.iter().map(precompile_element).collect(),
+        },
+        _ => MatcherPrecompile::default(),
+    }
+}
+
+/// 🧭 Builds one element's node, recursing into its container handler.
+fn precompile_element(element: &HandlerElement) -> MatcherPrecompile {
+    MatcherPrecompile {
+        element_matcher: element.matcher.as_ref().map(CompiledMatcher::compile),
+        children: match &element.handler {
+            HandlerConfig::Pipeline { handlers }
+            | HandlerConfig::Handle { handlers }
+            | HandlerConfig::HandlePath { handlers, .. } => {
+                handlers.iter().map(precompile_element).collect()
+            }
+            HandlerConfig::TryFiles {
+                fallback: Some(fallback),
+                ..
+            } => {
+                vec![precompile_handler(fallback)]
+            }
+            _ => Vec::new(),
+        },
     }
 }
 

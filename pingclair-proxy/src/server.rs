@@ -9,7 +9,7 @@ use pingclair_core::config::{
     AccessControlConfig, CacheConfig, HandlerConfig, ResourceLimitsConfig, RetryConfig,
     ReverseProxyConfig, ServerConfig,
 };
-use pingclair_core::server::Router;
+use pingclair_core::server::{MatcherPrecompile, MatcherRequest, Router, evaluate};
 
 use async_trait::async_trait;
 use pingora_core::Result as PingoraResult;
@@ -2553,6 +2553,30 @@ impl PingclairProxy {
         Self::write_simple_response(session, ctx, status, &format!("{status} {reason}")).await
     }
 
+    /// 🎯 Evaluates one pipeline element's precompiled matcher.
+    fn element_matcher_matches(
+        &self,
+        precompile: Option<&MatcherPrecompile>,
+        session: &Session,
+        ctx: &RequestContext,
+        path: &str,
+    ) -> bool {
+        let Some(compiled) = precompile.and_then(|node| node.element_matcher.as_ref()) else {
+            return true;
+        };
+        let host = authority_host(request_authority(session.req_header()));
+        let remote_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
+        let request = MatcherRequest {
+            path,
+            method: session.req_header().method.as_str(),
+            headers: &session.req_header().headers,
+            host,
+            remote_ip: remote_ip.as_deref().unwrap_or(""),
+            protocol: ctx.request_scheme,
+        };
+        evaluate(compiled, &request)
+    }
+
     /// Handle a specific handler configuration
     #[async_recursion]
     async fn handle_config(
@@ -2562,6 +2586,7 @@ impl PingclairProxy {
         handler: &HandlerConfig,
         path: &str,
         route_index: usize,
+        precompile: Option<&MatcherPrecompile>,
     ) -> PingoraResult<bool> {
         match handler {
             HandlerConfig::Respond {
@@ -2836,13 +2861,32 @@ impl PingclairProxy {
                 // Pingora phase after local handlers, so a file server in
                 // the same chain must stand down or it would shadow the
                 // proxy for every request.
-                let has_proxy = handlers.iter().any(contains_reverse_proxy);
-                for h in handlers {
-                    if has_proxy && matches!(h, HandlerConfig::FileServer { .. }) {
+                let has_proxy = handlers
+                    .iter()
+                    .any(|element| contains_reverse_proxy(&element.handler));
+                for (index, element) in handlers.iter().enumerate() {
+                    let handler = &element.handler;
+                    let element_precompile = precompile.and_then(|node| node.children.get(index));
+                    if !self.element_matcher_matches(
+                        element_precompile,
+                        session,
+                        ctx,
+                        &current_path,
+                    ) {
+                        continue;
+                    }
+                    if has_proxy && matches!(handler, HandlerConfig::FileServer { .. }) {
                         continue;
                     }
                     if self
-                        .handle_config(session, ctx, h, &current_path, route_index)
+                        .handle_config(
+                            session,
+                            ctx,
+                            handler,
+                            &current_path,
+                            route_index,
+                            element_precompile,
+                        )
                         .await?
                     {
                         return Ok(true);
@@ -2855,22 +2899,30 @@ impl PingclairProxy {
                 Ok(false)
             }
             HandlerConfig::Handle { handlers } => {
-                let mut current_path = path.to_string();
-                let has_proxy = handlers.iter().any(contains_reverse_proxy);
-                for h in handlers {
-                    if has_proxy && matches!(h, HandlerConfig::FileServer { .. }) {
+                let has_proxy = handlers
+                    .iter()
+                    .any(|element| contains_reverse_proxy(&element.handler));
+                for (index, element) in handlers.iter().enumerate() {
+                    let element_precompile = precompile.and_then(|node| node.children.get(index));
+                    if !self.element_matcher_matches(element_precompile, session, ctx, path) {
                         continue;
                     }
-                    if self
-                        .handle_config(session, ctx, h, &current_path, route_index)
-                        .await?
-                    {
-                        return Ok(true);
+                    if has_proxy && matches!(&element.handler, HandlerConfig::FileServer { .. }) {
+                        continue;
                     }
-                    current_path = ctx
-                        .rewritten_path
-                        .take()
-                        .unwrap_or_else(|| session.req_header().uri.path().to_string());
+                    // 🧭 A `handle` group is mutually exclusive: the first
+                    // matching element owns the request, and later elements
+                    // never run even when it passes through.
+                    return self
+                        .handle_config(
+                            session,
+                            ctx,
+                            &element.handler,
+                            path,
+                            route_index,
+                            element_precompile,
+                        )
+                        .await;
                 }
                 Ok(false)
             }
@@ -2894,13 +2946,27 @@ impl PingclairProxy {
                     .map_or(rewritten.as_str(), |(rewritten_path, _)| rewritten_path);
                 ctx.rewritten_path = Some(new_path.to_string());
 
-                for handler in handlers {
+                for (index, element) in handlers.iter().enumerate() {
+                    let element_precompile = precompile.and_then(|node| node.children.get(index));
+                    if !self.element_matcher_matches(element_precompile, session, ctx, new_path) {
+                        continue;
+                    }
                     if self
-                        .handle_config(session, ctx, handler, new_path, route_index)
+                        .handle_config(
+                            session,
+                            ctx,
+                            &element.handler,
+                            new_path,
+                            route_index,
+                            element_precompile,
+                        )
                         .await?
                     {
                         return Ok(true);
                     }
+                    // 🧭 `handle_path` is a `handle` under another name:
+                    // first matching element owns the group.
+                    return Ok(false);
                 }
                 Ok(false)
             }
@@ -3120,8 +3186,17 @@ impl PingclairProxy {
                     // the request simply continues with its original path.
                     None => match fallback {
                         Some(fallback) => {
-                            self.handle_config(session, ctx, fallback, path, route_index)
-                                .await
+                            let fallback_precompile =
+                                precompile.and_then(|node| node.children.first());
+                            self.handle_config(
+                                session,
+                                ctx,
+                                fallback,
+                                path,
+                                route_index,
+                                fallback_precompile,
+                            )
+                            .await
                         }
                         None => Ok(false),
                     },
@@ -4391,8 +4466,12 @@ impl ProxyHttp for PingclairProxy {
                 if find_reverse_proxy_config(h).is_none() {
                     Self::drain_local_request_body(session, ctx).await?;
                 }
+                let route_precompile = state
+                    .router
+                    .compiled_route(index)
+                    .map(|route| &route.matcher_precompile);
                 if self
-                    .handle_config(session, ctx, h, &path_str, index)
+                    .handle_config(session, ctx, h, &path_str, index, route_precompile)
                     .await?
                 {
                     // ⏱️ A locally produced response never reaches `response_filter`.
@@ -5563,9 +5642,9 @@ fn find_reverse_proxy_config(handler: &HandlerConfig) -> Option<&ReverseProxyCon
         HandlerConfig::ReverseProxy(config) => Some(config),
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::Handle { handlers }
-        | HandlerConfig::HandlePath { handlers, .. } => {
-            handlers.iter().find_map(|h| find_reverse_proxy_config(h))
-        }
+        | HandlerConfig::HandlePath { handlers, .. } => handlers
+            .iter()
+            .find_map(|element| find_reverse_proxy_config(&element.handler)),
         _ => None,
     }
 }
@@ -5621,9 +5700,9 @@ fn find_access_control_config(handler: &HandlerConfig) -> Option<&AccessControlC
         HandlerConfig::AccessControl(config) => Some(config),
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::Handle { handlers }
-        | HandlerConfig::HandlePath { handlers, .. } => {
-            handlers.iter().find_map(find_access_control_config)
-        }
+        | HandlerConfig::HandlePath { handlers, .. } => handlers
+            .iter()
+            .find_map(|element| find_access_control_config(&element.handler)),
         _ => None,
     }
 }
@@ -5635,7 +5714,9 @@ pub(crate) fn contains_reverse_proxy(handler: &HandlerConfig) -> bool {
         HandlerConfig::ReverseProxy(_) => true,
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::Handle { handlers }
-        | HandlerConfig::HandlePath { handlers, .. } => handlers.iter().any(contains_reverse_proxy),
+        | HandlerConfig::HandlePath { handlers, .. } => handlers
+            .iter()
+            .any(|element| contains_reverse_proxy(&element.handler)),
         _ => false,
     }
 }
@@ -5654,8 +5735,8 @@ fn collect_rewrite_regexes(handler: &HandlerConfig, regexes: &mut HashMap<String
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::Handle { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
-            for handler in handlers {
-                collect_rewrite_regexes(handler, regexes);
+            for element in handlers {
+                collect_rewrite_regexes(&element.handler, regexes);
             }
         }
         _ => {}
@@ -5766,9 +5847,9 @@ fn find_file_server_config(handler: &HandlerConfig) -> Option<&HandlerConfig> {
         HandlerConfig::FileServer { .. } => Some(handler),
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::Handle { handlers }
-        | HandlerConfig::HandlePath { handlers, .. } => {
-            handlers.iter().find_map(|h| find_file_server_config(h))
-        }
+        | HandlerConfig::HandlePath { handlers, .. } => handlers
+            .iter()
+            .find_map(|element| find_file_server_config(&element.handler)),
         _ => None,
     }
 }
@@ -5800,8 +5881,8 @@ fn find_rate_limit_config(
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::Handle { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
-            for h in handlers {
-                if let Some(config) = find_rate_limit_config(h, route) {
+            for element in handlers {
+                if let Some(config) = find_rate_limit_config(&element.handler, route) {
                     return Some(config);
                 }
             }
@@ -6593,12 +6674,14 @@ mod caddy_parity_tests {
                 path: "/*".into(),
                 handler: HandlerConfig::Pipeline {
                     handlers: vec![
-                        HandlerConfig::AccessControl(access),
-                        HandlerConfig::Respond {
+                        pingclair_core::config::HandlerElement::plain(
+                            HandlerConfig::AccessControl(access),
+                        ),
+                        pingclair_core::config::HandlerElement::plain(HandlerConfig::Respond {
                             status: 200,
                             body: Some("ok".into()),
                             headers: BTreeMap::new(),
-                        },
+                        }),
                     ],
                 },
                 methods: None,

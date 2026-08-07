@@ -9,11 +9,11 @@ use crate::parser::ast::*;
 use pingclair_core::config::Encoding as CoreEncoding;
 use pingclair_core::config::{
     AccessControlConfig as CoreAccessControlConfig, AdminConfig,
-    AutoHttpsMode as CoreAutoHttpsMode, HandlerConfig, LoadBalanceConfig, LogConfig,
-    LogFormat as CoreLogFormat, LogOutput as CoreLogOutput, Matcher as CoreMatcher,
-    MatcherCondition, PingclairConfig, ProxyUpstream, RateLimitKey as CoreRateLimitKey,
-    ReverseProxyConfig, RouteConfig, ServerConfig, TlsConfig, default_encodings,
-    default_gzip_types,
+    AutoHttpsMode as CoreAutoHttpsMode, HandlerConfig, HandlerElement as CoreHandlerElement,
+    LoadBalanceConfig, LogConfig, LogFormat as CoreLogFormat, LogOutput as CoreLogOutput,
+    Matcher as CoreMatcher, MatcherCondition, PingclairConfig, ProxyUpstream,
+    RateLimitKey as CoreRateLimitKey, ReverseProxyConfig, RouteConfig, ServerConfig, TlsConfig,
+    default_encodings, default_gzip_types,
 };
 use pingclair_core::server::{MAX_BCRYPT_COST, bcrypt_hash_cost};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -378,8 +378,8 @@ fn apply_site_root(handler: &mut pingclair_core::config::HandlerConfig, site_roo
         pingclair_core::config::HandlerConfig::Pipeline { handlers }
         | pingclair_core::config::HandlerConfig::Handle { handlers }
         | pingclair_core::config::HandlerConfig::HandlePath { handlers, .. } => {
-            for inner in handlers {
-                apply_site_root(inner, site_root);
+            for element in handlers {
+                apply_site_root(&mut element.handler, site_root);
             }
         }
         _ => {}
@@ -594,8 +594,8 @@ fn reject_unimplemented_handler(handler: &HandlerConfig) -> CompileResult<()> {
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::Handle { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
-            for handler in handlers {
-                reject_unimplemented_handler(handler)?;
+            for element in handlers {
+                reject_unimplemented_handler(&element.handler)?;
             }
             Ok(())
         }
@@ -857,8 +857,8 @@ fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<(
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::Handle { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
-            for handler in handlers {
-                validate_proxy_protection_handler(handler)?;
+            for element in handlers {
+                validate_proxy_protection_handler(&element.handler)?;
             }
         }
         HandlerConfig::HandleErrors { errors } => {
@@ -1209,7 +1209,7 @@ fn compile_route_arm(
         .transpose()?;
 
     // Compile handler
-    let handler = compile_handler(&arm.handler, root)?;
+    let handler = compile_handler(&arm.handler, matchers, root)?;
 
     if patterns.is_empty() {
         return Ok(vec![RouteConfig {
@@ -1335,7 +1335,11 @@ fn compile_matcher(
     })
 }
 
-fn compile_handler(handler: &Handler, root: Option<&str>) -> CompileResult<HandlerConfig> {
+fn compile_handler(
+    handler: &Handler,
+    matchers: &HashMap<String, Matcher>,
+    root: Option<&str>,
+) -> CompileResult<HandlerConfig> {
     match handler {
         Handler::Proxy(proxy) => {
             let mut config = ReverseProxyConfig {
@@ -1471,14 +1475,12 @@ fn compile_handler(handler: &Handler, root: Option<&str>) -> CompileResult<Handl
             remove: headers.remove.clone(),
         }),
 
-        Handler::Pipeline(handlers) => {
-            let compiled: Result<Vec<_>, _> = handlers
+        Handler::Pipeline(elements) => {
+            let handlers = elements
                 .iter()
-                .map(|handler| compile_handler(handler, root))
-                .collect();
-            Ok(HandlerConfig::Pipeline {
-                handlers: compiled?,
-            })
+                .map(|element| compile_handler_element(element, matchers, root))
+                .collect::<CompileResult<Vec<_>>>()?;
+            Ok(HandlerConfig::Pipeline { handlers })
         }
 
         Handler::FileServer(fs) => Ok(HandlerConfig::FileServer {
@@ -1494,23 +1496,22 @@ fn compile_handler(handler: &Handler, root: Option<&str>) -> CompileResult<Handl
         }),
 
         Handler::HandlePath { prefix, handlers } => {
-            let mut compiled = Vec::new();
-            for h in handlers {
-                compiled.push(compile_handler(h, root)?);
-            }
+            let handlers = handlers
+                .iter()
+                .map(|element| compile_handler_element(element, matchers, root))
+                .collect::<CompileResult<Vec<_>>>()?;
             Ok(HandlerConfig::HandlePath {
                 prefix: prefix.clone(),
-                handlers: compiled,
+                handlers,
             })
         }
 
-        Handler::Handle(sub_handlers) => {
-            // Recursively compile each sub-handler in the Handle block
-            let mut compiled = Vec::new();
-            for h in sub_handlers {
-                compiled.push(compile_handler(h, root)?);
-            }
-            Ok(HandlerConfig::Handle { handlers: compiled })
+        Handler::Handle(elements) => {
+            let handlers = elements
+                .iter()
+                .map(|element| compile_handler_element(element, matchers, root))
+                .collect::<CompileResult<Vec<_>>>()?;
+            Ok(HandlerConfig::Handle { handlers })
         }
 
         Handler::BasicAuth(config) => {
@@ -1620,6 +1621,22 @@ fn compile_handler(handler: &Handler, root: Option<&str>) -> CompileResult<Handl
             })
         }
     }
+}
+
+/// 🧩 Compiles one matcher-guarded pipeline element.
+fn compile_handler_element(
+    element: &HandlerElement,
+    matchers: &HashMap<String, Matcher>,
+    root: Option<&str>,
+) -> CompileResult<CoreHandlerElement> {
+    Ok(CoreHandlerElement {
+        matcher: element
+            .matcher
+            .as_ref()
+            .map(|matcher| compile_matcher(matcher, matchers, 0))
+            .transpose()?,
+        handler: compile_handler(&element.handler, matchers, root)?,
+    })
 }
 
 /// 🔐 Compiles and bounds a Basic Auth credential's bcrypt work factor.
@@ -1838,7 +1855,7 @@ mod tests {
             key,
             dry_run,
             ..
-        } = &handlers[0]
+        } = &handlers[0].handler
         else {
             panic!("expected rate limiter");
         };
@@ -2068,20 +2085,26 @@ mod fail_closed_handler_tests {
             (
                 "pipeline",
                 HandlerConfig::Pipeline {
-                    handlers: vec![harmless(), plugin()],
+                    handlers: vec![
+                        CoreHandlerElement::plain(harmless()),
+                        CoreHandlerElement::plain(plugin()),
+                    ],
                 },
             ),
             (
                 "handle",
                 HandlerConfig::Handle {
-                    handlers: vec![plugin()],
+                    handlers: vec![CoreHandlerElement::plain(plugin())],
                 },
             ),
             (
                 "handle_path",
                 HandlerConfig::HandlePath {
                     prefix: "/api".to_string(),
-                    handlers: vec![harmless(), plugin()],
+                    handlers: vec![
+                        CoreHandlerElement::plain(harmless()),
+                        CoreHandlerElement::plain(plugin()),
+                    ],
                 },
             ),
             (
@@ -2101,19 +2124,22 @@ mod fail_closed_handler_tests {
             (
                 "two containers deep",
                 HandlerConfig::Handle {
-                    handlers: vec![HandlerConfig::Pipeline {
-                        handlers: vec![harmless(), plugin()],
-                    }],
+                    handlers: vec![CoreHandlerElement::plain(HandlerConfig::Pipeline {
+                        handlers: vec![
+                            CoreHandlerElement::plain(harmless()),
+                            CoreHandlerElement::plain(plugin()),
+                        ],
+                    })],
                 },
             ),
             (
                 "a try_files fallback inside a pipeline",
                 HandlerConfig::Pipeline {
-                    handlers: vec![HandlerConfig::TryFiles {
+                    handlers: vec![CoreHandlerElement::plain(HandlerConfig::TryFiles {
                         files: vec!["{path}".to_string()],
                         root: None,
                         fallback: Some(Box::new(plugin())),
-                    }],
+                    })],
                 },
             ),
         ];
@@ -2134,7 +2160,10 @@ mod fail_closed_handler_tests {
         let allowed = vec![
             harmless(),
             HandlerConfig::Pipeline {
-                handlers: vec![harmless(), harmless()],
+                handlers: vec![
+                    CoreHandlerElement::plain(harmless()),
+                    CoreHandlerElement::plain(harmless()),
+                ],
             },
             HandlerConfig::TryFiles {
                 files: vec!["{path}".to_string()],

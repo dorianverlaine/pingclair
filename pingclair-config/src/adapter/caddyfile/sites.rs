@@ -6,11 +6,13 @@ use super::addresses::{
     is_local_https_default, looks_like_unsupported_address, parse_server_address,
     reject_impossible_address,
 };
-use super::directives::{adapt_handler, adapt_header_directive, adapt_resource_limits};
+use super::directives::{
+    adapt_handle_path, adapt_handler, adapt_header_directive, adapt_resource_limits,
+    adapt_subroute_block,
+};
 use super::logs::adapt_log_block;
 use super::matchers::{
     parse_matcher_and_block, parse_matcher_definition, parse_route_matcher_and_block,
-    reject_matcher_inside_route_body,
 };
 use super::options::is_wildcard_host;
 use super::order::DirectiveOrder;
@@ -378,55 +380,17 @@ pub(super) fn adapt_server(
                 // was missing, which is why a directive we could already
                 // execute was reported as unimplemented.
                 "handle_path" => {
-                    let (matcher, inner_block) = parse_route_matcher_and_block(&sub_d)?;
-                    let Some(Matcher::Path(path)) = matcher.clone() else {
-                        return Err(AdapterError::InvalidArgument(
-                            "handle_path".into(),
-                            "expected a path to match and strip, e.g. `handle_path /api/* { … }`"
-                                .into(),
-                        ));
-                    };
-                    // 🧭 The prefix is the pattern without its glob: matching
-                    // `/api/*` strips `/api`. Stripping the `*` as well would
-                    // leave a prefix nothing starts with.
-                    let prefix = path
-                        .patterns
-                        .first()
-                        .map(|pattern| pattern.trim_end_matches('*').trim_end_matches('/'))
-                        .unwrap_or_default()
-                        .to_string();
-                    if prefix.is_empty() {
-                        return Err(AdapterError::InvalidArgument(
-                            "handle_path".into(),
-                            "the path to strip cannot be empty; use `handle` instead".into(),
-                        ));
-                    }
-                    let mut handlers = Vec::new();
-                    if let Some(blk) = inner_block {
-                        for inner_d in &blk.directives {
-                            reject_matcher_inside_route_body(inner_d)?;
-                            handlers.push(adapt_handler(inner_d.clone())?);
-                        }
-                    }
-                    add_route(
-                        &mut server,
-                        matcher,
-                        Handler::HandlePath { prefix, handlers },
-                    );
+                    let (matcher, handler) = adapt_handle_path(&sub_d, &server.matchers, order)?;
+                    add_route(&mut server, matcher, handler);
                 }
                 "route" | "handle" => {
-                    let (matcher, inner_block) = parse_route_matcher_and_block(&sub_d)?;
-                    if let Some(blk) = inner_block {
-                        let mut handlers = Vec::new();
-                        for inner_d in &blk.directives {
-                            reject_matcher_inside_route_body(inner_d)?;
-                            handlers.push(adapt_handler(inner_d.clone())?);
-                        }
-                        if matcher.is_none() {
-                            default_handlers.push(Handler::Pipeline(handlers));
-                        } else {
-                            add_route(&mut server, matcher, Handler::Pipeline(handlers));
-                        }
+                    let (matcher, _) = parse_route_matcher_and_block(&sub_d)?;
+                    let sorted = sub_d.name == "handle";
+                    let handler = adapt_subroute_block(&sub_d, &server.matchers, order, sorted)?;
+                    if matcher.is_none() {
+                        default_handlers.push(handler);
+                    } else {
+                        add_route(&mut server, matcher, handler);
                     }
                 }
                 name if name.starts_with('@') => {
@@ -510,7 +474,7 @@ pub(super) fn adapt_server(
                         let route_matcher = Matcher::Path(PathMatcher {
                             patterns: vec![path.clone()],
                         });
-                        let handler = adapt_handler(handler_d)?;
+                        let handler = adapt_handler(handler_d, &server.matchers, order)?;
                         add_route(&mut server, Some(route_matcher), handler);
                         continue;
                     }
@@ -529,7 +493,7 @@ pub(super) fn adapt_server(
                         handler_d.drop_first_arg();
                     }
 
-                    let handler = adapt_handler(handler_d)?;
+                    let handler = adapt_handler(handler_d, &server.matchers, order)?;
                     if matcher.is_some() {
                         add_route(&mut server, matcher, handler);
                     } else {
@@ -548,7 +512,15 @@ pub(super) fn adapt_server(
         let final_handler = if default_handlers.len() == 1 {
             default_handlers[0].clone()
         } else {
-            Handler::Pipeline(default_handlers.clone())
+            Handler::Pipeline(
+                default_handlers
+                    .iter()
+                    .map(|handler| HandlerElement {
+                        matcher: None,
+                        handler: handler.clone(),
+                    })
+                    .collect(),
+            )
         };
 
         if let Some(routes) = server.routes.as_mut() {
@@ -674,7 +646,9 @@ pub(super) fn handler_has_terminal(handler: &Handler) -> bool {
         | Handler::Templates => true,
         Handler::Pipeline(handlers)
         | Handler::Handle(handlers)
-        | Handler::HandlePath { handlers, .. } => handlers.iter().any(handler_has_terminal),
+        | Handler::HandlePath { handlers, .. } => handlers
+            .iter()
+            .any(|element| handler_has_terminal(&element.handler)),
         // 🗂️ `try_files` belongs here rather than with the terminals: it only
         // changes which path is asked for, and a site whose route ends there
         // has answered nothing. The `file_server` after it is the terminal.
@@ -699,7 +673,15 @@ pub(super) fn compose_with_default_handlers(matched: Handler, defaults: &[Handle
     handlers.extend_from_slice(&defaults[..terminal_index]);
     handlers.push(matched);
     handlers.extend_from_slice(&defaults[terminal_index..]);
-    Handler::Pipeline(handlers)
+    Handler::Pipeline(
+        handlers
+            .into_iter()
+            .map(|handler| HandlerElement {
+                matcher: None,
+                handler,
+            })
+            .collect(),
+    )
 }
 
 pub(super) fn add_route(server: &mut ServerBlock, matcher: Option<Matcher>, handler: Handler) {
@@ -740,6 +722,7 @@ mod directive_order_tests {
             HandlerConfig::Pipeline { handlers } => {
                 let kinds: Vec<&str> = handlers
                     .iter()
+                    .map(|element| &element.handler)
                     .map(|h| match h {
                         HandlerConfig::Headers { .. } => "headers",
                         HandlerConfig::Respond { .. } => "respond",
@@ -761,8 +744,14 @@ mod directive_order_tests {
                 .expect("compile");
         match &config.servers[0].routes[0].handler {
             HandlerConfig::Pipeline { handlers } => {
-                assert!(matches!(handlers[0], HandlerConfig::BasicAuth { .. }));
-                assert!(matches!(handlers[1], HandlerConfig::FileServer { .. }));
+                assert!(matches!(
+                    handlers[0].handler,
+                    HandlerConfig::BasicAuth { .. }
+                ));
+                assert!(matches!(
+                    handlers[1].handler,
+                    HandlerConfig::FileServer { .. }
+                ));
             }
             other => panic!("expected pipeline, got {other:?}"),
         }
@@ -780,10 +769,13 @@ mod directive_order_tests {
             panic!("expected a pipeline");
         };
         assert!(
-            matches!(handlers[0], HandlerConfig::ReverseProxy(_)),
+            matches!(handlers[0].handler, HandlerConfig::ReverseProxy(_)),
             "reverse_proxy must run before file_server, got {handlers:?}"
         );
-        assert!(matches!(handlers[1], HandlerConfig::FileServer { .. }));
+        assert!(matches!(
+            handlers[1].handler,
+            HandlerConfig::FileServer { .. }
+        ));
 
         let respond_first =
             compile("example.com {\n    respond \"x\"\n    file_server\n}").expect("compile");
@@ -791,8 +783,11 @@ mod directive_order_tests {
         else {
             panic!("expected a pipeline");
         };
-        assert!(matches!(handlers[0], HandlerConfig::Respond { .. }));
-        assert!(matches!(handlers[1], HandlerConfig::FileServer { .. }));
+        assert!(matches!(handlers[0].handler, HandlerConfig::Respond { .. }));
+        assert!(matches!(
+            handlers[1].handler,
+            HandlerConfig::FileServer { .. }
+        ));
     }
 
     #[test]
@@ -803,10 +798,13 @@ mod directive_order_tests {
             panic!("expected a pipeline");
         };
         assert!(
-            matches!(&handlers[0], HandlerConfig::Templates { root: Some(root) } if root == "/site"),
+            matches!(&handlers[0].handler, HandlerConfig::Templates { root: Some(root) } if root == "/site"),
             "templates must run before file_server with the site root"
         );
-        assert!(matches!(&handlers[1], HandlerConfig::FileServer { .. }));
+        assert!(matches!(
+            &handlers[1].handler,
+            HandlerConfig::FileServer { .. }
+        ));
     }
 
     #[test]
@@ -830,7 +828,7 @@ mod directive_order_tests {
             matches!(&routes[0].handler, HandlerConfig::Headers { .. })
                 || matches!(
                     &routes[0].handler,
-                    HandlerConfig::Pipeline { handlers } if handlers.iter().any(|h| matches!(h, HandlerConfig::Headers { .. }))
+                    HandlerConfig::Pipeline { handlers } if handlers.iter().any(|element| matches!(&element.handler, HandlerConfig::Headers { .. }))
                 ),
             "the middleware route must come first, got {:?}",
             routes[0].handler

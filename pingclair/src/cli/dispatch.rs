@@ -585,10 +585,10 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
             let handler = if templates {
                 HandlerConfig::Pipeline {
                     handlers: vec![
-                        HandlerConfig::Templates {
+                        pingclair_core::config::HandlerElement::plain(HandlerConfig::Templates {
                             root: Some(template_root),
-                        },
-                        file_handler,
+                        }),
+                        pingclair_core::config::HandlerElement::plain(file_handler),
                     ],
                 }
             } else {

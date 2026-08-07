@@ -554,6 +554,7 @@ mod global_tests {
                 matches!(
                     &r.handler,
                     pingclair_core::config::HandlerConfig::ReverseProxy(_)
+                        | pingclair_core::config::HandlerConfig::Handle { .. }
                         | pingclair_core::config::HandlerConfig::Pipeline { .. }
                 )
             })
@@ -1190,23 +1191,40 @@ mod fail_closed_tests {
     }
 
     #[test]
-    fn reverse_proxy_path_matcher_inside_handle_fails_closed() {
-        let error = compile_err(
+    fn reverse_proxy_path_matcher_inside_handle_compiles_scoped() {
+        let config = crate::compile(
             r#"example.com {
                 handle /ws {
                     reverse_proxy /ws 127.0.0.1:9001
                 }
             }"#,
+        )
+        .expect("a matcher on a directive inside handle must compile");
+        let route = &config.servers[0].routes[0];
+        assert_eq!(
+            route.path, "/ws",
+            "the container matcher must stay on the route"
         );
-        // 🧭 The wording moved on 2026-08-07: `reverse_proxy` used to catch
-        // this with its own narrower guard, and now one shared guard catches
-        // every directive in a route/handle body. What is asserted is the
-        // behaviour — refused, and pointing at the real limitation — rather
-        // than the sentence, so the next rewording does not fail a test that
-        // is not about wording.
+        let pingclair_core::config::HandlerConfig::Handle { handlers } = &route.handler else {
+            panic!("handle must compile to a Handle group");
+        };
+        let element = handlers
+            .iter()
+            .find(|element| {
+                matches!(
+                    &element.handler,
+                    pingclair_core::config::HandlerConfig::ReverseProxy(_)
+                )
+            })
+            .expect("reverse proxy element");
         assert!(
-            error.contains("route/handle") || error.contains("inline path matcher"),
-            "a matcher token inside handle must fail closed, got: {error}"
+            matches!(
+                &element.matcher,
+                Some(pingclair_core::config::Matcher::Path { patterns })
+                    if patterns == &["/ws".to_string()]
+            ),
+            "the inner /ws must become the element matcher, got {:?}",
+            element.matcher
         );
     }
 
@@ -1558,12 +1576,12 @@ mod p3_syntax_tests {
                 assert!(
                     handlers
                         .iter()
-                        .any(|h| matches!(h, HandlerConfig::Headers { .. }))
+                        .any(|element| matches!(&element.handler, HandlerConfig::Headers { .. }))
                 );
                 assert!(
                     handlers
                         .iter()
-                        .any(|h| matches!(h, HandlerConfig::Respond { .. }))
+                        .any(|element| matches!(&element.handler, HandlerConfig::Respond { .. }))
                 );
             }
             other => panic!("expected a pipeline, got {other:?}"),
@@ -1801,7 +1819,10 @@ mod uri_and_try_files_tests {
             .remove(0)
             .handler
         {
-            HandlerConfig::Pipeline { handlers } => handlers,
+            HandlerConfig::Pipeline { handlers } => handlers
+                .into_iter()
+                .map(|element| element.handler)
+                .collect(),
             single => vec![single],
         }
     }
@@ -2051,7 +2072,8 @@ mod basic_auth_grammar_tests {
         {
             HandlerConfig::Pipeline { handlers } => handlers
                 .into_iter()
-                .find(|handler| matches!(handler, HandlerConfig::BasicAuth { .. }))
+                .find(|element| matches!(&element.handler, HandlerConfig::BasicAuth { .. }))
+                .map(|element| element.handler)
                 .expect("a basic_auth handler"),
             single => single,
         };
@@ -2149,28 +2171,37 @@ mod basic_auth_grammar_tests {
 
 // MARK: - Matcher tokens inside route/handle
 
-/// 🚧 The blockade for the one shape that was silently wrong.
+/// 🧭 Per-element matchers inside `route`/`handle`/`handle_path` blocks.
 ///
-/// Each of these compiled green before 2026-08-07 and then did something the
-/// operator never wrote. They are grouped here rather than spread through the
-/// fail-closed tests so that the commit which implements per-handler matching
-/// has one place to convert them from "must be refused" into "must work".
+/// These used to be refused by the A1 blockade; C2 implements them, so every
+/// former refusal becomes a "must compile and gate" assertion.
 #[cfg(test)]
 mod matcher_inside_route_body_tests {
     use crate::compile;
+    use pingclair_core::config::{HandlerConfig, Matcher};
 
-    fn refusal(source: &str) -> String {
-        compile(source)
-            .expect_err(&format!("must be refused:\n{source}"))
-            .to_string()
+    fn route_handlers(source: &str) -> Vec<pingclair_core::config::HandlerElement> {
+        let config = compile(source).unwrap_or_else(|error| panic!("must compile: {error}"));
+        match &config.servers[0].routes[0].handler {
+            HandlerConfig::Pipeline { handlers }
+            | HandlerConfig::Handle { handlers }
+            | HandlerConfig::HandlePath { handlers, .. } => handlers.clone(),
+            other => panic!("expected a container handler, got {other:?}"),
+        }
     }
 
-    /// 🤡 The measured case: validated on both servers, and then answered every
-    /// request with the literal text `@admin`. Caddy v2.11.4 gated correctly —
-    /// 3 of 3 requests differed.
+    fn path_matcher(element: &pingclair_core::config::HandlerElement) -> Option<&[String]> {
+        match &element.matcher {
+            Some(Matcher::Path { patterns }) => Some(patterns),
+            _ => None,
+        }
+    }
+
+    /// 🤡 The measured case: the token used to become the response body and
+    /// every request got `@admin`; now it must gate the first element.
     #[test]
-    fn a_named_matcher_on_respond_is_refused_rather_than_becoming_the_body() {
-        let message = refusal(
+    fn a_named_matcher_on_respond_gates_the_element() {
+        let handlers = route_handlers(
             "example.com {\n\
              \t@admin path /admin/*\n\
              \troute {\n\
@@ -2179,21 +2210,28 @@ mod matcher_inside_route_body_tests {
              \t}\n\
              }",
         );
-        assert!(
-            message.contains("@admin") && message.contains("respond"),
-            "the message must name the token and the directive: {message}"
+        assert_eq!(handlers.len(), 2);
+        assert_eq!(
+            path_matcher(&handlers[0]),
+            Some(&["/admin/*".to_string()][..])
         );
-        assert!(
-            !message.contains("Unknown directive"),
-            "this is a missing feature, not a typo: {message}"
+        assert!(handlers[0].matcher.is_some(), "first element must be gated");
+        let HandlerConfig::Respond { body, .. } = &handlers[0].handler else {
+            panic!("expected respond");
+        };
+        assert_eq!(
+            body.as_deref(),
+            Some("SECRET"),
+            "the token must not become the body"
         );
+        assert!(handlers[1].matcher.is_none());
     }
 
-    /// 🛡️ The fail-open direction: the token was filtered out of the arguments,
-    /// so a proxy that was meant to be gated ran for every request instead.
+    /// 🛡️ The fail-open direction: the token used to be filtered out and the
+    /// proxy ran unconditionally; now it must stay on the element.
     #[test]
-    fn a_named_matcher_on_reverse_proxy_is_refused_rather_than_dropped() {
-        let message = refusal(
+    fn a_named_matcher_on_reverse_proxy_is_not_dropped() {
+        let handlers = route_handlers(
             "example.com {\n\
              \t@api path /api/*\n\
              \troute {\n\
@@ -2201,44 +2239,99 @@ mod matcher_inside_route_body_tests {
              \t}\n\
              }",
         );
-        assert!(message.contains("@api"), "got {message}");
+        assert_eq!(
+            path_matcher(&handlers[0]),
+            Some(&["/api/*".to_string()][..])
+        );
+        let HandlerConfig::ReverseProxy(proxy) = &handlers[0].handler else {
+            panic!("expected reverse proxy");
+        };
+        assert_eq!(proxy.upstreams, vec!["127.0.0.1:9000".to_string()]);
     }
 
     #[test]
-    fn a_matcher_token_is_refused_in_handle_and_handle_path_too() {
+    fn a_matcher_token_works_in_handle_and_handle_path_too() {
         for container in [
             "handle {\n\t\trespond @admin \"x\" 200\n\t}",
             "handle_path /api/* {\n\t\trespond @admin \"x\" 200\n\t}",
         ] {
-            let message = refusal(&format!(
+            let handlers = route_handlers(&format!(
                 "example.com {{\n\t@admin path /admin/*\n\t{container}\n}}"
             ));
-            assert!(message.contains("@admin"), "{container} → {message}");
+            assert_eq!(
+                path_matcher(&handlers[0]),
+                Some(&["/admin/*".to_string()][..]),
+                "{container} must keep its matcher"
+            );
         }
     }
 
-    /// 🏷️ A matcher *definition* inside the block used to be reported as an
-    /// unknown directive, which reads as a misspelling of a word spelled
-    /// correctly.
+    /// 🏷️ A matcher definition inside a block resolves locally and does not
+    /// leak upward: the same name outside the block is still undefined.
     #[test]
-    fn a_matcher_definition_inside_the_block_says_what_is_wrong() {
-        let message = refusal(
+    fn a_matcher_definition_inside_the_block_stays_local() {
+        let handlers = route_handlers(
+            "example.com {\n\
+             \troute {\n\
+             \t\t@admin path /admin/*\n\
+             \t\trespond @admin \"x\"\n\
+             \t}\n\
+             }",
+        );
+        assert_eq!(
+            path_matcher(&handlers[0]),
+            Some(&["/admin/*".to_string()][..])
+        );
+
+        compile(
             "example.com {\n\
              \troute {\n\
              \t\t@admin path /admin/*\n\
              \t\trespond \"x\"\n\
              \t}\n\
+             \theader @admin X-A b\n\
              }",
-        );
-        assert!(
-            !message.contains("Unknown directive"),
-            "a matcher definition is valid syntax we do not support here: {message}"
-        );
-        assert!(message.contains("site block"), "got {message}");
+        )
+        .expect_err("a block-local matcher must not be visible outside the block");
     }
 
-    /// 🎯 The other direction: a matcher on the container itself is how you say
-    /// this today, and it must keep working.
+    /// 🧭 `route` preserves file order; `handle` sorts by directive order.
+    #[test]
+    fn route_preserves_file_order_and_handle_sorts() {
+        let route = route_handlers(
+            "example.com {\n\
+             \troute {\n\
+             \t\trespond \"b\"\n\
+             \t\theader X-A b\n\
+             \t\trespond \"a\"\n\
+             \t}\n\
+             }",
+        );
+        let names = |handlers: &[pingclair_core::config::HandlerElement]| {
+            handlers
+                .iter()
+                .map(|element| match &element.handler {
+                    HandlerConfig::Respond { .. } => "respond",
+                    HandlerConfig::Headers { .. } => "header",
+                    other => panic!("unexpected {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&route), vec!["respond", "header", "respond"]);
+
+        let handle = route_handlers(
+            "example.com {\n\
+             \thandle {\n\
+             \t\trespond \"b\"\n\
+             \t\theader X-A b\n\
+             \t\trespond \"a\"\n\
+             \t}\n\
+             }",
+        );
+        assert_eq!(names(&handle), vec!["header", "respond", "respond"]);
+    }
+
+    /// 🎯 A matcher on the container itself keeps working.
     #[test]
     fn a_matcher_on_the_container_still_compiles() {
         compile(
@@ -2250,25 +2343,13 @@ mod matcher_inside_route_body_tests {
              \trespond \"public\" 200\n\
              }",
         )
-        .expect("a matcher on the container is the supported spelling");
+        .expect("a matcher on the container is supported");
     }
 
-    /// 🤡 A nested container carrying a matcher is the same defect wearing a
-    /// different hat, and it is the one that cost a corpus point.
-    ///
-    /// `handle /foo/*` inside `route` used to compile — the `handle` arm reads
-    /// only `d.block` and never `d.args`, so the matcher was dropped and both
-    /// handles became unconditional. The first one then answered every request.
-    /// Upstream's own fixture `handle_nested_in_route` was passing for exactly
-    /// that reason: the corpus asks "does it compile", and it did.
-    ///
-    /// 📉 Refusing it costs one corpus fixture (67 → 66) and is still right.
-    /// The repository has taken this trade before: rejecting four
-    /// silently-misread configurations on 2026-08-05 dropped the score by 3
-    /// while making the behaviour correct.
+    /// 🤡 A nested container carrying a matcher now compiles and gates.
     #[test]
-    fn a_nested_container_carrying_a_matcher_is_refused() {
-        let message = refusal(
+    fn a_nested_container_carrying_a_matcher_works() {
+        let handlers = route_handlers(
             "example.com {\n\
              \troute {\n\
              \t\thandle /foo/* {\n\
@@ -2280,12 +2361,18 @@ mod matcher_inside_route_body_tests {
              \t}\n\
              }",
         );
-        assert!(message.contains("/foo/*"), "got {message}");
+        assert_eq!(handlers.len(), 2);
+        assert_eq!(
+            path_matcher(&handlers[0]),
+            Some(&["/foo/*".to_string()][..])
+        );
+        assert!(matches!(handlers[0].handler, HandlerConfig::Handle { .. }));
+        assert!(handlers[1].matcher.is_none());
+        assert!(matches!(handlers[1].handler, HandlerConfig::Handle { .. }));
     }
 
-    /// 📌 And a directive whose first argument merely looks like a matcher must
-    /// not be caught by the guard — `respond` with a leading-slash *body* is
-    /// data, decided by the one rule in `matcher_token`.
+    /// 📌 A directive whose first argument merely looks like a matcher stays
+    /// data — `file_server /var/www` is a root, not a path matcher.
     #[test]
     fn a_directive_whose_argument_is_data_is_not_caught() {
         compile("example.com {\n\troute {\n\t\tfile_server /var/www\n\t}\n}")

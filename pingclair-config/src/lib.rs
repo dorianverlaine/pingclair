@@ -1278,7 +1278,7 @@ mod tests {
         };
         let auth = handlers
             .iter()
-            .find_map(|h| match h {
+            .find_map(|element| match &element.handler {
                 HandlerConfig::BasicAuth { realm, credentials } => Some((realm, credentials)),
                 _ => None,
             })
@@ -1310,7 +1310,7 @@ mod tests {
         };
         let auth = handlers
             .iter()
-            .find_map(|h| match h {
+            .find_map(|element| match &element.handler {
                 HandlerConfig::BasicAuth { realm, credentials } => Some((realm, credentials)),
                 _ => None,
             })
@@ -1339,7 +1339,7 @@ mod tests {
         };
         let credentials = handlers
             .iter()
-            .find_map(|handler| match handler {
+            .find_map(|element| match &element.handler {
                 HandlerConfig::BasicAuth { credentials, .. } => Some(credentials),
                 _ => None,
             })
@@ -1623,10 +1623,10 @@ mod tests {
         "#;
 
         let config = compile(source).unwrap();
-        let HandlerConfig::Pipeline { handlers } = &config.servers[0].routes[0].handler else {
-            panic!("expected handler pipeline");
+        let HandlerConfig::Handle { handlers } = &config.servers[0].routes[0].handler else {
+            panic!("expected handler group");
         };
-        assert!(handlers.iter().any(|handler| matches!(handler, HandlerConfig::Cors {
+        assert!(handlers.iter().any(|element| matches!(&element.handler, HandlerConfig::Cors {
             allowed_origins,
             allowed_methods,
             allow_credentials: true,
@@ -1634,19 +1634,17 @@ mod tests {
             ..
         } if allowed_origins == &["https://app.example.com"] && allowed_methods == &["GET", "POST"])));
         assert!(handlers.iter().any(
-            |handler| matches!(handler, HandlerConfig::AccessControl(access)
+            |element| matches!(&element.handler, HandlerConfig::AccessControl(access)
             if access.allowed_ips.len() == 2 && access.denied_user_agents == ["(?i)bot"])
         ));
-        assert!(
-            handlers
-                .iter()
-                .any(|handler| matches!(handler, HandlerConfig::Rewrite {
+        assert!(handlers.iter().any(
+            |element| matches!(&element.handler, HandlerConfig::Rewrite {
             regex: Some(pattern), regex_replace: Some(replacement), ..
-        } if pattern == "^/api/(.*)$" && replacement == "/v1/$1"))
-        );
+        } if pattern == "^/api/(.*)$" && replacement == "/v1/$1")
+        ));
         let proxy = handlers
             .iter()
-            .find_map(|handler| match handler {
+            .find_map(|element| match &element.handler {
                 HandlerConfig::ReverseProxy(proxy) => Some(proxy),
                 _ => None,
             })
@@ -1714,9 +1712,9 @@ mod tests {
                     HandlerConfig::Pipeline { handlers }
                     | HandlerConfig::Handle { handlers }
                     | HandlerConfig::HandlePath { handlers, .. } => {
-                        for handler in handlers {
+                        for element in handlers {
                             visit(
-                                handler,
+                                &element.handler,
                                 cache_control,
                                 has_security_header,
                                 removes_server,
