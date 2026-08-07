@@ -12,4 +12,6 @@ pub use self::handlers::{
     execute_handler, verify_basic_auth, verify_basic_auth_async,
 };
 pub use self::redirect::{HttpRedirectServer, RedirectConfig};
-pub use self::router::{CompiledMatcher, CompiledRoute, Router};
+pub use self::router::{
+    CompiledMatcher, CompiledRoute, MatcherPrecompile, MatcherRequest, Router, evaluate,
+};

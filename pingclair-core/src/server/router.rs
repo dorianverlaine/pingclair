@@ -11,13 +11,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// 🧭 Bundles the immutable request attributes used by matcher evaluation.
-struct MatcherRequest<'a> {
-    path: &'a str,
-    method: &'a str,
-    headers: &'a http::HeaderMap,
-    host: &'a str,
-    remote_ip: &'a str,
-    protocol: &'a str,
+pub struct MatcherRequest<'a> {
+    pub path: &'a str,
+    pub method: &'a str,
+    pub headers: &'a http::HeaderMap,
+    pub host: &'a str,
+    pub remote_ip: &'a str,
+    pub protocol: &'a str,
 }
 
 /// Pre-compiled matcher with cached regex
@@ -67,6 +67,21 @@ impl CompiledMatcher {
     }
 }
 
+/// 🔎 Evaluates a pre-compiled matcher against one request's immutable
+/// attributes. This is the standalone primitive C2 will reuse for matchers
+/// attached to pipeline elements; the router calls the same function so the
+/// two paths cannot drift.
+pub fn evaluate(compiled: &CompiledMatcher, request: &MatcherRequest<'_>) -> bool {
+    evaluate_matcher_inner(&compiled.matcher, compiled, request)
+}
+
+/// 🧭 Precompiled per-route matcher state, populated by C2.
+///
+/// Deliberately empty today: adding the container now means C2 can fill it
+/// without moving this abstraction a second time.
+#[derive(Debug, Clone, Default)]
+pub struct MatcherPrecompile {}
+
 /// Route entry with precompiled matchers
 #[derive(Debug, Clone)]
 pub struct CompiledRoute {
@@ -76,6 +91,8 @@ pub struct CompiledRoute {
     pub index: usize,
     /// Pre-compiled matcher (if route has one)
     pub compiled_matcher: Option<CompiledMatcher>,
+    /// Pre-compiled per-route matcher state (empty until C2 fills it)
+    pub matcher_precompile: MatcherPrecompile,
 }
 
 /// High-performance router using radix tree
@@ -103,6 +120,7 @@ impl Router {
                 config: config.clone(),
                 index,
                 compiled_matcher,
+                matcher_precompile: MatcherPrecompile::default(),
             };
 
             // Normalize path for radix tree
@@ -235,160 +253,7 @@ impl Router {
         route
             .compiled_matcher
             .as_ref()
-            .is_none_or(|compiled| Self::evaluate_matcher_compiled(compiled, request))
-    }
-
-    /// Evaluate a pre-compiled matcher against request context
-    fn evaluate_matcher_compiled(compiled: &CompiledMatcher, request: &MatcherRequest<'_>) -> bool {
-        Self::evaluate_matcher_inner(&compiled.matcher, compiled, request)
-    }
-
-    /// Inner matcher evaluation with access to pre-compiled regexes
-    fn evaluate_matcher_inner(
-        matcher: &Matcher,
-        compiled: &CompiledMatcher,
-        request: &MatcherRequest<'_>,
-    ) -> bool {
-        match matcher {
-            Matcher::Path { patterns } => patterns
-                .iter()
-                .any(|pattern| Self::path_matches(request.path, pattern)),
-            Matcher::Header { name, condition } => {
-                let header_value = request.headers.get(name).and_then(|v| v.to_str().ok());
-                Self::evaluate_condition(header_value, condition, compiled)
-            }
-            Matcher::Method { methods } => methods
-                .iter()
-                .any(|method| method.eq_ignore_ascii_case(request.method)),
-            Matcher::Query { name, condition } => {
-                Self::query_matches(request.path, name, condition, compiled)
-            }
-            Matcher::Host(hosts) => hosts
-                .iter()
-                .any(|host| host.eq_ignore_ascii_case(request.host)),
-            Matcher::RemoteIp(ips) => Self::remote_ip_matches(ips, request.remote_ip),
-            Matcher::Protocol(protocols) => protocols
-                .iter()
-                .any(|protocol| protocol.eq_ignore_ascii_case(request.protocol)),
-            Matcher::And(left, right) => {
-                Self::evaluate_matcher_inner(left, compiled, request)
-                    && Self::evaluate_matcher_inner(right, compiled, request)
-            }
-            Matcher::Or(left, right) => {
-                Self::evaluate_matcher_inner(left, compiled, request)
-                    || Self::evaluate_matcher_inner(right, compiled, request)
-            }
-            Matcher::Not(inner) => !Self::evaluate_matcher_inner(inner, compiled, request),
-        }
-    }
-
-    /// 🔎 Evaluates one query-parameter condition against the request's query
-    /// string. A key with several repeated values matches when any one value
-    /// satisfies the condition; a key that is absent never matches, even for
-    /// `Exists`. This replaces the old unconditional `true`, which turned any
-    /// query matcher into a match-all rule.
-    fn query_matches(
-        path: &str,
-        name: &str,
-        condition: &MatcherCondition,
-        compiled: &CompiledMatcher,
-    ) -> bool {
-        let Some(query) = path.split_once('?').map(|(_, q)| q) else {
-            return false;
-        };
-        query.split('&').any(|pair| {
-            let Some((key, value)) = pair.split_once('=') else {
-                return false;
-            };
-            if key != name {
-                return false;
-            }
-            Self::evaluate_condition(Some(value), condition, compiled)
-        })
-    }
-
-    /// Evaluate a condition against a value (using pre-compiled regex)
-    fn evaluate_condition(
-        value: Option<&str>,
-        condition: &MatcherCondition,
-        compiled: &CompiledMatcher,
-    ) -> bool {
-        match condition {
-            MatcherCondition::Exists => value.is_some(),
-            MatcherCondition::Equals(expected) => value.map(|v| v == expected).unwrap_or(false),
-            MatcherCondition::Contains(substring) => {
-                value.map(|v| v.contains(substring)).unwrap_or(false)
-            }
-            MatcherCondition::StartsWith(prefix) => {
-                value.map(|v| v.starts_with(prefix)).unwrap_or(false)
-            }
-            MatcherCondition::EndsWith(suffix) => {
-                value.map(|v| v.ends_with(suffix)).unwrap_or(false)
-            }
-            MatcherCondition::Regex(pattern) => {
-                // Use pre-compiled regex for performance
-                if let Some(re) = compiled.get_regex(pattern) {
-                    value.map(|v| re.is_match(v)).unwrap_or(false)
-                } else {
-                    // Fallback (shouldn't happen normally)
-                    false
-                }
-            }
-        }
-    }
-
-    /// 🌐 Matches the remote/client IP against exact literals and CIDR
-    /// ranges, as Caddy's `remote_ip`/`client_ip` matchers do.
-    fn remote_ip_matches(patterns: &[String], remote_ip: &str) -> bool {
-        let Ok(remote) = remote_ip.parse::<std::net::IpAddr>() else {
-            return false;
-        };
-        patterns.iter().any(|pattern| {
-            if let Ok(net) = pattern.parse::<ipnet::IpNet>() {
-                net.contains(&remote)
-            } else {
-                pattern.parse::<std::net::IpAddr>().ok() == Some(remote)
-            }
-        })
-    }
-
-    /// Check if path matches a glob pattern
-    fn path_matches(path: &str, pattern: &str) -> bool {
-        Self::glob_match(pattern, path)
-    }
-
-    /// 🧭 Classic glob matching with `*` as a wildcard, compared
-    /// case-insensitively like Caddy. Matching is byte-based (ASCII case
-    /// folding) to stay allocation-free on the request hot path.
-    fn glob_match(pattern: &str, text: &str) -> bool {
-        let pattern = pattern.as_bytes();
-        let text = text.as_bytes();
-        let mut p = 0usize;
-        let mut t = 0usize;
-        let mut star_p: Option<usize> = None;
-        let mut star_t = 0usize;
-        let ascii_eq = |a: u8, b: u8| a.eq_ignore_ascii_case(&b);
-
-        while t < text.len() {
-            if p < pattern.len() && ascii_eq(pattern[p], text[t]) {
-                p += 1;
-                t += 1;
-            } else if p < pattern.len() && pattern[p] == b'*' {
-                star_p = Some(p);
-                star_t = t;
-                p += 1;
-            } else if let Some(sp) = star_p {
-                p = sp + 1;
-                star_t += 1;
-                t = star_t;
-            } else {
-                return false;
-            }
-        }
-        while p < pattern.len() && pattern[p] == b'*' {
-            p += 1;
-        }
-        p == pattern.len()
+            .is_none_or(|compiled| evaluate(compiled, request))
     }
 
     /// 🧹 Cleans a request path before matching: merges repeated slashes and
@@ -482,6 +347,152 @@ impl Default for Router {
     fn default() -> Self {
         Self::new(Vec::new())
     }
+}
+
+/// Inner matcher evaluation with access to pre-compiled regexes
+fn evaluate_matcher_inner(
+    matcher: &Matcher,
+    compiled: &CompiledMatcher,
+    request: &MatcherRequest<'_>,
+) -> bool {
+    match matcher {
+        Matcher::Path { patterns } => patterns
+            .iter()
+            .any(|pattern| path_matches(request.path, pattern)),
+        Matcher::Header { name, condition } => {
+            let header_value = request.headers.get(name).and_then(|v| v.to_str().ok());
+            evaluate_condition(header_value, condition, compiled)
+        }
+        Matcher::Method { methods } => methods
+            .iter()
+            .any(|method| method.eq_ignore_ascii_case(request.method)),
+        Matcher::Query { name, condition } => {
+            query_matches(request.path, name, condition, compiled)
+        }
+        Matcher::Host(hosts) => hosts
+            .iter()
+            .any(|host| host.eq_ignore_ascii_case(request.host)),
+        Matcher::RemoteIp(ips) => remote_ip_matches(ips, request.remote_ip),
+        Matcher::Protocol(protocols) => protocols
+            .iter()
+            .any(|protocol| protocol.eq_ignore_ascii_case(request.protocol)),
+        Matcher::And(left, right) => {
+            evaluate_matcher_inner(left, compiled, request)
+                && evaluate_matcher_inner(right, compiled, request)
+        }
+        Matcher::Or(left, right) => {
+            evaluate_matcher_inner(left, compiled, request)
+                || evaluate_matcher_inner(right, compiled, request)
+        }
+        Matcher::Not(inner) => !evaluate_matcher_inner(inner, compiled, request),
+    }
+}
+
+/// 🔎 Evaluates one query-parameter condition against the request's query
+/// string. A key with several repeated values matches when any one value
+/// satisfies the condition; a key that is absent never matches, even for
+/// `Exists`. This replaces the old unconditional `true`, which turned any
+/// query matcher into a match-all rule.
+fn query_matches(
+    path: &str,
+    name: &str,
+    condition: &MatcherCondition,
+    compiled: &CompiledMatcher,
+) -> bool {
+    let Some(query) = path.split_once('?').map(|(_, q)| q) else {
+        return false;
+    };
+    query.split('&').any(|pair| {
+        let Some((key, value)) = pair.split_once('=') else {
+            return false;
+        };
+        if key != name {
+            return false;
+        }
+        evaluate_condition(Some(value), condition, compiled)
+    })
+}
+
+/// Evaluate a condition against a value (using pre-compiled regex)
+fn evaluate_condition(
+    value: Option<&str>,
+    condition: &MatcherCondition,
+    compiled: &CompiledMatcher,
+) -> bool {
+    match condition {
+        MatcherCondition::Exists => value.is_some(),
+        MatcherCondition::Equals(expected) => value.map(|v| v == expected).unwrap_or(false),
+        MatcherCondition::Contains(substring) => {
+            value.map(|v| v.contains(substring)).unwrap_or(false)
+        }
+        MatcherCondition::StartsWith(prefix) => {
+            value.map(|v| v.starts_with(prefix)).unwrap_or(false)
+        }
+        MatcherCondition::EndsWith(suffix) => value.map(|v| v.ends_with(suffix)).unwrap_or(false),
+        MatcherCondition::Regex(pattern) => {
+            // Use pre-compiled regex for performance
+            if let Some(re) = compiled.get_regex(pattern) {
+                value.map(|v| re.is_match(v)).unwrap_or(false)
+            } else {
+                // Fallback (shouldn't happen normally)
+                false
+            }
+        }
+    }
+}
+
+/// 🌐 Matches the remote/client IP against exact literals and CIDR
+/// ranges, as Caddy's `remote_ip`/`client_ip` matchers do.
+fn remote_ip_matches(patterns: &[String], remote_ip: &str) -> bool {
+    let Ok(remote) = remote_ip.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    patterns.iter().any(|pattern| {
+        if let Ok(net) = pattern.parse::<ipnet::IpNet>() {
+            net.contains(&remote)
+        } else {
+            pattern.parse::<std::net::IpAddr>().ok() == Some(remote)
+        }
+    })
+}
+
+/// Check if path matches a glob pattern
+fn path_matches(path: &str, pattern: &str) -> bool {
+    glob_match(pattern, path)
+}
+
+/// 🧭 Classic glob matching with `*` as a wildcard, compared
+/// case-insensitively like Caddy. Matching is byte-based (ASCII case
+/// folding) to stay allocation-free on the request hot path.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let text = text.as_bytes();
+    let mut p = 0usize;
+    let mut t = 0usize;
+    let mut star_p: Option<usize> = None;
+    let mut star_t = 0usize;
+    let ascii_eq = |a: u8, b: u8| a.eq_ignore_ascii_case(&b);
+
+    while t < text.len() {
+        if p < pattern.len() && ascii_eq(pattern[p], text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star_p = Some(p);
+            star_t = t;
+            p += 1;
+        } else if let Some(sp) = star_p {
+            p = sp + 1;
+            star_t += 1;
+            t = star_t;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 #[cfg(test)]
@@ -637,6 +648,39 @@ mod tests {
         assert!(matches("/a/one"));
         assert!(matches("/b/two"));
         assert!(!matches("/c/three"));
+    }
+
+    /// 🧭 The public `evaluate` primitive answers the same question the
+    /// router answers for a route-level matcher, so C2 can reuse it for
+    /// pipeline-element matchers without reimplementing evaluation.
+    #[test]
+    fn the_public_evaluate_primitive_matches_like_the_router() {
+        let matcher = Matcher::And(
+            Box::new(Matcher::Path {
+                patterns: vec!["/api/*".to_string()],
+            }),
+            Box::new(Matcher::Header {
+                name: "x-tenant".to_string(),
+                condition: MatcherCondition::Equals("acme".to_string()),
+            }),
+        );
+        let compiled = CompiledMatcher::compile(&matcher);
+        let mut matching = HeaderMap::new();
+        matching.insert("x-tenant", "acme".parse().unwrap());
+        let empty = HeaderMap::new();
+        fn request(headers: &HeaderMap) -> MatcherRequest<'_> {
+            MatcherRequest {
+                path: "/api/users",
+                method: "GET",
+                headers,
+                host: "example.com",
+                remote_ip: "10.0.0.1",
+                protocol: "https",
+            }
+        }
+
+        assert!(evaluate(&compiled, &request(&matching)));
+        assert!(!evaluate(&compiled, &request(&empty)));
     }
 
     /// 🛡️ A query matcher must actually evaluate the query string. The old
