@@ -38,6 +38,20 @@ lets the rest converge.
 
 ### 🔄 Changed
 
+- 🔐 **`basic_auth` takes the grammar the format defines.** The arguments are
+  now `[<hash_algorithm> [<realm>]]` and the block holds nothing but
+  `<username> <hashed_password>` accounts, so the documented
+  `basic_auth bcrypt "Admin Area" { … }` works — it used to be refused with
+  "cannot mix inline credentials with a block". **The two spellings this crate
+  had before are gone**: credentials as arguments, and `realm` as a block
+  line. They could not be kept alongside because they collide with the real
+  grammar rather than extending it — under it, a block line reading
+  `realm "X"` is an account named `realm`. A `realm` block line is therefore
+  refused with a message naming the replacement, instead of silently becoming
+  a working credential nobody wrote. `basic_auth` never appeared in a release,
+  so no `0.1.7` configuration is affected. `argon2id` is refused by name: this
+  server verifies bcrypt only, and a hash it cannot verify is compared as
+  plain text.
 - 🗂️ **`try_files` resolves candidates under the site root and rewrites instead
   of serving.** It was previously reachable only from JSON, where it treated
   each candidate as a filesystem path and served any match itself through an

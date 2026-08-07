@@ -195,6 +195,22 @@ pub fn is_implemented_directive(name: &str) -> bool {
     directive(name).is_some_and(|spec| spec.support == Support::Implemented)
 }
 
+/// 🚩 Every directive and global option the format defines and this crate
+/// refuses, in table order.
+///
+/// 📌 Exposed so the READMEs' "not supported" list can be checked against the
+/// table rather than maintained by hand. A promise of compatibility is only
+/// worth what its stated limits are worth, and a limits list nobody verifies
+/// goes stale in the direction that flatters us — it keeps naming things we
+/// have since implemented and stops naming things we never did.
+pub fn recognised_but_unimplemented() -> impl Iterator<Item = &'static str> {
+    DIRECTIVES
+        .iter()
+        .chain(GLOBAL_OPTIONS.iter())
+        .filter(|spec| spec.support == Support::Recognised)
+        .map(|spec| spec.name)
+}
+
 /// Looks a global-block option up by name.
 pub(super) fn global_option(name: &str) -> Option<&'static Spec> {
     GLOBAL_OPTIONS.iter().find(|spec| spec.name == name)

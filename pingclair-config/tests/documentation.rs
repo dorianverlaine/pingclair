@@ -151,3 +151,41 @@ fn every_documented_configuration_still_compiles() {
     // but a silent drop to zero would make this test meaningless.
     println!("checked {checked} documented configuration block(s)");
 }
+
+/// 🚩 Every directive the parser refuses must be named in all three READMEs.
+///
+/// 📏 What this checks, exactly: the name appears *somewhere* in each file, not
+/// that it appears in the limits list. That catches the drift that matters —
+/// a refused directive the documentation never mentions — and deliberately
+/// tolerates a name discussed in prose as well as listed. Verified to fail
+/// when a name is removed, rather than assumed to.
+///
+/// The claim on the tin is "Caddyfile-compatible", and a compatibility claim is
+/// only worth what its stated limits are worth. Those limits drift in the
+/// direction that flatters us if nobody checks: the list keeps naming things
+/// that have since been implemented, and stops naming things that never were.
+///
+/// 🤡 The same shape has already bitten this repository twice in one week —
+/// `list-modules` advertised `try_files` for weeks while the adapter refused
+/// it, and the CHANGELOG called `handle_errors` a working container. Both were
+/// hand-maintained copies of an answer the registry already knew.
+#[test]
+fn the_readme_limits_match_the_registry() {
+    let root = workspace_root();
+    let missing: Vec<String> = ["README.md", "README.zh.md", "README.fr.md"]
+        .into_iter()
+        .flat_map(|name| {
+            let markdown = std::fs::read_to_string(root.join(name)).unwrap_or_default();
+            pingclair_config::adapter::recognised_but_unimplemented()
+                .filter(move |directive| !markdown.contains(&format!("`{directive}`")))
+                .map(move |directive| format!("{name}: `{directive}`"))
+        })
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "the parser refuses these, and the README does not say so:\n  {}\n\
+         (add them to the \"not supported yet\" list, or implement them)",
+        missing.join("\n  ")
+    );
+}

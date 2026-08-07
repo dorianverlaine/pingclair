@@ -611,6 +611,42 @@ example.com {
 }
 ```
 
+### 尚未支援
+
+Pingclair 對外宣稱相容 Caddyfile，那麼這個宣稱誠實的另一半，就是講清楚它到哪裡
+為止。以下每一個名字都是**認得的**：寫了會得到「這個功能還沒做」的錯誤，
+不會被當成拼錯，也不會被安靜忽略。用到它們的設定**啟動不了**。
+
+Directive：
+
+  `abort` `acme_server` `copy_response` `copy_response_headers` `error` `forward_auth`
+  `fs` `handle_errors` `intercept` `invoke` `log_append` `log_name`
+  `log_skip` `map` `method` `metrics` `php_fastcgi` `push`
+  `request_body` `request_header` `skip_log` `tracing` `vars`
+
+全域選項：
+
+  `acme_ca` `acme_ca_root` `acme_dns` `acme_eab` `cert_issuer` `cert_lifetime`
+  `default_bind` `default_sni` `dns` `ech` `events` `fallback_sni`
+  `filesystem` `frankenphp` `key_type` `local_certs` `ocsp_interval` `ocsp_stapling`
+  `on_demand_tls` `persist_config` `pki` `preferred_chains` `renew_interval` `renewal_window_ratio`
+  `shutdown_delay` `skip_install_trust` `storage` `storage_clean_interval`
+
+其中三件值得直接講明白，因為它們決定的是「Pingclair 適不適合你」，
+而不是之後才會踩到的細節：
+
+- **沒有 DNS-01 challenge**（`acme_dns`、`tls { dns … }`），所以**沒有萬用字元
+  憑證**，80 埠不通的機器也簽不到憑證。
+- **沒有 PHP**（`php_fastcgi`）、**沒有 forward authentication**（`forward_auth`）。
+- **憑證與狀態只存在本機磁碟**（`storage`），多個實例無法共用同一份憑證儲存。
+
+`handle_errors` 值得單獨一行：這個型別在程式碼裡存在但什麼都不做，
+所以它是**被拒絕**而不是被接受。自訂錯誤頁請用 `error_page`——
+那是 Pingclair 自己的 directive，不是 Caddy 的。
+
+> 🔁 只要 parser 拒絕的名字沒出現在這份文件裡，測試就會紅，所以這份清單不會
+> 悄悄落後 parser 查的那張表。README 宣稱一個 binary 沒有的能力，比宣稱得少還糟。
+
 ## 🏗️ 架構概觀
 
 Pingclair 採用模組化的 Cargo Workspace 結構管理程式碼：

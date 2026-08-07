@@ -640,6 +640,47 @@ example.com {
 }
 ```
 
+### What is not supported yet
+
+Pingclair calls itself Caddyfile-compatible, so the honest half of that claim
+is saying where it stops. Every name below is **recognised**: writing one is
+refused with a message saying the feature is missing, never mistaken for a
+typo and never quietly ignored. A configuration using them does not start.
+
+Directives:
+
+  `abort` `acme_server` `copy_response` `copy_response_headers` `error` `forward_auth`
+  `fs` `handle_errors` `intercept` `invoke` `log_append` `log_name`
+  `log_skip` `map` `method` `metrics` `php_fastcgi` `push`
+  `request_body` `request_header` `skip_log` `tracing` `vars`
+
+Global options:
+
+  `acme_ca` `acme_ca_root` `acme_dns` `acme_eab` `cert_issuer` `cert_lifetime`
+  `default_bind` `default_sni` `dns` `ech` `events` `fallback_sni`
+  `filesystem` `frankenphp` `key_type` `local_certs` `ocsp_interval` `ocsp_stapling`
+  `on_demand_tls` `persist_config` `pki` `preferred_chains` `renew_interval` `renewal_window_ratio`
+  `shutdown_delay` `skip_install_trust` `storage` `storage_clean_interval`
+
+Three consequences worth stating plainly, because they decide whether
+Pingclair fits at all rather than being details you discover later:
+
+- **No DNS-01 challenge** (`acme_dns`, `tls { dns … }`), so **no wildcard
+  certificates**, and no issuance on a host where port 80 is unreachable.
+- **No PHP** (`php_fastcgi`) and **no forward authentication**
+  (`forward_auth`).
+- **Certificates and state are stored on local disk only** (`storage`), so
+  several instances cannot share one certificate store.
+
+`handle_errors` deserves its own line: the type exists in this codebase and
+does nothing, so it is refused rather than accepted. A custom error page comes
+from `error_page`, which is a Pingclair directive rather than a Caddy one.
+
+> 🔁 A test fails if the parser refuses a name this file never mentions, so
+> the list cannot quietly fall behind the table the parser consults. A README
+> that claims support the binary does not have is worse than one that claims
+> less.
+
 ## 🏗️ Architecture
 
 Pingclair is organized as a modular Cargo workspace:

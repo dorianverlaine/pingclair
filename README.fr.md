@@ -642,6 +642,50 @@ example.com {
 }
 ```
 
+### Ce qui n'est pas encore pris en charge
+
+Pingclair se dit compatible Caddyfile ; la moitié honnête de cette affirmation
+consiste à dire où elle s'arrête. Chaque nom ci-dessous est **reconnu** :
+l'écrire produit une erreur disant que la fonctionnalité manque, jamais une
+faute de frappe supposée et jamais un silence. Une configuration qui les
+utilise ne démarre pas.
+
+Directives :
+
+  `abort` `acme_server` `copy_response` `copy_response_headers` `error` `forward_auth`
+  `fs` `handle_errors` `intercept` `invoke` `log_append` `log_name`
+  `log_skip` `map` `method` `metrics` `php_fastcgi` `push`
+  `request_body` `request_header` `skip_log` `tracing` `vars`
+
+Options globales :
+
+  `acme_ca` `acme_ca_root` `acme_dns` `acme_eab` `cert_issuer` `cert_lifetime`
+  `default_bind` `default_sni` `dns` `ech` `events` `fallback_sni`
+  `filesystem` `frankenphp` `key_type` `local_certs` `ocsp_interval` `ocsp_stapling`
+  `on_demand_tls` `persist_config` `pki` `preferred_chains` `renew_interval` `renewal_window_ratio`
+  `shutdown_delay` `skip_install_trust` `storage` `storage_clean_interval`
+
+Trois conséquences méritent d'être énoncées franchement, car elles décident si
+Pingclair convient, plutôt que d'être des détails découverts plus tard :
+
+- **Pas de challenge DNS-01** (`acme_dns`, `tls { dns … }`), donc **pas de
+  certificat générique**, et pas d'émission sur un hôte dont le port 80 est
+  injoignable.
+- **Pas de PHP** (`php_fastcgi`) ni d'authentification déléguée
+  (`forward_auth`).
+- **Certificats et état uniquement sur disque local** (`storage`) : plusieurs
+  instances ne peuvent pas partager un même magasin de certificats.
+
+`handle_errors` mérite sa propre ligne : le type existe dans ce dépôt et ne
+fait rien, il est donc refusé plutôt qu'accepté. Une page d'erreur
+personnalisée passe par `error_page`, une directive de Pingclair et non de
+Caddy.
+
+> 🔁 Un test échoue dès que l'analyseur refuse un nom que ce fichier ne
+> mentionne pas : la liste ne peut donc pas prendre du retard sur la table que
+> consulte l'analyseur. Un README qui annonce une prise en charge que le
+> binaire n'a pas est pire qu'un README qui en annonce moins.
+
 ## 🏗️ Architecture
 
 Pingclair est organisé en workspace Cargo modulaire :
