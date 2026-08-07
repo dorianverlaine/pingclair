@@ -642,6 +642,34 @@ example.com {
 }
 ```
 
+### Snippets et importations
+
+Un snippet est un fragment réutilisable `(name) { … }` inséré avec
+`import name`. Une importation peut fournir un bloc au snippet, qui est inséré
+à l'endroit où le snippet écrit `{block}` ; les sous-blocs nommés sont
+adressés avec `{blocks.<key>}` :
+
+```caddyfile
+(site) {
+    https://{args[0]} {
+        {block}
+    }
+}
+
+import site test.domain {
+    reverse_proxy 127.0.0.1:3000 {
+        header_up Host {host}
+    }
+}
+```
+
+Un placeholder sans contenu est remplacé par rien, donc un snippet qui écrit
+`{block}` compile même quand l'appel ne fournit pas de bloc. Un placeholder
+dans une liste d'arguments est refusé : la couche de tokens de Caddy peut
+relire la ligne après l'insertion, l'arbre de directives ne le peut pas, alors
+Pingclair le dit au lieu de deviner. Les définitions de snippets importées
+depuis un fichier sont visibles par les importations ultérieures.
+
 ### Grammaire des journaux
 
 `log <name> { … }` suit Caddy : le bloc configure un **logger nommé par site**

@@ -640,6 +640,32 @@ example.com {
 }
 ```
 
+### Snippets and imports
+
+A snippet is a reusable fragment `(name) { … }` pulled in with `import name`.
+An import can hand the snippet a block, which is spliced where the snippet
+writes `{block}`; named sub-blocks are addressed as `{blocks.<key>}`:
+
+```caddyfile
+(site) {
+    https://{args[0]} {
+        {block}
+    }
+}
+
+import site test.domain {
+    reverse_proxy 127.0.0.1:3000 {
+        header_up Host {host}
+    }
+}
+```
+
+A placeholder fed nothing splices nothing, so a snippet written with `{block}`
+still compiles when a call supplies no block. A placeholder inside an argument
+list is refused: Caddy's token layer re-parses the line after splicing, while
+the directive tree cannot, so Pingclair says so instead of guessing. Snippet
+definitions in an imported file are visible to imports that come later.
+
 ### Logging grammar
 
 `log <name> { … }` follows Caddy: the block configures a **named per-site

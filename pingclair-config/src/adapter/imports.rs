@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::caddyfile::AdapterError;
-use crate::parser::caddy_ast::{Block, Directive};
+use crate::parser::caddy_ast::{Block, Directive, TokenRun};
 
 /// Snippet bodies, by name.
 pub type SnippetMap = HashMap<String, Vec<Directive>>;
@@ -207,6 +207,100 @@ fn substitute_args(directives: Vec<Directive>, args: &[String]) -> Vec<Directive
         .collect()
 }
 
+/// 🌊 Builds the `{blocks.<key>}` mapping from an import block.
+///
+/// Each top-level directive in the block becomes one mapping entry. Upstream
+/// stores the tokens that follow the directive's name — its arguments plus the
+/// contents of its block — and the tree restores that shape: a block's own
+/// directives are spliced as siblings, and arguments become a synthetic
+/// directive named after the first one so the line re-parses the same way.
+fn collect_named_blocks(block: &Block) -> Result<HashMap<String, Vec<Directive>>, AdapterError> {
+    let mut named = HashMap::new();
+    for d in &block.directives {
+        // 🚫 A `{` where a mapping key belongs has no name to be looked up by,
+        // and upstream refuses it by name — an anonymous block can never be
+        // addressed by `{blocks.*}`.
+        if d.name == "{" || (d.name.is_empty() && d.block.is_some()) {
+            return Err(AdapterError::InvalidArgument(
+                "import".into(),
+                "anonymous blocks are not supported".into(),
+            ));
+        }
+        let content = match (d.args.is_empty(), d.block.as_ref()) {
+            (true, None) => Vec::new(),
+            (true, Some(inner)) => inner.directives.clone(),
+            (false, nested) => vec![Directive {
+                name: d.args[0].clone(),
+                args: d.args[1..].to_vec(),
+                block: nested.cloned(),
+                tokens: TokenRun::synthetic(),
+            }],
+        };
+        named.insert(d.name.clone(), content);
+    }
+    Ok(named)
+}
+
+/// 🔁 Slices an import block into an imported body in place of `{block}` and
+/// `{blocks.<key>}`.
+///
+/// Upstream performs this substitution on the token stream, and the tree keeps
+/// the same rules: an exact placeholder on a line of its own splices the
+/// mapped directives, a missing key splices nothing, nested snippet
+/// definitions keep their placeholders for their own future expansion, and
+/// spliced content is not walked again.
+fn substitute_block_placeholders(
+    directives: Vec<Directive>,
+    block: &[Directive],
+    named: &HashMap<String, Vec<Directive>>,
+) -> Result<Vec<Directive>, AdapterError> {
+    let mut out = Vec::with_capacity(directives.len());
+    for d in directives {
+        if d.name == "{block}" {
+            out.extend(block.iter().cloned());
+            continue;
+        }
+        if let Some(key) = d
+            .name
+            .strip_prefix("{blocks.")
+            .and_then(|rest| rest.strip_suffix('}'))
+        {
+            if let Some(content) = named.get(key) {
+                out.extend(content.iter().cloned());
+            }
+            continue;
+        }
+        // 🚫 A placeholder inside an argument list cannot be spliced without
+        // changing how many arguments there are — the token layer re-parses
+        // the whole line and the tree cannot. Refusing names the shape rather
+        // than emitting a directive that silently means something else.
+        for arg in &d.args {
+            if arg == "{block}" || (arg.starts_with("{blocks.") && arg.ends_with('}')) {
+                return Err(AdapterError::InvalidArgument(
+                    "import".into(),
+                    format!(
+                        "`{arg}` inside an argument list is substituted by the token layer \
+                         upstream, which the directive tree cannot express; rewrite the \
+                         snippet so the placeholder is a directive on its own line"
+                    ),
+                ));
+            }
+        }
+        let block = if d.name.starts_with('(') && d.name.ends_with(')') {
+            d.block
+        } else {
+            match d.block {
+                Some(b) => Some(Block {
+                    directives: substitute_block_placeholders(b.directives, block, named)?,
+                }),
+                None => None,
+            }
+        };
+        out.push(Directive { block, ..d });
+    }
+    Ok(out)
+}
+
 /// 🕳️ How deep block recursion may go.
 ///
 /// Separate from cycle detection, and both are needed. Cycles are about a name
@@ -259,7 +353,7 @@ impl<'a> ImportContext<'a> {
 /// 📦 Expands every `import` in `directives`.
 pub fn expand(
     directives: Vec<Directive>,
-    snippets: &SnippetMap,
+    snippets: &mut SnippetMap,
     context: &mut ImportContext<'_>,
 ) -> Result<Vec<Directive>, AdapterError> {
     // 🕳️ Checked on entry so the very first call is counted, and so the error
@@ -301,32 +395,31 @@ pub fn expand(
         };
         let args: Vec<String> = d.args[1..].to_vec();
 
-        // 🚫 `import name { … }` passes the block to the snippet, which splices
-        // it in wherever the snippet writes `{block}`. We do not implement that
-        // substitution — and until this check existed the block was simply
-        // dropped, so a snippet invocation full of nonsense compiled green and
-        // contributed nothing.
-        //
-        // 🤡 It went unnoticed because the format's own fixture for it imports
-        // a file our corpus harness could not resolve: we "correctly rejected"
-        // the case for the wrong reason, and fixing the harness is what exposed
-        // it. A test passing is not the same as a test testing something.
-        if d.block.is_some() {
-            return Err(AdapterError::UnsupportedFeature(
-                "import with a block".into(),
-                format!(
-                    "`import {pattern} {{ … }}` substitutes the block into the snippet's                      `{{block}}` placeholder, which Pingclair does not implement yet;                      move the block's contents into the snippet itself"
-                ),
-            ));
-        }
+        // 🌊 An import block feeds two substitutions into the imported body:
+        // `{block}` splices the whole block and `{blocks.<key>}` splices one
+        // named sub-block. The empty case is a real import too — a snippet
+        // written with a placeholder compiles even when the call supplies no
+        // block, and the placeholder simply splices nothing.
+        let (block_directives, named_blocks) = match &d.block {
+            Some(block) => (block.directives.clone(), collect_named_blocks(block)?),
+            None => (Vec::new(), HashMap::new()),
+        };
 
         // 🥇 Snippets win over files, so a snippet named like a path stays
         // reachable and no filesystem lookup happens for the common case.
         if let Some(body) = snippets.get(&pattern) {
             context.enter(&pattern)?;
-            let expanded = expand(body.clone(), snippets, context)?;
+            // 🧭 The order mirrors upstream's token pass: arguments are
+            // replaced and block placeholders spliced *before* the body is
+            // expanded again, so a placeholder inside a nested import's block
+            // resolves against this import's mapping, and the block's own
+            // content never sees this import's arguments.
+            let substituted = substitute_args(body.clone(), &args);
+            let substituted =
+                substitute_block_placeholders(substituted, &block_directives, &named_blocks)?;
+            let expanded = expand(substituted, snippets, context)?;
             context.leave();
-            out.extend(substitute_args(expanded, &args));
+            out.extend(expanded);
             continue;
         }
 
@@ -356,15 +449,27 @@ pub fn expand(
                 depth: context.depth,
             };
             let (nested_snippets, body) = super::caddyfile::collect_snippets(parsed)?;
-            let mut merged = nested_snippets;
-            for (name, value) in snippets {
-                merged.entry(name.clone()).or_insert_with(|| value.clone());
+            // 🗺️ Snippet definitions from an imported file are part of the
+            // merged token stream, so they must be visible to imports that
+            // come *later* in the configuration. Scoping them to the file's
+            // own body dropped the site that followed the import — a file of
+            // snippets compiled green and contributed nothing.
+            //
+            // The file's definitions win over outer ones, which is the same
+            // precedence the previous local merge gave the file's own body,
+            // and the order stays in-order the way Caddy registers snippets
+            // while it parses.
+            for (name, body) in nested_snippets {
+                snippets.insert(name, body);
             }
-            let expanded = expand(body, &merged, &mut nested)?;
+            let substituted = substitute_args(body, &args);
+            let substituted =
+                substitute_block_placeholders(substituted, &block_directives, &named_blocks)?;
+            let expanded = expand(substituted, snippets, &mut nested)?;
             context.active = nested.active;
             context.leave();
 
-            out.extend(substitute_args(expanded, &args));
+            out.extend(expanded);
         }
     }
 
@@ -499,6 +604,161 @@ mod tests {
         .expect("must compile");
         let rendered = format!("{:?}", config.servers[0]);
         assert!(rendered.contains("production"), "{rendered}");
+    }
+
+    /// 🔁 `{block}` splices the whole import block at the directive that asks
+    /// for it, arguments and nested blocks included.
+    #[test]
+    fn a_block_placeholder_splices_the_whole_import_block() {
+        let config = crate::compile(
+            "(wrap) {\n\theader {\n\t\t{block}\n\t}\n}\n\n\
+             example.com {\n\timport wrap {\n\t\tFoo bar\n\t}\n}\n",
+        )
+        .expect("a block import must compile");
+        let rendered = format!("{:?}", config.servers[0]);
+        assert!(
+            rendered.contains("Foo") && rendered.contains("bar"),
+            "the block must reach the header: {rendered}"
+        );
+    }
+
+    /// 🗺️ `{blocks.<key>}` splices one named sub-block and leaves the others
+    /// behind.
+    #[test]
+    fn a_named_block_placeholder_splices_only_that_key() {
+        let config = crate::compile(
+            "(pick) {\n\theader {\n\t\t{blocks.first}\n\t}\n}\n\n\
+             example.com {\n\timport pick {\n\t\tfirst {\n\t\t\tFoo a\n\t\t}\n\t\t\
+             second {\n\t\t\tBar b\n\t\t}\n\t}\n}\n",
+        )
+        .expect("a named block import must compile");
+        let rendered = format!("{:?}", config.servers[0]);
+        assert!(
+            rendered.contains("Foo") && !rendered.contains("Bar"),
+            "only the named sub-block may reach the header: {rendered}"
+        );
+    }
+
+    /// 🪆 A placeholder inside a nested import's block resolves against the
+    /// outer import's mapping, exactly as it does on the upstream token
+    /// stream.
+    #[test]
+    fn a_placeholder_inside_a_nested_import_block_uses_the_outer_mapping() {
+        let config = crate::compile(
+            "(outer) {\n\theader {\n\t\t{blocks.bar}\n\t}\n\t\
+             import inner {\n\t\tbar {\n\t\t\t{blocks.foo}\n\t\t}\n\t}\n}\n\
+             (inner) {\n\theader {\n\t\t{blocks.bar}\n\t}\n}\n\n\
+             example.com {\n\timport outer {\n\t\tfoo {\n\t\t\tFoo a\n\t\t}\n\t\t\
+             bar {\n\t\t\tBar b\n\t\t}\n\t}\n}\n",
+        )
+        .expect("nested block imports must compile");
+        let rendered = format!("{:?}", config.servers[0]);
+        assert!(
+            rendered.contains("Foo") && rendered.contains("Bar"),
+            "both mappings must reach a header: {rendered}"
+        );
+    }
+
+    /// 🧹 A placeholder with no block and a missing key both splice nothing,
+    /// so a snippet written with them still compiles when the call is bare.
+    #[test]
+    fn an_unfed_block_placeholder_splices_nothing() {
+        let config = crate::compile(
+            "(quiet) {\n\theader {\n\t\treverse_proxy localhost:3000\n\t\t{block}\n\t\t\
+             {blocks.missing}\n\t}\n}\n\nexample.com {\n\timport quiet\n}\n",
+        )
+        .expect("unfed placeholders must be removed");
+        let rendered = format!("{:?}", config.servers[0]);
+        assert!(
+            rendered.contains("reverse_proxy")
+                && !rendered.contains("{block}")
+                && !rendered.contains("missing"),
+            "the placeholders must vanish but the rest must survive: {rendered}"
+        );
+    }
+
+    /// 🏠 A block import can assemble a whole site, addresses included, the
+    /// way Caddy's own `import site test.domain { … }` does.
+    #[test]
+    fn a_block_import_can_build_a_site() {
+        let config = crate::compile(
+            "(site) {\n\thttps://{args[0]} {\n\t\t{block}\n\t}\n}\n\n\
+             import site test.domain {\n\trespond \"hi\" 200\n}\n",
+        )
+        .expect("a block import may build a site");
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers[0].name.as_deref(), Some("test.domain"));
+    }
+
+    /// 🚫 An anonymous block inside an import has no key to be addressed by,
+    /// and is refused exactly as upstream refuses it.
+    #[test]
+    fn an_anonymous_import_block_is_refused() {
+        let error = crate::compile(
+            "(site) {\n\thttp://{args[0]} {\n\t\t{block}\n\t}\n}\n\n\
+             import site example.com {\n\t{\n\t\trespond \"x\"\n\t}\n}\n",
+        )
+        .expect_err("an anonymous block must be refused")
+        .to_string();
+        assert!(error.contains("anonymous block"), "{error}");
+    }
+
+    /// 🚫 A placeholder inside an argument list cannot be spliced by the
+    /// directive tree, and is refused rather than silently misread.
+    #[test]
+    fn a_placeholder_in_an_argument_list_is_refused() {
+        let error = crate::compile(
+            "(arg) {\n\trespond {block}\n}\nexample.com {\n\timport arg {\n\t\tfoo bar\n\t}\n}\n",
+        )
+        .expect_err("an argument-position placeholder must be refused")
+        .to_string();
+        assert!(error.contains("argument list"), "{error}");
+    }
+
+    /// 🗂️ Snippet definitions from an imported file are visible to imports
+    /// that come later, the way Caddy registers them while parsing — a file
+    /// of snippets compiled green and contributed nothing before this was
+    /// fixed, because the definitions were scoped to the file's own body.
+    #[test]
+    fn a_file_import_exposes_its_snippets_to_later_imports() {
+        let dir = temp_dir("filesnippets");
+        write(&dir, "defs.conf", "(common) {\n\theader X-File yes\n}\n");
+        let main = write(
+            &dir,
+            "main.conf",
+            "import ./defs.conf\n\nexample.com {\n\timport common\n}\n",
+        );
+        let source = std::fs::read_to_string(&main).unwrap();
+        let config = crate::compile_named(&source, Some(&main)).expect("must compile");
+        assert_eq!(config.servers.len(), 1, "the site must survive the import");
+        let rendered = format!("{:?}", config.servers[0]);
+        assert!(
+            rendered.contains("X-File"),
+            "the file snippet must apply: {rendered}"
+        );
+    }
+
+    /// 🚫 A block supplied to a file-defined snippet reaches the snippet and
+    /// is parsed, so an invalid subdirective is refused instead of being
+    /// dropped along with the site.
+    #[test]
+    fn a_block_supplied_to_a_file_defined_snippet_is_not_dropped() {
+        let dir = temp_dir("fileblock");
+        write(
+            &dir,
+            "defs.conf",
+            "(test) {\n\treverse_proxy {\n\t\t{block}\n\t}\n}\n",
+        );
+        let main = write(
+            &dir,
+            "main.conf",
+            "import ./defs.conf\n\n:8080 {\n\timport test {\n\t\tthis_is_nonsense\n\t}\n}\n",
+        );
+        let source = std::fs::read_to_string(&main).unwrap();
+        let error = crate::compile_named(&source, Some(&main))
+            .expect_err("the nonsense subdirective must be refused")
+            .to_string();
+        assert!(error.contains("this_is_nonsense"), "{error}");
     }
 
     /// 🔁 A cycle is named, not counted out. The message has to say which

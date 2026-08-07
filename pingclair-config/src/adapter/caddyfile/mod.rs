@@ -134,13 +134,13 @@ pub fn adapt_from(
     base: Option<&std::path::Path>,
 ) -> Result<Ast, AdapterError> {
     // Pass 1: Snippet collection + import expansion
-    let (snippets, remaining) = collect_snippets(directives)?;
+    let (mut snippets, remaining) = collect_snippets(directives)?;
     // 📦 Snippets, files, globs, arguments and cycle detection all live in
     // `super::imports` now; the old expansion only knew about snippets, so
     // `import ./part.conf` failed with "undefined snippet" — a message about the
     // wrong concept entirely.
     let mut context = super::imports::ImportContext::new(base);
-    let expanded = super::imports::expand(remaining, &snippets, &mut context)?;
+    let expanded = super::imports::expand(remaining, &mut snippets, &mut context)?;
     let expanded = coalesce_bare_single_site(expanded)?;
 
     // Pass 2: Convert to typed AST

@@ -611,6 +611,31 @@ example.com {
 }
 ```
 
+### 片段與 import
+
+片段（snippet）是以 `(name) { … }` 定義、用 `import name` 引用的可重用片段。
+import 可以把一個區塊交給片段，片段裡寫 `{block}` 的地方會被該區塊取代；
+具名子區塊用 `{blocks.<key>}` 定址：
+
+```caddyfile
+(site) {
+    https://{args[0]} {
+        {block}
+    }
+}
+
+import site test.domain {
+    reverse_proxy 127.0.0.1:3000 {
+        header_up Host {host}
+    }
+}
+```
+
+沒有餵內容的佔位符就取代為空，所以寫了 `{block}` 的片段在呼叫端沒給區塊時
+仍然可以編譯。參數列內的佔位符會被拒絕：Caddy 的 token 層可以在取代後重新
+解析那一行，directive 樹做不到，所以 Pingclair 會明說而不是猜測。從檔案
+import 進來的片段定義，對之後的 import 都看得到。
+
 ### 日誌文法
 
 `log <name> { … }` 跟 Caddy 一樣：區塊設定一個**具名的站台 logger**，名字就是

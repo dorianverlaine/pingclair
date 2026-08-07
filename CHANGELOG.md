@@ -56,6 +56,14 @@ lets the rest converge.
   operation. `log_append`, `log_name`, and the `append`/`journald` encoders
   remain unsupported.
 
+- 📦 **`import name { … }` now feeds the snippet's block placeholders.** The
+  block is spliced where the snippet writes `{block}`, named sub-blocks are
+  addressed as `{blocks.<key>}`, and a placeholder fed nothing splices
+  nothing. Snippet definitions imported from a file are visible to imports
+  that come later. `{block}` inside an argument list is refused because the
+  directive tree cannot re-parse a spliced line the way Caddy's token layer
+  can.
+
 - 🔐 **`basic_auth` takes the grammar the format defines.** The arguments are
   now `[<hash_algorithm> [<realm>]]` and the block holds nothing but
   `<username> <hashed_password>` accounts, so the documented

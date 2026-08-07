@@ -211,6 +211,23 @@ impl<'a> Parser<'a> {
             // 🧱 The shorthand: an address on its own line, directives after it,
             // no braces anywhere. Runs to end of file.
             _ => {
+                // 🧭 A top-level `import` line is a directive, not a site
+                // address, and upstream expands it while parsing addresses.
+                // Letting the shorthand rule run to EOF would swallow the
+                // following site blocks into the import's own block, where
+                // they are dropped — a file of snippets imported first and
+                // a site imported after compiled green and served nothing.
+                if matches!(
+                    keys.first().map(|token| &token.value),
+                    Some(Token::Word(word)) if word == "import"
+                ) {
+                    return Ok(ServerBlock {
+                        keys,
+                        segments: Vec::new(),
+                        has_braces: false,
+                        is_snippet: false,
+                    });
+                }
                 let segments = self.parse_bare_segments()?;
                 Ok(ServerBlock {
                     keys,
@@ -411,6 +428,21 @@ mod tests {
         assert!(parsed[0].is_snippet);
         assert!(!parsed[0].is_global_options());
         assert!(!parsed[1].is_snippet);
+    }
+
+    /// 🧭 A top-level `import` line must not swallow the blocks that follow
+    /// it, the way the braceless shorthand swallows directives after a bare
+    /// site address — upstream expands top-level imports while parsing
+    /// addresses, so `import ./defs.conf` and the next site are two blocks.
+    #[test]
+    fn a_top_level_import_does_not_swallow_the_following_site() {
+        let parsed = blocks("import ./defs.conf\n\nexample.com {\n\trespond \"ok\"\n}\n");
+        assert_eq!(parsed.len(), 2, "import and site are separate blocks");
+        assert_eq!(parsed[0].key_texts(), vec!["import", "./defs.conf"]);
+        assert!(parsed[0].segments.is_empty());
+        assert!(!parsed[0].has_braces);
+        assert_eq!(parsed[1].key_texts(), vec!["example.com"]);
+        assert!(parsed[1].has_braces);
     }
 
     #[test]

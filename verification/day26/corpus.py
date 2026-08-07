@@ -53,7 +53,11 @@ if _TESTDATA.is_dir() and not _LINK.exists():
     except OSError:
         pass
 
-SEPARATOR = re.compile(r"^-{5,}$", re.M)
+# 🧹 The separator tolerates trailing whitespace: two upstream fixtures
+# (`import_block_snippet_non_replaced_*`) end the dashes with a space, and a
+# split that misses them reads the expected JSON as configuration — which
+# fails for a reason the fixture never asked about.
+SEPARATOR = re.compile(r"^-{5,}\s*$", re.M)
 
 
 def split_fixture(text):
