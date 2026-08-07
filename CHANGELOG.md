@@ -158,6 +158,17 @@ lets the rest converge.
 
 ### 🐛 Fixed
 
+- 🔗 **A placeholder is no longer split from the word it is glued to.**
+  `{host}/moved` used to tokenize as two arguments, because a placeholder at
+  the *start* of a token was emitted on its own while one glued *after* a word
+  was absorbed into it — the same file answering the same question two
+  different ways depending on which side the placeholder sat. Two things this
+  fixes: `redir {host}/moved 302` was refused as having three arguments, and
+  `try_files {path} {path}/ /index.html` silently became four candidates whose
+  stray `/` matched the site root on every request, so every URL served the
+  shell and the configuration looked like it worked. Any directive taking an
+  argument that begins with a placeholder was affected.
+
 - 🗜️ **`Accept-Encoding: gzip;q=0` was answered with gzip.** A `q` of zero is an
   explicit refusal, and a static file ignored it — the negotiation on that path
   was `header.contains("gzip")`, which cannot see a quality value, matched

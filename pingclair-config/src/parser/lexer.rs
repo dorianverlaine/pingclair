@@ -264,6 +264,27 @@ fn unescape_string(s: &str) -> String {
     result
 }
 
+/// 🔚 The characters that end a word.
+///
+/// 📌 Named once because two places have to agree about it: the word scanner
+/// that stops on them, and [`is_glued_to_word`], which decides whether a
+/// closing brace is followed by more of the same word. Two hand-written copies
+/// of this set would drift, and the drift would show up as a token boundary
+/// appearing in one construct and not another — the exact shape of the defect
+/// this constant was introduced to fix.
+const ENDS_A_WORD: [char; 8] = [' ', '\t', '\r', '\n', '\x0C', '}', '#', '"'];
+
+/// 🔗 Whether the character at `index` continues the word a brace just closed.
+///
+/// End of input is not glued, and neither is a delimiter. Everything else is:
+/// `{path}/`, `{host}:8080` and `{labels.0}.example.com` are each one word,
+/// the same way `www.{host}` already was.
+fn is_glued_to_word(chars: &[char], index: usize) -> bool {
+    chars
+        .get(index)
+        .is_some_and(|next| !ENDS_A_WORD.contains(next))
+}
+
 /// ✂️ Tokenizes a Pingclair DSL source string.
 ///
 /// 🏗️ ARCHITECTURE: Hand-written lexer instead of `logos` derive macro.
@@ -446,6 +467,8 @@ pub fn tokenize(source: &str) -> LexResult {
         //   {$...}        → EnvVar
         //   {word.word...} → Placeholder (no spaces, no newlines inside)
         //   {             → BlockOpen (standalone or followed by newline/space)
+        // 🔗 …unless a word character follows the closing brace, in which case
+        // the whole thing is one word — see `is_glued_to_word`.
         if c == '{' {
             let start = pos;
 
@@ -491,19 +514,39 @@ pub fn tokenize(source: &str) -> LexResult {
             }
 
             if is_placeholder && inner_end < chars.len() && chars[inner_end] == '}' {
-                let inner: String = chars[inner_start..inner_end].iter().collect();
-                pos = inner_end + 1;
-                tokens.push(Spanned::new(
-                    Token::Placeholder(inner),
-                    lines.span(start, pos),
-                ));
+                // 🔗 A placeholder with a word character straight after it is
+                // part of that word, not a token of its own: `{path}/` is one
+                // argument, exactly as `www.{host}` is one argument. Falling
+                // through to the generic word scanner is what makes it so —
+                // that scanner already absorbs a placeholder glued *after* a
+                // word, and this is the same rule applied from the other side.
+                //
+                // 🤡 Without this the two directions disagreed inside one
+                // file: `www.{host}` was right and `{host}/x` was wrong. The
+                // cost was not theoretical. `redir {host}/moved 302` — which
+                // the format accepts — was refused here as three arguments,
+                // and the documented `try_files {path} {path}/ /index.html`
+                // silently became four candidates, the stray `/` matching the
+                // site root on every request so that every URL served the
+                // shell and the configuration looked like it worked.
+                if !is_glued_to_word(&chars, inner_end + 1) {
+                    let inner: String = chars[inner_start..inner_end].iter().collect();
+                    pos = inner_end + 1;
+                    tokens.push(Spanned::new(
+                        Token::Placeholder(inner),
+                        lines.span(start, pos),
+                    ));
+                    continue;
+                }
+                // 🧭 Deliberately no `continue`: control reaches the generic
+                // word scanner below, which re-reads this `{` as the start of
+                // a word.
+            } else {
+                // Plain block open
+                tokens.push(Spanned::new(Token::BlockOpen, lines.span(start, pos + 1)));
+                pos += 1;
                 continue;
             }
-
-            // Plain block open
-            tokens.push(Spanned::new(Token::BlockOpen, lines.span(start, pos + 1)));
-            pos += 1;
-            continue;
         }
 
         if c == '}' {
@@ -518,7 +561,7 @@ pub fn tokenize(source: &str) -> LexResult {
         while pos < chars.len() {
             let wc = chars[pos];
             match wc {
-                ' ' | '\t' | '\r' | '\n' | '\x0C' | '}' | '#' | '"' => break,
+                _ if ENDS_A_WORD.contains(&wc) => break,
                 '{' => {
                     // 🧭 A placeholder (`{host}`, `{http.request.uri}`) glued
                     // to a word belongs to that word, so `https://www.{host}`
@@ -618,6 +661,94 @@ mod tests {
             tokens[2].value,
             Token::Placeholder("http.request.header.CF-Connecting-IP".to_string())
         );
+    }
+
+    /// 🔗 A placeholder with a word character after it is part of that word.
+    ///
+    /// 🤡 Until 2026-08-07 this held in one direction only: `www.{host}` was
+    /// one token because the word scanner absorbed a trailing placeholder,
+    /// while `{host}/x` was two because a *leading* placeholder was emitted
+    /// and the scan stopped there. Same file, opposite answers, and the seam
+    /// between them was invisible to anyone not reading the lexer.
+    #[test]
+    fn a_placeholder_glued_to_what_follows_is_one_word() {
+        let words = |source: &str| -> Vec<Token> {
+            tokenize(source)
+                .unwrap()
+                .into_iter()
+                .map(|spanned| spanned.value)
+                .filter(|token| !matches!(token, Token::Newline))
+                .collect()
+        };
+
+        // 🎯 The two shapes that were measured against the format and found
+        // wrong: a rewrite target and a `try_files` directory candidate.
+        assert_eq!(
+            words("redir {host}/moved 302"),
+            vec![
+                Token::Word("redir".into()),
+                Token::Word("{host}/moved".into()),
+                Token::Word("302".into()),
+            ]
+        );
+        assert_eq!(
+            words("try_files {path} {path}/ /index.html"),
+            vec![
+                Token::Word("try_files".into()),
+                Token::Placeholder("path".into()),
+                Token::Word("{path}/".into()),
+                Token::Word("/index.html".into()),
+            ],
+            "`{{path}}/` is one argument; splitting it invents a `/` candidate"
+        );
+
+        // 📌 Gluing in the other direction, and both at once, keep working.
+        assert_eq!(
+            words("redir www.{host}{uri}"),
+            vec![
+                Token::Word("redir".into()),
+                Token::Word("www.{host}{uri}".into()),
+            ]
+        );
+        assert_eq!(
+            words("reverse_proxy {host}:8080"),
+            vec![
+                Token::Word("reverse_proxy".into()),
+                Token::Word("{host}:8080".into()),
+            ]
+        );
+    }
+
+    /// 🎯 The other side of the rule: a placeholder that ends the word is
+    /// still its own token, so nothing that already worked changed shape.
+    #[test]
+    fn a_placeholder_at_a_word_boundary_stays_a_placeholder() {
+        for (source, expected) in [
+            ("header_up X-Host {host}", "host"),
+            ("respond {path}\n", "path"),
+        ] {
+            let tokens: Vec<Token> = tokenize(source)
+                .unwrap()
+                .into_iter()
+                .map(|spanned| spanned.value)
+                .filter(|token| !matches!(token, Token::Newline))
+                .collect();
+            assert_eq!(
+                tokens.last().unwrap(),
+                &Token::Placeholder(expected.into()),
+                "{source} must end in a placeholder token"
+            );
+        }
+
+        // 🧱 A closing brace right after one is a block ending, not a word.
+        let tokens: Vec<Token> = tokenize("handle {\nrespond {path}\n}")
+            .unwrap()
+            .into_iter()
+            .map(|spanned| spanned.value)
+            .filter(|token| !matches!(token, Token::Newline))
+            .collect();
+        assert_eq!(tokens.last().unwrap(), &Token::BlockClose);
+        assert!(tokens.contains(&Token::Placeholder("path".into())));
     }
 
     #[test]

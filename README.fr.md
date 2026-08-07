@@ -596,10 +596,9 @@ nomme la raison plutôt qu'une compilation au sens subtilement différent :
 | Le bloc `{ policy … }` | Seule la première correspondance est implémentée. |
 | Un segment `..` dans un candidat | Le confinement est lexical : un candidat pouvant sortir du root est refusé d'emblée. |
 
-> ⚠️ `try_files {path} {path}/ /index.html` est actuellement refusé. Le candidat
-> `{path}/` est découpé en deux, et le `/` résultant correspondrait à la racine
-> du site à chaque requête — il est donc rejeté plutôt que laissé à faire
-> semblant de fonctionner. Utilisez `try_files {path} /index.html` en attendant.
+`try_files {path} {path}/ /index.html` fonctionne aussi : le second candidat
+correspond à un répertoire, si bien qu'une requête vers `/docs` trouve `/docs/`
+et que le serveur de fichiers prend le relais.
 
 ### Chirurgie de chemin : `uri`
 

@@ -568,9 +568,8 @@ example.com {
 | `{ policy … }` 區塊 | 只實作了「取第一個匹配」。 |
 | 候選裡的 `..` 片段 | 限制在 document root 內是詞法層做的，所以有可能跳出去的候選直接拒絕。 |
 
-> ⚠️ `try_files {path} {path}/ /index.html` 目前會被拒絕。`{path}/` 會被切成兩個
-> 候選，多出來的那個 `/` 會對每一個請求都匹配到站台根目錄——與其讓它看起來像能用，
-> 不如直接擋掉。修好之前請用 `try_files {path} /index.html`。
+`try_files {path} {path}/ /index.html` 也可以：第二個候選匹配目錄，所以請求
+`/docs` 會找到 `/docs/`，剩下的交給 file server。
 
 ### 路徑手術：`uri`
 

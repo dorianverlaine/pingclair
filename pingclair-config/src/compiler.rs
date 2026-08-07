@@ -881,26 +881,6 @@ fn validate_try_files_candidate(candidate: &str) -> CompileResult<()> {
             ),
         });
     }
-    // 🚫 A bare `/` matches the site root directory on every request, so every
-    // candidate after it is unreachable and the directive collapses into
-    // "always rewrite to the root".
-    //
-    // 🤡 It is refused rather than merely useless because it is also what
-    // `{path}/` currently *becomes*: the lexer emits a placeholder at the start
-    // of a token without absorbing what follows, so the documented
-    // `try_files {path} {path}/ /index.html` tokenizes into four candidates,
-    // `/` among them. The result compiles and serves the shell for every
-    // request, which looks close enough to working to survive review. Until
-    // the tokenizer glues them (tracked in `TRIAGE.md`), this is the only
-    // place that can tell the operator something is wrong.
-    if candidate == "/" {
-        return Err(CompileError::InvalidRoute {
-            message: "try_files candidate `/` matches the site root on every request, leaving \
-                      later candidates unreachable; note that `{path}/` is currently tokenized \
-                      as two candidates and produces exactly this"
-                .to_string(),
-        });
-    }
     // 🚫 Upstream expands glob patterns in a candidate; this crate would take
     // the metacharacter literally and look for a file with a `*` in its name.
     // Both "compile" — one of them just never matches, and the operator has

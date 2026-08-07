@@ -1974,16 +1974,32 @@ mod uri_and_try_files_tests {
         assert!(message.contains("query"), "got {message}");
     }
 
-    /// 🚫 The artifact of the placeholder-gluing defect: `{path}/` tokenizes
-    /// into `{path}` and `/`, and a `/` candidate would otherwise make every
-    /// request rewrite to the site root while looking like it worked.
+    /// 🔗 The directory-candidate form, which needs the lexer to keep
+    /// `{path}/` as one word. It used to tokenize into `{path}` and `/`, and
+    /// the stray `/` matched the site root on every request — so the site
+    /// served its shell for every URL and looked like it worked.
     #[test]
-    fn try_files_refuses_a_bare_root_candidate() {
-        let message =
-            compile("example.com {\n\troot * /srv\n\ttry_files {path} {path}/ /index.html\n}")
-                .expect_err("a `/` candidate must be refused")
-                .to_string();
-        assert!(message.contains("site root"), "got {message}");
+    fn a_slashed_placeholder_candidate_stays_one_candidate() {
+        let handlers = handlers(
+            "example.com {\n\troot * /srv\n\ttry_files {path} {path}/ /index.html\n\tfile_server\n}",
+        );
+        let files = handlers
+            .iter()
+            .find_map(|handler| match handler {
+                HandlerConfig::TryFiles { files, .. } => Some(files),
+                _ => None,
+            })
+            .expect("try_files must survive into the compiled routes");
+        assert_eq!(
+            files,
+            &[
+                "{path}".to_string(),
+                "{path}/".to_string(),
+                "/index.html".to_string()
+            ],
+            "`{{path}}/` is one candidate; splitting it adds a `/` that matches the site root \
+             on every request"
+        );
     }
 
     #[test]

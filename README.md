@@ -595,10 +595,9 @@ naming the reason rather than compiling into something subtly different:
 | The `{ policy … }` block | Only first-match is implemented. |
 | A `..` segment in a candidate | Confinement is lexical, so a candidate that could leave the root is refused outright. |
 
-> ⚠️ `try_files {path} {path}/ /index.html` is currently refused. The `{path}/`
-> candidate is tokenized as two candidates, and the resulting `/` would match
-> the site root on every request — so it is rejected rather than allowed to
-> look like it works. Use `try_files {path} /index.html` until that is fixed.
+`try_files {path} {path}/ /index.html` works too: the second candidate matches
+a directory, so a request for `/docs` finds `/docs/` and the file server takes
+it from there.
 
 ### Path surgery: `uri`
 
