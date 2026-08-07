@@ -9,6 +9,15 @@ Read it together with the planning documents before changing anything:
   public, prioritised list of unpatched defects in released code is a target
   list. Publish the fix, not the queue. If you are working from a clone and
   this file is missing, that is expected — ask the maintainer for it.
+- `TRIAGE.md` — the inbox for problems found while working on something else,
+  one row each with a severity and a status. Read it before starting so you do
+  not spend a session re-discovering something already written down, and write
+  to it instead of widening the diff in hand. 🔒 **Kept local, deliberately not
+  in the repository**: a row is only useful when it names the exact input that
+  breaks something, which makes a well-written row a working reproduction for a
+  defect that is by definition still unfixed. Saying the inbox exists is fine —
+  that is why this bullet is public. Its contents are not. If you are working
+  from a clone and this file is missing, that is expected; ask the maintainer.
 - `benchmarks/README.md` — published performance claims and verification
   methodology. The per-run evidence ledger lives locally under
   `benchmarks/results/`, deliberately not committed; do not infer that
@@ -85,7 +94,9 @@ window. These are the limits:
   current diff.** The fix will be small and obviously right and it will be
   right there. Write the row anyway. The exceptions are a security defect
   under active exploitation, and a problem that makes the change in hand wrong
-  regardless — nothing else.
+  regardless — nothing else. The file is local and absent from a fresh clone;
+  if it is not there, create it rather than treating its absence as permission
+  to fold the fix into the diff.
 - **Three fix commits in one session is a stop sign.** Before attempting a
   fourth, write down why the first fix was insufficient. Not what the fourth
   fix will be — why the first one did not hold.
@@ -411,6 +422,10 @@ configuration load or hot reload. Invalid security policy should fail closed.
 
 - `docs/TODO.md`: the v0.2.0 execution plan. Day-by-day only — no status,
   no evidence, no reference material.
+- `TRIAGE.md`: problems found and deliberately not fixed yet — date, source,
+  severity, one line, status. It is not a plan (`docs/TODO.md` is) and not a
+  record of what shipped (`CHANGELOG.md` is); the distinction it owns is
+  "known, and not being worked on right now". Local, not committed.
 - `docs/guardrails/{testing,config,tls,proxy}.md`: environment constraints and
   implementation rules, one file per subsystem. A new rule goes in the file it
   belongs to; `docs/GUARDRAILS.md` is only the index over them and must stay
