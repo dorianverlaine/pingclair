@@ -20,6 +20,39 @@ use crate::cli::service::manage_system_service;
 use crate::paths::{resolve_config_path, tls_store_dir};
 use crate::run::run_server;
 
+/// 🧩 The directives `list-modules` reports as request handlers.
+///
+/// This is a curated subset rather than the whole directive table, because the
+/// table also holds site-level names — `root`, `listen`, `tls` — that are not
+/// handlers and would be a different kind of wrong under an
+/// `http.handlers.` prefix. What keeps the curation honest is
+/// [`every_listed_module_is_an_implemented_directive`]: every name here must
+/// be one the adapter actually turns into configuration.
+///
+/// 🤡 Why the test exists: until 2026-08-07 this list was hand-written with no
+/// tie to the adapter, and it advertised `try_files` for weeks while a
+/// Pingclairfile containing `try_files` was refused. Someone checking what
+/// their binary supports would have been told yes by the tool and no by the
+/// parser, which is worse than either answer alone.
+const HANDLER_MODULES: [&str; 16] = [
+    "access_control",
+    "basic_auth",
+    "cors",
+    "file_server",
+    "handle",
+    "handle_path",
+    "header",
+    "rate_limit",
+    "redir",
+    "respond",
+    "reverse_proxy",
+    "rewrite",
+    "route",
+    "templates",
+    "try_files",
+    "uri",
+];
+
 /// ✍️ Renders parsed directives back to canonical Pingclairfile text: two
 /// spaces per block level, one directive per line, arguments re-quoted only
 /// when whitespace or a comment marker demands it.
@@ -202,20 +235,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
         }
 
         Commands::ListModules { json } => {
-            let modules = [
-                "respond",
-                "file_server",
-                "reverse_proxy",
-                "templates",
-                "redirect",
-                "headers",
-                "basic_auth",
-                "rate_limit",
-                "rewrite",
-                "cors",
-                "access_control",
-                "try_files",
-            ];
+            let modules = HANDLER_MODULES;
             let features = [
                 "http/1.1",
                 "http/2",
@@ -786,4 +806,30 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HANDLER_MODULES;
+
+    /// 🎯 The check the list cannot do for itself: a module this binary tells
+    /// an operator it has must be a directive the adapter accepts.
+    #[test]
+    fn every_listed_module_is_an_implemented_directive() {
+        for module in HANDLER_MODULES {
+            assert!(
+                pingclair_config::adapter::is_implemented_directive(module),
+                "`list-modules` advertises `{module}`, but the Caddyfile adapter does not \
+                 implement it — either wire the directive up or stop listing it"
+            );
+        }
+    }
+
+    /// 📌 Sorted so a new handler has one obvious home in the list.
+    #[test]
+    fn the_module_list_is_sorted() {
+        let mut sorted = HANDLER_MODULES;
+        sorted.sort_unstable();
+        assert_eq!(HANDLER_MODULES, sorted, "the module list is out of order");
+    }
 }

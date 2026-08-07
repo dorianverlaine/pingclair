@@ -101,6 +101,8 @@ pub(super) static DIRECTIVES: &[Spec] = &[
     implemented("route"),
     implemented("templates"),
     implemented("tls"),
+    implemented("try_files"),
+    implemented("uri"),
     // MARK: - Recognised, not implemented
     recognised("abort"),
     recognised("acme_server"),
@@ -124,8 +126,6 @@ pub(super) static DIRECTIVES: &[Spec] = &[
     recognised("request_header"),
     recognised("skip_log"),
     recognised("tracing"),
-    recognised("try_files"),
-    recognised("uri"),
     recognised("vars"),
 ];
 
@@ -179,6 +179,20 @@ pub(super) static GLOBAL_OPTIONS: &[Spec] = &[
 /// Looks a directive up by name.
 pub(super) fn directive(name: &str) -> Option<&'static Spec> {
     DIRECTIVES.iter().find(|spec| spec.name == name)
+}
+
+/// 🧾 Whether this adapter turns `name` into configuration, for callers
+/// outside the crate.
+///
+/// 📌 This exists so that anything advertising a directive to a user can be
+/// checked against the one table that decides. `pingclair list-modules` used
+/// to carry its own hand-written copy of the answer, and on 2026-08-07 that
+/// copy still listed `try_files` — which the adapter refused. A name a tool
+/// prints and a name the parser accepts have to come from the same place, or
+/// the tool becomes a way to learn something untrue about the binary you are
+/// holding.
+pub fn is_implemented_directive(name: &str) -> bool {
+    directive(name).is_some_and(|spec| spec.support == Support::Implemented)
 }
 
 /// Looks a global-block option up by name.
@@ -279,6 +293,8 @@ mod tests {
             ("route", "route {\n respond \"x\"\n }"),
             ("templates", "templates"),
             ("tls", "tls internal"),
+            ("try_files", "try_files {path} /index.html"),
+            ("uri", "uri strip_prefix /api"),
         ];
 
         for spec in DIRECTIVES

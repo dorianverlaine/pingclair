@@ -1770,3 +1770,231 @@ mod p3_syntax_tests {
         );
     }
 }
+
+// MARK: - uri and try_files
+
+/// 🗂️ The two request-manipulation directives wired up on 2026-08-07.
+///
+/// Every source here is written the way the format's own documentation writes
+/// it, verbatim where a documented example exists. That is the point of the
+/// tests: the question is never "does our parser like this", it is "does the
+/// configuration someone will actually paste in work".
+#[cfg(test)]
+mod uri_and_try_files_tests {
+    use crate::compile;
+    use pingclair_core::config::HandlerConfig;
+
+    fn handlers(source: &str) -> Vec<HandlerConfig> {
+        let config = compile(source).unwrap_or_else(|error| panic!("must compile: {error}"));
+        match config
+            .servers
+            .into_iter()
+            .next()
+            .unwrap()
+            .routes
+            .remove(0)
+            .handler
+        {
+            HandlerConfig::Pipeline { handlers } => handlers,
+            single => vec![single],
+        }
+    }
+
+    /// 🎯 The documented single-page-application pattern, pasted unchanged.
+    /// Before this it did not compile at all: `try_files` was refused as an
+    /// unimplemented directive, so the first page of the migration guide was
+    /// also the first thing to fail.
+    #[test]
+    fn the_documented_spa_pattern_compiles() {
+        let handlers = handlers(
+            "example.com {\n\
+             \troot * /srv\n\
+             \tencode gzip\n\
+             \ttry_files {path} /index.html\n\
+             \tfile_server\n\
+             }",
+        );
+        let try_files = handlers
+            .iter()
+            .find_map(|handler| match handler {
+                HandlerConfig::TryFiles { files, root, .. } => Some((files, root)),
+                _ => None,
+            })
+            .expect("try_files must survive into the compiled routes");
+        assert_eq!(
+            try_files.0,
+            &["{path}".to_string(), "/index.html".to_string()]
+        );
+        assert_eq!(
+            try_files.1.as_deref(),
+            Some("/srv"),
+            "try_files must capture the site root, or every candidate is looked up at the \
+             filesystem root and the pattern answers 404 for every application route"
+        );
+    }
+
+    /// 🔢 `try_files` runs before `file_server` however the site is written,
+    /// because the order is the format's, not the file's.
+    #[test]
+    fn try_files_is_ordered_before_the_file_server() {
+        let handlers = handlers(
+            "example.com {\n\
+             \troot * /srv\n\
+             \tfile_server\n\
+             \ttry_files {path} /index.html\n\
+             }",
+        );
+        let position = |name: &str| {
+            handlers
+                .iter()
+                .position(|handler| match handler {
+                    HandlerConfig::TryFiles { .. } => name == "try_files",
+                    HandlerConfig::FileServer { .. } => name == "file_server",
+                    _ => false,
+                })
+                .unwrap_or_else(|| panic!("{name} missing from {handlers:?}"))
+        };
+        assert!(
+            position("try_files") < position("file_server"),
+            "try_files decides which path is asked for, so it cannot run after the handler \
+             that reads it"
+        );
+    }
+
+    #[test]
+    fn uri_strip_prefix_and_suffix_become_rewrites() {
+        let stripped_prefix =
+            handlers("example.com {\n\turi strip_prefix /api\n\trespond \"ok\"\n}");
+        assert!(
+            matches!(
+                &stripped_prefix[0],
+                HandlerConfig::Rewrite { strip_prefix: Some(prefix), .. } if prefix == "/api"
+            ),
+            "got {:?}",
+            stripped_prefix[0]
+        );
+
+        let stripped_suffix =
+            handlers("example.com {\n\turi strip_suffix .php\n\trespond \"ok\"\n}");
+        assert!(
+            matches!(
+                &stripped_suffix[0],
+                HandlerConfig::Rewrite { strip_suffix: Some(suffix), .. } if suffix == ".php"
+            ),
+            "got {:?}",
+            stripped_suffix[0]
+        );
+    }
+
+    #[test]
+    fn uri_path_regexp_becomes_a_regex_rewrite() {
+        let handlers = handlers("example.com {\n\turi path_regexp /{2,} /\n\trespond \"ok\"\n}");
+        assert!(
+            matches!(
+                &handlers[0],
+                HandlerConfig::Rewrite {
+                    regex: Some(pattern),
+                    regex_replace: Some(replacement),
+                    ..
+                } if pattern == "/{2,}" && replacement == "/"
+            ),
+            "got {:?}",
+            handlers[0]
+        );
+    }
+
+    /// 🚫 `uri replace` substitutes a substring; this crate's rewrite replaces
+    /// the whole path. Accepting it would compile and silently serve a
+    /// different URL than the operator wrote, which is the one outcome worse
+    /// than an error.
+    #[test]
+    fn uri_replace_and_query_are_refused_by_name() {
+        for (source, expected) in [
+            ("uri replace /docs /documentation", "uri replace"),
+            ("uri query +foo bar", "uri query"),
+        ] {
+            let message = compile(&format!("example.com {{\n\t{source}\n}}"))
+                .expect_err(&format!("`{source}` must be refused"))
+                .to_string();
+            assert!(
+                message.contains(expected),
+                "`{source}` must be refused by name rather than as a typo: {message}"
+            );
+            assert!(
+                !message.contains("Unknown directive"),
+                "`{source}` is part of the format, so it must not read as a misspelling: \
+                 {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn uri_rejects_an_unknown_operation_and_a_wrong_argument_count() {
+        for source in [
+            "uri",
+            "uri sideways /a",
+            "uri strip_prefix",
+            "uri strip_prefix /a /b",
+            "uri path_regexp /only-one",
+        ] {
+            compile(&format!("example.com {{\n\t{source}\n}}"))
+                .expect_err(&format!("`{source}` must be refused"));
+        }
+    }
+
+    /// 🛡️ Confinement is lexical and enforced once, at configuration time.
+    #[test]
+    fn try_files_refuses_a_candidate_that_leaves_the_root() {
+        let message = compile("example.com {\n\troot * /srv\n\ttry_files ../../etc/passwd\n}")
+            .expect_err("a `..` candidate must be refused")
+            .to_string();
+        assert!(message.contains(".."), "got {message}");
+    }
+
+    /// 🚫 `{path}` is the only placeholder the handler expands, so any other
+    /// one would be looked up as a literal directory name — a misconfiguration
+    /// that behaves exactly like a missing file.
+    #[test]
+    fn try_files_refuses_a_placeholder_it_cannot_expand() {
+        let message = compile("example.com {\n\troot * /srv\n\ttry_files {uri} /index.html\n}")
+            .expect_err("an unexpandable placeholder must be refused")
+            .to_string();
+        assert!(message.contains("{uri}"), "got {message}");
+    }
+
+    /// 🚫 The `php_fastcgi` shape. Nothing here would do anything with the
+    /// query, and dropping it silently is how a configuration written for that
+    /// pattern comes to look like it works.
+    #[test]
+    fn try_files_refuses_a_candidate_carrying_a_query() {
+        let message =
+            compile("example.com {\n\troot * /srv\n\ttry_files {path} /index.php?{query}\n}")
+                .expect_err("a candidate with a query must be refused")
+                .to_string();
+        assert!(message.contains("query"), "got {message}");
+    }
+
+    /// 🚫 The artifact of the placeholder-gluing defect: `{path}/` tokenizes
+    /// into `{path}` and `/`, and a `/` candidate would otherwise make every
+    /// request rewrite to the site root while looking like it worked.
+    #[test]
+    fn try_files_refuses_a_bare_root_candidate() {
+        let message =
+            compile("example.com {\n\troot * /srv\n\ttry_files {path} {path}/ /index.html\n}")
+                .expect_err("a `/` candidate must be refused")
+                .to_string();
+        assert!(message.contains("site root"), "got {message}");
+    }
+
+    #[test]
+    fn try_files_refuses_a_glob_candidate() {
+        compile("example.com {\n\troot * /srv\n\ttry_files {path}*.html\n}")
+            .expect_err("a glob candidate must be refused");
+    }
+
+    #[test]
+    fn try_files_requires_at_least_one_candidate() {
+        compile("example.com {\n\troot * /srv\n\ttry_files\n}")
+            .expect_err("try_files with no candidate must be refused");
+    }
+}

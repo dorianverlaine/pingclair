@@ -561,6 +561,61 @@ IP literals never reach a resolver at all.
 }
 ```
 
+### Single-page applications: `try_files`
+
+`try_files` rewrites the request to the first candidate that exists under the
+site `root`, and serves nothing itself — the `file_server` after it does that.
+The standard single-page-application pattern works as written:
+
+```caddyfile
+example.com {
+    root * /srv
+    encode gzip
+    try_files {path} /index.html
+    file_server
+}
+```
+
+A request for a real file gets that file; anything else is rewritten to
+`/index.html` so the application can route it. The query string survives the
+rewrite.
+
+A candidate ending in `/` matches only a directory, and one without matches
+only a regular file — the trailing slash that decides is the one in the
+configuration, not the one the request arrived with.
+
+Four differences from Caddy, all of which **fail closed** with a message
+naming the reason rather than compiling into something subtly different:
+
+| Not supported | Why |
+| --- | --- |
+| Placeholders other than `{path}` | Only `{path}` is expanded; anything else would be looked up as a literal directory name. |
+| A candidate with a query string (`/index.php?{query}`) | The query would be dropped silently. |
+| Glob characters in a candidate | Caddy expands globs; Pingclair matches literally. |
+| The `{ policy … }` block | Only first-match is implemented. |
+| A `..` segment in a candidate | Confinement is lexical, so a candidate that could leave the root is refused outright. |
+
+> ⚠️ `try_files {path} {path}/ /index.html` is currently refused. The `{path}/`
+> candidate is tokenized as two candidates, and the resulting `/` would match
+> the site root on every request — so it is rejected rather than allowed to
+> look like it works. Use `try_files {path} /index.html` until that is fixed.
+
+### Path surgery: `uri`
+
+```caddyfile
+example.com {
+    uri strip_prefix /api
+    uri strip_suffix .php
+    uri path_regexp /{2,} /
+    reverse_proxy 127.0.0.1:3000
+}
+```
+
+`uri replace` and `uri query` are **refused by name**. `replace` substitutes a
+substring of the path in Caddy, while Pingclair's rewrite replaces the whole
+path; accepting it would compile and serve a different URL than the one
+written, so it errors instead. Query-string rewriting does not exist here yet.
+
 ### Caddy parity controls
 
 ```caddyfile

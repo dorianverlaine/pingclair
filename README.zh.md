@@ -536,6 +536,57 @@ IP 字面位址完全不會經過 resolver。
 }
 ```
 
+### 單頁應用：`try_files`
+
+`try_files` 會把請求改寫成第一個「在站台 `root` 底下確實存在」的候選路徑，
+它本身不回應任何東西——真正送出檔案的是排在它後面的 `file_server`。
+官方的單頁應用寫法可以原樣貼上：
+
+```caddyfile
+example.com {
+    root * /srv
+    encode gzip
+    try_files {path} /index.html
+    file_server
+}
+```
+
+請求打到真實檔案就送那個檔案，其餘一律改寫成 `/index.html`，交給前端自己路由。
+改寫會保留 query string。
+
+候選路徑結尾有 `/` 的只匹配目錄，沒有 `/` 的只匹配一般檔案——**決定的是設定檔裡
+寫的那個斜線，不是請求帶進來的那個**。
+
+與 Caddy 有四項差異，全部**fail closed**，並且錯誤訊息會講出理由，
+而不是編譯成一個語意悄悄不同的東西：
+
+| 不支援 | 理由 |
+| --- | --- |
+| `{path}` 以外的 placeholder | 只有 `{path}` 會展開，其他會被當成字面上的目錄名去找。 |
+| 帶 query string 的候選（`/index.php?{query}`） | query 會被無聲丟掉。 |
+| 候選裡的 glob 字元 | Caddy 會展開 glob，Pingclair 是字面比對。 |
+| `{ policy … }` 區塊 | 只實作了「取第一個匹配」。 |
+| 候選裡的 `..` 片段 | 限制在 document root 內是詞法層做的，所以有可能跳出去的候選直接拒絕。 |
+
+> ⚠️ `try_files {path} {path}/ /index.html` 目前會被拒絕。`{path}/` 會被切成兩個
+> 候選，多出來的那個 `/` 會對每一個請求都匹配到站台根目錄——與其讓它看起來像能用，
+> 不如直接擋掉。修好之前請用 `try_files {path} /index.html`。
+
+### 路徑手術：`uri`
+
+```caddyfile
+example.com {
+    uri strip_prefix /api
+    uri strip_suffix .php
+    uri path_regexp /{2,} /
+    reverse_proxy 127.0.0.1:3000
+}
+```
+
+`uri replace` 與 `uri query` 會**指名拒絕**。在 Caddy 裡 `replace` 是取代路徑中的
+一段子字串，而 Pingclair 的 rewrite 是整條路徑換掉；收下它會編得過、然後送出一個
+跟你寫的不一樣的 URL，所以改成報錯。改寫 query string 這件事目前還沒有。
+
 ### Caddy parity 控制項
 
 ```caddyfile

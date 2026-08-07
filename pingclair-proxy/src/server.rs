@@ -3088,40 +3088,44 @@ impl PingclairProxy {
                     }
                 }
             }
-            HandlerConfig::TryFiles { files, fallback } => {
-                // 🏗️ ARCHITECTURE: try_files checks each file path in order.
-                // If a file exists, serve it via FileServer. If none match,
-                // execute the fallback handler (or 404).
-                for file_path in files {
-                    // Resolve {path} variable
-                    let resolved = file_path.replace("{path}", path);
-                    // Check if file exists (delegate to static server)
-                    let full_path = std::path::Path::new(&resolved);
-                    if full_path.exists() && full_path.is_file() {
-                        // Serve via FileServer handler
-                        let parent = full_path
-                            .parent()
-                            .map(|p| p.to_string_lossy().to_string())
-                            .unwrap_or_else(|| ".".to_string());
-                        let file_handler = HandlerConfig::FileServer {
-                            root: parent,
-                            index: vec![],
-                            browse: false,
-                            browse_limit: None,
-                            compress: true,
-                        };
-                        return self
-                            .handle_config(session, ctx, &file_handler, &resolved, route_index)
-                            .await;
+            HandlerConfig::TryFiles {
+                files,
+                root,
+                fallback,
+            } => {
+                // 🗂️ A match rewrites the request and stands down; whatever
+                // runs next — normally `file_server` — is what serves it.
+                // Returning "not handled" is how the pipeline learns to carry
+                // on, and `apply_rewrite` is reused rather than reimplemented
+                // so the query string survives and `ctx.rewritten_path` is
+                // published the same way every other rewrite publishes it.
+                match crate::http_policy::resolve_try_files(files, root.as_deref(), path) {
+                    Some(target) => {
+                        self.apply_rewrite(
+                            session,
+                            ctx,
+                            route_index,
+                            RewriteRule {
+                                strip_prefix: None,
+                                strip_suffix: None,
+                                replace: Some(&target),
+                                regex: None,
+                                regex_replace: None,
+                            },
+                        )?;
+                        Ok(false)
                     }
+                    // 🧭 No candidate exists. A JSON configuration may name a
+                    // handler for that case; a Pingclairfile never does, and
+                    // the request simply continues with its original path.
+                    None => match fallback {
+                        Some(fallback) => {
+                            self.handle_config(session, ctx, fallback, path, route_index)
+                                .await
+                        }
+                        None => Ok(false),
+                    },
                 }
-                // No file found — execute fallback
-                if let Some(fb) = fallback {
-                    return self
-                        .handle_config(session, ctx, fb, path, route_index)
-                        .await;
-                }
-                Ok(false)
             }
             // 🔁 A reverse proxy is not answered here on purpose: returning
             // "not handled" is what hands the request to Pingora's

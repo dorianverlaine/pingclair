@@ -833,6 +833,11 @@ fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<(
                 });
             }
         }
+        HandlerConfig::TryFiles { files, .. } => {
+            for candidate in files {
+                validate_try_files_candidate(candidate)?;
+            }
+        }
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::Handle { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
@@ -848,6 +853,77 @@ fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<(
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// 🛡️ Rejects a `try_files` candidate that could leave the document root or
+/// that names a placeholder nothing expands.
+///
+/// Both rules exist so the request path never has to be re-examined. The
+/// candidates come from configuration and the request path is normalized long
+/// before a handler sees it, so if no candidate can spell `..` then no request
+/// can produce one either — confinement stays lexical and costs nothing per
+/// request, which is the same bargain the static file server makes.
+///
+/// 🚫 The placeholder rule is the fail-closed half. `{path}` is the only name
+/// the handler substitutes, so a candidate containing `{uri}` would be looked
+/// up as a directory literally called `{uri}`, find nothing, and fall through —
+/// a misconfiguration that behaves exactly like a missing file. The core type
+/// documented `{uri}` support that never existed, which is how a wrong comment
+/// becomes a wrong configuration.
+fn validate_try_files_candidate(candidate: &str) -> CompileResult<()> {
+    if candidate.split('/').any(|segment| segment == "..") {
+        return Err(CompileError::InvalidRoute {
+            message: format!(
+                "try_files candidate `{candidate}` contains `..`, which would resolve outside \
+                 the document root"
+            ),
+        });
+    }
+    // 🚫 A bare `/` matches the site root directory on every request, so every
+    // candidate after it is unreachable and the directive collapses into
+    // "always rewrite to the root".
+    //
+    // 🤡 It is refused rather than merely useless because it is also what
+    // `{path}/` currently *becomes*: the lexer emits a placeholder at the start
+    // of a token without absorbing what follows, so the documented
+    // `try_files {path} {path}/ /index.html` tokenizes into four candidates,
+    // `/` among them. The result compiles and serves the shell for every
+    // request, which looks close enough to working to survive review. Until
+    // the tokenizer glues them (tracked in `TRIAGE.md`), this is the only
+    // place that can tell the operator something is wrong.
+    if candidate == "/" {
+        return Err(CompileError::InvalidRoute {
+            message: "try_files candidate `/` matches the site root on every request, leaving \
+                      later candidates unreachable; note that `{path}/` is currently tokenized \
+                      as two candidates and produces exactly this"
+                .to_string(),
+        });
+    }
+    // 🚫 Upstream expands glob patterns in a candidate; this crate would take
+    // the metacharacter literally and look for a file with a `*` in its name.
+    // Both "compile" — one of them just never matches, and the operator has
+    // no way to tell which they got.
+    if let Some(glob) = candidate.chars().find(|c| matches!(c, '*' | '[' | ']')) {
+        return Err(CompileError::InvalidRoute {
+            message: format!(
+                "try_files candidate `{candidate}` contains the glob character `{glob}`, and \
+                 Pingclair matches candidate paths literally"
+            ),
+        });
+    }
+    let remainder = candidate.replace("{path}", "");
+    if let Some(start) = remainder.find('{') {
+        let placeholder = remainder[start..]
+            .split_once('}')
+            .map_or(&remainder[start..], |(name, _)| name);
+        return Err(CompileError::InvalidRoute {
+            message: format!(
+                "try_files candidate `{candidate}` uses `{placeholder}}}`, and `{{path}}` is the \
+                 only placeholder it expands"
+            ),
+        });
     }
     Ok(())
 }
@@ -1479,13 +1555,22 @@ fn compile_handler(handler: &Handler, root: Option<&str>) -> CompileResult<Handl
                 })?;
             }
             Ok(HandlerConfig::Rewrite {
-                strip_prefix: None,
-                strip_suffix: None,
+                strip_prefix: rewrite.strip_prefix.clone(),
+                strip_suffix: rewrite.strip_suffix.clone(),
                 replace: rewrite.replace.clone(),
                 regex: rewrite.regex.clone(),
                 regex_replace: rewrite.regex_replace.clone(),
             })
         }
+
+        // 🗂️ The site root is captured here rather than looked up per request:
+        // it is known at configuration time and the handler needs it on every
+        // candidate of every request.
+        Handler::TryFiles(candidates) => Ok(HandlerConfig::TryFiles {
+            files: candidates.clone(),
+            root: root.map(str::to_string),
+            fallback: None,
+        }),
 
         Handler::Cors(cors) => Ok(HandlerConfig::Cors {
             allowed_origins: cors.allowed_origins.clone(),
@@ -2007,6 +2092,7 @@ mod fail_closed_handler_tests {
                 "try_files fallback",
                 HandlerConfig::TryFiles {
                     files: vec!["{path}".to_string()],
+                    root: None,
                     fallback: Some(Box::new(plugin())),
                 },
             ),
@@ -2029,6 +2115,7 @@ mod fail_closed_handler_tests {
                 HandlerConfig::Pipeline {
                     handlers: vec![HandlerConfig::TryFiles {
                         files: vec!["{path}".to_string()],
+                        root: None,
                         fallback: Some(Box::new(plugin())),
                     }],
                 },
@@ -2055,10 +2142,12 @@ mod fail_closed_handler_tests {
             },
             HandlerConfig::TryFiles {
                 files: vec!["{path}".to_string()],
+                root: None,
                 fallback: None,
             },
             HandlerConfig::TryFiles {
                 files: vec!["{path}".to_string()],
+                root: None,
                 fallback: Some(Box::new(harmless())),
             },
             HandlerConfig::HandleErrors {

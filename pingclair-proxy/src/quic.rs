@@ -1744,7 +1744,40 @@ async fn plan_h3_handler(
         }
         HandlerConfig::FileServer { .. } => Ok(H3Plan::Terminal(H3Terminal::FileServer)),
         HandlerConfig::ReverseProxy(_) => Ok(H3Plan::Terminal(H3Terminal::ReverseProxy)),
-        HandlerConfig::TryFiles { .. } => Err((501, "Try Files Not Supported Over HTTP/3")),
+        // 🗂️ Parity with H1/H2 comes from sharing the resolver, not from
+        // reproducing its rules here. This arm used to answer 501, which was
+        // defensible while only JSON could reach the handler and indefensible
+        // the moment a Pingclairfile could: the same site would then serve a
+        // single-page application over HTTP/2 and refuse it over HTTP/3,
+        // depending on nothing the operator wrote.
+        HandlerConfig::TryFiles {
+            files,
+            root,
+            fallback,
+        } => match crate::http_policy::resolve_try_files(files, root.as_deref(), effective_uri) {
+            Some(target) => {
+                *effective_uri =
+                    rewrite_uri(effective_uri, None, None, Some(target.as_str()), None, None);
+                request_header
+                    .set_raw_path(effective_uri.as_bytes())
+                    .map_err(|_| (500, "Rewrite Failed"))?;
+                Ok(H3Plan::Continue)
+            }
+            None => match fallback {
+                Some(fallback) => {
+                    plan_h3_handler(
+                        fallback,
+                        state,
+                        route_index,
+                        request_header,
+                        effective_uri,
+                        response_policy,
+                    )
+                    .await
+                }
+                None => Ok(H3Plan::Continue),
+            },
+        },
         HandlerConfig::Plugin { .. } => Err((501, "Plugin Not Supported Over HTTP/3")),
     }
 }

@@ -2166,6 +2166,116 @@ async fn test_regex_rewrite_reaches_the_rewritten_static_path() {
     assert_eq!(response.text().await.unwrap(), "rewritten");
 }
 
+/// 🗂️ The single-page-application pattern from the format's own patterns
+/// page, running against the real binary.
+///
+/// The configuration below is that example, changed only where a test must
+/// change it: a temporary directory for the root and a loopback port. Every
+/// directive and its argument order is the documented one, because the claim
+/// under test is not "our parser accepts this" — it is that someone migrating
+/// can paste the page in and have it work.
+///
+/// 🤡 Until 2026-08-07 it failed twice over: `try_files` was refused by the
+/// adapter outright, and the handler behind it resolved candidates against the
+/// filesystem root rather than the site root, so even a JSON configuration that
+/// reached it answered 404 for every client-side route.
+#[tokio::test]
+async fn test_spa_pattern_serves_assets_and_falls_back_to_the_shell() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    std::fs::write(tmp_dir.path().join("index.html"), "spa-shell").unwrap();
+    std::fs::create_dir(tmp_dir.path().join("assets")).unwrap();
+    std::fs::write(tmp_dir.path().join("assets/app.js"), "real-asset").unwrap();
+    let root = tmp_dir.path().to_str().unwrap().replace("\\", "/");
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            try_files {{path}} /index.html
+            file_server
+        }}
+    "#
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    // 🎯 A real file must be served as itself. If `try_files` hijacked every
+    // request to the shell, the application would load and then fetch its own
+    // HTML in place of its JavaScript — a failure that looks like a bundler
+    // problem and is not one.
+    let asset = client
+        .get(server.url(0, "/assets/app.js"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(asset.status(), 200);
+    assert_eq!(asset.text().await.unwrap(), "real-asset");
+
+    // 🎯 A client-side route has no file behind it and must reach the shell.
+    let deep_route = client
+        .get(server.url(0, "/settings/profile"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deep_route.status(), 200);
+    assert_eq!(deep_route.text().await.unwrap(), "spa-shell");
+
+    // 🎯 The rewrite must keep the query, which is where the application
+    // usually keeps the state it is about to read.
+    let with_query = client
+        .get(server.url(0, "/settings/profile?tab=security"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(with_query.status(), 200);
+    assert_eq!(with_query.text().await.unwrap(), "spa-shell");
+}
+
+/// 🪚 `uri strip_prefix` reaches the file server with the prefix removed.
+#[tokio::test]
+async fn test_uri_strip_prefix_reaches_the_stripped_static_path() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    std::fs::write(tmp_dir.path().join("hello.txt"), "stripped").unwrap();
+    let root = tmp_dir.path().to_str().unwrap().replace("\\", "/");
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            uri strip_prefix /api
+            file_server
+        }}
+    "#
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/api/hello.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "stripped");
+}
+
 #[tokio::test]
 async fn test_compression() {
     let tmp_dir = tempfile::tempdir().unwrap();

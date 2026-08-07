@@ -38,6 +38,19 @@ lets the rest converge.
 
 ### 🔄 Changed
 
+- 🗂️ **`try_files` resolves candidates under the site root and rewrites instead
+  of serving.** It was previously reachable only from JSON, where it treated
+  each candidate as a filesystem path and served any match itself through an
+  ad-hoc file server. That meant `/index.html` was looked up at the filesystem
+  root rather than under `root`, so the pattern it exists for answered 404 for
+  every application route. It now expands `{path}`, resolves under the site
+  root, rewrites the request to the first match, and lets the next handler
+  serve it — matching Caddy, and verified against Caddy v2.11.4 (17 of 17
+  request comparisons agree). A candidate ending in `/` matches only a
+  directory and one without matches only a regular file, per upstream's file
+  matcher. **A JSON configuration using `try_files` must drop the site-root
+  prefix from its candidates and add a `file_server` after it.**
+
 - 🏷️ **Route matchers serialize in a tagged representation.** The untagged shape
   0.1.7 wrote could not round-trip unambiguously — a `Query` matcher read back
   as a `Header`. Existing documents still load, since the deserializer accepts
@@ -50,9 +63,18 @@ lets the rest converge.
 ### ✨ Added
 
 - 📝 **Caddyfile compatibility.** Complete directive syntax and matcher
-  semantics, Caddy's directive ordering, `handle`/`handle_path`/`handle_errors`
-  /`try_files` containers, a redirect DSL, response templates, and dual-stack
-  (IPv4 + IPv6) wildcard listeners.
+  semantics, Caddy's directive ordering, `handle`/`handle_path` containers, a
+  redirect DSL, response templates, and dual-stack (IPv4 + IPv6) wildcard
+  listeners. (`handle_errors` parses but does nothing yet, and is refused
+  rather than silently accepted.)
+- 🗂️ **`try_files` and `uri` in the Pingclairfile.** The documented
+  single-page-application pattern — `root * /srv`, `try_files {path}
+  /index.html`, `file_server` — compiles and serves, on HTTP/1.1, HTTP/2 and
+  HTTP/3 alike. `uri strip_prefix`, `uri strip_suffix` and `uri path_regexp`
+  map onto the existing rewrite. `uri replace` and `uri query` are refused by
+  name: `replace` means substring replacement upstream and whole-path
+  replacement here, so accepting it would serve a different URL than the one
+  written.
 - 🌐 **Admin API.** `/load`, `/adapt` and `/stop`, Caddy-style config traversal
   with `@id` addressing, dynamic listeners, autosave and resume, and graceful
   stop.

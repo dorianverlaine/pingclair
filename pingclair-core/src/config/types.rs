@@ -772,12 +772,32 @@ pub enum HandlerConfig {
     /// Deny rules take precedence; populated allow lists are mandatory.
     AccessControl(AccessControlConfig),
 
-    /// Try files — attempt to serve from a list of paths, fall through if none match
-    /// Similar to Nginx's try_files directive
+    /// 🗂️ Rewrites the request to the first candidate that exists on disk.
+    ///
+    /// The candidates are URI paths, not filesystem paths: each one is looked
+    /// up under [`root`](Self::TryFiles::root) and, when it exists, becomes
+    /// the request's new path. Nothing is served here — the handler that runs
+    /// next does that, which is why the single-page-application pattern is
+    /// `try_files` followed by `file_server`. When no candidate exists the
+    /// request continues with its path untouched.
+    ///
+    /// 📌 This is a rewrite rather than a file server because that is the only
+    /// arrangement in which `root`, `index`, compression, range requests, and
+    /// `Etag` keep working: the file server stays the one thing that reads
+    /// files, and `try_files` only decides which path it is asked for.
     TryFiles {
-        /// List of file paths to try (supports {path} and {uri} variables)
+        /// Candidate URI paths, tried in order. `{path}` expands to the
+        /// request path; validation refuses any other placeholder, and
+        /// refuses `..` in any segment.
         files: Vec<String>,
-        /// Fallback handler if no file is found
+        /// Document root the candidates are resolved against. Filled in from
+        /// the site's `root` directive; `None` means the working directory,
+        /// matching a file server that was given no root either.
+        #[serde(default)]
+        root: Option<String>,
+        /// Handler to run when no candidate exists. The Pingclairfile
+        /// adapter never produces one — it exists for JSON configurations,
+        /// which had it before `try_files` was reachable from the DSL.
         fallback: Option<Box<HandlerConfig>>,
     },
 

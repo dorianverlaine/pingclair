@@ -616,7 +616,11 @@ pub(super) fn handler_directive_name(handler: &Handler) -> &'static str {
     match handler {
         Handler::Headers(_) => "header",
         Handler::Redirect(_) => "redir",
-        Handler::Rewrite(_) => "rewrite",
+        // 🏷️ `rewrite` and `uri` compile to the same handler and rank one
+        // apart, so the handler alone cannot answer this; the config records
+        // which word was written.
+        Handler::Rewrite(rewrite) => rewrite.directive,
+        Handler::TryFiles(_) => "try_files",
         Handler::BasicAuth(_) => "basic_auth",
         Handler::Templates => "templates",
         Handler::Handle(_) => "handle",
@@ -668,10 +672,14 @@ pub(super) fn handler_has_terminal(handler: &Handler) -> bool {
         Handler::Pipeline(handlers)
         | Handler::Handle(handlers)
         | Handler::HandlePath { handlers, .. } => handlers.iter().any(handler_has_terminal),
+        // 🗂️ `try_files` belongs here rather than with the terminals: it only
+        // changes which path is asked for, and a site whose route ends there
+        // has answered nothing. The `file_server` after it is the terminal.
         Handler::Headers(_)
         | Handler::BasicAuth(_)
         | Handler::RateLimit(_)
         | Handler::Rewrite(_)
+        | Handler::TryFiles(_)
         | Handler::Cors(_)
         | Handler::AccessControl(_)
         | Handler::Plugin { .. } => false,

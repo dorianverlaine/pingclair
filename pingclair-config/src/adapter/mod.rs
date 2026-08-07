@@ -9,6 +9,7 @@ pub mod caddyfile;
 pub mod imports;
 pub mod json;
 
+pub use caddyfile::registry::is_implemented_directive;
 pub use caddyfile::{AdapterError, adapt};
 pub use json::JsonAdapter;
 

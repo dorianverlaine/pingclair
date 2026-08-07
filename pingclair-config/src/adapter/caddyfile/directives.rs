@@ -114,6 +114,8 @@ pub(super) fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
         "basic_auth" | "basicauth" => adapt_basic_auth(d),
         "rate_limit" => adapt_rate_limit(d),
         "rewrite" => adapt_rewrite(d),
+        "uri" => adapt_uri(d),
+        "try_files" => adapt_try_files(d),
         "cors" => adapt_cors(d),
         "access_control" => adapt_access_control(d),
         // 🚫 A directive that exists in Caddy's standard set but has no
@@ -254,19 +256,126 @@ pub(super) fn adapt_rewrite(d: Directive) -> Result<Handler, AdapterError> {
     match d.args.as_slice() {
         [replace] => Ok(Handler::Rewrite(RewriteConfig {
             replace: Some(replace.clone()),
-            regex: None,
-            regex_replace: None,
+            ..Default::default()
         })),
         [regex, replacement] => Ok(Handler::Rewrite(RewriteConfig {
-            replace: None,
             regex: Some(regex.clone()),
             regex_replace: Some(replacement.clone()),
+            ..Default::default()
         })),
         _ => Err(AdapterError::InvalidArgument(
             "rewrite".into(),
             "expected <replacement> or <regex> <replacement>".into(),
         )),
     }
+}
+
+/// 🪚 Adapts `uri <operation> <args...>`, the path-surgery half of rewriting.
+///
+/// Three of the format's operations map onto the rewrite this crate already
+/// performs. Two do not, and are refused by name rather than approximated:
+///
+/// - `replace` means *substring* replacement upstream, while this crate's
+///   `replace` swaps the whole path. Accepting it would compile, run, and
+///   quietly produce a different URL than the operator asked for — the one
+///   outcome worse than an error, because nothing announces it.
+/// - `query` edits the query string, which no handler here touches at all.
+///
+/// 📌 They are named in the message because an operator who wrote `uri replace`
+/// spelled it correctly; sending them to hunt for a typo would be a second
+/// wrong answer on top of the missing feature.
+pub(super) fn adapt_uri(d: Directive) -> Result<Handler, AdapterError> {
+    if d.block.is_some() {
+        return Err(AdapterError::BlockNotAllowed("uri".into()));
+    }
+    let operation = d.args.first().map(String::as_str).ok_or_else(|| {
+        AdapterError::InvalidArgument(
+            "uri".into(),
+            "expected strip_prefix, strip_suffix, or path_regexp".into(),
+        )
+    })?;
+    let operands = &d.args[1..];
+
+    match (operation, operands) {
+        ("strip_prefix", [prefix]) => Ok(Handler::Rewrite(RewriteConfig {
+            strip_prefix: Some(prefix.clone()),
+            directive: "uri",
+            ..Default::default()
+        })),
+        ("strip_suffix", [suffix]) => Ok(Handler::Rewrite(RewriteConfig {
+            strip_suffix: Some(suffix.clone()),
+            directive: "uri",
+            ..Default::default()
+        })),
+        // 🧭 Both operands are required, matching the documented form. Making
+        // the replacement optional here would accept a configuration the
+        // format refuses, which is the direction of mistake that gets found
+        // in production rather than at adapt time.
+        ("path_regexp", [pattern, replacement]) => Ok(Handler::Rewrite(RewriteConfig {
+            regex: Some(pattern.clone()),
+            regex_replace: Some(replacement.clone()),
+            directive: "uri",
+            ..Default::default()
+        })),
+        ("strip_prefix" | "strip_suffix", operands) => Err(AdapterError::ArgumentCount(
+            format!("uri {operation}"),
+            1,
+            operands.len(),
+        )),
+        ("path_regexp", operands) => Err(AdapterError::ArgumentCount(
+            "uri path_regexp".into(),
+            2,
+            operands.len(),
+        )),
+        ("replace", _) => Err(AdapterError::UnsupportedFeature(
+            "uri replace".into(),
+            "`uri replace` substitutes a substring of the path, while Pingclair's rewrite \
+             replaces the whole path; rather than silently produce a different URL, this is \
+             refused until substring replacement exists"
+                .into(),
+        )),
+        ("query", _) => Err(AdapterError::UnsupportedFeature(
+            "uri query".into(),
+            "Pingclair does not rewrite query strings yet".into(),
+        )),
+        (other, _) => Err(AdapterError::InvalidArgument(
+            "uri".into(),
+            format!(
+                "unknown operation `{other}` (expected strip_prefix, strip_suffix, or path_regexp)"
+            ),
+        )),
+    }
+}
+
+/// 🗂️ Adapts `try_files <candidate...>`.
+///
+/// Each candidate is a URI path resolved under the site root, and the first one
+/// that exists becomes the request's new path. The directive serves nothing on
+/// its own — the single-page-application pattern is `try_files` followed by
+/// `file_server`, and that second line is what answers.
+fn adapt_try_files(d: Directive) -> Result<Handler, AdapterError> {
+    if d.block.is_some() {
+        return Err(AdapterError::BlockNotAllowed("try_files".into()));
+    }
+    if d.args.is_empty() {
+        return Err(AdapterError::InvalidArgument(
+            "try_files".into(),
+            "expected at least one candidate path".into(),
+        ));
+    }
+    // 🚫 A candidate carrying a query string is the `php_fastcgi` shape
+    // (`try_files {path} /index.php?{query}`), and nothing here would do
+    // anything with the query. Refusing it keeps a configuration written for
+    // that pattern from looking like it works.
+    if let Some(candidate) = d.args.iter().find(|candidate| candidate.contains('?')) {
+        return Err(AdapterError::UnsupportedFeature(
+            format!("try_files {candidate}"),
+            "a candidate with a query string is not supported; Pingclair rewrites the path \
+             only and would drop the query without saying so"
+                .into(),
+        ));
+    }
+    Ok(Handler::TryFiles(d.args))
 }
 
 /// Adapt the CORS directive. Inline arguments are allowed origins; block

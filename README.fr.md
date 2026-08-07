@@ -562,6 +562,62 @@ avant son application. Les adresses IP littérales n'atteignent jamais un résol
 }
 ```
 
+### Applications monopages : `try_files`
+
+`try_files` réécrit la requête vers le premier candidat qui existe sous le
+`root` du site, et ne sert rien lui-même — c'est le `file_server` qui suit qui
+répond. Le motif standard pour une application monopage fonctionne tel quel :
+
+```caddyfile
+example.com {
+    root * /srv
+    encode gzip
+    try_files {path} /index.html
+    file_server
+}
+```
+
+Une requête vers un vrai fichier obtient ce fichier ; tout le reste est réécrit
+vers `/index.html` pour que l'application fasse son propre routage. La query
+string survit à la réécriture.
+
+Un candidat terminé par `/` ne correspond qu'à un répertoire, et un candidat
+sans `/` qu'à un fichier ordinaire — la barre oblique qui tranche est celle
+écrite dans la configuration, pas celle portée par la requête.
+
+Quatre différences avec Caddy, toutes en **échec fermé**, avec un message qui
+nomme la raison plutôt qu'une compilation au sens subtilement différent :
+
+| Non pris en charge | Pourquoi |
+| --- | --- |
+| Les placeholders autres que `{path}` | Seul `{path}` est développé ; le reste serait cherché comme un nom de répertoire littéral. |
+| Un candidat avec query string (`/index.php?{query}`) | La query serait supprimée sans le dire. |
+| Les caractères glob dans un candidat | Caddy développe les globs ; Pingclair compare littéralement. |
+| Le bloc `{ policy … }` | Seule la première correspondance est implémentée. |
+| Un segment `..` dans un candidat | Le confinement est lexical : un candidat pouvant sortir du root est refusé d'emblée. |
+
+> ⚠️ `try_files {path} {path}/ /index.html` est actuellement refusé. Le candidat
+> `{path}/` est découpé en deux, et le `/` résultant correspondrait à la racine
+> du site à chaque requête — il est donc rejeté plutôt que laissé à faire
+> semblant de fonctionner. Utilisez `try_files {path} /index.html` en attendant.
+
+### Chirurgie de chemin : `uri`
+
+```caddyfile
+example.com {
+    uri strip_prefix /api
+    uri strip_suffix .php
+    uri path_regexp /{2,} /
+    reverse_proxy 127.0.0.1:3000
+}
+```
+
+`uri replace` et `uri query` sont **refusés nommément**. Dans Caddy, `replace`
+substitue une sous-chaîne du chemin, alors que la réécriture de Pingclair
+remplace le chemin entier ; l'accepter compilerait et servirait une URL autre
+que celle écrite, d'où l'erreur. La réécriture de query string n'existe pas
+encore ici.
+
 ### Contrôles de parité Caddy
 
 ```caddyfile

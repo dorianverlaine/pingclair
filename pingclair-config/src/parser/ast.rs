@@ -503,6 +503,9 @@ pub enum Handler {
     /// Internal URI rewrite.
     Rewrite(RewriteConfig),
 
+    /// 🗂️ Rewrite to the first candidate path that exists on disk.
+    TryFiles(Vec<String>),
+
     /// Cross-origin resource sharing policy.
     Cors(CorsConfig),
 
@@ -637,11 +640,40 @@ impl Default for HealthCheckConfig {
 
 /// Rewrite configuration. A two-argument `rewrite` directive is a regex
 /// rewrite; the replacement follows Rust-regex `$1` capture syntax.
+///
+/// 📌 Every field is optional and unset means "do not touch", so `Default` is
+/// the identity rewrite. That is what lets each `uri` operation name only the
+/// field it is about instead of spelling out four `None`s it has no opinion on.
 #[derive(Debug, Clone)]
 pub struct RewriteConfig {
+    /// 🪚 Remove this prefix from the path. Only `uri strip_prefix` sets it.
+    pub strip_prefix: Option<String>,
+    /// 🪚 Remove this suffix from the path. Only `uri strip_suffix` sets it.
+    pub strip_suffix: Option<String>,
     pub replace: Option<String>,
     pub regex: Option<String>,
     pub regex_replace: Option<String>,
+    /// 🏷️ Which directive produced this rewrite, `rewrite` or `uri`.
+    ///
+    /// Both compile to the same handler, and the shared directive order runs
+    /// them in adjacent but distinct positions — `rewrite`, then `uri`. Without
+    /// this the two would tie, and a site writing `uri` above `rewrite` would
+    /// execute them in the order written rather than the order the format
+    /// defines. Nothing else reads it.
+    pub directive: &'static str,
+}
+
+impl Default for RewriteConfig {
+    fn default() -> Self {
+        Self {
+            strip_prefix: None,
+            strip_suffix: None,
+            replace: None,
+            regex: None,
+            regex_replace: None,
+            directive: "rewrite",
+        }
+    }
 }
 
 /// CORS policy declared by the `cors` directive.
