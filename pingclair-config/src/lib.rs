@@ -936,6 +936,48 @@ mod tests {
         );
     }
 
+    /// 🎯 `https://host` must not be worth less than the bare hostname: it
+    /// names a listener explicitly, but it still asks for the same automatic
+    /// certificate management. Before 2026-08-07 the scheme-derived default
+    /// left `auto` false, so the site listened on 443 with nothing to serve.
+    #[test]
+    fn test_https_scheme_gets_the_same_automatic_tls_as_a_bare_hostname() {
+        let source = r#"
+            https://example.com {
+                respond "OK"
+            }
+        "#;
+
+        let config = compile(source).unwrap();
+        let tls = config.servers[0].tls.as_ref().expect("tls config");
+        assert!(
+            tls.auto,
+            "https:// must default to automatic TLS like a bare hostname"
+        );
+        assert!(!tls.internal);
+        assert_eq!(config.servers[0].listen, vec!["[::]:443".to_string()]);
+    }
+
+    #[test]
+    fn test_https_scheme_localhost_keeps_the_internal_authority() {
+        let config = compile("https://localhost {\n    respond \"OK\"\n}").unwrap();
+        let tls = config.servers[0].tls.as_ref().expect("tls config");
+        assert!(
+            tls.internal,
+            "https://localhost must use the internal CA, not ACME"
+        );
+        assert!(!tls.auto);
+    }
+
+    #[test]
+    fn test_tls_off_on_a_bare_hostname_stays_off() {
+        let config = compile("example.com {\n    tls off\n    respond \"OK\"\n}").unwrap();
+        assert!(
+            config.servers[0].tls.is_none(),
+            "`tls off` must not be re-enabled by the automatic HTTPS default"
+        );
+    }
+
     #[test]
     fn test_compile_admin_listen() {
         let source = r#"{

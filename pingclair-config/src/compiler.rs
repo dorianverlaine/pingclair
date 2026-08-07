@@ -50,10 +50,15 @@ pub fn compile_ast(ast: &Ast) -> CompileResult<PingclairConfig> {
         // 🌐 Caddy serves any named site over HTTPS by default: a bare
         // hostname with no explicit scheme/listen and automatic HTTPS
         // enabled gets `tls auto` (localhost/IP sites already get the
-        // internal authority from the adapter). `http://` sites keep their
-        // explicit plaintext listener.
-        if server_config.tls.is_none()
-            && block.listens.is_empty()
+        // internal authority from the adapter). An explicit `https://`
+        // address qualifies exactly like a bare hostname, while `http://`
+        // keeps its explicit plaintext listener.
+        let has_http_listener = block
+            .listens
+            .iter()
+            .any(|listen| listen.scheme == Scheme::Http);
+        if block.tls.is_none()
+            && !has_http_listener
             && config.global.auto_https != CoreAutoHttpsMode::Off
             && block
                 .names
@@ -65,11 +70,22 @@ pub fn compile_ast(ast: &Ast) -> CompileResult<PingclairConfig> {
                     || name.ends_with(".localhost")
                     || name.parse::<std::net::IpAddr>().is_ok()
             });
-            server_config.tls = Some(TlsConfig {
+            let automatic = TlsConfig {
                 auto: !internal,
                 internal,
                 ..Default::default()
-            });
+            };
+            match server_config.tls.as_mut() {
+                // 🔐 `compile_server` already created a scheme-derived
+                // default for an explicit `https://` address; upgrade it to
+                // the same automatic issuer a bare hostname gets instead of
+                // leaving TLS enabled with no certificate management.
+                Some(tls) => {
+                    tls.auto = automatic.auto;
+                    tls.internal = automatic.internal;
+                }
+                None => server_config.tls = Some(automatic),
+            }
         }
         config.servers.push(server_config);
     }
