@@ -357,6 +357,10 @@ pub(super) fn adapt_server(
                                 output: LogOutput::Stdout,
                                 format: LogFormat::default(),
                                 level: None,
+                                hostnames: Vec::new(),
+                                include: Vec::new(),
+                                exclude: Vec::new(),
+                                sampling: None,
                             },
                             Location::synthetic(),
                         ));
@@ -608,6 +612,7 @@ pub(super) fn adapt_server(
 pub(super) fn handler_directive_name(handler: &Handler) -> &'static str {
     match handler {
         Handler::Headers(_) => "header",
+        Handler::LogSkip => "log_skip",
         Handler::Redirect(_) => "redir",
         // 🏷️ `rewrite` and `uri` compile to the same handler and rank one
         // apart, so the handler alone cannot answer this; the config records
@@ -677,6 +682,7 @@ pub(super) fn handler_has_terminal(handler: &Handler) -> bool {
         | Handler::TryFiles(_)
         | Handler::Cors(_)
         | Handler::AccessControl(_)
+        | Handler::LogSkip
         | Handler::Plugin { .. } => false,
     }
 }

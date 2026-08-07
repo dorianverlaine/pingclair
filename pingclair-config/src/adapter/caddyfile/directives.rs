@@ -99,6 +99,7 @@ pub(super) fn adapt_handler(
         }
         "templates" => Ok(Handler::Templates),
         "header" => adapt_header_directive(&d),
+        "log_skip" => Ok(Handler::LogSkip),
         "route" => adapt_subroute_block(&d, matchers, order, false),
         "handle" => adapt_subroute_block(&d, matchers, order, true),
         "handle_path" => adapt_handle_path(&d, matchers, order).map(|(_, handler)| handler),

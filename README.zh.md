@@ -615,7 +615,9 @@ example.com {
 
 `log <name> { … }` 跟 Caddy 一樣：區塊設定一個**具名的站台 logger**，名字就是
 它的 handle。沒有區塊的 `log <name>` 仍指向全域選項宣告的 channel；單獨一個
-`log` 則開啟站台預設的 access log。
+`log` 則開啟站台預設的 access log。log 區塊接受 `hostnames`、`include`／
+`exclude`（全域）、`sampling`，以及檔案輪替選項（`mode`、`dir_mode`、
+`roll_*`）；`log_skip` 會把符合的請求排除在 access log 之外。
 
 ### 尚未支援
 
@@ -627,7 +629,7 @@ Directive：
 
   `abort` `acme_server` `copy_response` `copy_response_headers` `error` `forward_auth`
   `fs` `handle_errors` `intercept` `invoke` `log_append` `log_name`
-  `log_skip` `map` `method` `metrics` `php_fastcgi` `push`
+  `map` `method` `metrics` `php_fastcgi` `push`
   `request_body` `request_header` `skip_log` `tracing` `vars`
 
 全域選項：

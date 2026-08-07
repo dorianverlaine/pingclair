@@ -313,6 +313,22 @@ pub struct LogBlock {
     pub format: LogFormat,
     /// 🚦 Minimum level for this server's access log, when configured.
     pub level: Option<LogLevel>,
+    /// 🏠 Hostnames this logger serves, from `log { hostnames … }`.
+    pub hostnames: Vec<String>,
+    /// 🔌 Log sources this logger accepts, from global `log { include … }`.
+    pub include: Vec<String>,
+    /// 🚫 Log sources this logger excludes, from global `log { exclude … }`.
+    pub exclude: Vec<String>,
+    /// 🎲 Sampling policy from `log { sampling { … } }`.
+    pub sampling: Option<LogSampling>,
+}
+
+/// 🎲 Sampling policy declared by a `sampling` block.
+#[derive(Debug, Clone, Copy)]
+pub struct LogSampling {
+    pub interval_secs: u64,
+    pub first: usize,
+    pub thereafter: usize,
 }
 
 /// 🔄 Typed `roll` policy produced by the adapter.
@@ -322,6 +338,13 @@ pub struct LogRotationBlock {
     pub max_age_secs: Option<u64>,
     pub keep: Option<usize>,
     pub compress: bool,
+    pub mode: Option<String>,
+    pub dir_mode: Option<String>,
+    pub roll_local_time: bool,
+    pub roll_interval_secs: Option<u64>,
+    pub roll_at: Option<String>,
+    pub roll_minutes: Option<String>,
+    pub roll_compression: Option<String>,
 }
 
 impl LogRotationBlock {
@@ -489,6 +512,9 @@ pub enum Handler {
 
     /// Headers modification only
     Headers(HeadersConfig),
+
+    /// 🚫 Excludes the request from access logging (`log_skip`).
+    LogSkip,
 
     /// Multiple matcher-guarded elements (pipeline, file order preserved)
     Pipeline(Vec<HandlerElement>),

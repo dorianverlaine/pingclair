@@ -46,6 +46,16 @@ lets the rest converge.
 
 ### 🔄 Changed
 
+- 🪵 **Logger sub-options now parse like Caddy.** Log blocks accept
+  `hostnames`, global `include`/`exclude`, `sampling { interval; first;
+  thereafter }`, and the file rotation options (`mode`, `dir_mode`,
+  `roll_compression`, `roll_local_time`, `roll_interval`, `roll_at`,
+  `roll_minutes`). `log_skip` is implemented as request-scoped middleware,
+  and flat `format filter` directives such as
+  `request>headers>Authorization delete` are honoured for the `delete`
+  operation. `log_append`, `log_name`, and the `append`/`journald` encoders
+  remain unsupported.
+
 - 🔐 **`basic_auth` takes the grammar the format defines.** The arguments are
   now `[<hash_algorithm> [<realm>]]` and the block holds nothing but
   `<username> <hashed_password>` accounts, so the documented

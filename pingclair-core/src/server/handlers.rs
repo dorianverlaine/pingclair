@@ -252,6 +252,8 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             Ok(HandlerResponse::status(200))
         }
 
+        HandlerConfig::LogSkip => Ok(HandlerResponse::status(200)),
+
         HandlerConfig::HandleErrors { errors: _ } => {
             // HandleErrors is a configuration directive that attaches error handlers to the route.
             // When executed as part of the normal request flow, it doesn't do anything itself.

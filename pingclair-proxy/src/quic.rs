@@ -1710,6 +1710,7 @@ async fn plan_h3_handler(
             }
             Ok(H3Plan::Continue)
         }
+        HandlerConfig::LogSkip => Ok(H3Plan::Continue),
         HandlerConfig::Rewrite {
             strip_prefix,
             strip_suffix,

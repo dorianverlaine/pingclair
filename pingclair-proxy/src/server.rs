@@ -141,6 +141,9 @@ pub struct RequestContext {
     pub rewritten_path: Option<String>,
     /// 📦 Request-body bytes observed incrementally by the streaming filter.
     pub request_body_bytes: u64,
+    /// 🚫 Whether a `log_skip` middleware excluded this request from access
+    /// logging.
+    pub log_skip: bool,
     /// ⌛ Active whole-request deadline after applying long-connection policy.
     pub request_deadline: Option<std::time::Instant>,
     /// 🌊 Whether this request uses the separately configured long-connection policy.
@@ -195,6 +198,7 @@ impl Default for RequestContext {
             active_connection_metric: None,
             rewritten_path: None,
             request_body_bytes: 0,
+            log_skip: false,
             request_deadline: None,
             long_connection: false,
             upload_pacer: None,
@@ -3088,6 +3092,10 @@ impl PingclairProxy {
                 }
                 Ok(false)
             }
+            HandlerConfig::LogSkip => {
+                ctx.log_skip = true;
+                Ok(false)
+            }
             HandlerConfig::Rewrite {
                 strip_prefix,
                 strip_suffix,
@@ -5395,6 +5403,10 @@ impl ProxyHttp for PingclairProxy {
         e: Option<&pingora_core::Error>,
         ctx: &mut Self::CTX,
     ) {
+        // 🚫 `log_skip` excludes the request before any entry is built.
+        if ctx.log_skip {
+            return;
+        }
         let response_code = session
             .response_written()
             .map(|resp| resp.status.as_u16())

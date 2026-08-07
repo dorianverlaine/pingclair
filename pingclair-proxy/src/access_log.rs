@@ -950,6 +950,10 @@ mod tests {
             request_headers: vec![],
             response_headers: vec![],
             include_tls: false,
+            hostnames: vec![],
+            include: vec![],
+            exclude: vec![],
+            sampling: None,
         };
 
         // 🗂️ Two servers configured with the same path must share one handle,
@@ -999,6 +1003,10 @@ mod tests {
             request_headers: vec![],
             response_headers: vec![],
             include_tls: false,
+            hostnames: vec![],
+            include: vec![],
+            exclude: vec![],
+            sampling: None,
         };
         let logger = AccessLogger::from_config(Some(&cfg)).unwrap().unwrap();
         logger.log(&entry());
@@ -1118,6 +1126,10 @@ mod rotation_tests {
             request_headers: vec![],
             response_headers: vec![],
             include_tls: false,
+            hostnames: vec![],
+            include: vec![],
+            exclude: vec![],
+            sampling: None,
         };
         AccessLogger::from_config(Some(&cfg)).unwrap().unwrap()
     }
@@ -1353,6 +1365,10 @@ mod channel_sharing_tests {
             request_headers: vec![],
             response_headers: vec![],
             include_tls: false,
+            hostnames: vec![],
+            include: vec![],
+            exclude: vec![],
+            sampling: None,
         }
     }
 

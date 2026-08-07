@@ -730,6 +730,9 @@ pub enum HandlerConfig {
         remove: Vec<String>,
     },
 
+    /// 🚫 Marks the request as excluded from access logging (`log_skip`).
+    LogSkip,
+
     /// Pipeline of matcher-guarded elements
     Pipeline { handlers: Vec<HandlerElement> },
 
@@ -1590,6 +1593,31 @@ pub struct LogConfig {
     /// 🔐 Whether to record the negotiated TLS version and cipher.
     #[serde(default)]
     pub include_tls: bool,
+
+    /// 🏠 Hostnames this logger serves, from `log { hostnames … }`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hostnames: Vec<String>,
+
+    /// 🔌 Log sources this logger accepts, from global `log { include … }`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
+
+    /// 🚫 Log sources this logger excludes, from global `log { exclude … }`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+
+    /// 🎲 Sampling policy from `log { sampling { … } }`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<LogSampling>,
+}
+
+/// 🎲 Keeps the first `first` events, then every `thereafter`-th event in a
+/// rolling interval — the shape Caddy's `sampling` block declares.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogSampling {
+    pub interval_secs: u64,
+    pub first: usize,
+    pub thereafter: usize,
 }
 
 /// 🪵 A named per-site access logger from `log <name> { … }`.
@@ -1628,6 +1656,38 @@ pub struct LogRotation {
     /// an order of magnitude on text logs.
     #[serde(default)]
     pub compress: bool,
+
+    /// 🧱 File mode for the active log file, from `output file { mode … }`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+
+    /// 🧱 Directory mode, from `output file { dir_mode … }`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir_mode: Option<String>,
+
+    /// 🕐 Whether rotated names use local time (`roll_local_time`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub roll_local_time: bool,
+
+    /// ⏲️ Fixed rotation interval (`roll_interval`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roll_interval_secs: Option<u64>,
+
+    /// 🕰️ Wall-clock rotation times (`roll_at`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roll_at: Option<String>,
+
+    /// ⏱️ Minute-of-hour rotation times (`roll_minutes`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roll_minutes: Option<String>,
+
+    /// 🗜️ Compression module from `roll_compression`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roll_compression: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl LogRotation {

@@ -647,7 +647,10 @@ example.com {
 `log <name> { … }` suit Caddy : le bloc configure un **logger nommé par site**
 et le nom est son identifiant. `log <name>` sans bloc référence toujours un
 canal global déclaré dans les options globales, et un `log` nu active le
-sink d'accès par défaut du site.
+sink d'accès par défaut du site. Les blocs `log` acceptent `hostnames`,
+`include`/`exclude` (global), `sampling` et les options de rotation de
+fichier (`mode`, `dir_mode`, `roll_*`) ; `log_skip` exclut les requêtes
+correspondantes du journal d'accès.
 
 ### Ce qui n'est pas encore pris en charge
 
@@ -661,7 +664,7 @@ Directives :
 
   `abort` `acme_server` `copy_response` `copy_response_headers` `error` `forward_auth`
   `fs` `handle_errors` `intercept` `invoke` `log_append` `log_name`
-  `log_skip` `map` `method` `metrics` `php_fastcgi` `push`
+  `map` `method` `metrics` `php_fastcgi` `push`
   `request_body` `request_header` `skip_log` `tracing` `vars`
 
 Options globales :

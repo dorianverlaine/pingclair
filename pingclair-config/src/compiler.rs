@@ -411,6 +411,24 @@ fn validate_log_channels_exist(config: &PingclairConfig) -> CompileResult<()> {
     for server in &config.servers {
         for channel in &server.log_channels {
             if !config.logging.channels.contains_key(channel) {
+                // 🧭 Upstream `log <name>` names a log *source*: a global
+                // logger subscribes to it with `include http.log.access.<name>`.
+                // The name is therefore valid even when no channel of that
+                // exact name exists.
+                let included_elsewhere = config
+                    .logging
+                    .channels
+                    .values()
+                    .chain(config.logging.default.iter())
+                    .any(|logger| {
+                        logger
+                            .include
+                            .iter()
+                            .any(|source| source == &format!("http.log.access.{channel}"))
+                    });
+                if included_elsewhere {
+                    continue;
+                }
                 let mut known: Vec<&str> =
                     config.logging.channels.keys().map(String::as_str).collect();
                 known.sort_unstable();
@@ -634,6 +652,7 @@ fn reject_unimplemented_handler(handler: &HandlerConfig) -> CompileResult<()> {
         | HandlerConfig::Rewrite { .. }
         | HandlerConfig::Respond { .. }
         | HandlerConfig::Headers { .. }
+        | HandlerConfig::LogSkip
         | HandlerConfig::BasicAuth { .. }
         | HandlerConfig::RateLimit { .. }
         | HandlerConfig::Cors { .. }
@@ -1186,10 +1205,27 @@ fn compile_log(log: &LogBlock) -> CompileResult<LogConfig> {
             max_age_secs: log.rotation.max_age_secs,
             keep: log.rotation.keep,
             compress: log.rotation.compress,
+            mode: log.rotation.mode.clone(),
+            dir_mode: log.rotation.dir_mode.clone(),
+            roll_local_time: log.rotation.roll_local_time,
+            roll_interval_secs: log.rotation.roll_interval_secs,
+            roll_at: log.rotation.roll_at.clone(),
+            roll_minutes: log.rotation.roll_minutes.clone(),
+            roll_compression: log.rotation.roll_compression.clone(),
         },
         request_headers: log.request_headers.clone(),
         response_headers: log.response_headers.clone(),
         include_tls: log.include_tls,
+        hostnames: log.hostnames.clone(),
+        include: log.include.clone(),
+        exclude: log.exclude.clone(),
+        sampling: log
+            .sampling
+            .map(|sampling| pingclair_core::config::LogSampling {
+                interval_secs: sampling.interval_secs,
+                first: sampling.first,
+                thereafter: sampling.thereafter,
+            }),
     })
 }
 
@@ -1488,6 +1524,8 @@ fn compile_handler(
             add: headers.add.clone(),
             remove: headers.remove.clone(),
         }),
+
+        Handler::LogSkip => Ok(HandlerConfig::LogSkip),
 
         Handler::Pipeline(elements) => {
             let handlers = elements

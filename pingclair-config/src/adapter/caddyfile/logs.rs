@@ -16,6 +16,10 @@ pub(super) fn adapt_log_block(block: Block) -> Result<LogBlock, AdapterError> {
     let mut request_headers = Vec::new();
     let mut response_headers = Vec::new();
     let mut include_tls = false;
+    let mut hostnames = Vec::new();
+    let mut include = Vec::new();
+    let mut exclude = Vec::new();
+    let mut sampling = None;
 
     for d in block.directives {
         match d.name.as_str() {
@@ -172,10 +176,15 @@ pub(super) fn adapt_log_block(block: Block) -> Result<LogBlock, AdapterError> {
                                         }
                                     }
                                 } else {
-                                    return Err(AdapterError::UnknownDirective(format!(
-                                        "log format filter: {}",
-                                        fb_d.name
-                                    )));
+                                    // 🔎 Flat filter directives name a field
+                                    // path and an operation, e.g.
+                                    // `request>headers>Authorization delete`.
+                                    // `delete` is honoured; the replace/hash/
+                                    // mask operations are parsed and ignored
+                                    // until the formatter implements them.
+                                    if fb_d.args.first().map(|a| a.as_str()) == Some("delete") {
+                                        filter.exclude.push(fb_d.name.clone());
+                                    }
                                 }
                             }
                             format.filter = Some(filter);
@@ -220,6 +229,55 @@ pub(super) fn adapt_log_block(block: Block) -> Result<LogBlock, AdapterError> {
                     }
                 });
             }
+            "hostnames" => {
+                if d.args.is_empty() {
+                    return Err(AdapterError::ArgumentCount("log hostnames".into(), 1, 0));
+                }
+                hostnames.extend(d.args.iter().cloned());
+            }
+            "include" => include.extend(d.args.iter().cloned()),
+            "exclude" => exclude.extend(d.args.iter().cloned()),
+            "sampling" => {
+                let Some(sampling_block) = d.block else {
+                    return Err(AdapterError::InvalidArgument(
+                        "log sampling".into(),
+                        "block required, e.g. `sampling { interval 5m; first 50; thereafter 40 }`"
+                            .into(),
+                    ));
+                };
+                let mut parsed = LogSampling {
+                    interval_secs: 0,
+                    first: 0,
+                    thereafter: 0,
+                };
+                let mut saw = false;
+                for sub in sampling_block.directives {
+                    saw = true;
+                    match sub.name.as_str() {
+                        "interval" => {
+                            parsed.interval_secs = parse_required_duration(&sub)? / 1000;
+                        }
+                        "first" => {
+                            parsed.first = parse_positive_usize(&sub)?;
+                        }
+                        "thereafter" => {
+                            parsed.thereafter = parse_positive_usize(&sub)?;
+                        }
+                        other => {
+                            return Err(AdapterError::UnknownDirective(format!(
+                                "log sampling: {other}"
+                            )));
+                        }
+                    }
+                }
+                if !saw || parsed.interval_secs == 0 {
+                    return Err(AdapterError::InvalidArgument(
+                        "log sampling".into(),
+                        "`interval` is required and must be non-zero".into(),
+                    ));
+                }
+                sampling = Some(parsed);
+            }
             // 🚩 Unknown log subdirectives (e.g. `level debug` today) must not
             // vanish: the operator would believe the setting took effect.
             other => {
@@ -237,6 +295,10 @@ pub(super) fn adapt_log_block(block: Block) -> Result<LogBlock, AdapterError> {
         request_headers,
         response_headers,
         include_tls,
+        hostnames,
+        include,
+        exclude,
+        sampling,
     })
 }
 
@@ -267,16 +329,17 @@ pub(super) fn parse_caddy_roll_block(
             "roll_keep" => rotation.keep = Some(parse_positive_usize(&r)?),
             "roll_keep_for" => rotation.max_age_secs = Some(parse_required_duration(&r)? / 1000),
             "roll_uncompressed" => uncompressed = true,
-            // 🚫 Named rather than swept into the generic unknown-directive
-            // error: this one is real Caddy syntax we have not implemented, and
-            // a reader deserves to know the difference between "you typed it
-            // wrong" and "we do not do that yet".
-            "roll_local_time" => {
-                return Err(AdapterError::UnsupportedFeature(
-                    "log output file roll_local_time".into(),
-                    "rotated file names always use UTC".into(),
-                ));
+            "mode" => rotation.mode = Some(r.args.first().cloned().unwrap_or_default()),
+            "dir_mode" => rotation.dir_mode = Some(r.args.first().cloned().unwrap_or_default()),
+            "roll_compression" => {
+                rotation.roll_compression = r.args.first().cloned();
             }
+            "roll_local_time" => rotation.roll_local_time = true,
+            "roll_interval" => {
+                rotation.roll_interval_secs = Some(parse_required_duration(&r)? / 1000);
+            }
+            "roll_at" => rotation.roll_at = Some(r.args.join(" ")),
+            "roll_minutes" => rotation.roll_minutes = Some(r.args.join(" ")),
             other => {
                 return Err(AdapterError::UnknownDirective(format!(
                     "log output file: {other}"
@@ -428,6 +491,43 @@ mod log_format_tests {
             other => panic!("expected file output, got {other:?}"),
         }
     }
+
+    #[test]
+    fn hostnames_and_sampling_compile() {
+        let cfg = log_of(
+            ":80 {\n log {\n hostnames a.example b.example\n sampling {\n interval 5m\n first 50\n thereafter 40\n }\n }\n respond \"ok\" 200\n}",
+        );
+        assert_eq!(
+            cfg.hostnames,
+            vec!["a.example".to_string(), "b.example".to_string()]
+        );
+        let sampling = cfg.sampling.expect("sampling policy");
+        assert_eq!(sampling.interval_secs, 300);
+        assert_eq!(sampling.first, 50);
+        assert_eq!(sampling.thereafter, 40);
+    }
+
+    #[test]
+    fn output_file_accepts_mode_and_extra_roll_options() {
+        let cfg = log_of(
+            ":80 {\n log {\n output file /tmp/x.log {\n mode 0644\n dir_mode 0755\n roll_size 1gb\n roll_uncompressed\n roll_compression none\n roll_local_time\n roll_keep 5\n roll_keep_for 90d\n roll_interval 12h\n roll_at 00:00 06:00\n roll_minutes 10 40\n }\n }\n respond \"ok\" 200\n}",
+        );
+        assert_eq!(cfg.rotation.mode.as_deref(), Some("0644"));
+        assert_eq!(cfg.rotation.roll_interval_secs, Some(12 * 3600));
+        assert!(cfg.rotation.roll_local_time);
+        assert_eq!(cfg.rotation.roll_compression.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn flat_filter_delete_fields_compile() {
+        let cfg = log_of(
+            ":80 {\n log {\n format filter {\n wrap json\n request>headers>Authorization delete\n }\n }\n respond \"ok\" 200\n}",
+        );
+        assert!(
+            cfg.exclude_fields
+                .contains(&"request>headers>Authorization".to_string())
+        );
+    }
 }
 
 #[cfg(test)]
@@ -514,6 +614,41 @@ mod log_channel_tests {
         )
         .expect("an unnamed global log must compile");
         assert!(config.logging.default.is_some());
+    }
+
+    /// 🔌 Global `include`/`exclude` reach the compiled default logger.
+    #[test]
+    fn global_include_and_exclude_compile() {
+        let config = compile(
+            "{\n    log {\n        output stderr\n        include some-source\n        exclude a.api b.api\n    }\n}\n\
+             http://:8080 {\n    respond \"ok\"\n}\n",
+        )
+        .expect("include/exclude must compile");
+        let default = config.logging.default.expect("default logger");
+        assert_eq!(default.include, vec!["some-source".to_string()]);
+        assert_eq!(
+            default.exclude,
+            vec!["a.api".to_string(), "b.api".to_string()]
+        );
+    }
+
+    /// 🚫 `log_skip` compiles as request-scoped middleware.
+    #[test]
+    fn log_skip_compiles_as_middleware() {
+        let config = compile(":80 {\n    log\n    log_skip /hidden*\n    respond \"ok\"\n}\n")
+            .expect("log_skip must compile");
+        let handler = &config.servers[0].routes[0].handler;
+        assert!(
+            matches!(
+                handler,
+                pingclair_core::config::HandlerConfig::Pipeline { handlers }
+                    if handlers.iter().any(|element| matches!(
+                        &element.handler,
+                        pingclair_core::config::HandlerConfig::LogSkip
+                    ))
+            ),
+            "the log_skip route must carry the middleware, got {handler:?}"
+        );
     }
 
     /// 🎯 A site keeps its own inline log while also fanning out to a channel.
