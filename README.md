@@ -296,6 +296,10 @@ H1/H2 and H3 use the same persisted leaf. `tls internal` requires a concrete
 site name and cannot be combined with `tls auto`, ACME email, or manual
 certificate paths.
 
+The global `local_certs` option applies the same choice to every site that
+has no certificate management of its own: all default automation uses the
+persisted local authority instead of public ACME.
+
 When Pingclair is behind a load balancer or CDN that you operate, list only
 those proxy networks in the global block. Untrusted peers cannot supply
 `X-Forwarded-For`, `X-Real-IP`, or `X-Forwarded-Proto` identity:
@@ -694,8 +698,8 @@ Global options:
 
   `acme_ca` `acme_ca_root` `acme_dns` `acme_eab` `cert_issuer` `cert_lifetime`
   `default_bind` `default_sni` `dns` `ech` `events` `fallback_sni`
-  `filesystem` `frankenphp` `key_type` `local_certs` `ocsp_interval` `ocsp_stapling`
-  `on_demand_tls` `persist_config` `pki` `preferred_chains` `renew_interval` `renewal_window_ratio`
+  `filesystem` `frankenphp` `key_type` `ocsp_interval` `ocsp_stapling`
+  `on_demand_tls` `pki` `preferred_chains` `renew_interval` `renewal_window_ratio`
   `shutdown_delay` `skip_install_trust` `storage` `storage_clean_interval`
 
 Three consequences worth stating plainly, because they decide whether

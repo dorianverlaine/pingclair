@@ -11,6 +11,36 @@ use crate::parser::caddy_ast::Directive;
 pub(super) fn adapt_tls_directive(d: &Directive) -> Result<TlsDirective, AdapterError> {
     let mut tls = TlsDirective::default();
 
+    // 📧 Positional arguments mean the same with and without a block, so they
+    // are read once. A single argument containing `@` is the ACME account
+    // email, decided exactly the way upstream decides it; anything else on
+    // its own is refused rather than silently dropped when a block follows.
+    match d.args.as_slice() {
+        [] => {}
+        [arg] if arg == "off" => tls.off = true,
+        [arg] if arg == "auto" => tls.auto = true,
+        [arg] if arg == "internal" => tls.internal = true,
+        [arg] if arg.contains('@') => tls.acme_email = Some(arg.clone()),
+        [arg] if arg == "force_automate" => {
+            return Err(AdapterError::UnsupportedFeature(
+                "tls force_automate".into(),
+                "Pingclair does not implement certificate force-automation yet".into(),
+            ));
+        }
+        [cert, key] => {
+            tls.cert = Some(cert.clone());
+            tls.key = Some(key.clone());
+        }
+        _ => {
+            return Err(AdapterError::InvalidArgument(
+                "tls".into(),
+                "expected 'off', 'auto', 'internal', an email address, '<cert> <key>', \
+                 or a block"
+                    .into(),
+            ));
+        }
+    }
+
     if let Some(block) = &d.block {
         for sub in &block.directives {
             match sub.name.as_str() {
@@ -55,22 +85,16 @@ pub(super) fn adapt_tls_directive(d: &Directive) -> Result<TlsDirective, Adapter
                 _ => return Err(AdapterError::UnknownDirective(format!("tls: {}", sub.name))),
             }
         }
-    } else {
-        match d.args.as_slice() {
-            [arg] if arg == "off" => tls.off = true,
-            [arg] if arg == "auto" => tls.auto = true,
-            [arg] if arg == "internal" => tls.internal = true,
-            [cert, key] => {
-                tls.cert = Some(cert.clone());
-                tls.key = Some(key.clone());
-            }
-            _ => {
-                return Err(AdapterError::InvalidArgument(
-                    "tls".into(),
-                    "expected 'off', 'auto', 'internal', '<cert> <key>', or a block".into(),
-                ));
-            }
-        }
+    }
+
+    // 🚫 `tls off` with a block contradicts itself — one half says there is
+    // no TLS and the other configures it — so the combination is refused
+    // rather than letting one half win silently.
+    if tls.off && d.block.is_some() {
+        return Err(AdapterError::InvalidArgument(
+            "tls".into(),
+            "off cannot be combined with a block".into(),
+        ));
     }
 
     // 🔗 A certificate without its matching private key is unusable.

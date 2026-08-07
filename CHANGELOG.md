@@ -64,6 +64,15 @@ lets the rest converge.
   directive tree cannot re-parse a spliced line the way Caddy's token layer
   can.
 
+- 🔐 **`validate` and `adapt` now agree on three TLS/global spellings.** The
+  `tls <email>` shorthand sets the ACME account while keeping automatic
+  issuance; the global `persist_config` option accepts only `off` (the
+  behaviour this server already has, since the admin config is never
+  persisted) and refuses `on`; and the global `local_certs` option moves
+  every site without its own certificate management onto the built-in local
+  authority. `admin` with a block but no address now defaults its listen
+  address instead of being refused.
+
 - 🔐 **`basic_auth` takes the grammar the format defines.** The arguments are
   now `[<hash_algorithm> [<realm>]]` and the block holds nothing but
   `<username> <hashed_password>` accounts, so the documented

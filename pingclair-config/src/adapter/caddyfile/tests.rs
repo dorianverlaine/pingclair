@@ -788,6 +788,25 @@ mod global_tests {
         let admin = ast.global.unwrap().inner.admin.expect("admin directive");
         assert!(!admin.enabled);
     }
+
+    /// 🌐 `admin` with a block but no address keeps the default endpoint,
+    /// the way Caddy parses it — an origin allowlist is not a reason to
+    /// demand an address the format does not.
+    #[test]
+    fn test_admin_without_an_address_uses_the_default_listen() {
+        let source = r#"{
+            admin {
+                origins localhost:2019
+            }
+        }"#;
+        let directives = parse(source).unwrap();
+        let ast = adapt(directives).unwrap();
+
+        let admin = ast.global.unwrap().inner.admin.expect("admin directive");
+        assert_eq!(admin.listen, "127.0.0.1:2019");
+        assert!(admin.enabled);
+        assert_eq!(admin.origins, ["localhost:2019"]);
+    }
 }
 
 // MARK: - P1 Fail-Closed Tests

@@ -292,6 +292,10 @@ propriétaire. H1/H2 et H3 utilisent le même certificat leaf persistant.
 `tls internal` exige un nom de site concret et ne peut pas être combiné avec
 `tls auto`, un email ACME ou des chemins de certificat manuels.
 
+L'option globale `local_certs` applique le même choix à chaque site sans
+gestion de certificats propre : toute l'automatisation par défaut utilise
+l'autorité locale persistante au lieu de l'ACME public.
+
 Lorsque Pingclair se trouve derrière un load balancer ou un CDN que vous
 administrez, déclarez uniquement ces réseaux mandataires dans le bloc global.
 Un pair non approuvé ne peut pas fournir l'identité via `X-Forwarded-For`,
@@ -699,8 +703,8 @@ Options globales :
 
   `acme_ca` `acme_ca_root` `acme_dns` `acme_eab` `cert_issuer` `cert_lifetime`
   `default_bind` `default_sni` `dns` `ech` `events` `fallback_sni`
-  `filesystem` `frankenphp` `key_type` `local_certs` `ocsp_interval` `ocsp_stapling`
-  `on_demand_tls` `persist_config` `pki` `preferred_chains` `renew_interval` `renewal_window_ratio`
+  `filesystem` `frankenphp` `key_type` `ocsp_interval` `ocsp_stapling`
+  `on_demand_tls` `pki` `preferred_chains` `renew_interval` `renewal_window_ratio`
   `shutdown_delay` `skip_install_trust` `storage` `storage_clean_interval`
 
 Trois conséquences méritent d'être énoncées franchement, car elles décident si

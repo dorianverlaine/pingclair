@@ -283,6 +283,9 @@ Pingclair 會在 `PINGCLAIR_TLS_STORE` 下持久化一個有效十年的本機 C
 `authority.json`。H1/H2 與 H3 共用同一份持久化 leaf。`tls internal`
 必須搭配明確站台名稱，且不可和 `tls auto`、ACME email 或手動憑證路徑混用。
 
+全域的 `local_certs` 選項對所有沒有自己憑證管理的站台套用同一選擇：所有
+預設自動化改用持久化本機 CA，而不是公開 ACME。
+
 若 Pingclair 位於你所管理的負載平衡器或 CDN 後方，只能在全域區塊列出可信
 代理網段。未受信任的上一跳不能透過 `X-Forwarded-For`、`X-Real-IP` 或
 `X-Forwarded-Proto` 偽造 client identity：
@@ -661,8 +664,8 @@ Directive：
 
   `acme_ca` `acme_ca_root` `acme_dns` `acme_eab` `cert_issuer` `cert_lifetime`
   `default_bind` `default_sni` `dns` `ech` `events` `fallback_sni`
-  `filesystem` `frankenphp` `key_type` `local_certs` `ocsp_interval` `ocsp_stapling`
-  `on_demand_tls` `persist_config` `pki` `preferred_chains` `renew_interval` `renewal_window_ratio`
+  `filesystem` `frankenphp` `key_type` `ocsp_interval` `ocsp_stapling`
+  `on_demand_tls` `pki` `preferred_chains` `renew_interval` `renewal_window_ratio`
   `shutdown_delay` `skip_install_trust` `storage` `storage_clean_interval`
 
 其中三件值得直接講明白，因為它們決定的是「Pingclair 適不適合你」，

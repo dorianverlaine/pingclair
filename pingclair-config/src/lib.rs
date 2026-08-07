@@ -178,6 +178,7 @@ fn merge_globals(
         https_port,
         metrics,
         auto_https,
+        local_certs,
         blocked_ips,
         trusted_proxies,
         upstream_keepalive_pool_size,
@@ -204,6 +205,9 @@ fn merge_globals(
     }
     if auto_https != default.auto_https {
         into.auto_https = auto_https;
+    }
+    if local_certs != default.local_certs {
+        into.local_certs = local_certs;
     }
     if upstream_keepalive_pool_size.is_some() {
         into.upstream_keepalive_pool_size = upstream_keepalive_pool_size;
@@ -943,6 +947,82 @@ mod tests {
             config.servers[0].tls.is_none(),
             "tls off must clear the https-scheme default"
         );
+    }
+
+    /// 📧 `tls <email>` is the ACME account shorthand, decided exactly as
+    /// upstream decides it: a single argument containing `@` is an email,
+    /// anything else on its own is refused.
+    #[test]
+    fn test_compile_tls_email_shorthand() {
+        let source = r#"
+            example.com {
+                tls abc@example.com
+                respond "OK"
+            }
+        "#;
+
+        let config = compile(source).unwrap();
+        let tls = config.servers[0].tls.as_ref().expect("tls config");
+        assert_eq!(tls.acme_email.as_deref(), Some("abc@example.com"));
+        assert!(tls.auto, "an email alone must keep automatic issuance");
+
+        // 🚫 A single argument without `@` is not an email and has no other
+        // reading here, so it is refused instead of becoming a certificate
+        // path with a missing key.
+        let error = compile("example.com {\n    tls not-an-email\n    respond \"OK\"\n}")
+            .expect_err("a lone non-email argument must be refused");
+        assert!(error.to_string().contains("email address"), "{error}");
+    }
+
+    /// 🔐 The global `local_certs` option moves default automation onto the
+    /// built-in local authority, exactly as `tls internal` would.
+    #[test]
+    fn test_compile_local_certs_uses_the_internal_authority() {
+        let source = r#"
+            {
+                local_certs
+            }
+            example.com {
+                respond "OK"
+            }
+        "#;
+
+        let config = compile(source).unwrap();
+        let tls = config.servers[0].tls.as_ref().expect("tls config");
+        assert!(
+            tls.internal && !tls.auto,
+            "local_certs must select the internal authority: {tls:?}"
+        );
+    }
+
+    /// 🚩 `local_certs` is a bare flag, like `debug`; an argument would read
+    /// like `off` disabled it while Caddy's parser ignores the word entirely,
+    /// so both readings are refused.
+    #[test]
+    fn test_compile_local_certs_rejects_arguments() {
+        let error = compile("{\n    local_certs off\n}\nexample.com {\n}")
+            .expect_err("an argument to local_certs must be refused");
+        assert!(error.to_string().contains("local_certs"), "{error}");
+    }
+
+    /// 💾 `persist_config off` is the only accepted spelling: this server
+    /// never persists the admin config, so `off` is the behaviour it already
+    /// has, and `on` or a bare option would claim something it does not do.
+    #[test]
+    fn test_compile_persist_config_accepts_off_and_refuses_everything_else() {
+        compile("{\n    persist_config off\n}\n:8080 {\n}")
+            .expect("persist_config off must compile");
+
+        for source in [
+            "{\n    persist_config on\n}\n:8080 {\n}",
+            "{\n    persist_config\n}\n:8080 {\n}",
+        ] {
+            let error = compile(source).expect_err("only `off` may be accepted");
+            assert!(
+                error.to_string().contains("persist_config"),
+                "the error must name the option: {error}"
+            );
+        }
     }
 
     /// 🎯 `https://host` must not be worth less than the bare hostname: it

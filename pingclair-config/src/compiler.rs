@@ -65,11 +65,16 @@ pub fn compile_ast(ast: &Ast) -> CompileResult<PingclairConfig> {
                 .iter()
                 .any(|name| !name.is_empty() && name != "_")
         {
-            let internal = block.names.iter().any(|name| {
-                name == "localhost"
-                    || name.ends_with(".localhost")
-                    || name.parse::<std::net::IpAddr>().is_ok()
-            });
+            // 🔐 The global `local_certs` option moves every default policy
+            // onto the built-in local authority, exactly as a `tls internal`
+            // on the site would; a site that named localhost or an IP
+            // literal already lands there.
+            let internal = config.global.local_certs
+                || block.names.iter().any(|name| {
+                    name == "localhost"
+                        || name.ends_with(".localhost")
+                        || name.parse::<std::net::IpAddr>().is_ok()
+                });
             let automatic = TlsConfig {
                 auto: !internal,
                 internal,
@@ -102,6 +107,12 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
     // Set global ACME email
     if let Some(email) = &global.email {
         config.global.email = Some(email.clone());
+    }
+
+    // 🔐 Caddy's `local_certs` option selects the built-in local authority
+    // for every site that has no explicit certificate management.
+    if global.local_certs {
+        config.global.local_certs = true;
     }
 
     // 🌐 Port overrides flow straight into the runtime config; every
@@ -285,6 +296,14 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
             }
             if let Some(http3) = tls.http3 {
                 merged.http3 = http3;
+            }
+            // 📧 An ACME email with no certificate management of its own is
+            // an instruction to *keep* automatic issuance with that account,
+            // not to stop it — `tls you@example.com` and
+            // `tls { acme_email you@example.com }` both mean "issue
+            // automatically as this account".
+            if merged.acme_email.is_some() && merged.cert.is_none() && !merged.internal {
+                merged.auto = true;
             }
             config.tls = Some(merged);
         }

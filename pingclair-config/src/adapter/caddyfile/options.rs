@@ -211,7 +211,58 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                                 enforce_origin,
                             });
                         }
-                        None => return Err(AdapterError::ArgumentCount("admin".into(), 1, 0)),
+                        // 🌐 No address means the default admin endpoint,
+                        // exactly as upstream parses it — `admin { origins
+                        // … }` must not demand an address Caddy does not.
+                        None => {
+                            global.admin = Some(AdminDirective {
+                                listen: "127.0.0.1:2019".into(),
+                                enabled: true,
+                                api_key: None,
+                                origins,
+                                enforce_origin,
+                            });
+                        }
+                    }
+                }
+                "local_certs" => {
+                    // 🔐 A bare toggle, like Caddy's: default automation
+                    // switches to the built-in local authority. Any argument
+                    // is a mistake, because `local_certs off` would read like
+                    // it disabled the option while Caddy's flag parser ignores
+                    // the word entirely — a silent misreading either way.
+                    if !sub.args.is_empty() {
+                        return Err(AdapterError::ArgumentCount(
+                            "local_certs".into(),
+                            0,
+                            sub.args.len(),
+                        ));
+                    }
+                    global.local_certs = true;
+                }
+                "persist_config" => {
+                    // 💾 `persist_config off` is the only accepted spelling,
+                    // exactly as upstream parses it: Caddy's admin API
+                    // persists the loaded config by default, and this server
+                    // never does, so `off` is the behaviour we already have.
+                    // `on` and a bare option are refused rather than guessed.
+                    match sub.args.as_slice() {
+                        [value] if value == "off" => global.persist_config_off = true,
+                        [value] => {
+                            return Err(AdapterError::InvalidArgument(
+                                "persist_config".into(),
+                                format!("must be 'off', got {value}"),
+                            ));
+                        }
+                        [_, _, ..] => {
+                            return Err(AdapterError::InvalidArgument(
+                                "persist_config".into(),
+                                "must be a single 'off'".into(),
+                            ));
+                        }
+                        [] => {
+                            return Err(AdapterError::ArgumentCount("persist_config".into(), 1, 0));
+                        }
                     }
                 }
                 "trusted_proxies" => {

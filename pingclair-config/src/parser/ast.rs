@@ -55,6 +55,13 @@ pub struct GlobalBlock {
     pub metrics: Option<bool>,
     pub auto_https: Option<AutoHttpsMode>,
     pub admin: Option<AdminDirective>,
+    /// 🔐 Caddy's global `local_certs` toggle: default automation uses the
+    /// built-in local authority instead of public ACME.
+    pub local_certs: bool,
+    /// 💾 Caddy's `persist_config off` toggle. Pingclair never persists the
+    /// admin config, so the only accepted spelling is the one that matches
+    /// the behaviour we already have.
+    pub persist_config_off: bool,
     /// 🛡️ Proxy IP or CIDR ranges allowed to supply client identity headers.
     pub trusted_proxies: Vec<String>,
     /// 🔄 Upstream re-resolution interval in seconds; `Some(0)` disables it.

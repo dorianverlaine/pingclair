@@ -64,6 +64,11 @@ pub struct GlobalConfig {
     #[serde(default)]
     pub auto_https: AutoHttpsMode,
 
+    /// 🔐 Whether default automation uses the built-in local authority
+    /// instead of public ACME, matching Caddy's global `local_certs` option.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub local_certs: bool,
+
     /// Blocked IP addresses (CIDR supported)
     #[serde(default)]
     pub blocked_ips: Vec<String>,
@@ -133,6 +138,7 @@ impl Default for GlobalConfig {
             https_port: default_https_port(),
             metrics: default_bool_true(),
             auto_https: AutoHttpsMode::default(),
+            local_certs: false,
             blocked_ips: Vec::new(),
             trusted_proxies: Vec::new(),
             upstream_keepalive_pool_size: None,
@@ -1734,6 +1740,21 @@ mod tests {
         }"#;
         let config: PingclairConfig = serde_json::from_str(json).unwrap();
         assert!(config.debug);
+    }
+
+    /// 🔐 `local_certs` stays absent in legacy documents and survives a
+    /// round trip when set, so JSON configuration can carry it without
+    /// re-defaulting old files.
+    #[test]
+    fn test_local_certs_round_trip_and_legacy_default() {
+        let legacy: PingclairConfig = serde_json::from_str(r#"{"global":{}}"#).unwrap();
+        assert!(!legacy.global.local_certs);
+
+        let config: PingclairConfig =
+            serde_json::from_str(r#"{"global":{"local_certs":true}}"#).unwrap();
+        assert!(config.global.local_certs);
+        let rendered = serde_json::to_string(&config).unwrap();
+        assert!(rendered.contains("\"local_certs\":true"), "{rendered}");
     }
 
     #[test]
