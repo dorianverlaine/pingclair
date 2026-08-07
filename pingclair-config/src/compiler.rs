@@ -11,7 +11,7 @@ use pingclair_core::config::{
     AccessControlConfig as CoreAccessControlConfig, AdminConfig,
     AutoHttpsMode as CoreAutoHttpsMode, HandlerConfig, HandlerElement as CoreHandlerElement,
     LoadBalanceConfig, LogConfig, LogFormat as CoreLogFormat, LogOutput as CoreLogOutput,
-    Matcher as CoreMatcher, MatcherCondition, PingclairConfig, ProxyUpstream,
+    Matcher as CoreMatcher, MatcherCondition, NamedLogConfig, PingclairConfig, ProxyUpstream,
     RateLimitKey as CoreRateLimitKey, ReverseProxyConfig, RouteConfig, ServerConfig, TlsConfig,
     default_encodings, default_gzip_types,
 };
@@ -166,6 +166,9 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
                 .channels
                 .insert(name.clone(), compile_log(block)?);
         }
+        if let Some(default) = &logging.default {
+            config.logging.default = Some(compile_log(default)?);
+        }
     }
 
     if !global.protocols.is_empty() {
@@ -215,6 +218,7 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         tls: None,
         log: None,
         log_channels: server.log_channels.clone(),
+        named_logs: Vec::new(),
         client_max_body_size: 1024 * 1024, // 1MB default
         limits: pingclair_core::config::ResourceLimitsConfig {
             header_timeout_ms: server.limits.header_timeout_ms,
@@ -296,6 +300,16 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
     if let Some(log) = &server.log {
         config.log = Some(compile_log(&log.inner)?);
     }
+    config.named_logs = server
+        .named_logs
+        .iter()
+        .map(|log| {
+            Ok(NamedLogConfig {
+                name: log.inner.name.clone().unwrap_or_default(),
+                config: compile_log(&log.inner)?,
+            })
+        })
+        .collect::<CompileResult<Vec<_>>>()?;
 
     // Routes
     if let Some(routes) = &server.routes {

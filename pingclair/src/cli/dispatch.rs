@@ -436,6 +436,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 tls,
                 log: None,
                 log_channels: Vec::new(),
+                named_logs: Vec::new(),
                 client_max_body_size: 10 * 1024 * 1024, // 10MB
                 limits: Default::default(),
                 security: Default::default(),
@@ -557,6 +558,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                     include_tls: false,
                 }),
                 log_channels: Vec::new(),
+                named_logs: Vec::new(),
                 client_max_body_size: 10 * 1024 * 1024,
                 limits: Default::default(),
                 security: Default::default(),

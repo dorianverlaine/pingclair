@@ -762,6 +762,8 @@ pub struct ProxyState {
     /// 📝 Per-server access logger built from this server's `log` block.
     /// `None` keeps the previous process-wide `tracing` output.
     access_logger: Option<Arc<crate::access_log::AccessLogger>>,
+    /// 🪵 Named per-site loggers from `log <name> { … }`.
+    named_loggers: Vec<(String, Arc<crate::access_log::AccessLogger>)>,
 
     /// 🪵 Shared channels this server also writes to, resolved once at
     /// configuration time. Empty in the common case, so the fan-out loop below
@@ -1370,6 +1372,20 @@ impl ProxyState {
             .iter()
             .filter_map(|name| crate::access_log::channel_logger(name))
             .collect();
+        let mut named_loggers = Vec::new();
+        for named in &config.named_logs {
+            match crate::access_log::AccessLogger::from_config(Some(&named.config)) {
+                Ok(Some(logger)) => named_loggers.push((named.name.clone(), Arc::new(logger))),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        logger = %named.name,
+                        "❌ Could not open named access logger"
+                    );
+                }
+            }
+        }
 
         let access_logger = match crate::access_log::AccessLogger::from_config(config.log.as_ref())
         {
@@ -1397,6 +1413,7 @@ impl ProxyState {
             access_controls,
             rewrite_regexes,
             access_logger,
+            named_loggers,
             log_channels,
         }
     }
@@ -5468,12 +5485,23 @@ impl ProxyHttp for PingclairProxy {
         }
 
         // 📝 Prefer this server's configured access logger. Only when the
-        // server has no `log` block do we fall back to the process-wide
-        // tracing output, so existing configs keep their current behavior.
-        let configured_logger = ctx
-            .state
-            .as_ref()
-            .and_then(|state| state.access_logger.clone());
+        // server has no `log` block and no named loggers do we fall back to
+        // the process-wide tracing output.
+        let state_ref = ctx.state.as_ref();
+        let named_loggers = state_ref
+            .map(|state| state.named_loggers.clone())
+            .unwrap_or_default();
+        let configured_logger = state_ref
+            .and_then(|state| state.access_logger.clone())
+            .or_else(|| named_loggers.first().map(|(_, logger)| logger.clone()));
+        let extra_named_loggers = if state_ref
+            .and_then(|state| state.access_logger.as_ref())
+            .is_some()
+        {
+            named_loggers
+        } else {
+            named_loggers.into_iter().skip(1).collect()
+        };
 
         if let Some(logger) = configured_logger {
             let upstream_addr = ctx.upstream.as_ref().map(|u| u.addr.to_string());
@@ -5582,6 +5610,10 @@ impl ProxyHttp for PingclairProxy {
                 .unwrap_or_default()
             {
                 channel.log(&entry);
+            }
+            // 🪵 Named per-site loggers, each formatted with its own config.
+            for (_, logger) in &extra_named_loggers {
+                logger.log(&entry);
             }
             return;
         }

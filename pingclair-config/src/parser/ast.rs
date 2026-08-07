@@ -173,6 +173,9 @@ pub struct ServerBlock {
     /// 🪵 Global channel names this server also writes to (`log <name>`).
     pub log_channels: Vec<String>,
 
+    /// 🪵 Named per-site access loggers from `log <name> { … }`.
+    pub named_logs: Vec<Node<LogBlock>>,
+
     /// TLS configuration (from the `tls` directive)
     pub tls: Option<TlsDirective>,
 
@@ -278,6 +281,8 @@ pub struct LoggingConfig {
     pub format: LogFormat,
     /// 🪵 Named channels from `log <name> { … }` in the global block.
     pub channels: BTreeMap<String, LogBlock>,
+    /// 🪵 Default logger from an unnamed global `log { … }` block.
+    pub default: Option<LogBlock>,
 }
 
 /// Log level
@@ -294,6 +299,9 @@ pub enum LogLevel {
 /// Log block (per-server)
 #[derive(Debug, Clone)]
 pub struct LogBlock {
+    /// 🔖 Logger name from `log <name> { … }`; `None` for the site's default
+    /// access logger.
+    pub name: Option<String>,
     /// 🔄 File rotation policy from `roll { … }`.
     pub rotation: LogRotationBlock,
     /// 🏷️ Header names to record, from `format filter { headers { … } }`.
@@ -947,6 +955,7 @@ impl ServerBlock {
             gzip_types: Vec::new(),
             log: None,
             log_channels: Vec::new(),
+            named_logs: Vec::new(),
             tls: None,
             routes: None,
             matchers: HashMap::new(),

@@ -281,6 +281,15 @@ pub struct ServerConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub log_channels: Vec<String>,
 
+    /// 🪵 Named per-site access loggers from `log <name> { … }`.
+    ///
+    /// A named site logger is configured by the block that declares it, in
+    /// the shape upstream Caddy gives the same spelling. The name is a
+    /// handle for `log_name`/`include` associations (D2); the logger itself
+    /// is independent of any global channel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub named_logs: Vec<NamedLogConfig>,
+
     /// Maximum request body size in bytes (default: 1MB)
     #[serde(default = "default_body_limit")]
     pub client_max_body_size: u64,
@@ -330,6 +339,7 @@ impl Default for ServerConfig {
             routes: Vec::new(),
             log: None,
             log_channels: Vec::new(),
+            named_logs: Vec::new(),
             client_max_body_size: default_body_limit(),
             limits: ResourceLimitsConfig::default(),
             security: SecurityConfig::default(),
@@ -1430,6 +1440,12 @@ pub struct LoggingConfig {
     /// sending 4xx/5xx somewhere separate from the ordinary access log.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub channels: BTreeMap<String, LogConfig>,
+
+    /// 🪵 The default logger, configured by an unnamed global `log { … }`
+    /// block. Process-level runtime logging is still environment-driven;
+    /// accepting the block is what makes the format's own grammar compile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<LogConfig>,
 }
 
 /// Security headers configuration
@@ -1576,6 +1592,16 @@ pub struct LogConfig {
     pub include_tls: bool,
 }
 
+/// 🪵 A named per-site access logger from `log <name> { … }`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NamedLogConfig {
+    /// 🔖 The logger's handle, used by `log_name`/`include` associations.
+    pub name: String,
+    /// 🧾 The logger's output, format, level and rotation policy.
+    #[serde(flatten)]
+    pub config: LogConfig,
+}
+
 /// 🔄 When to start a new log file, and how many old ones to keep.
 ///
 /// Rotation exists for one reason: a log that only grows eventually fills the
@@ -1662,6 +1688,7 @@ mod tests {
             routes: vec![],
             log: None,
             log_channels: Vec::new(),
+            named_logs: Vec::new(),
             client_max_body_size: 1024 * 1024,
             limits: ResourceLimitsConfig::default(),
             security: Default::default(),

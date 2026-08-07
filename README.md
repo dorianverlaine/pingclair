@@ -640,6 +640,13 @@ example.com {
 }
 ```
 
+### Logging grammar
+
+`log <name> { … }` follows Caddy: the block configures a **named per-site
+logger**, and the name is its handle. `log <name>` without a block still
+references a global channel declared in the global options, and a bare `log`
+enables the site's default access sink.
+
 ### What is not supported yet
 
 Pingclair calls itself Caddyfile-compatible, so the honest half of that claim

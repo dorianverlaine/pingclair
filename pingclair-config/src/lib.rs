@@ -249,18 +249,19 @@ fn merge_logging(
     from: pingclair_core::config::LoggingConfig,
     path: &Path,
 ) -> Result<(), FullCompileError> {
-    let default = pingclair_core::config::LoggingConfig::default();
+    let base = pingclair_core::config::LoggingConfig::default();
     let pingclair_core::config::LoggingConfig {
         level,
         format,
         file,
         channels,
+        default,
     } = from;
 
-    if level != default.level {
+    if level != base.level {
         into.level = level;
     }
-    if format != default.format {
+    if format != base.format {
         into.format = format;
     }
     if file.is_some() {
@@ -276,6 +277,14 @@ fn merge_logging(
             )));
         }
         into.channels.insert(name, channel);
+    }
+    if let Some(default) = default {
+        if into.default.is_some() {
+            return Err(FullCompileError::Compile(pingclair_config_compile_error(
+                "the default logger is declared more than once across merged files".to_string(),
+            )));
+        }
+        into.default = Some(default);
     }
     Ok(())
 }

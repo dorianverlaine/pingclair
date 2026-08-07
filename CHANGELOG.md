@@ -28,6 +28,14 @@ lets the rest converge.
 
 ### ⚠️ Breaking
 
+- 🪵 **`log <name> { … }` now configures a named per-site logger.** This is
+  the spelling upstream Caddy gives the same tokens: the block is the
+  logger's configuration, and the name is its handle. It used to be refused
+  as ambiguous. `log <name>` without a block still references a global
+  channel, a bare `log` enables the site's default access sink, and an
+  unnamed global `log { … }` now configures the default logger instead of
+  being refused.
+
 - 🔐 **A bare hostname site now derives an HTTPS listener.** Writing a site
   address with no scheme and no port (for example `example.com { … }`) used to
   produce a plaintext listener on port 80. It now behaves the way Caddy does:

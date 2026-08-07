@@ -318,29 +318,47 @@ pub(super) fn adapt_server(
                     }
                     server.gzip_types = sub_d.args;
                 }
-                // 🪵 Two shapes. `log { … }` configures this server's own
-                // sink; `log <name>` also fans out to a channel declared in the
-                // global block. Both may appear, which is how "everything to
-                // stdout, errors also to a shared file" is written without
-                // repeating the whole block.
+                // 🪵 Caddy's `log` grammar. `log { … }` configures this
+                // server's default access sink; `log <name> { … }` configures
+                // a *named* per-site logger with the block's own output;
+                // `log <name>` (no block) fans out to a channel declared in
+                // the global block; a bare `log` enables the default sink.
                 "log" => match (sub_d.args.first(), sub_d.block) {
                     (None, Some(log_block)) => {
                         let log = adapt_log_block(log_block)?;
                         server.log = Some(Node::new(log, Location::synthetic()));
                     }
-                    (Some(name), None) => server.log_channels.push(name.clone()),
-                    (Some(_), Some(_)) => {
-                        return Err(AdapterError::InvalidArgument(
-                            "log".into(),
-                            "name a channel or open a block, not both — `log errors` \
-                                 references a global channel, `log { … }` configures this site"
-                                .into(),
-                        ));
+                    (Some(name), Some(log_block)) => {
+                        if sub_d.args.len() != 1 {
+                            return Err(AdapterError::ArgumentCount(
+                                "log".into(),
+                                1,
+                                sub_d.args.len(),
+                            ));
+                        }
+                        let mut log = adapt_log_block(log_block)?;
+                        log.name = Some(name.clone());
+                        server
+                            .named_logs
+                            .push(Node::new(log, Location::synthetic()));
                     }
+                    (Some(name), None) => server.log_channels.push(name.clone()),
                     (None, None) => {
-                        return Err(AdapterError::InvalidArgument(
-                            "log".into(),
-                            "expected a channel name or a block".into(),
+                        // 📝 A bare `log` enables the default access sink, as
+                        // in Caddy, so `log_skip`/`log_append` have a logger
+                        // to act on.
+                        server.log = Some(Node::new(
+                            LogBlock {
+                                name: None,
+                                rotation: Default::default(),
+                                request_headers: Vec::new(),
+                                response_headers: Vec::new(),
+                                include_tls: false,
+                                output: LogOutput::Stdout,
+                                format: LogFormat::default(),
+                                level: None,
+                            },
+                            Location::synthetic(),
                         ));
                     }
                 },

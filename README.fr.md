@@ -642,6 +642,13 @@ example.com {
 }
 ```
 
+### Grammaire des journaux
+
+`log <name> { … }` suit Caddy : le bloc configure un **logger nommé par site**
+et le nom est son identifiant. `log <name>` sans bloc référence toujours un
+canal global déclaré dans les options globales, et un `log` nu active le
+sink d'accès par défaut du site.
+
 ### Ce qui n'est pas encore pris en charge
 
 Pingclair se dit compatible Caddyfile ; la moitié honnête de cette affirmation

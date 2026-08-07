@@ -23,41 +23,31 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                 // writer — two writers on one file would interleave, so "the
                 // same channel" has to mean the same queue.
                 "log" => {
-                    let Some(name) = sub.args.first().cloned() else {
-                        // 🚫 An unnamed global `log` configures the *default*
-                        // logger — the one the server's own runtime messages go
-                        // to. This crate has nowhere to put that: process
-                        // logging is set up from the environment at startup,
-                        // and `logging.level`/`format`/`file` are carried in the
-                        // config type without anything reading them.
-                        //
-                        // 🤡 The message used to say the channel "needs a
-                        // name", which describes neither the operator's mistake
-                        // nor ours — they wrote something the format accepts,
-                        // and we cannot honour it. Being stricter than the
-                        // format is defensible; misnaming why is not.
-                        //
-                        // TODO(v0.3): configure process logging from the global
-                        // block, then accept this form.
-                        return Err(AdapterError::UnsupportedFeature(
-                            "global log without a channel name".into(),
-                            "an unnamed `log` block configures the server's own runtime log, which \
-                             Pingclair configures from the environment instead; name the channel \
-                             (`log access { … }`) to define an access-log channel"
-                                .into(),
-                        ));
-                    };
                     if sub.args.len() > 1 {
                         return Err(AdapterError::ArgumentCount("log".into(), 1, sub.args.len()));
                     }
                     let Some(channel_block) = sub.block else {
                         return Err(AdapterError::InvalidArgument(
                             "log".into(),
-                            format!("channel `{name}` needs a block describing its output"),
+                            "a global `log` option needs a block describing its output".into(),
                         ));
                     };
                     let channel = adapt_log_block(channel_block)?;
                     let logging = global.logging.get_or_insert_with(Default::default);
+                    let Some(name) = sub.args.first().cloned() else {
+                        // 🪵 An unnamed global `log` configures the default
+                        // logger. Process-level runtime logging is still
+                        // environment-driven, but the format accepts this
+                        // spelling and the compiled config now carries it.
+                        if logging.default.is_some() {
+                            return Err(AdapterError::InvalidArgument(
+                                "log".into(),
+                                "the default logger is declared twice".into(),
+                            ));
+                        }
+                        logging.default = Some(channel);
+                        continue;
+                    };
                     // 🚫 A redeclared channel is a mistake, not a merge: the
                     // second block would silently win and the first one's
                     // output would vanish.

@@ -128,7 +128,7 @@ pub(super) fn adapt_log_block(block: Block) -> Result<LogBlock, AdapterError> {
                     .ok_or_else(|| AdapterError::ArgumentCount("log format".into(), 1, 0))?;
                 match kind.as_str() {
                     "json" => format.format_type = LogFormatType::Json,
-                    "text" => format.format_type = LogFormatType::Text,
+                    "text" | "console" => format.format_type = LogFormatType::Text,
                     "filter" => {
                         // `format filter { wrap <json|text> ... }`.
                         // JSON is the default here because a filter block
@@ -229,6 +229,7 @@ pub(super) fn adapt_log_block(block: Block) -> Result<LogBlock, AdapterError> {
     }
 
     Ok(LogBlock {
+        name: None,
         output,
         format,
         level,
@@ -479,16 +480,40 @@ mod log_channel_tests {
         assert!(error.to_string().contains("dup"));
     }
 
-    /// 🧾 The inline block and a channel reference are different shapes and
-    /// must not be written together, since one configures this site and the
-    /// other points elsewhere.
+    /// 🧾 `log <name> { … }` is upstream's spelling for a *named per-site
+    /// logger* — the block configures it. The old refusal treated the name
+    /// as a channel reference and rejected the combination.
     #[test]
-    fn a_name_and_a_block_together_are_rejected() {
-        let error = compile(
+    fn a_named_site_logger_compiles() {
+        let config = compile(
             "http://:8080 {\n    log errors {\n        output stderr\n    }\n    respond \"ok\"\n}\n",
         )
-        .expect_err("naming a channel and opening a block is ambiguous");
-        assert!(error.to_string().to_lowercase().contains("log"));
+        .expect("a named site logger must compile");
+        assert_eq!(config.servers[0].named_logs.len(), 1);
+        assert_eq!(config.servers[0].named_logs[0].name, "errors");
+        assert!(matches!(
+            config.servers[0].named_logs[0].config.output,
+            pingclair_core::config::LogOutput::Stderr
+        ));
+    }
+
+    /// 📝 A bare `log` enables the site's default access sink.
+    #[test]
+    fn a_bare_log_enables_the_default_sink() {
+        let config = compile("http://:8080 {\n    log\n    respond \"ok\"\n}\n")
+            .expect("a bare log must compile");
+        assert!(config.servers[0].log.is_some());
+    }
+
+    /// 🪵 An unnamed global `log { … }` configures the default logger.
+    #[test]
+    fn an_unnamed_global_log_configures_the_default_logger() {
+        let config = compile(
+            "{\n    log {\n        output stderr\n        format json\n    }\n}\n\
+             http://:8080 {\n    respond \"ok\"\n}\n",
+        )
+        .expect("an unnamed global log must compile");
+        assert!(config.logging.default.is_some());
     }
 
     /// 🎯 A site keeps its own inline log while also fanning out to a channel.

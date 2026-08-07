@@ -611,6 +611,12 @@ example.com {
 }
 ```
 
+### 日誌文法
+
+`log <name> { … }` 跟 Caddy 一樣：區塊設定一個**具名的站台 logger**，名字就是
+它的 handle。沒有區塊的 `log <name>` 仍指向全域選項宣告的 channel；單獨一個
+`log` 則開啟站台預設的 access log。
+
 ### 尚未支援
 
 Pingclair 對外宣稱相容 Caddyfile，那麼這個宣稱誠實的另一半，就是講清楚它到哪裡
