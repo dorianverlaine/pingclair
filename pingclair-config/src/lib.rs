@@ -1217,11 +1217,14 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_basic_auth_inline() {
+    fn test_compile_basic_auth_accounts_in_a_block() {
         let source = r#"
             example.com {
                 listen :80
-                basic_auth alice secret1 bob secret2
+                basic_auth {
+                    alice secret1
+                    bob secret2
+                }
                 respond "OK"
             }
         "#;
@@ -1247,12 +1250,11 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_basic_auth_block_with_realm() {
+    fn test_compile_basic_auth_realm_is_the_second_argument() {
         let source = r#"
             example.com {
                 listen :80
-                basic_auth {
-                    realm "Admin Area"
+                basic_auth bcrypt "Admin Area" {
                     admin hunter2
                 }
                 respond "OK"
@@ -1282,7 +1284,9 @@ mod tests {
         let source = r#"
             example.com {
                 listen :80
-                basic_auth alice "$2y$04$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W"
+                basic_auth {
+                    alice "$2y$04$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W"
+                }
                 respond "OK"
             }
         "#;

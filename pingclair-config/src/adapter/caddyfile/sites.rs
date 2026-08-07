@@ -754,7 +754,7 @@ mod directive_order_tests {
     #[test]
     fn basic_auth_runs_before_file_server() {
         let config =
-            compile("example.com {\n    file_server ./public\n    basic_auth user pass\n}")
+            compile("example.com {\n    file_server ./public\n    basic_auth {\n user pass\n }\n}")
                 .expect("compile");
         match &config.servers[0].routes[0].handler {
             HandlerConfig::Pipeline { handlers } => {

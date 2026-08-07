@@ -458,54 +458,112 @@ pub(super) fn adapt_access_control(d: Directive) -> Result<Handler, AdapterError
 
 /// 🔐 Adapts the `basic_auth` directive.
 ///
-/// Supported forms are:
-///   basic_auth <user> <password> [<user2> <password2>...]
-///   basic_auth {
-///       realm "Restricted Area"
-///       <user> <password>
-///   }
+/// The grammar is the format's own, read from `caddyauth/caddyfile.go` at
+/// `ff6da121`:
 ///
-/// Password values beginning with a bcrypt marker are validated by the
-/// compiler and emitted as hashed credentials.
+/// ```text
+/// basic_auth [<matcher>] [<hash_algorithm> [<realm>]] {
+///     <username> <hashed_password>
+///     ...
+/// }
+/// ```
+///
+/// The realm is the **second argument**, not a subdirective, and the block
+/// holds nothing but accounts. With no arguments the algorithm is bcrypt.
+///
+/// 🤡 This crate used to read the arguments as inline `<user> <password>`
+/// pairs and take `realm` as a subdirective — two spellings the format does
+/// not have, both of which *collide* with the one it does. `basic_auth bcrypt
+/// "Admin Area" { … }`, straight out of the documentation, was refused with
+/// "cannot mix inline credentials with a block", so an authenticated site
+/// failed on the first paste. The collision is why the old spellings could not
+/// simply be kept alongside: under the real grammar, a block line reading
+/// `realm "Admin Area"` is an *account* named `realm`.
 pub(super) fn adapt_basic_auth(d: Directive) -> Result<Handler, AdapterError> {
+    // 🔑 `[<hash_algorithm> [<realm>]]`, and nothing else, may precede the block.
+    let (algorithm, realm) = match d.args.as_slice() {
+        [] => ("bcrypt", None),
+        [algorithm] => (algorithm.as_str(), None),
+        [algorithm, realm] => (algorithm.as_str(), Some(realm.clone())),
+        args => {
+            return Err(AdapterError::InvalidArgument(
+                "basic_auth".into(),
+                format!(
+                    "expected at most <hash_algorithm> <realm>, got {} arguments; credentials                      belong in the block, one `<username> <hashed_password>` per line",
+                    args.len()
+                ),
+            ));
+        }
+    };
+
+    match algorithm {
+        "bcrypt" => {}
+        // 🚫 The format also accepts argon2id. This server only verifies
+        // bcrypt, and a credential it cannot verify as a hash is compared as
+        // a literal string — so accepting the word here would produce a login
+        // whose password is the hash text. Refusing is the only honest answer
+        // until the verifier exists.
+        "argon2id" => {
+            return Err(AdapterError::UnsupportedFeature(
+                "basic_auth argon2id".into(),
+                "Pingclair verifies bcrypt hashes only; an argon2id hash would be compared as                  plain text rather than verified"
+                    .into(),
+            ));
+        }
+        other => {
+            return Err(AdapterError::InvalidArgument(
+                "basic_auth".into(),
+                format!("unrecognized hash algorithm `{other}` (expected bcrypt)"),
+            ));
+        }
+    }
+
     let mut config = BasicAuthConfig {
-        realm: None,
+        realm,
         credentials: Vec::new(),
     };
 
-    let mut pairs_from = |args: &[String]| -> Result<(), AdapterError> {
-        if !args.len().is_multiple_of(2) {
-            return Err(AdapterError::InvalidArgument(
-                "basic_auth".into(),
-                "credentials must be <user> <password> pairs".into(),
-            ));
-        }
-        for pair in args.chunks(2) {
-            config.credentials.push((pair[0].clone(), pair[1].clone()));
-        }
-        Ok(())
+    let Some(block) = &d.block else {
+        return Err(AdapterError::InvalidArgument(
+            "basic_auth".into(),
+            "expected a block of `<username> <hashed_password>` lines".into(),
+        ));
     };
 
-    if let Some(block) = &d.block {
-        if !d.args.is_empty() {
+    for account in &block.directives {
+        // 🛡️ `realm` as the first word of a block line used to configure the
+        // realm here and now names an account. Silently accepting it would
+        // turn a line that configured nothing into a *working credential* —
+        // username `realm`, password whatever the realm string was — which is
+        // an account the operator never meant to create. The format would
+        // allow a user genuinely called `realm`; refusing that is the price of
+        // not creating one by accident, and it is the cheaper mistake.
+        if account.name == "realm" {
             return Err(AdapterError::InvalidArgument(
                 "basic_auth".into(),
-                "cannot mix inline credentials with a block".into(),
+                "`realm` is the second argument, not a block line: write                  `basic_auth bcrypt \"Your Realm\" { … }`. A block line named `realm` would                  otherwise define an account called `realm`"
+                    .into(),
             ));
         }
-        for sub in &block.directives {
-            if sub.name == "realm" {
-                config.realm = sub.args.first().cloned();
-            } else {
-                pairs_from(
-                    &std::iter::once(sub.name.clone())
-                        .chain(sub.args.iter().cloned())
-                        .collect::<Vec<_>>(),
-                )?;
-            }
+        let [password] = account.args.as_slice() else {
+            return Err(AdapterError::InvalidArgument(
+                "basic_auth".into(),
+                format!(
+                    "account `{}` needs exactly one hashed password, got {}",
+                    account.name,
+                    account.args.len()
+                ),
+            ));
+        };
+        if account.name.is_empty() || password.is_empty() {
+            return Err(AdapterError::InvalidArgument(
+                "basic_auth".into(),
+                "username and password cannot be empty".into(),
+            ));
         }
-    } else {
-        pairs_from(&d.args)?;
+        config
+            .credentials
+            .push((account.name.clone(), password.clone()));
     }
 
     if config.credentials.is_empty() {

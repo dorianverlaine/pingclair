@@ -58,10 +58,11 @@ example.com:8080 {
     }
 
     # 🔐 The admin area uses a bcrypt hash; replace this demonstration hash.
-    # Its example plaintext is "change-me", and inline form is also valid.
+    # Its example plaintext is "change-me". The arguments are the hash
+    # algorithm and the realm, in that order; accounts go in the block, one
+    # `<username> <hashed_password>` per line.
     handle /admin/* {
-        basic_auth {
-            realm "Admin Area"
+        basic_auth bcrypt "Admin Area" {
             admin "$2y$12$iKzVHkDoCr2oz1DAOzX9wec0yf3A.FZM3SmsP9dYHmhE2O.3TSpSW"
         }
         respond "Welcome to the admin area"

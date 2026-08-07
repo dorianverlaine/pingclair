@@ -2014,3 +2014,129 @@ mod uri_and_try_files_tests {
             .expect_err("try_files with no candidate must be refused");
     }
 }
+
+// MARK: - basic_auth grammar
+
+/// 🔐 The `basic_auth` grammar, as the format defines it.
+///
+/// Every source here is written the way the documentation writes it. The whole
+/// point of the 2026-08-07 rewrite was that the documented form did not work:
+/// this crate read the arguments as inline credentials and the realm as a
+/// subdirective, so `basic_auth bcrypt "Admin Area" { … }` was refused with
+/// "cannot mix inline credentials with a block".
+#[cfg(test)]
+mod basic_auth_grammar_tests {
+    use crate::compile;
+    use pingclair_core::config::HandlerConfig;
+
+    /// 🔑 bcrypt hash of `change-me`, cost 12.
+    const HASH: &str = "$2y$12$iKzVHkDoCr2oz1DAOzX9wec0yf3A.FZM3SmsP9dYHmhE2O.3TSpSW";
+
+    fn basic_auth_of(source: &str) -> (String, Vec<(String, String)>) {
+        let config = compile(source).unwrap_or_else(|error| panic!("must compile: {error}"));
+        let handler = match config
+            .servers
+            .into_iter()
+            .next()
+            .unwrap()
+            .routes
+            .remove(0)
+            .handler
+        {
+            HandlerConfig::Pipeline { handlers } => handlers
+                .into_iter()
+                .find(|handler| matches!(handler, HandlerConfig::BasicAuth { .. }))
+                .expect("a basic_auth handler"),
+            single => single,
+        };
+        let HandlerConfig::BasicAuth { realm, credentials } = handler else {
+            panic!("expected basic_auth");
+        };
+        (
+            realm,
+            credentials
+                .into_iter()
+                .map(|credential| (credential.username, credential.password))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn the_documented_form_compiles() {
+        let (realm, accounts) = basic_auth_of(&format!(
+            "example.com {{\n\tbasic_auth bcrypt \"Admin Area\" {{\n\t\tadmin {HASH}\n\t}}\n\trespond \"ok\"\n}}"
+        ));
+        assert_eq!(realm, "Admin Area");
+        assert_eq!(accounts, vec![("admin".to_string(), HASH.to_string())]);
+    }
+
+    #[test]
+    fn the_algorithm_and_realm_are_both_optional() {
+        for source in [
+            format!(
+                "example.com {{\n\tbasic_auth {{\n\t\tadmin {HASH}\n\t}}\n\trespond \"ok\"\n}}"
+            ),
+            format!(
+                "example.com {{\n\tbasic_auth bcrypt {{\n\t\tadmin {HASH}\n\t}}\n\trespond \"ok\"\n}}"
+            ),
+        ] {
+            let (_, accounts) = basic_auth_of(&source);
+            assert_eq!(accounts.len(), 1, "{source}");
+        }
+    }
+
+    /// 🛡️ `realm` used to be a block line here. Under the real grammar a block
+    /// line *is* an account, so silently accepting it would create a working
+    /// login named `realm` whose password is the realm string — a credential
+    /// the operator never wrote. The error names the replacement.
+    #[test]
+    fn a_realm_block_line_is_refused_rather_than_becoming_an_account() {
+        let message = compile(&format!(
+            "example.com {{\n\tbasic_auth {{\n\t\trealm \"Admin Area\"\n\t\tadmin {HASH}\n\t}}\n}}"
+        ))
+        .expect_err("a `realm` block line must be refused")
+        .to_string();
+        assert!(
+            message.contains("second argument"),
+            "the message must point at the replacement spelling: {message}"
+        );
+    }
+
+    /// 🚫 We verify bcrypt only. A hash we cannot verify is compared as a
+    /// literal string, so accepting the word would create a login whose
+    /// password is the hash text.
+    #[test]
+    fn argon2id_is_refused_by_name() {
+        let message = compile(
+            "example.com {\n\tbasic_auth argon2id {\n\t\tadmin $argon2id$v=19$m=65536,t=1,p=4$a$b\n\t}\n}",
+        )
+        .expect_err("argon2id must be refused")
+        .to_string();
+        assert!(message.contains("argon2id"), "got {message}");
+        assert!(
+            !message.contains("Unknown directive"),
+            "argon2id is part of the format, so it must not read as a typo: {message}"
+        );
+    }
+
+    #[test]
+    fn malformed_shapes_are_refused() {
+        for source in [
+            // 🚫 More than `<hash_algorithm> <realm>`; upstream errors too.
+            format!(
+                "example.com {{\n\tbasic_auth bcrypt \"A\" extra {{\n\t\tadmin {HASH}\n\t}}\n}}"
+            ),
+            // 🚫 An algorithm the format does not define.
+            format!("example.com {{\n\tbasic_auth md5 {{\n\t\tadmin {HASH}\n\t}}\n}}"),
+            // 🚫 An account line with two passwords.
+            format!("example.com {{\n\tbasic_auth {{\n\t\tadmin {HASH} extra\n\t}}\n}}"),
+            // 🚫 No accounts at all would deny every request.
+            "example.com {\n\tbasic_auth bcrypt \"A\" {\n\t}\n}".to_string(),
+            // 🚫 Credentials as arguments: the old spelling, now read as an
+            // algorithm named `alice`.
+            "example.com {\n\tbasic_auth alice secret\n}".to_string(),
+        ] {
+            compile(&source).expect_err(&format!("must be refused:\n{source}"));
+        }
+    }
+}
