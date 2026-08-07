@@ -1552,6 +1552,7 @@ async fn plan_h3_handler(
     request_header: &mut RequestHeader,
     effective_uri: &mut String,
     response_policy: &mut ResponseHeaderPolicy,
+    verified_client_ip: &str,
 ) -> Result<H3Plan, HandlerError> {
     match handler {
         HandlerConfig::Pipeline { handlers } | HandlerConfig::Handle { handlers } => {
@@ -1567,6 +1568,7 @@ async fn plan_h3_handler(
                     request_header,
                     effective_uri,
                     response_policy,
+                    verified_client_ip,
                 )
                 .await?
                 {
@@ -1601,6 +1603,7 @@ async fn plan_h3_handler(
                     request_header,
                     effective_uri,
                     response_policy,
+                    verified_client_ip,
                 )
                 .await?
                 {
@@ -1703,18 +1706,30 @@ async fn plan_h3_handler(
             status,
             body,
             headers,
-        } => Ok(H3Plan::Terminal(H3Terminal::Respond {
-            status: *status,
-            body: body.clone(),
-            headers: headers.clone(),
-        })),
+        } => {
+            // 🏷️ The body is a template exactly as it is for H1/H2: `respond
+            // "hello {host}"` expands placeholders from the same request.
+            // Until 2026-08-07 HTTP/3 wrote the raw text while H1/H2
+            // resolved it, so a site served `path={path}` over HTTP/3 and
+            // the value over HTTP/1 and HTTP/2.
+            let body = body.as_deref().map(|raw| {
+                let verified = raw.contains('{').then_some(verified_client_ip);
+                resolve_caddy_placeholders(raw, request_header, verified, "https").into_owned()
+            });
+            Ok(H3Plan::Terminal(H3Terminal::Respond {
+                status: *status,
+                body,
+                headers: headers.clone(),
+            }))
+        }
         // 🧭 Resolved here rather than at send time so H3 and H1/H2 expand the
         // same templates from the same request; a redirect that only works on
         // one transport is the parity gap this crate keeps having to fix.
         HandlerConfig::Redirect { to, code } => Ok(H3Plan::Terminal(H3Terminal::Redirect {
             // 🚀 An HTTP/3 request always arrived over TLS, so the scheme is a
             // constant here rather than something to thread through.
-            to: resolve_caddy_placeholders(to, request_header, None, "https").into_owned(),
+            to: resolve_caddy_placeholders(to, request_header, Some(verified_client_ip), "https")
+                .into_owned(),
             code: *code,
         })),
         HandlerConfig::Templates { root } => {
@@ -1772,6 +1787,7 @@ async fn plan_h3_handler(
                         request_header,
                         effective_uri,
                         response_policy,
+                        verified_client_ip,
                     )
                     .await
                 }
@@ -2011,6 +2027,7 @@ async fn handle_request_inner(
         &mut header,
         &mut effective_uri,
         response_policy,
+        &verified_client_ip_text,
     )
     .await?;
 
@@ -3686,9 +3703,17 @@ mod tests {
         let mut uri = "/old/item?q=1".to_string();
         let mut policy = ResponseHeaderPolicy::default();
 
-        let plan = plan_h3_handler(&handler, &state, 0, &mut request, &mut uri, &mut policy)
-            .await
-            .unwrap();
+        let plan = plan_h3_handler(
+            &handler,
+            &state,
+            0,
+            &mut request,
+            &mut uri,
+            &mut policy,
+            "203.0.113.7",
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(
             plan,
@@ -3734,9 +3759,17 @@ mod tests {
         let mut uri = "/resource".to_string();
         let mut policy = ResponseHeaderPolicy::default();
 
-        let plan = plan_h3_handler(&handler, &state, 0, &mut request, &mut uri, &mut policy)
-            .await
-            .unwrap();
+        let plan = plan_h3_handler(
+            &handler,
+            &state,
+            0,
+            &mut request,
+            &mut uri,
+            &mut policy,
+            "203.0.113.7",
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(
             plan,
@@ -3768,9 +3801,17 @@ mod tests {
         let mut uri = "/private".to_string();
         let mut policy = ResponseHeaderPolicy::default();
 
-        let plan = plan_h3_handler(&handler, &state, 0, &mut request, &mut uri, &mut policy)
-            .await
-            .unwrap();
+        let plan = plan_h3_handler(
+            &handler,
+            &state,
+            0,
+            &mut request,
+            &mut uri,
+            &mut policy,
+            "203.0.113.7",
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(
             plan,
@@ -3794,12 +3835,88 @@ mod tests {
         let mut uri = "/api/users?q=1".to_string();
         let mut policy = ResponseHeaderPolicy::default();
 
-        let plan = plan_h3_handler(&handler, &state, 0, &mut request, &mut uri, &mut policy)
-            .await
-            .unwrap();
+        let plan = plan_h3_handler(
+            &handler,
+            &state,
+            0,
+            &mut request,
+            &mut uri,
+            &mut policy,
+            "203.0.113.7",
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(plan, H3Plan::Terminal(H3Terminal::ReverseProxy)));
         assert_eq!(uri, "/users?q=1");
+    }
+
+    #[tokio::test]
+    async fn h3_respond_expands_placeholders_like_h1_h2() {
+        let handler = HandlerConfig::Respond {
+            status: 200,
+            body: Some("path={path} scheme={scheme} host={host} remote={remote_ip}".to_string()),
+            headers: BTreeMap::new(),
+        };
+        let state = proxy_state(handler.clone());
+        let mut request = RequestHeader::build(http::Method::GET, b"/probe?q=1", None).unwrap();
+        request.insert_header("host", "probe.example").unwrap();
+        let mut uri = "/probe?q=1".to_string();
+        let mut policy = ResponseHeaderPolicy::default();
+
+        let plan = plan_h3_handler(
+            &handler,
+            &state,
+            0,
+            &mut request,
+            &mut uri,
+            &mut policy,
+            "203.0.113.7",
+        )
+        .await
+        .unwrap();
+
+        match plan {
+            H3Plan::Terminal(H3Terminal::Respond { body, .. }) => {
+                assert_eq!(
+                    body.as_deref(),
+                    Some("path=/probe scheme=https host=probe.example remote=203.0.113.7")
+                );
+            }
+            _ => panic!("expected a respond terminal"),
+        }
+    }
+
+    #[tokio::test]
+    async fn h3_redirect_expands_the_verified_remote_ip() {
+        let handler = HandlerConfig::Redirect {
+            to: "https://{host}/from/{remote_host}".to_string(),
+            code: 302,
+        };
+        let state = proxy_state(handler.clone());
+        let mut request = RequestHeader::build(http::Method::GET, b"/probe", None).unwrap();
+        request.insert_header("host", "probe.example").unwrap();
+        let mut uri = "/probe".to_string();
+        let mut policy = ResponseHeaderPolicy::default();
+
+        let plan = plan_h3_handler(
+            &handler,
+            &state,
+            0,
+            &mut request,
+            &mut uri,
+            &mut policy,
+            "203.0.113.9",
+        )
+        .await
+        .unwrap();
+
+        match plan {
+            H3Plan::Terminal(H3Terminal::Redirect { to, .. }) => {
+                assert_eq!(to, "https://probe.example/from/203.0.113.9");
+            }
+            _ => panic!("expected a redirect terminal"),
+        }
     }
 
     #[test]
