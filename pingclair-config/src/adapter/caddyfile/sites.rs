@@ -10,6 +10,7 @@ use super::directives::{adapt_handler, adapt_header_directive, adapt_resource_li
 use super::logs::adapt_log_block;
 use super::matchers::{
     parse_matcher_and_block, parse_matcher_definition, parse_route_matcher_and_block,
+    reject_matcher_inside_route_body,
 };
 use super::options::is_wildcard_host;
 use super::order::DirectiveOrder;
@@ -403,6 +404,7 @@ pub(super) fn adapt_server(
                     let mut handlers = Vec::new();
                     if let Some(blk) = inner_block {
                         for inner_d in &blk.directives {
+                            reject_matcher_inside_route_body(inner_d)?;
                             handlers.push(adapt_handler(inner_d.clone())?);
                         }
                     }
@@ -417,6 +419,7 @@ pub(super) fn adapt_server(
                     if let Some(blk) = inner_block {
                         let mut handlers = Vec::new();
                         for inner_d in &blk.directives {
+                            reject_matcher_inside_route_body(inner_d)?;
                             handlers.push(adapt_handler(inner_d.clone())?);
                         }
                         if matcher.is_none() {

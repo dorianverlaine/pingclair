@@ -95,17 +95,12 @@ pub(super) fn adapt_handler(d: Directive) -> Result<Handler, AdapterError> {
             let mut handlers = Vec::new();
             if let Some(block) = d.block {
                 for inner_d in block.directives {
-                    if inner_d.name.starts_with('@') {
-                        // TODO(v0.3): support matcher tokens on directives
-                        // inside route/handle blocks (needs per-handler
-                        // conditional execution in the runtime chain).
-                        return Err(AdapterError::UnsupportedFeature(
-                            "route/handle matcher token".into(),
-                            "matcher tokens inside route/handle blocks are not \
-                             implemented yet"
-                                .into(),
-                        ));
-                    }
+                    // 🎯 The same guard the site level uses. This arm used to
+                    // carry its own narrower version that only looked at
+                    // `@`-prefixed *names*, so it caught a matcher definition
+                    // and missed a matcher token — the shape that actually
+                    // produced wrong responses.
+                    super::matchers::reject_matcher_inside_route_body(&inner_d)?;
                     handlers.push(adapt_handler(inner_d)?);
                 }
             }

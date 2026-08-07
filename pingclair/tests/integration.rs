@@ -2240,6 +2240,48 @@ async fn test_spa_pattern_serves_assets_and_falls_back_to_the_shell() {
     assert_eq!(with_query.text().await.unwrap(), "spa-shell");
 }
 
+/// 🚧 A matcher token inside `route` must stop the server starting, rather
+/// than serving the token as content.
+///
+/// 🤡 This configuration used to start and answer **every** request with the
+/// literal text `@admin` — the matcher was discarded and the token was read as
+/// the response body. Measured against Caddy v2.11.4 on 2026-08-07: 3 of 3
+/// requests differed. The real fix is per-handler conditional execution; until
+/// it lands, refusing to start is the honest answer, and this test is what
+/// stops the silent version coming back.
+#[test]
+fn test_matcher_token_inside_route_refuses_to_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("Pingclairfile");
+    std::fs::write(
+        &config_path,
+        ":0 {\n\
+         \t@admin path /admin/*\n\
+         \troute {\n\
+         \t\trespond @admin \"SECRET\" 200\n\
+         \t\trespond \"public\" 200\n\
+         \t}\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pingclair"))
+        .arg("validate")
+        .arg(&config_path)
+        .output()
+        .expect("the binary runs");
+
+    assert!(
+        !output.status.success(),
+        "a matcher token inside route must be refused, not accepted"
+    );
+    let message = String::from_utf8_lossy(&output.stderr) + String::from_utf8_lossy(&output.stdout);
+    assert!(
+        message.contains("@admin"),
+        "the refusal must name the token: {message}"
+    );
+}
+
 /// 🪚 `uri strip_prefix` reaches the file server with the prefix removed.
 #[tokio::test]
 async fn test_uri_strip_prefix_reaches_the_stripped_static_path() {

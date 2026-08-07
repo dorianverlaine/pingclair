@@ -122,6 +122,66 @@ pub(super) fn parse_route_matcher_and_block(
     Ok((matcher, block))
 }
 
+/// 🚧 Refuses a directive inside a `route`/`handle` body that carries its own
+/// matcher, because nothing here can honour one yet.
+///
+/// The format lets every directive inside such a body take a matcher token, and
+/// gives each one its own route. This crate compiles a body into a flat
+/// `Vec<Handler>` with no per-element matcher — matchers live only on the route
+/// — so the token has nowhere to go.
+///
+/// 🤡 Until 2026-08-07 it went nowhere *silently*, and worse than silently.
+/// Each directive's parser dealt with the stray token on its own: `reverse_proxy`
+/// and `header` filtered `@`-prefixed arguments away, so the handler ran
+/// unconditionally with its guard removed; `respond` read the token as its body.
+/// Measured against Caddy v2.11.4, this configuration
+///
+/// ```caddyfile
+/// @admin path /admin/*
+/// route {
+///     respond @admin "SECRET" 200
+///     respond "public" 200
+/// }
+/// ```
+///
+/// validated on both servers and then answered **every** request with the
+/// literal text `@admin` — 3 of 3 requests differing, a secret route that never
+/// gated and a body that was never written by anyone.
+///
+/// 🧭 This is a blockade, not the fix. The fix needs per-handler conditional
+/// execution: `HandlerConfig::Pipeline`/`Handle` must carry a matcher per
+/// element, the router must expose matcher evaluation as a callable primitive,
+/// and both executors must consult it. That is three core abstractions, which
+/// the change budget does not allow in one sitting. **Delete this function in
+/// the commit that lands them**, exactly as the `try_files` `/`-candidate guard
+/// was deleted the day the lexer stopped splitting `{path}/`.
+pub(super) fn reject_matcher_inside_route_body(d: &Directive) -> Result<(), AdapterError> {
+    // 🏷️ A matcher *definition* line. It reaches the generic directive
+    // dispatch otherwise and is reported as an unknown directive, which sends
+    // an operator hunting for a typo in a name they spelled correctly.
+    if d.name.starts_with('@') {
+        return Err(AdapterError::UnsupportedFeature(
+            format!("matcher definition `{}` inside route/handle", d.name),
+            "define named matchers in the site block, outside `route`/`handle`; Pingclair \
+             cannot yet scope a matcher definition to a block"
+                .into(),
+        ));
+    }
+    // 🎯 One rule decides what a matcher token is, and it is the same rule the
+    // site level uses — a second copy here would drift from it.
+    if matcher_token(d).is_some() {
+        let token = d.args.first().map(String::as_str).unwrap_or_default();
+        return Err(AdapterError::UnsupportedFeature(
+            format!("matcher `{token}` on `{}` inside route/handle", d.name),
+            "Pingclair cannot yet run one handler conditionally inside a route or handle \
+             block; move the matcher onto the enclosing `handle`/`route`, or give the \
+             directive its own site-level route"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn parse_matcher_definition(d: &Directive) -> Result<Matcher, AdapterError> {
     if let Some(block) = &d.block {
         let mut matchers = Vec::new();

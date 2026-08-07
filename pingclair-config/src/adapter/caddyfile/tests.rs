@@ -1198,8 +1198,14 @@ mod fail_closed_tests {
                 }
             }"#,
         );
+        // 🧭 The wording moved on 2026-08-07: `reverse_proxy` used to catch
+        // this with its own narrower guard, and now one shared guard catches
+        // every directive in a route/handle body. What is asserted is the
+        // behaviour — refused, and pointing at the real limitation — rather
+        // than the sentence, so the next rewording does not fail a test that
+        // is not about wording.
         assert!(
-            error.contains("inline path matcher"),
+            error.contains("route/handle") || error.contains("inline path matcher"),
             "a matcher token inside handle must fail closed, got: {error}"
         );
     }
@@ -2138,5 +2144,151 @@ mod basic_auth_grammar_tests {
         ] {
             compile(&source).expect_err(&format!("must be refused:\n{source}"));
         }
+    }
+}
+
+// MARK: - Matcher tokens inside route/handle
+
+/// 🚧 The blockade for the one shape that was silently wrong.
+///
+/// Each of these compiled green before 2026-08-07 and then did something the
+/// operator never wrote. They are grouped here rather than spread through the
+/// fail-closed tests so that the commit which implements per-handler matching
+/// has one place to convert them from "must be refused" into "must work".
+#[cfg(test)]
+mod matcher_inside_route_body_tests {
+    use crate::compile;
+
+    fn refusal(source: &str) -> String {
+        compile(source)
+            .expect_err(&format!("must be refused:\n{source}"))
+            .to_string()
+    }
+
+    /// 🤡 The measured case: validated on both servers, and then answered every
+    /// request with the literal text `@admin`. Caddy v2.11.4 gated correctly —
+    /// 3 of 3 requests differed.
+    #[test]
+    fn a_named_matcher_on_respond_is_refused_rather_than_becoming_the_body() {
+        let message = refusal(
+            "example.com {\n\
+             \t@admin path /admin/*\n\
+             \troute {\n\
+             \t\trespond @admin \"SECRET\" 200\n\
+             \t\trespond \"public\" 200\n\
+             \t}\n\
+             }",
+        );
+        assert!(
+            message.contains("@admin") && message.contains("respond"),
+            "the message must name the token and the directive: {message}"
+        );
+        assert!(
+            !message.contains("Unknown directive"),
+            "this is a missing feature, not a typo: {message}"
+        );
+    }
+
+    /// 🛡️ The fail-open direction: the token was filtered out of the arguments,
+    /// so a proxy that was meant to be gated ran for every request instead.
+    #[test]
+    fn a_named_matcher_on_reverse_proxy_is_refused_rather_than_dropped() {
+        let message = refusal(
+            "example.com {\n\
+             \t@api path /api/*\n\
+             \troute {\n\
+             \t\treverse_proxy @api 127.0.0.1:9000\n\
+             \t}\n\
+             }",
+        );
+        assert!(message.contains("@api"), "got {message}");
+    }
+
+    #[test]
+    fn a_matcher_token_is_refused_in_handle_and_handle_path_too() {
+        for container in [
+            "handle {\n\t\trespond @admin \"x\" 200\n\t}",
+            "handle_path /api/* {\n\t\trespond @admin \"x\" 200\n\t}",
+        ] {
+            let message = refusal(&format!(
+                "example.com {{\n\t@admin path /admin/*\n\t{container}\n}}"
+            ));
+            assert!(message.contains("@admin"), "{container} → {message}");
+        }
+    }
+
+    /// 🏷️ A matcher *definition* inside the block used to be reported as an
+    /// unknown directive, which reads as a misspelling of a word spelled
+    /// correctly.
+    #[test]
+    fn a_matcher_definition_inside_the_block_says_what_is_wrong() {
+        let message = refusal(
+            "example.com {\n\
+             \troute {\n\
+             \t\t@admin path /admin/*\n\
+             \t\trespond \"x\"\n\
+             \t}\n\
+             }",
+        );
+        assert!(
+            !message.contains("Unknown directive"),
+            "a matcher definition is valid syntax we do not support here: {message}"
+        );
+        assert!(message.contains("site block"), "got {message}");
+    }
+
+    /// 🎯 The other direction: a matcher on the container itself is how you say
+    /// this today, and it must keep working.
+    #[test]
+    fn a_matcher_on_the_container_still_compiles() {
+        compile(
+            "example.com {\n\
+             \t@admin path /admin/*\n\
+             \thandle @admin {\n\
+             \t\trespond \"SECRET\" 200\n\
+             \t}\n\
+             \trespond \"public\" 200\n\
+             }",
+        )
+        .expect("a matcher on the container is the supported spelling");
+    }
+
+    /// 🤡 A nested container carrying a matcher is the same defect wearing a
+    /// different hat, and it is the one that cost a corpus point.
+    ///
+    /// `handle /foo/*` inside `route` used to compile — the `handle` arm reads
+    /// only `d.block` and never `d.args`, so the matcher was dropped and both
+    /// handles became unconditional. The first one then answered every request.
+    /// Upstream's own fixture `handle_nested_in_route` was passing for exactly
+    /// that reason: the corpus asks "does it compile", and it did.
+    ///
+    /// 📉 Refusing it costs one corpus fixture (67 → 66) and is still right.
+    /// The repository has taken this trade before: rejecting four
+    /// silently-misread configurations on 2026-08-05 dropped the score by 3
+    /// while making the behaviour correct.
+    #[test]
+    fn a_nested_container_carrying_a_matcher_is_refused() {
+        let message = refusal(
+            "example.com {\n\
+             \troute {\n\
+             \t\thandle /foo/* {\n\
+             \t\t\trespond \"Foo\"\n\
+             \t\t}\n\
+             \t\thandle {\n\
+             \t\t\trespond \"Bar\"\n\
+             \t\t}\n\
+             \t}\n\
+             }",
+        );
+        assert!(message.contains("/foo/*"), "got {message}");
+    }
+
+    /// 📌 And a directive whose first argument merely looks like a matcher must
+    /// not be caught by the guard — `respond` with a leading-slash *body* is
+    /// data, decided by the one rule in `matcher_token`.
+    #[test]
+    fn a_directive_whose_argument_is_data_is_not_caught() {
+        compile("example.com {\n\troute {\n\t\tfile_server /var/www\n\t}\n}")
+            .expect("a file server root is data, not a matcher");
     }
 }
