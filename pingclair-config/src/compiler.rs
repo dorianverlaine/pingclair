@@ -256,6 +256,7 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         encodings: compile_encodings(server)?,
         error_pages: server.error_pages.iter().cloned().collect(),
         error_routes: Vec::new(),
+        vars_routes: Vec::new(),
     };
 
     // Listen addresses
@@ -361,6 +362,23 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
                 codes: route.codes.clone(),
                 hundreds: route.hundreds.clone(),
                 handlers,
+            })
+        })
+        .collect::<CompileResult<Vec<_>>>()?;
+
+    // 🧰 Site-level `vars` rules compile their matchers once, like every
+    // other matcher, so request time never re-parses them.
+    config.vars_routes = server
+        .vars_routes
+        .iter()
+        .map(|rule| {
+            Ok(pingclair_core::config::VarsRule {
+                matcher: rule
+                    .matcher
+                    .as_ref()
+                    .map(|matcher| compile_matcher(matcher, &server.matchers, 0))
+                    .transpose()?,
+                values: rule.values.clone(),
             })
         })
         .collect::<CompileResult<Vec<_>>>()?;
@@ -704,6 +722,7 @@ fn reject_unimplemented_handler(handler: &HandlerConfig) -> CompileResult<()> {
         | HandlerConfig::Error { .. }
         | HandlerConfig::Headers { .. }
         | HandlerConfig::LogSkip
+        | HandlerConfig::Vars { .. }
         | HandlerConfig::BasicAuth { .. }
         | HandlerConfig::RateLimit { .. }
         | HandlerConfig::Cors { .. }
@@ -774,6 +793,7 @@ fn validate_basic_auth_credentials(handler: &HandlerConfig) -> CompileResult<()>
         | HandlerConfig::Error { .. }
         | HandlerConfig::Headers { .. }
         | HandlerConfig::LogSkip
+        | HandlerConfig::Vars { .. }
         | HandlerConfig::RateLimit { .. }
         | HandlerConfig::Cors { .. }
         | HandlerConfig::AccessControl(_)
@@ -1493,6 +1513,10 @@ fn compile_matcher(
         Matcher::Host(hosts) => CoreMatcher::Host(hosts.clone()),
         Matcher::RemoteIp(ips) => CoreMatcher::RemoteIp(ips.clone()),
         Matcher::Protocol(protocols) => CoreMatcher::Protocol(protocols.clone()),
+        Matcher::Vars { name, values } => CoreMatcher::Vars {
+            name: name.clone(),
+            values: values.clone(),
+        },
         Matcher::And(left, right) => CoreMatcher::And(
             Box::new(compile_matcher(left, matchers, depth + 1)?),
             Box::new(compile_matcher(right, matchers, depth + 1)?),
@@ -1653,6 +1677,10 @@ fn compile_handler(
         }),
 
         Handler::LogSkip => Ok(HandlerConfig::LogSkip),
+
+        Handler::Vars(config) => Ok(HandlerConfig::Vars {
+            values: config.values.clone(),
+        }),
 
         Handler::Pipeline(elements) => {
             let handlers = elements

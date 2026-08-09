@@ -13,6 +13,34 @@ use pingora_core::Result as PingoraResult;
 use pingora_http::ResponseHeader;
 use regex::Regex;
 
+/// 🧰 Request-scoped variables set by `vars` handlers and read by
+/// `{http.vars.*}` placeholders and the `vars` matcher.
+///
+/// Both transports carry one of these (H1/H2 on the request context, H3
+/// threaded through planning), so a value set by middleware is visible to
+/// every later placeholder on the same request regardless of protocol.
+#[derive(Debug, Clone, Default)]
+pub struct RequestVars {
+    values: BTreeMap<String, String>,
+}
+
+impl RequestVars {
+    /// 🧩 Sets one variable, replacing any value an earlier rule wrote.
+    pub fn set(&mut self, name: impl Into<String>, value: impl Into<String>) {
+        self.values.insert(name.into(), value.into());
+    }
+
+    /// 🔎 Reads one variable, or `None` when nothing set it.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.values.get(name).map(String::as_str)
+    }
+
+    /// 🔎 The whole map, for matcher evaluation and placeholder expansion.
+    pub fn as_map(&self) -> &BTreeMap<String, String> {
+        &self.values
+    }
+}
+
 /// 🌐 Extracts a hostname from HTTP authority syntax without breaking IPv6 literals.
 pub(crate) fn authority_host(authority: &str) -> &str {
     if let Some(bracketed) = authority.strip_prefix('[') {

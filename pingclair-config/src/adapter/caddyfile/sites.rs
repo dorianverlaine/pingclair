@@ -20,6 +20,7 @@ use super::tls::adapt_tls_directive;
 use crate::parser::ast::*;
 use crate::parser::caddy_ast::Directive;
 use crate::parser::lexer::Location;
+use std::collections::BTreeMap;
 
 // MARK: - Server Block
 
@@ -205,6 +206,62 @@ pub(super) fn adapt_server(
                         return Err(AdapterError::ArgumentCount("root".into(), 1, args.len()));
                     }
                     server.root = Some(path.clone());
+                }
+                "vars" => {
+                    // 🧰 `vars [<matcher>] <name> <value>` and
+                    // `vars { <name> <value> … }` become site-level rules.
+                    // Rules are sorted least specific first (below), and
+                    // every matching rule runs — so the most specific value
+                    // wins, the reverse of ordinary route priority.
+                    let (matcher, _) = parse_matcher_and_block(&sub_d)?;
+                    let mut handler_d = sub_d.clone();
+                    if matcher.is_some() {
+                        if handler_d.args.is_empty() {
+                            return Err(AdapterError::ArgumentCount("vars".into(), 1, 0));
+                        }
+                        handler_d.drop_first_arg();
+                    }
+                    // 🌐 `*` means "every request", which is the same as no
+                    // matcher; the generic matcher rule says so by returning
+                    // `None`, so drop the token here before the data reader.
+                    let args = if handler_d.args.first().is_some_and(|arg| arg == "*") {
+                        &handler_d.args[1..]
+                    } else {
+                        &handler_d.args[..]
+                    };
+                    let mut values = BTreeMap::new();
+                    match args {
+                        [] => {}
+                        [name, value] => {
+                            values.insert(name.clone(), value.clone());
+                        }
+                        _ => {
+                            return Err(AdapterError::ArgumentCount("vars".into(), 2, args.len()));
+                        }
+                    }
+                    if let Some(block) = &handler_d.block {
+                        for line in &block.directives {
+                            let [value] = line.args.as_slice() else {
+                                return Err(AdapterError::InvalidArgument(
+                                    "vars".into(),
+                                    format!(
+                                        "each block line needs exactly `<name> <value>`, got {} \
+                                         arguments for `{}`",
+                                        line.args.len(),
+                                        line.name
+                                    ),
+                                ));
+                            };
+                            values.insert(line.name.clone(), value.clone());
+                        }
+                    }
+                    if values.is_empty() {
+                        return Err(AdapterError::InvalidArgument(
+                            "vars".into(),
+                            "at least one `<name> <value>` pair is required".into(),
+                        ));
+                    }
+                    server.vars_routes.push(VarsRule { matcher, values });
                 }
                 "handle_errors" => {
                     // 🚨 `handle_errors [<codes…>] { … }` registers a
@@ -641,6 +698,51 @@ pub(super) fn adapt_server(
         if !default_handlers.is_empty() {
             add_route(&mut server, None, final_handler);
         }
+
+        // 🧰 `vars` rules sort least specific first, the reverse of route
+        // priority: every matching rule runs, so the most specific value is
+        // the last one written. The comparator mirrors upstream's
+        // `sortByPath` negated, including the "same path, one with a
+        // trailing wildcard" tie-break (`/foo` before `/foo*` normally,
+        // after `/foo*` here).
+        let standard_less = |left: &VarsRule, right: &VarsRule| -> bool {
+            let path = |matcher: &Option<Matcher>| -> (String, usize) {
+                match matcher {
+                    Some(Matcher::Path(PathMatcher { patterns })) if patterns.len() == 1 => {
+                        let pattern = &patterns[0];
+                        (
+                            pattern.strip_suffix('*').unwrap_or(pattern).to_string(),
+                            pattern.len(),
+                        )
+                    }
+                    _ => (String::new(), 0),
+                }
+            };
+            let (left_trimmed, left_len) = path(&left.matcher);
+            let (right_trimmed, right_len) = path(&right.matcher);
+            if left_len > 0 && right_len > 0 {
+                if left_trimmed == right_trimmed {
+                    left_len < right_len
+                } else if left_trimmed.len() == right_trimmed.len() {
+                    left_trimmed < right_trimmed
+                } else {
+                    left_trimmed.len() > right_trimmed.len()
+                }
+            } else {
+                left.matcher.is_some() && right.matcher.is_none()
+            }
+        };
+        // 🔃 `vars` runs the least specific matcher first so the most
+        // specific rule can overwrite it, the negation of normal order.
+        server.vars_routes.sort_by(|left, right| {
+            let left_first = !standard_less(left, right);
+            let right_first = !standard_less(right, left);
+            match (left_first, right_first) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
+            }
+        });
     }
 
     // 🏠 Caddy serves localhost and IP-literal sites over HTTPS with its local
@@ -678,6 +780,7 @@ pub(super) fn handler_directive_name(handler: &Handler) -> &'static str {
     match handler {
         Handler::Headers(_) => "header",
         Handler::LogSkip => "log_skip",
+        Handler::Vars(_) => "vars",
         Handler::Redirect(_) => "redir",
         Handler::Error(_) => "error",
         // 🏷️ `rewrite` and `uri` compile to the same handler and rank one
@@ -750,6 +853,7 @@ pub(super) fn handler_has_terminal(handler: &Handler) -> bool {
         | Handler::Cors(_)
         | Handler::AccessControl(_)
         | Handler::LogSkip
+        | Handler::Vars(_)
         | Handler::Plugin { .. } => false,
     }
 }

@@ -2207,6 +2207,61 @@ async fn test_handle_errors_intercepts_file_server_404() {
 }
 
 #[tokio::test]
+async fn test_vars_rules_placeholders_and_matcher() {
+    // 🧰 Request-scoped vars: a catch-all rule sets a value every request
+    // sees, a path-scoped rule adds another, `{http.vars.*}` expands in
+    // later placeholders, and a route-level `vars` matcher gates on the
+    // value the rules wrote.
+    let config = serde_json::json!({
+        "servers": [
+            {
+                "listen": ["127.0.0.1:0"],
+                "vars_routes": [
+                    { "values": { "greeting": "hello" } },
+                    {
+                        "matcher": { "path": { "patterns": ["/admin*"] } },
+                        "values": { "role": "admin" }
+                    }
+                ],
+                "routes": [
+                    {
+                        "path": "/show",
+                        "handler": {
+                            "type": "respond",
+                            "status": 200,
+                            "body": "{http.vars.greeting}"
+                        }
+                    },
+                    {
+                        "path": "/admin",
+                        "matcher": { "vars": { "name": "role", "values": ["admin"] } },
+                        "handler": { "type": "respond", "status": 200, "body": "admin ok" }
+                    },
+                    {
+                        "path": "/admin",
+                        "matcher": { "vars": { "name": "role", "values": ["user"] } },
+                        "handler": { "type": "respond", "status": 200, "body": "wrong role" }
+                    }
+                ]
+            }
+        ]
+    })
+    .to_string();
+
+    let mut server = TestServer::new(&config);
+    let client = no_proxy_client();
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let resp = client.get(server.url(0, "/show")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "hello");
+
+    let resp = client.get(server.url(0, "/admin")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "admin ok");
+}
+
+#[tokio::test]
 async fn test_custom_error_pages() {
     // 🎨 Verify custom pages for both static and upstream failures.
     let tmp_dir = tempfile::tempdir().unwrap();

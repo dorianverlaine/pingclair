@@ -330,6 +330,11 @@ pub struct ServerConfig {
     /// 🚨 Status-selective routes run when a handler raises an error status.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub error_routes: Vec<ErrorRouteConfig>,
+
+    /// 🧰 Site-level `vars` rules, least specific first; every matching rule
+    /// runs so the most specific value wins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vars_routes: Vec<VarsRule>,
 }
 
 /// 🚨 One `handle_errors [<codes…>]` block: a status-selective error route.
@@ -360,6 +365,17 @@ impl ErrorRouteConfig {
     }
 }
 
+/// 🧰 One `vars [<matcher>] <name> <value>` rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VarsRule {
+    /// Optional matcher; `None` runs for every request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<Matcher>,
+    /// 🧩 Variable names to values, set when the rule matches.
+    #[serde(default)]
+    pub values: BTreeMap<String, String>,
+}
+
 /// Hand-written rather than derived so `ServerConfig::default()` agrees with
 /// what deserializing `{}` produces. `#[derive(Default)]` ignores the
 /// `#[serde(default = ...)]` attributes, which would silently hand out
@@ -385,6 +401,7 @@ impl Default for ServerConfig {
             encodings: default_encodings(),
             error_pages: BTreeMap::new(),
             error_routes: Vec::new(),
+            vars_routes: Vec::new(),
         }
     }
 }
@@ -523,6 +540,9 @@ pub enum Matcher {
     /// Match by protocol
     Protocol(Vec<String>),
 
+    /// Match by request-scoped variable (`vars` matcher).
+    Vars { name: String, values: Vec<String> },
+
     /// AND combination
     And(Box<Matcher>, Box<Matcher>),
 
@@ -568,6 +588,10 @@ impl<'de> Deserialize<'de> for Matcher {
             Host(Vec<String>),
             RemoteIp(Vec<String>),
             Protocol(Vec<String>),
+            Vars {
+                name: String,
+                values: Vec<String>,
+            },
             And(Box<Matcher>, Box<Matcher>),
             Or(Box<Matcher>, Box<Matcher>),
             Not(Box<Matcher>),
@@ -619,6 +643,7 @@ impl<'de> Deserialize<'de> for Matcher {
             Repr::Tagged(Tagged::Host(hosts)) => Matcher::Host(hosts),
             Repr::Tagged(Tagged::RemoteIp(ips)) => Matcher::RemoteIp(ips),
             Repr::Tagged(Tagged::Protocol(protocols)) => Matcher::Protocol(protocols),
+            Repr::Tagged(Tagged::Vars { name, values }) => Matcher::Vars { name, values },
             Repr::Tagged(Tagged::And(left, right)) => Matcher::And(left, right),
             Repr::Tagged(Tagged::Or(left, right)) => Matcher::Or(left, right),
             Repr::Tagged(Tagged::Not(inner)) => Matcher::Not(inner),
@@ -781,6 +806,12 @@ pub enum HandlerConfig {
 
     /// 🚫 Marks the request as excluded from access logging (`log_skip`).
     LogSkip,
+
+    /// 🧰 Sets request-scoped variables, visible to `{http.vars.*}`.
+    Vars {
+        #[serde(default)]
+        values: BTreeMap<String, String>,
+    },
 
     /// Pipeline of matcher-guarded elements
     Pipeline { handlers: Vec<HandlerElement> },
@@ -1929,6 +1960,7 @@ mod tests {
             encodings: default_encodings(),
             error_pages: Default::default(),
             error_routes: Vec::new(),
+            vars_routes: Vec::new(),
         };
         assert_eq!(config.name, Some("example.com".to_string()));
     }

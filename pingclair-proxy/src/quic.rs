@@ -1550,6 +1550,7 @@ fn h3_element_matcher_matches(
     request_header: &RequestHeader,
     effective_uri: &str,
     verified_client_ip: &str,
+    request_vars: &crate::http_policy::RequestVars,
 ) -> bool {
     let Some(compiled) = element_precompile.and_then(|node| node.element_matcher.as_ref()) else {
         return true;
@@ -1567,6 +1568,7 @@ fn h3_element_matcher_matches(
         host,
         remote_ip: verified_client_ip,
         protocol: "https",
+        vars: Some(request_vars.as_map()),
     };
     evaluate(compiled, &request)
 }
@@ -1584,6 +1586,7 @@ async fn plan_h3_handler(
     verified_client_ip: &str,
     precompile: Option<&MatcherPrecompile>,
     handling_error: bool,
+    request_vars: &mut crate::http_policy::RequestVars,
 ) -> Result<H3Plan, HandlerError> {
     match handler {
         HandlerConfig::Pipeline { handlers } => {
@@ -1598,6 +1601,7 @@ async fn plan_h3_handler(
                     request_header,
                     effective_uri,
                     verified_client_ip,
+                    request_vars,
                 ) {
                     continue;
                 }
@@ -1614,6 +1618,7 @@ async fn plan_h3_handler(
                     verified_client_ip,
                     element_precompile,
                     handling_error,
+                    request_vars,
                 )
                 .await?
                 {
@@ -1634,6 +1639,7 @@ async fn plan_h3_handler(
                     request_header,
                     effective_uri,
                     verified_client_ip,
+                    request_vars,
                 ) {
                     continue;
                 }
@@ -1652,6 +1658,7 @@ async fn plan_h3_handler(
                     verified_client_ip,
                     element_precompile,
                     handling_error,
+                    request_vars,
                 )
                 .await;
             }
@@ -1679,6 +1686,7 @@ async fn plan_h3_handler(
                     request_header,
                     effective_uri,
                     verified_client_ip,
+                    request_vars,
                 ) {
                     continue;
                 }
@@ -1697,6 +1705,7 @@ async fn plan_h3_handler(
                     verified_client_ip,
                     element_precompile,
                     handling_error,
+                    request_vars,
                 )
                 .await;
             }
@@ -1715,6 +1724,21 @@ async fn plan_h3_handler(
             Ok(H3Plan::Continue)
         }
         HandlerConfig::LogSkip => Ok(H3Plan::Continue),
+        HandlerConfig::Vars { values } => {
+            // 🧰 Values are templates resolved against the same request, so
+            // a value may reference placeholders and earlier vars.
+            for (name, template) in values {
+                let resolved = resolve_caddy_placeholders(
+                    template,
+                    request_header,
+                    Some(verified_client_ip),
+                    "https",
+                    request_vars,
+                );
+                request_vars.set(name.clone(), resolved.into_owned());
+            }
+            Ok(H3Plan::Continue)
+        }
         HandlerConfig::Rewrite {
             strip_prefix,
             strip_suffix,
@@ -1804,7 +1828,8 @@ async fn plan_h3_handler(
             // the value over HTTP/1 and HTTP/2.
             let body = body.as_deref().map(|raw| {
                 let verified = raw.contains('{').then_some(verified_client_ip);
-                resolve_caddy_placeholders(raw, request_header, verified, "https").into_owned()
+                resolve_caddy_placeholders(raw, request_header, verified, "https", request_vars)
+                    .into_owned()
             });
             Ok(H3Plan::Terminal(H3Terminal::Respond {
                 status: *status,
@@ -1824,7 +1849,8 @@ async fn plan_h3_handler(
             });
             let verified = raw.contains('{').then_some(verified_client_ip);
             let body = Some(
-                resolve_caddy_placeholders(raw, request_header, verified, "https").into_owned(),
+                resolve_caddy_placeholders(raw, request_header, verified, "https", request_vars)
+                    .into_owned(),
             );
             // 🚫 Inside an error route a second raise responds directly —
             // routing it again is the infinite recursion this guard stops.
@@ -1847,6 +1873,7 @@ async fn plan_h3_handler(
                         verified_client_ip,
                         precompile,
                         true,
+                        request_vars,
                     )
                     .await?;
                     return Ok(match plan {
@@ -1871,8 +1898,14 @@ async fn plan_h3_handler(
         HandlerConfig::Redirect { to, code } => Ok(H3Plan::Terminal(H3Terminal::Redirect {
             // 🚀 An HTTP/3 request always arrived over TLS, so the scheme is a
             // constant here rather than something to thread through.
-            to: resolve_caddy_placeholders(to, request_header, Some(verified_client_ip), "https")
-                .into_owned(),
+            to: resolve_caddy_placeholders(
+                to,
+                request_header,
+                Some(verified_client_ip),
+                "https",
+                request_vars,
+            )
+            .into_owned(),
             code: *code,
         })),
         HandlerConfig::Templates { root } => {
@@ -1934,6 +1967,7 @@ async fn plan_h3_handler(
                         verified_client_ip,
                         fallback_precompile,
                         handling_error,
+                        request_vars,
                     )
                     .await
                 }
@@ -2075,24 +2109,63 @@ async fn handle_request_inner(
 
     let host_bare = authority_host(&req.authority).to_string();
 
-    // 🧭 Routes through the shared matcher used by the H1 and H2 path.
-    let (state, route_index) = match proxy.match_route_index(
-        &host_bare,
-        path_only,
-        req.method.as_str(),
-        &header,
-        &verified_client_ip_text,
-    ) {
-        Some((state, Some(index))) => {
-            *error_state = Some(state.clone());
-            (state, index)
+    // 🧭 Routes through the shared matcher used by the H1 and H2 path. The
+    // state is resolved by host first so site-level `vars` rules can run
+    // before route matching, exactly as they do on H1/H2.
+    let mut request_vars = crate::http_policy::RequestVars::default();
+    let (state, route_index) = {
+        let Some(state) = proxy.get_state(&host_bare) else {
+            return Err((404, "No Matching Virtual Host"));
+        };
+        for (index, rule) in state.config.vars_routes.iter().enumerate() {
+            let compiled = state.vars_precompiles.get(index).and_then(Option::as_ref);
+            let matches = match compiled {
+                Some(compiled) => {
+                    let request = MatcherRequest {
+                        path: path_only,
+                        method: req.method.as_str(),
+                        headers: &header.headers,
+                        host: &host_bare,
+                        remote_ip: &verified_client_ip_text,
+                        protocol: "https",
+                        vars: Some(request_vars.as_map()),
+                    };
+                    evaluate(compiled, &request)
+                }
+                None => true,
+            };
+            if matches {
+                for (name, template) in &rule.values {
+                    let resolved = resolve_caddy_placeholders(
+                        template,
+                        &header,
+                        Some(&verified_client_ip_text),
+                        "https",
+                        &request_vars,
+                    );
+                    request_vars.set(name.clone(), resolved.into_owned());
+                }
+            }
         }
-        Some((state, None)) => {
-            *error_state = Some(state);
-            return Err((404, "No Matching Route"));
-        }
-        None => return Err((404, "No Matching Virtual Host")),
+        let route_index = state
+            .router
+            .match_normalized_request(
+                path_only,
+                req.method.as_str(),
+                &header.headers,
+                &host_bare,
+                &verified_client_ip_text,
+                "https",
+                Some(request_vars.as_map()),
+            )
+            .map(|route| route.index);
+        (state, route_index)
     };
+    let Some(route_index) = route_index else {
+        *error_state = Some(state);
+        return Err((404, "No Matching Route"));
+    };
+    *error_state = Some(state.clone());
     let handler = &state
         .config
         .routes
@@ -2180,6 +2253,7 @@ async fn handle_request_inner(
         &verified_client_ip_text,
         route_precompile,
         false,
+        &mut request_vars,
     )
     .await?;
 
@@ -2401,6 +2475,7 @@ async fn handle_request_inner(
                 resp_tx,
                 body_notify,
                 request_started,
+                &request_vars,
             )
             .await
         }
@@ -2428,6 +2503,7 @@ async fn reverse_proxy_upstream(
     resp_tx: &RespSender,
     body_notify: &Arc<Notify>,
     request_started: Instant,
+    request_vars: &crate::http_policy::RequestVars,
 ) -> Result<(), HandlerError> {
     let _route_admission = match proxy.admit_route(state, route_index).await {
         Ok(admission) => admission,
@@ -2650,6 +2726,7 @@ async fn reverse_proxy_upstream(
                     client_header,
                     Some(verified_client_ip),
                     "https",
+                    request_vars,
                 );
                 up_req.insert_header(key.clone(), resolved.as_ref()).ok();
             }
@@ -3586,6 +3663,7 @@ mod tests {
             &resp_tx,
             &body_notify,
             Instant::now(),
+            &crate::http_policy::RequestVars::default(),
         )
         .await
         .unwrap();
@@ -3678,6 +3756,7 @@ mod tests {
             &resp_tx,
             &Arc::new(Notify::new()),
             Instant::now(),
+            &crate::http_policy::RequestVars::default(),
         )
         .await
         .unwrap();
@@ -3704,6 +3783,7 @@ mod tests {
             &resp_tx,
             &Arc::new(Notify::new()),
             Instant::now(),
+            &crate::http_policy::RequestVars::default(),
         )
         .await;
         assert_eq!(result, Err((503, "Upstream Overloaded")));
@@ -3792,6 +3872,7 @@ mod tests {
             &resp_tx,
             &body_notify,
             Instant::now(),
+            &crate::http_policy::RequestVars::default(),
         )
         .await
         .unwrap();
@@ -3866,6 +3947,7 @@ mod tests {
             "203.0.113.7",
             None,
             false,
+            &mut crate::http_policy::RequestVars::default(),
         )
         .await
         .unwrap();
@@ -3924,6 +4006,7 @@ mod tests {
             "203.0.113.7",
             None,
             false,
+            &mut crate::http_policy::RequestVars::default(),
         )
         .await
         .unwrap();
@@ -3931,6 +4014,48 @@ mod tests {
         assert!(matches!(
             plan,
             H3Plan::Respond(H3ImmediateResponse { status: 403, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn h3_vars_set_values_visible_to_later_placeholders() {
+        let handler = HandlerConfig::Pipeline {
+            handlers: vec![
+                HandlerElement::plain(HandlerConfig::Vars {
+                    values: BTreeMap::from([("who".to_string(), "h3".to_string())]),
+                }),
+                HandlerElement::plain(HandlerConfig::Respond {
+                    status: 200,
+                    body: Some("{http.vars.who}".to_string()),
+                    headers: BTreeMap::new(),
+                }),
+            ],
+        };
+        let state = proxy_state(handler.clone());
+        let mut request = RequestHeader::build(http::Method::GET, b"/", None).unwrap();
+        let mut uri = "/".to_string();
+        let mut policy = ResponseHeaderPolicy::default();
+
+        let plan = plan_h3_handler(
+            &handler,
+            &state,
+            0,
+            &mut request,
+            &mut uri,
+            &mut policy,
+            "203.0.113.7",
+            None,
+            false,
+            &mut crate::http_policy::RequestVars::default(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            plan,
+            H3Plan::Terminal(H3Terminal::Respond {
+                body: Some(ref body),
+                ..
+            }) if body == "h3"
         ));
     }
 
@@ -3969,6 +4094,7 @@ mod tests {
             "203.0.113.7",
             None,
             false,
+            &mut crate::http_policy::RequestVars::default(),
         )
         .await
         .unwrap();
@@ -4007,6 +4133,7 @@ mod tests {
             "203.0.113.7",
             None,
             false,
+            &mut crate::http_policy::RequestVars::default(),
         )
         .await
         .unwrap();
@@ -4038,6 +4165,7 @@ mod tests {
             "203.0.113.7",
             None,
             false,
+            &mut crate::http_policy::RequestVars::default(),
         )
         .await
         .unwrap();
@@ -4075,6 +4203,7 @@ mod tests {
             "203.0.113.9",
             None,
             false,
+            &mut crate::http_policy::RequestVars::default(),
         )
         .await
         .unwrap();
@@ -4127,6 +4256,7 @@ mod tests {
             "203.0.113.7",
             precompile,
             false,
+            &mut crate::http_policy::RequestVars::default(),
         )
         .await
         .unwrap();
@@ -4148,6 +4278,7 @@ mod tests {
             "203.0.113.7",
             precompile,
             false,
+            &mut crate::http_policy::RequestVars::default(),
         )
         .await
         .unwrap();

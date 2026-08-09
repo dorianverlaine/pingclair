@@ -118,6 +118,17 @@ lets the rest converge.
   statuses the same way; H3 file-server 404 interception remains a tracked
   parity gap.
 
+- 🧰 **`vars` gives each request a place to store values.** `vars
+  [<matcher>] <name> <value>` and `vars { <name> <value> … }` set
+  request-scoped variables, ordered least specific first so the most
+  specific rule wins when several match. Values are templates: they may
+  reference other placeholders and earlier variables. `{http.vars.*}`
+  reads them back in any later placeholder, and the `vars` matcher gates
+  routes on their value. The state lives in `http_policy.rs` and both H1/H2
+  and H3 carry it, so a value set by middleware is visible on either
+  transport. `vars` matcher placeholder keys stay refused: they resolve
+  against the request's placeholder engine, which the router cannot reach.
+
 - 🗂️ **`try_files` resolves candidates under the site root and rewrites instead
   of serving.** It was previously reachable only from JSON, where it treated
   each candidate as a filesystem path and served any match itself through an

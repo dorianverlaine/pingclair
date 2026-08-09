@@ -106,6 +106,7 @@ pub(super) static DIRECTIVES: &[Spec] = &[
     implemented("tls"),
     implemented("try_files"),
     implemented("uri"),
+    implemented("vars"),
     // MARK: - Recognised, not implemented
     recognised("abort"),
     recognised("acme_server"),
@@ -126,7 +127,6 @@ pub(super) static DIRECTIVES: &[Spec] = &[
     recognised("request_header"),
     recognised("skip_log"),
     recognised("tracing"),
-    recognised("vars"),
 ];
 
 /// 🌐 Every global-block option name.
@@ -314,6 +314,7 @@ mod tests {
             ("tls", "tls internal"),
             ("try_files", "try_files {path} /index.html"),
             ("uri", "uri strip_prefix /api"),
+            ("vars", "vars foo bar"),
         ];
 
         for spec in DIRECTIVES

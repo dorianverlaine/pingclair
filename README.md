@@ -692,7 +692,7 @@ Directives:
   `abort` `acme_server` `copy_response` `copy_response_headers` `forward_auth`
   `fs` `intercept` `invoke` `log_append` `log_name`
   `map` `method` `metrics` `php_fastcgi` `push`
-  `request_body` `request_header` `skip_log` `tracing` `vars`
+  `request_body` `request_header` `skip_log` `tracing`
 
 Global options:
 

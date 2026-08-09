@@ -14,7 +14,7 @@ use super::reverse_proxy::adapt_reverse_proxy;
 use crate::parser::ast::*;
 use crate::parser::caddy_ast::{Block, Directive};
 use pingclair_core::config::BasicAuthAlgorithm;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 // MARK: - Handler Adaptation
 
@@ -107,6 +107,7 @@ pub(super) fn adapt_handler(
         "basic_auth" | "basicauth" => adapt_basic_auth(d),
         "rate_limit" => adapt_rate_limit(d),
         "error" => adapt_error_directive(&d),
+        "vars" => adapt_vars_directive(&d),
         "rewrite" => adapt_rewrite(d),
         "uri" => adapt_uri(d),
         "try_files" => adapt_try_files(d),
@@ -831,6 +832,50 @@ pub(super) fn adapt_error_directive(d: &Directive) -> Result<Handler, AdapterErr
     }
 
     Ok(Handler::Error(ErrorConfig { status, message }))
+}
+
+// MARK: - vars Directive Adapter
+
+/// Adapt Caddy `vars` directive: an optional inline `<name> <value>` pair,
+/// then block lines of the same shape. Names and values are templates and
+/// stay literal here; they resolve per request against the request's own
+/// placeholders and variables.
+pub(super) fn adapt_vars_directive(d: &Directive) -> Result<Handler, AdapterError> {
+    let mut values = BTreeMap::new();
+
+    match d.args.as_slice() {
+        [] => {}
+        [name, value] => {
+            values.insert(name.clone(), value.clone());
+        }
+        _ => {
+            return Err(AdapterError::ArgumentCount("vars".into(), 2, d.args.len()));
+        }
+    }
+    if let Some(block) = &d.block {
+        for line in &block.directives {
+            let [value] = line.args.as_slice() else {
+                return Err(AdapterError::InvalidArgument(
+                    "vars".into(),
+                    format!(
+                        "each block line needs exactly `<name> <value>`, got {} arguments \
+                         for `{}`",
+                        line.args.len(),
+                        line.name
+                    ),
+                ));
+            };
+            values.insert(line.name.clone(), value.clone());
+        }
+    }
+    if values.is_empty() {
+        return Err(AdapterError::InvalidArgument(
+            "vars".into(),
+            "at least one `<name> <value>` pair is required".into(),
+        ));
+    }
+
+    Ok(Handler::Vars(VarsConfig { values }))
 }
 
 // MARK: - header Directive Adapter

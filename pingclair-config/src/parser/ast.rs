@@ -199,6 +199,9 @@ pub struct ServerBlock {
     /// 🚨 Status-selective error routes from `handle_errors` blocks.
     pub error_routes: Vec<ErrorRouteConfig>,
 
+    /// 🧰 Site-level `vars` rules, least specific first.
+    pub vars_routes: Vec<VarsRule>,
+
     /// Other directives (including macro calls)
     pub directives: Vec<Directive>,
 
@@ -216,6 +219,15 @@ pub struct ErrorRouteConfig {
     pub hundreds: Vec<u8>,
     /// 🧭 Matcher-guarded handlers in file order.
     pub handlers: Vec<HandlerElement>,
+}
+
+/// 🧰 One site-level `vars [<matcher>] <name> <value>` rule.
+#[derive(Debug, Clone)]
+pub struct VarsRule {
+    /// Optional matcher; `None` runs for every request.
+    pub matcher: Option<Matcher>,
+    /// 🧩 Variable names to values.
+    pub values: BTreeMap<String, String>,
 }
 
 /// 🧱 Typed server resource limits produced by the Caddyfile adapter.
@@ -450,6 +462,9 @@ pub enum Matcher {
     /// Match by protocol: protocol("https" | "http")
     Protocol(Vec<String>),
 
+    /// Match by request-scoped variable: vars("name", "value" | ...)
+    Vars { name: String, values: Vec<String> },
+
     /// Combined matchers with AND
     And(Box<Matcher>, Box<Matcher>),
 
@@ -538,6 +553,9 @@ pub enum Handler {
 
     /// 🚫 Excludes the request from access logging (`log_skip`).
     LogSkip,
+
+    /// 🧰 Sets request-scoped variables (`vars` handler).
+    Vars(VarsConfig),
 
     /// Multiple matcher-guarded elements (pipeline, file order preserved)
     Pipeline(Vec<HandlerElement>),
@@ -907,6 +925,12 @@ pub struct ErrorConfig {
     pub message: Option<String>,
 }
 
+/// 🧰 Variable assignments produced by the `vars` directive.
+#[derive(Debug, Clone)]
+pub struct VarsConfig {
+    pub values: BTreeMap<String, String>,
+}
+
 /// Redirect configuration
 #[derive(Debug, Clone)]
 pub struct RedirectConfig {
@@ -1025,6 +1049,7 @@ impl ServerBlock {
             matchers: HashMap::new(),
             error_pages: Vec::new(),
             error_routes: Vec::new(),
+            vars_routes: Vec::new(),
             directives: Vec::new(),
             limits: ResourceLimitsConfig::default(),
         }

@@ -2410,6 +2410,119 @@ mod handle_errors_tests {
     }
 }
 
+// MARK: - vars
+
+/// 🧰 `vars` gives the request a place to store values: inline and block
+/// forms, optional matchers (with `*` meaning "every request"), and rules
+/// sorted least specific first so the most specific value wins.
+#[cfg(test)]
+mod vars_tests {
+    use crate::compile;
+    use pingclair_core::config::Matcher;
+
+    fn vars_routes_of(source: &str) -> Vec<pingclair_core::config::VarsRule> {
+        let config = compile(source).unwrap_or_else(|error| panic!("must compile: {error}"));
+        config
+            .servers
+            .into_iter()
+            .next()
+            .expect("one server")
+            .vars_routes
+    }
+
+    #[test]
+    fn inline_and_block_forms_compile() {
+        let routes = vars_routes_of(
+            "example.com {\n\tvars foo bar\n\tvars {\n\t\tabc true\n\t\tdef 1\n\t}\n}",
+        );
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].values.get("foo").map(String::as_str), Some("bar"));
+        assert_eq!(routes[1].values.len(), 2);
+        assert_eq!(
+            routes[1].values.get("abc").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn matchers_and_the_wildcard_compile() {
+        let routes = vars_routes_of("example.com {\n\tvars /foo foo middle\n\tvars * foo first\n}");
+        assert_eq!(routes.len(), 2);
+        let path_rule = routes
+            .iter()
+            .find(|rule| rule.matcher.is_some())
+            .expect("a path-scoped rule");
+        assert!(matches!(path_rule.matcher, Some(Matcher::Path { .. })));
+        let catch_all = routes
+            .iter()
+            .find(|rule| rule.matcher.is_none())
+            .expect("a catch-all rule");
+        assert!(
+            catch_all.matcher.is_none(),
+            "the `*` matcher is the same as no matcher"
+        );
+    }
+
+    #[test]
+    fn rules_sort_least_specific_first() {
+        let routes = vars_routes_of(
+            "example.com {\n\tvars /foobar foo last\n\tvars /foo foo middle-last\n\t\
+             vars /foo* foo middle-first\n\tvars * foo first\n}",
+        );
+        assert!(routes[0].matcher.is_none(), "the catch-all runs first");
+        assert!(
+            matches!(&routes[1].matcher, Some(Matcher::Path { patterns }) if patterns[0] == "/foo*"),
+            "then the shorter glob: {:?}",
+            routes[1].matcher
+        );
+        assert!(
+            matches!(&routes[2].matcher, Some(Matcher::Path { patterns }) if patterns[0] == "/foo"),
+            "then the exact path: {:?}",
+            routes[2].matcher
+        );
+        assert!(
+            matches!(&routes[3].matcher, Some(Matcher::Path { patterns }) if patterns[0] == "/foobar"),
+            "the most specific runs last: {:?}",
+            routes[3].matcher
+        );
+    }
+
+    #[test]
+    fn malformed_shapes_are_refused() {
+        for source in [
+            "example.com {\n\tvars\n}",
+            "example.com {\n\tvars foo\n}",
+            "example.com {\n\tvars foo bar baz\n}",
+            "example.com {\n\tvars {\n\t\tabc\n\t}\n}",
+            "example.com {\n\tvars {\n\t\tabc 1 2\n\t}\n}",
+        ] {
+            compile(source).expect_err(&format!("must be refused:\n{source}"));
+        }
+    }
+
+    #[test]
+    fn the_vars_matcher_compiles_to_a_variable_lookup() {
+        let config = compile("example.com {\n\t@m vars foo bar\n\trespond @m \"hit\"\n}")
+            .expect("a vars matcher must compile");
+        let route = &config.servers[0].routes[0];
+        assert!(matches!(
+            &route.matcher,
+            Some(Matcher::Vars { name, values })
+                if name == "foo" && values == &["bar".to_string()]
+        ));
+    }
+
+    #[test]
+    fn the_vars_matcher_refuses_placeholder_keys() {
+        let error = compile(
+            "example.com {\n\t@m vars \"{http.request.uri}\" \"/x\"\n\trespond @m \"hit\"\n}",
+        )
+        .expect_err("a placeholder key must be refused")
+        .to_string();
+        assert!(error.contains("placeholder"), "{error}");
+    }
+}
+
 // MARK: - Matcher tokens inside route/handle
 
 /// 🧭 Per-element matchers inside `route`/`handle`/`handle_path` blocks.

@@ -18,6 +18,9 @@ pub struct MatcherRequest<'a> {
     pub host: &'a str,
     pub remote_ip: &'a str,
     pub protocol: &'a str,
+    /// 🧰 Request-scoped variables set by `vars` handlers, for the `vars`
+    /// matcher. `None` means no variables are visible, which matches nothing.
+    pub vars: Option<&'a std::collections::BTreeMap<String, String>>,
 }
 
 /// Pre-compiled matcher with cached regex
@@ -208,6 +211,10 @@ impl Router {
     }
 
     /// 🧭 Matches a request after normalizing paths supplied by direct callers.
+    // 📏 The eighth argument is the request-vars map for `vars` matchers;
+    // bundling the six request facts into a struct is a refactor, not part
+    // of this change.
+    #[allow(clippy::too_many_arguments)]
     pub fn match_request(
         &self,
         path: &str,
@@ -216,9 +223,18 @@ impl Router {
         host: &str,
         remote_ip: &str,
         protocol: &str,
+        vars: Option<&std::collections::BTreeMap<String, String>>,
     ) -> Option<&CompiledRoute> {
         let normalized_path = Self::normalize_request_path(path);
-        self.match_normalized_request(&normalized_path, method, headers, host, remote_ip, protocol)
+        self.match_normalized_request(
+            &normalized_path,
+            method,
+            headers,
+            host,
+            remote_ip,
+            protocol,
+            vars,
+        )
     }
 
     /// 🍃 Matches a path already normalized by the protocol ingress.
@@ -227,6 +243,7 @@ impl Router {
     /// policy and the origin see the same resource. Repeating that work here
     /// allocated both a segment vector and a new string on every ordinary
     /// request. Direct callers can continue to use [`Self::match_request`].
+    #[allow(clippy::too_many_arguments)]
     pub fn match_normalized_request(
         &self,
         path: &str,
@@ -235,6 +252,7 @@ impl Router {
         host: &str,
         remote_ip: &str,
         protocol: &str,
+        vars: Option<&std::collections::BTreeMap<String, String>>,
     ) -> Option<&CompiledRoute> {
         let request = MatcherRequest {
             path,
@@ -243,6 +261,7 @@ impl Router {
             host,
             remote_ip,
             protocol,
+            vars,
         };
 
         // 🌲 Consult the radix match before catch-all routes while borrowing
@@ -438,6 +457,14 @@ fn evaluate_matcher_inner(
         Matcher::Protocol(protocols) => protocols
             .iter()
             .any(|protocol| protocol.eq_ignore_ascii_case(request.protocol)),
+        // 🧰 The `vars` matcher reads a request-scoped variable and matches
+        // when its value equals any listed value. A request with no visible
+        // variables never matches, which is the fail-closed reading of a
+        // variable that has not been set.
+        Matcher::Vars { name, values } => request
+            .vars
+            .and_then(|vars| vars.get(name))
+            .is_some_and(|value| values.iter().any(|candidate| candidate == value)),
         Matcher::And(left, right) => {
             evaluate_matcher_inner(left, compiled, request)
                 && evaluate_matcher_inner(right, compiled, request)
@@ -671,7 +698,15 @@ mod tests {
 
         let matches = |path: &str| {
             router
-                .match_request(path, "GET", &headers, "example.com", "10.0.0.1", "https")
+                .match_request(
+                    path,
+                    "GET",
+                    &headers,
+                    "example.com",
+                    "10.0.0.1",
+                    "https",
+                    None,
+                )
                 .is_some()
         };
 
@@ -701,7 +736,15 @@ mod tests {
 
         let matches = |path: &str| {
             router
-                .match_request(path, "GET", &headers, "example.com", "10.0.0.1", "https")
+                .match_request(
+                    path,
+                    "GET",
+                    &headers,
+                    "example.com",
+                    "10.0.0.1",
+                    "https",
+                    None,
+                )
                 .is_some()
         };
 
@@ -738,6 +781,7 @@ mod tests {
                 host: "example.com",
                 remote_ip: "10.0.0.1",
                 protocol: "https",
+                vars: None,
             }
         }
 
@@ -769,7 +813,15 @@ mod tests {
 
         let matches = |path: &str| {
             router
-                .match_request(path, "GET", &headers, "example.com", "10.0.0.1", "https")
+                .match_request(
+                    path,
+                    "GET",
+                    &headers,
+                    "example.com",
+                    "10.0.0.1",
+                    "https",
+                    None,
+                )
                 .is_some()
         };
 
@@ -815,20 +867,31 @@ mod tests {
                     &headers,
                     "e.com",
                     "10.0.0.1",
-                    "https"
+                    "https",
+                    None
                 )
                 .is_some()
         );
         assert!(
             suffix
-                .match_request("/site.js", "GET", &headers, "e.com", "10.0.0.1", "https")
+                .match_request(
+                    "/site.js", "GET", &headers, "e.com", "10.0.0.1", "https", None
+                )
                 .is_none()
         );
 
         let prefix = Router::new(vec![route_for("/api/*")]);
         assert!(
             prefix
-                .match_request("/api/users", "GET", &headers, "e.com", "10.0.0.1", "https")
+                .match_request(
+                    "/api/users",
+                    "GET",
+                    &headers,
+                    "e.com",
+                    "10.0.0.1",
+                    "https",
+                    None
+                )
                 .is_some()
         );
 
@@ -841,7 +904,8 @@ mod tests {
                     &headers,
                     "e.com",
                     "10.0.0.1",
-                    "https"
+                    "https",
+                    None
                 )
                 .is_some()
         );
@@ -855,7 +919,8 @@ mod tests {
                     &headers,
                     "e.com",
                     "10.0.0.1",
-                    "https"
+                    "https",
+                    None
                 )
                 .is_some()
         );
@@ -867,7 +932,8 @@ mod tests {
                     &headers,
                     "e.com",
                     "10.0.0.1",
-                    "https"
+                    "https",
+                    None
                 )
                 .is_none()
         );
@@ -900,7 +966,8 @@ mod tests {
                     &headers,
                     "e.com",
                     "10.0.0.1",
-                    "https"
+                    "https",
+                    None
                 )
                 .is_some()
         );
@@ -912,7 +979,8 @@ mod tests {
                     &headers,
                     "e.com",
                     "10.0.0.1",
-                    "https"
+                    "https",
+                    None
                 )
                 .is_some()
         );
@@ -946,6 +1014,7 @@ mod tests {
                 "e.com",
                 "10.0.0.1",
                 "https",
+                None,
             )
             .map(|route| route.index);
         let normalized = router
@@ -956,6 +1025,7 @@ mod tests {
                 "e.com",
                 "10.0.0.1",
                 "https",
+                None,
             )
             .map(|route| route.index);
 
@@ -982,12 +1052,12 @@ mod tests {
 
         assert!(
             router
-                .match_request("/", "GET", &headers, "e.com", "10.1.2.3", "https")
+                .match_request("/", "GET", &headers, "e.com", "10.1.2.3", "https", None)
                 .is_some()
         );
         assert!(
             router
-                .match_request("/", "GET", &headers, "e.com", "192.168.1.1", "https")
+                .match_request("/", "GET", &headers, "e.com", "192.168.1.1", "https", None)
                 .is_none()
         );
     }
@@ -1013,13 +1083,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         assert!(
             router
-                .match_request("/", "GET", &headers, "e.com", "10.0.0.1", "https")
+                .match_request("/", "GET", &headers, "e.com", "10.0.0.1", "https", None)
                 .is_some()
         );
         headers.insert("Foo", "bar".parse().unwrap());
         assert!(
             router
-                .match_request("/", "GET", &headers, "e.com", "10.0.0.1", "https")
+                .match_request("/", "GET", &headers, "e.com", "10.0.0.1", "https", None)
                 .is_none()
         );
     }

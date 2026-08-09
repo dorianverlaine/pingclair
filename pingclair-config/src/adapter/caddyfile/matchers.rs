@@ -501,12 +501,42 @@ pub(super) fn parse_single_matcher_at(
                 condition: HeaderCondition::Regex(pattern.clone()),
             }))
         }
+        "vars" => {
+            // 🧰 The `vars` matcher reads one request-scoped variable and
+            // matches when its value equals any listed value.
+            let [name, values @ ..] = d.args.as_slice() else {
+                return Err(AdapterError::InvalidArgument(
+                    "vars".into(),
+                    "malformed vars matcher: expected a field name".into(),
+                ));
+            };
+            if values.is_empty() {
+                return Err(AdapterError::InvalidArgument(
+                    "vars".into(),
+                    "malformed vars matcher: expected at least one value".into(),
+                ));
+            }
+            // 🚫 A `{placeholder}` key resolves against the request's
+            // placeholder engine, which this matcher cannot reach from the
+            // router; refusing is honest, and a literal-brace comparison
+            // would be a matcher that silently never matches.
+            if name.starts_with('{') && name.ends_with('}') {
+                return Err(AdapterError::UnsupportedFeature(
+                    "vars matcher".into(),
+                    "placeholder keys are not implemented yet; use a variable name".into(),
+                ));
+            }
+            Ok(Matcher::Vars {
+                name: name.clone(),
+                values: values.to_vec(),
+            })
+        }
         // 🚫 Matchers the format defines and this crate does not implement.
         // Each needs a capability we do not have rather than an arm here:
         // `path_regexp` a path matcher that runs a regular expression,
-        // `expression` an expression language, `vars`/`vars_regexp` the
-        // variable subsystem, `url_pattern` the URLPattern syntax, and `tls`
-        // access to the handshake from a matcher.
+        // `expression` an expression language, `vars_regexp` regex against
+        // the variable subsystem, `url_pattern` the URLPattern syntax, and
+        // `tls` access to the handshake from a matcher.
         name if is_known_matcher(name) => Err(AdapterError::UnsupportedFeature(
             format!("{name} matcher"),
             "Pingclair does not implement this matcher yet".into(),
@@ -526,6 +556,6 @@ pub(super) fn parse_single_matcher_at(
 fn is_known_matcher(name: &str) -> bool {
     matches!(
         name,
-        "expression" | "path_regexp" | "url_pattern" | "vars" | "vars_regexp" | "tls"
+        "expression" | "path_regexp" | "url_pattern" | "vars_regexp" | "tls"
     )
 }

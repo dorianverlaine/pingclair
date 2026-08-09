@@ -9,7 +9,9 @@ use pingclair_core::config::{
     AccessControlConfig, CacheConfig, HandlerConfig, ResourceLimitsConfig, RetryConfig,
     ReverseProxyConfig, ServerConfig,
 };
-use pingclair_core::server::{MatcherPrecompile, MatcherRequest, Router, evaluate};
+use pingclair_core::server::{
+    CompiledMatcher, MatcherPrecompile, MatcherRequest, Router, evaluate,
+};
 
 use async_trait::async_trait;
 use pingora_core::Result as PingoraResult;
@@ -145,6 +147,8 @@ pub struct RequestContext {
     pub error_status: Option<u16>,
     /// 💬 Message carried with the raised error status.
     pub error_message: Option<String>,
+    /// 🧰 Request-scoped variables set by `vars` handlers.
+    pub request_vars: crate::http_policy::RequestVars,
     /// 🚫 Whether the request is already inside an error route; a second
     /// raised error then responds directly instead of recursing forever.
     pub handling_error: bool,
@@ -207,6 +211,7 @@ impl Default for RequestContext {
             request_body_bytes: 0,
             error_status: None,
             error_message: None,
+            request_vars: crate::http_policy::RequestVars::default(),
             handling_error: false,
             log_skip: false,
             request_deadline: None,
@@ -756,6 +761,9 @@ pub struct ProxyState {
     /// 🚨 Precompiled per-element matchers for each error route, parallel to
     /// `config.error_routes`.
     pub error_route_precompiles: Vec<MatcherPrecompile>,
+    /// 🧰 Precompiled matchers for site-level `vars` rules, parallel to
+    /// `config.vars_routes`; `None` means the rule has no matcher.
+    pub vars_precompiles: Vec<Option<CompiledMatcher>>,
     /// Load balancers per route
     pub load_balancers: Vec<Option<Arc<LoadBalancer>>>,
     /// Health checkers per route
@@ -1162,6 +1170,11 @@ impl ProxyState {
             .iter()
             .map(|route| pingclair_core::server::precompile_handler_list(&route.handlers))
             .collect();
+        let vars_precompiles = config
+            .vars_routes
+            .iter()
+            .map(|rule| rule.matcher.as_ref().map(CompiledMatcher::compile))
+            .collect();
         let host_label = config.name.clone().unwrap_or_else(|| "_".to_string());
 
         // 🧩 Initializes index-aligned components for each route.
@@ -1431,6 +1444,7 @@ impl ProxyState {
             config: Arc::new(config),
             router: Arc::new(router),
             error_route_precompiles,
+            vars_precompiles,
             load_balancers,
             health_checkers,
             file_servers,
@@ -1835,8 +1849,9 @@ impl PingclairProxy {
         method: &str,
         headers: &pingora_http::RequestHeader,
         remote_ip: &str,
+        vars: Option<&std::collections::BTreeMap<String, String>>,
     ) -> Option<(Arc<ProxyState>, Option<usize>, Option<HandlerConfig>)> {
-        self.match_route_index(host, path, method, headers, remote_ip)
+        self.match_route_index(host, path, method, headers, remote_ip, vars)
             .map(|(state, route_index)| {
                 let handler = route_index
                     .and_then(|index| state.config.routes.get(index))
@@ -1853,6 +1868,7 @@ impl PingclairProxy {
         method: &str,
         headers: &pingora_http::RequestHeader,
         remote_ip: &str,
+        vars: Option<&std::collections::BTreeMap<String, String>>,
     ) -> Option<(Arc<ProxyState>, Option<usize>)> {
         // 🏠 Resolves the immutable state published for this virtual host.
         let state = self.get_state(host)?;
@@ -1862,7 +1878,15 @@ impl PingclairProxy {
 
         let route_index = state
             .router
-            .match_normalized_request(path, method, &headers.headers, host, remote_ip, protocol)
+            .match_normalized_request(
+                path,
+                method,
+                &headers.headers,
+                host,
+                remote_ip,
+                protocol,
+                vars,
+            )
             .map(|route| route.index);
         Some((state, route_index))
     }
@@ -1875,7 +1899,7 @@ impl PingclairProxy {
     /// 1. Exact hostname match (`api.example.com`)
     /// 2. Wildcard match (`*.example.com`) — checks all registered wildcard hosts
     /// 3. Default catch-all server
-    fn get_state(&self, host: &str) -> Option<Arc<ProxyState>> {
+    pub(crate) fn get_state(&self, host: &str) -> Option<Arc<ProxyState>> {
         let hosts = self.hosts.load();
 
         // 1. Exact match (fast path)
@@ -2624,6 +2648,7 @@ impl PingclairProxy {
                 session.req_header(),
                 verified_client_ip.as_deref(),
                 ctx.request_scheme,
+                &ctx.request_vars,
             );
             Bytes::copy_from_slice(resolved.as_bytes())
         };
@@ -2709,6 +2734,7 @@ impl PingclairProxy {
             host,
             remote_ip: remote_ip.as_deref().unwrap_or(""),
             protocol: ctx.request_scheme,
+            vars: Some(ctx.request_vars.as_map()),
         };
         evaluate(compiled, &request)
     }
@@ -2769,6 +2795,7 @@ impl PingclairProxy {
                         session.req_header(),
                         verified_client_ip.as_deref(),
                         ctx.request_scheme,
+                        &ctx.request_vars,
                     );
                     Bytes::copy_from_slice(resolved.as_bytes())
                 };
@@ -2810,6 +2837,7 @@ impl PingclairProxy {
                     session.req_header(),
                     verified_client_ip.as_deref(),
                     ctx.request_scheme,
+                    &ctx.request_vars,
                 );
                 let mut response = ResponseHeader::build(*code, Some(3)).unwrap();
                 response
@@ -3187,6 +3215,7 @@ impl PingclairProxy {
                             session.req_header(),
                             ctx.verified_client_ip.map(|ip| ip.to_string()).as_deref(),
                             ctx.request_scheme,
+                            &ctx.request_vars,
                         )
                         .into_owned()
                     } else {
@@ -3225,6 +3254,22 @@ impl PingclairProxy {
             }
             HandlerConfig::LogSkip => {
                 ctx.log_skip = true;
+                Ok(false)
+            }
+            HandlerConfig::Vars { values } => {
+                // 🧰 Values are templates resolved against the same request,
+                // so a value may reference placeholders and earlier vars.
+                for (name, template) in values {
+                    let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
+                    let resolved = resolve_caddy_placeholders(
+                        template,
+                        session.req_header(),
+                        verified_client_ip.as_deref(),
+                        ctx.request_scheme,
+                        &ctx.request_vars,
+                    );
+                    ctx.request_vars.set(name.clone(), resolved.into_owned());
+                }
                 Ok(false)
             }
             HandlerConfig::Rewrite {
@@ -3725,6 +3770,7 @@ pub(crate) fn resolve_caddy_placeholders<'a>(
     req: &'a RequestHeader,
     verified_client_ip: Option<&'a str>,
     scheme: &'static str,
+    vars: &crate::http_policy::RequestVars,
 ) -> std::borrow::Cow<'a, str> {
     if !template.contains('{') {
         // ⚡ OPTIMIZATION: Fast path — no placeholders, return as-is.
@@ -3748,7 +3794,7 @@ pub(crate) fn resolve_caddy_placeholders<'a>(
 
             // Resolve the placeholder
             let resolved =
-                resolve_single_placeholder(&placeholder, req, verified_client_ip, scheme);
+                resolve_single_placeholder(&placeholder, req, verified_client_ip, scheme, vars);
             result.push_str(&resolved);
         } else {
             result.push(c);
@@ -3826,6 +3872,7 @@ fn resolve_single_placeholder(
     req: &RequestHeader,
     verified_client_ip: Option<&str>,
     scheme: &'static str,
+    vars: &crate::http_policy::RequestVars,
 ) -> String {
     // {http.request.header.Header-Name}
     if let Some(header_name) = name.strip_prefix("http.request.header.") {
@@ -3835,6 +3882,12 @@ fn resolve_single_placeholder(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+    }
+    // 🧰 `{http.vars.<name>}` reads a request-scoped variable set by a
+    // `vars` handler or rule; an unset variable is empty, like every other
+    // missing placeholder.
+    if let Some(var_name) = name.strip_prefix("http.vars.") {
+        return vars.get(var_name).unwrap_or("").to_string();
     }
 
     // 🧭 Caddy's `{host}` shorthand is the hostname without the port; the
@@ -4457,6 +4510,41 @@ impl ProxyHttp for PingclairProxy {
                 }
             };
 
+            // 🧰 Site-level `vars` rules run before route matching, so a
+            // route-level `vars` matcher and every later placeholder see
+            // them. Rules are ordered least specific first, and all matching
+            // rules run — the most specific value therefore wins.
+            for (index, rule) in state.config.vars_routes.iter().enumerate() {
+                let compiled = state.vars_precompiles.get(index).and_then(Option::as_ref);
+                let matches = match compiled {
+                    Some(compiled) => {
+                        let request = MatcherRequest {
+                            path,
+                            method,
+                            headers: &request_header.headers,
+                            host,
+                            remote_ip: &remote_ip,
+                            protocol,
+                            vars: Some(ctx.request_vars.as_map()),
+                        };
+                        evaluate(compiled, &request)
+                    }
+                    None => true,
+                };
+                if matches {
+                    for (name, template) in &rule.values {
+                        let resolved = resolve_caddy_placeholders(
+                            template,
+                            request_header,
+                            Some(remote_ip.as_str()),
+                            protocol,
+                            &ctx.request_vars,
+                        );
+                        ctx.request_vars.set(name.clone(), resolved.into_owned());
+                    }
+                }
+            }
+
             if let Some(route) = state.router.match_normalized_request(
                 path,
                 method,
@@ -4464,6 +4552,7 @@ impl ProxyHttp for PingclairProxy {
                 host,
                 &remote_ip,
                 protocol,
+                Some(ctx.request_vars.as_map()),
             ) {
                 let index = route.index;
                 (
@@ -5010,6 +5099,7 @@ impl ProxyHttp for PingclairProxy {
                 downstream_headers,
                 verified_client_ip.as_deref(),
                 ctx.request_scheme,
+                &ctx.request_vars,
             );
             upstream_request.insert_header(key.clone(), resolved.as_ref())?;
         }
