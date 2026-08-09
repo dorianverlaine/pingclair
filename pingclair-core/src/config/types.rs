@@ -726,6 +726,16 @@ pub enum HandlerConfig {
         headers: BTreeMap<String, String>,
     },
 
+    /// 🚨 Static error response raised by the `error` directive.
+    Error {
+        #[serde(default = "default_error_status")]
+        status: u16,
+        /// 💬 Message rendered as the response body; the status's canonical
+        /// text is used when none is given.
+        #[serde(default)]
+        message: Option<String>,
+    },
+
     /// Headers modification
     Headers {
         #[serde(default)]
@@ -890,6 +900,11 @@ fn default_cors_max_age() -> u64 {
 
 fn default_status_code() -> u16 {
     200
+}
+
+/// 🚨 A bare `error` raises 500, exactly as upstream defaults it.
+fn default_error_status() -> u16 {
+    500
 }
 
 fn default_auth_realm() -> String {

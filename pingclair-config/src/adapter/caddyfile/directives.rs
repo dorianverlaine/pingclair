@@ -106,6 +106,7 @@ pub(super) fn adapt_handler(
         "handle_path" => adapt_handle_path(&d, matchers, order).map(|(_, handler)| handler),
         "basic_auth" | "basicauth" => adapt_basic_auth(d),
         "rate_limit" => adapt_rate_limit(d),
+        "error" => adapt_error_directive(&d),
         "rewrite" => adapt_rewrite(d),
         "uri" => adapt_uri(d),
         "try_files" => adapt_try_files(d),
@@ -752,6 +753,76 @@ pub(super) fn adapt_respond(d: Directive) -> Result<Handler, AdapterError> {
         body,
         headers: Default::default(),
     }))
+}
+
+// MARK: - error Directive Adapter
+
+/// Adapt Caddy `error` directive: `error [<status> [<message>]]`.
+///
+/// The grammar is the one upstream parses: a lone three-digit number is the
+/// status, a lone word is the message with status 500, and two arguments are
+/// message then status. A block may add `message <text…>` when no positional
+/// message was given.
+pub(super) fn adapt_error_directive(d: &Directive) -> Result<Handler, AdapterError> {
+    let mut status: u16 = 500;
+    let mut message: Option<String> = None;
+
+    match d.args.as_slice() {
+        [] => {}
+        [arg] => {
+            if arg.len() == 3
+                && let Ok(code) = arg.parse::<u16>()
+                && (100..=599).contains(&code)
+            {
+                status = code;
+            } else {
+                message = Some(arg.clone());
+            }
+        }
+        [message_arg, status_arg] => {
+            let Ok(code) = status_arg.parse::<u16>() else {
+                return Err(AdapterError::InvalidArgument(
+                    "error".into(),
+                    format!("`{status_arg}` is not a numeric status code"),
+                ));
+            };
+            if !(100..=599).contains(&code) {
+                return Err(AdapterError::InvalidArgument(
+                    "error".into(),
+                    format!("status code {code} is outside 100..=599"),
+                ));
+            }
+            message = Some(message_arg.clone());
+            status = code;
+        }
+        _ => {
+            return Err(AdapterError::ArgumentCount("error".into(), 2, d.args.len()));
+        }
+    }
+
+    if let Some(block) = &d.block {
+        for sub in &block.directives {
+            match sub.name.as_str() {
+                "message" => {
+                    if message.is_some() {
+                        return Err(AdapterError::InvalidArgument(
+                            "error".into(),
+                            "message already specified".into(),
+                        ));
+                    }
+                    if sub.args.is_empty() {
+                        return Err(AdapterError::ArgumentCount("error message".into(), 1, 0));
+                    }
+                    message = Some(sub.args.join(" "));
+                }
+                other => {
+                    return Err(AdapterError::UnknownDirective(format!("error: {other}")));
+                }
+            }
+        }
+    }
+
+    Ok(Handler::Error(ErrorConfig { status, message }))
 }
 
 // MARK: - header Directive Adapter

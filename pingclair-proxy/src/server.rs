@@ -2667,6 +2667,44 @@ impl PingclairProxy {
                 Self::write_local_body(session, ctx, body_bytes, true).await?;
                 Ok(true)
             }
+            // 🚨 A static error raises its status with the operator's message
+            // (or the status's canonical text) as the body, exactly like a
+            // `respond` — Phase F2 routes this through `handle_errors`.
+            HandlerConfig::Error { status, message } => {
+                let body_bytes = {
+                    let raw_body = message.as_deref().unwrap_or_else(|| {
+                        http::StatusCode::from_u16(*status)
+                            .ok()
+                            .and_then(|code| code.canonical_reason())
+                            .unwrap_or("")
+                    });
+                    let verified_client_ip = if raw_body.contains('{') {
+                        ctx.verified_client_ip.map(|ip| ip.to_string())
+                    } else {
+                        None
+                    };
+                    let resolved = resolve_caddy_placeholders(
+                        raw_body,
+                        session.req_header(),
+                        verified_client_ip.as_deref(),
+                        ctx.request_scheme,
+                    );
+                    Bytes::copy_from_slice(resolved.as_bytes())
+                };
+                let mut response = ResponseHeader::build(*status, Some(3)).unwrap();
+                response
+                    .insert_header("Content-Type", "text/plain; charset=utf-8")
+                    .unwrap();
+                response
+                    .insert_header("Content-Length", body_bytes.len().to_string())
+                    .unwrap();
+                Self::apply_local_response_headers(&mut response, ctx)?;
+                session
+                    .write_response_header(Box::new(response), false)
+                    .await?;
+                Self::write_local_body(session, ctx, body_bytes, true).await?;
+                Ok(true)
+            }
             HandlerConfig::Redirect { to, code } => {
                 // 🧭 A redirect target is a template, so `redir https://{host}{uri}`
                 // can send a client to the same resource over another scheme.

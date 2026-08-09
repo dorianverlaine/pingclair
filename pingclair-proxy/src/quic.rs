@@ -1808,6 +1808,25 @@ async fn plan_h3_handler(
                 headers: headers.clone(),
             }))
         }
+        // 🚨 A static error answers with its status and message on HTTP/3
+        // exactly as on H1/H2 — same default body, same placeholder rules.
+        HandlerConfig::Error { status, message } => {
+            let raw = message.as_deref().unwrap_or_else(|| {
+                http::StatusCode::from_u16(*status)
+                    .ok()
+                    .and_then(|code| code.canonical_reason())
+                    .unwrap_or("")
+            });
+            let verified = raw.contains('{').then_some(verified_client_ip);
+            let body = Some(
+                resolve_caddy_placeholders(raw, request_header, verified, "https").into_owned(),
+            );
+            Ok(H3Plan::Terminal(H3Terminal::Respond {
+                status: *status,
+                body,
+                headers: BTreeMap::new(),
+            }))
+        }
         // 🧭 Resolved here rather than at send time so H3 and H1/H2 expand the
         // same templates from the same request; a redirect that only works on
         // one transport is the parity gap this crate keeps having to fix.

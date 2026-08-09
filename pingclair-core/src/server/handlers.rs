@@ -125,6 +125,19 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             Ok(response)
         }
 
+        // 🚨 A static error is a response with the raised status; when the
+        // operator gave no message, the status's canonical text is the body,
+        // matching what Caddy's default error handler writes.
+        HandlerConfig::Error { status, message } => {
+            let body = message.clone().unwrap_or_else(|| {
+                http::StatusCode::from_u16(*status)
+                    .ok()
+                    .and_then(|code| code.canonical_reason().map(str::to_string))
+                    .unwrap_or_default()
+            });
+            Ok(HandlerResponse::with_body(*status, Bytes::from(body)))
+        }
+
         HandlerConfig::Redirect { to, code } => Ok(HandlerResponse::redirect(to, *code)),
 
         // 🧭 Templates render in the proxy pipeline where file access and
@@ -470,6 +483,31 @@ mod tests {
         let response = execute_handler(&config, &empty_headers()).unwrap();
         assert_eq!(response.status, StatusCode::OK);
         assert!(response.body.is_some());
+    }
+
+    #[test]
+    fn test_error_handler_uses_status_and_message() {
+        let config = HandlerConfig::Error {
+            status: 403,
+            message: Some("Unauthorized".to_string()),
+        };
+        let response = execute_handler(&config, &empty_headers()).unwrap();
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        assert_eq!(response.body.as_deref(), Some(&b"Unauthorized"[..]));
+    }
+
+    #[test]
+    fn test_error_handler_defaults_to_canonical_status_text() {
+        let config = HandlerConfig::Error {
+            status: 500,
+            message: None,
+        };
+        let response = execute_handler(&config, &empty_headers()).unwrap();
+        assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.body.as_deref(),
+            Some(&b"Internal Server Error"[..])
+        );
     }
 
     #[test]

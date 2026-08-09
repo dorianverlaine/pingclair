@@ -614,6 +614,7 @@ pub(super) fn handler_directive_name(handler: &Handler) -> &'static str {
         Handler::Headers(_) => "header",
         Handler::LogSkip => "log_skip",
         Handler::Redirect(_) => "redir",
+        Handler::Error(_) => "error",
         // 🏷️ `rewrite` and `uri` compile to the same handler and rank one
         // apart, so the handler alone cannot answer this; the config records
         // which word was written.
@@ -664,6 +665,7 @@ pub(super) fn handler_has_terminal(handler: &Handler) -> bool {
     match handler {
         Handler::Proxy(_)
         | Handler::Respond(_)
+        | Handler::Error(_)
         | Handler::Redirect(_)
         | Handler::FileServer(_)
         | Handler::Templates => true,

@@ -561,6 +561,9 @@ pub enum Handler {
     /// Cross-origin resource sharing policy.
     Cors(CorsConfig),
 
+    /// 🚨 Static error response: the status this handler raises.
+    Error(ErrorConfig),
+
     /// IP, Referer-host, and User-Agent access policy.
     AccessControl(AccessControlConfig),
 
@@ -878,6 +881,15 @@ pub struct ResponseConfig {
     pub status: u16,
     pub body: Option<Expr>,
     pub headers: BTreeMap<String, String>,
+}
+
+/// Static error configuration produced by the `error` directive.
+#[derive(Debug, Clone)]
+pub struct ErrorConfig {
+    /// 🚨 Status code the error carries; 500 when the directive says nothing.
+    pub status: u16,
+    /// 💬 Optional message, rendered as the response body.
+    pub message: Option<String>,
 }
 
 /// Redirect configuration

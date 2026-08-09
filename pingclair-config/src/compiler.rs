@@ -672,6 +672,7 @@ fn reject_unimplemented_handler(handler: &HandlerConfig) -> CompileResult<()> {
         | HandlerConfig::Redirect { .. }
         | HandlerConfig::Rewrite { .. }
         | HandlerConfig::Respond { .. }
+        | HandlerConfig::Error { .. }
         | HandlerConfig::Headers { .. }
         | HandlerConfig::LogSkip
         | HandlerConfig::BasicAuth { .. }
@@ -741,6 +742,7 @@ fn validate_basic_auth_credentials(handler: &HandlerConfig) -> CompileResult<()>
         | HandlerConfig::Redirect { .. }
         | HandlerConfig::Rewrite { .. }
         | HandlerConfig::Respond { .. }
+        | HandlerConfig::Error { .. }
         | HandlerConfig::Headers { .. }
         | HandlerConfig::LogSkip
         | HandlerConfig::RateLimit { .. }
@@ -1603,6 +1605,11 @@ fn compile_handler(
                 _ => None,
             }),
             headers: resp.headers.clone(),
+        }),
+
+        Handler::Error(config) => Ok(HandlerConfig::Error {
+            status: config.status,
+            message: config.message.clone(),
         }),
 
         Handler::Redirect(redir) => Ok(HandlerConfig::Redirect {

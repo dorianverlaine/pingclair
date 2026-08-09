@@ -2052,6 +2052,49 @@ async fn test_basic_auth_argon2id_end_to_end() {
 }
 
 #[tokio::test]
+async fn test_error_handler_end_to_end() {
+    // 🚨 The `error` handler raises its status and stops the pipeline — the
+    // handler after it must never run, and a missing message falls back to
+    // the status's canonical text.
+    let config = serde_json::json!({
+        "servers": [
+            {
+                "listen": ["127.0.0.1:0"],
+                "routes": [
+                    {
+                        "path": "/private",
+                        "handler": {
+                            "type": "pipeline",
+                            "handlers": [
+                                { "type": "error", "status": 403, "message": "Unauthorized" },
+                                { "type": "respond", "status": 200, "body": "must not run" }
+                            ]
+                        }
+                    },
+                    {
+                        "path": "/oops",
+                        "handler": { "type": "error", "status": 500 }
+                    }
+                ]
+            }
+        ]
+    })
+    .to_string();
+
+    let mut server = TestServer::new(&config);
+    let client = no_proxy_client();
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let resp = client.get(server.url(0, "/private")).send().await.unwrap();
+    assert_eq!(resp.status(), 403);
+    assert_eq!(resp.text().await.unwrap(), "Unauthorized");
+
+    let resp = client.get(server.url(0, "/oops")).send().await.unwrap();
+    assert_eq!(resp.status(), 500);
+    assert_eq!(resp.text().await.unwrap(), "Internal Server Error");
+}
+
+#[tokio::test]
 async fn test_custom_error_pages() {
     // 🎨 Verify custom pages for both static and upstream failures.
     let tmp_dir = tempfile::tempdir().unwrap();

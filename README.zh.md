@@ -655,7 +655,7 @@ Pingclair 對外宣稱相容 Caddyfile，那麼這個宣稱誠實的另一半，
 
 Directive：
 
-  `abort` `acme_server` `copy_response` `copy_response_headers` `error` `forward_auth`
+  `abort` `acme_server` `copy_response` `copy_response_headers` `forward_auth`
   `fs` `handle_errors` `intercept` `invoke` `log_append` `log_name`
   `map` `method` `metrics` `php_fastcgi` `push`
   `request_body` `request_header` `skip_log` `tracing` `vars`

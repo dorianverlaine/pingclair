@@ -98,6 +98,13 @@ lets the rest converge.
   is refused at load on every path, DSL and JSON. Legacy JSON documents that
   said `"hashed": true` still load as bcrypt; the old plaintext JSON spelling
   is refused.
+
+- 🚨 **`error` is a handler now.** `error [<status> [<message>]]` raises its
+  status as the response, with Caddy's grammar: a lone three-digit number is
+  the status, a lone word is a message on 500, and two arguments are message
+  then status. A block may add `message <text…>` when no positional message
+  was given. The directive is removed from the not-supported list.
+
 - 🗂️ **`try_files` resolves candidates under the site root and rewrites instead
   of serving.** It was previously reachable only from JSON, where it treated
   each candidate as a filesystem path and served any match itself through an

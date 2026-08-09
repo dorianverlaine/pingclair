@@ -2224,6 +2224,96 @@ mod basic_auth_grammar_tests {
     }
 }
 
+// MARK: - error directive
+
+/// 🚨 The `error` directive grammar, as upstream parses it: a lone three-digit
+/// number is the status, a lone word is the message with 500, two arguments
+/// are message then status, and a block may add `message <text…>`.
+#[cfg(test)]
+mod error_directive_tests {
+    use crate::compile;
+    use pingclair_core::config::HandlerConfig;
+
+    fn error_of(source: &str) -> (u16, Option<String>) {
+        let config = compile(source).unwrap_or_else(|error| panic!("must compile: {error}"));
+        let handler = match config
+            .servers
+            .into_iter()
+            .next()
+            .unwrap()
+            .routes
+            .remove(0)
+            .handler
+        {
+            HandlerConfig::Pipeline { handlers } => handlers
+                .into_iter()
+                .find(|element| matches!(&element.handler, HandlerConfig::Error { .. }))
+                .map(|element| element.handler)
+                .expect("an error handler"),
+            single => single,
+        };
+        let HandlerConfig::Error { status, message } = handler else {
+            panic!("expected error");
+        };
+        (status, message)
+    }
+
+    #[test]
+    fn a_lone_three_digit_number_is_the_status() {
+        let (status, message) = error_of("example.com {\n\terror 404\n}");
+        assert_eq!(status, 404);
+        assert_eq!(message, None);
+    }
+
+    #[test]
+    fn a_lone_word_is_the_message_with_status_500() {
+        let (status, message) = error_of("example.com {\n\terror \"oops\"\n}");
+        assert_eq!(status, 500);
+        assert_eq!(message.as_deref(), Some("oops"));
+    }
+
+    #[test]
+    fn message_and_status_are_two_arguments() {
+        let (status, message) = error_of("example.com {\n\terror \"Unauthorized\" 403\n}");
+        assert_eq!(status, 403);
+        assert_eq!(message.as_deref(), Some("Unauthorized"));
+    }
+
+    #[test]
+    fn the_block_may_carry_the_message() {
+        let (status, message) =
+            error_of("example.com {\n\terror 404 {\n\t\tmessage \"not here\"\n\t}\n}");
+        assert_eq!(status, 404);
+        assert_eq!(message.as_deref(), Some("not here"));
+    }
+
+    #[test]
+    fn a_two_digit_number_is_a_message_not_a_status() {
+        let (status, message) = error_of("example.com {\n\terror 99\n}");
+        assert_eq!(status, 500);
+        assert_eq!(message.as_deref(), Some("99"));
+    }
+
+    #[test]
+    fn malformed_shapes_are_refused() {
+        for source in [
+            // 🚫 A positional message plus a block message is contradictory.
+            "example.com {\n\terror \"oops\" 404 {\n\t\tmessage \"again\"\n\t}\n}",
+            // 🚫 The block's `message` needs a value.
+            "example.com {\n\terror 404 {\n\t\tmessage\n\t}\n}",
+            // 🚫 An unknown subdirective is a typo.
+            "example.com {\n\terror 404 {\n\t\tbody \"x\"\n\t}\n}",
+            // 🚫 The two-argument status must be numeric and in range.
+            "example.com {\n\terror \"oops\" 12\n}",
+            "example.com {\n\terror \"oops\" 999\n}",
+            // 🚫 More than message + status has no reading.
+            "example.com {\n\terror \"a\" 404 extra\n}",
+        ] {
+            compile(source).expect_err(&format!("must be refused:\n{source}"));
+        }
+    }
+}
+
 // MARK: - Matcher tokens inside route/handle
 
 /// 🧭 Per-element matchers inside `route`/`handle`/`handle_path` blocks.
