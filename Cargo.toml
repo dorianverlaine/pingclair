@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "pingclair",
+    "pingclair-fastcgi",
     "pingclair-core",
     "pingclair-proxy",
     "pingclair-static",

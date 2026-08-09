@@ -2861,6 +2861,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pingclair-fastcgi"
+version = "0.2.0-dev"
+dependencies = [
+ "bytes",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "pingclair-plugin"
 version = "0.2.0-dev"
 dependencies = [
