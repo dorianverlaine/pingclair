@@ -221,10 +221,11 @@ lets the rest converge.
   the same handlers for proxied responses.
 - 🔐 **`forward_auth`.** One inline auth round trip before the request
   continues to the backend: a 2xx copies the configured identity headers onto
-  the request (deleting the client-supplied versions first, per
-  GHSA-f59h-q822-g45g) and falls through; anything else is streamed to the
-  client. Incoming header names containing `_` are dropped, matching Caddy's
-  default, so the underscore alias cannot smuggle past `copy_headers`.
+  their configured request destinations, deleting each destination first even
+  when it was renamed (per GHSA-7r4p-vjf4-gxv4), and falls through; anything
+  else is streamed to the client. Incoming header names containing `_` are
+  dropped per GHSA-f59h-q822-g45g, matching Caddy's default, so the underscore
+  alias cannot smuggle past `copy_headers`.
 - 🧵 **`php_fastcgi` over a real FastCGI client.** The shortcut expands the
   way upstream does — canonical-path redirect, `try_files` rewrite, and a
   FastCGI reverse proxy, each with its own matcher — and the proxy speaks the

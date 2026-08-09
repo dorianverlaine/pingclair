@@ -2829,10 +2829,10 @@ impl PingclairProxy {
             .unwrap_or(502);
 
         if (200..300).contains(&status) {
-            // 🔐 GHSA-f59h-q822-g45g: the client-supplied version of every
-            // copied header is deleted first; the auth value is set only when
-            // non-empty, so a client can never smuggle a header the gateway
-            // did not issue.
+            // 🔐 GHSA-7r4p-vjf4-gxv4: the configured destination of every
+            // copied header is deleted first, including renamed headers; the
+            // auth value is set only when non-empty, so a client cannot retain
+            // a destination value that the gateway did not issue.
             for mapping in &config.copy_headers {
                 let from_value = auth
                     .response_header()
@@ -2840,11 +2840,9 @@ impl PingclairProxy {
                     .and_then(|value| value.to_str().ok())
                     .unwrap_or_default()
                     .to_string();
-                session
-                    .req_header_mut()
-                    .remove_header(mapping.from.as_str());
+                let to = mapping.to.as_deref().unwrap_or(&mapping.from);
+                session.req_header_mut().remove_header(to);
                 if !from_value.is_empty() {
-                    let to = mapping.to.as_deref().unwrap_or(&mapping.from);
                     session
                         .req_header_mut()
                         .insert_header(to.to_string(), from_value)?;

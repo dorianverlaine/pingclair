@@ -3493,21 +3493,34 @@ async fn test_pingclairfile_forward_auth_copies_headers_and_answers_denials() {
         .unwrap();
     let auth_address = auth_listener.local_addr().unwrap();
     let auth_task = tokio::spawn(async move {
-        for _ in 0..2 {
+        for _ in 0..4 {
             let (mut stream, _) = auth_listener.accept().await.unwrap();
             let request = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
             let text = String::from_utf8_lossy(&request);
-            if text.to_ascii_lowercase().contains("x-auth-mode: deny") {
+            let lower = text.to_ascii_lowercase();
+            if lower.contains("x-auth-mode: deny") {
                 stream
                     .write_all(
                         b"HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\nConnection: close\r\n\r\nforbidden",
                     )
                     .await
                     .unwrap();
+            } else if lower.contains("x-auth-mode: omit") {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            } else if lower.contains("x-auth-mode: empty") {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-User-Id:\r\nX-Role:\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
             } else {
                 stream
                     .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-User-Id: alice\r\nConnection: close\r\n\r\n",
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-User-Id: alice\r\nX-Role: operator\r\nConnection: close\r\n\r\n",
                     )
                     .await
                     .unwrap();
@@ -3520,25 +3533,35 @@ async fn test_pingclairfile_forward_auth_copies_headers_and_answers_denials() {
         .unwrap();
     let backend_address = backend_listener.local_addr().unwrap();
     let backend_task = tokio::spawn(async move {
-        let (mut stream, _) = backend_listener.accept().await.unwrap();
-        let request = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
-        let text = String::from_utf8_lossy(&request);
-        let user_id = text
-            .lines()
-            .find(|line| line.to_ascii_lowercase().starts_with("x-user-id:"))
-            .unwrap_or_default()
-            .to_string();
-        let body = format!("user={user_id};underscore={}", text.contains("X_User_Id"));
-        stream
-            .write_all(
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
+        for _ in 0..3 {
+            let (mut stream, _) = backend_listener.accept().await.unwrap();
+            let request = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+            let text = String::from_utf8_lossy(&request);
+            let header_value = |name: &str| {
+                text.lines().find_map(|line| {
+                    let (header_name, value) = line.split_once(':')?;
+                    header_name
+                        .eq_ignore_ascii_case(name)
+                        .then(|| value.trim().to_string())
+                })
+            };
+            let body = format!(
+                "user={};identity={};underscore={}",
+                header_value("X-User-Id").unwrap_or_default(),
+                header_value("X-Identity").unwrap_or_default(),
+                text.lines().any(|line| line.starts_with("X_User_Id:"))
+            );
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
                 )
-                .as_bytes(),
-            )
-            .await
-            .unwrap();
+                .await
+                .unwrap();
+        }
     });
 
     let config = format!(
@@ -3553,7 +3576,7 @@ async fn test_pingclairfile_forward_auth_copies_headers_and_answers_denials() {
 
             forward_auth http://{auth} {{
                 uri /auth
-                copy_headers X-User-Id
+                copy_headers X-User-Id X-Role>X-Identity
             }}
             reverse_proxy http://{backend}
         }}
@@ -3565,24 +3588,56 @@ async fn test_pingclairfile_forward_auth_copies_headers_and_answers_denials() {
     assert!(server.wait_until_ready().await, "server failed to start");
 
     let client = no_proxy_client();
-    // 🔐 GHSA-f59h-q822-g45g: the client's own X-User-Id and the underscore
-    // alias must not survive; only the auth gateway's value is forwarded.
+    // 🔐 Both same-name and renamed destinations must contain only values
+    // issued by the authentication gateway, and underscore aliases must not
+    // survive the proxy request path.
     let accepted = client
         .get(server.url(0, "/app"))
         .header("X-User-Id", "attacker")
+        .header("X-Identity", "attacker")
         .header("X_User_Id", "evil")
         .send()
         .await
         .unwrap();
     assert_eq!(accepted.status(), 200);
     let body = accepted.text().await.unwrap();
-    assert!(
-        body.contains("X-User-Id: alice") && !body.contains("attacker"),
-        "the auth gateway's header must replace the client's: {body}"
+    assert_eq!(body, "user=alice;identity=operator;underscore=false");
+
+    // 🔐 A missing source header must still delete both client-controlled
+    // destination headers instead of retaining either spoofed identity.
+    let omitted = client
+        .get(server.url(0, "/app"))
+        .header("X-Auth-Mode", "omit")
+        .header("X-User-Id", "attacker")
+        .header("X-Identity", "attacker")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(omitted.status(), 200);
+    assert_eq!(
+        omitted.text().await.unwrap(),
+        "user=;identity=;underscore=false"
     );
+
+    // 🔐 An explicitly empty source header has the same deletion semantics
+    // as an absent source header.
+    let empty = client
+        .get(server.url(0, "/app"))
+        .header("X-Auth-Mode", "empty")
+        .header("X-User-Id", "attacker")
+        .header("X-Identity", "attacker")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), 200);
+    assert_eq!(
+        empty.text().await.unwrap(),
+        "user=;identity=;underscore=false"
+    );
+
     assert!(
-        body.contains("underscore=false"),
-        "the underscore alias must be dropped: {body}"
+        !body.contains("attacker"),
+        "client-controlled identity headers must be replaced: {body}"
     );
 
     let denied = client

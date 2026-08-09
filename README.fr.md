@@ -581,8 +581,9 @@ réponses proxifiées.
 
 `forward_auth <gateway> { uri …; copy_headers … }` effectue un aller-retour
 d'authentification avant que la requête continue vers le backend. Un 2xx copie
-les en-têtes de réponse listés sur la requête — en supprimant d'abord ceux
-fournis par le client — et tout autre statut est répondu directement au client.
+les en-têtes de réponse listés vers leurs destinations configurées sur la
+requête — en supprimant d'abord ces destinations, y compris celles renommées —
+et tout autre statut est répondu directement au client.
 Les noms d'en-têtes entrants contenant `_` sont supprimés, comme par défaut
 chez Caddy.
 
