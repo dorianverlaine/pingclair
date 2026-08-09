@@ -56,19 +56,33 @@ The workspace has eight crates:
 
 ## Start every task this way
 
-1. Read `docs/TODO.md` and work the current Day. One Day per sitting; do not
+1. Run `scripts/snapshot-sensitive-plans.sh start`. It validates every existing
+   sensitive-plan snapshot before writing a new one; stop immediately if it
+   fails.
+2. Read `docs/TODO.md` and work the current Day. One Day per sitting; do not
    merge a 🔨 coding Day with a ✅ verification Day.
-2. Read the relevant guardrail file before editing: `docs/guardrails/proxy.md`
+3. Read the relevant guardrail file before editing: `docs/guardrails/proxy.md`
    for H3 or anything that streams a response body, `docs/guardrails/tls.md`
    for TLS and dependencies, `docs/guardrails/config.md` for the DSL and the
    compiler, `docs/guardrails/testing.md` for test and verification
    infrastructure.
-3. Inspect `git status --short --branch`; preserve existing user changes.
-4. Locate the real execution path, not only the config type or AST.
-5. Decide the required verification level before editing:
+4. Inspect `git status --short --branch`; preserve existing user changes.
+5. Locate the real execution path, not only the config type or AST.
+6. Decide the required verification level before editing:
    unit, local real-binary integration, Linux/container, or remote VPS.
-6. Record verification evidence locally under `benchmarks/results/` and mark
-   the finished Day in `docs/TODO.md`.
+7. Record verification evidence locally under `benchmarks/results/`, mark the
+   finished Day in `docs/TODO.md`, then run
+   `scripts/snapshot-sensitive-plans.sh end`. A failed final checksum validation
+   blocks handoff.
+
+### Sensitive planning snapshots
+
+`scripts/snapshot-sensitive-plans.sh` copies `docs/TODO.md` and `TRIAGE.md`
+together into the gitignored `.plan-snapshots/` directory with a SHA-256
+manifest. It retains the newest 30 complete snapshot sets. Never stage or
+publish that directory: the files remain sensitive even though they are backup
+copies. Do not bypass a validation failure by deleting or regenerating the
+manifest; inspect the named snapshot and recover the intended source first.
 
 Do not mark an item as remotely verified because unit tests or
 `cargo test --workspace` pass. The ledger deliberately distinguishes:

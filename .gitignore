@@ -67,6 +67,7 @@ docs/STATUS.md
 docs/TODO_CADDYFILE*.md
 TRIAGE.md
 docs/refactor/
+/.plan-snapshots/
 # 🧹 The same two notes also exist as loose copies at the repository root.
 # Ignored by name so a stray `git add -A` cannot publish what the entry
 # above was written to keep local.

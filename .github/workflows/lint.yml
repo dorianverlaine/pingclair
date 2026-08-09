@@ -74,6 +74,9 @@ jobs:
       - name: Check shell syntax
         run: bash -n scripts/*.sh benchmarks/scripts/*.sh
 
+      - name: Test sensitive plan snapshots
+        run: scripts/test-sensitive-plan-snapshots.sh
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
