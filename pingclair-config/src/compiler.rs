@@ -672,11 +672,13 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
         for route in &server.routes {
             validate_proxy_protection_handler(&route.handler)?;
             validate_basic_auth_credentials(&route.handler)?;
+            validate_subrequest_handler(&route.handler)?;
             reject_unimplemented_handler(&route.handler)?;
         }
         for error_route in &server.error_routes {
             for element in &error_route.handlers {
                 validate_basic_auth_credentials(&element.handler)?;
+                validate_subrequest_handler(&element.handler)?;
                 reject_unimplemented_handler(&element.handler)?;
             }
         }
@@ -719,6 +721,140 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
     }
 
     Ok(())
+}
+
+/// 🔁 Validates inline proxy exchanges on the Admin API's shared config path.
+fn validate_subrequest_handler(handler: &HandlerConfig) -> CompileResult<()> {
+    let validate = |config: &pingclair_core::config::ReverseProxyConfig| {
+        let policy = config
+            .subrequest
+            .as_ref()
+            .ok_or_else(|| CompileError::InvalidRoute {
+                message: "inline subrequest is missing its continuation policy".to_string(),
+            })?;
+        if config.upstreams.len() != 1
+            || config.dynamic_upstream.is_some()
+            || config.fastcgi.is_some()
+        {
+            return Err(CompileError::InvalidRoute {
+                message: "inline subrequest requires exactly one HTTP upstream".to_string(),
+            });
+        }
+        let upstream = &config.upstreams[0];
+        if upstream.contains('{') || pingclair_proxy_address_is_invalid(upstream) {
+            return Err(CompileError::InvalidRoute {
+                message: format!("inline subrequest upstream `{upstream}` is invalid"),
+            });
+        }
+        if config.rewrite_method.as_deref() != Some("GET") {
+            return Err(CompileError::InvalidRoute {
+                message: "inline subrequest must use GET so the client body is never replayed"
+                    .to_string(),
+            });
+        }
+        if config.rewrite_uri.as_deref().is_none_or(str::is_empty) {
+            return Err(CompileError::InvalidRoute {
+                message: "inline subrequest requires a non-empty URI rewrite".to_string(),
+            });
+        }
+        if policy.continue_status_classes.is_empty()
+            || policy
+                .continue_status_classes
+                .iter()
+                .any(|class| !(1..=5).contains(class))
+        {
+            return Err(CompileError::InvalidRoute {
+                message: "inline subrequest continuation classes must be between 1 and 5"
+                    .to_string(),
+            });
+        }
+        for mapping in &policy.copy_headers {
+            let destination = mapping.to.as_deref().unwrap_or(&mapping.from);
+            if mapping.from.is_empty()
+                || destination.is_empty()
+                || http::HeaderName::from_bytes(mapping.from.as_bytes()).is_err()
+                || http::HeaderName::from_bytes(destination.as_bytes()).is_err()
+            {
+                return Err(CompileError::InvalidRoute {
+                    message: "inline subrequest copy_headers contains an invalid header name"
+                        .to_string(),
+                });
+            }
+        }
+        Ok(())
+    };
+
+    match handler {
+        HandlerConfig::ReverseProxy(config) if config.subrequest.is_some() => validate(config),
+        // 🔐 Legacy JSON is normalized before applying the exact same rules.
+        HandlerConfig::ForwardAuth(config) => validate(&config.as_reverse_proxy_subrequest()),
+        HandlerConfig::Pipeline { handlers }
+        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::HandlePath { handlers, .. } => {
+            for element in handlers {
+                validate_subrequest_handler(&element.handler)?;
+            }
+            Ok(())
+        }
+        HandlerConfig::HandleErrors { errors } => {
+            for handlers in errors.values() {
+                for handler in handlers {
+                    validate_subrequest_handler(handler)?;
+                }
+            }
+            Ok(())
+        }
+        HandlerConfig::TryFiles {
+            fallback: Some(fallback),
+            ..
+        } => validate_subrequest_handler(fallback),
+        HandlerConfig::TryFiles { fallback: None, .. } => Ok(()),
+        _ => Ok(()),
+    }
+}
+
+/// 🧭 Applies the same address grammar the proxy runtime parses without resolving DNS.
+fn pingclair_proxy_address_is_invalid(address: &str) -> bool {
+    if let Some(path) = address
+        .strip_prefix("unix+h2c/")
+        .or_else(|| address.strip_prefix("unix/"))
+    {
+        return path.is_empty() || path == "/";
+    }
+    let candidate = if let Some(candidate) = address
+        .strip_prefix("https://")
+        .or_else(|| address.strip_prefix("http://"))
+        .or_else(|| address.strip_prefix("h2c://"))
+        .or_else(|| address.strip_prefix("h2://"))
+    {
+        candidate
+    } else {
+        if address.contains("://") {
+            return true;
+        }
+        address
+    };
+    if candidate.is_empty() || candidate == ":" || candidate.contains('/') {
+        return true;
+    }
+    if let Some(bracketed) = candidate.strip_prefix('[') {
+        let Some(close) = bracketed.find(']') else {
+            return true;
+        };
+        let host = &bracketed[..close];
+        let suffix = &bracketed[close + 1..];
+        return host.is_empty()
+            || (!suffix.is_empty()
+                && suffix
+                    .strip_prefix(':')
+                    .is_none_or(|port| port.parse::<u16>().is_err()));
+    }
+    if candidate.matches(':').count() > 1 {
+        return true;
+    }
+    candidate
+        .rsplit_once(':')
+        .is_some_and(|(_, port)| port.is_empty() || port.parse::<u16>().is_err())
 }
 
 /// 🚫 Rejects handlers the server cannot actually execute.
@@ -1735,6 +1871,7 @@ fn compile_handler(
                 upstreams: proxy.upstreams.clone(),
                 dynamic_upstream: proxy.dynamic.clone().map(Box::new),
                 handle_response: proxy.handle_response.clone(),
+                subrequest: None,
                 rewrite_method: proxy.rewrite_method.clone(),
                 rewrite_uri: proxy.rewrite_uri.clone(),
                 request_buffer_bytes: proxy.request_buffer_bytes,
@@ -1858,7 +1995,11 @@ fn compile_handler(
             handlers: handlers.clone(),
         }),
 
-        Handler::ForwardAuth(config) => Ok(HandlerConfig::ForwardAuth(Box::new(config.clone()))),
+        // 🔐 The Pingclairfile shortcut compiles to the same typed reverse-proxy
+        // subrequest used at runtime; only legacy JSON retains `type: forward_auth`.
+        Handler::ForwardAuth(config) => Ok(HandlerConfig::ReverseProxy(Box::new(
+            config.as_reverse_proxy_subrequest(),
+        ))),
 
         Handler::Respond(resp) => Ok(HandlerConfig::Respond {
             status: resp.status,
@@ -2432,6 +2573,81 @@ mod fail_closed_handler_tests {
                 ..Default::default()
             }],
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn legacy_forward_auth_json_loads_and_normalizes_to_one_subrequest_policy() {
+        let handler: HandlerConfig = serde_json::from_str(
+            r#"{
+                "type":"forward_auth",
+                "upstream":"http://127.0.0.1:9000",
+                "uri":"/auth",
+                "copy_headers":[{"from":"X-User","to":"X-Identity"}]
+            }"#,
+        )
+        .unwrap();
+        assert!(validate_config(&config_with(handler.clone())).is_ok());
+
+        let HandlerConfig::ForwardAuth(legacy) = handler else {
+            panic!("legacy JSON must retain its deserialization entry point");
+        };
+        let normalized = legacy.as_reverse_proxy_subrequest();
+        assert_eq!(normalized.rewrite_method.as_deref(), Some("GET"));
+        assert_eq!(normalized.rewrite_uri.as_deref(), Some("/auth"));
+        assert_eq!(
+            normalized
+                .subrequest
+                .as_ref()
+                .unwrap()
+                .continue_status_classes,
+            [2]
+        );
+    }
+
+    #[test]
+    fn direct_json_subrequests_fail_closed_on_ambiguous_runtime_shapes() {
+        let valid = pingclair_core::config::ForwardAuthConfig {
+            upstream: "http://127.0.0.1:9000".to_string(),
+            uri: "/auth".to_string(),
+            copy_headers: Vec::new(),
+        }
+        .as_reverse_proxy_subrequest();
+        for (config, expected) in [
+            (
+                {
+                    let mut config = valid.clone();
+                    config.upstreams.push("127.0.0.1:9001".to_string());
+                    config
+                },
+                "exactly one",
+            ),
+            (
+                {
+                    let mut config = valid.clone();
+                    config.rewrite_method = Some("POST".to_string());
+                    config
+                },
+                "must use GET",
+            ),
+            (
+                {
+                    let mut config = valid.clone();
+                    config.subrequest.as_mut().unwrap().copy_headers.push(
+                        pingclair_core::config::ForwardAuthHeaderMap {
+                            from: "bad header".to_string(),
+                            to: None,
+                        },
+                    );
+                    config
+                },
+                "invalid header",
+            ),
+        ] {
+            let error =
+                validate_config(&config_with(HandlerConfig::ReverseProxy(Box::new(config))))
+                    .expect_err("an ambiguous subrequest must be rejected");
+            assert!(error.to_string().contains(expected), "{error}");
         }
     }
 

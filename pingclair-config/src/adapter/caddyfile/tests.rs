@@ -1595,8 +1595,7 @@ mod fail_closed_tests {
         assert!(intercept[1].matcher.is_none());
     }
 
-    /// 🔐 `forward_auth` compiles with header renames and must keep its
-    /// ordering ahead of the backend reverse_proxy.
+    /// 🔐 `forward_auth` compiles into a GET proxy subrequest ahead of the backend.
     #[test]
     fn forward_auth_compiles_with_copy_header_renames() {
         let config = crate::compile(
@@ -1624,12 +1623,32 @@ mod fail_closed_tests {
                 _ => None,
             })
             .expect("a pipeline");
-        let pingclair_core::config::HandlerConfig::ForwardAuth(config) = found else {
-            panic!("forward_auth must lead the pipeline");
+        let pingclair_core::config::HandlerConfig::ReverseProxy(config) = found else {
+            panic!("forward_auth must compile into the leading reverse proxy");
         };
-        assert_eq!(config.upstream, "localhost:9000");
-        assert_eq!(config.uri, "/auth");
+        assert_eq!(config.upstreams, ["localhost:9000"]);
+        assert_eq!(config.rewrite_method.as_deref(), Some("GET"));
+        assert_eq!(config.rewrite_uri.as_deref(), Some("/auth"));
+        assert_eq!(
+            config
+                .headers_up
+                .get("X-Forwarded-Method")
+                .map(String::as_str),
+            Some("{http.request.method}")
+        );
+        assert_eq!(
+            config.headers_up.get("X-Forwarded-Uri").map(String::as_str),
+            Some("{http.request.uri}")
+        );
+        let subrequest = config
+            .subrequest
+            .as_ref()
+            .expect("forward_auth must carry a continuation policy");
+        assert_eq!(subrequest.continue_status_classes, [2]);
         let maps: Vec<(&str, Option<&str>)> = config
+            .subrequest
+            .as_ref()
+            .unwrap()
             .copy_headers
             .iter()
             .map(|mapping| (mapping.from.as_str(), mapping.to.as_deref()))

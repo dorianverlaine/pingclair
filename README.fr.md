@@ -600,7 +600,9 @@ les en-têtes de réponse listés vers leurs destinations configurées sur la
 requête — en supprimant d'abord ces destinations, y compris celles renommées —
 et tout autre statut est répondu directement au client.
 Les noms d'en-têtes entrants contenant `_` sont supprimés, comme par défaut
-chez Caddy.
+chez Caddy. Ce raccourci est compilé en sous-requête proxy GET sans corps,
+qui transmet la méthode et l'URI d'origine ; H1, H2 et H3 partagent le même
+échange en streaming.
 
 Les amonts écrits sous forme de noms d'hôtes sont ré-résolus pendant l'exécution :
 un conteneur qui redémarre sur une nouvelle adresse est suivi sans rechargement.

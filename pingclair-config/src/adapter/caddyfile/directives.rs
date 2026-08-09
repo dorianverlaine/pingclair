@@ -339,14 +339,14 @@ pub(super) fn adapt_php_fastcgi(d: Directive) -> Result<Handler, AdapterError> {
     Ok(Handler::Pipeline(elements))
 }
 
-/// 🔐 Adapts Caddy's `forward_auth` shortcut into a dedicated handler.
+/// 🔐 Adapts Caddy's `forward_auth` shortcut into a proxy subrequest description.
 ///
 /// Caddy expands this into a reverse_proxy plus a `handle_response` block
 /// whose 2xx branch copies response headers onto the request and then calls
 /// `next`. Pingora's lifecycle cannot continue to the next handler after an
-/// upstream response, so the same behavior is implemented as one inline auth
-/// round trip in `request_filter`: 2xx mutates the request and falls through,
-/// anything else is answered directly. The grammar is the same as upstream's.
+/// upstream response. The compiler normalizes this AST node into that same
+/// reverse-proxy shape, and the runtime executes its bounded subrequest policy
+/// for every downstream protocol. The grammar is the same as upstream's.
 fn adapt_forward_auth(d: Directive) -> Result<Handler, AdapterError> {
     let upstream = d
         .args

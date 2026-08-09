@@ -1535,6 +1535,8 @@ enum H3Terminal {
     },
     FileServer,
     ReverseProxy,
+    /// 🚫 Streams a non-continuing inline proxy response to the H3 client.
+    Subrequest(Box<crate::subrequest::SubrequestResponse>),
 }
 
 /// ✉️ Describes a local response without coupling policy to a QUIC stream.
@@ -1573,12 +1575,39 @@ fn h3_element_matcher_matches(
     evaluate(compiled, &mut request)
 }
 
+/// 🔁 Executes one inline proxy while leaving QUIC framing to the caller.
+async fn plan_h3_subrequest(
+    prepared: &crate::subrequest::PreparedSubrequest,
+    connector: Option<&pingora_core::connectors::http::Connector>,
+    request_header: &mut RequestHeader,
+    verified_client_ip: &str,
+    request_vars: &crate::http_policy::RequestVars,
+) -> Result<H3Plan, HandlerError> {
+    let connector = connector.ok_or((500, "Missing H3 Subrequest Connector"))?;
+    match crate::subrequest::execute(
+        connector,
+        prepared,
+        request_header,
+        Some(verified_client_ip),
+        "https",
+        request_vars,
+    )
+    .await?
+    {
+        crate::subrequest::SubrequestOutcome::Continue => Ok(H3Plan::Continue),
+        crate::subrequest::SubrequestOutcome::Respond(response) => {
+            Ok(H3Plan::Terminal(H3Terminal::Subrequest(response)))
+        }
+    }
+}
+
 /// 🧩 Executes non-terminal middleware before selecting an H3 terminal handler.
 #[async_recursion::async_recursion]
 #[allow(clippy::too_many_arguments)]
-async fn plan_h3_handler(
+async fn plan_h3_handler_with_connector(
     handler: &HandlerConfig,
     state: &ProxyState,
+    connector: Option<&pingora_core::connectors::http::Connector>,
     route_index: usize,
     request_header: &mut RequestHeader,
     effective_uri: &mut String,
@@ -1609,9 +1638,10 @@ async fn plan_h3_handler(
                 if has_proxy && matches!(handler, HandlerConfig::FileServer { .. }) {
                     continue;
                 }
-                match plan_h3_handler(
+                match plan_h3_handler_with_connector(
                     handler,
                     state,
+                    connector,
                     route_index,
                     request_header,
                     effective_uri,
@@ -1650,9 +1680,10 @@ async fn plan_h3_handler(
                 }
                 // 🧭 A `handle` group is mutually exclusive: the first
                 // matching element owns the request.
-                return plan_h3_handler(
+                return plan_h3_handler_with_connector(
                     &element.handler,
                     state,
+                    connector,
                     route_index,
                     request_header,
                     effective_uri,
@@ -1698,9 +1729,10 @@ async fn plan_h3_handler(
                 }
                 // 🧭 `handle_path` is a `handle` under another name: the
                 // first matching element owns the group.
-                return plan_h3_handler(
+                return plan_h3_handler_with_connector(
                     &element.handler,
                     state,
+                    connector,
                     route_index,
                     request_header,
                     effective_uri,
@@ -1735,14 +1767,20 @@ async fn plan_h3_handler(
         HandlerConfig::CopyResponse { .. } | HandlerConfig::CopyResponseHeaders { .. } => {
             Ok(H3Plan::Continue)
         }
-        // 🔐 `forward_auth` needs an inline upstream round trip that the H3
-        // planner does not implement yet; refusing beats silently skipping
-        // authentication (tracked in TRIAGE).
-        HandlerConfig::ForwardAuth(_) => Ok(H3Plan::Respond(H3ImmediateResponse {
-            status: 501,
-            body: "forward_auth is not available on HTTP/3 yet".to_string(),
-            headers: Vec::new(),
-        })),
+        // 🔐 Legacy JSON enters the exact proxy subrequest used by Pingclairfiles.
+        HandlerConfig::ForwardAuth(config) => {
+            let prepared = state
+                .prepared_forward_auth_subrequest(route_index, config)
+                .ok_or((500, "Subrequest Plan Was Not Prepared"))?;
+            plan_h3_subrequest(
+                &prepared,
+                connector,
+                request_header,
+                verified_client_ip,
+                request_vars,
+            )
+            .await
+        }
         HandlerConfig::Vars { values } => {
             // 🧰 Values are templates resolved against the same request, so
             // a value may reference placeholders and earlier vars.
@@ -1882,9 +1920,10 @@ async fn plan_h3_handler(
                     let handlers = HandlerConfig::Pipeline {
                         handlers: route.handlers.clone(),
                     };
-                    let plan = plan_h3_handler(
+                    let plan = plan_h3_handler_with_connector(
                         &handlers,
                         state,
+                        connector,
                         route_index,
                         request_header,
                         effective_uri,
@@ -1964,7 +2003,23 @@ async fn plan_h3_handler(
                 headers: Vec::new(),
             }))
         }
-        HandlerConfig::ReverseProxy(_) => Ok(H3Plan::Terminal(H3Terminal::ReverseProxy)),
+        HandlerConfig::ReverseProxy(config) => {
+            if config.subrequest.is_some() {
+                let prepared = state
+                    .prepared_reverse_proxy_subrequest(route_index, config)
+                    .ok_or((500, "Subrequest Plan Was Not Prepared"))?;
+                plan_h3_subrequest(
+                    &prepared,
+                    connector,
+                    request_header,
+                    verified_client_ip,
+                    request_vars,
+                )
+                .await
+            } else {
+                Ok(H3Plan::Terminal(H3Terminal::ReverseProxy))
+            }
+        }
         // 🗂️ Parity with H1/H2 comes from sharing the resolver, not from
         // reproducing its rules here. This arm used to answer 501, which was
         // defensible while only JSON could reach the handler and indefensible
@@ -1987,9 +2042,10 @@ async fn plan_h3_handler(
             None => match fallback {
                 Some(fallback) => {
                     let fallback_precompile = precompile.and_then(|node| node.children.first());
-                    plan_h3_handler(
+                    plan_h3_handler_with_connector(
                         fallback,
                         state,
+                        connector,
                         route_index,
                         request_header,
                         effective_uri,
@@ -2007,6 +2063,39 @@ async fn plan_h3_handler(
         },
         HandlerConfig::Plugin { .. } => Err((501, "Plugin Not Supported Over HTTP/3")),
     }
+}
+
+/// 🧪 Plans non-subrequest handlers without constructing an unused connector.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn plan_h3_handler(
+    handler: &HandlerConfig,
+    state: &ProxyState,
+    route_index: usize,
+    request_header: &mut RequestHeader,
+    effective_uri: &mut String,
+    response_policy: &mut ResponseHeaderPolicy,
+    verified_client_ip: &str,
+    precompile: Option<&MatcherPrecompile>,
+    handling_error: bool,
+    request_vars: &mut crate::http_policy::RequestVars,
+    response_handlers: &mut Option<Vec<pingclair_core::config::ResponseHandlerConfig>>,
+) -> Result<H3Plan, HandlerError> {
+    plan_h3_handler_with_connector(
+        handler,
+        state,
+        None,
+        route_index,
+        request_header,
+        effective_uri,
+        response_policy,
+        verified_client_ip,
+        precompile,
+        handling_error,
+        request_vars,
+        response_handlers,
+    )
+    .await
 }
 
 /// 🛑 Waits for an explicit abort while allowing normal sender cleanup to finish.
@@ -2275,9 +2364,10 @@ async fn handle_request_inner(
         .compiled_route(route_index)
         .map(|route| &route.matcher_precompile);
     let mut response_handlers = None;
-    let plan = plan_h3_handler(
+    let plan = plan_h3_handler_with_connector(
         handler,
         &state,
+        Some(connector),
         route_index,
         &mut header,
         &mut effective_uri,
@@ -2572,6 +2662,26 @@ async fn handle_request_inner(
             }
         }
 
+        H3Terminal::Subrequest(response) => {
+            stream_h3_subrequest_response(
+                connector,
+                response,
+                &state,
+                &header,
+                &effective_uri,
+                &verified_client_ip_text,
+                &request_vars,
+                response_handlers.as_deref(),
+                response_policy,
+                request_id,
+                stream_id,
+                resp_tx,
+                request_deadline,
+                &mut download_pacer,
+            )
+            .await
+        }
+
         H3Terminal::ReverseProxy => {
             reverse_proxy_upstream(
                 proxy,
@@ -2597,6 +2707,270 @@ async fn handle_request_inner(
             .await
         }
     }
+}
+
+/// 🌊 Streams an inline proxy rejection through the bounded H3 response channel.
+#[allow(clippy::too_many_arguments)]
+async fn stream_h3_subrequest_response(
+    connector: &pingora_core::connectors::http::Connector,
+    response: Box<crate::subrequest::SubrequestResponse>,
+    state: &ProxyState,
+    request_header: &RequestHeader,
+    effective_uri: &str,
+    verified_client_ip: &str,
+    request_vars: &crate::http_policy::RequestVars,
+    response_handlers: Option<&[pingclair_core::config::ResponseHandlerConfig]>,
+    response_policy: &ResponseHeaderPolicy,
+    request_id: &str,
+    stream_id: u64,
+    resp_tx: &RespSender,
+    request_deadline: Option<Instant>,
+    download_pacer: &mut Option<StreamPacer>,
+) -> Result<(), HandlerError> {
+    let mut response = *response;
+    let (mut status, mut upstream_headers, upstream_version) = response
+        .session
+        .response_header()
+        .map(|upstream| {
+            (
+                upstream.status.as_u16(),
+                upstream.headers.clone(),
+                upstream.version,
+            )
+        })
+        .unwrap_or((502, http::HeaderMap::new(), http::Version::HTTP_11));
+
+    if let Some(handlers) = response_handlers.filter(|handlers| !handlers.is_empty()) {
+        let mut eval_vars = request_vars.clone();
+        eval_vars.set("http.reverse_proxy.status_code", status.to_string());
+        if let Some(outcome) = crate::http_policy::evaluate_response_handlers(
+            handlers,
+            status,
+            &upstream_headers,
+            &mut eval_vars,
+        ) {
+            if let Some(file_server) = outcome.file_server {
+                let mut request_path = effective_uri.to_string();
+                if let Some(template) = outcome.request_rewrite {
+                    let resolved = resolve_caddy_placeholders(
+                        &template,
+                        request_header,
+                        Some(verified_client_ip),
+                        "https",
+                        &eval_vars,
+                    );
+                    request_path = rewrite_uri(
+                        &request_path,
+                        None,
+                        None,
+                        Some(resolved.as_ref()),
+                        None,
+                        None,
+                    );
+                }
+                let root = if file_server.root == "." {
+                    eval_vars.get("root").unwrap_or(".").to_string()
+                } else {
+                    file_server.root
+                };
+                let server =
+                    pingclair_static::FileServer::new(pingclair_static::FileServerConfig {
+                        root: std::path::PathBuf::from(&root),
+                        index: file_server.index,
+                        browse: file_server.browse,
+                        browse_limit: file_server.browse_limit,
+                        compress: file_server.compress,
+                        precompressed: false,
+                    });
+                let Some(stream) = server
+                    .serve_streaming(request_path.split('?').next().unwrap_or("/"))
+                    .await
+                    .map_err(|_| (500, "Response File Server Error"))?
+                else {
+                    response.session.shutdown().await;
+                    return Err((404, "Not Found"));
+                };
+                response.session.shutdown().await;
+                let mut headers = http::HeaderMap::new();
+                headers.insert("content-type", stream.content_type.clone());
+                headers.insert("content-length", stream.content_length.clone());
+                if let Some(value) = &stream.last_modified {
+                    headers.insert("last-modified", value.clone());
+                }
+                if let Some(value) = &stream.etag {
+                    headers.insert("etag", value.clone());
+                }
+                return send_h3_local_response(
+                    resp_tx,
+                    stream_id,
+                    state,
+                    request_header,
+                    &request_path,
+                    verified_client_ip,
+                    &eval_vars,
+                    None,
+                    200,
+                    headers,
+                    H3LocalBody::File(stream),
+                    response_policy,
+                    request_id,
+                    request_deadline,
+                    download_pacer,
+                )
+                .await;
+            }
+            if let Some(replacement) = outcome.replacement {
+                response.session.shutdown().await;
+                let mut headers = http::HeaderMap::new();
+                for (name, template) in replacement.headers {
+                    let resolved = resolve_caddy_placeholders(
+                        &template,
+                        request_header,
+                        Some(verified_client_ip),
+                        "https",
+                        &eval_vars,
+                    );
+                    if let (Ok(name), Ok(value)) = (
+                        http::header::HeaderName::from_bytes(name.as_bytes()),
+                        http::HeaderValue::from_str(resolved.as_ref()),
+                    ) {
+                        headers.insert(name, value);
+                    }
+                }
+                return send_h3_local_response(
+                    resp_tx,
+                    stream_id,
+                    state,
+                    request_header,
+                    effective_uri,
+                    verified_client_ip,
+                    &eval_vars,
+                    None,
+                    replacement.status,
+                    headers,
+                    H3LocalBody::Bytes(replacement.body),
+                    response_policy,
+                    request_id,
+                    request_deadline,
+                    download_pacer,
+                )
+                .await;
+            }
+            if let Some(replacement_status) = outcome.passthrough_status {
+                status = replacement_status;
+            }
+            for name in outcome.header_remove {
+                upstream_headers.remove(name);
+            }
+            for (name, template) in outcome.header_set {
+                let resolved = resolve_caddy_placeholders(
+                    &template,
+                    request_header,
+                    Some(verified_client_ip),
+                    "https",
+                    &eval_vars,
+                );
+                if let (Ok(name), Ok(value)) = (
+                    http::header::HeaderName::from_bytes(name.as_bytes()),
+                    http::HeaderValue::from_str(resolved.as_ref()),
+                ) {
+                    upstream_headers.insert(name, value);
+                }
+            }
+        }
+    }
+    if state.intercepts_error_status(status) {
+        response.session.shutdown().await;
+        return Err((status, error_reason(status)));
+    }
+
+    let mut headers = vec![quiche::h3::Header::new(
+        b":status",
+        status.to_string().as_bytes(),
+    )];
+    for (name, value) in &upstream_headers {
+        let lower = name.as_str().to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "connection"
+                | "proxy-connection"
+                | "keep-alive"
+                | "transfer-encoding"
+                | "te"
+                | "trailer"
+                | "upgrade"
+        ) {
+            continue;
+        }
+        headers.push(quiche::h3::Header::new(lower.as_bytes(), value.as_bytes()));
+    }
+    if !response_policy.suppresses_via() {
+        headers.push(quiche::h3::Header::new(
+            b"via",
+            crate::http_policy::via_value(upstream_version).as_bytes(),
+        ));
+    }
+    apply_h3_response_policy(&mut headers, response_policy, request_id, Some(state));
+    send_headers(resp_tx, stream_id, headers, false).await;
+
+    let mut clean = true;
+    loop {
+        match response.session.read_response_body().await {
+            Ok(Some(bytes)) => {
+                pace_h3_body(download_pacer, request_deadline, bytes.len()).await?;
+                send_body(resp_tx, stream_id, bytes.to_vec(), false).await;
+            }
+            Ok(None) => break,
+            Err(error) => {
+                tracing::debug!(%error, "🔌 H3 subrequest response stream failed");
+                clean = false;
+                break;
+            }
+        }
+    }
+
+    let mut trailers = None;
+    if clean && let HttpSession::H2(h2) = &mut response.session {
+        match h2.read_trailers().await {
+            Ok(Some(values)) => {
+                let mut converted = Vec::with_capacity(values.len());
+                for (name, value) in &values {
+                    let lower = name.as_str().to_ascii_lowercase();
+                    if !matches!(
+                        lower.as_str(),
+                        "connection"
+                            | "proxy-connection"
+                            | "keep-alive"
+                            | "transfer-encoding"
+                            | "te"
+                            | "trailer"
+                            | "upgrade"
+                    ) {
+                        converted.push(quiche::h3::Header::new(lower.as_bytes(), value.as_bytes()));
+                    }
+                }
+                trailers = Some(converted);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(%error, "🔌 H3 subrequest trailer stream failed");
+                clean = false;
+            }
+        }
+    }
+    if let Some(trailers) = trailers.filter(|trailers| !trailers.is_empty()) {
+        send_trailers(resp_tx, stream_id, trailers).await;
+    } else {
+        send_body(resp_tx, stream_id, Vec::new(), true).await;
+    }
+    if clean {
+        connector
+            .release_http_session(response.session, &response.peer, None)
+            .await;
+    } else {
+        response.session.shutdown().await;
+    }
+    Ok(())
 }
 
 /// Reverse-proxy an HTTP/3 request to an upstream through Pingora's
@@ -2843,12 +3217,15 @@ async fn reverse_proxy_upstream(
             .insert_header("Host", peer.sni.clone())
             .map_err(|_| (502, "Upstream Request Error"))?;
 
-        // 🧹 Forwards end-to-end headers while stripping hop-by-hop framing metadata.
-        for (key, value) in &req.headers {
-            let name = key.to_ascii_lowercase();
+        // 🧹 Forward the mutable policy header map so an authorizing
+        // subrequest's identity fields reach the backend on H3 too.
+        for (key, value) in &client_header.headers {
+            let name = key.as_str().to_ascii_lowercase();
             if name == "te" {
                 if upstream_is_h2
                     && value
+                        .to_str()
+                        .unwrap_or_default()
                         .split(',')
                         .any(|token| token.trim().eq_ignore_ascii_case("trailers"))
                 {
@@ -2868,7 +3245,7 @@ async fn reverse_proxy_upstream(
             ) {
                 continue;
             }
-            up_req.insert_header(key.clone(), value.as_str()).ok();
+            up_req.append_header(key.clone(), value.clone()).ok();
         }
 
         match client_content_length {
@@ -4568,6 +4945,7 @@ mod tests {
         client_header
             .insert_header(http::header::CONTENT_TYPE, "application/grpc")
             .unwrap();
+        client_header.insert_header("te", "trailers").unwrap();
         let (body_tx, mut body_rx) = mpsc::channel(1);
         drop(body_tx);
         let (resp_tx, mut resp_rx) = mpsc::channel(8);

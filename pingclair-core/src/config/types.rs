@@ -1061,7 +1061,7 @@ pub struct ForwardAuthHeaderMap {
 }
 
 /// 🔐 The auth round trip Caddy's `forward_auth` shortcut configures.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ForwardAuthConfig {
     /// Auth gateway dial address.
     pub upstream: String,
@@ -1071,6 +1071,32 @@ pub struct ForwardAuthConfig {
     /// Response headers copied onto the forwarded request, with renames.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub copy_headers: Vec<ForwardAuthHeaderMap>,
+}
+
+impl ForwardAuthConfig {
+    /// 🔐 Normalizes the legacy handler into the reverse-proxy subrequest Caddy defines.
+    pub fn as_reverse_proxy_subrequest(&self) -> ReverseProxyConfig {
+        let mut headers_up = BTreeMap::new();
+        headers_up.insert(
+            "X-Forwarded-Method".to_string(),
+            "{http.request.method}".to_string(),
+        );
+        headers_up.insert(
+            "X-Forwarded-Uri".to_string(),
+            "{http.request.uri}".to_string(),
+        );
+        ReverseProxyConfig {
+            upstreams: vec![self.upstream.clone()],
+            rewrite_method: Some("GET".to_string()),
+            rewrite_uri: Some(self.uri.clone()),
+            headers_up,
+            subrequest: Some(Box::new(ReverseProxySubrequestConfig {
+                continue_status_classes: vec![2],
+                copy_headers: self.copy_headers.clone(),
+            })),
+            ..ReverseProxyConfig::default()
+        }
+    }
 }
 
 fn default_bool_true() -> bool {
@@ -1241,6 +1267,13 @@ pub struct ReverseProxyConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub handle_response: Vec<ResponseHandlerConfig>,
 
+    /// 🔁 Turns this proxy exchange into a bounded inline subrequest.
+    ///
+    /// A matching response class mutates the original request and continues
+    /// the handler pipeline. Every other response is streamed to the client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subrequest: Option<Box<ReverseProxySubrequestConfig>>,
+
     /// Per-upstream weight and backup role. When empty, every address in
     /// `upstreams` is a primary with weight one (the legacy JSON form).
     #[serde(default)]
@@ -1299,6 +1332,17 @@ pub struct ReverseProxyConfig {
     /// 🗄️ Response caching for this route, off unless configured.
     #[serde(default)]
     pub cache: Option<Box<CacheConfig>>,
+}
+
+/// 🔁 Runtime-neutral continuation policy for one inline reverse-proxy subrequest.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ReverseProxySubrequestConfig {
+    /// 🎯 One-digit HTTP status classes that authorize pipeline continuation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub continue_status_classes: Vec<u16>,
+    /// 🔐 Response headers copied onto the continued request after deleting each destination.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub copy_headers: Vec<ForwardAuthHeaderMap>,
 }
 
 /// 🧵 The FastCGI transport: how PHP-FPM is spoken to.

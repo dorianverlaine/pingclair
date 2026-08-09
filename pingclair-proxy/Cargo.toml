@@ -53,6 +53,7 @@ chrono = "0.4"
 serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
+pingclair-config = { path = "../pingclair-config" }
 serde_json.workspace = true
 tempfile = "3"
 rcgen.workspace = true

@@ -67,12 +67,40 @@ struct H3Response {
     body: Vec<u8>,
 }
 
+/// 🧾 Reads one bounded HTTP/1 request head from a test upstream.
+async fn read_http_head(stream: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+
+    let mut request = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while request.len() < 64 * 1024 {
+        let read = stream.read(&mut chunk).await.unwrap();
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..read]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    String::from_utf8(request).unwrap()
+}
+
 /// Perform one HTTP/3 request and read the complete response.
 ///
 /// A hand-driven client rather than a library one: this has to exercise the
 /// server's own event loop, so the test must not depend on tokio-quiche's
 /// client path being correct.
 async fn h3_get(server: SocketAddr, path: &str) -> Result<H3Response, String> {
+    h3_get_with_headers(server, path, &[]).await
+}
+
+/// 🔐 Performs an H3 GET with explicit client fields for middleware security tests.
+async fn h3_get_with_headers(
+    server: SocketAddr,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+) -> Result<H3Response, String> {
     let mut config = quiche::Config::with_boring_ssl_ctx_builder(
         quiche::PROTOCOL_VERSION,
         boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()).unwrap(),
@@ -83,9 +111,9 @@ async fn h3_get(server: SocketAddr, path: &str) -> Result<H3Response, String> {
     config.set_max_idle_timeout(5_000);
     config.set_max_recv_udp_payload_size(1350);
     config.set_max_send_udp_payload_size(1350);
-    config.set_initial_max_data(10_000_000);
-    config.set_initial_max_stream_data_bidi_local(1_000_000);
-    config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    config.set_initial_max_data(64 * 1024 * 1024);
+    config.set_initial_max_stream_data_bidi_local(32 * 1024 * 1024);
+    config.set_initial_max_stream_data_bidi_remote(32 * 1024 * 1024);
     config.set_initial_max_stream_data_uni(1_000_000);
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(100);
@@ -154,12 +182,15 @@ async fn h3_get(server: SocketAddr, path: &str) -> Result<H3Response, String> {
 
         if let Some(h3) = h3.as_mut() {
             if !sent {
-                let request = [
+                let mut request = vec![
                     quiche::h3::Header::new(b":method", b"GET"),
                     quiche::h3::Header::new(b":scheme", b"https"),
                     quiche::h3::Header::new(b":authority", b"h3.pingclair.test"),
                     quiche::h3::Header::new(b":path", path.as_bytes()),
                 ];
+                request.extend(extra_headers.iter().map(|(name, value)| {
+                    quiche::h3::Header::new(name.as_bytes(), value.as_bytes())
+                }));
                 match h3.send_request(&mut conn, &request, true) {
                     Ok(_) => sent = true,
                     Err(quiche::h3::Error::StreamBlocked) => {}
@@ -270,6 +301,99 @@ async fn h3_streams_a_body_larger_than_one_packet() {
         "a 512 KiB body must stream back whole, not truncated at a packet boundary"
     );
     assert_eq!(response.body, payload.as_bytes());
+}
+
+#[tokio::test]
+async fn h3_forward_auth_mutates_the_backend_request_and_streams_denials() {
+    use tokio::io::AsyncWriteExt;
+
+    let auth_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let auth_address = auth_listener.local_addr().unwrap();
+    let auth_task = tokio::spawn(async move {
+        for expected_uri in ["/allow", "/deny"] {
+            let (mut stream, _) = auth_listener.accept().await.unwrap();
+            let request = read_http_head(&mut stream).await;
+            let lower = request.to_ascii_lowercase();
+            assert!(lower.starts_with("get /auth "));
+            assert!(lower.contains("x-forwarded-method: get\r\n"));
+            assert!(
+                lower.contains(&format!("x-forwarded-uri: {expected_uri}\r\n")),
+                "auth request did not preserve the original URI: {request}"
+            );
+            if expected_uri == "/allow" {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nX-User: alice\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                let denial = vec![b'd'; 20 * 1024 * 1024];
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            denial.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                stream.write_all(&denial).await.unwrap();
+            }
+        }
+    });
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_address = backend_listener.local_addr().unwrap();
+    let backend_task = tokio::spawn(async move {
+        let (mut stream, _) = backend_listener.accept().await.unwrap();
+        let request = read_http_head(&mut stream).await;
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("X-Identity: alice")),
+            "the backend did not receive the auth identity: {request}"
+        );
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nauthorized",
+            )
+            .await
+            .unwrap();
+    });
+
+    // 🧾 The real adapter must produce the same handler tree the H3 server executes.
+    let source = format!(
+        r#":443 {{
+            intercept {{
+                @denied status 403
+                replace_status @denied 401
+            }}
+            forward_auth http://{auth_address} {{
+                uri /auth
+                copy_headers X-User>X-Identity
+            }}
+            reverse_proxy http://{backend_address}
+        }}"#
+    );
+    let config = pingclair_config::compile(&source).unwrap();
+    let handler = config.servers[0].routes[0].handler.clone();
+    let server = spawn_h3_server(handler).await;
+
+    let accepted = h3_get_with_headers(server, "/allow", &[("x-identity", "attacker")])
+        .await
+        .unwrap();
+    assert_eq!(accepted.status, 200);
+    assert_eq!(accepted.body, b"authorized");
+
+    let denied = h3_get(server, "/deny").await.unwrap();
+    assert_eq!(denied.status, 401);
+    assert_eq!(denied.body.len(), 20 * 1024 * 1024);
+    assert!(denied.body.iter().all(|byte| *byte == b'd'));
+
+    auth_task.await.unwrap();
+    backend_task.await.unwrap();
 }
 
 // MARK: - Malformed HTTP/3 frames

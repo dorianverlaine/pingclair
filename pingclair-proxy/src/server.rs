@@ -843,6 +843,8 @@ pub struct ProxyState {
     /// 🧵 Precomputed FastCGI dial targets per route, parallel to
     /// `load_balancers`; `None` means the route speaks HTTP.
     pub(crate) fastcgi_upstreams: Vec<Option<Arc<FastCgiUpstream>>>,
+    /// 🔁 Parsed inline subrequest targets for each route's handler tree.
+    pub(crate) subrequests: Vec<Vec<Arc<crate::subrequest::PreparedSubrequest>>>,
     /// Health checkers per route
     pub health_checkers: Vec<Option<Arc<HealthChecker>>>,
     /// File servers per route
@@ -1268,6 +1270,7 @@ impl ProxyState {
         let mut load_balancers = Vec::new();
         let mut dynamic_dials = Vec::new();
         let mut fastcgi_upstreams = Vec::new();
+        let mut subrequests = Vec::new();
         let mut health_checkers = Vec::new();
         let mut file_servers = Vec::new();
         let mut rate_limiters = Vec::new();
@@ -1278,6 +1281,9 @@ impl ProxyState {
         let mut rewrite_regexes = Vec::new();
 
         for (route_index, route) in config.routes.iter().enumerate() {
+            let mut route_subrequests = Vec::new();
+            collect_subrequest_plans(&route.handler, &mut route_subrequests);
+            subrequests.push(route_subrequests);
             // Each per-route slot is resolved independently by walking the
             // route's handler tree. A `reverse_proxy`/`file_server`/
             // `rate_limit` may sit at the top level *or* be nested inside a
@@ -1623,6 +1629,7 @@ impl ProxyState {
             load_balancers,
             dynamic_dials,
             fastcgi_upstreams,
+            subrequests,
             health_checkers,
             file_servers,
             rate_limiters,
@@ -1653,6 +1660,32 @@ impl ProxyState {
             // existed rather than inventing a new failure mode.
             Some(RouteUpstreamTls::Default) | None => Ok(None),
         }
+    }
+
+    /// 🔁 Finds the pre-parsed dial plan for one inline proxy handler.
+    pub(crate) fn prepared_reverse_proxy_subrequest(
+        &self,
+        route_index: usize,
+        config: &ReverseProxyConfig,
+    ) -> Option<Arc<crate::subrequest::PreparedSubrequest>> {
+        self.subrequests
+            .get(route_index)?
+            .iter()
+            .find(|prepared| prepared.matches_reverse_proxy(config))
+            .cloned()
+    }
+
+    /// 🔐 Finds the pre-parsed plan for a legacy JSON forward-auth handler.
+    pub(crate) fn prepared_forward_auth_subrequest(
+        &self,
+        route_index: usize,
+        config: &pingclair_core::config::ForwardAuthConfig,
+    ) -> Option<Arc<crate::subrequest::PreparedSubrequest>> {
+        self.subrequests
+            .get(route_index)?
+            .iter()
+            .find(|prepared| prepared.matches_forward_auth(config))
+            .cloned()
     }
 
     /// 🛡️ Applies the route's compiled access policy to a verified client.
@@ -2761,13 +2794,114 @@ impl PingclairProxy {
         Ok(true)
     }
 
-    /// 🔐 Runs Caddy's `forward_auth` round trip inline.
-    ///
-    /// A 2xx copies the configured identity headers onto the downstream
-    /// request and returns "not handled" so the next handler (usually the
-    /// backend reverse_proxy) serves the request. Anything else is the auth
-    /// gateway's own answer and is streamed to the client, so memory stays
-    /// bounded by one response chunk.
+    /// 🔁 Runs one normalized reverse-proxy subrequest inline.
+    async fn proxy_subrequest(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestContext,
+        prepared: &crate::subrequest::PreparedSubrequest,
+    ) -> pingora_core::Result<bool> {
+        let subrequest_error =
+            |(status, message): (u16, &'static str)| -> Box<pingora_core::Error> {
+                pingora_core::Error::explain(pingora_core::ErrorType::HTTPStatus(status), message)
+            };
+        let Some(state) = ctx.state.clone() else {
+            return Err(subrequest_error((
+                500,
+                "Subrequest Ran Without Route State",
+            )));
+        };
+        let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
+        let outcome = crate::subrequest::execute(
+            &self.connector,
+            prepared,
+            session.req_header_mut(),
+            verified_client_ip.as_deref(),
+            ctx.request_scheme,
+            &ctx.request_vars,
+        )
+        .await
+        .map_err(subrequest_error)?;
+        let crate::subrequest::SubrequestOutcome::Respond(rejected) = outcome else {
+            return Ok(false);
+        };
+        let mut rejected = *rejected;
+        let mut response = rejected
+            .session
+            .response_header()
+            .cloned()
+            .unwrap_or_else(|| {
+                ResponseHeader::build(502, None).expect("a status-502 response header is valid")
+            });
+        let response_handlers = std::mem::take(&mut ctx.intercept_handlers);
+        if !response_handlers.is_empty() {
+            self.apply_response_interception(
+                session,
+                ctx,
+                &mut response,
+                Some(response_handlers.as_slice()),
+            )
+            .await?;
+        }
+        if let Some(error_status) = ctx.response_decision_error.take() {
+            rejected.session.shutdown().await;
+            ctx.error_status = Some(error_status);
+            return Ok(true);
+        }
+        if ctx.intercepted_file.is_some() || ctx.intercepted_response.is_some() {
+            rejected.session.shutdown().await;
+            return self
+                .write_local_response(session, ctx, response, LocalResponseBody::Empty, false)
+                .await;
+        }
+        if state.intercepts_error_status(response.status.as_u16()) {
+            rejected.session.shutdown().await;
+            ctx.error_status = Some(response.status.as_u16());
+            return Ok(true);
+        }
+        for header in [
+            "connection",
+            "proxy-connection",
+            "keep-alive",
+            "transfer-encoding",
+            "te",
+            "trailer",
+            "upgrade",
+        ] {
+            response.remove_header(header);
+        }
+        response.remove_header("transfer-encoding");
+        ctx.response_status = response.status.as_u16();
+        Self::apply_local_response_headers(&mut response, ctx)?;
+        session
+            .write_response_header(Box::new(response), false)
+            .await?;
+        let mut clean = true;
+        loop {
+            match rejected.session.read_response_body().await {
+                Ok(Some(bytes)) => {
+                    session.write_response_body(Some(bytes), false).await?;
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::debug!(%error, "🔌 Subrequest response stream failed");
+                    clean = false;
+                    break;
+                }
+            }
+        }
+        session.write_response_body(None, true).await?;
+        if clean {
+            self.connector
+                .release_http_session(rejected.session, &rejected.peer, None)
+                .await;
+        } else {
+            rejected.session.shutdown().await;
+        }
+        Ok(true)
+    }
+
+    /// 🔐 Normalizes legacy JSON before entering the shared subrequest exchange.
     async fn forward_auth(
         &self,
         session: &mut Session,
@@ -2775,130 +2909,17 @@ impl PingclairProxy {
         route_index: usize,
         config: &pingclair_core::config::ForwardAuthConfig,
     ) -> pingora_core::Result<bool> {
-        let auth_error =
-            |status: u16, message: &'static str| -> std::boxed::Box<pingora_core::Error> {
-                pingora_core::Error::explain(pingora_core::ErrorType::HTTPStatus(status), message)
-            };
-        let Some(state) = ctx.state.clone() else {
-            return Err(auth_error(502, "forward_auth ran without route state"));
-        };
-        let tls_policy = state
-            .upstream_tls_for(route_index)
-            .map_err(|()| auth_error(500, "upstream TLS configuration failed to load"))?;
-        let Some(spec) = UpstreamSpec::parse(&config.upstream) else {
-            return Err(auth_error(502, "invalid forward_auth upstream address"));
-        };
-        let Some(upstream) = crate::upstream::resolve_dynamic_dial(spec).await else {
-            return Err(auth_error(502, "forward_auth upstream did not resolve"));
-        };
-        let peer = Self::build_http_peer(&upstream, None, None, None, tls_policy)?;
-        let (mut auth, _reused) =
-            self.connector
-                .get_http_session(&peer)
-                .await
-                .map_err(|error| {
-                    tracing::warn!(%error, "🔌 forward_auth upstream connection failed");
-                    auth_error(502, "forward_auth upstream connection failed")
-                })?;
-
-        let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
-        let uri = resolve_caddy_placeholders(
-            &config.uri,
-            session.req_header(),
-            verified_client_ip.as_deref(),
-            ctx.request_scheme,
-            &ctx.request_vars,
-        )
-        .into_owned();
-        let mut auth_req = RequestHeader::build("GET", uri.as_bytes(), None)?;
-        let host = upstream
-            .ext
-            .get::<HostName>()
-            .map(|host| host.0.clone())
-            .unwrap_or_else(|| upstream.addr.to_string());
-        auth_req.insert_header("Host", host)?;
-        for (name, value) in session.req_header().headers.iter() {
-            let lower = name.as_str().to_ascii_lowercase();
-            if matches!(
-                lower.as_str(),
-                "host"
-                    | "connection"
-                    | "keep-alive"
-                    | "transfer-encoding"
-                    | "te"
-                    | "trailer"
-                    | "upgrade"
-                    | "content-length"
-            ) || name.as_str().contains('_')
-            {
-                continue;
-            }
-            auth_req.insert_header(name.to_string(), value.as_bytes())?;
-        }
-        auth_req.insert_header("X-Forwarded-Method", session.req_header().method.as_str())?;
-        auth_req.insert_header(
-            "X-Forwarded-Uri".to_string(),
-            session.req_header().uri.to_string(),
-        )?;
-
-        auth.write_request_header(Box::new(auth_req)).await?;
-        auth.finish_request_body().await?;
-        auth.read_response_header().await?;
-        let status = auth
-            .response_header()
-            .map(|response| response.status.as_u16())
-            .unwrap_or(502);
-
-        if (200..300).contains(&status) {
-            // 🔐 GHSA-7r4p-vjf4-gxv4: the configured destination of every
-            // copied header is deleted first, including renamed headers; the
-            // auth value is set only when non-empty, so a client cannot retain
-            // a destination value that the gateway did not issue.
-            for mapping in &config.copy_headers {
-                let from_value = auth
-                    .response_header()
-                    .and_then(|response| response.headers.get(&mapping.from))
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or_default()
-                    .to_string();
-                let to = mapping.to.as_deref().unwrap_or(&mapping.from);
-                session.req_header_mut().remove_header(to);
-                if !from_value.is_empty() {
-                    session
-                        .req_header_mut()
-                        .insert_header(to.to_string(), from_value)?;
-                }
-            }
-            // 🌊 Drain the auth body so the connection can be reused; the
-            // client never sees the 2xx.
-            while let Ok(Some(_)) = auth.read_response_body().await {}
-            auth.shutdown().await;
-            return Ok(false);
-        }
-
-        // 🚫 A non-2xx is the auth gateway's own answer: stream it to the
-        // client, bounded by one chunk.
-        let mut response = auth.response_header().cloned().unwrap_or_else(|| {
-            ResponseHeader::build(502, None).expect("a status-502 response header is valid")
-        });
-        response.remove_header("transfer-encoding");
-        ctx.response_status = status;
-        Self::apply_local_response_headers(&mut response, ctx)?;
-        session
-            .write_response_header(Box::new(response), false)
-            .await?;
-        loop {
-            match auth.read_response_body().await {
-                Ok(Some(bytes)) => {
-                    session.write_response_body(Some(bytes), false).await?;
-                }
-                Ok(None) => break,
-                Err(_) => break,
-            }
-        }
-        session.write_response_body(None, true).await?;
-        auth.shutdown().await;
-        Ok(true)
+        let prepared = ctx
+            .state
+            .as_ref()
+            .and_then(|state| state.prepared_forward_auth_subrequest(route_index, config))
+            .ok_or_else(|| {
+                pingora_core::Error::explain(
+                    pingora_core::ErrorType::HTTPStatus(500),
+                    "Subrequest Plan Was Not Prepared",
+                )
+            })?;
+        self.proxy_subrequest(session, ctx, &prepared).await
     }
 
     /// 🧵 Serves one request through the FastCGI transport.
@@ -4526,7 +4547,21 @@ impl PingclairProxy {
             // FastCGI transport cannot ride Pingora's HTTP lifecycle, so it
             // answers inline instead.
             HandlerConfig::ReverseProxy(config) => {
-                if config.fastcgi.is_some() {
+                if config.subrequest.is_some() {
+                    let prepared = ctx
+                        .state
+                        .as_ref()
+                        .and_then(|state| {
+                            state.prepared_reverse_proxy_subrequest(route_index, config)
+                        })
+                        .ok_or_else(|| {
+                            pingora_core::Error::explain(
+                                pingora_core::ErrorType::HTTPStatus(500),
+                                "Subrequest Plan Was Not Prepared",
+                            )
+                        })?;
+                    self.proxy_subrequest(session, ctx, &prepared).await
+                } else if config.fastcgi.is_some() {
                     self.fastcgi_proxy(session, ctx, route_index, config).await
                 } else {
                     Ok(false)
@@ -7330,7 +7365,7 @@ fn fastcgi_join_root(root: &str, path: &str) -> String {
 /// ConnectNoRoute. Mirrors [`find_rate_limit_config`].
 pub(crate) fn find_reverse_proxy_config(handler: &HandlerConfig) -> Option<&ReverseProxyConfig> {
     match handler {
-        HandlerConfig::ReverseProxy(config) => Some(config),
+        HandlerConfig::ReverseProxy(config) if config.subrequest.is_none() => Some(config),
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::Handle { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => handlers
@@ -7411,13 +7446,55 @@ fn find_access_control_config(handler: &HandlerConfig) -> Option<&AccessControlC
 /// `file_server` stand down when Caddy's directive order would proxy first).
 pub(crate) fn contains_reverse_proxy(handler: &HandlerConfig) -> bool {
     match handler {
-        HandlerConfig::ReverseProxy(_) => true,
+        HandlerConfig::ReverseProxy(config) => config.subrequest.is_none(),
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::Handle { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => handlers
             .iter()
             .any(|element| contains_reverse_proxy(&element.handler)),
         _ => false,
+    }
+}
+
+/// 🔁 Collects every inline proxy target before the route becomes reachable.
+fn collect_subrequest_plans(
+    handler: &HandlerConfig,
+    prepared: &mut Vec<Arc<crate::subrequest::PreparedSubrequest>>,
+) {
+    match handler {
+        HandlerConfig::ReverseProxy(config) if config.subrequest.is_some() => {
+            if let Some(plan) = crate::subrequest::PreparedSubrequest::new((**config).clone()) {
+                prepared.push(Arc::new(plan));
+            }
+        }
+        // 🔐 Direct JSON may still use the legacy handler; it enters the same
+        // prepared exchange as the normalized Pingclairfile form.
+        HandlerConfig::ForwardAuth(config) => {
+            if let Some(plan) =
+                crate::subrequest::PreparedSubrequest::new(config.as_reverse_proxy_subrequest())
+            {
+                prepared.push(Arc::new(plan));
+            }
+        }
+        HandlerConfig::Pipeline { handlers }
+        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::HandlePath { handlers, .. } => {
+            for element in handlers {
+                collect_subrequest_plans(&element.handler, prepared);
+            }
+        }
+        HandlerConfig::HandleErrors { errors } => {
+            for handlers in errors.values() {
+                for handler in handlers {
+                    collect_subrequest_plans(handler, prepared);
+                }
+            }
+        }
+        HandlerConfig::TryFiles {
+            fallback: Some(fallback),
+            ..
+        } => collect_subrequest_plans(fallback, prepared),
+        _ => {}
     }
 }
 

@@ -29,6 +29,7 @@ pub mod readiness;
 pub mod redaction;
 mod retry;
 pub mod server;
+mod subrequest;
 pub mod upstream;
 pub mod upstream_tls;
 

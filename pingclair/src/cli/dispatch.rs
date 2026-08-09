@@ -463,6 +463,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 fastcgi: None,
                 dynamic_upstream: None,
                 handle_response: Vec::new(),
+                subrequest: None,
                 rewrite_method: None,
                 rewrite_uri: None,
                 request_buffer_bytes: None,

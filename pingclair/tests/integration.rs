@@ -3751,7 +3751,17 @@ async fn test_pingclairfile_forward_auth_copies_headers_and_answers_denials() {
             let request = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
             let text = String::from_utf8_lossy(&request);
             let lower = text.to_ascii_lowercase();
-            if lower.contains("x-auth-mode: deny") {
+            let forwards_original_request = lower.starts_with("get /auth ")
+                && lower.contains("x-forwarded-method: get\r\n")
+                && lower.contains("x-forwarded-uri: /app\r\n");
+            if !forwards_original_request {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 400 Bad Request\r\nContent-Length: 18\r\nConnection: close\r\n\r\nmissing forwarding",
+                    )
+                    .await
+                    .unwrap();
+            } else if lower.contains("x-auth-mode: deny") {
                 stream
                     .write_all(
                         b"HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\nConnection: close\r\n\r\nforbidden",
@@ -3827,6 +3837,10 @@ async fn test_pingclairfile_forward_auth_copies_headers_and_answers_denials() {
             @readiness path __PINGCLAIR_TEST_READINESS_PATH__
             respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
 
+            intercept {{
+                @denied status 403
+                replace_status @denied 401
+            }}
             forward_auth http://{auth} {{
                 uri /auth
                 copy_headers X-User-Id X-Role>X-Identity
@@ -3899,7 +3913,7 @@ async fn test_pingclairfile_forward_auth_copies_headers_and_answers_denials() {
         .send()
         .await
         .unwrap();
-    assert_eq!(denied.status(), 403);
+    assert_eq!(denied.status(), 401);
     assert_eq!(denied.text().await.unwrap(), "forbidden");
 
     auth_task.await.unwrap();

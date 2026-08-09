@@ -593,7 +593,9 @@ before the request continues to the backend. A 2xx copies the listed response
 headers onto their configured request destinations — deleting those
 destinations before any copy, including renamed ones — and anything else is
 answered to the client directly. Header names containing `_`
-are dropped from incoming requests, matching Caddy's default.
+are dropped from incoming requests, matching Caddy's default. The shortcut is
+compiled into a bodyless GET proxy subrequest that forwards the original
+method and URI; H1, H2, and H3 share the same streamed exchange.
 
 Upstreams written as hostnames are re-resolved while the server runs, so a
 container that restarts on a new address is picked up without a reload. A

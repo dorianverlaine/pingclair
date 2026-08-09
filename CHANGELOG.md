@@ -242,7 +242,9 @@ lets the rest converge.
   when it was renamed (per GHSA-7r4p-vjf4-gxv4), and falls through; anything
   else is streamed to the client. Incoming header names containing `_` are
   dropped per GHSA-f59h-q822-g45g, matching Caddy's default, so the underscore
-  alias cannot smuggle past `copy_headers`.
+  alias cannot smuggle past `copy_headers`. Pingclairfiles now compile the
+  shortcut into the same bodyless GET proxy subrequest used by legacy JSON,
+  forwarding the original method and URI with identical H1/H2/H3 behavior.
 - 🧵 **`php_fastcgi` over a real FastCGI client.** The shortcut expands the
   way upstream does — canonical-path redirect, `try_files` rewrite, and a
   FastCGI reverse proxy, each with its own matcher — and the proxy speaks the
