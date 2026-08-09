@@ -571,6 +571,14 @@ compilée et sont journalisées au démarrage. `lb_policy weighted_round_robin`
 porte un poids par amont, et un bloc `method`/`rewrite` de reverse_proxy modifie
 la requête amont avant son envoi.
 
+`reverse_proxy` accepte aussi les blocs `handle_response` avec des matchers de
+réponse (`@name status …` / `@name header …`), `replace_status`,
+`copy_response` et `copy_response_headers`. La décision se prend à partir de
+l'en-tête seul ; un remplacement émet son corps statique une fois puis jette le
+corps amont morceau par morceau, donc l'interception ne met jamais en tampon une
+réponse entière. `intercept { … }` enregistre les mêmes handlers pour les
+réponses proxifiées.
+
 Les amonts écrits sous forme de noms d'hôtes sont ré-résolus pendant l'exécution :
 un conteneur qui redémarre sur une nouvelle adresse est suivi sans rechargement.
 Une résolution en échec laisse l'adresse précédente en rotation — une panne du

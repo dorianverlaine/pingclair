@@ -149,6 +149,13 @@ pub struct RequestContext {
     pub error_message: Option<String>,
     /// 🧰 Request-scoped variables set by `vars` handlers.
     pub request_vars: crate::http_policy::RequestVars,
+    /// 🧭 Response handlers registered by an `intercept` handler for this
+    /// request; the proxy's own `handle_response` takes precedence.
+    pub intercept_handlers: Vec<pingclair_core::config::ResponseHandlerConfig>,
+    /// 🧭 Replacement response decided by `handle_response`, emitted once.
+    pub intercepted_response: Option<crate::http_policy::InterceptedResponse>,
+    /// 🚩 Whether the replacement body has already been handed downstream.
+    pub intercepted_body_emitted: bool,
     /// 🚫 Whether the request is already inside an error route; a second
     /// raised error then responds directly instead of recursing forever.
     pub handling_error: bool,
@@ -212,6 +219,9 @@ impl Default for RequestContext {
             error_status: None,
             error_message: None,
             request_vars: crate::http_policy::RequestVars::default(),
+            intercept_handlers: Vec::new(),
+            intercepted_response: None,
+            intercepted_body_emitted: false,
             handling_error: false,
             log_skip: false,
             request_deadline: None,
@@ -2434,6 +2444,111 @@ impl PingclairProxy {
         Ok(())
     }
 
+    /// 🧭 Evaluates the route's `handle_response` entries (or `intercept`
+    /// handlers registered for this request) against the upstream response
+    /// header, before the client sees a single byte.
+    ///
+    /// The decision only reads status and headers. A replacement response is
+    /// scheduled on the context and its static body is emitted exactly once
+    /// by the body filter; the upstream body is then drained chunk by chunk
+    /// and discarded, so a 20 MB upstream response costs one chunk of memory,
+    /// not one whole body.
+    fn apply_response_interception(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestContext,
+        upstream_response: &mut ResponseHeader,
+    ) -> pingora_core::Result<()> {
+        let (Some(state), Some(route_index)) = (ctx.state.as_ref(), ctx.route_index) else {
+            return Ok(());
+        };
+        let handlers = state
+            .config
+            .routes
+            .get(route_index)
+            .and_then(|route| find_reverse_proxy_config(&route.handler))
+            .map(|config| config.handle_response.as_slice())
+            .filter(|handlers| !handlers.is_empty())
+            .unwrap_or(ctx.intercept_handlers.as_slice());
+        if handlers.is_empty() {
+            return Ok(());
+        }
+
+        let status = upstream_response.status.as_u16();
+        let Some(outcome) = crate::http_policy::evaluate_response_handlers(
+            handlers,
+            status,
+            &upstream_response.headers,
+            &mut ctx.request_vars,
+        ) else {
+            return Ok(());
+        };
+
+        if let Some(replacement) = outcome.replacement {
+            let mut headers = BTreeMap::new();
+            let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
+            for (name, template) in replacement.headers {
+                let resolved = resolve_caddy_placeholders(
+                    &template,
+                    session.req_header(),
+                    verified_client_ip.as_deref(),
+                    ctx.request_scheme,
+                    &ctx.request_vars,
+                )
+                .into_owned();
+                headers.insert(name, resolved);
+            }
+            upstream_response.status = http::StatusCode::from_u16(replacement.status)
+                .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+            let existing: Vec<String> = upstream_response
+                .headers
+                .keys()
+                .map(|name| name.as_str().to_string())
+                .collect();
+            for name in existing {
+                upstream_response.remove_header(name.as_str());
+            }
+            for (name, value) in &headers {
+                upstream_response.insert_header(name.clone(), value.clone())?;
+            }
+            upstream_response.insert_header(
+                "Content-Length".to_string(),
+                replacement.body.len().to_string(),
+            )?;
+            upstream_response.remove_header("transfer-encoding");
+            ctx.response_status = replacement.status;
+            ctx.intercepted_response = Some(crate::http_policy::InterceptedResponse {
+                status: replacement.status,
+                headers,
+                body: replacement.body,
+            });
+            return Ok(());
+        }
+
+        if let Some(code) = outcome.passthrough_status
+            && let Ok(code) = http::StatusCode::from_u16(code)
+        {
+            upstream_response.status = code;
+            ctx.response_status = code.as_u16();
+        }
+        let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
+        for name in outcome.header_remove {
+            upstream_response.remove_header(name.as_str());
+        }
+        for (name, template) in outcome.header_set {
+            let resolved = resolve_caddy_placeholders(
+                &template,
+                session.req_header(),
+                verified_client_ip.as_deref(),
+                ctx.request_scheme,
+                &ctx.request_vars,
+            )
+            .into_owned();
+            upstream_response.insert_header(name.clone(), resolved)?;
+        }
+        Ok(())
+    }
+
     /// 🔁 Returns a gateway timeout when the route's total retry budget expired.
     fn enforce_retry_deadline(ctx: &RequestContext) -> pingora_core::Result<()> {
         if ctx
@@ -2896,6 +3011,12 @@ impl PingclairProxy {
                 Self::write_local_body(session, ctx, body_bytes, true).await?;
                 Ok(true)
             }
+            // 🧭 Response handlers only make sense against an upstream
+            // response; a configuration that reaches the request dispatcher
+            // with one is inert here by construction.
+            HandlerConfig::CopyResponse { .. } | HandlerConfig::CopyResponseHeaders { .. } => {
+                Ok(false)
+            }
             // 🚨 A static error raises its status into the request context
             // instead of writing: the dispatch then runs the server's error
             // routes, and only falls back to a direct response when none
@@ -3357,6 +3478,14 @@ impl PingclairProxy {
                     );
                     ctx.request_vars.set(name.clone(), resolved.into_owned());
                 }
+                Ok(false)
+            }
+            HandlerConfig::Intercept { handlers } => {
+                // 🧭 Registers response handlers for the response of later
+                // handlers in this request. Proxied responses pass through
+                // `response_filter` and are intercepted; locally generated
+                // responses do not yet run that filter (tracked in TRIAGE).
+                ctx.intercept_handlers = handlers.clone();
                 Ok(false)
             }
             HandlerConfig::Rewrite {
@@ -5440,6 +5569,11 @@ impl ProxyHttp for PingclairProxy {
         // Capture response status for access log
         ctx.response_status = upstream_response.status.as_u16();
 
+        // 🧭 `handle_response`/`intercept` evaluate before any response byte
+        // reaches the client, and before compression decides what to do with
+        // the body.
+        self.apply_response_interception(session, ctx, upstream_response)?;
+
         // ⏱️ TTFB is measured at the response header, which is the first byte
         // the client can actually observe. Recorded once — a retry or an
         // interceptor running this filter again must not reset it.
@@ -5490,6 +5624,7 @@ impl ProxyHttp for PingclairProxy {
         //   - Body is not too small (> 256 bytes via Content-Length)
         if let Some(encoding) = ctx.negotiated_encoding
             && !ctx.streaming_response
+            && ctx.intercepted_response.is_none()
         {
             let already_encoded = upstream_response.headers.get("content-encoding").is_some();
             let content_type = upstream_response
@@ -5556,6 +5691,22 @@ impl ProxyHttp for PingclairProxy {
     ) -> pingora_core::Result<Option<Duration>> {
         Self::enforce_request_deadline(ctx)?;
         Self::enforce_retry_deadline(ctx)?;
+
+        // 🧭 A `handle_response` replacement emits its static body exactly
+        // once and then discards every upstream chunk, keeping memory bounded
+        // by the replacement, not by the upstream body size.
+        if ctx.intercepted_response.is_some() {
+            if !ctx.intercepted_body_emitted {
+                ctx.intercepted_body_emitted = true;
+                if let Some(replacement) = &ctx.intercepted_response {
+                    *body = Some(Bytes::copy_from_slice(&replacement.body));
+                }
+            } else {
+                *body = None;
+            }
+            return Ok(None);
+        }
+
         // Track response bytes for access log
         if let Some(b) = body.as_ref() {
             ctx.response_bytes += b.len() as u64;
@@ -6080,7 +6231,7 @@ impl ProxyHttp for PingclairProxy {
 /// Without this recursion the reverse proxy nested in that pipeline would
 /// get no load balancer and every request to it would fail with
 /// ConnectNoRoute. Mirrors [`find_rate_limit_config`].
-fn find_reverse_proxy_config(handler: &HandlerConfig) -> Option<&ReverseProxyConfig> {
+pub(crate) fn find_reverse_proxy_config(handler: &HandlerConfig) -> Option<&ReverseProxyConfig> {
     match handler {
         HandlerConfig::ReverseProxy(config) => Some(config),
         HandlerConfig::Pipeline { handlers }

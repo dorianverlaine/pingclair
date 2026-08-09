@@ -1477,6 +1477,98 @@ mod fail_closed_tests {
         assert_eq!(headers.get("X-Probe").map(String::as_str), Some("probe"));
     }
 
+    /// 🧭 `handle_response` and `intercept` compile into the response-handler
+    /// configuration the runtime evaluates before the client sees a byte.
+    #[test]
+    fn handle_response_and_intercept_compile() {
+        let config = crate::compile(
+            r#"example.com {
+                reverse_proxy localhost:8080 {
+                    @err status 401 403
+                    handle_response @err {
+                        copy_response_headers {
+                            include X-Retry
+                        }
+                        respond "denied" 403
+                    }
+                    @ok status 2xx
+                    handle_response @ok {
+                        copy_response 202
+                    }
+                }
+            }
+            intercept.example {
+                intercept {
+                    @500 status 500
+                    replace_status @500 400
+                    handle_response {
+                        respond "any" 418
+                    }
+                }
+                respond "wrapped"
+            }"#,
+        )
+        .expect("response handlers must compile");
+
+        let example = config
+            .servers
+            .iter()
+            .find(|server| server.name.as_deref() == Some("example.com"))
+            .expect("the example.com server");
+        let proxy = match &example.routes[0].handler {
+            pingclair_core::config::HandlerConfig::ReverseProxy(proxy) => proxy,
+            other => panic!("expected a proxy handler, got {other:?}"),
+        };
+        assert_eq!(proxy.handle_response.len(), 2);
+        let pingclair_core::config::ResponseHandlerConfig {
+            matcher: Some(matcher),
+            status_code: None,
+            handlers,
+        } = &proxy.handle_response[0]
+        else {
+            panic!("the first entry must carry a matcher and handlers");
+        };
+        assert_eq!(matcher.status_codes, [401, 403]);
+        assert!(matches!(
+            handlers[0],
+            pingclair_core::config::HandlerConfig::CopyResponseHeaders { .. }
+        ));
+        assert!(matches!(
+            handlers[1],
+            pingclair_core::config::HandlerConfig::Respond { status: 403, .. }
+        ));
+        assert!(matches!(
+            proxy.handle_response[1].handlers[0],
+            pingclair_core::config::HandlerConfig::CopyResponse {
+                status_code: Some(202)
+            }
+        ));
+
+        let intercept_site = config
+            .servers
+            .iter()
+            .find(|server| server.name.as_deref() == Some("intercept.example"))
+            .expect("the intercept.example server");
+        let pingclair_core::config::HandlerConfig::Pipeline { handlers } =
+            &intercept_site.routes[0].handler
+        else {
+            panic!("expected a pipeline with intercept and respond");
+        };
+        let pingclair_core::config::HandlerConfig::Intercept {
+            handlers: intercept,
+        } = &handlers[0].handler
+        else {
+            panic!("expected an intercept handler");
+        };
+        assert_eq!(intercept.len(), 2);
+        assert_eq!(
+            intercept[0].status_code.as_deref(),
+            Some("400"),
+            "replace_status folds into the first entry"
+        );
+        assert!(intercept[1].matcher.is_none());
+    }
+
     #[test]
     fn reverse_proxy_rejects_header_up_with_extra_arguments() {
         let error = compile_err(

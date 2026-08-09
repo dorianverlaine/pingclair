@@ -3396,6 +3396,91 @@ async fn test_pingclairfile_reverse_proxy_method_and_rewrite_reach_upstream() {
 }
 
 #[tokio::test]
+async fn test_pingclairfile_handle_response_replaces_and_forwards() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let upstream_address = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let mut seen = 0u32;
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+            seen += 1;
+            if seen == 1 {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 6\r\nX-Retry: yes\r\nConnection: close\r\n\r\nsecret",
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                let payload = "x".repeat(1024 * 1024);
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                            payload.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+
+    // 📄 A matched `handle_response` replaces the response (with copied
+    // headers) while an unmatched passthrough entry only changes the status —
+    // and the 1 MiB body still streams through untouched.
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            reverse_proxy http://{upstream} {{
+                @err status 401
+                handle_response @err {{
+                    copy_response_headers {{
+                        include X-Retry
+                    }}
+                    respond "denied" 403
+                }}
+
+                @ok status 200
+                handle_response @ok {{
+                    copy_response 202
+                }}
+            }}
+        }}
+        "#,
+        upstream = upstream_address
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    let denied = client.get(server.url(0, "/probe")).send().await.unwrap();
+    assert_eq!(denied.status(), 403);
+    assert_eq!(denied.headers()["x-retry"], "yes");
+    assert_eq!(denied.text().await.unwrap(), "denied");
+
+    let streamed = client.get(server.url(0, "/probe")).send().await.unwrap();
+    assert_eq!(streamed.status(), 202);
+    let body = streamed.text().await.unwrap();
+    assert_eq!(body.len(), 1024 * 1024);
+    assert!(body.bytes().all(|byte| byte == b'x'));
+    upstream_task.await.unwrap();
+}
+
+#[tokio::test]
 async fn test_pingclairfile_wildcard_internal_tls_serves_subdomains() {
     let config = r#"
         {

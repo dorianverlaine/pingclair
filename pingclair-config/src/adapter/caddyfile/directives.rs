@@ -10,6 +10,7 @@ use super::matchers::{
     parse_matcher_definition, parse_route_matcher_and_block, resolve_matcher_token,
 };
 use super::order::DirectiveOrder;
+use super::reverse_proxy::adapt_intercept;
 use super::reverse_proxy::adapt_reverse_proxy;
 use crate::parser::ast::*;
 use crate::parser::caddy_ast::{Block, Directive};
@@ -25,6 +26,7 @@ pub(super) fn adapt_handler(
 ) -> Result<Handler, AdapterError> {
     match d.name.as_str() {
         "reverse_proxy" => adapt_reverse_proxy(d),
+        "intercept" => adapt_intercept(d),
         "respond" => adapt_respond(d),
         "redir" | "redirect" => adapt_redirect(d),
         "file_server" => {

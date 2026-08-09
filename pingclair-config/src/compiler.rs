@@ -724,6 +724,9 @@ fn reject_unimplemented_handler(handler: &HandlerConfig) -> CompileResult<()> {
         // instead of defaulting to "allowed" and shipping as a silent no-op.
         HandlerConfig::FileServer { .. }
         | HandlerConfig::ReverseProxy(_)
+        | HandlerConfig::CopyResponse { .. }
+        | HandlerConfig::CopyResponseHeaders { .. }
+        | HandlerConfig::Intercept { .. }
         | HandlerConfig::Redirect { .. }
         | HandlerConfig::Rewrite { .. }
         | HandlerConfig::Respond { .. }
@@ -795,6 +798,9 @@ fn validate_basic_auth_credentials(handler: &HandlerConfig) -> CompileResult<()>
         // is: a new handler variant must decide whether it can hold credentials.
         HandlerConfig::FileServer { .. }
         | HandlerConfig::ReverseProxy(_)
+        | HandlerConfig::CopyResponse { .. }
+        | HandlerConfig::CopyResponseHeaders { .. }
+        | HandlerConfig::Intercept { .. }
         | HandlerConfig::Redirect { .. }
         | HandlerConfig::Rewrite { .. }
         | HandlerConfig::Respond { .. }
@@ -1551,6 +1557,7 @@ fn compile_handler(
             let mut config = ReverseProxyConfig {
                 upstreams: proxy.upstreams.clone(),
                 dynamic_upstream: proxy.dynamic.clone().map(Box::new),
+                handle_response: proxy.handle_response.clone(),
                 rewrite_method: proxy.rewrite_method.clone(),
                 rewrite_uri: proxy.rewrite_uri.clone(),
                 request_buffer_bytes: proxy.request_buffer_bytes,
@@ -1668,6 +1675,10 @@ fn compile_handler(
 
             Ok(HandlerConfig::ReverseProxy(Box::new(config)))
         }
+
+        Handler::Intercept(handlers) => Ok(HandlerConfig::Intercept {
+            handlers: handlers.clone(),
+        }),
 
         Handler::Respond(resp) => Ok(HandlerConfig::Respond {
             status: resp.status,

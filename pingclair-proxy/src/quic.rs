@@ -1724,6 +1724,10 @@ async fn plan_h3_handler(
             Ok(H3Plan::Continue)
         }
         HandlerConfig::LogSkip => Ok(H3Plan::Continue),
+        HandlerConfig::Intercept { .. } => Ok(H3Plan::Continue),
+        HandlerConfig::CopyResponse { .. } | HandlerConfig::CopyResponseHeaders { .. } => {
+            Ok(H3Plan::Continue)
+        }
         HandlerConfig::Vars { values } => {
             // 🧰 Values are templates resolved against the same request, so
             // a value may reference placeholders and earlier vars.
@@ -2993,14 +2997,50 @@ async fn reverse_proxy_upstream(
         .response_header()
         .map(|response| response.status.as_u16())
         .unwrap_or(502);
-    if state.intercepts_error_status(upstream_status) {
+
+    // 🧭 `handle_response` evaluates from the response header alone — status
+    // and headers, never the body — so the H3 path stays streaming-safe just
+    // like the H1/H2 response_filter.
+    let mut intercept_remove: Vec<String> = Vec::new();
+    let mut intercept_set: Vec<(String, String)> = Vec::new();
+    let mut intercept_status: Option<u16> = None;
+    let mut intercept_replacement: Option<crate::http_policy::InterceptedResponse> = None;
+    {
+        let handlers = state
+            .config
+            .routes
+            .get(route_index)
+            .and_then(|route| crate::server::find_reverse_proxy_config(&route.handler))
+            .map(|config| config.handle_response.as_slice())
+            .filter(|handlers| !handlers.is_empty())
+            .unwrap_or(&[]);
+        if !handlers.is_empty()
+            && let Some(resp) = session.response_header()
+        {
+            let mut eval_vars = request_vars.clone();
+            if let Some(outcome) = crate::http_policy::evaluate_response_handlers(
+                handlers,
+                resp.status.as_u16(),
+                &resp.headers,
+                &mut eval_vars,
+            ) {
+                intercept_remove = outcome.header_remove;
+                intercept_set = outcome.header_set;
+                intercept_status = outcome.passthrough_status;
+                intercept_replacement = outcome.replacement;
+            }
+        }
+    }
+    let effective_status = intercept_status.unwrap_or(upstream_status);
+    if intercept_replacement.is_none() && state.intercepts_error_status(effective_status) {
         session.shutdown().await;
-        return Err((upstream_status, error_reason(upstream_status)));
+        return Err((effective_status, error_reason(effective_status)));
     }
 
-    if session
-        .response_header()
-        .is_some_and(|response| response.headers.contains_key("trailer"))
+    if intercept_replacement.is_none()
+        && session
+            .response_header()
+            .is_some_and(|response| response.headers.contains_key("trailer"))
     {
         tracing::warn!(
             "🚫 Rejecting an H3 upstream response that requires unsupported trailer forwarding"
@@ -3011,19 +3051,58 @@ async fn reverse_proxy_upstream(
 
     let mut hdrs = Vec::new();
     if let Some(resp) = session.response_header() {
-        hdrs.push(quiche::h3::Header::new(
-            b":status",
-            resp.status.as_u16().to_string().as_bytes(),
-        ));
-        for (name, value) in resp.headers.iter() {
-            let lower = name.as_str().to_ascii_lowercase();
-            if matches!(
-                lower.as_str(),
-                "connection" | "keep-alive" | "transfer-encoding" | "te" | "trailer" | "upgrade"
-            ) {
-                continue;
+        if let Some(replacement) = &intercept_replacement {
+            hdrs.push(quiche::h3::Header::new(
+                b":status",
+                replacement.status.to_string().as_bytes(),
+            ));
+            for (name, value) in &replacement.headers {
+                hdrs.push(quiche::h3::Header::new(
+                    name.to_ascii_lowercase().as_bytes(),
+                    value.as_bytes(),
+                ));
             }
-            hdrs.push(quiche::h3::Header::new(lower.as_bytes(), value.as_bytes()));
+            hdrs.push(quiche::h3::Header::new(
+                b"content-length",
+                replacement.body.len().to_string().as_bytes(),
+            ));
+        } else {
+            hdrs.push(quiche::h3::Header::new(
+                b":status",
+                effective_status.to_string().as_bytes(),
+            ));
+            for (name, value) in resp.headers.iter() {
+                let lower = name.as_str().to_ascii_lowercase();
+                if matches!(
+                    lower.as_str(),
+                    "connection"
+                        | "keep-alive"
+                        | "transfer-encoding"
+                        | "te"
+                        | "trailer"
+                        | "upgrade"
+                ) || intercept_remove
+                    .iter()
+                    .any(|removed| removed.eq_ignore_ascii_case(&lower))
+                {
+                    continue;
+                }
+                hdrs.push(quiche::h3::Header::new(lower.as_bytes(), value.as_bytes()));
+            }
+            for (name, value) in &intercept_set {
+                let resolved = crate::server::resolve_caddy_placeholders(
+                    value,
+                    client_header,
+                    Some(verified_client_ip),
+                    "https",
+                    request_vars,
+                )
+                .into_owned();
+                hdrs.push(quiche::h3::Header::new(
+                    name.to_ascii_lowercase().as_bytes(),
+                    resolved.as_bytes(),
+                ));
+            }
         }
     } else {
         hdrs.push(quiche::h3::Header::new(b":status", b"502"));
@@ -3053,9 +3132,20 @@ async fn reverse_proxy_upstream(
     // 🌊 Streams the upstream response without committing the final H3 frame early.
     let mut clean = true;
     let mut download_pacer = limits.download_bytes_per_sec.map(StreamPacer::new);
+    let mut replacement_sent = false;
     loop {
         match session.read_response_body().await {
             Ok(Some(bytes)) => {
+                if let Some(replacement) = &intercept_replacement {
+                    // 🧭 The static replacement is emitted once; upstream
+                    // chunks are drained and discarded so memory stays
+                    // bounded by the replacement, not the upstream body.
+                    if !replacement_sent {
+                        replacement_sent = true;
+                        send_body(resp_tx, stream_id, replacement.body.clone(), false).await;
+                    }
+                    continue;
+                }
                 if let Some(delay) = download_pacer
                     .as_mut()
                     .and_then(|pacer| pacer.delay_for(bytes.len()))
@@ -3069,7 +3159,14 @@ async fn reverse_proxy_upstream(
                 }
                 send_body(resp_tx, stream_id, bytes.to_vec(), false).await;
             }
-            Ok(None) => break,
+            Ok(None) => {
+                if let Some(replacement) = &intercept_replacement
+                    && !replacement_sent
+                {
+                    send_body(resp_tx, stream_id, replacement.body.clone(), false).await;
+                }
+                break;
+            }
             Err(e) => {
                 tracing::error!("❌ H3 upstream read body failed: {}", e);
                 clean = false;
@@ -3079,7 +3176,10 @@ async fn reverse_proxy_upstream(
     }
 
     let mut response_trailers = None;
-    if clean && let HttpSession::H2(h2) = &mut session {
+    if clean
+        && intercept_replacement.is_none()
+        && let HttpSession::H2(h2) = &mut session
+    {
         match h2.read_trailers().await {
             Ok(Some(headers)) => {
                 let mut trailers = Vec::with_capacity(headers.len());

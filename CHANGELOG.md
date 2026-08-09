@@ -212,6 +212,13 @@ lets the rest converge.
   may set the `Host` header, and `method`/`rewrite` mutate the upstream
   request. Buffer ceilings and transport tuning knobs without a runtime
   equivalent are accepted for compatibility and logged at startup.
+- 🧭 **Response interception.** `handle_response`, `replace_status`,
+  `copy_response`, and `copy_response_headers` evaluate the upstream response
+  from its header alone — status and headers — before the client sees a byte.
+  A replacement emits its static body exactly once and then drains the
+  upstream body chunk by chunk, so 20 MB upstream bodies and SSE streams stay
+  bounded on both H1/H2 and H3. The standalone `intercept` handler registers
+  the same handlers for proxied responses.
 - 📦 **Response caching.** RFC 9111 decides what may be stored, and a second
   identical request is served without asking the origin. The store is bounded
   by `max_size` (128 MiB unless you say otherwise) and evicts least-recently-

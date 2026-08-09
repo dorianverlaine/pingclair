@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http::{HeaderMap, Method};
+use pingclair_core::config::{HandlerConfig, ResponseHandlerConfig, ResponseMatcher};
 use pingora_core::Result as PingoraResult;
 use pingora_http::ResponseHeader;
 use regex::Regex;
@@ -44,6 +45,324 @@ impl RequestVars {
     /// captures into the same request-scoped state.
     pub(crate) fn values_mut(&mut self) -> &mut BTreeMap<String, String> {
         &mut self.values
+    }
+}
+
+// MARK: - Response Interception
+
+/// 🧭 A replacement response decided by `handle_response`, emitted to the
+/// client exactly once; the upstream body is then drained chunk by chunk and
+/// discarded, so memory stays bounded by this static body.
+pub struct InterceptedResponse {
+    pub status: u16,
+    pub headers: BTreeMap<String, String>,
+    pub body: Vec<u8>,
+}
+
+/// 🧭 What a matched `handle_response` entry wants done with the response.
+pub struct ResponseInterception {
+    /// Status replacement for a passthrough response (`replace_status`,
+    /// `copy_response <status>`).
+    pub passthrough_status: Option<u16>,
+    /// Header names to remove from the passthrough response.
+    pub header_remove: Vec<String>,
+    /// Header values to set on the passthrough response (templates may still
+    /// contain placeholders; the transport resolves them).
+    pub header_set: Vec<(String, String)>,
+    /// Full replacement response when a terminal handler replaced it.
+    pub replacement: Option<InterceptedResponse>,
+}
+
+/// 🧭 Evaluates the ordered `handle_response` entries against one upstream
+/// response, returning the first match's outcome.
+///
+/// The decision is made from the response header alone — status and headers —
+/// never from the body, which is the property that keeps this streaming-safe.
+pub fn evaluate_response_handlers(
+    handlers: &[ResponseHandlerConfig],
+    status: u16,
+    upstream_headers: &HeaderMap,
+    request_vars: &mut RequestVars,
+) -> Option<ResponseInterception> {
+    let entry = handlers.iter().find(|entry| {
+        entry
+            .matcher
+            .as_ref()
+            .is_none_or(|matcher| response_matcher_matches(matcher, status, upstream_headers))
+    })?;
+
+    // 🔢 `replace_status` is the status-only shorthand: change the code and
+    // keep streaming the body untouched.
+    if let Some(status_code) = &entry.status_code {
+        let code = status_code.parse::<u16>().unwrap_or(status);
+        return Some(ResponseInterception {
+            passthrough_status: (code != status).then_some(code),
+            header_remove: Vec::new(),
+            header_set: Vec::new(),
+            replacement: None,
+        });
+    }
+
+    let mut outcome = ResponseInterception {
+        passthrough_status: None,
+        header_remove: Vec::new(),
+        header_set: Vec::new(),
+        replacement: None,
+    };
+    let mut copied: Vec<(String, String)> = Vec::new();
+    for handler in &entry.handlers {
+        match handler {
+            HandlerConfig::Headers { set, add, remove } => {
+                for (name, value) in set.iter().chain(add.iter()) {
+                    outcome.header_set.push((name.clone(), value.clone()));
+                }
+                outcome.header_remove.extend(remove.iter().cloned());
+            }
+            HandlerConfig::CopyResponseHeaders { include, exclude } => {
+                copied = collect_copied_headers(upstream_headers, include, exclude);
+            }
+            HandlerConfig::Vars { values } => {
+                for (name, value) in values {
+                    request_vars.set(name.clone(), value.clone());
+                }
+            }
+            HandlerConfig::Respond {
+                status,
+                body,
+                headers,
+            } => {
+                let mut response_headers = BTreeMap::new();
+                for (name, value) in copied.iter().chain(outcome.header_set.iter()) {
+                    response_headers.insert(name.clone(), value.clone());
+                }
+                for (name, value) in headers {
+                    response_headers.insert(name.clone(), value.clone());
+                }
+                for name in &outcome.header_remove {
+                    response_headers.remove(name);
+                }
+                outcome.replacement = Some(InterceptedResponse {
+                    status: *status,
+                    headers: response_headers,
+                    body: body.clone().unwrap_or_default().into_bytes(),
+                });
+            }
+            HandlerConfig::Error { status, message } => {
+                let body = message.clone().unwrap_or_else(|| {
+                    http::StatusCode::from_u16(*status)
+                        .ok()
+                        .and_then(|code| code.canonical_reason().map(str::to_string))
+                        .unwrap_or_default()
+                });
+                outcome.replacement = Some(InterceptedResponse {
+                    status: *status,
+                    headers: outcome
+                        .header_set
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone()))
+                        .collect(),
+                    body: body.into_bytes(),
+                });
+            }
+            HandlerConfig::CopyResponse { status_code } => {
+                outcome.passthrough_status = *status_code;
+            }
+            // 🧭 Response-context handlers that do not make sense nested
+            // here are skipped; the caller logs a warning when one appears.
+            HandlerConfig::Intercept { .. }
+            | HandlerConfig::FileServer { .. }
+            | HandlerConfig::ReverseProxy(_)
+            | HandlerConfig::Redirect { .. }
+            | HandlerConfig::Rewrite { .. }
+            | HandlerConfig::Templates { .. }
+            | HandlerConfig::LogSkip
+            | HandlerConfig::BasicAuth { .. }
+            | HandlerConfig::RateLimit { .. }
+            | HandlerConfig::Cors { .. }
+            | HandlerConfig::AccessControl(_)
+            | HandlerConfig::TryFiles { .. }
+            | HandlerConfig::Plugin { .. }
+            | HandlerConfig::HandleErrors { .. }
+            | HandlerConfig::Handle { .. }
+            | HandlerConfig::HandlePath { .. }
+            | HandlerConfig::Pipeline { .. } => {}
+        }
+    }
+    Some(outcome)
+}
+
+/// 🎯 Matches one response matcher against an upstream status and headers.
+fn response_matcher_matches(matcher: &ResponseMatcher, status: u16, headers: &HeaderMap) -> bool {
+    let status_ok = matcher.status_codes.is_empty()
+        || matcher.status_codes.contains(&status)
+        || matcher.status_codes.contains(&(status / 100));
+    let headers_ok = matcher.headers.iter().all(|(name, patterns)| {
+        let values: Vec<&str> = headers
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        !values.is_empty()
+            && patterns.iter().all(|pattern| {
+                values
+                    .iter()
+                    .any(|value| pattern == "*" || pattern == value)
+            })
+    });
+    status_ok && headers_ok
+}
+
+/// 🧾 Collects the upstream headers a `copy_response_headers` entry wants on
+/// the downstream response; `include` wins when both lists are present.
+fn collect_copied_headers(
+    headers: &HeaderMap,
+    include: &[String],
+    exclude: &[String],
+) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            let name = name.as_str();
+            if include.is_empty() {
+                !exclude
+                    .iter()
+                    .any(|excluded| excluded.eq_ignore_ascii_case(name))
+            } else {
+                include
+                    .iter()
+                    .any(|included| included.eq_ignore_ascii_case(name))
+            }
+        })
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod response_interception_tests {
+    use super::*;
+    use pingclair_core::config::{ResponseHandlerConfig, ResponseMatcher};
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                http::header::HeaderName::from_static(name),
+                value.parse().unwrap(),
+            );
+        }
+        map
+    }
+
+    fn status_matcher(codes: &[u16]) -> ResponseMatcher {
+        ResponseMatcher {
+            status_codes: codes.to_vec(),
+            headers: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn status_classes_and_exact_codes_both_match() {
+        let matcher = status_matcher(&[2, 401]);
+        let empty = headers(&[]);
+        assert!(response_matcher_matches(&matcher, 204, &empty));
+        assert!(response_matcher_matches(&matcher, 401, &empty));
+        assert!(!response_matcher_matches(&matcher, 500, &empty));
+    }
+
+    #[test]
+    fn header_matchers_require_presence_and_pattern() {
+        let matcher = ResponseMatcher {
+            status_codes: vec![],
+            headers: BTreeMap::from([("X-Retry".to_string(), vec!["*".to_string()])]),
+        };
+        assert!(response_matcher_matches(
+            &matcher,
+            500,
+            &headers(&[("x-retry", "yes")])
+        ));
+        assert!(!response_matcher_matches(&matcher, 500, &headers(&[])));
+    }
+
+    #[test]
+    fn replace_status_forwards_the_body_with_a_new_code() {
+        let handlers = vec![ResponseHandlerConfig {
+            matcher: Some(status_matcher(&[500])),
+            status_code: Some("400".to_string()),
+            handlers: vec![],
+        }];
+        let outcome =
+            evaluate_response_handlers(&handlers, 500, &headers(&[]), &mut RequestVars::default())
+                .expect("a matching entry");
+        assert_eq!(outcome.passthrough_status, Some(400));
+        assert!(outcome.replacement.is_none());
+    }
+
+    #[test]
+    fn respond_replaces_with_copied_and_set_headers() {
+        let handlers = vec![ResponseHandlerConfig {
+            matcher: Some(status_matcher(&[401])),
+            status_code: None,
+            handlers: vec![
+                HandlerConfig::CopyResponseHeaders {
+                    include: vec!["X-Retry".to_string()],
+                    exclude: vec![],
+                },
+                HandlerConfig::Headers {
+                    set: BTreeMap::from([("X-Reason".to_string(), "auth".to_string())]),
+                    add: BTreeMap::new(),
+                    remove: vec![],
+                },
+                HandlerConfig::Respond {
+                    status: 403,
+                    body: Some("denied".to_string()),
+                    headers: BTreeMap::new(),
+                },
+            ],
+        }];
+        let outcome = evaluate_response_handlers(
+            &handlers,
+            401,
+            &headers(&[("x-retry", "yes"), ("x-strip", "me")]),
+            &mut RequestVars::default(),
+        )
+        .expect("a matching entry");
+        let replacement = outcome.replacement.expect("a replacement");
+        assert_eq!(replacement.status, 403);
+        assert_eq!(replacement.body, b"denied");
+        assert_eq!(
+            replacement.headers.get("x-retry").map(String::as_str),
+            Some("yes")
+        );
+        assert_eq!(
+            replacement.headers.get("X-Reason").map(String::as_str),
+            Some("auth")
+        );
+        assert!(!replacement.headers.contains_key("x-strip"));
+    }
+
+    #[test]
+    fn matcherless_entries_are_tried_last() {
+        let handlers = vec![
+            ResponseHandlerConfig {
+                matcher: Some(status_matcher(&[404])),
+                status_code: Some("410".to_string()),
+                handlers: vec![],
+            },
+            ResponseHandlerConfig {
+                matcher: None,
+                status_code: Some("418".to_string()),
+                handlers: vec![],
+            },
+        ];
+        let outcome =
+            evaluate_response_handlers(&handlers, 500, &headers(&[]), &mut RequestVars::default())
+                .expect("the matcherless entry must match last");
+        assert_eq!(outcome.passthrough_status, Some(418));
     }
 }
 

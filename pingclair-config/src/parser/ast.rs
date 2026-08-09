@@ -557,6 +557,9 @@ pub enum Handler {
     /// Reverse proxy
     Proxy(Box<ProxyConfig>),
 
+    /// 🧭 Wraps the response of later handlers with response handlers.
+    Intercept(Vec<pingclair_core::config::ResponseHandlerConfig>),
+
     /// Static response
     Respond(ResponseConfig),
 
@@ -677,6 +680,9 @@ pub struct ProxyConfig {
 
     /// 🧭 Transport tuning options without a runtime equivalent.
     pub transport_options: BTreeMap<String, String>,
+
+    /// 🧭 Response handlers evaluated before the client sees the response.
+    pub handle_response: Vec<pingclair_core::config::ResponseHandlerConfig>,
 
     /// Per-upstream options, including weighted and backup peers.
     pub upstream_options: Vec<ProxyUpstreamConfig>,
@@ -1112,6 +1118,7 @@ impl ProxyConfig {
             request_buffer_bytes: None,
             response_buffer_bytes: None,
             transport_options: BTreeMap::new(),
+            handle_response: Vec::new(),
             lb_policy: None,
             lb_hash_key: None,
             health_check: None,

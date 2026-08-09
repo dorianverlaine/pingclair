@@ -784,6 +784,32 @@ pub enum HandlerConfig {
     /// Reverse proxy
     ReverseProxy(Box<ReverseProxyConfig>),
 
+    /// 🌊 Copies the upstream response through to the client, optionally with
+    /// a different status. The body keeps streaming chunk by chunk and is
+    /// never buffered whole.
+    CopyResponse {
+        /// Replacement status code; `None` keeps the upstream status.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status_code: Option<u16>,
+    },
+
+    /// 🧾 Copies selected upstream response headers onto the downstream
+    /// response; `include` wins when both lists are present.
+    CopyResponseHeaders {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        include: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        exclude: Vec<String>,
+    },
+
+    /// 🧭 Wraps the response of later handlers in the same request with the
+    /// given response handlers, like Caddy's `intercept`.
+    Intercept {
+        /// Response handlers evaluated against the wrapped response.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        handlers: Vec<ResponseHandlerConfig>,
+    },
+
     /// Redirect
     Redirect {
         to: String,
@@ -1125,6 +1151,12 @@ pub struct ReverseProxyConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub transport_options: BTreeMap<String, String>,
 
+    /// 🧭 Response handlers evaluated against the upstream response before
+    /// the client sees it; the first matching entry wins, matcherless
+    /// entries last, mirroring Caddy's `handle_response`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handle_response: Vec<ResponseHandlerConfig>,
+
     /// Per-upstream weight and backup role. When empty, every address in
     /// `upstreams` is a primary with weight one (the legacy JSON form).
     #[serde(default)]
@@ -1183,6 +1215,33 @@ pub struct ReverseProxyConfig {
     /// 🗄️ Response caching for this route, off unless configured.
     #[serde(default)]
     pub cache: Option<Box<CacheConfig>>,
+}
+
+/// 🧭 A matcher evaluated against an upstream response: status and headers.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ResponseMatcher {
+    /// Status codes; a one-digit value such as `2` means the whole class.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub status_codes: Vec<u16>,
+    /// Header name → value patterns (`*` means "header present").
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, Vec<String>>,
+}
+
+/// One ordered `handle_response` entry.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResponseHandlerConfig {
+    /// Response matcher; `None` matches every response and is evaluated last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<ResponseMatcher>,
+    /// `replace_status` shorthand: a literal status or a placeholder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<String>,
+    /// Response subroute handlers, executed in order. A terminal handler
+    /// (`respond`, `copy_response`, `error`) replaces or forwards the
+    /// response; header-only entries mutate it in place.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handlers: Vec<HandlerConfig>,
 }
 
 /// 🧭 The two DNS record families Caddy's `dynamic` source understands.

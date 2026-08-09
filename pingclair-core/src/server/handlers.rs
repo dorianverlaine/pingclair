@@ -182,6 +182,14 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             ))
         }
 
+        // 🚫 Response handlers evaluate against an upstream response, which
+        // the pure request executor never has; reaching here is a wiring bug.
+        HandlerConfig::CopyResponse { .. }
+        | HandlerConfig::CopyResponseHeaders { .. }
+        | HandlerConfig::Intercept { .. } => Err(HandlerError::Config(
+            "response handlers can only run against an upstream response".to_string(),
+        )),
+
         HandlerConfig::Pipeline { handlers } => {
             // Execute handlers in order, combining results
             let mut final_response = HandlerResponse::status(200);

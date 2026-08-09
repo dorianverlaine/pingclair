@@ -542,6 +542,12 @@ retry 政策接受 Caddy 的 `lb_retry_match` 拼法：`method`、`path`、`head
 `lb_policy weighted_round_robin` 支援每個 upstream 一個權重；reverse_proxy
 區塊裡的 `method`／`rewrite` 會在請求送往上游前改寫請求。
 
+`reverse_proxy` 也接受 `handle_response` 區塊，搭配 response matcher
+（`@name status …`／`@name header …`）、`replace_status`、`copy_response` 與
+`copy_response_headers`。決策只讀回應標頭；替換回應只發一次靜態 body，
+其餘上游 body 逐塊丟棄，所以攔截絕不會整份緩衝。`intercept { … }` 會對
+proxied response 註冊同一組 handler。
+
 以主機名寫的 upstream 會在執行期間定期重解析，容器換 IP 重啟後不需 reload 即可跟上。
 解析失敗時會保留上一個位址繼續服務 —— resolver 故障不該讓站台跟著掛掉；啟動當下
 還解析不到的名稱，也會在解析成功後自動加入 pool，因此代理可以先於 app 啟動。

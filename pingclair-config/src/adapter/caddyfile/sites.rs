@@ -795,6 +795,7 @@ pub(super) fn handler_directive_name(handler: &Handler) -> &'static str {
         Handler::Pipeline(_) => "route",
         Handler::Respond(_) => "respond",
         Handler::Proxy(_) => "reverse_proxy",
+        Handler::Intercept(_) => "intercept",
         Handler::FileServer(_) => "file_server",
         // 🧭 Three of ours with no counterpart in the shared order. They are
         // middleware that guards what follows, so they belong with the other
@@ -854,6 +855,7 @@ pub(super) fn handler_has_terminal(handler: &Handler) -> bool {
         | Handler::AccessControl(_)
         | Handler::LogSkip
         | Handler::Vars(_)
+        | Handler::Intercept(_)
         | Handler::Plugin { .. } => false,
     }
 }

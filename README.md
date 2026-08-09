@@ -568,6 +568,13 @@ compiled configuration and logged at startup. `lb_policy weighted_round_robin`
 carries one weight per upstream, and a reverse_proxy `method`/`rewrite` block
 changes the upstream request before it is sent.
 
+`reverse_proxy` also accepts `handle_response` blocks with response matchers
+(`@name status …` / `@name header …`), `replace_status`, `copy_response`, and
+`copy_response_headers`. The decision is made from the response header alone;
+a replacement emits its static body once and discards the upstream body chunk
+by chunk, so interception never buffers a whole response. `intercept { … }`
+registers the same handlers for proxied responses.
+
 Upstreams written as hostnames are re-resolved while the server runs, so a
 container that restarts on a new address is picked up without a reload. A
 lookup that fails leaves the previous address in rotation — a resolver outage

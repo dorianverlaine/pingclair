@@ -8,6 +8,8 @@ use super::args::{
 };
 use crate::parser::ast::*;
 use crate::parser::caddy_ast::Directive;
+use pingclair_core::config::{ResponseHandlerConfig, ResponseMatcher};
+use std::collections::HashMap;
 
 // MARK: - reverse_proxy Full Block Parsing
 
@@ -49,11 +51,18 @@ pub(super) fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError>
     // same before the AST is compiled so JSON and runtime see the peers.
     let upstreams = crate::adapter::expand_upstream_port_ranges(upstreams);
     let mut proxy = ProxyConfig::new(upstreams);
+    // 🧭 Response matchers defined inside the block (`@500 status 500`) are
+    // a separate namespace from request matchers: they match the upstream
+    // response, and `handle_response`/`replace_status` reference them.
+    let mut response_matchers: HashMap<String, ResponseMatcher> = HashMap::new();
 
     // Parse sub-block if present
     if let Some(block) = d.block {
         for sub in block.directives {
             match sub.name.as_str() {
+                name if name.starts_with('@') => {
+                    response_matchers.insert(name.to_string(), parse_response_matcher(&sub)?);
+                }
                 "header_up" => {
                     // header_up Key Value
                     // Value may be a {placeholder} → preserved as-is for runtime resolution
@@ -312,6 +321,16 @@ pub(super) fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError>
                 }
                 "lb_retry_match" => {
                     apply_retry_match(&mut proxy.retry, &sub)?;
+                }
+                "replace_status" => {
+                    proxy
+                        .handle_response
+                        .push(parse_replace_status(&sub, &response_matchers)?);
+                }
+                "handle_response" => {
+                    proxy
+                        .handle_response
+                        .push(parse_handle_response(&sub, &response_matchers)?);
                 }
                 "lb_policy" => {
                     let policy = sub
@@ -921,8 +940,6 @@ fn is_known_proxy_option(name: &str) -> bool {
             | "stream_timeout"
             | "stream_close_delay"
             | "trusted_proxies"
-            | "handle_response"
-            | "replace_status"
             | "verbose_logs"
             | "proxy_protocol"
             | "forward_proxy_url"
@@ -1367,4 +1384,307 @@ fn parse_buffer_size(directive: &Directive) -> Result<i64, AdapterError> {
         }
     };
     Ok(number * multiplier)
+}
+
+// MARK: - Response Handling
+
+/// 🧭 Collects the ordered response-handler entries of a block that defines
+/// response matchers plus `replace_status`/`handle_response`, moving
+/// matcherless entries last exactly like Caddy. Shared by `reverse_proxy`
+/// and the standalone `intercept` handler.
+pub(super) fn collect_response_handlers(
+    block: &crate::parser::caddy_ast::Block,
+) -> Result<Vec<ResponseHandlerConfig>, AdapterError> {
+    let mut matchers: HashMap<String, ResponseMatcher> = HashMap::new();
+    let mut ordered = Vec::new();
+    let mut matcherless = Vec::new();
+    for sub in &block.directives {
+        if sub.name.starts_with('@') {
+            matchers.insert(sub.name.clone(), parse_response_matcher(sub)?);
+            continue;
+        }
+        match sub.name.as_str() {
+            "replace_status" => ordered.push(parse_replace_status(sub, &matchers)?),
+            "handle_response" => {
+                let entry = parse_handle_response(sub, &matchers)?;
+                if entry.matcher.is_some() {
+                    ordered.push(entry);
+                } else {
+                    matcherless.push(entry);
+                }
+            }
+            other => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "response interception: {other}"
+                )));
+            }
+        }
+    }
+    ordered.extend(matcherless);
+    Ok(ordered)
+}
+
+/// 🧭 Adapts the standalone `intercept` handler: a block of response
+/// matchers and response handlers that wraps the response of later handlers.
+pub(super) fn adapt_intercept(d: Directive) -> Result<Handler, AdapterError> {
+    let block = d.block.as_ref().ok_or_else(|| {
+        AdapterError::InvalidArgument("intercept".into(), "block required".into())
+    })?;
+    if !d.args.is_empty() {
+        return Err(AdapterError::ArgumentCount(
+            "intercept".into(),
+            0,
+            d.args.len(),
+        ));
+    }
+    Ok(Handler::Intercept(collect_response_handlers(block)?))
+}
+
+/// 🧭 Parses one named response matcher (`@name status 500` or a block of
+/// `status`/`header` lines).
+fn parse_response_matcher(d: &Directive) -> Result<ResponseMatcher, AdapterError> {
+    let mut matcher = ResponseMatcher::default();
+    let mut status = |args: &[String]| -> Result<(), AdapterError> {
+        if args.is_empty() {
+            return Err(AdapterError::ArgumentCount("status".into(), 1, 0));
+        }
+        for value in args {
+            if let Some(class) = value.strip_suffix("xx") {
+                let class: u16 = class
+                    .parse()
+                    .map_err(|_| AdapterError::InvalidArgument("status".into(), value.clone()))?;
+                if !(1..=5).contains(&class) {
+                    return Err(AdapterError::InvalidArgument(
+                        "status".into(),
+                        value.clone(),
+                    ));
+                }
+                matcher.status_codes.push(class);
+            } else {
+                let code: u16 = value
+                    .parse()
+                    .map_err(|_| AdapterError::InvalidArgument("status".into(), value.clone()))?;
+                if !(100..=599).contains(&code) {
+                    return Err(AdapterError::InvalidArgument(
+                        "status".into(),
+                        value.clone(),
+                    ));
+                }
+                matcher.status_codes.push(code);
+            }
+        }
+        Ok(())
+    };
+    let mut header = |args: &[String]| -> Result<(), AdapterError> {
+        let (name, patterns) = args
+            .split_first()
+            .ok_or_else(|| AdapterError::ArgumentCount("header".into(), 1, args.len()))?;
+        if name.is_empty() || name.bytes().any(|byte| byte.is_ascii_whitespace()) {
+            return Err(AdapterError::InvalidArgument(
+                "header".into(),
+                format!("`{name}` is not a header name"),
+            ));
+        }
+        matcher
+            .headers
+            .entry(name.clone())
+            .or_default()
+            .extend(patterns.iter().cloned());
+        Ok(())
+    };
+
+    if let Some(block) = &d.block {
+        for sub in &block.directives {
+            match sub.name.as_str() {
+                "status" => status(&sub.args)?,
+                "header" => header(&sub.args)?,
+                other => {
+                    return Err(AdapterError::UnknownDirective(format!(
+                        "response matcher: {other}"
+                    )));
+                }
+            }
+        }
+    } else {
+        match d.args.as_slice() {
+            [kind, rest @ ..] => match kind.as_str() {
+                "status" => status(rest)?,
+                "header" => header(rest)?,
+                other => {
+                    return Err(AdapterError::InvalidArgument(
+                        d.name.clone(),
+                        format!("`{other}` is not `status` or `header`"),
+                    ));
+                }
+            },
+            _ => {
+                return Err(AdapterError::InvalidArgument(
+                    d.name.clone(),
+                    "a response matcher needs `status` or `header`".into(),
+                ));
+            }
+        }
+    }
+    Ok(matcher)
+}
+
+/// 🔢 Parses `replace_status [@matcher] <status>` into a status-only entry.
+fn parse_replace_status(
+    d: &Directive,
+    matchers: &HashMap<String, ResponseMatcher>,
+) -> Result<ResponseHandlerConfig, AdapterError> {
+    let (matcher, status) = match d.args.as_slice() {
+        [name, status] if name.starts_with('@') => (matchers.get(name).cloned(), status.clone()),
+        [status] => (None, status.clone()),
+        _ => {
+            return Err(AdapterError::ArgumentCount(
+                "replace_status".into(),
+                1,
+                d.args.len(),
+            ));
+        }
+    };
+    Ok(ResponseHandlerConfig {
+        matcher,
+        status_code: Some(status),
+        handlers: Vec::new(),
+    })
+}
+
+/// 🧭 Parses one `handle_response [@matcher] { … }` entry.
+fn parse_handle_response(
+    d: &Directive,
+    matchers: &HashMap<String, ResponseMatcher>,
+) -> Result<ResponseHandlerConfig, AdapterError> {
+    let matcher = match d.args.as_slice() {
+        [] => None,
+        [name] if name.starts_with('@') => Some(matchers.get(name).cloned().ok_or_else(|| {
+            AdapterError::InvalidArgument(
+                "handle_response".into(),
+                format!("unknown response matcher `{name}`"),
+            )
+        })?),
+        _ => {
+            return Err(AdapterError::ArgumentCount(
+                "handle_response".into(),
+                1,
+                d.args.len(),
+            ));
+        }
+    };
+    let block = d.block.as_ref().ok_or_else(|| {
+        AdapterError::InvalidArgument("handle_response".into(), "block required".into())
+    })?;
+    if block.directives.is_empty() {
+        return Err(AdapterError::InvalidArgument(
+            "handle_response".into(),
+            "at least one response handler is required".into(),
+        ));
+    }
+    let handlers = block
+        .directives
+        .iter()
+        .map(adapt_response_handler)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ResponseHandlerConfig {
+        matcher,
+        status_code: None,
+        handlers,
+    })
+}
+
+/// 🧭 Adapts one directive that may appear inside a `handle_response` block
+/// into the shared handler configuration.
+fn adapt_response_handler(
+    d: &Directive,
+) -> Result<pingclair_core::config::HandlerConfig, AdapterError> {
+    match d.name.as_str() {
+        "respond" => {
+            let handler = super::directives::adapt_respond(d.clone())?;
+            let Handler::Respond(config) = handler else {
+                unreachable!("the respond adapter returns a Respond handler")
+            };
+            let body = match config.body {
+                Some(Expr::String(value)) => Some(value),
+                Some(other) => {
+                    return Err(AdapterError::InvalidArgument(
+                        "respond".into(),
+                        format!("unsupported response body expression {other:?}"),
+                    ));
+                }
+                None => None,
+            };
+            Ok(pingclair_core::config::HandlerConfig::Respond {
+                status: config.status,
+                body,
+                headers: config.headers,
+            })
+        }
+        "copy_response" => {
+            let status_code = d
+                .args
+                .first()
+                .map(|value| {
+                    value.parse::<u16>().map_err(|_| {
+                        AdapterError::InvalidArgument("copy_response".into(), value.clone())
+                    })
+                })
+                .transpose()?;
+            Ok(pingclair_core::config::HandlerConfig::CopyResponse { status_code })
+        }
+        "copy_response_headers" => {
+            let mut include = Vec::new();
+            let mut exclude = Vec::new();
+            if let Some(block) = &d.block {
+                for sub in &block.directives {
+                    match sub.name.as_str() {
+                        "include" => include.extend(sub.args.iter().cloned()),
+                        "exclude" => exclude.extend(sub.args.iter().cloned()),
+                        other => {
+                            return Err(AdapterError::UnknownDirective(format!(
+                                "copy_response_headers: {other}"
+                            )));
+                        }
+                    }
+                }
+            } else {
+                include.extend(d.args.iter().cloned());
+            }
+            Ok(pingclair_core::config::HandlerConfig::CopyResponseHeaders { include, exclude })
+        }
+        "header" => {
+            let handler = super::directives::adapt_header_directive(d)?;
+            let Handler::Headers(config) = handler else {
+                unreachable!("the header adapter returns a Headers handler")
+            };
+            Ok(pingclair_core::config::HandlerConfig::Headers {
+                set: config.set,
+                add: config.add,
+                remove: config.remove,
+            })
+        }
+        "error" => {
+            let handler = super::directives::adapt_error_directive(d)?;
+            let Handler::Error(config) = handler else {
+                unreachable!("the error adapter returns an Error handler")
+            };
+            Ok(pingclair_core::config::HandlerConfig::Error {
+                status: config.status,
+                message: config.message,
+            })
+        }
+        "vars" => {
+            let handler = super::directives::adapt_vars_directive(d)?;
+            let Handler::Vars(config) = handler else {
+                unreachable!("the vars adapter returns a Vars handler")
+            };
+            Ok(pingclair_core::config::HandlerConfig::Vars {
+                values: config.values,
+            })
+        }
+        other => Err(AdapterError::UnsupportedFeature(
+            "handle_response".into(),
+            format!("`{other}` is not a supported response handler yet"),
+        )),
+    }
 }
