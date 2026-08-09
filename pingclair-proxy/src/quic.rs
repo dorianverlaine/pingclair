@@ -2561,6 +2561,26 @@ async fn reverse_proxy_upstream(
         (500, "Upstream TLS Configuration Error")
     })?;
 
+    // 🧭 Replaceable dial templates get the same per-request treatment as on
+    // H1/H2: expand against the request variables, resolve through the shared
+    // bounded cache, and reuse that peer for every retry attempt.
+    let mut dynamic_upstream = None;
+    if let Some(dial_plan) = state
+        .dynamic_dials
+        .get(route_index)
+        .and_then(|plan| plan.as_ref())
+    {
+        let Some(spec) = dial_plan.resolve(client_header, Some(verified_client_ip), request_vars)
+        else {
+            return Err((502, "Dynamic Upstream Not Resolved"));
+        };
+        dynamic_upstream = Some(
+            crate::upstream::resolve_dynamic_dial(spec)
+                .await
+                .ok_or((502, "Dynamic Upstream Not Resolved"))?,
+        );
+    }
+
     let (mut session, peer, mut request_deadline, _upstream_admission) = loop {
         if attempts > 0 {
             let delay = crate::retry::backoff(&retry_policy);
@@ -2578,22 +2598,26 @@ async fn reverse_proxy_upstream(
             return Err((504, "Upstream Retry Timeout"));
         }
 
-        let mut selected =
-            proxy.select_admitted_upstream(state, route_index, Some(&ip_bytes), &excluded);
-        if matches!(
-            selected,
-            Err(crate::server::UpstreamSelectionError::NoUpstream)
-        ) && !excluded.is_empty()
-        {
-            // ♻️ A status policy may revisit a backend after every candidate was tried once.
-            excluded.clear();
-            selected =
+        let (upstream, mut admission) = if let Some(upstream) = &dynamic_upstream {
+            (upstream.clone(), None)
+        } else {
+            let mut selected =
                 proxy.select_admitted_upstream(state, route_index, Some(&ip_bytes), &excluded);
-        }
-        let (upstream, mut admission) = selected.map_err(|error| match error {
-            crate::server::UpstreamSelectionError::NoUpstream => (502, "No Upstream Available"),
-            crate::server::UpstreamSelectionError::Unavailable => (503, "Upstream Overloaded"),
-        })?;
+            if matches!(
+                selected,
+                Err(crate::server::UpstreamSelectionError::NoUpstream)
+            ) && !excluded.is_empty()
+            {
+                // ♻️ A status policy may revisit a backend after every candidate was tried once.
+                excluded.clear();
+                selected =
+                    proxy.select_admitted_upstream(state, route_index, Some(&ip_bytes), &excluded);
+            }
+            selected.map_err(|error| match error {
+                crate::server::UpstreamSelectionError::NoUpstream => (502, "No Upstream Available"),
+                crate::server::UpstreamSelectionError::Unavailable => (503, "Upstream Overloaded"),
+            })?
+        };
         attempts += 1;
 
         let request_budget = base_request_deadline

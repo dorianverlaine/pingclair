@@ -658,7 +658,15 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
         }
 
         let name = server.name.as_deref().unwrap_or_default();
-        if name.is_empty() || name == "_" || name.contains('*') || name.starts_with(':') {
+        // 🏗️ A wildcard site (`*.sandbox.localhost`) is issuable by the
+        // internal authority; only a wildcard that is exactly `*.suffix`
+        // qualifies, so `foo.*.bar` and bare `*` stay rejected.
+        let wildcard_ok = name
+            .strip_prefix("*.")
+            .is_some_and(|suffix| !suffix.is_empty() && !suffix.contains('*'));
+        let concrete_ok = !name.contains('*');
+        if name.is_empty() || name == "_" || name.starts_with(':') || !(wildcard_ok || concrete_ok)
+        {
             return Err(CompileError::InvalidServer {
                 message: "tls internal requires a concrete server name".to_string(),
             });
@@ -1553,6 +1561,7 @@ fn compile_handler(
         Handler::Proxy(proxy) => {
             let mut config = ReverseProxyConfig {
                 upstreams: proxy.upstreams.clone(),
+                dynamic_upstream: proxy.dynamic.clone().map(Box::new),
                 upstream_options: proxy
                     .upstream_options
                     .iter()

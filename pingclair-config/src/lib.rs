@@ -877,6 +877,33 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_tls_internal_accepts_wildcard_names() {
+        let config = compile(
+            r#"
+                *.sandbox.localhost {
+                    tls internal
+                    respond "OK"
+                }
+            "#,
+        )
+        .unwrap();
+        assert!(config.servers[0].tls.as_ref().unwrap().internal);
+    }
+
+    #[test]
+    fn test_compile_tls_internal_rejects_malformed_wildcards() {
+        for source in [
+            "*. { tls internal\n respond \"OK\" }",
+            "foo.*.bar { tls internal\n respond \"OK\" }",
+        ] {
+            assert!(
+                compile(source).is_err(),
+                "{source} must not compile with internal TLS"
+            );
+        }
+    }
+
+    #[test]
     fn test_compile_tls_internal_rejects_conflicting_issuer() {
         let error = compile(
             r#"

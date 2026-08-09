@@ -43,6 +43,9 @@ toml = "1"
 logos = "0.16"
 ariadne = "0.6"      # error reporting
 
+# DNS (dynamic upstreams)
+hickory-resolver = "0.24"
+
 # TLS / certificates
 rustls = { version = "0.23", features = ["ring"] }
 rcgen = { version = "0.14", features = ["x509-parser"] }

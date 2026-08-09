@@ -1001,18 +1001,24 @@ mod fail_closed_tests {
     }
 
     #[test]
-    fn reverse_proxy_rejects_dynamic_as_unsupported() {
-        let error = compile_err(
+    fn reverse_proxy_with_a_dynamic_source_needs_no_static_upstreams() {
+        let config = crate::compile(
             r#"example.com {
                 reverse_proxy /api/* {
                     dynamic srv _api._tcp.example.com
                 }
             }"#,
-        );
-        assert!(
-            error.contains("dynamic") && error.contains("not supported"),
-            "dynamic must fail with a named unsupported error; got {error}"
-        );
+        )
+        .expect("a dynamic-only reverse_proxy must compile");
+        match &config.servers[0].routes[0].handler {
+            pingclair_core::config::HandlerConfig::ReverseProxy(proxy) => {
+                assert!(
+                    proxy.dynamic_upstream.is_some(),
+                    "the dynamic source must survive compilation"
+                );
+            }
+            other => panic!("expected a proxy handler, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1230,6 +1236,115 @@ mod fail_closed_tests {
                 assert_eq!(proxy.retry.max_attempts, 5);
             }
             other => panic!("expected a proxy handler, got {other:?}"),
+        }
+    }
+
+    /// 🧭 `dynamic a` and `dynamic srv` compile into their DNS source, with
+    /// every block option preserved for the runtime refresher.
+    #[test]
+    fn dynamic_upstream_sources_compile_with_their_options() {
+        let config = crate::compile(
+            r#":8884 {
+                reverse_proxy {
+                    dynamic a foo 9000
+                }
+            }
+            :8885 {
+                reverse_proxy {
+                    dynamic srv _api._tcp.example.com
+                }
+            }
+            :8886 {
+                reverse_proxy {
+                    dynamic a {
+                        name bar
+                        port 9001
+                        refresh 5m
+                        resolvers 8.8.8.8 8.8.4.4
+                        dial_timeout 2s
+                        dial_fallback_delay 300ms
+                        versions ipv6
+                    }
+                }
+            }
+            :8887 {
+                reverse_proxy {
+                    dynamic srv {
+                        service api
+                        proto tcp
+                        name example.com
+                        refresh 5m
+                        resolvers 8.8.8.8
+                        dial_timeout 1s
+                        dial_fallback_delay -1s
+                        grace_period 5s
+                    }
+                }
+            }"#,
+        )
+        .expect("dynamic sources must compile");
+        let handlers: Vec<_> = config
+            .servers
+            .iter()
+            .flat_map(|server| server.routes.iter())
+            .map(|route| route.handler.clone())
+            .collect();
+        assert_eq!(handlers.len(), 4);
+
+        let proxy = |index: usize| match &handlers[index] {
+            pingclair_core::config::HandlerConfig::ReverseProxy(proxy) => proxy,
+            other => panic!("expected a proxy handler, got {other:?}"),
+        };
+
+        let compact_a = proxy(0).dynamic_upstream.as_ref().expect("an A source");
+        assert!(matches!(
+            &**compact_a,
+            pingclair_core::config::DynamicUpstreamConfig::A(source)
+                if source.name == "foo" && source.port == 9000
+        ));
+
+        let compact_srv = proxy(1).dynamic_upstream.as_ref().expect("an SRV source");
+        assert!(matches!(
+            &**compact_srv,
+            pingclair_core::config::DynamicUpstreamConfig::Srv(source)
+                if source.name == "_api._tcp.example.com" && source.service.is_none()
+        ));
+
+        let block_a = proxy(2).dynamic_upstream.as_ref().expect("an A source");
+        let pingclair_core::config::DynamicUpstreamConfig::A(block_a) = &**block_a else {
+            panic!("expected an A source");
+        };
+        assert_eq!(block_a.name, "bar");
+        assert_eq!(block_a.port, 9001);
+        assert_eq!(block_a.refresh_secs, Some(300));
+        assert_eq!(block_a.resolvers, ["8.8.8.8", "8.8.4.4"]);
+        assert_eq!(block_a.dial_timeout_ms, Some(2_000));
+        assert_eq!(block_a.fallback_delay_ms, Some(300));
+        assert_eq!(block_a.versions.as_deref(), Some("ipv6"));
+
+        let block_srv = proxy(3).dynamic_upstream.as_ref().expect("an SRV source");
+        let pingclair_core::config::DynamicUpstreamConfig::Srv(block_srv) = &**block_srv else {
+            panic!("expected an SRV source");
+        };
+        assert_eq!(block_srv.service.as_deref(), Some("api"));
+        assert_eq!(block_srv.proto.as_deref(), Some("tcp"));
+        assert_eq!(block_srv.name, "example.com");
+        assert_eq!(block_srv.refresh_secs, Some(300));
+        assert_eq!(block_srv.fallback_delay_ms, Some(-1_000));
+        assert_eq!(block_srv.grace_period_ms, Some(5_000));
+    }
+
+    /// 🚫 A malformed dynamic source is refused instead of degrading to a
+    /// static peer list that never matches the operator's intent.
+    #[test]
+    fn malformed_dynamic_sources_are_refused() {
+        for source in [
+            "example.com {\n    reverse_proxy {\n        dynamic cname app\n    }\n}",
+            "example.com {\n    reverse_proxy {\n        dynamic srv {\n            service api\n            name example.com\n        }\n    }\n}",
+            "example.com {\n    reverse_proxy {\n        dynamic a {\n            name app\n            resolvers not-an-ip\n        }\n    }\n}",
+            "example.com {\n    reverse_proxy {\n        dynamic a {\n            name app\n            versions tcp\n        }\n    }\n}",
+        ] {
+            compile_err(source);
         }
     }
 

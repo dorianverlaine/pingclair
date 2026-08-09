@@ -17,6 +17,7 @@
 //! publishes a whole new pool at once, so a request never observes a
 //! half-updated backend list.
 
+use crate::dynamic_upstream::DynamicUpstreamSource;
 use crate::health_check::{HealthCheckConfig, HealthChecker, RecoveryState};
 use crate::upstream::{Resolve, SystemResolver, Upstream, UpstreamSpec};
 use arc_swap::ArcSwap;
@@ -373,6 +374,9 @@ pub struct LoadBalancer {
     /// load, instead of walking the pool on every request to find out nothing
     /// moved.
     generation: AtomicU64,
+    /// 🧭 DNS-driven source whose whole peer set is republished on refresh;
+    /// absent for pools built from a fixed upstream list.
+    dynamic: Option<Box<dyn DynamicUpstreamSource>>,
 }
 
 // MARK: - Implementation
@@ -443,6 +447,56 @@ impl LoadBalancer {
         Self::from_entries_with_resolver(primary, backup, strategy, Arc::new(SystemResolver))
     }
 
+    /// 🧭 Builds a pool from a DNS-driven source plus optional static peers.
+    ///
+    /// The source is resolved once here so the pool is usable at boot, and
+    /// every later `refresh_dns` pass re-queries it and republishes the whole
+    /// set — the request path never touches the resolver. A lookup failure at
+    /// startup leaves the pool empty and is retried, exactly like a hostname
+    /// that has not resolved yet.
+    pub fn from_dynamic(
+        source: Box<dyn DynamicUpstreamSource>,
+        primary: Vec<UpstreamEntry>,
+        backup: Vec<UpstreamEntry>,
+        strategy: Strategy,
+    ) -> Self {
+        let resolver: Arc<dyn Resolve> = Arc::new(SystemResolver);
+        let mut tracked = resolve_entries(primary, resolver.as_ref());
+        match source.resolve_specs() {
+            Ok(specs) => {
+                tracked.extend(specs.into_iter().map(|spec| {
+                    let backend = spec
+                        .resolve(&*resolver)
+                        .ok()
+                        .and_then(|address| spec.backend(address, 1));
+                    TrackedUpstream {
+                        spec: Some(spec),
+                        weight: 1,
+                        backend,
+                    }
+                }));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    source = %source.describe(),
+                    %error,
+                    "⚠️ Dynamic upstream lookup failed at startup; it will be retried"
+                );
+            }
+        }
+        let backup_pool = (!backup.is_empty()).then(|| {
+            Arc::new(Self::from_tracked(
+                resolve_entries(backup, resolver.as_ref()),
+                strategy,
+                resolver.clone(),
+                None,
+            ))
+        });
+        let mut load_balancer = Self::from_tracked(tracked, strategy, resolver, backup_pool);
+        load_balancer.dynamic = Some(source);
+        load_balancer
+    }
+
     /// [`Self::from_entries`] with an injected resolver (tests).
     pub fn from_entries_with_resolver(
         primary: Vec<UpstreamEntry>,
@@ -487,6 +541,7 @@ impl LoadBalancer {
             health_backoff: AtomicU64::new(0),
             backup,
             generation: AtomicU64::new(0),
+            dynamic: None,
         }
     }
 
@@ -494,6 +549,9 @@ impl LoadBalancer {
     /// Pools built purely from IP literals are never registered with the
     /// refresher, so a config without hostnames generates no DNS traffic.
     pub fn needs_dns_refresh(&self) -> bool {
+        if self.dynamic.is_some() {
+            return true;
+        }
         let own = self
             .tracked
             .lock()
@@ -514,6 +572,14 @@ impl LoadBalancer {
         let mut report = DnsRefresh::default();
         if let Some(backup) = &self.backup {
             report.merge(backup.refresh_dns());
+        }
+
+        // 🧭 A dynamic source owns the whole peer set: refresh it directly
+        // rather than re-resolving whatever the last generation happened to
+        // publish, so records that moved or disappeared are picked up.
+        if let Some(source) = &self.dynamic {
+            report.merge(self.refresh_dynamic(source.as_ref()));
+            return report;
         }
 
         let mut tracked = self.tracked.lock();
@@ -582,6 +648,85 @@ impl LoadBalancer {
         if changed {
             self.publish(&tracked);
         }
+        report
+    }
+
+    /// 🧭 Re-queries one DNS-driven source and republishes its peer set.
+    ///
+    /// A source-level failure keeps the previous generation serving, matching
+    /// the hostname refresher's last-known-good rule. Individual peers whose
+    /// address lookup fails are dropped from the new set and rejoin the next
+    /// time the source answers for them.
+    fn refresh_dynamic(&self, source: &dyn DynamicUpstreamSource) -> DnsRefresh {
+        let mut report = DnsRefresh::default();
+        let new_specs = match source.resolve_specs() {
+            Ok(specs) => specs,
+            Err(error) => {
+                report.kept_stale += 1;
+                tracing::warn!(
+                    source = %source.describe(),
+                    %error,
+                    "⚠️ Dynamic upstream lookup failed; keeping the previous peer set"
+                );
+                return report;
+            }
+        };
+
+        let mut new_tracked = Vec::with_capacity(new_specs.len());
+        for spec in new_specs {
+            match spec.resolve(self.resolver.as_ref()) {
+                Ok(address) => {
+                    if let Some(backend) = spec.backend(address, 1) {
+                        new_tracked.push(TrackedUpstream {
+                            spec: Some(spec),
+                            weight: 1,
+                            backend: Some(backend),
+                        });
+                    }
+                }
+                Err(error) => {
+                    report.unresolved += 1;
+                    tracing::warn!(
+                        source = %source.describe(),
+                        upstream = %spec.authority(),
+                        %error,
+                        "⚠️ A dynamic peer did not resolve; it stays out of this generation"
+                    );
+                }
+            }
+        }
+
+        let previous = self.tracked.lock();
+        let previous_keys: Vec<String> = previous
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .backend
+                    .as_ref()
+                    .map(|backend| backend.addr.to_string())
+            })
+            .collect();
+        let next_keys: Vec<String> = new_tracked
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .backend
+                    .as_ref()
+                    .map(|backend| backend.addr.to_string())
+            })
+            .collect();
+        if previous_keys == next_keys {
+            return report;
+        }
+
+        drop(previous);
+        self.publish(&new_tracked);
+        *self.tracked.lock() = new_tracked;
+        report.changed += 1;
+        tracing::info!(
+            source = %source.describe(),
+            "🔄 Dynamic upstream peer set refreshed"
+        );
         report
     }
 
@@ -1131,6 +1276,100 @@ mod tests {
             selected.addr,
             pingora_core::protocols::l4::socket::SocketAddr::Unix(_)
         ));
+    }
+
+    /// 🧭 A scripted DNS source drives a pool whose whole peer set is
+    /// republished on refresh, and a failed lookup keeps the old set serving.
+    struct ScriptedSource {
+        shared: Arc<ScriptedSourceState>,
+    }
+
+    struct ScriptedSourceState {
+        addresses: Mutex<Vec<String>>,
+        failing: std::sync::atomic::AtomicBool,
+    }
+
+    impl ScriptedSource {
+        fn new(addresses: Vec<String>) -> (Arc<ScriptedSourceState>, Self) {
+            let shared = Arc::new(ScriptedSourceState {
+                addresses: Mutex::new(addresses),
+                failing: std::sync::atomic::AtomicBool::new(false),
+            });
+            let source = Self {
+                shared: shared.clone(),
+            };
+            (shared, source)
+        }
+    }
+
+    impl ScriptedSourceState {
+        fn set(&self, addresses: Vec<String>) {
+            *self.addresses.lock() = addresses;
+        }
+
+        fn fail_next(&self) {
+            self.failing
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    impl crate::dynamic_upstream::DynamicUpstreamSource for ScriptedSource {
+        fn describe(&self) -> String {
+            "scripted".to_string()
+        }
+
+        fn resolve_specs(&self) -> std::io::Result<Vec<UpstreamSpec>> {
+            if self
+                .shared
+                .failing
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(std::io::Error::other("scripted resolver unavailable"));
+            }
+            Ok(self
+                .shared
+                .addresses
+                .lock()
+                .iter()
+                .filter_map(|address| UpstreamSpec::parse(address))
+                .collect())
+        }
+    }
+
+    #[test]
+    fn dynamic_sources_publish_their_peer_set_and_keep_it_on_failure() {
+        let (shared, source) = ScriptedSource::new(vec![
+            "127.0.0.1:8401".to_string(),
+            "127.0.0.1:8402".to_string(),
+        ]);
+        let lb = LoadBalancer::from_dynamic(Box::new(source), vec![], vec![], Strategy::RoundRobin);
+        assert!(
+            lb.needs_dns_refresh(),
+            "a dynamic pool must register with the refresher"
+        );
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for _ in 0..8 {
+            seen.insert(lb.select(None).expect("a dynamic peer").addr.to_string());
+        }
+        assert_eq!(seen.len(), 2, "both scripted peers must rotate: {seen:?}");
+
+        // 🧭 The source moved: the next refresh must publish the new set.
+        shared.set(vec!["127.0.0.1:8403".to_string()]);
+        lb.refresh_dns();
+        let after: std::collections::HashSet<String> = (0..4)
+            .filter_map(|_| lb.select(None).map(|backend| backend.addr.to_string()))
+            .collect();
+        assert_eq!(
+            after,
+            std::collections::HashSet::from(["127.0.0.1:8403".to_string()])
+        );
+
+        // 🧯 A source failure keeps the last published generation.
+        shared.fail_next();
+        lb.refresh_dns();
+        let kept = lb.select(None).expect("a stale peer must still serve");
+        assert_eq!(kept.addr.to_string(), "127.0.0.1:8403");
     }
 
     #[test]

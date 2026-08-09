@@ -3,8 +3,8 @@
 
 use super::AdapterError;
 use super::args::{
-    expect_no_arguments, expect_one_argument, parse_positive_u64, parse_positive_usize,
-    parse_required_duration,
+    expect_no_arguments, expect_one_argument, parse_duration_ms, parse_positive_u64,
+    parse_positive_usize, parse_required_duration,
 };
 use crate::parser::ast::*;
 use crate::parser::caddy_ast::Directive;
@@ -86,14 +86,10 @@ pub(super) fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError>
                     ));
                 }
                 "dynamic" => {
-                    // 🚫 SRV-based dynamic upstream discovery is a Caddy
-                    // feature with no runtime equivalent here yet; a config
-                    // naming it must not silently degrade to static upstreams.
-                    // TODO(v0.3): implement SRV/dynamic upstream discovery.
-                    return Err(AdapterError::UnsupportedFeature(
-                        "reverse_proxy dynamic".into(),
-                        "dynamic upstream discovery is not implemented yet".into(),
-                    ));
+                    // 🧭 DNS-driven upstreams replace the fixed peer list:
+                    // `a` resolves one name's address records, `srv` resolves
+                    // RFC 2782 records whose targets carry the ports.
+                    proxy.dynamic = Some(parse_dynamic_upstream(&sub)?);
                 }
                 "flush_interval" => {
                     if let Some(val) = sub.args.first() {
@@ -438,7 +434,7 @@ pub(super) fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError>
         }
     }
 
-    if proxy.upstreams.is_empty() {
+    if proxy.upstreams.is_empty() && proxy.dynamic.is_none() {
         return Err(AdapterError::ArgumentCount("reverse_proxy".into(), 1, 0));
     }
 
@@ -879,4 +875,231 @@ fn whole_seconds(directive: &Directive) -> Result<u64, AdapterError> {
         ));
     }
     Ok(millis / 1_000)
+}
+
+// MARK: - Dynamic Upstreams
+
+/// 🧭 Parses one `dynamic` subdirective into the DNS source it names.
+///
+/// The first argument selects the record family (`a` or `srv`); the optional
+/// block carries the source's knobs. A positional name and port are accepted
+/// for the compact spelling (`dynamic a foo 9000`), mirroring Caddy.
+fn parse_dynamic_upstream(
+    d: &Directive,
+) -> Result<pingclair_core::config::DynamicUpstreamConfig, AdapterError> {
+    let source = d
+        .args
+        .first()
+        .ok_or_else(|| AdapterError::ArgumentCount("dynamic".into(), 1, d.args.len()))?;
+    match source.as_str() {
+        "a" => Ok(pingclair_core::config::DynamicUpstreamConfig::A(
+            parse_dynamic_addr(d)?,
+        )),
+        "srv" => Ok(pingclair_core::config::DynamicUpstreamConfig::Srv(
+            parse_dynamic_srv(d)?,
+        )),
+        other => Err(AdapterError::InvalidArgument(
+            "dynamic source".into(),
+            format!(
+                "`{other}` is not a DNS source; use `a` for address records or \
+                 `srv` for service records"
+            ),
+        )),
+    }
+}
+
+/// 📜 Reads the A-record source, accepting both the compact and block forms.
+fn parse_dynamic_addr(
+    d: &Directive,
+) -> Result<pingclair_core::config::DynamicAddrUpstream, AdapterError> {
+    let mut name = d.args.get(1).cloned();
+    let mut port = d
+        .args
+        .get(2)
+        .map(|value| parse_port("dynamic port", value))
+        .transpose()?;
+    let mut refresh_secs = None;
+    let mut resolvers = Vec::new();
+    let mut dial_timeout_ms = None;
+    let mut fallback_delay_ms = None;
+    let mut versions = None;
+
+    if let Some(block) = &d.block {
+        for sub in &block.directives {
+            match sub.name.as_str() {
+                "name" => {
+                    name = Some(expect_one_argument(sub)?.to_string());
+                }
+                "port" => {
+                    port = Some(parse_port("port", expect_one_argument(sub)?)?);
+                }
+                "refresh" => {
+                    refresh_secs = Some(whole_seconds(sub)?);
+                }
+                "resolvers" => {
+                    resolvers = parse_resolvers(&sub.args)?;
+                }
+                "dial_timeout" => {
+                    dial_timeout_ms = Some(parse_required_duration(sub)?);
+                }
+                "dial_fallback_delay" => {
+                    fallback_delay_ms = Some(parse_signed_duration(sub)?);
+                }
+                "versions" => {
+                    let value = expect_one_argument(sub)?;
+                    if !matches!(value, "ipv4" | "ipv6" | "ip4" | "ip6" | "ip") {
+                        return Err(AdapterError::InvalidArgument(
+                            "versions".into(),
+                            format!("`{value}` is not `ipv4` or `ipv6`"),
+                        ));
+                    }
+                    versions = Some(value.to_string());
+                }
+                other => {
+                    return Err(AdapterError::UnsupportedFeature(
+                        "dynamic a".into(),
+                        format!("`{other}` is not a dynamic A-source option"),
+                    ));
+                }
+            }
+        }
+    }
+
+    let name = name.ok_or_else(|| {
+        AdapterError::InvalidArgument("dynamic a".into(), "a dynamic A source needs a name".into())
+    })?;
+    Ok(pingclair_core::config::DynamicAddrUpstream {
+        name,
+        port: port.unwrap_or(80),
+        refresh_secs,
+        resolvers,
+        dial_timeout_ms,
+        fallback_delay_ms,
+        versions,
+    })
+}
+
+/// 🧾 Reads the SRV source, accepting both the compact and block forms.
+fn parse_dynamic_srv(
+    d: &Directive,
+) -> Result<pingclair_core::config::DynamicSrvUpstream, AdapterError> {
+    let mut name = d.args.get(1).cloned();
+    let mut service = None;
+    let mut proto = None;
+    let mut refresh_secs = None;
+    let mut resolvers = Vec::new();
+    let mut dial_timeout_ms = None;
+    let mut fallback_delay_ms = None;
+    let mut grace_period_ms = None;
+
+    if let Some(block) = &d.block {
+        for sub in &block.directives {
+            match sub.name.as_str() {
+                "name" => {
+                    name = Some(expect_one_argument(sub)?.to_string());
+                }
+                "service" => {
+                    service = Some(expect_one_argument(sub)?.to_string());
+                }
+                "proto" => {
+                    proto = Some(expect_one_argument(sub)?.to_string());
+                }
+                "refresh" => {
+                    refresh_secs = Some(whole_seconds(sub)?);
+                }
+                "resolvers" => {
+                    resolvers = parse_resolvers(&sub.args)?;
+                }
+                "dial_timeout" => {
+                    dial_timeout_ms = Some(parse_required_duration(sub)?);
+                }
+                "dial_fallback_delay" => {
+                    fallback_delay_ms = Some(parse_signed_duration(sub)?);
+                }
+                "grace_period" => {
+                    grace_period_ms = Some(parse_required_duration(sub)?);
+                }
+                other => {
+                    return Err(AdapterError::UnsupportedFeature(
+                        "dynamic srv".into(),
+                        format!("`{other}` is not a dynamic SRV-source option"),
+                    ));
+                }
+            }
+        }
+    }
+
+    let name = name.ok_or_else(|| {
+        AdapterError::InvalidArgument(
+            "dynamic srv".into(),
+            "a dynamic SRV source needs a name".into(),
+        )
+    })?;
+    if service.is_some() != proto.is_some() {
+        return Err(AdapterError::InvalidArgument(
+            "dynamic srv".into(),
+            "`service` and `proto` must be set together; otherwise give the \
+             full SRV name in `name`"
+                .into(),
+        ));
+    }
+    Ok(pingclair_core::config::DynamicSrvUpstream {
+        name,
+        service,
+        proto,
+        refresh_secs,
+        resolvers,
+        dial_timeout_ms,
+        fallback_delay_ms,
+        grace_period_ms,
+    })
+}
+
+/// 🔌 Parses a dial port out of one argument.
+fn parse_port(label: &str, value: &str) -> Result<u16, AdapterError> {
+    value.parse::<u16>().map_err(|_| {
+        AdapterError::InvalidArgument(label.into(), format!("`{value}` is not a port"))
+    })
+}
+
+/// 📡 Validates explicit resolver addresses, which must be IP literals.
+fn parse_resolvers(args: &[String]) -> Result<Vec<String>, AdapterError> {
+    if args.is_empty() {
+        return Err(AdapterError::InvalidArgument(
+            "resolvers".into(),
+            "at least one resolver address is required".into(),
+        ));
+    }
+    for arg in args {
+        if arg.parse::<std::net::IpAddr>().is_err() {
+            return Err(AdapterError::InvalidArgument(
+                "resolvers".into(),
+                format!("`{arg}` is not an IP address"),
+            ));
+        }
+    }
+    Ok(args.to_vec())
+}
+
+/// ⏱️ Parses a duration that may be negative (Caddy's `-1s` disables the
+/// RFC 6555 fast-fallback delay).
+fn parse_signed_duration(directive: &Directive) -> Result<i64, AdapterError> {
+    let value = directive.args.first().ok_or_else(|| {
+        AdapterError::ArgumentCount(directive.name.clone(), 1, directive.args.len())
+    })?;
+    if directive.args.len() != 1 {
+        return Err(AdapterError::ArgumentCount(
+            directive.name.clone(),
+            1,
+            directive.args.len(),
+        ));
+    }
+    if let Some(rest) = value.strip_prefix('-') {
+        return parse_duration_ms(rest)
+            .map(|millis| -(millis as i64))
+            .ok_or_else(|| AdapterError::InvalidArgument(directive.name.clone(), value.clone()));
+    }
+    parse_duration_ms(value)
+        .map(|millis| millis as i64)
+        .ok_or_else(|| AdapterError::InvalidArgument(directive.name.clone(), value.clone()))
 }

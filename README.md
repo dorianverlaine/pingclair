@@ -554,6 +554,13 @@ A Unix-socket upstream is written `unix//path/to.sock` and dials that socket;
 `unix+h2c//path/to.sock` speaks prior-knowledge HTTP/2 over it. Unix upstreams
 are never handed to the DNS refresher.
 
+Upstreams can also be discovered from DNS while the server runs:
+`dynamic a name port` resolves every address record of `name`, and
+`dynamic srv _svc._tcp.example.com` resolves SRV records whose targets carry
+their own ports. Lookups happen on a background refresher, never on the
+request path. A dial may also contain request placeholders —
+`reverse_proxy {re.dial.1}` — expanded per request and cached by host and port.
+
 Upstreams written as hostnames are re-resolved while the server runs, so a
 container that restarts on a new address is picked up without a reload. A
 lookup that fails leaves the previous address in rotation — a resolver outage

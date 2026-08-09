@@ -6,8 +6,12 @@
 //! Provides types and helpers for defining and creating backend servers.
 //! This module acts as a bridge between Pingclair's configuration and Pingora's native backend types.
 
+use parking_lot::Mutex;
 pub use pingora_load_balancing::Backend as Upstream;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 // MARK: - Types
 
@@ -281,6 +285,147 @@ pub fn create_upstream(address_string: &str) -> Option<Upstream> {
     spec.backend(address, 1)
 }
 
+// MARK: - Dynamic Dial Templates
+
+/// 🧭 Upstream dial strings that may contain request placeholders.
+///
+/// The templates are precomputed once per route at configuration time; per
+/// request they are expanded against the request-scoped variables (regexp
+/// captures in particular) and the first non-empty result is dialed. Nothing
+/// about parsing or templating is rebuilt per request.
+pub struct DynamicDialPlan {
+    templates: Vec<String>,
+}
+
+impl DynamicDialPlan {
+    /// Creates a plan from every dial string that contains a placeholder.
+    pub fn new(templates: Vec<String>) -> Self {
+        Self { templates }
+    }
+
+    /// Whether the plan has any template to try.
+    pub fn is_empty(&self) -> bool {
+        self.templates.is_empty()
+    }
+
+    /// 🧭 Expands the templates and returns the first dial that means
+    /// something; an empty expansion (a missing capture) falls through to the
+    /// next template, matching Caddy.
+    pub fn resolve(
+        &self,
+        req: &pingora_http::RequestHeader,
+        verified_client_ip: Option<&str>,
+        vars: &crate::http_policy::RequestVars,
+    ) -> Option<UpstreamSpec> {
+        for template in &self.templates {
+            let expanded = crate::server::resolve_caddy_placeholders(
+                template,
+                req,
+                verified_client_ip,
+                "http",
+                vars,
+            );
+            if expanded.is_empty() {
+                continue;
+            }
+            if let Some(spec) = UpstreamSpec::parse(&expanded) {
+                return Some(spec);
+            }
+        }
+        None
+    }
+}
+
+/// One cached resolution of a hostname dial, with the moment it was resolved.
+struct CachedDial {
+    upstream: Arc<Upstream>,
+    resolved_at: Instant,
+}
+
+/// 🗄️ Bounded, TTL-cached hostname resolutions for dynamic dial templates.
+///
+/// A per-request dial may name an arbitrary host, so the result is keyed by
+/// the expanded `host:port` (plus scheme) rather than by route — two routes
+/// dialing the same peer share one entry, while different peers never share
+/// one. The cap and TTL keep a request-derived namespace from growing without
+/// bound, which is the open-proxy-shaped risk Caddy accepts and this cache
+/// bounds.
+struct DynamicDialCache {
+    entries: HashMap<String, CachedDial>,
+}
+
+const DYNAMIC_DIAL_CACHE_CAP: usize = 512;
+const DYNAMIC_DIAL_CACHE_TTL: Duration = Duration::from_secs(60);
+
+static DYNAMIC_DIAL_CACHE: LazyLock<Mutex<DynamicDialCache>> = LazyLock::new(|| {
+    Mutex::new(DynamicDialCache {
+        entries: HashMap::new(),
+    })
+});
+
+/// 🏗️ Turns one expanded dial spec into a peer backend.
+///
+/// IP literals and Unix sockets resolve with no I/O. A hostname is looked up
+/// in the shared bounded cache; only the first sighting of that `host:port`
+/// performs DNS, and it does so on a blocking thread so the request worker is
+/// never stalled by a slow resolver.
+pub async fn resolve_dynamic_dial(spec: UpstreamSpec) -> Option<Upstream> {
+    if spec.is_unix() {
+        return spec.unix_backend(1);
+    }
+    if !spec.needs_dns() {
+        return spec
+            .resolve(&SystemResolver)
+            .ok()
+            .and_then(|address| spec.backend(address, 1));
+    }
+
+    let key = format!("{}://{}", scheme_key(spec.scheme), spec.authority());
+    let now = Instant::now();
+    {
+        let cache = DYNAMIC_DIAL_CACHE.lock();
+        if let Some(entry) = cache.entries.get(&key)
+            && now.duration_since(entry.resolved_at) < DYNAMIC_DIAL_CACHE_TTL
+        {
+            return Some((*entry.upstream).clone());
+        }
+    }
+
+    let lookup = spec.clone();
+    let address = tokio::task::spawn_blocking(move || lookup.resolve(&SystemResolver))
+        .await
+        .ok()?
+        .ok()?;
+    let upstream = spec.backend(address, 1)?;
+
+    let mut cache = DYNAMIC_DIAL_CACHE.lock();
+    if cache.entries.len() >= DYNAMIC_DIAL_CACHE_CAP {
+        cache
+            .entries
+            .retain(|_, entry| now.duration_since(entry.resolved_at) < DYNAMIC_DIAL_CACHE_TTL);
+        if cache.entries.len() >= DYNAMIC_DIAL_CACHE_CAP {
+            cache.entries.clear();
+        }
+    }
+    cache.entries.insert(
+        key,
+        CachedDial {
+            upstream: Arc::new(upstream.clone()),
+            resolved_at: now,
+        },
+    );
+    Some(upstream)
+}
+
+fn scheme_key(scheme: Scheme) -> &'static str {
+    match scheme {
+        Scheme::Http => "http",
+        Scheme::Https => "https",
+        Scheme::H2c => "h2c",
+        Scheme::H2 => "h2",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,5 +592,38 @@ mod tests {
 
         let spec = UpstreamSpec::parse("http://app:8080").unwrap();
         assert!(spec.resolve(&Empty).is_err());
+    }
+
+    /// 🧭 A replaceable dial expands per request, skipping templates whose
+    /// captures are missing until one means something.
+    #[test]
+    fn dynamic_dial_plan_expands_captures_and_skips_empty_values() {
+        let plan = DynamicDialPlan::new(vec![
+            "{re.missing.1}".to_string(),
+            "{re.dial.1}".to_string(),
+        ]);
+        let mut req = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header("Host", "example.test").unwrap();
+        let mut vars = crate::http_policy::RequestVars::default();
+        vars.set("re.dial.1", "127.0.0.1:9000");
+
+        let spec = plan
+            .resolve(&req, None, &vars)
+            .expect("the second template must resolve");
+        assert_eq!(spec.host, "127.0.0.1");
+        assert_eq!(spec.port, 9000);
+
+        let empty = crate::http_policy::RequestVars::default();
+        assert!(plan.resolve(&req, None, &empty).is_none());
+    }
+
+    /// 🏗️ A literal expanded dial resolves with no I/O and no cache entry.
+    #[tokio::test]
+    async fn literal_dynamic_dials_build_backends_directly() {
+        let spec = UpstreamSpec::parse("127.0.0.1:9000").unwrap();
+        let backend = crate::upstream::resolve_dynamic_dial(spec)
+            .await
+            .expect("a literal dial must resolve");
+        assert_eq!(backend.addr.to_string(), "127.0.0.1:9000");
     }
 }

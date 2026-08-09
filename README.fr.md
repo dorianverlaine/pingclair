@@ -555,6 +555,14 @@ Un amont sur socket Unix s'écrit `unix//path/to.sock` et se connecte à cette
 socket ; `unix+h2c//path/to.sock` parle HTTP/2 en connaissance préalable par
 dessus. Les amonts Unix ne passent jamais par le rafraîchissement DNS.
 
+Les amonts peuvent aussi être découverts par DNS pendant l'exécution :
+`dynamic a name port` résout chaque adresse de `name`, et
+`dynamic srv _svc._tcp.example.com` résout les enregistrements SRV dont les
+cibles portent leur propre port. Les résolutions ont lieu sur un rafraîchisseur
+d'arrière-plan, jamais sur le chemin de requête. Une adresse de dial peut aussi
+contenir des placeholders — `reverse_proxy {re.dial.1}` — développés par
+requête et mis en cache par hôte et port.
+
 Les amonts écrits sous forme de noms d'hôtes sont ré-résolus pendant l'exécution :
 un conteneur qui redémarre sur une nouvelle adresse est suivi sans rechargement.
 Une résolution en échec laisse l'adresse précédente en rotation — une panne du

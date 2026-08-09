@@ -138,11 +138,16 @@ impl InternalCa {
     }
 }
 
-/// 🌐 Accepts only concrete DNS names or IP literals that can be used for TLS.
+/// 🌐 Accepts concrete DNS names, IP literals, and one-level wildcard DNS
+/// names (`*.example.com`) that the internal authority can issue for.
 fn validate_domain(domain: &str) -> Result<(), InternalCaError> {
-    if domain.is_empty()
-        || domain.contains('*')
-        || rustls::pki_types::ServerName::try_from(domain.to_string()).is_err()
+    if domain.is_empty() {
+        return Err(InternalCaError::InvalidDomain(domain.to_string()));
+    }
+    let concrete = domain.strip_prefix("*.").unwrap_or(domain);
+    if concrete.is_empty()
+        || concrete.contains('*')
+        || rustls::pki_types::ServerName::try_from(concrete.to_string()).is_err()
     {
         return Err(InternalCaError::InvalidDomain(domain.to_string()));
     }
@@ -301,11 +306,50 @@ mod tests {
         let authority = InternalCa::new(directory.path());
 
         assert!(authority.get_or_issue("../escape").await.is_err());
+        assert!(authority.get_or_issue("foo.*.bar").await.is_err());
+        assert!(authority.get_or_issue("*.").await.is_err());
         assert!(
             !directory
                 .path()
                 .join("internal/certificates/___escape.json")
                 .exists()
+        );
+    }
+
+    /// 🏗️ A wildcard site name is issuable, and the leaf must carry the
+    /// wildcard SAN so every subdomain handshake can present it.
+    #[tokio::test]
+    async fn wildcard_domains_are_issuable_for_subdomains() {
+        use x509_parser::extensions::GeneralName;
+        use x509_parser::prelude::FromDer;
+
+        let directory = tempfile::tempdir().unwrap();
+        let authority = InternalCa::new(directory.path());
+        let leaf = authority
+            .get_or_issue("*.sandbox.localhost")
+            .await
+            .expect("a wildcard internal leaf must issue");
+
+        assert_eq!(leaf.domains, vec!["*.sandbox.localhost"]);
+        let (_, pem) = x509_parser::pem::parse_x509_pem(leaf.cert_pem.as_bytes()).unwrap();
+        let (_, certificate) =
+            x509_parser::prelude::X509Certificate::from_der(&pem.contents).unwrap();
+        let sans = certificate
+            .subject_alternative_name()
+            .expect("a SAN extension")
+            .expect("a SAN value");
+        let names: Vec<String> = sans
+            .value
+            .general_names
+            .iter()
+            .filter_map(|name| match name {
+                GeneralName::DNSName(name) => Some(name.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "*.sandbox.localhost"),
+            "the leaf must carry the wildcard SAN: {names:?}"
         );
     }
 

@@ -459,6 +459,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
             }
             let handler = HandlerConfig::ReverseProxy(ReverseProxyConfig {
                 upstreams: to,
+                dynamic_upstream: None,
                 upstream_options: Vec::new(),
                 // 🗄️ `pingclair reverse-proxy` is a throwaway one-liner; caching
                 // is a deliberate per-route decision, so it stays off here.

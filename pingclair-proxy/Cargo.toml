@@ -38,6 +38,7 @@ zstd = "0.13"
 arc-swap.workspace = true
 regex = "1"
 futures = "0.3"
+hickory-resolver.workspace = true
 
 # HTTP/3 (QUIC) — quiche + BoringSSL
 quiche.workspace = true

@@ -3252,6 +3252,121 @@ async fn test_pingclairfile_unix_socket_upstream_serves_requests() {
 }
 
 #[tokio::test]
+async fn test_pingclairfile_replaceable_upstream_uses_request_captures() {
+    use tokio::io::AsyncWriteExt;
+
+    async fn spawn_upstream(body: &'static str) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+            let _ = String::from_utf8_lossy(&request);
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        (address, task)
+    }
+
+    let (first_address, first_task) = spawn_upstream("first").await;
+    let (second_address, second_task) = spawn_upstream("second").await;
+
+    // 📄 The dial is decided by a per-request header capture: the same route
+    // must reach whichever backend the client names, not a pool fixed at load.
+    let config = r#"
+        {
+            admin off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            @dial header_regexp dial X-Upstream ^(127\.0\.0\.1:[0-9]+)$
+            handle @dial {
+                reverse_proxy {re.dial.1}
+            }
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    let first = client
+        .get(server.url(0, "/probe"))
+        .header("X-Upstream", first_address.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        first.status(),
+        200,
+        "the capture-selected upstream must serve"
+    );
+    assert_eq!(first.text().await.unwrap(), "first");
+
+    let second = client
+        .get(server.url(0, "/probe"))
+        .header("X-Upstream", second_address.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 200);
+    assert_eq!(second.text().await.unwrap(), "second");
+
+    first_task.await.unwrap();
+    second_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_pingclairfile_wildcard_internal_tls_serves_subdomains() {
+    let config = r#"
+        {
+            admin off
+        }
+
+        https://*.sandbox.test:__PINGCLAIR_TEST_PORT__ {
+            tls internal
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "wildcard-ok"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(
+        server.wait_until_tls_ready("123.sandbox.test").await,
+        "server failed to start with a wildcard internal certificate"
+    );
+
+    let root_path = server._temp_dir.path().join("tls/internal/root.crt");
+    let root = reqwest::Certificate::from_pem(&std::fs::read(&root_path).unwrap()).unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .add_root_certificate(root)
+        .resolve("123.sandbox.test", server.address(0))
+        .build()
+        .unwrap();
+    let response = client
+        .get(server.tls_url(0, "123.sandbox.test", "/probe"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "wildcard-ok");
+}
+
+#[tokio::test]
 async fn test_pingclairfile_internal_tls_serves_trusted_h1_and_h2() {
     let config = r#"
         {

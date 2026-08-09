@@ -46,7 +46,7 @@ use crate::http_policy::{
 };
 use crate::metrics;
 use crate::overload::{AdmissionError, RouteAdmission, RouteProtection, UpstreamAdmission};
-use crate::upstream::{HostName, Scheme, UpstreamSpec};
+use crate::upstream::{DynamicDialPlan, HostName, Scheme, UpstreamSpec};
 use crate::{HealthChecker, LoadBalancer, Strategy, Upstream, UpstreamEntry};
 use bytes::Bytes;
 use ipnet::IpNet;
@@ -766,6 +766,9 @@ pub struct ProxyState {
     pub vars_precompiles: Vec<Option<CompiledMatcher>>,
     /// Load balancers per route
     pub load_balancers: Vec<Option<Arc<LoadBalancer>>>,
+    /// 🧭 Per-route dial templates with request placeholders, parallel to
+    /// `load_balancers`; `None` means the route dials only static peers.
+    pub dynamic_dials: Vec<Option<Arc<DynamicDialPlan>>>,
     /// Health checkers per route
     pub health_checkers: Vec<Option<Arc<HealthChecker>>>,
     /// File servers per route
@@ -1179,6 +1182,7 @@ impl ProxyState {
 
         // 🧩 Initializes index-aligned components for each route.
         let mut load_balancers = Vec::new();
+        let mut dynamic_dials = Vec::new();
         let mut health_checkers = Vec::new();
         let mut file_servers = Vec::new();
         let mut rate_limiters = Vec::new();
@@ -1203,9 +1207,13 @@ impl ProxyState {
 
             // Load balancer (possibly nested inside a handle/route block)
             if let Some(proxy_config) = find_reverse_proxy_config(&route.handler) {
-                let (primary, backup) = build_weighted_upstreams(proxy_config);
+                let (primary, backup, dynamic_templates) = build_weighted_upstreams(proxy_config);
 
-                if primary.is_empty() && backup.is_empty() {
+                if primary.is_empty()
+                    && backup.is_empty()
+                    && dynamic_templates.is_empty()
+                    && proxy_config.dynamic_upstream.is_none()
+                {
                     tracing::warn!("⚠️ No valid upstreams found for route {}", route.path);
                 }
                 let primary_is_empty = primary.is_empty();
@@ -1221,13 +1229,37 @@ impl ProxyState {
                     _ => Strategy::RoundRobin,
                 };
 
-                let load_balancer = Arc::new(if primary_is_empty {
-                    // A backup-only configuration is still useful for a
-                    // deliberately standby-only route; there is no primary
-                    // pool to wait on in that case.
-                    LoadBalancer::from_entries(backup, vec![], strategy)
+                let load_balancer = Arc::new(
+                    if let Some(dynamic_config) = proxy_config.dynamic_upstream.as_ref() {
+                        match crate::dynamic_upstream::dynamic_source(dynamic_config) {
+                            Ok(source) => {
+                                LoadBalancer::from_dynamic(source, primary, backup, strategy)
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    route = %route.path,
+                                    %error,
+                                    "🚫 Dynamic upstream source failed to build"
+                                );
+                                LoadBalancer::from_entries(vec![], vec![], strategy)
+                            }
+                        }
+                    } else if primary_is_empty {
+                        // A backup-only configuration is still useful for a
+                        // deliberately standby-only route; there is no primary
+                        // pool to wait on in that case.
+                        LoadBalancer::from_entries(backup, vec![], strategy)
+                    } else {
+                        LoadBalancer::from_entries(primary, backup, strategy)
+                    },
+                );
+                // 🧭 Replaceable dial templates are expanded per request; the
+                // plan itself is precomputed here so the request path only
+                // substitutes values into strings it already owns.
+                dynamic_dials.push(if dynamic_templates.is_empty() {
+                    None
                 } else {
-                    LoadBalancer::from_entries(primary, backup, strategy)
+                    Some(Arc::new(DynamicDialPlan::new(dynamic_templates)))
                 });
 
                 // 🔐 Compile the route policy before its probe peer so health and
@@ -1354,6 +1386,7 @@ impl ProxyState {
                 upstream_tls.push(route_tls);
             } else {
                 load_balancers.push(None);
+                dynamic_dials.push(None);
                 route_protections.push(None);
                 hash_key_sources.push(None);
                 upstream_tls.push(RouteUpstreamTls::Default);
@@ -1455,6 +1488,7 @@ impl ProxyState {
             error_route_precompiles,
             vars_precompiles,
             load_balancers,
+            dynamic_dials,
             health_checkers,
             file_servers,
             rate_limiters,
@@ -4927,6 +4961,61 @@ impl ProxyHttp for PingclairProxy {
             );
         };
 
+        // 🧭 A route whose dials contain placeholders resolves them per
+        // request. The plan was precomputed at configuration time, so this
+        // branch only substitutes captured values and consults the bounded
+        // resolution cache — no parsing or DNS setup work repeats here.
+        if let Some(dial_plan) = state
+            .dynamic_dials
+            .get(route_index)
+            .and_then(|plan| plan.as_ref())
+        {
+            let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
+            let Some(spec) = dial_plan.resolve(
+                session.req_header(),
+                verified_client_ip.as_deref(),
+                &ctx.request_vars,
+            ) else {
+                return pingora_core::Error::e_explain(
+                    pingora_core::ErrorType::HTTPStatus(502),
+                    "dynamic upstream template did not resolve for this request",
+                );
+            };
+            let Some(upstream) = crate::upstream::resolve_dynamic_dial(spec).await else {
+                return pingora_core::Error::e_explain(
+                    pingora_core::ErrorType::HTTPStatus(502),
+                    "dynamic upstream did not resolve for this request",
+                );
+            };
+            if let Some(proxy_config) = &proxy_config {
+                ctx.headers_upstream = proxy_config.headers_up.clone();
+                ctx.response_headers
+                    .merge_proxy_set(&proxy_config.headers_down);
+                ctx.streaming_response = wants_immediate_flush(proxy_config.flush_interval);
+            }
+            let request_budget = ctx
+                .request_deadline
+                .and_then(|deadline| deadline.checked_duration_since(std::time::Instant::now()));
+            let retry_budget = ctx
+                .retry_deadline
+                .and_then(|deadline| deadline.checked_duration_since(std::time::Instant::now()));
+            let attempt_budget = shortest_duration(request_budget, retry_budget);
+            let read_budget = match state.config.limits.long_connections.idle_timeout_ms {
+                Some(0) => None,
+                Some(value) => Some(Duration::from_millis(value)),
+                None => attempt_budget,
+            };
+            let mut peer = Self::build_http_peer(
+                &upstream,
+                proxy_config.as_ref(),
+                attempt_budget,
+                read_budget,
+                tls_policy,
+            )?;
+            peer.options.read_timeout = shortest_duration(peer.options.read_timeout, retry_budget);
+            return Ok(Box::new(peer));
+        }
+
         // 🚦 `proxy_upstream_filter` already admitted the first attempt; taking
         // its result keeps a backend slot and a circuit probe charged exactly
         // once per attempt, and spares the common path a second identity lookup.
@@ -5958,9 +6047,13 @@ fn find_reverse_proxy_config(handler: &HandlerConfig) -> Option<&ReverseProxyCon
 /// Addresses are *not* resolved here: the load balancer keeps the parsed
 /// specs so a hostname can be re-resolved later, and an upstream that is not
 /// answering DNS yet stays in the list instead of being dropped for good.
+///
+/// 🧭 Dial strings containing placeholders cannot join the static pool at
+/// all — their address is only known per request — so they are returned as
+/// templates instead of being parsed into a hostname that can never dial.
 fn build_weighted_upstreams(
     config: &ReverseProxyConfig,
-) -> (Vec<UpstreamEntry>, Vec<UpstreamEntry>) {
+) -> (Vec<UpstreamEntry>, Vec<UpstreamEntry>, Vec<String>) {
     let options: Vec<_> = if config.upstream_options.is_empty() {
         config
             .upstreams
@@ -5977,7 +6070,12 @@ fn build_weighted_upstreams(
 
     let mut primary = Vec::new();
     let mut backup = Vec::new();
+    let mut dynamic_templates = Vec::new();
     for option in options {
+        if option.address.contains('{') {
+            dynamic_templates.push(option.address);
+            continue;
+        }
         let weight = option.weight.clamp(1, 100);
         let target = if option.backup {
             &mut backup
@@ -5992,7 +6090,7 @@ fn build_weighted_upstreams(
             None => tracing::warn!(upstream = %option.address, "Ignoring invalid upstream address"),
         }
     }
-    (primary, backup)
+    (primary, backup, dynamic_templates)
 }
 
 fn find_access_control_config(handler: &HandlerConfig) -> Option<&AccessControlConfig> {
@@ -7016,7 +7114,8 @@ mod caddy_parity_tests {
             ],
             ..Default::default()
         };
-        let (primary, backup) = build_weighted_upstreams(&config);
+        let (primary, backup, templates) = build_weighted_upstreams(&config);
+        assert!(templates.is_empty());
         assert_eq!(primary.len(), 1);
         assert_eq!(primary[0].spec.authority(), "127.0.0.1:8301");
         assert_eq!(primary[0].weight, 3);

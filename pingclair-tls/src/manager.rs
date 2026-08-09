@@ -226,6 +226,23 @@ impl TlsManager {
         Ok((certificate.cert_pem, certificate.key_pem))
     }
 
+    /// 🏗️ Picks the configured internal pattern that issues for `domain`: an
+    /// exact name first, then a wildcard (`*.example.com`) whose suffix covers
+    /// the concrete SNI. `None` means the name has no local issuer.
+    fn internal_issuance_domain(&self, domain: &str) -> Option<String> {
+        let normalized = normalize_internal_domain(domain);
+        let domains = self.internal_domains.read();
+        if domains.contains(&normalized) {
+            return Some(normalized);
+        }
+        domains.iter().find_map(|pattern| {
+            let suffix = pattern.strip_prefix("*.")?;
+            normalized
+                .ends_with(&format!(".{suffix}"))
+                .then(|| pattern.clone())
+        })
+    }
+
     /// 🌳 Returns the public root certificate for trust-store installation.
     pub async fn internal_root_certificate_pem(&self) -> Result<String, InternalCaError> {
         self.internal_ca.root_certificate_pem().await
@@ -243,8 +260,7 @@ impl TlsManager {
         }
 
         // 🏛️ Configured internal leaves can renew without contacting a public issuer.
-        let internal_domain = normalize_internal_domain(domain);
-        if self.internal_domains.read().contains(&internal_domain) {
+        if let Some(internal_domain) = self.internal_issuance_domain(domain) {
             return match self.internal_ca.get_or_issue(&internal_domain).await {
                 Ok(cert) => Some((cert.cert_pem, cert.key_pem)),
                 Err(error) => {
@@ -276,8 +292,7 @@ impl TlsManager {
         }
 
         // 🏛️ Internal domains must never fall through to public ACME issuance.
-        let internal_domain = normalize_internal_domain(domain);
-        if self.internal_domains.read().contains(&internal_domain) {
+        if let Some(internal_domain) = self.internal_issuance_domain(domain) {
             return match self.internal_ca.get_or_issue(&internal_domain).await {
                 Ok(cert) => Some((cert.cert_pem, cert.key_pem)),
                 Err(error) => {
@@ -354,8 +369,7 @@ impl TlsManager {
         }
 
         // 🏛️ Internal domains must never fall through to public ACME issuance.
-        let internal_domain = normalize_internal_domain(domain);
-        if self.internal_domains.read().contains(&internal_domain) {
+        if let Some(internal_domain) = self.internal_issuance_domain(domain) {
             return match self.internal_ca.get_or_issue(&internal_domain).await {
                 Ok(cert) => self.cache_rustls_certificate(domain, &cert),
                 Err(error) => {
@@ -639,6 +653,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn wildcard_internal_domains_cover_concrete_snis() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = TlsManager::new_with_memory_challenges(None, directory.path());
+        manager
+            .enable_internal_domain("*.sandbox.localhost")
+            .await
+            .unwrap();
+
+        let (cert, key) = manager
+            .resolve_pem("123.sandbox.localhost")
+            .await
+            .expect("a wildcard internal domain must cover a subdomain SNI");
+        assert!(cert.contains("BEGIN CERTIFICATE"));
+        assert!(key.contains("PRIVATE KEY"));
+        assert_eq!(
+            manager.peek_pem("456.sandbox.localhost").await,
+            Some((cert, key)),
+            "peek_pem must resolve the same wildcard leaf without ACME"
+        );
+
+        // 🧭 A bare suffix is not covered by `*.suffix`, matching DNS
+        // wildcard semantics; it must not fall through to public issuance.
+        assert!(manager.resolve_pem("sandbox.localhost").await.is_none());
     }
 
     #[tokio::test]

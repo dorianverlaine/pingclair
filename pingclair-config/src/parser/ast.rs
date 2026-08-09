@@ -659,6 +659,10 @@ pub struct ProxyConfig {
     /// Upstream URLs
     pub upstreams: Vec<String>,
 
+    /// 🧭 DNS-driven upstream discovery; when present the fixed list is
+    /// usually empty, but the two may coexist.
+    pub dynamic: Option<pingclair_core::config::DynamicUpstreamConfig>,
+
     /// Per-upstream options, including weighted and backup peers.
     pub upstream_options: Vec<ProxyUpstreamConfig>,
 
@@ -1083,6 +1087,7 @@ impl ProxyConfig {
                 })
                 .collect(),
             upstreams,
+            dynamic: None,
             lb_policy: None,
             lb_hash_key: None,
             health_check: None,

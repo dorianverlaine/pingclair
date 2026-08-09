@@ -1091,6 +1091,12 @@ pub struct ReverseProxyConfig {
     /// Upstream URLs
     pub upstreams: Vec<String>,
 
+    /// 🧭 Upstream discovery that happens after configuration, from DNS
+    /// records rather than a fixed list. When present, `upstreams` usually
+    /// stays empty; both may coexist, with dynamic peers joining the pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_upstream: Option<Box<DynamicUpstreamConfig>>,
+
     /// Per-upstream weight and backup role. When empty, every address in
     /// `upstreams` is a primary with weight one (the legacy JSON form).
     #[serde(default)]
@@ -1149,6 +1155,76 @@ pub struct ReverseProxyConfig {
     /// 🗄️ Response caching for this route, off unless configured.
     #[serde(default)]
     pub cache: Option<Box<CacheConfig>>,
+}
+
+/// 🧭 The two DNS record families Caddy's `dynamic` source understands.
+///
+/// 🚨 This enum must stay externally tagged in JSON: an untagged shape would
+/// invite the same ambiguous-deserialization class of bug the matcher types
+/// guard against, and the adapter always writes one concrete variant.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DynamicUpstreamConfig {
+    /// 📜 A-record discovery: every address of `name` on one fixed `port`.
+    A(DynamicAddrUpstream),
+    /// 🧾 SRV-record discovery: the target host and port of every record.
+    Srv(DynamicSrvUpstream),
+}
+
+/// 📜 A dynamic upstream resolved from the A/AAAA records of one name.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DynamicAddrUpstream {
+    /// 🌐 Hostname whose address records supply the peers.
+    pub name: String,
+    /// 🔌 Port every discovered peer is dialed on.
+    pub port: u16,
+    /// ⏱️ Refresh interval in seconds; `None` follows the global `dns_refresh`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_secs: Option<u64>,
+    /// 📡 Explicit DNS server addresses; empty means the system resolver.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolvers: Vec<String>,
+    /// ⏱️ Per-lookup timeout in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dial_timeout_ms: Option<u64>,
+    /// ⏱️ RFC 6555 fast-fallback delay in milliseconds; negative disables it.
+    /// Stored for compatibility; Pingclair's DNS client dials one server at a
+    /// time, so the value is accepted but has no runtime effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_delay_ms: Option<i64>,
+    /// 🧭 Address family filter: `ipv4`, `ipv6`, or `None` for both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub versions: Option<String>,
+}
+
+/// 🧾 A dynamic upstream resolved from SRV records (RFC 2782).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DynamicSrvUpstream {
+    /// 🧭 The full SRV name, or the `name` part when `service`/`proto` are set.
+    pub name: String,
+    /// 🏷️ Service label; the lookup name becomes `_service._proto.name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    /// 🌐 Protocol label (`tcp` or `udp`) used when `service` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proto: Option<String>,
+    /// ⏱️ Refresh interval in seconds; `None` follows the global `dns_refresh`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_secs: Option<u64>,
+    /// 📡 Explicit DNS server addresses; empty means the system resolver.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolvers: Vec<String>,
+    /// ⏱️ Per-lookup timeout in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dial_timeout_ms: Option<u64>,
+    /// ⏱️ RFC 6555 fast-fallback delay in milliseconds; negative disables it.
+    /// Stored for compatibility; Pingclair's DNS client dials one server at a
+    /// time, so the value is accepted but has no runtime effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_delay_ms: Option<i64>,
+    /// 🌤️ Milliseconds to keep serving last-known-good peers after a lookup
+    /// failure; `None` fails the request instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_period_ms: Option<u64>,
 }
 
 /// 🗄️ Stores upstream responses so identical requests skip the origin.

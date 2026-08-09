@@ -197,6 +197,14 @@ lets the rest converge.
   domain socket, and `unix+h2c//path/to.sock` speaks prior-knowledge HTTP/2 over
   one — the shape local gRPC and application backends expect. Unix upstreams
   never enter the DNS refresher.
+- 🧭 **Dynamic and replaceable upstreams.** `dynamic a name port` and
+  `dynamic srv _svc._tcp.example.com` discover peers from DNS on a background
+  refresher, so no request ever performs a lookup. Dial strings with request
+  placeholders (`reverse_proxy {re.dial.1}`) are expanded per request and the
+  resulting peers cached by host and port.
+- 🏗️ **Wildcard internal certificates.** `tls internal` on a `*.example.com`
+  site issues a wildcard leaf that serves every subdomain on H1, H2 and H3,
+  matching Caddy's local-CA behavior for `.localhost`-style wildcard sites.
 - 📦 **Response caching.** RFC 9111 decides what may be stored, and a second
   identical request is served without asking the origin. The store is bounded
   by `max_size` (128 MiB unless you say otherwise) and evicts least-recently-
