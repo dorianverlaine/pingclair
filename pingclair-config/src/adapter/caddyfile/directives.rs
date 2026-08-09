@@ -12,8 +12,9 @@ use super::matchers::{
 use super::order::DirectiveOrder;
 use super::reverse_proxy::adapt_intercept;
 use super::reverse_proxy::adapt_reverse_proxy;
+use super::reverse_proxy::validate_fastcgi_split_path;
 use crate::parser::ast::*;
-use crate::parser::caddy_ast::{Block, Directive};
+use crate::parser::caddy_ast::{Block, Directive, TokenRun};
 use pingclair_core::config::BasicAuthAlgorithm;
 use std::collections::{BTreeMap, HashMap};
 
@@ -26,6 +27,7 @@ pub(super) fn adapt_handler(
 ) -> Result<Handler, AdapterError> {
     match d.name.as_str() {
         "reverse_proxy" => adapt_reverse_proxy(d),
+        "php_fastcgi" => adapt_php_fastcgi(d),
         "intercept" => adapt_intercept(d),
         "forward_auth" => adapt_forward_auth(d),
         "respond" => adapt_respond(d),
@@ -142,6 +144,199 @@ pub(super) fn adapt_handler(
             None => AdapterError::UnknownDirective(other.to_string()),
         }),
     }
+}
+
+/// 🐘 Expands Caddy's `php_fastcgi` shortcut into a route pipeline.
+///
+/// The shortcut is exactly what upstream's parser produces: a canonical-path
+/// redirect route, a try_files rewrite route, and a FastCGI reverse proxy
+/// route, each guarded by its own matcher. Subdirectives the shortcut owns
+/// (`split`, `env`, `index`, `try_files`, timeouts) are consumed here;
+/// everything else is handed to the reverse_proxy parser so `lb_policy`,
+/// `header_up`, `handle_response` and the rest keep working unchanged.
+pub(super) fn adapt_php_fastcgi(d: Directive) -> Result<Handler, AdapterError> {
+    let upstreams: Vec<String> = d
+        .args
+        .iter()
+        .filter(|arg| !arg.starts_with('@') && !arg.starts_with('/'))
+        .cloned()
+        .collect();
+    if upstreams.is_empty() {
+        return Err(AdapterError::ArgumentCount(
+            "php_fastcgi".into(),
+            1,
+            d.args.len(),
+        ));
+    }
+
+    let mut fastcgi = pingclair_core::config::FastCgiTransportConfig {
+        root: None,
+        split_path: vec![".php".to_string()],
+        env: BTreeMap::new(),
+        resolve_root_symlink: false,
+        dial_timeout_ms: None,
+        read_timeout_ms: None,
+        write_timeout_ms: None,
+        capture_stderr: false,
+    };
+    let mut index_file = "index.php".to_string();
+    let mut try_files: Option<Vec<String>> = None;
+    let mut passthrough = Vec::new();
+    if let Some(block) = &d.block {
+        for sub in &block.directives {
+            match sub.name.as_str() {
+                "root" => {
+                    fastcgi.root = Some(expect_one_argument(sub)?.to_string());
+                }
+                "split" => {
+                    if sub.args.is_empty() {
+                        return Err(AdapterError::ArgumentCount(
+                            "php_fastcgi split".into(),
+                            1,
+                            0,
+                        ));
+                    }
+                    fastcgi.split_path = sub.args.clone();
+                }
+                "env" => match sub.args.as_slice() {
+                    [key, value] => {
+                        fastcgi.env.insert(key.clone(), value.clone());
+                    }
+                    _ => {
+                        return Err(AdapterError::ArgumentCount(
+                            "php_fastcgi env".into(),
+                            2,
+                            sub.args.len(),
+                        ));
+                    }
+                },
+                "index" => {
+                    let [value] = sub.args.as_slice() else {
+                        return Err(AdapterError::ArgumentCount(
+                            "php_fastcgi index".into(),
+                            1,
+                            sub.args.len(),
+                        ));
+                    };
+                    index_file = value.clone();
+                }
+                "try_files" => {
+                    if sub.args.is_empty() {
+                        return Err(AdapterError::ArgumentCount(
+                            "php_fastcgi try_files".into(),
+                            1,
+                            0,
+                        ));
+                    }
+                    try_files = Some(sub.args.clone());
+                }
+                "resolve_root_symlink" => {
+                    expect_no_arguments(sub)?;
+                    fastcgi.resolve_root_symlink = true;
+                }
+                "dial_timeout" => {
+                    fastcgi.dial_timeout_ms = Some(parse_required_duration(sub)?);
+                }
+                "read_timeout" => {
+                    fastcgi.read_timeout_ms = Some(parse_required_duration(sub)?);
+                }
+                "write_timeout" => {
+                    fastcgi.write_timeout_ms = Some(parse_required_duration(sub)?);
+                }
+                "capture_stderr" => {
+                    expect_no_arguments(sub)?;
+                    fastcgi.capture_stderr = true;
+                }
+                // 🧭 Everything else belongs to the reverse_proxy syntax and
+                // is passed through untouched.
+                _ => passthrough.push(sub.clone()),
+            }
+        }
+    }
+    validate_fastcgi_split_path(&fastcgi.split_path)?;
+
+    let reverse_proxy_d = Directive {
+        name: "reverse_proxy".to_string(),
+        args: upstreams,
+        block: if passthrough.is_empty() {
+            None
+        } else {
+            Some(Block {
+                directives: passthrough,
+            })
+        },
+        tokens: TokenRun::synthetic(),
+    };
+    let Handler::Proxy(mut proxy) = adapt_reverse_proxy(reverse_proxy_d)? else {
+        unreachable!("the reverse_proxy adapter returns a Proxy handler")
+    };
+    proxy.fastcgi = Some(fastcgi.clone());
+
+    let extensions = fastcgi.split_path.clone();
+    let mut elements = Vec::new();
+    if index_file != "off" {
+        let dir_index = format!("{{http.request.uri.path}}/{index_file}");
+        let (try_policy, dir_redir) = match &try_files {
+            Some(overrides) => {
+                let last_is_php = overrides.last().is_some_and(|last| last.ends_with(".php"));
+                (
+                    last_is_php.then_some("first_exist_fallback"),
+                    overrides.contains(&dir_index),
+                )
+            }
+            None => (Some("first_exist_fallback"), true),
+        };
+        let candidates = try_files.unwrap_or_else(|| {
+            vec![
+                "{http.request.uri.path}".to_string(),
+                dir_index.clone(),
+                index_file.clone(),
+            ]
+        });
+        if dir_redir {
+            elements.push(HandlerElement {
+                matcher: Some(Matcher::And(
+                    Box::new(Matcher::File {
+                        try_files: vec![dir_index],
+                        root: None,
+                        try_policy: None,
+                        split_path: Vec::new(),
+                    }),
+                    Box::new(Matcher::Not(Box::new(Matcher::Path(PathMatcher {
+                        patterns: vec!["*/".to_string()],
+                    })))),
+                )),
+                handler: Handler::Redirect(RedirectConfig {
+                    to: "{http.request.orig_uri.path}/{http.request.orig_uri.prefixed_query}"
+                        .to_string(),
+                    code: 308,
+                }),
+            });
+        }
+        elements.push(HandlerElement {
+            matcher: Some(Matcher::File {
+                try_files: candidates,
+                root: None,
+                try_policy: try_policy.map(str::to_string),
+                split_path: extensions.clone(),
+            }),
+            handler: Handler::Rewrite(RewriteConfig {
+                replace: Some("{http.matchers.file.relative}".to_string()),
+                ..Default::default()
+            }),
+        });
+    }
+    let path_patterns: Vec<String> = extensions
+        .iter()
+        .map(|extension| format!("*{extension}"))
+        .collect();
+    elements.push(HandlerElement {
+        matcher: Some(Matcher::Path(PathMatcher {
+            patterns: path_patterns,
+        })),
+        handler: Handler::Proxy(proxy),
+    });
+    Ok(Handler::Pipeline(elements))
 }
 
 /// 🔐 Adapts Caddy's `forward_auth` shortcut into a dedicated handler.

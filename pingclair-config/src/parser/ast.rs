@@ -480,6 +480,18 @@ pub enum Matcher {
         pattern: String,
     },
 
+    /// 📂 Match by file existence: `file { try_files …; split_path … }`.
+    File {
+        /// URI candidates tried in order; `{path}` expands per request.
+        try_files: Vec<String>,
+        /// Filesystem root; `None` inherits the site root at compile time.
+        root: Option<String>,
+        /// Selection policy; `None` means `first_exist`.
+        try_policy: Option<String>,
+        /// ASCII path split delimiters.
+        split_path: Vec<String>,
+    },
+
     /// Combined matchers with AND
     And(Box<Matcher>, Box<Matcher>),
 
@@ -683,6 +695,10 @@ pub struct ProxyConfig {
 
     /// 🧭 Transport tuning options without a runtime equivalent.
     pub transport_options: BTreeMap<String, String>,
+
+    /// 🧵 FastCGI transport selected by `transport fastcgi` or
+    /// `php_fastcgi`; `None` means the HTTP transports.
+    pub fastcgi: Option<pingclair_core::config::FastCgiTransportConfig>,
 
     /// 🧭 Response handlers evaluated before the client sees the response.
     pub handle_response: Vec<pingclair_core::config::ResponseHandlerConfig>,
@@ -1121,6 +1137,7 @@ impl ProxyConfig {
             request_buffer_bytes: None,
             response_buffer_bytes: None,
             transport_options: BTreeMap::new(),
+            fastcgi: None,
             handle_response: Vec::new(),
             lb_policy: None,
             lb_hash_key: None,

@@ -12,6 +12,7 @@ description = "Reverse proxy module for Pingclair"
 libc.workspace = true
 
 pingclair-core = { path = "../pingclair-core" }
+pingclair-fastcgi = { path = "../pingclair-fastcgi" }
 pingclair-static = { path = "../pingclair-static" }
 pingclair-tls = { path = "../pingclair-tls" }
 

@@ -71,6 +71,27 @@ pub struct ResponseInterception {
     pub header_set: Vec<(String, String)>,
     /// Full replacement response when a terminal handler replaced it.
     pub replacement: Option<InterceptedResponse>,
+    /// 🧭 Rewrite template a response subroute wants applied to the request
+    /// before its `file_server` runs.
+    pub request_rewrite: Option<String>,
+    /// 📂 A response subroute that ends in `file_server`; the caller serves
+    /// the rewritten request path from this root.
+    pub file_server: Option<ResponseFileServer>,
+}
+
+/// 📂 The file server a response subroute asked for.
+#[derive(Debug, Clone)]
+pub struct ResponseFileServer {
+    /// Document root; `"."` means read `{http.vars.root}` at request time.
+    pub root: String,
+    /// Index files tried for a directory path.
+    pub index: Vec<String>,
+    /// Whether directory listings were requested.
+    pub browse: bool,
+    /// Optional listing-entry ceiling.
+    pub browse_limit: Option<usize>,
+    /// Whether compression metadata should be announced.
+    pub compress: bool,
 }
 
 /// 🧭 Evaluates the ordered `handle_response` entries against one upstream
@@ -100,6 +121,8 @@ pub fn evaluate_response_handlers(
             header_remove: Vec::new(),
             header_set: Vec::new(),
             replacement: None,
+            request_rewrite: None,
+            file_server: None,
         });
     }
 
@@ -108,6 +131,8 @@ pub fn evaluate_response_handlers(
         header_remove: Vec::new(),
         header_set: Vec::new(),
         replacement: None,
+        request_rewrite: None,
+        file_server: None,
     };
     let mut copied: Vec<(String, String)> = Vec::new();
     for handler in &entry.handlers {
@@ -167,14 +192,34 @@ pub fn evaluate_response_handlers(
             HandlerConfig::CopyResponse { status_code } => {
                 outcome.passthrough_status = *status_code;
             }
+            HandlerConfig::Rewrite {
+                replace: Some(replace),
+                ..
+            } => {
+                outcome.request_rewrite = Some(replace.clone());
+            }
+            HandlerConfig::FileServer {
+                root,
+                index,
+                browse,
+                browse_limit,
+                compress,
+            } => {
+                outcome.file_server = Some(ResponseFileServer {
+                    root: root.clone(),
+                    index: index.clone(),
+                    browse: *browse,
+                    browse_limit: *browse_limit,
+                    compress: *compress,
+                });
+            }
             // 🧭 Response-context handlers that do not make sense nested
             // here are skipped; the caller logs a warning when one appears.
             HandlerConfig::Intercept { .. }
             | HandlerConfig::ForwardAuth(_)
-            | HandlerConfig::FileServer { .. }
             | HandlerConfig::ReverseProxy(_)
             | HandlerConfig::Redirect { .. }
-            | HandlerConfig::Rewrite { .. }
+            | HandlerConfig::Rewrite { replace: None, .. }
             | HandlerConfig::Templates { .. }
             | HandlerConfig::LogSkip
             | HandlerConfig::BasicAuth { .. }

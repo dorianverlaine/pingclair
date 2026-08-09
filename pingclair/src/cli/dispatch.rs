@@ -459,6 +459,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
             }
             let handler = HandlerConfig::ReverseProxy(Box::new(ReverseProxyConfig {
                 upstreams: to,
+                fastcgi: None,
                 dynamic_upstream: None,
                 handle_response: Vec::new(),
                 rewrite_method: None,

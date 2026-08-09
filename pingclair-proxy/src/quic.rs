@@ -1946,6 +1946,16 @@ async fn plan_h3_handler(
             }
         }
         HandlerConfig::FileServer { .. } => Ok(H3Plan::Terminal(H3Terminal::FileServer)),
+        // 🧵 FastCGI speaks a different wire protocol than HTTP; the H3
+        // planner has no FastCGI client, so a `php_fastcgi` route refuses
+        // over HTTP/3 rather than silently HTTP-proxying to php-fpm.
+        HandlerConfig::ReverseProxy(config) if config.fastcgi.is_some() => {
+            Ok(H3Plan::Respond(H3ImmediateResponse {
+                status: 501,
+                body: "php_fastcgi is not available on HTTP/3 yet".to_string(),
+                headers: Vec::new(),
+            }))
+        }
         HandlerConfig::ReverseProxy(_) => Ok(H3Plan::Terminal(H3Terminal::ReverseProxy)),
         // 🗂️ Parity with H1/H2 comes from sharing the resolver, not from
         // reproducing its rules here. This arm used to answer 501, which was

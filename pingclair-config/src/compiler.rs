@@ -388,6 +388,9 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
     // comes from `root`, so a bare `file_server` must inherit it.
     if let Some(site_root) = &server.root {
         for route in &mut config.routes {
+            if let Some(matcher) = &mut route.matcher {
+                apply_site_root_to_matcher(matcher, site_root);
+            }
             apply_site_root(&mut route.handler, site_root);
         }
     }
@@ -450,12 +453,42 @@ fn apply_site_root(handler: &mut pingclair_core::config::HandlerConfig, site_roo
                 *root = site_root.to_string();
             }
         }
+        // 🧵 The FastCGI transport's document root defaults to the site
+        // root, exactly like Caddy's `{http.vars.root}` default.
+        pingclair_core::config::HandlerConfig::ReverseProxy(config) => {
+            if let Some(fastcgi) = config.fastcgi.as_mut()
+                && fastcgi.root.is_none()
+            {
+                fastcgi.root = Some(site_root.to_string());
+            }
+        }
         pingclair_core::config::HandlerConfig::Pipeline { handlers }
         | pingclair_core::config::HandlerConfig::Handle { handlers }
         | pingclair_core::config::HandlerConfig::HandlePath { handlers, .. } => {
             for element in handlers {
+                if let Some(matcher) = &mut element.matcher {
+                    apply_site_root_to_matcher(matcher, site_root);
+                }
                 apply_site_root(&mut element.handler, site_root);
             }
+        }
+        _ => {}
+    }
+}
+
+/// 📂 Fills a `file` matcher's root with the site root, recursively.
+fn apply_site_root_to_matcher(matcher: &mut pingclair_core::config::Matcher, site_root: &str) {
+    match matcher {
+        pingclair_core::config::Matcher::File { root, .. } if root.is_none() => {
+            *root = Some(site_root.to_string());
+        }
+        pingclair_core::config::Matcher::And(left, right)
+        | pingclair_core::config::Matcher::Or(left, right) => {
+            apply_site_root_to_matcher(left, site_root);
+            apply_site_root_to_matcher(right, site_root);
+        }
+        pingclair_core::config::Matcher::Not(inner) => {
+            apply_site_root_to_matcher(inner, site_root);
         }
         _ => {}
     }
@@ -1535,6 +1568,17 @@ fn compile_matcher(
             field: field.clone(),
             pattern: pattern.clone(),
         },
+        Matcher::File {
+            try_files,
+            root,
+            try_policy,
+            split_path,
+        } => CoreMatcher::File {
+            try_files: try_files.clone(),
+            root: root.clone(),
+            try_policy: try_policy.clone(),
+            split_path: split_path.clone(),
+        },
         Matcher::And(left, right) => CoreMatcher::And(
             Box::new(compile_matcher(left, matchers, depth + 1)?),
             Box::new(compile_matcher(right, matchers, depth + 1)?),
@@ -1565,6 +1609,7 @@ fn compile_handler(
                 request_buffer_bytes: proxy.request_buffer_bytes,
                 response_buffer_bytes: proxy.response_buffer_bytes,
                 transport_options: proxy.transport_options.clone(),
+                fastcgi: proxy.fastcgi.clone().map(Box::new),
                 upstream_options: proxy
                     .upstream_options
                     .iter()

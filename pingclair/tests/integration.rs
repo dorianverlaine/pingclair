@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dorian Verlaine
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 
 struct TestServer {
     process: Child,
@@ -7976,5 +7980,474 @@ async fn test_malformed_content_length_is_rejected_before_it_reaches_the_origin(
     assert!(
         !seen.contains("/probe"),
         "a request with a malformed Content-Length reached the origin:\n{seen}"
+    );
+}
+
+// MARK: - FastCGI (php_fastcgi)
+
+/// 🧾 One request the mock responder recorded: CGI environment and body.
+type FastCgiReceivedRequest = (std::collections::BTreeMap<String, String>, Vec<u8>);
+
+/// 🧵 A scripted FastCGI responder for the end-to-end `php_fastcgi` tests.
+///
+/// The responder speaks just enough of the protocol for PHP-FPM's side of a
+/// request: read `BEGIN_REQUEST`, collect `PARAMS` until the empty record,
+/// drain `STDIN`, then write the configured CGI response as `STDOUT`
+/// records and finish with `END_REQUEST`. Each connection serves one
+/// request, like Caddy's own FastCGI client.
+struct MockFastCgi {
+    port: u16,
+    /// The full CGI response (headers plus optional body) served next.
+    response: Arc<Mutex<Vec<u8>>>,
+    /// One entry per received request: the environment and body bytes.
+    requests: Arc<Mutex<Vec<FastCgiReceivedRequest>>>,
+    stop: Arc<AtomicBool>,
+    accept_thread: Option<thread::JoinHandle<()>>,
+}
+
+impl MockFastCgi {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind the FastCGI responder");
+        let port = listener.local_addr().unwrap().port();
+        let response = Arc::new(Mutex::new(
+            b"Status: 200 OK\r\nContent-Type: text/plain\r\n\r\nhello from php".to_vec(),
+        ));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_response = response.clone();
+        let thread_requests = requests.clone();
+        let thread_stop = stop.clone();
+        let accept_thread = thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !thread_stop.load(Ordering::Relaxed) {
+                let (stream, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let response = thread_response.clone();
+                let requests = thread_requests.clone();
+                thread::spawn(move || {
+                    let _ = MockFastCgi::serve_one(stream, response, requests);
+                });
+            }
+        });
+        Self {
+            port,
+            response,
+            requests,
+            stop,
+            accept_thread: Some(accept_thread),
+        }
+    }
+
+    /// 🧵 Serves one FastCGI request on `stream`.
+    fn serve_one(
+        mut stream: std::net::TcpStream,
+        response: Arc<Mutex<Vec<u8>>>,
+        requests: Arc<Mutex<Vec<FastCgiReceivedRequest>>>,
+    ) -> std::io::Result<()> {
+        let mut env = std::collections::BTreeMap::new();
+        let mut body = Vec::new();
+        loop {
+            let (record_type, content) = read_fcgi_record(&mut stream)?;
+            match record_type {
+                4 => {
+                    if content.is_empty() {
+                        continue;
+                    }
+                    let mut offset = 0;
+                    while offset < content.len() {
+                        let name_len = read_fcgi_size(&content, &mut offset)?;
+                        let value_len = read_fcgi_size(&content, &mut offset)?;
+                        let name = String::from_utf8_lossy(&content[offset..offset + name_len])
+                            .into_owned();
+                        offset += name_len;
+                        let value = String::from_utf8_lossy(&content[offset..offset + value_len])
+                            .into_owned();
+                        offset += value_len;
+                        env.insert(name, value);
+                    }
+                }
+                5 => {
+                    if content.is_empty() {
+                        break;
+                    }
+                    body.extend_from_slice(&content);
+                }
+                _ => {}
+            }
+        }
+        requests.lock().unwrap().push((env, body));
+
+        let bytes = response.lock().unwrap().clone();
+        for chunk in bytes.chunks(65_000) {
+            write_fcgi_record(&mut stream, 6, chunk)?;
+        }
+        write_fcgi_record(&mut stream, 6, &[])?;
+        let mut end = [0u8; 8];
+        end[4] = 0;
+        write_fcgi_record(&mut stream, 3, &end)?;
+        Ok(())
+    }
+}
+
+impl Drop for MockFastCgi {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.accept_thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// 📡 Reads one FastCGI record's header, content, and padding.
+fn read_fcgi_record(stream: &mut std::net::TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
+    let mut header = [0u8; 8];
+    stream.read_exact(&mut header)?;
+    let content_length = u16::from_be_bytes([header[4], header[5]]) as usize;
+    let padding = header[6] as usize;
+    let mut content = vec![0u8; content_length];
+    stream.read_exact(&mut content)?;
+    let mut skip = vec![0u8; padding];
+    stream.read_exact(&mut skip)?;
+    Ok((header[1], content))
+}
+
+/// 📤 Writes one FastCGI record with padding to the 8-byte boundary.
+fn write_fcgi_record(
+    stream: &mut std::net::TcpStream,
+    record_type: u8,
+    content: &[u8],
+) -> std::io::Result<()> {
+    let padding = (8 - (content.len() % 8)) % 8;
+    let mut frame = Vec::with_capacity(8 + content.len() + padding);
+    frame.push(1);
+    frame.push(record_type);
+    frame.extend_from_slice(&1u16.to_be_bytes());
+    frame.extend_from_slice(&(content.len() as u16).to_be_bytes());
+    frame.push(padding as u8);
+    frame.push(0);
+    frame.extend_from_slice(content);
+    frame.resize(frame.len() + padding, 0);
+    stream.write_all(&frame)
+}
+
+/// 📐 Reads one FastCGI name/value length (1 or 4 bytes, high bit set).
+fn read_fcgi_size(content: &[u8], offset: &mut usize) -> std::io::Result<usize> {
+    let first = *content.get(*offset).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "truncated FastCGI params",
+        )
+    })?;
+    if first & 0x80 == 0 {
+        *offset += 1;
+        Ok(first as usize)
+    } else {
+        let raw = u32::from_be_bytes([
+            first,
+            content[*offset + 1],
+            content[*offset + 2],
+            content[*offset + 3],
+        ]);
+        *offset += 4;
+        Ok((raw & 0x7fff_ffff) as usize)
+    }
+}
+
+/// 🐘 The `php_fastcgi` shortcut really talks FastCGI to PHP-FPM.
+#[tokio::test]
+async fn test_php_fastcgi_proxies_to_a_fastcgi_responder() {
+    let responder = MockFastCgi::start();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("index.php"),
+        "<?php // served by the responder",
+    )
+    .unwrap();
+    let root = root.path().to_str().unwrap().replace("\\", "/");
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            php_fastcgi 127.0.0.1:{fcgi_port} {{
+                env FOO bar
+            }}
+        }}
+        "#,
+        fcgi_port = responder.port
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let response = client
+        .get(server.url(0, "/index.php"))
+        .send()
+        .await
+        .unwrap();
+    if response.status() != 200 {
+        eprintln!(
+            "stderr:\n{}",
+            std::fs::read_to_string(&server.stderr_path).unwrap_or_default()
+        );
+        eprintln!(
+            "stdout:\n{}",
+            std::fs::read_to_string(&server.stdout_path).unwrap_or_default()
+        );
+    }
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "hello from php");
+
+    // 🎯 The responder must have seen the CGI environment the transport
+    // promises: script filename under the site root, method, scheme, and the
+    // configured env override.
+    let (env, body) = responder
+        .requests
+        .lock()
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("the responder saw one request");
+    assert_eq!(env.get("REQUEST_METHOD").map(String::as_str), Some("GET"));
+    assert_eq!(
+        env.get("SERVER_PROTOCOL").map(String::as_str),
+        Some("HTTP/1.1")
+    );
+    assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
+    assert_eq!(
+        env.get("SCRIPT_FILENAME").map(String::as_str),
+        Some(format!("{root}/index.php").as_str())
+    );
+    assert!(body.is_empty(), "a GET carries no STDIN body");
+}
+
+/// 🐘 POST bodies stream to the responder with their declared length.
+#[tokio::test]
+async fn test_php_fastcgi_streams_a_post_body() {
+    let responder = MockFastCgi::start();
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().to_str().unwrap().replace("\\", "/");
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            php_fastcgi 127.0.0.1:{fcgi_port}
+        }}
+        "#,
+        fcgi_port = responder.port
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = no_proxy_client()
+        .post(server.url(0, "/submit.php"))
+        .body("uploaded-bytes")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let (env, body) = responder
+        .requests
+        .lock()
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("the responder saw one request");
+    assert_eq!(env.get("REQUEST_METHOD").map(String::as_str), Some("POST"));
+    assert_eq!(env.get("CONTENT_LENGTH").map(String::as_str), Some("14"));
+    assert_eq!(body, b"uploaded-bytes");
+}
+
+/// 🐘 `handle_response` in `php_fastcgi` serves the configured error page
+/// when the responder raises a 4xx/5xx.
+#[tokio::test]
+async fn test_php_fastcgi_handle_response_serves_an_error_page() {
+    let responder = MockFastCgi::start();
+    *responder.response.lock().unwrap() =
+        b"Status: 404 Not Found\r\nContent-Type: text/plain\r\n\r\n".to_vec();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("index.php"), "<?php").unwrap();
+    let errors = tempfile::tempdir().unwrap();
+    std::fs::write(errors.path().join("404.html"), "custom-error-page").unwrap();
+    let root = root.path().to_str().unwrap().replace("\\", "/");
+    let errors = errors.path().to_str().unwrap().replace("\\", "/");
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            php_fastcgi 127.0.0.1:{fcgi_port} {{
+                @err status 4xx
+                handle_response @err {{
+                    root * {errors}
+                    rewrite * /{{http.reverse_proxy.status_code}}.html
+                    file_server
+                }}
+            }}
+        }}
+        "#,
+        fcgi_port = responder.port
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/index.php"))
+        .send()
+        .await
+        .unwrap();
+    if response.status() != 200 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        eprintln!(
+            "stderr:\n{}",
+            std::fs::read_to_string(&server.stderr_path).unwrap_or_default()
+        );
+        eprintln!(
+            "stdout:\n{}",
+            std::fs::read_to_string(&server.stdout_path).unwrap_or_default()
+        );
+    }
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "custom-error-page");
+}
+
+/// 🚫 A body without Content-Length is refused with 411, exactly like
+/// Caddy's FastCGI client, because PHP-FPM needs the length before STDIN.
+#[tokio::test]
+async fn test_php_fastcgi_refuses_a_chunked_body() {
+    let responder = MockFastCgi::start();
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().to_str().unwrap().replace("\\", "/");
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            php_fastcgi 127.0.0.1:{fcgi_port}
+        }}
+        "#,
+        fcgi_port = responder.port
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let mut stream = tokio::net::TcpStream::connect(server.address(0))
+        .await
+        .unwrap();
+    let request = "POST /index.php HTTP/1.1\r\nHost: chunked\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response),
+    )
+    .await;
+    let text = String::from_utf8_lossy(&response);
+    assert!(
+        text.starts_with("HTTP/1.1 411 "),
+        "a chunked FastCGI body must be refused with 411, got:\n{text}"
+    );
+    assert!(
+        responder.requests.lock().unwrap().is_empty(),
+        "the responder must never see a body that was refused"
+    );
+}
+
+/// 🧭 The shortcut's canonical redirect sends a directory request without a
+/// trailing slash to the slash form, using the original URI placeholders.
+#[tokio::test]
+async fn test_php_fastcgi_canonical_directory_redirect() {
+    let responder = MockFastCgi::start();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("blog")).unwrap();
+    std::fs::write(root.path().join("blog/index.php"), "<?php").unwrap();
+    let root = root.path().to_str().unwrap().replace("\\", "/");
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            php_fastcgi 127.0.0.1:{fcgi_port}
+        }}
+        "#,
+        fcgi_port = responder.port
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let no_redirect_client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let response = no_redirect_client
+        .get(server.url(0, "/blog?page=2"))
+        .send()
+        .await
+        .unwrap();
+    if response.status() != 308 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        eprintln!(
+            "stderr:\n{}",
+            std::fs::read_to_string(&server.stderr_path).unwrap_or_default()
+        );
+        eprintln!(
+            "stdout:\n{}",
+            std::fs::read_to_string(&server.stdout_path).unwrap_or_default()
+        );
+    }
+    assert_eq!(response.status(), 308);
+    assert_eq!(
+        response.headers().get("location").unwrap(),
+        "/blog/?page=2",
+        "the redirect must keep the original path and query"
     );
 }

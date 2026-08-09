@@ -1821,10 +1821,10 @@ mod fail_closed_tests {
 
     #[test]
     fn known_caddy_directives_are_reported_as_unsupported() {
-        let error = compile_err("example.com {\n    php_fastcgi localhost:9000\n}");
+        let error = compile_err("example.com {\n    metrics\n}");
         assert!(
             error.contains("not supported by Pingclair") || error.contains("Unknown directive"),
-            "php_fastcgi must be rejected; got {error}"
+            "a recognised-but-unimplemented directive must be rejected; got {error}"
         );
     }
 
@@ -3182,5 +3182,175 @@ mod matcher_inside_route_body_tests {
     fn a_directive_whose_argument_is_data_is_not_caught() {
         compile("example.com {\n\troute {\n\t\tfile_server /var/www\n\t}\n}")
             .expect("a file server root is data, not a matcher");
+    }
+}
+
+// MARK: - php_fastcgi
+
+/// 🐘 `php_fastcgi` expands into the guarded pipeline upstream's shortcut
+/// produces: canonical redirect, try_files rewrite, FastCGI proxy.
+#[cfg(test)]
+mod php_fastcgi_tests {
+    use crate::compile;
+    use pingclair_core::config::{HandlerConfig, Matcher};
+
+    fn proxy_from(source: &str) -> HandlerConfig {
+        let config = compile(source).unwrap_or_else(|error| panic!("must compile: {error}"));
+        let handler = &config.servers[0].routes[0].handler;
+        let HandlerConfig::Pipeline { handlers } = handler else {
+            panic!("php_fastcgi must compile to a pipeline, got {handler:?}");
+        };
+        handlers
+            .iter()
+            .find_map(|element| match &element.handler {
+                HandlerConfig::ReverseProxy(config) => {
+                    Some(HandlerConfig::ReverseProxy(config.clone()))
+                }
+                _ => None,
+            })
+            .expect("the pipeline must contain a reverse proxy")
+    }
+
+    /// 🎯 The default expansion carries the three matcher-guarded elements.
+    #[test]
+    fn php_fastcgi_expands_into_three_guarded_elements() {
+        let config = compile("example.com {\n\tphp_fastcgi localhost:9000\n}").unwrap();
+        let HandlerConfig::Pipeline { handlers } = &config.servers[0].routes[0].handler else {
+            panic!("expected a pipeline");
+        };
+        assert_eq!(handlers.len(), 3, "redirect, rewrite, and proxy");
+        assert!(matches!(&handlers[0].matcher, Some(Matcher::And(_, _))));
+        assert!(matches!(
+            &handlers[0].handler,
+            HandlerConfig::Redirect { code: 308, .. }
+        ));
+        assert!(matches!(&handlers[1].matcher, Some(Matcher::File { .. })));
+        assert!(matches!(
+            &handlers[1].handler,
+            HandlerConfig::Rewrite {
+                replace: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &handlers[2].matcher,
+            Some(Matcher::Path { patterns }) if patterns == &["*.php"]
+        ));
+    }
+
+    /// 🎯 `index off` skips the redirect and rewrite, leaving only the proxy.
+    #[test]
+    fn php_fastcgi_index_off_keeps_only_the_proxy() {
+        let config =
+            compile("example.com {\n\tphp_fastcgi localhost:9000 {\n\t\tindex off\n\t}\n}")
+                .unwrap();
+        let HandlerConfig::Pipeline { handlers } = &config.servers[0].routes[0].handler else {
+            panic!("expected a pipeline");
+        };
+        assert_eq!(handlers.len(), 1);
+        assert!(matches!(
+            handlers[0].handler,
+            HandlerConfig::ReverseProxy(_)
+        ));
+    }
+
+    /// 🧵 The shortcut's subdirectives reach the FastCGI transport.
+    #[test]
+    fn php_fastcgi_subdirectives_reach_the_transport() {
+        let handler = proxy_from(
+            "example.com {\n\tphp_fastcgi localhost:9000 {\n\t\tsplit .php .php5\n\t\tenv FOO bar\n\t\troot /var/www\n\t\tdial_timeout 3s\n\t}\n}",
+        );
+        let HandlerConfig::ReverseProxy(config) = handler else {
+            panic!("expected a reverse proxy");
+        };
+        let fastcgi = config.fastcgi.expect("fastcgi transport");
+        assert_eq!(fastcgi.split_path, [".php", ".php5"]);
+        assert_eq!(fastcgi.env.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(fastcgi.root.as_deref(), Some("/var/www"));
+        assert_eq!(fastcgi.dial_timeout_ms, Some(3_000));
+    }
+
+    /// 🧵 `transport fastcgi` inside a plain reverse_proxy is parsed too.
+    #[test]
+    fn reverse_proxy_transport_fastcgi_is_parsed() {
+        let config = compile(
+            "example.com {\n\treverse_proxy localhost:9000 {\n\t\ttransport fastcgi {\n\t\t\tsplit .php\n\t\t\tenv FOO bar\n\t\t}\n\t}\n}",
+        )
+        .unwrap();
+        let HandlerConfig::ReverseProxy(config) = &config.servers[0].routes[0].handler else {
+            panic!("expected a reverse proxy");
+        };
+        let fastcgi = config.fastcgi.as_ref().expect("fastcgi transport");
+        assert_eq!(fastcgi.split_path, [".php"]);
+        assert_eq!(fastcgi.env.get("FOO").map(String::as_str), Some("bar"));
+    }
+
+    /// 🚫 A non-ASCII split delimiter is refused, not silently unmatched.
+    #[test]
+    fn fastcgi_split_path_refuses_non_ascii() {
+        let error =
+            compile("example.com {\n\tphp_fastcgi localhost:9000 {\n\t\tsplit .php 分割\n\t}\n}")
+                .expect_err("non-ASCII split paths must be refused")
+                .to_string();
+        assert!(error.contains("non-ASCII"), "got {error}");
+    }
+
+    /// 🧭 `handle_response` accepts the root/rewrite/file_server shape the
+    /// `php_fastcgi` error-page fixture uses.
+    #[test]
+    fn php_fastcgi_handle_response_accepts_an_error_page_subroute() {
+        let handler = proxy_from(
+            r#"example.com {
+                php_fastcgi localhost:9000 {
+                    @err status 4xx
+                    handle_response @err {
+                        root * /errors
+                        rewrite * /{http.reverse_proxy.status_code}.html
+                        file_server
+                    }
+                }
+            }"#,
+        );
+        let HandlerConfig::ReverseProxy(config) = handler else {
+            panic!("expected a reverse proxy");
+        };
+        let entry = config
+            .handle_response
+            .first()
+            .expect("one handle_response entry");
+        assert_eq!(
+            entry
+                .matcher
+                .as_ref()
+                .map(|matcher| matcher.status_codes.as_slice()),
+            Some(&[4][..])
+        );
+        assert_eq!(entry.handlers.len(), 3);
+        assert!(matches!(
+            &entry.handlers[0],
+            HandlerConfig::Vars { values } if values.get("root").is_some()
+        ));
+        assert!(matches!(
+            &entry.handlers[1],
+            HandlerConfig::Rewrite {
+                replace: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &entry.handlers[2],
+            HandlerConfig::FileServer { .. }
+        ));
+    }
+
+    /// 📂 A named `file` matcher parses at the site level.
+    #[test]
+    fn named_file_matcher_is_parsed() {
+        let config = compile(
+            "example.com {\n\t@php {\n\t\tfile {\n\t\t\ttry_files {path} index.php\n\t\t\tsplit_path .php\n\t\t}\n\t}\n\trespond @php \"x\"\n}",
+        )
+        .unwrap();
+        let route = &config.servers[0].routes[0];
+        assert!(matches!(&route.matcher, Some(Matcher::File { .. })));
     }
 }

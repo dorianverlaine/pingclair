@@ -2,6 +2,7 @@
 // Copyright 2026 Dorian Verlaine
 
 use super::AdapterError;
+use super::args::expect_one_argument;
 use crate::parser::ast::*;
 use crate::parser::caddy_ast::{Block, Directive, TokenRun};
 
@@ -279,6 +280,75 @@ pub(super) fn parse_single_matcher_at(
         "path" => Ok(Matcher::Path(PathMatcher {
             patterns: d.args.clone(),
         })),
+        // 📂 `file <files…>` or `file { try_files …; split_path … }` matches
+        // requests whose candidate exists on disk, publishing
+        // `{http.matchers.file.*}` placeholders on a match.
+        "file" => {
+            let mut try_files = d.args.clone();
+            let mut root = None;
+            let mut try_policy = None;
+            let mut split_path = Vec::new();
+            if let Some(block) = &d.block {
+                for sub in &block.directives {
+                    match sub.name.as_str() {
+                        "root" => {
+                            root = Some(expect_one_argument(sub)?.to_string());
+                        }
+                        "try_files" => {
+                            if sub.args.is_empty() {
+                                return Err(AdapterError::ArgumentCount(
+                                    "file try_files".into(),
+                                    1,
+                                    0,
+                                ));
+                            }
+                            try_files.extend(sub.args.iter().cloned());
+                        }
+                        "try_policy" => {
+                            let policy = expect_one_argument(sub)?;
+                            if !matches!(
+                                policy,
+                                "first_exist"
+                                    | "first_exist_fallback"
+                                    | "largest_size"
+                                    | "smallest_size"
+                                    | "most_recently_modified"
+                            ) {
+                                return Err(AdapterError::InvalidArgument(
+                                    "file try_policy".into(),
+                                    policy.to_string(),
+                                ));
+                            }
+                            try_policy = Some(policy.to_string());
+                        }
+                        "split_path" => {
+                            if sub.args.is_empty() {
+                                return Err(AdapterError::ArgumentCount(
+                                    "file split_path".into(),
+                                    1,
+                                    0,
+                                ));
+                            }
+                            split_path.extend(sub.args.iter().cloned());
+                        }
+                        other => {
+                            return Err(AdapterError::UnknownDirective(format!("file: {other}")));
+                        }
+                    }
+                }
+            }
+            if try_files.is_empty() {
+                // 🧭 Upstream treats an omitted candidate list as the
+                // request path itself.
+                try_files.push("{path}".to_string());
+            }
+            Ok(Matcher::File {
+                try_files,
+                root,
+                try_policy,
+                split_path,
+            })
+        }
         "not" => {
             let inner = if let Some(block) = &d.block {
                 let mut matchers = block

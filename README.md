@@ -720,9 +720,9 @@ typo and never quietly ignored. A configuration using them does not start.
 
 Directives:
 
-  `abort` `acme_server` `copy_response` `copy_response_headers` `forward_auth`
+  `abort` `acme_server` `copy_response` `copy_response_headers`
   `fs` `intercept` `invoke` `log_append` `log_name`
-  `map` `method` `metrics` `php_fastcgi` `push`
+  `map` `method` `metrics` `push`
   `request_body` `request_header` `skip_log` `tracing`
 
 Global options:
@@ -738,8 +738,9 @@ Pingclair fits at all rather than being details you discover later:
 
 - **No DNS-01 challenge** (`acme_dns`, `tls { dns … }`), so **no wildcard
   certificates**, and no issuance on a host where port 80 is unreachable.
-- **No PHP** (`php_fastcgi`) and **no forward authentication**
-  (`forward_auth`).
+- **PHP runs through `php_fastcgi` over FastCGI** on HTTP/1.1 and HTTP/2;
+  HTTP/3 refuses FastCGI routes with 501 until the H3 planner grows its own
+  FastCGI client.
 - **Certificates and state are stored on local disk only** (`storage`), so
   several instances cannot share one certificate store.
 

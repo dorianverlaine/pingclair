@@ -558,6 +558,31 @@ pub enum Matcher {
         pattern: String,
     },
 
+    /// 📂 Match by file existence under a document root, exactly like
+    /// Caddy's `file` matcher.
+    ///
+    /// A match publishes `{http.matchers.file.relative}`, `.absolute`,
+    /// `.type` and `.remainder` into the request-scoped variables so the
+    /// rewrite that follows a `php_fastcgi` expansion can target the matched
+    /// file. A candidate spelled `=404` raises that status instead of
+    /// matching, matching the upstream matcher's error fallback.
+    File {
+        /// URI candidates tried in order; `{path}` expands to the request
+        /// path, and a trailing slash demands a directory.
+        try_files: Vec<String>,
+        /// Filesystem root the candidates are resolved against; `None`
+        /// means the current directory, like a file server without a root.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        root: Option<String>,
+        /// Selection policy: `first_exist` (default), `first_exist_fallback`,
+        /// `smallest_size`, `largest_size`, or `most_recently_modified`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        try_policy: Option<String>,
+        /// ASCII delimiters that split the path into a script and path info.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        split_path: Vec<String>,
+    },
+
     /// AND combination
     And(Box<Matcher>, Box<Matcher>),
 
@@ -615,6 +640,12 @@ impl<'de> Deserialize<'de> for Matcher {
                 name: Option<String>,
                 field: String,
                 pattern: String,
+            },
+            File {
+                try_files: Vec<String>,
+                root: Option<String>,
+                try_policy: Option<String>,
+                split_path: Vec<String>,
             },
             And(Box<Matcher>, Box<Matcher>),
             Or(Box<Matcher>, Box<Matcher>),
@@ -679,6 +710,17 @@ impl<'de> Deserialize<'de> for Matcher {
                 name,
                 field,
                 pattern,
+            },
+            Repr::Tagged(Tagged::File {
+                try_files,
+                root,
+                try_policy,
+                split_path,
+            }) => Matcher::File {
+                try_files,
+                root,
+                try_policy,
+                split_path,
             },
             Repr::Tagged(Tagged::And(left, right)) => Matcher::And(left, right),
             Repr::Tagged(Tagged::Or(left, right)) => Matcher::Or(left, right),
@@ -1144,6 +1186,11 @@ pub struct ReverseProxyConfig {
     /// Upstream URLs
     pub upstreams: Vec<String>,
 
+    /// 🧵 FastCGI transport chosen by `transport fastcgi` or the
+    /// `php_fastcgi` shortcut. `None` means the ordinary HTTP transports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fastcgi: Option<Box<FastCgiTransportConfig>>,
+
     /// 🧭 Upstream discovery that happens after configuration, from DNS
     /// records rather than a fixed list. When present, `upstreams` usually
     /// stays empty; both may coexist, with dynamic peers joining the pool.
@@ -1242,6 +1289,42 @@ pub struct ReverseProxyConfig {
     /// 🗄️ Response caching for this route, off unless configured.
     #[serde(default)]
     pub cache: Option<Box<CacheConfig>>,
+}
+
+/// 🧵 The FastCGI transport: how PHP-FPM is spoken to.
+///
+/// Caddy's `transport fastcgi { … }` block and the `php_fastcgi` shortcut
+/// both compile into this shape. `dial_timeout`, `read_timeout` and
+/// `write_timeout` are millisecond durations; `root` defaults to the site's
+/// `root` directive at compile time.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct FastCgiTransportConfig {
+    /// 📂 Document root reported to the responder as `DOCUMENT_ROOT`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+    /// 🪚 ASCII path split delimiters (`.php`, `.php5`); comparison is
+    /// case-insensitive and non-ASCII entries are refused at load time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub split_path: Vec<String>,
+    /// 🧰 Extra environment variables sent to the responder.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// 🔗 Resolve `root` symlinks before reporting `DOCUMENT_ROOT`; PHP's
+    /// opcache caches the path, so a changing symlink needs the real path.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resolve_root_symlink: bool,
+    /// 🔌 Connect deadline in milliseconds; default 3s like upstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dial_timeout_ms: Option<u64>,
+    /// ⏱️ Read deadline in milliseconds per record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_timeout_ms: Option<u64>,
+    /// ⏱️ Write deadline in milliseconds per record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_timeout_ms: Option<u64>,
+    /// ⚠️ Keep the responder's stderr for the access log; discarded when off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub capture_stderr: bool,
 }
 
 /// 🧭 A matcher evaluated against an upstream response: status and headers.
@@ -2281,6 +2364,29 @@ mod tests {
     }
 
     #[test]
+    fn fastcgi_transport_round_trips_and_legacy_proxies_load_without_it() {
+        let fastcgi = FastCgiTransportConfig {
+            root: Some("/srv/www".to_string()),
+            split_path: vec![".php".to_string()],
+            env: BTreeMap::from([("FOO".to_string(), "bar".to_string())]),
+            resolve_root_symlink: true,
+            dial_timeout_ms: Some(3_000),
+            read_timeout_ms: Some(10_000),
+            write_timeout_ms: Some(20_000),
+            capture_stderr: true,
+        };
+        let json = serde_json::to_string(&fastcgi).unwrap();
+        let back: FastCgiTransportConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, fastcgi);
+
+        // 🧭 A proxy document written before FastCGI existed loads unchanged,
+        // with the transport absent rather than defaulted to something wrong.
+        let legacy: ReverseProxyConfig =
+            serde_json::from_str(r#"{"upstreams":["127.0.0.1:9000"]}"#).unwrap();
+        assert!(legacy.fastcgi.is_none());
+    }
+
+    #[test]
     fn test_global_http3_defaults_to_true() {
         assert!(GlobalConfig::default().http3);
         assert!(GlobalConfig::default().trusted_proxies.is_empty());
@@ -2328,6 +2434,12 @@ mod tests {
             Matcher::And(Box::new(path("/a")), Box::new(path("/b"))),
             Matcher::Or(Box::new(path("/a")), Box::new(path("/b"))),
             Matcher::Not(Box::new(path("/admin/*"))),
+            Matcher::File {
+                try_files: vec!["{path}".into(), "index.php".into()],
+                root: Some("/srv/www".into()),
+                try_policy: Some("first_exist_fallback".into()),
+                split_path: vec![".php".into()],
+            },
         ] {
             assert_eq!(round_trip(&matcher), matcher, "{matcher:?}");
         }

@@ -14,4 +14,4 @@ mod file_server;
 mod mime;
 
 pub use compress::CompressionLevel;
-pub use file_server::{FileServer, FileServerConfig, ServedResponse};
+pub use file_server::{FileServer, FileServerConfig, ServedResponse, StreamingFile};

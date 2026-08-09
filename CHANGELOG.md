@@ -225,6 +225,15 @@ lets the rest converge.
   GHSA-f59h-q822-g45g) and falls through; anything else is streamed to the
   client. Incoming header names containing `_` are dropped, matching Caddy's
   default, so the underscore alias cannot smuggle past `copy_headers`.
+- 🧵 **`php_fastcgi` over a real FastCGI client.** The shortcut expands the
+  way upstream does — canonical-path redirect, `try_files` rewrite, and a
+  FastCGI reverse proxy, each with its own matcher — and the proxy speaks the
+  FastCGI 1.1 wire protocol itself: `BEGIN_REQUEST`, a streamed `PARAMS`
+  environment, a streamed request body, and a CGI response parsed from the
+  responder's `STDOUT`. Bodies stream record by record (bounded by 65,500
+  bytes), `handle_response` error pages can serve files from disk, and a body
+  without `Content-Length` is refused with 411 exactly like upstream's
+  client. HTTP/3 refuses FastCGI routes with 501 for now.
 - 📦 **Response caching.** RFC 9111 decides what may be stored, and a second
   identical request is served without asking the origin. The store is bounded
   by `max_size` (128 MiB unless you say otherwise) and evicts least-recently-

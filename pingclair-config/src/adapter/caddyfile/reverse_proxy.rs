@@ -111,117 +111,201 @@ pub(super) fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError>
                 }
                 "transport" => {
                     // transport http { read_timeout 300s; write_timeout 300s }
-                    if let Some(transport_block) = sub.block {
-                        let mut transport = TransportConfig {
-                            connect_timeout: None,
-                            first_byte_timeout: None,
-                            between_reads_timeout: None,
-                            read_timeout: None,
-                            write_timeout: None,
-                            tls: UpstreamTlsConfig::default(),
-                        };
-                        for t_sub in transport_block.directives {
-                            match t_sub.name.as_str() {
-                                "connect_timeout" => {
-                                    transport.connect_timeout =
-                                        Some(parse_required_duration(&t_sub)?);
-                                }
-                                "first_byte_timeout" => {
-                                    transport.first_byte_timeout =
-                                        Some(parse_required_duration(&t_sub)?);
-                                }
-                                "between_reads_timeout" => {
-                                    transport.between_reads_timeout =
-                                        Some(parse_required_duration(&t_sub)?);
-                                }
-                                "read_timeout" => {
-                                    transport.read_timeout = Some(parse_required_duration(&t_sub)?);
-                                }
-                                "write_timeout" => {
-                                    transport.write_timeout =
-                                        Some(parse_required_duration(&t_sub)?);
-                                }
-                                "tls" => {
-                                    expect_no_arguments(&t_sub)?;
-                                    transport.tls.enable = true;
-                                }
-                                "tls_server_name" => {
-                                    transport.tls.server_name =
-                                        Some(expect_one_argument(&t_sub)?.to_string());
-                                }
-                                "tls_trusted_ca_certs" => {
-                                    if t_sub.args.is_empty() {
-                                        return Err(AdapterError::ArgumentCount(
-                                            "tls_trusted_ca_certs".into(),
-                                            1,
-                                            0,
-                                        ));
+                    // transport fastcgi { split .php; env FOO bar }
+                    match sub.args.first().map(String::as_str).unwrap_or("http") {
+                        "http" => {
+                            if let Some(transport_block) = &sub.block {
+                                let mut transport = TransportConfig {
+                                    connect_timeout: None,
+                                    first_byte_timeout: None,
+                                    between_reads_timeout: None,
+                                    read_timeout: None,
+                                    write_timeout: None,
+                                    tls: UpstreamTlsConfig::default(),
+                                };
+                                for t_sub in &transport_block.directives {
+                                    match t_sub.name.as_str() {
+                                        "connect_timeout" => {
+                                            transport.connect_timeout =
+                                                Some(parse_required_duration(t_sub)?);
+                                        }
+                                        "first_byte_timeout" => {
+                                            transport.first_byte_timeout =
+                                                Some(parse_required_duration(t_sub)?);
+                                        }
+                                        "between_reads_timeout" => {
+                                            transport.between_reads_timeout =
+                                                Some(parse_required_duration(t_sub)?);
+                                        }
+                                        "read_timeout" => {
+                                            transport.read_timeout =
+                                                Some(parse_required_duration(t_sub)?);
+                                        }
+                                        "write_timeout" => {
+                                            transport.write_timeout =
+                                                Some(parse_required_duration(t_sub)?);
+                                        }
+                                        "tls" => {
+                                            expect_no_arguments(t_sub)?;
+                                            transport.tls.enable = true;
+                                        }
+                                        "tls_server_name" => {
+                                            transport.tls.server_name =
+                                                Some(expect_one_argument(t_sub)?.to_string());
+                                        }
+                                        "tls_trusted_ca_certs" => {
+                                            if t_sub.args.is_empty() {
+                                                return Err(AdapterError::ArgumentCount(
+                                                    "tls_trusted_ca_certs".into(),
+                                                    1,
+                                                    0,
+                                                ));
+                                            }
+                                            transport
+                                                .tls
+                                                .trusted_ca_certs
+                                                .extend(t_sub.args.iter().cloned());
+                                        }
+                                        "tls_client_auth" => {
+                                            // 🎫 Both halves are required together: a
+                                            // certificate without its key silently
+                                            // becomes an anonymous handshake that the
+                                            // upstream rejects much later.
+                                            if t_sub.args.len() != 2 {
+                                                return Err(AdapterError::ArgumentCount(
+                                                    "tls_client_auth".into(),
+                                                    2,
+                                                    t_sub.args.len(),
+                                                ));
+                                            }
+                                            transport.tls.client_cert = Some(t_sub.args[0].clone());
+                                            transport.tls.client_key = Some(t_sub.args[1].clone());
+                                        }
+                                        "tls_insecure_skip_verify" => {
+                                            expect_no_arguments(t_sub)?;
+                                            transport.tls.insecure_skip_verify = true;
+                                        }
+                                        // 🔌 Caddy's transport spells the connect and
+                                        // response-header timeouts under different
+                                        // names; both map onto the same runtime knobs.
+                                        "dial_timeout" => {
+                                            transport.connect_timeout =
+                                                Some(parse_required_duration(t_sub)?);
+                                        }
+                                        "response_header_timeout" => {
+                                            transport.first_byte_timeout =
+                                                Some(parse_required_duration(t_sub)?);
+                                        }
+                                        // 🧭 Tuning knobs without a runtime equivalent
+                                        // are kept verbatim in the compiled config and
+                                        // logged at startup; accepting them silently
+                                        // would tell an operator a knob took effect.
+                                        other @ ("read_buffer"
+                                        | "write_buffer"
+                                        | "max_response_header"
+                                        | "dial_fallback_delay"
+                                        | "expect_continue_timeout"
+                                        | "resolvers"
+                                        | "versions"
+                                        | "compression"
+                                        | "max_conns_per_host"
+                                        | "keepalive_idle_conns_per_host"
+                                        | "keepalive_interval"
+                                        | "tls_renegotiation"
+                                        | "tls_except_ports") => {
+                                            proxy
+                                                .transport_options
+                                                .insert(other.to_string(), t_sub.args.join(" "));
+                                        }
+                                        _ => {
+                                            return Err(AdapterError::UnknownDirective(format!(
+                                                "transport http: {}",
+                                                t_sub.name
+                                            )));
+                                        }
                                     }
-                                    transport
-                                        .tls
-                                        .trusted_ca_certs
-                                        .extend(t_sub.args.iter().cloned());
                                 }
-                                "tls_client_auth" => {
-                                    // 🎫 Both halves are required together: a certificate
-                                    // without its key silently becomes an anonymous
-                                    // handshake that the upstream rejects much later.
-                                    if t_sub.args.len() != 2 {
-                                        return Err(AdapterError::ArgumentCount(
-                                            "tls_client_auth".into(),
-                                            2,
-                                            t_sub.args.len(),
-                                        ));
-                                    }
-                                    transport.tls.client_cert = Some(t_sub.args[0].clone());
-                                    transport.tls.client_key = Some(t_sub.args[1].clone());
-                                }
-                                "tls_insecure_skip_verify" => {
-                                    expect_no_arguments(&t_sub)?;
-                                    transport.tls.insecure_skip_verify = true;
-                                }
-                                // 🔌 Caddy's transport spells the connect and
-                                // response-header timeouts under different
-                                // names; both map onto the same runtime knobs.
-                                "dial_timeout" => {
-                                    transport.connect_timeout =
-                                        Some(parse_required_duration(&t_sub)?);
-                                }
-                                "response_header_timeout" => {
-                                    transport.first_byte_timeout =
-                                        Some(parse_required_duration(&t_sub)?);
-                                }
-                                // 🧭 Tuning knobs without a runtime equivalent
-                                // are kept verbatim in the compiled config and
-                                // logged at startup; accepting them silently
-                                // would tell an operator a knob took effect.
-                                other @ ("read_buffer"
-                                | "write_buffer"
-                                | "max_response_header"
-                                | "dial_fallback_delay"
-                                | "expect_continue_timeout"
-                                | "resolvers"
-                                | "versions"
-                                | "compression"
-                                | "max_conns_per_host"
-                                | "keepalive_idle_conns_per_host"
-                                | "keepalive_interval"
-                                | "tls_renegotiation"
-                                | "tls_except_ports") => {
-                                    proxy
-                                        .transport_options
-                                        .insert(other.to_string(), t_sub.args.join(" "));
-                                }
-                                _ => {
-                                    return Err(AdapterError::UnknownDirective(format!(
-                                        "transport http: {}",
-                                        t_sub.name
-                                    )));
-                                }
+                                validate_upstream_tls(&transport.tls)?;
+                                proxy.transport = Some(transport);
                             }
                         }
-                        validate_upstream_tls(&transport.tls)?;
-                        proxy.transport = Some(transport);
+                        "fastcgi" => {
+                            let mut fastcgi = pingclair_core::config::FastCgiTransportConfig {
+                                root: None,
+                                split_path: Vec::new(),
+                                env: std::collections::BTreeMap::new(),
+                                resolve_root_symlink: false,
+                                dial_timeout_ms: None,
+                                read_timeout_ms: None,
+                                write_timeout_ms: None,
+                                capture_stderr: false,
+                            };
+                            if let Some(transport_block) = &sub.block {
+                                for t_sub in &transport_block.directives {
+                                    match t_sub.name.as_str() {
+                                        "root" => {
+                                            fastcgi.root =
+                                                Some(expect_one_argument(t_sub)?.to_string());
+                                        }
+                                        "split" => {
+                                            if t_sub.args.is_empty() {
+                                                return Err(AdapterError::ArgumentCount(
+                                                    "transport fastcgi split".into(),
+                                                    1,
+                                                    0,
+                                                ));
+                                            }
+                                            fastcgi.split_path = t_sub.args.clone();
+                                        }
+                                        "env" => match t_sub.args.as_slice() {
+                                            [key, value] => {
+                                                fastcgi.env.insert(key.clone(), value.clone());
+                                            }
+                                            _ => {
+                                                return Err(AdapterError::ArgumentCount(
+                                                    "transport fastcgi env".into(),
+                                                    2,
+                                                    t_sub.args.len(),
+                                                ));
+                                            }
+                                        },
+                                        "resolve_root_symlink" => {
+                                            expect_no_arguments(t_sub)?;
+                                            fastcgi.resolve_root_symlink = true;
+                                        }
+                                        "dial_timeout" => {
+                                            fastcgi.dial_timeout_ms =
+                                                Some(parse_required_duration(t_sub)?);
+                                        }
+                                        "read_timeout" => {
+                                            fastcgi.read_timeout_ms =
+                                                Some(parse_required_duration(t_sub)?);
+                                        }
+                                        "write_timeout" => {
+                                            fastcgi.write_timeout_ms =
+                                                Some(parse_required_duration(t_sub)?);
+                                        }
+                                        "capture_stderr" => {
+                                            expect_no_arguments(t_sub)?;
+                                            fastcgi.capture_stderr = true;
+                                        }
+                                        other => {
+                                            return Err(AdapterError::UnknownDirective(format!(
+                                                "transport fastcgi: {other}"
+                                            )));
+                                        }
+                                    }
+                                }
+                            }
+                            validate_fastcgi_split_path(&fastcgi.split_path)?;
+                            proxy.fastcgi = Some(fastcgi);
+                        }
+                        other => {
+                            return Err(AdapterError::UnsupportedFeature(
+                                "reverse_proxy transport".into(),
+                                format!("`{other}` is not a supported transport"),
+                            ));
+                        }
                     }
                 }
                 "cache" => {
@@ -1593,6 +1677,21 @@ fn parse_handle_response(
     })
 }
 
+/// 🛡️ Refuses non-ASCII split delimiters.
+///
+/// Matching is byte-wise ASCII case-insensitive, exactly like the upstream
+/// transport; a Unicode delimiter would silently never match, so it is
+/// refused rather than stored.
+pub(super) fn validate_fastcgi_split_path(split_path: &[String]) -> Result<(), AdapterError> {
+    if let Some(non_ascii) = split_path.iter().find(|split| !split.is_ascii()) {
+        return Err(AdapterError::InvalidArgument(
+            "transport fastcgi split".into(),
+            format!("split path `{non_ascii}` contains non-ASCII characters"),
+        ));
+    }
+    Ok(())
+}
+
 /// 🧭 Adapts one directive that may appear inside a `handle_response` block
 /// into the shared handler configuration.
 fn adapt_response_handler(
@@ -1680,6 +1779,60 @@ fn adapt_response_handler(
             };
             Ok(pingclair_core::config::HandlerConfig::Vars {
                 values: config.values,
+            })
+        }
+        // 📂 `root * /errors` inside a response subroute sets the document
+        // root the file server that follows serves from.
+        "root" => {
+            let args = if d.args.first().is_some_and(|arg| arg == "*") {
+                &d.args[1..]
+            } else {
+                &d.args[..]
+            };
+            let [root] = args else {
+                return Err(AdapterError::ArgumentCount("root".into(), 1, args.len()));
+            };
+            let mut values = std::collections::BTreeMap::new();
+            values.insert("root".to_string(), root.clone());
+            Ok(pingclair_core::config::HandlerConfig::Vars { values })
+        }
+        // 🧭 `rewrite * /{http.reverse_proxy.status_code}.html` retargets the
+        // request inside the response subroute before `file_server` runs.
+        "rewrite" => {
+            let handler = super::directives::adapt_rewrite(d.clone())?;
+            let Handler::Rewrite(config) = handler else {
+                unreachable!("the rewrite adapter returns a Rewrite handler")
+            };
+            if config.regex.is_some() || config.regex_replace.is_some() {
+                return Err(AdapterError::UnsupportedFeature(
+                    "handle_response rewrite".into(),
+                    "only a plain `<replacement>` rewrite is supported in response subroutes yet"
+                        .into(),
+                ));
+            }
+            Ok(pingclair_core::config::HandlerConfig::Rewrite {
+                strip_prefix: None,
+                strip_suffix: None,
+                replace: config.replace,
+                regex: config.regex,
+                regex_replace: config.regex_replace,
+            })
+        }
+        // 📂 `file_server` in a response subroute serves the rewritten path
+        // from the root declared by the `root` handler that preceded it.
+        "file_server" => {
+            if d.block.is_some() || !d.args.is_empty() {
+                return Err(AdapterError::UnsupportedFeature(
+                    "handle_response file_server".into(),
+                    "only a bare `file_server` is supported in response subroutes yet".into(),
+                ));
+            }
+            Ok(pingclair_core::config::HandlerConfig::FileServer {
+                root: ".".to_string(),
+                index: vec!["index.html".to_string()],
+                browse: false,
+                browse_limit: None,
+                compress: true,
             })
         }
         other => Err(AdapterError::UnsupportedFeature(

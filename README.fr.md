@@ -729,9 +729,9 @@ utilise ne démarre pas.
 
 Directives :
 
-  `abort` `acme_server` `copy_response` `copy_response_headers` `forward_auth`
+  `abort` `acme_server` `copy_response` `copy_response_headers`
   `fs` `intercept` `invoke` `log_append` `log_name`
-  `map` `method` `metrics` `php_fastcgi` `push`
+  `map` `method` `metrics` `push`
   `request_body` `request_header` `skip_log` `tracing`
 
 Options globales :
@@ -748,8 +748,9 @@ Pingclair convient, plutôt que d'être des détails découverts plus tard :
 - **Pas de challenge DNS-01** (`acme_dns`, `tls { dns … }`), donc **pas de
   certificat générique**, et pas d'émission sur un hôte dont le port 80 est
   injoignable.
-- **Pas de PHP** (`php_fastcgi`) ni d'authentification déléguée
-  (`forward_auth`).
+- **PHP passe par `php_fastcgi` via FastCGI** en HTTP/1.1 et HTTP/2 ;
+  l'HTTP/3 refuse les routes FastCGI avec un 501 tant que le planificateur H3
+  n'a pas son propre client FastCGI.
 - **Certificats et état uniquement sur disque local** (`storage`) : plusieurs
   instances ne peuvent pas partager un même magasin de certificats.
 

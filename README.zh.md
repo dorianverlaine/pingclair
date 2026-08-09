@@ -682,9 +682,9 @@ Pingclair 對外宣稱相容 Caddyfile，那麼這個宣稱誠實的另一半，
 
 Directive：
 
-  `abort` `acme_server` `copy_response` `copy_response_headers` `forward_auth`
+  `abort` `acme_server` `copy_response` `copy_response_headers`
   `fs` `intercept` `invoke` `log_append` `log_name`
-  `map` `method` `metrics` `php_fastcgi` `push`
+  `map` `method` `metrics` `push`
   `request_body` `request_header` `skip_log` `tracing`
 
 全域選項：
@@ -700,7 +700,8 @@ Directive：
 
 - **沒有 DNS-01 challenge**（`acme_dns`、`tls { dns … }`），所以**沒有萬用字元
   憑證**，80 埠不通的機器也簽不到憑證。
-- **沒有 PHP**（`php_fastcgi`）、**沒有 forward authentication**（`forward_auth`）。
+- **PHP 透過 `php_fastcgi` 以 FastCGI 提供**（HTTP/1.1 與 HTTP/2）；
+  HTTP/3 在 H3 planner 自備 FastCGI client 之前，會對 FastCGI route 回 501。
 - **憑證與狀態只存在本機磁碟**（`storage`），多個實例無法共用同一份憑證儲存。
 
 `handle_errors` 值得單獨一行：這個型別在程式碼裡存在但什麼都不做，
