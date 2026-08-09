@@ -543,6 +543,21 @@ pub enum Matcher {
     /// Match by request-scoped variable (`vars` matcher).
     Vars { name: String, values: Vec<String> },
 
+    /// Match the request path against a regular expression; captures are
+    /// written back as `{re.*}` placeholders when the matcher has a name.
+    PathRegexp {
+        name: Option<String>,
+        pattern: String,
+    },
+
+    /// Match a header against a regular expression; captures are written
+    /// back as `{re.*}` placeholders when the matcher has a name.
+    HeaderRegexp {
+        name: Option<String>,
+        field: String,
+        pattern: String,
+    },
+
     /// AND combination
     And(Box<Matcher>, Box<Matcher>),
 
@@ -591,6 +606,15 @@ impl<'de> Deserialize<'de> for Matcher {
             Vars {
                 name: String,
                 values: Vec<String>,
+            },
+            PathRegexp {
+                name: Option<String>,
+                pattern: String,
+            },
+            HeaderRegexp {
+                name: Option<String>,
+                field: String,
+                pattern: String,
             },
             And(Box<Matcher>, Box<Matcher>),
             Or(Box<Matcher>, Box<Matcher>),
@@ -644,6 +668,18 @@ impl<'de> Deserialize<'de> for Matcher {
             Repr::Tagged(Tagged::RemoteIp(ips)) => Matcher::RemoteIp(ips),
             Repr::Tagged(Tagged::Protocol(protocols)) => Matcher::Protocol(protocols),
             Repr::Tagged(Tagged::Vars { name, values }) => Matcher::Vars { name, values },
+            Repr::Tagged(Tagged::PathRegexp { name, pattern }) => {
+                Matcher::PathRegexp { name, pattern }
+            }
+            Repr::Tagged(Tagged::HeaderRegexp {
+                name,
+                field,
+                pattern,
+            }) => Matcher::HeaderRegexp {
+                name,
+                field,
+                pattern,
+            },
             Repr::Tagged(Tagged::And(left, right)) => Matcher::And(left, right),
             Repr::Tagged(Tagged::Or(left, right)) => Matcher::Or(left, right),
             Repr::Tagged(Tagged::Not(inner)) => Matcher::Not(inner),

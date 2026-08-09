@@ -464,18 +464,14 @@ pub(super) fn parse_single_matcher_at(
         "header_regexp" => {
             let (field, pattern) = match d.args.as_slice() {
                 [field, pattern] => (field, pattern),
-                // 🚫 The three-argument form names the capture groups so they
-                // can be read back as placeholders (`{re.name.1}`). We have no
-                // placeholders from matchers, so accepting the name would mean
-                // accepting a configuration whose whole purpose is a value we
-                // will never produce.
-                [_name, _field, _pattern] => {
-                    return Err(AdapterError::UnsupportedFeature(
-                        "header_regexp with a capture-group name".into(),
-                        "the name exists to read capture groups back as placeholders, which \
-                         Pingclair does not support; drop it to match without capturing"
-                            .into(),
-                    ));
+                // 🔍 The three-argument form names the capture groups so
+                // they can be read back as `{re.<name>.N}` placeholders.
+                [name, field, pattern] => {
+                    return Ok(Matcher::HeaderRegexp {
+                        name: Some(name.clone()),
+                        field: field.clone(),
+                        pattern: pattern.clone(),
+                    });
                 }
                 other => {
                     return Err(AdapterError::ArgumentCount(
@@ -496,10 +492,39 @@ pub(super) fn parse_single_matcher_at(
                 ));
             }
 
-            Ok(Matcher::Header(HeaderMatcher {
-                name: field.clone(),
-                condition: HeaderCondition::Regex(pattern.clone()),
-            }))
+            Ok(Matcher::HeaderRegexp {
+                name: None,
+                field: field.clone(),
+                pattern: pattern.clone(),
+            })
+        }
+        // 🔤 `path_regexp [<name>] <pattern>` matches the request path
+        // against a regular expression; the optional name makes capture
+        // groups readable as `{re.<name>.N}` placeholders.
+        "path_regexp" => {
+            if d.block.is_some() {
+                return Err(AdapterError::BlockNotAllowed("path_regexp".into()));
+            }
+            let (name, pattern) = match d.args.as_slice() {
+                [pattern] => (None, pattern.clone()),
+                [name, pattern] => (Some(name.clone()), pattern.clone()),
+                other => {
+                    return Err(AdapterError::ArgumentCount(
+                        "path_regexp".into(),
+                        2,
+                        other.len(),
+                    ));
+                }
+            };
+            // 🚫 An unparseable pattern would compile green and then match
+            // nothing, for the lifetime of the server.
+            if let Err(error) = regex::Regex::new(&pattern) {
+                return Err(AdapterError::InvalidArgument(
+                    "path_regexp".into(),
+                    format!("`{pattern}` is not a valid regular expression: {error}"),
+                ));
+            }
+            Ok(Matcher::PathRegexp { name, pattern })
         }
         "vars" => {
             // 🧰 The `vars` matcher reads one request-scoped variable and
@@ -533,7 +558,6 @@ pub(super) fn parse_single_matcher_at(
         }
         // 🚫 Matchers the format defines and this crate does not implement.
         // Each needs a capability we do not have rather than an arm here:
-        // `path_regexp` a path matcher that runs a regular expression,
         // `expression` an expression language, `vars_regexp` regex against
         // the variable subsystem, `url_pattern` the URLPattern syntax, and
         // `tls` access to the handshake from a matcher.
@@ -554,8 +578,5 @@ pub(super) fn parse_single_matcher_at(
 /// wrote `path_regexp` spelled it correctly, and telling them the word is
 /// unknown sends them looking for a spelling rather than a workaround.
 fn is_known_matcher(name: &str) -> bool {
-    matches!(
-        name,
-        "expression" | "path_regexp" | "url_pattern" | "vars_regexp" | "tls"
-    )
+    matches!(name, "expression" | "url_pattern" | "vars_regexp" | "tls")
 }

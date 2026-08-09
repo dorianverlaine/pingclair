@@ -1849,7 +1849,7 @@ impl PingclairProxy {
         method: &str,
         headers: &pingora_http::RequestHeader,
         remote_ip: &str,
-        vars: Option<&std::collections::BTreeMap<String, String>>,
+        vars: Option<&mut std::collections::BTreeMap<String, String>>,
     ) -> Option<(Arc<ProxyState>, Option<usize>, Option<HandlerConfig>)> {
         self.match_route_index(host, path, method, headers, remote_ip, vars)
             .map(|(state, route_index)| {
@@ -1868,7 +1868,7 @@ impl PingclairProxy {
         method: &str,
         headers: &pingora_http::RequestHeader,
         remote_ip: &str,
-        vars: Option<&std::collections::BTreeMap<String, String>>,
+        vars: Option<&mut std::collections::BTreeMap<String, String>>,
     ) -> Option<(Arc<ProxyState>, Option<usize>)> {
         // 🏠 Resolves the immutable state published for this virtual host.
         let state = self.get_state(host)?;
@@ -2719,7 +2719,7 @@ impl PingclairProxy {
         &self,
         precompile: Option<&MatcherPrecompile>,
         session: &Session,
-        ctx: &RequestContext,
+        ctx: &mut RequestContext,
         path: &str,
     ) -> bool {
         let Some(compiled) = precompile.and_then(|node| node.element_matcher.as_ref()) else {
@@ -2727,16 +2727,16 @@ impl PingclairProxy {
         };
         let host = authority_host(request_authority(session.req_header()));
         let remote_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
-        let request = MatcherRequest {
+        let mut request = MatcherRequest {
             path,
             method: session.req_header().method.as_str(),
             headers: &session.req_header().headers,
             host,
             remote_ip: remote_ip.as_deref().unwrap_or(""),
             protocol: ctx.request_scheme,
-            vars: Some(ctx.request_vars.as_map()),
+            vars: Some(ctx.request_vars.values_mut()),
         };
-        evaluate(compiled, &request)
+        evaluate(compiled, &mut request)
     }
 
     /// Handle a specific handler configuration
@@ -3889,6 +3889,12 @@ fn resolve_single_placeholder(
     if let Some(var_name) = name.strip_prefix("http.vars.") {
         return vars.get(var_name).unwrap_or("").to_string();
     }
+    // 🔍 `{re.<name>.<index>}`, `{re.<index>}` and named groups read regexp
+    // captures recorded by `path_regexp`/`header_regexp` matchers into the
+    // same request-scoped map.
+    if name == "re" || name.starts_with("re.") {
+        return vars.get(name).unwrap_or("").to_string();
+    }
 
     // 🧭 Caddy's `{host}` shorthand is the hostname without the port; the
     // port lives in `{hostport}` instead. Stripping it here keeps
@@ -4518,16 +4524,16 @@ impl ProxyHttp for PingclairProxy {
                 let compiled = state.vars_precompiles.get(index).and_then(Option::as_ref);
                 let matches = match compiled {
                     Some(compiled) => {
-                        let request = MatcherRequest {
+                        let mut request = MatcherRequest {
                             path,
                             method,
                             headers: &request_header.headers,
                             host,
                             remote_ip: &remote_ip,
                             protocol,
-                            vars: Some(ctx.request_vars.as_map()),
+                            vars: Some(ctx.request_vars.values_mut()),
                         };
-                        evaluate(compiled, &request)
+                        evaluate(compiled, &mut request)
                     }
                     None => true,
                 };
@@ -4552,7 +4558,7 @@ impl ProxyHttp for PingclairProxy {
                 host,
                 &remote_ip,
                 protocol,
-                Some(ctx.request_vars.as_map()),
+                Some(ctx.request_vars.values_mut()),
             ) {
                 let index = route.index;
                 (

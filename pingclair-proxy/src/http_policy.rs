@@ -39,6 +39,12 @@ impl RequestVars {
     pub fn as_map(&self) -> &BTreeMap<String, String> {
         &self.values
     }
+
+    /// 🔧 Mutable access for matcher evaluation, which writes regexp
+    /// captures into the same request-scoped state.
+    pub(crate) fn values_mut(&mut self) -> &mut BTreeMap<String, String> {
+        &mut self.values
+    }
 }
 
 /// 🌐 Extracts a hostname from HTTP authority syntax without breaking IPv6 literals.

@@ -129,6 +129,15 @@ lets the rest converge.
   transport. `vars` matcher placeholder keys stay refused: they resolve
   against the request's placeholder engine, which the router cannot reach.
 
+- 🔍 **Named regexp captures become `{re.*}` placeholders.**
+  `path_regexp [<name>] <pattern>` and
+  `header_regexp [<name>] <field> <pattern>` record their capture groups
+  when they match: `{re.<name>.<index>}`, `{re.<index>}`, and named groups
+  by their group name, resolved the way Caddy's replacer does. The three
+  `replaceable_upstream*` fixtures compile as a side effect, but their
+  runtime behaviour — capture values used as upstream addresses — belongs
+  to Phase H2, not this change.
+
 - 🗂️ **`try_files` resolves candidates under the site root and rewrites instead
   of serving.** It was previously reachable only from JSON, where it treated
   each candidate as a filesystem path and served any match itself through an

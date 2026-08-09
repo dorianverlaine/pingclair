@@ -465,6 +465,21 @@ pub enum Matcher {
     /// Match by request-scoped variable: vars("name", "value" | ...)
     Vars { name: String, values: Vec<String> },
 
+    /// Match the request path against a regular expression; an optional name
+    /// makes captures readable as `{re.<name>.N}` placeholders.
+    PathRegexp {
+        name: Option<String>,
+        pattern: String,
+    },
+
+    /// Match a header against a regular expression; an optional name makes
+    /// captures readable as `{re.<name>.N}` placeholders.
+    HeaderRegexp {
+        name: Option<String>,
+        field: String,
+        pattern: String,
+    },
+
     /// Combined matchers with AND
     And(Box<Matcher>, Box<Matcher>),
 

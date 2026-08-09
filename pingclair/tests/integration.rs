@@ -2262,6 +2262,68 @@ async fn test_vars_rules_placeholders_and_matcher() {
 }
 
 #[tokio::test]
+async fn test_regexp_capture_placeholders() {
+    // 🔍 `path_regexp` and `header_regexp` with a name record their capture
+    // groups, and `{re.<name>.N}` reads them back in the response.
+    let config = serde_json::json!({
+        "servers": [
+            {
+                "listen": ["127.0.0.1:0"],
+                "routes": [
+                    {
+                        "path": "/item/*",
+                        "matcher": {
+                            "path_regexp": {
+                                "name": "item",
+                                "pattern": "^/item/([0-9]+)$"
+                            }
+                        },
+                        "handler": {
+                            "type": "respond",
+                            "status": 200,
+                            "body": "item {re.item.1}"
+                        }
+                    },
+                    {
+                        "path": "/agent",
+                        "matcher": {
+                            "header_regexp": {
+                                "name": "ua",
+                                "field": "User-Agent",
+                                "pattern": "^Mozilla/([0-9]+)"
+                            }
+                        },
+                        "handler": {
+                            "type": "respond",
+                            "status": 200,
+                            "body": "ua {re.ua.1}"
+                        }
+                    }
+                ]
+            }
+        ]
+    })
+    .to_string();
+
+    let mut server = TestServer::new(&config);
+    let client = no_proxy_client();
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let resp = client.get(server.url(0, "/item/42")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "item 42");
+
+    let resp = client
+        .get(server.url(0, "/agent"))
+        .header("User-Agent", "Mozilla/5.0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "ua 5");
+}
+
+#[tokio::test]
 async fn test_custom_error_pages() {
     // 🎨 Verify custom pages for both static and upstream failures.
     let tmp_dir = tempfile::tempdir().unwrap();

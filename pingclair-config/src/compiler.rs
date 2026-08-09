@@ -1517,6 +1517,19 @@ fn compile_matcher(
             name: name.clone(),
             values: values.clone(),
         },
+        Matcher::PathRegexp { name, pattern } => CoreMatcher::PathRegexp {
+            name: name.clone(),
+            pattern: pattern.clone(),
+        },
+        Matcher::HeaderRegexp {
+            name,
+            field,
+            pattern,
+        } => CoreMatcher::HeaderRegexp {
+            name: name.clone(),
+            field: field.clone(),
+            pattern: pattern.clone(),
+        },
         Matcher::And(left, right) => CoreMatcher::And(
             Box::new(compile_matcher(left, matchers, depth + 1)?),
             Box::new(compile_matcher(right, matchers, depth + 1)?),

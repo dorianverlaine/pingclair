@@ -1550,7 +1550,7 @@ fn h3_element_matcher_matches(
     request_header: &RequestHeader,
     effective_uri: &str,
     verified_client_ip: &str,
-    request_vars: &crate::http_policy::RequestVars,
+    request_vars: &mut crate::http_policy::RequestVars,
 ) -> bool {
     let Some(compiled) = element_precompile.and_then(|node| node.element_matcher.as_ref()) else {
         return true;
@@ -1561,16 +1561,16 @@ fn h3_element_matcher_matches(
         .and_then(|v| v.to_str().ok())
         .map(authority_host)
         .unwrap_or("");
-    let request = MatcherRequest {
+    let mut request = MatcherRequest {
         path: effective_uri,
         method: request_header.method.as_str(),
         headers: &request_header.headers,
         host,
         remote_ip: verified_client_ip,
         protocol: "https",
-        vars: Some(request_vars.as_map()),
+        vars: Some(request_vars.values_mut()),
     };
-    evaluate(compiled, &request)
+    evaluate(compiled, &mut request)
 }
 
 /// 🧩 Executes non-terminal middleware before selecting an H3 terminal handler.
@@ -2121,16 +2121,16 @@ async fn handle_request_inner(
             let compiled = state.vars_precompiles.get(index).and_then(Option::as_ref);
             let matches = match compiled {
                 Some(compiled) => {
-                    let request = MatcherRequest {
+                    let mut request = MatcherRequest {
                         path: path_only,
                         method: req.method.as_str(),
                         headers: &header.headers,
                         host: &host_bare,
                         remote_ip: &verified_client_ip_text,
                         protocol: "https",
-                        vars: Some(request_vars.as_map()),
+                        vars: Some(request_vars.values_mut()),
                     };
-                    evaluate(compiled, &request)
+                    evaluate(compiled, &mut request)
                 }
                 None => true,
             };
@@ -2156,7 +2156,7 @@ async fn handle_request_inner(
                 &host_bare,
                 &verified_client_ip_text,
                 "https",
-                Some(request_vars.as_map()),
+                Some(request_vars.values_mut()),
             )
             .map(|route| route.index);
         (state, route_index)

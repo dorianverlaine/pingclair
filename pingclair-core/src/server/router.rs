@@ -18,9 +18,10 @@ pub struct MatcherRequest<'a> {
     pub host: &'a str,
     pub remote_ip: &'a str,
     pub protocol: &'a str,
-    /// 🧰 Request-scoped variables set by `vars` handlers, for the `vars`
-    /// matcher. `None` means no variables are visible, which matches nothing.
-    pub vars: Option<&'a std::collections::BTreeMap<String, String>>,
+    /// 🧰 Request-scoped variables and regexp captures, written and read by
+    /// the `vars` and regexp matchers. `None` means nothing is visible,
+    /// which matches nothing.
+    pub vars: Option<&'a mut std::collections::BTreeMap<String, String>>,
 }
 
 /// Pre-compiled matcher with cached regex
@@ -53,6 +54,11 @@ impl CompiledMatcher {
                     regexes.insert(pattern.clone(), Arc::new(re));
                 }
             }
+            Matcher::PathRegexp { pattern, .. } | Matcher::HeaderRegexp { pattern, .. } => {
+                if let Ok(re) = regex::Regex::new(pattern) {
+                    regexes.insert(pattern.clone(), Arc::new(re));
+                }
+            }
             Matcher::And(left, right) | Matcher::Or(left, right) => {
                 Self::collect_regexes(left, regexes);
                 Self::collect_regexes(right, regexes);
@@ -74,7 +80,7 @@ impl CompiledMatcher {
 /// attributes. This is the standalone primitive C2 will reuse for matchers
 /// attached to pipeline elements; the router calls the same function so the
 /// two paths cannot drift.
-pub fn evaluate(compiled: &CompiledMatcher, request: &MatcherRequest<'_>) -> bool {
+pub fn evaluate(compiled: &CompiledMatcher, request: &mut MatcherRequest<'_>) -> bool {
     evaluate_matcher_inner(&compiled.matcher, compiled, request)
 }
 
@@ -223,7 +229,7 @@ impl Router {
         host: &str,
         remote_ip: &str,
         protocol: &str,
-        vars: Option<&std::collections::BTreeMap<String, String>>,
+        vars: Option<&mut std::collections::BTreeMap<String, String>>,
     ) -> Option<&CompiledRoute> {
         let normalized_path = Self::normalize_request_path(path);
         self.match_normalized_request(
@@ -252,9 +258,9 @@ impl Router {
         host: &str,
         remote_ip: &str,
         protocol: &str,
-        vars: Option<&std::collections::BTreeMap<String, String>>,
+        vars: Option<&mut std::collections::BTreeMap<String, String>>,
     ) -> Option<&CompiledRoute> {
-        let request = MatcherRequest {
+        let mut request = MatcherRequest {
             path,
             method,
             headers,
@@ -269,18 +275,18 @@ impl Router {
         // request only to iterate it immediately.
         if let Ok(matched) = self.path_router.at(path) {
             for route in matched.value {
-                if Self::route_matches(route, &request) {
+                if Self::route_matches(route, &mut request) {
                     return Some(route);
                 }
             }
         }
         self.default_routes
             .iter()
-            .find(|route| Self::route_matches(route, &request))
+            .find(|route| Self::route_matches(route, &mut request))
     }
 
     /// 🔎 Evaluates the constraints attached to one precompiled route.
-    fn route_matches(route: &CompiledRoute, request: &MatcherRequest<'_>) -> bool {
+    fn route_matches(route: &CompiledRoute, request: &mut MatcherRequest<'_>) -> bool {
         if let Some(methods) = &route.config.methods
             && !methods
                 .iter()
@@ -434,7 +440,7 @@ impl Default for Router {
 fn evaluate_matcher_inner(
     matcher: &Matcher,
     compiled: &CompiledMatcher,
-    request: &MatcherRequest<'_>,
+    request: &mut MatcherRequest<'_>,
 ) -> bool {
     match matcher {
         Matcher::Path { patterns } => patterns
@@ -463,8 +469,39 @@ fn evaluate_matcher_inner(
         // variable that has not been set.
         Matcher::Vars { name, values } => request
             .vars
+            .as_deref_mut()
             .and_then(|vars| vars.get(name))
             .is_some_and(|value| values.iter().any(|candidate| candidate == value)),
+        // 🔍 A regexp matcher records its capture groups as `{re.*}`
+        // placeholders before answering, exactly like upstream: numeric
+        // groups under the matcher's name (or bare when unnamed), and named
+        // groups by their group name. A request with no variable map cannot
+        // record anything, so it never matches.
+        Matcher::PathRegexp { name, pattern } => {
+            let Some(regex) = compiled.compiled_regexes.get(pattern) else {
+                return false;
+            };
+            let Some(vars) = request.vars.as_deref_mut() else {
+                return false;
+            };
+            record_regexp_captures(vars, name.as_deref(), regex, request.path)
+        }
+        Matcher::HeaderRegexp {
+            name,
+            field,
+            pattern,
+        } => {
+            let Some(regex) = compiled.compiled_regexes.get(pattern) else {
+                return false;
+            };
+            let Some(value) = request.headers.get(field).and_then(|v| v.to_str().ok()) else {
+                return false;
+            };
+            let Some(vars) = request.vars.as_deref_mut() else {
+                return false;
+            };
+            record_regexp_captures(vars, name.as_deref(), regex, value)
+        }
         Matcher::And(left, right) => {
             evaluate_matcher_inner(left, compiled, request)
                 && evaluate_matcher_inner(right, compiled, request)
@@ -475,6 +512,45 @@ fn evaluate_matcher_inner(
         }
         Matcher::Not(inner) => !evaluate_matcher_inner(inner, compiled, request),
     }
+}
+
+/// 🔍 Writes one regex match's captures into the request's variable map.
+///
+/// Keys mirror Caddy's replacer: `{re.<name>.<index>}` (index 0 is the whole
+/// match) or `{re.<index>}` for an unnamed matcher, plus
+/// `{re.<name>.<group>}` / `{re.<group>}` for named groups.
+fn record_regexp_captures(
+    vars: &mut std::collections::BTreeMap<String, String>,
+    name: Option<&str>,
+    regex: &regex::Regex,
+    text: &str,
+) -> bool {
+    let Some(captures) = regex.captures(text) else {
+        return false;
+    };
+    for (index, value) in captures.iter().enumerate() {
+        let Some(value) = value else {
+            continue;
+        };
+        if let Some(name) = name {
+            vars.insert(format!("re.{name}.{index}"), value.as_str().to_string());
+        }
+        vars.insert(format!("re.{index}"), value.as_str().to_string());
+    }
+    for (index, group_name) in regex.capture_names().enumerate() {
+        if let Some(group_name) = group_name
+            && let Some(value) = captures.get(index)
+        {
+            if let Some(name) = name {
+                vars.insert(
+                    format!("re.{name}.{group_name}"),
+                    value.as_str().to_string(),
+                );
+            }
+            vars.insert(format!("re.{group_name}"), value.as_str().to_string());
+        }
+    }
+    true
 }
 
 /// 🔎 Evaluates one query-parameter condition against the request's query
@@ -785,8 +861,8 @@ mod tests {
             }
         }
 
-        assert!(evaluate(&compiled, &request(&matching)));
-        assert!(!evaluate(&compiled, &request(&empty)));
+        assert!(evaluate(&compiled, &mut request(&matching)));
+        assert!(!evaluate(&compiled, &mut request(&empty)));
     }
 
     /// 🛡️ A query matcher must actually evaluate the query string. The old

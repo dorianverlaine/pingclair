@@ -1089,14 +1089,10 @@ mod fail_closed_tests {
         assert!(error.contains("handle_path"), "got {error}");
     }
 
-    /// 🔤 `header_regexp` matches a header against a regular expression.
-    ///
-    /// Everything it needs already existed — the condition, its compilation,
-    /// and the router's compiled-regex cache. Only the adapter arm was
-    /// missing, which is why three corpus configurations failed on a feature
-    /// this crate could already execute.
+    /// 🔤 `header_regexp` matches a header against a regular expression and
+    /// keeps the matcher's optional name so captures become placeholders.
     #[test]
-    fn header_regexp_compiles_into_a_regex_condition() {
+    fn header_regexp_compiles_into_a_regex_matcher() {
         let config = crate::compile(
             "example.com {\n    @mobile header_regexp User-Agent (?i)android\n                 respond @mobile \"mobile\" 200\n    respond \"desktop\"\n}",
         )
@@ -1107,14 +1103,16 @@ mod fail_closed_tests {
             .find(|route| route.matcher.is_some())
             .expect("a matched route");
         match matched.matcher.as_ref().expect("a matcher") {
-            pingclair_core::config::Matcher::Header { name, condition } => {
-                assert_eq!(name, "User-Agent");
-                assert_eq!(
-                    condition,
-                    &pingclair_core::config::MatcherCondition::Regex("(?i)android".into())
-                );
+            pingclair_core::config::Matcher::HeaderRegexp {
+                name,
+                field,
+                pattern,
+            } => {
+                assert_eq!(name, &None);
+                assert_eq!(field, "User-Agent");
+                assert_eq!(pattern, "(?i)android");
             }
-            other => panic!("expected a header matcher, got {other:?}"),
+            other => panic!("expected a header regexp matcher, got {other:?}"),
         }
     }
 
@@ -1133,16 +1131,70 @@ mod fail_closed_tests {
         );
     }
 
-    /// 🚫 The three-argument form names capture groups so they can be read back
-    /// as placeholders. We produce no placeholders from matchers, so accepting
-    /// the name would accept a configuration whose whole point is a value we
-    /// never generate.
+    /// 🔍 The three-argument form names the capture groups so they can be
+    /// read back as `{re.<name>.N}` placeholders.
     #[test]
-    fn a_named_capture_group_is_refused_rather_than_ignored() {
-        let error = compile_err(
+    fn a_named_capture_group_compiles_with_its_name() {
+        let config = crate::compile(
             "example.com {\n    @x header_regexp mobile User-Agent android\n                 respond @x \"y\"\n}",
-        );
-        assert!(error.contains("capture-group name"), "got {error}");
+        )
+        .expect("a named header_regexp must compile");
+        let matched = config.servers[0]
+            .routes
+            .iter()
+            .find(|route| route.matcher.is_some())
+            .expect("a matched route");
+        assert!(matches!(
+            matched.matcher.as_ref().expect("a matcher"),
+            pingclair_core::config::Matcher::HeaderRegexp {
+                name: Some(name),
+                field,
+                ..
+            } if name == "mobile" && field == "User-Agent"
+        ));
+    }
+
+    /// 🔤 `path_regexp [<name>] <pattern>` matches the path against a regular
+    /// expression, with an optional name for capture placeholders.
+    #[test]
+    fn path_regexp_compiles_with_and_without_a_name() {
+        let config = crate::compile(
+            "example.com {\n    @id path_regexp item ^/item/([0-9]+)$\n    respond @id \"{re.item.1}\"\n    @any path_regexp ^/public$\n    respond @any \"public\"\n}",
+        )
+        .expect("path_regexp must compile");
+        let matchers: Vec<_> = config.servers[0]
+            .routes
+            .iter()
+            .filter_map(|route| route.matcher.clone())
+            .collect();
+        assert_eq!(matchers.len(), 2);
+        assert!(matches!(
+            &matchers[0],
+            pingclair_core::config::Matcher::PathRegexp {
+                name: Some(name),
+                pattern,
+            } if name == "item" && pattern == "^/item/([0-9]+)$"
+        ));
+        assert!(matches!(
+            &matchers[1],
+            pingclair_core::config::Matcher::PathRegexp {
+                name: None,
+                pattern,
+            } if pattern == "^/public$"
+        ));
+    }
+
+    /// 🚫 A path regexp that cannot compile is refused, and so is a matcher
+    /// with the wrong argument count.
+    #[test]
+    fn malformed_path_regexp_is_refused() {
+        for source in [
+            "example.com {\n    @x path_regexp \"(unclosed\"\n    respond @x \"y\"\n}",
+            "example.com {\n    @x path_regexp a b c\n    respond @x \"y\"\n}",
+            "example.com {\n    @x path_regexp\n    respond @x \"y\"\n}",
+        ] {
+            compile_err(source);
+        }
     }
 
     /// 🩺 Health checking spelled flat, which is how the format spells it.
