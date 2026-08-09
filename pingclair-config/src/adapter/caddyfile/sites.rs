@@ -77,6 +77,7 @@ pub(super) fn adapt_server(
                 },
                 host: "[::]".to_string(),
                 port: Some(if is_https { 443 } else { 80 }),
+                force_plaintext: !is_https,
                 proxy_protocol: false,
             });
             continue;
@@ -187,6 +188,7 @@ pub(super) fn adapt_server(
                         },
                         host: "[::]".to_string(),
                         port: addr.split(':').next_back().and_then(|p| p.parse().ok()),
+                        force_plaintext: addr.starts_with("http://"),
                         proxy_protocol,
                     });
                 }

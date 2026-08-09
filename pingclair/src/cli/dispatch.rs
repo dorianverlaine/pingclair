@@ -431,6 +431,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 names: if name == "_" { Vec::new() } else { vec![name] },
                 bind: None,
                 proxy_protocol_listen: Vec::new(),
+                plaintext_listen: (!https).then(|| listen.clone()).into_iter().collect(),
                 error_routes: Vec::new(),
                 vars_routes: Vec::new(),
                 listen: vec![listen],
@@ -551,6 +552,11 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 names: domain.clone().map_or_else(Vec::new, |d| vec![d]),
                 bind: None,
                 proxy_protocol_listen: Vec::new(),
+                plaintext_listen: domain
+                    .is_none()
+                    .then(|| listen_addr.clone())
+                    .into_iter()
+                    .collect(),
                 error_routes: Vec::new(),
                 vars_routes: Vec::new(),
                 listen: vec![listen_addr],

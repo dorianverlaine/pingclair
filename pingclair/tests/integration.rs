@@ -3846,6 +3846,64 @@ async fn test_hostname_tls_site_derives_https_and_http_companion() {
     );
 }
 
+/// 🌐 One site block may serve the same hostname over explicit HTTP and HTTPS.
+///
+/// The HTTPS half must still obtain an automatic certificate, while the HTTP
+/// half serves the configured route directly instead of redirecting or trying
+/// to parse a plaintext request as TLS.
+#[tokio::test]
+async fn test_mixed_scheme_site_keeps_http_plain_and_https_automatic() {
+    let config = r#"
+        {
+            admin off
+            http_port __PINGCLAIR_TEST_HTTP_PORT__
+            https_port __PINGCLAIR_TEST_HTTPS_PORT__
+        }
+
+        https://localhost:__PINGCLAIR_TEST_HTTPS_PORT__, http://localhost:__PINGCLAIR_TEST_HTTP_PORT__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "mixed-scheme-ok"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(
+        server.wait_until_tls_ready("localhost").await,
+        "the HTTPS half did not start with its automatic internal certificate"
+    );
+
+    let root_path = server._temp_dir.path().join("tls/internal/root.crt");
+    let root = reqwest::Certificate::from_pem(&std::fs::read(root_path).unwrap()).unwrap();
+    let tls_client = reqwest::Client::builder()
+        .no_proxy()
+        .add_root_certificate(root)
+        .resolve("localhost", server.address(0))
+        .build()
+        .unwrap();
+    let tls_response = tls_client
+        .get(server.tls_url(0, "localhost", "/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tls_response.status(), reqwest::StatusCode::OK);
+    assert_eq!(tls_response.text().await.unwrap(), "mixed-scheme-ok");
+
+    let plain_address = server.listener_address(0, 1);
+    let plain_client = reqwest::Client::builder()
+        .no_proxy()
+        .resolve("localhost", plain_address)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let plain_response = plain_client
+        .get(format!("http://localhost:{}/", plain_address.port()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(plain_response.status(), reqwest::StatusCode::OK);
+    assert_eq!(plain_response.text().await.unwrap(), "mixed-scheme-ok");
+}
+
 /// 🔁 The file server canonicalizes trailing slashes like Caddy: a directory
 /// request without one gets a 308 adding it, and a file request with one gets
 /// a 308 removing it.

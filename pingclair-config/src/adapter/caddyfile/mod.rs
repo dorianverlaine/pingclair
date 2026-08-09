@@ -123,6 +123,91 @@ pub fn adapt(directives: Vec<Directive>) -> Result<Ast, AdapterError> {
     adapt_from(directives, None)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SiteAddressGroup {
+    Implicit,
+    Listener {
+        scheme: Scheme,
+        host: String,
+        port: Option<u16>,
+        force_plaintext: bool,
+    },
+}
+
+/// 🌐 Separates site addresses that Caddy assigns to different listeners.
+///
+/// One block may spell `http://plain.example, https://secure.example`. The
+/// handlers are shared, but the host matchers and TLS policy are not: Caddy
+/// emits one server per listener group. Keeping the block whole loses the
+/// hostname-to-scheme relationship and lets one HTTP address suppress TLS for
+/// every HTTPS address beside it.
+fn split_site_address_groups(directive: Directive) -> Vec<Directive> {
+    let mut groups: Vec<(SiteAddressGroup, Vec<String>)> = Vec::new();
+    let addresses =
+        std::iter::once(directive.name.as_str()).chain(directive.args.iter().map(String::as_str));
+
+    for raw in addresses {
+        let address = raw.trim_end_matches(',').to_string();
+        let group = match address.as_str() {
+            "http://" => SiteAddressGroup::Listener {
+                scheme: Scheme::Http,
+                host: "[::]".to_string(),
+                port: Some(80),
+                force_plaintext: true,
+            },
+            "https://" => SiteAddressGroup::Listener {
+                scheme: Scheme::Https,
+                host: "[::]".to_string(),
+                port: Some(443),
+                force_plaintext: false,
+            },
+            _ => addresses::parse_server_address(&address).map_or(
+                SiteAddressGroup::Implicit,
+                |parsed| {
+                    if parsed.explicit {
+                        SiteAddressGroup::Listener {
+                            scheme: parsed.listen.scheme,
+                            host: parsed.listen.host,
+                            // 🎧 Bare ports are one catch-all site with several
+                            // listeners; they carry no hostname whose scope could
+                            // leak across ports, so preserve that established shape.
+                            port: (parsed.hostname != "[::]")
+                                .then_some(parsed.listen.port)
+                                .flatten(),
+                            force_plaintext: parsed.listen.force_plaintext,
+                        }
+                    } else {
+                        SiteAddressGroup::Implicit
+                    }
+                },
+            ),
+        };
+
+        if let Some((_, grouped)) = groups.iter_mut().find(|(candidate, _)| *candidate == group) {
+            grouped.push(address);
+        } else {
+            groups.push((group, vec![address]));
+        }
+    }
+
+    if groups.len() <= 1 {
+        return vec![directive];
+    }
+
+    groups
+        .into_iter()
+        .map(|(_, mut addresses)| {
+            let name = addresses.remove(0);
+            // 🧪 A split site is compiler-generated, so a synthetic token run
+            // is the honest representation; its handlers retain their own
+            // original token runs through the cloned block.
+            let mut split = Directive::new(name).with_args(addresses);
+            split.block = directive.block.clone();
+            split
+        })
+        .collect()
+}
+
 /// 📦 Adapts directives, resolving relative `import` paths against `base`.
 ///
 /// `base` is the directory of the file these directives were read from. `None`
@@ -171,8 +256,10 @@ pub fn adapt_from(
             // 🐛 TODO: Support macros in Caddyfile?
             // Caddy uses snippets (import), which we now handle above.
         } else {
-            let server = adapt_server(d, &order)?;
-            ast.servers.push(Node::new(server, Location::synthetic()));
+            for split in split_site_address_groups(d) {
+                let server = adapt_server(split, &order)?;
+                ast.servers.push(Node::new(server, Location::synthetic()));
+            }
         }
     }
 

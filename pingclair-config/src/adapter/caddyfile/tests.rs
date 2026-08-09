@@ -45,6 +45,32 @@ mod global_tests {
     }
 
     #[test]
+    fn mixed_site_schemes_split_before_host_matchers_are_built() {
+        let directives =
+            parse("http://plain.example, https://secure.example { respond \"shared\" }").unwrap();
+        let ast = adapt(directives).unwrap();
+
+        assert_eq!(ast.servers.len(), 2);
+        let plain = ast
+            .servers
+            .iter()
+            .find(|server| server.inner.names == ["plain.example"])
+            .expect("plaintext group");
+        assert_eq!(plain.inner.listens.len(), 1);
+        assert!(plain.inner.listens[0].force_plaintext);
+        assert_eq!(plain.inner.listens[0].scheme, Scheme::Http);
+
+        let secure = ast
+            .servers
+            .iter()
+            .find(|server| server.inner.names == ["secure.example"])
+            .expect("HTTPS group");
+        assert_eq!(secure.inner.listens.len(), 1);
+        assert!(!secure.inner.listens[0].force_plaintext);
+        assert_eq!(secure.inner.listens[0].scheme, Scheme::Https);
+    }
+
+    #[test]
     fn test_snippet_expansion() {
         let source = r#"
             (security_headers) {

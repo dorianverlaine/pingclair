@@ -46,6 +46,13 @@ lets the rest converge.
 
 ### 🔄 Changed
 
+- 🌐 **Mixed HTTP/HTTPS site addresses now retain per-listener policy.** A
+  block such as `http://example.com, https://example.com { … }` shares its
+  handlers without letting the HTTP address disable automatic certificates
+  for HTTPS. Explicit HTTP remains plaintext, including on a conventional TLS
+  port when `tls off` applies, and different hostnames stay scoped to their
+  respective listeners instead of leaking across both schemes.
+
 - 🪵 **Logger sub-options now parse like Caddy.** Log blocks accept
   `hostnames`, global `include`/`exclude`, `sampling { interval; first;
   thereafter }`, and the file rotation options (`mode`, `dir_mode`,

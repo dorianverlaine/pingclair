@@ -266,6 +266,15 @@ pub struct ServerConfig {
     #[serde(default)]
     pub proxy_protocol_listen: Vec<String>,
 
+    /// 📴 The subset of [`Self::listen`] that must remain plaintext.
+    ///
+    /// An explicit `http://` address and `tls off` are listener policy, not
+    /// hints. Keeping that decision beside the concrete address prevents a
+    /// conventional HTTPS port from silently turning TLS back on at runtime.
+    /// Every entry must also appear in `listen`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plaintext_listen: Vec<String>,
+
     /// TLS configuration
     #[serde(default)]
     pub tls: Option<TlsConfig>,
@@ -389,6 +398,7 @@ impl Default for ServerConfig {
             bind: None,
             listen: Vec::new(),
             proxy_protocol_listen: Vec::new(),
+            plaintext_listen: Vec::new(),
             tls: None,
             routes: Vec::new(),
             log: None,
@@ -2269,6 +2279,7 @@ mod tests {
             bind: None,
             listen: vec!["127.0.0.1:8080".to_string()],
             proxy_protocol_listen: Vec::new(),
+            plaintext_listen: Vec::new(),
             tls: None,
             routes: vec![],
             log: None,

@@ -283,6 +283,10 @@ pub struct ListenAddr {
     pub scheme: Scheme,
     pub host: String,
     pub port: Option<u16>,
+    /// 📴 Forces this exact listener to remain plaintext because the site
+    /// address explicitly used `http://`. The compiler applies `tls off` to
+    /// every listener after this address-level policy is collected.
+    pub force_plaintext: bool,
     /// 🧭 Requires a PROXY protocol header on this listener, as nginx spells
     /// `listen 443 proxy_protocol`. It is per-listener because a deployment
     /// commonly has one port behind an L4 balancer and another reached

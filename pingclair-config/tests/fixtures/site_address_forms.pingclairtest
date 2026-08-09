@@ -25,6 +25,9 @@ plain.example:8080 {
         "[::]:80"
       ],
       "proxy_protocol_listen": [],
+      "plaintext_listen": [
+        "[::]:80"
+      ],
       "tls": null,
       "routes": [
         {

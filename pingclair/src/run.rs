@@ -19,8 +19,9 @@
 
 use crate::certs::{DynamicCertResolver, eager_issuance_domains, refresh_h3_cert_table};
 use crate::listen::{
-    automatic_http_companion, can_bind_automatic_http_port, normalize_listen_addr,
-    reserve_private_listener_address, server_requires_tls, servers_by_bind_address,
+    automatic_http_companion, can_bind_automatic_http_port, explicit_http_names,
+    normalize_listen_addr, reserve_private_listener_address, server_requires_tls,
+    servers_by_bind_address,
 };
 use crate::paths::tls_store_dir;
 use crate::runtime_listeners::RuntimeListeners;
@@ -369,6 +370,7 @@ pub(crate) fn run_server(
     let auto_https_mode = config.global.auto_https.clone();
     let http_port = config.global.http_port;
     let https_port = config.global.https_port;
+    let explicit_http_names = explicit_http_names(&config);
     let automatic_http_available = auto_https_mode != pingclair_core::config::AutoHttpsMode::Off
         && config.servers.iter().any(|server| server.tls.is_some())
         && can_bind_automatic_http_port(http_port);
@@ -408,6 +410,7 @@ pub(crate) fn run_server(
             server_config,
             auto_https_mode.clone(),
             &listen_addrs,
+            &explicit_http_names,
             http_port,
             https_port,
         )

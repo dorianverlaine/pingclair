@@ -198,6 +198,7 @@ pub(super) fn parse_server_address(addr: &str) -> Option<ParsedAddress> {
             scheme,
             host: bind_host,
             port,
+            force_plaintext: explicit_scheme && scheme == Scheme::Http,
             // 📍 A site address carries no listener flags; `listen` does.
             proxy_protocol: false,
         },

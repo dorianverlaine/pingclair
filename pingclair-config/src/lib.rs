@@ -974,6 +974,163 @@ mod tests {
             config.servers[0].tls.is_none(),
             "tls off must clear the https-scheme default"
         );
+        assert_eq!(
+            config.servers[0].plaintext_listen,
+            ["[::]:443"],
+            "tls off must remain authoritative when the runtime sees port 443"
+        );
+    }
+
+    /// 🌐 Mixed schemes share handlers but retain independent host and TLS policy.
+    #[test]
+    fn mixed_http_and_https_site_addresses_compile_to_independent_servers() {
+        let config = compile(
+            r#"
+                http://plain.example, https://secure.example {
+                    respond "shared"
+                }
+            "#,
+        )
+        .expect("mixed schemes compile");
+
+        assert_eq!(config.servers.len(), 2);
+        let plain = config
+            .servers
+            .iter()
+            .find(|server| server.names == ["plain.example"])
+            .expect("plaintext site");
+        assert_eq!(plain.listen, ["[::]:80"]);
+        assert_eq!(plain.plaintext_listen, ["[::]:80"]);
+        assert!(plain.tls.is_none());
+        assert_eq!(plain.routes.len(), 1);
+
+        let secure = config
+            .servers
+            .iter()
+            .find(|server| server.names == ["secure.example"])
+            .expect("HTTPS site");
+        assert_eq!(secure.listen, ["[::]:443"]);
+        assert!(secure.plaintext_listen.is_empty());
+        assert!(secure.tls.as_ref().is_some_and(|tls| tls.auto));
+        assert_eq!(secure.routes.len(), 1);
+    }
+
+    /// 🛡️ The same hostname may deliberately remain active on both schemes.
+    #[test]
+    fn mixed_schemes_for_one_hostname_keep_http_plain_and_https_automatic() {
+        let config = compile(
+            r#"
+                http://mixed.example, https://mixed.example {
+                    respond "shared"
+                }
+            "#,
+        )
+        .expect("same-host mixed schemes compile");
+
+        assert_eq!(config.servers.len(), 2);
+        let plain = config
+            .servers
+            .iter()
+            .find(|server| !server.plaintext_listen.is_empty())
+            .expect("plaintext half");
+        let secure = config
+            .servers
+            .iter()
+            .find(|server| server.plaintext_listen.is_empty())
+            .expect("TLS half");
+        assert_eq!(plain.names, ["mixed.example"]);
+        assert!(plain.tls.is_none());
+        assert_eq!(secure.names, ["mixed.example"]);
+        assert!(secure.tls.as_ref().is_some_and(|tls| tls.auto));
+    }
+
+    #[test]
+    fn mixed_schemes_preserve_auto_https_off_and_manual_certificates() {
+        let automatic_off = compile(
+            r#"
+                { auto_https off }
+                http://plain.example, https://secure.example {
+                    respond "shared"
+                }
+            "#,
+        )
+        .unwrap();
+        let secure = automatic_off
+            .servers
+            .iter()
+            .find(|server| server.names == ["secure.example"])
+            .unwrap();
+        assert!(
+            secure.tls.is_some(),
+            "an explicit https:// address still uses TLS"
+        );
+        assert!(!secure.tls.as_ref().unwrap().auto);
+
+        let manual = compile(
+            r#"
+                http://plain.example, https://secure.example {
+                    tls /run/cert.pem /run/key.pem
+                    respond "shared"
+                }
+            "#,
+        )
+        .unwrap();
+        let plain = manual
+            .servers
+            .iter()
+            .find(|server| server.names == ["plain.example"])
+            .unwrap();
+        assert_eq!(plain.plaintext_listen, ["[::]:80"]);
+        let secure = manual
+            .servers
+            .iter()
+            .find(|server| server.names == ["secure.example"])
+            .unwrap();
+        let tls = secure.tls.as_ref().unwrap();
+        assert_eq!(tls.cert.as_deref(), Some("/run/cert.pem"));
+        assert_eq!(tls.key.as_deref(), Some("/run/key.pem"));
+    }
+
+    #[test]
+    fn mixed_scheme_policy_survives_json_and_rejects_invalid_documents() {
+        let compiled =
+            compile("http://mixed.example, https://mixed.example {\n    respond \"ok\"\n}")
+                .unwrap();
+        let encoded = serde_json::to_string(&compiled).unwrap();
+        let mut decoded: PingclairConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            decoded.servers[0].plaintext_listen,
+            compiled.servers[0].plaintext_listen
+        );
+        compiler::validate_config(&decoded).unwrap();
+
+        // 🛡️ A legacy document defaults to no explicit plaintext override.
+        let legacy: PingclairConfig = serde_json::from_value(serde_json::json!({
+            "servers": [{ "listen": ["[::]:8080"], "routes": [] }]
+        }))
+        .unwrap();
+        assert!(legacy.servers[0].plaintext_listen.is_empty());
+
+        decoded.servers[0].plaintext_listen = vec!["[::]:8081".to_string()];
+        assert!(compiler::validate_config(&decoded).is_err());
+
+        let mut disagreement = PingclairConfig::default();
+        disagreement.global.https_port = 9443;
+        disagreement.servers = vec![
+            pingclair_core::config::ServerConfig {
+                listen: vec!["[::]:9443".to_string()],
+                tls: Some(Default::default()),
+                ..Default::default()
+            },
+            pingclair_core::config::ServerConfig {
+                listen: vec![":9443".to_string()],
+                plaintext_listen: vec![":9443".to_string()],
+                ..Default::default()
+            },
+        ];
+        let error = compiler::validate_config(&disagreement)
+            .expect_err("one socket cannot be both TLS and plaintext");
+        assert!(error.to_string().contains("disagree about TLS"), "{error}");
     }
 
     /// 📧 `tls <email>` is the ACME account shorthand, decided exactly as

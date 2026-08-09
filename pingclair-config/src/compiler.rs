@@ -226,6 +226,7 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         bind: server.bind.clone(),
         listen: Vec::new(),
         proxy_protocol_listen: Vec::new(),
+        plaintext_listen: Vec::new(),
         routes: Vec::new(),
         tls: None,
         log: None,
@@ -269,6 +270,9 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         if listen.proxy_protocol && !config.proxy_protocol_listen.contains(&addr) {
             config.proxy_protocol_listen.push(addr.clone());
         }
+        if listen.force_plaintext && !config.plaintext_listen.contains(&addr) {
+            config.plaintext_listen.push(addr.clone());
+        }
         config.listen.push(addr);
 
         // 🔐 Set TLS based on scheme or the conventional HTTPS ports. A bare
@@ -284,6 +288,13 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
     if let Some(tls) = &server.tls {
         if tls.off {
             config.tls = None;
+            // 📴 `tls off` applies to every listener in this site, including
+            // conventional HTTPS ports that the runtime would otherwise infer.
+            for address in &config.listen {
+                if !config.plaintext_listen.contains(address) {
+                    config.plaintext_listen.push(address.clone());
+                }
+            }
         } else {
             let mut merged = config.tls.take().unwrap_or_default();
             merged.auto = merged.auto || tls.auto;
@@ -595,6 +606,7 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
         }
     }
     validate_proxy_protocol_listeners(config)?;
+    validate_plaintext_listeners(config)?;
     validate_cache_ceiling_agrees(config)?;
     validate_log_channels_exist(config)?;
 
@@ -1307,6 +1319,71 @@ fn validate_proxy_protocol_listeners(config: &PingclairConfig) -> CompileResult<
         });
     }
     Ok(())
+}
+
+/// 🛡️ Rejects plaintext listener declarations that cannot be honoured.
+///
+/// A shared socket has one transport policy. Accepting disagreement here would
+/// make server order decide whether the same bytes are parsed as HTTP or TLS.
+fn validate_plaintext_listeners(config: &PingclairConfig) -> CompileResult<()> {
+    let mut policies: HashMap<String, bool> = HashMap::new();
+
+    for server in &config.servers {
+        for address in &server.plaintext_listen {
+            let normalized = normalize_config_listen(address);
+            if !server
+                .listen
+                .iter()
+                .any(|listen| normalize_config_listen(listen) == normalized)
+            {
+                return Err(CompileError::InvalidServer {
+                    message: format!(
+                        "plaintext is declared on `{address}`, which this server does not listen on"
+                    ),
+                });
+            }
+        }
+
+        for address in &server.listen {
+            let normalized = normalize_config_listen(address);
+            let plaintext = server
+                .plaintext_listen
+                .iter()
+                .any(|declared| normalize_config_listen(declared) == normalized);
+            let requires_tls = if plaintext {
+                false
+            } else {
+                let port = normalized
+                    .rsplit_once(':')
+                    .and_then(|(_, port)| port.parse::<u16>().ok());
+                if port == Some(config.global.http_port) {
+                    false
+                } else {
+                    server.tls.is_some()
+                        || port.is_some_and(|port| port == config.global.https_port || port == 8443)
+                }
+            };
+
+            if let Some(existing) = policies.insert(normalized.clone(), requires_tls)
+                && existing != requires_tls
+            {
+                return Err(CompileError::InvalidServer {
+                    message: format!(
+                        "listener `{normalized}` is shared by servers that disagree about TLS"
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// 🌐 Normalizes the shorthand accepted by JSON before comparing sockets.
+fn normalize_config_listen(address: &str) -> String {
+    address
+        .strip_prefix(':')
+        .map_or_else(|| address.to_string(), |port| format!("[::]:{port}"))
 }
 
 /// 🔐 Rejects upstream TLS settings whose parts cancel each other out.

@@ -260,6 +260,13 @@ Pingclair then serves that port exactly as configured. If port 80 cannot be
 bound (already in use, or unprivileged), the automatic listener is skipped with
 a warning and HTTPS still serves; ACME HTTP-01 validation will not work.
 
+A block may mix explicit schemes, for example
+`http://example.com, https://example.com { … }`. Pingclair shares the handlers
+but keeps independent listener policy: HTTP stays plaintext and serves the
+configured route, while HTTPS still obtains its automatic certificate. The
+same rule keeps hostnames scoped correctly when the HTTP and HTTPS addresses
+name different hosts. `tls off` is authoritative even on port 443.
+
 The certificate Pingclair installs includes the intermediates the CA issued with
 it. A server that sends only its leaf certificate appears to work in a browser —
 browsers cache intermediates and fetch missing ones over AIA — while `curl`, Go,

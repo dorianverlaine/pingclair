@@ -250,6 +250,12 @@ HTTP-01 挑戰——CA 是以**明文** HTTP 打在這個 port（RFC 8555 §8.3�
 的設定服務那個 port。若 port 80 無法綁定（已被占用，或權限不足），自動
 listener 會被跳過並留下警告，HTTPS 照常服務，但 ACME HTTP-01 驗證不會運作。
 
+同一個 block 可以混用明確 scheme，例如
+`http://example.com, https://example.com { … }`。Pingclair 會共用 handler，
+但維持各 listener 的獨立策略：HTTP 保持明文並直接服務設定的 route，HTTPS
+仍會取得自動憑證。HTTP 與 HTTPS 使用不同 hostname 時，也會各自保留正確的
+host 範圍；`tls off` 即使寫在 port 443 上也仍具優先權。
+
 Pingclair 安裝憑證時會一併送出 CA 簽發的中繼憑證。只送 leaf 的伺服器在瀏覽器
 裡看起來是正常的——瀏覽器會快取中繼憑證，也會用 AIA 自行補抓——但 `curl`、
 Go 與 Java 會直接拒絕連線。

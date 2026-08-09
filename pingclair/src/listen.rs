@@ -14,7 +14,7 @@
 //! [`crate::addr`] answers the neighbouring question for the quick commands:
 //! what a single address string means. Nothing here parses an address.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// 🌐 Pingora requires a full `IP:port` socket address.
 ///
@@ -62,6 +62,7 @@ pub(crate) fn automatic_http_companion(
     server_config: &pingclair_core::config::ServerConfig,
     mode: pingclair_core::config::AutoHttpsMode,
     listen_addrs: &[String],
+    explicit_http_names: &HashSet<String>,
     http_port: u16,
     https_port: u16,
 ) -> Option<pingclair_core::config::ServerConfig> {
@@ -71,10 +72,18 @@ pub(crate) fn automatic_http_companion(
         return None;
     }
 
-    let name = server_config.name.as_deref()?;
-    if name.is_empty() || name.contains('*') {
-        return None;
-    }
+    let mut names = if server_config.names.is_empty() {
+        server_config.name.iter().cloned().collect()
+    } else {
+        server_config.names.clone()
+    };
+    names.retain(|name| {
+        !name.is_empty()
+            && name != "_"
+            && !name.contains('*')
+            && !explicit_http_names.contains(&name.to_ascii_lowercase())
+    });
+    let name = names.first()?.clone();
 
     let already_serving_http = listen_addrs.iter().any(|addr| {
         addr.rsplit_once(':')
@@ -111,9 +120,11 @@ pub(crate) fn automatic_http_companion(
     };
 
     Some(pingclair_core::config::ServerConfig {
-        name: server_config.name.clone(),
+        name: Some(name),
+        names,
         listen: vec![format!("[::]:{http_port}")],
         proxy_protocol_listen: Vec::new(),
+        plaintext_listen: vec![format!("[::]:{http_port}")],
         tls: None,
         routes,
         ..Default::default()
@@ -142,6 +153,15 @@ pub(crate) fn server_requires_tls(
     http_port: u16,
     https_port: u16,
 ) -> bool {
+    let normalized = normalize_listen_addr(addr);
+    if config
+        .plaintext_listen
+        .iter()
+        .any(|declared| normalize_listen_addr(declared) == normalized)
+    {
+        return false;
+    }
+
     let port = addr
         .rsplit_once(':')
         .and_then(|(_, port)| port.parse::<u16>().ok());
@@ -155,6 +175,36 @@ pub(crate) fn server_requires_tls(
     config.tls.is_some() || port.is_some_and(|port| port == https_port || port == 8443)
 }
 
+/// 🌐 Collects names whose conventional HTTP listener is explicitly configured.
+///
+/// Those names must stay routed to their plaintext site instead of being
+/// captured by a synthetic redirect generated for a neighbouring HTTPS site.
+pub(crate) fn explicit_http_names(
+    config: &pingclair_core::config::PingclairConfig,
+) -> HashSet<String> {
+    let http_port = config.global.http_port;
+    config
+        .servers
+        .iter()
+        .filter(|server| {
+            server.plaintext_listen.iter().any(|address| {
+                normalize_listen_addr(address)
+                    .rsplit_once(':')
+                    .and_then(|(_, port)| port.parse::<u16>().ok())
+                    == Some(http_port)
+            })
+        })
+        .flat_map(|server| {
+            if server.names.is_empty() {
+                server.name.iter().cloned().collect::<Vec<_>>()
+            } else {
+                server.names.clone()
+            }
+        })
+        .map(|name| name.to_ascii_lowercase())
+        .collect()
+}
+
 /// 🧭 Maps every server (and its automatic HTTP companion) to the concrete
 /// bind addresses it serves, exactly like the startup listener derivation.
 ///
@@ -166,6 +216,7 @@ pub(crate) fn servers_by_bind_address(
 ) -> HashMap<String, Vec<pingclair_core::config::ServerConfig>> {
     let http_port = config.global.http_port;
     let https_port = config.global.https_port;
+    let explicit_http_names = explicit_http_names(config);
     let mut by_port: HashMap<String, Vec<pingclair_core::config::ServerConfig>> = HashMap::new();
     for server in &config.servers {
         let addrs: Vec<String> = if server.listen.is_empty() {
@@ -197,6 +248,7 @@ pub(crate) fn servers_by_bind_address(
             server,
             config.global.auto_https.clone(),
             &addrs,
+            &explicit_http_names,
             http_port,
             https_port,
         ) {
@@ -242,6 +294,30 @@ mod tests {
         assert!(server_requires_tls(&plain, "[::]:8443", 80, 443));
     }
 
+    /// 📴 Explicit plaintext policy wins over every port and TLS heuristic.
+    #[test]
+    fn explicit_http_and_tls_off_listeners_stay_plaintext() {
+        let explicit_http = pingclair_core::config::ServerConfig {
+            listen: vec!["127.0.0.1:21209".to_string()],
+            plaintext_listen: vec!["127.0.0.1:21209".to_string()],
+            tls: Some(Default::default()),
+            ..Default::default()
+        };
+        assert!(!server_requires_tls(
+            &explicit_http,
+            "127.0.0.1:21209",
+            80,
+            21209
+        ));
+
+        let tls_off = pingclair_core::config::ServerConfig {
+            listen: vec!["[::]:443".to_string()],
+            plaintext_listen: vec![":443".to_string()],
+            ..Default::default()
+        };
+        assert!(!server_requires_tls(&tls_off, "[::]:443", 80, 443));
+    }
+
     /// 🚫 A `tls` block must not drag port 80 into TLS along with it.
     ///
     /// `example.com { listen :80  listen :443  tls auto }` is the config anyone
@@ -279,9 +355,15 @@ mod tests {
             ..Default::default()
         };
 
-        let companion =
-            automatic_http_companion(&site, AutoHttpsMode::On, &["[::]:443".to_string()], 80, 443)
-                .expect("an HTTPS site needs its plaintext companion");
+        let companion = automatic_http_companion(
+            &site,
+            AutoHttpsMode::On,
+            &["[::]:443".to_string()],
+            &HashSet::new(),
+            80,
+            443,
+        )
+        .expect("an HTTPS site needs its plaintext companion");
 
         assert_eq!(companion.listen, vec!["[::]:80".to_string()]);
         assert!(
@@ -298,6 +380,32 @@ mod tests {
             },
             other => panic!("expected exactly one catch-all route, got {other:?}"),
         }
+    }
+
+    /// 🛡️ An explicitly configured HTTP host must not be replaced by a redirect.
+    #[test]
+    fn mixed_scheme_hostname_suppresses_automatic_redirect_companion() {
+        use pingclair_core::config::AutoHttpsMode;
+
+        let secure = pingclair_core::config::ServerConfig {
+            name: Some("mixed.example".to_string()),
+            names: vec!["mixed.example".to_string()],
+            listen: vec!["[::]:443".to_string()],
+            tls: Some(Default::default()),
+            ..Default::default()
+        };
+        let explicit = HashSet::from(["mixed.example".to_string()]);
+        assert!(
+            automatic_http_companion(
+                &secure,
+                AutoHttpsMode::On,
+                &["[::]:443".to_string()],
+                &explicit,
+                80,
+                443,
+            )
+            .is_none()
+        );
     }
 
     /// 🚫 Every reason to provision nothing at all.
@@ -318,6 +426,7 @@ mod tests {
                 &https(Some("example.com")),
                 AutoHttpsMode::Off,
                 &ports,
+                &HashSet::new(),
                 80,
                 443,
             )
@@ -325,7 +434,15 @@ mod tests {
             "`auto_https off` opts out of all of this"
         );
         assert!(
-            automatic_http_companion(&https(None), AutoHttpsMode::On, &ports, 80, 443).is_none(),
+            automatic_http_companion(
+                &https(None),
+                AutoHttpsMode::On,
+                &ports,
+                &HashSet::new(),
+                80,
+                443,
+            )
+            .is_none(),
             "a redirect needs a concrete host to send the client to"
         );
         assert!(
@@ -333,6 +450,7 @@ mod tests {
                 &https(Some("*.example.com")),
                 AutoHttpsMode::On,
                 &ports,
+                &HashSet::new(),
                 80,
                 443,
             )
@@ -350,6 +468,7 @@ mod tests {
                 &plaintext,
                 AutoHttpsMode::On,
                 &["0.0.0.0:8080".to_string()],
+                &HashSet::new(),
                 80,
                 443,
             )
@@ -363,6 +482,7 @@ mod tests {
                 &https(Some("example.com")),
                 AutoHttpsMode::On,
                 &["[::]:80".to_string(), "[::]:443".to_string()],
+                &HashSet::new(),
                 80,
                 443,
             )
@@ -390,6 +510,7 @@ mod tests {
             &site,
             AutoHttpsMode::DisableRedirects,
             &["[::]:443".to_string()],
+            &HashSet::new(),
             80,
             443,
         )

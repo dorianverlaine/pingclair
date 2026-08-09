@@ -254,6 +254,14 @@ pas être lié (déjà utilisé, ou privilèges insuffisants), le listener autom
 est ignoré avec un avertissement et HTTPS continue de servir ; la validation
 HTTP-01 d'ACME, elle, ne fonctionnera pas.
 
+Un même bloc peut mélanger des schémas explicites, par exemple
+`http://example.com, https://example.com { … }`. Pingclair partage les handlers
+mais conserve une politique indépendante par listener : HTTP reste en clair et
+sert la route configurée, tandis que HTTPS obtient toujours son certificat
+automatique. Les noms d'hôte restent également correctement isolés lorsque les
+adresses HTTP et HTTPS diffèrent. `tls off` reste prioritaire même sur le port
+443.
+
 Le certificat installé inclut les intermédiaires émis par l'autorité. Un serveur
 qui n'envoie que son certificat feuille semble fonctionner dans un navigateur —
 les navigateurs mettent les intermédiaires en cache et récupèrent les manquants
