@@ -207,6 +207,10 @@ pub struct RequestContext {
     pub intercepted_file: Option<pingclair_static::StreamingFile>,
     /// 🚩 Whether the replacement body has already been handed downstream.
     pub intercepted_body_emitted: bool,
+    /// 🚨 Status raised while a response subroute evaluates its terminal handler.
+    pub response_decision_error: Option<u16>,
+    /// 🌊 Whether response interception fully wrote and framed the downstream body.
+    pub response_takeover_complete: bool,
     /// 🧭 The request URI before any rewrite, for `{http.request.orig_uri.*}`.
     pub orig_uri: String,
     /// 🚫 Whether the request is already inside an error route; a second
@@ -276,6 +280,8 @@ impl Default for RequestContext {
             intercepted_response: None,
             intercepted_file: None,
             intercepted_body_emitted: false,
+            response_decision_error: None,
+            response_takeover_complete: false,
             orig_uri: String::new(),
             handling_error: false,
             log_skip: false,
@@ -1214,6 +1220,16 @@ struct RewriteRule<'a> {
     replace: Option<&'a str>,
     regex: Option<&'a str>,
     regex_replace: Option<&'a str>,
+}
+
+/// 🌊 One locally generated body whose framing is owned by Pingclair.
+enum LocalResponseBody {
+    /// 📭 A header-only response ends with the header block.
+    Empty,
+    /// 📄 A bounded in-memory response is emitted in one write.
+    Bytes(Bytes),
+    /// 📂 A file response is emitted in fixed-size chunks.
+    File(pingclair_static::StreamingFile),
 }
 
 impl ProxyState {
@@ -2549,20 +2565,23 @@ impl PingclairProxy {
         session: &mut Session,
         ctx: &mut RequestContext,
         upstream_response: &mut ResponseHeader,
-    ) -> pingora_core::Result<()> {
+        explicit_handlers: Option<&[pingclair_core::config::ResponseHandlerConfig]>,
+    ) -> pingora_core::Result<bool> {
         let (Some(state), Some(route_index)) = (ctx.state.as_ref(), ctx.route_index) else {
-            return Ok(());
+            return Ok(false);
         };
-        let handlers = state
-            .config
-            .routes
-            .get(route_index)
-            .and_then(|route| find_reverse_proxy_config(&route.handler))
-            .map(|config| config.handle_response.as_slice())
-            .filter(|handlers| !handlers.is_empty())
-            .unwrap_or(ctx.intercept_handlers.as_slice());
+        let handlers = explicit_handlers.unwrap_or_else(|| {
+            state
+                .config
+                .routes
+                .get(route_index)
+                .and_then(|route| find_reverse_proxy_config(&route.handler))
+                .map(|config| config.handle_response.as_slice())
+                .filter(|handlers| !handlers.is_empty())
+                .unwrap_or(ctx.intercept_handlers.as_slice())
+        });
         if handlers.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         let status = upstream_response.status.as_u16();
@@ -2578,7 +2597,7 @@ impl PingclairProxy {
             &upstream_response.headers,
             &mut ctx.request_vars,
         ) else {
-            return Ok(());
+            return Ok(false);
         };
 
         // 📂 A response subroute ending in `file_server` rewrites the request
@@ -2663,16 +2682,18 @@ impl PingclairProxy {
                 upstream_response.remove_header("transfer-encoding");
                 ctx.response_status = 200;
                 ctx.intercepted_file = Some(stream);
-                return Ok(());
+                return Ok(true);
             }
-            // 🚨 A missing response-page file falls back to the upstream
-            // response unchanged; upstream would route this through its
-            // error pages, which this proxy does not re-enter here.
+            // 🚨 A missing response-page file raises its own 404. The caller
+            // routes it once through error handling instead of resurrecting
+            // the upstream response the matched handler already replaced.
+            ctx.response_decision_error = Some(404);
             tracing::warn!(
                 path = request_path,
                 root = %root,
-                "⚠️ handle_response file_server found no file; passing the upstream response through"
+                "⚠️ handle_response file_server found no file; raising a routable 404"
             );
+            return Ok(true);
         }
 
         if let Some(replacement) = outcome.replacement {
@@ -2713,7 +2734,7 @@ impl PingclairProxy {
                 headers,
                 body: replacement.body,
             });
-            return Ok(());
+            return Ok(true);
         }
 
         if let Some(code) = outcome.passthrough_status
@@ -2737,7 +2758,7 @@ impl PingclairProxy {
             .into_owned();
             upstream_response.insert_header(name.clone(), resolved)?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// 🔐 Runs Caddy's `forward_auth` round trip inline.
@@ -3019,8 +3040,13 @@ impl PingclairProxy {
 
         // 🧭 `handle_response`/`intercept` evaluate before the client sees
         // the CGI response, exactly like proxied HTTP responses.
-        self.apply_response_interception(session, ctx, &mut response)
+        self.apply_response_interception(session, ctx, &mut response, None)
             .await?;
+        if let Some(status) = ctx.response_decision_error.take() {
+            ctx.error_status = Some(status);
+            let _ = client.abort().await;
+            return Ok(true);
+        }
         Self::apply_local_response_headers(&mut response, ctx)?;
 
         // 📂 A response-subroute file server streams from disk; the FastCGI
@@ -3390,6 +3416,80 @@ impl PingclairProxy {
         session.write_response_body(Some(body), end_of_stream).await
     }
 
+    /// 🧭 Runs a local response through the same interception decision as a proxy response.
+    async fn write_local_response(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestContext,
+        mut response: ResponseHeader,
+        original_body: LocalResponseBody,
+        require_interception: bool,
+    ) -> PingoraResult<bool> {
+        let handlers = ctx.intercept_handlers.clone();
+        let intercepted = if handlers.is_empty() {
+            false
+        } else {
+            self.apply_response_interception(session, ctx, &mut response, Some(handlers.as_slice()))
+                .await?
+        };
+        if require_interception && !intercepted {
+            return Ok(false);
+        }
+        if let Some(status) = ctx.response_decision_error.take() {
+            ctx.error_status = Some(status);
+            return Ok(false);
+        }
+
+        let body = if let Some(stream) = ctx.intercepted_file.take() {
+            LocalResponseBody::File(stream)
+        } else if let Some(replacement) = ctx.intercepted_response.take() {
+            LocalResponseBody::Bytes(Bytes::from(replacement.body))
+        } else {
+            original_body
+        };
+        ctx.intercepted_body_emitted = false;
+        ctx.response_status = response.status.as_u16();
+        Self::apply_local_response_headers(&mut response, ctx)?;
+
+        match body {
+            LocalResponseBody::Empty => {
+                session
+                    .write_response_header(Box::new(response), true)
+                    .await?;
+            }
+            LocalResponseBody::Bytes(bytes) => {
+                let empty = bytes.is_empty();
+                session
+                    .write_response_header(Box::new(response), empty)
+                    .await?;
+                if !empty {
+                    Self::write_local_body(session, ctx, bytes, true).await?;
+                }
+            }
+            LocalResponseBody::File(mut stream) => {
+                session
+                    .write_response_header(Box::new(response), false)
+                    .await?;
+                let mut wrote = false;
+                while let Some(chunk) = stream.read_chunk().map_err(|error| {
+                    pingora_core::Error::because(
+                        pingora_core::ErrorType::ReadError,
+                        "streaming intercepted file body",
+                        error,
+                    )
+                })? {
+                    wrote = true;
+                    let last = stream.is_complete();
+                    Self::write_local_body(session, ctx, Bytes::from(chunk), last).await?;
+                }
+                if !wrote {
+                    session.write_response_body(None, true).await?;
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// Write a minimal plain-text response and end the request.
     /// Used for early, handler-less answers such as 404s.
     async fn write_simple_response(
@@ -3754,11 +3854,14 @@ impl PingclairProxy {
                 response
                     .insert_header("Content-Length", body_bytes.len().to_string())
                     .unwrap();
-                Self::apply_local_response_headers(&mut response, ctx)?;
-                session
-                    .write_response_header(Box::new(response), false)
-                    .await?;
-                Self::write_local_body(session, ctx, body_bytes, true).await?;
+                self.write_local_response(
+                    session,
+                    ctx,
+                    response,
+                    LocalResponseBody::Bytes(body_bytes),
+                    false,
+                )
+                .await?;
                 Ok(true)
             }
             // 🧭 Response handlers only make sense against an upstream
@@ -3801,9 +3904,7 @@ impl PingclairProxy {
                 response
                     .insert_header("Location", location.as_ref())
                     .unwrap();
-                Self::apply_local_response_headers(&mut response, ctx)?;
-                session
-                    .write_response_header(Box::new(response), true)
+                self.write_local_response(session, ctx, response, LocalResponseBody::Empty, false)
                     .await?;
                 Ok(true)
             }
@@ -3848,11 +3949,14 @@ impl PingclairProxy {
                 response
                     .insert_header("Content-Length", body.len().to_string())
                     .unwrap();
-                Self::apply_local_response_headers(&mut response, ctx)?;
-                session
-                    .write_response_header(Box::new(response), false)
-                    .await?;
-                Self::write_local_body(session, ctx, Bytes::from(body), true).await?;
+                self.write_local_response(
+                    session,
+                    ctx,
+                    response,
+                    LocalResponseBody::Bytes(Bytes::from(body)),
+                    false,
+                )
+                .await?;
                 Ok(true)
             }
             HandlerConfig::FileServer { .. } => {
@@ -3886,13 +3990,17 @@ impl PingclairProxy {
                             let mut header =
                                 Self::build_downstream_header(session, 308, Some(2)).unwrap();
                             header.insert_header("Location", location.as_str()).unwrap();
-                            Self::apply_local_response_headers(&mut header, ctx)?;
-                            session
-                                .write_response_header(Box::new(header), false)
-                                .await?;
+                            self.write_local_response(
+                                session,
+                                ctx,
+                                header,
+                                LocalResponseBody::Empty,
+                                false,
+                            )
+                            .await?;
                             return Ok(true);
                         }
-                        Ok(Some(pingclair_static::ServedResponse::Stream(mut stream))) => {
+                        Ok(Some(pingclair_static::ServedResponse::Stream(stream))) => {
                             let mut header =
                                 Self::build_downstream_header(session, 200, Some(5)).unwrap();
                             header
@@ -3915,24 +4023,14 @@ impl PingclairProxy {
                                 header.insert_header("Vary", "Accept-Encoding").unwrap();
                             }
                             header.insert_header("Accept-Ranges", "bytes").unwrap();
-                            Self::apply_local_response_headers(&mut header, ctx)?;
-
-                            session
-                                .write_response_header(Box::new(header), false)
-                                .await?;
-                            // Synchronous chunk reads (see StreamingFile):
-                            // only the socket writes are async here.
-                            while let Some(chunk) = stream.read_chunk().map_err(|e| {
-                                pingora_core::Error::because(
-                                    pingora_core::ErrorType::ReadError,
-                                    "streaming file body",
-                                    e,
-                                )
-                            })? {
-                                let last = stream.is_complete();
-                                Self::write_local_body(session, ctx, Bytes::from(chunk), last)
-                                    .await?;
-                            }
+                            self.write_local_response(
+                                session,
+                                ctx,
+                                header,
+                                LocalResponseBody::File(stream),
+                                false,
+                            )
+                            .await?;
                             return Ok(true);
                         }
                         Ok(Some(pingclair_static::ServedResponse::Buffered(file))) => {
@@ -3970,13 +4068,14 @@ impl PingclairProxy {
                                 header.insert_header("Vary", "Accept-Encoding").unwrap();
                             }
                             header.insert_header("Accept-Ranges", "bytes").unwrap();
-                            Self::apply_local_response_headers(&mut header, ctx)?;
-
-                            session
-                                .write_response_header(Box::new(header), false)
-                                .await?;
-                            Self::write_local_body(session, ctx, Bytes::from(file.content), true)
-                                .await?;
+                            self.write_local_response(
+                                session,
+                                ctx,
+                                header,
+                                LocalResponseBody::Bytes(Bytes::from(file.content)),
+                                false,
+                            )
+                            .await?;
                             return Ok(true);
                         }
                         // Missing file (or read error): a file_server route
@@ -3985,6 +4084,21 @@ impl PingclairProxy {
                         // instead of falling through to upstream_peer, which
                         // would surface a 500 (ConnectNoRoute).
                         _ => {
+                            let mut header =
+                                Self::build_downstream_header(session, 404, Some(2)).unwrap();
+                            header.insert_header("Content-Length", "0").unwrap();
+                            if self
+                                .write_local_response(
+                                    session,
+                                    ctx,
+                                    header,
+                                    LocalResponseBody::Empty,
+                                    true,
+                                )
+                                .await?
+                            {
+                                return Ok(true);
+                            }
                             ctx.error_status = Some(404);
                             return Ok(true);
                         }
@@ -4249,9 +4363,9 @@ impl PingclairProxy {
             }
             HandlerConfig::Intercept { handlers } => {
                 // 🧭 Registers response handlers for the response of later
-                // handlers in this request. Proxied responses pass through
-                // `response_filter` and are intercepted; locally generated
-                // responses do not yet run that filter (tracked in TRIAGE).
+                // handlers in this request. Local, proxied, and FastCGI
+                // responses all enter the same response decision before any
+                // downstream bytes are committed.
                 ctx.intercept_handlers = handlers.clone();
                 Ok(false)
             }
@@ -6438,8 +6552,14 @@ impl ProxyHttp for PingclairProxy {
         // 🧭 `handle_response`/`intercept` evaluate before any response byte
         // reaches the client, and before compression decides what to do with
         // the body.
-        self.apply_response_interception(session, ctx, upstream_response)
+        self.apply_response_interception(session, ctx, upstream_response, None)
             .await?;
+        if let Some(status) = ctx.response_decision_error {
+            return pingora_core::Error::e_explain(
+                pingora_core::ErrorType::HTTPStatus(status),
+                "response subroute raised an error status",
+            );
+        }
 
         // ⏱️ TTFB is measured at the response header, which is the first byte
         // the client can actually observe. Recorded once — a retry or an
@@ -6479,6 +6599,44 @@ impl ProxyHttp for PingclairProxy {
         // 🛡️ Applies the same security policy used by locally generated responses.
         if let Some(state) = &ctx.state {
             Self::apply_security_response_headers(upstream_response, state)?;
+        }
+
+        // 🌊 A response-subroute file owns the downstream stream once its
+        // header decision succeeds. Writing the complete bounded-chunk stream
+        // here avoids tying progress to upstream body callbacks: an empty
+        // upstream response may produce only one callback, while the local
+        // replacement can contain arbitrarily many chunks.
+        if let Some(mut stream) = ctx.intercepted_file.take() {
+            let mut response = upstream_response.clone();
+            if session.req_header().version == http::Version::HTTP_2 {
+                // 🧭 Pingora's HTTP/2 writer expects the same HTTP/1.1
+                // compatibility version that its normal response path applies
+                // after this hook returns.
+                response.set_version(http::Version::HTTP_11);
+            }
+            session
+                .write_response_header(Box::new(response), false)
+                .await?;
+            let mut wrote = false;
+            while let Some(chunk) = stream.read_chunk().map_err(|error| {
+                pingora_core::Error::because(
+                    pingora_core::ErrorType::ReadError,
+                    "streaming intercepted proxy response file",
+                    error,
+                )
+            })? {
+                wrote = true;
+                let last = stream.is_complete();
+                Self::write_local_body(session, ctx, Bytes::from(chunk), last).await?;
+            }
+            if !wrote {
+                session.write_response_body(None, true).await?;
+            }
+            ctx.response_takeover_complete = true;
+            return pingora_core::Error::e_explain(
+                pingora_core::ErrorType::InternalError,
+                "response interception takeover completed",
+            );
         }
 
         // 7. Set up response compression if applicable.
@@ -6558,16 +6716,6 @@ impl ProxyHttp for PingclairProxy {
     ) -> pingora_core::Result<Option<Duration>> {
         Self::enforce_request_deadline(ctx)?;
         Self::enforce_retry_deadline(ctx)?;
-
-        // 📂 A `handle_response` file server streams from disk one chunk at
-        // a time while the upstream body is drained and discarded.
-        if let Some(stream) = &mut ctx.intercepted_file {
-            *body = match stream.read_chunk() {
-                Ok(Some(chunk)) => Some(Bytes::from(chunk)),
-                Ok(None) | Err(_) => None,
-            };
-            return Ok(None);
-        }
 
         // 🧭 A `handle_response` replacement emits its static body exactly
         // once and then discards every upstream chunk, keeping memory bounded
@@ -6739,6 +6887,17 @@ impl ProxyHttp for PingclairProxy {
     {
         use pingora_core::{ErrorSource, ErrorType};
 
+        // 🌊 The response filter uses a private control-flow error after it
+        // has streamed a response-subroute file to completion. The downstream
+        // framing is complete and reusable; no second error response belongs
+        // on the wire.
+        if ctx.response_takeover_complete {
+            return pingora_proxy::FailToProxy {
+                error_code: ctx.response_status,
+                can_reuse_downstream: true,
+            };
+        }
+
         // 💥 Count upstream and internal failures as *attempts*, which is a
         // different number from requests the client saw fail: a request retried
         // twice and then served contributes two here and none to
@@ -6797,7 +6956,16 @@ impl ProxyHttp for PingclairProxy {
                 },
             }
         };
-        let served = code > 0 && self.serve_error_page(session, ctx, code).await.is_ok();
+        let served = if let Some(status) = ctx.response_decision_error.take() {
+            // 🚫 A response subroute owns the original upstream response once
+            // it matches. Its raised status may enter error routing once, but
+            // the outer interceptor is cleared so the error response cannot
+            // wrap itself recursively.
+            ctx.intercept_handlers.clear();
+            self.handle_raised_error(session, ctx, status).await.is_ok()
+        } else {
+            code > 0 && self.serve_error_page(session, ctx, code).await.is_ok()
+        };
 
         // 🔁 A fail-fast rejection is a complete, locally generated response, so
         // the keep-alive connection it was written on is still perfectly good.
@@ -6822,6 +6990,15 @@ impl ProxyHttp for PingclairProxy {
             error_code: code,
             can_reuse_downstream,
         }
+    }
+
+    fn suppress_error_log(
+        &self,
+        _session: &Session,
+        ctx: &Self::CTX,
+        _error: &pingora_core::Error,
+    ) -> bool {
+        ctx.response_takeover_complete
     }
 
     async fn logging(

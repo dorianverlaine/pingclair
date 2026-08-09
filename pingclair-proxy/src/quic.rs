@@ -1587,6 +1587,7 @@ async fn plan_h3_handler(
     precompile: Option<&MatcherPrecompile>,
     handling_error: bool,
     request_vars: &mut crate::http_policy::RequestVars,
+    response_handlers: &mut Option<Vec<pingclair_core::config::ResponseHandlerConfig>>,
 ) -> Result<H3Plan, HandlerError> {
     match handler {
         HandlerConfig::Pipeline { handlers } => {
@@ -1619,6 +1620,7 @@ async fn plan_h3_handler(
                     element_precompile,
                     handling_error,
                     request_vars,
+                    response_handlers,
                 )
                 .await?
                 {
@@ -1659,6 +1661,7 @@ async fn plan_h3_handler(
                     element_precompile,
                     handling_error,
                     request_vars,
+                    response_handlers,
                 )
                 .await;
             }
@@ -1706,6 +1709,7 @@ async fn plan_h3_handler(
                     element_precompile,
                     handling_error,
                     request_vars,
+                    response_handlers,
                 )
                 .await;
             }
@@ -1724,7 +1728,10 @@ async fn plan_h3_handler(
             Ok(H3Plan::Continue)
         }
         HandlerConfig::LogSkip => Ok(H3Plan::Continue),
-        HandlerConfig::Intercept { .. } => Ok(H3Plan::Continue),
+        HandlerConfig::Intercept { handlers } => {
+            *response_handlers = Some(handlers.clone());
+            Ok(H3Plan::Continue)
+        }
         HandlerConfig::CopyResponse { .. } | HandlerConfig::CopyResponseHeaders { .. } => {
             Ok(H3Plan::Continue)
         }
@@ -1886,6 +1893,7 @@ async fn plan_h3_handler(
                         precompile,
                         true,
                         request_vars,
+                        response_handlers,
                     )
                     .await?;
                     return Ok(match plan {
@@ -1990,6 +1998,7 @@ async fn plan_h3_handler(
                         fallback_precompile,
                         handling_error,
                         request_vars,
+                        response_handlers,
                     )
                     .await
                 }
@@ -2265,6 +2274,7 @@ async fn handle_request_inner(
         .router
         .compiled_route(route_index)
         .map(|route| &route.matcher_precompile);
+    let mut response_handlers = None;
     let plan = plan_h3_handler(
         handler,
         &state,
@@ -2276,6 +2286,7 @@ async fn handle_request_inner(
         route_precompile,
         false,
         &mut request_vars,
+        &mut response_handlers,
     )
     .await?;
 
@@ -2294,6 +2305,11 @@ async fn handle_request_inner(
                 response_policy,
                 request_id,
                 &state,
+                &header,
+                &effective_uri,
+                &verified_client_ip_text,
+                &request_vars,
+                response_handlers.as_deref(),
             )
             .await?;
             return Ok(());
@@ -2325,30 +2341,58 @@ async fn handle_request_inner(
             headers,
         } => {
             let body = body.unwrap_or_default();
-            let mut hdrs = vec![
-                quiche::h3::Header::new(b":status", status.to_string().as_bytes()),
-                quiche::h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
-            ];
+            let mut hdrs = http::HeaderMap::new();
             for (k, v) in &headers {
-                hdrs.push(quiche::h3::Header::new(k.as_bytes(), v.as_bytes()));
+                if let (Ok(name), Ok(value)) = (
+                    http::header::HeaderName::from_bytes(k.as_bytes()),
+                    http::HeaderValue::from_str(v),
+                ) {
+                    hdrs.insert(name, value);
+                }
             }
-            apply_h3_response_policy(&mut hdrs, response_policy, request_id, Some(&state));
-            send_headers(resp_tx, stream_id, hdrs, body.is_empty()).await;
-            if !body.is_empty() {
-                pace_h3_body(&mut download_pacer, request_deadline, body.len()).await?;
-                send_body(resp_tx, stream_id, body.into_bytes(), true).await;
-            }
-            Ok(())
+            send_h3_local_response(
+                resp_tx,
+                stream_id,
+                &state,
+                &header,
+                &effective_uri,
+                &verified_client_ip_text,
+                &request_vars,
+                response_handlers.as_deref(),
+                status,
+                hdrs,
+                H3LocalBody::Bytes(body.into_bytes()),
+                response_policy,
+                request_id,
+                request_deadline,
+                &mut download_pacer,
+            )
+            .await
         }
 
         H3Terminal::Redirect { to, code } => {
-            let mut hdrs = vec![
-                quiche::h3::Header::new(b":status", code.to_string().as_bytes()),
-                quiche::h3::Header::new(b"location", to.as_bytes()),
-            ];
-            apply_h3_response_policy(&mut hdrs, response_policy, request_id, Some(&state));
-            send_headers(resp_tx, stream_id, hdrs, true).await;
-            Ok(())
+            let mut hdrs = http::HeaderMap::new();
+            if let Ok(value) = http::HeaderValue::from_str(&to) {
+                hdrs.insert("location", value);
+            }
+            send_h3_local_response(
+                resp_tx,
+                stream_id,
+                &state,
+                &header,
+                &effective_uri,
+                &verified_client_ip_text,
+                &request_vars,
+                response_handlers.as_deref(),
+                code,
+                hdrs,
+                H3LocalBody::Bytes(Vec::new()),
+                response_policy,
+                request_id,
+                request_deadline,
+                &mut download_pacer,
+            )
+            .await
         }
 
         H3Terminal::Templates { root } => {
@@ -2365,15 +2409,29 @@ async fn handle_request_inner(
             let source = std::fs::read_to_string(&file_path).map_err(|_| (404, "Not Found"))?;
             let body = crate::server::render_template(&source, &root)
                 .map_err(|_| (500, "Template Rendering Failed"))?;
-            let mut hdrs = vec![
-                quiche::h3::Header::new(b":status", b"200"),
-                quiche::h3::Header::new(b"content-type", b"text/html; charset=utf-8"),
-                quiche::h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
-            ];
-            apply_h3_response_policy(&mut hdrs, response_policy, request_id, Some(&state));
-            send_headers(resp_tx, stream_id, hdrs, false).await;
-            send_body(resp_tx, stream_id, body.into_bytes(), true).await;
-            Ok(())
+            let mut hdrs = http::HeaderMap::new();
+            hdrs.insert(
+                "content-type",
+                http::HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+            send_h3_local_response(
+                resp_tx,
+                stream_id,
+                &state,
+                &header,
+                &effective_uri,
+                &verified_client_ip_text,
+                &request_vars,
+                response_handlers.as_deref(),
+                200,
+                hdrs,
+                H3LocalBody::Bytes(body.into_bytes()),
+                response_policy,
+                request_id,
+                request_deadline,
+                &mut download_pacer,
+            )
+            .await
         }
 
         H3Terminal::FileServer => {
@@ -2394,83 +2452,119 @@ async fn handle_request_inner(
                 .await
             {
                 Ok(Some(ServedResponse::Redirect(location))) => {
-                    let mut hdrs = vec![quiche::h3::Header::new(b":status", b"308")];
-                    hdrs.push(quiche::h3::Header::new(b"location", location.as_bytes()));
-                    apply_h3_response_policy(&mut hdrs, response_policy, request_id, Some(&state));
-                    send_headers(resp_tx, stream_id, hdrs, true).await;
-                    Ok(())
+                    let mut hdrs = http::HeaderMap::new();
+                    if let Ok(value) = http::HeaderValue::from_str(&location) {
+                        hdrs.insert("location", value);
+                    }
+                    send_h3_local_response(
+                        resp_tx,
+                        stream_id,
+                        &state,
+                        &header,
+                        &effective_uri,
+                        &verified_client_ip_text,
+                        &request_vars,
+                        response_handlers.as_deref(),
+                        308,
+                        hdrs,
+                        H3LocalBody::Bytes(Vec::new()),
+                        response_policy,
+                        request_id,
+                        request_deadline,
+                        &mut download_pacer,
+                    )
+                    .await
                 }
-                Ok(Some(ServedResponse::Stream(mut stream))) => {
-                    let mut hdrs = vec![
-                        quiche::h3::Header::new(b":status", b"200"),
-                        quiche::h3::Header::new(b"content-type", stream.content_type.as_bytes()),
-                        quiche::h3::Header::new(
-                            b"content-length",
-                            stream.content_length.as_bytes(),
-                        ),
-                        quiche::h3::Header::new(b"accept-ranges", b"bytes"),
-                    ];
+                Ok(Some(ServedResponse::Stream(stream))) => {
+                    let mut hdrs = http::HeaderMap::new();
+                    hdrs.insert("content-type", stream.content_type.clone());
+                    hdrs.insert("content-length", stream.content_length.clone());
+                    hdrs.insert("accept-ranges", http::HeaderValue::from_static("bytes"));
                     if let Some(lm) = &stream.last_modified {
-                        hdrs.push(quiche::h3::Header::new(b"last-modified", lm.as_bytes()));
+                        hdrs.insert("last-modified", lm.clone());
                     }
                     if let Some(etag) = &stream.etag {
-                        hdrs.push(quiche::h3::Header::new(b"etag", etag.as_bytes()));
+                        hdrs.insert("etag", etag.clone());
                     }
-                    apply_h3_response_policy(&mut hdrs, response_policy, request_id, Some(&state));
-                    send_headers(resp_tx, stream_id, hdrs, false).await;
-
-                    // 🌊 Streams file chunks without buffering the complete representation.
-                    let mut fin_sent = false;
-                    loop {
-                        match stream.read_chunk() {
-                            Ok(Some(chunk)) => {
-                                let last = stream.is_complete();
-                                pace_h3_body(&mut download_pacer, request_deadline, chunk.len())
-                                    .await?;
-                                send_body(resp_tx, stream_id, chunk, last).await;
-                                fin_sent = last;
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                tracing::error!("❌ H3 file stream error: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                    if !fin_sent {
-                        send_body(resp_tx, stream_id, Vec::new(), true).await;
-                    }
-                    Ok(())
+                    send_h3_local_response(
+                        resp_tx,
+                        stream_id,
+                        &state,
+                        &header,
+                        &effective_uri,
+                        &verified_client_ip_text,
+                        &request_vars,
+                        response_handlers.as_deref(),
+                        200,
+                        hdrs,
+                        H3LocalBody::File(stream),
+                        response_policy,
+                        request_id,
+                        request_deadline,
+                        &mut download_pacer,
+                    )
+                    .await
                 }
                 Ok(Some(ServedResponse::Buffered(file))) => {
-                    let mut hdrs = vec![
-                        quiche::h3::Header::new(b":status", file.status.to_string().as_bytes()),
-                        quiche::h3::Header::new(b"content-type", file.content_type.as_bytes()),
-                        quiche::h3::Header::new(b"content-length", file.content_length.as_bytes()),
-                        quiche::h3::Header::new(b"accept-ranges", b"bytes"),
-                    ];
-                    if let Some(range) = &file.content_range {
-                        hdrs.push(quiche::h3::Header::new(b"content-range", range.as_bytes()));
+                    let mut hdrs = http::HeaderMap::new();
+                    hdrs.insert("content-type", file.content_type.clone());
+                    hdrs.insert("content-length", file.content_length.clone());
+                    hdrs.insert("accept-ranges", http::HeaderValue::from_static("bytes"));
+                    if let Some(range) = &file.content_range
+                        && let Ok(value) = http::HeaderValue::from_str(range)
+                    {
+                        hdrs.insert("content-range", value);
                     }
                     if let Some(lm) = &file.last_modified {
-                        hdrs.push(quiche::h3::Header::new(b"last-modified", lm.as_bytes()));
+                        hdrs.insert("last-modified", lm.clone());
                     }
                     if let Some(etag) = &file.etag {
-                        hdrs.push(quiche::h3::Header::new(b"etag", etag.as_bytes()));
+                        hdrs.insert("etag", etag.clone());
                     }
-                    if let Some(enc) = &file.content_encoding {
-                        hdrs.push(quiche::h3::Header::new(b"content-encoding", enc.as_bytes()));
+                    if let Some(enc) = &file.content_encoding
+                        && let Ok(value) = http::HeaderValue::from_str(enc)
+                    {
+                        hdrs.insert("content-encoding", value);
                     }
-                    apply_h3_response_policy(&mut hdrs, response_policy, request_id, Some(&state));
-                    send_headers(resp_tx, stream_id, hdrs, file.content.is_empty()).await;
-                    if !file.content.is_empty() {
-                        pace_h3_body(&mut download_pacer, request_deadline, file.content.len())
-                            .await?;
-                        send_body(resp_tx, stream_id, file.content, true).await;
-                    }
-                    Ok(())
+                    send_h3_local_response(
+                        resp_tx,
+                        stream_id,
+                        &state,
+                        &header,
+                        &effective_uri,
+                        &verified_client_ip_text,
+                        &request_vars,
+                        response_handlers.as_deref(),
+                        file.status,
+                        hdrs,
+                        H3LocalBody::Bytes(file.content),
+                        response_policy,
+                        request_id,
+                        request_deadline,
+                        &mut download_pacer,
+                    )
+                    .await
                 }
-                Ok(None) => Err((404, "Not Found")),
+                Ok(None) => {
+                    send_h3_local_response(
+                        resp_tx,
+                        stream_id,
+                        &state,
+                        &header,
+                        &effective_uri,
+                        &verified_client_ip_text,
+                        &request_vars,
+                        response_handlers.as_deref(),
+                        404,
+                        http::HeaderMap::new(),
+                        H3LocalBody::Bytes(Vec::new()),
+                        response_policy,
+                        request_id,
+                        request_deadline,
+                        &mut download_pacer,
+                    )
+                    .await
+                }
                 Err(e) => {
                     tracing::error!("❌ H3 FileServer error: {}", e);
                     Err((500, "File Server Error"))
@@ -2498,6 +2592,7 @@ async fn handle_request_inner(
                 body_notify,
                 request_started,
                 &request_vars,
+                response_handlers.as_deref(),
             )
             .await
         }
@@ -2526,6 +2621,7 @@ async fn reverse_proxy_upstream(
     body_notify: &Arc<Notify>,
     request_started: Instant,
     request_vars: &crate::http_policy::RequestVars,
+    standalone_response_handlers: Option<&[pingclair_core::config::ResponseHandlerConfig]>,
 ) -> Result<(), HandlerError> {
     let _route_admission = match proxy.admit_route(state, route_index).await {
         Ok(admission) => admission,
@@ -3023,6 +3119,7 @@ async fn reverse_proxy_upstream(
     let mut intercept_set: Vec<(String, String)> = Vec::new();
     let mut intercept_status: Option<u16> = None;
     let mut intercept_replacement: Option<crate::http_policy::InterceptedResponse> = None;
+    let mut intercept_file: Option<pingclair_static::StreamingFile> = None;
     {
         let handlers = state
             .config
@@ -3031,6 +3128,7 @@ async fn reverse_proxy_upstream(
             .and_then(|route| crate::server::find_reverse_proxy_config(&route.handler))
             .map(|config| config.handle_response.as_slice())
             .filter(|handlers| !handlers.is_empty())
+            .or(standalone_response_handlers)
             .unwrap_or(&[]);
         if !handlers.is_empty()
             && let Some(resp) = session.response_header()
@@ -3042,6 +3140,53 @@ async fn reverse_proxy_upstream(
                 &resp.headers,
                 &mut eval_vars,
             ) {
+                if let Some(file_server) = outcome.file_server {
+                    let mut request_path = effective_uri.to_string();
+                    if let Some(template) = outcome.request_rewrite {
+                        let resolved = crate::server::resolve_caddy_placeholders(
+                            &template,
+                            client_header,
+                            Some(verified_client_ip),
+                            "https",
+                            &eval_vars,
+                        );
+                        request_path = rewrite_uri(
+                            &request_path,
+                            None,
+                            None,
+                            Some(resolved.as_ref()),
+                            None,
+                            None,
+                        );
+                    }
+                    let root = if file_server.root == "." {
+                        eval_vars.get("root").unwrap_or(".").to_string()
+                    } else {
+                        file_server.root
+                    };
+                    let server =
+                        pingclair_static::FileServer::new(pingclair_static::FileServerConfig {
+                            root: std::path::PathBuf::from(&root),
+                            index: file_server.index,
+                            browse: file_server.browse,
+                            browse_limit: file_server.browse_limit,
+                            compress: file_server.compress,
+                            precompressed: false,
+                        });
+                    intercept_file = server
+                        .serve_streaming(request_path.split('?').next().unwrap_or("/"))
+                        .await
+                        .map_err(|_| (500, "Response File Server Error"))?;
+                    if intercept_file.is_none() {
+                        tracing::warn!(
+                            path = request_path,
+                            root,
+                            "⚠️ H3 proxy response file server found no file; raising a routable 404"
+                        );
+                        session.shutdown().await;
+                        return Err((404, "Not Found"));
+                    }
+                }
                 intercept_remove = outcome.header_remove;
                 intercept_set = outcome.header_set;
                 intercept_status = outcome.passthrough_status;
@@ -3049,8 +3194,15 @@ async fn reverse_proxy_upstream(
             }
         }
     }
-    let effective_status = intercept_status.unwrap_or(upstream_status);
-    if intercept_replacement.is_none() && state.intercepts_error_status(effective_status) {
+    let effective_status = if intercept_file.is_some() {
+        200
+    } else {
+        intercept_status.unwrap_or(upstream_status)
+    };
+    if intercept_replacement.is_none()
+        && intercept_file.is_none()
+        && state.intercepts_error_status(effective_status)
+    {
         session.shutdown().await;
         return Err((effective_status, error_reason(effective_status)));
     }
@@ -3069,7 +3221,39 @@ async fn reverse_proxy_upstream(
 
     let mut hdrs = Vec::new();
     if let Some(resp) = session.response_header() {
-        if let Some(replacement) = &intercept_replacement {
+        if let Some(stream) = &intercept_file {
+            hdrs.push(quiche::h3::Header::new(b":status", b"200"));
+            hdrs.push(quiche::h3::Header::new(
+                b"content-type",
+                stream.content_type.as_bytes(),
+            ));
+            hdrs.push(quiche::h3::Header::new(
+                b"content-length",
+                stream.content_length.as_bytes(),
+            ));
+            if let Some(value) = &stream.last_modified {
+                hdrs.push(quiche::h3::Header::new(b"last-modified", value.as_bytes()));
+            }
+            if let Some(value) = &stream.etag {
+                hdrs.push(quiche::h3::Header::new(b"etag", value.as_bytes()));
+            }
+            if stream.vary_accept_encoding {
+                hdrs.push(quiche::h3::Header::new(b"vary", b"Accept-Encoding"));
+            }
+            for (name, template) in &intercept_set {
+                let resolved = crate::server::resolve_caddy_placeholders(
+                    template,
+                    client_header,
+                    Some(verified_client_ip),
+                    "https",
+                    request_vars,
+                );
+                hdrs.push(quiche::h3::Header::new(
+                    name.to_ascii_lowercase().as_bytes(),
+                    resolved.as_bytes(),
+                ));
+            }
+        } else if let Some(replacement) = &intercept_replacement {
             hdrs.push(quiche::h3::Header::new(
                 b":status",
                 replacement.status.to_string().as_bytes(),
@@ -3144,12 +3328,42 @@ async fn reverse_proxy_upstream(
         ));
     }
     apply_h3_response_policy(&mut hdrs, &effective_policy, request_id, Some(state));
+    let mut download_pacer = limits.download_bytes_per_sec.map(StreamPacer::new);
 
     send_headers(resp_tx, stream_id, hdrs, false).await;
 
+    // 🌊 A response-subroute file is a controlled takeover: stream the
+    // bounded local body and tear down the unused upstream response instead
+    // of making file progress depend on upstream body callbacks.
+    if let Some(mut stream) = intercept_file {
+        let mut fin_sent = false;
+        while let Some(chunk) = stream
+            .read_chunk()
+            .map_err(|_| (500, "Response File Read Failed"))?
+        {
+            let last = stream.is_complete();
+            if let Some(delay) = download_pacer
+                .as_mut()
+                .and_then(|pacer| pacer.delay_for(chunk.len()))
+            {
+                if request_deadline.is_some_and(|deadline| Instant::now() + delay >= deadline) {
+                    session.shutdown().await;
+                    return Err((408, "Request Timeout"));
+                }
+                tokio::time::sleep(delay).await;
+            }
+            send_body(resp_tx, stream_id, chunk, last).await;
+            fin_sent = last;
+        }
+        if !fin_sent {
+            send_body(resp_tx, stream_id, Vec::new(), true).await;
+        }
+        session.shutdown().await;
+        return Ok(());
+    }
+
     // 🌊 Streams the upstream response without committing the final H3 frame early.
     let mut clean = true;
-    let mut download_pacer = limits.download_bytes_per_sec.map(StreamPacer::new);
     let mut replacement_sent = false;
     loop {
         match session.read_response_body().await {
@@ -3244,6 +3458,197 @@ async fn reverse_proxy_upstream(
 
 // MARK: - Response channel helpers
 
+/// 🌊 A local HTTP/3 body that stays bounded while response policy runs.
+enum H3LocalBody {
+    Bytes(Vec<u8>),
+    File(pingclair_static::StreamingFile),
+}
+
+/// 🧭 Evaluates and sends one local HTTP/3 response through shared interception policy.
+#[allow(clippy::too_many_arguments)]
+async fn send_h3_local_response(
+    resp_tx: &RespSender,
+    stream_id: u64,
+    state: &ProxyState,
+    request_header: &RequestHeader,
+    effective_uri: &str,
+    verified_client_ip: &str,
+    request_vars: &crate::http_policy::RequestVars,
+    response_handlers: Option<&[pingclair_core::config::ResponseHandlerConfig]>,
+    mut status: u16,
+    mut headers: http::HeaderMap,
+    mut body: H3LocalBody,
+    policy: &ResponseHeaderPolicy,
+    request_id: &str,
+    request_deadline: Option<Instant>,
+    download_pacer: &mut Option<StreamPacer>,
+) -> Result<(), HandlerError> {
+    if let Some(handlers) = response_handlers.filter(|handlers| !handlers.is_empty()) {
+        let mut eval_vars = request_vars.clone();
+        eval_vars.set("http.reverse_proxy.status_code", status.to_string());
+        if let Some(outcome) = crate::http_policy::evaluate_response_handlers(
+            handlers,
+            status,
+            &headers,
+            &mut eval_vars,
+        ) {
+            if let Some(file_server) = outcome.file_server {
+                let mut request_path = effective_uri.to_string();
+                if let Some(template) = outcome.request_rewrite {
+                    let resolved = crate::server::resolve_caddy_placeholders(
+                        &template,
+                        request_header,
+                        Some(verified_client_ip),
+                        "https",
+                        &eval_vars,
+                    );
+                    request_path = rewrite_uri(
+                        &request_path,
+                        None,
+                        None,
+                        Some(resolved.as_ref()),
+                        None,
+                        None,
+                    );
+                }
+                let root = if file_server.root == "." {
+                    eval_vars.get("root").unwrap_or(".").to_string()
+                } else {
+                    file_server.root
+                };
+                let server =
+                    pingclair_static::FileServer::new(pingclair_static::FileServerConfig {
+                        root: std::path::PathBuf::from(&root),
+                        index: file_server.index,
+                        browse: file_server.browse,
+                        browse_limit: file_server.browse_limit,
+                        compress: file_server.compress,
+                        precompressed: false,
+                    });
+                let Some(stream) = server
+                    .serve_streaming(request_path.split('?').next().unwrap_or("/"))
+                    .await
+                    .map_err(|_| (500, "Response File Server Error"))?
+                else {
+                    tracing::warn!(
+                        path = request_path,
+                        root,
+                        "⚠️ H3 response file server found no file; raising a routable 404"
+                    );
+                    return Err((404, "Not Found"));
+                };
+                status = 200;
+                headers.clear();
+                headers.insert("content-type", stream.content_type.clone());
+                headers.insert("content-length", stream.content_length.clone());
+                if let Some(value) = &stream.last_modified {
+                    headers.insert("last-modified", value.clone());
+                }
+                if let Some(value) = &stream.etag {
+                    headers.insert("etag", value.clone());
+                }
+                if stream.vary_accept_encoding {
+                    headers.insert("vary", http::HeaderValue::from_static("Accept-Encoding"));
+                }
+                body = H3LocalBody::File(stream);
+            } else if let Some(replacement) = outcome.replacement {
+                status = replacement.status;
+                headers.clear();
+                for (name, template) in replacement.headers {
+                    let resolved = crate::server::resolve_caddy_placeholders(
+                        &template,
+                        request_header,
+                        Some(verified_client_ip),
+                        "https",
+                        &eval_vars,
+                    );
+                    if let (Ok(name), Ok(value)) = (
+                        http::header::HeaderName::from_bytes(name.as_bytes()),
+                        http::HeaderValue::from_str(resolved.as_ref()),
+                    ) {
+                        headers.insert(name, value);
+                    }
+                }
+                body = H3LocalBody::Bytes(replacement.body);
+            } else {
+                if let Some(replacement_status) = outcome.passthrough_status {
+                    status = replacement_status;
+                }
+                for name in outcome.header_remove {
+                    headers.remove(name);
+                }
+                for (name, template) in outcome.header_set {
+                    let resolved = crate::server::resolve_caddy_placeholders(
+                        &template,
+                        request_header,
+                        Some(verified_client_ip),
+                        "https",
+                        &eval_vars,
+                    );
+                    if let (Ok(name), Ok(value)) = (
+                        http::header::HeaderName::from_bytes(name.as_bytes()),
+                        http::HeaderValue::from_str(resolved.as_ref()),
+                    ) {
+                        headers.insert(name, value);
+                    }
+                }
+            }
+        }
+    }
+
+    headers.remove("content-length");
+    let content_length = match &body {
+        H3LocalBody::Bytes(bytes) => bytes.len() as u64,
+        H3LocalBody::File(stream) => stream.content_length(),
+    };
+    headers.insert(
+        "content-length",
+        http::HeaderValue::from_str(&content_length.to_string())
+            .map_err(|_| (500, "Invalid Response Content Length"))?,
+    );
+    let mut h3_headers = vec![quiche::h3::Header::new(
+        b":status",
+        status.to_string().as_bytes(),
+    )];
+    for (name, value) in &headers {
+        let lower = name.as_str().to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "connection" | "keep-alive" | "transfer-encoding" | "te" | "trailer" | "upgrade"
+        ) {
+            continue;
+        }
+        h3_headers.push(quiche::h3::Header::new(lower.as_bytes(), value.as_bytes()));
+    }
+    apply_h3_response_policy(&mut h3_headers, policy, request_id, Some(state));
+    send_headers(resp_tx, stream_id, h3_headers, content_length == 0).await;
+
+    match body {
+        H3LocalBody::Bytes(bytes) => {
+            if !bytes.is_empty() {
+                pace_h3_body(download_pacer, request_deadline, bytes.len()).await?;
+                send_body(resp_tx, stream_id, bytes, true).await;
+            }
+        }
+        H3LocalBody::File(mut stream) => {
+            let mut fin_sent = false;
+            while let Some(chunk) = stream
+                .read_chunk()
+                .map_err(|_| (500, "Response File Read Failed"))?
+            {
+                let last = stream.is_complete();
+                pace_h3_body(download_pacer, request_deadline, chunk.len()).await?;
+                send_body(resp_tx, stream_id, chunk, last).await;
+                fin_sent = last;
+            }
+            if !fin_sent && content_length > 0 {
+                send_body(resp_tx, stream_id, Vec::new(), true).await;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 🧩 Replaces one H3 response header while preserving unrelated values.
 fn set_h3_header(headers: &mut Vec<quiche::h3::Header>, name: &str, value: &str) {
     let normalized = name.to_ascii_lowercase();
@@ -3320,6 +3725,7 @@ fn apply_h3_response_policy(
 }
 
 /// 📤 Sends one middleware-generated H3 response with the shared header policy.
+#[allow(clippy::too_many_arguments)]
 async fn send_immediate_response(
     resp_tx: &RespSender,
     stream_id: u64,
@@ -3327,6 +3733,11 @@ async fn send_immediate_response(
     policy: &ResponseHeaderPolicy,
     request_id: &str,
     state: &ProxyState,
+    request_header: &RequestHeader,
+    effective_uri: &str,
+    verified_client_ip: &str,
+    request_vars: &crate::http_policy::RequestVars,
+    response_handlers: Option<&[pingclair_core::config::ResponseHandlerConfig]>,
 ) -> Result<(), HandlerError> {
     let body = response.body.into_bytes();
     let mut pacer = state
@@ -3338,28 +3749,41 @@ async fn send_immediate_response(
         .headers
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
-    let mut headers = vec![
-        quiche::h3::Header::new(b":status", response.status.to_string().as_bytes()),
-        quiche::h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
-    ];
+    let mut headers = http::HeaderMap::new();
     if !body.is_empty() && !has_content_type {
-        headers.push(quiche::h3::Header::new(b"content-type", b"text/plain"));
+        headers.insert("content-type", http::HeaderValue::from_static("text/plain"));
     }
     for (name, value) in response.headers {
-        headers.push(quiche::h3::Header::new(name.as_bytes(), value.as_bytes()));
+        if let (Ok(name), Ok(value)) = (
+            http::header::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(&value),
+        ) {
+            headers.insert(name, value);
+        }
     }
-    apply_h3_response_policy(&mut headers, policy, request_id, Some(state));
-    send_headers(resp_tx, stream_id, headers, body.is_empty()).await;
-    if !body.is_empty() {
-        let request_deadline = state
-            .config
-            .limits
-            .request_timeout_ms
-            .map(|value| Instant::now() + Duration::from_millis(value));
-        pace_h3_body(&mut pacer, request_deadline, body.len()).await?;
-        send_body(resp_tx, stream_id, body, true).await;
-    }
-    Ok(())
+    let request_deadline = state
+        .config
+        .limits
+        .request_timeout_ms
+        .map(|value| Instant::now() + Duration::from_millis(value));
+    send_h3_local_response(
+        resp_tx,
+        stream_id,
+        state,
+        request_header,
+        effective_uri,
+        verified_client_ip,
+        request_vars,
+        response_handlers,
+        response.status,
+        headers,
+        H3LocalBody::Bytes(body),
+        policy,
+        request_id,
+        request_deadline,
+        &mut pacer,
+    )
+    .await
 }
 
 async fn send_headers(
@@ -3832,6 +4256,7 @@ mod tests {
             &body_notify,
             Instant::now(),
             &crate::http_policy::RequestVars::default(),
+            None,
         )
         .await
         .unwrap();
@@ -3850,6 +4275,130 @@ mod tests {
             body.msg,
             RespMsg::Body(ref bytes, false) if bytes == b"ok"
         ));
+        upstream_task.await.unwrap();
+    }
+
+    /// 🌊 An H3 proxy response file streams independently of the upstream body.
+    #[tokio::test]
+    async fn h3_bridge_streams_response_subroute_file_to_completion() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "H3 bridge request closed before its headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let root = tempfile::tempdir().unwrap();
+        let replacement = vec![b'x'; 512 * 1024];
+        std::fs::write(root.path().join("500.html"), &replacement).unwrap();
+        let handlers = vec![pingclair_core::config::ResponseHandlerConfig {
+            matcher: Some(pingclair_core::config::ResponseMatcher {
+                status_codes: vec![500],
+                headers: BTreeMap::new(),
+            }),
+            status_code: None,
+            handlers: vec![
+                HandlerConfig::Rewrite {
+                    strip_prefix: None,
+                    strip_suffix: None,
+                    replace: Some("/500.html".to_string()),
+                    regex: None,
+                    regex_replace: None,
+                },
+                HandlerConfig::FileServer {
+                    root: root.path().to_string_lossy().into_owned(),
+                    index: Vec::new(),
+                    browse: false,
+                    browse_limit: None,
+                    compress: false,
+                },
+            ],
+        }];
+        let state = proxy_state(HandlerConfig::ReverseProxy(Box::new(ReverseProxyConfig {
+            upstreams: vec![format!("http://{upstream_address}")],
+            ..Default::default()
+        })));
+        let proxy = PingclairProxy::new();
+        let connector = pingora_core::connectors::http::Connector::new(Some(
+            pingora_core::connectors::ConnectorOptions::new(16),
+        ));
+        let request = H3Request {
+            method: "GET".to_string(),
+            protocol: None,
+            path: "/probe".to_string(),
+            authority: "example.test".to_string(),
+            headers: Vec::new(),
+        };
+        let client_header = RequestHeader::build(http::Method::GET, b"/probe", None).unwrap();
+        let (body_tx, mut body_rx) = mpsc::channel(1);
+        drop(body_tx);
+        let (resp_tx, mut resp_rx) = mpsc::channel(4);
+        let body_notify = Arc::new(Notify::new());
+        let response_policy = ResponseHeaderPolicy::default();
+        let request_vars = crate::http_policy::RequestVars::default();
+
+        let bridge = reverse_proxy_upstream(
+            &proxy,
+            &connector,
+            &state,
+            0,
+            &request,
+            &client_header,
+            &request.path,
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1",
+            "response-file-request-id",
+            &response_policy,
+            0,
+            0,
+            &mut body_rx,
+            &resp_tx,
+            &body_notify,
+            Instant::now(),
+            &request_vars,
+            Some(&handlers),
+        );
+        let collect = async {
+            let mut status = None;
+            let mut body = Vec::new();
+            while let Some(event) = resp_rx.recv().await {
+                match event.msg {
+                    RespMsg::Headers(headers, _) => {
+                        status = headers
+                            .iter()
+                            .find(|header| header.name() == b":status")
+                            .map(|header| header.value().to_vec());
+                    }
+                    RespMsg::Body(bytes, fin) => {
+                        body.extend_from_slice(&bytes);
+                        if fin {
+                            break;
+                        }
+                    }
+                    RespMsg::Trailers(_) | RespMsg::HandlerDone => {}
+                }
+            }
+            (status, body)
+        };
+        let (result, (status, body)) = tokio::join!(bridge, collect);
+
+        result.unwrap();
+        assert_eq!(status.as_deref(), Some(b"200".as_slice()));
+        assert_eq!(body, replacement);
         upstream_task.await.unwrap();
     }
 
@@ -3925,6 +4474,7 @@ mod tests {
             &Arc::new(Notify::new()),
             Instant::now(),
             &crate::http_policy::RequestVars::default(),
+            None,
         )
         .await
         .unwrap();
@@ -3952,6 +4502,7 @@ mod tests {
             &Arc::new(Notify::new()),
             Instant::now(),
             &crate::http_policy::RequestVars::default(),
+            None,
         )
         .await;
         assert_eq!(result, Err((503, "Upstream Overloaded")));
@@ -4041,6 +4592,7 @@ mod tests {
             &body_notify,
             Instant::now(),
             &crate::http_policy::RequestVars::default(),
+            None,
         )
         .await
         .unwrap();
@@ -4116,6 +4668,7 @@ mod tests {
             None,
             false,
             &mut crate::http_policy::RequestVars::default(),
+            &mut None,
         )
         .await
         .unwrap();
@@ -4175,6 +4728,7 @@ mod tests {
             None,
             false,
             &mut crate::http_policy::RequestVars::default(),
+            &mut None,
         )
         .await
         .unwrap();
@@ -4215,6 +4769,7 @@ mod tests {
             None,
             false,
             &mut crate::http_policy::RequestVars::default(),
+            &mut None,
         )
         .await
         .unwrap();
@@ -4263,6 +4818,7 @@ mod tests {
             None,
             false,
             &mut crate::http_policy::RequestVars::default(),
+            &mut None,
         )
         .await
         .unwrap();
@@ -4302,12 +4858,126 @@ mod tests {
             None,
             false,
             &mut crate::http_policy::RequestVars::default(),
+            &mut None,
         )
         .await
         .unwrap();
 
         assert!(matches!(plan, H3Plan::Terminal(H3Terminal::ReverseProxy)));
         assert_eq!(uri, "/users?q=1");
+    }
+
+    /// 🧭 A standalone interceptor survives planning until the proxied response arrives.
+    #[tokio::test]
+    async fn h3_standalone_intercept_registers_response_handlers() {
+        let response_handler = pingclair_core::config::ResponseHandlerConfig {
+            matcher: Some(pingclair_core::config::ResponseMatcher {
+                status_codes: vec![418],
+                headers: BTreeMap::new(),
+            }),
+            status_code: Some("201".to_string()),
+            handlers: Vec::new(),
+        };
+        let handler = HandlerConfig::Pipeline {
+            handlers: vec![
+                HandlerElement::plain(HandlerConfig::Intercept {
+                    handlers: vec![response_handler.clone()],
+                }),
+                HandlerElement::plain(HandlerConfig::ReverseProxy(Default::default())),
+            ],
+        };
+        let state = proxy_state(handler.clone());
+        let mut request = RequestHeader::build(http::Method::GET, b"/probe", None).unwrap();
+        let mut uri = "/probe".to_string();
+        let mut policy = ResponseHeaderPolicy::default();
+        let mut registered = None;
+
+        let plan = plan_h3_handler(
+            &handler,
+            &state,
+            0,
+            &mut request,
+            &mut uri,
+            &mut policy,
+            "203.0.113.7",
+            None,
+            false,
+            &mut crate::http_policy::RequestVars::default(),
+            &mut registered,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(plan, H3Plan::Terminal(H3Terminal::ReverseProxy)));
+        let registered = registered.expect("the intercept handlers must survive planning");
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0].status_code.as_deref(), Some("201"));
+        assert_eq!(
+            registered[0]
+                .matcher
+                .as_ref()
+                .map(|matcher| matcher.status_codes.as_slice()),
+            Some([418].as_slice())
+        );
+    }
+
+    /// 🧭 A local H3 response enters the same standalone response decision.
+    #[tokio::test]
+    async fn h3_standalone_intercept_replaces_local_response() {
+        let handlers = vec![pingclair_core::config::ResponseHandlerConfig {
+            matcher: Some(pingclair_core::config::ResponseMatcher {
+                status_codes: vec![418],
+                headers: BTreeMap::new(),
+            }),
+            status_code: None,
+            handlers: vec![HandlerConfig::Respond {
+                status: 201,
+                body: Some("wrapped-local".to_string()),
+                headers: BTreeMap::new(),
+            }],
+        }];
+        let state = proxy_state(HandlerConfig::Respond {
+            status: 418,
+            body: Some("original".to_string()),
+            headers: BTreeMap::new(),
+        });
+        let request = RequestHeader::build(http::Method::GET, b"/probe", None).unwrap();
+        let (resp_tx, mut resp_rx) = mpsc::channel(8);
+
+        send_h3_local_response(
+            &resp_tx,
+            0,
+            &state,
+            &request,
+            "/probe",
+            "203.0.113.7",
+            &crate::http_policy::RequestVars::default(),
+            Some(&handlers),
+            418,
+            http::HeaderMap::new(),
+            H3LocalBody::Bytes(b"original".to_vec()),
+            &ResponseHeaderPolicy::default(),
+            "request-id",
+            None,
+            &mut None,
+        )
+        .await
+        .unwrap();
+
+        let headers = resp_rx.recv().await.unwrap();
+        let RespMsg::Headers(headers, false) = headers.msg else {
+            panic!("expected replacement response headers");
+        };
+        assert!(
+            headers
+                .iter()
+                .any(|header| header.name() == b":status" && header.value() == b"201")
+        );
+        let body = resp_rx.recv().await.unwrap();
+        assert!(matches!(
+            body.msg,
+            RespMsg::Body(ref bytes, true) if bytes == b"wrapped-local"
+        ));
     }
 
     #[tokio::test]
@@ -4334,6 +5004,7 @@ mod tests {
             None,
             false,
             &mut crate::http_policy::RequestVars::default(),
+            &mut None,
         )
         .await
         .unwrap();
@@ -4372,6 +5043,7 @@ mod tests {
             None,
             false,
             &mut crate::http_policy::RequestVars::default(),
+            &mut None,
         )
         .await
         .unwrap();
@@ -4425,6 +5097,7 @@ mod tests {
             precompile,
             false,
             &mut crate::http_policy::RequestVars::default(),
+            &mut None,
         )
         .await
         .unwrap();
@@ -4447,6 +5120,7 @@ mod tests {
             precompile,
             false,
             &mut crate::http_policy::RequestVars::default(),
+            &mut None,
         )
         .await
         .unwrap();

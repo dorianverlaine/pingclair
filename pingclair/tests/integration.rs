@@ -3538,6 +3538,205 @@ async fn test_pingclairfile_handle_response_replaces_and_forwards() {
     upstream_task.await.unwrap();
 }
 
+/// 🧭 A standalone interceptor wraps local responders and file-server misses.
+#[tokio::test]
+async fn test_pingclairfile_intercept_wraps_local_responses() {
+    let respond_config = r#"
+        {
+            admin off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            intercept {
+                @teapot status 418
+                handle_response @teapot {
+                    respond "wrapped-local" 201
+                }
+            }
+
+            respond "original" 418
+        }
+        "#;
+    let mut respond_server = TestServer::new_pingclairfile(respond_config);
+    assert!(
+        respond_server.wait_until_ready().await,
+        "server failed to start"
+    );
+
+    let client = no_proxy_client();
+    let local = client
+        .get(respond_server.url(0, "/local"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(local.status(), 201);
+    assert_eq!(local.text().await.unwrap(), "wrapped-local");
+
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().to_str().unwrap().replace('\\', "/");
+    let file_config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            root * {root}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            intercept {{
+                @missing status 404
+                handle_response @missing {{
+                    respond "wrapped-missing" 200
+                }}
+            }}
+
+            file_server
+        }}
+        "#,
+    );
+    let mut file_server = TestServer::new_pingclairfile(&file_config);
+    assert!(
+        file_server.wait_until_ready().await,
+        "server failed to start"
+    );
+
+    let missing = client
+        .get(file_server.url(0, "/missing.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 200);
+    assert_eq!(missing.text().await.unwrap(), "wrapped-missing");
+}
+
+/// 🚨 A missing HTTP response page enters the configured error route exactly once.
+#[tokio::test]
+async fn test_handle_response_missing_file_enters_error_route_once() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let upstream_address = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+        stream
+            .write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 8\r\nConnection: close\r\n\r\noriginal",
+            )
+            .await
+            .unwrap();
+    });
+    let errors = tempfile::tempdir().unwrap();
+    let errors = errors.path().to_str().unwrap().replace('\\', "/");
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            handle_errors 404 {{
+                respond "missing-error-page" 200
+            }}
+
+            reverse_proxy http://{upstream_address} {{
+                @err status 5xx
+                handle_response @err {{
+                    root * {errors}
+                    rewrite * /500.html
+                    file_server
+                }}
+            }}
+        }}
+        "#,
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/probe"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "missing-error-page");
+    upstream_task.await.unwrap();
+}
+
+/// 🌊 A proxy response replacement must finish independently of upstream body callbacks.
+#[tokio::test]
+async fn test_handle_response_streams_twenty_megabyte_file_to_completion() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let upstream_address = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+        stream
+            .write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+    });
+    let errors = tempfile::tempdir().unwrap();
+    let replacement_size = 20 * 1024 * 1024;
+    std::fs::write(errors.path().join("500.html"), vec![b'x'; replacement_size]).unwrap();
+    let errors = errors.path().to_str().unwrap().replace('\\', "/");
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            reverse_proxy http://{upstream_address} {{
+                @err status 5xx
+                handle_response @err {{
+                    root * {errors}
+                    rewrite * /500.html
+                    file_server
+                }}
+            }}
+        }}
+        "#,
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/probe"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers()["content-length"],
+        replacement_size.to_string()
+    );
+    let body = response.bytes().await.unwrap();
+    assert_eq!(body.len(), replacement_size);
+    assert!(body.iter().all(|byte| *byte == b'x'));
+    upstream_task.await.unwrap();
+}
+
 #[tokio::test]
 async fn test_pingclairfile_forward_auth_copies_headers_and_answers_denials() {
     use tokio::io::AsyncWriteExt;
@@ -8541,6 +8740,58 @@ async fn test_php_fastcgi_handle_response_serves_an_error_page() {
     }
     assert_eq!(response.status(), 200);
     assert_eq!(response.text().await.unwrap(), "custom-error-page");
+}
+
+/// 🚨 A missing FastCGI response page raises a routable 404 instead of restoring the CGI body.
+#[tokio::test]
+async fn test_php_fastcgi_missing_response_page_enters_error_route_once() {
+    let responder = MockFastCgi::start();
+    *responder.response.lock().unwrap() =
+        b"Status: 500 Internal Server Error\r\nContent-Type: text/plain\r\n\r\noriginal".to_vec();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("index.php"), "<?php").unwrap();
+    let errors = tempfile::tempdir().unwrap();
+    let root = root.path().to_str().unwrap().replace('\\', "/");
+    let errors = errors.path().to_str().unwrap().replace('\\', "/");
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            handle_errors 404 {{
+                respond "missing-error-page" 200
+            }}
+
+            php_fastcgi 127.0.0.1:{fcgi_port} {{
+                @err status 5xx
+                handle_response @err {{
+                    root * {errors}
+                    rewrite * /500.html
+                    file_server
+                }}
+            }}
+        }}
+        "#,
+        fcgi_port = responder.port
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/index.php"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "missing-error-page");
 }
 
 /// 🚫 A body without Content-Length is refused with 411, exactly like
