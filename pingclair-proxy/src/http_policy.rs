@@ -170,6 +170,7 @@ pub fn evaluate_response_handlers(
             // 🧭 Response-context handlers that do not make sense nested
             // here are skipped; the caller logs a warning when one appears.
             HandlerConfig::Intercept { .. }
+            | HandlerConfig::ForwardAuth(_)
             | HandlerConfig::FileServer { .. }
             | HandlerConfig::ReverseProxy(_)
             | HandlerConfig::Redirect { .. }

@@ -219,6 +219,12 @@ lets the rest converge.
   upstream body chunk by chunk, so 20 MB upstream bodies and SSE streams stay
   bounded on both H1/H2 and H3. The standalone `intercept` handler registers
   the same handlers for proxied responses.
+- 🔐 **`forward_auth`.** One inline auth round trip before the request
+  continues to the backend: a 2xx copies the configured identity headers onto
+  the request (deleting the client-supplied versions first, per
+  GHSA-f59h-q822-g45g) and falls through; anything else is streamed to the
+  client. Incoming header names containing `_` are dropped, matching Caddy's
+  default, so the underscore alias cannot smuggle past `copy_headers`.
 - 📦 **Response caching.** RFC 9111 decides what may be stored, and a second
   identical request is served without asking the origin. The store is bounded
   by `max_size` (128 MiB unless you say otherwise) and evicts least-recently-

@@ -810,6 +810,11 @@ pub enum HandlerConfig {
         handlers: Vec<ResponseHandlerConfig>,
     },
 
+    /// 🔐 Caddy's `forward_auth`: one auth round trip before the request
+    /// continues to later handlers. A 2xx copies identity headers onto the
+    /// request and moves on; anything else is answered directly.
+    ForwardAuth(Box<ForwardAuthConfig>),
+
     /// Redirect
     Redirect {
         to: String,
@@ -992,6 +997,28 @@ pub enum HandlerConfig {
 
     /// Plugin invocation
     Plugin { name: String, args: Vec<String> },
+}
+
+/// 🔐 One `copy_headers` mapping: the auth response header `from` is copied
+/// onto the forwarded request as `to` (defaulting to `from`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForwardAuthHeaderMap {
+    pub from: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+}
+
+/// 🔐 The auth round trip Caddy's `forward_auth` shortcut configures.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForwardAuthConfig {
+    /// Auth gateway dial address.
+    pub upstream: String,
+    /// URI the auth gateway is asked for; placeholders are expanded per
+    /// request.
+    pub uri: String,
+    /// Response headers copied onto the forwarded request, with renames.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub copy_headers: Vec<ForwardAuthHeaderMap>,
 }
 
 fn default_bool_true() -> bool {

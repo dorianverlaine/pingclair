@@ -727,6 +727,7 @@ fn reject_unimplemented_handler(handler: &HandlerConfig) -> CompileResult<()> {
         | HandlerConfig::CopyResponse { .. }
         | HandlerConfig::CopyResponseHeaders { .. }
         | HandlerConfig::Intercept { .. }
+        | HandlerConfig::ForwardAuth(_)
         | HandlerConfig::Redirect { .. }
         | HandlerConfig::Rewrite { .. }
         | HandlerConfig::Respond { .. }
@@ -801,6 +802,7 @@ fn validate_basic_auth_credentials(handler: &HandlerConfig) -> CompileResult<()>
         | HandlerConfig::CopyResponse { .. }
         | HandlerConfig::CopyResponseHeaders { .. }
         | HandlerConfig::Intercept { .. }
+        | HandlerConfig::ForwardAuth(_)
         | HandlerConfig::Redirect { .. }
         | HandlerConfig::Rewrite { .. }
         | HandlerConfig::Respond { .. }
@@ -1679,6 +1681,8 @@ fn compile_handler(
         Handler::Intercept(handlers) => Ok(HandlerConfig::Intercept {
             handlers: handlers.clone(),
         }),
+
+        Handler::ForwardAuth(config) => Ok(HandlerConfig::ForwardAuth(Box::new(config.clone()))),
 
         Handler::Respond(resp) => Ok(HandlerConfig::Respond {
             status: resp.status,

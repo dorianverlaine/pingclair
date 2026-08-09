@@ -1671,6 +1671,9 @@ pub struct PingclairProxy {
     proxy_protocol_registry: Arc<crate::proxy_protocol::ProxyProtocolRegistry>,
     /// 🚫 Rejects TCP requests that bypass the required external PROXY ingress.
     proxy_protocol_required: bool,
+    /// 🔌 Shared upstream connector for inline sub-requests (`forward_auth`),
+    /// with the same keepalive pool the H3 path uses.
+    pub connector: Arc<pingora_core::connectors::http::Connector>,
 }
 
 impl Default for PingclairProxy {
@@ -1685,6 +1688,9 @@ impl Default for PingclairProxy {
                 crate::proxy_protocol::ProxyProtocolRegistry::default(),
             ),
             proxy_protocol_required: false,
+            connector: Arc::new(pingora_core::connectors::http::Connector::new(Some(
+                pingora_core::connectors::ConnectorOptions::new(512),
+            ))),
         }
     }
 }
@@ -1707,6 +1713,9 @@ impl PingclairProxy {
                 crate::proxy_protocol::ProxyProtocolRegistry::default(),
             ),
             proxy_protocol_required: false,
+            connector: Arc::new(pingora_core::connectors::http::Connector::new(Some(
+                pingora_core::connectors::ConnectorOptions::new(512),
+            ))),
         }
     }
 
@@ -1726,6 +1735,9 @@ impl PingclairProxy {
                 crate::proxy_protocol::ProxyProtocolRegistry::default(),
             ),
             proxy_protocol_required,
+            connector: Arc::new(pingora_core::connectors::http::Connector::new(Some(
+                pingora_core::connectors::ConnectorOptions::new(512),
+            ))),
         }
     }
 
@@ -2547,6 +2559,148 @@ impl PingclairProxy {
             upstream_response.insert_header(name.clone(), resolved)?;
         }
         Ok(())
+    }
+
+    /// 🔐 Runs Caddy's `forward_auth` round trip inline.
+    ///
+    /// A 2xx copies the configured identity headers onto the downstream
+    /// request and returns "not handled" so the next handler (usually the
+    /// backend reverse_proxy) serves the request. Anything else is the auth
+    /// gateway's own answer and is streamed to the client, so memory stays
+    /// bounded by one response chunk.
+    async fn forward_auth(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestContext,
+        route_index: usize,
+        config: &pingclair_core::config::ForwardAuthConfig,
+    ) -> pingora_core::Result<bool> {
+        let auth_error =
+            |status: u16, message: &'static str| -> std::boxed::Box<pingora_core::Error> {
+                pingora_core::Error::explain(pingora_core::ErrorType::HTTPStatus(status), message)
+            };
+        let Some(state) = ctx.state.clone() else {
+            return Err(auth_error(502, "forward_auth ran without route state"));
+        };
+        let tls_policy = state
+            .upstream_tls_for(route_index)
+            .map_err(|()| auth_error(500, "upstream TLS configuration failed to load"))?;
+        let Some(spec) = UpstreamSpec::parse(&config.upstream) else {
+            return Err(auth_error(502, "invalid forward_auth upstream address"));
+        };
+        let Some(upstream) = crate::upstream::resolve_dynamic_dial(spec).await else {
+            return Err(auth_error(502, "forward_auth upstream did not resolve"));
+        };
+        let peer = Self::build_http_peer(&upstream, None, None, None, tls_policy)?;
+        let (mut auth, _reused) =
+            self.connector
+                .get_http_session(&peer)
+                .await
+                .map_err(|error| {
+                    tracing::warn!(%error, "🔌 forward_auth upstream connection failed");
+                    auth_error(502, "forward_auth upstream connection failed")
+                })?;
+
+        let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
+        let uri = resolve_caddy_placeholders(
+            &config.uri,
+            session.req_header(),
+            verified_client_ip.as_deref(),
+            ctx.request_scheme,
+            &ctx.request_vars,
+        )
+        .into_owned();
+        let mut auth_req = RequestHeader::build("GET", uri.as_bytes(), None)?;
+        let host = upstream
+            .ext
+            .get::<HostName>()
+            .map(|host| host.0.clone())
+            .unwrap_or_else(|| upstream.addr.to_string());
+        auth_req.insert_header("Host", host)?;
+        for (name, value) in session.req_header().headers.iter() {
+            let lower = name.as_str().to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "host"
+                    | "connection"
+                    | "keep-alive"
+                    | "transfer-encoding"
+                    | "te"
+                    | "trailer"
+                    | "upgrade"
+                    | "content-length"
+            ) || name.as_str().contains('_')
+            {
+                continue;
+            }
+            auth_req.insert_header(name.to_string(), value.as_bytes())?;
+        }
+        auth_req.insert_header("X-Forwarded-Method", session.req_header().method.as_str())?;
+        auth_req.insert_header(
+            "X-Forwarded-Uri".to_string(),
+            session.req_header().uri.to_string(),
+        )?;
+
+        auth.write_request_header(Box::new(auth_req)).await?;
+        auth.finish_request_body().await?;
+        auth.read_response_header().await?;
+        let status = auth
+            .response_header()
+            .map(|response| response.status.as_u16())
+            .unwrap_or(502);
+
+        if (200..300).contains(&status) {
+            // 🔐 GHSA-f59h-q822-g45g: the client-supplied version of every
+            // copied header is deleted first; the auth value is set only when
+            // non-empty, so a client can never smuggle a header the gateway
+            // did not issue.
+            for mapping in &config.copy_headers {
+                let from_value = auth
+                    .response_header()
+                    .and_then(|response| response.headers.get(&mapping.from))
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                session
+                    .req_header_mut()
+                    .remove_header(mapping.from.as_str());
+                if !from_value.is_empty() {
+                    let to = mapping.to.as_deref().unwrap_or(&mapping.from);
+                    session
+                        .req_header_mut()
+                        .insert_header(to.to_string(), from_value)?;
+                }
+            }
+            // 🌊 Drain the auth body so the connection can be reused; the
+            // client never sees the 2xx.
+            while let Ok(Some(_)) = auth.read_response_body().await {}
+            auth.shutdown().await;
+            return Ok(false);
+        }
+
+        // 🚫 A non-2xx is the auth gateway's own answer: stream it to the
+        // client, bounded by one chunk.
+        let mut response = auth.response_header().cloned().unwrap_or_else(|| {
+            ResponseHeader::build(502, None).expect("a status-502 response header is valid")
+        });
+        response.remove_header("transfer-encoding");
+        ctx.response_status = status;
+        Self::apply_local_response_headers(&mut response, ctx)?;
+        session
+            .write_response_header(Box::new(response), false)
+            .await?;
+        loop {
+            match auth.read_response_body().await {
+                Ok(Some(bytes)) => {
+                    session.write_response_body(Some(bytes), false).await?;
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        session.write_response_body(None, true).await?;
+        auth.shutdown().await;
+        Ok(true)
     }
 
     /// 🔁 Returns a gateway timeout when the route's total retry budget expired.
@@ -3623,6 +3777,12 @@ impl PingclairProxy {
             // "not handled" is what hands the request to Pingora's
             // `upstream_peer` phase, which is where proxying actually happens.
             HandlerConfig::ReverseProxy(_) => Ok(false),
+            // 🔐 `forward_auth` answers inline because its 2xx branch must
+            // fall through to the next handler — something the Pingora
+            // upstream lifecycle cannot do after a response arrives.
+            HandlerConfig::ForwardAuth(config) => {
+                self.forward_auth(session, ctx, route_index, config).await
+            }
             // 🚫 Unreachable by construction — `validate_config` refuses a
             // `plugin` handler, so no accepted configuration contains one.
             // It is answered rather than ignored anyway: this used to be a
@@ -4594,6 +4754,22 @@ impl ProxyHttp for PingclairProxy {
                 Self::write_simple_response(session, ctx, 400, rejection.reason()).await?;
                 return Ok(true);
             }
+        }
+
+        // 🛡️ GHSA-f59h-q822-g45g: a header name containing `_` aliases its
+        // hyphenated CGI/FastCGI form, so a client could inject the exact
+        // identity headers `forward_auth copy_headers` is supposed to own.
+        // Drop underscore-named headers before anything routes on them,
+        // matching Caddy's default.
+        let underscore_headers: Vec<String> = session
+            .req_header()
+            .headers
+            .keys()
+            .filter(|name| name.as_str().contains('_'))
+            .map(|name| name.as_str().to_string())
+            .collect();
+        for name in underscore_headers {
+            session.req_header_mut().remove_header(name.as_str());
         }
 
         // 🧭 Resolve `.` and `..` before anything routes on the path, so this

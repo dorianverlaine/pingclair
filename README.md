@@ -575,6 +575,12 @@ a replacement emits its static body once and discards the upstream body chunk
 by chunk, so interception never buffers a whole response. `intercept { … }`
 registers the same handlers for proxied responses.
 
+`forward_auth <gateway> { uri …; copy_headers … }` runs one auth round trip
+before the request continues to the backend. A 2xx copies the listed response
+headers onto the request — deleting whatever the client supplied first — and
+anything else is answered to the client directly. Header names containing `_`
+are dropped from incoming requests, matching Caddy's default.
+
 Upstreams written as hostnames are re-resolved while the server runs, so a
 container that restarts on a new address is picked up without a reload. A
 lookup that fails leaves the previous address in rotation — a resolver outage

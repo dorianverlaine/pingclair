@@ -1569,6 +1569,57 @@ mod fail_closed_tests {
         assert!(intercept[1].matcher.is_none());
     }
 
+    /// 🔐 `forward_auth` compiles with header renames and must keep its
+    /// ordering ahead of the backend reverse_proxy.
+    #[test]
+    fn forward_auth_compiles_with_copy_header_renames() {
+        let config = crate::compile(
+            r#":8881 {
+                forward_auth localhost:9000 {
+                    uri /auth
+                    copy_headers A>1 B C>3 {
+                        D
+                        E>5
+                    }
+                }
+                reverse_proxy localhost:8080
+            }"#,
+        )
+        .expect("forward_auth must compile");
+
+        let found = config
+            .servers
+            .iter()
+            .flat_map(|server| server.routes.iter())
+            .find_map(|route| match &route.handler {
+                pingclair_core::config::HandlerConfig::Pipeline { handlers } => {
+                    handlers.first().map(|element| &element.handler)
+                }
+                _ => None,
+            })
+            .expect("a pipeline");
+        let pingclair_core::config::HandlerConfig::ForwardAuth(config) = found else {
+            panic!("forward_auth must lead the pipeline");
+        };
+        assert_eq!(config.upstream, "localhost:9000");
+        assert_eq!(config.uri, "/auth");
+        let maps: Vec<(&str, Option<&str>)> = config
+            .copy_headers
+            .iter()
+            .map(|mapping| (mapping.from.as_str(), mapping.to.as_deref()))
+            .collect();
+        assert_eq!(
+            maps,
+            [
+                ("A", Some("1")),
+                ("B", None),
+                ("C", Some("3")),
+                ("D", None),
+                ("E", Some("5"))
+            ]
+        );
+    }
+
     #[test]
     fn reverse_proxy_rejects_header_up_with_extra_arguments() {
         let error = compile_err(

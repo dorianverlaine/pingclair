@@ -3481,6 +3481,120 @@ async fn test_pingclairfile_handle_response_replaces_and_forwards() {
 }
 
 #[tokio::test]
+async fn test_pingclairfile_forward_auth_copies_headers_and_answers_denials() {
+    use tokio::io::AsyncWriteExt;
+
+    let auth_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let auth_address = auth_listener.local_addr().unwrap();
+    let auth_task = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = auth_listener.accept().await.unwrap();
+            let request = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+            let text = String::from_utf8_lossy(&request);
+            if text.to_ascii_lowercase().contains("x-auth-mode: deny") {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\nConnection: close\r\n\r\nforbidden",
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-User-Id: alice\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+
+    let backend_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let backend_address = backend_listener.local_addr().unwrap();
+    let backend_task = tokio::spawn(async move {
+        let (mut stream, _) = backend_listener.accept().await.unwrap();
+        let request = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+        let text = String::from_utf8_lossy(&request);
+        let user_id = text
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("x-user-id:"))
+            .unwrap_or_default()
+            .to_string();
+        let body = format!("user={user_id};underscore={}", text.contains("X_User_Id"));
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            forward_auth http://{auth} {{
+                uri /auth
+                copy_headers X-User-Id
+            }}
+            reverse_proxy http://{backend}
+        }}
+        "#,
+        auth = auth_address,
+        backend = backend_address
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    // 🔐 GHSA-f59h-q822-g45g: the client's own X-User-Id and the underscore
+    // alias must not survive; only the auth gateway's value is forwarded.
+    let accepted = client
+        .get(server.url(0, "/app"))
+        .header("X-User-Id", "attacker")
+        .header("X_User_Id", "evil")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 200);
+    let body = accepted.text().await.unwrap();
+    assert!(
+        body.contains("X-User-Id: alice") && !body.contains("attacker"),
+        "the auth gateway's header must replace the client's: {body}"
+    );
+    assert!(
+        body.contains("underscore=false"),
+        "the underscore alias must be dropped: {body}"
+    );
+
+    let denied = client
+        .get(server.url(0, "/app"))
+        .header("X-Auth-Mode", "deny")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403);
+    assert_eq!(denied.text().await.unwrap(), "forbidden");
+
+    auth_task.await.unwrap();
+    backend_task.await.unwrap();
+}
+
+#[tokio::test]
 async fn test_pingclairfile_wildcard_internal_tls_serves_subdomains() {
     let config = r#"
         {

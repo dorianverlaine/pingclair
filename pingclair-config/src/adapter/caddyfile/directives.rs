@@ -27,6 +27,7 @@ pub(super) fn adapt_handler(
     match d.name.as_str() {
         "reverse_proxy" => adapt_reverse_proxy(d),
         "intercept" => adapt_intercept(d),
+        "forward_auth" => adapt_forward_auth(d),
         "respond" => adapt_respond(d),
         "redir" | "redirect" => adapt_redirect(d),
         "file_server" => {
@@ -141,6 +142,93 @@ pub(super) fn adapt_handler(
             None => AdapterError::UnknownDirective(other.to_string()),
         }),
     }
+}
+
+/// 🔐 Adapts Caddy's `forward_auth` shortcut into a dedicated handler.
+///
+/// Caddy expands this into a reverse_proxy plus a `handle_response` block
+/// whose 2xx branch copies response headers onto the request and then calls
+/// `next`. Pingora's lifecycle cannot continue to the next handler after an
+/// upstream response, so the same behavior is implemented as one inline auth
+/// round trip in `request_filter`: 2xx mutates the request and falls through,
+/// anything else is answered directly. The grammar is the same as upstream's.
+fn adapt_forward_auth(d: Directive) -> Result<Handler, AdapterError> {
+    let upstream = d
+        .args
+        .first()
+        .ok_or_else(|| AdapterError::ArgumentCount("forward_auth".into(), 1, 0))?;
+    if d.args.len() > 1 {
+        return Err(AdapterError::ArgumentCount(
+            "forward_auth".into(),
+            1,
+            d.args.len(),
+        ));
+    }
+    let block = d.block.as_ref().ok_or_else(|| {
+        AdapterError::InvalidArgument("forward_auth".into(), "block required".into())
+    })?;
+
+    let mut uri: Option<String> = None;
+    let mut copy_headers: Vec<pingclair_core::config::ForwardAuthHeaderMap> = Vec::new();
+    for sub in &block.directives {
+        match sub.name.as_str() {
+            "uri" => {
+                if uri.is_some() {
+                    return Err(AdapterError::InvalidArgument(
+                        "forward_auth".into(),
+                        "`uri` cannot be declared twice".into(),
+                    ));
+                }
+                uri = Some(expect_one_argument(sub)?.to_string());
+            }
+            "copy_headers" => {
+                let mut fields: Vec<String> = sub.args.clone();
+                if let Some(header_block) = &sub.block {
+                    fields.extend(
+                        header_block
+                            .directives
+                            .iter()
+                            .map(|header| header.name.clone()),
+                    );
+                }
+                if fields.is_empty() {
+                    return Err(AdapterError::ArgumentCount("copy_headers".into(), 1, 0));
+                }
+                for field in fields {
+                    if let Some((from, to)) = field.split_once('>') {
+                        copy_headers.push(pingclair_core::config::ForwardAuthHeaderMap {
+                            from: from.to_string(),
+                            to: Some(to.to_string()),
+                        });
+                    } else {
+                        copy_headers.push(pingclair_core::config::ForwardAuthHeaderMap {
+                            from: field.clone(),
+                            to: None,
+                        });
+                    }
+                }
+            }
+            other => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "forward_auth: {other}"
+                )));
+            }
+        }
+    }
+
+    let uri = uri.ok_or_else(|| {
+        AdapterError::InvalidArgument(
+            "forward_auth".into(),
+            "the `uri` subdirective is required".into(),
+        )
+    })?;
+    Ok(Handler::ForwardAuth(
+        pingclair_core::config::ForwardAuthConfig {
+            upstream: upstream.clone(),
+            uri,
+            copy_headers,
+        },
+    ))
 }
 
 /// 🛣️ Builds a `route` or `handle` block's elements.

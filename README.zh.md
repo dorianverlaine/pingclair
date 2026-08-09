@@ -548,6 +548,11 @@ retry 政策接受 Caddy 的 `lb_retry_match` 拼法：`method`、`path`、`head
 其餘上游 body 逐塊丟棄，所以攔截絕不會整份緩衝。`intercept { … }` 會對
 proxied response 註冊同一組 handler。
 
+`forward_auth <gateway> { uri …; copy_headers … }` 在請求繼續送往後端前先做
+一次 auth round trip：2xx 會把列出的回應 header 複製到請求上（先刪掉
+客戶端自帶的版本），其餘狀態直接回給客戶端。含 `_` 的傳入 header 名稱
+會被丟棄，與 Caddy 預設一致。
+
 以主機名寫的 upstream 會在執行期間定期重解析，容器換 IP 重啟後不需 reload 即可跟上。
 解析失敗時會保留上一個位址繼續服務 —— resolver 故障不該讓站台跟著掛掉；啟動當下
 還解析不到的名稱，也會在解析成功後自動加入 pool，因此代理可以先於 app 啟動。

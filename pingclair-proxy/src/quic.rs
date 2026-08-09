@@ -1728,6 +1728,14 @@ async fn plan_h3_handler(
         HandlerConfig::CopyResponse { .. } | HandlerConfig::CopyResponseHeaders { .. } => {
             Ok(H3Plan::Continue)
         }
+        // 🔐 `forward_auth` needs an inline upstream round trip that the H3
+        // planner does not implement yet; refusing beats silently skipping
+        // authentication (tracked in TRIAGE).
+        HandlerConfig::ForwardAuth(_) => Ok(H3Plan::Respond(H3ImmediateResponse {
+            status: 501,
+            body: "forward_auth is not available on HTTP/3 yet".to_string(),
+            headers: Vec::new(),
+        })),
         HandlerConfig::Vars { values } => {
             // 🧰 Values are templates resolved against the same request, so
             // a value may reference placeholders and earlier vars.

@@ -560,6 +560,9 @@ pub enum Handler {
     /// 🧭 Wraps the response of later handlers with response handlers.
     Intercept(Vec<pingclair_core::config::ResponseHandlerConfig>),
 
+    /// 🔐 Caddy's `forward_auth` shortcut: one auth round trip, then continue.
+    ForwardAuth(pingclair_core::config::ForwardAuthConfig),
+
     /// Static response
     Respond(ResponseConfig),
 

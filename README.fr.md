@@ -579,6 +579,13 @@ corps amont morceau par morceau, donc l'interception ne met jamais en tampon une
 réponse entière. `intercept { … }` enregistre les mêmes handlers pour les
 réponses proxifiées.
 
+`forward_auth <gateway> { uri …; copy_headers … }` effectue un aller-retour
+d'authentification avant que la requête continue vers le backend. Un 2xx copie
+les en-têtes de réponse listés sur la requête — en supprimant d'abord ceux
+fournis par le client — et tout autre statut est répondu directement au client.
+Les noms d'en-têtes entrants contenant `_` sont supprimés, comme par défaut
+chez Caddy.
+
 Les amonts écrits sous forme de noms d'hôtes sont ré-résolus pendant l'exécution :
 un conteneur qui redémarre sur une nouvelle adresse est suivi sans rechargement.
 Une résolution en échec laisse l'adresse précédente en rotation — une panne du
