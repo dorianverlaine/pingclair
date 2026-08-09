@@ -326,6 +326,38 @@ pub struct ServerConfig {
     /// response when unset or unreadable.
     #[serde(default)]
     pub error_pages: BTreeMap<u16, String>,
+
+    /// 🚨 Status-selective routes run when a handler raises an error status.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub error_routes: Vec<ErrorRouteConfig>,
+}
+
+/// 🚨 One `handle_errors [<codes…>]` block: a status-selective error route.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorRouteConfig {
+    /// Exact status codes this route handles; empty means every status.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codes: Vec<u16>,
+    /// `Nxx` ranges — `[4]` selects 400..=499 — when the block wrote them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hundreds: Vec<u8>,
+    /// 🧭 Matcher-guarded handlers, run in order until one answers.
+    #[serde(default)]
+    pub handlers: Vec<HandlerElement>,
+}
+
+impl ErrorRouteConfig {
+    /// 🚨 Whether `status` falls in this route's codes or hundred-range.
+    pub fn matches(&self, status: u16) -> bool {
+        // 🌐 A route with no codes at all is the catch-all: it handles every
+        // error status, which is what a bare `handle_errors { … }` means.
+        (self.codes.is_empty() && self.hundreds.is_empty())
+            || self.codes.contains(&status)
+            || self
+                .hundreds
+                .iter()
+                .any(|hundred| status / 100 == u16::from(*hundred))
+    }
 }
 
 /// Hand-written rather than derived so `ServerConfig::default()` agrees with
@@ -352,6 +384,7 @@ impl Default for ServerConfig {
             gzip_types: default_gzip_types(),
             encodings: default_encodings(),
             error_pages: BTreeMap::new(),
+            error_routes: Vec::new(),
         }
     }
 }
@@ -1856,6 +1889,26 @@ mod tests {
         );
     }
 
+    /// 🚨 A status-selective error route matches its exact codes, its `Nxx`
+    /// ranges, and — with no codes at all — every status.
+    #[test]
+    fn error_route_matches_exact_codes_ranges_and_everything() {
+        let route = ErrorRouteConfig {
+            codes: vec![404, 410],
+            hundreds: vec![4],
+            handlers: Vec::new(),
+        };
+        assert!(route.matches(404) && route.matches(410) && route.matches(499));
+        assert!(!route.matches(500) && !route.matches(301));
+
+        let catch_all = ErrorRouteConfig {
+            codes: Vec::new(),
+            hundreds: Vec::new(),
+            handlers: Vec::new(),
+        };
+        assert!(catch_all.matches(404) && catch_all.matches(503));
+    }
+
     #[test]
     fn test_server_config() {
         let config = ServerConfig {
@@ -1875,6 +1928,7 @@ mod tests {
             gzip_types: default_gzip_types(),
             encodings: default_encodings(),
             error_pages: Default::default(),
+            error_routes: Vec::new(),
         };
         assert_eq!(config.name, Some("example.com".to_string()));
     }

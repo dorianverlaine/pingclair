@@ -690,7 +690,7 @@ typo and never quietly ignored. A configuration using them does not start.
 Directives:
 
   `abort` `acme_server` `copy_response` `copy_response_headers` `forward_auth`
-  `fs` `handle_errors` `intercept` `invoke` `log_append` `log_name`
+  `fs` `intercept` `invoke` `log_append` `log_name`
   `map` `method` `metrics` `php_fastcgi` `push`
   `request_body` `request_header` `skip_log` `tracing` `vars`
 

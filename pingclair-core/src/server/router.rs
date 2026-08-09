@@ -396,6 +396,15 @@ fn precompile_element(element: &HandlerElement) -> MatcherPrecompile {
     }
 }
 
+/// 🧭 Builds a precompile tree for a standalone handler list — the body of an
+/// error route, which is a pipeline without a route of its own.
+pub fn precompile_handler_list(handlers: &[HandlerElement]) -> MatcherPrecompile {
+    MatcherPrecompile {
+        element_matcher: None,
+        children: handlers.iter().map(precompile_element).collect(),
+    }
+}
+
 impl Default for Router {
     fn default() -> Self {
         Self::new(Vec::new())

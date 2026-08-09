@@ -368,7 +368,15 @@ pub(super) fn adapt_rewrite(d: Directive) -> Result<Handler, AdapterError> {
     if d.block.is_some() {
         return Err(AdapterError::BlockNotAllowed("rewrite".into()));
     }
-    match d.args.as_slice() {
+    // 🎯 Caddy's `*` matcher token matches every request and exists only to
+    // disambiguate data from a path matcher; `rewrite * /new` means the same
+    // as `rewrite /new` and must not reach the regex reader.
+    let args = if d.args.first().is_some_and(|arg| arg == "*") {
+        &d.args[1..]
+    } else {
+        &d.args[..]
+    };
+    match args {
         [replace] => Ok(Handler::Rewrite(RewriteConfig {
             replace: Some(replace.clone()),
             ..Default::default()

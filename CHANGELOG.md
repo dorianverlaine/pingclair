@@ -105,6 +105,19 @@ lets the rest converge.
   then status. A block may add `message <text…>` when no positional message
   was given. The directive is removed from the not-supported list.
 
+- 🚨 **`handle_errors` routes raised error statuses like requests.**
+  `handle_errors [<codes…>] { … }` registers a server-level error route:
+  exact three-digit statuses and `Nxx` ranges OR together, and no codes
+  catches every error. A raised status — from the `error` directive or a
+  missing `file_server` file — runs the first matching route as a route body
+  (`handle` blocks keep their mutually exclusive semantics, rewrites apply),
+  and only falls back to the custom error page or the status text when no
+  route answers. An error raised inside an error route responds directly
+  instead of recursing; the duplicate-response and infinite-recursion shapes
+  are covered by real-binary integration tests. H3 routes `error`-raised
+  statuses the same way; H3 file-server 404 interception remains a tracked
+  parity gap.
+
 - 🗂️ **`try_files` resolves candidates under the site root and rewrites instead
   of serving.** It was previously reachable only from JSON, where it treated
   each candidate as a filesystem path and served any match itself through an

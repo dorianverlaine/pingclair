@@ -141,6 +141,13 @@ pub struct RequestContext {
     pub rewritten_path: Option<String>,
     /// 📦 Request-body bytes observed incrementally by the streaming filter.
     pub request_body_bytes: u64,
+    /// 🚨 Status raised by an `error` handler, awaiting error-route dispatch.
+    pub error_status: Option<u16>,
+    /// 💬 Message carried with the raised error status.
+    pub error_message: Option<String>,
+    /// 🚫 Whether the request is already inside an error route; a second
+    /// raised error then responds directly instead of recursing forever.
+    pub handling_error: bool,
     /// 🚫 Whether a `log_skip` middleware excluded this request from access
     /// logging.
     pub log_skip: bool,
@@ -198,6 +205,9 @@ impl Default for RequestContext {
             active_connection_metric: None,
             rewritten_path: None,
             request_body_bytes: 0,
+            error_status: None,
+            error_message: None,
+            handling_error: false,
             log_skip: false,
             request_deadline: None,
             long_connection: false,
@@ -743,6 +753,9 @@ pub struct ProxyState {
     pub config: Arc<ServerConfig>,
     /// Route matcher
     pub router: Arc<Router>,
+    /// 🚨 Precompiled per-element matchers for each error route, parallel to
+    /// `config.error_routes`.
+    pub error_route_precompiles: Vec<MatcherPrecompile>,
     /// Load balancers per route
     pub load_balancers: Vec<Option<Arc<LoadBalancer>>>,
     /// Health checkers per route
@@ -1136,9 +1149,19 @@ impl ProxyState {
         Self::new_with_previous(config, None)
     }
 
+    /// 🚨 Returns one error route's precompiled matcher tree.
+    pub fn compiled_error_route(&self, index: usize) -> Option<&MatcherPrecompile> {
+        self.error_route_precompiles.get(index)
+    }
+
     /// ♻️ Rebuilds configuration while retaining compatible breaker state.
     fn new_with_previous(config: ServerConfig, previous: Option<&ProxyState>) -> Self {
         let router = Router::new(config.routes.clone());
+        let error_route_precompiles = config
+            .error_routes
+            .iter()
+            .map(|route| pingclair_core::server::precompile_handler_list(&route.handlers))
+            .collect();
         let host_label = config.name.clone().unwrap_or_else(|| "_".to_string());
 
         // 🧩 Initializes index-aligned components for each route.
@@ -1407,6 +1430,7 @@ impl ProxyState {
         Self {
             config: Arc::new(config),
             router: Arc::new(router),
+            error_route_precompiles,
             load_balancers,
             health_checkers,
             file_servers,
@@ -2574,6 +2598,97 @@ impl PingclairProxy {
         Self::write_simple_response(session, ctx, status, &format!("{status} {reason}")).await
     }
 
+    /// 🚨 Writes the default response for a raised error status.
+    ///
+    /// The operator's message wins when one exists; otherwise the site's
+    /// custom error page, and finally the status's canonical text.
+    async fn write_error_response(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestContext,
+        status: u16,
+        message: Option<String>,
+    ) -> PingoraResult<()> {
+        let Some(message) = message else {
+            self.serve_error_page(session, ctx, status).await?;
+            return Ok(());
+        };
+        let body_bytes = {
+            let verified_client_ip = if message.contains('{') {
+                ctx.verified_client_ip.map(|ip| ip.to_string())
+            } else {
+                None
+            };
+            let resolved = resolve_caddy_placeholders(
+                &message,
+                session.req_header(),
+                verified_client_ip.as_deref(),
+                ctx.request_scheme,
+            );
+            Bytes::copy_from_slice(resolved.as_bytes())
+        };
+        let mut response = ResponseHeader::build(status, Some(3)).unwrap();
+        response
+            .insert_header("Content-Type", "text/plain; charset=utf-8")
+            .unwrap();
+        response
+            .insert_header("Content-Length", body_bytes.len().to_string())
+            .unwrap();
+        Self::apply_local_response_headers(&mut response, ctx)?;
+        session
+            .write_response_header(Box::new(response), false)
+            .await?;
+        Self::write_local_body(session, ctx, body_bytes, true).await?;
+        Ok(())
+    }
+
+    /// 🚨 Runs the server's error routes for a raised status, falling back to
+    /// the default error response when none of them answers.
+    async fn handle_raised_error(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestContext,
+        status: u16,
+    ) -> PingoraResult<()> {
+        let message = ctx.error_message.take();
+        // 📎 Cloned so `state` does not borrow `ctx`: the error routes below
+        // need `&mut ctx` for the same handler machinery that matched them.
+        let Some(state) = ctx.state.clone() else {
+            self.write_error_response(session, ctx, status, message)
+                .await?;
+            return Ok(());
+        };
+        ctx.handling_error = true;
+        let path = session.req_header().uri.path().to_string();
+        let route_index = ctx.route_index.unwrap_or(0);
+        for (index, route) in state.config.error_routes.iter().enumerate() {
+            if !route.matches(status) {
+                continue;
+            }
+            let precompile = state.compiled_error_route(index);
+            let handlers = HandlerConfig::Pipeline {
+                handlers: route.handlers.clone(),
+            };
+            if self
+                .handle_config(session, ctx, &handlers, &path, route_index, precompile)
+                .await?
+            {
+                // 🚫 A handler inside the error route raised again (a
+                // `file_server` 404, say): answer it directly rather than
+                // routing a second time — that re-entry is the recursion the
+                // guard exists to stop.
+                if let Some(inner_status) = ctx.error_status.take() {
+                    let inner_message = ctx.error_message.take();
+                    self.write_error_response(session, ctx, inner_status, inner_message)
+                        .await?;
+                }
+                return Ok(());
+            }
+        }
+        self.write_error_response(session, ctx, status, message)
+            .await
+    }
+
     /// 🎯 Evaluates one pipeline element's precompiled matcher.
     fn element_matcher_matches(
         &self,
@@ -2667,42 +2782,19 @@ impl PingclairProxy {
                 Self::write_local_body(session, ctx, body_bytes, true).await?;
                 Ok(true)
             }
-            // 🚨 A static error raises its status with the operator's message
-            // (or the status's canonical text) as the body, exactly like a
-            // `respond` — Phase F2 routes this through `handle_errors`.
+            // 🚨 A static error raises its status into the request context
+            // instead of writing: the dispatch then runs the server's error
+            // routes, and only falls back to a direct response when none
+            // handles it. Inside an error route a second raise responds
+            // directly — that is the recursion guard.
             HandlerConfig::Error { status, message } => {
-                let body_bytes = {
-                    let raw_body = message.as_deref().unwrap_or_else(|| {
-                        http::StatusCode::from_u16(*status)
-                            .ok()
-                            .and_then(|code| code.canonical_reason())
-                            .unwrap_or("")
-                    });
-                    let verified_client_ip = if raw_body.contains('{') {
-                        ctx.verified_client_ip.map(|ip| ip.to_string())
-                    } else {
-                        None
-                    };
-                    let resolved = resolve_caddy_placeholders(
-                        raw_body,
-                        session.req_header(),
-                        verified_client_ip.as_deref(),
-                        ctx.request_scheme,
-                    );
-                    Bytes::copy_from_slice(resolved.as_bytes())
-                };
-                let mut response = ResponseHeader::build(*status, Some(3)).unwrap();
-                response
-                    .insert_header("Content-Type", "text/plain; charset=utf-8")
-                    .unwrap();
-                response
-                    .insert_header("Content-Length", body_bytes.len().to_string())
-                    .unwrap();
-                Self::apply_local_response_headers(&mut response, ctx)?;
-                session
-                    .write_response_header(Box::new(response), false)
-                    .await?;
-                Self::write_local_body(session, ctx, body_bytes, true).await?;
+                if ctx.handling_error {
+                    self.write_error_response(session, ctx, *status, message.clone())
+                        .await?;
+                    return Ok(true);
+                }
+                ctx.error_status = Some(*status);
+                ctx.error_message = message.clone();
                 Ok(true)
             }
             HandlerConfig::Redirect { to, code } => {
@@ -2903,10 +2995,11 @@ impl PingclairProxy {
                         }
                         // Missing file (or read error): a file_server route
                         // has no upstream to fall back to, so answer 404
-                        // here instead of falling through to upstream_peer,
-                        // which would surface a 500 (ConnectNoRoute).
+                        // here — through the error routes when configured —
+                        // instead of falling through to upstream_peer, which
+                        // would surface a 500 (ConnectNoRoute).
                         _ => {
-                            self.serve_error_page(session, ctx, 404).await?;
+                            ctx.error_status = Some(404);
                             return Ok(true);
                         }
                     }
@@ -4541,6 +4634,12 @@ impl ProxyHttp for PingclairProxy {
                     // ⏱️ Record its TTFB immediately after the synchronous write.
                     ctx.first_byte_at
                         .get_or_insert_with(std::time::Instant::now);
+                    // 🚨 A handler that raised an error status hands the
+                    // response over to the server's error routes before the
+                    // request is considered finished.
+                    if let Some(status) = ctx.error_status.take() {
+                        self.handle_raised_error(session, ctx, status).await?;
+                    }
                     return Ok(true);
                 }
             }

@@ -14,4 +14,5 @@ pub use self::handlers::{
 pub use self::redirect::{HttpRedirectServer, RedirectConfig};
 pub use self::router::{
     CompiledMatcher, CompiledRoute, MatcherPrecompile, MatcherRequest, Router, evaluate,
+    precompile_handler_list,
 };

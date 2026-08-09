@@ -255,6 +255,7 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         },
         encodings: compile_encodings(server)?,
         error_pages: server.error_pages.iter().cloned().collect(),
+        error_routes: Vec::new(),
     };
 
     // Listen addresses
@@ -341,6 +342,28 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
             )?);
         }
     }
+
+    // 🚨 Error routes compile like routes: their handlers inherit the site
+    // root and named matchers, so a `file_server` inside `handle_errors`
+    // serves the same document root it would have outside.
+    config.error_routes = server
+        .error_routes
+        .iter()
+        .map(|route| {
+            let handlers = route
+                .handlers
+                .iter()
+                .map(|element| {
+                    compile_handler_element(element, &server.matchers, server.root.as_deref())
+                })
+                .collect::<CompileResult<Vec<_>>>()?;
+            Ok(pingclair_core::config::ErrorRouteConfig {
+                codes: route.codes.clone(),
+                hundreds: route.hundreds.clone(),
+                handlers,
+            })
+        })
+        .collect::<CompileResult<Vec<_>>>()?;
 
     // 📂 Hand the `root` directive to every file server that did not name its
     // own root. Caddy's `file_server` takes no root argument; the site root
@@ -587,6 +610,12 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
             validate_proxy_protection_handler(&route.handler)?;
             validate_basic_auth_credentials(&route.handler)?;
             reject_unimplemented_handler(&route.handler)?;
+        }
+        for error_route in &server.error_routes {
+            for element in &error_route.handlers {
+                validate_basic_auth_credentials(&element.handler)?;
+                reject_unimplemented_handler(&element.handler)?;
+            }
         }
 
         let Some(tls) = &server.tls else {

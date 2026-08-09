@@ -1949,6 +1949,24 @@ mod uri_and_try_files_tests {
         );
     }
 
+    /// 🎯 The `*` matcher token is data-free: `rewrite * /new` must replace
+    /// the path like the bare two-argument form, not reach the regex reader.
+    #[test]
+    fn rewrite_accepts_the_match_everything_token() {
+        let handlers = handlers("example.com {\n\trewrite * /new\n\trespond \"ok\"\n}");
+        assert!(
+            matches!(
+                &handlers[0],
+                HandlerConfig::Rewrite {
+                    replace: Some(target),
+                    ..
+                } if target == "/new"
+            ),
+            "got {:?}",
+            handlers[0]
+        );
+    }
+
     /// 🚫 `uri replace` substitutes a substring; this crate's rewrite replaces
     /// the whole path. Accepting it would compile and silently serve a
     /// different URL than the operator wrote, which is the one outcome worse
@@ -2308,6 +2326,84 @@ mod error_directive_tests {
             "example.com {\n\terror \"oops\" 999\n}",
             // 🚫 More than message + status has no reading.
             "example.com {\n\terror \"a\" 404 extra\n}",
+        ] {
+            compile(source).expect_err(&format!("must be refused:\n{source}"));
+        }
+    }
+}
+
+// MARK: - handle_errors
+
+/// 🚨 `handle_errors [<codes…>] { … }` registers a status-selective error
+/// route: three-digit statuses and `Nxx` ranges OR together, no codes means
+/// every error, and the block is a route body with `handle` blocks keeping
+/// their mutually exclusive semantics.
+#[cfg(test)]
+mod handle_errors_tests {
+    use crate::compile;
+    use pingclair_core::config::HandlerConfig;
+
+    fn error_routes_of(source: &str) -> Vec<pingclair_core::config::ErrorRouteConfig> {
+        let config = compile(source).unwrap_or_else(|error| panic!("must compile: {error}"));
+        config
+            .servers
+            .into_iter()
+            .next()
+            .expect("one server")
+            .error_routes
+    }
+
+    #[test]
+    fn exact_codes_compile() {
+        let routes =
+            error_routes_of("example.com {\n\thandle_errors 404 410 {\n\t\trespond \"x\"\n\t}\n}");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].codes, vec![404, 410]);
+        assert!(routes[0].hundreds.is_empty());
+        assert_eq!(routes[0].handlers.len(), 1);
+    }
+
+    #[test]
+    fn range_codes_compile() {
+        let routes =
+            error_routes_of("example.com {\n\thandle_errors 4xx {\n\t\trespond \"x\"\n\t}\n}");
+        assert_eq!(routes[0].hundreds, vec![4]);
+    }
+
+    #[test]
+    fn codes_and_ranges_can_combine() {
+        let routes =
+            error_routes_of("example.com {\n\thandle_errors 500 3xx {\n\t\trespond \"x\"\n\t}\n}");
+        assert_eq!(routes[0].codes, vec![500]);
+        assert_eq!(routes[0].hundreds, vec![3]);
+    }
+
+    #[test]
+    fn no_codes_is_the_catch_all() {
+        let routes = error_routes_of("example.com {\n\thandle_errors {\n\t\trespond \"x\"\n\t}\n}");
+        assert!(routes[0].codes.is_empty() && routes[0].hundreds.is_empty());
+        assert!(routes[0].matches(404) && routes[0].matches(503));
+    }
+
+    #[test]
+    fn handle_blocks_inside_keep_their_exclusive_semantics() {
+        let routes = error_routes_of(
+            "example.com {\n\thandle_errors 404 {\n\t\thandle /en/* {\n\t\t\trespond \"en\"\n\t\t}\n\t\thandle {\n\t\t\trespond \"default\"\n\t\t}\n\t}\n}",
+        );
+        assert_eq!(routes[0].handlers.len(), 2);
+        assert!(matches!(
+            routes[0].handlers[0].handler,
+            HandlerConfig::Handle { .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_shapes_are_refused() {
+        for source in [
+            "example.com {\n\thandle_errors abc {\n\t\trespond \"x\"\n\t}\n}",
+            "example.com {\n\thandle_errors 40 {\n\t\trespond \"x\"\n\t}\n}",
+            "example.com {\n\thandle_errors 404\n}",
+            "example.com {\n\thandle_errors {\n\t}\n}",
         ] {
             compile(source).expect_err(&format!("must be refused:\n{source}"));
         }

@@ -2091,7 +2091,119 @@ async fn test_error_handler_end_to_end() {
 
     let resp = client.get(server.url(0, "/oops")).send().await.unwrap();
     assert_eq!(resp.status(), 500);
-    assert_eq!(resp.text().await.unwrap(), "Internal Server Error");
+    assert_eq!(resp.text().await.unwrap(), "500 Internal Server Error");
+}
+
+#[tokio::test]
+async fn test_handle_errors_routes_raised_statuses() {
+    // 🚨 Raised error statuses run the server's error routes: exact codes and
+    // `Nxx` ranges match, the first matching route answers, and an error route
+    // that raises again responds directly instead of recursing forever.
+    let config = serde_json::json!({
+        "servers": [
+            {
+                "listen": ["127.0.0.1:0"],
+                "routes": [
+                    { "path": "/gone", "handler": { "type": "error", "status": 404 } },
+                    { "path": "/private", "handler": { "type": "error", "status": 403, "message": "Unauthorized" } },
+                    { "path": "/boom", "handler": { "type": "error", "status": 500 } }
+                ],
+                "error_routes": [
+                    {
+                        "codes": [404, 410],
+                        "handlers": [
+                            { "type": "respond", "status": 200, "body": "handled 404" }
+                        ]
+                    },
+                    {
+                        "hundreds": [4],
+                        "handlers": [
+                            { "type": "respond", "status": 200, "body": "handled 4xx" }
+                        ]
+                    },
+                    {
+                        "codes": [500],
+                        "handlers": [
+                            { "type": "error", "status": 500 }
+                        ]
+                    }
+                ]
+            }
+        ]
+    })
+    .to_string();
+
+    let mut server = TestServer::new(&config);
+    let client = no_proxy_client();
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    // ✅ Exact code route answers first.
+    let resp = client.get(server.url(0, "/gone")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "handled 404");
+
+    // ✅ The 4xx range catches 403 when no exact route matches.
+    let resp = client.get(server.url(0, "/private")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "handled 4xx");
+
+    // 🚫 An error route that raises again must not hang or double-write: the
+    // recursion guard answers with the default 500.
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.get(server.url(0, "/boom")).send(),
+    )
+    .await
+    .expect("the recursion guard must answer, not hang")
+    .unwrap();
+    assert_eq!(resp.status(), 500);
+}
+
+#[tokio::test]
+async fn test_handle_errors_intercepts_file_server_404() {
+    // 🗂️ A missing file raises 404 like the `error` directive does, so a
+    // `handle_errors 404` route answers instead of the built-in page — and
+    // the handled response is the only response written.
+    let empty_root = tempfile::tempdir().unwrap();
+    let config = format!(
+        r#"{{
+            "servers": [
+                {{
+                    "listen": ["127.0.0.1:0"],
+                    "routes": [
+                        {{
+                            "path": "/static/*",
+                            "handler": {{
+                                "type": "file_server",
+                                "root": "{}"
+                            }}
+                        }}
+                    ],
+                    "error_routes": [
+                        {{
+                            "codes": [404],
+                            "handlers": [
+                                {{ "type": "respond", "status": 200, "body": "custom 404" }}
+                            ]
+                        }}
+                    ]
+                }}
+            ]
+        }}"#,
+        empty_root.path().display()
+    );
+
+    let mut server = TestServer::new(&config);
+    let client = no_proxy_client();
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let resp = client
+        .get(server.url(0, "/static/missing.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "custom 404");
 }
 
 #[tokio::test]

@@ -1583,6 +1583,7 @@ async fn plan_h3_handler(
     response_policy: &mut ResponseHeaderPolicy,
     verified_client_ip: &str,
     precompile: Option<&MatcherPrecompile>,
+    handling_error: bool,
 ) -> Result<H3Plan, HandlerError> {
     match handler {
         HandlerConfig::Pipeline { handlers } => {
@@ -1612,6 +1613,7 @@ async fn plan_h3_handler(
                     response_policy,
                     verified_client_ip,
                     element_precompile,
+                    handling_error,
                 )
                 .await?
                 {
@@ -1649,6 +1651,7 @@ async fn plan_h3_handler(
                     response_policy,
                     verified_client_ip,
                     element_precompile,
+                    handling_error,
                 )
                 .await;
             }
@@ -1693,6 +1696,7 @@ async fn plan_h3_handler(
                     response_policy,
                     verified_client_ip,
                     element_precompile,
+                    handling_error,
                 )
                 .await;
             }
@@ -1809,7 +1813,8 @@ async fn plan_h3_handler(
             }))
         }
         // 🚨 A static error answers with its status and message on HTTP/3
-        // exactly as on H1/H2 — same default body, same placeholder rules.
+        // exactly as on H1/H2 — same default body, same placeholder rules —
+        // but only after the matching error routes have had their say.
         HandlerConfig::Error { status, message } => {
             let raw = message.as_deref().unwrap_or_else(|| {
                 http::StatusCode::from_u16(*status)
@@ -1821,6 +1826,39 @@ async fn plan_h3_handler(
             let body = Some(
                 resolve_caddy_placeholders(raw, request_header, verified, "https").into_owned(),
             );
+            // 🚫 Inside an error route a second raise responds directly —
+            // routing it again is the infinite recursion this guard stops.
+            if !handling_error {
+                for (index, route) in state.config.error_routes.iter().enumerate() {
+                    if !route.matches(*status) {
+                        continue;
+                    }
+                    let precompile = state.compiled_error_route(index);
+                    let handlers = HandlerConfig::Pipeline {
+                        handlers: route.handlers.clone(),
+                    };
+                    let plan = plan_h3_handler(
+                        &handlers,
+                        state,
+                        route_index,
+                        request_header,
+                        effective_uri,
+                        response_policy,
+                        verified_client_ip,
+                        precompile,
+                        true,
+                    )
+                    .await?;
+                    return Ok(match plan {
+                        H3Plan::Continue => H3Plan::Terminal(H3Terminal::Respond {
+                            status: *status,
+                            body: body.clone(),
+                            headers: BTreeMap::new(),
+                        }),
+                        completed => completed,
+                    });
+                }
+            }
             Ok(H3Plan::Terminal(H3Terminal::Respond {
                 status: *status,
                 body,
@@ -1895,6 +1933,7 @@ async fn plan_h3_handler(
                         response_policy,
                         verified_client_ip,
                         fallback_precompile,
+                        handling_error,
                     )
                     .await
                 }
@@ -2140,6 +2179,7 @@ async fn handle_request_inner(
         response_policy,
         &verified_client_ip_text,
         route_precompile,
+        false,
     )
     .await?;
 
@@ -3825,6 +3865,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             None,
+            false,
         )
         .await
         .unwrap();
@@ -3882,6 +3923,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             None,
+            false,
         )
         .await
         .unwrap();
@@ -3926,6 +3968,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             None,
+            false,
         )
         .await
         .unwrap();
@@ -3963,6 +4006,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             None,
+            false,
         )
         .await
         .unwrap();
@@ -3993,6 +4037,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             None,
+            false,
         )
         .await
         .unwrap();
@@ -4029,6 +4074,7 @@ mod tests {
             &mut policy,
             "203.0.113.9",
             None,
+            false,
         )
         .await
         .unwrap();
@@ -4080,6 +4126,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             precompile,
+            false,
         )
         .await
         .unwrap();
@@ -4100,6 +4147,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             precompile,
+            false,
         )
         .await
         .unwrap();

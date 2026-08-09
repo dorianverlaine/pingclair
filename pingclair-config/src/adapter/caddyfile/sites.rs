@@ -206,6 +206,71 @@ pub(super) fn adapt_server(
                     }
                     server.root = Some(path.clone());
                 }
+                "handle_errors" => {
+                    // 🚨 `handle_errors [<codes…>] { … }` registers a
+                    // server-level error route. Codes are three-digit
+                    // statuses or `Nxx` ranges, ORed together; no codes means
+                    // the route catches every error status. The block is a
+                    // route body — directives run in file order, and `handle`
+                    // blocks are mutually exclusive — exactly the shape the
+                    // upstream format parses.
+                    let mut codes = Vec::new();
+                    let mut hundreds = Vec::new();
+                    for arg in &sub_d.args {
+                        if arg.len() == 3
+                            && let Ok(code) = arg.parse::<u16>()
+                            && (100..=599).contains(&code)
+                        {
+                            codes.push(code);
+                        } else if arg.len() == 3
+                            && let Some(digit) = arg.strip_suffix("xx")
+                            && let Ok(hundred) = digit.parse::<u8>()
+                        {
+                            if !hundreds.contains(&hundred) {
+                                hundreds.push(hundred);
+                            }
+                        } else {
+                            return Err(AdapterError::InvalidArgument(
+                                "handle_errors".into(),
+                                format!("bad status value `{arg}`"),
+                            ));
+                        }
+                    }
+                    let block = sub_d.block.as_ref().ok_or_else(|| {
+                        AdapterError::InvalidArgument(
+                            "handle_errors".into(),
+                            "a block is required".into(),
+                        )
+                    })?;
+                    let mut handlers = Vec::new();
+                    for directive in &block.directives {
+                        let (matcher, _) = parse_matcher_and_block(directive)?;
+                        let mut handler_d = directive.clone();
+                        if matcher.is_some() {
+                            if handler_d.args.is_empty() {
+                                return Err(AdapterError::ArgumentCount(
+                                    directive.name.clone(),
+                                    1,
+                                    0,
+                                ));
+                            }
+                            handler_d.drop_first_arg();
+                        }
+                        let handler = adapt_handler(handler_d, &server.matchers, order)?;
+                        handlers.push(HandlerElement { matcher, handler });
+                    }
+                    if handlers.is_empty() {
+                        return Err(AdapterError::InvalidArgument(
+                            "handle_errors".into(),
+                            "at least one directive is required".into(),
+                        ));
+                    }
+                    server.error_routes.push(ErrorRouteConfig {
+                        codes,
+                        hundreds,
+                        handlers,
+                    });
+                }
                 "compress" | "encode" => {
                     // 🎯 The first directive reading its arguments from the
                     // token cursor rather than from `args`.

@@ -196,11 +196,26 @@ pub struct ServerBlock {
     /// Custom error pages: HTTP status code → file path (`error_page` directive)
     pub error_pages: Vec<(u16, String)>,
 
+    /// 🚨 Status-selective error routes from `handle_errors` blocks.
+    pub error_routes: Vec<ErrorRouteConfig>,
+
     /// Other directives (including macro calls)
     pub directives: Vec<Directive>,
 
     /// 🧱 Downstream time, size, connection, and bandwidth bounds.
     pub limits: ResourceLimitsConfig,
+}
+
+/// 🚨 One `handle_errors [<codes…>]` block, adapted to a status-selective
+/// error route whose handlers run like a route body.
+#[derive(Debug, Clone)]
+pub struct ErrorRouteConfig {
+    /// Exact status codes; empty means the catch-all error route.
+    pub codes: Vec<u16>,
+    /// `Nxx` ranges (`4xx` selects 400..=499) when the block wrote them.
+    pub hundreds: Vec<u8>,
+    /// 🧭 Matcher-guarded handlers in file order.
+    pub handlers: Vec<HandlerElement>,
 }
 
 /// 🧱 Typed server resource limits produced by the Caddyfile adapter.
@@ -1009,6 +1024,7 @@ impl ServerBlock {
             routes: None,
             matchers: HashMap::new(),
             error_pages: Vec::new(),
+            error_routes: Vec::new(),
             directives: Vec::new(),
             limits: ResourceLimitsConfig::default(),
         }
