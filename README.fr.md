@@ -563,6 +563,14 @@ d'arrière-plan, jamais sur le chemin de requête. Une adresse de dial peut auss
 contenir des placeholders — `reverse_proxy {re.dial.1}` — développés par
 requête et mis en cache par hôte et port.
 
+La politique de nouvelle tentative accepte les orthographes `lb_retry_match` de
+Caddy : `method`, `path`, `header` et expressions CEL. Les expressions de
+méthode, de chemin et de code de statut sont évaluées à l'exécution ; les
+expressions que le runtime ne peut pas évaluer restent dans la configuration
+compilée et sont journalisées au démarrage. `lb_policy weighted_round_robin`
+porte un poids par amont, et un bloc `method`/`rewrite` de reverse_proxy modifie
+la requête amont avant son envoi.
+
 Les amonts écrits sous forme de noms d'hôtes sont ré-résolus pendant l'exécution :
 un conteneur qui redémarre sur une nouvelle adresse est suivi sans rechargement.
 Une résolution en échec laisse l'adresse précédente en rotation — une panne du

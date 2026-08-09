@@ -38,6 +38,7 @@ pub(crate) fn permits_status_retry(
     policy: &RetryConfig,
     method: &Method,
     body_is_empty: bool,
+    path: &str,
     status: u16,
     attempts: usize,
     retry_deadline: Option<Instant>,
@@ -48,7 +49,40 @@ pub(crate) fn permits_status_retry(
             .methods
             .iter()
             .any(|configured| configured.eq_ignore_ascii_case(method.as_str()))
+        && (policy.path_patterns.is_empty()
+            || policy
+                .path_patterns
+                .iter()
+                .any(|pattern| glob_matches(pattern, path)))
         && permits_another_attempt(policy, attempts, retry_deadline)
+}
+
+/// 🧭 Matches one Caddy-style path glob (`/foo*`) against a request path.
+///
+/// `*` matches any run of characters; a pattern without `*` must equal the
+/// path exactly, mirroring Caddy's path matcher.
+fn glob_matches(pattern: &str, value: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let mut parts = pattern.split('*');
+    let Some(first) = parts.next() else {
+        return true;
+    };
+    if !value.starts_with(first) {
+        return false;
+    }
+    let mut rest = &value[first.len()..];
+    for part in parts {
+        if part.is_empty() {
+            continue;
+        }
+        let Some(index) = rest.find(part) else {
+            return false;
+        };
+        rest = &rest[index + part.len()..];
+    }
+    pattern.ends_with('*') || rest.is_empty()
 }
 
 #[cfg(test)]
@@ -67,6 +101,7 @@ mod tests {
             &policy,
             &Method::GET,
             true,
+            "/probe",
             503,
             1,
             None
@@ -75,6 +110,7 @@ mod tests {
             &policy,
             &Method::POST,
             true,
+            "/probe",
             503,
             1,
             None
@@ -83,6 +119,36 @@ mod tests {
             &policy,
             &Method::GET,
             false,
+            "/probe",
+            503,
+            1,
+            None
+        ));
+    }
+
+    #[test]
+    fn path_patterns_gate_status_redispatch_like_caddy() {
+        let policy = RetryConfig {
+            max_attempts: 3,
+            status_codes: vec![503],
+            methods: vec!["GET".to_string()],
+            path_patterns: vec!["/api/*".to_string()],
+            ..Default::default()
+        };
+        assert!(permits_status_retry(
+            &policy,
+            &Method::GET,
+            true,
+            "/api/users",
+            503,
+            1,
+            None
+        ));
+        assert!(!permits_status_retry(
+            &policy,
+            &Method::GET,
+            true,
+            "/public",
             503,
             1,
             None

@@ -561,6 +561,13 @@ their own ports. Lookups happen on a background refresher, never on the
 request path. A dial may also contain request placeholders —
 `reverse_proxy {re.dial.1}` — expanded per request and cached by host and port.
 
+Retry policy accepts Caddy's `lb_retry_match` spellings: `method`, `path`,
+`header`, and CEL expressions. Method, path, and status-code expressions are
+evaluated at runtime; expressions the runtime cannot evaluate are kept in the
+compiled configuration and logged at startup. `lb_policy weighted_round_robin`
+carries one weight per upstream, and a reverse_proxy `method`/`rewrite` block
+changes the upstream request before it is sent.
+
 Upstreams written as hostnames are re-resolved while the server runs, so a
 container that restarts on a new address is picked up without a reload. A
 lookup that fails leaves the previous address in rotation — a resolver outage

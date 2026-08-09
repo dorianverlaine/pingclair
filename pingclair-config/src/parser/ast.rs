@@ -663,6 +663,21 @@ pub struct ProxyConfig {
     /// usually empty, but the two may coexist.
     pub dynamic: Option<pingclair_core::config::DynamicUpstreamConfig>,
 
+    /// 🧭 Request method change applied before proxying.
+    pub rewrite_method: Option<String>,
+
+    /// 🧭 URI template applied to the upstream request target.
+    pub rewrite_uri: Option<String>,
+
+    /// 🧱 Request body buffer ceiling in bytes (`-1` unlimited).
+    pub request_buffer_bytes: Option<i64>,
+
+    /// 🧱 Response body buffer ceiling in bytes (`-1` unlimited).
+    pub response_buffer_bytes: Option<i64>,
+
+    /// 🧭 Transport tuning options without a runtime equivalent.
+    pub transport_options: BTreeMap<String, String>,
+
     /// Per-upstream options, including weighted and backup peers.
     pub upstream_options: Vec<ProxyUpstreamConfig>,
 
@@ -864,6 +879,8 @@ pub struct RetryConfig {
     pub backoff_ms: u64,
     pub status_codes: Vec<u16>,
     pub methods: Vec<String>,
+    pub path_patterns: Vec<String>,
+    pub expressions: Vec<String>,
 }
 
 impl Default for RetryConfig {
@@ -877,6 +894,8 @@ impl Default for RetryConfig {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            path_patterns: Vec::new(),
+            expressions: Vec::new(),
         }
     }
 }
@@ -1088,6 +1107,11 @@ impl ProxyConfig {
                 .collect(),
             upstreams,
             dynamic: None,
+            rewrite_method: None,
+            rewrite_uri: None,
+            request_buffer_bytes: None,
+            response_buffer_bytes: None,
+            transport_options: BTreeMap::new(),
             lb_policy: None,
             lb_hash_key: None,
             health_check: None,

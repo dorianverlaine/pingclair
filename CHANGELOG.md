@@ -205,6 +205,13 @@ lets the rest converge.
 - 🏗️ **Wildcard internal certificates.** `tls internal` on a `*.example.com`
   site issues a wildcard leaf that serves every subdomain on H1, H2 and H3,
   matching Caddy's local-CA behavior for `.localhost`-style wildcard sites.
+- 🔁 **Remaining reverse_proxy options.** `lb_retry_match` accepts Caddy's
+  method, path, header, and expression forms — method/path/status shapes drive
+  real runtime retry decisions, and unmappable expressions stay visible in the
+  compiled config. `weighted_round_robin` carries inline weights, health probes
+  may set the `Host` header, and `method`/`rewrite` mutate the upstream
+  request. Buffer ceilings and transport tuning knobs without a runtime
+  equivalent are accepted for compatibility and logged at startup.
 - 📦 **Response caching.** RFC 9111 decides what may be stored, and a second
   identical request is served without asking the origin. The store is bounded
   by `max_size` (128 MiB unless you say otherwise) and evicts least-recently-

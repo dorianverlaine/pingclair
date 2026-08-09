@@ -870,24 +870,16 @@ fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<(
                         .to_string(),
                 });
             }
-            const IDEMPOTENT_METHODS: [&str; 6] =
-                ["GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE"];
-            if let Some(method) = retry
-                .methods
-                .iter()
-                .find(|method| !IDEMPOTENT_METHODS.contains(&method.as_str()))
-            {
-                return Err(CompileError::InvalidRoute {
-                    message: format!(
-                        "retry method {method} is not idempotent; v0.2 does not replay it"
-                    ),
-                });
-            }
-            if retry.methods.len() > IDEMPOTENT_METHODS.len()
+            // 🧭 Non-idempotent methods are allowed when the operator names
+            // them explicitly via `lb_retry_match method`; the runtime still
+            // refuses to replay a request that carries a body, which is the
+            // actual safety property.
+            if retry.methods.is_empty()
+                || retry.methods.len() > 12
                 || retry.methods.iter().collect::<HashSet<_>>().len() != retry.methods.len()
             {
                 return Err(CompileError::InvalidRoute {
-                    message: "retry methods must be unique".to_string(),
+                    message: "retry methods must be non-empty, unique, and at most 12".to_string(),
                 });
             }
 
@@ -1146,10 +1138,7 @@ fn validate_health_check(health: &pingclair_core::config::HealthCheckConfig) -> 
     }
     if health.headers.len() > 64
         || health.headers.iter().any(|(name, value)| {
-            let managed =
-                name.eq_ignore_ascii_case("host") || name.eq_ignore_ascii_case("connection");
             name.is_empty()
-                || managed
                 || name.len() > 256
                 || !name.bytes().all(|byte| {
                     byte.is_ascii_alphanumeric()
@@ -1562,6 +1551,11 @@ fn compile_handler(
             let mut config = ReverseProxyConfig {
                 upstreams: proxy.upstreams.clone(),
                 dynamic_upstream: proxy.dynamic.clone().map(Box::new),
+                rewrite_method: proxy.rewrite_method.clone(),
+                rewrite_uri: proxy.rewrite_uri.clone(),
+                request_buffer_bytes: proxy.request_buffer_bytes,
+                response_buffer_bytes: proxy.response_buffer_bytes,
+                transport_options: proxy.transport_options.clone(),
                 upstream_options: proxy
                     .upstream_options
                     .iter()
@@ -1611,6 +1605,8 @@ fn compile_handler(
                     backoff_ms: proxy.retry.backoff_ms,
                     status_codes: proxy.retry.status_codes.clone(),
                     methods: proxy.retry.methods.clone(),
+                    path_patterns: proxy.retry.path_patterns.clone(),
+                    expressions: proxy.retry.expressions.clone(),
                 }),
                 overload: Box::new(pingclair_core::config::OverloadConfig {
                     max_in_flight: proxy.overload.max_in_flight,
@@ -1670,7 +1666,7 @@ fn compile_handler(
                 });
             }
 
-            Ok(HandlerConfig::ReverseProxy(config))
+            Ok(HandlerConfig::ReverseProxy(Box::new(config)))
         }
 
         Handler::Respond(resp) => Ok(HandlerConfig::Respond {
@@ -2253,14 +2249,16 @@ mod fail_closed_handler_tests {
     fn config_with_two_cache_ceilings(first: usize, second: usize) -> PingclairConfig {
         let route = |path: &str, max_size_bytes: usize| RouteConfig {
             path: path.to_string(),
-            handler: HandlerConfig::ReverseProxy(pingclair_core::config::ReverseProxyConfig {
-                upstreams: vec!["127.0.0.1:9000".to_string()],
-                cache: Some(Box::new(pingclair_core::config::CacheConfig {
-                    ttl_secs: 60,
-                    max_size_bytes,
-                })),
-                ..Default::default()
-            }),
+            handler: HandlerConfig::ReverseProxy(Box::new(
+                pingclair_core::config::ReverseProxyConfig {
+                    upstreams: vec!["127.0.0.1:9000".to_string()],
+                    cache: Some(Box::new(pingclair_core::config::CacheConfig {
+                        ttl_secs: 60,
+                        max_size_bytes,
+                    })),
+                    ..Default::default()
+                },
+            )),
             methods: None,
             matcher: None,
         };

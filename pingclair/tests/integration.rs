@@ -3329,6 +3329,73 @@ async fn test_pingclairfile_replaceable_upstream_uses_request_captures() {
 }
 
 #[tokio::test]
+async fn test_pingclairfile_reverse_proxy_method_and_rewrite_reach_upstream() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let upstream_address = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+        let request_line = String::from_utf8_lossy(&request)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let body = format!("saw:{request_line}");
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+
+    // 📄 `method` and `rewrite` must mutate the upstream request, not just
+    // compile: the origin sees GET /rewritten for a POST /original.
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            reverse_proxy http://{upstream} {{
+                method GET
+                rewrite /rewritten
+            }}
+        }}
+        "#,
+        upstream = upstream_address
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    let response = client
+        .post(server.url(0, "/original?x=1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+    assert!(
+        body.starts_with("saw:GET /rewritten"),
+        "the upstream must see the rewritten method and URI, got {body}"
+    );
+    upstream_task.await.unwrap();
+}
+
+#[tokio::test]
 async fn test_pingclairfile_wildcard_internal_tls_serves_subdomains() {
     let config = r#"
         {

@@ -457,9 +457,14 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
             if change_host_header && let Some(upstream) = to.first() {
                 headers_up.insert("Host".to_string(), upstream_hostport(upstream));
             }
-            let handler = HandlerConfig::ReverseProxy(ReverseProxyConfig {
+            let handler = HandlerConfig::ReverseProxy(Box::new(ReverseProxyConfig {
                 upstreams: to,
                 dynamic_upstream: None,
+                rewrite_method: None,
+                rewrite_uri: None,
+                request_buffer_bytes: None,
+                response_buffer_bytes: None,
+                transport_options: std::collections::BTreeMap::new(),
                 upstream_options: Vec::new(),
                 // 🗄️ `pingclair reverse-proxy` is a throwaway one-liner; caching
                 // is a deliberate per-route decision, so it stays off here.
@@ -478,7 +483,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 overload: Default::default(),
                 circuit_breaker: Default::default(),
                 upstream_tls: Box::new(upstream_tls),
-            });
+            }));
 
             server.routes.push(RouteConfig {
                 path: "/*".to_string(),

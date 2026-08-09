@@ -509,7 +509,7 @@ mod tests {
             ":8080 { limits { request_timeout 18446744073709551615m } respond \"ok\" }",
             ":8080 { reverse_proxy 127.0.0.1:9000 { transport http { first_byte_timeout nope } } }",
             ":8080 { reverse_proxy 127.0.0.1:9000 { retry { max_attempts 17 } } }",
-            ":8080 { reverse_proxy 127.0.0.1:9000 { retry { methods GET POST } } }",
+            ":8080 { reverse_proxy 127.0.0.1:9000 { retry { methods POST POST } } }",
             ":8080 { reverse_proxy 127.0.0.1:9000 { retry { methods GET GET } } }",
             ":8080 { reverse_proxy 127.0.0.1:9000 { retry { status_codes 200 } } }",
             ":8080 { reverse_proxy 127.0.0.1:9000 { retry { status_codes 503 503 } } }",
@@ -565,7 +565,7 @@ mod tests {
         unsafe_source["servers"][0]["routes"][0]["handler"]["retry"] = serde_json::json!({
             "max_attempts": 2,
             "status_codes": [503],
-            "methods": ["POST"]
+            "methods": []
         });
         let unsafe_config: PingclairConfig = serde_json::from_value(unsafe_source).unwrap();
         assert!(compiler::validate_config(&unsafe_config).is_err());

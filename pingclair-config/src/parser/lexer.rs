@@ -461,6 +461,27 @@ pub fn tokenize(source: &str) -> LexResult {
             continue;
         }
 
+        // ── Raw quoted strings: `...` ─────────────────────────────────
+        // 🧭 Caddy's backticks quote without escaping: everything up to the
+        // next backtick is one literal token. That is how retry-match CEL
+        // expressions survive with their braces, brackets, and single quotes
+        // intact — `{rp.status_code} in [502, 503]` must never be read as a
+        // block open followed by arguments.
+        if c == '`' {
+            let start = pos;
+            pos += 1; // skip opening backtick
+            let mut s = String::new();
+            while pos < chars.len() && chars[pos] != '`' {
+                s.push(chars[pos]);
+                pos += 1;
+            }
+            if pos < chars.len() {
+                pos += 1; // skip closing backtick
+            }
+            tokens.push(Spanned::new(Token::QuotedString(s), lines.span(start, pos)));
+            continue;
+        }
+
         // ── Braces ────────────────────────────────────────────────────
         // 🛑 SAFETY: We must check for {$VAR} and {placeholder} BEFORE
         // emitting a bare BlockOpen. The disambiguation rule:

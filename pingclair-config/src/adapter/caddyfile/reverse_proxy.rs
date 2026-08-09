@@ -171,6 +171,38 @@ pub(super) fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError>
                                     expect_no_arguments(&t_sub)?;
                                     transport.tls.insecure_skip_verify = true;
                                 }
+                                // 🔌 Caddy's transport spells the connect and
+                                // response-header timeouts under different
+                                // names; both map onto the same runtime knobs.
+                                "dial_timeout" => {
+                                    transport.connect_timeout =
+                                        Some(parse_required_duration(&t_sub)?);
+                                }
+                                "response_header_timeout" => {
+                                    transport.first_byte_timeout =
+                                        Some(parse_required_duration(&t_sub)?);
+                                }
+                                // 🧭 Tuning knobs without a runtime equivalent
+                                // are kept verbatim in the compiled config and
+                                // logged at startup; accepting them silently
+                                // would tell an operator a knob took effect.
+                                other @ ("read_buffer"
+                                | "write_buffer"
+                                | "max_response_header"
+                                | "dial_fallback_delay"
+                                | "expect_continue_timeout"
+                                | "resolvers"
+                                | "versions"
+                                | "compression"
+                                | "max_conns_per_host"
+                                | "keepalive_idle_conns_per_host"
+                                | "keepalive_interval"
+                                | "tls_renegotiation"
+                                | "tls_except_ports") => {
+                                    proxy
+                                        .transport_options
+                                        .insert(other.to_string(), t_sub.args.join(" "));
+                                }
                                 _ => {
                                     return Err(AdapterError::UnknownDirective(format!(
                                         "transport http: {}",
@@ -278,6 +310,9 @@ pub(super) fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError>
                 "lb_try_interval" => {
                     proxy.retry.backoff_ms = parse_required_duration(&sub)?;
                 }
+                "lb_retry_match" => {
+                    apply_retry_match(&mut proxy.retry, &sub)?;
+                }
                 "lb_policy" => {
                     let policy = sub
                         .args
@@ -321,6 +356,46 @@ pub(super) fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError>
                             proxy.lb_policy = Some(policy.clone());
                             proxy.lb_hash_key = Some(field.clone());
                         }
+                        // ⚖️ Caddy's weighted form carries one weight per
+                        // upstream on the same line; the weights land on the
+                        // existing per-upstream options, so runtime selection
+                        // honors them through the native weighted backend.
+                        "weighted_round_robin" => {
+                            let weights = sub
+                                .args
+                                .iter()
+                                .skip(1)
+                                .map(|value| {
+                                    value.parse::<u32>().map_err(|_| {
+                                        AdapterError::InvalidArgument(
+                                            "lb_policy weighted_round_robin".into(),
+                                            format!("`{value}` is not a weight"),
+                                        )
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            if weights.is_empty() {
+                                return Err(AdapterError::ArgumentCount(
+                                    "lb_policy weighted_round_robin".into(),
+                                    2,
+                                    sub.args.len(),
+                                ));
+                            }
+                            if weights.len() != proxy.upstream_options.len() {
+                                return Err(AdapterError::InvalidArgument(
+                                    "lb_policy weighted_round_robin".into(),
+                                    format!(
+                                        "{} weights were given for {} upstreams",
+                                        weights.len(),
+                                        proxy.upstream_options.len()
+                                    ),
+                                ));
+                            }
+                            for (option, weight) in proxy.upstream_options.iter_mut().zip(weights) {
+                                option.weight = weight;
+                            }
+                            proxy.lb_policy = Some("round_robin".to_string());
+                        }
                         _ => {
                             return Err(AdapterError::InvalidArgument(
                                 "lb_policy".into(),
@@ -328,6 +403,23 @@ pub(super) fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError>
                             ));
                         }
                     }
+                }
+                // 🧭 `method` and `rewrite` rewrite the upstream request,
+                // exactly as Caddy's reverse_proxy does.
+                "method" => {
+                    proxy.rewrite_method = Some(expect_one_argument(&sub)?.to_ascii_uppercase());
+                }
+                "rewrite" => {
+                    proxy.rewrite_uri = Some(expect_one_argument(&sub)?.to_string());
+                }
+                // 🧱 Buffer ceilings are accepted for Caddyfile compatibility
+                // and kept visible in the compiled config; Pingclair streams
+                // bodies and never buffers them whole.
+                "request_buffers" => {
+                    proxy.request_buffer_bytes = Some(parse_buffer_size(&sub)?);
+                }
+                "response_buffers" => {
+                    proxy.response_buffer_bytes = Some(parse_buffer_size(&sub)?);
                 }
                 "to" => {
                     // 🧭 Caddy's `to` accepts several upstreams on one line
@@ -825,14 +917,10 @@ fn is_known_proxy_option(name: &str) -> bool {
             | "unhealthy_request_count"
             | "unhealthy_status"
             | "unhealthy_latency"
-            | "request_buffers"
-            | "response_buffers"
             | "stream_buffer_size"
             | "stream_timeout"
             | "stream_close_delay"
             | "trusted_proxies"
-            | "method"
-            | "rewrite"
             | "handle_response"
             | "replace_status"
             | "verbose_logs"
@@ -1102,4 +1190,181 @@ fn parse_signed_duration(directive: &Directive) -> Result<i64, AdapterError> {
     parse_duration_ms(value)
         .map(|millis| millis as i64)
         .ok_or_else(|| AdapterError::InvalidArgument(directive.name.clone(), value.clone()))
+}
+
+// MARK: - Retry Match
+
+/// 🔁 Folds one `lb_retry_match` into the route's retry policy.
+///
+/// Caddy spells the same setting three ways: a bare expression
+/// (`lb_retry_match \`{rp.status_code} == 504\``), a named form
+/// (`lb_retry_match expression \`...\`` / `path /foo*`), and a block mixing
+/// `method`, `path`, `header`, and `expression`. Method and path forms map
+/// onto runtime fields; status and method expressions are folded into the
+/// status/method lists; anything the runtime cannot evaluate (response
+/// headers, transport errors, request functions) is kept verbatim in
+/// `expressions` and logged at startup.
+fn apply_retry_match(retry: &mut RetryConfig, directive: &Directive) -> Result<(), AdapterError> {
+    let mut apply = |kind: &str, args: &[String]| -> Result<(), AdapterError> {
+        match kind {
+            "path" => {
+                let pattern = args.first().ok_or_else(|| {
+                    AdapterError::ArgumentCount("lb_retry_match path".into(), 1, args.len())
+                })?;
+                retry.path_patterns.push(pattern.clone());
+            }
+            "method" => {
+                if args.is_empty() {
+                    return Err(AdapterError::ArgumentCount(
+                        "lb_retry_match method".into(),
+                        1,
+                        args.len(),
+                    ));
+                }
+                retry.methods = args
+                    .iter()
+                    .map(|method| method.to_ascii_uppercase())
+                    .collect();
+            }
+            "header" => {
+                if args.len() != 2 {
+                    return Err(AdapterError::ArgumentCount(
+                        "lb_retry_match header".into(),
+                        2,
+                        args.len(),
+                    ));
+                }
+                retry
+                    .expressions
+                    .push(format!("header({{'{}': '{}'}})", args[0], args[1]));
+            }
+            "expression" => {
+                let expression = args.first().ok_or_else(|| {
+                    AdapterError::ArgumentCount("lb_retry_match expression".into(), 1, args.len())
+                })?;
+                fold_retry_expression(retry, expression);
+            }
+            other => {
+                return Err(AdapterError::InvalidArgument(
+                    "lb_retry_match".into(),
+                    format!("`{other}` is not a retry-match form"),
+                ));
+            }
+        }
+        Ok(())
+    };
+
+    if let Some(block) = &directive.block {
+        for sub in &block.directives {
+            apply(&sub.name, &sub.args)?;
+        }
+        return Ok(());
+    }
+
+    // 🧭 One-line spellings: `lb_retry_match <form> <arg>` or a bare CEL
+    // expression when the first argument is not a known form name.
+    if directive.args.len() >= 2
+        && matches!(
+            directive.args[0].as_str(),
+            "path" | "method" | "header" | "expression"
+        )
+    {
+        apply(&directive.args[0], &directive.args[1..])?;
+    } else if let Some(expression) = directive.args.first() {
+        fold_retry_expression(retry, expression);
+    }
+    Ok(())
+}
+
+/// 🧾 Folds one CEL retry expression into the mappable fields, keeping the
+/// raw text when the runtime cannot evaluate it.
+fn fold_retry_expression(retry: &mut RetryConfig, raw: &str) {
+    let expression = raw.trim().trim_matches('`');
+    let mut mapped = false;
+
+    if let Some((_, rest)) = expression.split_once("method('")
+        && let Some(method) = rest.split('\'').next()
+    {
+        retry.methods = vec![method.to_ascii_uppercase()];
+        mapped = true;
+    }
+
+    if let Some((_, rest)) = expression.split_once("{rp.status_code} in [") {
+        if let Some(codes) = rest.strip_suffix(']') {
+            retry.status_codes.extend(
+                codes
+                    .split(',')
+                    .filter_map(|code| code.trim().parse::<u16>().ok()),
+            );
+            mapped = true;
+        }
+    } else if let Some((_, rest)) = expression.split_once("{rp.status_code} == ") {
+        if let Some(code) = rest
+            .split_whitespace()
+            .next()
+            .and_then(|code| code.parse::<u16>().ok())
+        {
+            retry.status_codes.push(code);
+            mapped = true;
+        }
+    } else if let Some((_, rest)) = expression.split_once("{rp.status_code} >= ")
+        && let Some(bound) = rest
+            .split_whitespace()
+            .next()
+            .and_then(|code| code.parse::<u16>().ok())
+    {
+        retry.status_codes.extend(bound..=599);
+        mapped = true;
+    }
+
+    // 🧭 A pure status/method expression is fully represented by the folds
+    // above. Anything mentioning response headers, transport errors, or the
+    // request functions stays verbatim so startup can say it is not evaluated.
+    let unmappable = [
+        "{rp.header.",
+        "{rp.is_transport_error",
+        "header(",
+        "query(",
+        "protocol(",
+        "path(",
+        "host(",
+    ]
+    .iter()
+    .any(|needle| expression.contains(needle));
+    if !mapped || unmappable {
+        retry.expressions.push(expression.to_string());
+    }
+    // 🧭 Several expressions may fold the same status ranges (`>= 500` and
+    // `in [502, 503]` overlap); the compiled list stays unique so validation
+    // and runtime selection agree on one set.
+    retry.status_codes.sort_unstable();
+    retry.status_codes.dedup();
+}
+
+/// 🧱 Parses a Caddy buffer size (`4KB`, `10MB`, `unlimited`) into bytes,
+/// with `-1` standing for unlimited.
+fn parse_buffer_size(directive: &Directive) -> Result<i64, AdapterError> {
+    let value = expect_one_argument(directive)?;
+    if value == "unlimited" {
+        return Ok(-1);
+    }
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let number: i64 = value[..split]
+        .parse()
+        .map_err(|_| AdapterError::InvalidArgument(directive.name.clone(), value.to_string()))?;
+    let multiplier = match value[split..].to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" => 1_024,
+        "m" | "mb" => 1_024 * 1_024,
+        "g" | "gb" => 1_024 * 1_024 * 1_024,
+        unit => {
+            return Err(AdapterError::InvalidArgument(
+                directive.name.clone(),
+                format!("`{unit}` is not a byte unit (b/kb/mb/gb)"),
+            ));
+        }
+    };
+    Ok(number * multiplier)
 }

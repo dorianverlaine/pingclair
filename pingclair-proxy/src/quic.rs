@@ -2581,6 +2581,29 @@ async fn reverse_proxy_upstream(
         );
     }
 
+    // 🧭 The reverse_proxy `method`/`rewrite` subdirectives change the
+    // upstream request, mirroring the H1/H2 path; the downstream request
+    // object stays untouched.
+    let mut upstream_method = method.clone();
+    let mut upstream_uri = effective_uri.to_string();
+    if let Some(proxy_config) = proxy_config.as_ref() {
+        if let Some(rewritten) = &proxy_config.rewrite_method
+            && let Ok(rewritten) = http::Method::from_bytes(rewritten.as_bytes())
+        {
+            upstream_method = rewritten;
+        }
+        if let Some(template) = &proxy_config.rewrite_uri {
+            let resolved = crate::server::resolve_caddy_placeholders(
+                template,
+                client_header,
+                Some(verified_client_ip),
+                "http",
+                request_vars,
+            );
+            upstream_uri = resolved.into_owned();
+        }
+    }
+
     let (mut session, peer, mut request_deadline, _upstream_admission) = loop {
         if attempts > 0 {
             let delay = crate::retry::backoff(&retry_policy);
@@ -2693,8 +2716,9 @@ async fn reverse_proxy_upstream(
         }
 
         // 📤 Builds the upstream request with every middleware rewrite already applied.
-        let mut up_req = RequestHeader::build(method.clone(), effective_uri.as_bytes(), None)
-            .map_err(|_| (400, "Bad Request"))?;
+        let mut up_req =
+            RequestHeader::build(upstream_method.clone(), upstream_uri.as_bytes(), None)
+                .map_err(|_| (400, "Bad Request"))?;
 
         // 🏷️ Uses the selected upstream's authority instead of the downstream host.
         up_req
@@ -2887,6 +2911,7 @@ async fn reverse_proxy_upstream(
             &retry_policy,
             &method,
             counted == 0,
+            effective_uri.split('?').next().unwrap_or(effective_uri),
             upstream_status,
             attempts,
             retry_deadline,
@@ -3643,7 +3668,7 @@ mod tests {
             }
         });
 
-        let state = proxy_state(HandlerConfig::ReverseProxy(ReverseProxyConfig {
+        let state = proxy_state(HandlerConfig::ReverseProxy(Box::new(ReverseProxyConfig {
             upstreams: vec![format!("http://{upstream_address}")],
             retry: Box::new(RetryConfig {
                 max_attempts: 2,
@@ -3652,7 +3677,7 @@ mod tests {
                 ..Default::default()
             }),
             ..Default::default()
-        }));
+        })));
         let proxy = PingclairProxy::new();
         let connector = pingora_core::connectors::http::Connector::new(Some(
             pingora_core::connectors::ConnectorOptions::new(16),
@@ -3734,7 +3759,7 @@ mod tests {
                 .unwrap();
         });
 
-        let state = proxy_state(HandlerConfig::ReverseProxy(ReverseProxyConfig {
+        let state = proxy_state(HandlerConfig::ReverseProxy(Box::new(ReverseProxyConfig {
             upstreams: vec![format!("http://{upstream_address}")],
             retry: Box::new(RetryConfig {
                 max_attempts: 1,
@@ -3746,7 +3771,7 @@ mod tests {
                 ..Default::default()
             }),
             ..Default::default()
-        }));
+        })));
         let proxy = PingclairProxy::new();
         let connector = pingora_core::connectors::http::Connector::new(Some(
             pingora_core::connectors::ConnectorOptions::new(16),
@@ -3850,10 +3875,10 @@ mod tests {
             }
         });
 
-        let state = proxy_state(HandlerConfig::ReverseProxy(ReverseProxyConfig {
+        let state = proxy_state(HandlerConfig::ReverseProxy(Box::new(ReverseProxyConfig {
             upstreams: vec![format!("h2c://{upstream_address}")],
             ..Default::default()
-        }));
+        })));
         let proxy = PingclairProxy::new();
         let connector = pingora_core::connectors::http::Connector::new(Some(
             pingora_core::connectors::ConnectorOptions::new(16),

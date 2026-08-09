@@ -1047,12 +1047,12 @@ mod fail_closed_tests {
         let error = compile_err(
             r#"example.com {
                 reverse_proxy localhost:8080 {
-                    request_buffers 4KB
+                    stream_buffer_size 4KB
                 }
             }"#,
         );
         assert!(
-            error.contains("request_buffers") && error.contains("does not implement"),
+            error.contains("stream_buffer_size") && error.contains("does not implement"),
             "a real option must be reported as missing, not unknown; got {error}"
         );
     }
@@ -1346,6 +1346,135 @@ mod fail_closed_tests {
         ] {
             compile_err(source);
         }
+    }
+
+    /// 🔁 `lb_retry_match` folds method, path, and status expressions into the
+    /// runtime retry policy while keeping unmappable CEL visible.
+    #[test]
+    fn lb_retry_match_folds_mappable_forms_and_keeps_expressions() {
+        let config = crate::compile(
+            r#":8884 {
+                reverse_proxy 127.0.0.1:65535 {
+                    lb_retries 5
+                    lb_retry_match {
+                        method POST PUT
+                    }
+                    lb_retry_match {
+                        path /foo*
+                    }
+                    lb_retry_match {
+                        expression `{rp.status_code} in [502, 503, 504]`
+                    }
+                    lb_retry_match {
+                        expression `{rp.header.X-Retry} == "true"`
+                    }
+                    lb_retry_match `{rp.status_code} >= 500`
+                    lb_retry_match path /bar*
+                }
+            }"#,
+        )
+        .expect("retry matches must compile");
+        let pingclair_core::config::HandlerConfig::ReverseProxy(proxy) =
+            &config.servers[0].routes[0].handler
+        else {
+            panic!("expected a proxy handler");
+        };
+        assert_eq!(proxy.retry.methods, ["POST", "PUT"]);
+        assert_eq!(proxy.retry.path_patterns, ["/foo*", "/bar*"]);
+        assert!(
+            proxy.retry.status_codes.contains(&502)
+                && proxy.retry.status_codes.contains(&503)
+                && proxy.retry.status_codes.contains(&504)
+                && proxy.retry.status_codes.contains(&599),
+            "the folded set must cover both the `in [...]` and `>= 500` forms"
+        );
+        assert_eq!(proxy.retry.status_codes.len(), 100);
+        assert_eq!(proxy.retry.expressions, ["{rp.header.X-Retry} == \"true\""]);
+    }
+
+    /// ⚖️ `weighted_round_robin` carries one inline weight per upstream and
+    /// the weights land on the per-upstream options the runtime selects with.
+    #[test]
+    fn weighted_round_robin_assigns_inline_weights() {
+        let config = crate::compile(
+            r#":8884 {
+                reverse_proxy 127.0.0.1:65535 127.0.0.1:35535 {
+                    lb_policy weighted_round_robin 10 1
+                }
+            }"#,
+        )
+        .expect("weighted round robin must compile");
+        let pingclair_core::config::HandlerConfig::ReverseProxy(proxy) =
+            &config.servers[0].routes[0].handler
+        else {
+            panic!("expected a proxy handler");
+        };
+        assert_eq!(proxy.load_balance.strategy, "round_robin");
+        assert_eq!(
+            proxy
+                .upstream_options
+                .iter()
+                .map(|upstream| upstream.weight)
+                .collect::<Vec<_>>(),
+            [10, 1]
+        );
+    }
+
+    /// 🧭 `method`/`rewrite` mutate the upstream request; buffer ceilings stay
+    /// visible in the compiled configuration.
+    #[test]
+    fn method_rewrite_and_buffer_ceilings_compile() {
+        let config = crate::compile(
+            r#"example.com {
+                reverse_proxy https://localhost:54321 {
+                    method GET
+                    rewrite /rewritten?uri={uri}
+                    request_buffers 4KB
+                    response_buffers unlimited
+                }
+            }"#,
+        )
+        .expect("the options must compile");
+        let pingclair_core::config::HandlerConfig::ReverseProxy(proxy) =
+            &config.servers[0].routes[0].handler
+        else {
+            panic!("expected a proxy handler");
+        };
+        assert_eq!(proxy.rewrite_method.as_deref(), Some("GET"));
+        assert_eq!(proxy.rewrite_uri.as_deref(), Some("/rewritten?uri={uri}"));
+        assert_eq!(proxy.request_buffer_bytes, Some(4 * 1024));
+        assert_eq!(proxy.response_buffer_bytes, Some(-1));
+    }
+
+    /// 🩺 A health probe may set the Host header: that is how an operator asks
+    /// a different virtual host on the same origin.
+    #[test]
+    fn health_headers_may_set_host() {
+        let config = crate::compile(
+            r#"example.com {
+                reverse_proxy 127.0.0.1:65535 {
+                    health_headers {
+                        Host example.com
+                        X-Probe probe
+                    }
+                    health_uri /health
+                }
+            }"#,
+        )
+        .expect("Host must be allowed in health-check headers");
+        let pingclair_core::config::HandlerConfig::ReverseProxy(proxy) =
+            &config.servers[0].routes[0].handler
+        else {
+            panic!("expected a proxy handler");
+        };
+        let headers = proxy
+            .health_check
+            .as_ref()
+            .expect("a health check")
+            .headers
+            .clone();
+        assert_eq!(headers.get("Host").map(String::as_str), Some("example.com"));
+        assert_eq!(headers.get("X-Probe").map(String::as_str), Some("probe"));
     }
 
     #[test]

@@ -1261,6 +1261,36 @@ impl ProxyState {
                 } else {
                     Some(Arc::new(DynamicDialPlan::new(dynamic_templates)))
                 });
+                // 🧭 Compatibility-only knobs are logged once at load so an
+                // operator is never silently told a setting took effect.
+                if !proxy_config.transport_options.is_empty() {
+                    let options: Vec<&str> = proxy_config
+                        .transport_options
+                        .keys()
+                        .map(String::as_str)
+                        .collect();
+                    tracing::warn!(
+                        route = %route.path,
+                        ?options,
+                        "🧭 These transport options are accepted but have no runtime effect yet"
+                    );
+                }
+                if proxy_config.request_buffer_bytes.is_some()
+                    || proxy_config.response_buffer_bytes.is_some()
+                {
+                    tracing::warn!(
+                        route = %route.path,
+                        "🧭 Request/response buffer ceilings are informational; bodies always stream"
+                    );
+                }
+                if !proxy_config.retry.expressions.is_empty() {
+                    let expressions = &proxy_config.retry.expressions;
+                    tracing::warn!(
+                        route = %route.path,
+                        ?expressions,
+                        "🧭 Retry-match expressions are accepted but not evaluated"
+                    );
+                }
 
                 // 🔐 Compile the route policy before its probe peer so health and
                 // ordinary traffic use identical trust roots, client identity, and SNI.
@@ -4856,6 +4886,29 @@ impl ProxyHttp for PingclairProxy {
             return Ok(true);
         };
 
+        // 🧭 A reverse_proxy `method`/`rewrite` mutates the request before
+        // Pingora clones it for the upstream connection, so the change is
+        // visible to routing, retry policy, and the upstream request alike.
+        if let Some(proxy_config) = self.get_proxy_config(&state, route_index) {
+            if let Some(rewritten) = &proxy_config.rewrite_method
+                && let Ok(rewritten) = http::Method::from_bytes(rewritten.as_bytes())
+            {
+                session.req_header_mut().method = rewritten;
+            }
+            if let Some(template) = &proxy_config.rewrite_uri {
+                let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
+                let resolved = resolve_caddy_placeholders(
+                    template,
+                    session.req_header(),
+                    verified_client_ip.as_deref(),
+                    ctx.request_scheme,
+                    &ctx.request_vars,
+                )
+                .into_owned();
+                session.req_header_mut().set_raw_path(resolved.as_bytes())?;
+            }
+        }
+
         let client_ip = self.balancing_identity(session, ctx);
         match self.select_admitted_upstream(
             &state,
@@ -5324,6 +5377,7 @@ impl ProxyHttp for PingclairProxy {
             &retry_policy,
             &method,
             body_is_empty,
+            session.req_header().uri.path(),
             status,
             ctx.retry_attempts,
             ctx.retry_deadline,
@@ -6514,7 +6568,7 @@ mod p0_regression_tests {
             name: Some("reload.example".to_string()),
             routes: vec![pingclair_core::config::RouteConfig {
                 path: "/api/*".to_string(),
-                handler: HandlerConfig::ReverseProxy(proxy),
+                handler: HandlerConfig::ReverseProxy(Box::new(proxy)),
                 methods: None,
                 matcher: None,
             }],
@@ -7282,11 +7336,11 @@ mod caddy_parity_tests {
         ProxyState::new(ServerConfig {
             routes: vec![pingclair_core::config::RouteConfig {
                 path: "/*".into(),
-                handler: HandlerConfig::ReverseProxy(ReverseProxyConfig {
+                handler: HandlerConfig::ReverseProxy(Box::new(ReverseProxyConfig {
                     upstreams: vec!["https://127.0.0.1:8443".into()],
                     upstream_tls: Box::new(tls),
                     ..Default::default()
-                }),
+                })),
                 methods: None,
                 matcher: None,
             }],

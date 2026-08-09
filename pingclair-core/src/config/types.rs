@@ -782,7 +782,7 @@ pub enum HandlerConfig {
     },
 
     /// Reverse proxy
-    ReverseProxy(ReverseProxyConfig),
+    ReverseProxy(Box<ReverseProxyConfig>),
 
     /// Redirect
     Redirect {
@@ -1097,6 +1097,34 @@ pub struct ReverseProxyConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dynamic_upstream: Option<Box<DynamicUpstreamConfig>>,
 
+    /// 🧭 Request method change applied before proxying, from Caddy's
+    /// `method` subdirective; `None` forwards the client's method untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewrite_method: Option<String>,
+
+    /// 🧭 URI template applied to the upstream request target; placeholders
+    /// are expanded per request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewrite_uri: Option<String>,
+
+    /// 🧱 Request body buffer ceiling in bytes (`-1` means unlimited).
+    /// Accepted for Caddyfile compatibility; Pingclair streams request bodies
+    /// and never buffers them whole, so this is informational.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_buffer_bytes: Option<i64>,
+
+    /// 🧱 Response body buffer ceiling in bytes (`-1` means unlimited).
+    /// Accepted for Caddyfile compatibility; Pingclair streams response
+    /// bodies, so this is informational.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_buffer_bytes: Option<i64>,
+
+    /// 🧭 Transport tuning options that have no runtime equivalent yet. They
+    /// stay visible in the compiled configuration and are logged at startup
+    /// so an operator is never silently told a knob took effect.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub transport_options: BTreeMap<String, String>,
+
     /// Per-upstream weight and backup role. When empty, every address in
     /// `upstreams` is a primary with weight one (the legacy JSON form).
     #[serde(default)]
@@ -1278,6 +1306,16 @@ pub struct RetryConfig {
     /// 🛡️ Idempotent methods eligible for status-code redispatch.
     #[serde(default = "default_retry_methods")]
     pub methods: Vec<String>,
+    /// 🧭 Request-path glob patterns (`/foo*`) that must match for a status
+    /// redispatch to be permitted, mirroring Caddy's `lb_retry_match path`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_patterns: Vec<String>,
+    /// 🧾 Retry-match expressions accepted for Caddyfile compatibility. The
+    /// runtime cannot evaluate arbitrary CEL, so every expression is surfaced
+    /// in the compiled configuration and logged at startup; the mappable
+    /// status/method forms are folded into the fields above.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expressions: Vec<String>,
 }
 
 impl Default for RetryConfig {
@@ -1288,6 +1326,8 @@ impl Default for RetryConfig {
             backoff_ms: 0,
             status_codes: Vec::new(),
             methods: default_retry_methods(),
+            path_patterns: Vec::new(),
+            expressions: Vec::new(),
         }
     }
 }
