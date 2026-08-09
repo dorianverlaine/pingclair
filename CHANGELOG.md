@@ -46,6 +46,16 @@ lets the rest converge.
 
 ### 🔄 Changed
 
+- 🌐 **Dynamic DNS now honors source policy.** Empty `resolvers` uses the
+  host's system DNS configuration instead of Hickory's Google default. Each
+  dynamic pool follows its own `refresh` interval, including when global
+  `dns_refresh` is off, while an omitted interval still follows the global
+  setting. SRV `grace_period` now bounds stale peers from the first failed
+  refresh and withdraws them when the window expires; without a grace period,
+  discovery failure withdraws them immediately. Dynamic `dial_fallback_delay`
+  is now rejected instead of being accepted without effect. Requests continue
+  to read only the atomically published pool snapshot.
+
 - 🌐 **Mixed HTTP/HTTPS site addresses now retain per-listener policy.** A
   block such as `http://example.com, https://example.com { … }` shares its
   handlers without letting the HTTP address disable automatic certificates

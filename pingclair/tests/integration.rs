@@ -3255,6 +3255,60 @@ async fn test_pingclairfile_unix_socket_upstream_serves_requests() {
     upstream_task.await.unwrap();
 }
 
+/// 🌐 A dynamic source without `resolvers` must use the host's DNS settings
+/// through the full Pingclairfile, compiler, runtime, and proxy path.
+#[tokio::test]
+async fn test_pingclairfile_dynamic_a_uses_the_system_resolver() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let mut request = vec![0u8; 8_192];
+        let _ = stream.read(&mut request).await.unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\nConnection: close\r\n\r\nsystem-dns-dynamic",
+            )
+            .await
+            .unwrap();
+    });
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            reverse_proxy {{
+                dynamic a localhost {upstream_port} {{
+                    refresh 1s
+                    versions ipv4
+                }}
+            }}
+        }}
+        "#
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/dynamic"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "system-dns-dynamic");
+    upstream_task.await.unwrap();
+}
+
 #[tokio::test]
 async fn test_pingclairfile_replaceable_upstream_uses_request_captures() {
     use tokio::io::AsyncWriteExt;
@@ -5652,6 +5706,39 @@ async fn test_admin_runs_the_canonical_validator_on_posted_config() {
         .await
         .unwrap();
     assert_eq!(response.status(), 400);
+
+    // 🚫 Legacy JSON may still deserialize the old field, but Admin validation
+    // must reject an option the resolver transport cannot honor exactly.
+    let unsupported_dynamic_dns = serde_json::json!({
+        "listen": [server.address(0).to_string()],
+        "routes": [{
+            "path": "/*",
+            "handler": {
+                "type": "reverse_proxy",
+                "upstreams": [],
+                "dynamic_upstream": {
+                    "A": {
+                        "name": "app.example.test",
+                        "port": 8080,
+                        "resolvers": ["127.0.0.1"],
+                        "fallback_delay_ms": 300
+                    }
+                }
+            }
+        }]
+    });
+    let response = client
+        .post(server.admin_url("/config/0"))
+        .json(&unsupported_dynamic_dns)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains("dial_fallback_delay"),
+        "the canonical validator must name the unsupported option: {body}"
+    );
 
     let still_serving = client
         .get(server.url(0, "/__ready_retry"))

@@ -1110,7 +1110,6 @@ fn parse_dynamic_addr(
     let mut refresh_secs = None;
     let mut resolvers = Vec::new();
     let mut dial_timeout_ms = None;
-    let mut fallback_delay_ms = None;
     let mut versions = None;
 
     if let Some(block) = &d.block {
@@ -1132,7 +1131,11 @@ fn parse_dynamic_addr(
                     dial_timeout_ms = Some(parse_required_duration(sub)?);
                 }
                 "dial_fallback_delay" => {
-                    fallback_delay_ms = Some(parse_signed_duration(sub)?);
+                    let _ = parse_signed_duration(sub)?;
+                    return Err(AdapterError::UnsupportedFeature(
+                        "dynamic a dial_fallback_delay".into(),
+                        "Hickory has no exact RFC 6555 resolver-dial fallback hook".into(),
+                    ));
                 }
                 "versions" => {
                     let value = expect_one_argument(sub)?;
@@ -1163,7 +1166,7 @@ fn parse_dynamic_addr(
         refresh_secs,
         resolvers,
         dial_timeout_ms,
-        fallback_delay_ms,
+        fallback_delay_ms: None,
         versions,
     })
 }
@@ -1178,7 +1181,6 @@ fn parse_dynamic_srv(
     let mut refresh_secs = None;
     let mut resolvers = Vec::new();
     let mut dial_timeout_ms = None;
-    let mut fallback_delay_ms = None;
     let mut grace_period_ms = None;
 
     if let Some(block) = &d.block {
@@ -1203,7 +1205,11 @@ fn parse_dynamic_srv(
                     dial_timeout_ms = Some(parse_required_duration(sub)?);
                 }
                 "dial_fallback_delay" => {
-                    fallback_delay_ms = Some(parse_signed_duration(sub)?);
+                    let _ = parse_signed_duration(sub)?;
+                    return Err(AdapterError::UnsupportedFeature(
+                        "dynamic srv dial_fallback_delay".into(),
+                        "Hickory has no exact RFC 6555 resolver-dial fallback hook".into(),
+                    ));
                 }
                 "grace_period" => {
                     grace_period_ms = Some(parse_required_duration(sub)?);
@@ -1239,7 +1245,7 @@ fn parse_dynamic_srv(
         refresh_secs,
         resolvers,
         dial_timeout_ms,
-        fallback_delay_ms,
+        fallback_delay_ms: None,
         grace_period_ms,
     })
 }

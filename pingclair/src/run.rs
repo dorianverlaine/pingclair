@@ -996,25 +996,23 @@ pub(crate) fn run_server(
         });
     }
 
-    // ========================================
-    // 🔄 Upstream DNS re-resolution
-    // ========================================
-    // Every route was resolved once while its ProxyState was built. Container
-    // addresses do not stay put, so one shared task re-resolves the hostname
-    // pools on an interval; pools built from IP literals never registered and
-    // cost nothing here.
+    // 🔄 ========================================
+    // 🔄 Upstream DNS re-resolution.
+    // 🔄 ========================================
+    // 🔄 Every route was resolved once while its ProxyState was built. One
+    // shared scheduler honors each dynamic source's interval while ordinary
+    // hostname pools follow the global interval.
     //
-    // The task runs even when no pool has registered yet: a hot reload can
-    // introduce the first hostname upstream, and it would have no refresher
-    // if starting one depended on the boot-time config.
+    // ♻️ The task runs even when no pool has registered yet because a hot
+    // reload can introduce the first hostname or explicitly scheduled source.
     let dns_refresh_secs = config.global.dns_refresh_secs;
-    if dns_refresh_secs == 0 {
-        tracing::info!("🔄 Upstream DNS re-resolution disabled (dns_refresh off)");
+    let default_dns_interval = if dns_refresh_secs == 0 {
+        tracing::info!("🔄 Global upstream DNS re-resolution disabled (dns_refresh off)");
+        None
     } else {
-        bg_handle.spawn(pingclair_proxy::dns::run(std::time::Duration::from_secs(
-            dns_refresh_secs,
-        )));
-    }
+        Some(std::time::Duration::from_secs(dns_refresh_secs))
+    };
+    bg_handle.spawn(pingclair_proxy::dns::run(default_dns_interval));
 
     // ========================================
     // 🛑 Signal Handling for Shutdown (SIGINT/SIGTERM)

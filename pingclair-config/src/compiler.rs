@@ -863,10 +863,64 @@ fn validate_basic_auth_credentials(handler: &HandlerConfig) -> CompileResult<()>
     }
 }
 
+/// 🚫 Validates DNS-source policy for both Pingclairfiles and direct JSON.
+fn validate_dynamic_upstream(
+    source: &pingclair_core::config::DynamicUpstreamConfig,
+) -> CompileResult<()> {
+    let (refresh_secs, resolvers, fallback_delay_ms) = match source {
+        pingclair_core::config::DynamicUpstreamConfig::A(source) => {
+            if !matches!(
+                source.versions.as_deref(),
+                None | Some("ip" | "ip4" | "ip6" | "ipv4" | "ipv6")
+            ) {
+                return Err(CompileError::InvalidRoute {
+                    message: "dynamic A versions must be ipv4, ipv6, or ip".to_string(),
+                });
+            }
+            (
+                source.refresh_secs,
+                source.resolvers.as_slice(),
+                source.fallback_delay_ms,
+            )
+        }
+        pingclair_core::config::DynamicUpstreamConfig::Srv(source) => (
+            source.refresh_secs,
+            source.resolvers.as_slice(),
+            source.fallback_delay_ms,
+        ),
+    };
+
+    if refresh_secs == Some(0) {
+        return Err(CompileError::InvalidRoute {
+            message: "dynamic refresh interval must be at least one second".to_string(),
+        });
+    }
+    if let Some(resolver) = resolvers
+        .iter()
+        .find(|resolver| resolver.parse::<std::net::IpAddr>().is_err())
+    {
+        return Err(CompileError::InvalidRoute {
+            message: format!("dynamic resolver `{resolver}` is not an IP address"),
+        });
+    }
+    if fallback_delay_ms.is_some() {
+        return Err(CompileError::InvalidRoute {
+            message: "dynamic dial_fallback_delay is unsupported because Hickory has no exact \
+                      RFC 6555 resolver-dial fallback hook"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// 🛡️ Rejects unsafe retry, overload, and circuit-breaker policies.
 fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<()> {
     match handler {
         HandlerConfig::ReverseProxy(proxy) => {
+            if let Some(source) = proxy.dynamic_upstream.as_deref() {
+                validate_dynamic_upstream(source)?;
+            }
+
             // ⏳ A zero TTL would admit entries that are stale on arrival, and an
             // unbounded one would pin a response past any plausible deployment.
             // Both are configuration mistakes rather than useful settings.
@@ -2378,6 +2432,59 @@ mod fail_closed_handler_tests {
                 ..Default::default()
             }],
             ..Default::default()
+        }
+    }
+
+    /// 🌐 Builds a direct-JSON-shaped proxy around one dynamic DNS source.
+    fn config_with_dynamic_source(
+        source: pingclair_core::config::DynamicUpstreamConfig,
+    ) -> PingclairConfig {
+        config_with(HandlerConfig::ReverseProxy(Box::new(
+            pingclair_core::config::ReverseProxyConfig {
+                dynamic_upstream: Some(Box::new(source)),
+                ..Default::default()
+            },
+        )))
+    }
+
+    /// 🚫 Direct JSON must not bypass dynamic resolver validation or retain a
+    /// resolver option that the runtime would silently ignore.
+    #[test]
+    fn direct_json_dynamic_dns_policy_fails_closed() {
+        use pingclair_core::config::{DynamicAddrUpstream, DynamicUpstreamConfig};
+
+        let source = |refresh_secs, resolvers, fallback_delay_ms, versions| {
+            DynamicUpstreamConfig::A(DynamicAddrUpstream {
+                name: "app.example.test".to_string(),
+                port: 8080,
+                refresh_secs,
+                resolvers,
+                dial_timeout_ms: None,
+                fallback_delay_ms,
+                versions,
+            })
+        };
+        for (source, expected) in [
+            (source(Some(0), vec![], None, None), "at least one second"),
+            (
+                source(None, vec!["resolver.example.test".to_string()], None, None),
+                "is not an IP address",
+            ),
+            (
+                source(None, vec![], None, Some("tcp".to_string())),
+                "versions",
+            ),
+            (
+                source(None, vec!["127.0.0.1".to_string()], Some(300), None),
+                "unsupported",
+            ),
+        ] {
+            let error = validate_config(&config_with_dynamic_source(source))
+                .expect_err("an inexact dynamic DNS policy must be refused");
+            assert!(
+                error.to_string().contains(expected),
+                "the rejection must name the invalid policy: {error}"
+            );
         }
     }
 

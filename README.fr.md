@@ -566,8 +566,15 @@ dessus. Les amonts Unix ne passent jamais par le rafraîchissement DNS.
 Les amonts peuvent aussi être découverts par DNS pendant l'exécution :
 `dynamic a name port` résout chaque adresse de `name`, et
 `dynamic srv _svc._tcp.example.com` résout les enregistrements SRV dont les
-cibles portent leur propre port. Les résolutions ont lieu sur un rafraîchisseur
-d'arrière-plan, jamais sur le chemin de requête. Une adresse de dial peut aussi
+cibles portent leur propre port. L'intervalle `refresh` de chaque source est
+indépendant ; s'il est omis, il suit le `dns_refresh` global. Sans option
+`resolvers`, la configuration DNS du système hôte est utilisée. Pour une source
+SRV, `grace_period` conserve le dernier ensemble valide seulement entre le
+premier échec et l'expiration de cette fenêtre bornée ; sans cette option, un
+échec retire les amonts dynamiques. `dial_fallback_delay` est refusé, car
+Hickory n'expose aucun mécanisme RFC 6555 équivalent pour joindre un serveur
+DNS explicite ; l'option n'est jamais acceptée comme no-op. Les résolutions sont
+planifiées en arrière-plan, jamais sur le chemin de requête. Une adresse de dial peut aussi
 contenir des placeholders — `reverse_proxy {re.dial.1}` — développés par
 requête et mis en cache par hôte et port.
 
@@ -604,8 +611,9 @@ avant son application. Les adresses IP littérales n'atteignent jamais un résol
 
 ```caddyfile
 {
-    # 30s par défaut. `dns_refresh off` fige chaque amont sur l'adresse qu'il
-    # avait au démarrage. L'unité est obligatoire : `30` n'est pas `30s`.
+    # ⏱️ 30s par défaut. `dns_refresh off` fige les noms ordinaires et les sources
+    # ⏱️ dynamiques sans `refresh` propre ; un intervalle explicite reste actif.
+    # ⏱️ L'unité est obligatoire : `30` n'est pas `30s`.
     dns_refresh 15s
 }
 ```

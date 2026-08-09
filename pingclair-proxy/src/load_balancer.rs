@@ -31,9 +31,9 @@ use pingora_load_balancing::selection::consistent::KetamaHashing;
 use pingora_load_balancing::selection::{BackendIter, BackendSelection};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // MARK: - Types
 
@@ -42,6 +42,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// selection after the cooldown acts as the half-open probe: if it fails
 /// too, the backend is marked down for another cooldown.
 pub const FAIL_COOLDOWN: Duration = Duration::from_secs(10);
+
+/// ⏱️ Monotonic origin shared by dynamic DNS deadlines and grace windows.
+static DNS_CLOCK_START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// ⏱️ Returns monotonic process-relative milliseconds for DNS bookkeeping.
+pub(crate) fn dns_now_millis() -> u64 {
+    u64::try_from(DNS_CLOCK_START.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
 
 fn now_millis() -> u64 {
     SystemTime::now()
@@ -299,6 +307,7 @@ struct HealthCheckSettings {
 /// re-resolved. `backend` is `None` while a hostname has never resolved
 /// successfully — the entry stays in the list so a later refresh can adopt
 /// it, which is what lets the proxy start before its app container does.
+#[derive(Clone)]
 struct TrackedUpstream {
     spec: Option<UpstreamSpec>,
     weight: usize,
@@ -377,6 +386,14 @@ pub struct LoadBalancer {
     /// 🧭 DNS-driven source whose whole peer set is republished on refresh;
     /// absent for pools built from a fixed upstream list.
     dynamic: Option<Box<dyn DynamicUpstreamSource>>,
+    /// 🧱 Static peers that remain present when a dynamic generation changes.
+    dynamic_static: Vec<TrackedUpstream>,
+    /// 🌤️ First failure of the current dynamic outage, which bounds grace.
+    dynamic_stale_since_ms: AtomicU64,
+    /// ⏱️ Next DNS deadline for this pool's own source or hostname entries.
+    next_dns_refresh_ms: AtomicU64,
+    /// 🧭 Whether fixed configuration contains names that follow global refresh.
+    static_dns_refresh: bool,
 }
 
 // MARK: - Implementation
@@ -461,7 +478,8 @@ impl LoadBalancer {
         strategy: Strategy,
     ) -> Self {
         let resolver: Arc<dyn Resolve> = Arc::new(SystemResolver);
-        let mut tracked = resolve_entries(primary, resolver.as_ref());
+        let static_tracked = resolve_entries(primary, resolver.as_ref());
+        let mut tracked = static_tracked.clone();
         match source.resolve_specs() {
             Ok(specs) => {
                 tracked.extend(specs.into_iter().map(|spec| {
@@ -493,6 +511,7 @@ impl LoadBalancer {
             ))
         });
         let mut load_balancer = Self::from_tracked(tracked, strategy, resolver, backup_pool);
+        load_balancer.dynamic_static = static_tracked;
         load_balancer.dynamic = Some(source);
         load_balancer
     }
@@ -527,6 +546,9 @@ impl LoadBalancer {
         resolver: Arc<dyn Resolve>,
         backup: Option<Arc<LoadBalancer>>,
     ) -> Self {
+        let static_dns_refresh = tracked
+            .iter()
+            .any(|entry| entry.spec.as_ref().is_some_and(UpstreamSpec::needs_dns));
         let backends: Vec<Upstream> = tracked.iter().filter_map(|t| t.backend.clone()).collect();
         let recovery = Arc::new(RecoveryState::default());
         let pool = build_pool(strategy, backends, None, None, &recovery);
@@ -542,6 +564,10 @@ impl LoadBalancer {
             backup,
             generation: AtomicU64::new(0),
             dynamic: None,
+            dynamic_static: Vec::new(),
+            dynamic_stale_since_ms: AtomicU64::new(0),
+            next_dns_refresh_ms: AtomicU64::new(0),
+            static_dns_refresh,
         }
     }
 
@@ -552,33 +578,99 @@ impl LoadBalancer {
         if self.dynamic.is_some() {
             return true;
         }
-        let own = self
-            .tracked
-            .lock()
-            .iter()
-            .any(|t| t.spec.as_ref().is_some_and(|spec| spec.needs_dns()));
-        own || self.backup.as_ref().is_some_and(|b| b.needs_dns_refresh())
+        self.static_dns_refresh || self.backup.as_ref().is_some_and(|b| b.needs_dns_refresh())
     }
 
-    /// Re-resolves every hostname upstream and republishes the pool if any
-    /// address moved.
+    /// ⏱️ Refreshes only DNS work whose per-pool deadline has arrived.
+    pub(crate) fn refresh_dns_due(
+        &self,
+        default_interval: Option<Duration>,
+        now_ms: u64,
+    ) -> DnsRefresh {
+        let mut report = DnsRefresh::default();
+        if let Some(backup) = &self.backup {
+            report.merge(backup.refresh_dns_due(default_interval, now_ms));
+        }
+
+        let Some(interval) = self.own_dns_refresh_interval(default_interval) else {
+            return report;
+        };
+        if !self.claim_dns_refresh(now_ms, interval) {
+            return report;
+        }
+        report.merge(self.refresh_own_dns_at(now_ms));
+        report
+    }
+
+    /// 🧭 Resolves the interval for this pool without consulting request state.
+    fn own_dns_refresh_interval(&self, default_interval: Option<Duration>) -> Option<Duration> {
+        if let Some(source) = &self.dynamic {
+            return source.refresh_interval().or(default_interval);
+        }
+        self.static_dns_refresh
+            .then_some(default_interval)
+            .flatten()
+    }
+
+    /// ⏱️ Reports whether this pool or its backup has an active DNS schedule.
+    pub(crate) fn has_dns_schedule(&self, default_interval: Option<Duration>) -> bool {
+        self.own_dns_refresh_interval(default_interval).is_some()
+            || self
+                .backup
+                .as_ref()
+                .is_some_and(|backup| backup.has_dns_schedule(default_interval))
+    }
+
+    /// ⏱️ Advances one deadline atomically so overlapping scheduler passes do not duplicate DNS.
+    fn claim_dns_refresh(&self, now_ms: u64, interval: Duration) -> bool {
+        let interval_ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
+        let next = self.next_dns_refresh_ms.load(Ordering::Acquire);
+        if next == 0 {
+            let deadline = now_ms.saturating_add(interval_ms).max(1);
+            let _ = self.next_dns_refresh_ms.compare_exchange(
+                0,
+                deadline,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            return false;
+        }
+        if now_ms < next {
+            return false;
+        }
+        self.next_dns_refresh_ms
+            .compare_exchange(
+                next,
+                now_ms.saturating_add(interval_ms).max(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// 🔄 Re-resolves every hostname upstream and republishes moved addresses.
     ///
-    /// Failure is deliberately non-destructive: a lookup that errors leaves
-    /// the previous address in rotation. A resolver outage — a DNS container
-    /// restarting, a `resolv.conf` briefly missing — must not empty the pool
-    /// and take the site down, because the old address is very often still
-    /// serving traffic perfectly well.
+    /// 🧭 Fixed hostname failures keep their last-known-good addresses because
+    /// they have no source-level grace policy. Dynamic sources retain the
+    /// previous generation only for their configured grace period.
     pub fn refresh_dns(&self) -> DnsRefresh {
         let mut report = DnsRefresh::default();
         if let Some(backup) = &self.backup {
             report.merge(backup.refresh_dns());
         }
+        report.merge(self.refresh_own_dns_at(dns_now_millis().max(1)));
+        report
+    }
+
+    /// 🔄 Refreshes this pool without recursively touching its backup.
+    fn refresh_own_dns_at(&self, now_ms: u64) -> DnsRefresh {
+        let mut report = DnsRefresh::default();
 
         // 🧭 A dynamic source owns the whole peer set: refresh it directly
         // rather than re-resolving whatever the last generation happened to
         // publish, so records that moved or disappeared are picked up.
         if let Some(source) = &self.dynamic {
-            report.merge(self.refresh_dynamic(source.as_ref()));
+            report.merge(self.refresh_dynamic_at(source.as_ref(), now_ms));
             return report;
         }
 
@@ -653,26 +745,57 @@ impl LoadBalancer {
 
     /// 🧭 Re-queries one DNS-driven source and republishes its peer set.
     ///
-    /// A source-level failure keeps the previous generation serving, matching
-    /// the hostname refresher's last-known-good rule. Individual peers whose
-    /// address lookup fails are dropped from the new set and rejoin the next
-    /// time the source answers for them.
-    fn refresh_dynamic(&self, source: &dyn DynamicUpstreamSource) -> DnsRefresh {
+    /// 🌤️ A source-level failure retains the previous generation only inside
+    /// its configured grace period. Individual peers whose address lookup
+    /// fails are dropped from the new set and rejoin when the source answers.
+    fn refresh_dynamic_at(&self, source: &dyn DynamicUpstreamSource, now_ms: u64) -> DnsRefresh {
         let mut report = DnsRefresh::default();
         let new_specs = match source.resolve_specs() {
-            Ok(specs) => specs,
+            Ok(specs) => {
+                self.dynamic_stale_since_ms.store(0, Ordering::Release);
+                specs
+            }
             Err(error) => {
-                report.kept_stale += 1;
+                let has_stale_generation = self.tracked.lock().len() > self.dynamic_static.len();
+                let within_grace = has_stale_generation
+                    && source.grace_period().is_some_and(|grace| {
+                        let grace_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX);
+                        let proposed_start = now_ms.max(1);
+                        let _ = self.dynamic_stale_since_ms.compare_exchange(
+                            0,
+                            proposed_start,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                        let stale_since = self.dynamic_stale_since_ms.load(Ordering::Acquire);
+                        now_ms < stale_since.saturating_add(grace_ms)
+                    });
+                if within_grace {
+                    report.kept_stale += 1;
+                    tracing::warn!(
+                        source = %source.describe(),
+                        %error,
+                        "⚠️ Dynamic upstream lookup failed; keeping peers within the grace period"
+                    );
+                    return report;
+                }
+
+                report.unresolved += 1;
+                let replacement = self.dynamic_static.clone();
+                if self.replace_dynamic_generation(replacement) {
+                    report.changed += 1;
+                }
                 tracing::warn!(
                     source = %source.describe(),
                     %error,
-                    "⚠️ Dynamic upstream lookup failed; keeping the previous peer set"
+                    "⚠️ Dynamic upstream lookup failed; the stale peer set expired"
                 );
                 return report;
             }
         };
 
-        let mut new_tracked = Vec::with_capacity(new_specs.len());
+        let mut new_tracked = self.dynamic_static.clone();
+        new_tracked.reserve(new_specs.len());
         for spec in new_specs {
             match spec.resolve(self.resolver.as_ref()) {
                 Ok(address) => {
@@ -696,7 +819,20 @@ impl LoadBalancer {
             }
         }
 
-        let previous = self.tracked.lock();
+        if !self.replace_dynamic_generation(new_tracked) {
+            return report;
+        }
+        report.changed += 1;
+        tracing::info!(
+            source = %source.describe(),
+            "🔄 Dynamic upstream peer set refreshed"
+        );
+        report
+    }
+
+    /// 🔄 Publishes one dynamic generation only when its concrete peers changed.
+    fn replace_dynamic_generation(&self, new_tracked: Vec<TrackedUpstream>) -> bool {
+        let mut previous = self.tracked.lock();
         let previous_keys: Vec<String> = previous
             .iter()
             .filter_map(|entry| {
@@ -716,18 +852,12 @@ impl LoadBalancer {
             })
             .collect();
         if previous_keys == next_keys {
-            return report;
+            return false;
         }
 
-        drop(previous);
         self.publish(&new_tracked);
-        *self.tracked.lock() = new_tracked;
-        report.changed += 1;
-        tracing::info!(
-            source = %source.describe(),
-            "🔄 Dynamic upstream peer set refreshed"
-        );
-        report
+        *previous = new_tracked;
+        true
     }
 
     /// Rebuilds and atomically installs the selector set for `tracked`.
@@ -1287,13 +1417,29 @@ mod tests {
     struct ScriptedSourceState {
         addresses: Mutex<Vec<String>>,
         failing: std::sync::atomic::AtomicBool,
+        refresh_interval: Option<Duration>,
+        grace_period: Option<Duration>,
     }
 
     impl ScriptedSource {
         fn new(addresses: Vec<String>) -> (Arc<ScriptedSourceState>, Self) {
+            Self::with_policy(
+                addresses,
+                Some(Duration::from_secs(5)),
+                Some(Duration::from_secs(60)),
+            )
+        }
+
+        fn with_policy(
+            addresses: Vec<String>,
+            refresh_interval: Option<Duration>,
+            grace_period: Option<Duration>,
+        ) -> (Arc<ScriptedSourceState>, Self) {
             let shared = Arc::new(ScriptedSourceState {
                 addresses: Mutex::new(addresses),
                 failing: std::sync::atomic::AtomicBool::new(false),
+                refresh_interval,
+                grace_period,
             });
             let source = Self {
                 shared: shared.clone(),
@@ -1334,6 +1480,14 @@ mod tests {
                 .filter_map(|address| UpstreamSpec::parse(address))
                 .collect())
         }
+
+        fn refresh_interval(&self) -> Option<Duration> {
+            self.shared.refresh_interval
+        }
+
+        fn grace_period(&self) -> Option<Duration> {
+            self.shared.grace_period
+        }
     }
 
     #[test]
@@ -1370,6 +1524,103 @@ mod tests {
         lb.refresh_dns();
         let kept = lb.select(None).expect("a stale peer must still serve");
         assert_eq!(kept.addr.to_string(), "127.0.0.1:8403");
+    }
+
+    #[test]
+    fn dynamic_sources_refresh_only_when_their_own_deadline_arrives() {
+        let (shared, source) = ScriptedSource::new(vec!["127.0.0.1:8411".to_string()]);
+        let lb = LoadBalancer::from_dynamic(Box::new(source), vec![], vec![], Strategy::RoundRobin);
+        shared.set(vec!["127.0.0.1:8412".to_string()]);
+
+        assert_eq!(
+            lb.refresh_dns_due(Some(Duration::from_secs(30)), 1_000),
+            DnsRefresh::default(),
+            "the first scheduler visit only establishes the deadline"
+        );
+        assert_eq!(selected(&lb), "127.0.0.1:8411");
+        assert_eq!(
+            lb.refresh_dns_due(Some(Duration::from_secs(30)), 5_999),
+            DnsRefresh::default()
+        );
+        assert_eq!(selected(&lb), "127.0.0.1:8411");
+
+        assert_eq!(
+            lb.refresh_dns_due(Some(Duration::from_secs(30)), 6_000)
+                .changed,
+            1
+        );
+        assert_eq!(selected(&lb), "127.0.0.1:8412");
+
+        let (off_shared, off_source) = ScriptedSource::new(vec!["127.0.0.1:8413".to_string()]);
+        let off_lb =
+            LoadBalancer::from_dynamic(Box::new(off_source), vec![], vec![], Strategy::RoundRobin);
+        assert!(off_lb.has_dns_schedule(None));
+        off_shared.set(vec!["127.0.0.1:8414".to_string()]);
+        assert_eq!(
+            off_lb.refresh_dns_due(None, 10_000),
+            DnsRefresh::default(),
+            "an explicit source interval schedules even when global refresh is off"
+        );
+        assert_eq!(off_lb.refresh_dns_due(None, 15_000).changed, 1);
+        assert_eq!(selected(&off_lb), "127.0.0.1:8414");
+    }
+
+    #[test]
+    fn dynamic_source_grace_expires_from_the_first_failed_refresh() {
+        let (shared, source) = ScriptedSource::with_policy(
+            vec!["127.0.0.1:8421".to_string()],
+            Some(Duration::from_secs(5)),
+            Some(Duration::from_secs(2)),
+        );
+        let lb = LoadBalancer::from_dynamic(Box::new(source), vec![], vec![], Strategy::RoundRobin);
+        shared.fail_next();
+
+        let first_failure = lb.refresh_own_dns_at(1_000);
+        assert_eq!(first_failure.kept_stale, 1);
+        let within = lb.refresh_own_dns_at(2_999);
+        assert_eq!(within.kept_stale, 1);
+        assert_eq!(selected(&lb), "127.0.0.1:8421");
+
+        let expired = lb.refresh_own_dns_at(3_000);
+        assert_eq!(expired.changed, 1);
+        assert_eq!(expired.unresolved, 1);
+        assert!(lb.select(None).is_none());
+    }
+
+    #[test]
+    fn dynamic_source_without_grace_drops_stale_peers_immediately() {
+        let (shared, source) = ScriptedSource::with_policy(
+            vec!["127.0.0.1:8431".to_string()],
+            Some(Duration::from_secs(5)),
+            None,
+        );
+        let lb = LoadBalancer::from_dynamic(Box::new(source), vec![], vec![], Strategy::RoundRobin);
+        shared.fail_next();
+
+        let report = lb.refresh_dns();
+        assert_eq!(report.changed, 1);
+        assert_eq!(report.unresolved, 1);
+        assert_eq!(report.kept_stale, 0);
+        assert!(lb.select(None).is_none());
+    }
+
+    #[test]
+    fn dynamic_refresh_preserves_static_peers() {
+        let (shared, source) = ScriptedSource::new(vec!["127.0.0.1:8441".to_string()]);
+        let lb = LoadBalancer::from_dynamic(
+            Box::new(source),
+            vec![entry("127.0.0.1:8440")],
+            vec![],
+            Strategy::RoundRobin,
+        );
+        shared.set(vec!["127.0.0.1:8442".to_string()]);
+        assert_eq!(lb.refresh_dns().changed, 1);
+
+        let seen: HashSet<String> = (0..8).map(|_| selected(&lb)).collect();
+        assert_eq!(
+            seen,
+            HashSet::from(["127.0.0.1:8440".to_string(), "127.0.0.1:8442".to_string(),])
+        );
     }
 
     #[test]

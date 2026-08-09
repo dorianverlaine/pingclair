@@ -9,22 +9,19 @@
 //! a proxy holding the old address serves 502s until it is restarted.
 //!
 //! 🏗️ ARCHITECTURE: every load-balancer pool that has at least one hostname
-//! registers itself here as a `Weak`, and a single background task re-resolves
-//! all of them on a fixed interval. One task for the whole process rather than
-//! one per pool keeps the DNS traffic proportional to the number of distinct
-//! upstreams, not to the number of routes that mention them. `Weak` is what
-//! makes reload safe: a pool retired by `update_config` simply stops being
-//! visited, with no deregistration step to forget.
+//! registers itself here as a `Weak`, and a single background scheduler asks
+//! each pool whether its own deadline has arrived. One task for the whole
+//! process rather than one per pool keeps the scheduler bounded while honoring
+//! dynamic-source intervals independently. `Weak` is what makes reload safe: a
+//! pool retired by `update_config` simply stops being visited, with no
+//! deregistration step to forget.
 //!
-//! ⏱️ INTERVAL, NOT TTL: the standard-library resolver reports addresses and
-//! not their TTL, and reading TTLs would mean carrying a full DNS client and
-//! its transport dependencies. It would also buy little where it matters —
-//! Docker's embedded resolver answers with a 600 s TTL, far longer than the
-//! window in which a restarted container needs to be picked up. A fixed,
-//! configurable interval is both the smaller dependency and the tighter
-//! bound. `dns_refresh` in the global block controls it.
+//! ⏱️ INTERVAL, NOT TTL: static hostname pools follow the global `dns_refresh`;
+//! dynamic sources may override it with their own `refresh`. The one-second
+//! scheduler only compares precompiled deadlines and performs no lookup until
+//! a pool is due.
 
-use crate::load_balancer::{DnsRefresh, LoadBalancer};
+use crate::load_balancer::{DnsRefresh, LoadBalancer, dns_now_millis};
 use parking_lot::Mutex;
 use std::sync::{Arc, LazyLock, Weak};
 use std::time::Duration;
@@ -37,6 +34,7 @@ use std::time::Duration;
 pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 static POOLS: LazyLock<Mutex<Vec<Weak<LoadBalancer>>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static REGISTRATION: LazyLock<tokio::sync::Notify> = LazyLock::new(tokio::sync::Notify::new);
 
 /// Registers a pool for periodic re-resolution.
 ///
@@ -49,6 +47,7 @@ pub fn register(pool: &Arc<LoadBalancer>) {
     let mut pools = POOLS.lock();
     pools.retain(|weak| weak.strong_count() > 0);
     pools.push(Arc::downgrade(pool));
+    REGISTRATION.notify_one();
 }
 
 /// Number of live registered pools. Retiring dead entries here as well keeps
@@ -78,23 +77,58 @@ pub fn refresh_all() -> DnsRefresh {
     report
 }
 
-/// Runs the refresh loop until the process ends.
-pub async fn run(interval: Duration) {
-    tracing::info!(
-        interval_secs = interval.as_secs(),
-        pools = registered_pools(),
-        "🔄 Upstream DNS re-resolution enabled"
-    );
+/// ⏱️ Refreshes only pools whose independently compiled deadline is due.
+fn refresh_due(default_interval: Option<Duration>) -> DnsRefresh {
+    let live: Vec<Arc<LoadBalancer>> = {
+        let mut pools = POOLS.lock();
+        pools.retain(|weak| weak.strong_count() > 0);
+        pools.iter().filter_map(Weak::upgrade).collect()
+    };
+    let now_ms = dns_now_millis().max(1);
 
-    let mut ticker = tokio::time::interval(interval);
+    let mut report = DnsRefresh::default();
+    for pool in live {
+        report.merge(pool.refresh_dns_due(default_interval, now_ms));
+    }
+    report
+}
+
+/// ⏱️ Checks precompiled pool policy without performing a DNS lookup.
+fn has_scheduled_pools(default_interval: Option<Duration>) -> bool {
+    let mut pools = POOLS.lock();
+    pools.retain(|weak| weak.strong_count() > 0);
+    pools
+        .iter()
+        .filter_map(Weak::upgrade)
+        .any(|pool| pool.has_dns_schedule(default_interval))
+}
+
+/// Runs the refresh loop until the process ends.
+pub async fn run(default_interval: Option<Duration>) {
+    match default_interval {
+        Some(interval) => tracing::info!(
+            interval_secs = interval.as_secs(),
+            pools = registered_pools(),
+            "🔄 Upstream DNS scheduler enabled"
+        ),
+        None => tracing::info!(
+            pools = registered_pools(),
+            "🔄 Upstream DNS scheduler enabled for explicit dynamic intervals"
+        ),
+    }
+
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // The first tick fires immediately; the pools were just resolved at boot,
-    // so skip it and let the first real pass happen one interval later.
-    ticker.tick().await;
 
     loop {
+        let registered = REGISTRATION.notified();
+        if !has_scheduled_pools(default_interval) {
+            registered.await;
+            continue;
+        }
         ticker.tick().await;
-        let report = match tokio::task::spawn_blocking(refresh_all).await {
+        let report = match tokio::task::spawn_blocking(move || refresh_due(default_interval)).await
+        {
             Ok(report) => report,
             Err(error) => {
                 tracing::error!(%error, "❌ DNS refresh task failed");
@@ -159,6 +193,8 @@ mod tests {
         let hostname = pool("http://app:8080");
         register(&hostname);
         assert_eq!(registered_pools(), 1);
+        assert!(!hostname.has_dns_schedule(None));
+        assert!(hostname.has_dns_schedule(Some(Duration::from_secs(30))));
 
         // A reload drops the old ProxyState, and with it the pool.
         drop(hostname);

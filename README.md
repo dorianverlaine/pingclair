@@ -564,8 +564,14 @@ are never handed to the DNS refresher.
 Upstreams can also be discovered from DNS while the server runs:
 `dynamic a name port` resolves every address record of `name`, and
 `dynamic srv _svc._tcp.example.com` resolves SRV records whose targets carry
-their own ports. Lookups happen on a background refresher, never on the
-request path. A dial may also contain request placeholders —
+their own ports. Each source's `refresh` interval is independent; an omitted
+interval follows the global `dns_refresh`. An omitted `resolvers` option uses
+the host's system DNS configuration. For SRV sources, `grace_period` keeps the
+last successful peer set only from the first failed refresh until that bounded
+window expires; without it, failed discovery withdraws the dynamic peers.
+`dial_fallback_delay` is rejected because Hickory has no exact RFC 6555 hook
+for dialing an explicitly configured DNS server; it is never accepted as a no-op.
+Lookups happen on a background scheduler, never on the request path. A dial may also contain request placeholders —
 `reverse_proxy {re.dial.1}` — expanded per request and cached by host and port.
 
 Retry policy accepts Caddy's `lb_retry_match` spellings: `method`, `path`,
@@ -598,8 +604,9 @@ IP literals never reach a resolver at all.
 
 ```caddyfile
 {
-    # Default 30s. `dns_refresh off` pins every upstream to the address it
-    # had at startup. A unit is required: `30` is not `30s`.
+    # ⏱️ Default 30s. `dns_refresh off` pins ordinary hostnames and dynamic
+    # ⏱️ sources without their own `refresh`; an explicit source interval remains
+    # ⏱️ active. A unit is required: `30` is not `30s`.
     dns_refresh 15s
 }
 ```

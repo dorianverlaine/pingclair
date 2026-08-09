@@ -1394,8 +1394,8 @@ pub struct DynamicAddrUpstream {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dial_timeout_ms: Option<u64>,
     /// ⏱️ RFC 6555 fast-fallback delay in milliseconds; negative disables it.
-    /// Stored for compatibility; Pingclair's DNS client dials one server at a
-    /// time, so the value is accepted but has no runtime effect.
+    /// 🚫 Retained for JSON decoding compatibility; validation rejects a value
+    /// because Hickory exposes no equivalent resolver-dial fallback hook.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_delay_ms: Option<i64>,
     /// 🧭 Address family filter: `ipv4`, `ipv6`, or `None` for both.
@@ -1424,8 +1424,8 @@ pub struct DynamicSrvUpstream {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dial_timeout_ms: Option<u64>,
     /// ⏱️ RFC 6555 fast-fallback delay in milliseconds; negative disables it.
-    /// Stored for compatibility; Pingclair's DNS client dials one server at a
-    /// time, so the value is accepted but has no runtime effect.
+    /// 🚫 Retained for JSON decoding compatibility; validation rejects a value
+    /// because Hickory exposes no equivalent resolver-dial fallback hook.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_delay_ms: Option<i64>,
     /// 🌤️ Milliseconds to keep serving last-known-good peers after a lookup

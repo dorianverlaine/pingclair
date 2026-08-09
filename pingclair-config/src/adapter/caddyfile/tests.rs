@@ -1288,7 +1288,6 @@ mod fail_closed_tests {
                         refresh 5m
                         resolvers 8.8.8.8 8.8.4.4
                         dial_timeout 2s
-                        dial_fallback_delay 300ms
                         versions ipv6
                     }
                 }
@@ -1302,7 +1301,6 @@ mod fail_closed_tests {
                         refresh 5m
                         resolvers 8.8.8.8
                         dial_timeout 1s
-                        dial_fallback_delay -1s
                         grace_period 5s
                     }
                 }
@@ -1345,7 +1343,7 @@ mod fail_closed_tests {
         assert_eq!(block_a.refresh_secs, Some(300));
         assert_eq!(block_a.resolvers, ["8.8.8.8", "8.8.4.4"]);
         assert_eq!(block_a.dial_timeout_ms, Some(2_000));
-        assert_eq!(block_a.fallback_delay_ms, Some(300));
+        assert_eq!(block_a.fallback_delay_ms, None);
         assert_eq!(block_a.versions.as_deref(), Some("ipv6"));
 
         let block_srv = proxy(3).dynamic_upstream.as_ref().expect("an SRV source");
@@ -1356,7 +1354,7 @@ mod fail_closed_tests {
         assert_eq!(block_srv.proto.as_deref(), Some("tcp"));
         assert_eq!(block_srv.name, "example.com");
         assert_eq!(block_srv.refresh_secs, Some(300));
-        assert_eq!(block_srv.fallback_delay_ms, Some(-1_000));
+        assert_eq!(block_srv.fallback_delay_ms, None);
         assert_eq!(block_srv.grace_period_ms, Some(5_000));
     }
 
@@ -1369,6 +1367,8 @@ mod fail_closed_tests {
             "example.com {\n    reverse_proxy {\n        dynamic srv {\n            service api\n            name example.com\n        }\n    }\n}",
             "example.com {\n    reverse_proxy {\n        dynamic a {\n            name app\n            resolvers not-an-ip\n        }\n    }\n}",
             "example.com {\n    reverse_proxy {\n        dynamic a {\n            name app\n            versions tcp\n        }\n    }\n}",
+            "example.com {\n    reverse_proxy {\n        dynamic a {\n            name app\n            dial_fallback_delay 300ms\n        }\n    }\n}",
+            "example.com {\n    reverse_proxy {\n        dynamic srv {\n            name _api._tcp.example.com\n            dial_fallback_delay -1s\n        }\n    }\n}",
         ] {
             compile_err(source);
         }

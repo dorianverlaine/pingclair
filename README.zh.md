@@ -538,7 +538,12 @@ Unix upstream 不會進入 DNS refresher。
 
 上游也可以由 DNS 在執行期間動態發現：`dynamic a name port` 解析 `name` 的
 所有位址記錄，`dynamic srv _svc._tcp.example.com` 解析 SRV 記錄並使用
-記錄自帶的 port。查詢一律在背景 refresher 進行，絕不在請求路徑上。
+記錄自帶的 port。每個 source 的 `refresh` 間隔各自生效；未設定時才跟隨全域
+`dns_refresh`。省略 `resolvers` 會使用主機的系統 DNS 設定。SRV source 的
+`grace_period` 只會從第一次刷新失敗起，在有限期間內保留上一次成功的 peer set；
+未設定時，發現失敗會撤下 dynamic peers。Hickory 沒有精確的 RFC 6555 DNS server
+撥號 hook，因此 `dial_fallback_delay` 會被明確拒絕，絕不接受為 no-op。查詢一律由
+背景 scheduler 執行，絕不在請求路徑上。
 dial 字串也可以含請求 placeholder（例如 `reverse_proxy {re.dial.1}`），
 每個請求展開一次，並以 host＋port 快取。
 
@@ -566,8 +571,9 @@ IP 字面位址完全不會經過 resolver。
 
 ```caddyfile
 {
-    # 預設 30s。`dns_refresh off` 會把每個 upstream 釘在啟動時的位址。
-    # 單位是必填的：`30` 不等於 `30s`。
+    # ⏱️ 預設 30s。`dns_refresh off` 會釘住一般 hostname 與未自訂 `refresh`
+    # ⏱️ 的 dynamic source；source 自訂的間隔仍會生效。單位是必填的：
+    # ⏱️ `30` 不等於 `30s`。
     dns_refresh 15s
 }
 ```
