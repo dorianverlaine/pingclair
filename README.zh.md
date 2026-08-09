@@ -526,6 +526,10 @@ Redis distributed limit 不在 v0.2 範圍內。
 prior-knowledge HTTP/2；`h2://` 則強制使用 TLS HTTP/2。原生 gRPC 應使用
 `h2c://` 或 `h2://`，確保 response trailers 以端到端 metadata 傳遞。
 
+Unix socket upstream 寫成 `unix//path/to.sock`，直接撥接該 socket；
+`unix+h2c//path/to.sock` 則在其上使用 prior-knowledge HTTP/2。
+Unix upstream 不會進入 DNS refresher。
+
 以主機名寫的 upstream 會在執行期間定期重解析，容器換 IP 重啟後不需 reload 即可跟上。
 解析失敗時會保留上一個位址繼續服務 —— resolver 故障不該讓站台跟著掛掉；啟動當下
 還解析不到的名稱，也會在解析成功後自動加入 pool，因此代理可以先於 app 啟動。

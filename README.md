@@ -550,6 +550,10 @@ uses HTTP/1.1, `https://` negotiates HTTP/2 with HTTP/1.1 fallback through ALPN,
 over TLS. Use `h2c://` or `h2://` for native gRPC so response trailers remain
 end-to-end metadata.
 
+A Unix-socket upstream is written `unix//path/to.sock` and dials that socket;
+`unix+h2c//path/to.sock` speaks prior-knowledge HTTP/2 over it. Unix upstreams
+are never handed to the DNS refresher.
+
 Upstreams written as hostnames are re-resolved while the server runs, so a
 container that restarts on a new address is picked up without a reload. A
 lookup that fails leaves the previous address in rotation — a resolver outage

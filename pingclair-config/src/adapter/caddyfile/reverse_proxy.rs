@@ -39,19 +39,9 @@ pub(super) fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError>
                 ),
             ));
         }
-        // 🚫 A Unix-socket upstream (`unix//run/php.sock`) used to compile
-        // into a bogus hostname that could never dial. Refuse it here instead
-        // of shipping a proxy whose upstream silently never comes up.
-        if arg.starts_with("unix") {
-            // TODO(v0.3): support Unix-socket upstreams (unix//path).
-            return Err(AdapterError::UnsupportedFeature(
-                "reverse_proxy".into(),
-                format!(
-                    "`{arg}` is a Unix-socket upstream address; Pingclair does not \
-                     support Unix-socket upstreams yet"
-                ),
-            ));
-        }
+        // 🏗️ A Unix-socket upstream (`unix//run/php.sock`, `unix+h2c//run/app.sock`)
+        // passes through as its dial string; the proxy runtime parses it into a
+        // Unix-domain peer, so it must never be turned into a hostname here.
         upstreams.push(arg.clone());
     }
 

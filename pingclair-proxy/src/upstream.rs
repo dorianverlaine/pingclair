@@ -69,6 +69,9 @@ pub struct UpstreamSpec {
     /// `Some` when the host is already an IP literal, which never needs a
     /// resolver and never goes stale.
     literal: Option<IpAddr>,
+    /// 🏗️ `Some` when this upstream is a Unix-domain socket; the path is the
+    /// dial target and no port or resolver participates in reaching it.
+    pub unix_path: Option<String>,
 }
 
 impl UpstreamSpec {
@@ -76,6 +79,17 @@ impl UpstreamSpec {
     /// touching the resolver.
     pub fn parse(address: &str) -> Option<Self> {
         let trimmed = address.trim();
+
+        // 🏗️ Caddy spells Unix sockets as `unix//path` (and `unix/path` for a
+        // relative one); `unix+h2c//` is the same socket speaking
+        // prior-knowledge HTTP/2. Both must be recognized before the generic
+        // host parsing below, which would otherwise read `unix` as a hostname.
+        if let Some(path) = trimmed.strip_prefix("unix+h2c/") {
+            return Self::unix_spec(Scheme::H2c, path);
+        }
+        if let Some(path) = trimmed.strip_prefix("unix/") {
+            return Self::unix_spec(Scheme::Http, path);
+        }
 
         let (scheme, minimal_url) = if let Some(stripped) = trimmed.strip_prefix("h2c://") {
             (Scheme::H2c, stripped)
@@ -123,16 +137,41 @@ impl UpstreamSpec {
             port,
             scheme,
             literal: bare_host(host).parse::<IpAddr>().ok(),
+            unix_path: None,
+        })
+    }
+
+    /// Builds a spec whose dial target is a Unix socket instead of a host.
+    fn unix_spec(scheme: Scheme, path: &str) -> Option<Self> {
+        // 🚫 An empty path is a spelling mistake, and `/` (what `unix//` parses
+        // to) names the root directory, which can never be a socket.
+        if path.is_empty() || path == "/" {
+            return None;
+        }
+        Some(Self {
+            host: path.to_string(),
+            port: 0,
+            scheme,
+            literal: None,
+            unix_path: Some(path.to_string()),
         })
     }
 
     /// Whether this upstream depends on a resolver at all.
     pub fn needs_dns(&self) -> bool {
-        self.literal.is_none()
+        self.unix_path.is_none() && self.literal.is_none()
+    }
+
+    /// 🏗️ Whether this upstream dials a Unix-domain socket.
+    pub fn is_unix(&self) -> bool {
+        self.unix_path.is_some()
     }
 
     /// `host:port` as written, for logging.
     pub fn authority(&self) -> String {
+        if let Some(path) = &self.unix_path {
+            return path.clone();
+        }
         format!("{}:{}", self.host, self.port)
     }
 
@@ -143,6 +182,12 @@ impl UpstreamSpec {
     /// yields the *same* answer every tick — an unstable pick would make the
     /// refresher rebuild the pool forever for a host that never moved.
     pub fn resolve(&self, resolver: &dyn Resolve) -> std::io::Result<SocketAddr> {
+        if let Some(path) = &self.unix_path {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Unix-socket upstream `{path}` needs no resolution"),
+            ));
+        }
         if let Some(ip) = self.literal {
             return Ok(SocketAddr::new(ip, self.port));
         }
@@ -165,6 +210,34 @@ impl UpstreamSpec {
         backend.ext.insert(self.scheme);
         backend.ext.insert(HostName(self.host.clone()));
         Some(backend)
+    }
+
+    /// 🏗️ Builds a Pingora backend that dials a Unix socket.
+    ///
+    /// Pingora's `Backend::new` only parses inet addresses, so the Unix
+    /// variant is assembled directly; its `SocketAddr` is the path that the
+    /// peer builder later turns into a Unix-domain connection.
+    #[cfg(unix)]
+    pub fn unix_backend(&self, weight: usize) -> Option<Upstream> {
+        let path = self.unix_path.as_ref()?;
+        let addr = pingora_core::protocols::l4::socket::SocketAddr::Unix(
+            std::os::unix::net::SocketAddr::from_pathname(path).ok()?,
+        );
+        let mut backend = Upstream {
+            addr,
+            weight,
+            ext: Default::default(),
+        };
+        backend.ext.insert(self.scheme);
+        backend.ext.insert(HostName(self.host.clone()));
+        Some(backend)
+    }
+
+    /// Non-Unix platforms have no Unix sockets to dial; the upstream stays
+    /// unusable instead of pretending a path can be reached.
+    #[cfg(not(unix))]
+    pub fn unix_backend(&self, _weight: usize) -> Option<Upstream> {
+        None
     }
 }
 
@@ -201,6 +274,9 @@ fn bare_host(host: &str) -> &str {
 /// Uses standard library resolution which is blocking. Acceptable for startup configuration phase.
 pub fn create_upstream(address_string: &str) -> Option<Upstream> {
     let spec = UpstreamSpec::parse(address_string)?;
+    if spec.is_unix() {
+        return spec.unix_backend(1);
+    }
     let address = spec.resolve(&SystemResolver).ok()?;
     spec.backend(address, 1)
 }
@@ -216,9 +292,56 @@ mod tests {
             ("https://127.0.0.1:8002", Scheme::Https),
             ("h2c://127.0.0.1:8003", Scheme::H2c),
             ("h2://127.0.0.1:8004", Scheme::H2),
+            ("unix//run/php.sock", Scheme::Http),
+            ("unix+h2c//run/grpc.sock", Scheme::H2c),
         ] {
             let upstream = create_upstream(address).unwrap();
             assert_eq!(*upstream.ext.get::<Scheme>().unwrap(), expected);
+        }
+    }
+
+    /// 🏗️ Unix-socket upstreams keep their exact path, skip the resolver, and
+    /// build backends whose address is the socket itself rather than an inet
+    /// pair that can never dial.
+    #[test]
+    fn unix_socket_upstreams_skip_resolution_and_keep_their_path() {
+        for (address, expected_path, expected_scheme) in [
+            ("unix//run/php/php.sock", "/run/php/php.sock", Scheme::Http),
+            ("unix/run/php/php.sock", "run/php/php.sock", Scheme::Http),
+            ("unix+h2c//run/app.sock", "/run/app.sock", Scheme::H2c),
+        ] {
+            let spec =
+                UpstreamSpec::parse(address).unwrap_or_else(|| panic!("{address} must parse"));
+            assert_eq!(spec.unix_path.as_deref(), Some(expected_path), "{address}");
+            assert_eq!(spec.scheme, expected_scheme, "{address}");
+            assert!(spec.is_unix(), "{address}");
+            assert!(!spec.needs_dns(), "{address} must never touch a resolver");
+            assert_eq!(spec.authority(), expected_path, "{address}");
+
+            let backend = spec
+                .unix_backend(1)
+                .unwrap_or_else(|| panic!("{address} must build"));
+            assert!(
+                matches!(
+                    backend.addr,
+                    pingora_core::protocols::l4::socket::SocketAddr::Unix(_)
+                ),
+                "{address} must dial a Unix socket"
+            );
+            assert_eq!(*backend.ext.get::<Scheme>().unwrap(), expected_scheme);
+            assert_eq!(backend.ext.get::<HostName>().unwrap().0, expected_path);
+        }
+    }
+
+    /// 🏗️ A Unix path with nothing after the separator is a mistake, not an
+    /// upstream that silently means something else.
+    #[test]
+    fn empty_unix_paths_are_refused() {
+        for address in ["unix//", "unix/", "unix+h2c//"] {
+            assert!(
+                UpstreamSpec::parse(address).is_none(),
+                "{address} must not parse"
+            );
         }
     }
 

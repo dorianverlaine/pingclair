@@ -1248,17 +1248,29 @@ mod fail_closed_tests {
         );
     }
 
+    /// 🏗️ Unix-socket upstreams keep their dial string so the proxy can build
+    /// a Unix-domain peer; `unix+h2c//` additionally carries the h2c scheme.
     #[test]
-    fn reverse_proxy_rejects_unix_socket_upstream() {
-        let error = compile_err(
-            r#"example.com {
-                reverse_proxy unix//run/php/php.sock
-            }"#,
-        );
-        assert!(
-            error.contains("Unix-socket"),
-            "unix// upstream must be refused with a clear message; got {error}"
-        );
+    fn reverse_proxy_accepts_unix_socket_upstreams() {
+        for (source, expected) in [
+            (
+                "example.com {\n    reverse_proxy unix//run/php/php.sock\n}",
+                "unix//run/php/php.sock",
+            ),
+            (
+                "example.com {\n    reverse_proxy unix+h2c//run/app.sock\n}",
+                "unix+h2c//run/app.sock",
+            ),
+        ] {
+            let config = crate::compile(source)
+                .unwrap_or_else(|error| panic!("{source} must compile: {error}"));
+            match &config.servers[0].routes[0].handler {
+                pingclair_core::config::HandlerConfig::ReverseProxy(proxy) => {
+                    assert_eq!(proxy.upstreams, vec![expected.to_string()]);
+                }
+                other => panic!("expected a proxy handler, got {other:?}"),
+            }
+        }
     }
 
     #[test]

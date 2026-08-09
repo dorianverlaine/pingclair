@@ -3175,6 +3175,83 @@ async fn test_production_cache_headers_compose_with_reverse_proxy() {
 }
 
 #[tokio::test]
+async fn test_pingclairfile_unix_socket_upstream_serves_requests() {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
+    // 🏗️ The upstream speaks plain HTTP/1.1 on a Unix socket, which is the
+    // shape PHP-FPM and local gRPC services use; the proxy must dial the
+    // socket instead of treating the path as a hostname.
+    let temp_dir = tempfile::tempdir().expect("failed to create the socket directory");
+    let socket_path = temp_dir.path().join("upstream.sock");
+    let listener =
+        tokio::net::UnixListener::bind(&socket_path).expect("failed to bind the upstream socket");
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .expect("the proxy must connect to the socket");
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let read = stream.read(&mut chunk).await.expect("socket read failed");
+            assert!(read > 0, "socket closed before the request completed");
+            request.extend_from_slice(&chunk[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let request_line = String::from_utf8_lossy(&request);
+        let path = request_line
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or_default();
+        let body = format!("unix-ok:{path}");
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("socket write failed");
+        stream.shutdown().await.ok();
+    });
+
+    // 📄 `unix/` plus an absolute path spells Caddy's `unix//…` upstream form.
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            reverse_proxy unix/{socket}
+        }}
+        "#,
+        socket = socket_path.display()
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    let response = client.get(server.url(0, "/probe")).send().await.unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "the Unix-socket upstream must serve"
+    );
+    assert_eq!(response.text().await.unwrap(), "unix-ok:/probe");
+    upstream_task.await.unwrap();
+}
+
+#[tokio::test]
 async fn test_pingclairfile_internal_tls_serves_trusted_h1_and_h2() {
     let config = r#"
         {

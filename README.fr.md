@@ -551,6 +551,10 @@ ALPN, `h2c://` impose HTTP/2 en clair avec connaissance préalable, et `h2://`
 impose HTTP/2 sur TLS. Utilisez `h2c://` ou `h2://` pour gRPC natif afin de
 préserver les trailers de réponse comme métadonnées de bout en bout.
 
+Un amont sur socket Unix s'écrit `unix//path/to.sock` et se connecte à cette
+socket ; `unix+h2c//path/to.sock` parle HTTP/2 en connaissance préalable par
+dessus. Les amonts Unix ne passent jamais par le rafraîchissement DNS.
+
 Les amonts écrits sous forme de noms d'hôtes sont ré-résolus pendant l'exécution :
 un conteneur qui redémarre sur une nouvelle adresse est suivi sans rechargement.
 Une résolution en échec laisse l'adresse précédente en rotation — une panne du

@@ -2614,7 +2614,8 @@ async fn reverse_proxy_upstream(
             attempt_budget,
             attempt_budget,
             tls_policy,
-        );
+        )
+        .map_err(|_| (500, "Upstream Peer Configuration Error"))?;
         // ⌛ The retry total bounds response-header wait even when phase timers are longer.
         peer.options.read_timeout = match (peer.options.read_timeout, retry_budget) {
             (Some(left), Some(right)) => Some(left.min(right)),

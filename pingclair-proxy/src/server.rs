@@ -1243,48 +1243,57 @@ impl ProxyState {
                         (load_balancer.first_backend(), tls_policy)
                     {
                         let timeout = Duration::from_secs(hc_config.timeout);
-                        let peer_template = PingclairProxy::build_http_peer(
+                        match PingclairProxy::build_http_peer(
                             &upstream,
                             Some(proxy_config),
                             Some(timeout),
                             Some(timeout),
                             tls_policy,
-                        );
-                        let host = hc_config.host.clone().unwrap_or_else(|| {
-                            upstream
-                                .ext
-                                .get::<HostName>()
-                                .map(|host| host.0.clone())
-                                .unwrap_or_else(|| upstream.addr.to_string())
-                        });
-                        load_balancer.set_health_check(
-                            crate::health_check::HealthCheckConfig {
-                                path: hc_config.path.clone(),
-                                timeout,
-                                positive_threshold: hc_config.consecutive_success as usize,
-                                negative_threshold: hc_config
-                                    .consecutive_failure
-                                    .unwrap_or(hc_config.threshold)
-                                    as usize,
-                                expected_statuses: hc_config.expected_statuses.clone(),
-                                expected_body: hc_config.expected_body.clone(),
-                                method: hc_config.method.clone(),
-                                host,
-                                host_override: hc_config.host.clone(),
-                                sni_override: tls_policy
-                                    .and_then(|policy| policy.server_name())
-                                    .map(str::to_string),
-                                headers: hc_config.headers.clone(),
-                                port_override: hc_config.port,
-                                reuse_connection: hc_config.reuse_connection,
-                                max_response_body_bytes: hc_config.max_response_body_bytes,
-                                slow_start: Duration::from_millis(hc_config.slow_start_ms),
-                            },
-                            peer_template,
-                        );
-                        load_balancer
-                            .set_health_check_frequency(Duration::from_secs(hc_config.interval));
-                        crate::health_check::register(&load_balancer);
+                        ) {
+                            Ok(peer_template) => {
+                                let host = hc_config.host.clone().unwrap_or_else(|| {
+                                    upstream
+                                        .ext
+                                        .get::<HostName>()
+                                        .map(|host| host.0.clone())
+                                        .unwrap_or_else(|| upstream.addr.to_string())
+                                });
+                                load_balancer.set_health_check(
+                                    crate::health_check::HealthCheckConfig {
+                                        path: hc_config.path.clone(),
+                                        timeout,
+                                        positive_threshold: hc_config.consecutive_success as usize,
+                                        negative_threshold: hc_config
+                                            .consecutive_failure
+                                            .unwrap_or(hc_config.threshold)
+                                            as usize,
+                                        expected_statuses: hc_config.expected_statuses.clone(),
+                                        expected_body: hc_config.expected_body.clone(),
+                                        method: hc_config.method.clone(),
+                                        host,
+                                        host_override: hc_config.host.clone(),
+                                        sni_override: tls_policy
+                                            .and_then(|policy| policy.server_name())
+                                            .map(str::to_string),
+                                        headers: hc_config.headers.clone(),
+                                        port_override: hc_config.port,
+                                        reuse_connection: hc_config.reuse_connection,
+                                        max_response_body_bytes: hc_config.max_response_body_bytes,
+                                        slow_start: Duration::from_millis(hc_config.slow_start_ms),
+                                    },
+                                    peer_template,
+                                );
+                                load_balancer.set_health_check_frequency(Duration::from_secs(
+                                    hc_config.interval,
+                                ));
+                                crate::health_check::register(&load_balancer);
+                            }
+                            Err(error) => tracing::error!(
+                                route = %route.path,
+                                %error,
+                                "🚫 Active health checking did not start because no valid probe peer exists"
+                            ),
+                        }
                     } else {
                         tracing::error!(
                             route = %route.path,
@@ -2174,13 +2183,16 @@ impl PingclairProxy {
     ///
     /// 🤝 This shared builder keeps protocol, timeout, and SNI semantics identical
     /// between the Pingora and HTTP/3 paths.
+    ///
+    /// 🏗️ A Unix-socket backend needs the fallible `new_uds` peer constructor,
+    /// so the builder reports failure instead of panicking on the request path.
     pub(crate) fn build_http_peer(
         upstream: &Upstream,
         config: Option<&ReverseProxyConfig>,
         request_budget: Option<Duration>,
         read_budget: Option<Duration>,
         tls_policy: Option<&Arc<crate::upstream_tls::UpstreamTls>>,
-    ) -> HttpPeer {
+    ) -> pingora_core::Result<HttpPeer> {
         let addr = upstream.addr.clone();
         let scheme = upstream.ext.get::<Scheme>().unwrap_or(&Scheme::Http);
         let host = upstream
@@ -2213,7 +2225,18 @@ impl PingclairProxy {
             protocol_group = PROTOCOL_GROUP_HTTPS;
         }
 
-        let mut peer = HttpPeer::new(addr, tls, host);
+        let mut peer = match &addr {
+            pingora_core::protocols::l4::socket::SocketAddr::Inet(_) => {
+                HttpPeer::new(addr, tls, host)
+            }
+            #[cfg(unix)]
+            pingora_core::protocols::l4::socket::SocketAddr::Unix(_) => {
+                // 🏗️ The path stored in the backend was validated when the
+                // backend was built; rebuilding the peer from the same path
+                // can only fail on a platform that no longer accepts it.
+                HttpPeer::new_uds(&host, tls, host.clone())?
+            }
+        };
         peer.options
             .set_http_version(max_http_version, min_http_version);
         if max_http_version == 2 {
@@ -2274,7 +2297,7 @@ impl PingclairProxy {
         peer.options.connection_timeout = shortest_duration(Some(connect_timeout), request_budget);
         peer.options.total_connection_timeout = peer.options.connection_timeout;
 
-        peer
+        Ok(peer)
     }
 
     /// 🧱 Applies one virtual host's request deadlines without buffering body data.
@@ -4983,7 +5006,7 @@ impl ProxyHttp for PingclairProxy {
                 attempt_budget,
                 read_budget,
                 tls_policy,
-            );
+            )?;
             // ⌛ A configured retry total is a hard bound, even when phase timers are longer.
             peer.options.read_timeout = shortest_duration(peer.options.read_timeout, retry_budget);
             return Ok(Box::new(peer));
@@ -7015,9 +7038,12 @@ mod caddy_parity_tests {
             ("https://127.0.0.1:8302", true, 1, 2, 2),
             ("h2c://127.0.0.1:8303", false, 2, 2, 3),
             ("h2://127.0.0.1:8304", true, 2, 2, 4),
+            ("unix//run/app.sock", false, 1, 1, 1),
+            ("unix+h2c//run/grpc.sock", false, 2, 2, 3),
         ] {
             let upstream = create_upstream(address).unwrap();
-            let peer = PingclairProxy::build_http_peer(&upstream, None, None, None, None);
+            let peer = PingclairProxy::build_http_peer(&upstream, None, None, None, None)
+                .expect("peer builds");
 
             assert_eq!(peer.is_tls(), tls);
             assert_eq!(
@@ -7063,8 +7089,8 @@ mod caddy_parity_tests {
         let upstream = create_upstream("https://10.0.0.7:8443").unwrap();
 
         // Verification
-        let peer =
-            PingclairProxy::build_http_peer(&upstream, None, None, None, Some(&policy)).clone();
+        let peer = PingclairProxy::build_http_peer(&upstream, None, None, None, Some(&policy))
+            .expect("peer builds");
         assert_eq!(peer.sni, "internal.example");
         assert_eq!(
             peer_protocol_group(&peer),
@@ -7095,8 +7121,10 @@ mod caddy_parity_tests {
         });
 
         // Verification
-        let left = PingclairProxy::build_http_peer(&upstream, None, None, None, Some(&strict));
-        let right = PingclairProxy::build_http_peer(&upstream, None, None, None, Some(&other));
+        let left = PingclairProxy::build_http_peer(&upstream, None, None, None, Some(&strict))
+            .expect("peer builds");
+        let right = PingclairProxy::build_http_peer(&upstream, None, None, None, Some(&other))
+            .expect("peer builds");
         assert_ne!(left.group_key, right.group_key);
         assert_eq!(peer_protocol_group(&left), peer_protocol_group(&right));
     }
@@ -7111,7 +7139,8 @@ mod caddy_parity_tests {
         let upstream = create_upstream("https://127.0.0.1:8443").unwrap();
 
         // Verification
-        let peer = PingclairProxy::build_http_peer(&upstream, None, None, None, Some(&policy));
+        let peer = PingclairProxy::build_http_peer(&upstream, None, None, None, Some(&policy))
+            .expect("peer builds");
         assert!(!peer.options.verify_cert);
         assert!(!peer.options.verify_hostname);
     }
@@ -7127,7 +7156,8 @@ mod caddy_parity_tests {
         let prior_knowledge_h2 = create_upstream("h2c://127.0.0.1:8443").unwrap();
 
         // Verification
-        let upgraded = PingclairProxy::build_http_peer(&plain, None, None, None, Some(&policy));
+        let upgraded = PingclairProxy::build_http_peer(&plain, None, None, None, Some(&policy))
+            .expect("peer builds");
         assert!(
             upgraded.is_tls(),
             "`tls` must upgrade a scheme-less upstream"
@@ -7140,7 +7170,8 @@ mod caddy_parity_tests {
         assert_eq!(peer_protocol_group(&upgraded), PROTOCOL_GROUP_HTTPS);
 
         let untouched =
-            PingclairProxy::build_http_peer(&prior_knowledge_h2, None, None, None, Some(&policy));
+            PingclairProxy::build_http_peer(&prior_knowledge_h2, None, None, None, Some(&policy))
+                .expect("peer builds");
         assert!(
             !untouched.is_tls(),
             "prior-knowledge h2c has no TLS form to be upgraded into"
@@ -7241,7 +7272,8 @@ mod caddy_parity_tests {
             Some(Duration::from_millis(50)),
             Some(Duration::from_millis(60)),
             None,
-        );
+        )
+        .expect("peer builds");
         assert_eq!(
             peer.options.connection_timeout,
             Some(Duration::from_millis(50))

@@ -193,6 +193,10 @@ lets the rest converge.
   limiting, bounded idempotent redispatch, per-request resource bounds,
   upstream authentication, gRPC parity, h2c, hostname re-resolution while the
   server runs, and a `Via` header per RFC 9110.
+- 🏗️ **Unix-socket upstreams.** `reverse_proxy unix//path/to.sock` dials a Unix
+  domain socket, and `unix+h2c//path/to.sock` speaks prior-knowledge HTTP/2 over
+  one — the shape local gRPC and application backends expect. Unix upstreams
+  never enter the DNS refresher.
 - 📦 **Response caching.** RFC 9111 decides what may be stored, and a second
   identical request is served without asking the origin. The store is bounded
   by `max_size` (128 MiB unless you say otherwise) and evicts least-recently-

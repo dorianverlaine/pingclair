@@ -190,8 +190,9 @@ impl BackendHealth {
 ///
 /// Thread-safe via `Arc<AtomicUsize>` per slot.
 struct LeastConnTracker {
-    /// Ordered list of (addr, counter) pairs mirroring the upstream list order.
-    counters: Vec<(SocketAddr, Arc<AtomicUsize>)>,
+    /// Ordered list of (addr, counter) pairs mirroring the upstream list
+    /// order; `None` marks a Unix-socket backend, which has no inet address.
+    counters: Vec<(Option<SocketAddr>, Arc<AtomicUsize>)>,
     /// The raw upstream list for returning the selected `Upstream` value.
     upstreams: Vec<Upstream>,
     /// Passive health marks — down backends are skipped by `select`.
@@ -202,7 +203,7 @@ impl LeastConnTracker {
     fn new(upstreams: Vec<Upstream>, health: Arc<BackendHealth>) -> Self {
         let counters = upstreams
             .iter()
-            .filter_map(|u| inet_address(u).map(|inet| (inet, Arc::new(AtomicUsize::new(0)))))
+            .map(|u| (inet_address(u), Arc::new(AtomicUsize::new(0))))
             .collect();
         Self {
             counters,
@@ -224,10 +225,14 @@ impl LeastConnTracker {
         if crate::metrics::enabled() {
             // 🩺 Publish the passive health state for every backend so
             // /metrics can answer `is this upstream healthy?` (MT-5).
-            for (addr, _) in &self.counters {
+            for (index, backend) in self.upstreams.iter().enumerate() {
+                let Some((addr, _)) = self.counters.get(index) else {
+                    continue;
+                };
+                let healthy = addr.is_none_or(|inet| self.health.is_up(&inet));
                 crate::metrics::UPSTREAM_HEALTHY
-                    .with_label_values(&[&addr.to_string()])
-                    .set(if self.health.is_up(addr) { 1 } else { 0 });
+                    .with_label_values(&[&backend.addr.to_string()])
+                    .set(if healthy { 1 } else { 0 });
             }
         }
 
@@ -238,13 +243,15 @@ impl LeastConnTracker {
             .iter()
             .enumerate()
             .filter(|(index, (addr, _))| {
-                self.health.is_up(addr)
-                    && !excluded.contains(addr)
+                let inet = addr.as_ref();
+                inet.is_none_or(|address| self.health.is_up(address))
+                    && inet.is_none_or(|address| !excluded.contains(address))
                     && self
                         .upstreams
                         .get(*index)
                         .is_some_and(|backend| active_ready(active, backend))
-                    && slow_start_ready(addr, recovery_slots, slow_start)
+                    && inet
+                        .is_none_or(|address| slow_start_ready(address, recovery_slots, slow_start))
             })
             .min_by_key(|(_, (_, ctr))| ctr.load(Ordering::Relaxed))?;
 
@@ -905,15 +912,28 @@ fn resolve_entries(entries: Vec<UpstreamEntry>, resolver: &dyn Resolve) -> Vec<T
     entries
         .into_iter()
         .map(|entry| {
-            let backend = match entry.spec.resolve(resolver) {
-                Ok(address) => entry.spec.backend(address, entry.weight),
-                Err(error) => {
-                    tracing::warn!(
-                        upstream = %entry.spec.authority(),
-                        %error,
-                        "⚠️ Upstream did not resolve at startup; it will be retried"
-                    );
-                    None
+            let backend = if entry.spec.is_unix() {
+                match entry.spec.unix_backend(entry.weight) {
+                    Some(backend) => Some(backend),
+                    None => {
+                        tracing::warn!(
+                            upstream = %entry.spec.authority(),
+                            "⚠️ Unix-socket upstream path is invalid; it stays out of the pool"
+                        );
+                        None
+                    }
+                }
+            } else {
+                match entry.spec.resolve(resolver) {
+                    Ok(address) => entry.spec.backend(address, entry.weight),
+                    Err(error) => {
+                        tracing::warn!(
+                            upstream = %entry.spec.authority(),
+                            %error,
+                            "⚠️ Upstream did not resolve at startup; it will be retried"
+                        );
+                        None
+                    }
                 }
             };
             TrackedUpstream {
@@ -1058,6 +1078,59 @@ mod tests {
             .select(&HashSet::new(), None, &HashMap::new(), Duration::ZERO)
             .unwrap();
         assert_eq!(selected.addr.to_string(), "127.0.0.1:9002");
+    }
+
+    /// 🏗️ A Unix-socket pool must be selectable without a resolver, and it
+    /// must not register itself for DNS refreshes it can never use.
+    #[test]
+    fn unix_socket_backends_are_selectable_without_a_resolver() {
+        let resolver = ScriptedResolver::with("app", "172.20.0.3:8080");
+        let lb = LoadBalancer::from_entries_with_resolver(
+            vec![entry("unix//run/app.sock")],
+            vec![],
+            Strategy::RoundRobin,
+            resolver,
+        );
+
+        assert!(
+            !lb.needs_dns_refresh(),
+            "a Unix pool must skip the refresher"
+        );
+        let backend = lb
+            .select(None)
+            .expect("the socket backend must be selectable");
+        match backend.addr {
+            pingora_core::protocols::l4::socket::SocketAddr::Unix(addr) => {
+                assert_eq!(
+                    addr.as_pathname()
+                        .map(|path| path.to_string_lossy().to_string()),
+                    Some("/run/app.sock".to_string())
+                );
+            }
+            other => panic!("expected a Unix socket backend, got {other:?}"),
+        }
+    }
+
+    /// 🏗️ Least-conn must see Unix-socket backends too; filtering them out
+    /// would make a single-socket route permanently unselectable.
+    #[test]
+    fn least_conn_counts_unix_socket_backends() {
+        let lb = LoadBalancer::from_entries(
+            vec![entry("unix//run/app.sock")],
+            vec![],
+            Strategy::LeastConn,
+        );
+        let pool = lb.pool.load();
+        let tracker = pool.least_conn.as_ref().expect("least-conn tracker");
+        assert_eq!(tracker.counters.len(), 1, "the socket must have a counter");
+
+        let (selected, _guard) = tracker
+            .select(&HashSet::new(), None, &HashMap::new(), Duration::ZERO)
+            .expect("the socket backend must be selectable");
+        assert!(matches!(
+            selected.addr,
+            pingora_core::protocols::l4::socket::SocketAddr::Unix(_)
+        ));
     }
 
     #[test]
