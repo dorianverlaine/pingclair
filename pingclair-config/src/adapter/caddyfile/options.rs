@@ -33,6 +33,17 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                         ));
                     };
                     let channel = adapt_log_block(channel_block)?;
+                    // 🚫 `hostnames` selects which request hosts reach a
+                    // logger, and a global logger is not attached to a site
+                    // block, so there is nothing for it to select from. Upstream
+                    // refuses it here; accepting it would leave an operator with
+                    // a host filter that quietly never applies.
+                    if !channel.hostnames.is_empty() {
+                        return Err(AdapterError::InvalidArgument(
+                            "log".into(),
+                            "hostnames is not allowed in the log global options".into(),
+                        ));
+                    }
                     let logging = global.logging.get_or_insert_with(Default::default);
                     let Some(name) = sub.args.first().cloned() else {
                         // 🪵 An unnamed global `log` configures the default

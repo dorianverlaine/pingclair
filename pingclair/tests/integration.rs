@@ -9206,3 +9206,79 @@ async fn test_php_fastcgi_canonical_directory_redirect() {
         "the redirect must keep the original path and query"
     );
 }
+
+/// 🏠 `hostnames` sends a host's access lines to its own destination and no other.
+///
+/// Before this, every configured logger received every request: the field
+/// compiled, serialised, and decided nothing. The two files below are the
+/// difference — `a.example` must not appear in b's log, and vice versa.
+#[tokio::test]
+async fn test_log_hostnames_route_each_host_to_its_own_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let a_log = dir.path().join("a.log").to_str().unwrap().replace("\\", "/");
+    let b_log = dir.path().join("b.log").to_str().unwrap().replace("\\", "/");
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            log only_a {{
+                hostnames a.example
+                output file {a_log}
+                format json
+            }}
+            log only_b {{
+                hostnames b.example
+                output file {b_log}
+                format json
+            }}
+
+            respond "ok" 200
+        }}
+        "#
+    );
+
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    for host in ["a.example", "b.example"] {
+        let response = client
+            .get(server.url(0, "/hit"))
+            .header("Host", host)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
+    // 🕰️ The writer thread owns the sink, so the line is queued rather than
+    // written before the response returns. Poll instead of sleeping blind.
+    let mut a = String::new();
+    let mut b = String::new();
+    for _ in 0..50 {
+        a = std::fs::read_to_string(&a_log).unwrap_or_default();
+        b = std::fs::read_to_string(&b_log).unwrap_or_default();
+        if a.contains("a.example") && b.contains("b.example") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(a.contains("a.example"), "a's own request is missing: {a:?}");
+    assert!(b.contains("b.example"), "b's own request is missing: {b:?}");
+    assert!(
+        !a.contains("b.example"),
+        "b's request leaked into a's destination: {a:?}"
+    );
+    assert!(
+        !b.contains("a.example"),
+        "a's request leaked into b's destination: {b:?}"
+    );
+}

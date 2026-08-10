@@ -507,6 +507,23 @@ mod log_format_tests {
         assert_eq!(sampling.thereafter, 40);
     }
 
+    /// 🚫 A global logger has no site block, so `hostnames` can never select
+    /// anything and is refused rather than accepted and ignored.
+    ///
+    /// Confirmed against Caddy v2.11.4, which answers
+    /// "hostnames is not allowed in the log global options".
+    #[test]
+    fn hostnames_in_the_global_log_block_is_refused() {
+        let error = crate::compile(
+            "{\n\tlog {\n\t\thostnames a.example\n\t\toutput stdout\n\t}\n}\n\n:80 {\n\trespond \"ok\" 200\n}",
+        )
+        .expect_err("a global logger must not accept hostnames");
+        assert!(
+            format!("{error}").contains("hostnames is not allowed in the log global options"),
+            "the message must name the setting and where it is not allowed: {error}"
+        );
+    }
+
     #[test]
     fn output_file_accepts_mode_and_extra_roll_options() {
         let cfg = log_of(

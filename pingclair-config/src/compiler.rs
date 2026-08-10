@@ -513,6 +513,29 @@ fn apply_site_root_to_matcher(matcher: &mut pingclair_core::config::Matcher, sit
 /// and a particularly bad one here: the missing output is the very thing an
 /// operator would use to notice something is missing.
 fn validate_log_channels_exist(config: &PingclairConfig) -> CompileResult<()> {
+    // 🚫 `hostnames` picks which request hosts reach a logger. A global logger
+    // is not attached to a site block, so it has no hosts to pick from and the
+    // setting can never take effect. Refusing it here rather than only in the
+    // adapter is the point: a JSON config posted to the Admin API does not go
+    // through the adapter, and a rule that lives there alone is a rule the
+    // Admin API bypasses.
+    for (name, logger) in config
+        .logging
+        .channels
+        .iter()
+        .map(|(name, logger)| (name.as_str(), logger))
+        .chain(config.logging.default.iter().map(|l| ("<default>", l)))
+    {
+        if !logger.hostnames.is_empty() {
+            return Err(CompileError::InvalidServer {
+                message: format!(
+                    "global log channel `{name}` sets `hostnames`, which only applies to a \
+                     site block's own logger — remove it, or declare the logger inside the site"
+                ),
+            });
+        }
+    }
+
     for server in &config.servers {
         for channel in &server.log_channels {
             if !config.logging.channels.contains_key(channel) {
@@ -2249,6 +2272,39 @@ fn compile_basic_auth_credential(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🚫 The global-logger `hostnames` refusal must hold for JSON too.
+    ///
+    /// The Caddyfile adapter already rejects it, but the Admin API deserialises
+    /// straight into `PingclairConfig` and never runs the adapter. A rule that
+    /// lives only in the adapter is a rule the Admin API bypasses, which is why
+    /// this one is asserted against `validate_config` directly.
+    #[test]
+    fn a_global_log_channel_may_not_carry_hostnames_even_from_json() {
+        let config: PingclairConfig = serde_json::from_str(
+            r#"{
+                "logging": {
+                    "channels": {
+                        "audit": {
+                            "output": "stdout",
+                            "format": "json",
+                            "hostnames": ["a.example"]
+                        }
+                    }
+                },
+                "servers": []
+            }"#,
+        )
+        .expect("the shape still deserialises for backward compatibility");
+
+        let error = validate_config(&config)
+            .expect_err("a global channel with hostnames must be refused")
+            .to_string();
+        assert!(
+            error.contains("audit") && error.contains("hostnames"),
+            "the message must name the channel and the setting: {error}"
+        );
+    }
 
     /// 🚫 `protocols` without `h3` must actually switch HTTP/3 off.
     ///

@@ -9,11 +9,16 @@
 //! ignored. This module makes that configuration actually decide where a
 //! request line goes and how it is shaped.
 //!
-//! ⚠️ Scope note: this is the *routing and formatting* layer only. Rotation,
-//! retention, compression and a bounded async writer are deliberately absent.
-//! Writes are synchronous and serialized per sink — correct, but they block
-//! the caller if the disk stalls, so a slow or full disk becomes back-pressure
-//! on the request path rather than a dropped log line.
+//! Writes leave the request path immediately: [`LogWriter`] owns the sink and
+//! drains a bounded queue from its own thread, so a stalled disk costs log
+//! lines rather than requests. Size- and age-based rotation, gzip and
+//! retention live here too.
+//!
+//! ⚠️ Scope note: [`LogTargets`] decides *which* destinations a request
+//! reaches, from each logger's `hostnames`. The other two selection layers
+//! Caddy has — `include`/`exclude` over logger namespaces, and `sampling` —
+//! are not implemented yet and are refused rather than accepted, so no
+//! configuration can quietly believe it is filtering.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -236,6 +241,132 @@ pub struct AccessLogger {
     response_headers: Vec<String>,
     /// 🔐 Whether to record the negotiated TLS version and cipher.
     include_tls: bool,
+}
+
+// MARK: - Host selection
+
+/// 🏠 One entry of a logger's `hostnames` list, precompiled.
+///
+/// Upstream stores the pattern verbatim and, per request, walks the host's
+/// labels replacing them with `*` one at a time **without restoring the
+/// previous one**. For `a.b.c` that yields `*.b.c`, then `*.*.c`, then
+/// `*.*.*` — so only a *leading run* of stars can ever match, and a pattern
+/// like `a.*.c` is unreachable no matter what host arrives.
+///
+/// That quirk is copied deliberately. The obvious generalisation — same label
+/// count, every non-star label equal — is strictly more permissive, and a
+/// configuration that logs on one server and not the other is worse than one
+/// that is uselessly strict in the same way on both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostPattern {
+    /// 🔢 Labels the host must have, since upstream never changes the count.
+    label_count: usize,
+    /// ⭐ How many leading labels are `*`. Zero means an exact match.
+    leading_stars: usize,
+    /// 🏷️ The labels after the stars, which must match exactly.
+    tail: Vec<String>,
+}
+
+impl HostPattern {
+    /// 🧭 Compiles one configured pattern, or `None` if no host can match it.
+    fn compile(pattern: &str) -> Option<Self> {
+        let labels: Vec<&str> = pattern.split('.').collect();
+        let leading_stars = labels.iter().take_while(|label| **label == "*").count();
+        // 🚫 A star after a non-star label is unreachable upstream, so keeping
+        // it would mean carrying a pattern that can never fire.
+        if labels[leading_stars..].contains(&"*") {
+            return None;
+        }
+        Some(Self {
+            label_count: labels.len(),
+            leading_stars,
+            tail: labels[leading_stars..]
+                .iter()
+                .map(|label| label.to_ascii_lowercase())
+                .collect(),
+        })
+    }
+
+    /// 🎯 Whether a request host matches, without allocating.
+    fn matches(&self, host: &str) -> bool {
+        let mut labels = host.split('.');
+        let count = host.split('.').count();
+        if count != self.label_count {
+            return false;
+        }
+        for _ in 0..self.leading_stars {
+            if labels.next().is_none() {
+                return false;
+            }
+        }
+        self.tail
+            .iter()
+            .zip(labels)
+            .all(|(expected, actual)| expected.eq_ignore_ascii_case(actual))
+    }
+}
+
+/// 🪵 Which destinations a request reaches, resolved once at configuration time.
+///
+/// The request path used to hand every entry to every logger, which made
+/// `hostnames` a field that compiled, serialised, and did nothing. Selection
+/// now happens here, and the request path only walks a precomputed list — no
+/// name lookups, no pattern parsing, no allocation.
+#[derive(Default, Clone)]
+pub struct LogTargets {
+    /// 🌐 Destinations that take every request to this server, which is what a
+    /// logger without `hostnames` means.
+    unrestricted: Vec<Arc<AccessLogger>>,
+    /// 🏠 Destinations restricted to particular hosts, most specific first.
+    restricted: Vec<(HostPattern, Arc<AccessLogger>)>,
+}
+
+impl LogTargets {
+    /// 🧭 Builds the selection, ordering restricted entries the way upstream
+    /// resolves them: an exact hostname wins over `*.example.com`, which wins
+    /// over `*.*.com`.
+    pub fn new(entries: Vec<(Vec<String>, Arc<AccessLogger>)>) -> Self {
+        let mut targets = Self::default();
+        for (hostnames, logger) in entries {
+            if hostnames.is_empty() {
+                targets.unrestricted.push(logger);
+                continue;
+            }
+            for hostname in &hostnames {
+                match HostPattern::compile(hostname) {
+                    Some(pattern) => targets.restricted.push((pattern, logger.clone())),
+                    None => tracing::warn!(
+                        hostname = %hostname,
+                        "🚫 Ignoring a log hostname no request can match"
+                    ),
+                }
+            }
+        }
+        targets
+            .restricted
+            .sort_by_key(|(pattern, _)| pattern.leading_stars);
+        targets
+    }
+
+    /// 📮 Every destination this host's entries belong in.
+    ///
+    /// A host may reach several: upstream maps one hostname to a list, and a
+    /// logger without `hostnames` covers the whole server alongside them.
+    pub fn select(&self, host: &str) -> impl Iterator<Item = &Arc<AccessLogger>> {
+        let host = host.split(':').next().unwrap_or(host);
+        self.unrestricted.iter().chain(
+            self.restricted
+                .iter()
+                .filter(move |(pattern, _)| pattern.matches(host))
+                .map(|(_, logger)| logger),
+        )
+    }
+
+    /// 🈳 Whether nothing at all is configured, so callers keep the previous
+    /// process-wide `tracing` behaviour instead of silently dropping lines.
+    pub fn is_empty(&self) -> bool {
+        self.unrestricted.is_empty() && self.restricted.is_empty()
+    }
 }
 
 /// 🚚 Owns the sink and drains a bounded queue from a dedicated thread.
@@ -848,6 +979,110 @@ mod tests {
             response_headers: Vec::new(),
             include_tls: false,
         }
+    }
+
+    // MARK: - Host selection
+
+    /// 🧪 Builds targets from `(hostnames, tag)` pairs, where the tag is
+    /// recoverable afterwards through the logger's `exclude` set.
+    fn targets(entries: &[(&[&str], &str)]) -> LogTargets {
+        LogTargets::new(
+            entries
+                .iter()
+                .map(|(hostnames, tag)| {
+                    (
+                        hostnames.iter().map(|host| host.to_string()).collect(),
+                        Arc::new(logger(LogFormat::Json, vec![tag.to_string()])),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// 🔖 The tags of the destinations a host reaches, in selection order.
+    fn selected(targets: &LogTargets, host: &str) -> Vec<String> {
+        targets
+            .select(host)
+            .map(|logger| logger.exclude.iter().next().cloned().unwrap_or_default())
+            .collect()
+    }
+
+    /// 🏠 A logger without `hostnames` takes everything; one with them does not.
+    #[test]
+    fn hostnames_restrict_a_logger_to_its_own_hosts() {
+        let targets = targets(&[
+            (&[][..], "everything"),
+            (&["a.example.com"][..], "only-a"),
+            (&["b.example.com"][..], "only-b"),
+        ]);
+
+        assert_eq!(
+            selected(&targets, "a.example.com"),
+            ["everything", "only-a"]
+        );
+        assert_eq!(
+            selected(&targets, "b.example.com"),
+            ["everything", "only-b"]
+        );
+        // 🎯 The whole point: before this, every destination saw every request,
+        // so `only-a` received b.example.com's lines too.
+        assert_eq!(selected(&targets, "c.example.com"), ["everything"]);
+    }
+
+    /// 🔌 A port on the request host must not defeat the match.
+    #[test]
+    fn the_port_is_stripped_before_matching() {
+        let targets = targets(&[(&["a.example.com"][..], "only-a")]);
+        assert_eq!(selected(&targets, "a.example.com:8443"), ["only-a"]);
+    }
+
+    /// ⭐ Wildcards match a leading run of labels, and only that.
+    ///
+    /// Upstream rewrites the host's labels to `*` one at a time without
+    /// restoring the previous one, so `a.b.c` is looked up as `*.b.c`,
+    /// `*.*.c`, `*.*.*`. A pattern with a star after a real label is therefore
+    /// unreachable, and we reproduce that rather than being more generous.
+    #[test]
+    fn wildcards_match_only_a_leading_run_of_labels() {
+        let targets = targets(&[
+            (&["*.example.com"][..], "sub"),
+            (&["*.*.com"][..], "two-deep"),
+            (&["a.*.com"][..], "unreachable"),
+        ]);
+
+        assert_eq!(selected(&targets, "www.example.com"), ["sub", "two-deep"]);
+        assert_eq!(selected(&targets, "a.other.com"), ["two-deep"]);
+        // 🚫 Same label count, and the literal label agrees — still no match,
+        // because upstream never generates this pattern.
+        assert!(!selected(&targets, "a.other.com").contains(&"unreachable".to_string()));
+        // 🔢 The label count has to agree; `*.example.com` is not a suffix rule.
+        assert_eq!(
+            selected(&targets, "deep.www.example.com"),
+            Vec::<String>::new()
+        );
+        assert_eq!(selected(&targets, "example.com"), Vec::<String>::new());
+    }
+
+    /// 📶 An exact hostname is offered before a wildcard, and a narrower
+    /// wildcard before a broader one.
+    #[test]
+    fn exact_hosts_are_selected_before_wildcards() {
+        let targets = targets(&[
+            (&["*.*.com"][..], "broad"),
+            (&["*.example.com"][..], "narrow"),
+            (&["www.example.com"][..], "exact"),
+        ]);
+        assert_eq!(
+            selected(&targets, "www.example.com"),
+            ["exact", "narrow", "broad"]
+        );
+    }
+
+    /// 🈳 No configured destination means the caller keeps tracing output.
+    #[test]
+    fn no_destinations_is_reported_as_empty() {
+        assert!(LogTargets::default().is_empty());
+        assert!(!targets(&[(&[][..], "one")]).is_empty());
     }
 
     #[test]

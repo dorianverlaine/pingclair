@@ -813,16 +813,15 @@ pub struct ProxyState {
     access_controls: Vec<Option<Arc<RouteAccessControl>>>,
     /// Pre-compiled regular expressions used by route rewrite handlers.
     rewrite_regexes: Vec<HashMap<String, Arc<Regex>>>,
-    /// 📝 Per-server access logger built from this server's `log` block.
-    /// `None` keeps the previous process-wide `tracing` output.
-    access_logger: Option<Arc<crate::access_log::AccessLogger>>,
-    /// 🪵 Named per-site loggers from `log <name> { … }`.
-    named_loggers: Vec<(String, Arc<crate::access_log::AccessLogger>)>,
-
-    /// 🪵 Shared channels this server also writes to, resolved once at
-    /// configuration time. Empty in the common case, so the fan-out loop below
-    /// costs nothing for servers that do not use channels.
-    log_channels: Vec<Arc<crate::access_log::AccessLogger>>,
+    /// 🪵 Every access-log destination this server can reach, already narrowed
+    /// by each logger's `hostnames`.
+    ///
+    /// The server's own `log` block, its global channels and its named loggers
+    /// used to be three separate fields that the request path fanned out to
+    /// unconditionally. They are one list now because the question a request
+    /// asks is not "which kind of logger is this" but "does this host belong
+    /// here", and that is answered once, at configuration time.
+    log_targets: crate::access_log::LogTargets,
 }
 
 /// 🔐 A route's upstream TLS posture, resolved once per configuration load.
@@ -1525,9 +1524,18 @@ impl ProxyState {
             .filter_map(|name| crate::access_log::channel_logger(name))
             .collect();
         let mut named_loggers = Vec::new();
+        // 🏠 A named logger's `hostnames` decides which requests reach it. The
+        // list travels with the logger so `LogTargets` can resolve it once,
+        // here, instead of the request path re-reading configuration.
+        let mut named_targets: Vec<(Vec<String>, Arc<crate::access_log::AccessLogger>)> =
+            Vec::new();
         for named in &config.named_logs {
             match crate::access_log::AccessLogger::from_config(Some(&named.config)) {
-                Ok(Some(logger)) => named_loggers.push((named.name.clone(), Arc::new(logger))),
+                Ok(Some(logger)) => {
+                    let logger = Arc::new(logger);
+                    named_targets.push((named.config.hostnames.clone(), logger.clone()));
+                    named_loggers.push((named.name.clone(), logger));
+                }
                 Ok(None) => {}
                 Err(error) => {
                     tracing::error!(
@@ -1552,6 +1560,19 @@ impl ProxyState {
             }
         };
 
+        // 🪵 The server's own `log` block and any global channels are not
+        // host-restricted; only named loggers carry `hostnames`.
+        let mut target_entries: Vec<(Vec<String>, Arc<crate::access_log::AccessLogger>)> =
+            Vec::new();
+        if let Some(logger) = &access_logger {
+            target_entries.push((Vec::new(), logger.clone()));
+        }
+        for channel in &log_channels {
+            target_entries.push((Vec::new(), channel.clone()));
+        }
+        target_entries.extend(named_targets);
+        let log_targets = crate::access_log::LogTargets::new(target_entries);
+
         Self {
             config: Arc::new(config),
             router: Arc::new(router),
@@ -1568,9 +1589,7 @@ impl ProxyState {
             upstream_tls,
             access_controls,
             rewrite_regexes,
-            access_logger,
-            named_loggers,
-            log_channels,
+            log_targets,
         }
     }
 
@@ -6909,26 +6928,16 @@ impl ProxyHttp for PingclairProxy {
             record_cache_outcome(session, host, route);
         }
 
-        // 📝 Prefer this server's configured access logger. Only when the
-        // server has no `log` block and no named loggers do we fall back to
-        // the process-wide tracing output.
+        // 📝 Which destinations this request belongs in was decided when the
+        // configuration was compiled; here it is a walk over a precomputed
+        // list. Only when the server configured nothing at all do we fall back
+        // to the process-wide tracing output.
         let state_ref = ctx.state.as_ref();
-        let named_loggers = state_ref
-            .map(|state| state.named_loggers.clone())
+        let selected: Vec<Arc<crate::access_log::AccessLogger>> = state_ref
+            .map(|state| state.log_targets.select(host).cloned().collect())
             .unwrap_or_default();
-        let configured_logger = state_ref
-            .and_then(|state| state.access_logger.clone())
-            .or_else(|| named_loggers.first().map(|(_, logger)| logger.clone()));
-        let extra_named_loggers = if state_ref
-            .and_then(|state| state.access_logger.as_ref())
-            .is_some()
-        {
-            named_loggers
-        } else {
-            named_loggers.into_iter().skip(1).collect()
-        };
 
-        if let Some(logger) = configured_logger {
+        if let Some(logger) = selected.first().cloned() {
             let upstream_addr = ctx.upstream.as_ref().map(|u| u.addr.to_string());
             let route = ctx.state.as_ref().and_then(|state| {
                 ctx.route_index
@@ -7024,21 +7033,12 @@ impl ProxyHttp for PingclairProxy {
                 error: error_text.as_deref(),
             };
 
-            // 🪵 The server's own sink first, then any shared channels. One
-            // entry, formatted separately per destination, because channels
-            // may differ in format and in which fields they drop.
+            // 🪵 One entry, formatted separately per destination, because
+            // destinations may differ in format and in which fields they drop.
+            // The first was already taken above to size the header collection.
             logger.log(&entry);
-            for channel in ctx
-                .state
-                .as_ref()
-                .map(|state| state.log_channels.as_slice())
-                .unwrap_or_default()
-            {
-                channel.log(&entry);
-            }
-            // 🪵 Named per-site loggers, each formatted with its own config.
-            for (_, logger) in &extra_named_loggers {
-                logger.log(&entry);
+            for destination in selected.iter().skip(1) {
+                destination.log(&entry);
             }
             return;
         }
