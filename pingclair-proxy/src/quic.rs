@@ -57,6 +57,7 @@ use pingora_core::protocols::http::client::HttpSession;
 use pingora_http::RequestHeader;
 use quiche::h3::NameValue;
 
+use crate::client_auth::ClientAuthTable;
 use crate::connection_filter::PingclairConnectionFilter;
 use crate::http_policy::{
     CorsDecision, ResponseHeaderPolicy, authority_host, evaluate_cors, resolve_request_id,
@@ -326,6 +327,7 @@ impl Default for CertTable {
 /// socket, so that indirection is the only thing that makes reload work.
 fn build_ssl_context_builder(
     certs: Arc<CertTable>,
+    client_auth: Option<Arc<ClientAuthTable>>,
 ) -> Result<boring::ssl::SslContextBuilder, QuicError> {
     use boring::ssl::{NameType, SelectCertError, SslContext, SslMethod, SslVersion};
 
@@ -337,12 +339,46 @@ fn build_ssl_context_builder(
         .set_min_proto_version(Some(SslVersion::TLS1_3))
         .map_err(|e| QuicError::Tls(format!("failed to set min TLS version: {e}")))?;
 
+    // 🚫 Same trade the TCP listener makes, and for the same reason: a resumed
+    // TLS 1.3 handshake sends no `CertificateRequest`, so BoringSSL restores
+    // the peer's chain from the ticket and never re-checks it. A ticket would
+    // keep admitting its holder after the certificate behind it expired or the
+    // trust pool changed. 0-RTT is already off (`enable_early_data`), which is
+    // a different question — that one is about replaying requests.
+    //
+    // ⚠️ `NO_TICKET` and *only* `NO_TICKET`. Setting the session cache mode
+    // here would read as belt and braces and would in fact be nothing: quiche
+    // 0.29.3 overwrites it a moment later, in `Context::from_boring`, which
+    // unconditionally calls `SSL_CTX_set_session_cache_mode(ctx,
+    // SSL_SESS_CACHE_CLIENT)` to install its client-side session callback
+    // (`src/tls/mod.rs:155` and `:264`). Options, by contrast, accumulate and
+    // quiche never clears them. A comment claiming two protections where one
+    // is silently reverted is worse than the single one that works, so the
+    // call is gone and the reason is here.
+    if client_auth.is_some() {
+        builder.set_options(boring::ssl::SslOptions::NO_TICKET);
+    }
+
     let table = certs;
     builder.set_select_certificate_callback(move |mut hello| {
         let sni = hello
             .servername(NameType::HOST_NAME)
             .unwrap_or("")
             .to_string();
+
+        // 🪪 Installed before the certificate is chosen, which is well before
+        // the `CertificateRequest` is written — the same window the TCP
+        // listener uses, reached through a different callback because QUIC
+        // never runs BoringSSL's `cert_cb`.
+        //
+        // The policy is picked from the name the client actually sent, so a
+        // client that named nothing gets the catch-all and is then refused any
+        // named site by the SNI-against-`:authority` check below.
+        if let Some(policies) = &client_auth
+            && let Some(policy) = policies.policy_for(&sni)
+        {
+            policy.install(hello.ssl_mut());
+        }
 
         let Some(entry) = table.lookup(&sni) else {
             tracing::warn!(
@@ -396,11 +432,16 @@ pub const IN_MEMORY_CERT_SENTINEL: &str = "<pingclair:in-memory-cert-table>";
 /// Serves certificates to `tokio_quiche` from an in-memory [`CertTable`].
 pub struct CertTableSslHook {
     certs: Arc<CertTable>,
+    /// 🪪 What this listener's sites ask of a client's own certificate.
+    ///
+    /// `None` on the overwhelming majority of listeners, and the context is
+    /// built once per socket, so an ordinary HTTP/3 listener pays nothing.
+    client_auth: Option<Arc<ClientAuthTable>>,
 }
 
 impl CertTableSslHook {
-    pub fn new(certs: Arc<CertTable>) -> Self {
-        Self { certs }
+    pub fn new(certs: Arc<CertTable>, client_auth: Option<Arc<ClientAuthTable>>) -> Self {
+        Self { certs, client_auth }
     }
 }
 
@@ -410,7 +451,7 @@ impl tokio_quiche::quic::ConnectionHook for CertTableSslHook {
         _settings: tokio_quiche::settings::TlsCertificatePaths<'_>,
     ) -> Option<boring::ssl::SslContextBuilder> {
         // The paths are deliberately ignored; see `IN_MEMORY_CERT_SENTINEL`.
-        match build_ssl_context_builder(Arc::clone(&self.certs)) {
+        match build_ssl_context_builder(Arc::clone(&self.certs), self.client_auth.clone()) {
             Ok(builder) => Some(builder),
             Err(e) => {
                 // Returning `None` makes tokio-quiche fall back to reading the
@@ -657,6 +698,14 @@ struct H3App {
     /// instead of letting the worker buffer the whole body out of order.
     deferred: Option<RespEvent>,
     body_notify: Arc<Notify>,
+    /// 🪪 The server name this connection's handshake asked for.
+    ///
+    /// Read once when the handshake completes rather than per request: it
+    /// belongs to the connection and cannot change between its requests.
+    /// Only listeners that demand a client certificate ever consult it, and
+    /// only those record it — everywhere else this stays `None` and no
+    /// allocation happens.
+    tls_identity: Option<crate::tls_identity::DownstreamTlsIdentity>,
     /// 🔢 Releases this connection's slot against `limits.max_connections`.
     _slot: ConnectionSlot,
     /// 📦 Lent to the worker for outbound packets; see `ApplicationOverQuic::buffer`.
@@ -706,6 +755,15 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
             qconn,
             &self.h3_config,
         )?);
+        // 🪪 Admission was decided from the ClientHello and routing is decided
+        // from `:authority`; capture the one so a request can be checked
+        // against the other. Only on listeners that ask for a certificate —
+        // elsewhere there is nothing to enforce and nothing to pay for.
+        if self.proxy.requires_strict_sni_host() {
+            self.tls_identity = Some(crate::tls_identity::DownstreamTlsIdentity::new(
+                qconn.server_name().unwrap_or(""),
+            ));
+        }
         // 🚀 Tracked here rather than at socket accept: a QUIC connection that
         // never completes its handshake is not one this server is serving, and
         // counting it would make the gauge drift upward on scanning traffic.
@@ -902,6 +960,8 @@ pub struct QuicServer {
     listen: SocketAddr,
     proxy: Arc<PingclairProxy>,
     certs: Arc<CertTable>,
+    /// 🪪 What this listener's sites ask of a client certificate, or `None`.
+    client_auth: Option<Arc<ClientAuthTable>>,
     connector: Arc<pingora_core::connectors::http::Connector>,
     filter: PingclairConnectionFilter,
 }
@@ -920,14 +980,23 @@ impl QuicServer {
         listen: SocketAddr,
         proxy: Arc<PingclairProxy>,
         certs: Arc<CertTable>,
+        client_auth: Option<Arc<ClientAuthTable>>,
         upstream_keepalive_pool_size: usize,
         blocked_ips: Vec<String>,
     ) -> Self {
         let options = pingora_core::connectors::ConnectorOptions::new(upstream_keepalive_pool_size);
+        // 🪪 Derived here rather than asked of the caller, so the two halves of
+        // the rule cannot be wired up separately and disagree: a listener that
+        // demands a client certificate is exactly a listener that must insist
+        // `:authority` names the site the handshake asked for.
+        if client_auth.as_ref().is_some_and(|table| !table.is_empty()) {
+            proxy.set_strict_sni_host(true);
+        }
         Self {
             listen,
             proxy,
             certs,
+            client_auth,
             connector: Arc::new(pingora_core::connectors::http::Connector::new(Some(
                 options,
             ))),
@@ -1000,7 +1069,10 @@ impl QuicServer {
         let hooks = tokio_quiche::settings::Hooks {
             // 🔐 Certificates come from the in-memory table, never from disk;
             // see `IN_MEMORY_CERT_SENTINEL`.
-            connection_hook: Some(Arc::new(CertTableSslHook::new(self.certs.clone()))),
+            connection_hook: Some(Arc::new(CertTableSslHook::new(
+                self.certs.clone(),
+                self.client_auth.clone(),
+            ))),
         };
 
         let mut listeners = tokio_quiche::listen(
@@ -1058,6 +1130,7 @@ impl QuicServer {
 
             let (resp_tx, resp_rx) = mpsc::channel::<RespEvent>(RESP_CHANNEL_CAPACITY);
             connection.start(H3App {
+                tls_identity: None,
                 proxy: self.proxy.clone(),
                 connector: self.connector.clone(),
                 h3_config: Arc::clone(&h3_config),
@@ -1199,6 +1272,30 @@ impl H3App {
                 rejection.reason()
             );
             self.queue_simple_response(qconn, stream_id, 400, rejection.reason());
+            return;
+        }
+
+        // 🪪 On a listener where some site demands a client certificate, the
+        // name in the handshake and the name in `:authority` have to be the
+        // same one — the identical rule the TCP listener applies to `Host`,
+        // for the identical reason. A client that offered the unprotected
+        // site's name proved nothing about the protected one.
+        //
+        // 🛡️ Parity is the whole point of doing this here. If HTTP/3 skipped
+        // the check, an attacker would simply use HTTP/3.
+        if let Some(identity) = &self.tls_identity
+            && !identity.may_request_host(crate::http_policy::authority_host(&req.authority))
+        {
+            tracing::warn!(
+                authority = %req.authority,
+                "🚫 H3: rejected a request whose :authority is not the name its handshake asked for"
+            );
+            self.queue_simple_response(
+                qconn,
+                stream_id,
+                421,
+                "TLS server name and :authority values differ",
+            );
             return;
         }
 

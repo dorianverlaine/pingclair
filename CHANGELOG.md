@@ -271,7 +271,7 @@ lets the rest converge.
   rather than through temporary files.
 - 🔐 **TLS.** A persistent internal CA for private origins, and durable ACME
   state across restarts.
-- 🪪 **Mutual TLS on HTTP/1.1 and HTTP/2.** `tls { client_auth { … } }` is now
+- 🪪 **Mutual TLS.** `tls { client_auth { … } }` is now
   enforced during the handshake rather than merely parsed. All four upstream
   modes behave as their names say: `request` asks and accepts anything,
   `require` insists on a certificate without checking it, `verify_if_given`
@@ -283,19 +283,22 @@ lets the rest converge.
   startup, so a missing CA file stops the process instead of failing a
   stranger's handshake later.
 
-  Two consequences worth knowing before turning it on. A listener carrying any
-  mutual-TLS site **requires a request's `Host` to be the name its handshake
-  asked for**, answering `421` otherwise — without it, a client could offer an
-  unprotected name in the ClientHello and then ask for the protected site by
-  header. And that listener **turns TLS session resumption off**, because a
-  resumed handshake carries no certificate request, so a ticket would keep
-  admitting its holder after the certificate behind it expired or the trust
-  pool changed. The cost is a full handshake per connection on that listener.
+  Two consequences worth knowing before turning it on, and both apply to every
+  protocol. A listener carrying any mutual-TLS site **requires a request's
+  `Host` (or HTTP/3 `:authority`) to be the name its handshake asked for**,
+  answering `421` otherwise — without it, a client could offer an unprotected
+  name in the ClientHello and then ask for the protected site by header. And
+  that listener **turns TLS session resumption off**, because a resumed
+  handshake carries no certificate request, so a ticket would keep admitting
+  its holder after the certificate behind it expired or the trust pool changed.
+  The cost is a full handshake per connection on that listener.
 
-  HTTP/3 does not verify client certificates yet, so a listener with
-  `client_auth` **does not start an HTTP/3 socket and does not advertise
-  `Alt-Svc`**, and says so at startup. Serving QUIC there would demand a
-  certificate over TCP and admit everyone over UDP.
+  HTTP/3 enforces the identical policy through its own BoringSSL context, and
+  applies the same name check against `:authority`. This matters more than it
+  sounds: HTTP/1.1 and HTTP/2 go through Pingora's acceptor while HTTP/3 goes
+  through `tokio-quiche`, so a rule enforced on only one of them would be a
+  rule any client opts out of by choosing the other transport — and `Alt-Svc`
+  invites them to.
 - 🛡️ **Identity and trust.** PROXY protocol required per listener, verified
   trusted client identity, and `CF-Connecting-IP` honored only from trusted
   peers.

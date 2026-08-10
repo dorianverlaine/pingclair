@@ -1934,6 +1934,15 @@ impl PingclairProxy {
         self.strict_sni_host.store(required, Ordering::Relaxed);
     }
 
+    /// 🪪 Reports whether this listener enforces SNI against the routed host.
+    ///
+    /// Read by the HTTP/3 path, which has no Pingora `Session` to hang the
+    /// handshake name off and so has to decide per connection whether to
+    /// record one at all.
+    pub(crate) fn requires_strict_sni_host(&self) -> bool {
+        self.strict_sni_host.load(Ordering::Relaxed)
+    }
+
     /// 🚫 Reports whether this request may name the host it named.
     ///
     /// Returns `None` when there is nothing to check, which is the answer on

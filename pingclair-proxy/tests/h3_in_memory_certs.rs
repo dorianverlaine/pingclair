@@ -97,7 +97,7 @@ async fn spawn_listener(table: Arc<CertTable>) -> SocketAddr {
     quic_settings.enable_dgram = false;
 
     let hooks = Hooks {
-        connection_hook: Some(Arc::new(CertTableSslHook::new(table))),
+        connection_hook: Some(Arc::new(CertTableSslHook::new(table, None))),
     };
 
     let mut listeners = tokio_quiche::listen(

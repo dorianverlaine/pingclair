@@ -37,6 +37,9 @@ ipnet.workspace = true
 flate2 = "1.0"
 zstd = "0.13"
 arc-swap.workspace = true
+# 🔡 Client trust material arrives base64-DER in JSON, the way upstream stores
+# it; decoding happens once at startup, never on a handshake.
+base64 = "0.22"
 regex = "1"
 futures = "0.3"
 hickory-resolver.workspace = true

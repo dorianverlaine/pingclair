@@ -32,11 +32,22 @@
 //! certificate is demanded, and the callback decides what, if anything, is
 //! checked about it.
 //!
+//! ## Why this lives here rather than in the binary
+//!
+//! Both transports need it, and they reach it through different doors.
+//! HTTP/1.1 and HTTP/2 install the policy from Pingora's certificate callback;
+//! HTTP/3 installs it from `tokio-quiche`'s ClientHello callback, because QUIC
+//! never runs BoringSSL's `cert_cb` at all. Both windows are the same moment —
+//! the name is known, the `CertificateRequest` has not been written — so one
+//! compiled policy serves both. A security control that held on only one
+//! transport would be a control any client opts out of by picking the other,
+//! and `Alt-Svc` actively invites them to.
+//!
 //! ## What the handshake still cannot tell you
 //!
 //! A resumed TLS session carries no `CertificateRequest`, so BoringSSL never
-//! re-runs any of this — see the session-resumption note in `run.rs`, where the
-//! listener turns resumption off for exactly this reason.
+//! re-runs any of this. Both listeners therefore turn resumption off when a
+//! policy is present — see the notes in `run.rs` and `quic.rs`.
 
 use boring::error::ErrorStack;
 use boring::ssl::{SslAlert, SslRef, SslVerifyError, SslVerifyMode};
@@ -58,7 +69,7 @@ use base64::Engine as _;
 const MAX_TRUST_POOL_DEPTH: usize = 8;
 
 /// 🪪 One site's client-certificate policy, resolved once at startup.
-pub(crate) struct CompiledClientAuth {
+pub struct CompiledClientAuth {
     /// 🎚️ What BoringSSL is told to demand: whether to send a
     /// `CertificateRequest` at all, and whether an empty answer is fatal.
     verify_mode: SslVerifyMode,
@@ -92,7 +103,7 @@ impl CompiledClientAuth {
     /// missing a CA, because a trust store with a silently dropped root rejects
     /// exactly the clients the operator meant to admit — and does it at
     /// handshake time, to a real user, with an error that says nothing useful.
-    pub(crate) fn compile(config: &ClientAuthConfig) -> Result<Self, String> {
+    pub fn compile(config: &ClientAuthConfig) -> Result<Self, String> {
         let verifies = matches!(
             config.mode,
             ClientAuthMode::VerifyIfGiven | ClientAuthMode::RequireAndVerify
@@ -129,7 +140,7 @@ impl CompiledClientAuth {
     /// Called from inside BoringSSL's certificate callback, which runs after
     /// the ClientHello and before the `CertificateRequest` is written — the one
     /// moment where the SNI is known and the demand can still be changed.
-    pub(crate) fn install(self: &Arc<Self>, ssl: &mut SslRef) {
+    pub fn install(self: &Arc<Self>, ssl: &mut SslRef) {
         let policy = Arc::clone(self);
         ssl.set_custom_verify_callback(self.verify_mode, move |ssl| policy.verify(ssl));
     }
@@ -192,7 +203,7 @@ impl CompiledClientAuth {
 /// a client would send the harmless name in the handshake and the protected one
 /// in the `Host` header.
 #[derive(Debug, Default)]
-pub(crate) struct ClientAuthTable {
+pub struct ClientAuthTable {
     /// 🏷️ Sites named outright. The common case, and a hash lookup.
     exact: HashMap<Box<str>, Arc<CompiledClientAuth>>,
 
@@ -208,7 +219,7 @@ pub(crate) struct ClientAuthTable {
 
 impl ClientAuthTable {
     /// 🏗️ Records one site's policy under every name it answers to.
-    pub(crate) fn insert(&mut self, names: &[&str], policy: Arc<CompiledClientAuth>) {
+    pub fn insert(&mut self, names: &[&str], policy: Arc<CompiledClientAuth>) {
         if names.is_empty() {
             self.fallback = Some(policy);
             return;
@@ -235,7 +246,7 @@ impl ClientAuthTable {
     /// Exact names win over wildcards, and a wildcard covers exactly one label
     /// — `*.example.com` answers for `a.example.com` and not `a.b.example.com`,
     /// matching how upstream matches an SNI.
-    pub(crate) fn policy_for(&self, sni: &str) -> Option<&Arc<CompiledClientAuth>> {
+    pub fn policy_for(&self, sni: &str) -> Option<&Arc<CompiledClientAuth>> {
         if !sni.is_empty() {
             // 🏷️ SNI is case-insensitive, and almost always already lowercase;
             // only the rare mixed-case name pays for a copy.
@@ -262,7 +273,7 @@ impl ClientAuthTable {
     }
 
     /// 🕳️ Reports whether this listener asks anything of any client.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.exact.is_empty() && self.wildcards.is_empty() && self.fallback.is_none()
     }
 }

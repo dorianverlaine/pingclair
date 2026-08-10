@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pingclair_core::config::{HandlerConfig, RouteConfig, ServerConfig};
+use pingclair_proxy::client_auth::{ClientAuthTable, CompiledClientAuth};
 use pingclair_proxy::quic::{CertTable, QuicServer};
 use pingclair_proxy::server::PingclairProxy;
 use quiche::h3::NameValue;
@@ -45,6 +46,21 @@ async fn spawn_h3_server(handler: HandlerConfig) -> SocketAddr {
 /// The port is only known after binding, so the caller receives it and fills it
 /// into the configuration it already compiled.
 async fn spawn_h3_server_with(build: impl FnOnce(SocketAddr) -> ServerConfig) -> SocketAddr {
+    spawn_h3_listener(|address| vec![build(address)], &["h3.pingclair.test"], None).await
+}
+
+/// 🎧 Starts one HTTP/3 listener carrying several sites, optionally demanding a
+/// client certificate.
+///
+/// Several sites on one socket is the shape mutual TLS has to survive: SNI
+/// decides what a client must prove and `:authority` decides which site it
+/// reaches, so a listener with only one site cannot show whether those two are
+/// held together.
+async fn spawn_h3_listener(
+    build: impl FnOnce(SocketAddr) -> Vec<ServerConfig>,
+    certificate_names: &[&str],
+    client_auth: Option<Arc<ClientAuthTable>>,
+) -> SocketAddr {
     let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
     // 🔌 Bind first so the test knows the port; `QuicServer` rebinds the same
@@ -54,13 +70,15 @@ async fn spawn_h3_server_with(build: impl FnOnce(SocketAddr) -> ServerConfig) ->
     drop(probe);
 
     let proxy = PingclairProxy::new();
-    proxy.update_config(vec![build(address)]);
+    proxy.update_config(build(address));
 
     let certs = Arc::new(CertTable::new());
-    let (cert, key) = self_signed_pem(&["h3.pingclair.test"]);
-    certs.upsert_pem("h3.pingclair.test", &cert, &key).unwrap();
+    let (cert, key) = self_signed_pem(certificate_names);
+    for name in certificate_names {
+        certs.upsert_pem(name, &cert, &key).unwrap();
+    }
 
-    let server = QuicServer::new(address, Arc::new(proxy), certs, 8, Vec::new());
+    let server = QuicServer::new(address, Arc::new(proxy), certs, client_auth, 8, Vec::new());
     tokio::spawn(async move {
         if let Err(e) = server.run().await {
             eprintln!("H3 server stopped: {e}");
@@ -72,6 +90,7 @@ async fn spawn_h3_server_with(build: impl FnOnce(SocketAddr) -> ServerConfig) ->
     address
 }
 
+#[derive(Debug)]
 struct H3Response {
     status: u16,
     headers: Vec<(String, String)>,
@@ -258,13 +277,77 @@ async fn h3_get_observing_first_chunk(
     server: SocketAddr,
     path: &str,
     extra_headers: &[(&str, &str)],
+    first_body_tx: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
+) -> Result<H3Response, String> {
+    h3_attempt(
+        H3Attempt {
+            server,
+            path,
+            extra_headers,
+            ..H3Attempt::to(server, path)
+        },
+        first_body_tx,
+    )
+    .await
+}
+
+/// 🎛️ One HTTP/3 request, with everything a mutual-TLS test needs to vary.
+///
+/// The three fields beyond the ordinary ones exist because mutual TLS is
+/// decided from things an HTTP client normally derives for you: `sni` is what
+/// the handshake asks for, `authority` is what the request asks for, and
+/// letting them differ is the whole point of the check being tested.
+struct H3Attempt<'a> {
+    server: SocketAddr,
+    path: &'a str,
+    /// 🏷️ The name sent in the ClientHello.
+    sni: &'a str,
+    /// 🏠 The `:authority` pseudo-header, which is what routing reads.
+    authority: &'a str,
+    extra_headers: &'a [(&'a str, &'a str)],
+    /// 🪪 A client certificate and key, in PEM.
+    identity: Option<(&'a str, &'a str)>,
+}
+
+impl<'a> H3Attempt<'a> {
+    /// 🧾 The ordinary request every other test in this file makes.
+    fn to(server: SocketAddr, path: &'a str) -> Self {
+        Self {
+            server,
+            path,
+            sni: "h3.pingclair.test",
+            authority: "h3.pingclair.test",
+            extra_headers: &[],
+            identity: None,
+        }
+    }
+}
+
+async fn h3_attempt(
+    attempt: H3Attempt<'_>,
     mut first_body_tx: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
 ) -> Result<H3Response, String> {
-    let mut config = quiche::Config::with_boring_ssl_ctx_builder(
-        quiche::PROTOCOL_VERSION,
-        boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()).unwrap(),
-    )
-    .unwrap();
+    let H3Attempt {
+        server,
+        path,
+        sni,
+        authority,
+        extra_headers,
+        identity,
+    } = attempt;
+
+    let mut ssl = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()).unwrap();
+    if let Some((certificate_pem, key_pem)) = identity {
+        let certificate =
+            boring::x509::X509::from_pem(certificate_pem.as_bytes()).expect("client certificate");
+        let key = boring::pkey::PKey::private_key_from_pem(key_pem.as_bytes())
+            .expect("client private key");
+        ssl.set_certificate(&certificate)
+            .expect("set client certificate");
+        ssl.set_private_key(&key).expect("set client key");
+    }
+    let mut config =
+        quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, ssl).unwrap();
     config.verify_peer(false);
     config.set_application_protos(&[ALPN]).unwrap();
     config.set_max_idle_timeout(5_000);
@@ -284,7 +367,7 @@ async fn h3_get_observing_first_chunk(
     boring::rand::rand_bytes(&mut scid).unwrap();
     let scid = quiche::ConnectionId::from_ref(&scid);
 
-    let mut conn = quiche::connect(Some("h3.pingclair.test"), &scid, local, server, &mut config)
+    let mut conn = quiche::connect(Some(sni), &scid, local, server, &mut config)
         .map_err(|e| format!("connect: {e}"))?;
 
     let mut out = [0u8; 1350];
@@ -345,7 +428,7 @@ async fn h3_get_observing_first_chunk(
                 let mut request = vec![
                     quiche::h3::Header::new(b":method", b"GET"),
                     quiche::h3::Header::new(b":scheme", b"https"),
-                    quiche::h3::Header::new(b":authority", b"h3.pingclair.test"),
+                    quiche::h3::Header::new(b":authority", authority.as_bytes()),
                     quiche::h3::Header::new(b":path", path.as_bytes()),
                 ];
                 request.extend(extra_headers.iter().map(|(name, value)| {
@@ -892,5 +975,417 @@ async fn h3_requests_reach_the_access_log_selected_by_hostnames() {
             .unwrap_or_default()
             .is_empty(),
         "a logger scoped to another hostname must stay empty"
+    );
+}
+
+// MARK: - Mutual TLS (K4): HTTP/3 gives the same answer as HTTP/1.1 and HTTP/2
+
+/// 🏛️ A throwaway CA and the leaves it signs.
+///
+/// The second authority in each test matters as much as the first: a client
+/// certificate the server was never told about is the only way to tell a trust
+/// pool that is consulted from one that is merely configured.
+struct H3Authority {
+    ca_pem: String,
+    params: rcgen::CertificateParams,
+    key: rcgen::KeyPair,
+}
+
+impl H3Authority {
+    fn new(common_name: &str) -> Self {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        let key = rcgen::KeyPair::generate().expect("ca key");
+        let ca_pem = params.self_signed(&key).expect("ca certificate").pem();
+        Self {
+            ca_pem,
+            params,
+            key,
+        }
+    }
+
+    fn issue(&self, name: &str) -> (String, String) {
+        let mut params =
+            rcgen::CertificateParams::new(vec![name.to_string()]).expect("leaf params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        let key = rcgen::KeyPair::generate().expect("leaf key");
+        let certificate = params
+            .signed_by(&key, &rcgen::Issuer::from_params(&self.params, &self.key))
+            .expect("leaf certificate");
+        (certificate.pem(), key.serialize_pem())
+    }
+}
+
+/// 🚫 Asserts the connection was refused *by TLS*, not merely that it failed.
+///
+/// `is_err()` on its own would also pass if the server crashed, if the port
+/// were wrong, or if the request timed out — three failures that have nothing
+/// to do with client certificates. A refused handshake shows up as the peer
+/// closing the connection, so that is what gets asserted; a timeout would mean
+/// the test proved nothing.
+fn assert_handshake_refused(outcome: Result<H3Response, String>, what_went_wrong: &str) {
+    match outcome {
+        Ok(response) => panic!("{what_went_wrong}: answered {}", response.status),
+        Err(error) => assert!(
+            error.starts_with("connection closed"),
+            "{what_went_wrong}. The connection did fail, but not as a rejected handshake, so this \
+             run proves nothing: {error}"
+        ),
+    }
+}
+
+/// 🧾 An HTTP/3 listener with one mutual-TLS site beside one ordinary site.
+async fn spawn_h3_mtls_listener(
+    mode: pingclair_core::config::ClientAuthMode,
+    ca_pem: &str,
+) -> (SocketAddr, tempfile::TempDir) {
+    use pingclair_core::config::{ClientAuthConfig, TrustPool};
+
+    let material = tempfile::tempdir().expect("trust material dir");
+    let ca_path = material.path().join("client-ca.pem");
+    std::fs::write(&ca_path, ca_pem).expect("write client CA");
+
+    let policy = Arc::new(
+        CompiledClientAuth::compile(&ClientAuthConfig {
+            mode,
+            trust_pool: Some(TrustPool::File {
+                pem_files: vec![ca_path.to_string_lossy().into_owned()],
+            }),
+            ..Default::default()
+        })
+        .expect("the trust pool compiles"),
+    );
+    let mut table = ClientAuthTable::default();
+    table.insert(&["secure.h3.test"], policy);
+
+    let address = spawn_h3_listener(
+        |address| {
+            let route = |body: &str| RouteConfig {
+                path: "/*".to_string(),
+                handler: HandlerConfig::Respond {
+                    status: 200,
+                    body: Some(body.to_string()),
+                    headers: Default::default(),
+                },
+                methods: None,
+                matcher: None,
+            };
+            vec![
+                ServerConfig {
+                    name: Some("open.h3.test".to_string()),
+                    listen: vec![address.to_string()],
+                    routes: vec![route("open-ok")],
+                    ..Default::default()
+                },
+                ServerConfig {
+                    name: Some("secure.h3.test".to_string()),
+                    listen: vec![address.to_string()],
+                    routes: vec![route("secure-ok")],
+                    ..Default::default()
+                },
+            ]
+        },
+        &["open.h3.test", "secure.h3.test"],
+        Some(Arc::new(table)),
+    )
+    .await;
+    (address, material)
+}
+
+/// 🪪 `require_and_verify` has to mean the same thing over QUIC.
+///
+/// The point of doing this at all: HTTP/1.1 and HTTP/2 go through Pingora's
+/// acceptor while HTTP/3 goes through `tokio-quiche`, two separate TLS setups.
+/// A policy enforced on only one of them is a policy any client opts out of by
+/// choosing the other transport — and `Alt-Svc` invites them to.
+#[tokio::test]
+async fn h3_client_auth_admits_only_the_trusted_client() {
+    let authority = H3Authority::new("H3 Client CA");
+    let stranger = H3Authority::new("Somebody Else's CA");
+    let (address, _material) = spawn_h3_mtls_listener(
+        pingclair_core::config::ClientAuthMode::RequireAndVerify,
+        &authority.ca_pem,
+    )
+    .await;
+    let trusted = authority.issue("client.h3.test");
+    let foreign = stranger.issue("client.h3.test");
+
+    let trusted_ref: (&str, &str) = (&trusted.0, &trusted.1);
+    let foreign_ref: (&str, &str) = (&foreign.0, &foreign.1);
+
+    let no_certificate = h3_attempt(
+        H3Attempt {
+            sni: "secure.h3.test",
+            authority: "secure.h3.test",
+            ..H3Attempt::to(address, "/probe")
+        },
+        None,
+    )
+    .await;
+    assert_handshake_refused(
+        no_certificate,
+        "a client with no certificate completed an HTTP/3 handshake to a site that requires one",
+    );
+
+    let untrusted = h3_attempt(
+        H3Attempt {
+            sni: "secure.h3.test",
+            authority: "secure.h3.test",
+            identity: Some(foreign_ref),
+            ..H3Attempt::to(address, "/probe")
+        },
+        None,
+    )
+    .await;
+    assert_handshake_refused(
+        untrusted,
+        "a certificate from an untrusted CA was accepted over HTTP/3; the trust pool is not being \
+         consulted",
+    );
+
+    let admitted = h3_attempt(
+        H3Attempt {
+            sni: "secure.h3.test",
+            authority: "secure.h3.test",
+            identity: Some(trusted_ref),
+            ..H3Attempt::to(address, "/probe")
+        },
+        None,
+    )
+    .await
+    .expect("the client holding a certificate from the configured CA was turned away");
+    assert_eq!(admitted.status, 200);
+    assert_eq!(admitted.body, b"secure-ok");
+
+    // 🌐 The ordinary site sharing the socket must stay ordinary.
+    let open = h3_attempt(
+        H3Attempt {
+            sni: "open.h3.test",
+            authority: "open.h3.test",
+            ..H3Attempt::to(address, "/probe")
+        },
+        None,
+    )
+    .await
+    .expect("a site without client_auth started demanding certificates over HTTP/3");
+    assert_eq!(open.status, 200);
+    assert_eq!(open.body, b"open-ok");
+}
+
+/// 🛡️ SNI and `:authority` must name the same site, exactly as `Host` must on
+/// the TCP listener.
+///
+/// Without this the HTTP/3 socket would be the easy way around mutual TLS:
+/// handshake as the site that demands nothing, then ask for the site that
+/// demands a certificate.
+#[tokio::test]
+async fn h3_client_auth_refuses_an_authority_the_handshake_did_not_name() {
+    let authority = H3Authority::new("H3 Client CA");
+    let (address, _material) = spawn_h3_mtls_listener(
+        pingclair_core::config::ClientAuthMode::RequireAndVerify,
+        &authority.ca_pem,
+    )
+    .await;
+    let (trusted_cert, trusted_key) = authority.issue("client.h3.test");
+
+    let smuggled = h3_attempt(
+        H3Attempt {
+            sni: "open.h3.test",
+            authority: "secure.h3.test",
+            ..H3Attempt::to(address, "/probe")
+        },
+        None,
+    )
+    .await
+    .expect("the request should be answered, not dropped");
+    assert_eq!(
+        smuggled.status, 421,
+        "an HTTP/3 request reached a mutual-TLS site by naming a different site in its handshake"
+    );
+
+    // 🚫 Holding a valid certificate does not excuse the mismatch either;
+    // otherwise the check would only stop the attacker who forgot to bring one.
+    let smuggled_with_certificate = h3_attempt(
+        H3Attempt {
+            sni: "open.h3.test",
+            authority: "secure.h3.test",
+            identity: Some((&trusted_cert, &trusted_key)),
+            ..H3Attempt::to(address, "/probe")
+        },
+        None,
+    )
+    .await
+    .expect("the request should be answered, not dropped");
+    assert_eq!(smuggled_with_certificate.status, 421);
+
+    // 👍 Naming the same site in both places is ordinary traffic.
+    let honest = h3_attempt(
+        H3Attempt {
+            sni: "open.h3.test",
+            authority: "open.h3.test",
+            ..H3Attempt::to(address, "/probe")
+        },
+        None,
+    )
+    .await
+    .expect("an honest request was refused");
+    assert_eq!(honest.status, 200);
+}
+
+/// 🔍 `verify_if_given` over QUIC: admit the empty-handed client, refuse the
+/// one whose certificate does not chain to the trust pool.
+#[tokio::test]
+async fn h3_client_auth_verify_if_given_checks_only_what_is_offered() {
+    let authority = H3Authority::new("H3 Client CA");
+    let stranger = H3Authority::new("Somebody Else's CA");
+    let (address, _material) = spawn_h3_mtls_listener(
+        pingclair_core::config::ClientAuthMode::VerifyIfGiven,
+        &authority.ca_pem,
+    )
+    .await;
+    let (foreign_cert, foreign_key) = stranger.issue("client.h3.test");
+
+    let empty_handed = h3_attempt(
+        H3Attempt {
+            sni: "secure.h3.test",
+            authority: "secure.h3.test",
+            ..H3Attempt::to(address, "/probe")
+        },
+        None,
+    )
+    .await
+    .expect("`verify_if_given` must admit a client that offers no certificate");
+    assert_eq!(empty_handed.status, 200);
+
+    let untrusted = h3_attempt(
+        H3Attempt {
+            sni: "secure.h3.test",
+            authority: "secure.h3.test",
+            identity: Some((&foreign_cert, &foreign_key)),
+            ..H3Attempt::to(address, "/probe")
+        },
+        None,
+    )
+    .await;
+    assert_handshake_refused(
+        untrusted,
+        "`verify_if_given` verified nothing over HTTP/3: an untrusted certificate was accepted",
+    );
+}
+
+/// 🎫 Attempts two QUIC handshakes, reusing the first one's session on the
+/// second, and reports whether the second actually resumed.
+///
+/// Deliberately raw rather than layered on `h3_attempt`: what is being measured
+/// is a property of the handshake, and everything HTTP would only be noise.
+async fn h3_session_resumes(server: SocketAddr, sni: &str) -> bool {
+    async fn handshake(
+        server: SocketAddr,
+        sni: &str,
+        session: Option<Vec<u8>>,
+    ) -> (bool, Option<Vec<u8>>) {
+        let ssl = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()).unwrap();
+        let mut config =
+            quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, ssl).unwrap();
+        config.verify_peer(false);
+        config.set_application_protos(&[ALPN]).unwrap();
+        config.set_max_idle_timeout(5_000);
+        config.set_max_recv_udp_payload_size(1350);
+        config.set_max_send_udp_payload_size(1350);
+        config.set_initial_max_data(1_000_000);
+        config.set_initial_max_stream_data_bidi_local(100_000);
+        config.set_initial_max_stream_data_bidi_remote(100_000);
+        config.set_initial_max_stream_data_uni(100_000);
+        config.set_initial_max_streams_bidi(10);
+        config.set_initial_max_streams_uni(10);
+
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local = socket.local_addr().unwrap();
+        let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
+        boring::rand::rand_bytes(&mut scid).unwrap();
+        let scid = quiche::ConnectionId::from_ref(&scid);
+        let mut conn =
+            quiche::connect(Some(sni), &scid, local, server, &mut config).expect("connect");
+        if let Some(session) = &session {
+            conn.set_session(session)
+                .expect("install the saved session");
+        }
+
+        let mut out = [0u8; 1350];
+        let mut buf = [0u8; 65535];
+        // ⏳ Long enough for the server's NewSessionTicket, which arrives after
+        // the handshake completes rather than as part of it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            while let Ok((write, info)) = conn.send(&mut out) {
+                socket.send_to(&out[..write], info.to).await.unwrap();
+            }
+            if conn.is_closed() {
+                return (false, None);
+            }
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                received = socket.recv_from(&mut buf) => {
+                    let (len, from) = received.unwrap();
+                    let info = quiche::RecvInfo { from, to: local };
+                    let _ = conn.recv(&mut buf[..len], info);
+                }
+                _ = tokio::time::sleep(Duration::from_millis(50)) => conn.on_timeout(),
+            }
+            if conn.is_established() && (session.is_some() || conn.session().is_some()) {
+                break;
+            }
+        }
+        (conn.is_resumed(), conn.session().map(<[u8]>::to_vec))
+    }
+
+    let (_, saved) = handshake(server, sni, None).await;
+    let Some(saved) = saved else {
+        // 🎫 No ticket was ever issued, so there is nothing to resume with.
+        return false;
+    };
+    handshake(server, sni, Some(saved)).await.0
+}
+
+/// 🚫 A mutual-TLS listener must not resume a TLS session.
+///
+/// A resumed TLS 1.3 handshake carries no `CertificateRequest`: BoringSSL
+/// restores the peer's chain from the ticket and never re-checks it, so a
+/// ticket would keep admitting its holder after the certificate behind it
+/// expired or the trust pool changed.
+///
+/// 🎯 The control is the whole test. Asserting only "the mutual-TLS listener
+/// did not resume" would pass just as happily if this harness could never
+/// resume anything — so the ordinary listener has to resume first, in the same
+/// process, through the same code.
+#[tokio::test]
+async fn h3_client_auth_turns_session_resumption_off() {
+    let ordinary = spawn_h3_server(HandlerConfig::Respond {
+        status: 200,
+        body: Some("ok".to_string()),
+        headers: Default::default(),
+    })
+    .await;
+    assert!(
+        h3_session_resumes(ordinary, "h3.pingclair.test").await,
+        "this harness cannot resume a session even against an ordinary listener, so it cannot \
+         show that a mutual-TLS listener refuses to"
+    );
+
+    let authority = H3Authority::new("H3 Client CA");
+    let (mtls, _material) = spawn_h3_mtls_listener(
+        pingclair_core::config::ClientAuthMode::VerifyIfGiven,
+        &authority.ca_pem,
+    )
+    .await;
+    assert!(
+        !h3_session_resumes(mtls, "secure.h3.test").await,
+        "a mutual-TLS listener resumed a TLS session; a resumed handshake asks for no certificate, \
+         so the ticket outlives the policy that issued it"
     );
 }

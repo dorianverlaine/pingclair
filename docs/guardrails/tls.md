@@ -158,6 +158,30 @@
   `VerifyConnection`（每條連線都跑，含 resumed）補的；
   BoringSSL 沒有等價 hook，所以我們關 resumption。
 
-- 🚫 **H3 還沒驗客戶端憑證，所以有 `client_auth` 的位址不啟動 QUIC、
-  也不發 `Alt-Svc`。** 發了等於主動把客戶端推去那條不檢查的傳輸。
-  這條在 K4 完成後解除。
+- 🛡️ **兩個 transport 必須給同一個答案，而它們是兩套 TLS 設定。**
+  H1/H2 走 Pingora acceptor 的 `cert_cb`，H3 走 `tokio-quiche` 的
+  `set_select_certificate_callback`——**QUIC 根本不跑 `cert_cb`**。
+  兩邊都在「ClientHello 已知、`CertificateRequest` 未送」的那個窗口裡，
+  所以同一份 `CompiledClientAuth` 可以直接掛上去。
+  📌 政策編譯層因此住在 `pingclair-proxy/src/client_auth.rs` 而不是 binary 裡：
+  只在一個 transport 上成立的安全開關，等於給攻擊者一個「換傳輸」的選項，
+  而 `Alt-Svc` 還會主動邀請他們換。
+  🚫 K3 落地時 H3 尚未驗，當時的 fail-closed 做法是**有 `client_auth` 的位址
+  不啟 QUIC、不發 `Alt-Svc`**；K4（`4e4b05e` 之後）補上之後這條已解除。
+
+- 🤡 **quiche 會覆寫你設的 session cache mode，所以在 QUIC 上關 resumption
+  只能靠 `SSL_OP_NO_TICKET`。**
+  `Context::from_boring`（quiche 0.29.3 `src/tls/mod.rs:155`）接手你的
+  `SslContextBuilder` 之後，**無條件**呼叫
+  `set_session_callback()` → `SSL_CTX_set_session_cache_mode(ctx,
+  SSL_SESS_CACHE_CLIENT)`（`:264`）來裝它自己的 client session callback。
+  你在 builder 上設的 `SslSessionCacheMode::OFF` 當場被蓋掉。
+  **options 則是累加的**，quiche 從不清除，所以 `NO_TICKET` 活得下來。
+  📌 我第一版兩個都設了，還寫了一段「雙保險」的註釋——**一個被默默還原的保護
+  比一個誠實的保護更糟**，因為它讓下一個讀的人以為有兩層。
+  🎯 這條是**測出來的不是讀出來的**：`h3_client_auth_turns_session_resumption_off`
+  先證明同一支 harness 對普通 listener **resume 得起來**（沒有這個對照組，
+  「沒 resume」也可能只是 harness 不會 resume），再證明 mTLS listener 不會。
+  H1/H2 那邊沒有這層覆寫——`TlsSettings::build()` 只是
+  `accept_builder.build()`，中間沒有人碰 options——所以那邊是靠推理成立的，
+  這個不對稱刻意寫下來。

@@ -23,11 +23,11 @@
 //! one over AIA — so it looks fine in a browser and fails hard in `curl`, Go,
 //! and Java. Hence a whole chain everywhere, never a single certificate.
 
-use crate::client_auth::ClientAuthTable;
 use boring::pkey::{PKey, Private};
 use boring::ssl::NameType;
 use boring::x509::X509;
 use parking_lot::RwLock;
+use pingclair_proxy::client_auth::ClientAuthTable;
 use pingclair_proxy::tls_identity::DownstreamTlsIdentity;
 use pingclair_tls::manager::TlsManager;
 use pingora_core::listeners::TlsAccept;

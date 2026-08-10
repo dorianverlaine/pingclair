@@ -18,7 +18,6 @@
 //! has a TRIAGE row instead of being smuggled in here.
 
 use crate::certs::{DynamicCertResolver, eager_issuance_domains, refresh_h3_cert_table};
-use crate::client_auth::{ClientAuthTable, CompiledClientAuth};
 use crate::listen::{
     automatic_http_companion, can_bind_automatic_http_port, explicit_http_names,
     normalize_listen_addr, reserve_private_listener_address, server_requires_tls,
@@ -28,6 +27,7 @@ use crate::paths::tls_store_dir;
 use crate::runtime_listeners::RuntimeListeners;
 use crate::systemd::{notify_systemd_ready, notify_systemd_stopping};
 use parking_lot::RwLock;
+use pingclair_proxy::client_auth::{ClientAuthTable, CompiledClientAuth};
 use pingora_core::listeners::tls::TlsSettings;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -636,21 +636,12 @@ pub(crate) fn run_server(
                 // advertise Alt-Svc on this listener and queue the port for
                 // a QUIC socket.
                 //
-                // 🚫 Except where a site demands a client certificate. The
-                // HTTP/3 listener does not verify one yet, so starting it here
-                // would make the same site demand proof over TCP and admit
-                // everyone over QUIC — and advertising `Alt-Svc` would actively
-                // push clients onto the transport that checks nothing. Not
-                // starting it is the fail-closed answer, and saying so is the
-                // difference between a limitation and a silent hole.
-                if http3_globally_enabled && requires_client_auth {
-                    tracing::warn!(
-                        "🚫 HTTP/3 is not started on {} because a site there requires a client \
-                         certificate, and the HTTP/3 listener cannot verify one yet; HTTP/1.1 \
-                         and HTTP/2 on this address enforce it normally",
-                        addr
-                    );
-                } else if http3_globally_enabled {
+                // 🪪 A listener demanding a client certificate starts HTTP/3
+                // like any other: `quic.rs` installs the same compiled policy
+                // through its own BoringSSL context, and enforces the same
+                // SNI-against-`:authority` rule. Suppressing HTTP/3 here was
+                // the fail-closed answer while that was not true.
+                if http3_globally_enabled {
                     https_ports.push(addr.clone());
                     http3_enabled = true;
 
@@ -720,6 +711,11 @@ pub(crate) fn run_server(
         let proxies_for_task = port_proxies.clone();
         let domains_for_task = h3_domains.clone();
         let blocked_for_task = h3_blocked_ips.clone();
+        // 🪪 The same compiled policies the TCP acceptor uses. Built once at
+        // startup and shared, so the two transports cannot answer differently
+        // — a client-auth policy that held on one and not the other would be
+        // an invitation to use the other.
+        let client_auth_for_task = client_auth_by_address.clone();
 
         bg_handle.spawn(async move {
             // Populate the table before serving so the first handshake can
@@ -745,6 +741,10 @@ pub(crate) fn run_server(
                     socket_addr,
                     proxy,
                     table_for_task.clone(),
+                    client_auth_for_task
+                        .get(addr_str.as_str())
+                        .filter(|table| !table.is_empty())
+                        .cloned(),
                     h3_pool_size,
                     blocked_for_task.clone(),
                 );
