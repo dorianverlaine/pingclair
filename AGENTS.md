@@ -306,6 +306,15 @@ POST bodies with and without Content-Length, 413, and upstream keepalive.
 
 ### Hot paths
 
+**The comparison point is nginx, and that shapes new code, not just reviews of
+old code.** Before a new function goes on a request path, answer four
+questions: could configuration have decided this (then precompute it into
+`ProxyState`); does it allocate (borrow, or own it at startup); does it lock,
+and does the lock cross an `await` (the second is a defect); is it bounded
+(bodies stream, queues have capacity). Off the request path — startup, reload,
+admin, CLI — optimise for clarity instead and say so. `CLAUDE.md` carries the
+long form.
+
 Performance is a correctness requirement:
 
 - no per-request regex compilation, config parsing, DNS resolution, or

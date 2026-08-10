@@ -184,6 +184,47 @@ could not express something a user will eventually want to express. Note which
 directive was missing or misbehaving, then fix it. Use JSON only where there is
 genuinely no DSL equivalent, and say which case that was.
 
+### 🏎️ Write it fast the first time
+
+This is a web server whose comparison point is nginx. That is not an aspiration
+to be revisited later; it is the standing constraint on how new code is shaped.
+The rule below about fixing problems you walk past is about code that already
+exists. This one is about code you are writing now: **the first version should
+already have the right shape**, because a request path is not somewhere you get
+to iterate — it runs a hundred thousand times a second, and by the time a
+profile shows the cost, the shape is load-bearing and three callers deep.
+
+Four questions to answer before a new function goes on a request path:
+
+1. **Could configuration have decided this?** If the answer at request time can
+   never differ from the answer at load time, compute it at load time and put it
+   in `ProxyState`. Parsing, regex compilation, DNS resolution, path
+   canonicalization, trust-store construction, and header-name lookup tables all
+   belong there. This is the single most common defect in this codebase.
+2. **Does it allocate?** A `String` built to be compared once, a `Vec` collected
+   to be iterated once, a `to_string()` before a match — all avoidable. Borrow,
+   compare in place, or precompute an owned copy at startup. `Arc<str>` over
+   `String` when the value is shared and never mutated.
+3. **Does it lock, and does the lock cross an `await`?** Published snapshots go
+   through `ArcSwap`, which is why readers never block. A `Mutex` on a request
+   path needs a reason written next to it; one held across an `await` is a
+   defect, not a trade.
+4. **Is it bounded?** Bodies stream, queues have capacity, and buffers have
+   ceilings that do not scale with what a client sends. "It works on a 2 KB
+   response" is not evidence about a 20 MB one.
+
+Two things this rule is *not*. It is not licence to hand-roll or vendor: this
+repository deleted 38,532 lines of forks that were all plausible and none
+measured. And it is not licence to complicate — an obvious `O(n)` scan over
+three items beats a `HashMap` that has to be built first, and the simpler code
+is usually also the faster one. When a fast shape and a clear shape genuinely
+conflict on a hot path, take the fast one and write the sentence that explains
+why to the next reader.
+
+📌 Off the request path — startup, reload, admin endpoints, the CLI — optimise
+for clarity instead, and say so. Startup can afford to be slow and obvious. A
+handshake cannot.
+
 ### ⚡ Fix performance problems you walk past
 
 While you are already in a function, treat per-request work that configuration
