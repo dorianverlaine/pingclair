@@ -5639,7 +5639,22 @@ impl ProxyHttp for PingclairProxy {
                     // request, so answer 404 now. Returning Ok(false) here
                     // would land in upstream_peer with no state and surface
                     // as a 500 (ConnectNoRoute).
-                    Self::write_simple_response(session, ctx, 404, "404 Not Found").await?;
+                    //
+                    // 📏 The body is empty, matching what upstream sends for
+                    // the same status (measured 2026-08-07). The status is
+                    // the answer; a body repeating it in prose is one more
+                    // thing for a differential run to flag as a difference
+                    // that turns out not to matter.
+                    let mut header = Self::build_downstream_header(session, 404, Some(1)).unwrap();
+                    header.insert_header("Content-Length", "0").unwrap();
+                    self.write_local_response(
+                        session,
+                        ctx,
+                        header,
+                        LocalResponseBody::Empty,
+                        false,
+                    )
+                    .await?;
                     return Ok(true);
                 }
             };

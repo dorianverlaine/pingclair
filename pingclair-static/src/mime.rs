@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dorian Verlaine
 
-#![allow(dead_code)]
-//! MIME type handling
+//! 🧭 MIME type handling.
+//!
+//! 📌 No blanket `allow(dead_code)` here. It used to carry one because
+//! `build_meta` inlined `guess_mime_type` instead of calling it, so the
+//! function looked unused — and the attribute then suppressed dead-code
+//! warnings on everything else in the file too. The duplication is gone, so
+//! the lint is back on and can do its job.
 
 /// Get MIME type for a file extension
 pub fn guess_mime_type(path: &str) -> String {

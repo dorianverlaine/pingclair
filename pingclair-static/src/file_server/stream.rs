@@ -195,9 +195,19 @@ impl FileServer {
         })
     }
 
-    /// 📏 Check if a file should be served with streaming (based on size).
+    /// 📏 Reports whether a request path names a file big enough to stream.
+    ///
+    /// 🛡️ Goes through `resolve_path` like every other entry point, so a
+    /// `..` in the request cannot reach outside the document root. It used to
+    /// join the path onto `config.root` directly — no caller in this
+    /// workspace reached it, but it is a `pub` method on a `pub` type, which
+    /// makes it reachable API and a trap for whoever wires up the next
+    /// caller. A path outside the root now answers `false`, the same as a
+    /// path that does not exist.
     pub async fn should_stream(&self, path: &str) -> Result<bool> {
-        let file_path = self.config.root.join(path.trim_start_matches('/'));
+        let Some(file_path) = self.resolve_path(path) else {
+            return Ok(false);
+        };
         match std::fs::metadata(&file_path) {
             Ok(m) => Ok(m.len() > Self::STREAMING_THRESHOLD),
             Err(_) => Ok(false),
@@ -374,5 +384,40 @@ mod stream_decision_tests {
         assert!(server(false).should_stream_response(BIG, None, Some("gzip")));
         // Unsupported encodings don't count as negotiated.
         assert!(fs.should_stream_response(BIG, None, Some("identity")));
+    }
+}
+
+#[cfg(test)]
+mod should_stream_tests {
+    use super::*;
+
+    /// 🛡️ `should_stream` goes through the docroot check like everything else.
+    ///
+    /// It used to join the request path onto the root directly. No caller in
+    /// this workspace reached it, but it is `pub` on a `pub` type — a trap for
+    /// whoever wires up the next one.
+    #[tokio::test]
+    async fn should_stream_refuses_a_path_outside_the_document_root() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        // 📦 Large enough that a positive answer would be about the size
+        // check rather than about the file merely existing.
+        std::fs::write(base.path().join("secret.bin"), vec![0u8; 2 * 1024 * 1024]).unwrap();
+        std::fs::write(root.join("public.bin"), vec![0u8; 2 * 1024 * 1024]).unwrap();
+
+        let fs = FileServer::new(FileServerConfig {
+            root: root.clone(),
+            ..FileServerConfig::default()
+        });
+
+        assert!(
+            fs.should_stream("/public.bin").await.unwrap(),
+            "a large file inside the root must stream, or the control below proves nothing"
+        );
+        assert!(
+            !fs.should_stream("/../secret.bin").await.unwrap(),
+            "a traversal reached outside the document root"
+        );
     }
 }

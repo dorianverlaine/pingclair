@@ -271,6 +271,18 @@ lets the rest converge.
   rather than through temporary files.
 - 🔐 **TLS.** A persistent internal CA for private origins, and durable ACME
   state across restarts.
+- 📏 **`Range` handling follows RFC 9110 instead of guessing.** Three defects,
+  all in one function, all found by executing it rather than reading it. A
+  `Range` request for a **zero-byte file** underflowed `file_size - 1` before
+  any guard could run — a debug build panicked the worker and dropped the
+  connection, for a well-formed `bytes=0-5`; release wrapped and answered
+  correctly, which is the only reason it was not shipping. A **malformed
+  range** was silently repaired: `bytes=abc-99` became a 206 for bytes 0-99,
+  a partial body answering a request the server could not read; it is now
+  ignored, and the full body is served as nginx and Caddy do. And a **suffix
+  range was read backwards** — `bytes=-5` means the *last* five bytes, and the
+  first six were served instead.
+
 - 📁 **`file_server` takes the subdirectives the format defines.** `hide`,
   `status`, `pass_thru`, `disable_canonical_uris`, `etag_file_extensions` and
   `precompressed` all work; `fs` selects a file-system module this build does

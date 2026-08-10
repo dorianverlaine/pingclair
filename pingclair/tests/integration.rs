@@ -10346,3 +10346,93 @@ async fn test_file_server_canonical_redirect_uses_the_original_request() {
     assert_eq!(followed.status(), 200);
     assert_eq!(followed.text().await.unwrap(), "<h1>inside</h1>");
 }
+
+/// 🕳️ A Range request for a zero-byte file must be answered, not panic.
+///
+/// Measured on 2026-08-06: `Range: bytes=0-5` against an empty file panicked
+/// the proxy worker and dropped the connection in a debug build, because
+/// `unwrap_or(file_size - 1)` evaluated `0 - 1` before any guard could run.
+/// Release wrapped instead of trapping, so the shipped binary was correct and
+/// only debug/test builds aborted — which is the only reason it was P2. Note
+/// `panic = "abort"` is set: the day anyone enables `overflow-checks` for
+/// release, this stops being a thread dying and becomes the process dying.
+///
+/// 🎯 That is why this test drives the real binary rather than calling
+/// `parse_range` — the unit tests cover the arithmetic, this covers the
+/// server surviving.
+#[tokio::test]
+async fn test_range_request_for_an_empty_file_does_not_kill_the_worker() {
+    let tree = tempfile::tempdir().expect("document root");
+    std::fs::write(tree.path().join("empty.txt"), b"").expect("write empty file");
+    std::fs::write(tree.path().join("full.txt"), b"0123456789").expect("write full file");
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+            file_server
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+        }}
+        "#,
+        root = tree.path().to_string_lossy()
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    let response = client
+        .get(server.url(0, "/empty.txt"))
+        .header("Range", "bytes=0-5")
+        .send()
+        .await
+        .expect("the connection was dropped, which is what the panic looked like");
+    assert_eq!(
+        response.status(),
+        200,
+        "an unsatisfiable range must be ignored and the whole (empty) file served"
+    );
+    assert_eq!(response.text().await.unwrap(), "");
+
+    // 🚫 A range the server cannot read is ignored too: the full body, not a
+    // partial one the client never asked for.
+    let repaired = client
+        .get(server.url(0, "/full.txt"))
+        .header("Range", "bytes=abc-99")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(repaired.status(), 200, "a malformed Range produced a 206");
+    assert_eq!(repaired.text().await.unwrap(), "0123456789");
+
+    // 📐 …and a suffix range counts back from the end.
+    let suffix = client
+        .get(server.url(0, "/full.txt"))
+        .header("Range", "bytes=-3")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(suffix.status(), 206);
+    assert_eq!(
+        suffix
+            .headers()
+            .get("content-range")
+            .map(|v| v.to_str().unwrap()),
+        Some("bytes 7-9/10")
+    );
+    assert_eq!(suffix.text().await.unwrap(), "789");
+
+    // 🎯 The server is still alive after all of it — the panic this pins
+    // killed the worker, so a later request was the symptom.
+    let after = client
+        .get(server.url(0, "/full.txt"))
+        .send()
+        .await
+        .expect("the server died partway through");
+    assert_eq!(after.status(), 200);
+}

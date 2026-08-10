@@ -477,31 +477,74 @@ impl FileServer {
     }
 
     /// Parse Range header (bytes=start-end)
+    /// 📏 Reads a single-range `Range` header, or `None` to serve the whole
+    /// file.
+    ///
+    /// `None` is not an error path — it is how an unsatisfiable or
+    /// unintelligible range is handled, and RFC 9110 §14.2 says exactly that:
+    /// a recipient that cannot understand a range request "MUST ignore" the
+    /// header. nginx and Caddy both answer 200 with the full body.
+    ///
+    /// 🤡 Three defects lived in the previous version of this function, all
+    /// found by executing it rather than reading it:
+    ///
+    /// 1. **A zero-byte file panicked a debug build.** `unwrap_or(file_size -
+    ///    1)` evaluates its argument eagerly, so `0 - 1` underflowed before
+    ///    the `start >= file_size` guard could run — for a well-formed
+    ///    `bytes=0-5`, not only a malformed one. Release wrapped to
+    ///    `u64::MAX` and the guard caught it, which is the only reason this
+    ///    was not shipping. The guard is now the first thing that happens.
+    /// 2. **A malformed range was silently repaired.** `parse().ok().
+    ///    unwrap_or(0)` turned `bytes=abc-99` into a 206 for bytes 0-99 — a
+    ///    partial body answering a request the server could not read. Every
+    ///    parse is now fallible and a failure means "ignore the header".
+    /// 3. **A suffix range was read backwards.** `bytes=-5` means *the last
+    ///    five bytes*; splitting on `-` produced an empty start that fell
+    ///    through to 0, so the first six were served instead. Nothing in the
+    ///    TRIAGE rows named this one; it surfaced while rewriting the rest.
     fn parse_range(&self, header: &str, file_size: u64) -> Option<(u64, u64)> {
-        if !header.starts_with("bytes=") {
+        let spec = header.strip_prefix("bytes=")?.trim();
+
+        // 🕳️ Nothing can be satisfied in an empty file, and answering this
+        // first is what keeps every subtraction below in range.
+        if file_size == 0 {
             return None;
         }
-        let val = &header[6..];
-        let parts: Vec<&str> = val.split('-').collect();
-        if parts.len() != 2 {
+        let last = file_size - 1;
+
+        // 🚫 A multi-range request is served whole rather than as the first
+        // range, which would be a body the client did not ask for. Falls out
+        // of the parse below too — `1,5-6` is not a number — but saying so
+        // here is cheaper than leaving the reader to derive it.
+        if spec.contains(',') {
             return None;
         }
 
-        let start_str = parts[0];
-        let end_str = parts[1];
+        let (start_spec, end_spec) = spec.split_once('-')?;
+        let start_spec = start_spec.trim();
+        let end_spec = end_spec.trim();
 
-        let start = start_str.parse::<u64>().ok().unwrap_or(0);
-        let end = if end_str.is_empty() {
-            file_size - 1
+        // 📐 `bytes=-N`: the last N bytes. An N past the file's length is not
+        // an error — it means "as much as there is", per RFC 9110 §14.1.2.
+        if start_spec.is_empty() {
+            let wanted: u64 = end_spec.parse().ok()?;
+            if wanted == 0 {
+                return None;
+            }
+            return Some((file_size.saturating_sub(wanted), last));
+        }
+
+        let start: u64 = start_spec.parse().ok()?;
+        let end: u64 = if end_spec.is_empty() {
+            last
         } else {
-            end_str.parse::<u64>().ok().unwrap_or(file_size - 1)
+            end_spec.parse().ok()?
         };
 
-        if start > end || start >= file_size {
+        if start > end || start > last {
             return None;
         }
-
-        Some((start, std::cmp::min(end, file_size - 1)))
+        Some((start, end.min(last)))
     }
 }
 
@@ -881,5 +924,87 @@ fn path_basename(path: &str) -> &str {
     match trimmed.rfind('/') {
         Some(index) => &trimmed[index + 1..],
         None => trimmed,
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    fn server(root: &std::path::Path) -> FileServer {
+        FileServer::new(FileServerConfig {
+            root: root.to_path_buf(),
+            ..FileServerConfig::default()
+        })
+    }
+
+    /// 🕳️ A zero-byte file can satisfy no range, and asking must not underflow.
+    ///
+    /// This is the shape that panicked a debug build: `unwrap_or(file_size -
+    /// 1)` evaluated `0 - 1` eagerly, before any guard could run, for a
+    /// perfectly well-formed request.
+    #[test]
+    fn a_zero_byte_file_answers_no_range_instead_of_underflowing() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = server(dir.path());
+        for header in ["bytes=0-5", "bytes=0-", "bytes=-5", "bytes=0-0"] {
+            assert_eq!(
+                fs.parse_range(header, 0),
+                None,
+                "{header} against an empty file must be ignored, not computed"
+            );
+        }
+    }
+
+    /// 🚫 A range the server cannot read is ignored, not repaired.
+    ///
+    /// `bytes=abc-99` used to become a 206 for bytes 0-99 — a partial body
+    /// answering a request nobody made. RFC 9110 §14.2 says to ignore it, and
+    /// both nginx and Caddy answer 200.
+    #[test]
+    fn an_unreadable_range_is_ignored_rather_than_guessed() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = server(dir.path());
+        for header in [
+            "bytes=abc-99",
+            "bytes=0-xyz",
+            "bytes=",
+            "bytes=5",
+            "items=0-5",
+            "bytes=0-1,5-6",
+        ] {
+            assert_eq!(fs.parse_range(header, 100), None, "{header} was repaired");
+        }
+    }
+
+    /// 📐 A suffix range is the *last* N bytes.
+    ///
+    /// Splitting on `-` left an empty start that fell through to zero, so
+    /// `bytes=-5` served the first six bytes instead of the last five.
+    #[test]
+    fn a_suffix_range_counts_back_from_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = server(dir.path());
+        assert_eq!(fs.parse_range("bytes=-5", 100), Some((95, 99)));
+        // 📏 More than the file holds is "as much as there is", not an error.
+        assert_eq!(fs.parse_range("bytes=-500", 100), Some((0, 99)));
+        // 🚫 Zero bytes is not a range anyone can serve.
+        assert_eq!(fs.parse_range("bytes=-0", 100), None);
+    }
+
+    /// 👍 The ordinary forms still work, or the fixes above would have been
+    /// bought by breaking the feature.
+    #[test]
+    fn ordinary_ranges_are_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = server(dir.path());
+        assert_eq!(fs.parse_range("bytes=0-5", 100), Some((0, 5)));
+        assert_eq!(fs.parse_range("bytes=10-", 100), Some((10, 99)));
+        // 📏 An end past the file is clamped, which is what makes
+        // `bytes=0-99999` a valid request for the whole thing.
+        assert_eq!(fs.parse_range("bytes=0-99999", 100), Some((0, 99)));
+        // 🚫 …but a start past the end is unsatisfiable.
+        assert_eq!(fs.parse_range("bytes=100-200", 100), None);
+        assert_eq!(fs.parse_range("bytes=5-1", 100), None);
     }
 }

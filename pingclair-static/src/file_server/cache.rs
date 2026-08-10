@@ -201,11 +201,11 @@ impl FileServer {
         size: u64,
         etag_file_extensions: &[String],
     ) -> FileMeta {
-        let mime_type = crate::mime::with_charset(
-            mime_guess::from_path(file_path)
-                .first_raw()
-                .unwrap_or("application/octet-stream"),
-        );
+        // 🧭 One place decides what a file's type is. This used to inline
+        // exactly what `guess_mime_type` does, and the duplication is why
+        // `mime.rs` carried a blanket `allow(dead_code)` — which then hid
+        // dead-code warnings on everything else in that file.
+        let mime_type = crate::mime::guess_mime_type(&file_path.to_string_lossy());
         let last_modified = metadata.modified().ok().map(httpdate::fmt_http_date);
         let modified_secs = metadata
             .modified()

@@ -109,9 +109,6 @@ impl FileServer {
 
     // MARK: - Negotiation
 
-    /// Pick a content encoding from an `Accept-Encoding` header.
-    /// Priority: br > zstd > gzip. Returns `None` if the client accepts none
-    /// of them (or sent no header), meaning "serve uncompressed".
     /// 🗜️ Codings this server will produce, in preference order.
     ///
     /// Brotli stays in the list even though the DSL refuses `encode br`,
@@ -121,7 +118,12 @@ impl FileServer {
     /// inconsistency with the proxy path is recorded rather than papered over.
     const OFFERED: &'static [&'static str] = &["br", "zstd", "gzip"];
 
-    /// Picks the coding for a response, honouring the client's quality values.
+    /// 🗜️ Picks the coding for a response, honouring the client's quality
+    /// values.
+    ///
+    /// `None` means "serve uncompressed" — the client accepted none of
+    /// [`Self::OFFERED`], or sent no `Accept-Encoding` at all. It is an
+    /// ordinary answer, not a failure.
     ///
     /// This used to be `header.contains("gzip")`. Day 26 measured what that
     /// costs: a client sending `Accept-Encoding: gzip;q=0` — an explicit
