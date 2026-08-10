@@ -9365,3 +9365,74 @@ async fn test_global_log_channel_receives_the_source_it_includes() {
         "a channel subscribing to another source must stay empty"
     );
 }
+
+/// 🎲 `sampling` holds the line count down without silencing the log.
+///
+/// The policy below keeps the first two entries of a very long window and then
+/// one in every five. Twelve requests must therefore leave far fewer than
+/// twelve lines — but not zero, because a sampling policy that logs nothing is
+/// indistinguishable from a broken sink.
+#[tokio::test]
+async fn test_log_sampling_keeps_a_bounded_share_of_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("sampled.log");
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            log {{
+                output file {log}
+                format json
+                sampling {{
+                    interval 1h
+                    first 2
+                    thereafter 5
+                }}
+            }}
+
+            respond "ok" 200
+        }}
+        "#,
+        log = log.display(),
+    );
+
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    for _ in 0..12 {
+        let response = client.get(server.url(0, "/sampled")).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
+    // 🕰️ The writer thread owns the sink, so lines are queued rather than
+    // written before the response returns.
+    let mut lines = 0;
+    for _ in 0..50 {
+        lines = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("/sampled"))
+            .count();
+        if lines >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(
+        lines >= 2,
+        "the opening entries of the window must always be kept, got {lines}"
+    );
+    assert!(
+        lines < 12,
+        "sampling had no effect: every one of the twelve requests was logged"
+    );
+}

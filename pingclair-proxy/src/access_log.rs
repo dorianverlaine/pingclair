@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use crate::metrics;
 
@@ -364,6 +365,8 @@ pub struct AccessLogger {
     /// 🔌 Which log sources this destination subscribes to. Empty on both
     /// sides — the common case — admits everything and costs one length check.
     namespaces: NamespaceFilter,
+    /// 🎲 Optional rate policy. `None` is the common case and costs one branch.
+    sampling: Option<SamplingWindow>,
 }
 
 // MARK: - Host selection
@@ -426,6 +429,95 @@ impl HostPattern {
             .iter()
             .zip(labels)
             .all(|(expected, actual)| expected.eq_ignore_ascii_case(actual))
+    }
+}
+
+// MARK: - Sampling
+
+/// 🎲 Keeps a bounded share of entries inside a rolling window.
+///
+/// Sampling exists for the load where the log itself becomes the cost: the
+/// first `first` entries of each window are kept, and after that one in every
+/// `thereafter`. The window then resets, so a burst is represented rather than
+/// recorded in full and a quiet period is unaffected.
+///
+/// 🚫 The lines this drops are **not** counted in
+/// [`metrics::ACCESS_LOG_DROPPED_TOTAL`]. That metric means "the writer could
+/// not keep up", which is a fault an operator should act on; a sampled line is
+/// a line they asked not to have. One counter cannot mean both without making
+/// the alerting useless.
+struct SamplingWindow {
+    /// ⏱️ Monotonic base, because an atomic cannot hold an `Instant` and the
+    /// wall clock can step backwards.
+    origin: Instant,
+    interval_nanos: u64,
+    first: u64,
+    thereafter: u64,
+    /// 🪟 Start of the current window, in nanoseconds since `origin`.
+    window_start: AtomicU64,
+    /// 🔢 Entries seen in the current window.
+    count: AtomicU64,
+}
+
+impl SamplingWindow {
+    /// 🧭 Builds a window, filling in upstream's defaults for anything unset.
+    ///
+    /// Zero means "not specified" in the configuration, and upstream substitutes
+    /// one second and one hundred. Treating zero literally would mean a window
+    /// that expires instantly or a `first` of none, both of which turn a tuning
+    /// knob into an outage of the log.
+    fn new(policy: pingclair_core::config::LogSampling) -> Self {
+        let interval_secs = if policy.interval_secs == 0 {
+            1
+        } else {
+            policy.interval_secs
+        };
+        Self {
+            origin: Instant::now(),
+            interval_nanos: interval_secs.saturating_mul(1_000_000_000),
+            first: if policy.first == 0 {
+                100
+            } else {
+                policy.first as u64
+            },
+            thereafter: policy.thereafter as u64,
+            window_start: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    /// 🎯 Whether this entry survives sampling.
+    ///
+    /// Lock-free on purpose: this runs on the request path, and a mutex here
+    /// would serialise every request behind whichever one is currently deciding
+    /// whether to write a log line. The window handover uses one
+    /// compare-exchange so exactly one thread resets the counter; a thread that
+    /// increments across the boundary is off by one entry, which is the right
+    /// trade for a mechanism whose whole purpose is approximation.
+    fn admits(&self) -> bool {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+
+        let now = self.origin.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let start = self.window_start.load(Acquire);
+        if now.saturating_sub(start) >= self.interval_nanos
+            && self
+                .window_start
+                .compare_exchange(start, now, AcqRel, Acquire)
+                .is_ok()
+        {
+            self.count.store(0, Release);
+        }
+
+        let seen = self.count.fetch_add(1, AcqRel) + 1;
+        if seen <= self.first {
+            return true;
+        }
+        // 📌 `thereafter 0` means nothing beyond the first entries is kept,
+        // which is a meaningful setting rather than a division by zero.
+        if self.thereafter == 0 {
+            return false;
+        }
+        (seen - self.first).is_multiple_of(self.thereafter)
     }
 }
 
@@ -1074,6 +1166,7 @@ impl AccessLogger {
             response_headers: config.response_headers.clone(),
             include_tls: config.include_tls,
             namespaces: NamespaceFilter::new(config.include.clone(), config.exclude.clone()),
+            sampling: config.sampling.map(SamplingWindow::new),
         }))
     }
 
@@ -1106,6 +1199,13 @@ impl AccessLogger {
     /// that cannot be written must never take down the request that produced
     /// the line.
     pub fn log(&self, entry: &AccessEntry<'_>) {
+        // 🎲 Decided before the line is formatted, because formatting is the
+        // expensive part and a sampled entry is one nobody will ever read.
+        if let Some(sampling) = &self.sampling
+            && !sampling.admits()
+        {
+            return;
+        }
         let line = match self.format {
             LogFormat::Json => self.format_json(entry),
             LogFormat::Text => self.format_text(entry),
@@ -1350,7 +1450,82 @@ mod tests {
             response_headers: Vec::new(),
             include_tls: false,
             namespaces: NamespaceFilter::default(),
+            sampling: None,
         }
+    }
+
+    // MARK: - Sampling
+
+    fn window(interval_secs: u64, first: usize, thereafter: usize) -> SamplingWindow {
+        SamplingWindow::new(pingclair_core::config::LogSampling {
+            interval_secs,
+            first,
+            thereafter,
+        })
+    }
+
+    /// 🎲 The first `first` entries are kept, then one in every `thereafter`.
+    #[test]
+    fn the_first_entries_are_kept_then_one_in_every_thereafter() {
+        let sampling = window(3600, 3, 4);
+        // 🥇 The opening burst goes through untouched.
+        assert!(sampling.admits());
+        assert!(sampling.admits());
+        assert!(sampling.admits());
+        // 📉 Then entries 4, 5, 6 are dropped and 7 — the fourth after the
+        // first three — is kept.
+        assert!(!sampling.admits());
+        assert!(!sampling.admits());
+        assert!(!sampling.admits());
+        assert!(sampling.admits());
+        assert!(!sampling.admits());
+    }
+
+    /// 🚫 `thereafter 0` keeps only the opening entries, and is not a divide by zero.
+    #[test]
+    fn thereafter_zero_keeps_nothing_after_the_first() {
+        let sampling = window(3600, 2, 0);
+        assert!(sampling.admits());
+        assert!(sampling.admits());
+        for _ in 0..10 {
+            assert!(!sampling.admits());
+        }
+    }
+
+    /// 🪟 A new window restores the full allowance.
+    #[test]
+    fn the_allowance_returns_when_the_window_rolls() {
+        // ⏱️ A window shorter than the test's own runtime, so the second call
+        // is guaranteed to land in a fresh one.
+        let sampling = window(0, 1, 0);
+        assert!(sampling.admits(), "the first entry of the first window");
+        assert!(!sampling.admits(), "the allowance is spent");
+
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        assert!(
+            sampling.admits(),
+            "a fresh window must restore the allowance, not stay exhausted"
+        );
+    }
+
+    /// 🧭 Zero means "unset", and takes upstream's defaults rather than
+    /// being read literally.
+    ///
+    /// Read literally, `first: 0` would drop everything and `interval: 0`
+    /// would expire the window on every entry — a tuning knob turned into an
+    /// outage of the log.
+    #[test]
+    fn unset_sampling_fields_take_the_upstream_defaults() {
+        let sampling = window(0, 0, 0);
+        assert_eq!(sampling.first, 100);
+        assert_eq!(sampling.interval_nanos, 1_000_000_000);
+    }
+
+    /// 🈳 A logger without a sampling policy keeps every line.
+    #[test]
+    fn no_policy_means_no_sampling() {
+        let logger = logger(LogFormat::Json, Vec::new());
+        assert!(logger.sampling.is_none());
     }
 
     // MARK: - Namespace selection
