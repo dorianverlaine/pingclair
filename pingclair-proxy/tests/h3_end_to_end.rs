@@ -26,6 +26,25 @@ fn self_signed_pem(names: &[&str]) -> (String, String) {
 
 /// Start an H3 server on an ephemeral port serving `handler` at `/*`.
 async fn spawn_h3_server(handler: HandlerConfig) -> SocketAddr {
+    spawn_h3_server_with(|address| ServerConfig {
+        listen: vec![address.to_string()],
+        routes: vec![RouteConfig {
+            path: "/*".to_string(),
+            handler,
+            methods: None,
+            matcher: None,
+        }],
+        ..Default::default()
+    })
+    .await
+}
+
+/// 🧾 Starts an H3 server from a whole `ServerConfig`, so a test can exercise
+/// server-level settings such as `log` rather than only a route's handler.
+///
+/// The port is only known after binding, so the caller receives it and fills it
+/// into the configuration it already compiled.
+async fn spawn_h3_server_with(build: impl FnOnce(SocketAddr) -> ServerConfig) -> SocketAddr {
     let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
     // 🔌 Bind first so the test knows the port; `QuicServer` rebinds the same
@@ -35,16 +54,7 @@ async fn spawn_h3_server(handler: HandlerConfig) -> SocketAddr {
     drop(probe);
 
     let proxy = PingclairProxy::new();
-    proxy.update_config(vec![ServerConfig {
-        listen: vec![address.to_string()],
-        routes: vec![RouteConfig {
-            path: "/*".to_string(),
-            handler,
-            methods: None,
-            matcher: None,
-        }],
-        ..Default::default()
-    }]);
+    proxy.update_config(vec![build(address)]);
 
     let certs = Arc::new(CertTable::new());
     let (cert, key) = self_signed_pem(&["h3.pingclair.test"]);
@@ -807,5 +817,80 @@ async fn h3_rejects_a_data_frame_before_any_headers() {
         code,
         Some(H3_FRAME_UNEXPECTED),
         "a DATA frame before HEADERS must close the connection with H3_FRAME_UNEXPECTED"
+    );
+}
+
+/// 🧾 HTTP/3 traffic reaches the access log, and reaches the right destination.
+///
+/// Before this, `quic.rs` contained no reference to access logging at all: a
+/// site that turned HTTP/3 on stopped producing records for that share of its
+/// traffic without saying so. The assertions below are the two halves that
+/// matter — the record exists, and `hostnames` narrowed it the same way it does
+/// on HTTP/1.1.
+#[tokio::test]
+async fn h3_requests_reach_the_access_log_selected_by_hostnames() {
+    let dir = tempfile::tempdir().unwrap();
+    let matching = dir.path().join("match.log");
+    let other = dir.path().join("other.log");
+
+    // 🧾 Written in the DSL so the adapter compiles it, exactly as a user's
+    // configuration would be.
+    let source = format!(
+        r#"h3.pingclair.test {{
+            log wanted {{
+                hostnames h3.pingclair.test
+                output file {}
+                format json
+            }}
+            log unwanted {{
+                hostnames somewhere.else
+                output file {}
+                format json
+            }}
+            respond "logged" 200
+        }}"#,
+        matching.display(),
+        other.display()
+    );
+    let compiled = pingclair_config::compile(&source).expect("the log block compiles");
+    let template = compiled.servers[0].clone();
+
+    let server = spawn_h3_server_with(move |address| ServerConfig {
+        listen: vec![address.to_string()],
+        ..template
+    })
+    .await;
+
+    let response = h3_get(server, "/logged?token=secret").await.unwrap();
+    assert_eq!(response.status, 200);
+
+    // 🕰️ The writer thread owns the sink, so the line is queued rather than
+    // written before the response returns.
+    let mut recorded = String::new();
+    for _ in 0..50 {
+        recorded = std::fs::read_to_string(&matching).unwrap_or_default();
+        if recorded.contains("HTTP/3") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(
+        recorded.contains("HTTP/3"),
+        "the HTTP/3 request produced no access record: {recorded:?}"
+    );
+    assert!(
+        recorded.contains("\"status\":200"),
+        "the record must carry the status the client saw: {recorded:?}"
+    );
+    assert!(
+        !recorded.contains("secret"),
+        "the query string must be redacted before it reaches the log: {recorded:?}"
+    );
+    assert!(
+        std::fs::read_to_string(&other)
+            .unwrap_or_default()
+            .is_empty(),
+        "a logger scoped to another hostname must stay empty"
     );
 }

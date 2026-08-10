@@ -498,6 +498,91 @@ struct RespEvent {
 
 type RespSender = mpsc::Sender<RespEvent>;
 
+/// 🚚 The per-request response channel, which records what it carried.
+///
+/// HTTP/3 had no access log at all: a site that enabled it stopped producing
+/// records for that share of its traffic, silently. Writing one needs the
+/// status, the body size and the time to first byte — none of which any single
+/// place in the H3 path knows, because a response can leave from a dozen
+/// different branches.
+///
+/// Rather than thread three counters through every one of them, the channel
+/// they all already share observes what passes through it. Call sites are
+/// unchanged; only the type they hold is.
+pub(crate) struct ResponseSink {
+    tx: RespSender,
+    started: Instant,
+    /// 📟 The `:status` of the response headers, or 0 if none was ever sent.
+    status: std::sync::atomic::AtomicU16,
+    /// 📏 Body bytes handed to quiche, excluding headers — the same meaning as
+    /// the H1/H2 counter, which deliberately avoids Pingora's own because that
+    /// one changes meaning with the client's protocol.
+    body_bytes: std::sync::atomic::AtomicU64,
+    /// ⏱️ Microseconds from request start to the first response event, or 0
+    /// when nothing was ever sent.
+    first_byte_us: std::sync::atomic::AtomicU64,
+}
+
+impl ResponseSink {
+    fn new(tx: RespSender, started: Instant) -> Self {
+        Self {
+            tx,
+            started,
+            status: std::sync::atomic::AtomicU16::new(0),
+            body_bytes: std::sync::atomic::AtomicU64::new(0),
+            first_byte_us: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// ⏱️ Stamps the first byte, if this is the first thing to leave.
+    ///
+    /// Relaxed throughout: one task owns a request, so these counters never
+    /// race — the atomics exist so the sink can be shared behind `&` across
+    /// await points, not to order anything.
+    fn mark_first_byte(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.first_byte_us.load(Relaxed) == 0 {
+            let elapsed = self.started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            self.first_byte_us.store(elapsed.max(1), Relaxed);
+        }
+    }
+
+    /// 📟 Records the status carried by an outgoing header block.
+    fn observe_headers(&self, headers: &[quiche::h3::Header]) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.mark_first_byte();
+        if self.status.load(Relaxed) != 0 {
+            return;
+        }
+        if let Some(status) = headers
+            .iter()
+            .find(|header| header.name() == b":status")
+            .and_then(|header| std::str::from_utf8(header.value()).ok())
+            .and_then(|value| value.parse::<u16>().ok())
+        {
+            self.status.store(status, Relaxed);
+        }
+    }
+
+    /// 📏 Adds one body chunk to the byte count.
+    fn observe_body(&self, len: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.mark_first_byte();
+        self.body_bytes.fetch_add(len as u64, Relaxed);
+    }
+
+    /// 📊 What actually went out: status, body bytes, and time to first byte.
+    fn observed(&self) -> (u16, u64, Option<u128>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let first_byte = self.first_byte_us.load(Relaxed);
+        (
+            self.status.load(Relaxed),
+            self.body_bytes.load(Relaxed),
+            (first_byte > 0).then(|| u128::from(first_byte) / 1000),
+        )
+    }
+}
+
 /// 🌊 Per-stream cap on response bytes waiting to enter quiche.
 ///
 /// Without a bound, a handler that produces a 1 MiB body hands the whole
@@ -2130,6 +2215,8 @@ async fn handle_request(
     body_notify: Arc<Notify>,
     mut cancel_rx: watch::Receiver<bool>,
 ) {
+    let request_started = Instant::now();
+    let resp_tx = ResponseSink::new(resp_tx, request_started);
     let remote_ip = crate::server::canonical_client_ip(remote_addr.ip());
     let request_id = resolve_request_id(
         req.headers
@@ -2138,6 +2225,7 @@ async fn handle_request(
             .map(|(_, value)| value.as_str()),
     );
     let mut error_state = None;
+    let mut matched_route = None;
     let mut response_policy = ResponseHeaderPolicy::default();
     let result = run_until_request_cancelled(
         &mut cancel_rx,
@@ -2153,6 +2241,7 @@ async fn handle_request(
             &body_notify,
             &request_id,
             &mut error_state,
+            &mut matched_route,
             &mut response_policy,
         ),
     )
@@ -2166,25 +2255,118 @@ async fn handle_request(
         // blocked forever.
         body_notify.notify_one();
     }
-    let Some(Err(e)) = result else {
-        return;
+    // 🧾 Every outcome reaches the access log, which is the point: a request
+    // that failed, or one the client abandoned, is exactly the one an operator
+    // goes looking for afterwards.
+    let error_text: Option<&str> = match result {
+        Some(Err((status, msg))) => {
+            // 🧯 Applies the virtual host error policy only while the client
+            // still owns the stream.
+            let _ = run_until_request_cancelled(
+                &mut cancel_rx,
+                send_error_response(
+                    &resp_tx,
+                    stream_id,
+                    status,
+                    msg,
+                    error_state.as_deref(),
+                    &response_policy,
+                    &request_id,
+                ),
+            )
+            .await;
+            Some(msg)
+        }
+        Some(Ok(())) => None,
+        // 🚪 `None` means the client went away mid-request. Nothing more can be
+        // sent, but the attempt is still worth a record.
+        None => Some("client cancelled the request"),
     };
 
-    let (status, msg) = e;
-    // 🧯 Applies the virtual host error policy only while the client still owns the stream.
-    let _ = run_until_request_cancelled(
-        &mut cancel_rx,
-        send_error_response(
-            &resp_tx,
-            stream_id,
-            status,
-            msg,
-            error_state.as_deref(),
-            &response_policy,
+    if let Some(state) = error_state.as_ref() {
+        write_h3_access_log(
+            state,
+            &req,
             &request_id,
-        ),
-    )
-    .await;
+            remote_ip,
+            matched_route,
+            &resp_tx,
+            request_started,
+            error_text,
+        );
+    }
+}
+
+/// 🧾 Writes one HTTP/3 access record to the destinations this host selects.
+///
+/// The record is built from the same [`crate::access_log::AccessEntry`] the
+/// H1/H2 path uses and goes through the same [`crate::access_log::LogTargets`],
+/// so `hostnames` and the record's shape cannot drift between transports —
+/// which is the failure mode this project keeps hitting whenever the two
+/// transports grow their own answer to the same question.
+#[allow(clippy::too_many_arguments)]
+fn write_h3_access_log(
+    state: &ProxyState,
+    req: &H3Request,
+    request_id: &str,
+    remote_ip: IpAddr,
+    matched_route: Option<usize>,
+    sink: &ResponseSink,
+    request_started: Instant,
+    error: Option<&str>,
+) {
+    let host = authority_host(&req.authority);
+    let mut destinations = state.log_targets().select(host).peekable();
+    if destinations.peek().is_none() {
+        return;
+    }
+
+    let (status, body_bytes, ttfb_ms) = sink.observed();
+    // 🙈 The target can carry a credential in its query string, and `Referer`
+    // carries the *previous* page's URL, so it can leak a token this request
+    // never contained. Both go through the same redaction the H1/H2 record uses.
+    let logged_path = crate::redaction::redact_target(&req.path);
+    let header = |wanted: &str| {
+        req.headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(wanted))
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("")
+    };
+    let redacted_referer = crate::redaction::redact_referer(header("referer"));
+    let route = matched_route
+        .and_then(|index| state.config.routes.get(index))
+        .map(|route| route.path.as_str());
+
+    let entry = crate::access_log::AccessEntry {
+        request_id,
+        method: &req.method,
+        host,
+        path: &logged_path,
+        status,
+        bytes: body_bytes,
+        duration_ms: request_started.elapsed().as_millis(),
+        ttfb_ms,
+        client_ip: &remote_ip.to_string(),
+        route,
+        // 🧭 The upstream a request reached is not published out of the H3
+        // handler yet, so this field is absent rather than wrong.
+        upstream: None,
+        user_agent: header("user-agent"),
+        referer: &redacted_referer,
+        protocol: "HTTP/3",
+        error,
+        // 🏷️ Header capture and TLS details are H1/H2-only for now; naming them
+        // here with empty values would claim a parity this does not have.
+        request_headers: &[],
+        response_headers: &[],
+        tls_version: None,
+        tls_cipher: None,
+    };
+
+    for destination in destinations {
+        destination.log(&entry);
+    }
 }
 
 /// 🧯 Carries an HTTP failure to the wrapper before response bytes are queued.
@@ -2199,10 +2381,13 @@ async fn handle_request_inner(
     peer_port: u16,
     stream_id: u64,
     body_rx: &mut mpsc::Receiver<Vec<u8>>,
-    resp_tx: &RespSender,
+    resp_tx: &ResponseSink,
     body_notify: &Arc<Notify>,
     request_id: &str,
     error_state: &mut Option<Arc<ProxyState>>,
+    // 🧭 The matched route, published so the access log can name it the way the
+    // H1/H2 record does. Stays `None` when nothing matched.
+    matched_route: &mut Option<usize>,
     response_policy: &mut ResponseHeaderPolicy,
 ) -> Result<(), HandlerError> {
     let request_started = Instant::now();
@@ -2289,6 +2474,7 @@ async fn handle_request_inner(
         return Err((404, "No Matching Route"));
     };
     *error_state = Some(state.clone());
+    *matched_route = Some(route_index);
     let handler = &state
         .config
         .routes
@@ -2750,7 +2936,7 @@ async fn stream_h3_subrequest_response(
     response_policy: &ResponseHeaderPolicy,
     request_id: &str,
     stream_id: u64,
-    resp_tx: &RespSender,
+    resp_tx: &ResponseSink,
     request_deadline: Option<Instant>,
     download_pacer: &mut Option<StreamPacer>,
 ) -> Result<(), HandlerError> {
@@ -3017,7 +3203,7 @@ async fn fastcgi_upstream(
     body_limit: u64,
     stream_id: u64,
     body_rx: &mut mpsc::Receiver<Vec<u8>>,
-    resp_tx: &RespSender,
+    resp_tx: &ResponseSink,
     body_notify: &Arc<Notify>,
     request_started: Instant,
     request_vars: &crate::http_policy::RequestVars,
@@ -3415,7 +3601,7 @@ async fn reverse_proxy_upstream(
     body_limit: u64,
     stream_id: u64,
     body_rx: &mut mpsc::Receiver<Vec<u8>>,
-    resp_tx: &RespSender,
+    resp_tx: &ResponseSink,
     body_notify: &Arc<Notify>,
     request_started: Instant,
     request_vars: &crate::http_policy::RequestVars,
@@ -4268,7 +4454,7 @@ enum H3LocalBody {
 /// 🧭 Evaluates and sends one local HTTP/3 response through shared interception policy.
 #[allow(clippy::too_many_arguments)]
 async fn send_h3_local_response(
-    resp_tx: &RespSender,
+    resp_tx: &ResponseSink,
     stream_id: u64,
     state: &ProxyState,
     request_header: &RequestHeader,
@@ -4528,7 +4714,7 @@ fn apply_h3_response_policy(
 /// 📤 Sends one middleware-generated H3 response with the shared header policy.
 #[allow(clippy::too_many_arguments)]
 async fn send_immediate_response(
-    resp_tx: &RespSender,
+    resp_tx: &ResponseSink,
     stream_id: u64,
     response: H3ImmediateResponse,
     policy: &ResponseHeaderPolicy,
@@ -4588,12 +4774,14 @@ async fn send_immediate_response(
 }
 
 async fn send_headers(
-    resp_tx: &RespSender,
+    resp_tx: &ResponseSink,
     stream_id: u64,
     headers: Vec<quiche::h3::Header>,
     fin: bool,
 ) {
+    resp_tx.observe_headers(&headers);
     let _ = resp_tx
+        .tx
         .send(RespEvent {
             stream_id,
             msg: RespMsg::Headers(headers, fin),
@@ -4601,8 +4789,10 @@ async fn send_headers(
         .await;
 }
 
-async fn send_body(resp_tx: &RespSender, stream_id: u64, bytes: Vec<u8>, fin: bool) {
+async fn send_body(resp_tx: &ResponseSink, stream_id: u64, bytes: Vec<u8>, fin: bool) {
+    resp_tx.observe_body(bytes.len());
     let _ = resp_tx
+        .tx
         .send(RespEvent {
             stream_id,
             msg: RespMsg::Body(bytes, fin),
@@ -4611,8 +4801,9 @@ async fn send_body(resp_tx: &RespSender, stream_id: u64, bytes: Vec<u8>, fin: bo
 }
 
 /// 🧾 Queues H3 response trailers after every response body chunk.
-async fn send_trailers(resp_tx: &RespSender, stream_id: u64, headers: Vec<quiche::h3::Header>) {
+async fn send_trailers(resp_tx: &ResponseSink, stream_id: u64, headers: Vec<quiche::h3::Header>) {
     let _ = resp_tx
+        .tx
         .send(RespEvent {
             stream_id,
             msg: RespMsg::Trailers(headers),
@@ -4623,7 +4814,7 @@ async fn send_trailers(resp_tx: &RespSender, stream_id: u64, headers: Vec<quiche
 /// 🧯 Sends a custom or built-in error response before an H3 stream is committed.
 #[allow(clippy::too_many_arguments)]
 async fn send_error_response(
-    resp_tx: &RespSender,
+    resp_tx: &ResponseSink,
     stream_id: u64,
     status: u16,
     msg: &str,
@@ -5036,6 +5227,8 @@ mod tests {
         let (body_tx, mut body_rx) = mpsc::channel(1);
         drop(body_tx);
         let (resp_tx, mut resp_rx) = mpsc::channel(8);
+        // 🧪 Handlers write through the observing sink, so tests build one too.
+        let resp_tx = ResponseSink::new(resp_tx, Instant::now());
         let body_notify = Arc::new(Notify::new());
 
         reverse_proxy_upstream(
@@ -5148,6 +5341,8 @@ mod tests {
         let (body_tx, mut body_rx) = mpsc::channel(1);
         drop(body_tx);
         let (resp_tx, mut resp_rx) = mpsc::channel(4);
+        // 🧪 Handlers write through the observing sink, so tests build one too.
+        let resp_tx = ResponseSink::new(resp_tx, Instant::now());
         let body_notify = Arc::new(Notify::new());
         let response_policy = ResponseHeaderPolicy::default();
         let request_vars = crate::http_policy::RequestVars::default();
@@ -5256,6 +5451,8 @@ mod tests {
         let (body_tx, mut body_rx) = mpsc::channel(1);
         drop(body_tx);
         let (resp_tx, _resp_rx) = mpsc::channel(8);
+        // 🧪 Handlers write through the observing sink, so tests build one too.
+        let resp_tx = ResponseSink::new(resp_tx, Instant::now());
         reverse_proxy_upstream(
             &proxy,
             &connector,
@@ -5284,6 +5481,8 @@ mod tests {
         let (body_tx, mut body_rx) = mpsc::channel(1);
         drop(body_tx);
         let (resp_tx, _resp_rx) = mpsc::channel(8);
+        // 🧪 Handlers write through the observing sink, so tests build one too.
+        let resp_tx = ResponseSink::new(resp_tx, Instant::now());
         let result = reverse_proxy_upstream(
             &proxy,
             &connector,
@@ -5373,6 +5572,8 @@ mod tests {
         let (body_tx, mut body_rx) = mpsc::channel(1);
         drop(body_tx);
         let (resp_tx, mut resp_rx) = mpsc::channel(8);
+        // 🧪 Handlers write through the observing sink, so tests build one too.
+        let resp_tx = ResponseSink::new(resp_tx, Instant::now());
         let body_notify = Arc::new(Notify::new());
 
         reverse_proxy_upstream(
@@ -5745,6 +5946,8 @@ mod tests {
         });
         let request = RequestHeader::build(http::Method::GET, b"/probe", None).unwrap();
         let (resp_tx, mut resp_rx) = mpsc::channel(8);
+        // 🧪 Handlers write through the observing sink, so tests build one too.
+        let resp_tx = ResponseSink::new(resp_tx, Instant::now());
 
         send_h3_local_response(
             &resp_tx,

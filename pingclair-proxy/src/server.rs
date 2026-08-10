@@ -824,6 +824,14 @@ pub struct ProxyState {
     log_targets: crate::access_log::LogTargets,
 }
 
+impl ProxyState {
+    /// 🪵 The access-log destinations this server can reach, for the HTTP/3
+    /// path, which builds its record outside this module.
+    pub(crate) fn log_targets(&self) -> &crate::access_log::LogTargets {
+        &self.log_targets
+    }
+}
+
 /// 🔐 A route's upstream TLS posture, resolved once per configuration load.
 #[derive(Clone)]
 pub(crate) enum RouteUpstreamTls {

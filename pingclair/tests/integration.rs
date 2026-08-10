@@ -9215,8 +9215,18 @@ async fn test_php_fastcgi_canonical_directory_redirect() {
 #[tokio::test]
 async fn test_log_hostnames_route_each_host_to_its_own_destination() {
     let dir = tempfile::tempdir().unwrap();
-    let a_log = dir.path().join("a.log").to_str().unwrap().replace("\\", "/");
-    let b_log = dir.path().join("b.log").to_str().unwrap().replace("\\", "/");
+    let a_log = dir
+        .path()
+        .join("a.log")
+        .to_str()
+        .unwrap()
+        .replace("\\", "/");
+    let b_log = dir
+        .path()
+        .join("b.log")
+        .to_str()
+        .unwrap()
+        .replace("\\", "/");
 
     let config = format!(
         r#"
