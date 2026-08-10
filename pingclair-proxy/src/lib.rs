@@ -17,6 +17,7 @@ pub mod connection_filter;
 pub mod dns;
 pub mod dynamic_upstream;
 pub mod encoding;
+mod fastcgi;
 pub mod health_check;
 mod http_policy;
 pub mod load_balancer;

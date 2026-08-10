@@ -3303,7 +3303,7 @@ mod php_fastcgi_tests {
     #[test]
     fn php_fastcgi_subdirectives_reach_the_transport() {
         let handler = proxy_from(
-            "example.com {\n\tphp_fastcgi localhost:9000 {\n\t\tsplit .php .php5\n\t\tenv FOO bar\n\t\troot /var/www\n\t\tdial_timeout 3s\n\t}\n}",
+            "example.com {\n\tphp_fastcgi localhost:9000 localhost:9001 {\n\t\tsplit .php .php5\n\t\tenv FOO bar\n\t\troot /var/www\n\t\tdial_timeout 3s\n\t\theader_up X-Method {http.request.method}\n\t\tlb_policy round_robin\n\t}\n}",
         );
         let HandlerConfig::ReverseProxy(config) = handler else {
             panic!("expected a reverse proxy");
@@ -3313,6 +3313,14 @@ mod php_fastcgi_tests {
         assert_eq!(fastcgi.env.get("FOO").map(String::as_str), Some("bar"));
         assert_eq!(fastcgi.root.as_deref(), Some("/var/www"));
         assert_eq!(fastcgi.dial_timeout_ms, Some(3_000));
+        // 🧭 Both addresses have to survive into the compiled peer list, or
+        // the load balancer below has only one peer to choose between.
+        assert_eq!(config.upstreams, ["localhost:9000", "localhost:9001"]);
+        assert_eq!(
+            config.headers_up.get("X-Method").map(String::as_str),
+            Some("{http.request.method}")
+        );
+        assert_eq!(config.load_balance.strategy, "round_robin");
     }
 
     /// 🧵 `transport fastcgi` inside a plain reverse_proxy is parsed too.

@@ -64,6 +64,7 @@ async fn spawn_h3_server(handler: HandlerConfig) -> SocketAddr {
 
 struct H3Response {
     status: u16,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -86,6 +87,144 @@ async fn read_http_head(stream: &mut tokio::net::TcpStream) -> String {
     String::from_utf8(request).unwrap()
 }
 
+/// 🧵 Starts one real FastCGI responder and returns its address plus observed environment.
+async fn spawn_fastcgi_responder(
+    status: u16,
+    body: Vec<u8>,
+) -> (
+    SocketAddr,
+    tokio::task::JoinHandle<std::collections::BTreeMap<String, String>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut environment = std::collections::BTreeMap::new();
+        loop {
+            let mut record_header = [0u8; 8];
+            stream.read_exact(&mut record_header).await.unwrap();
+            let record_type = record_header[1];
+            let content_length = u16::from_be_bytes([record_header[4], record_header[5]]) as usize;
+            let padding = record_header[6] as usize;
+            let mut content = vec![0u8; content_length];
+            stream.read_exact(&mut content).await.unwrap();
+            let mut discard = vec![0u8; padding];
+            stream.read_exact(&mut discard).await.unwrap();
+            if record_type == 4 && !content.is_empty() {
+                let mut offset = 0;
+                while offset < content.len() {
+                    let name_length = read_fastcgi_size(&content, &mut offset);
+                    let value_length = read_fastcgi_size(&content, &mut offset);
+                    let name = String::from_utf8_lossy(
+                        &content[offset..offset.saturating_add(name_length)],
+                    )
+                    .into_owned();
+                    offset += name_length;
+                    let value = String::from_utf8_lossy(
+                        &content[offset..offset.saturating_add(value_length)],
+                    )
+                    .into_owned();
+                    offset += value_length;
+                    environment.insert(name, value);
+                }
+            }
+            if record_type == 5 && content.is_empty() {
+                break;
+            }
+        }
+
+        let header = format!(
+            "Status: {status}\r\nContent-Type: application/octet-stream\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\n"
+        );
+        write_fastcgi_record(&mut stream, 6, header.as_bytes()).await;
+        for chunk in body.chunks(65_000) {
+            write_fastcgi_record(&mut stream, 6, chunk).await;
+        }
+        write_fastcgi_record(&mut stream, 6, &[]).await;
+        let mut end_request = [0u8; 8];
+        end_request[4] = 0;
+        write_fastcgi_record(&mut stream, 3, &end_request).await;
+        stream.shutdown().await.unwrap();
+        environment
+    });
+    (address, task)
+}
+
+/// 🌊 Starts a responder whose second SSE record is deliberately delayed.
+async fn spawn_slow_fastcgi_sse_responder() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        loop {
+            let mut record_header = [0u8; 8];
+            stream.read_exact(&mut record_header).await.unwrap();
+            let record_type = record_header[1];
+            let content_length = u16::from_be_bytes([record_header[4], record_header[5]]) as usize;
+            let padding = record_header[6] as usize;
+            let mut discard = vec![0u8; content_length + padding];
+            stream.read_exact(&mut discard).await.unwrap();
+            if record_type == 5 && content_length == 0 {
+                break;
+            }
+        }
+        write_fastcgi_record(
+            &mut stream,
+            6,
+            b"Status: 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
+        )
+        .await;
+        write_fastcgi_record(&mut stream, 6, b"data: first\n\n").await;
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        write_fastcgi_record(&mut stream, 6, b"data: second\n\n").await;
+        write_fastcgi_record(&mut stream, 6, &[]).await;
+        let mut end_request = [0u8; 8];
+        end_request[4] = 0;
+        write_fastcgi_record(&mut stream, 3, &end_request).await;
+        stream.shutdown().await.unwrap();
+    });
+    (address, task)
+}
+
+/// 📐 Reads one FastCGI name/value length from a PARAMS record.
+fn read_fastcgi_size(content: &[u8], offset: &mut usize) -> usize {
+    let first = content[*offset];
+    if first & 0x80 == 0 {
+        *offset += 1;
+        first as usize
+    } else {
+        let value = u32::from_be_bytes([
+            first,
+            content[*offset + 1],
+            content[*offset + 2],
+            content[*offset + 3],
+        ]);
+        *offset += 4;
+        (value & 0x7fff_ffff) as usize
+    }
+}
+
+/// 📤 Writes one padded FastCGI record to the scripted responder socket.
+async fn write_fastcgi_record(stream: &mut tokio::net::TcpStream, record_type: u8, content: &[u8]) {
+    use tokio::io::AsyncWriteExt;
+
+    let padding = (8 - content.len() % 8) % 8;
+    let mut frame = Vec::with_capacity(8 + content.len() + padding);
+    frame.push(1);
+    frame.push(record_type);
+    frame.extend_from_slice(&1u16.to_be_bytes());
+    frame.extend_from_slice(&(content.len() as u16).to_be_bytes());
+    frame.push(padding as u8);
+    frame.push(0);
+    frame.extend_from_slice(content);
+    frame.resize(frame.len() + padding, 0);
+    stream.write_all(&frame).await.unwrap();
+}
+
 /// Perform one HTTP/3 request and read the complete response.
 ///
 /// A hand-driven client rather than a library one: this has to exercise the
@@ -100,6 +239,16 @@ async fn h3_get_with_headers(
     server: SocketAddr,
     path: &str,
     extra_headers: &[(&str, &str)],
+) -> Result<H3Response, String> {
+    h3_get_observing_first_chunk(server, path, extra_headers, None).await
+}
+
+/// 🌊 Performs an H3 request and optionally publishes its first body chunk.
+async fn h3_get_observing_first_chunk(
+    server: SocketAddr,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+    mut first_body_tx: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
 ) -> Result<H3Response, String> {
     let mut config = quiche::Config::with_boring_ssl_ctx_builder(
         quiche::PROTOCOL_VERSION,
@@ -133,6 +282,7 @@ async fn h3_get_with_headers(
     let mut h3: Option<quiche::h3::Connection> = None;
     let mut sent = false;
     let mut status = None;
+    let mut response_headers = Vec::new();
     let mut body = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
 
@@ -204,6 +354,11 @@ async fn h3_get_with_headers(
                         for header in &list {
                             if header.name() == b":status" {
                                 status = String::from_utf8_lossy(header.value()).parse().ok();
+                            } else {
+                                response_headers.push((
+                                    String::from_utf8_lossy(header.name()).into_owned(),
+                                    String::from_utf8_lossy(header.value()).into_owned(),
+                                ));
                             }
                         }
                     }
@@ -213,6 +368,9 @@ async fn h3_get_with_headers(
                             if read == 0 {
                                 break;
                             }
+                            if let Some(sender) = first_body_tx.take() {
+                                let _ = sender.send(chunk[..read].to_vec());
+                            }
                             body.extend_from_slice(&chunk[..read]);
                         }
                     }
@@ -220,6 +378,7 @@ async fn h3_get_with_headers(
                         flush!();
                         return Ok(H3Response {
                             status: status.ok_or("finished without a :status")?,
+                            headers: response_headers,
                             body,
                         });
                     }
@@ -394,6 +553,132 @@ async fn h3_forward_auth_mutates_the_backend_request_and_streams_denials() {
 
     auth_task.await.unwrap();
     backend_task.await.unwrap();
+}
+
+/// 🐘 HTTP/3 reaches the same FastCGI exchange and streams a 20 MiB response.
+#[tokio::test]
+async fn h3_fastcgi_streams_a_large_response_and_builds_h3_cgi_variables() {
+    let body: Vec<u8> = (0..20 * 1024 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let (fastcgi_address, fastcgi_task) = spawn_fastcgi_responder(200, body.clone()).await;
+    // 🧾 The real adapter must produce the FastCGI handler the QUIC server executes.
+    let source = format!(
+        r#":443 {{
+            reverse_proxy {fastcgi_address} {{
+                transport fastcgi {{
+                    root /srv/www
+                    split .php
+                }}
+                header_up X-Protocol h3
+            }}
+        }}"#
+    );
+    let config = pingclair_config::compile(&source).unwrap();
+    let handler = config.servers[0].routes[0].handler.clone();
+    let server = spawn_h3_server(handler).await;
+
+    let response = h3_get(server, "/index.php/tail?item=1").await.unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, body);
+    // 🍪 HTTP/3 must keep a repeated CGI header name as two fields, exactly
+    // like H1/H2 does; collapsing them would silently drop a cookie.
+    assert_eq!(
+        response
+            .headers
+            .iter()
+            .filter(|(name, _)| name == "set-cookie")
+            .count(),
+        2
+    );
+
+    let environment = fastcgi_task.await.unwrap();
+    assert_eq!(
+        environment.get("SERVER_PROTOCOL").map(String::as_str),
+        Some("HTTP/3.0")
+    );
+    assert_eq!(
+        environment.get("SCRIPT_FILENAME").map(String::as_str),
+        Some("/srv/www/index.php")
+    );
+    assert_eq!(
+        environment.get("PATH_INFO").map(String::as_str),
+        Some("/tail")
+    );
+    assert_eq!(
+        environment.get("REQUEST_URI").map(String::as_str),
+        Some("/index.php/tail?item=1")
+    );
+    assert_eq!(
+        environment.get("HTTP_X_PROTOCOL").map(String::as_str),
+        Some("h3")
+    );
+}
+
+/// 🧭 HTTP/3 evaluates FastCGI response handlers before committing CGI bytes.
+#[tokio::test]
+async fn h3_fastcgi_handle_response_streams_the_configured_error_file() {
+    let (fastcgi_address, fastcgi_task) = spawn_fastcgi_responder(404, Vec::new()).await;
+    let errors = tempfile::tempdir().unwrap();
+    std::fs::write(errors.path().join("404.html"), "h3-fastcgi-error").unwrap();
+    let errors = errors.path().to_string_lossy();
+    // 🧾 This Pingclairfile drives adapter, matcher, response decision, and H3 runtime together.
+    let source = format!(
+        r#":443 {{
+            reverse_proxy {fastcgi_address} {{
+                transport fastcgi {{
+                    root /srv/www
+                    split .php
+                }}
+                @err status 4xx
+                handle_response @err {{
+                    root * {errors}
+                    rewrite * /{{http.reverse_proxy.status_code}}.html
+                    file_server
+                }}
+            }}
+        }}"#
+    );
+    let config = pingclair_config::compile(&source).unwrap();
+    let handler = config.servers[0].routes[0].handler.clone();
+    let server = spawn_h3_server(handler).await;
+
+    let response = h3_get(server, "/missing.php").await.unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"h3-fastcgi-error");
+    fastcgi_task.await.unwrap();
+}
+
+/// 🌊 HTTP/3 exposes the first FastCGI SSE record before a later record exists.
+#[tokio::test]
+async fn h3_fastcgi_sends_the_first_sse_event_immediately() {
+    let (fastcgi_address, fastcgi_task) = spawn_slow_fastcgi_sse_responder().await;
+    // 🧾 The DSL carries immediate flushing through the FastCGI terminal path.
+    let source = format!(
+        r#":443 {{
+            reverse_proxy {fastcgi_address} {{
+                flush_interval -1
+                transport fastcgi
+            }}
+        }}"#
+    );
+    let config = pingclair_config::compile(&source).unwrap();
+    let handler = config.servers[0].routes[0].handler.clone();
+    let server = spawn_h3_server(handler).await;
+    let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+    let request = tokio::spawn(async move {
+        h3_get_observing_first_chunk(server, "/events.php", &[], Some(first_tx)).await
+    });
+
+    let first = tokio::time::timeout(Duration::from_millis(400), first_rx)
+        .await
+        .expect("the first H3 SSE record must beat the responder delay")
+        .unwrap();
+    assert_eq!(first, b"data: first\n\n");
+    let response = request.await.unwrap().unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"data: first\n\ndata: second\n\n");
+    fastcgi_task.await.unwrap();
 }
 
 // MARK: - Malformed HTTP/3 frames

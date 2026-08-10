@@ -1146,14 +1146,14 @@ impl H3App {
         // not contain an IPv6 address. Parity matters here specifically because
         // `remote_ip` is an access-control matcher — a rule that holds on
         // HTTP/1.1 and not on HTTP/3 is worse than one that fails everywhere.
-        let remote_ip = crate::server::canonical_client_ip(self.remote_addr.ip());
+        let remote_addr = self.remote_addr;
 
         tokio::spawn(async move {
             handle_request(
                 proxy,
                 connector,
                 req,
-                remote_ip,
+                remote_addr,
                 stream_id,
                 req_body_rx,
                 resp_tx,
@@ -1535,6 +1535,8 @@ enum H3Terminal {
     },
     FileServer,
     ReverseProxy,
+    /// 🧵 Streams a FastCGI exchange without coupling it to Pingora's HTTP session.
+    FastCgi,
     /// 🚫 Streams a non-continuing inline proxy response to the H3 client.
     Subrequest(Box<crate::subrequest::SubrequestResponse>),
 }
@@ -1993,15 +1995,8 @@ async fn plan_h3_handler_with_connector(
             }
         }
         HandlerConfig::FileServer { .. } => Ok(H3Plan::Terminal(H3Terminal::FileServer)),
-        // 🧵 FastCGI speaks a different wire protocol than HTTP; the H3
-        // planner has no FastCGI client, so a `php_fastcgi` route refuses
-        // over HTTP/3 rather than silently HTTP-proxying to php-fpm.
         HandlerConfig::ReverseProxy(config) if config.fastcgi.is_some() => {
-            Ok(H3Plan::Respond(H3ImmediateResponse {
-                status: 501,
-                body: "php_fastcgi is not available on HTTP/3 yet".to_string(),
-                headers: Vec::new(),
-            }))
+            Ok(H3Plan::Terminal(H3Terminal::FastCgi))
         }
         HandlerConfig::ReverseProxy(config) => {
             if config.subrequest.is_some() {
@@ -2128,13 +2123,14 @@ async fn handle_request(
     proxy: Arc<PingclairProxy>,
     connector: Arc<pingora_core::connectors::http::Connector>,
     req: H3Request,
-    remote_ip: IpAddr,
+    remote_addr: SocketAddr,
     stream_id: u64,
     mut body_rx: mpsc::Receiver<Vec<u8>>,
     resp_tx: RespSender,
     body_notify: Arc<Notify>,
     mut cancel_rx: watch::Receiver<bool>,
 ) {
+    let remote_ip = crate::server::canonical_client_ip(remote_addr.ip());
     let request_id = resolve_request_id(
         req.headers
             .iter()
@@ -2150,6 +2146,7 @@ async fn handle_request(
             &connector,
             &req,
             remote_ip,
+            remote_addr.port(),
             stream_id,
             &mut body_rx,
             &resp_tx,
@@ -2199,6 +2196,7 @@ async fn handle_request_inner(
     connector: &pingora_core::connectors::http::Connector,
     req: &H3Request,
     peer_ip: IpAddr,
+    peer_port: u16,
     stream_id: u64,
     body_rx: &mut mpsc::Receiver<Vec<u8>>,
     resp_tx: &RespSender,
@@ -2215,6 +2213,11 @@ async fn handle_request_inner(
 
     let mut header = RequestHeader::build(method.clone(), req.path.as_bytes(), None)
         .map_err(|_| (400, "Bad Request"))?;
+    // 🏷️ `RequestHeader::build` defaults to HTTP/1.1, and this header is the
+    // transport-neutral view of the request that shared code reads. Leaving the
+    // default here made every HTTP/3 request describe itself as HTTP/1.1 —
+    // visible to a FastCGI application as `SERVER_PROTOCOL`.
+    header.set_version(http::Version::HTTP_3);
     for (k, v) in &req.headers {
         header.insert_header(k.clone(), v.as_str()).ok();
     }
@@ -2407,7 +2410,7 @@ async fn handle_request_inner(
         H3Plan::Continue => return Err((501, "Handler Pipeline Produced No Response")),
     };
 
-    if !matches!(&handler, H3Terminal::ReverseProxy) {
+    if !matches!(&handler, H3Terminal::ReverseProxy | H3Terminal::FastCgi) {
         drain_local_h3_body(
             body_rx,
             body_notify,
@@ -2706,6 +2709,30 @@ async fn handle_request_inner(
             )
             .await
         }
+        H3Terminal::FastCgi => {
+            fastcgi_upstream(
+                proxy,
+                &state,
+                route_index,
+                req,
+                &header,
+                &effective_uri,
+                peer_ip,
+                peer_port,
+                &verified_client_ip_text,
+                request_id,
+                response_policy,
+                body_limit,
+                stream_id,
+                body_rx,
+                resp_tx,
+                body_notify,
+                request_started,
+                &request_vars,
+                response_handlers.as_deref(),
+            )
+            .await
+        }
     }
 }
 
@@ -2969,6 +2996,403 @@ async fn stream_h3_subrequest_response(
             .await;
     } else {
         response.session.shutdown().await;
+    }
+    Ok(())
+}
+
+/// 🧵 Proxies one HTTP/3 request through the shared FastCGI exchange.
+#[allow(clippy::too_many_arguments)]
+async fn fastcgi_upstream(
+    proxy: &PingclairProxy,
+    state: &ProxyState,
+    route_index: usize,
+    req: &H3Request,
+    request_header: &RequestHeader,
+    effective_uri: &str,
+    peer_ip: IpAddr,
+    peer_port: u16,
+    verified_client_ip: &str,
+    request_id: &str,
+    response_policy: &ResponseHeaderPolicy,
+    body_limit: u64,
+    stream_id: u64,
+    body_rx: &mut mpsc::Receiver<Vec<u8>>,
+    resp_tx: &RespSender,
+    body_notify: &Arc<Notify>,
+    request_started: Instant,
+    request_vars: &crate::http_policy::RequestVars,
+    standalone_response_handlers: Option<&[pingclair_core::config::ResponseHandlerConfig]>,
+) -> Result<(), HandlerError> {
+    let method = request_header.method.as_str().to_ascii_uppercase();
+    let bodyless = matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS");
+    let content_length = request_header
+        .headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    // 🚫 Refusing a lengthless FastCGI body before admission preserves both
+    // H1/H2 parity and upstream capacity for requests that can be served.
+    if !bodyless && content_length.is_none() {
+        let mut headers = vec![
+            quiche::h3::Header::new(b":status", b"411"),
+            quiche::h3::Header::new(b"content-length", b"0"),
+        ];
+        apply_h3_response_policy(&mut headers, response_policy, request_id, Some(state));
+        send_headers(resp_tx, stream_id, headers, true).await;
+        return Ok(());
+    }
+    let _route_admission = match proxy.admit_route(state, route_index).await {
+        Ok(admission) => admission,
+        Err(crate::overload::AdmissionError::QueueFull) => {
+            return Err((429, "Too Many Requests"));
+        }
+        Err(_) => return Err((503, "Service Unavailable")),
+    };
+    let proxy_config = proxy
+        .get_proxy_config(state, route_index)
+        .ok_or((500, "Missing FastCGI Route"))?;
+    let fastcgi = proxy_config
+        .fastcgi
+        .as_ref()
+        .ok_or((500, "Missing FastCGI Transport"))?;
+    let balance_key = PingclairProxy::balancing_identity_for_request(
+        state,
+        route_index,
+        request_header,
+        Some(peer_ip),
+    );
+    let (upstream, mut upstream_admission) = proxy
+        .select_admitted_upstream(state, route_index, balance_key.as_deref(), &HashSet::new())
+        .map_err(|error| match error {
+            crate::server::UpstreamSelectionError::NoUpstream => {
+                (502, "FastCGI Upstream Unavailable")
+            }
+            crate::server::UpstreamSelectionError::Unavailable => {
+                (503, "FastCGI Upstream Overloaded")
+            }
+        })?;
+    let mut exchange = match crate::fastcgi::Exchange::connect(&upstream, fastcgi).await {
+        Ok(exchange) => exchange,
+        Err(error) => {
+            if let Some(admission) = &mut upstream_admission {
+                admission.report_failure();
+            }
+            // 🩺 Same limit as the H1/H2 path: the health map is keyed by
+            // `std::net::SocketAddr`, so a Unix-socket responder cannot be
+            // marked down and keeps its turn in the rotation.
+            if let pingora_core::protocols::l4::socket::SocketAddr::Inet(address) = &upstream.addr {
+                proxy.mark_upstream_unhealthy(state, route_index, address);
+            }
+            tracing::warn!(%error, upstream = %upstream.addr, "🔌 H3 FastCGI dial failed");
+            return Err(match error {
+                crate::fastcgi::ExchangeError::DialTimedOut => {
+                    (504, "FastCGI Upstream Connection Timed Out")
+                }
+                _ => (502, "FastCGI Upstream Connection Failed"),
+            });
+        }
+    };
+
+    let prepared_request = crate::fastcgi::prepare_request_header(
+        request_header,
+        &proxy_config.headers_up,
+        Some(verified_client_ip),
+        "https",
+        request_vars,
+    )
+    .map_err(|()| (500, "FastCGI Upstream Header Is Invalid"))?;
+    let mut environment = crate::fastcgi::build_environment(
+        crate::fastcgi::EnvironmentInput {
+            request: &prepared_request,
+            remote_ip: peer_ip,
+            remote_port: Some(peer_port),
+            scheme: "https",
+            original_uri: &req.path,
+            request_vars,
+        },
+        fastcgi,
+    )
+    .map_err(|error| {
+        tracing::warn!(%error, "⚠️ H3 FastCGI environment preparation failed");
+        (502, "FastCGI Document Root Could Not Be Resolved")
+    })?;
+    environment.insert("REQUEST_METHOD".to_string(), method);
+    environment.insert(
+        "CONTENT_LENGTH".to_string(),
+        content_length.unwrap_or(0).to_string(),
+    );
+
+    let exchange_error = |error: crate::fastcgi::ExchangeError| {
+        tracing::warn!(%error, "🧵 H3 FastCGI exchange failed");
+        (502, "FastCGI Exchange Failed")
+    };
+    exchange.begin(&environment).await.map_err(exchange_error)?;
+    let limits = &state.config.limits;
+    let request_deadline = limits
+        .request_timeout_ms
+        .filter(|value| *value > 0)
+        .map(|value| request_started + Duration::from_millis(value));
+    let mut counted = 0u64;
+    let mut upload_pacer = limits.upload_bytes_per_sec.map(StreamPacer::new);
+    if !bodyless {
+        loop {
+            let next = match limits.body_timeout_ms {
+                Some(timeout_ms) => {
+                    tokio::time::timeout(Duration::from_millis(timeout_ms), body_rx.recv())
+                        .await
+                        .map_err(|_| (408, "Request Body Timeout"))?
+                }
+                None => body_rx.recv().await,
+            };
+            let Some(chunk) = next else { break };
+            // 🔔 Releasing one bounded channel slot lets the QUIC reader resume.
+            body_notify.notify_one();
+            counted = counted.saturating_add(chunk.len() as u64);
+            if body_limit > 0 && counted > body_limit {
+                exchange.abort().await;
+                return Err((413, "Request Entity Too Large"));
+            }
+            if let Some(delay) = upload_pacer
+                .as_mut()
+                .and_then(|pacer| pacer.delay_for(chunk.len()))
+            {
+                if request_deadline.is_some_and(|deadline| Instant::now() + delay >= deadline) {
+                    exchange.abort().await;
+                    return Err((408, "Request Timeout"));
+                }
+                tokio::time::sleep(delay).await;
+            }
+            exchange.send_body(&chunk).await.map_err(exchange_error)?;
+        }
+    }
+    if !bodyless
+        && let Some(content_length) = content_length
+        && counted != content_length
+    {
+        tracing::warn!(
+            content_length,
+            streamed = counted,
+            "⚠️ H3 FastCGI request body length mismatch"
+        );
+        exchange.abort().await;
+        return Err((400, "Bad Request"));
+    }
+    exchange.finish_body().await.map_err(exchange_error)?;
+    let response = exchange
+        .read_response_header()
+        .await
+        .map_err(exchange_error)?;
+    if let Some(admission) = &mut upstream_admission {
+        admission.report_status(response.status);
+    }
+
+    let mut status = response.status;
+    let mut headers = http::HeaderMap::new();
+    for (name, value) in response.headers {
+        if let (Ok(name), Ok(value)) = (
+            http::header::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(&value),
+        ) {
+            headers.append(name, value);
+        }
+    }
+    let mut effective_response_policy = response_policy.clone();
+    effective_response_policy.merge_proxy_set(&proxy_config.headers_down);
+    let handlers = (!proxy_config.handle_response.is_empty())
+        .then_some(proxy_config.handle_response.as_slice())
+        .or(standalone_response_handlers)
+        .unwrap_or(&[]);
+    let mut eval_vars = request_vars.clone();
+    eval_vars.set("http.reverse_proxy.status_code", status.to_string());
+    if let Some(outcome) =
+        crate::http_policy::evaluate_response_handlers(handlers, status, &headers, &mut eval_vars)
+    {
+        if let Some(file_server) = outcome.file_server {
+            let mut request_path = effective_uri.to_string();
+            if let Some(template) = outcome.request_rewrite {
+                let resolved = resolve_caddy_placeholders(
+                    &template,
+                    request_header,
+                    Some(verified_client_ip),
+                    "https",
+                    &eval_vars,
+                );
+                request_path = rewrite_uri(
+                    &request_path,
+                    None,
+                    None,
+                    Some(resolved.as_ref()),
+                    None,
+                    None,
+                );
+            }
+            let root = if file_server.root == "." {
+                eval_vars.get("root").unwrap_or(".").to_string()
+            } else {
+                file_server.root
+            };
+            let server = pingclair_static::FileServer::new(pingclair_static::FileServerConfig {
+                root: std::path::PathBuf::from(&root),
+                index: file_server.index,
+                browse: file_server.browse,
+                browse_limit: file_server.browse_limit,
+                compress: file_server.compress,
+                precompressed: false,
+            });
+            let Some(stream) = server
+                .serve_streaming(request_path.split('?').next().unwrap_or("/"))
+                .await
+                .map_err(|_| (500, "Response File Server Error"))?
+            else {
+                exchange.abort().await;
+                return Err((404, "Not Found"));
+            };
+            exchange.abort().await;
+            let mut local_headers = http::HeaderMap::new();
+            local_headers.insert("content-type", stream.content_type.clone());
+            local_headers.insert("content-length", stream.content_length.clone());
+            if let Some(value) = &stream.last_modified {
+                local_headers.insert("last-modified", value.clone());
+            }
+            if let Some(value) = &stream.etag {
+                local_headers.insert("etag", value.clone());
+            }
+            let mut download_pacer = limits.download_bytes_per_sec.map(StreamPacer::new);
+            return send_h3_local_response(
+                resp_tx,
+                stream_id,
+                state,
+                request_header,
+                &request_path,
+                verified_client_ip,
+                &eval_vars,
+                None,
+                200,
+                local_headers,
+                H3LocalBody::File(stream),
+                &effective_response_policy,
+                request_id,
+                request_deadline,
+                &mut download_pacer,
+            )
+            .await;
+        }
+        if let Some(replacement) = outcome.replacement {
+            exchange.abort().await;
+            let mut local_headers = http::HeaderMap::new();
+            for (name, template) in replacement.headers {
+                let resolved = resolve_caddy_placeholders(
+                    &template,
+                    request_header,
+                    Some(verified_client_ip),
+                    "https",
+                    &eval_vars,
+                );
+                if let (Ok(name), Ok(value)) = (
+                    http::header::HeaderName::from_bytes(name.as_bytes()),
+                    http::HeaderValue::from_str(resolved.as_ref()),
+                ) {
+                    local_headers.append(name, value);
+                }
+            }
+            let mut download_pacer = limits.download_bytes_per_sec.map(StreamPacer::new);
+            return send_h3_local_response(
+                resp_tx,
+                stream_id,
+                state,
+                request_header,
+                effective_uri,
+                verified_client_ip,
+                &eval_vars,
+                None,
+                replacement.status,
+                local_headers,
+                H3LocalBody::Bytes(replacement.body),
+                &effective_response_policy,
+                request_id,
+                request_deadline,
+                &mut download_pacer,
+            )
+            .await;
+        }
+        if let Some(replacement_status) = outcome.passthrough_status {
+            status = replacement_status;
+        }
+        for name in outcome.header_remove {
+            headers.remove(name);
+        }
+        for (name, template) in outcome.header_set {
+            let resolved = resolve_caddy_placeholders(
+                &template,
+                request_header,
+                Some(verified_client_ip),
+                "https",
+                &eval_vars,
+            );
+            if let (Ok(name), Ok(value)) = (
+                http::header::HeaderName::from_bytes(name.as_bytes()),
+                http::HeaderValue::from_str(resolved.as_ref()),
+            ) {
+                headers.insert(name, value);
+            }
+        }
+    }
+    if state.intercepts_error_status(status) {
+        exchange.abort().await;
+        return Err((status, error_reason(status)));
+    }
+
+    let mut h3_headers = vec![quiche::h3::Header::new(
+        b":status",
+        status.to_string().as_bytes(),
+    )];
+    for (name, value) in &headers {
+        let lower = name.as_str().to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "connection"
+                | "proxy-connection"
+                | "keep-alive"
+                | "transfer-encoding"
+                | "te"
+                | "trailer"
+                | "upgrade"
+        ) {
+            continue;
+        }
+        h3_headers.push(quiche::h3::Header::new(lower.as_bytes(), value.as_bytes()));
+    }
+    apply_h3_response_policy(
+        &mut h3_headers,
+        &effective_response_policy,
+        request_id,
+        Some(state),
+    );
+    send_headers(resp_tx, stream_id, h3_headers, false).await;
+
+    let mut download_pacer = limits.download_bytes_per_sec.map(StreamPacer::new);
+    loop {
+        match exchange.read_body_chunk().await {
+            Ok(Some(bytes)) => {
+                pace_h3_body(&mut download_pacer, request_deadline, bytes.len()).await?;
+                send_body(resp_tx, stream_id, bytes.to_vec(), false).await;
+            }
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(%error, "🧵 H3 FastCGI response stream failed");
+                break;
+            }
+        }
+    }
+    send_body(resp_tx, stream_id, Vec::new(), true).await;
+    let stderr = exchange.take_stderr();
+    if !stderr.is_empty() {
+        let text = String::from_utf8_lossy(&stderr);
+        if status >= 400 {
+            tracing::error!(body = %text, "⚠️ H3 FastCGI responder stderr");
+        } else {
+            tracing::warn!(body = %text, "⚠️ H3 FastCGI responder stderr");
+        }
     }
     Ok(())
 }

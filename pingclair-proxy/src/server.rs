@@ -53,53 +53,6 @@ use bytes::Bytes;
 use ipnet::IpNet;
 use pingclair_core::config::Encoding;
 use regex::Regex;
-use tokio::io::{AsyncRead, AsyncWrite};
-
-// MARK: - FastCGI upstream precomputation
-
-/// 🧵 A boxable stream that can carry FastCGI records.
-///
-/// TCP and Unix sockets are different concrete types but the same protocol
-/// surface; the client is generic over `AsyncRead + AsyncWrite`, so this
-/// single-trait alias is what lets one `Box` hold either.
-trait FastCgiStream: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> FastCgiStream for T {}
-
-/// 🧵 Where one FastCGI request dials.
-#[derive(Debug, Clone)]
-pub(crate) enum FastCgiTarget {
-    /// 🌐 A resolved TCP address; hostnames are resolved once at
-    /// configuration load, so the request path never touches DNS.
-    Tcp(SocketAddr),
-    /// 🏗️ A Unix-domain socket path.
-    #[cfg(unix)]
-    Unix(std::path::PathBuf),
-}
-
-/// 🧵 A precomputed FastCGI upstream: the dial target only.
-#[derive(Debug, Clone)]
-pub(crate) struct FastCgiUpstream {
-    /// 🔌 The target dialed per request.
-    pub target: FastCgiTarget,
-}
-
-/// 🧭 Resolves one FastCGI upstream address at configuration time.
-fn resolve_fastcgi_target(address: &str) -> Option<FastCgiTarget> {
-    let spec = UpstreamSpec::parse(address)?;
-    if let Some(path) = spec.unix_path {
-        #[cfg(unix)]
-        {
-            return Some(FastCgiTarget::Unix(path.into()));
-        }
-        #[cfg(not(unix))]
-        {
-            return None;
-        }
-    }
-    Some(FastCgiTarget::Tcp(
-        spec.resolve(&crate::upstream::SystemResolver).ok()?,
-    ))
-}
 
 /// 🧭 Runtime listener callbacks used by the Admin API to create and tear
 /// down listeners on `/load`, matching Caddy's dynamic listener behavior.
@@ -840,9 +793,6 @@ pub struct ProxyState {
     /// 🧭 Per-route dial templates with request placeholders, parallel to
     /// `load_balancers`; `None` means the route dials only static peers.
     pub dynamic_dials: Vec<Option<Arc<DynamicDialPlan>>>,
-    /// 🧵 Precomputed FastCGI dial targets per route, parallel to
-    /// `load_balancers`; `None` means the route speaks HTTP.
-    pub(crate) fastcgi_upstreams: Vec<Option<Arc<FastCgiUpstream>>>,
     /// 🔁 Parsed inline subrequest targets for each route's handler tree.
     pub(crate) subrequests: Vec<Vec<Arc<crate::subrequest::PreparedSubrequest>>>,
     /// Health checkers per route
@@ -1269,7 +1219,6 @@ impl ProxyState {
         // 🧩 Initializes index-aligned components for each route.
         let mut load_balancers = Vec::new();
         let mut dynamic_dials = Vec::new();
-        let mut fastcgi_upstreams = Vec::new();
         let mut subrequests = Vec::new();
         let mut health_checkers = Vec::new();
         let mut file_servers = Vec::new();
@@ -1374,23 +1323,6 @@ impl ProxyState {
                         "🧭 Request/response buffer ceilings are informational; bodies always stream"
                     );
                 }
-                // 🧵 FastCGI routes dial one precomputed target per request;
-                // a hostname that cannot resolve at load time is logged and
-                // the route answers 502 rather than resolving on the hot path.
-                fastcgi_upstreams.push(proxy_config.fastcgi.as_ref().and_then(|_| {
-                    let address = proxy_config.upstreams.first()?;
-                    match resolve_fastcgi_target(address) {
-                        Some(target) => Some(Arc::new(FastCgiUpstream { target })),
-                        None => {
-                            tracing::warn!(
-                                upstream = %address,
-                                route = %route.path,
-                                "⚠️ FastCGI upstream could not be resolved at load time"
-                            );
-                            None
-                        }
-                    }
-                }));
                 if !proxy_config.retry.expressions.is_empty() {
                     let expressions = &proxy_config.retry.expressions;
                     tracing::warn!(
@@ -1525,7 +1457,6 @@ impl ProxyState {
             } else {
                 load_balancers.push(None);
                 dynamic_dials.push(None);
-                fastcgi_upstreams.push(None);
                 route_protections.push(None);
                 hash_key_sources.push(None);
                 upstream_tls.push(RouteUpstreamTls::Default);
@@ -1628,7 +1559,6 @@ impl ProxyState {
             vars_precompiles,
             load_balancers,
             dynamic_dials,
-            fastcgi_upstreams,
             subrequests,
             health_checkers,
             file_servers,
@@ -2180,30 +2110,44 @@ impl PingclairProxy {
 
     /// ⚖️ Returns the identity IP-hash balancing uses, matching request policy.
     fn balancing_identity(&self, session: &mut Session, ctx: &RequestContext) -> Option<Vec<u8>> {
+        let state = ctx.state.as_ref()?;
+        let fallback_ip = ctx.verified_client_ip.or_else(|| {
+            Some(
+                self.downstream_identity(session, &session.req_header().headers)
+                    .2,
+            )
+        });
+        Self::balancing_identity_for_request(
+            state,
+            ctx.route_index?,
+            session.req_header(),
+            fallback_ip,
+        )
+    }
+
+    /// 🔑 Resolves a route's precompiled load-balancer key for any HTTP transport.
+    pub(crate) fn balancing_identity_for_request(
+        state: &ProxyState,
+        route_index: usize,
+        request: &RequestHeader,
+        fallback_ip: Option<IpAddr>,
+    ) -> Option<Vec<u8>> {
         // 🔑 A route may hash something other than the client address — a
         // session header, a cookie, a query parameter. The source was decided
         // at configuration time and precomputed into `ProxyState`, so this is a
         // lookup rather than a per-request parse of the strategy string.
-        if let Some(source) = ctx
-            .state
-            .as_ref()
-            .and_then(|state| state.hash_key_sources.get(ctx.route_index?))
+        if let Some(source) = state
+            .hash_key_sources
+            .get(route_index)
             .and_then(|source| source.as_ref())
         {
-            return extract_hash_key(session.req_header(), source);
+            return extract_hash_key(request, source);
         }
 
-        ctx.verified_client_ip
-            .or_else(|| {
-                Some(
-                    self.downstream_identity(session, &session.req_header().headers)
-                        .2,
-                )
-            })
-            .map(|address| match address {
-                IpAddr::V4(ip) => ip.octets().to_vec(),
-                IpAddr::V6(ip) => ip.octets().to_vec(),
-            })
+        fallback_ip.map(|address| match address {
+            IpAddr::V4(ip) => ip.octets().to_vec(),
+            IpAddr::V6(ip) => ip.octets().to_vec(),
+        })
     }
 
     /// 🔌 Selects a backend that has both load-balancer and protection capacity.
@@ -2946,54 +2890,6 @@ impl PingclairProxy {
         let Some(fastcgi) = config.fastcgi.as_ref() else {
             return Ok(false);
         };
-        let Some(upstream) = state
-            .fastcgi_upstreams
-            .get(route_index)
-            .and_then(|target| target.clone())
-        else {
-            tracing::warn!(
-                route = route_index,
-                "⚠️ FastCGI upstream is unavailable for this route"
-            );
-            return Err(proxy_error(502, "FastCGI upstream is unavailable"));
-        };
-
-        // 🔌 Dial with the configured deadline; Caddy's default is 3s.
-        let dial_timeout = Duration::from_millis(fastcgi.dial_timeout_ms.unwrap_or(3_000));
-        let stream: Box<dyn FastCgiStream> = match &upstream.target {
-            FastCgiTarget::Tcp(address) => {
-                match tokio::time::timeout(dial_timeout, tokio::net::TcpStream::connect(address))
-                    .await
-                {
-                    Ok(Ok(stream)) => Box::new(stream),
-                    Ok(Err(error)) => {
-                        tracing::warn!(%error, "🔌 FastCGI TCP dial failed");
-                        return Err(proxy_error(502, "FastCGI upstream connection failed"));
-                    }
-                    Err(_) => {
-                        tracing::warn!("⏱️ FastCGI TCP dial timed out");
-                        return Err(proxy_error(504, "FastCGI upstream connection timed out"));
-                    }
-                }
-            }
-            #[cfg(unix)]
-            FastCgiTarget::Unix(path) => {
-                match tokio::time::timeout(dial_timeout, tokio::net::UnixStream::connect(&path))
-                    .await
-                {
-                    Ok(Ok(stream)) => Box::new(stream),
-                    Ok(Err(error)) => {
-                        tracing::warn!(%error, path = %path.display(), "🔌 FastCGI Unix dial failed");
-                        return Err(proxy_error(502, "FastCGI upstream connection failed"));
-                    }
-                    Err(_) => {
-                        tracing::warn!(path = %path.display(), "⏱️ FastCGI Unix dial timed out");
-                        return Err(proxy_error(504, "FastCGI upstream connection timed out"));
-                    }
-                }
-            }
-        };
-
         let method = session.req_header().method.as_str().to_ascii_uppercase();
         let bodyless = matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS");
         let content_length = session
@@ -3002,9 +2898,8 @@ impl PingclairProxy {
             .get("content-length")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok());
-        // 🚫 PHP-FPM needs CONTENT_LENGTH before any STDIN byte; a body
-        // without a length (chunked upload) would hang the responder, so it
-        // is refused exactly like Caddy's client refuses it.
+        // 🚫 PHP-FPM needs CONTENT_LENGTH before any STDIN byte; refusing
+        // first also keeps invalid requests from consuming an upstream slot.
         if !bodyless && content_length.is_none() {
             let mut response = ResponseHeader::build(411, Some(2)).unwrap();
             response.insert_header("Content-Length", "0").unwrap();
@@ -3014,8 +2909,77 @@ impl PingclairProxy {
                 .await?;
             return Ok(true);
         }
+        let balance_key = self.balancing_identity(session, ctx);
+        let (upstream, mut upstream_admission) = self
+            .select_admitted_upstream(&state, route_index, balance_key.as_deref(), &HashSet::new())
+            .map_err(|error| match error {
+                UpstreamSelectionError::NoUpstream => {
+                    proxy_error(502, "FastCGI upstream is unavailable")
+                }
+                UpstreamSelectionError::Unavailable => {
+                    proxy_error(503, "FastCGI upstream is overloaded")
+                }
+            })?;
+        ctx.upstream = Some(upstream.clone());
+        let mut exchange = match crate::fastcgi::Exchange::connect(&upstream, fastcgi).await {
+            Ok(exchange) => exchange,
+            Err(error) => {
+                if let Some(admission) = &mut upstream_admission {
+                    admission.report_failure();
+                }
+                // 🩺 The health map is keyed by `std::net::SocketAddr`, so a
+                // Unix-socket responder cannot be marked down. A php-fpm
+                // socket that stops accepting therefore keeps its turn in the
+                // rotation; the dial failure still fails this request closed.
+                if let pingora_core::protocols::l4::socket::SocketAddr::Inet(address) =
+                    &upstream.addr
+                {
+                    self.mark_upstream_unhealthy(&state, route_index, address);
+                }
+                tracing::warn!(%error, upstream = %upstream.addr, "🔌 FastCGI dial failed");
+                return Err(match error {
+                    crate::fastcgi::ExchangeError::DialTimedOut => {
+                        proxy_error(504, "FastCGI upstream connection timed out")
+                    }
+                    _ => proxy_error(502, "FastCGI upstream connection failed"),
+                });
+            }
+        };
 
-        let mut env = self.build_fastcgi_env(session, ctx, fastcgi)?;
+        let (remote_ip, remote_port) = match session.client_addr() {
+            Some(pingora_core::protocols::l4::socket::SocketAddr::Inet(address)) => {
+                (canonical_client_ip(address.ip()), Some(address.port()))
+            }
+            _ => (
+                ctx.verified_client_ip
+                    .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                None,
+            ),
+        };
+        let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
+        let prepared_request = crate::fastcgi::prepare_request_header(
+            session.req_header(),
+            &config.headers_up,
+            verified_client_ip.as_deref(),
+            ctx.request_scheme,
+            &ctx.request_vars,
+        )
+        .map_err(|()| proxy_error(500, "FastCGI upstream header is invalid"))?;
+        let mut env = crate::fastcgi::build_environment(
+            crate::fastcgi::EnvironmentInput {
+                request: &prepared_request,
+                remote_ip,
+                remote_port,
+                scheme: ctx.request_scheme,
+                original_uri: &ctx.orig_uri,
+                request_vars: &ctx.request_vars,
+            },
+            fastcgi,
+        )
+        .map_err(|error| {
+            tracing::warn!(%error, "⚠️ FastCGI environment preparation failed");
+            proxy_error(502, "FastCGI document root could not be resolved")
+        })?;
         env.insert("REQUEST_METHOD".to_string(), method.clone());
         if bodyless {
             env.insert("CONTENT_LENGTH".to_string(), "0".to_string());
@@ -3023,30 +2987,36 @@ impl PingclairProxy {
             env.insert("CONTENT_LENGTH".to_string(), length.to_string());
         }
 
-        let mut client = pingclair_fastcgi::Client::new(
-            stream,
-            1,
-            fastcgi.read_timeout_ms.map(Duration::from_millis),
-            fastcgi.write_timeout_ms.map(Duration::from_millis),
-            fastcgi.capture_stderr,
-        );
-        let protocol_error = |error: pingclair_fastcgi::FastCgiError| {
+        let protocol_error = |error: crate::fastcgi::ExchangeError| {
             tracing::warn!(%error, "🧵 FastCGI exchange failed");
             proxy_error(502, "FastCGI exchange failed")
         };
-        client.begin_request().await.map_err(protocol_error)?;
-        client.send_params(&env).await.map_err(protocol_error)?;
+        exchange.begin(&env).await.map_err(protocol_error)?;
         if !bodyless {
             while let Some(bytes) = session.read_request_body().await? {
-                client.send_stdin(&bytes).await.map_err(protocol_error)?;
+                // 🛡️ FastCGI is the one upstream path that never enters
+                // Pingora's proxy lifecycle, so the body limit, the request
+                // and retry deadlines, and the upload pacer have to be applied
+                // here explicitly. Skipping them would let `php_fastcgi` be the
+                // single route on which `client_max_body_size` does not hold.
+                if let Err(error) =
+                    Self::enforce_request_body_chunk(session, ctx, bytes.len()).await
+                {
+                    exchange.abort().await;
+                    return Err(error);
+                }
+                exchange.send_body(&bytes).await.map_err(protocol_error)?;
             }
         }
-        client.finish_stdin().await.map_err(protocol_error)?;
+        exchange.finish_body().await.map_err(protocol_error)?;
 
-        let header = client
+        let header = exchange
             .read_response_header()
             .await
             .map_err(protocol_error)?;
+        if let Some(admission) = &mut upstream_admission {
+            admission.report_status(header.status);
+        }
         let mut response = ResponseHeader::build(header.status, Some(header.headers.len() + 4))
             .map_err(|_| proxy_error(500, "FastCGI status is not a valid HTTP status"))?;
         for (name, value) in &header.headers {
@@ -3054,10 +3024,14 @@ impl PingclairProxy {
                 http::header::HeaderName::from_bytes(name.as_bytes()),
                 http::header::HeaderValue::from_str(value),
             ) {
-                response.insert_header(name, value).unwrap();
+                response.append_header(name, value).unwrap();
             }
         }
         ctx.response_status = header.status;
+        // 🧩 FastCGI never enters `upstream_peer`, so proxy-owned response
+        // fields must join the local policy before the response decision runs.
+        ctx.response_headers.merge_proxy_set(&config.headers_down);
+        ctx.streaming_response = wants_immediate_flush(config.flush_interval);
 
         // 🧭 `handle_response`/`intercept` evaluate before the client sees
         // the CGI response, exactly like proxied HTTP responses.
@@ -3065,14 +3039,18 @@ impl PingclairProxy {
             .await?;
         if let Some(status) = ctx.response_decision_error.take() {
             ctx.error_status = Some(status);
-            let _ = client.abort().await;
+            exchange.abort().await;
             return Ok(true);
         }
         Self::apply_local_response_headers(&mut response, ctx)?;
 
-        // 📂 A response-subroute file server streams from disk; the FastCGI
-        // body is drained and discarded after the file is open.
+        // 📂 A response-subroute file server takes over after the file opens.
+        // The abort comes first, before a single downstream byte: the responder
+        // is already known to be unwanted, and holding its connection open for
+        // the length of the error page would pin a php-fpm worker for as long
+        // as the client takes to read it. The H3 path aborts at the same point.
         if let Some(mut stream) = ctx.intercepted_file.take() {
+            exchange.abort().await;
             session
                 .write_response_header(Box::new(response), false)
                 .await?;
@@ -3082,18 +3060,17 @@ impl PingclairProxy {
                     .await
                     .is_err()
                 {
-                    let _ = client.abort().await;
                     break;
                 }
             }
             session.write_response_body(None, true).await?;
-            self.drain_fastcgi_body(&mut client).await;
             return Ok(true);
         }
 
         // 📄 A static replacement emits its body once and discards the
         // FastCGI stream.
         if let Some(replacement) = ctx.intercepted_response.take() {
+            exchange.abort().await;
             session
                 .write_response_header(Box::new(response), false)
                 .await?;
@@ -3103,7 +3080,6 @@ impl PingclairProxy {
                     .await?;
             }
             session.write_response_body(None, true).await?;
-            self.drain_fastcgi_body(&mut client).await;
             return Ok(true);
         }
 
@@ -3113,14 +3089,14 @@ impl PingclairProxy {
             .write_response_header(Box::new(response), false)
             .await?;
         loop {
-            match client.read_body_chunk().await {
+            match exchange.read_body_chunk().await {
                 Ok(Some(chunk)) => {
                     if session
                         .write_response_body(Some(chunk), false)
                         .await
                         .is_err()
                     {
-                        let _ = client.abort().await;
+                        exchange.abort().await;
                         break;
                     }
                 }
@@ -3132,7 +3108,7 @@ impl PingclairProxy {
             }
         }
         session.write_response_body(None, true).await?;
-        let stderr = client.take_stderr();
+        let stderr = exchange.take_stderr();
         if !stderr.is_empty() {
             let text = String::from_utf8_lossy(&stderr);
             if header.status >= 400 {
@@ -3142,208 +3118,6 @@ impl PingclairProxy {
             }
         }
         Ok(true)
-    }
-
-    /// 🧹 Drains and discards the rest of a FastCGI response body so the
-    /// connection can be closed cleanly; the stream is bounded by one record.
-    async fn drain_fastcgi_body(
-        &self,
-        client: &mut pingclair_fastcgi::Client<Box<dyn FastCgiStream>>,
-    ) {
-        while let Ok(Some(_)) = client.read_body_chunk().await {}
-    }
-
-    /// 🧾 Builds the CGI environment Caddy sends to PHP-FPM.
-    ///
-    /// The variables mirror `buildEnv` in upstream's FastCGI transport:
-    /// RFC 3875 fields first, then the configured `env` overrides, then
-    /// every request header as `HTTP_*`. `CONTENT_LENGTH` is patched in by
-    /// the caller once the request body mode is decided.
-    fn build_fastcgi_env(
-        &self,
-        session: &Session,
-        ctx: &RequestContext,
-        fastcgi: &pingclair_core::config::FastCgiTransportConfig,
-    ) -> PingoraResult<BTreeMap<String, String>> {
-        let request = session.req_header();
-        let path = request.uri.path();
-
-        let (remote_ip, remote_port) = match session.client_addr() {
-            Some(pingora_core::protocols::l4::socket::SocketAddr::Inet(inet)) => (
-                canonical_client_ip(inet.ip()).to_string(),
-                inet.port().to_string(),
-            ),
-            _ => (
-                ctx.verified_client_ip
-                    .map(|ip| ip.to_string())
-                    .unwrap_or_default(),
-                String::new(),
-            ),
-        };
-
-        // 📂 The document root, resolved from the transport or the site root
-        // that the compiler baked in.
-        let mut root = fastcgi.root.clone().unwrap_or_else(|| ".".to_string());
-        if fastcgi.resolve_root_symlink {
-            root = std::fs::canonicalize(&root)
-                .map(|path| path.to_string_lossy().into_owned())
-                .map_err(|error| {
-                    tracing::warn!(%error, root = %root, "⚠️ FastCGI root symlink resolution failed");
-                    pingora_core::Error::explain(
-                        pingora_core::ErrorType::HTTPStatus(502),
-                        "FastCGI document root could not be resolved",
-                    )
-                })?;
-        }
-
-        // 🪚 Split the path into script and PATH_INFO at the first
-        // case-insensitive delimiter, falling back to the file matcher's
-        // remainder when the rewrite left one.
-        let split_pos = fastcgi_split_pos(path, &fastcgi.split_path);
-        let (doc_uri, mut path_info) = match split_pos {
-            Some(position) => (&path[..position], path[position..].to_string()),
-            None => (path, String::new()),
-        };
-        if path_info.is_empty() {
-            path_info = ctx
-                .request_vars
-                .get("http.matchers.file.remainder")
-                .unwrap_or("")
-                .to_string();
-        }
-        let script_name = if path_info.is_empty() {
-            path.to_string()
-        } else {
-            path.trim_end_matches(&path_info).to_string()
-        };
-        let script_name = if script_name.starts_with('/') {
-            script_name
-        } else {
-            format!("/{script_name}")
-        };
-
-        let authority = request_authority(request);
-        let host = authority_host(authority);
-        let port = authority_port(authority)
-            .unwrap_or(if ctx.request_scheme == "https" {
-                443
-            } else {
-                80
-            })
-            .to_string();
-        let proto = match request.version {
-            http::Version::HTTP_2 => "HTTP/2.0",
-            http::Version::HTTP_3 => "HTTP/3.0",
-            _ => "HTTP/1.1",
-        };
-        let request_uri = if ctx.orig_uri.is_empty() {
-            request.uri.to_string()
-        } else {
-            ctx.orig_uri.clone()
-        };
-        let query = request.uri.query().unwrap_or("").to_string();
-
-        let mut env = BTreeMap::new();
-        env.insert("AUTH_TYPE".to_string(), String::new());
-        env.insert(
-            "CONTENT_TYPE".to_string(),
-            request
-                .headers
-                .get("content-type")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("")
-                .to_string(),
-        );
-        env.insert("GATEWAY_INTERFACE".to_string(), "CGI/1.1".to_string());
-        env.insert("PATH_INFO".to_string(), path_info.clone());
-        env.insert("QUERY_STRING".to_string(), query);
-        env.insert("REMOTE_ADDR".to_string(), remote_ip.clone());
-        env.insert("REMOTE_HOST".to_string(), remote_ip);
-        env.insert("REMOTE_PORT".to_string(), remote_port);
-        env.insert("REMOTE_IDENT".to_string(), String::new());
-        env.insert(
-            "REMOTE_USER".to_string(),
-            ctx.request_vars
-                .get("http.auth.user.id")
-                .unwrap_or("")
-                .to_string(),
-        );
-        env.insert(
-            "REQUEST_METHOD".to_string(),
-            request.method.as_str().to_string(),
-        );
-        env.insert("REQUEST_SCHEME".to_string(), ctx.request_scheme.to_string());
-        env.insert("SERVER_NAME".to_string(), host.to_string());
-        env.insert("SERVER_PORT".to_string(), port);
-        env.insert("SERVER_PROTOCOL".to_string(), proto.to_string());
-        env.insert(
-            "SERVER_SOFTWARE".to_string(),
-            format!("Pingclair/{}", env!("CARGO_PKG_VERSION")),
-        );
-        env.insert("DOCUMENT_ROOT".to_string(), root.clone());
-        env.insert("DOCUMENT_URI".to_string(), doc_uri.to_string());
-        env.insert("HTTP_HOST".to_string(), authority.to_string());
-        env.insert("REQUEST_URI".to_string(), request_uri);
-        env.insert(
-            "SCRIPT_FILENAME".to_string(),
-            fastcgi_join_root(&root, &script_name),
-        );
-        env.insert("SCRIPT_NAME".to_string(), script_name.to_string());
-        if !path_info.is_empty() {
-            env.insert(
-                "PATH_TRANSLATED".to_string(),
-                fastcgi_join_root(&root, &path_info),
-            );
-        }
-        if ctx.request_scheme == "https" {
-            env.insert("HTTPS".to_string(), "on".to_string());
-        }
-
-        // 🧰 Configured environment wins over the CGI defaults.
-        let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
-        for (key, template) in &fastcgi.env {
-            let resolved = resolve_caddy_placeholders(
-                template,
-                request,
-                verified_client_ip.as_deref(),
-                ctx.request_scheme,
-                &ctx.request_vars,
-            );
-            env.insert(key.clone(), resolved.into_owned());
-        }
-
-        // 🧾 Every request header becomes an `HTTP_*` variable; Host,
-        // framing and content fields are owned by the dedicated variables.
-        for name in request.headers.keys() {
-            let lower = name.as_str().to_ascii_lowercase();
-            if matches!(
-                lower.as_str(),
-                "host"
-                    | "content-length"
-                    | "connection"
-                    | "keep-alive"
-                    | "transfer-encoding"
-                    | "te"
-                    | "trailer"
-                    | "upgrade"
-            ) || lower.contains('_')
-            {
-                continue;
-            }
-            let variable = format!(
-                "HTTP_{}",
-                name.as_str().to_ascii_uppercase().replace('-', "_")
-            );
-            let joined = request
-                .headers
-                .get_all(name)
-                .iter()
-                .filter_map(|value| value.to_str().ok())
-                .collect::<Vec<_>>()
-                .join(", ");
-            env.insert(variable, joined);
-        }
-        Ok(env)
     }
 
     /// 🔁 Returns a gateway timeout when the route's total retry budget expired.
@@ -7311,49 +7085,6 @@ impl ProxyHttp for PingclairProxy {
 
 // MARK: - Helper Functions
 
-/// 🪚 Finds the first ASCII case-insensitive split delimiter in a path,
-/// returning the index just past it, like Caddy's transport `splitPos`.
-///
-/// The split does not need to end a path segment here: the transport matches
-/// the delimiter anywhere, and the `try_files` rewrite is what defends
-/// against CVE-2019-11043 style path confusion.
-fn fastcgi_split_pos(path: &str, split_path: &[String]) -> Option<usize> {
-    let bytes = path.as_bytes();
-    for split in split_path {
-        if split.is_empty() || split.len() > bytes.len() {
-            continue;
-        }
-        let needle = split.as_bytes();
-        for index in 0..=bytes.len() - needle.len() {
-            if bytes[index..index + needle.len()]
-                .iter()
-                .zip(needle)
-                .all(|(left, right)| left.eq_ignore_ascii_case(right))
-            {
-                return Some(index + needle.len());
-            }
-        }
-    }
-    None
-}
-
-/// 📂 Joins a document root with a CGI path without allowing `..` escape.
-///
-/// The request path was normalized before routing, so `..` cannot reach
-/// here; the check stays as a second layer because `SCRIPT_FILENAME` is
-/// handed to code that may run with this proxy's privileges.
-fn fastcgi_join_root(root: &str, path: &str) -> String {
-    if path.split('/').any(|segment| segment == "..") {
-        return root.to_string();
-    }
-    let trimmed = path.trim_start_matches('/');
-    if trimmed.is_empty() {
-        root.to_string()
-    } else {
-        format!("{}/{}", root.trim_end_matches('/'), trimmed)
-    }
-}
-
 /// Recursively find a rate limit config in a handler tree
 /// Find the first `ReverseProxy` config in a handler tree, recursing
 /// through `Pipeline`/`Handle`/`HandlePath` wrappers.
@@ -8507,6 +8238,40 @@ mod caddy_parity_tests {
         let selected = load_balancer.select(None).unwrap();
         assert_eq!(selected.addr.to_string(), "127.0.0.1:8301");
         assert_eq!(selected.weight, 3);
+    }
+
+    /// ⚖️ FastCGI routes retain every upstream in the runtime selector.
+    #[test]
+    fn fastcgi_routes_select_all_configured_upstreams() {
+        let state = ProxyState::new(ServerConfig {
+            routes: vec![pingclair_core::config::RouteConfig {
+                path: "/*".into(),
+                handler: HandlerConfig::ReverseProxy(Box::new(ReverseProxyConfig {
+                    upstreams: vec!["127.0.0.1:8301".into(), "127.0.0.1:8302".into()],
+                    fastcgi: Some(Box::default()),
+                    ..Default::default()
+                })),
+                methods: None,
+                matcher: None,
+            }],
+            ..Default::default()
+        });
+        let balancer = state.load_balancers[0]
+            .as_ref()
+            .expect("FastCGI route has a selector");
+
+        let selected: Vec<String> = (0..4)
+            .map(|_| balancer.select(None).unwrap().addr.to_string())
+            .collect();
+        assert_eq!(
+            selected,
+            [
+                "127.0.0.1:8301",
+                "127.0.0.1:8302",
+                "127.0.0.1:8301",
+                "127.0.0.1:8302",
+            ]
+        );
     }
 
     #[test]
