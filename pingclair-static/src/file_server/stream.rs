@@ -232,7 +232,7 @@ mod serve_auto_tests {
 
         let fs = server(dir.path(), false);
         match fs
-            .serve_auto("/big.bin", None, None)
+            .serve_auto("/big.bin", "/big.bin", None, None)
             .await
             .unwrap()
             .unwrap()
@@ -263,7 +263,7 @@ mod serve_auto_tests {
 
         let fs = server(dir.path(), false);
         match fs
-            .serve_auto("/one.bin", None, None)
+            .serve_auto("/one.bin", "/one.bin", None, None)
             .await
             .unwrap()
             .unwrap()
@@ -290,7 +290,7 @@ mod serve_auto_tests {
 
         let fs = server(dir.path(), true);
         match fs
-            .serve_auto("/big.txt", None, Some("gzip"))
+            .serve_auto("/big.txt", "/big.txt", None, Some("gzip"))
             .await
             .unwrap()
             .unwrap()

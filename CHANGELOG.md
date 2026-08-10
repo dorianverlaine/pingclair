@@ -271,6 +271,34 @@ lets the rest converge.
   rather than through temporary files.
 - 🔐 **TLS.** A persistent internal CA for private origins, and durable ACME
   state across restarts.
+- 📁 **`file_server` takes the subdirectives the format defines.** `hide`,
+  `status`, `pass_thru`, `disable_canonical_uris`, `etag_file_extensions` and
+  `precompressed` all work; `fs` selects a file-system module this build does
+  not have and is still refused by name.
+
+  **`precompressed` is now opt-in, which is a behaviour change.** Sidecar
+  files were served unconditionally, so a request for `/app.js` with
+  `Accept-Encoding: gzip` got `/app.js.gz` whenever that file existed —
+  upstream serves it only when asked, and a stale sidecar is a wrong response
+  rather than a missing feature. A site relying on sidecars must now write
+  `precompressed`; in exchange the encoding order is the operator's, and an
+  encoding this build cannot read is refused by name instead of being dropped
+  from the list in silence.
+
+  `hide` follows upstream's two rules: a pattern with no separator hides any
+  path *component* of that name (`.git` hides `/a/.git/b`, not
+  `/.gitignore`), one with a separator is a path prefix resolved against the
+  document root. A hidden path answers exactly like a missing one, and a
+  hidden sidecar stays hidden.
+
+- 🔁 **The canonical trailing-slash redirect now follows the original
+  request.** It was decided from the *rewritten* path and pointed at it, so
+  `try_files {path} {path}/ /index.html` — which produces the canonical form
+  itself — served the index directly where Caddy answers 308. Relative links
+  in that document then resolved against the wrong base, which is the whole
+  reason the redirect exists. It now redirects only when the filename survived
+  the rewrite, and always back to the path the client asked for.
+
 - 🏛️ **`pki` and `acme_server` are configuration, not behaviour.** The global
   `pki { ca <id> { name, root_cn, intermediate_cn, root/intermediate { cert,
   key, format } } }` block, a site's `acme_server { ca, lifetime,

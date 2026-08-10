@@ -95,6 +95,7 @@ impl FileServer {
     pub async fn serve_auto(
         &self,
         path: &str,
+        original_path: &str,
         range_header: Option<&str>,
         accept_encoding: Option<&str>,
     ) -> Result<Option<ServedResponse>> {
@@ -129,15 +130,26 @@ impl FileServer {
         // resolve against the right base, which is why upstream does it and
         // why `disable_canonical_uris` exists for the deployments that put
         // something else in front and do not want the extra round trip.
-        if self.config.canonical_uris {
-            let needs_directory_slash = metadata.is_dir() && !path.ends_with('/');
-            let needs_file_slash_removal = metadata.is_file() && path.ends_with('/');
+        // 🔁 …but only when the *filename* survived any rewrite, and always
+        // back to the path the client actually asked for.
+        //
+        // 🤡 Both halves are corrections. We used to decide from the rewritten
+        // path and redirect to it, so `try_files {path} {path}/ /index.html`
+        // — which rewrites `/withindex` to `/withindex/` itself — made us
+        // serve the index at 200 where upstream answers 308 to `/withindex/`.
+        // Redirecting to a path the operator rewrote *away from* is also how
+        // upstream got a redirect loop (caddyserver/caddy#4205): if they
+        // wanted the canonical form they would have rewritten to it, so a
+        // rewritten filename means hands off.
+        if self.config.canonical_uris && path_basename(path) == path_basename(original_path) {
+            let needs_directory_slash = metadata.is_dir() && !original_path.ends_with('/');
+            let needs_file_slash_removal = metadata.is_file() && original_path.ends_with('/');
             if needs_directory_slash {
-                return Ok(Some(ServedResponse::Redirect(format!("{path}/"))));
+                return Ok(Some(ServedResponse::Redirect(format!("{original_path}/"))));
             }
             if needs_file_slash_removal {
                 return Ok(Some(ServedResponse::Redirect(
-                    path.trim_end_matches('/').to_string(),
+                    original_path.trim_end_matches('/').to_string(),
                 )));
             }
         }
@@ -404,7 +416,10 @@ impl FileServer {
         range_header: Option<&str>,
         accept_encoding: Option<&str>,
     ) -> Result<Option<ServedFile>> {
-        match self.serve_auto(path, range_header, accept_encoding).await? {
+        match self
+            .serve_auto(path, path, range_header, accept_encoding)
+            .await?
+        {
             Some(ServedResponse::Buffered(file)) => Ok(Some(file)),
             Some(ServedResponse::Redirect(_)) => Ok(None),
             Some(ServedResponse::Stream(mut stream)) => {
@@ -854,5 +869,17 @@ mod browse_limit_tests {
             2,
             "listing must be capped at the configured limit: {listing}"
         );
+    }
+}
+
+/// 🔁 The last path element, the way `path.Base` means it.
+///
+/// A trailing slash is ignored, so `/docs` and `/docs/` share a basename —
+/// which is the point: adding the slash is the redirect, not a rewrite.
+fn path_basename(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(index) => &trimmed[index + 1..],
+        None => trimmed,
     }
 }

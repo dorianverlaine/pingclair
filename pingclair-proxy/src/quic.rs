@@ -2827,8 +2827,13 @@ async fn handle_request_inner(
                 .and_then(|v| v.to_str().ok());
 
             let effective_path = effective_uri.split('?').next().unwrap_or("/");
+            // 🔁 `req.path` is what the client asked for, before any rewrite:
+            // the canonical redirect is decided against it and points back to
+            // it, or a `try_files` that already produced the canonical form
+            // would be redirected away from — see `serve_auto`.
+            let original_path = req.path.split('?').next().unwrap_or("/");
             match fs
-                .serve_auto(effective_path, range_header, accept_encoding)
+                .serve_auto(effective_path, original_path, range_header, accept_encoding)
                 .await
             {
                 Ok(Some(ServedResponse::Redirect(location))) => {

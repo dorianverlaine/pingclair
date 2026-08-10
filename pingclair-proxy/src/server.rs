@@ -3895,8 +3895,17 @@ impl PingclairProxy {
                     // pass (single resolve + stat per request): large,
                     // complete, uncompressed responses stream in 64KB chunks
                     // instead of being buffered whole in memory.
+                    // 🔁 `ctx.orig_uri` is the request as it arrived, before
+                    // any rewrite: the canonical redirect is decided against
+                    // it and points back to it — see `serve_auto`.
+                    let original_path = ctx
+                        .orig_uri
+                        .split('?')
+                        .next()
+                        .filter(|candidate| !candidate.is_empty())
+                        .unwrap_or(path);
                     match file_server
-                        .serve_auto(path, range_header, accept_encoding)
+                        .serve_auto(path, original_path, range_header, accept_encoding)
                         .await
                     {
                         Ok(Some(pingclair_static::ServedResponse::Redirect(location))) => {

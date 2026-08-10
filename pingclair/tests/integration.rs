@@ -10272,3 +10272,77 @@ async fn test_file_server_disable_canonical_uris_stops_the_redirect() {
     assert_eq!(response.status(), 200, "the redirect was still issued");
     assert_eq!(response.text().await.unwrap(), "<h1>docs</h1>");
 }
+
+/// 🔁 A rewrite that already produced the canonical form must not be undone.
+///
+/// The defect this pins, found on 2026-08-07: `try_files {path} {path}/
+/// /index.html` rewrites `/withindex` to `/withindex/` itself, and the file
+/// server then decided its canonical redirect from the *rewritten* path — so
+/// it served the index at 200 where upstream answers 308 to `/withindex/`.
+/// Relative `href`s in that document then resolve against the wrong base,
+/// which is the entire reason the redirect exists (caddyserver/caddy#2741).
+///
+/// The guard is upstream's: redirect only when the filename survived the
+/// rewrite, and redirect back to the path the client actually asked for.
+/// Without it, redirecting to a path the operator deliberately rewrote away
+/// from is how upstream got a redirect loop (caddyserver/caddy#4205).
+#[tokio::test]
+async fn test_file_server_canonical_redirect_uses_the_original_request() {
+    let tree = tempfile::tempdir().expect("document root");
+    std::fs::create_dir(tree.path().join("withindex")).expect("create dir");
+    std::fs::write(tree.path().join("withindex/index.html"), b"<h1>inside</h1>")
+        .expect("write index");
+    let root = tree.path().to_string_lossy().into_owned();
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+            try_files {{path}} {{path}}/ /index.html
+            file_server
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+        }}
+        "#
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let response = client
+        .get(server.url(0, "/withindex"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        response.status(),
+        308,
+        "the rewrite's canonical form was served directly instead of redirected"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("location")
+            .map(|v| v.to_str().unwrap()),
+        Some("/withindex/"),
+        "the redirect must name the path the client asked for, slash added"
+    );
+
+    // 🎯 And the redirect target itself serves, so this is not a loop.
+    let followed = client
+        .get(server.url(0, "/withindex/"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(followed.status(), 200);
+    assert_eq!(followed.text().await.unwrap(), "<h1>inside</h1>");
+}
