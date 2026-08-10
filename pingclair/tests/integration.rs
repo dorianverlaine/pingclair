@@ -8799,7 +8799,19 @@ async fn test_php_fastcgi_round_robins_across_multiple_responders() {
         assert_eq!(response.status(), 200);
         bodies.push(response.text().await.unwrap());
     }
-    assert_eq!(bodies, ["first", "second", "first", "second"]);
+    // ⚖️ Round-robin guarantees that consecutive requests alternate and that
+    // the load ends up even. It does not guarantee which peer goes first —
+    // that follows the shared counter's starting value, which no part of this
+    // configuration pins. Asserting the exact sequence passed on macOS and
+    // failed on Linux with `["second", "first", "second", "first"]`, which is
+    // the same correct behaviour observed one step out of phase.
+    assert_eq!(bodies.len(), 4);
+    for pair in bodies.windows(2) {
+        assert_ne!(
+            pair[0], pair[1],
+            "consecutive requests must not reuse the same responder: {bodies:?}"
+        );
+    }
     assert_eq!(first.requests.lock().unwrap().len(), 2);
     assert_eq!(second.requests.lock().unwrap().len(), 2);
 }

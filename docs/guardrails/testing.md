@@ -92,6 +92,35 @@
   `docker run ... validate` 一份真 Pingclairfile）。這是「一份沒人跑的建置
   腳本等於沒測試過的程式碼」這句話的直接對策——上面那次 Dockerfile 漂移,
   如果這個 job 當時存在,第一次 push 就會紅。
+- 🧑‍🔧 **在容器裡跑整合測試必須加
+  `--sysctl net.ipv4.ip_unprivileged_port_start=1024`**。
+  `test_admin_adapt_export_and_load`、
+  `test_admin_config_for_an_unknown_listener_applies_nothing`、
+  `test_admin_config_traversal_unbindable_listener_rolls_back` 這三支證明的是
+  「設定裡有綁不上的 listener 就要拒絕並回滾」，而它們把「綁不上」寫成
+  `127.0.0.1:1`。**Docker 預設把這個 sysctl 設成 `0`**，於是容器裡的**任何**使用者
+  都綁得上 port 1；設定被接受，三支同時以 `200 != 400` 失敗。
+
+  > 🤡 2026-08-10 的除錯順序值得記下來，因為第一個結論是錯的：先看到容器以 root
+  > 執行，判斷是 `CAP_NET_BIND_SERVICE`，於是 `useradd` 一個使用者用 `runuser` 重跑
+  > ——**三支照樣紅**。真正的機制是那個 sysctl，跟使用者是誰無關。
+  > 「以 root 執行」是個看起來足以解釋現象、而且改起來很自然的假設，
+  > 這正是它耗掉一整輪的原因。
+  >
+  > 非 root 仍然該做（那才是產品實際跑的樣子，也是過去 Linux 證據的取得方式），
+  > 但它不是這件事的解法。
+
+  > 📌 更一般的形狀：**任何用「這個操作會失敗」當斷言的測試，都隱含一個環境前提**。
+  > 前提沒寫下來時，換一個環境就從「證明了某件事」變成「證明不了任何事」，
+  > 而且失敗訊息不會提到那個前提。
+
+- ⚖️ **round-robin 測試不可斷言「誰先」**。負載平衡保證的是相鄰請求交替、
+  總量平均；**起始的那一台由共用計數器的初始值決定**，設定裡沒有任何東西釘住它。
+  2026-08-10：`test_php_fastcgi_round_robins_across_multiple_responders` 斷言
+  `["first","second","first","second"]`，在 macOS 綠、在 Linux 紅成
+  `["second","first",…]`——同一個正確行為，差一個相位。斷言要寫成性質
+  （相鄰不重複 ＋ 各收到一半），不是寫成某一次觀察到的序列。
+
 - 🎲 **`test_websocket_upgrade_tunnels_bytes_in_both_directions` 是已知的
   上游（Pingora）flaky**。`ci.yml` 的 `Run tests` 步驟會重跑整輪測試
   （最多三次），但**僅限**該測試是唯一失敗項；其他測試失敗或三次都失敗
