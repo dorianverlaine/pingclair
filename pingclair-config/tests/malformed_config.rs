@@ -239,8 +239,16 @@ proptest! {
 /// proptest reports the failing input once, in the output of a run nobody
 /// captured, and the next run starts from scratch. This checks the destination
 /// the same way proptest will use it — create the parent, write, read back —
-/// so a broken path is a red test on an ordinary day rather than a lost
+/// so a misconfigured path is a red test on an ordinary day rather than a lost
 /// reproduction on a bad one.
+///
+/// 🧑‍🔧 What it deliberately does **not** do is fail because the checkout is
+/// read-only. A container that mounts the source read-only cannot record a
+/// regression anywhere in the tree, and that is a fact about the mount, not a
+/// defect in this configuration. The first version of this test did fail there,
+/// turning a green Linux gate red for a reason unrelated to the code under
+/// test — the exact shape `docs/guardrails/testing.md` warns about two entries
+/// above, written one commit earlier and then walked straight into.
 #[test]
 fn the_regression_destination_is_writable() {
     let path = std::path::Path::new(REGRESSION_FILE);
@@ -250,8 +258,21 @@ fn the_regression_destination_is_writable() {
         path.display()
     );
     let parent = path.parent().expect("the regression path has a directory");
-    std::fs::create_dir_all(parent)
-        .unwrap_or_else(|error| panic!("cannot create {}: {error}", parent.display()));
+
+    if let Err(error) = std::fs::create_dir_all(parent) {
+        assert!(
+            source_tree_is_read_only(),
+            "cannot create {} and the source tree is writable, so this is a \
+             misconfigured path rather than a read-only checkout: {error}",
+            parent.display()
+        );
+        eprintln!(
+            "🧑‍🔧 Skipping the write probe: the source tree is read-only, so proptest \
+             could not persist a regression here either. That is a property of this \
+             environment, not of the configuration."
+        );
+        return;
+    }
 
     // 🧹 Probe beside the real file rather than through it: a genuine
     // regression file is a recorded defect and must survive a test run.
@@ -261,4 +282,20 @@ fn the_regression_destination_is_writable() {
     let read_back = std::fs::read(&probe).expect("the probe must read back");
     let _ = std::fs::remove_file(&probe);
     assert_eq!(read_back, b"probe");
+}
+
+/// 🔍 Whether the package root itself refuses writes.
+///
+/// Asked only after a failure, to tell "this path is wrong" apart from "nothing
+/// in this checkout is writable" — two situations with the same error and
+/// opposite meanings.
+fn source_tree_is_read_only() -> bool {
+    let probe = std::path::Path::new(".pingclair-write-probe");
+    match std::fs::write(probe, b"probe") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(probe);
+            false
+        }
+        Err(_) => true,
+    }
 }
