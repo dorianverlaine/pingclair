@@ -301,6 +301,41 @@ pub(crate) fn run_server(
         manual_certs.push((name.to_string(), cert_path.clone(), key_path.clone()));
     }
 
+    // 📡 A site can now *say* it wants DNS-01, and nothing performs it yet.
+    // Starting anyway is the worst of the three options: HTTP-01 cannot prove
+    // control of a wildcard, so `*.example.com` would simply never get a
+    // certificate, and the operator would find out at renewal time from a
+    // validation error that says nothing about the option they set.
+    //
+    // 🚫 Refusing at startup names the gap where it can still be acted on.
+    let dns_challenge_sites: Vec<String> = config
+        .servers
+        .iter()
+        .filter_map(|server| {
+            let provider = server
+                .tls
+                .as_ref()?
+                .dns_challenge
+                .as_ref()?
+                .provider
+                .as_ref()?;
+            Some(format!(
+                "{} (provider `{}`)",
+                server.name.as_deref().unwrap_or("_"),
+                provider.name
+            ))
+        })
+        .collect();
+    if !dns_challenge_sites.is_empty() {
+        anyhow::bail!(
+            "site(s) {} ask for the DNS-01 challenge, and no DNS provider is implemented yet; \
+             refusing to start rather than fall back to HTTP-01, which cannot prove control of a \
+             wildcard name. Remove the `dns` setting to use HTTP-01, or supply the certificate \
+             with `tls <cert> <key>`",
+            dns_challenge_sites.join(", ")
+        );
+    }
+
     // 🏗️ Every client trust pool is read, parsed and turned into a BoringSSL
     // store right here, keyed by the listen address the site named. Doing it at
     // startup is the whole point: a handshake then costs one map lookup and an

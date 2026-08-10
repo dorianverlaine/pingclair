@@ -2,9 +2,10 @@
 // Copyright 2026 Dorian Verlaine
 
 use super::AdapterError;
+use super::args::parse_required_duration;
 use crate::parser::ast::*;
 use crate::parser::caddy_ast::Directive;
-use pingclair_core::config::{ClientAuthConfig, ClientAuthMode, TrustPool};
+use pingclair_core::config::{ClientAuthConfig, ClientAuthMode, DnsProviderConfig, TrustPool};
 
 // MARK: - 🔐 TLS Directive
 
@@ -269,6 +270,51 @@ pub(super) fn adapt_tls_directive(d: &Directive) -> Result<TlsDirective, Adapter
                 }
                 "default_sni" => tls.default_sni = Some(parse_default_sni(sub)?),
                 "client_auth" => tls.client_auth = Some(parse_client_auth(sub)?),
+                // 📡 The DNS-01 cluster. Every one of these implies the DNS
+                // challenge, so they share one accumulator rather than each
+                // setting an independent field that could be written without
+                // the challenge ever being switched on.
+                "dns" => {
+                    let name = sub
+                        .args
+                        .first()
+                        .ok_or_else(|| AdapterError::ArgumentCount("tls dns".into(), 1, 0))?;
+                    tls.dns_challenge.get_or_insert_default().provider = Some(DnsProviderConfig {
+                        name: name.clone(),
+                        arguments: sub.args[1..].to_vec(),
+                    });
+                }
+                "resolvers" => {
+                    if sub.args.is_empty() {
+                        return Err(AdapterError::ArgumentCount("tls resolvers".into(), 1, 0));
+                    }
+                    tls.dns_challenge
+                        .get_or_insert_default()
+                        .resolvers
+                        .extend(sub.args.iter().cloned());
+                }
+                "dns_ttl" => {
+                    tls.dns_challenge.get_or_insert_default().ttl_secs =
+                        Some(parse_required_duration(sub)?.div_ceil(1000));
+                }
+                "propagation_delay" => {
+                    tls.dns_challenge
+                        .get_or_insert_default()
+                        .propagation_delay_secs =
+                        Some(parse_required_duration(sub)?.div_ceil(1000));
+                }
+                "propagation_timeout" => {
+                    tls.dns_challenge
+                        .get_or_insert_default()
+                        .propagation_timeout_secs =
+                        Some(parse_required_duration(sub)?.div_ceil(1000));
+                }
+                "dns_challenge_override_domain" => {
+                    tls.dns_challenge
+                        .get_or_insert_default()
+                        .challenge_override_domain =
+                        Some(expect_single(sub, "tls dns_challenge_override_domain")?);
+                }
                 // 🚫 TLS options the format defines and this crate does not
                 // implement. Almost all of them belong to two subsystems we do
                 // not have — certificate issuance beyond the built-in local
@@ -341,12 +387,6 @@ fn is_known_tls_option(name: &str) -> bool {
             | "eab"
             | "issuer"
             | "get_certificate"
-            | "dns"
-            | "resolvers"
-            | "propagation_delay"
-            | "propagation_timeout"
-            | "dns_ttl"
-            | "dns_challenge_override_domain"
             | "on_demand"
             | "reuse_private_keys"
             | "insecure_secrets_log"
@@ -475,5 +515,156 @@ mod client_auth_tests {
         )
         .expect_err("an unimplemented verifier must not look configured");
         assert!(format!("{error}").contains("verifier"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod dns_challenge_tests {
+
+    fn config_of(source: &str) -> pingclair_core::config::PingclairConfig {
+        crate::compile(source).expect("the configuration compiles")
+    }
+
+    fn challenge_of(source: &str) -> pingclair_core::config::DnsChallengeConfig {
+        config_of(source).servers[0]
+            .tls
+            .as_ref()
+            .expect("tls")
+            .dns_challenge
+            .clone()
+            .expect("a DNS challenge")
+    }
+
+    /// 📡 Every DNS-01 option lands on the same challenge, so writing one of
+    /// them is enough to ask for the challenge at all.
+    #[test]
+    fn the_site_options_all_reach_one_challenge() {
+        let challenge = challenge_of(
+            r#"
+            localhost {
+                tls {
+                    dns cloudflare secret-token
+                    resolvers 1.1.1.1 8.8.8.8
+                    dns_ttl 5m10s
+                    propagation_delay 30s
+                    propagation_timeout 10m
+                }
+            }
+            "#,
+        );
+        let provider = challenge.provider.expect("a provider");
+        assert_eq!(provider.name, "cloudflare");
+        assert_eq!(provider.arguments, vec!["secret-token"]);
+        assert_eq!(challenge.resolvers, vec!["1.1.1.1", "8.8.8.8"]);
+        // ⏱️ Upstream writes durations with units; 5m10s is 310 seconds.
+        assert_eq!(challenge.ttl_secs, Some(310));
+        assert_eq!(challenge.propagation_delay_secs, Some(30));
+        assert_eq!(challenge.propagation_timeout_secs, Some(600));
+    }
+
+    /// 📡 The global `dns` provider and `tls_resolvers` fill in what a site
+    /// left blank, and a site that named its own keeps it.
+    #[test]
+    fn global_options_fill_the_blanks_without_overriding() {
+        let config = config_of(
+            r#"
+            {
+                dns cloudflare global-token
+                tls_resolvers 1.1.1.1 8.8.8.8
+                acme_dns
+            }
+
+            inherits.test {
+            }
+
+            overrides.test {
+                tls {
+                    dns cloudflare own-token
+                    resolvers 9.9.9.9
+                }
+            }
+            "#,
+        );
+        let challenge = |name: &str| {
+            config
+                .servers
+                .iter()
+                .find(|server| server.name.as_deref() == Some(name))
+                .and_then(|server| server.tls.as_ref())
+                .and_then(|tls| tls.dns_challenge.clone())
+                .unwrap_or_else(|| panic!("{name} has no DNS challenge"))
+        };
+
+        // 🌐 `acme_dns` moved a site that said nothing at all onto DNS-01.
+        let inherited = challenge("inherits.test");
+        assert_eq!(
+            inherited.provider.as_ref().unwrap().arguments,
+            ["global-token"]
+        );
+        assert_eq!(inherited.resolvers, vec!["1.1.1.1", "8.8.8.8"]);
+
+        // 🎯 The site that spoke for itself is not overwritten by the global.
+        let own = challenge("overrides.test");
+        assert_eq!(own.provider.as_ref().unwrap().arguments, ["own-token"]);
+        assert_eq!(own.resolvers, vec!["9.9.9.9"]);
+    }
+
+    /// 🚫 A challenge nobody can answer must not compile.
+    ///
+    /// Both spellings upstream refuses: the bare `acme_dns` with no global
+    /// `dns`, and a site setting DNS-01 timers without naming a provider. The
+    /// failure they prevent is the same one — the certificate can never be
+    /// issued, and without this the operator learns that at renewal.
+    #[test]
+    fn a_challenge_without_a_provider_is_refused() {
+        let naked_acme_dns = crate::compile(
+            r#"
+            {
+                acme_dns
+            }
+
+            example.com {
+                respond "hello"
+            }
+            "#,
+        );
+        assert!(naked_acme_dns.is_err(), "{naked_acme_dns:?}");
+
+        let timers_only = crate::compile(
+            r#"
+            :443 {
+                tls {
+                    propagation_delay 30s
+                }
+            }
+            "#,
+        );
+        assert!(timers_only.is_err(), "{timers_only:?}");
+    }
+
+    /// 🏛️ A site with its own certificate, or one served by the internal
+    /// authority, never talks to a public CA — so a global `acme_dns` must not
+    /// give it a challenge it would then be refused for having no provider.
+    #[test]
+    fn sites_that_never_use_acme_are_left_alone() {
+        let config = config_of(
+            r#"
+            {
+                acme_dns cloudflare token
+            }
+
+            internal.test {
+                tls internal
+            }
+            "#,
+        );
+        assert!(
+            config.servers[0]
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.dns_challenge.as_ref())
+                .is_none(),
+            "an internally issued site acquired a DNS-01 challenge"
+        );
     }
 }

@@ -132,10 +132,12 @@ pub(super) static DIRECTIVES: &[Spec] = &[
 /// 🌐 Every global-block option name.
 pub(super) static GLOBAL_OPTIONS: &[Spec] = &[
     // MARK: - Implemented
+    implemented("acme_dns"),
     implemented("admin"),
     implemented("auto_https"),
     implemented("debug"),
     implemented("default_sni"),
+    implemented("dns"),
     implemented("dns_refresh"),
     implemented("email"),
     implemented("grace_period"),
@@ -147,16 +149,15 @@ pub(super) static GLOBAL_OPTIONS: &[Spec] = &[
     implemented("order"),
     implemented("persist_config"),
     implemented("protocols"),
+    implemented("tls_resolvers"),
     implemented("trusted_proxies"),
     // MARK: - Recognised, not implemented
     recognised("acme_ca"),
     recognised("acme_ca_root"),
-    recognised("acme_dns"),
     recognised("acme_eab"),
     recognised("cert_issuer"),
     recognised("cert_lifetime"),
     recognised("default_bind"),
-    recognised("dns"),
     recognised("ech"),
     recognised("events"),
     recognised("fallback_sni"),

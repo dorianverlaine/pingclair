@@ -42,6 +42,23 @@ pub struct GlobalConfig {
     /// Global ACME email
     pub email: Option<String>,
 
+    /// 📡 The DNS provider every site falls back to, from the global `dns`
+    /// option. It answers two different questions upstream — DNS-01 challenges
+    /// and general resolution — and this field is the first of those.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<DnsProviderConfig>,
+
+    /// 📡 The global `acme_dns` option: switch every site's automatic
+    /// certificate onto DNS-01. `Some(None)` is the bare spelling, which means
+    /// "use the provider `dns` named".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acme_dns: Option<Option<DnsProviderConfig>>,
+
+    /// 🔎 The global `tls_resolvers` option: which resolvers every DNS-01
+    /// propagation check asks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tls_resolvers: Vec<String>,
+
     /// 🌐 Port the server uses for plaintext HTTP, matching Caddy's
     /// `http_port` option. The automatic port-80 companion and the default
     /// listener for non-TLS hostname sites honor this.
@@ -134,6 +151,9 @@ impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
             email: None,
+            dns: None,
+            acme_dns: None,
+            tls_resolvers: Vec::new(),
             http_port: default_http_port(),
             https_port: default_https_port(),
             metrics: default_bool_true(),
@@ -483,6 +503,13 @@ pub struct TlsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_auth: Option<ClientAuthConfig>,
 
+    /// 📡 DNS-01 settings for this site, when it asks for the DNS challenge.
+    ///
+    /// Present means the site wants DNS-01 rather than HTTP-01 — including a
+    /// wildcard site, which has no other option.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_challenge: Option<DnsChallengeConfig>,
+
     /// 🏷️ The server name to assume when a client sends no SNI.
     ///
     /// TLS 1.2 made SNI optional and plenty of clients still omit it: older
@@ -492,6 +519,61 @@ pub struct TlsConfig {
     /// between "this endpoint does not work for that client" and "it does".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_sni: Option<String>,
+}
+
+/// 📡 Which DNS provider answers a DNS-01 challenge, and how it is addressed.
+///
+/// The arguments are the provider's own, not ours: upstream hands whatever
+/// follows the name straight to the provider module, and a Cloudflare token
+/// and a Route 53 hosted-zone ID have nothing in common. Keeping them as an
+/// opaque list is what lets the parser stay honest about not knowing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DnsProviderConfig {
+    /// 🏷️ The provider's module name, for example `cloudflare`.
+    pub name: String,
+
+    /// 🎛️ Everything written after the name, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<String>,
+}
+
+/// 📡 The DNS-01 challenge settings for one site, or for the whole server.
+///
+/// DNS-01 is the only challenge that can prove control of a wildcard, which is
+/// why it is worth its own configuration rather than a boolean: a certificate
+/// for `*.example.com` cannot be obtained any other way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DnsChallengeConfig {
+    /// 🏢 The provider that publishes the TXT record. `None` means "whatever
+    /// the global `dns` option named", which is how upstream's bare
+    /// `acme_dns` works.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<DnsProviderConfig>,
+
+    /// 🔎 The resolvers used to *check* the record has propagated. These are
+    /// deliberately not the system resolvers: a recursive resolver that has
+    /// cached the old (absent) record will keep saying so, and the ACME server
+    /// is asking authoritative servers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolvers: Vec<String>,
+
+    /// ⏱️ The TTL to publish on the TXT record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
+
+    /// ⏳ How long to wait before even starting to check for propagation.
+    /// Some providers accept a record and serve it seconds later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub propagation_delay_secs: Option<u64>,
+
+    /// ⌛ How long to keep checking before giving up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub propagation_timeout_secs: Option<u64>,
+
+    /// 🔀 A delegated domain to write the record into instead, for operators
+    /// who keep ACME records in a zone separate from the served one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge_override_domain: Option<String>,
 }
 
 /// 🪪 How strictly a client certificate is demanded and checked.

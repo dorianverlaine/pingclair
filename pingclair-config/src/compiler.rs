@@ -10,8 +10,8 @@ use pingclair_core::config::Encoding as CoreEncoding;
 use pingclair_core::config::{
     AccessControlConfig as CoreAccessControlConfig, AdminConfig,
     AutoHttpsMode as CoreAutoHttpsMode, BasicAuthAlgorithm as CoreBasicAuthAlgorithm,
-    HandlerConfig, HandlerElement as CoreHandlerElement, LoadBalanceConfig, LogConfig,
-    LogFormat as CoreLogFormat, LogOutput as CoreLogOutput, Matcher as CoreMatcher,
+    DnsChallengeConfig, HandlerConfig, HandlerElement as CoreHandlerElement, LoadBalanceConfig,
+    LogConfig, LogFormat as CoreLogFormat, LogOutput as CoreLogOutput, Matcher as CoreMatcher,
     MatcherCondition, NamedLogConfig, PingclairConfig, ProxyUpstream,
     RateLimitKey as CoreRateLimitKey, ReverseProxyConfig, RouteConfig, ServerConfig, TlsConfig,
     default_encodings, default_gzip_types,
@@ -113,7 +113,71 @@ pub fn compile_ast(ast: &Ast) -> CompileResult<PingclairConfig> {
         }
     }
 
+    // 📡 DNS-01 inheritance, once every site exists — the rule depends on what
+    // each site said for itself, so it cannot be applied while parsing one.
+    apply_global_dns_challenge(&mut config);
+
     Ok(config)
+}
+
+/// 📡 Spreads the global DNS-01 options over the sites that need them.
+///
+/// Three rules, in the order upstream applies them:
+///
+/// - A site that configured anything under `tls { dns … }` already wants the
+///   DNS challenge; it only needs the blanks filling in.
+/// - The global `acme_dns` option moves *every* remaining automatic site onto
+///   DNS-01, which is the whole point of writing it.
+/// - Whatever is still unset falls back to the global `dns` provider and the
+///   global `tls_resolvers`.
+///
+/// 🏎️ Startup work, deliberately: every site's challenge settings are resolved
+/// once here so an issuance or a renewal never has to consult the global block
+/// again. It is also the only place the three sources are visible together,
+/// which is what stops the precedence from being re-derived in two places.
+fn apply_global_dns_challenge(config: &mut PingclairConfig) {
+    let global_provider = config.global.dns.clone();
+    let global_resolvers = config.global.tls_resolvers.clone();
+    let acme_dns = config.global.acme_dns.clone();
+
+    if global_provider.is_none() && global_resolvers.is_empty() && acme_dns.is_none() {
+        return;
+    }
+
+    for server in &mut config.servers {
+        let Some(tls) = server.tls.as_mut() else {
+            continue;
+        };
+        // 🚫 A site with its own certificate, or one served by the internal
+        // authority, never talks to a public CA — so it has no challenge to
+        // configure and must not acquire one from a global option.
+        let manages_its_own = tls.cert.is_some() || tls.internal;
+        if tls.dns_challenge.is_none() {
+            if manages_its_own {
+                continue;
+            }
+            match &acme_dns {
+                Some(provider) => {
+                    tls.dns_challenge = Some(DnsChallengeConfig {
+                        provider: provider.clone(),
+                        ..Default::default()
+                    })
+                }
+                None => continue,
+            }
+        }
+
+        let challenge = tls
+            .dns_challenge
+            .as_mut()
+            .expect("the challenge was just ensured");
+        if challenge.provider.is_none() {
+            challenge.provider = global_provider.clone();
+        }
+        if challenge.resolvers.is_empty() {
+            challenge.resolvers = global_resolvers.clone();
+        }
+    }
 }
 
 fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> CompileResult<()> {
@@ -125,6 +189,19 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
     // Set global ACME email
     if let Some(email) = &global.email {
         config.global.email = Some(email.clone());
+    }
+
+    // 📡 The DNS-01 globals. Carried across as written; turning them into a
+    // per-site challenge happens once every site exists, below, because the
+    // rule depends on what each site said for itself.
+    if let Some(provider) = &global.dns {
+        config.global.dns = Some(provider.clone());
+    }
+    if let Some(acme_dns) = &global.acme_dns {
+        config.global.acme_dns = Some(acme_dns.clone());
+    }
+    if !global.tls_resolvers.is_empty() {
+        config.global.tls_resolvers = global.tls_resolvers.clone();
     }
 
     // 🔐 Caddy's `local_certs` option selects the built-in local authority
@@ -330,6 +407,9 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
             }
             if tls.default_sni.is_some() {
                 merged.default_sni = tls.default_sni.clone();
+            }
+            if tls.dns_challenge.is_some() {
+                merged.dns_challenge = tls.dns_challenge.clone();
             }
             if tls.client_auth.is_some() {
                 merged.client_auth = tls.client_auth.clone();
@@ -789,6 +869,24 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
 
         if let Some(client_auth) = &tls.client_auth {
             validate_client_auth(client_auth)?;
+        }
+
+        // 📡 A DNS-01 challenge with nobody to answer it is not a partial
+        // configuration, it is a broken one: the certificate can never be
+        // issued, and the site would fail at renewal rather than at load.
+        // Upstream refuses the same shapes — both the bare `acme_dns` with no
+        // `dns` option and a `tls { propagation_delay … }` that names no
+        // provider — which is why the message names the two ways to fix it.
+        if let Some(challenge) = &tls.dns_challenge
+            && challenge.provider.is_none()
+        {
+            return Err(CompileError::InvalidServer {
+                message: format!(
+                    "site {} asks for the DNS-01 challenge but names no DNS provider; \
+                     set one with `tls {{ dns <provider> }}` or the global `dns` option",
+                    server.name.as_deref().unwrap_or("_")
+                ),
+            });
         }
 
         if !tls.internal {

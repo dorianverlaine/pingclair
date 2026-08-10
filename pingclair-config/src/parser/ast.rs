@@ -71,6 +71,14 @@ pub struct GlobalBlock {
     /// 🏷️ Server name assumed when a client sends no SNI, for every site that
     /// does not name its own.
     pub default_sni: Option<String>,
+    /// 📡 The DNS provider named by the global `dns` option.
+    pub dns: Option<pingclair_core::config::DnsProviderConfig>,
+    /// 📡 The global `acme_dns` option. `Some(None)` is the bare spelling,
+    /// which means "use the provider `dns` named" — a different answer from
+    /// "not asked for", and only one of the two is an error without `dns`.
+    pub acme_dns: Option<Option<pingclair_core::config::DnsProviderConfig>>,
+    /// 🔎 Resolvers every DNS-01 propagation check asks (`tls_resolvers`).
+    pub tls_resolvers: Vec<String>,
     pub directives: Vec<Directive>,
 }
 
@@ -282,8 +290,12 @@ pub struct TlsDirective {
     /// 🏷️ The server name assumed when a client sends no SNI.
     pub default_sni: Option<String>,
 
-    /// 🪪 Mutual TLS, parsed but not yet enforced by any acceptor.
+    /// 🪪 Mutual TLS: what to ask of the client's own certificate.
     pub client_auth: Option<pingclair_core::config::ClientAuthConfig>,
+
+    /// 📡 DNS-01 settings. Present means this site asks for the DNS challenge
+    /// rather than HTTP-01 — which a wildcard site has no alternative to.
+    pub dns_challenge: Option<pingclair_core::config::DnsChallengeConfig>,
 }
 
 /// Listen address

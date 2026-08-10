@@ -6,6 +6,7 @@ use super::args::{expect_one_argument, parse_dns_refresh, parse_required_duratio
 use super::logs::adapt_log_block;
 use crate::parser::ast::*;
 use crate::parser::caddy_ast::Directive;
+use pingclair_core::config::DnsProviderConfig;
 
 // MARK: - Global Block
 
@@ -291,6 +292,42 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                         }
                         global.trusted_proxies.push(rule);
                     }
+                }
+                // 📡 `dns <provider> [args…]` names the provider used both for
+                // DNS-01 challenges and, upstream, for general resolution. We
+                // only have the first meaning, which is why `acme_dns` below
+                // is what actually switches a site's challenge over.
+                "dns" => {
+                    let name = sub
+                        .args
+                        .first()
+                        .ok_or_else(|| AdapterError::ArgumentCount("dns".into(), 1, 0))?;
+                    global.dns = Some(DnsProviderConfig {
+                        name: name.clone(),
+                        arguments: sub.args[1..].to_vec(),
+                    });
+                }
+                // 📡 `acme_dns [<provider> [args…]]` moves automatic issuance
+                // onto DNS-01 for every site that has not said otherwise. The
+                // bare spelling means "use whatever `dns` named", which is why
+                // the field is an `Option<Option<…>>` rather than a provider:
+                // "not asked for" and "asked for, unnamed" are different
+                // answers, and only the second one is an error when no `dns`
+                // option exists.
+                "acme_dns" => {
+                    global.acme_dns = Some(sub.args.first().map(|name| DnsProviderConfig {
+                        name: name.clone(),
+                        arguments: sub.args[1..].to_vec(),
+                    }));
+                }
+                // 🔎 `tls_resolvers <ip…>` — which resolvers a propagation
+                // check asks. Not the system resolvers on purpose: a recursive
+                // resolver that cached the record's absence keeps saying so.
+                "tls_resolvers" => {
+                    if sub.args.is_empty() {
+                        return Err(AdapterError::ArgumentCount("tls_resolvers".into(), 1, 0));
+                    }
+                    global.tls_resolvers = sub.args.clone();
                 }
                 "dns_refresh" => {
                     let Some(value) = sub.args.first() else {

@@ -174,6 +174,9 @@ fn merge_globals(
     let default = pingclair_core::config::GlobalConfig::default();
     let pingclair_core::config::GlobalConfig {
         email,
+        dns,
+        acme_dns,
+        tls_resolvers,
         http_port,
         https_port,
         metrics,
@@ -193,6 +196,15 @@ fn merge_globals(
     // the fields that are not `Option`.
     if email.is_some() {
         into.email = email;
+    }
+    if dns.is_some() {
+        into.dns = dns;
+    }
+    if acme_dns.is_some() {
+        into.acme_dns = acme_dns;
+    }
+    if !tls_resolvers.is_empty() {
+        into.tls_resolvers = tls_resolvers;
     }
     if http_port != default.http_port {
         into.http_port = http_port;
