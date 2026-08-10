@@ -42,6 +42,18 @@ pub struct GlobalConfig {
     /// Global ACME email
     pub email: Option<String>,
 
+    /// 🏛️ Certificate authorities declared by the global `pki` block.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pki: Vec<PkiAuthority>,
+
+    /// 🤝 Upstream's `skip_install_trust`. It describes what this server
+    /// already does: the internal CA root is only ever installed by the
+    /// explicit `pingclair trust` command, never automatically at startup. The
+    /// option is accepted so a configuration written for upstream translates,
+    /// and it changes nothing here.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_install_trust: bool,
+
     /// 📡 The DNS provider every site falls back to, from the global `dns`
     /// option. It answers two different questions upstream — DNS-01 challenges
     /// and general resolution — and this field is the first of those.
@@ -151,6 +163,8 @@ impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
             email: None,
+            pki: Vec::new(),
+            skip_install_trust: false,
             dns: None,
             acme_dns: None,
             tls_resolvers: Vec::new(),
@@ -521,6 +535,91 @@ pub struct TlsConfig {
     pub default_sni: Option<String>,
 }
 
+/// 🏛️ One certificate authority declared by the global `pki` block.
+///
+/// Upstream lets a server *be* a CA and hand certificates to other clients over
+/// RFC 8555. This build parses, validates and serialises that configuration and
+/// refuses to perform it — see the runtime refusal in `run.rs`. Keeping the
+/// shape means a configuration written for upstream still translates, which is
+/// what `adapt` is for; it does not mean the server will act as a CA.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PkiAuthority {
+    /// 🏷️ The identifier a site's `acme_server { ca … }` refers to.
+    /// Upstream calls the unnamed one `local`.
+    pub id: String,
+
+    /// 📛 Human-readable name, shown in the certificates it signs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    /// 📜 Common name for the root certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_cn: Option<String>,
+
+    /// 📜 Common name for the intermediate certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intermediate_cn: Option<String>,
+
+    /// 🔑 An existing root to sign with, rather than generating one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<PkiKeyPair>,
+
+    /// 🔑 An existing intermediate to sign with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intermediate: Option<PkiKeyPair>,
+}
+
+/// 🔑 A certificate and key an authority signs with, loaded from disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PkiKeyPair {
+    pub cert: Option<String>,
+    pub key: Option<String>,
+    /// 📄 How the two above are stored. Upstream's only Caddyfile spelling is
+    /// `pem_file`; the field exists so a different one is refused rather than
+    /// silently read as PEM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+}
+
+/// 🏛️ A site acting as an ACME server for other clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AcmeServerConfig {
+    /// 🏷️ Which `pki` authority signs what this server issues.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<String>,
+
+    /// ⏱️ How long the certificates it issues are valid for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifetime_secs: Option<u64>,
+
+    /// 🌳 Sign with the root directly instead of the intermediate.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sign_with_root: bool,
+
+    /// 🧩 Which challenges this server offers. Empty means upstream's default
+    /// set, which is why "written with no arguments" and "not written" have to
+    /// stay distinguishable — hence the `Option`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenges: Option<Vec<String>>,
+
+    /// ✅ Names this server will issue for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<AcmeServerPolicy>,
+
+    /// 🚫 Names this server refuses, checked after `allow`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny: Option<AcmeServerPolicy>,
+}
+
+/// 🧭 One half of an ACME server's issuance policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AcmeServerPolicy {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ip_ranges: Vec<String>,
+}
+
 /// 📡 Which DNS provider answers a DNS-01 challenge, and how it is addressed.
 ///
 /// The arguments are the provider's own, not ours: upstream hands whatever
@@ -620,6 +719,16 @@ pub enum TrustPool {
     },
     /// 🖥️ The host's own trust store.
     System,
+    /// 🏛️ The root of a `pki` authority declared in the global block.
+    PkiRoot {
+        #[serde(default)]
+        authority: String,
+    },
+    /// 🏛️ The intermediate of a `pki` authority.
+    PkiIntermediate {
+        #[serde(default)]
+        authority: String,
+    },
     /// 🧩 Several pools treated as one.
     Combined {
         #[serde(default)]
@@ -997,6 +1106,13 @@ pub enum HandlerConfig {
         #[serde(default = "default_bool_true")]
         compress: bool,
     },
+
+    /// 🏛️ A site that acts as an ACME server for other clients.
+    ///
+    /// Parsed, validated and serialised; never performed. `run.rs` refuses to
+    /// start when a site carries this, because a server that answers ACME
+    /// requests and issues nothing is worse than one that says so.
+    AcmeServer(Box<AcmeServerConfig>),
 
     /// Caddy-compatible template rendering (`{{now | date "..."}}`)
     Templates {

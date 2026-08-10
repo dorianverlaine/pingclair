@@ -271,6 +271,24 @@ lets the rest converge.
   rather than through temporary files.
 - 🔐 **TLS.** A persistent internal CA for private origins, and durable ACME
   state across restarts.
+- 🏛️ **`pki` and `acme_server` are configuration, not behaviour.** The global
+  `pki { ca <id> { name, root_cn, intermediate_cn, root/intermediate { cert,
+  key, format } } }` block, a site's `acme_server { ca, lifetime,
+  sign_with_root, challenges, allow, deny }`, `skip_install_trust`, and
+  `trust_pool pki_root`/`pki_intermediate` all parse, validate and serialise,
+  so a configuration written for upstream translates through `adapt`.
+
+  **Pingclair does not act as a certificate authority issuing to other
+  clients.** A site carrying `acme_server` is refused at startup by name,
+  because a server that answers ACME requests and issues nothing is worse than
+  one that says so — the clients would keep retrying against something that
+  looks alive. A `trust_pool` naming a `pki` authority is refused when the
+  trust store is built, rather than silently becoming an empty store that
+  rejects every client at handshake time. `skip_install_trust` is accepted and
+  changes nothing: the internal CA root is only ever installed by the explicit
+  `pingclair trust` command, never automatically, which is what the option asks
+  for.
+
 - 📡 **DNS-01 and wildcard certificates, through Cloudflare.** `tls { dns
   cloudflare <token> }`, the global `dns`/`acme_dns`/`tls_resolvers` options,
   and the per-site `resolvers`, `dns_ttl`, `propagation_delay`,

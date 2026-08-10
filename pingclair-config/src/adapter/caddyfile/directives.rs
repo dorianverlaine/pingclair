@@ -104,6 +104,13 @@ pub(super) fn adapt_handler(
             Ok(Handler::FileServer(config))
         }
         "templates" => Ok(Handler::Templates),
+        // 🏛️ Parsed here so `adapt` translates a configuration written for
+        // upstream; `run.rs` refuses to start with one, because a server that
+        // answers ACME requests and issues nothing is worse than one that says
+        // so out loud.
+        "acme_server" => Ok(Handler::AcmeServer(Box::new(
+            super::tls::parse_acme_server(&d)?,
+        ))),
         "header" => adapt_header_directive(&d),
         "log_skip" => Ok(Handler::LogSkip),
         "route" => adapt_subroute_block(&d, matchers, order, false),

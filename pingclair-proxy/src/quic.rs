@@ -2239,6 +2239,10 @@ async fn plan_h3_handler_with_connector(
             },
         },
         HandlerConfig::Plugin { .. } => Err((501, "Plugin Not Supported Over HTTP/3")),
+        // 🚫 Unreachable: startup refuses a configuration carrying an ACME
+        // server. Answered rather than ignored so loosening that refusal
+        // without finishing this shows up as a status, not as a fall-through.
+        HandlerConfig::AcmeServer(_) => Err((501, "ACME Server Not Implemented")),
     }
 }
 

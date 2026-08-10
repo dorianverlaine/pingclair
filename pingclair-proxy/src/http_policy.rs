@@ -228,6 +228,7 @@ pub fn evaluate_response_handlers(
             | HandlerConfig::AccessControl(_)
             | HandlerConfig::TryFiles { .. }
             | HandlerConfig::Plugin { .. }
+            | HandlerConfig::AcmeServer(_)
             | HandlerConfig::HandleErrors { .. }
             | HandlerConfig::Handle { .. }
             | HandlerConfig::HandlePath { .. }

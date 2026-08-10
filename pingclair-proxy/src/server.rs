@@ -4462,6 +4462,19 @@ impl PingclairProxy {
             // wildcard arm that returned "not handled", which made an
             // unimplemented handler indistinguishable from a route that
             // deliberately falls through. A loud 500 beats a silent bypass.
+            // 🏛️ Same reasoning as `plugin` below: startup refuses a
+            // configuration with an ACME server, so this cannot be reached.
+            // Failing loudly keeps that true if the refusal is ever loosened.
+            HandlerConfig::AcmeServer(_) => {
+                tracing::error!(
+                    "🚫 An acme_server handler reached the request path, which startup should \
+                     have refused; failing closed"
+                );
+                Err(pingora_core::Error::explain(
+                    pingora_core::ErrorType::InternalError,
+                    "acme_server handler is not implemented",
+                ))
+            }
             HandlerConfig::Plugin { name, .. } => {
                 tracing::error!(
                     plugin = %name,

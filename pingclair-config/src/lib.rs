@@ -174,6 +174,8 @@ fn merge_globals(
     let default = pingclair_core::config::GlobalConfig::default();
     let pingclair_core::config::GlobalConfig {
         email,
+        pki,
+        skip_install_trust,
         dns,
         acme_dns,
         tls_resolvers,
@@ -196,6 +198,12 @@ fn merge_globals(
     // the fields that are not `Option`.
     if email.is_some() {
         into.email = email;
+    }
+    if !pki.is_empty() {
+        into.pki = pki;
+    }
+    if skip_install_trust {
+        into.skip_install_trust = true;
     }
     if dns.is_some() {
         into.dns = dns;

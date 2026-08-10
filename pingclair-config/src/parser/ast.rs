@@ -79,6 +79,10 @@ pub struct GlobalBlock {
     pub acme_dns: Option<Option<pingclair_core::config::DnsProviderConfig>>,
     /// 🔎 Resolvers every DNS-01 propagation check asks (`tls_resolvers`).
     pub tls_resolvers: Vec<String>,
+    /// 🏛️ Authorities from the global `pki` block. Parsed, never operated.
+    pub pki: Vec<pingclair_core::config::PkiAuthority>,
+    /// 🤝 `skip_install_trust`, which describes what this build already does.
+    pub skip_install_trust: bool,
     pub directives: Vec<Directive>,
 }
 
@@ -596,6 +600,9 @@ pub enum Handler {
 
     /// 🧭 Wraps the response of later handlers with response handlers.
     Intercept(Vec<pingclair_core::config::ResponseHandlerConfig>),
+
+    /// 🏛️ A site acting as an ACME server. Parsed, refused at startup.
+    AcmeServer(Box<pingclair_core::config::AcmeServerConfig>),
 
     /// 🔐 Caddy's `forward_auth` shortcut: one auth round trip, then continue.
     ForwardAuth(pingclair_core::config::ForwardAuthConfig),

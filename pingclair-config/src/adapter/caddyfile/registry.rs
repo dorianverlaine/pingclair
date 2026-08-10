@@ -75,6 +75,7 @@ const fn recognised(name: &'static str) -> Spec {
 pub(super) static DIRECTIVES: &[Spec] = &[
     // MARK: - Implemented
     implemented("access_control"),
+    implemented("acme_server"),
     implemented("basic_auth"),
     implemented("basicauth"),
     implemented("bind"),
@@ -112,7 +113,6 @@ pub(super) static DIRECTIVES: &[Spec] = &[
     implemented("vars"),
     // MARK: - Recognised, not implemented
     recognised("abort"),
-    recognised("acme_server"),
     recognised("copy_response"),
     recognised("copy_response_headers"),
     recognised("fs"),
@@ -148,7 +148,9 @@ pub(super) static GLOBAL_OPTIONS: &[Spec] = &[
     implemented("metrics"),
     implemented("order"),
     implemented("persist_config"),
+    implemented("pki"),
     implemented("protocols"),
+    implemented("skip_install_trust"),
     implemented("tls_resolvers"),
     implemented("trusted_proxies"),
     // MARK: - Recognised, not implemented
@@ -167,12 +169,10 @@ pub(super) static GLOBAL_OPTIONS: &[Spec] = &[
     recognised("ocsp_interval"),
     recognised("ocsp_stapling"),
     recognised("on_demand_tls"),
-    recognised("pki"),
     recognised("preferred_chains"),
     recognised("renew_interval"),
     recognised("renewal_window_ratio"),
     recognised("shutdown_delay"),
-    recognised("skip_install_trust"),
     recognised("storage"),
     recognised("storage_clean_interval"),
 ];
@@ -305,6 +305,9 @@ mod tests {
                 "forward_auth",
                 "forward_auth 127.0.0.1:9000 {\n uri /auth\n copy_headers X-User-Id\n }",
             ),
+            // 🏛️ `ca` is required: an ACME server with no authority names
+            // nothing to sign with.
+            ("acme_server", "acme_server {\n ca local\n }"),
             ("limits", "limits {\n max_connections 10\n }"),
             ("listen", "listen :8080"),
             ("log", "log {\n output stdout\n }"),

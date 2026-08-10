@@ -297,6 +297,27 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                 // DNS-01 challenges and, upstream, for general resolution. We
                 // only have the first meaning, which is why `acme_dns` below
                 // is what actually switches a site's challenge over.
+                // 🏛️ Parsed so a configuration written for upstream still
+                // translates; this build never acts as a CA, and the refusal
+                // to do so lives at startup where it can be acted on.
+                "pki" => {
+                    global.pki = super::tls::parse_pki_block(&sub)?;
+                }
+                // 🤝 A bare toggle describing behaviour we already have: the
+                // internal CA root is installed only by `pingclair trust`,
+                // never automatically. Refusing an argument rather than
+                // ignoring one, because `skip_install_trust off` would read
+                // like it re-enabled something.
+                "skip_install_trust" => {
+                    if !sub.args.is_empty() {
+                        return Err(AdapterError::ArgumentCount(
+                            "skip_install_trust".into(),
+                            0,
+                            sub.args.len(),
+                        ));
+                    }
+                    global.skip_install_trust = true;
+                }
                 "dns" => {
                     let name = sub
                         .args

@@ -144,6 +144,12 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
         // response writing live; the pure core handler has nothing to do.
         HandlerConfig::Templates { .. } => Ok(HandlerResponse::status(200)),
 
+        // 🚫 Unreachable: `run.rs` refuses to start a configuration carrying an
+        // ACME server, so no request can arrive at one. Answering 501 rather
+        // than a plausible status keeps that true if the refusal is ever
+        // loosened without this being finished.
+        HandlerConfig::AcmeServer(_) => Ok(HandlerResponse::status(501)),
+
         HandlerConfig::Headers {
             set,
             add,

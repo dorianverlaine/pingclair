@@ -179,6 +179,31 @@ fn parse_trust_pool(d: &Directive, depth: usize) -> Result<TrustPool, AdapterErr
             Ok(TrustPool::File { pem_files })
         }
         "system" => Ok(TrustPool::System),
+        // 🏛️ Parsed so a configuration written for upstream translates. The
+        // refusal lives at startup, in `CompiledClientAuth::compile`, because
+        // this build never becomes a CA and so has no such root to trust.
+        "pki_root" | "pki_intermediate" => {
+            let mut authority = String::new();
+            for sub in directives {
+                match sub.name.as_str() {
+                    "authority" => authority = expect_single(sub, "trust_pool authority")?,
+                    other => {
+                        return Err(AdapterError::UnknownDirective(format!(
+                            "trust_pool {provider}: {other}"
+                        )));
+                    }
+                }
+            }
+            if authority.is_empty() {
+                // 🏷️ Upstream's own default when the block names none.
+                authority = "local".to_string();
+            }
+            Ok(if provider == "pki_root" {
+                TrustPool::PkiRoot { authority }
+            } else {
+                TrustPool::PkiIntermediate { authority }
+            })
+        }
         "combined" => {
             let mut sources = Vec::new();
             for sub in directives {
@@ -193,11 +218,10 @@ fn parse_trust_pool(d: &Directive, depth: usize) -> Result<TrustPool, AdapterErr
             }
             Ok(TrustPool::Combined { sources })
         }
-        // 🚫 `pki_root`, `pki_intermediate` and `storage` all read from
-        // subsystems this build does not have.
+        // 🚫 `storage` reads from a subsystem this build does not have.
         other => Err(AdapterError::UnsupportedFeature(
             format!("tls client_auth trust_pool {other}"),
-            "only inline, file, system and combined are implemented".into(),
+            "only inline, file, system, combined and the pki sources are parsed".into(),
         )),
     }
 }
@@ -665,6 +689,409 @@ mod dns_challenge_tests {
                 .and_then(|tls| tls.dns_challenge.as_ref())
                 .is_none(),
             "an internally issued site acquired a DNS-01 challenge"
+        );
+    }
+}
+
+// MARK: - PKI (configuration only)
+
+/// 🏛️ Reads the global `pki { ca <id> { … } }` block.
+///
+/// Every authority here is configuration this build understands and does not
+/// operate. Parsing it means a configuration written for upstream still
+/// translates through `adapt`, which is what `adapt` is for; the refusal to
+/// *act* as a CA lives at startup, where an operator can see it.
+pub(super) fn parse_pki_block(
+    d: &Directive,
+) -> Result<Vec<pingclair_core::config::PkiAuthority>, AdapterError> {
+    use pingclair_core::config::PkiAuthority;
+
+    let Some(block) = d.block.as_ref() else {
+        return Err(AdapterError::InvalidArgument(
+            "pki".into(),
+            "block required, e.g. `pki { ca local { name \"Local\" } }`".into(),
+        ));
+    };
+
+    let mut authorities: Vec<PkiAuthority> = Vec::new();
+    for entry in &block.directives {
+        if entry.name != "ca" {
+            return Err(AdapterError::UnknownDirective(format!(
+                "pki: {}",
+                entry.name
+            )));
+        }
+        if entry.args.len() > 1 {
+            return Err(AdapterError::ArgumentCount(
+                "pki ca".into(),
+                1,
+                entry.args.len(),
+            ));
+        }
+        // 🏷️ An unnamed `ca` block is upstream's `local` authority.
+        let id = entry
+            .args
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "local".into());
+        if authorities.iter().any(|existing| existing.id == id) {
+            return Err(AdapterError::InvalidArgument(
+                "pki ca".into(),
+                format!("authority `{id}` is declared twice"),
+            ));
+        }
+
+        let mut authority = PkiAuthority {
+            id,
+            ..Default::default()
+        };
+        for option in entry
+            .block
+            .as_ref()
+            .map(|b| b.directives.as_slice())
+            .unwrap_or_default()
+        {
+            match option.name.as_str() {
+                "name" => authority.name = Some(expect_single(option, "pki ca name")?),
+                "root_cn" => authority.root_cn = Some(expect_single(option, "pki ca root_cn")?),
+                "intermediate_cn" => {
+                    authority.intermediate_cn =
+                        Some(expect_single(option, "pki ca intermediate_cn")?)
+                }
+                "root" => authority.root = Some(parse_pki_key_pair(option)?),
+                "intermediate" => authority.intermediate = Some(parse_pki_key_pair(option)?),
+                other => {
+                    return Err(AdapterError::UnknownDirective(format!("pki ca: {other}")));
+                }
+            }
+        }
+        authorities.push(authority);
+    }
+    Ok(authorities)
+}
+
+/// 🔑 Reads a `root { … }` or `intermediate { … }` sub-block.
+fn parse_pki_key_pair(d: &Directive) -> Result<pingclair_core::config::PkiKeyPair, AdapterError> {
+    let mut pair = pingclair_core::config::PkiKeyPair::default();
+    for option in d
+        .block
+        .as_ref()
+        .map(|b| b.directives.as_slice())
+        .unwrap_or_default()
+    {
+        match option.name.as_str() {
+            "cert" => pair.cert = Some(expect_single(option, "pki cert")?),
+            "key" => pair.key = Some(expect_single(option, "pki key")?),
+            "format" => pair.format = Some(expect_single(option, "pki format")?),
+            other => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "pki {}: {other}",
+                    d.name
+                )));
+            }
+        }
+    }
+    // 🔗 A certificate without its key cannot sign anything, and a key without
+    // its certificate names nothing — the same pairing rule `tls cert/key` has.
+    if pair.cert.is_some() != pair.key.is_some() {
+        return Err(AdapterError::InvalidArgument(
+            format!("pki {}", d.name),
+            "cert and key must be given together".into(),
+        ));
+    }
+    Ok(pair)
+}
+
+/// 🏛️ Reads a site's `acme_server { … }` block.
+pub(super) fn parse_acme_server(
+    d: &Directive,
+) -> Result<pingclair_core::config::AcmeServerConfig, AdapterError> {
+    use pingclair_core::config::{AcmeServerConfig, AcmeServerPolicy};
+
+    let mut server = AcmeServerConfig::default();
+    for option in d
+        .block
+        .as_ref()
+        .map(|b| b.directives.as_slice())
+        .unwrap_or_default()
+    {
+        match option.name.as_str() {
+            "ca" => server.ca = Some(expect_single(option, "acme_server ca")?),
+            "lifetime" => {
+                server.lifetime_secs =
+                    Some(super::args::parse_required_duration(option)?.div_ceil(1000))
+            }
+            "sign_with_root" => {
+                if !option.args.is_empty() {
+                    return Err(AdapterError::ArgumentCount(
+                        "acme_server sign_with_root".into(),
+                        0,
+                        option.args.len(),
+                    ));
+                }
+                server.sign_with_root = true;
+            }
+            // 🧩 Written with no arguments means "the default set", which is a
+            // different answer from not written at all — so the empty list is
+            // kept rather than collapsed into `None`.
+            "challenges" => server.challenges = Some(option.args.clone()),
+            "allow" => server.allow = Some(parse_acme_server_policy(option)?),
+            "deny" => server.deny = Some(parse_acme_server_policy(option)?),
+            other => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "acme_server: {other}"
+                )));
+            }
+        }
+    }
+    let _ = AcmeServerPolicy::default();
+    Ok(server)
+}
+
+/// 🧭 Reads an `allow`/`deny` sub-block.
+fn parse_acme_server_policy(
+    d: &Directive,
+) -> Result<pingclair_core::config::AcmeServerPolicy, AdapterError> {
+    let mut policy = pingclair_core::config::AcmeServerPolicy::default();
+    for option in d
+        .block
+        .as_ref()
+        .map(|b| b.directives.as_slice())
+        .unwrap_or_default()
+    {
+        match option.name.as_str() {
+            "domains" => policy.domains.extend(option.args.iter().cloned()),
+            "ip_ranges" => policy.ip_ranges.extend(option.args.iter().cloned()),
+            other => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "acme_server {}: {other}",
+                    d.name
+                )));
+            }
+        }
+    }
+    if policy.domains.is_empty() && policy.ip_ranges.is_empty() {
+        return Err(AdapterError::InvalidArgument(
+            format!("acme_server {}", d.name),
+            "needs at least one `domains` or `ip_ranges` entry".into(),
+        ));
+    }
+    Ok(policy)
+}
+
+#[cfg(test)]
+mod pki_tests {
+    /// 🏛️ The whole `pki` shape upstream defines, in one configuration.
+    #[test]
+    fn a_pki_block_parses_every_authority_option() {
+        let config = crate::compile(
+            r#"
+            {
+                skip_install_trust
+                pki {
+                    ca {
+                        name "Local"
+                        root_cn "Custom Local Root Name"
+                        intermediate_cn "Custom Local Intermediate Name"
+                        root {
+                            cert /path/to/cert.pem
+                            key /path/to/key.pem
+                            format pem_file
+                        }
+                    }
+                    ca foo {
+                        name "Foo"
+                    }
+                }
+            }
+
+            a.example.com {
+                tls internal
+            }
+            "#,
+        )
+        .expect("the configuration compiles");
+
+        assert!(config.global.skip_install_trust);
+        assert_eq!(config.global.pki.len(), 2);
+
+        // 🏷️ An unnamed `ca` block is upstream's `local` authority; naming it
+        // anything else here would silently break `acme_server { ca local }`.
+        let local = &config.global.pki[0];
+        assert_eq!(local.id, "local");
+        assert_eq!(local.name.as_deref(), Some("Local"));
+        assert_eq!(local.root_cn.as_deref(), Some("Custom Local Root Name"));
+        let root = local.root.as_ref().expect("a root key pair");
+        assert_eq!(root.cert.as_deref(), Some("/path/to/cert.pem"));
+        assert_eq!(root.format.as_deref(), Some("pem_file"));
+
+        assert_eq!(config.global.pki[1].id, "foo");
+    }
+
+    /// 🔗 A signing certificate without its key cannot sign, and a key with no
+    /// certificate names nothing — the same pairing rule `tls cert/key` has.
+    #[test]
+    fn a_half_configured_signing_pair_is_refused() {
+        let result = crate::compile(
+            r#"
+            {
+                pki {
+                    ca {
+                        root {
+                            cert /path/to/cert.pem
+                        }
+                    }
+                }
+            }
+
+            a.example.com {
+                respond "hi"
+            }
+            "#,
+        );
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    /// 🏷️ Two authorities under one id would make `acme_server { ca … }`
+    /// ambiguous, and whichever won would be a coin toss.
+    #[test]
+    fn a_duplicate_authority_id_is_refused() {
+        let result = crate::compile(
+            r#"
+            {
+                pki {
+                    ca foo { name "One" }
+                    ca foo { name "Two" }
+                }
+            }
+
+            a.example.com {
+                respond "hi"
+            }
+            "#,
+        );
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    /// 🏛️ Every `acme_server` sub-directive reaches the configuration.
+    #[test]
+    fn an_acme_server_block_parses_its_options() {
+        use pingclair_core::config::HandlerConfig;
+
+        let config = crate::compile(
+            r#"
+            {
+                pki {
+                    ca custom-ca { name "Custom CA" }
+                }
+            }
+
+            acme.example.com {
+                acme_server {
+                    ca custom-ca
+                    lifetime 7d
+                    sign_with_root
+                    challenges dns-01 http-01
+                    allow {
+                        domains host-1.internal.example.com host-2.internal.example.com
+                    }
+                    deny {
+                        domains dc.internal.example.com
+                    }
+                }
+            }
+            "#,
+        )
+        .expect("the configuration compiles");
+
+        let handler = &config.servers[0].routes[0].handler;
+        let HandlerConfig::AcmeServer(server) = handler else {
+            panic!("expected an acme_server handler, got {handler:?}");
+        };
+        assert_eq!(server.ca.as_deref(), Some("custom-ca"));
+        assert_eq!(server.lifetime_secs, Some(7 * 24 * 60 * 60));
+        assert!(server.sign_with_root);
+        assert_eq!(
+            server.challenges.as_deref(),
+            Some(["dns-01".to_string(), "http-01".to_string()].as_slice())
+        );
+        assert_eq!(
+            server.allow.as_ref().expect("allow").domains,
+            ["host-1.internal.example.com", "host-2.internal.example.com"]
+        );
+        assert_eq!(
+            server.deny.as_ref().expect("deny").domains,
+            ["dc.internal.example.com"]
+        );
+    }
+
+    /// 🧩 `challenges` with no arguments means upstream's default set, which
+    /// is a different answer from not writing it — so the two must not both
+    /// arrive as `None`.
+    #[test]
+    fn a_bare_challenges_line_is_not_the_same_as_omitting_it() {
+        use pingclair_core::config::HandlerConfig;
+
+        let server_of = |source: &str| {
+            let config = crate::compile(source).expect("compiles");
+            match &config.servers[0].routes[0].handler {
+                HandlerConfig::AcmeServer(server) => server.clone(),
+                other => panic!("expected acme_server, got {other:?}"),
+            }
+        };
+
+        let written = server_of(
+            r#"
+            { pki { ca c { name "C" } } }
+            acme.example.com { acme_server { ca c
+                challenges
+            } }
+            "#,
+        );
+        let omitted = server_of(
+            r#"
+            { pki { ca c { name "C" } } }
+            acme.example.com { acme_server { ca c } }
+            "#,
+        );
+        assert_eq!(written.challenges, Some(Vec::new()));
+        assert_eq!(omitted.challenges, None);
+    }
+
+    /// 🏛️ A trust pool pointing at a `pki` authority parses, so an upstream
+    /// configuration translates. It is refused when the server tries to use
+    /// it, not here — see `CompiledClientAuth::compile`.
+    #[test]
+    fn a_pki_trust_pool_parses_and_defaults_to_the_local_authority() {
+        use pingclair_core::config::TrustPool;
+
+        let config = crate::compile(
+            r#"
+            localhost {
+                tls {
+                    client_auth {
+                        mode require_and_verify
+                        trust_pool pki_root {
+                            authority local
+                        }
+                    }
+                }
+            }
+            "#,
+        )
+        .expect("compiles");
+
+        let pool = config.servers[0]
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.client_auth.as_ref())
+            .and_then(|auth| auth.trust_pool.clone())
+            .expect("a trust pool");
+        assert_eq!(
+            pool,
+            TrustPool::PkiRoot {
+                authority: "local".to_string()
+            }
         );
     }
 }

@@ -395,6 +395,18 @@ fn add_trust_pool(
                 .set_default_paths()
                 .map_err(|error| format!("loading the system trust store failed: {error}"))?;
         }
+        // 🏛️ A `pki` authority is configuration this build parses and does not
+        // operate: it never becomes a CA, so it has no root to verify against.
+        // Refused here, at startup, where the operator can still act on it —
+        // an empty store would instead reject every client at handshake time
+        // with nothing pointing back at this setting.
+        TrustPool::PkiRoot { authority } | TrustPool::PkiIntermediate { authority } => {
+            return Err(format!(
+                "trust_pool refers to the `pki` authority `{authority}`, and this build does \
+                 not act as a certificate authority; name the CA's certificate with \
+                 `trust_pool file` instead"
+            ));
+        }
         TrustPool::Combined { sources } => {
             for source in sources {
                 add_trust_pool(builder, source, depth + 1)?;

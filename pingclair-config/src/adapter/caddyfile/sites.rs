@@ -783,6 +783,7 @@ pub(super) fn adapt_server(
 /// deciding anything, the order stops being data.
 pub(super) fn handler_directive_name(handler: &Handler) -> &'static str {
     match handler {
+        Handler::AcmeServer(_) => "acme_server",
         Handler::Headers(_) => "header",
         Handler::LogSkip => "log_skip",
         Handler::Vars(_) => "vars",
@@ -843,6 +844,9 @@ pub(super) fn handler_has_terminal(handler: &Handler) -> bool {
         | Handler::Error(_)
         | Handler::Redirect(_)
         | Handler::FileServer(_)
+        // 🏛️ An ACME server answers the request itself, so it terminates a
+        // route the same way `respond` does.
+        | Handler::AcmeServer(_)
         | Handler::Templates
         | Handler::ForwardAuth(_) => true,
         Handler::Pipeline(handlers)

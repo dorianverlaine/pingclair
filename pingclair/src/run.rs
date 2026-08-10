@@ -301,6 +301,38 @@ pub(crate) fn run_server(
         manual_certs.push((name.to_string(), cert_path.clone(), key_path.clone()));
     }
 
+    // 🏛️ `pki` and `acme_server` parse, validate and serialise; this build
+    // never acts as a certificate authority. A site carrying an ACME server
+    // would answer other clients' RFC 8555 requests and issue nothing, which
+    // is a worse answer than saying so — those clients would retry against a
+    // server that looks alive.
+    //
+    // 🚫 Refused here rather than in `validate_config` for the same reason as
+    // `client_auth` and DNS-01: `adapt` translating a configuration is honest,
+    // serving one it cannot honour is not.
+    let acme_server_sites: Vec<&str> = config
+        .servers
+        .iter()
+        .filter(|server| {
+            server.routes.iter().any(|route| {
+                matches!(
+                    route.handler,
+                    pingclair_core::config::HandlerConfig::AcmeServer(_)
+                )
+            })
+        })
+        .map(|server| server.name.as_deref().unwrap_or("_"))
+        .collect();
+    if !acme_server_sites.is_empty() {
+        anyhow::bail!(
+            "site(s) {} configure `acme_server`, and Pingclair does not act as a certificate \
+             authority issuing to other clients; refusing to start rather than answer ACME \
+             requests that can never produce a certificate. The `pki` block itself is accepted \
+             and unused",
+            acme_server_sites.join(", ")
+        );
+    }
+
     // 📡 DNS-01: build one provider per site that asked for it, and publish
     // which challenge proves which name. Everything expensive — the API client,
     // the token, the propagation policy — is resolved here so an issuance or a

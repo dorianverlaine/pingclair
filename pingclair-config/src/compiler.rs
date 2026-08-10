@@ -204,6 +204,17 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
         config.global.tls_resolvers = global.tls_resolvers.clone();
     }
 
+    // 🏛️ Carried across so the configuration round-trips through `adapt`;
+    // nothing reads either of these at runtime. `skip_install_trust` describes
+    // behaviour this build already has, and `pki` is refused when a site tries
+    // to act on it.
+    if !global.pki.is_empty() {
+        config.global.pki = global.pki.clone();
+    }
+    if global.skip_install_trust {
+        config.global.skip_install_trust = true;
+    }
+
     // 🔐 Caddy's `local_certs` option selects the built-in local authority
     // for every site that has no explicit certificate management.
     if global.local_certs {
@@ -1166,6 +1177,7 @@ fn reject_unimplemented_handler(handler: &HandlerConfig) -> CompileResult<()> {
         | HandlerConfig::BasicAuth { .. }
         | HandlerConfig::RateLimit { .. }
         | HandlerConfig::Cors { .. }
+        | HandlerConfig::AcmeServer(_)
         | HandlerConfig::AccessControl(_) => Ok(()),
     }
 }
@@ -1241,6 +1253,7 @@ fn validate_basic_auth_credentials(handler: &HandlerConfig) -> CompileResult<()>
         | HandlerConfig::RateLimit { .. }
         | HandlerConfig::Cors { .. }
         | HandlerConfig::AccessControl(_)
+        | HandlerConfig::AcmeServer(_)
         | HandlerConfig::Plugin { .. }
         | HandlerConfig::Templates { .. } => Ok(()),
     }
@@ -2113,6 +2126,7 @@ fn compile_handler(
     root: Option<&str>,
 ) -> CompileResult<HandlerConfig> {
     match handler {
+        Handler::AcmeServer(server) => Ok(HandlerConfig::AcmeServer(server.clone())),
         Handler::Proxy(proxy) => {
             let mut config = ReverseProxyConfig {
                 upstreams: proxy.upstreams.clone(),
