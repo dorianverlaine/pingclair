@@ -512,6 +512,53 @@ fn apply_site_root_to_matcher(matcher: &mut pingclair_core::config::Matcher, sit
 /// channel at all — the shape this project fails closed on everywhere else,
 /// and a particularly bad one here: the missing output is the very thing an
 /// operator would use to notice something is missing.
+/// 🚫 Refuses an `include`/`exclude` pair that cannot mean anything.
+///
+/// Populating both lists says "this rule, except that exception", so every
+/// entry has to be a super- or subspace of one in the other list. A namespace
+/// in both is a direct contradiction; one that is neither above nor below
+/// anything in the other list is neither a rule nor an exception, and the
+/// operator has expressed something that cannot be honoured either way.
+///
+/// Upstream refuses both at provision time. We refuse them in `validate_config`
+/// so a JSON config posted to the Admin API — which never sees the adapter —
+/// is held to the same bar.
+fn validate_namespace_filter(
+    name: &str,
+    include: &[String],
+    exclude: &[String],
+) -> CompileResult<()> {
+    if include.is_empty() || exclude.is_empty() {
+        return Ok(());
+    }
+    for allow in include {
+        if exclude.iter().any(|deny| deny == allow) {
+            return Err(CompileError::InvalidServer {
+                message: format!(
+                    "log channel `{name}` lists `{allow}` in both include and exclude, \
+                     which cannot be both a rule and its own exception"
+                ),
+            });
+        }
+    }
+    for allow in include {
+        let nested = exclude.iter().any(|deny| {
+            format!("{allow}.").starts_with(&format!("{deny}."))
+                || format!("{deny}.").starts_with(&format!("{allow}."))
+        });
+        if !nested {
+            return Err(CompileError::InvalidServer {
+                message: format!(
+                    "log channel `{name}` includes `{allow}`, which is neither inside nor \
+                     outside any excluded namespace — when both lists are set, each entry \
+                     must be a superspace or subspace of one in the other"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_log_channels_exist(config: &PingclairConfig) -> CompileResult<()> {
     // 🚫 `hostnames` picks which request hosts reach a logger. A global logger
     // is not attached to a site block, so it has no hosts to pick from and the
@@ -534,6 +581,7 @@ fn validate_log_channels_exist(config: &PingclairConfig) -> CompileResult<()> {
                 ),
             });
         }
+        validate_namespace_filter(name, &logger.include, &logger.exclude)?;
     }
 
     for server in &config.servers {
@@ -2304,6 +2352,51 @@ mod tests {
             error.contains("audit") && error.contains("hostnames"),
             "the message must name the channel and the setting: {error}"
         );
+    }
+
+    /// 🚫 A namespace in both `include` and `exclude` is a contradiction.
+    #[test]
+    fn a_namespace_in_both_lists_is_refused() {
+        let error = validate_namespace_filter(
+            "audit",
+            &["http.log.access".to_string()],
+            &["http.log.access".to_string()],
+        )
+        .expect_err("a namespace cannot be both a rule and its own exception")
+        .to_string();
+        assert!(error.contains("http.log.access"), "{error}");
+    }
+
+    /// 🚫 With both lists set, an entry unrelated to the other list means nothing.
+    ///
+    /// Populating both says "this rule, except that exception". A namespace that
+    /// is neither above nor below anything excluded is neither, so the operator
+    /// has written something that cannot be honoured either way.
+    #[test]
+    fn an_include_unrelated_to_every_exclude_is_refused() {
+        let error = validate_namespace_filter(
+            "audit",
+            &["http.log.access".to_string()],
+            &["tls".to_string()],
+        )
+        .expect_err("an unrelated pair cannot be resolved")
+        .to_string();
+        assert!(error.contains("superspace or subspace"), "{error}");
+
+        // 👍 Nested in either direction is the shape that does mean something.
+        validate_namespace_filter(
+            "audit",
+            &["http.log.access".to_string()],
+            &["http.log.access.noisy".to_string()],
+        )
+        .expect("carving one logger out of an included tree is valid");
+    }
+
+    /// 👍 One list alone carries no contradiction, so neither check applies.
+    #[test]
+    fn a_single_list_is_always_accepted() {
+        validate_namespace_filter("audit", &["http.log.access".to_string()], &[]).unwrap();
+        validate_namespace_filter("audit", &[], &["tls".to_string()]).unwrap();
     }
 
     /// 🚫 `protocols` without `h3` must actually switch HTTP/3 off.

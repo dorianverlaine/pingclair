@@ -1526,11 +1526,28 @@ impl ProxyState {
         // not resolve was already rejected by `validate_config`, so a failure
         // here is an I/O problem — reported and skipped rather than fatal,
         // since losing one log destination must not stop the server starting.
-        let log_channels: Vec<Arc<crate::access_log::AccessLogger>> = config
-            .log_channels
-            .iter()
-            .filter_map(|name| crate::access_log::channel_logger(name))
-            .collect();
+        // 🔌 A site reaches a global channel two ways: by naming it, or by the
+        // channel subscribing to the site's log source with
+        // `include http.log.access.<name>`. Only the first used to resolve, so
+        // the second passed validation and then received nothing.
+        let mut log_channels: Vec<Arc<crate::access_log::AccessLogger>> = Vec::new();
+        for name in &config.log_channels {
+            if let Some(logger) = crate::access_log::channel_logger(name) {
+                log_channels.push(logger);
+            }
+            for subscriber in
+                crate::access_log::channels_admitting(&format!("http.log.access.{name}"))
+            {
+                // 🚫 A channel named directly and subscribing by namespace is
+                // still one destination; two entries would double every line.
+                if !log_channels
+                    .iter()
+                    .any(|existing| Arc::ptr_eq(existing, &subscriber))
+                {
+                    log_channels.push(subscriber);
+                }
+            }
+        }
         let mut named_loggers = Vec::new();
         // 🏠 A named logger's `hostnames` decides which requests reach it. The
         // list travels with the logger so `LogTargets` can resolve it once,

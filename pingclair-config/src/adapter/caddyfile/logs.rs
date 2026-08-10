@@ -634,18 +634,36 @@ mod log_channel_tests {
     }
 
     /// 🔌 Global `include`/`exclude` reach the compiled default logger.
+    ///
+    /// The fixture carves one logger out of an included tree, which is the only
+    /// shape that means anything when both lists are set. It used to include
+    /// `some-source` while excluding `a.api b.api` — a pair upstream refuses,
+    /// so the test was green while asserting a configuration Caddy v2.11.4
+    /// rejects with "each element must be a superspace or subspace of one in
+    /// the other list". Confirmed by running that binary, not by reading.
     #[test]
     fn global_include_and_exclude_compile() {
         let config = compile(
-            "{\n    log {\n        output stderr\n        include some-source\n        exclude a.api b.api\n    }\n}\n\
+            "{\n    log {\n        output stderr\n        include http.log.access\n        exclude http.log.access.noisy\n    }\n}\n\
              http://:8080 {\n    respond \"ok\"\n}\n",
         )
         .expect("include/exclude must compile");
         let default = config.logging.default.expect("default logger");
-        assert_eq!(default.include, vec!["some-source".to_string()]);
-        assert_eq!(
-            default.exclude,
-            vec!["a.api".to_string(), "b.api".to_string()]
+        assert_eq!(default.include, vec!["http.log.access".to_string()]);
+        assert_eq!(default.exclude, vec!["http.log.access.noisy".to_string()]);
+    }
+
+    /// 🚫 Two lists that contradict each other are refused, as upstream does.
+    #[test]
+    fn global_include_and_exclude_must_be_nested() {
+        let error = compile(
+            "{\n    log {\n        output stderr\n        include some-source\n        exclude a.api b.api\n    }\n}\n\
+             http://:8080 {\n    respond \"ok\"\n}\n",
+        )
+        .expect_err("an unrelated include/exclude pair cannot be honoured either way");
+        assert!(
+            format!("{error}").contains("superspace or subspace"),
+            "the message must say why the pair is impossible: {error}"
         );
     }
 

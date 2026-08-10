@@ -241,6 +241,9 @@ pub struct AccessLogger {
     response_headers: Vec<String>,
     /// 🔐 Whether to record the negotiated TLS version and cipher.
     include_tls: bool,
+    /// 🔌 Which log sources this destination subscribes to. Empty on both
+    /// sides — the common case — admits everything and costs one length check.
+    namespaces: NamespaceFilter,
 }
 
 // MARK: - Host selection
@@ -303,6 +306,80 @@ impl HostPattern {
             .iter()
             .zip(labels)
             .all(|(expected, actual)| expected.eq_ignore_ascii_case(actual))
+    }
+}
+
+// MARK: - Namespace selection
+
+/// 🔌 Which log sources a destination subscribes to.
+///
+/// Upstream names every logger with a dotted namespace — a site's
+/// `log access_json` emits under `http.log.access.access_json` — and a global
+/// logger says which of those it wants with `include` and `exclude`. Both empty
+/// means everything.
+///
+/// The matching rule is longest-prefix, and the trailing dot is not decoration:
+/// without it `foo.b` would match `foo.bar`. `*` in `exclude` means every module
+/// logger and `.` means the core's own, which is why they are checked before the
+/// prefix walk rather than being treated as ordinary namespaces.
+#[derive(Debug, Clone, Default)]
+pub struct NamespaceFilter {
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+impl NamespaceFilter {
+    pub fn new(include: Vec<String>, exclude: Vec<String>) -> Self {
+        Self { include, exclude }
+    }
+
+    /// 🎯 Whether a log source may emit into this destination.
+    pub fn admits(&self, source: &str) -> bool {
+        if self.include.is_empty() && self.exclude.is_empty() {
+            return true;
+        }
+        // 📌 The dot is appended once here and compared against `namespace + "."`
+        // below, so an exact namespace and a parent namespace both match while a
+        // shared prefix that stops mid-label does not.
+        let dotted = if source.is_empty() || source == "*" || source == "." {
+            source.to_string()
+        } else {
+            format!("{source}.")
+        };
+
+        let mut longest_accept = 0usize;
+        let mut longest_reject = 0usize;
+
+        if !self.include.is_empty() {
+            for namespace in &self.include {
+                if dotted.starts_with(&format!("{namespace}.")) && namespace.len() > longest_accept
+                {
+                    longest_accept = namespace.len();
+                }
+            }
+            // 🚫 An `include` list is a requirement, not a hint: no match means
+            // this destination did not ask for this source.
+            if longest_accept == 0 {
+                return false;
+            }
+        }
+
+        if !self.exclude.is_empty() {
+            for namespace in &self.exclude {
+                if (namespace == "*" && dotted != ".") || (namespace == "." && dotted == ".") {
+                    return false;
+                }
+                if dotted.starts_with(&format!("{namespace}.")) && namespace.len() > longest_reject
+                {
+                    longest_reject = namespace.len();
+                }
+            }
+            if longest_reject > longest_accept {
+                return false;
+            }
+        }
+
+        longest_accept > longest_reject || (self.include.is_empty() && longest_reject == 0)
     }
 }
 
@@ -446,6 +523,23 @@ pub fn channel_logger(name: &str) -> Option<Arc<AccessLogger>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(name)
         .cloned()
+}
+
+/// 🔌 Every registered channel that subscribes to a log source.
+///
+/// A site block writes to a global channel in two ways, and only one of them
+/// used to work at runtime. Naming the channel directly (`log audit` where a
+/// global `log audit { … }` exists) resolved by name. The other way — a global
+/// logger saying `include http.log.access.audit` — passed validation and then
+/// received nothing, because nothing ever consulted `include`.
+pub fn channels_admitting(source: &str) -> Vec<Arc<AccessLogger>> {
+    channel_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .filter(|logger| logger.admits_source(source))
+        .cloned()
+        .collect()
 }
 
 /// 📏 Current size of the active log file, or `None` if it cannot be read.
@@ -708,7 +802,13 @@ impl AccessLogger {
             request_headers: config.request_headers.clone(),
             response_headers: config.response_headers.clone(),
             include_tls: config.include_tls,
+            namespaces: NamespaceFilter::new(config.include.clone(), config.exclude.clone()),
         }))
+    }
+
+    /// 🔌 Whether this destination subscribes to a given log source.
+    pub fn admits_source(&self, source: &str) -> bool {
+        self.namespaces.admits(source)
     }
 
     /// 🏷️ Header names this server asked to record, if any.
@@ -978,7 +1078,77 @@ mod tests {
             request_headers: Vec::new(),
             response_headers: Vec::new(),
             include_tls: false,
+            namespaces: NamespaceFilter::default(),
         }
+    }
+
+    // MARK: - Namespace selection
+
+    /// 🈳 No lists at all is the common case and admits everything.
+    #[test]
+    fn an_empty_filter_admits_every_source() {
+        let filter = NamespaceFilter::default();
+        assert!(filter.admits("http.log.access.audit"));
+        assert!(filter.admits("tls"));
+    }
+
+    /// 🔌 An `include` list is a requirement, and matches whole labels only.
+    #[test]
+    fn include_admits_the_namespace_and_everything_under_it() {
+        let filter = NamespaceFilter::new(vec!["http.log.access".to_string()], Vec::new());
+        assert!(filter.admits("http.log.access"), "the namespace itself");
+        assert!(filter.admits("http.log.access.audit"), "and below it");
+        assert!(
+            !filter.admits("http.log.error"),
+            "a sibling is not included"
+        );
+        assert!(!filter.admits("tls"), "an unrelated source is not included");
+    }
+
+    /// 📌 The trailing dot is what stops a shared prefix from matching.
+    ///
+    /// Without it `foo.b` would match a namespace of `foo.bar`, which is the
+    /// bug the appended dot exists to prevent upstream.
+    #[test]
+    fn a_partial_label_is_not_a_match() {
+        let filter = NamespaceFilter::new(vec!["foo.bar".to_string()], Vec::new());
+        assert!(filter.admits("foo.bar.baz"));
+        assert!(!filter.admits("foo.b"));
+        assert!(!filter.admits("foo.barn"));
+    }
+
+    /// 🥇 When both lists match, the longer namespace wins.
+    #[test]
+    fn the_longest_matching_namespace_decides() {
+        // 🎯 Include the whole access tree but carve one logger out of it.
+        let filter = NamespaceFilter::new(
+            vec!["http.log.access".to_string()],
+            vec!["http.log.access.noisy".to_string()],
+        );
+        assert!(filter.admits("http.log.access.audit"));
+        assert!(!filter.admits("http.log.access.noisy"));
+        assert!(!filter.admits("http.log.access.noisy.deeper"));
+    }
+
+    /// ⭐ `*` excludes every module logger; `.` excludes the core's own.
+    #[test]
+    fn the_two_special_exclusions_are_not_ordinary_namespaces() {
+        let everything = NamespaceFilter::new(Vec::new(), vec!["*".to_string()]);
+        assert!(!everything.admits("http.log.access.audit"));
+        assert!(everything.admits("."), "`*` does not cover the core");
+
+        let core = NamespaceFilter::new(Vec::new(), vec![".".to_string()]);
+        assert!(!core.admits("."));
+        assert!(core.admits("http.log.access.audit"));
+    }
+
+    /// 🚫 Excluding without including admits everything else.
+    #[test]
+    fn exclude_alone_removes_only_what_it_names() {
+        let filter = NamespaceFilter::new(Vec::new(), vec!["http.log.error".to_string()]);
+        assert!(filter.admits("http.log.access.audit"));
+        assert!(!filter.admits("http.log.error"));
+        assert!(!filter.admits("http.log.error.detail"));
     }
 
     // MARK: - Host selection

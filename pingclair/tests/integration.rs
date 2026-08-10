@@ -9292,3 +9292,76 @@ async fn test_log_hostnames_route_each_host_to_its_own_destination() {
         "a's request leaked into b's destination: {b:?}"
     );
 }
+
+/// 🔌 A global logger that subscribes with `include` receives the site's lines.
+///
+/// A site reaches a global channel two ways: by naming it, or by the channel
+/// subscribing to the site's log source. Only the first used to resolve, so a
+/// configuration written the second way validated green and then logged
+/// nothing at all — the shape this project treats as a defect, not a gap.
+#[tokio::test]
+async fn test_global_log_channel_receives_the_source_it_includes() {
+    let dir = tempfile::tempdir().unwrap();
+    let wanted = dir.path().join("wanted.log");
+    let unwanted = dir.path().join("unwanted.log");
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+
+            log subscriber {{
+                include http.log.access.site_source
+                output file {wanted}
+                format json
+            }}
+            log stranger {{
+                include http.log.access.somewhere_else
+                output file {unwanted}
+                format json
+            }}
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            log site_source
+
+            respond "ok" 200
+        }}
+        "#,
+        wanted = wanted.display(),
+        unwanted = unwanted.display(),
+    );
+
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/subscribed"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let mut recorded = String::new();
+    for _ in 0..50 {
+        recorded = std::fs::read_to_string(&wanted).unwrap_or_default();
+        if recorded.contains("/subscribed") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(
+        recorded.contains("/subscribed"),
+        "the subscribing channel received nothing: {recorded:?}"
+    );
+    assert!(
+        std::fs::read_to_string(&unwanted)
+            .unwrap_or_default()
+            .is_empty(),
+        "a channel subscribing to another source must stay empty"
+    );
+}
