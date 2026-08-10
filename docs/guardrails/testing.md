@@ -110,6 +110,22 @@
   > 非 root 仍然該做（那才是產品實際跑的樣子，也是過去 Linux 證據的取得方式），
   > 但它不是這件事的解法。
 
+  > 🪤 **2026-08-10 補正：上面那句「跟使用者是誰無關」只對了一半，害我又踩一次。**
+  > K3 那輪為了讓 `CARGO_HOME` 可寫，改回以 root 跑、**只**帶那個 sysctl
+  > ——三支又紅了。原因是 root 有 `CAP_NET_BIND_SERVICE`，
+  > 那個 capability 直接**繞過** `ip_unprivileged_port_start`（顧名思義：
+  > 它只管 unprivileged）。
+  >
+  > 📌 正確的說法是**兩個條件缺一不可**：
+  > **非 root 使用者 ＋ `--sysctl net.ipv4.ip_unprivileged_port_start=1024`**。
+  > 上一輪先試非 root（沒帶 sysctl）失敗、這一輪先試 sysctl（用 root）失敗，
+  > 兩次都得到「那不是原因」的結論——**逐一排除法在需要兩個條件的情況下
+  > 會把兩個真原因都判成無關**。
+  >
+  > 以非 root 跑時記得 `chown` `CARGO_HOME`、`CARGO_TARGET_DIR` 與 workspace，
+  > 否則 `cargo` 直接 `Permission denied`（`rust:1.97-bookworm` 的
+  > `/usr/local/cargo` 是 root 所有）。
+
   > 📌 更一般的形狀：**任何用「這個操作會失敗」當斷言的測試，都隱含一個環境前提**。
   > 前提沒寫下來時，換一個環境就從「證明了某件事」變成「證明不了任何事」，
   > 而且失敗訊息不會提到那個前提。

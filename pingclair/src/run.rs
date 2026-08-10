@@ -18,6 +18,7 @@
 //! has a TRIAGE row instead of being smuggled in here.
 
 use crate::certs::{DynamicCertResolver, eager_issuance_domains, refresh_h3_cert_table};
+use crate::client_auth::{ClientAuthTable, CompiledClientAuth};
 use crate::listen::{
     automatic_http_companion, can_bind_automatic_http_port, explicit_http_names,
     normalize_listen_addr, reserve_private_listener_address, server_requires_tls,
@@ -300,34 +301,42 @@ pub(crate) fn run_server(
         manual_certs.push((name.to_string(), cert_path.clone(), key_path.clone()));
     }
 
-    // 🪪 `client_auth` parses and compiles, and nothing in the acceptor checks a
-    // client certificate yet. Starting anyway would give an operator a site that
-    // reports mutual TLS in its configuration and admits everyone — the exact
-    // shape of silent failure this project treats as worse than not starting.
-    //
-    // The refusal is here rather than in `validate_config` on purpose: `adapt`
-    // converts a Caddyfile to JSON without running anything, and upstream
-    // converts these configurations happily. Refusing to *serve* is the honest
-    // line, not refusing to translate.
-    let mtls_sites: Vec<&str> = config
-        .servers
-        .iter()
-        .filter(|server| {
-            server
-                .tls
-                .as_ref()
-                .is_some_and(|tls| tls.client_auth.is_some())
-        })
-        .map(|server| server.name.as_deref().unwrap_or("_"))
-        .collect();
-    if !mtls_sites.is_empty() {
-        anyhow::bail!(
-            "site(s) {} ask for `tls client_auth`, and no client certificate is verified yet; \
-             refusing to start rather than serve a site that reports mutual TLS and admits \
-             everyone",
-            mtls_sites.join(", ")
-        );
+    // 🏗️ Every client trust pool is read, parsed and turned into a BoringSSL
+    // store right here, keyed by the listen address the site named. Doing it at
+    // startup is the whole point: a handshake then costs one map lookup and an
+    // `Arc` clone, and a missing or malformed CA file is a message the operator
+    // reads now instead of a handshake failure a user reports later.
+    let mut client_auth_by_address: HashMap<String, ClientAuthTable> = HashMap::new();
+    for server_config in &config.servers {
+        let Some(client_auth) = server_config
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.client_auth.as_ref())
+        else {
+            continue;
+        };
+        let names: Vec<&str> = if server_config.names.is_empty() {
+            server_config.name.as_deref().into_iter().collect()
+        } else {
+            server_config.names.iter().map(String::as_str).collect()
+        };
+        let policy = Arc::new(CompiledClientAuth::compile(client_auth).map_err(|problem| {
+            anyhow::anyhow!(
+                "site {} asks for `tls client_auth` that cannot be honoured: {problem}",
+                names.first().copied().unwrap_or("_")
+            )
+        })?);
+        for address in &server_config.listen {
+            client_auth_by_address
+                .entry(address.clone())
+                .or_default()
+                .insert(&names, Arc::clone(&policy));
+        }
     }
+    let client_auth_by_address: HashMap<String, Arc<ClientAuthTable>> = client_auth_by_address
+        .into_iter()
+        .map(|(address, table)| (address, Arc::new(table)))
+        .collect();
 
     match tls_manager.refresh_manual_certs(&manual_certs) {
         Ok(count) if count > 0 => {
@@ -572,11 +581,49 @@ pub(crate) fn run_server(
 
             if is_https {
                 // 🔐 Enable dynamic certificates and advertise HTTP/2 plus HTTP/1.1 over ALPN.
+                // 🪪 Derived from the table having something in it, not merely
+                // existing, so this flag can never disagree with what the
+                // acceptor installs. They gate different things — one turns on
+                // the SNI-against-Host check, the other records the name that
+                // check reads — and a listener where only the first fires would
+                // answer 421 to every request.
+                let client_auth = client_auth_by_address
+                    .get(addr.as_str())
+                    .filter(|table| !table.is_empty())
+                    .cloned();
+                let requires_client_auth = client_auth.is_some();
                 let acceptor = DynamicCertResolver::new(tls_manager.clone())
-                    .with_default_sni(default_sni_by_address.get(addr.as_str()).copied());
+                    .with_default_sni(default_sni_by_address.get(addr.as_str()).copied())
+                    .with_client_auth(client_auth);
                 match TlsSettings::with_callbacks(Box::new(acceptor)) {
                     Ok(mut tls_settings) => {
                         tls_settings.enable_h2();
+                        if requires_client_auth {
+                            // 🚫 Session resumption is turned off for the whole
+                            // listener, and this is a deliberate trade rather
+                            // than caution. A resumed handshake carries no
+                            // `CertificateRequest` — BoringSSL restores the
+                            // peer's chain from the ticket and never asks
+                            // again — so a ticket issued before a certificate
+                            // expired, was revoked, or before the trust pool
+                            // changed would keep letting its holder in. The
+                            // cost is a full handshake per connection on this
+                            // listener; the alternative is a site that reports
+                            // mutual TLS and, for the lifetime of a ticket,
+                            // does not enforce it.
+                            tls_settings.set_options(boring::ssl::SslOptions::NO_TICKET);
+                            tls_settings
+                                .set_session_cache_mode(boring::ssl::SslSessionCacheMode::OFF);
+                            // 🪪 Admission was decided from the ClientHello and
+                            // routing is decided from `Host`; make the request
+                            // path insist they name the same site.
+                            proxy_logic.set_strict_sni_host(true);
+                            tracing::info!(
+                                "🪪 Mutual TLS is enforced on {} (session resumption off, \
+                                 SNI must match Host)",
+                                addr
+                            );
+                        }
                         service.add_tls_with_settings(&service_address, None, tls_settings);
                         tls_enabled = true;
                     }
@@ -588,7 +635,22 @@ pub(crate) fn run_server(
                 // Enable HTTP/3 for HTTPS ports when the global switch is on:
                 // advertise Alt-Svc on this listener and queue the port for
                 // a QUIC socket.
-                if http3_globally_enabled {
+                //
+                // 🚫 Except where a site demands a client certificate. The
+                // HTTP/3 listener does not verify one yet, so starting it here
+                // would make the same site demand proof over TCP and admit
+                // everyone over QUIC — and advertising `Alt-Svc` would actively
+                // push clients onto the transport that checks nothing. Not
+                // starting it is the fail-closed answer, and saying so is the
+                // difference between a limitation and a silent hole.
+                if http3_globally_enabled && requires_client_auth {
+                    tracing::warn!(
+                        "🚫 HTTP/3 is not started on {} because a site there requires a client \
+                         certificate, and the HTTP/3 listener cannot verify one yet; HTTP/1.1 \
+                         and HTTP/2 on this address enforce it normally",
+                        addr
+                    );
+                } else if http3_globally_enabled {
                     https_ports.push(addr.clone());
                     http3_enabled = true;
 

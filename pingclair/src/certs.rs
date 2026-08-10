@@ -23,13 +23,16 @@
 //! one over AIA — so it looks fine in a browser and fails hard in `curl`, Go,
 //! and Java. Hence a whole chain everywhere, never a single certificate.
 
+use crate::client_auth::ClientAuthTable;
 use boring::pkey::{PKey, Private};
 use boring::ssl::NameType;
 use boring::x509::X509;
 use parking_lot::RwLock;
+use pingclair_proxy::tls_identity::DownstreamTlsIdentity;
 use pingclair_tls::manager::TlsManager;
 use pingora_core::listeners::TlsAccept;
 use pingora_core::protocols::tls::TlsRef;
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -63,6 +66,12 @@ pub(crate) struct DynamicCertResolver {
     /// allocating — the branch that reaches it is already the slow one for the
     /// client, and there is no reason to make it slower for the server.
     default_sni: Option<Arc<str>>,
+    /// 🪪 What this listener's sites ask of a client's own certificate.
+    ///
+    /// `None` on the overwhelming majority of listeners, which is what keeps
+    /// the ordinary handshake free of any mutual-TLS cost: the branch below is
+    /// a null check, not a lookup.
+    client_auth: Option<Arc<ClientAuthTable>>,
 }
 
 // Manual Debug because TlsManager might not implement it
@@ -81,6 +90,7 @@ impl DynamicCertResolver {
             tls_manager,
             ssl_cache: Arc::new(RwLock::new(HashMap::new())),
             default_sni: None,
+            client_auth: None,
         }
     }
 
@@ -92,6 +102,15 @@ impl DynamicCertResolver {
     /// older tooling and anything dialling a bare IP still omit it.
     pub(crate) fn with_default_sni(mut self, default_sni: Option<&str>) -> Self {
         self.default_sni = default_sni.filter(|name| !name.is_empty()).map(Arc::from);
+        self
+    }
+
+    /// 🪪 Installs what this listener's sites ask of a client certificate.
+    ///
+    /// The table is built once at startup — trust stores parsed, files read —
+    /// so a handshake only looks a name up and hands BoringSSL a pointer.
+    pub(crate) fn with_client_auth(mut self, client_auth: Option<Arc<ClientAuthTable>>) -> Self {
+        self.client_auth = client_auth.filter(|table| !table.is_empty());
         self
     }
 
@@ -165,6 +184,16 @@ impl TlsAccept for DynamicCertResolver {
             let sni = ssl.servername(NameType::HOST_NAME).unwrap_or("");
             (!sni.is_empty()).then(|| sni.to_string())
         };
+        // 🪪 Mutual TLS is decided from the name the client actually sent, not
+        // from `default_sni`. A client that named nothing has authorised
+        // nothing, so it falls to the catch-all policy — and the SNI-against-
+        // Host check at the HTTP layer refuses it any named site afterwards.
+        if let Some(table) = &self.client_auth
+            && let Some(policy) = table.policy_for(offered.as_deref().unwrap_or(""))
+        {
+            policy.install(ssl);
+        }
+
         let sni: &str = match (&offered, self.default_sni.as_deref()) {
             (Some(sni), _) => sni,
             // 🔐 A client that sent no SNI used to get no certificate at all,
@@ -236,6 +265,21 @@ impl TlsAccept for DynamicCertResolver {
                 CERT_CACHE_TTL_SECS
             );
         }
+    }
+
+    /// 🪪 Carries the handshake's server name into the request lifecycle.
+    ///
+    /// Only listeners that ask something of a client certificate pay for this.
+    /// Everywhere else the answer is `None` and no allocation happens, because
+    /// the only consumer is the SNI-against-Host check, and that check only
+    /// runs where being admitted is not the same as being authorised.
+    async fn handshake_complete_callback(
+        &self,
+        ssl: &TlsRef,
+    ) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.client_auth.as_ref()?;
+        let server_name = ssl.servername(NameType::HOST_NAME).unwrap_or("");
+        Some(Arc::new(DownstreamTlsIdentity::new(server_name)))
     }
 }
 

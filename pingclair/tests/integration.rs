@@ -9521,3 +9521,431 @@ async fn test_default_sni_serves_clients_that_send_no_sni() {
          must fail rather than quietly serving one"
     );
 }
+
+// MARK: - Mutual TLS (K3): the H1/H2 acceptor verifies client certificates
+
+/// 🏛️ One throwaway CA, plus whatever leaves a test asks it to sign.
+///
+/// Both halves matter. The server needs a certificate the test client will
+/// accept, and the client needs one the *server* will accept — and the only way
+/// to tell a working `client_auth` from a decorative one is to also hold a
+/// certificate signed by a CA the server was never told about.
+struct TestAuthority {
+    ca_pem: String,
+    params: rcgen::CertificateParams,
+    key: rcgen::KeyPair,
+}
+
+impl TestAuthority {
+    fn new(common_name: &str) -> Self {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        let key = rcgen::KeyPair::generate().expect("ca key");
+        let ca_pem = params.self_signed(&key).expect("ca certificate").pem();
+        Self {
+            ca_pem,
+            params,
+            key,
+        }
+    }
+
+    /// 🎫 Issues one leaf, returned as the `(certificate, key)` PEM pair.
+    fn issue(&self, names: &[&str]) -> (String, String) {
+        let subject: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+        let mut params = rcgen::CertificateParams::new(subject).expect("leaf params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, names[0]);
+        let key = rcgen::KeyPair::generate().expect("leaf key");
+        let certificate = params
+            .signed_by(&key, &rcgen::Issuer::from_params(&self.params, &self.key))
+            .expect("leaf certificate");
+        (certificate.pem(), key.serialize_pem())
+    }
+}
+
+/// 🚦 What one mutual-TLS attempt ended in.
+#[derive(Debug, PartialEq, Eq)]
+enum MutualTlsOutcome {
+    /// 🚫 The handshake itself was refused — the request never happened.
+    HandshakeRejected,
+    /// 📨 The handshake succeeded and the server answered with this status.
+    Status(u16),
+}
+
+/// 🔐 Drives one TLS connection with full control of SNI, `Host`, and identity.
+///
+/// Written against BoringSSL directly rather than an HTTP client because the
+/// two questions this file has to answer are both below the HTTP client's
+/// abstraction: "was the handshake refused" (an HTTP client reports that as an
+/// opaque transport error) and "what if SNI and `Host` name different sites"
+/// (an HTTP client derives one from the other on purpose).
+fn mutual_tls_attempt(
+    address: SocketAddr,
+    sni: &str,
+    host: &str,
+    identity: Option<(&str, &str)>,
+) -> MutualTlsOutcome {
+    mutual_tls_attempt_capped(address, sni, host, identity, None)
+}
+
+/// 🔢 The same attempt, with a ceiling on the protocol version.
+///
+/// TLS 1.2 and TLS 1.3 handle the client certificate in entirely separate code
+/// (`handshake_server.cc` against `tls13_server.cc`), so "it is enforced" is two
+/// claims, not one. Capping the client is how the older half gets exercised.
+fn mutual_tls_attempt_capped(
+    address: SocketAddr,
+    sni: &str,
+    host: &str,
+    identity: Option<(&str, &str)>,
+    max_version: Option<pingora_core::tls::ssl::SslVersion>,
+) -> MutualTlsOutcome {
+    use pingora_core::tls::ssl::{SslConnector, SslMethod, SslVerifyMode};
+    use std::io::{Read, Write};
+
+    let mut builder = SslConnector::builder(SslMethod::tls()).expect("tls connector builder");
+    if let Some(version) = max_version {
+        builder
+            .set_max_proto_version(Some(version))
+            .expect("cap the protocol version");
+    }
+    // 🎯 The server's own trust chain is a different test's subject; switching
+    // verification off here keeps a server-certificate problem from being
+    // reported as a client-certificate problem.
+    builder.set_verify(SslVerifyMode::NONE);
+    if let Some((certificate_pem, key_pem)) = identity {
+        let certificate =
+            boring::x509::X509::from_pem(certificate_pem.as_bytes()).expect("client certificate");
+        let key = boring::pkey::PKey::private_key_from_pem(key_pem.as_bytes()).expect("client key");
+        builder
+            .set_certificate(&certificate)
+            .expect("set client certificate");
+        builder.set_private_key(&key).expect("set client key");
+    }
+    let connector = builder.build();
+
+    let stream = std::net::TcpStream::connect(address).expect("connect to the test server");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    let session = connector
+        .configure()
+        .expect("connect configuration")
+        .verify_hostname(false)
+        .use_server_name_indication(true)
+        .connect(sni, stream);
+    let Ok(mut session) = session else {
+        return MutualTlsOutcome::HandshakeRejected;
+    };
+    if let Some(version) = max_version {
+        // 🎯 Without this the capped test would pass for the wrong reason: a
+        // cap that silently failed to apply just re-runs the TLS 1.3 case, and
+        // both cases have the same expected outcomes.
+        let negotiated = session.ssl().version2().expect("a negotiated version");
+        assert_eq!(
+            negotiated, version,
+            "the protocol cap did not take effect; this run proves nothing about the older path"
+        );
+    }
+
+    let request = format!("GET /probe HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    if session.write_all(request.as_bytes()).is_err() {
+        // 🚫 TLS 1.3 finishes the client's side of the handshake before the
+        // server has read the client's certificate, so a rejection can surface
+        // on the first write rather than on `connect`.
+        return MutualTlsOutcome::HandshakeRejected;
+    }
+    let mut response = Vec::new();
+    if session.read_to_end(&mut response).is_err() && response.is_empty() {
+        return MutualTlsOutcome::HandshakeRejected;
+    }
+    if response.is_empty() {
+        return MutualTlsOutcome::HandshakeRejected;
+    }
+    let head = String::from_utf8_lossy(&response);
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or_else(|| panic!("no status line in response: {head:?}"));
+    MutualTlsOutcome::Status(status)
+}
+
+/// 🧾 A listener carrying one mutual-TLS site next to one ordinary site.
+///
+/// Sharing the socket is the point: it is the configuration where SNI decides
+/// what a client must prove and `Host` decides which site it reaches, so it is
+/// the configuration where the two being allowed to differ is a way in.
+fn mutual_tls_fixture(mode: &str) -> (TestServer, TestAuthority, TestAuthority, tempfile::TempDir) {
+    let authority = TestAuthority::new("Pingclair Client CA");
+    let stranger = TestAuthority::new("Somebody Else's CA");
+    let (server_cert, server_key) = authority.issue(&["open.test", "secure.test"]);
+
+    let material = tempfile::tempdir().expect("certificate material dir");
+    let cert_path = material.path().join("server.pem");
+    let key_path = material.path().join("server.key");
+    let ca_path = material.path().join("client-ca.pem");
+    std::fs::write(&cert_path, &server_cert).expect("write server certificate");
+    std::fs::write(&key_path, &server_key).expect("write server key");
+    std::fs::write(&ca_path, &authority.ca_pem).expect("write client CA");
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        https://open.test:__PINGCLAIR_TEST_PORT__ {{
+            tls {{
+                cert {cert}
+                key {key}
+            }}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "open-ok"
+        }}
+
+        https://secure.test:__PINGCLAIR_TEST_PORT__ {{
+            tls {{
+                cert {cert}
+                key {key}
+                client_auth {{
+                    mode {mode}
+                    trust_pool file {{
+                        pem_file {ca}
+                    }}
+                }}
+            }}
+
+            respond "secure-ok"
+        }}
+        "#,
+        cert = cert_path.to_string_lossy(),
+        key = key_path.to_string_lossy(),
+        ca = ca_path.to_string_lossy(),
+    );
+
+    let server = TestServer::new_pingclairfile(&config);
+    (server, authority, stranger, material)
+}
+
+/// 🪪 `require_and_verify` has to mean all three of its words.
+///
+/// Before this landed, `client_auth` parsed, compiled, and was read by nothing
+/// at handshake time — a site could declare mutual TLS and admit the whole
+/// internet. The three cases below are the three ways that failure shows up:
+/// no certificate at all, a certificate from the wrong authority, and the one
+/// client that should actually get in.
+#[tokio::test]
+async fn test_client_auth_require_and_verify_admits_only_the_trusted_client() {
+    let (mut server, authority, stranger, _material) = mutual_tls_fixture("require_and_verify");
+    assert!(
+        server.wait_until_tls_ready("open.test").await,
+        "server failed to start with a client_auth site"
+    );
+    let address = server.address(0);
+    let (trusted_cert, trusted_key) = authority.issue(&["client.test"]);
+    let (foreign_cert, foreign_key) = stranger.issue(&["client.test"]);
+
+    let outcomes = tokio::task::spawn_blocking(move || {
+        (
+            mutual_tls_attempt(address, "secure.test", "secure.test", None),
+            mutual_tls_attempt(
+                address,
+                "secure.test",
+                "secure.test",
+                Some((&foreign_cert, &foreign_key)),
+            ),
+            mutual_tls_attempt(
+                address,
+                "secure.test",
+                "secure.test",
+                Some((&trusted_cert, &trusted_key)),
+            ),
+            // 🌐 The ordinary site on the same socket must stay ordinary; a
+            // listener-wide demand would break every other site sharing it.
+            mutual_tls_attempt(address, "open.test", "open.test", None),
+        )
+    })
+    .await
+    .expect("handshake task");
+
+    assert_eq!(
+        outcomes.0,
+        MutualTlsOutcome::HandshakeRejected,
+        "a client with no certificate reached a site that requires one"
+    );
+    assert_eq!(
+        outcomes.1,
+        MutualTlsOutcome::HandshakeRejected,
+        "a certificate from an untrusted CA was accepted; the trust pool is not being consulted"
+    );
+    assert_eq!(
+        outcomes.2,
+        MutualTlsOutcome::Status(200),
+        "the client holding a certificate from the configured CA was turned away"
+    );
+    assert_eq!(
+        outcomes.3,
+        MutualTlsOutcome::Status(200),
+        "a site without client_auth started demanding certificates"
+    );
+}
+
+/// 🛡️ SNI and `Host` must name the same site once any site here wants a
+/// certificate.
+///
+/// This is the bypass that makes per-site mutual TLS worth having at all: offer
+/// the harmless name in the ClientHello so nothing is demanded, then ask for
+/// the protected site in the header. Upstream turns the same enforcement on
+/// automatically for exactly this reason, and answers 421.
+#[tokio::test]
+async fn test_client_auth_listener_refuses_a_host_the_handshake_did_not_name() {
+    let (mut server, authority, _stranger, _material) = mutual_tls_fixture("require_and_verify");
+    assert!(
+        server.wait_until_tls_ready("open.test").await,
+        "server failed to start with a client_auth site"
+    );
+    let address = server.address(0);
+    let (trusted_cert, trusted_key) = authority.issue(&["client.test"]);
+
+    let outcomes = tokio::task::spawn_blocking(move || {
+        (
+            // 🚫 Handshake as the unprotected site, then ask for the protected
+            // one. Admission proved nothing about the site being reached.
+            mutual_tls_attempt(address, "open.test", "secure.test", None),
+            // 🚫 Even holding a valid certificate, the names still have to
+            // agree — otherwise the check would only stop the attacker who
+            // forgot to bring one.
+            mutual_tls_attempt(
+                address,
+                "open.test",
+                "secure.test",
+                Some((&trusted_cert, &trusted_key)),
+            ),
+            // 👍 Naming the same site in both places is ordinary traffic.
+            mutual_tls_attempt(address, "open.test", "open.test", None),
+        )
+    })
+    .await
+    .expect("handshake task");
+
+    assert_eq!(
+        outcomes.0,
+        MutualTlsOutcome::Status(421),
+        "a request reached a mutual-TLS site by naming a different site in the handshake"
+    );
+    assert_eq!(outcomes.1, MutualTlsOutcome::Status(421));
+    assert_eq!(outcomes.2, MutualTlsOutcome::Status(200));
+}
+
+/// 🔍 `verify_if_given` is the one mode whose name is easy to implement
+/// backwards: it must let an empty-handed client through and still reject a
+/// certificate that does not chain to the trust pool.
+#[tokio::test]
+async fn test_client_auth_verify_if_given_checks_only_what_is_offered() {
+    let (mut server, authority, stranger, _material) = mutual_tls_fixture("verify_if_given");
+    assert!(
+        server.wait_until_tls_ready("open.test").await,
+        "server failed to start with a verify_if_given site"
+    );
+    let address = server.address(0);
+    let (trusted_cert, trusted_key) = authority.issue(&["client.test"]);
+    let (foreign_cert, foreign_key) = stranger.issue(&["client.test"]);
+
+    let outcomes = tokio::task::spawn_blocking(move || {
+        (
+            mutual_tls_attempt(address, "secure.test", "secure.test", None),
+            mutual_tls_attempt(
+                address,
+                "secure.test",
+                "secure.test",
+                Some((&trusted_cert, &trusted_key)),
+            ),
+            mutual_tls_attempt(
+                address,
+                "secure.test",
+                "secure.test",
+                Some((&foreign_cert, &foreign_key)),
+            ),
+        )
+    })
+    .await
+    .expect("handshake task");
+
+    assert_eq!(
+        outcomes.0,
+        MutualTlsOutcome::Status(200),
+        "`verify_if_given` must admit a client that offers no certificate"
+    );
+    assert_eq!(outcomes.1, MutualTlsOutcome::Status(200));
+    assert_eq!(
+        outcomes.2,
+        MutualTlsOutcome::HandshakeRejected,
+        "`verify_if_given` verified nothing: an untrusted certificate was accepted"
+    );
+}
+
+/// 🔢 TLS 1.2 has to enforce the same policy as TLS 1.3.
+///
+/// The two are separate state machines inside BoringSSL — a client certificate
+/// is demanded and checked in `handshake_server.cc` for one and
+/// `tls13_server.cc` for the other — so a policy that only lands on the newer
+/// path is a policy any client can opt out of by offering an older version.
+#[tokio::test]
+async fn test_client_auth_is_enforced_on_tls12_as_well_as_tls13() {
+    use pingora_core::tls::ssl::SslVersion;
+
+    let (mut server, authority, stranger, _material) = mutual_tls_fixture("require_and_verify");
+    assert!(
+        server.wait_until_tls_ready("open.test").await,
+        "server failed to start with a client_auth site"
+    );
+    let address = server.address(0);
+    let (trusted_cert, trusted_key) = authority.issue(&["client.test"]);
+    let (foreign_cert, foreign_key) = stranger.issue(&["client.test"]);
+
+    let outcomes = tokio::task::spawn_blocking(move || {
+        let cap = Some(SslVersion::TLS1_2);
+        (
+            mutual_tls_attempt_capped(address, "secure.test", "secure.test", None, cap),
+            mutual_tls_attempt_capped(
+                address,
+                "secure.test",
+                "secure.test",
+                Some((&foreign_cert, &foreign_key)),
+                cap,
+            ),
+            mutual_tls_attempt_capped(
+                address,
+                "secure.test",
+                "secure.test",
+                Some((&trusted_cert, &trusted_key)),
+                cap,
+            ),
+        )
+    })
+    .await
+    .expect("handshake task");
+
+    assert_eq!(
+        outcomes.0,
+        MutualTlsOutcome::HandshakeRejected,
+        "a TLS 1.2 client with no certificate got in"
+    );
+    assert_eq!(
+        outcomes.1,
+        MutualTlsOutcome::HandshakeRejected,
+        "a TLS 1.2 client with an untrusted certificate got in"
+    );
+    assert_eq!(
+        outcomes.2,
+        MutualTlsOutcome::Status(200),
+        "a TLS 1.2 client holding the right certificate was turned away"
+    );
+}

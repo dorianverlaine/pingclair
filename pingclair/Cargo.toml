@@ -27,6 +27,10 @@ pingclair-plugin = { path = "../pingclair-plugin" }
 pingora = { workspace = true, features = ["proxy", "boringssl"] }
 boring.workspace = true
 
+# 🔡 Client trust material arrives base64-DER in JSON, the way upstream stores
+# it; decoding happens once at startup, never on a handshake.
+base64 = "0.22"
+
 pingora-core = { workspace = true, features = ["connection_filter"] }
 pingora-proxy.workspace = true
 rustls.workspace = true

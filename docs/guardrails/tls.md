@@ -108,3 +108,56 @@
 - **untagged 也代表「不可還原」**。variant 只靠 payload 形狀辨識，形狀相同的
   variant round-trip 後會變成別人——`Not` 甚至會整個消失，直接反轉路由決策。
   凡是會被序列化回去的設定型別（Admin dump→post、config 檔）都必須有 tag。
+
+---
+
+## 🪪 下游 mTLS（`tls client_auth`，2026-08-10 K3）
+
+- **設定解析得過不等於握手擋得住。** `client_auth` 一度完整解析、完整編譯，
+  而握手路徑上**沒有任何程式碼讀它**——站台在設定與日誌裡都宣稱雙向 TLS，
+  實際上放行整個網際網路。所以那段期間 `run.rs` 選擇**拒絕啟動**：
+  這類「宣稱有、實際沒有」的失敗，比乾脆不支援更糟。
+  📌 判準：新增任何安全開關時，找出**真正執行它的那一行**；找不到就別接受它。
+
+- **四個 mode 必須用 custom verify callback，不能用 BoringSSL 內建驗證。**
+  BoringSSL 內建只有一種答案（「建得出信任路徑，否則失敗」），
+  而 `request` 與 `require` 刻意不要驗。把它們交給內建驗證器，
+  會拒絕掉操作者明確要放行的客戶端。
+  對照表（`SSL_set_custom_verify` 的 mode 位元）：
+  `request` = `PEER`；`require` = `PEER|FAIL_IF_NO_PEER_CERT`；
+  `verify_if_given` = `PEER` ＋ callback 驗；
+  `require_and_verify` = `PEER|FAIL_IF_NO_PEER_CERT` ＋ callback 驗。
+  空憑證由 mode 位元自己處理（`tls13_server.cc:1102` 的 `allow_anonymous`），
+  callback 只在客戶端**真的送了憑證**時才會被呼叫。
+
+- **信任 store 要在啟動時建好，握手只借用。**
+  `SslRef::set_verify_cert_store` 走 `SSL_set0_verify_cert_store`，
+  **接管所有權**，而 boring 的 `X509Store` 沒有 `Clone`——照著寫就是每次握手
+  重建整個 store。改用 `X509StoreContext::init(&store, leaf, chain, …)`，
+  它只要 `&X509StoreRef`，於是每條連線只付一個 `Arc` clone。
+
+- **server 端的 `peer_cert_chain()` 不含 leaf，client 端含。**
+  BoringSSL 自己在 `ssl.h:1609` 用 `WARNING:` 標了這件事。
+  剛好就是 `X509_STORE_CTX_init(ctx, store, leaf, intermediates)` 要的那組參數，
+  搭配 `peer_certificate()` 取 leaf。寫成 client 端的直覺會少驗一層。
+
+- 🛡️ **有 mTLS 的 listener 必須強制 SNI 與 `Host` 同名。**
+  admission 由 ClientHello 決定，routing 由 `Host` 決定——兩者可以不同。
+  同一個 socket 上放一個要憑證的站台和一個不要的，攻擊者就用不要憑證的名字
+  握手、用要憑證的名字下 `Host`。上游偵測到 client auth 時會自動開啟
+  `strict_sni_host` 正是為此，回 `421` 並關連線。
+  ⚠️ **沒送 SNI 的客戶端在這種 listener 上一律拒絕**：它什麼都沒指名，
+  就不可能指名了現在要求的那個站台。
+
+- 🚫 **有 mTLS 的 listener 要關掉 session resumption。**
+  resumed handshake 不送 `CertificateRequest`（`tls13_server.cc:818`
+  只在 `!session_reused` 時設 `hs->cert_request`），BoringSSL 從 ticket
+  還原 peer chain 之後**不會重驗**。於是憑證過期、被撤銷，或 trust pool 換掉
+  之後，舊 ticket 仍然放行。代價是這個 listener 每條連線都走完整握手，
+  這是刻意付的。Go 的 `crypto/tls` 有同樣性質，上游是靠
+  `VerifyConnection`（每條連線都跑，含 resumed）補的；
+  BoringSSL 沒有等價 hook，所以我們關 resumption。
+
+- 🚫 **H3 還沒驗客戶端憑證，所以有 `client_auth` 的位址不啟動 QUIC、
+  也不發 `Alt-Svc`。** 發了等於主動把客戶端推去那條不檢查的傳輸。
+  這條在 K4 完成後解除。

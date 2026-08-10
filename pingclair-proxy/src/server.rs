@@ -38,6 +38,7 @@ use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use crate::encoding::{ResponseEncoder, negotiate, stream_chunk};
@@ -1772,6 +1773,15 @@ pub struct PingclairProxy {
     proxy_protocol_registry: Arc<crate::proxy_protocol::ProxyProtocolRegistry>,
     /// 🚫 Rejects TCP requests that bypass the required external PROXY ingress.
     proxy_protocol_required: bool,
+    /// 🪪 Requires a request's `Host` to be the name its handshake asked for.
+    ///
+    /// Turned on for any listener where a site demands a client certificate,
+    /// because routing happens on `Host` while admission happened on SNI. Left
+    /// off everywhere else: it is one relaxed atomic load per request, and the
+    /// check it guards would reject perfectly ordinary traffic — a browser
+    /// following a redirect, an IP-address request — on a listener that never
+    /// asked anyone to prove anything.
+    strict_sni_host: Arc<AtomicBool>,
     /// 🔌 Shared upstream connector for inline sub-requests (`forward_auth`),
     /// with the same keepalive pool the H3 path uses.
     pub connector: Arc<pingora_core::connectors::http::Connector>,
@@ -1789,6 +1799,7 @@ impl Default for PingclairProxy {
                 crate::proxy_protocol::ProxyProtocolRegistry::default(),
             ),
             proxy_protocol_required: false,
+            strict_sni_host: Arc::new(AtomicBool::new(false)),
             connector: Arc::new(pingora_core::connectors::http::Connector::new(Some(
                 pingora_core::connectors::ConnectorOptions::new(512),
             ))),
@@ -1814,6 +1825,7 @@ impl PingclairProxy {
                 crate::proxy_protocol::ProxyProtocolRegistry::default(),
             ),
             proxy_protocol_required: false,
+            strict_sni_host: Arc::new(AtomicBool::new(false)),
             connector: Arc::new(pingora_core::connectors::http::Connector::new(Some(
                 pingora_core::connectors::ConnectorOptions::new(512),
             ))),
@@ -1836,6 +1848,7 @@ impl PingclairProxy {
                 crate::proxy_protocol::ProxyProtocolRegistry::default(),
             ),
             proxy_protocol_required,
+            strict_sni_host: Arc::new(AtomicBool::new(false)),
             connector: Arc::new(pingora_core::connectors::http::Connector::new(Some(
                 pingora_core::connectors::ConnectorOptions::new(512),
             ))),
@@ -1907,6 +1920,49 @@ impl PingclairProxy {
     pub fn set_alt_svc(&self, port: u16) {
         self.alt_svc
             .store(Arc::new(Some(crate::alt_svc::alt_svc_value(port))));
+    }
+
+    /// 🪪 Requires `Host` to name the same site the handshake asked for.
+    ///
+    /// Startup turns this on for any listener carrying a site that demands a
+    /// client certificate. The reason is that admission and routing look at
+    /// different fields: BoringSSL decided what to demand from the SNI, and the
+    /// router picks a site from `Host`. A client that sends an unprotected name
+    /// in the ClientHello and a protected one in the header would otherwise
+    /// reach the protected site having proved nothing.
+    pub fn set_strict_sni_host(&self, required: bool) {
+        self.strict_sni_host.store(required, Ordering::Relaxed);
+    }
+
+    /// 🚫 Reports whether this request may name the host it named.
+    ///
+    /// Returns `None` when there is nothing to check, which is the answer on
+    /// every listener that never asked for a client certificate — one relaxed
+    /// load and no work. A TLS connection that reached here without a recorded
+    /// handshake name fails closed: the acceptor records one on exactly the
+    /// listeners this check runs on, so its absence is a bug, not a client
+    /// that happens to be fine.
+    fn strict_sni_host_rejection(&self, session: &Session, hostname: &str) -> Option<&'static str> {
+        if !self.strict_sni_host.load(Ordering::Relaxed) {
+            return None;
+        }
+        let Some(ssl) = session
+            .digest()
+            .and_then(|digest| digest.ssl_digest.as_ref())
+        else {
+            // 🔓 A plaintext hop on a mutual-TLS listener: the PROXY-protocol
+            // ingress terminates TLS elsewhere, and there is no handshake here
+            // to compare against. Nothing to enforce, nothing to claim.
+            return None;
+        };
+        match ssl
+            .extension
+            .get::<crate::tls_identity::DownstreamTlsIdentity>()
+        {
+            Some(identity) if identity.may_request_host(hostname) => None,
+            Some(_) => Some("TLS server name and Host header name differ"),
+            None => Some("TLS handshake recorded no server name"),
+        }
     }
 
     /// Add a server configuration to this proxy
@@ -5393,6 +5449,31 @@ impl ProxyHttp for PingclairProxy {
                 // may already disagree about where this request body ends.
                 session.as_mut().set_keepalive(None);
                 Self::write_simple_response(session, ctx, 400, rejection.reason()).await?;
+                return Ok(true);
+            }
+        }
+
+        // 🪪 On a listener where some site demands a client certificate, the
+        // name in the handshake and the name in `Host` have to be the same one.
+        // Admission was decided from the ClientHello; routing is decided from
+        // the header. Let them disagree and a client offers the site that asks
+        // for nothing, gets in, then asks for the site that asks for a
+        // certificate. 421 is the status for "this connection is not the right
+        // one for that host", and the connection is closed so the client opens
+        // a new one with honest SNI rather than reusing this one.
+        if self.strict_sni_host.load(Ordering::Relaxed) {
+            // 🏠 Owned only on the listeners that enforce this; every other
+            // request never reaches past the atomic load above.
+            let requested_host =
+                crate::http_policy::authority_host(request_authority(session.req_header()))
+                    .to_string();
+            if let Some(reason) = self.strict_sni_host_rejection(session, &requested_host) {
+                tracing::warn!(
+                    host = %requested_host,
+                    "🚫 Rejected a request on a mutual-TLS listener: {reason}"
+                );
+                session.as_mut().set_keepalive(None);
+                Self::write_simple_response(session, ctx, 421, reason).await?;
                 return Ok(true);
             }
         }

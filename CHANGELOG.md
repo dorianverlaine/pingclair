@@ -271,6 +271,31 @@ lets the rest converge.
   rather than through temporary files.
 - 🔐 **TLS.** A persistent internal CA for private origins, and durable ACME
   state across restarts.
+- 🪪 **Mutual TLS on HTTP/1.1 and HTTP/2.** `tls { client_auth { … } }` is now
+  enforced during the handshake rather than merely parsed. All four upstream
+  modes behave as their names say: `request` asks and accepts anything,
+  `require` insists on a certificate without checking it, `verify_if_given`
+  checks one only when offered, and `require_and_verify` does both. Trust
+  material comes from `trust_pool inline`, `trust_pool file`, `trust_pool
+  system`, or a `combined` tree of those, plus the deprecated flat
+  `trusted_ca_cert`/`trusted_ca_cert_file` spellings; `trusted_leaf_cert` pins
+  individual client certificates. Every certificate is read and parsed at
+  startup, so a missing CA file stops the process instead of failing a
+  stranger's handshake later.
+
+  Two consequences worth knowing before turning it on. A listener carrying any
+  mutual-TLS site **requires a request's `Host` to be the name its handshake
+  asked for**, answering `421` otherwise — without it, a client could offer an
+  unprotected name in the ClientHello and then ask for the protected site by
+  header. And that listener **turns TLS session resumption off**, because a
+  resumed handshake carries no certificate request, so a ticket would keep
+  admitting its holder after the certificate behind it expired or the trust
+  pool changed. The cost is a full handshake per connection on that listener.
+
+  HTTP/3 does not verify client certificates yet, so a listener with
+  `client_auth` **does not start an HTTP/3 socket and does not advertise
+  `Alt-Svc`**, and says so at startup. Serving QUIC there would demand a
+  certificate over TCP and admit everyone over UDP.
 - 🛡️ **Identity and trust.** PROXY protocol required per listener, verified
   trusted client identity, and `CF-Connecting-IP` honored only from trusted
   peers.

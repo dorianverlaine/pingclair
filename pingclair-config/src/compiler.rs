@@ -787,6 +787,10 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
             });
         }
 
+        if let Some(client_auth) = &tls.client_auth {
+            validate_client_auth(client_auth)?;
+        }
+
         if !tls.internal {
             continue;
         }
@@ -814,6 +818,57 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
         }
     }
 
+    Ok(())
+}
+
+/// 🛡️ How deeply `trust_pool combined { … }` may nest before it is refused.
+///
+/// The Caddyfile adapter bounds this too, and the duplication is deliberate:
+/// the Admin API deserialises a config document straight into the core types
+/// and never runs the adapter, so a rule that lives only there is a rule with a
+/// documented way around it.
+const MAX_TRUST_POOL_DEPTH: usize = 8;
+
+/// 🪪 Validates one site's mutual-TLS block.
+fn validate_client_auth(
+    client_auth: &pingclair_core::config::ClientAuthConfig,
+) -> CompileResult<()> {
+    // 📜 `trust_pool` replaced the flat `trusted_ca_cert*` fields. Accepting
+    // both would leave the operator with no way to know which one is in force,
+    // so upstream refuses the combination and so do we.
+    if client_auth.trust_pool.is_some()
+        && (!client_auth.trusted_ca_certs.is_empty()
+            || !client_auth.trusted_ca_cert_files.is_empty())
+    {
+        return Err(CompileError::InvalidServer {
+            message: "tls client_auth cannot set both `trust_pool` and the deprecated \
+                      `trusted_ca_cert`/`trusted_ca_cert_file`"
+                .to_string(),
+        });
+    }
+
+    if let Some(pool) = &client_auth.trust_pool {
+        validate_trust_pool_depth(pool, 0)?;
+    }
+
+    Ok(())
+}
+
+/// 🧩 Walks a possibly nested trust pool, refusing one that nests too deep.
+fn validate_trust_pool_depth(
+    pool: &pingclair_core::config::TrustPool,
+    depth: usize,
+) -> CompileResult<()> {
+    if depth > MAX_TRUST_POOL_DEPTH {
+        return Err(CompileError::InvalidServer {
+            message: format!("tls client_auth trust_pool nests deeper than {MAX_TRUST_POOL_DEPTH}"),
+        });
+    }
+    if let pingclair_core::config::TrustPool::Combined { sources } = pool {
+        for source in sources {
+            validate_trust_pool_depth(source, depth + 1)?;
+        }
+    }
     Ok(())
 }
 
@@ -2932,6 +2987,73 @@ mod fail_closed_handler_tests {
     fn agreeing_cache_ceilings_compile() {
         validate_config(&config_with_two_cache_ceilings(4_096, 4_096))
             .expect("routes that agree about the ceiling are fine");
+    }
+
+    /// 🪪 The two `client_auth` rules have to live in `validate_config`, not
+    /// only in the Caddyfile adapter.
+    ///
+    /// The adapter refuses both of these already, and that is exactly why the
+    /// duplication matters: the Admin API deserialises a config document
+    /// straight into the core types and never runs the adapter, so a rule that
+    /// lives only there is a rule with a documented way around it.
+    #[test]
+    fn client_auth_conflicts_are_refused_on_the_json_path_too() {
+        use pingclair_core::config::{ClientAuthConfig, ClientAuthMode, TlsConfig, TrustPool};
+
+        let config_with_client_auth = |client_auth: ClientAuthConfig| PingclairConfig {
+            servers: vec![ServerConfig {
+                name: Some("secure.example".to_string()),
+                listen: vec![":8443".to_string()],
+                tls: Some(TlsConfig {
+                    client_auth: Some(client_auth),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // 📜 `trust_pool` replaced the flat spellings; accepting both would
+        // leave no way to tell which one is in force.
+        let both = validate_config(&config_with_client_auth(ClientAuthConfig {
+            mode: ClientAuthMode::RequireAndVerify,
+            trust_pool: Some(TrustPool::System),
+            trusted_ca_cert_files: vec!["/etc/ca.pem".to_string()],
+            ..Default::default()
+        }))
+        .expect_err("a config naming two trust sources must not compile");
+        assert!(
+            both.to_string().contains("trust_pool"),
+            "the rejection must name the conflict: {both}"
+        );
+
+        // 🛡️ `combined` is recursive, and the Admin API decides how deep.
+        let mut deep = TrustPool::System;
+        for _ in 0..(MAX_TRUST_POOL_DEPTH + 2) {
+            deep = TrustPool::Combined {
+                sources: vec![deep],
+            };
+        }
+        assert!(
+            validate_config(&config_with_client_auth(ClientAuthConfig {
+                mode: ClientAuthMode::RequireAndVerify,
+                trust_pool: Some(deep),
+                ..Default::default()
+            }))
+            .is_err(),
+            "nesting past the bound must be refused"
+        );
+
+        // 🎯 The mirror case, so neither rule can degrade into "client_auth is
+        // an error".
+        validate_config(&config_with_client_auth(ClientAuthConfig {
+            mode: ClientAuthMode::RequireAndVerify,
+            trust_pool: Some(TrustPool::File {
+                pem_files: vec!["/etc/ca.pem".to_string()],
+            }),
+            ..Default::default()
+        }))
+        .expect("an ordinary client_auth block validates");
     }
 
     fn rejection_for(handler: HandlerConfig) -> String {
