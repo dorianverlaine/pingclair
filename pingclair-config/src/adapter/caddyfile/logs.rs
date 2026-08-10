@@ -8,6 +8,25 @@ use crate::parser::caddy_ast::{Block, Directive};
 
 // MARK: - Log Block
 
+/// 🔢 Refuses a permission value the runtime could not apply.
+///
+/// A mode that does not parse is not a small mistake: the runtime would leave
+/// the platform default in place, so a file meant to be `0600` ends up readable
+/// by everyone on the box while the configuration says it is not. Failing at
+/// load time is the only point where the operator can still see it.
+fn parse_octal_permissions(directive: &str, value: &str) -> Result<u32, AdapterError> {
+    let digits = value.trim().trim_start_matches("0o");
+    u32::from_str_radix(digits, 8)
+        .ok()
+        .filter(|mode| *mode <= 0o7777)
+        .ok_or_else(|| {
+            AdapterError::InvalidArgument(
+                format!("log output file {directive}"),
+                format!("`{value}` is not an octal permission such as 0644"),
+            )
+        })
+}
+
 pub(super) fn adapt_log_block(block: Block) -> Result<LogBlock, AdapterError> {
     let mut output = LogOutput::Stdout;
     let mut format = LogFormat::default();
@@ -329,10 +348,36 @@ pub(super) fn parse_caddy_roll_block(
             "roll_keep" => rotation.keep = Some(parse_positive_usize(&r)?),
             "roll_keep_for" => rotation.max_age_secs = Some(parse_required_duration(&r)? / 1000),
             "roll_uncompressed" => uncompressed = true,
-            "mode" => rotation.mode = Some(r.args.first().cloned().unwrap_or_default()),
-            "dir_mode" => rotation.dir_mode = Some(r.args.first().cloned().unwrap_or_default()),
+            "mode" => {
+                let value = r.args.first().cloned().unwrap_or_default();
+                parse_octal_permissions("mode", &value)?;
+                rotation.mode = Some(value);
+            }
+            // 🧭 `inherit` copies the nearest existing parent's permissions and
+            // `from_file` derives them from the file's own mode. Both are kept
+            // as words rather than resolved here, because the answer depends on
+            // the filesystem at open time, not on what the configuration said.
+            "dir_mode" => {
+                let value = r.args.first().cloned().unwrap_or_default();
+                if !matches!(value.as_str(), "inherit" | "from_file") {
+                    parse_octal_permissions("dir_mode", &value)?;
+                }
+                rotation.dir_mode = Some(value);
+            }
+            // 🗜️ `none` and `gzip` are implemented. `zstd` is refused rather
+            // than quietly falling back to gzip, which would hand the operator
+            // archives in a format they did not ask for.
             "roll_compression" => {
-                rotation.roll_compression = r.args.first().cloned();
+                let value = r.args.first().cloned().unwrap_or_default();
+                match value.as_str() {
+                    "none" | "gzip" | "zstd" => rotation.roll_compression = Some(value),
+                    other => {
+                        return Err(AdapterError::InvalidArgument(
+                            "log output file roll_compression".into(),
+                            format!("unknown compression `{other}` (expected none, gzip or zstd)"),
+                        ));
+                    }
+                }
             }
             "roll_local_time" => rotation.roll_local_time = true,
             "roll_interval" => {

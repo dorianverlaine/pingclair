@@ -83,7 +83,106 @@ fn file_registry() -> &'static Mutex<HashMap<PathBuf, Arc<Mutex<File>>>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn open_shared_file(path: &str) -> std::io::Result<Arc<Mutex<File>>> {
+/// 🔢 Reads an octal permission string such as `0644`.
+///
+/// Returns `None` for anything unreadable; the caller then leaves the platform
+/// default in place rather than guessing, because guessing at permissions on a
+/// file full of request data is how a log ends up world-readable.
+fn parse_octal_mode(value: &str) -> Option<u32> {
+    let digits = value.trim().trim_start_matches("0o");
+    u32::from_str_radix(digits, 8)
+        .ok()
+        .filter(|mode| *mode <= 0o7777)
+}
+
+/// 🔐 Applies a configured mode to a path that already exists.
+///
+/// Unix only: `mode` and `dir_mode` describe POSIX permission bits, and there
+/// is no honest mapping onto Windows ACLs. Pretending otherwise would report
+/// success for a restriction that was never applied.
+#[cfg(unix)]
+fn apply_mode(path: &Path, mode: Option<&String>) {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(mode) = mode.and_then(|value| parse_octal_mode(value)) else {
+        return;
+    };
+    if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+        tracing::warn!(
+            error = %error,
+            path = %path.display(),
+            "🔐 Could not apply the configured log file mode"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn apply_mode(_path: &Path, _mode: Option<&String>) {}
+
+/// 📁 Whatever mode a newly created log directory should carry.
+///
+/// A directory needs execute wherever it has read, or its contents cannot be
+/// listed — `0644` on a directory is unusable. `from_file` and `inherit` both
+/// derive from something else and then normalise that way, which is why the
+/// resolution happens here at open time rather than in the adapter: the answer
+/// depends on the filesystem, not on what the configuration said.
+#[cfg(unix)]
+fn resolve_dir_mode(parent: &Path, rotation: &LogRotation) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+
+    /// 🔁 Read implies traverse, the rule upstream applies to every derived
+    /// directory mode: 0644 becomes 0755, 0600 becomes 0700.
+    fn read_implies_execute(mode: u32) -> u32 {
+        let mut mode = mode;
+        for (read, execute) in [(0o400, 0o100), (0o040, 0o010), (0o004, 0o001)] {
+            if mode & read != 0 {
+                mode |= execute;
+            }
+        }
+        mode
+    }
+
+    match rotation.dir_mode.as_deref()? {
+        "from_file" => rotation
+            .mode
+            .as_deref()
+            .and_then(parse_octal_mode)
+            .map(read_implies_execute),
+        // 🧭 The nearest existing ancestor, since the directory being created
+        // has no permissions of its own to copy yet.
+        "inherit" => {
+            let mut ancestor = parent.parent();
+            while let Some(candidate) = ancestor {
+                if let Ok(metadata) = std::fs::metadata(candidate) {
+                    return Some(read_implies_execute(metadata.permissions().mode() & 0o7777));
+                }
+                ancestor = candidate.parent();
+            }
+            None
+        }
+        explicit => parse_octal_mode(explicit),
+    }
+}
+
+/// 📁 Applies the resolved directory mode, if one can be resolved.
+#[cfg(unix)]
+fn apply_resolved_dir_mode(parent: &Path, rotation: &LogRotation) {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(mode) = resolve_dir_mode(parent, rotation) else {
+        return;
+    };
+    if let Err(error) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(mode)) {
+        tracing::warn!(
+            error = %error,
+            path = %parent.display(),
+            "🔐 Could not apply the configured log directory mode"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn apply_resolved_dir_mode(_parent: &Path, _rotation: &LogRotation) {}
+
+fn open_shared_file(path: &str, rotation: &LogRotation) -> std::io::Result<Arc<Mutex<File>>> {
     // Canonicalize the *parent* — the log file itself may not exist yet, so
     // canonicalizing the full path would fail on first run.
     let raw = Path::new(path);
@@ -108,10 +207,23 @@ fn open_shared_file(path: &str) -> std::io::Result<Arc<Mutex<File>>> {
     if let Some(parent) = raw.parent()
         && !parent.as_os_str().is_empty()
     {
+        let existed = parent.exists();
         std::fs::create_dir_all(parent)?;
+        // 🔐 Only a directory this process created gets its mode set. Applying
+        // `dir_mode` to a pre-existing directory would silently re-permission
+        // something the operator may share with other services.
+        if !existed {
+            apply_resolved_dir_mode(parent, rotation);
+        }
     }
 
     let file = OpenOptions::new().create(true).append(true).open(raw)?;
+    // 🔐 A log file carries request paths, client addresses and any headers the
+    // operator asked to record, so the default mode is not always the right
+    // one. Applied after the open rather than through `OpenOptions::mode`,
+    // which only takes effect on creation and would leave an existing file at
+    // whatever permissions it already had.
+    apply_mode(raw, rotation.mode.as_ref());
     let handle = Arc::new(Mutex::new(file));
     registry.insert(key, handle.clone());
     Ok(handle)
@@ -128,8 +240,16 @@ fn open_shared_file(path: &str) -> std::io::Result<Arc<Mutex<File>>> {
 /// same path hold the same handle precisely so their writes cannot interleave.
 /// Replacing the Arc would rotate one of them and leave the other writing to
 /// the rotated file forever.
-fn reopen_shared_file(handle: &Arc<Mutex<File>>, path: &Path) -> std::io::Result<()> {
+fn reopen_shared_file(
+    handle: &Arc<Mutex<File>>,
+    path: &Path,
+    rotation: &LogRotation,
+) -> std::io::Result<()> {
     let fresh = OpenOptions::new().create(true).append(true).open(path)?;
+    // 🔐 The fresh file is a new inode, so it starts at the platform default
+    // rather than inheriting the rotated file's permissions. Reapplying the
+    // configured mode here is what stops rotation from quietly widening it.
+    apply_mode(path, rotation.mode.as_ref());
     let mut guard = handle
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -557,7 +677,146 @@ fn should_rotate(rotation: &LogRotation, written: u64, opened_at: std::time::Sys
             .elapsed()
             .is_ok_and(|elapsed| elapsed.as_secs() >= max)
     });
-    by_size || by_age
+    let by_interval = rotation.roll_interval_secs.is_some_and(|interval| {
+        interval > 0
+            && opened_at
+                .elapsed()
+                .is_ok_and(|elapsed| elapsed.as_secs() >= interval)
+    });
+    // 🕰️ Whichever trigger arrives first wins, so a file with both a size
+    // limit and a nightly time rolls on whichever comes up — the operator
+    // asked for both bounds, not for one to mask the other.
+    by_size || by_age || by_interval || crossed_a_scheduled_time(rotation, opened_at)
+}
+
+/// 🕰️ Whether a `roll_at` or `roll_minutes` boundary has passed since the file
+/// was opened.
+///
+/// Both are calendar triggers rather than durations: `roll_at 00:00` means
+/// midnight, not "24 hours from whenever this file happened to open". The
+/// question is therefore whether a scheduled instant falls in the half-open
+/// window between the file's open time and now.
+///
+/// 📌 Like upstream, this is only consulted when a line arrives. An idle log
+/// does not roll at midnight and then sit empty; it rolls when it next has
+/// something to write, which is the point at which the boundary matters.
+fn crossed_a_scheduled_time(rotation: &LogRotation, opened_at: std::time::SystemTime) -> bool {
+    use chrono::{DateTime, Local, Timelike};
+
+    if rotation.roll_at.is_none() && rotation.roll_minutes.is_none() {
+        return false;
+    }
+    let opened: DateTime<Local> = DateTime::from(opened_at);
+    let now = Local::now();
+    if now <= opened {
+        return false;
+    }
+
+    // 🕐 `roll_minutes 0 30` rolls at every xx:00 and xx:30. A boundary was
+    // crossed when the count of elapsed boundaries differs between the two
+    // instants, which avoids enumerating them.
+    if let Some(minutes) = &rotation.roll_minutes {
+        for minute in parse_minute_list(minutes) {
+            let elapsed_hours = |at: &DateTime<Local>| {
+                let reached = at.minute() >= minute;
+                at.timestamp().div_euclid(3600) + i64::from(reached)
+            };
+            if elapsed_hours(&now) > elapsed_hours(&opened) {
+                return true;
+            }
+        }
+    }
+
+    if let Some(times) = &rotation.roll_at {
+        for (hour, minute) in parse_time_list(times) {
+            let elapsed_days = |at: &DateTime<Local>| {
+                let reached = (at.hour(), at.minute()) >= (hour, minute);
+                at.timestamp().div_euclid(86_400) + i64::from(reached)
+            };
+            if elapsed_days(&now) > elapsed_days(&opened) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 🕰️ The timestamp a rotated file carries in its name.
+///
+/// Sortable and human-readable, because that name is what an operator greps
+/// when asked which file covers a given hour. It used to be epoch seconds,
+/// which is neither, and which made `roll_local_time` meaningless — a Unix
+/// timestamp has no timezone to express.
+///
+/// Colons are avoided on purpose: they are legal on Unix and not on Windows,
+/// and a rotated log that cannot be copied to another machine is a poor
+/// archive.
+fn rotation_stamp(local: bool) -> String {
+    const FORMAT: &str = "%Y-%m-%dT%H-%M-%S%.3f";
+    if local {
+        chrono::Local::now().format(FORMAT).to_string()
+    } else {
+        chrono::Utc::now().format(FORMAT).to_string()
+    }
+}
+
+/// 🗜️ How rotated files are compressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RotationCompression {
+    None,
+    Gzip,
+    Zstd,
+}
+
+/// 🗜️ Resolves the two spellings that can ask for compression.
+///
+/// The older boolean `compress` says whether, and Caddy's `roll_compression`
+/// says which. When both are present the algorithm wins, because naming one is
+/// the more specific statement — and an unknown name is refused at
+/// configuration time, so it cannot arrive here and quietly become gzip.
+fn rotation_compression(rotation: &LogRotation) -> RotationCompression {
+    match rotation.roll_compression.as_deref() {
+        Some("none") => RotationCompression::None,
+        Some("gzip") => RotationCompression::Gzip,
+        Some("zstd") => RotationCompression::Zstd,
+        _ if rotation.compress => RotationCompression::Gzip,
+        _ => RotationCompression::None,
+    }
+}
+
+/// 🕐 Reads `roll_minutes 0 30` into minute-of-hour values.
+///
+/// An unreadable entry is skipped with a warning rather than failing the
+/// writer, matching upstream — but the warning matters, because a silently
+/// ignored `roll_minutes 61` is a rotation the operator believes is armed.
+fn parse_minute_list(value: &str) -> Vec<u32> {
+    value
+        .split_whitespace()
+        .filter_map(|token| match token.parse::<u32>() {
+            Ok(minute) if minute < 60 => Some(minute),
+            _ => {
+                tracing::warn!(value = %token, "⚠️ Ignoring an out-of-range roll_minutes entry");
+                None
+            }
+        })
+        .collect()
+}
+
+/// 🕰️ Reads `roll_at 00:00 12:00` into hour and minute pairs.
+fn parse_time_list(value: &str) -> Vec<(u32, u32)> {
+    value
+        .split_whitespace()
+        .filter_map(|token| {
+            let (hour, minute) = token.split_once(':')?;
+            match (hour.parse::<u32>(), minute.parse::<u32>()) {
+                (Ok(hour), Ok(minute)) if hour < 24 && minute < 60 => Some((hour, minute)),
+                _ => {
+                    tracing::warn!(value = %token, "⚠️ Ignoring an unreadable roll_at entry");
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 /// 🔄 Renames the active file aside, reopens it, and applies retention.
@@ -567,13 +826,10 @@ fn should_rotate(rotation: &LogRotation, written: u64, opened_at: std::time::Sys
 /// never mean failing to log**: a permission problem on the directory is not a
 /// reason to start dropping lines.
 fn rotate(handle: &Arc<Mutex<File>>, path: &Path, rotation: &LogRotation) -> Option<()> {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
     let rotated = path.with_extension(format!(
-        "{}.{stamp}",
-        path.extension().and_then(|e| e.to_str()).unwrap_or("log")
+        "{}.{}",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("log"),
+        rotation_stamp(rotation.roll_local_time)
     ));
 
     if let Err(error) = std::fs::rename(path, &rotated) {
@@ -581,12 +837,10 @@ fn rotate(handle: &Arc<Mutex<File>>, path: &Path, rotation: &LogRotation) -> Opt
         return None;
     }
 
-    if rotation.compress {
-        compress_rotated(&rotated);
-    }
+    compress_rotated(&rotated, rotation_compression(rotation));
     apply_retention(path, rotation.keep);
 
-    match reopen_shared_file(handle, path) {
+    match reopen_shared_file(handle, path, rotation) {
         Ok(()) => Some(()),
         Err(error) => {
             tracing::error!(error = %error, "❌ Could not reopen access log after rotation");
@@ -599,24 +853,41 @@ fn rotate(handle: &Arc<Mutex<File>>, path: &Path, rotation: &LogRotation) -> Opt
 ///
 /// Best effort: a failure leaves the uncompressed file, which is strictly
 /// better than losing it.
-fn compress_rotated(rotated: &Path) {
+fn compress_rotated(rotated: &Path, algorithm: RotationCompression) {
     let Ok(raw) = std::fs::read(rotated) else {
         return;
     };
+    let (suffix, compressed) = match algorithm {
+        RotationCompression::None => return,
+        RotationCompression::Gzip => {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            if encoder.write_all(&raw).is_err() {
+                return;
+            }
+            let Ok(bytes) = encoder.finish() else {
+                return;
+            };
+            ("gz", bytes)
+        }
+        RotationCompression::Zstd => {
+            // 📏 Level 3 is zstd's own default: it is the point the algorithm
+            // is tuned around, and a rotated log is written once and read
+            // rarely, so spending more CPU here buys little.
+            let Ok(bytes) = zstd::stream::encode_all(raw.as_slice(), 3) else {
+                return;
+            };
+            ("zst", bytes)
+        }
+    };
+
     let target = rotated.with_extension(format!(
-        "{}.gz",
+        "{}.{suffix}",
         rotated
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("log")
     ));
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    if encoder.write_all(&raw).is_err() {
-        return;
-    }
-    let Ok(compressed) = encoder.finish() else {
-        return;
-    };
     if std::fs::write(&target, compressed).is_ok() {
         let _ = std::fs::remove_file(rotated);
     }
@@ -778,7 +1049,7 @@ impl AccessLogger {
         let sink = match &config.output {
             LogOutput::Stdout => LogSink::Stdout,
             LogOutput::Stderr => LogSink::Stderr,
-            LogOutput::File(path) => LogSink::File(open_shared_file(path)?),
+            LogOutput::File(path) => LogSink::File(open_shared_file(path, &config.rotation)?),
         };
         // 🔄 Rotation only applies to a file we own. Rotating stdout would mean
         // renaming whatever the service manager pointed it at.
@@ -1369,8 +1640,8 @@ mod tests {
         let LogOutput::File(path) = &cfg.output else {
             panic!("expected a file output");
         };
-        let first = open_shared_file(path).expect("open");
-        let second = open_shared_file(path).expect("open again");
+        let first = open_shared_file(path, &LogRotation::default()).expect("open");
+        let second = open_shared_file(path, &LogRotation::default()).expect("open again");
         assert!(
             Arc::ptr_eq(&first, &second),
             "same path must share one handle"
@@ -1519,6 +1790,200 @@ mod writer_backpressure_tests {
 #[cfg(test)]
 mod rotation_tests {
     use super::*;
+
+    /// ⏲️ A fixed interval is a trigger in its own right.
+    ///
+    /// It used to be neither read nor armed: `is_enabled` only counted size and
+    /// age, so `roll_interval 12h` alone left rotation switched off entirely.
+    #[test]
+    fn an_interval_alone_arms_and_fires_rotation() {
+        let rotation = LogRotation {
+            roll_interval_secs: Some(60),
+            ..Default::default()
+        };
+        assert!(rotation.is_enabled(), "an interval must arm rotation");
+
+        let opened = std::time::SystemTime::now() - std::time::Duration::from_secs(61);
+        assert!(should_rotate(&rotation, 0, opened));
+        assert!(
+            !should_rotate(&rotation, 0, std::time::SystemTime::now()),
+            "a file opened just now has not reached its interval"
+        );
+    }
+
+    /// 🕐 `roll_minutes` is a calendar boundary, not a duration.
+    ///
+    /// A file opened at 10:29 must roll at 10:30 — one minute later — rather
+    /// than thirty minutes after it happened to open.
+    #[test]
+    fn a_minute_boundary_fires_when_it_is_crossed() {
+        let rotation = LogRotation {
+            // 🎯 Every minute, so the boundary is guaranteed to have been
+            // crossed by a file opened two minutes ago whatever the wall clock
+            // says when this runs.
+            roll_minutes: Some((0..60).map(|m| m.to_string()).collect::<Vec<_>>().join(" ")),
+            ..Default::default()
+        };
+        assert!(rotation.is_enabled());
+        let opened = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        assert!(should_rotate(&rotation, 0, opened));
+        assert!(!should_rotate(&rotation, 0, std::time::SystemTime::now()));
+    }
+
+    /// 🚫 An out-of-range entry is skipped rather than treated as a boundary.
+    #[test]
+    fn unreadable_schedule_entries_are_dropped() {
+        assert_eq!(parse_minute_list("0 30 61 abc"), vec![0, 30]);
+        assert_eq!(
+            parse_time_list("00:00 24:00 12:30 nonsense"),
+            vec![(0, 0), (12, 30)]
+        );
+    }
+
+    /// 🕰️ The rotated name is sortable and carries no colons.
+    ///
+    /// Colons are legal on Unix and not on Windows, and a rotated log that
+    /// cannot be copied to another machine is a poor archive.
+    #[test]
+    fn the_rotation_stamp_is_sortable_and_portable() {
+        let stamp = rotation_stamp(false);
+        assert!(!stamp.contains(':'), "{stamp}");
+        assert!(stamp.starts_with("20"), "{stamp}");
+        assert_eq!(stamp.matches('-').count(), 4, "{stamp}");
+    }
+
+    /// 🗜️ The named algorithm wins over the older boolean.
+    #[test]
+    fn roll_compression_decides_over_the_legacy_flag() {
+        let with = |compress: bool, algorithm: Option<&str>| {
+            rotation_compression(&LogRotation {
+                compress,
+                roll_compression: algorithm.map(str::to_string),
+                ..Default::default()
+            })
+        };
+
+        assert_eq!(with(true, Some("none")), RotationCompression::None);
+        assert_eq!(with(false, Some("gzip")), RotationCompression::Gzip);
+        assert_eq!(with(false, Some("zstd")), RotationCompression::Zstd);
+        // 👍 With no algorithm named, the older spelling still decides.
+        assert_eq!(with(true, None), RotationCompression::Gzip);
+        assert_eq!(with(false, None), RotationCompression::None);
+    }
+
+    /// 🗜️ A zstd-rotated file is really zstd, and the plain one is gone.
+    #[test]
+    fn zstd_rotation_leaves_only_a_decodable_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        std::fs::write(&path, b"one line\n").unwrap();
+        let rotation = LogRotation {
+            max_size_bytes: Some(1),
+            roll_compression: Some("zstd".to_string()),
+            ..Default::default()
+        };
+        let handle = open_shared_file(path.to_str().unwrap(), &rotation).unwrap();
+        rotate(&handle, &path, &rotation).expect("rotation succeeds");
+
+        let archive = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|entry| entry.extension().is_some_and(|ext| ext == "zst"))
+            .expect("a .zst archive is left behind");
+        let raw = zstd::stream::decode_all(std::fs::read(&archive).unwrap().as_slice())
+            .expect("the archive really is zstd");
+        assert_eq!(raw, b"one line\n");
+    }
+
+    /// 📁 `from_file` derives the directory mode, adding traverse where read is.
+    ///
+    /// A directory at `0600` cannot be listed by its own owner's tools, so the
+    /// read bits have to imply execute — `0600` becomes `0700`, `0644` becomes
+    /// `0755`.
+    #[cfg(unix)]
+    #[test]
+    fn from_file_derives_the_directory_mode_and_adds_traverse() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("access.log");
+        let rotation = LogRotation {
+            mode: Some("0640".to_string()),
+            dir_mode: Some("from_file".to_string()),
+            ..Default::default()
+        };
+
+        open_shared_file(path.to_str().unwrap(), &rotation).unwrap();
+        let parent = path.parent().unwrap();
+        assert_eq!(
+            std::fs::metadata(parent).unwrap().permissions().mode() & 0o7777,
+            0o750,
+            "0640 must become 0750, not stay unreadable as a directory"
+        );
+    }
+
+    /// 📁 `inherit` copies the nearest existing ancestor rather than guessing.
+    #[cfg(unix)]
+    #[test]
+    fn inherit_copies_the_nearest_existing_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o705)).unwrap();
+        let path = dir.path().join("nested").join("access.log");
+        let rotation = LogRotation {
+            dir_mode: Some("inherit".to_string()),
+            ..Default::default()
+        };
+
+        open_shared_file(path.to_str().unwrap(), &rotation).unwrap();
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o705,
+            "the ancestor's mode already implies traverse where it reads"
+        );
+    }
+
+    /// 🔐 The configured mode reaches the file, and survives a rotation.
+    ///
+    /// A log holds request paths, client addresses and any headers the operator
+    /// asked to record. A rotation that quietly restored the default mode would
+    /// widen that exposure at the exact moment nobody is watching.
+    #[cfg(unix)]
+    #[test]
+    fn the_file_mode_is_applied_and_reapplied_after_rotation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("access.log");
+        let rotation = LogRotation {
+            max_size_bytes: Some(1),
+            mode: Some("0600".to_string()),
+            dir_mode: Some("0700".to_string()),
+            ..Default::default()
+        };
+
+        let handle = open_shared_file(path.to_str().unwrap(), &rotation).unwrap();
+        let mode_of = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode_of(&path), 0o600, "the log file starts restricted");
+        assert_eq!(
+            mode_of(path.parent().unwrap()),
+            0o700,
+            "the directory this process created is restricted too"
+        );
+
+        rotate(&handle, &path, &rotation).expect("rotation succeeds");
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "the fresh file must not fall back to the platform default"
+        );
+    }
 
     fn rotating_logger(dir: &Path, rotation: LogRotation) -> AccessLogger {
         let path = dir.join("access.log");

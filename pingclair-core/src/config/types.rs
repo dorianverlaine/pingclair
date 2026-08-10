@@ -2206,8 +2206,18 @@ fn is_false(value: &bool) -> bool {
 
 impl LogRotation {
     /// Whether any rotation trigger is configured at all.
+    /// 🔄 Whether anything can ever trigger a roll.
+    ///
+    /// Every trigger has to be listed here, not only the size and age ones.
+    /// While only those two counted, `roll_interval 12h` on its own left
+    /// rotation switched off entirely — the option was inert twice over, once
+    /// because nothing read it and once because nothing armed it.
     pub fn is_enabled(&self) -> bool {
-        self.max_size_bytes.is_some() || self.max_age_secs.is_some()
+        self.max_size_bytes.is_some()
+            || self.max_age_secs.is_some()
+            || self.roll_interval_secs.is_some()
+            || self.roll_at.is_some()
+            || self.roll_minutes.is_some()
     }
 }
 
