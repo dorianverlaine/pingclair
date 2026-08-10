@@ -764,6 +764,7 @@ pub(super) fn adapt_server(
             acme_email: None,
             http3: None,
             default_sni: None,
+            client_auth: None,
         });
     }
 

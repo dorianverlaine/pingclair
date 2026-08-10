@@ -479,6 +479,10 @@ pub struct TlsConfig {
     #[serde(default)]
     pub http3: bool,
 
+    /// 🪪 Mutual TLS: what to ask of the client's own certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_auth: Option<ClientAuthConfig>,
+
     /// 🏷️ The server name to assume when a client sends no SNI.
     ///
     /// TLS 1.2 made SNI optional and plenty of clients still omit it: older
@@ -488,6 +492,82 @@ pub struct TlsConfig {
     /// between "this endpoint does not work for that client" and "it does".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_sni: Option<String>,
+}
+
+/// 🪪 How strictly a client certificate is demanded and checked.
+///
+/// The four modes are upstream's, and the distinction between them is the whole
+/// point: `request` asks and accepts whatever comes back, `require` insists on a
+/// certificate but does not check it, `verify_if_given` checks one only if the
+/// client offers it, and `require_and_verify` does both. Two of these are
+/// commonly mistaken for security controls when they are not, which is why the
+/// spelling has to be exact rather than a boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAuthMode {
+    /// 🙋 Ask for a certificate; accept the connection either way.
+    Request,
+    /// ✋ Insist on a certificate, but do not build a trust path for it.
+    #[default]
+    Require,
+    /// 🔍 Verify a certificate if one is offered; allow the connection if not.
+    VerifyIfGiven,
+    /// 🛡️ Insist on a certificate and verify it against the trust pool.
+    RequireAndVerify,
+}
+
+/// 🏛️ Where the certificates a client is checked against come from.
+///
+/// 🛡️ Externally tagged and depth-bounded on purpose. `Combined` makes this
+/// recursive, and an untagged recursive type is precisely the shape that
+/// produced a remotely triggerable stack overflow in this codebase once
+/// already — the Admin API deserialises straight into these types, so the
+/// nesting an attacker can express is the nesting the parser has to survive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum TrustPool {
+    /// 📜 Certificates given directly, base64 DER as upstream spells them.
+    Inline {
+        #[serde(default)]
+        trust_der: Vec<String>,
+    },
+    /// 📂 PEM bundles read from disk.
+    File {
+        #[serde(default)]
+        pem_files: Vec<String>,
+    },
+    /// 🖥️ The host's own trust store.
+    System,
+    /// 🧩 Several pools treated as one.
+    Combined {
+        #[serde(default)]
+        sources: Vec<TrustPool>,
+    },
+}
+
+/// 🪪 Mutual TLS configuration for one site.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ClientAuthConfig {
+    /// 🎚️ How strictly the certificate is demanded and checked.
+    #[serde(default)]
+    pub mode: ClientAuthMode,
+
+    /// 🏛️ The trust pool clients are verified against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_pool: Option<TrustPool>,
+
+    /// 📜 Upstream's deprecated flat spellings, kept because configurations in
+    /// the wild still use them. They are mutually exclusive with `trust_pool`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_ca_certs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_ca_cert_files: Vec<String>,
+
+    /// 🍃 Leaf certificates pinned individually, rather than by their issuer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_leaf_certs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_leaf_cert_files: Vec<String>,
 }
 
 /// Route configuration

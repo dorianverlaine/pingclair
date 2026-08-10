@@ -281,6 +281,9 @@ pub struct TlsDirective {
 
     /// 🏷️ The server name assumed when a client sends no SNI.
     pub default_sni: Option<String>,
+
+    /// 🪪 Mutual TLS, parsed but not yet enforced by any acceptor.
+    pub client_auth: Option<pingclair_core::config::ClientAuthConfig>,
 }
 
 /// Listen address

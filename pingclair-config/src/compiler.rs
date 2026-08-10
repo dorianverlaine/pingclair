@@ -331,6 +331,9 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
             if tls.default_sni.is_some() {
                 merged.default_sni = tls.default_sni.clone();
             }
+            if tls.client_auth.is_some() {
+                merged.client_auth = tls.client_auth.clone();
+            }
             // 📧 An ACME email with no certificate management of its own is
             // an instruction to *keep* automatic issuance with that account,
             // not to stop it — `tls you@example.com` and

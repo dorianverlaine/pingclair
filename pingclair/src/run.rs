@@ -300,6 +300,35 @@ pub(crate) fn run_server(
         manual_certs.push((name.to_string(), cert_path.clone(), key_path.clone()));
     }
 
+    // 🪪 `client_auth` parses and compiles, and nothing in the acceptor checks a
+    // client certificate yet. Starting anyway would give an operator a site that
+    // reports mutual TLS in its configuration and admits everyone — the exact
+    // shape of silent failure this project treats as worse than not starting.
+    //
+    // The refusal is here rather than in `validate_config` on purpose: `adapt`
+    // converts a Caddyfile to JSON without running anything, and upstream
+    // converts these configurations happily. Refusing to *serve* is the honest
+    // line, not refusing to translate.
+    let mtls_sites: Vec<&str> = config
+        .servers
+        .iter()
+        .filter(|server| {
+            server
+                .tls
+                .as_ref()
+                .is_some_and(|tls| tls.client_auth.is_some())
+        })
+        .map(|server| server.name.as_deref().unwrap_or("_"))
+        .collect();
+    if !mtls_sites.is_empty() {
+        anyhow::bail!(
+            "site(s) {} ask for `tls client_auth`, and no client certificate is verified yet; \
+             refusing to start rather than serve a site that reports mutual TLS and admits \
+             everyone",
+            mtls_sites.join(", ")
+        );
+    }
+
     match tls_manager.refresh_manual_certs(&manual_certs) {
         Ok(count) if count > 0 => {
             tracing::info!("🔐 Loaded {count} manual TLS certificate(s)");
