@@ -478,6 +478,16 @@ pub struct TlsConfig {
     /// 🚀 Enables HTTP/3.
     #[serde(default)]
     pub http3: bool,
+
+    /// 🏷️ The server name to assume when a client sends no SNI.
+    ///
+    /// TLS 1.2 made SNI optional and plenty of clients still omit it: older
+    /// command-line tools, health checkers, and anything connecting to a bare
+    /// IP. Without a name there is nothing to select a certificate by, so the
+    /// handshake has to fail — which is why naming one here is the difference
+    /// between "this endpoint does not work for that client" and "it does".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_sni: Option<String>,
 }
 
 /// Route configuration

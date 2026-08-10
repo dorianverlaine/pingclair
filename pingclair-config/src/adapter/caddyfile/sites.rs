@@ -763,6 +763,7 @@ pub(super) fn adapt_server(
             key: None,
             acme_email: None,
             http3: None,
+            default_sni: None,
         });
     }
 

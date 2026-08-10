@@ -96,6 +96,23 @@ pub fn compile_ast(ast: &Ast) -> CompileResult<PingclairConfig> {
         config.servers.push(server_config);
     }
 
+    // 🏷️ The global `default_sni` is the fallback for every site that did not
+    // name its own, resolved here rather than per handshake: a TLS callback
+    // runs on every connection, and the answer cannot change between them.
+    if let Some(default_sni) = &ast
+        .global
+        .as_ref()
+        .and_then(|g| g.inner.default_sni.clone())
+    {
+        for server in &mut config.servers {
+            if let Some(tls) = server.tls.as_mut()
+                && tls.default_sni.is_none()
+            {
+                tls.default_sni = Some(default_sni.clone());
+            }
+        }
+    }
+
     Ok(config)
 }
 
@@ -310,6 +327,9 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
             }
             if let Some(http3) = tls.http3 {
                 merged.http3 = http3;
+            }
+            if tls.default_sni.is_some() {
+                merged.default_sni = tls.default_sni.clone();
             }
             // 📧 An ACME email with no certificate management of its own is
             // an instruction to *keep* automatic issuance with that account,

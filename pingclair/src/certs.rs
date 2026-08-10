@@ -55,6 +55,14 @@ pub(crate) struct DynamicCertResolver {
     tls_manager: Arc<TlsManager>,
     /// Cache for parsed BoringSSL objects to avoid PEM parsing on every TLS handshake
     ssl_cache: Arc<RwLock<HashMap<String, CachedSslCert>>>,
+    /// 🏷️ The name to resolve when a client sends no SNI.
+    ///
+    /// Resolved once when the listener is built, because this callback runs on
+    /// every single handshake and the answer cannot change between them. An
+    /// `Arc<str>` rather than a `String` so the no-SNI path borrows instead of
+    /// allocating — the branch that reaches it is already the slow one for the
+    /// client, and there is no reason to make it slower for the server.
+    default_sni: Option<Arc<str>>,
 }
 
 // Manual Debug because TlsManager might not implement it
@@ -72,7 +80,19 @@ impl DynamicCertResolver {
         Self {
             tls_manager,
             ssl_cache: Arc::new(RwLock::new(HashMap::new())),
+            default_sni: None,
         }
+    }
+
+    /// 🏷️ Names the certificate to serve when a client sends no SNI.
+    ///
+    /// Without one, such a client gets no certificate and the handshake fails —
+    /// which is correct, because there is nothing to choose by, but it is also
+    /// why the option exists: TLS 1.2 made SNI optional and health checkers,
+    /// older tooling and anything dialling a bare IP still omit it.
+    pub(crate) fn with_default_sni(mut self, default_sni: Option<&str>) -> Self {
+        self.default_sni = default_sni.filter(|name| !name.is_empty()).map(Arc::from);
+        self
     }
 
     /// Get current unix timestamp
@@ -137,14 +157,27 @@ fn install_certificate_chain(
 #[async_trait::async_trait]
 impl TlsAccept for DynamicCertResolver {
     async fn certificate_callback(&self, ssl: &mut TlsRef) {
-        // Get SNI
-        let sni = ssl
-            .servername(NameType::HOST_NAME)
-            .unwrap_or("")
-            .to_string();
-        if sni.is_empty() {
-            return;
-        }
+        // 🏷️ The borrow of `ssl` has to end before the chain is installed
+        // through `&mut ssl`, which is why the name is copied out. Only the
+        // path that has an SNI allocates; the no-SNI path borrows the
+        // configured default, so the fix below costs nothing on the hot path.
+        let offered = {
+            let sni = ssl.servername(NameType::HOST_NAME).unwrap_or("");
+            (!sni.is_empty()).then(|| sni.to_string())
+        };
+        let sni: &str = match (&offered, self.default_sni.as_deref()) {
+            (Some(sni), _) => sni,
+            // 🔐 A client that sent no SNI used to get no certificate at all,
+            // so the handshake failed with nothing to explain it. With a
+            // configured name there is something to select by.
+            (None, Some(default)) => default,
+            (None, None) => {
+                tracing::debug!(
+                    "🔐 No SNI and no default_sni configured; no certificate can be selected"
+                );
+                return;
+            }
+        };
 
         tracing::debug!("🔐 Resolving cert for SNI: {}", sni);
 
@@ -152,7 +185,7 @@ impl TlsAccept for DynamicCertResolver {
         let current_time = Self::current_time();
         {
             let cache = self.ssl_cache.read();
-            if let Some(cached) = cache.get(&sni)
+            if let Some(cached) = cache.get(sni)
                 && cached.expires_at > current_time
             {
                 // Cache hit - use cached BoringSSL objects
@@ -165,7 +198,7 @@ impl TlsAccept for DynamicCertResolver {
         }
 
         // Step 2: Cache miss or expired - fetch and parse PEM
-        if let Some((cert_pem, key_pem)) = self.tls_manager.resolve_pem(&sni).await {
+        if let Some((cert_pem, key_pem)) = self.tls_manager.resolve_pem(sni).await {
             let chain = match parse_certificate_chain(&cert_pem) {
                 Ok(c) => c,
                 Err(e) => {
@@ -196,7 +229,7 @@ impl TlsAccept for DynamicCertResolver {
                 expires_at,
             };
 
-            self.ssl_cache.write().insert(sni.clone(), cached_entry);
+            self.ssl_cache.write().insert(sni.to_string(), cached_entry);
             tracing::info!(
                 "🔐 Cached cert for {} (expires in {}s)",
                 sni,

@@ -9436,3 +9436,88 @@ async fn test_log_sampling_keeps_a_bounded_share_of_entries() {
         "sampling had no effect: every one of the twelve requests was logged"
     );
 }
+
+/// 🏷️ A client that sends no SNI is served the certificate `default_sni` names.
+///
+/// TLS 1.2 made SNI optional, and a client connecting to a bare IP must not send
+/// one at all — RFC 6066 forbids it. Without a configured default there is
+/// nothing to select a certificate by, so the handshake failed with nothing to
+/// explain it. The control below is the point of the test: the same request
+/// against the same site fails when the option is absent, so this proves the
+/// option is what made the difference rather than proving TLS works.
+#[tokio::test]
+async fn test_default_sni_serves_clients_that_send_no_sni() {
+    let with_default = r#"
+        {
+            admin off
+            default_sni sni.sandbox.test
+        }
+
+        https://sni.sandbox.test:__PINGCLAIR_TEST_PORT__ {
+            tls internal
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "served-without-sni"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(with_default);
+    assert!(
+        server.wait_until_tls_ready("sni.sandbox.test").await,
+        "server failed to start"
+    );
+
+    // 🔌 Connecting by IP is what makes the client omit SNI; a hostname URL
+    // would send one and never reach the path under test.
+    let by_ip = reqwest::Client::builder()
+        .no_proxy()
+        .danger_accept_invalid_certs(true)
+        // 🧭 HTTP/1.1 so the `Host` header below is what routes the request;
+        // over HTTP/2 the authority comes from the URL, which is the IP.
+        .http1_only()
+        .build()
+        .unwrap();
+    let response = by_ip
+        .get(format!("https://{}/probe", server.address(0)))
+        // 🧭 The certificate is chosen by SNI and the route by `Host`, so the
+        // header still has to name the site. Without it the handshake would
+        // succeed and the request would 404, which would look like the same
+        // pass for the wrong reason.
+        .header("Host", "sni.sandbox.test")
+        .send()
+        .await
+        .expect("a client without SNI must still complete the handshake");
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "served-without-sni");
+    server.stop();
+
+    // 🎯 Control: the same request, the same site, no `default_sni`.
+    let without_default = r#"
+        {
+            admin off
+        }
+
+        https://sni.sandbox.test:__PINGCLAIR_TEST_PORT__ {
+            tls internal
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "served-without-sni"
+        }
+    "#;
+    let mut bare = TestServer::new_pingclairfile(without_default);
+    assert!(
+        bare.wait_until_tls_ready("sni.sandbox.test").await,
+        "control server failed to start"
+    );
+    let refused = by_ip
+        .get(format!("https://{}/probe", bare.address(0)))
+        .header("Host", "sni.sandbox.test")
+        .send()
+        .await;
+    assert!(
+        refused.is_err(),
+        "without default_sni there is no certificate to select, so the handshake \
+         must fail rather than quietly serving one"
+    );
+}

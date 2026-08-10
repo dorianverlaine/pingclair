@@ -68,6 +68,9 @@ pub struct GlobalBlock {
     /// 🔄 Upstream re-resolution interval in seconds; `Some(0)` disables it.
     /// `None` means the directive was absent and the default applies.
     pub dns_refresh_secs: Option<u64>,
+    /// 🏷️ Server name assumed when a client sends no SNI, for every site that
+    /// does not name its own.
+    pub default_sni: Option<String>,
     pub directives: Vec<Directive>,
 }
 
@@ -275,6 +278,9 @@ pub struct TlsDirective {
 
     /// 🚀 Overrides HTTP/3 for this server.
     pub http3: Option<bool>,
+
+    /// 🏷️ The server name assumed when a client sends no SNI.
+    pub default_sni: Option<String>,
 }
 
 /// Listen address

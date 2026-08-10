@@ -480,6 +480,20 @@ pub(crate) fn run_server(
         tracing::info!("   📍 {} -> [{}]", addr, sites.join(", "));
     }
 
+    // 🏷️ Listen address → the name to serve when a client sends no SNI, built
+    // once here. The alternative is a lookup inside BoringSSL's SNI callback,
+    // which runs on every handshake and cannot get a different answer than it
+    // would have got at startup.
+    let default_sni_by_address: std::collections::HashMap<&str, &str> = config
+        .servers
+        .iter()
+        .filter_map(|server| {
+            let sni = server.tls.as_ref()?.default_sni.as_deref()?;
+            Some((server, sni))
+        })
+        .flat_map(|(server, sni)| server.listen.iter().map(move |addr| (addr.as_str(), sni)))
+        .collect();
+
     // Create services for each proxy
     let mut https_ports = Vec::new();
     let mut private_listener_reservations = Vec::new();
@@ -529,7 +543,8 @@ pub(crate) fn run_server(
 
             if is_https {
                 // 🔐 Enable dynamic certificates and advertise HTTP/2 plus HTTP/1.1 over ALPN.
-                let acceptor = DynamicCertResolver::new(tls_manager.clone());
+                let acceptor = DynamicCertResolver::new(tls_manager.clone())
+                    .with_default_sni(default_sni_by_address.get(addr.as_str()).copied());
                 match TlsSettings::with_callbacks(Box::new(acceptor)) {
                     Ok(mut tls_settings) => {
                         tls_settings.enable_h2();

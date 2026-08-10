@@ -8,6 +8,26 @@ use crate::parser::caddy_ast::Directive;
 // MARK: - 🔐 TLS Directive
 
 /// 🔐 Adapts the supported downstream TLS directive forms.
+/// 🏷️ Reads the one server name a `default_sni` may carry.
+///
+/// Shared by the site-level `tls { default_sni … }` and the global option of
+/// the same name, so the two spellings cannot drift into accepting different
+/// things — the failure this repository has already had once, when a flat
+/// alias took milliseconds where its block form took seconds.
+pub(super) fn parse_default_sni(d: &Directive) -> Result<String, AdapterError> {
+    match d.args.as_slice() {
+        [name] if !name.is_empty() => Ok(name.clone()),
+        // 🚫 An empty or missing name would select nothing, which is the state
+        // this option exists to get out of.
+        [] => Err(AdapterError::ArgumentCount("default_sni".into(), 1, 0)),
+        args => Err(AdapterError::ArgumentCount(
+            "default_sni".into(),
+            1,
+            args.len(),
+        )),
+    }
+}
+
 pub(super) fn adapt_tls_directive(d: &Directive) -> Result<TlsDirective, AdapterError> {
     let mut tls = TlsDirective::default();
 
@@ -65,6 +85,7 @@ pub(super) fn adapt_tls_directive(d: &Directive) -> Result<TlsDirective, Adapter
                             .unwrap_or(true),
                     );
                 }
+                "default_sni" => tls.default_sni = Some(parse_default_sni(sub)?),
                 // 🚫 TLS options the format defines and this crate does not
                 // implement. Almost all of them belong to two subsystems we do
                 // not have — certificate issuance beyond the built-in local

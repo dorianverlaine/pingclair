@@ -94,7 +94,15 @@ impl pingclair_proxy::server::DynamicListeners for RuntimeListeners {
             service.set_connection_filter(filter);
         }
         if is_https {
-            let acceptor = DynamicCertResolver::new(self.tls_manager.clone());
+            // 🏷️ Read straight off the server being added, so a listener
+            // created by a reload gets the same no-SNI answer as one created
+            // at startup.
+            let acceptor = DynamicCertResolver::new(self.tls_manager.clone()).with_default_sni(
+                server
+                    .tls
+                    .as_ref()
+                    .and_then(|tls| tls.default_sni.as_deref()),
+            );
             let mut tls_settings =
                 TlsSettings::with_callbacks(Box::new(acceptor)).map_err(|e| e.to_string())?;
             tls_settings.enable_h2();

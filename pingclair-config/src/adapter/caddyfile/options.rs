@@ -298,6 +298,11 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                     };
                     global.dns_refresh_secs = Some(parse_dns_refresh(value)?);
                 }
+                // 🏷️ The same reader as the site-level `tls { default_sni … }`,
+                // so the two spellings cannot accept different things.
+                "default_sni" => {
+                    global.default_sni = Some(super::tls::parse_default_sni(&sub)?);
+                }
                 "protocols" => {
                     for arg in &sub.args {
                         match arg.to_lowercase().as_str() {
