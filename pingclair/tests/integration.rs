@@ -11,6 +11,12 @@ use std::thread;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
+/// 🩺 The exact body `GET /health` serves on the admin listener
+/// (`pingclair-api/src/server.rs`). Readiness compares against this rather
+/// than against "some response arrived", so a 404 from a stale listener on the
+/// same port cannot be mistaken for the child under test being up.
+const ADMIN_HEALTH_BODY: &str = r#"{"status":"healthy"}"#;
+
 struct TestServer {
     process: Child,
     watchdog: Option<Child>,
@@ -259,8 +265,18 @@ impl TestServer {
             {
                 server_ready = body == self.readiness_token;
             }
-            if !admin_ready && let Some(url) = &admin_url {
-                admin_ready = client.get(url).send().await.is_ok();
+            // 🎯 Any completed request used to count as admin readiness, so a
+            // 404 from a wrong or half-initialised listener read as ready and
+            // the real assertion failed later with an unrelated status. Demand
+            // the exact health response, the same way the site check demands
+            // the exact readiness token.
+            if !admin_ready
+                && let Some(url) = &admin_url
+                && let Ok(response) = client.get(url).send().await
+                && response.status() == reqwest::StatusCode::OK
+                && let Ok(body) = response.text().await
+            {
+                admin_ready = body == ADMIN_HEALTH_BODY;
             }
             if server_ready && admin_ready {
                 return true;
@@ -5350,7 +5366,22 @@ async fn test_admin_stop_returns_response_then_exits() {
     let client = no_proxy_client();
 
     let resp = client.post(server.admin_url("/stop")).send().await.unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    // 🔍 A wrong status here has previously meant "something else owns this
+    // port", not "/stop is broken". Print the child's own output before the
+    // assertion fires, or the failure says only `404 != 200` and the next
+    // reader has to reproduce a race to learn anything.
+    if resp.status() != reqwest::StatusCode::OK {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        eprintln!("❌ POST /stop answered {status} with body: {body}");
+        eprintln!("🔌 Admin address under test: {:?}", server.admin_address);
+        eprintln!(
+            "🏃 Child still running: {:?}",
+            server.exit_status().is_none()
+        );
+        server.print_diagnostics();
+        panic!("POST /stop answered {status}, expected 200");
+    }
 
     let mut exited = false;
     for _ in 0..30 {
@@ -5359,6 +5390,9 @@ async fn test_admin_stop_returns_response_then_exits() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !exited {
+        server.print_diagnostics();
     }
     assert!(exited, "server did not exit after /stop");
 }

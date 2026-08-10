@@ -97,6 +97,21 @@
   （最多三次），但**僅限**該測試是唯一失敗項；其他測試失敗或三次都失敗
   仍然直接紅。**不要為了這個 flake 改測試代碼**——它偶發失敗不代表有
   回歸，用 retry 消掉雜訊就好。
+
+  > 📌 **依據**（2026-08-10 補；在此之前這條只有結論，沒有出處，
+  > 而本倉庫的規則是「只寫結論的否決註解會變成一道沒人敢推的門」）：
+  > 已回報上游 [cloudflare/pingora#946](https://github.com/cloudflare/pingora/issues/946)
+  > 〈HTTP/1 upgrade torn down when the upstream's 101 is read before the
+  > request's empty body〉（2026-07-30 開，仍 open），修正在
+  > [#947](https://github.com/cloudflare/pingora/pull/947)
+  > 〈Keep an upgraded tunnel open when the request body ends after 101〉
+  > （2026-08-04 開，**尚未合併**）。症狀是等 tunnel marker 時收到
+  > `UnexpectedEof`。
+  >
+  > **這條的有效期綁在 #947**：合併並進入我們釘的 pingora 版本之後，
+  > 這個 flake 應該消失，屆時要拿掉 `ci.yml` 的 retry 並讓它恢復成一次
+  > 就該綠的測試。留著 retry 而 flake 已經修好，等於留一個永遠不會紅的
+  > 測試。
 - 🔒 **新增 `security-audit` job（`cargo audit`）,每次 push 都跑**,不只在
   發布前跑一次。RustSec 公告的時間不受這個專案控制,一個已合併但後來被公告
   漏洞的依賴,只有持續跑才抓得到。真的出現 finding 時的例外處理是**書面風險

@@ -23,6 +23,34 @@
 //! process going away, and the Admin API is a way to reach it.
 
 use proptest::prelude::*;
+use proptest::test_runner::FileFailurePersistence;
+
+/// 📌 Where a shrunk counterexample gets written when one of these properties
+/// finally fails.
+///
+/// This has to be stated rather than defaulted. proptest's default is
+/// `SourceParallel("proptest-regressions")`, which walks up from this file
+/// looking for a directory that directly contains `lib.rs` or `main.rs` — the
+/// convention for a crate whose sources sit at its root. Every crate root here
+/// lives under `src/`, so the walk reaches the filesystem root, finds nothing,
+/// prints a confusing warning, and silently falls back to renaming this file's
+/// extension. The result is a regression file in an unexpected place, produced
+/// at the one moment nobody wants a surprise: the first time a fuzzed input
+/// finds a real defect.
+///
+/// `Direct` resolves against the process's working directory, which `cargo
+/// test` sets to the package root, so this path is stable regardless of where
+/// the run was started from.
+const REGRESSION_FILE: &str = "tests/proptest-regressions/malformed_config.txt";
+
+/// 🎛️ The shared runner configuration; `cases` differs per surface.
+fn config_with_cases(cases: u32) -> ProptestConfig {
+    ProptestConfig {
+        cases,
+        failure_persistence: Some(Box::new(FileFailurePersistence::Direct(REGRESSION_FILE))),
+        ..ProptestConfig::default()
+    }
+}
 
 /// 🎲 Fragments deliberately chosen from what a parser gets wrong: unbalanced
 /// delimiters, empty directives, recursive matcher forms, and the exact shapes
@@ -116,7 +144,7 @@ fn hostile_source() -> impl Strategy<Value = String> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(4096))]
+    #![proptest_config(config_with_cases(4096))]
 
     /// 🚪 The Pingclairfile front door must always answer.
     #[test]
@@ -193,7 +221,7 @@ fn deeply_nested_json_is_rejected_rather_than_overflowing() {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(2048))]
+    #![proptest_config(config_with_cases(2048))]
 
     /// 🚪 Arbitrary JSON into the core types, the Admin API's actual path.
     #[test]
@@ -202,4 +230,35 @@ proptest! {
             let _ = pingclair_config::compiler::validate_config(&config);
         }
     }
+}
+
+/// 🗂️ The counterexample above is only worth generating if it can be written
+/// down.
+///
+/// A persistence path that cannot be created fails the way that costs most:
+/// proptest reports the failing input once, in the output of a run nobody
+/// captured, and the next run starts from scratch. This checks the destination
+/// the same way proptest will use it — create the parent, write, read back —
+/// so a broken path is a red test on an ordinary day rather than a lost
+/// reproduction on a bad one.
+#[test]
+fn the_regression_destination_is_writable() {
+    let path = std::path::Path::new(REGRESSION_FILE);
+    assert!(
+        path.is_relative(),
+        "the regression path must stay relative to the package root, got {}",
+        path.display()
+    );
+    let parent = path.parent().expect("the regression path has a directory");
+    std::fs::create_dir_all(parent)
+        .unwrap_or_else(|error| panic!("cannot create {}: {error}", parent.display()));
+
+    // 🧹 Probe beside the real file rather than through it: a genuine
+    // regression file is a recorded defect and must survive a test run.
+    let probe = parent.join(".write-probe");
+    std::fs::write(&probe, b"probe")
+        .unwrap_or_else(|error| panic!("cannot write into {}: {error}", parent.display()));
+    let read_back = std::fs::read(&probe).expect("the probe must read back");
+    let _ = std::fs::remove_file(&probe);
+    assert_eq!(read_back, b"probe");
 }
