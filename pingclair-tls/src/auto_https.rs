@@ -6,7 +6,7 @@
 //! 🔐 Orchestra component that combines `AcmeClient` and `CertStore` to provide
 //! "Zero Configuration" HTTPS. Handles the certificate lifecycle: issuance, storage, and renewal.
 
-use crate::acme::{AcmeClient, AcmeError, Certificate, ChallengeHandler};
+use crate::acme::{AcmeClient, AcmeError, Certificate, ChallengePolicy, ChallengeSolver};
 use crate::cert_store::{CertStore, CertStoreError};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -167,11 +167,13 @@ impl AutoHttps {
     ///
     /// - Parameters:
     ///   - domain: The fully qualified domain name.
-    ///   - handler: The challenge handler needed for ACME validation.
-    pub async fn get_certificate<H: ChallengeHandler + ?Sized>(
+    ///   - solver: The challenge type this domain uses and the handler that
+    ///     answers it. Chosen per domain by the caller, because a wildcard
+    ///     needs DNS-01 while its neighbours are happy with HTTP-01.
+    pub async fn get_certificate(
         &self,
         domain: &str,
-        handler: &H,
+        solver: &ChallengeSolver,
     ) -> Result<Certificate, AutoHttpsError> {
         // 1. Fast Path: Check Store
         if let Some(cert) = self.store.get(domain).await {
@@ -208,7 +210,7 @@ impl AutoHttps {
         // Actually simple robust logic:
         let result = self
             .acme
-            .obtain_certificate(&[domain.to_string()], handler)
+            .obtain_certificate(&[domain.to_string()], solver)
             .await;
 
         // 5. Cleanup Processing Flag
@@ -231,7 +233,7 @@ impl AutoHttps {
     ///
     /// Scans the certificate store periodically and proactively renews certificates
     /// that are approaching expiration.
-    pub fn start_renewal_task(self: Arc<Self>, handler: Arc<dyn ChallengeHandler>) {
+    pub fn start_renewal_task(self: Arc<Self>, policy: Arc<ChallengePolicy>) {
         let interval = self.config.renewal_interval;
 
         tracing::info!("🔄 Starting Renewal Daemon (Interval: {:?})", interval);
@@ -270,7 +272,10 @@ impl AutoHttps {
                         }
                         tracing::info!("🔄 Renewing {}...", domain);
 
-                        match self.get_certificate(domain, handler.as_ref()).await {
+                        match self
+                            .get_certificate(domain, policy.solver_for(domain))
+                            .await
+                        {
                             Ok(_) => {
                                 tracing::info!("✅ Renewed successfully: {}", domain);
                                 next_attempt.remove(domain);
@@ -300,7 +305,7 @@ impl AutoHttps {
     pub fn start_eager_issuance(
         self: Arc<Self>,
         domains: Vec<String>,
-        handler: Arc<dyn ChallengeHandler>,
+        policy: Arc<ChallengePolicy>,
     ) {
         if domains.is_empty() {
             return;
@@ -312,7 +317,10 @@ impl AutoHttps {
                     tracing::debug!("✅ {} already has a valid certificate", domain);
                     continue;
                 }
-                match self.get_certificate(&domain, handler.as_ref()).await {
+                match self
+                    .get_certificate(&domain, policy.solver_for(&domain))
+                    .await
+                {
                     Ok(_) => tracing::info!("🎉 Eager issuance complete for {}", domain),
                     Err(e) => {
                         // ⚠️ Failure is not fatal: the lazy handshake path will

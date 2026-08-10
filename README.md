@@ -753,8 +753,12 @@ Global options:
 Three consequences worth stating plainly, because they decide whether
 Pingclair fits at all rather than being details you discover later:
 
-- **No DNS-01 challenge** (`acme_dns`, `tls { dns … }`), so **no wildcard
-  certificates**, and no issuance on a host where port 80 is unreachable.
+- **DNS-01 ships one provider: Cloudflare.** `tls { dns cloudflare <token> }`
+  and the global `acme_dns` obtain wildcard certificates and work on a host
+  where port 80 is unreachable. Any other provider name is refused at startup
+  by name — the server will not fall back to HTTP-01, because HTTP-01 cannot
+  prove control of a wildcard and the failure would surface at renewal as a
+  validation error that never mentions the option you set.
 - **PHP runs through `php_fastcgi` over FastCGI** on HTTP/1.1 and HTTP/2;
   HTTP/3 refuses FastCGI routes with 501 until the H3 planner grows its own
   FastCGI client.

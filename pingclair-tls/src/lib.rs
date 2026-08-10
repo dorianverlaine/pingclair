@@ -13,6 +13,7 @@ pub mod account_store;
 pub mod acme;
 pub mod auto_https;
 pub mod cert_store;
+pub mod dns01;
 pub mod internal_ca;
 pub mod manager;
 pub mod persistent_challenge_handler;

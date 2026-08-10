@@ -301,39 +301,72 @@ pub(crate) fn run_server(
         manual_certs.push((name.to_string(), cert_path.clone(), key_path.clone()));
     }
 
-    // 📡 A site can now *say* it wants DNS-01, and nothing performs it yet.
-    // Starting anyway is the worst of the three options: HTTP-01 cannot prove
-    // control of a wildcard, so `*.example.com` would simply never get a
-    // certificate, and the operator would find out at renewal time from a
-    // validation error that says nothing about the option they set.
+    // 📡 DNS-01: build one provider per site that asked for it, and publish
+    // which challenge proves which name. Everything expensive — the API client,
+    // the token, the propagation policy — is resolved here so an issuance or a
+    // renewal never has to read the configuration again.
     //
-    // 🚫 Refusing at startup names the gap where it can still be acted on.
-    let dns_challenge_sites: Vec<String> = config
-        .servers
-        .iter()
-        .filter_map(|server| {
-            let provider = server
-                .tls
-                .as_ref()?
-                .dns_challenge
-                .as_ref()?
-                .provider
-                .as_ref()?;
-            Some(format!(
-                "{} (provider `{}`)",
-                server.name.as_deref().unwrap_or("_"),
-                provider.name
-            ))
-        })
-        .collect();
-    if !dns_challenge_sites.is_empty() {
-        anyhow::bail!(
-            "site(s) {} ask for the DNS-01 challenge, and no DNS provider is implemented yet; \
-             refusing to start rather than fall back to HTTP-01, which cannot prove control of a \
-             wildcard name. Remove the `dns` setting to use HTTP-01, or supply the certificate \
-             with `tls <cert> <key>`",
-            dns_challenge_sites.join(", ")
+    // 🚫 A provider name we do not implement is refused by name rather than
+    // ignored. Ignoring it would leave the site on HTTP-01, which cannot prove
+    // control of a wildcard, and the operator would find out at renewal from
+    // an error that never mentions the option they set.
+    {
+        let mut policy = pingclair_tls::acme::ChallengePolicy::uniform(
+            pingclair_tls::acme::ChallengeSolver::http01(tls_manager.challenge_handler()),
         );
+        for server_config in &config.servers {
+            let Some(challenge) = server_config
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.dns_challenge.as_ref())
+            else {
+                continue;
+            };
+            let provider_config = challenge
+                .provider
+                .as_ref()
+                .expect("validate_config refuses a DNS challenge with no provider");
+
+            let names: Vec<&str> = if server_config.names.is_empty() {
+                server_config.name.as_deref().into_iter().collect()
+            } else {
+                server_config.names.iter().map(String::as_str).collect()
+            };
+
+            let provider = build_dns_provider(provider_config).map_err(|problem| {
+                anyhow::anyhow!(
+                    "site {} asks for the DNS-01 challenge, and its provider cannot be used: \
+                     {problem}",
+                    names.first().copied().unwrap_or("_")
+                )
+            })?;
+
+            let propagation = pingclair_tls::dns01::PropagationPolicy {
+                delay: std::time::Duration::from_secs(
+                    challenge.propagation_delay_secs.unwrap_or(0),
+                ),
+                timeout: std::time::Duration::from_secs(
+                    challenge.propagation_timeout_secs.unwrap_or(120),
+                ),
+                resolvers: challenge.resolvers.clone(),
+                ttl_secs: challenge.ttl_secs.unwrap_or(60),
+            };
+            let handler: Arc<dyn pingclair_tls::acme::ChallengeHandler> = Arc::new(
+                pingclair_tls::dns01::Dns01Handler::new(provider, propagation),
+            );
+            for name in names {
+                policy = policy.with_override(
+                    name,
+                    pingclair_tls::acme::ChallengeSolver::dns01(handler.clone()),
+                );
+                tracing::info!(
+                    "📡 {} will be proved with DNS-01 through `{}`",
+                    name,
+                    provider_config.name
+                );
+            }
+        }
+        tls_manager.set_challenge_policy(policy);
     }
 
     // 🏗️ Every client trust pool is read, parsed and turned into a BoringSSL
@@ -1243,4 +1276,30 @@ pub(crate) fn run_server(
     notify_systemd_ready();
 
     server.run_forever();
+}
+
+/// 📡 Builds the DNS provider a site named, or says why it cannot be used.
+///
+/// 🚫 One provider is implemented. Every other name upstream defines is a real
+/// module there and nothing here, so the refusal names what is available rather
+/// than calling the word unknown — an operator told `route53` is unrecognised
+/// would go looking for the right spelling of something that does not exist.
+fn build_dns_provider(
+    config: &pingclair_core::config::DnsProviderConfig,
+) -> anyhow::Result<Arc<dyn pingclair_tls::dns01::DnsProvider>> {
+    match config.name.as_str() {
+        "cloudflare" => {
+            let token = config.arguments.first().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the cloudflare provider needs an API token: `dns cloudflare <token>`"
+                )
+            })?;
+            let provider =
+                pingclair_tls::dns01::cloudflare::CloudflareProvider::new(token.clone())?;
+            Ok(Arc::new(provider))
+        }
+        other => anyhow::bail!(
+            "DNS provider `{other}` is not implemented; this build ships `cloudflare` only"
+        ),
+    }
 }

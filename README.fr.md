@@ -764,9 +764,13 @@ Options globales :
 Trois conséquences méritent d'être énoncées franchement, car elles décident si
 Pingclair convient, plutôt que d'être des détails découverts plus tard :
 
-- **Pas de challenge DNS-01** (`acme_dns`, `tls { dns … }`), donc **pas de
-  certificat générique**, et pas d'émission sur un hôte dont le port 80 est
-  injoignable.
+- **DNS-01 ne livre qu'un seul fournisseur : Cloudflare.**
+  `tls { dns cloudflare <token> }` et l'option globale `acme_dns` obtiennent
+  des certificats génériques et fonctionnent sur un hôte dont le port 80 est
+  injoignable. Tout autre nom de fournisseur est refusé nommément au
+  démarrage : le serveur ne se rabat pas sur HTTP-01, car HTTP-01 ne peut pas
+  prouver le contrôle d'un nom générique et l'échec n'apparaîtrait qu'au
+  renouvellement, dans un message qui ne mentionne jamais l'option choisie.
 - **PHP passe par `php_fastcgi` via FastCGI** en HTTP/1.1 et HTTP/2 ;
   l'HTTP/3 refuse les routes FastCGI avec un 501 tant que le planificateur H3
   n'a pas son propre client FastCGI.

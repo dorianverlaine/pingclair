@@ -185,3 +185,39 @@
   H1/H2 那邊沒有這層覆寫——`TlsSettings::build()` 只是
   `accept_builder.build()`，中間沒有人碰 options——所以那邊是靠推理成立的，
   這個不對稱刻意寫下來。
+
+---
+
+## 📡 DNS-01（`tls { dns … }`，2026-08-10 K5）
+
+- 🤡 **rustls 的 crypto provider 必須指名，否則第一次連線直接 panic。**
+  這個 binary 同時鏈進了兩套：`instant-acme` 帶 aws-lc-rs，workspace 的
+  `rustls` 又釘 `ring`。rustls 拒絕猜，`ClientConfig` 一建就
+  `panic!("Could not automatically determine the process-level CryptoProvider")`。
+  **那是簽發當下對著真 API 的 panic，不是測試產物**——
+  用 `HttpsConnectorBuilder::with_provider_and_webpki_roots(provider)` 明確指定。
+  📌 這條是被那支打 mock server 的測試抓到的。如果當初偷懶只寫「打真 API 的
+  測試」，這個 panic 會第一次出現在正式環境。**provider 的測試要能離線跑。**
+
+- 🏢 **zone 要由長到短試後綴，而且要快取。**
+  `_acme-challenge.a.example.com` 屬於哪個 zone，名字本身沒說，只有帳號知道。
+  長的先試，delegated 子 zone 才會贏過母 zone——那正是委派的意義。
+
+- 🧹 **TXT 記錄要「取代」不是「附加」。** 重試的訂單否則會留下上一次的挑戰值，
+  而一個名字帶兩筆 TXT，有些 CA 會直接判為無法判讀。
+
+- 🏷️ **萬用字元的挑戰記錄寫在母網域上。**
+  `*.example.com` 與 `example.com` 共用 `_acme-challenge.example.com`；
+  照字面組出 `_acme-challenge.*.example.com` 是任何 zone 都放不下的名字。
+
+- 🔎 **傳播檢查的 resolver 必須關快取。** 檢查要觀察的就是「記錄出現了」這個
+  變化，而快取住的 NXDOMAIN 會在整個 propagation 窗口內一直說沒有。
+
+- 🔐 **API token 是憑證。** 包在一個 `Debug` 什麼都不印的型別裡——
+  不是為了防人手寫 log，是為了防日後有人在外層結構加 `#[derive(Debug)]`。
+  連長度都不印：長度會洩漏 token 的種類。
+
+- 🚫 **沒實作的 provider 在啟動時指名拒絕，不在設定期。**
+  設定期拒絕會讓 12 份上游語料失敗——它們用 `dns mock`，而上游那是測試模組。
+  `adapt` 說「我翻譯得了」是誠實的，拒絕**服務**才是該畫的線；
+  跟 K3 的 `client_auth` 同一條理由。

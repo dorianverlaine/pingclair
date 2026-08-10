@@ -31,12 +31,27 @@ rustls-pemfile = "2"
 http.workspace = true
 bytes.workspace = true
 
+# ☁️ The DNS-01 provider's HTTP client. Every one of these is already linked
+# into the binary through `instant-acme`, which depends on them unconditionally
+# with these same features — naming them here only makes the API reachable and
+# adds no crate to the dependency tree. Deliberately not reqwest.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio"] }
+hyper-rustls = { version = "0.27", features = ["http1", "webpki-roots"] }
+http-body-util = "0.1"
+
+# 🔎 Checking a TXT record has propagated. Already in the tree via the proxy's
+# dynamic upstream resolution.
+hickory-resolver.workspace = true
+
 # Serialization
 serde_json = "1"
 
 # File system
 dirs.workspace = true
 parking_lot = "0.12"
+# 🗺️ The challenge policy is published once and read by every issuance.
+arc-swap.workspace = true
 
 # Testing
 tempfile = "3"

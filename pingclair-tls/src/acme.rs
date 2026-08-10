@@ -200,6 +200,80 @@ fn certificate_expiry(cert_pem: &str) -> Result<i64, AcmeError> {
     Ok(certificate.validity().not_after.timestamp())
 }
 
+/// 🧩 A challenge type and the handler that can answer it, kept together.
+///
+/// They are one decision, not two. Pairing HTTP-01 with a handler that writes
+/// DNS records — or the reverse — produces an order that deploys nothing the
+/// CA will look at, and fails several minutes later with an error about
+/// validation rather than about configuration. Passing them as a pair means
+/// the mismatch cannot be expressed.
+pub struct ChallengeSolver {
+    /// The challenge this solver answers.
+    pub challenge_type: ChallengeType,
+    /// The handler that deploys and cleans it up.
+    pub handler: std::sync::Arc<dyn ChallengeHandler>,
+}
+
+impl ChallengeSolver {
+    /// 🌐 The HTTP-01 solver, which is what a site gets unless it asked for
+    /// something else.
+    pub fn http01(handler: std::sync::Arc<dyn ChallengeHandler>) -> Self {
+        Self {
+            challenge_type: ChallengeType::Http01,
+            handler,
+        }
+    }
+
+    /// 📡 The DNS-01 solver, which a wildcard name has no alternative to.
+    pub fn dns01(handler: std::sync::Arc<dyn ChallengeHandler>) -> Self {
+        Self {
+            challenge_type: ChallengeType::Dns01,
+            handler,
+        }
+    }
+}
+
+/// 🗺️ Which challenge proves which name.
+///
+/// Almost every deployment has one answer for everything, and a few have two:
+/// a wildcard that must use DNS-01 sitting beside ordinary names that are
+/// happy with HTTP-01. Resolved from configuration once at startup, so an
+/// issuance never re-derives it and the two transports cannot disagree.
+pub struct ChallengePolicy {
+    /// 🌐 What a name gets when it asked for nothing in particular.
+    default: ChallengeSolver,
+    /// 📡 Names that asked for something else, by the exact string the
+    /// configuration used — including the leading `*.` of a wildcard, because
+    /// that is the identifier the certificate is ordered under.
+    overrides: std::collections::HashMap<String, ChallengeSolver>,
+}
+
+impl ChallengePolicy {
+    /// 🌐 A policy where everything uses one solver.
+    pub fn uniform(default: ChallengeSolver) -> Self {
+        Self {
+            default,
+            overrides: std::collections::HashMap::new(),
+        }
+    }
+
+    /// 📡 Gives one name its own solver.
+    pub fn with_override(mut self, domain: impl Into<String>, solver: ChallengeSolver) -> Self {
+        self.overrides.insert(domain.into(), solver);
+        self
+    }
+
+    /// 🔎 The solver that proves this name.
+    pub fn solver_for(&self, domain: &str) -> &ChallengeSolver {
+        self.overrides.get(domain).unwrap_or(&self.default)
+    }
+
+    /// 🧾 Whether any name uses something other than the default.
+    pub fn has_overrides(&self) -> bool {
+        !self.overrides.is_empty()
+    }
+}
+
 // MARK: - ACME Client
 
 /// The high-level client for ACME operations.
@@ -209,9 +283,6 @@ pub struct AcmeClient {
 
     /// Contact email for account registration and expiration notices.
     email: Option<String>,
-
-    /// Preferred challenge type for validation.
-    challenge_type: ChallengeType,
 
     /// Root directory of the TLS store where the ACME account credentials
     /// are persisted. When `None`, the account is not persisted.
@@ -224,7 +295,6 @@ impl AcmeClient {
         Self {
             staging: false,
             email: None,
-            challenge_type: ChallengeType::Http01,
             account_store_root: None,
         }
     }
@@ -234,7 +304,6 @@ impl AcmeClient {
         Self {
             staging: true,
             email: None,
-            challenge_type: ChallengeType::Http01,
             account_store_root: None,
         }
     }
@@ -252,12 +321,6 @@ impl AcmeClient {
         self
     }
 
-    /// Sets the preferred challenge type.
-    pub fn with_challenge_type(mut self, challenge_type: ChallengeType) -> Self {
-        self.challenge_type = challenge_type;
-        self
-    }
-
     /// Obtains a certificate for the specified domains.
     ///
     /// This method executes the full ACME workflow:
@@ -266,11 +329,12 @@ impl AcmeClient {
     /// 3. Authorization & Challenge solving.
     /// 4. Polling for validity.
     /// 5. Certificate finalization & download.
-    pub async fn obtain_certificate<H: ChallengeHandler + ?Sized>(
+    pub async fn obtain_certificate(
         &self,
         domains: &[String],
-        handler: &H,
+        solver: &ChallengeSolver,
     ) -> Result<Certificate, AcmeError> {
+        let handler = solver.handler.as_ref();
         tracing::info!("🔐 Starting ACME flow for domains: {:?}", domains);
 
         // 1. Select Directory
@@ -315,7 +379,7 @@ impl AcmeClient {
             tracing::info!("🧩 Solving challenge for {}", domain);
 
             // 4a. Pick Challenge
-            let target_type = match self.challenge_type {
+            let target_type = match solver.challenge_type {
                 ChallengeType::Http01 => AcmeChallengeType::Http01,
                 ChallengeType::Dns01 => AcmeChallengeType::Dns01,
                 ChallengeType::TlsAlpn01 => AcmeChallengeType::TlsAlpn01,
@@ -324,14 +388,14 @@ impl AcmeClient {
             let mut challenge = auth.challenge(target_type).ok_or_else(|| {
                 AcmeError::ChallengeFailed(format!(
                     "Challenge type {:?} not offered for {}",
-                    self.challenge_type, domain
+                    solver.challenge_type, domain
                 ))
             })?;
 
             // 4b. Deploy Solution
             let response = ChallengeResponse {
                 domain: domain.clone(),
-                challenge_type: self.challenge_type,
+                challenge_type: solver.challenge_type,
                 token: challenge.token.clone(),
                 key_authorization: challenge.key_authorization().as_str().to_string(),
             };

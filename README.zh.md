@@ -712,8 +712,11 @@ Directive：
 其中三件值得直接講明白，因為它們決定的是「Pingclair 適不適合你」，
 而不是之後才會踩到的細節：
 
-- **沒有 DNS-01 challenge**（`acme_dns`、`tls { dns … }`），所以**沒有萬用字元
-  憑證**，80 埠不通的機器也簽不到憑證。
+- **DNS-01 只出貨一個 provider：Cloudflare。** `tls { dns cloudflare <token> }`
+  與全域 `acme_dns` 可以簽發萬用字元憑證，80 埠不通的機器也簽得到。
+  其他 provider 名字在啟動時**指名拒絕**——不會默默退回 HTTP-01，因為
+  HTTP-01 證明不了萬用字元的控制權，而那個失敗會在續簽時才出現，
+  訊息裡完全不會提到你設的那個選項。
 - **PHP 透過 `php_fastcgi` 以 FastCGI 提供**（HTTP/1.1 與 HTTP/2）；
   HTTP/3 在 H3 planner 自備 FastCGI client 之前，會對 FastCGI route 回 501。
 - **憑證與狀態只存在本機磁碟**（`storage`），多個實例無法共用同一份憑證儲存。

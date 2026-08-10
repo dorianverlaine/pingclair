@@ -5,11 +5,12 @@
 //!
 //! 🛡️ Coordinates certificate management, ACME challenges, and TLS handshakes.
 
-use crate::acme::{ChallengeHandler, MemoryChallengeHandler};
+use crate::acme::{ChallengeHandler, ChallengePolicy, ChallengeSolver, MemoryChallengeHandler};
 use crate::auto_https::{AutoHttps, AutoHttpsConfig};
 use crate::cert_store::CertStore;
 use crate::internal_ca::{InternalCa, InternalCaError};
 use crate::persistent_challenge_handler::PersistentChallengeHandler;
+use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -43,6 +44,14 @@ pub struct TlsManager {
     cached_certs: RwLock<HashMap<String, CachedCert>>,
     /// ⏳ Limits parsed certificate lifetime so rotations become visible.
     cache_ttl: Duration,
+    /// 🗺️ Which challenge proves which name.
+    ///
+    /// Published through `ArcSwap` rather than held directly because the
+    /// DNS-01 half is built after the manager exists — `run.rs` has to read the
+    /// configuration to know which names need a provider — and a second
+    /// constructor taking a policy would leave the first one silently meaning
+    /// "HTTP-01 for everything".
+    challenge_policy: ArcSwap<ChallengePolicy>,
 }
 
 impl TlsManager {
@@ -70,12 +79,15 @@ impl TlsManager {
 
         Ok(Self {
             auto_https,
-            challenge_handler: challenge_handler as Arc<dyn ChallengeHandler>,
+            challenge_handler: challenge_handler.clone() as Arc<dyn ChallengeHandler>,
             manual_pem_certs: RwLock::new(HashMap::new()),
             internal_ca: Arc::new(InternalCa::new(store_path)),
             internal_domains: RwLock::new(HashSet::new()),
             cached_certs: RwLock::new(HashMap::new()),
             cache_ttl: Duration::from_secs(3600),
+            challenge_policy: ArcSwap::from_pointee(ChallengePolicy::uniform(
+                ChallengeSolver::http01(challenge_handler as Arc<dyn ChallengeHandler>),
+            )),
         })
     }
 
@@ -95,12 +107,15 @@ impl TlsManager {
 
         Self {
             auto_https,
-            challenge_handler: challenge_handler as Arc<dyn ChallengeHandler>,
+            challenge_handler: challenge_handler.clone() as Arc<dyn ChallengeHandler>,
             manual_pem_certs: RwLock::new(HashMap::new()),
             internal_ca: Arc::new(InternalCa::new(store_path)),
             internal_domains: RwLock::new(HashSet::new()),
             cached_certs: RwLock::new(HashMap::new()),
             cache_ttl: Duration::from_secs(3600),
+            challenge_policy: ArcSwap::from_pointee(ChallengePolicy::uniform(
+                ChallengeSolver::http01(challenge_handler as Arc<dyn ChallengeHandler>),
+            )),
         }
     }
 
@@ -126,12 +141,15 @@ impl TlsManager {
 
         Ok(Self {
             auto_https,
-            challenge_handler: challenge_handler as Arc<dyn ChallengeHandler>,
+            challenge_handler: challenge_handler.clone() as Arc<dyn ChallengeHandler>,
             manual_pem_certs: RwLock::new(HashMap::new()),
             internal_ca: Arc::new(InternalCa::new(store_path)),
             internal_domains: RwLock::new(HashSet::new()),
             cached_certs: RwLock::new(HashMap::new()),
             cache_ttl: Duration::from_secs(3600),
+            challenge_policy: ArcSwap::from_pointee(ChallengePolicy::uniform(
+                ChallengeSolver::http01(challenge_handler as Arc<dyn ChallengeHandler>),
+            )),
         })
     }
 
@@ -309,7 +327,7 @@ impl TlsManager {
         // 🌐 Remaining names may use automatic public HTTPS.
         if let Some(auto) = &self.auto_https {
             match auto
-                .get_certificate(domain, self.challenge_handler.as_ref())
+                .get_certificate(domain, self.challenge_policy.load().solver_for(domain))
                 .await
             {
                 Ok(cert) => {
@@ -386,7 +404,7 @@ impl TlsManager {
         // 🌐 Remaining names may use automatic public HTTPS.
         if let Some(auto) = &self.auto_https {
             match auto
-                .get_certificate(domain, self.challenge_handler.as_ref())
+                .get_certificate(domain, self.challenge_policy.load().solver_for(domain))
                 .await
             {
                 Ok(cert) => return self.cache_rustls_certificate(domain, &cert),
@@ -491,6 +509,15 @@ impl TlsManager {
         self.challenge_handler.clone()
     }
 
+    /// 🗺️ Publishes which challenge proves which name.
+    ///
+    /// Called once at startup, after the configuration has said which sites
+    /// need DNS-01 and a provider has been built for them. Anything not named
+    /// keeps the HTTP-01 default.
+    pub fn set_challenge_policy(&self, policy: ChallengePolicy) {
+        self.challenge_policy.store(Arc::new(policy));
+    }
+
     /// 🚀 Starts the background certificate machinery: the renewal daemon
     /// (once) plus eager issuance for every `tls auto` hostname, so the first
     /// handshake never blocks on ACME.
@@ -503,12 +530,12 @@ impl TlsManager {
         let Some(auto) = &self.auto_https else {
             return;
         };
-        let handler = self.challenge_handler.clone();
+        let policy = self.challenge_policy.load_full();
         if RENEWAL_STARTED.set(()).is_ok() {
             let renewal = auto.clone();
-            renewal.start_renewal_task(handler.clone());
+            renewal.start_renewal_task(policy.clone());
         }
-        auto.clone().start_eager_issuance(domains, handler);
+        auto.clone().start_eager_issuance(domains, policy);
     }
 
     /// 🛑 Clears in-flight ACME markers so a reloaded configuration can begin

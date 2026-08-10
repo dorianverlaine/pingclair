@@ -271,6 +271,30 @@ lets the rest converge.
   rather than through temporary files.
 - 🔐 **TLS.** A persistent internal CA for private origins, and durable ACME
   state across restarts.
+- 📡 **DNS-01 and wildcard certificates, through Cloudflare.** `tls { dns
+  cloudflare <token> }`, the global `dns`/`acme_dns`/`tls_resolvers` options,
+  and the per-site `resolvers`, `dns_ttl`, `propagation_delay`,
+  `propagation_timeout` and `dns_challenge_override_domain` settings all parse,
+  compile, and are performed. This is what makes `*.example.com` obtainable at
+  all — no other ACME challenge can prove control of a wildcard — and it makes
+  issuance work on a host where port 80 is unreachable.
+
+  The challenge is chosen **per name**, so a wildcard served next to ordinary
+  hostnames uses DNS-01 while its neighbours keep HTTP-01, in one process. A
+  published record is replaced rather than appended to, the zone is found by
+  walking the name's suffixes (longest first, so a delegated sub-zone wins),
+  and the record is removed on every path out of an order — including the ones
+  that failed. `resolvers` is honoured: propagation is confirmed against the
+  named servers, with caching off, before the CA is asked to look.
+
+  **Cloudflare is the only provider this build ships.** Any other name is
+  refused at startup, by name, with what is available — the server does not
+  fall back to HTTP-01, because that cannot answer for a wildcard and the
+  failure would surface at renewal as a validation error that never mentions
+  the option the operator set. API tokens are held in a wrapper that prints
+  nothing, so they cannot reach a log line or a panic message through a
+  `Debug` derive added later.
+
 - 🪪 **Mutual TLS.** `tls { client_auth { … } }` is now
   enforced during the handshake rather than merely parsed. All four upstream
   modes behave as their names say: `request` asks and accepts anything,
