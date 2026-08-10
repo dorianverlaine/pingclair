@@ -106,6 +106,14 @@ impl FileServer {
 
         tracing::debug!("📁 Serving request: {} -> {:?}", path, file_path);
 
+        // 🙈 A hidden path is answered as absent, before anything is read from
+        // it. Checked here rather than after the `stat` so a hidden file and a
+        // missing one are indistinguishable from outside — including in how
+        // long they take, which is what stops the list from being enumerable.
+        if self.config.hide.hides(&file_path) {
+            return Ok(None);
+        }
+
         // Check if metadata exists (synchronous by design — see
         // serve_streaming for why tokio::fs is avoided on this hot path)
         let metadata = match std::fs::metadata(&file_path) {
@@ -116,15 +124,22 @@ impl FileServer {
         // 🔁 Canonicalize the URL shape before serving: Caddy redirects a
         // directory request without a trailing slash to the slashed form, and
         // a file request with a trailing slash to the bare form.
-        let needs_directory_slash = metadata.is_dir() && !path.ends_with('/');
-        let needs_file_slash_removal = metadata.is_file() && path.ends_with('/');
-        if needs_directory_slash {
-            return Ok(Some(ServedResponse::Redirect(format!("{path}/"))));
-        }
-        if needs_file_slash_removal {
-            return Ok(Some(ServedResponse::Redirect(
-                path.trim_end_matches('/').to_string(),
-            )));
+        //
+        // The redirect is what makes relative links inside the served document
+        // resolve against the right base, which is why upstream does it and
+        // why `disable_canonical_uris` exists for the deployments that put
+        // something else in front and do not want the extra round trip.
+        if self.config.canonical_uris {
+            let needs_directory_slash = metadata.is_dir() && !path.ends_with('/');
+            let needs_file_slash_removal = metadata.is_file() && path.ends_with('/');
+            if needs_directory_slash {
+                return Ok(Some(ServedResponse::Redirect(format!("{path}/"))));
+            }
+            if needs_file_slash_removal {
+                return Ok(Some(ServedResponse::Redirect(
+                    path.trim_end_matches('/').to_string(),
+                )));
+            }
         }
 
         // 📁 Resolve an index only for directories. A regular file keeps the
@@ -186,7 +201,14 @@ impl FileServer {
         let meta = self.file_meta(&file_path, &metadata)?;
 
         // Handle Range Request
-        let mut status = 200;
+        //
+        // 🔢 `status` overrides the success code — the maintenance-page shape,
+        // where a whole tree is served as 503 so caches and monitors read it
+        // correctly. A range response still says 206: the override describes
+        // what serving this tree *means*, not how much of a file was sent, and
+        // answering 503 to a partial request would tell the client its range
+        // was honoured under a status that says nothing was served.
+        let mut status = self.config.status.unwrap_or(200);
         let mut content_range = None;
         let mut start = 0;
         let mut length = file_size;
@@ -213,7 +235,7 @@ impl FileServer {
         // Cache-key ingredients. Only full-file (200, non-range) responses
         // with compression enabled are cacheable; the negotiated encoding and
         // the file mtime (so an edit invalidates the stale entry) form the key.
-        let cache_encoding = if self.config.compress && status == 200 {
+        let cache_encoding = if self.config.compress && content_range.is_none() {
             Self::negotiate_encoding(accept_encoding)
         } else {
             None
@@ -260,8 +282,8 @@ impl FileServer {
         // before the raw read because it doesn't need the uncompressed body
         // — when a .br/.gz/.zst variant exists we skip buffering the full
         // file entirely.
-        if self.config.precompressed
-            && status == 200
+        if !self.config.precompressed.is_empty()
+            && content_range.is_none()
             && let Some((precompressed_content, encoding)) =
                 self.try_precompressed(&file_path, accept_encoding).await
         {
@@ -502,7 +524,7 @@ mod traversal_tests {
             browse: false,
             browse_limit: None,
             compress: false,
-            precompressed: false,
+            ..FileServerConfig::default()
         })
     }
 
@@ -626,7 +648,8 @@ mod serve_cache_tests {
             browse: false,
             browse_limit: None,
             compress: true,
-            precompressed: false, // force the on-the-fly path we're testing
+            // 🗜️ Empty: force the on-the-fly compression path this tests.
+            ..FileServerConfig::default()
         });
 
         // First request: cache miss, compresses and stores.
@@ -675,7 +698,7 @@ mod serve_cache_tests {
             browse: false,
             browse_limit: None,
             compress: true,
-            precompressed: false,
+            ..FileServerConfig::default()
         });
 
         let first = fs
@@ -738,7 +761,7 @@ mod serve_cache_tests {
             browse: false,
             browse_limit: None,
             compress: true,
-            precompressed: false,
+            ..FileServerConfig::default()
         }));
 
         // The key serve() will compute for this file: the lexically

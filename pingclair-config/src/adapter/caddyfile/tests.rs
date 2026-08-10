@@ -981,19 +981,34 @@ mod fail_closed_tests {
         );
     }
 
+    /// 🗜️ `precompressed` is implemented now, so the fail-closed rule it used
+    /// to be tested for moved: an *encoding* this build cannot read must still
+    /// be refused rather than quietly dropped, which would leave the operator
+    /// with a sidecar list missing an entry they wrote.
     #[test]
-    fn file_server_rejects_precompressed_as_unsupported() {
+    fn file_server_rejects_a_precompressed_encoding_it_cannot_read() {
         let error = compile_err(
             r#"example.com {
                 file_server /downloads/* {
-                    precompressed
+                    precompressed lz4
                 }
             }"#,
         );
         assert!(
-            error.contains("not supported by Pingclair"),
-            "precompressed must be reported as unsupported Caddy syntax; got {error}"
+            error.contains("lz4"),
+            "the rejection must name the encoding; got {error}"
         );
+
+        // 🎯 The mirror case, so this cannot degrade into "precompressed is an
+        // error".
+        crate::compile(
+            r#"example.com {
+                file_server /downloads/* {
+                    precompressed zstd gzip
+                }
+            }"#,
+        )
+        .expect("a supported encoding list compiles");
     }
 
     #[test]

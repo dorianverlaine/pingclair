@@ -606,6 +606,15 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 browse,
                 browse_limit: file_limit,
                 compress: !no_compress,
+                // 📄 `pingclair file-server` is the quick one-liner; the
+                // subdirectives that shape a served tree belong to a
+                // configuration file, so it takes their defaults.
+                precompressed: Vec::new(),
+                hide: Vec::new(),
+                status: None,
+                pass_thru: false,
+                canonical_uris: true,
+                etag_file_extensions: Vec::new(),
             };
             let handler = if templates {
                 HandlerConfig::Pipeline {

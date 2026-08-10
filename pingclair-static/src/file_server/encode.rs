@@ -66,8 +66,13 @@ impl FileServer {
 
     // MARK: - Pre-compressed variants
 
-    /// Try to find and load a pre-compressed version of the file
-    /// Checks for .br, .gz, .zst files in order of preference based on Accept-Encoding
+    /// 🗜️ Finds and loads a sidecar for this file, if one is allowed and the
+    /// client accepts its encoding.
+    ///
+    /// The order is the operator's, not ours: `precompressed zstd gzip` means
+    /// zstd is preferred, and a build that guessed would serve the wrong one.
+    /// Empty configuration never reaches here — the caller checks first, so a
+    /// site that did not ask for sidecars pays nothing.
     pub(super) async fn try_precompressed(
         &self,
         original_path: &std::path::Path,
@@ -75,27 +80,27 @@ impl FileServer {
     ) -> Option<(Vec<u8>, &'static str)> {
         let accept = accept_encoding?;
 
-        // Priority order based on compression ratio and modern support:
-        // 1. Brotli (.br) - best for web
-        // 2. Zstd (.zst) - fastest decompression
-        // 3. Gzip (.gz) - widest support
-        let candidates: Vec<(&'static str, &'static str)> =
-            vec![("br", ".br"), ("zstd", ".zst"), ("gzip", ".gz")];
-
-        for (encoding, ext) in candidates {
-            if !accept.contains(encoding) {
+        for format in &self.config.precompressed {
+            if !accept.contains(format.encoding) {
                 continue;
             }
 
-            // Build precompressed path
-            let mut precompressed_path = original_path.as_os_str().to_owned();
-            precompressed_path.push(ext);
-            let precompressed_path = std::path::PathBuf::from(precompressed_path);
+            // 🗜️ Built by appending to the OS string rather than through
+            // `with_extension`, which would replace `.js` instead of adding to
+            // it and ask for `app.br`.
+            let mut sidecar = original_path.as_os_str().to_owned();
+            sidecar.push(format.suffix);
+            let sidecar = std::path::PathBuf::from(sidecar);
 
-            // Check if pre-compressed file exists and is readable
+            // 🙈 A hidden sidecar stays hidden. Without this, `hide *.gz`
+            // would still serve the very file it was told to conceal.
+            if self.config.hide.hides(&sidecar) {
+                continue;
+            }
+
             // (synchronous read — same rationale as read_and_maybe_compress)
-            if let Ok(content) = std::fs::read(&precompressed_path) {
-                return Some((content, encoding));
+            if let Ok(content) = std::fs::read(&sidecar) {
+                return Some((content, format.encoding));
             }
         }
 

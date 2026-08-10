@@ -95,18 +95,18 @@ fn the_shorthand_accepts_a_directive_with_its_own_block() {
         ":80\nlog {\n\toutput stdout\n}\nfile_server {\n\tindex a.html\n}\n"
     ));
 
-    // 🧭 The corpus repro verbatim. It still does not compile — but for a
-    // reason about `hide`, which this file server has not implemented, rather
-    // than about site blocks. Asserting the *reason* is the point: the shape is
-    // fixed even where the feature behind it is missing, and a test that only
-    // asked "does it compile" would go green later for the wrong cause.
-    let error = compile(":80\nfile_server {\n\thide first.txt\n}\n")
-        .expect_err("`hide` is not implemented yet")
-        .to_string();
-    assert!(
-        error.contains("hide") && !error.contains("site"),
-        "the failure must be about `hide`, not about site blocks; got {error}"
-    );
+    // 🧭 The corpus repro verbatim. It used to fail for a reason about `hide`
+    // — implemented in M1 — rather than about site blocks, and the assertion
+    // was on that *reason*. Now that the feature exists the same shape is
+    // asserted the stronger way: it compiles, and what it compiled to is the
+    // directive's configuration rather than a site called `file_server`.
+    let config = compile(":80\nfile_server {\n\thide first.txt\n}\n")
+        .expect("a directive carrying its own block is not a site address");
+    let handler = &config.servers[0].routes[0].handler;
+    let pingclair_core::config::HandlerConfig::FileServer { hide, .. } = handler else {
+        panic!("expected a file server, got {handler:?}");
+    };
+    assert_eq!(hide, &["first.txt".to_string()]);
 }
 
 /// 🐛 A known directive name used where a site address belongs.

@@ -18,6 +18,9 @@ bytes.workspace = true
 arc-swap.workspace = true
 mime_guess.workspace = true
 httpdate = "1.0"
+# 🙈 `hide` patterns are globs, matched exactly as upstream matches them.
+# Already in the dependency tree; naming it only makes the API reachable.
+glob = "0.3"
 anyhow.workspace = true
 async-compression = { version = "0.4", features = ["gzip", "brotli", "zstd", "tokio"] }
 

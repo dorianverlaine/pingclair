@@ -1105,6 +1105,40 @@ pub enum HandlerConfig {
         browse_limit: Option<usize>,
         #[serde(default = "default_bool_true")]
         compress: bool,
+
+        /// 🗜️ Encodings whose sidecar files may be served, in preference
+        /// order (`app.js.br` for `app.js`). Empty means never look, which is
+        /// upstream's default: a stale sidecar is a wrong answer, so hunting
+        /// for one has to be asked for.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        precompressed: Vec<String>,
+
+        /// 🙈 Paths this server pretends do not exist. A pattern with no
+        /// separator hides any path *component* that matches it, so `.git`
+        /// hides `/a/.git/b`; one with a separator is a path prefix.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        hide: Vec<String>,
+
+        /// 🔢 Overrides the status of a successful response, for the
+        /// maintenance-page shape where every file is served as 503.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
+
+        /// ➡️ On a miss, hand the request to the next handler instead of
+        /// answering 404.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pass_thru: bool,
+
+        /// 🔁 Redirect a directory without a trailing slash to the slashed
+        /// form, and a file with one to the bare form. On by default, exactly
+        /// as upstream; `disable_canonical_uris` turns it off.
+        #[serde(default = "default_bool_true")]
+        canonical_uris: bool,
+
+        /// 🏷️ Extensions of sidecar files holding a precomputed ETag, tried
+        /// in order before one is derived from size and mtime.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        etag_file_extensions: Vec<String>,
     },
 
     /// 🏛️ A site that acts as an ACME server for other clients.

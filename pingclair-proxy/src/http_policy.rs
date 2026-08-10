@@ -204,6 +204,16 @@ pub fn evaluate_response_handlers(
                 browse,
                 browse_limit,
                 compress,
+                // 📄 A response subroute only reaches here from a bare
+                // `file_server`, so the rest take their defaults; the fields
+                // are named so a new one has to be decided rather than
+                // inherited by a wildcard.
+                precompressed: _,
+                hide: _,
+                status: _,
+                pass_thru: _,
+                canonical_uris: _,
+                etag_file_extensions: _,
             } => {
                 outcome.file_server = Some(ResponseFileServer {
                     root: root.clone(),

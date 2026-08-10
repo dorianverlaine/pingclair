@@ -2937,6 +2937,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "flate2",
+ "glob",
  "http",
  "httpdate",
  "mime_guess",

@@ -2307,6 +2307,12 @@ fn compile_handler(
             browse: fs.browse,
             browse_limit: None,
             compress: fs.compress,
+            precompressed: fs.precompressed.clone(),
+            hide: fs.hide.clone(),
+            status: fs.status,
+            pass_thru: fs.pass_thru,
+            canonical_uris: fs.canonical_uris,
+            etag_file_extensions: fs.etag_file_extensions.clone(),
         }),
 
         Handler::Templates => Ok(HandlerConfig::Templates {

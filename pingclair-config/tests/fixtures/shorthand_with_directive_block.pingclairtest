@@ -30,7 +30,8 @@ file_server {
             ],
             "browse": true,
             "browse_limit": null,
-            "compress": true
+            "compress": true,
+            "canonical_uris": true
           },
           "methods": null,
           "matcher": null

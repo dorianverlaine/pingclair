@@ -1839,6 +1839,12 @@ fn adapt_response_handler(
                 browse: false,
                 browse_limit: None,
                 compress: true,
+                precompressed: Vec::new(),
+                hide: Vec::new(),
+                status: None,
+                pass_thru: false,
+                canonical_uris: true,
+                etag_file_extensions: Vec::new(),
             })
         }
         other => Err(AdapterError::UnsupportedFeature(

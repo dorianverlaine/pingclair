@@ -173,6 +173,12 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             browse: _,
             browse_limit: _,
             compress: _,
+            precompressed: _,
+            hide: _,
+            status: _,
+            pass_thru: _,
+            canonical_uris: _,
+            etag_file_extensions: _,
         } => {
             // File server would need async file reading
             // Return placeholder for now

@@ -216,7 +216,7 @@ mod serve_auto_tests {
             browse: false,
             browse_limit: None,
             compress,
-            precompressed: false,
+            ..FileServerConfig::default()
         })
     }
 

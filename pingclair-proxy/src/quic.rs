@@ -3094,7 +3094,7 @@ async fn stream_h3_subrequest_response(
                         browse: file_server.browse,
                         browse_limit: file_server.browse_limit,
                         compress: file_server.compress,
-                        precompressed: false,
+                        ..pingclair_static::FileServerConfig::default()
                     });
                 let Some(stream) = server
                     .serve_streaming(request_path.split('?').next().unwrap_or("/"))
@@ -3524,7 +3524,10 @@ async fn fastcgi_upstream(
                 browse: file_server.browse,
                 browse_limit: file_server.browse_limit,
                 compress: file_server.compress,
-                precompressed: false,
+                // 📄 A response subroute only supports a bare `file_server`,
+                // so everything else takes its default — including sidecar
+                // lookup, which stays off.
+                ..pingclair_static::FileServerConfig::default()
             });
             let Some(stream) = server
                 .serve_streaming(request_path.split('?').next().unwrap_or("/"))
@@ -4259,7 +4262,7 @@ async fn reverse_proxy_upstream(
                             browse: file_server.browse,
                             browse_limit: file_server.browse_limit,
                             compress: file_server.compress,
-                            precompressed: false,
+                            ..pingclair_static::FileServerConfig::default()
                         });
                     intercept_file = server
                         .serve_streaming(request_path.split('?').next().unwrap_or("/"))
@@ -4611,7 +4614,7 @@ async fn send_h3_local_response(
                         browse: file_server.browse,
                         browse_limit: file_server.browse_limit,
                         compress: file_server.compress,
-                        precompressed: false,
+                        ..pingclair_static::FileServerConfig::default()
                     });
                 let Some(stream) = server
                     .serve_streaming(request_path.split('?').next().unwrap_or("/"))
@@ -5420,6 +5423,12 @@ mod tests {
                     browse: false,
                     browse_limit: None,
                     compress: false,
+                    precompressed: Vec::new(),
+                    hide: Vec::new(),
+                    status: None,
+                    pass_thru: false,
+                    canonical_uris: true,
+                    etag_file_extensions: Vec::new(),
                 },
             ],
         }];

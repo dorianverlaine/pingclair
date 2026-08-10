@@ -156,7 +156,12 @@ impl FileServer {
         // Files without a usable mtime are rebuilt per request: caching by
         // size alone could serve stale headers after a same-size overwrite.
         let Some(mtime_ns) = mtime_ns else {
-            return Ok(Arc::new(Self::build_meta(file_path, metadata, size)));
+            return Ok(Arc::new(Self::build_meta(
+                file_path,
+                metadata,
+                size,
+                &self.config.etag_file_extensions,
+            )));
         };
 
         let key = MetaKey {
@@ -168,7 +173,12 @@ impl FileServer {
             return Ok(meta.clone());
         }
 
-        let meta = Arc::new(Self::build_meta(file_path, metadata, size));
+        let meta = Arc::new(Self::build_meta(
+            file_path,
+            metadata,
+            size,
+            &self.config.etag_file_extensions,
+        ));
         let _guard = self.meta_write.lock().unwrap();
         // Whoever published first wins; the double-check avoids rebuilding
         // the map after a concurrent miss already inserted the entry.
@@ -185,7 +195,12 @@ impl FileServer {
     }
 
     /// Format one file's response metadata into reusable header values.
-    fn build_meta(file_path: &Path, metadata: &std::fs::Metadata, size: u64) -> FileMeta {
+    fn build_meta(
+        file_path: &Path,
+        metadata: &std::fs::Metadata,
+        size: u64,
+        etag_file_extensions: &[String],
+    ) -> FileMeta {
         let mime_type = crate::mime::with_charset(
             mime_guess::from_path(file_path)
                 .first_raw()
@@ -197,7 +212,17 @@ impl FileServer {
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_secs());
-        let etag = format!("\"{size:x}-{modified_secs:x}\"");
+        // 🏷️ A sidecar ETag wins when one exists. Build pipelines that hash
+        // content write `app.js.etag` beside the file; deriving one from size
+        // and mtime instead would change on every deploy that only touched
+        // timestamps, and would *not* change when two builds produce the same
+        // bytes — the opposite of what an ETag is for.
+        //
+        // Read here rather than per request: this runs on a cache miss, and
+        // the value is cached against the same (path, mtime, size) identity as
+        // everything else in `FileMeta`.
+        let etag = read_sidecar_etag(file_path, etag_file_extensions)
+            .unwrap_or_else(|| format!("\"{size:x}-{modified_secs:x}\""));
 
         FileMeta {
             content_type: HeaderValue::from_str(&mime_type).unwrap(),
@@ -207,6 +232,45 @@ impl FileServer {
         }
     }
 
+    // MARK: - Sidecar ETags
+}
+
+/// 🏷️ Reads a precomputed ETag from a sidecar file, if the site names any.
+///
+/// The value is used as written after trimming, and quoted when it is not
+/// already: an unquoted ETag is invalid per RFC 9110 and would be dropped by
+/// caches without a word, which is the silent failure this avoids.
+fn read_sidecar_etag(file_path: &Path, extensions: &[String]) -> Option<String> {
+    // 🕳️ The overwhelmingly common case: nothing configured, no syscall.
+    if extensions.is_empty() {
+        return None;
+    }
+    for extension in extensions {
+        let mut sidecar = file_path.as_os_str().to_owned();
+        // 📄 Upstream takes the extension as written, dot included or not.
+        if !extension.starts_with('.') {
+            sidecar.push(".");
+        }
+        sidecar.push(extension);
+        let Ok(contents) = std::fs::read_to_string(std::path::PathBuf::from(sidecar)) else {
+            continue;
+        };
+        let value = contents.trim();
+        // 🚫 An empty sidecar is not an ETag; fall through to the derived one
+        // rather than emitting `""`, which every cache treats as a mismatch.
+        if value.is_empty() {
+            continue;
+        }
+        return Some(if value.starts_with('"') || value.starts_with("W/") {
+            value.to_string()
+        } else {
+            format!("\"{value}\"")
+        });
+    }
+    None
+}
+
+impl FileServer {
     // MARK: - In-flight coalescing
 
     /// Remove the in-flight entry for `key`, but only if it is still the
@@ -464,7 +528,7 @@ mod meta_cache_tests {
         let fs = server(dir.path());
         let metadata = std::fs::metadata(&path).unwrap();
         let cached = meta_for(&fs, &path);
-        let rebuilt = FileServer::build_meta(&path, &metadata, metadata.len());
+        let rebuilt = FileServer::build_meta(&path, &metadata, metadata.len(), &[]);
 
         assert_eq!(header_text(&cached.etag), header_text(&rebuilt.etag));
         assert_eq!(

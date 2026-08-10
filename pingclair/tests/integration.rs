@@ -9949,3 +9949,326 @@ async fn test_client_auth_is_enforced_on_tls12_as_well_as_tls13() {
         "a TLS 1.2 client holding the right certificate was turned away"
     );
 }
+
+// MARK: - file_server subdirectives (M1)
+
+/// 📁 Builds a document root with a file, a sidecar, and something to hide.
+fn file_server_tree() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("document root");
+    std::fs::write(dir.path().join("app.js"), b"fresh-source").expect("write app.js");
+    // 🗜️ Deliberately *not* valid gzip. The point is which bytes are chosen,
+    // and a decodable sidecar would let a client-side decompression failure
+    // masquerade as the right answer.
+    std::fs::write(dir.path().join("app.js.gz"), b"stale-sidecar").expect("write sidecar");
+    std::fs::write(dir.path().join("app.js.etag"), "  \"from-build\"  ").expect("write etag");
+    std::fs::create_dir(dir.path().join(".git")).expect("create .git");
+    std::fs::write(dir.path().join(".git/config"), b"secret").expect("write git config");
+    std::fs::write(dir.path().join("visible.txt"), b"public").expect("write visible");
+    dir
+}
+
+/// 🗜️ Sidecars are served only when the site asks for them.
+///
+/// This is the behaviour change M1 carries: lookup used to be unconditional,
+/// so a stale `app.js.gz` beside a fresh `app.js` was served in its place —
+/// the same configuration answering with different bytes than upstream would.
+#[tokio::test]
+async fn test_file_server_precompressed_is_opt_in() {
+    let tree = file_server_tree();
+    let root = tree.path().to_string_lossy().into_owned();
+
+    let without = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+            file_server
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+        }}
+        "#
+    );
+    let mut server = TestServer::new_pingclairfile(&without);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let response = client
+        .get(server.url(0, "/app.js"))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), 200);
+    // 🎯 The sidecar must not be what came back. It is compared by bytes
+    // rather than by asserting the plain text, because with compression on the
+    // server legitimately gzips the *real* file on the fly — and that response
+    // is also not plain text. The question here is only which file was read.
+    assert_ne!(
+        response.bytes().await.unwrap().as_ref(),
+        b"stale-sidecar",
+        "a sidecar was served without the site asking for one"
+    );
+    // 🎯 …and with no encoding requested, the real file arrives verbatim.
+    let plain = client
+        .get(server.url(0, "/app.js"))
+        .header("Accept-Encoding", "identity")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(plain.text().await.unwrap(), "fresh-source");
+    server.stop();
+
+    let with = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+            file_server {{
+                precompressed gzip
+            }}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+        }}
+        "#
+    );
+    let mut server = TestServer::new_pingclairfile(&with);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let response = client
+        .get(server.url(0, "/app.js"))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        response
+            .headers()
+            .get("content-encoding")
+            .map(|v| v.to_str().unwrap()),
+        Some("gzip")
+    );
+    // 🎯 The body is the sidecar's bytes verbatim: reqwest does not decode it,
+    // because the fixture is not real gzip. That is what makes this assert
+    // "the sidecar was chosen" rather than "something gzip-shaped arrived".
+    assert_eq!(response.bytes().await.unwrap().as_ref(), b"stale-sidecar");
+}
+
+/// 🙈 A hidden path is answered exactly like a missing one.
+#[tokio::test]
+async fn test_file_server_hide_conceals_matching_paths() {
+    let tree = file_server_tree();
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+            file_server {{
+                hide .git
+            }}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+        }}
+        "#,
+        root = tree.path().to_string_lossy()
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    let hidden = client
+        .get(server.url(0, "/.git/config"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(hidden.status(), 404, "a hidden file was served");
+
+    // 🎯 The control: hiding one thing must not hide everything.
+    let visible = client
+        .get(server.url(0, "/visible.txt"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(visible.status(), 200);
+    assert_eq!(visible.text().await.unwrap(), "public");
+}
+
+/// ➡️ `pass_thru` hands a miss to the next handler instead of answering 404.
+#[tokio::test]
+async fn test_file_server_pass_thru_falls_through_to_the_next_handler() {
+    let tree = file_server_tree();
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+            # 🧭 An explicit route: directives run in written order here, which
+            # is the only shape where `pass_thru` can hand off to anything.
+            # Caddy's default order puts `respond` *before* `file_server`, so
+            # the two written bare would never reach the file server at all.
+            route {{
+                file_server {{
+                    pass_thru
+                }}
+                respond "fell-through"
+            }}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+        }}
+        "#,
+        root = tree.path().to_string_lossy()
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    let missing = client
+        .get(server.url(0, "/nothing-here.txt"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        missing.status(),
+        200,
+        "pass_thru answered instead of yielding"
+    );
+    assert_eq!(missing.text().await.unwrap(), "fell-through");
+
+    // 🎯 A file that does exist is still served by the file server, or
+    // `pass_thru` would have turned it into a bypass rather than a fallback.
+    let present = client
+        .get(server.url(0, "/visible.txt"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(present.status(), 200);
+    assert_eq!(present.text().await.unwrap(), "public");
+}
+
+/// 🔢 `status` re-labels every successful response, for a maintenance page.
+/// 🏷️ `etag_file_extensions` prefers a build-written ETag over a derived one.
+#[tokio::test]
+async fn test_file_server_status_override_and_sidecar_etag() {
+    let tree = file_server_tree();
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+            file_server {{
+                status 503
+                etag_file_extensions etag
+            }}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+        }}
+        "#,
+        root = tree.path().to_string_lossy()
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    let response = client
+        .get(server.url(0, "/app.js"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), 503, "the status override did not apply");
+    // 🏷️ Trimmed, and already quoted in the sidecar, so it is used as written.
+    assert_eq!(
+        response.headers().get("etag").map(|v| v.to_str().unwrap()),
+        Some("\"from-build\""),
+        "the derived ETag won over the one the build wrote"
+    );
+    // 🎯 The body is still the file: a status override re-labels, it does not
+    // replace what is served.
+    assert_eq!(response.text().await.unwrap(), "fresh-source");
+}
+
+/// 🔁 `disable_canonical_uris` stops the trailing-slash redirect.
+#[tokio::test]
+async fn test_file_server_disable_canonical_uris_stops_the_redirect() {
+    let tree = tempfile::tempdir().expect("document root");
+    std::fs::create_dir(tree.path().join("docs")).expect("create docs");
+    std::fs::write(tree.path().join("docs/index.html"), b"<h1>docs</h1>").expect("write index");
+    let root = tree.path().to_string_lossy().into_owned();
+
+    let redirecting = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+            file_server
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+        }}
+        "#
+    );
+    let mut server = TestServer::new_pingclairfile(&redirecting);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let response = client
+        .get(server.url(0, "/docs"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        response.status(),
+        308,
+        "the default must still canonicalise, or the option below proves nothing"
+    );
+    server.stop();
+
+    let plain = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+            file_server {{
+                disable_canonical_uris
+            }}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+        }}
+        "#
+    );
+    let mut server = TestServer::new_pingclairfile(&plain);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let response = client
+        .get(server.url(0, "/docs"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), 200, "the redirect was still issued");
+    assert_eq!(response.text().await.unwrap(), "<h1>docs</h1>");
+}

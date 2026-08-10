@@ -50,6 +50,14 @@ pub(super) fn adapt_handler(
                 index: vec!["index.html".into()],
                 browse,
                 compress: true,
+                precompressed: Vec::new(),
+                hide: Vec::new(),
+                status: None,
+                pass_thru: false,
+                // 🔁 On unless `disable_canonical_uris` says otherwise, which
+                // is upstream's default and the shape relative links need.
+                canonical_uris: true,
+                etag_file_extensions: Vec::new(),
             };
 
             if let Some(block) = d.block {
@@ -65,32 +73,101 @@ pub(super) fn adapt_handler(
                             config.browse =
                                 browse || sub.args.first().map(|s| s == "true").unwrap_or(true)
                         }
-                        // 🚩 Subdirectives the format defines and this file
-                        // server does not implement. They used to compile into
-                        // a file server that quietly served without any of the
-                        // behaviour asked for; rejecting them is the only
-                        // honest option until they exist.
+                        // 🗜️ Written with no arguments means upstream's own
+                        // default order, and writing it at all is what turns
+                        // sidecar lookup on: a stale `.gz` beside a file is a
+                        // wrong response, so it has to be asked for.
+                        "precompressed" => {
+                            config.precompressed = if sub.args.is_empty() {
+                                vec!["br".into(), "zstd".into(), "gzip".into()]
+                            } else {
+                                for format in &sub.args {
+                                    if !matches!(format.as_str(), "br" | "zstd" | "gzip") {
+                                        return Err(AdapterError::InvalidArgument(
+                                            "file_server precompressed".into(),
+                                            format!(
+                                                "`{format}` is not an encoding this server \
+                                                 reads; expected br, zstd or gzip"
+                                            ),
+                                        ));
+                                    }
+                                }
+                                sub.args.clone()
+                            };
+                        }
+                        // 🙈 Accumulates rather than replaces, so an imported
+                        // snippet's hides compose with a site's own.
+                        "hide" => {
+                            if sub.args.is_empty() {
+                                return Err(AdapterError::ArgumentCount(
+                                    "file_server hide".into(),
+                                    1,
+                                    0,
+                                ));
+                            }
+                            config.hide.extend(sub.args.iter().cloned());
+                        }
+                        "status" => {
+                            let raw = super::args::expect_one_argument(&sub)?;
+                            // 🔢 Upstream also accepts a `{placeholder}` here.
+                            // Refused rather than half-read: a status resolved
+                            // per request is a different feature, and silently
+                            // treating the text as a number would answer with
+                            // whatever `parse` happened to make of it.
+                            let code = raw.parse::<u16>().ok().filter(|c| (100..=599).contains(c));
+                            match code {
+                                Some(code) => config.status = Some(code),
+                                None => {
+                                    return Err(AdapterError::InvalidArgument(
+                                        "file_server status".into(),
+                                        format!("`{raw}` is not a status code between 100 and 599"),
+                                    ));
+                                }
+                            }
+                        }
+                        "pass_thru" => {
+                            if !sub.args.is_empty() {
+                                return Err(AdapterError::ArgumentCount(
+                                    "file_server pass_thru".into(),
+                                    0,
+                                    sub.args.len(),
+                                ));
+                            }
+                            config.pass_thru = true;
+                        }
+                        "disable_canonical_uris" => {
+                            if !sub.args.is_empty() {
+                                return Err(AdapterError::ArgumentCount(
+                                    "file_server disable_canonical_uris".into(),
+                                    0,
+                                    sub.args.len(),
+                                ));
+                            }
+                            config.canonical_uris = false;
+                        }
+                        "etag_file_extensions" => {
+                            if sub.args.is_empty() {
+                                return Err(AdapterError::ArgumentCount(
+                                    "file_server etag_file_extensions".into(),
+                                    1,
+                                    0,
+                                ));
+                            }
+                            config.etag_file_extensions.extend(sub.args.iter().cloned());
+                        }
+                        // 🚩 `fs` selects a file-system *module*, which is a
+                        // subsystem this build does not have — there is no
+                        // approximation of it that would not be a lie.
                         //
-                        // 📌 They are named here rather than falling through to
-                        // "unknown" on purpose: an operator who wrote `hide`
+                        // 📌 Named here rather than falling through to
+                        // "unknown" on purpose: an operator who wrote `fs`
                         // spelled it correctly, and "unknown directive" sends
                         // them hunting for a typo instead of telling them the
-                        // feature is missing. That distinction is the whole
-                        // difference between a wrong file and a missing
-                        // feature.
-                        "precompressed"
-                        | "fs"
-                        | "hide"
-                        | "status"
-                        | "pass_thru"
-                        | "disable_canonical_uris"
-                        | "etag_file_extensions" => {
-                            // TODO(v0.3): implement precompressed sidecar
-                            // lookup, custom file-system modules, hidden-path
-                            // filtering, and the response-shaping options.
+                        // feature is missing.
+                        "fs" => {
                             return Err(AdapterError::UnsupportedFeature(
-                                format!("file_server {}", sub.name),
-                                "Pingclair does not implement this subdirective yet".into(),
+                                "file_server fs".into(),
+                                "Pingclair serves from the local file system only".into(),
                             ));
                         }
                         other => {

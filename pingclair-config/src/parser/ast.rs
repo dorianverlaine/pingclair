@@ -1048,6 +1048,18 @@ pub struct FileServerConfig {
     pub index: Vec<String>,
     pub browse: bool,
     pub compress: bool,
+    /// 🗜️ Encodings whose sidecar files may be served, in preference order.
+    pub precompressed: Vec<String>,
+    /// 🙈 Paths this server pretends do not exist.
+    pub hide: Vec<String>,
+    /// 🔢 Status override for a successful response.
+    pub status: Option<u16>,
+    /// ➡️ Hand a miss to the next handler rather than answering 404.
+    pub pass_thru: bool,
+    /// 🔁 Whether to redirect to the canonical trailing-slash form.
+    pub canonical_uris: bool,
+    /// 🏷️ Extensions of sidecar files holding a precomputed ETag.
+    pub etag_file_extensions: Vec<String>,
 }
 
 // ============================================================

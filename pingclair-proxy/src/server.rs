@@ -1481,20 +1481,26 @@ impl ProxyState {
                 browse,
                 browse_limit,
                 compress,
+                precompressed,
+                hide,
+                status,
+                pass_thru: _,
+                canonical_uris,
+                etag_file_extensions,
             }) = find_file_server_config(&route.handler)
             {
-                let fs_config = pingclair_static::FileServerConfig {
-                    root: std::path::PathBuf::from(root),
-                    index: if index.is_empty() {
-                        vec!["index.html".to_string()]
-                    } else {
-                        index.clone()
-                    },
-                    browse: *browse,
-                    browse_limit: *browse_limit,
-                    compress: *compress,
-                    precompressed: true, // Enable pre-compressed file detection by default
-                };
+                let fs_config = pingclair_static::FileServerConfig::from_handler(
+                    root,
+                    index,
+                    *browse,
+                    *browse_limit,
+                    *compress,
+                    precompressed,
+                    hide,
+                    *status,
+                    *canonical_uris,
+                    etag_file_extensions,
+                );
 
                 file_servers.push(Some(Arc::new(pingclair_static::FileServer::new(fs_config))));
                 tracing::info!("📁 Initialized file server for route {}", route.path);
@@ -2725,7 +2731,10 @@ impl PingclairProxy {
                 browse: file_server.browse,
                 browse_limit: file_server.browse_limit,
                 compress: file_server.compress,
-                precompressed: false,
+                // 📄 A response subroute only supports a bare `file_server`,
+                // so everything else takes its default — including sidecar
+                // lookup, which stays off.
+                ..pingclair_static::FileServerConfig::default()
             };
             let server = pingclair_static::FileServer::new(fs_config);
             let request_path = session.req_header().uri.path();
@@ -3863,7 +3872,7 @@ impl PingclairProxy {
                 .await?;
                 Ok(true)
             }
-            HandlerConfig::FileServer { .. } => {
+            HandlerConfig::FileServer { pass_thru, .. } => {
                 let maybe_file_server = {
                     ctx.state.as_ref().and_then(|state| {
                         state.file_servers.get(route_index).and_then(|f| f.clone())
@@ -3982,6 +3991,13 @@ impl PingclairProxy {
                             .await?;
                             return Ok(true);
                         }
+                        // ➡️ `pass_thru`: the site said a miss is not this
+                        // handler's answer, so report "not handled" and let the
+                        // next one try. This is the `file_server` that fronts a
+                        // proxy — static assets win, everything else goes
+                        // upstream — and without it the 404 below would shadow
+                        // the application entirely.
+                        _ if *pass_thru => return Ok(false),
                         // Missing file (or read error): a file_server route
                         // has no upstream to fall back to, so answer 404
                         // here — through the error routes when configured —
