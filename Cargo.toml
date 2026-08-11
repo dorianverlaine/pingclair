@@ -45,7 +45,7 @@ logos = "0.16"
 ariadne = "0.6"      # error reporting
 
 # DNS (dynamic upstreams)
-hickory-resolver = "0.24"
+hickory-resolver = "0.26"
 
 # TLS / certificates
 rustls = { version = "0.23", features = ["ring"] }

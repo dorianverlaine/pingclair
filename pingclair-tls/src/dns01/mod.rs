@@ -254,10 +254,12 @@ async fn wait_for_propagation(
 /// times per certificate, minutes apart, and a resolver held across renewals
 /// would cache the very negative answer this is waiting to stop seeing.
 async fn resolve_txt(name: &str, resolvers: &[String]) -> Result<Vec<String>, String> {
-    use hickory_resolver::TokioAsyncResolver;
-    use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
+    use hickory_resolver::TokioResolver;
+    use hickory_resolver::config::{
+        ConnectionConfig, NameServerConfig, ProtocolConfig, ResolverConfig, ResolverOpts,
+    };
 
-    let mut config = ResolverConfig::new();
+    let mut config = ResolverConfig::from_parts(None, Vec::new(), Vec::new());
     for resolver in resolvers {
         // 🔌 A bare address means port 53; an explicit port is honoured so an
         // operator can point the check at a local authoritative server.
@@ -270,28 +272,43 @@ async fn resolve_txt(name: &str, resolvers: &[String]) -> Result<Vec<String>, St
                 }
             },
         };
-        config.add_name_server(NameServerConfig::new(address, Protocol::Udp));
+        // 🔌 The port travels on the connection, not the server: hickory 0.26
+        // defaults it to the protocol's standard one, so an explicit
+        // `127.0.0.1:5353` has to be carried over by hand or it becomes `:53`.
+        let mut connection = ConnectionConfig::new(ProtocolConfig::Udp);
+        connection.port = address.port();
+        config.add_name_server(NameServerConfig::new(address.ip(), true, vec![connection]));
     }
 
     let mut options = ResolverOpts::default();
     // 🚫 No cache. The point of the check is to observe a change, and a cached
     // NXDOMAIN would hide it for the whole propagation window.
     options.cache_size = 0;
-    let resolver = TokioAsyncResolver::tokio(config, options);
+    let mut builder = TokioResolver::builder_with_config(config, Default::default());
+    *builder.options_mut() = options;
+    let resolver = builder.build().map_err(|error| error.to_string())?;
 
     let lookup = resolver
         .txt_lookup(format!("{name}."))
         .await
         .map_err(|error| error.to_string())?;
+    // 🧵 One TXT record is a list of ≤255-byte chunks, and a key authorization
+    // is longer than that often enough to matter — the chunks have to be
+    // rejoined before comparing, or a long value never matches and the
+    // propagation wait times out on a record that is actually correct.
     Ok(lookup
+        .answers()
         .iter()
-        .map(|txt| {
-            let joined: Vec<u8> = txt
-                .txt_data()
-                .iter()
-                .flat_map(|chunk| chunk.iter().copied())
-                .collect();
-            String::from_utf8_lossy(&joined).into_owned()
+        .filter_map(|record| match &record.data {
+            hickory_resolver::proto::rr::RData::TXT(txt) => {
+                let joined: Vec<u8> = txt
+                    .txt_data
+                    .iter()
+                    .flat_map(|chunk| chunk.iter().copied())
+                    .collect();
+                Some(String::from_utf8_lossy(&joined).into_owned())
+            }
+            _ => None,
         })
         .collect())
 }

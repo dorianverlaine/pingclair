@@ -545,6 +545,16 @@ lets the rest converge.
 
 ### 🔐 Security
 
+- 📡 **`hickory-resolver` moved from 0.24 to 0.26 for RUSTSEC-2026-0119.**
+  `hickory-proto` 0.24.4 can be driven into quadratic work while compressing
+  names during message encoding; the advisory's fix is 0.26.1. The DNS-01
+  propagation check and the dynamic-upstream sources are the two places this
+  crate resolves anything. 0.25 removed the synchronous resolver, so the
+  dynamic sources now drive the async one on a current-thread runtime they own
+  — the same arrangement hickory used to ship, written here instead. Name
+  servers keep `trust_negative_responses: true`, which is what the old
+  two-argument constructor set, so an `NXDOMAIN` still means the same thing.
+
 - 📊 **The active-connection gauge was the one metric the cap missed.** The
   ceiling below applied to every host-labelled metric except
   `pingclair_active_connections`, which kept a series per distinct `Host`
