@@ -80,8 +80,20 @@ run_one() {
     mv "${dest}.tmp" "${dest}"
     echo "$((after - before))" > "${out}/${cand}-${workload}-cpu-r${round}.txt"
 
-    local rps
+    # 🚫 A row that did not fully succeed is not a slow row, it is not a row.
+    # `h2load -H "host: …"` cannot set an HTTP/1.1 Host — that comes from the
+    # URL authority — so a vhost mismatch turns every request into a 404 that
+    # the throughput column reports as a *win*. Measured on 2026-08-11: 30000
+    # 4xx read as "four times faster than nginx". The succeeded count is the
+    # only thing that caught it, so it travels beside every number.
+    local rps succeeded
     rps="$(awk '/finished in/ {print $4}' "${dest}" | tr -d ',')"
+    succeeded="$(awk '/^requests:/ {print $8}' "${dest}")"
+    if [[ "${succeeded}" != "${requests}" ]]; then
+        printf '   %-10s %-11s r%s  🚫 VOID — %s/%s succeeded\n' \
+            "${cand}" "${workload}" "${round}" "${succeeded:-0}" "${requests}"
+        return
+    fi
     printf '   %-10s %-11s r%s  %s\n' "${cand}" "${workload}" "${round}" "${rps:-FAILED}"
 }
 
