@@ -1,0 +1,74 @@
+# 📊 Benchmark configuration for Pingclair — the DSL twin of
+# `benchmarks/aws-h3/configs/config-pingclair-aws-proxy.json`.
+#
+# 🧾 Why this file exists: the JSON it replaces skips `adapter/caddyfile.rs`
+# entirely, so every benchmark run measured about half the path a real
+# operator's configuration takes — and the missing half is the one that
+# decides what the compiled handlers actually are. A number measured on a
+# shape nobody can write in the DSL is a number about something else.
+#
+# ⚖️ Fairness notes, so the comparison against nginx and pingap stays honest:
+#
+# - `compress` is OFF. The nginx and pingap benchmark configs do not compress
+#   either, and a 1 KiB body would spend more time being deflated than sent.
+#   (The general-purpose `configs/pingclair/Pingclairfile` DOES enable gzip;
+#   it is not the benchmark config, and using it here would have measured
+#   Pingclair doing work the others were not asked to do.)
+# - `flush_interval -1` matches the JSON: flush every write straight through
+#   rather than buffering, which is what nginx's `proxy_buffering off` does.
+# - Two knobs the JSON sets explicitly have no DSL spelling yet:
+#   `worker_threads` and `upstream_keepalive_pool_size`. Both are omitted here
+#   rather than worked around, because their defaults already are the values
+#   the JSON names: threads follow `available_parallelism()` (2 in a 2-vCPU
+#   container) and the pool defaults to 512 (`run.rs`). Verified, not assumed
+#   — see the equivalence check in the run log.
+#
+# 🔥 A third knob is a real difference, not a matching default. The JSON sets
+#   `"metrics": false`; the DSL's `metrics` is an on-only toggle and the
+#   compiled default is ON. So this file cannot turn metrics off, and every
+#   Pingclair configured from a Pingclairfile — which is every real operator —
+#   pays whatever per-request cost metrics collection has, while the numbers
+#   published on 2026-08-03 were measured with it off. That makes those
+#   numbers a measurement of a configuration nobody can write. Recorded in
+#   TRIAGE.md on 2026-08-11; this run measures the shape operators actually
+#   get, and the difference from the old figures is therefore expected and
+#   is itself a finding.
+#
+# 🌐 The upstream is the container network alias `bench-backend` rather than
+#   the JSON's `127.0.0.1:9000`. The AWS harness ran the backend on the same
+#   host; every container harness (OrbStack here, and the x86 image sent to
+#   the old AMD box) needs a name. nginx and pingap are pointed at the same
+#   alias, so no candidate gets a shorter path to the backend than another.
+#
+# 🚫 One deliberate difference from the JSON: it sets `index: []` and this
+#   sets the DSL default (`index.html`). The workload only ever requests
+#   `/small.txt` and `/proxy/small.txt`, so no request reaches index
+#   resolution. Called out rather than hidden, because it is a difference.
+
+{
+	auto_https off
+}
+
+# 🔓 Plaintext listener, used by the HTTP/1.1 `wrk` rows.
+http://bench.local:8080 {
+	handle /proxy/* {
+		reverse_proxy http://bench-backend:9000 {
+			flush_interval -1
+		}
+	}
+
+	file_server /var/www/html
+}
+
+# 🔐 TLS listener, used by every `h2load` row (H2 and H1S) and by HTTP/3.
+https://h3.local:8443 {
+	tls /tmp/bench.crt /tmp/bench.key
+
+	handle /proxy/* {
+		reverse_proxy http://bench-backend:9000 {
+			flush_interval -1
+		}
+	}
+
+	file_server /var/www/html
+}
