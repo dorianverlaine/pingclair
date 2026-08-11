@@ -228,3 +228,16 @@
   > 🎯 **可操作的規則**：**cipher 也算變因**。跨機器前先確認兩邊協商到同一個
   > cipher suite（`openssl s_client` 看得到），併發、client 執行緒、容器 CPU
   > 配額全部固定，否則得到的是自己的方法而不是機器的性質。
+
+- **會飽和的客戶端不是客戶端。** `benchmarks/aws-h3/h3_bench.py` 與
+  `h3_bench_pipeline.py` 是 **aioquic——純 Python 的 QUIC 實作**，harness 自己的
+  README 就註明「單執行緒、~2k req/s、client-bound」。用它去比三台跑得到
+  15k–47k req/s 的伺服器，量到的是客戶端；而且**名次可以任意翻轉**，因為剩下的
+  差異來自各家對慢速客戶端的 pacing 與 ACK 行為，不是吞吐能力。
+  2026-08-11 換成 ngtcp2/nghttp3 版的 h2load 重量，結論和先前的印象相反。
+
+  > 🎯 **可操作的規則**：H3 的**效能**比較一律用 `goodideal/nghttp2` 映像裡的
+  > h2load（`--alpn-list=h3`）。aioquic 那兩支只保留給**語義 parity**——
+  > 它們讀得懂回應內容，這是 h2load 做不到的，那才是它們的用途。
+  > 另外 QUIC 對 UDP 緩衝極敏感，`net.core.rmem_max`／`wmem_max` 必須在所有候選
+  > 之間固定（這次用 7500000），否則量到的是核心設定。
