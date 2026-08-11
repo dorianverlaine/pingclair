@@ -654,7 +654,13 @@ pub enum Handler {
     Rewrite(RewriteConfig),
 
     /// 🗂️ Rewrite to the first candidate path that exists on disk.
-    TryFiles(Vec<String>),
+    ///
+    /// The elements are the `file`-matcher-plus-rewrite groups the directive
+    /// expands into, and they are mutually exclusive: the first one whose
+    /// matcher answers owns the request. The variant survives the expansion
+    /// because directive *ordering* is defined over names, and `try_files`
+    /// ranks in its own place — a bare `Handle` would rank as `handle`.
+    TryFiles(Vec<HandlerElement>),
 
     /// Cross-origin resource sharing policy.
     Cors(CorsConfig),

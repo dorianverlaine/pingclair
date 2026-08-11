@@ -2357,13 +2357,70 @@ mod uri_and_try_files_tests {
         }
     }
 
+    /// 🗂️ One `try_files` group: the candidates its `file` matcher tries, the
+    /// root they resolve under, the selection policy, and the URI the rewrite
+    /// produces when that group is the one that matched.
+    #[derive(Debug, PartialEq, Eq)]
+    struct TryFilesGroup {
+        candidates: Vec<String>,
+        root: Option<String>,
+        policy: Option<String>,
+        rewrite_to: String,
+    }
+
+    /// 🗂️ Reads the groups back out of a compiled handler.
+    ///
+    /// `try_files` compiles to what upstream expands it into — a mutually
+    /// exclusive `Handle` of `file`-matcher-guarded rewrites — so there is no
+    /// `TryFiles` handler left to look for. Recognising it by *shape* is the
+    /// price of having one implementation instead of two.
+    fn try_files_groups(handler: &HandlerConfig) -> Option<Vec<TryFilesGroup>> {
+        let HandlerConfig::Handle { handlers } = handler else {
+            return None;
+        };
+        handlers
+            .iter()
+            .map(|element| match (&element.matcher, &element.handler) {
+                (
+                    Some(pingclair_core::config::Matcher::File {
+                        try_files,
+                        root,
+                        try_policy,
+                        ..
+                    }),
+                    HandlerConfig::Rewrite {
+                        replace: Some(target),
+                        ..
+                    },
+                ) if target.starts_with("{http.matchers.file.relative}") => Some(TryFilesGroup {
+                    candidates: try_files.clone(),
+                    root: root.clone(),
+                    policy: try_policy.clone(),
+                    rewrite_to: target.clone(),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 🗂️ The single group a plain `try_files` line compiles to.
+    fn only_try_files_group(source: &str) -> TryFilesGroup {
+        let handlers = handlers(source);
+        let mut groups = handlers
+            .iter()
+            .find_map(try_files_groups)
+            .expect("try_files must survive into the compiled routes");
+        assert_eq!(groups.len(), 1, "expected one group, got {groups:?}");
+        groups.remove(0)
+    }
+
     /// 🎯 The documented single-page-application pattern, pasted unchanged.
     /// Before this it did not compile at all: `try_files` was refused as an
     /// unimplemented directive, so the first page of the migration guide was
     /// also the first thing to fail.
     #[test]
     fn the_documented_spa_pattern_compiles() {
-        let handlers = handlers(
+        let group = only_try_files_group(
             "example.com {\n\
              \troot * /srv\n\
              \tencode gzip\n\
@@ -2371,22 +2428,19 @@ mod uri_and_try_files_tests {
              \tfile_server\n\
              }",
         );
-        let try_files = handlers
-            .iter()
-            .find_map(|handler| match handler {
-                HandlerConfig::TryFiles { files, root, .. } => Some((files, root)),
-                _ => None,
-            })
-            .expect("try_files must survive into the compiled routes");
         assert_eq!(
-            try_files.0,
-            &["{path}".to_string(), "/index.html".to_string()]
+            group.candidates,
+            ["{path}".to_string(), "/index.html".to_string()]
         );
         assert_eq!(
-            try_files.1.as_deref(),
+            group.root.as_deref(),
             Some("/srv"),
             "try_files must capture the site root, or every candidate is looked up at the \
              filesystem root and the pattern answers 404 for every application route"
+        );
+        assert_eq!(
+            group.rewrite_to, "{http.matchers.file.relative}",
+            "the rewrite target is whichever candidate the matcher picked"
         );
     }
 
@@ -2405,9 +2459,8 @@ mod uri_and_try_files_tests {
             handlers
                 .iter()
                 .position(|handler| match handler {
-                    HandlerConfig::TryFiles { .. } => name == "try_files",
                     HandlerConfig::FileServer { .. } => name == "file_server",
-                    _ => false,
+                    other => name == "try_files" && try_files_groups(other).is_some(),
                 })
                 .unwrap_or_else(|| panic!("{name} missing from {handlers:?}"))
         };
@@ -2526,27 +2579,94 @@ mod uri_and_try_files_tests {
         assert!(message.contains(".."), "got {message}");
     }
 
-    /// 🚫 `{path}` is the only placeholder the handler expands, so any other
-    /// one would be looked up as a literal directory name — a misconfiguration
-    /// that behaves exactly like a missing file.
+    /// 🧭 A candidate may name anything the request can answer. `{uri}` was
+    /// refused outright until the directive started expanding into the `file`
+    /// matcher, which has resolved a wider set all along.
     #[test]
-    fn try_files_refuses_a_placeholder_it_cannot_expand() {
-        let message = compile("example.com {\n\troot * /srv\n\ttry_files {uri} /index.html\n}")
-            .expect_err("an unexpandable placeholder must be refused")
-            .to_string();
-        assert!(message.contains("{uri}"), "got {message}");
+    fn try_files_accepts_the_placeholders_the_matcher_resolves() {
+        for candidate in [
+            "{uri}",
+            "{host}",
+            "{http.request.header.X-Tenant}",
+            "{re.1}",
+        ] {
+            let group = only_try_files_group(&format!(
+                "example.com {{\n\troot * /srv\n\ttry_files {candidate} /index.html\n}}"
+            ));
+            assert_eq!(
+                group.candidates[0], candidate,
+                "{candidate} must reach the matcher unchanged"
+            );
+        }
     }
 
-    /// 🚫 The `php_fastcgi` shape. Nothing here would do anything with the
-    /// query, and dropping it silently is how a configuration written for that
-    /// pattern comes to look like it works.
+    /// 🚫 A name the matcher cannot resolve would be looked up as a literal
+    /// filename containing braces — a misconfiguration that behaves exactly
+    /// like a missing file.
     #[test]
-    fn try_files_refuses_a_candidate_carrying_a_query() {
+    fn try_files_refuses_a_placeholder_it_cannot_expand() {
         let message =
-            compile("example.com {\n\troot * /srv\n\ttry_files {path} /index.php?{query}\n}")
-                .expect_err("a candidate with a query must be refused")
+            compile("example.com {\n\troot * /srv\n\ttry_files {env.HOME} /index.html\n}")
+                .expect_err("an unexpandable placeholder must be refused")
                 .to_string();
-        assert!(message.contains("query"), "got {message}");
+        assert!(message.contains("{env.HOME}"), "got {message}");
+    }
+
+    /// 🧭 A candidate carrying a query string gets its own group, because the
+    /// rewrite it produces is different: this candidate replaces the request's
+    /// query, while the ones beside it leave it alone. The groups are mutually
+    /// exclusive, so only the first matching rewrite runs.
+    #[test]
+    fn a_candidate_with_a_query_gets_its_own_rewrite_target() {
+        let handlers = handlers(
+            "example.com {\n\troot * /srv\n\ttry_files {path} /index.php?{query}\n\tfile_server\n}",
+        );
+        let groups = handlers
+            .iter()
+            .find_map(try_files_groups)
+            .expect("try_files must survive into the compiled routes");
+        assert_eq!(
+            groups,
+            vec![
+                TryFilesGroup {
+                    candidates: vec!["{path}".to_string()],
+                    root: Some("/srv".to_string()),
+                    policy: None,
+                    rewrite_to: "{http.matchers.file.relative}".to_string(),
+                },
+                TryFilesGroup {
+                    candidates: vec!["/index.php".to_string()],
+                    root: Some("/srv".to_string()),
+                    policy: None,
+                    rewrite_to: "{http.matchers.file.relative}?{query}".to_string(),
+                },
+            ]
+        );
+    }
+
+    /// 🎲 The `policy` block reaches the matcher that acts on it.
+    #[test]
+    fn try_files_carries_its_policy_to_the_matcher() {
+        let group = only_try_files_group(
+            "example.com {\n\
+             \troot * /srv\n\
+             \ttry_files {path} /index.php {\n\
+             \t\tpolicy first_exist_fallback\n\
+             \t}\n\
+             }",
+        );
+        assert_eq!(group.policy.as_deref(), Some("first_exist_fallback"));
+    }
+
+    /// 🚫 An unrecognised policy matches nothing at all, which on a live site
+    /// reads as "none of the candidates exist" — the symptom of a typo in a
+    /// filename, not of a typo in the policy.
+    #[test]
+    fn try_files_refuses_an_unknown_policy() {
+        compile("example.com {\n\troot * /srv\n\ttry_files {path} {\n\t\tpolicy newest\n\t}\n}")
+            .expect_err("an unknown policy must be refused");
+        compile("example.com {\n\troot * /srv\n\ttry_files {path} {\n\t\tsplit_path .php\n\t}\n}")
+            .expect_err("an unknown subdirective must be refused");
     }
 
     /// 🔗 The directory-candidate form, which needs the lexer to keep
@@ -2555,19 +2675,12 @@ mod uri_and_try_files_tests {
     /// served its shell for every URL and looked like it worked.
     #[test]
     fn a_slashed_placeholder_candidate_stays_one_candidate() {
-        let handlers = handlers(
+        let group = only_try_files_group(
             "example.com {\n\troot * /srv\n\ttry_files {path} {path}/ /index.html\n\tfile_server\n}",
         );
-        let files = handlers
-            .iter()
-            .find_map(|handler| match handler {
-                HandlerConfig::TryFiles { files, .. } => Some(files),
-                _ => None,
-            })
-            .expect("try_files must survive into the compiled routes");
         assert_eq!(
-            files,
-            &[
+            group.candidates,
+            [
                 "{path}".to_string(),
                 "{path}/".to_string(),
                 "/index.html".to_string()
@@ -2577,10 +2690,14 @@ mod uri_and_try_files_tests {
         );
     }
 
+    /// 🔍 A glob candidate compiles now that something expands it. It used to
+    /// be refused, on the grounds that this crate would look for a file whose
+    /// name really contained an asterisk.
     #[test]
-    fn try_files_refuses_a_glob_candidate() {
-        compile("example.com {\n\troot * /srv\n\ttry_files {path}*.html\n}")
-            .expect_err("a glob candidate must be refused");
+    fn a_glob_candidate_reaches_the_matcher() {
+        let group =
+            only_try_files_group("example.com {\n\troot * /srv\n\ttry_files {path}*.html\n}");
+        assert_eq!(group.candidates, ["{path}*.html".to_string()]);
     }
 
     #[test]

@@ -1389,3 +1389,76 @@ async fn h3_client_auth_turns_session_resumption_off() {
          so the ticket outlives the policy that issued it"
     );
 }
+
+/// 🗂️ `try_files` gives HTTP/3 the same answer it gives HTTP/1.1 and HTTP/2,
+/// including the `=code` candidate that raises a status rather than matching.
+///
+/// 🤡 The parity gap this pins, fixed 2026-08-11: H3 evaluated a pipeline
+/// element's matcher through a *boolean* helper, so the `file` matcher's
+/// `Error` verdict collapsed to no-match. The same site therefore answered 404
+/// over HTTP/2 and fell through to the next handler over HTTP/3 — a difference
+/// nothing in the configuration expressed. It was unreachable from the DSL
+/// until `try_files` started expanding into that matcher, and reachable
+/// through a `php_fastcgi` expansion before that.
+#[tokio::test]
+async fn h3_try_files_falls_back_and_raises_a_status_code_candidate() {
+    let tree = tempfile::tempdir().expect("document root");
+    std::fs::write(tree.path().join("index.html"), b"shell").expect("write shell");
+    let root = tree.path().to_string_lossy().into_owned();
+
+    // 🧾 The real adapter must produce the handler the QUIC server executes:
+    // a JSON handler here would skip the expansion under test.
+    let source = format!(
+        r#":443 {{
+            root * {root}
+            route /strict/* {{
+                try_files {{path}} =410
+                file_server
+            }}
+            route {{
+                try_files {{path}} /index.html
+                file_server
+            }}
+        }}"#
+    );
+    let config = pingclair_config::compile(&source).expect("the try_files site compiles");
+    // 🧭 The whole server, not one route: the two `route` blocks compile to two
+    // routes, and taking only the first would silently test the wrong one.
+    let compiled = config.servers[0].clone();
+    let server = spawn_h3_server_with(|address| ServerConfig {
+        listen: vec![address.to_string()],
+        // 🎧 The listener's certificate names the host, and the site must be
+        // the catch-all that answers it — the same shape `spawn_h3_server`
+        // builds for the single-handler tests.
+        name: None,
+        names: Vec::new(),
+        ..compiled
+    })
+    .await;
+
+    // 🎯 The ordinary fallback: no file behind the route, so the shell answers.
+    let shell = h3_get(server, "/client/route")
+        .await
+        .expect("request should succeed");
+    assert_eq!(shell.status, 200);
+    assert_eq!(String::from_utf8_lossy(&shell.body), "shell");
+
+    // 🎯 A real file is served as itself rather than hijacked to the shell.
+    let real = h3_get(server, "/index.html")
+        .await
+        .expect("request should succeed");
+    assert_eq!(real.status, 200);
+    assert_eq!(String::from_utf8_lossy(&real.body), "shell");
+
+    // 🎯 `=410` raises. The status is deliberately one the file server would
+    // never produce on its own: with `=404` this assertion would pass whether
+    // the candidate raised or the file server simply failed to find the file,
+    // which is exactly the difference under test.
+    let strict = h3_get(server, "/strict/missing")
+        .await
+        .expect("request should succeed");
+    assert_eq!(
+        strict.status, 410,
+        "`=410` must raise on HTTP/3 exactly as it does on HTTP/1.1 and HTTP/2"
+    );
+}

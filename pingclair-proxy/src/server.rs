@@ -3704,6 +3704,42 @@ impl PingclairProxy {
         evaluate_verdict(compiled, &mut request)
     }
 
+    /// 🗂️ Runs the `file` matcher for the JSON-only `try_files` handler.
+    ///
+    /// Returns the URI path to rewrite to, or `None` when no candidate exists.
+    /// The `=code` error fallback is not reachable from here — a JSON
+    /// `try_files` has a `fallback` handler for that case, and letting a
+    /// candidate raise a status as well would give one configuration two ways
+    /// to say what happens when nothing matched.
+    fn resolve_try_files(
+        &self,
+        session: &Session,
+        ctx: &mut RequestContext,
+        files: &[String],
+        root: Option<&str>,
+        path: &str,
+    ) -> Option<String> {
+        let host = authority_host(request_authority(session.req_header()));
+        let remote_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
+        let mut request = MatcherRequest {
+            path,
+            method: session.req_header().method.as_str(),
+            headers: &session.req_header().headers,
+            host,
+            remote_ip: remote_ip.as_deref().unwrap_or(""),
+            protocol: ctx.request_scheme,
+            vars: Some(ctx.request_vars.values_mut()),
+        };
+        match pingclair_core::server::evaluate_file_matcher(&mut request, files, root, None, &[]) {
+            MatcherVerdict::Match => ctx
+                .request_vars
+                .values_mut()
+                .get("http.matchers.file.relative")
+                .cloned(),
+            MatcherVerdict::NoMatch | MatcherVerdict::Error(_) => None,
+        }
+    }
+
     /// Handle a specific handler configuration
     #[async_recursion]
     async fn handle_config(
@@ -4412,7 +4448,15 @@ impl PingclairProxy {
                 // on, and `apply_rewrite` is reused rather than reimplemented
                 // so the query string survives and `ctx.rewritten_path` is
                 // published the same way every other rewrite publishes it.
-                match crate::http_policy::resolve_try_files(files, root.as_deref(), path) {
+                //
+                // 🧭 Only a JSON configuration reaches this arm: since
+                // 2026-08-11 the Pingclairfile adapter expands `try_files` into
+                // the `file` matcher plus a rewrite, exactly as upstream does.
+                // The lookup goes through that same matcher rather than a
+                // second one, which is what the two used to be — and they
+                // disagreed about policies, globs, and every placeholder but
+                // `{path}`.
+                match self.resolve_try_files(session, ctx, files, root.as_deref(), path) {
                     Some(target) => {
                         self.apply_rewrite(
                             session,

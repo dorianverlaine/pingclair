@@ -601,19 +601,49 @@ example.com {
 候選路徑結尾有 `/` 的只匹配目錄，沒有 `/` 的只匹配一般檔案——**決定的是設定檔裡
 寫的那個斜線，不是請求帶進來的那個**。
 
-與 Caddy 有四項差異，全部**fail closed**，並且錯誤訊息會講出理由，
-而不是編譯成一個語意悄悄不同的東西：
-
-| 不支援 | 理由 |
-| --- | --- |
-| `{path}` 以外的 placeholder | 只有 `{path}` 會展開，其他會被當成字面上的目錄名去找。 |
-| 帶 query string 的候選（`/index.php?{query}`） | query 會被無聲丟掉。 |
-| 候選裡的 glob 字元 | Caddy 會展開 glob，Pingclair 是字面比對。 |
-| `{ policy … }` 區塊 | 只實作了「取第一個匹配」。 |
-| 候選裡的 `..` 片段 | 限制在 document root 內是詞法層做的，所以有可能跳出去的候選直接拒絕。 |
-
 `try_files {path} {path}/ /index.html` 也可以：第二個候選匹配目錄，所以請求
 `/docs` 會找到 `/docs/`，剩下的交給 file server。
+
+這個指令不是獨立的 handler，而是一段簡寫：它展開成一個 `file` matcher，
+加上一個「改寫成 matcher 挑中的那個候選」的 rewrite。它其餘的行為都是從這裡來的：
+
+```caddyfile
+example.com {
+    root * /srv
+
+    # 🔍 用 glob 指名磁碟上那個帶雜湊的 bundle，設定檔不必知道雜湊值。
+    try_files /build/app.*.js
+
+    # 🎲 當「取第一個存在的」不是你要的規則時，指定挑選策略。
+    try_files {path} {path}.html {
+        policy most_recently_modified
+    }
+
+    # 🚨 候選寫成狀態碼就是「拋出這個狀態」，而不是去匹配一個檔案。
+    try_files {path} =404
+
+    file_server
+}
+```
+
+五種策略是 `first_exist`（預設）、`first_exist_fallback`、`smallest_size`、
+`largest_size`、`most_recently_modified`。候選可以使用任何「請求本身答得出來」
+的 placeholder——`{path}`、`{uri}`、`{query}`、`{host}`、`{method}`、
+`{http.request.header.*}`、`{http.vars.*}`、`{re.*}` 等等；而帶 query string
+的候選（`/index.php?{query}`）在它是被挑中的那一個時，會取代請求原本的 query。
+
+還有三件事維持 **fail closed**，錯誤訊息會講出理由，
+而不是編譯成一個語意悄悄不同的東西：
+
+| 拒絕 | 理由 |
+| --- | --- |
+| 候選裡的 `..` 片段 | 限制在 document root 內是詞法層做的，所以有可能跳出去的候選直接拒絕，而不是每個請求再檢查一次。 |
+| matcher 解不出來的 placeholder（`{env.HOME}`、`{scheme}`） | 它會被當成一個「檔名裡有大括號」的檔案去找——這種錯誤設定的表現和「檔案不存在」完全一樣。 |
+| 認不得的 `policy`，或任何其他子指令 | 未知策略什麼都匹配不到，在線上看起來就是「這些檔案都不存在」。 |
+
+🛡️ 從 placeholder 值裡帶進來的 glob 特殊字元會被跳脫，所以請求 `/*` 沒辦法把
+`try_files /files/{path}` 變成一次目錄列表。**只有設定檔裡寫的文字**能決定
+一個候選要不要當成 glob 展開。
 
 ### 路徑手術：`uri`
 

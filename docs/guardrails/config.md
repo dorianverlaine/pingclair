@@ -85,3 +85,35 @@
 
   > 🎯 **可操作的規則**：加別名或扁平拼法時，兩邊走**同一個解析 helper**，
   > 不要各自呼叫底層。
+
+- **一個「簡寫」指令，要展開成它所簡寫的那個東西，不要另寫一份實作。**
+  `try_files` 在上游不是 handler，是 `file` matcher 加一個 rewrite 的簡寫。
+  這個倉庫先寫了一份獨立的 `resolve_try_files`，之後又實作了 `file` matcher，
+  於是同一件事「找出第一個存在的候選」有了兩份程式碼——而它們對五種挑選策略、
+  `=404` 候選、glob、以及 `{path}` 以外的每一個 placeholder 都不同意。
+  兩份實作沒有「不同步」的問題，因為它們**從第一天就沒同步過**：
+  能力較弱的那一份把自己的缺口寫進了設定層的拒絕清單，讓缺口看起來像是設計。
+
+  > 🎯 **可操作的規則**：adapter 遇到上游明講是簡寫的指令（`try_files`、
+  > `php_fastcgi`、`forward_auth`），先去讀上游把它展開成什麼，然後展開成同一個
+  > 東西。要另寫一份執行期實作，得先寫下為什麼那個展開在這裡行不通。
+
+- **驗證規則要掛在真正做事的那個型別上，不是掛在當初碰巧呼叫它的那個型別上。**
+  `try_files` 候選的 `..` 與 placeholder 檢查原本只對 `HandlerConfig::TryFiles`
+  跑。`try_files` 改成展開成 `file` matcher 之後，那些檢查一條都不會再被觸發，
+  而 `Matcher::File`（`php_fastcgi` 一直在產生它）從來就沒被檢查過。
+
+  > 🎯 **可操作的規則**：改變一個指令編譯出來的型別時，把它的驗證**一起搬過去**，
+  > 並且順手問一句：本來就會產生新型別的那些路徑，之前是不是也漏檢了。
+
+- **指令的第一個參數是不是 matcher，答案要去上游的註冊方式找。**
+  上游用 `RegisterDirective` 註冊 `try_files`（而不是 `RegisterHandlerDirective`），
+  它自己的註釋寫著「notice no matcher tokens accepted」——所以每一個參數都是候選。
+  這裡把第一個以 `/` 開頭的參數當成 inline path matcher，於是
+  `try_files /a.html /b.html` 變成「只在 `/a.html` 這條路徑上、只試 `/b.html`」，
+  而且把站台其餘的 handler 一起拖進那個 matcher 底下。它編得過，做的事卻是
+  操作者從來沒寫過的。`try_files /index.html` 單獨一個參數則 fail closed
+  ——這才是缺陷被發現的方式。
+
+  > 🎯 **可操作的規則**：`first_argument_is_data` 新增條目時，理由要引上游的
+  > **註冊函式**，不要引某一份設定看起來像什麼。

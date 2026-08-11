@@ -840,35 +840,104 @@ pub(super) fn adapt_uri(d: Directive) -> Result<Handler, AdapterError> {
     }
 }
 
-/// 🗂️ Adapts `try_files <candidate...>`.
+/// 🗂️ Adapts `try_files <candidate...> [{ policy … }]`.
 ///
-/// Each candidate is a URI path resolved under the site root, and the first one
-/// that exists becomes the request's new path. The directive serves nothing on
-/// its own — the single-page-application pattern is `try_files` followed by
-/// `file_server`, and that second line is what answers.
+/// `try_files` is not a handler of its own — it is shorthand for a `file`
+/// matcher plus a rewrite to whichever candidate that matcher picked:
+///
+/// ```caddyfile
+/// @try_files file {
+///     try_files <candidate...>
+///     try_policy <policy>
+/// }
+/// rewrite @try_files {http.matchers.file.relative}
+/// ```
+///
+/// Expanding it that way rather than writing a second lookup is the whole
+/// point. Until 2026-08-11 there *was* a second lookup, and it knew about
+/// neither the five selection policies, nor `=404` candidates, nor globs, nor
+/// any placeholder but `{path}` — every one of which the matcher beside it
+/// already handled. One implementation cannot drift from itself.
+///
+/// 🧭 A candidate carrying a query string gets its own group, because the
+/// rewrite target differs: `try_files {path} index.php?{query}` rewrites to
+/// `index.php?<query>` when that candidate is the one that matched, and to the
+/// bare path when an earlier one did. The groups are mutually exclusive so
+/// only the first matching rewrite runs, which is what upstream's route
+/// grouping is for (caddyserver/caddy#2891).
 fn adapt_try_files(d: Directive) -> Result<Handler, AdapterError> {
-    if d.block.is_some() {
-        return Err(AdapterError::BlockNotAllowed("try_files".into()));
-    }
     if d.args.is_empty() {
         return Err(AdapterError::InvalidArgument(
             "try_files".into(),
             "expected at least one candidate path".into(),
         ));
     }
-    // 🚫 A candidate carrying a query string is the `php_fastcgi` shape
-    // (`try_files {path} /index.php?{query}`), and nothing here would do
-    // anything with the query. Refusing it keeps a configuration written for
-    // that pattern from looking like it works.
-    if let Some(candidate) = d.args.iter().find(|candidate| candidate.contains('?')) {
-        return Err(AdapterError::UnsupportedFeature(
-            format!("try_files {candidate}"),
-            "a candidate with a query string is not supported; Pingclair rewrites the path \
-             only and would drop the query without saying so"
-                .into(),
-        ));
+    let mut policy: Option<String> = None;
+    if let Some(block) = &d.block {
+        for sub in &block.directives {
+            match sub.name.as_str() {
+                "policy" => {
+                    if policy.is_some() {
+                        return Err(AdapterError::InvalidArgument(
+                            "try_files policy".into(),
+                            "already configured".into(),
+                        ));
+                    }
+                    let value = expect_one_argument(sub)?;
+                    if !matches!(
+                        value,
+                        "first_exist"
+                            | "first_exist_fallback"
+                            | "largest_size"
+                            | "smallest_size"
+                            | "most_recently_modified"
+                    ) {
+                        return Err(AdapterError::InvalidArgument(
+                            "try_files policy".into(),
+                            value.to_string(),
+                        ));
+                    }
+                    policy = Some(value.to_string());
+                }
+                other => {
+                    return Err(AdapterError::UnknownDirective(format!(
+                        "try_files: {other}"
+                    )));
+                }
+            }
+        }
     }
-    Ok(Handler::TryFiles(d.args))
+
+    let group = |candidates: Vec<String>, query: &str| HandlerElement {
+        matcher: Some(Matcher::File {
+            try_files: candidates,
+            root: None,
+            try_policy: policy.clone(),
+            split_path: Vec::new(),
+        }),
+        handler: Handler::Rewrite(RewriteConfig {
+            replace: Some(format!("{{http.matchers.file.relative}}{query}")),
+            ..Default::default()
+        }),
+    };
+
+    let mut elements = Vec::new();
+    let mut plain: Vec<String> = Vec::new();
+    for candidate in &d.args {
+        match candidate.split_once('?') {
+            Some((file, query)) => {
+                if !plain.is_empty() {
+                    elements.push(group(std::mem::take(&mut plain), ""));
+                }
+                elements.push(group(vec![file.to_string()], &format!("?{query}")));
+            }
+            None => plain.push(candidate.clone()),
+        }
+    }
+    if !plain.is_empty() {
+        elements.push(group(plain, ""));
+    }
+    Ok(Handler::TryFiles(elements))
 }
 
 /// Adapt the CORS directive. Inline arguments are allowed origins; block

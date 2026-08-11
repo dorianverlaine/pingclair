@@ -192,6 +192,16 @@ lets the rest converge.
   name: `replace` means substring replacement upstream and whole-path
   replacement here, so accepting it would serve a different URL than the one
   written.
+- 🗂️ **`try_files` is now the whole directive.** It expands into a `file`
+  matcher plus a rewrite — which is what it is upstream — so it gained
+  everything that matcher already did: the five selection policies through a
+  `{ policy … }` block, a `=404`-style candidate that raises a status instead
+  of matching, glob expansion in a candidate, the full set of placeholders the
+  request can answer rather than only `{path}`, and a candidate carrying a
+  query string. A first candidate that begins with `/` is a candidate again
+  rather than an inline path matcher, matching how upstream registers the
+  directive. `..`, an unresolvable placeholder, and an unrecognised policy
+  still fail closed.
 - 🌐 **Admin API.** `/load`, `/adapt` and `/stop`, Caddy-style config traversal
   with `@id` addressing, dynamic listeners, autosave and resume, and graceful
   stop.
@@ -429,6 +439,18 @@ lets the rest converge.
 
 ### 🐛 Fixed
 
+- 🔀 **HTTP/3 now resolves a rewrite target's placeholders.** `HandlerConfig::Rewrite`
+  ran `resolve_caddy_placeholders` on HTTP/1.1 and HTTP/2 and passed the
+  template through verbatim on HTTP/3, so a site using `try_files` or
+  `php_fastcgi` rewrote the URI to the literal text
+  `{http.matchers.file.relative}` and the file server behind it answered 404
+  for every request — the whole single-page-application pattern, silently, and
+  only over HTTP/3.
+- 🚨 **A `=404` candidate now raises its status on HTTP/3 too.** The `file`
+  matcher answers with three outcomes, not two, and HTTP/3 evaluated pipeline
+  element matchers through a boolean helper that collapsed the third
+  (`Error`) into no-match. The same configuration therefore answered 404 over
+  HTTP/2 and fell through to the next handler over HTTP/3.
 - 🔗 **A placeholder is no longer split from the word it is glued to.**
   `{host}/moved` used to tokenize as two arguments, because a placeholder at
   the *start* of a token was emitted on its own while one glued *after* a word

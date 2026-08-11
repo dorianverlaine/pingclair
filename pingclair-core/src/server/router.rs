@@ -593,75 +593,28 @@ fn bool_verdict(matched: bool) -> MatcherVerdict {
 /// `first_exist_fallback` matches its last candidate without touching the
 /// filesystem, which is how `php_fastcgi` treats `index.php` as existing.
 /// A reached `=code` candidate raises that status instead of matching.
-fn evaluate_file_matcher(
+///
+/// 📌 This is also what the `try_files` directive is: upstream expands it into
+/// this matcher plus a rewrite to `{http.matchers.file.relative}`, and since
+/// 2026-08-11 so does the Pingclairfile adapter. There is deliberately no
+/// second implementation of "find the first candidate that exists" — the one
+/// that existed until then disagreed with this one about policies, globs, and
+/// every placeholder except `{path}`.
+pub fn evaluate_file_matcher(
     request: &mut MatcherRequest<'_>,
     try_files: &[String],
     root: Option<&str>,
     try_policy: Option<&str>,
     split_path: &[String],
 ) -> MatcherVerdict {
-    let path = request
+    // 🍃 `request.path` is a borrow of the request *text*, not of the request
+    // struct, so this survives the `&mut request` the placeholder writes need.
+    let path: &str = request
         .path
         .split_once('?')
         .map_or(request.path, |(path, _)| path);
     let root = Path::new(root.unwrap_or("."));
     let policy = try_policy.unwrap_or("first_exist");
-
-    #[derive(Clone)]
-    struct Candidate {
-        full_path: String,
-        relative: String,
-        remainder: String,
-        is_dir: bool,
-    }
-
-    let make_candidate = |pattern: &str| -> Option<Candidate> {
-        let expanded = expand_file_placeholder(pattern, path);
-        let wants_directory = pattern.ends_with('/');
-        let mut cleaned = clean_file_path(&expanded);
-        if wants_directory && !cleaned.ends_with('/') {
-            cleaned.push('/');
-        }
-        let (before_split, remainder) = first_split(&cleaned, split_path);
-        let mut split_path_part = before_split;
-        if wants_directory && !split_path_part.ends_with('/') {
-            split_path_part.push('/');
-        }
-        let full_path = join_under_root(root, &split_path_part)?;
-        let relative = format!("/{}", split_path_part.trim_start_matches('/'));
-        Some(Candidate {
-            full_path,
-            relative,
-            remainder,
-            is_dir: wants_directory,
-        })
-    };
-
-    let set_placeholders = |request: &mut MatcherRequest<'_>, candidate: &Candidate| {
-        let Some(vars) = request.vars.as_deref_mut() else {
-            return;
-        };
-        vars.insert(
-            "http.matchers.file.relative".to_string(),
-            candidate.relative.clone(),
-        );
-        vars.insert(
-            "http.matchers.file.absolute".to_string(),
-            candidate.full_path.clone(),
-        );
-        vars.insert(
-            "http.matchers.file.type".to_string(),
-            if candidate.is_dir {
-                "directory".to_string()
-            } else {
-                "file".to_string()
-            },
-        );
-        vars.insert(
-            "http.matchers.file.remainder".to_string(),
-            candidate.remainder.clone(),
-        );
-    };
 
     match policy {
         "first_exist" | "first_exist_fallback" | "" => {
@@ -670,46 +623,49 @@ fn evaluate_file_matcher(
                 if let Some(status) = parse_error_code(pattern) {
                     return MatcherVerdict::Error(status);
                 }
-                let Some(candidate) = make_candidate(pattern) else {
-                    continue;
-                };
-                if fallback_last && index + 1 == try_files.len() {
-                    set_placeholders(request, &candidate);
-                    return MatcherVerdict::Match;
-                }
-                if file_exists_strict(&candidate.full_path, candidate.is_dir) {
-                    set_placeholders(request, &candidate);
-                    return MatcherVerdict::Match;
+                let candidates = file_candidates(request, pattern, path, root, split_path);
+                for candidate in candidates.as_slice() {
+                    // 🎲 The fallback policy claims its last candidate without
+                    // asking the filesystem, which is how `php_fastcgi` treats
+                    // `index.php` as present even before it is written.
+                    if fallback_last && index + 1 == try_files.len() {
+                        set_file_placeholders(request, candidate);
+                        return MatcherVerdict::Match;
+                    }
+                    if file_exists_strict(&candidate.full_path, candidate.is_dir) {
+                        set_file_placeholders(request, candidate);
+                        return MatcherVerdict::Match;
+                    }
                 }
             }
             MatcherVerdict::NoMatch
         }
         "largest_size" | "smallest_size" | "most_recently_modified" => {
-            let mut best: Option<(Candidate, u64)> = None;
+            let mut best: Option<(FileCandidate, u64)> = None;
             for pattern in try_files {
-                let Some(candidate) = make_candidate(pattern) else {
-                    continue;
-                };
-                let Ok(metadata) = Path::new(&candidate.full_path).metadata() else {
-                    continue;
-                };
-                let key = match policy {
-                    "largest_size" => metadata.len(),
-                    "smallest_size" => u64::MAX - metadata.len(),
-                    _ => metadata
-                        .modified()
-                        .ok()
-                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|duration| duration.as_nanos() as u64)
-                        .unwrap_or(0),
-                };
-                if best.as_ref().is_none_or(|(_, best_key)| key > *best_key) {
-                    best = Some((candidate, key));
+                let candidates = file_candidates(request, pattern, path, root, split_path);
+                for candidate in candidates.as_slice() {
+                    let Ok(metadata) = Path::new(&candidate.full_path).metadata() else {
+                        continue;
+                    };
+                    let key = match policy {
+                        "largest_size" => metadata.len(),
+                        "smallest_size" => u64::MAX - metadata.len(),
+                        _ => metadata
+                            .modified()
+                            .ok()
+                            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|duration| duration.as_nanos() as u64)
+                            .unwrap_or(0),
+                    };
+                    if best.as_ref().is_none_or(|(_, best_key)| key > *best_key) {
+                        best = Some((candidate.clone(), key));
+                    }
                 }
             }
             match best {
                 Some((candidate, _)) => {
-                    set_placeholders(request, &candidate);
+                    set_file_placeholders(request, &candidate);
                     MatcherVerdict::Match
                 }
                 None => MatcherVerdict::NoMatch,
@@ -719,11 +675,339 @@ fn evaluate_file_matcher(
     }
 }
 
+/// 📂 One resolved `file` matcher candidate.
+#[derive(Clone)]
+struct FileCandidate {
+    full_path: String,
+    relative: String,
+    remainder: String,
+    is_dir: bool,
+}
+
+/// 📂 The candidates one configured pattern produced.
+///
+/// A pattern without glob metacharacters yields at most one candidate and
+/// never allocates a `Vec` — which is every candidate in the documented
+/// single-page-application and `php_fastcgi` shapes.
+enum FileCandidates {
+    Single(Option<FileCandidate>),
+    Globbed(Vec<FileCandidate>),
+}
+
+impl FileCandidates {
+    fn as_slice(&self) -> &[FileCandidate] {
+        match self {
+            FileCandidates::Single(one) => one.as_slice(),
+            FileCandidates::Globbed(many) => many.as_slice(),
+        }
+    }
+}
+
+/// 🛡️ Most glob expansions a single candidate may produce.
+///
+/// Upstream has no ceiling here. This one exists because the expansion reads
+/// directories on a request path: `try_files /cache/*` pointed at a directory
+/// holding a hundred thousand entries would otherwise build a hundred thousand
+/// candidate structs before answering one request. The limit is far above any
+/// plausible configuration, so reaching it means the pattern was pointed
+/// somewhere it should not have been.
+const MAX_GLOB_CANDIDATES: usize = 1_024;
+
+/// 📂 Expands one configured pattern into the candidates it names.
+fn file_candidates(
+    request: &MatcherRequest<'_>,
+    pattern: &str,
+    path: &str,
+    root: &Path,
+    split_path: &[String],
+) -> FileCandidates {
+    let expanded = expand_file_pattern(pattern, request, path);
+    let wants_directory = pattern.ends_with('/');
+    let mut cleaned = clean_file_path(&expanded);
+    if wants_directory && !cleaned.ends_with('/') {
+        cleaned.push('/');
+    }
+    // 🪚 The split has to happen before globbing, or the `PATH_INFO` tail
+    // would be part of the filename the filesystem is asked about.
+    let (before_split, remainder) = first_split(&cleaned, split_path);
+    let mut split_path_part = before_split;
+    if wants_directory && !split_path_part.ends_with('/') {
+        split_path_part.push('/');
+    }
+    let Some(full_path) = join_under_root(root, &split_path_part) else {
+        return FileCandidates::Single(None);
+    };
+
+    if !pattern_globs(pattern) {
+        let relative = format!("/{}", split_path_part.trim_start_matches('/'));
+        return FileCandidates::Single(Some(FileCandidate {
+            full_path,
+            relative,
+            remainder,
+            is_dir: wants_directory,
+        }));
+    }
+
+    // 🔍 A glob only ever names paths that already exist, so the results are
+    // whatever the filesystem holds; the strict directory-or-file check still
+    // runs on each of them afterwards.
+    let Ok(matches) = glob::glob(&full_path) else {
+        return FileCandidates::Globbed(Vec::new());
+    };
+    let root_prefix = root.to_string_lossy().into_owned();
+    let mut expanded = Vec::new();
+    for entry in matches.flatten().take(MAX_GLOB_CANDIDATES) {
+        let full = entry.to_string_lossy().into_owned();
+        let relative = full
+            .strip_prefix(&root_prefix)
+            .map(|relative| format!("/{}", relative.trim_start_matches('/')))
+            .unwrap_or_else(|| full.clone());
+        expanded.push(FileCandidate {
+            full_path: full,
+            relative,
+            remainder: remainder.clone(),
+            is_dir: wants_directory,
+        });
+    }
+    FileCandidates::Globbed(expanded)
+}
+
+/// 🧰 Publishes `{http.matchers.file.*}` for the candidate that matched.
+fn set_file_placeholders(request: &mut MatcherRequest<'_>, candidate: &FileCandidate) {
+    let Some(vars) = request.vars.as_deref_mut() else {
+        return;
+    };
+    vars.insert(
+        "http.matchers.file.relative".to_string(),
+        candidate.relative.clone(),
+    );
+    vars.insert(
+        "http.matchers.file.absolute".to_string(),
+        candidate.full_path.clone(),
+    );
+    vars.insert(
+        "http.matchers.file.type".to_string(),
+        if candidate.is_dir {
+            "directory".to_string()
+        } else {
+            "file".to_string()
+        },
+    );
+    vars.insert(
+        "http.matchers.file.remainder".to_string(),
+        candidate.remainder.clone(),
+    );
+}
+
+/// 🧭 The placeholder names a `file` matcher candidate may use.
+///
+/// Every name here is answerable from [`MatcherRequest`] alone. That is the
+/// whole rule, and it is why the list is short: the matcher runs in this
+/// crate, which knows nothing about the proxy's request type, so a name that
+/// needs the listener's scheme or the process environment cannot be resolved
+/// here at all. `validate_config` refuses any other name rather than letting
+/// it stand as a literal — a candidate spelled `{env.HOME}` would otherwise be
+/// looked up as a file whose name contains braces, find nothing, and fall
+/// through, which is indistinguishable from a missing file.
+///
+/// 🤔 Evaluated and rejected on 2026-08-11: sharing
+/// `pingclair_proxy::server::resolve_single_placeholder`, which understands a
+/// wider set. It takes a `pingora_http::RequestHeader`, so sharing it means
+/// either this crate depending on the proxy (a cycle) or the proxy's request
+/// type moving into the router. The second is the right end state and is worth
+/// its own session; doing it here would have put a hot-path type change inside
+/// a `try_files` commit.
+pub const FILE_MATCHER_PLACEHOLDERS: &[&str] = &[
+    "path",
+    "uri",
+    "query",
+    "?query",
+    "host",
+    "hostport",
+    "port",
+    "method",
+    "remote_ip",
+    "remote_host",
+    "http.request.uri.path",
+    "http.request.uri",
+    "http.request.uri.query",
+    "http.request.host",
+    "http.request.hostport",
+    "http.request.port",
+    "http.request.method",
+    "http.request.remote.host",
+];
+
+/// 🧭 The placeholder prefixes a `file` matcher candidate may use.
+///
+/// These are open-ended families rather than single names: any header, any
+/// `vars` entry, any regexp capture.
+pub const FILE_MATCHER_PLACEHOLDER_PREFIXES: &[&str] = &[
+    "http.request.header.",
+    "http.vars.",
+    "http.request.orig_uri.",
+    "re.",
+    "labels.",
+    "http.request.host.labels.",
+];
+
 /// 🧭 Expands the placeholders the file matcher understands.
-fn expand_file_placeholder(pattern: &str, path: &str) -> String {
-    pattern
-        .replace("{path}", path)
-        .replace("{http.request.uri.path}", path)
+///
+/// 🛡️ Substituted values are glob-escaped, so a request can never introduce a
+/// metacharacter into a pattern. Without that, `try_files /files/{path}` under
+/// a request for `/*` would expand to a glob and list the directory — the
+/// client would be choosing which file the pattern matches. Upstream escapes
+/// for the same reason (`fileserver/matcher.go`, `globSafeRepl`, `ff6da121`).
+/// The escaping happens whether or not this pattern globs, because whether it
+/// globs is decided by the *configured* text, and that decision has to hold
+/// after substitution too.
+fn expand_file_pattern(pattern: &str, request: &MatcherRequest<'_>, path: &str) -> String {
+    if !pattern.contains('{') {
+        return pattern.to_string();
+    }
+    let mut out = String::with_capacity(pattern.len());
+    let mut rest = pattern;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        let Some(end) = rest[start..].find('}') else {
+            // 🚫 An unterminated brace is not a placeholder; keep it verbatim.
+            break;
+        };
+        let name = &rest[start + 1..start + end];
+        push_glob_safe(&mut out, &resolve_file_placeholder(name, request, path));
+        rest = &rest[start + end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 🧭 Resolves one `file` matcher placeholder from the request.
+///
+/// An unknown name resolves to the empty string, matching every other
+/// placeholder site in this project. It is not reachable from a Pingclairfile,
+/// because `validate_config` refuses names outside
+/// [`FILE_MATCHER_PLACEHOLDERS`], but a JSON configuration can still get here.
+fn resolve_file_placeholder(name: &str, request: &MatcherRequest<'_>, path: &str) -> String {
+    if let Some(header) = name.strip_prefix("http.request.header.") {
+        return request
+            .headers
+            .get(header)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+    }
+    if let Some(var) = name.strip_prefix("http.vars.") {
+        return request
+            .vars
+            .as_deref()
+            .and_then(|vars| vars.get(var))
+            .cloned()
+            .unwrap_or_default();
+    }
+    if name.starts_with("http.request.orig_uri.") || name == "re" || name.starts_with("re.") {
+        return request
+            .vars
+            .as_deref()
+            .and_then(|vars| vars.get(name))
+            .cloned()
+            .unwrap_or_default();
+    }
+    // 🧭 `{host}` is the hostname without its port; `{hostport}` keeps it.
+    // A bracketed IPv6 literal has colons of its own, so only a colon after
+    // the closing bracket is a port separator.
+    fn host_without_port(host: &str) -> &str {
+        match host.rsplit_once(':') {
+            Some((name, _)) if !host.starts_with('[') || host.contains("]:") => name,
+            _ => host,
+        }
+    }
+    let query = || {
+        request
+            .path
+            .split_once('?')
+            .map(|(_, query)| query)
+            .unwrap_or_default()
+    };
+    if let Some(raw) = name
+        .strip_prefix("http.request.host.labels.")
+        .or_else(|| name.strip_prefix("labels."))
+    {
+        let host = host_without_port(request.host);
+        let labels: Vec<&str> = host.split('.').collect();
+        return raw
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| labels.len().checked_sub(index + 1))
+            .and_then(|index| labels.get(index))
+            .unwrap_or(&"")
+            .to_string();
+    }
+    match name {
+        "path" | "http.request.uri.path" => path.to_string(),
+        "uri" | "http.request.uri" => request.path.to_string(),
+        "query" | "http.request.uri.query" => query().to_string(),
+        "?query" => {
+            let query = query();
+            if query.is_empty() {
+                String::new()
+            } else {
+                format!("?{query}")
+            }
+        }
+        "host" | "http.request.host" => host_without_port(request.host).to_string(),
+        "hostport" | "http.request.hostport" => request.host.to_string(),
+        "port" | "http.request.port" => request
+            .host
+            .rsplit_once(':')
+            .filter(|_| !request.host.starts_with('[') || request.host.contains("]:"))
+            .map(|(_, port)| port.to_string())
+            .unwrap_or_default(),
+        "method" | "http.request.method" => request.method.to_string(),
+        "remote_ip" | "remote_host" | "http.request.remote.host" => request.remote_ip.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// 🛡️ Appends a placeholder value with every glob metacharacter escaped.
+fn push_glob_safe(out: &mut String, value: &str) {
+    for character in value.chars() {
+        if matches!(character, '*' | '?' | '[' | ']') {
+            out.push('[');
+            out.push(character);
+            out.push(']');
+        } else {
+            out.push(character);
+        }
+    }
+}
+
+/// 🔍 Reports whether a *configured* candidate asks to be expanded as a glob.
+///
+/// The answer depends only on the configuration text, never on the request, so
+/// a candidate without a metacharacter never reaches the filesystem walk —
+/// which matters, because that walk reads directories and the common candidate
+/// (`{path}`, `/index.html`) is a single `stat`. It is a byte scan over a
+/// short configured string with no allocation, which is why it is not hoisted
+/// into the compiled matcher: the surrounding candidate construction allocates
+/// several times over, and hoisting this would be the smaller half of that job.
+///
+/// 📌 Characters *inside* a `{…}` span do not count. `index.php?{query}` asks
+/// for a query string, not a single-character wildcard, and `{?query}` names a
+/// placeholder. Upstream reaches the same answer from the other direction — it
+/// decides after substitution, and substitution escapes every metacharacter a
+/// value could contribute — so the only text that can turn on globbing is
+/// literal configuration text either way.
+fn pattern_globs(pattern: &str) -> bool {
+    let mut depth = 0usize;
+    for character in pattern.chars() {
+        match character {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            '*' | '?' | '[' if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// 🧹 Cleans `.`/`..` and repeated separators without canonicalizing.
@@ -1563,6 +1847,219 @@ mod tests {
         assert_eq!(
             vars.get("http.matchers.file.relative").unwrap(),
             "/index.php"
+        );
+    }
+
+    // MARK: - try_files, through the matcher it expands into
+    //
+    // 🧭 These cases were written against a second `try_files` lookup that
+    // lived in the proxy crate until 2026-08-11. The lookup is gone — the
+    // directive expands into this matcher now — but the cases are the reason
+    // its behaviour is known to be right, so they moved here rather than
+    // being deleted with it.
+
+    /// 🗂️ A site root with a shell page and one real asset, which is the
+    /// smallest fixture that can tell the two `try_files` outcomes apart.
+    fn spa_root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("index.html"), "shell").unwrap();
+        std::fs::create_dir(root.path().join("assets")).unwrap();
+        std::fs::write(root.path().join("assets/app.js"), "asset").unwrap();
+        root
+    }
+
+    /// 🗂️ Runs the matcher the way `try_files` does and reports the path it
+    /// would rewrite to, so each case reads as the behaviour it is about.
+    fn try_files_target(files: &[&str], root: Option<&str>, request_path: &str) -> Option<String> {
+        let candidates: Vec<String> = files.iter().map(|file| file.to_string()).collect();
+        let headers = HeaderMap::new();
+        let mut vars = BTreeMap::new();
+        let mut request = MatcherRequest {
+            path: request_path,
+            method: "GET",
+            headers: &headers,
+            host: "example.com",
+            remote_ip: "10.0.0.1",
+            protocol: "https",
+            vars: Some(&mut vars),
+        };
+        match evaluate_file_matcher(&mut request, &candidates, root, None, &[]) {
+            MatcherVerdict::Match => vars.get("http.matchers.file.relative").cloned(),
+            MatcherVerdict::NoMatch | MatcherVerdict::Error(_) => None,
+        }
+    }
+
+    #[test]
+    fn an_existing_file_is_returned_unchanged() {
+        let root = spa_root();
+        assert_eq!(
+            try_files_target(
+                &["{path}", "/index.html"],
+                root.path().to_str(),
+                "/assets/app.js"
+            ),
+            Some("/assets/app.js".to_string()),
+            "a request for a real file must resolve to itself, not to the shell"
+        );
+    }
+
+    #[test]
+    fn a_missing_file_falls_to_the_next_candidate() {
+        let root = spa_root();
+        assert_eq!(
+            try_files_target(
+                &["{path}", "/index.html"],
+                root.path().to_str(),
+                "/deep/client/route"
+            ),
+            Some("/index.html".to_string())
+        );
+    }
+
+    /// 🤡 The defect the original handler was rewritten for: candidates used to
+    /// be treated as filesystem paths, so `/index.html` was looked up at the
+    /// filesystem root instead of under the site root. Every application route
+    /// answered 404 while the configuration looked exactly right.
+    #[test]
+    fn candidates_resolve_under_the_root_not_the_filesystem_root() {
+        let root = spa_root();
+        assert_eq!(
+            try_files_target(&["/index.html"], root.path().to_str(), "/x"),
+            Some("/index.html".to_string())
+        );
+        assert_eq!(
+            try_files_target(&["/index.html"], Some("/nonexistent"), "/x"),
+            None,
+            "a candidate must not be found by accident at the filesystem root"
+        );
+    }
+
+    #[test]
+    fn nothing_matching_leaves_the_request_alone() {
+        let root = spa_root();
+        assert_eq!(
+            try_files_target(&["{path}"], root.path().to_str(), "/missing"),
+            None
+        );
+    }
+
+    /// 📏 The trailing slash in the *configured pattern* is what selects a
+    /// directory, so `{path}/` matches a directory whether or not the request
+    /// carried a slash of its own.
+    #[test]
+    fn a_slashed_candidate_matches_only_a_directory() {
+        let root = spa_root();
+        for request in ["/assets", "/assets/"] {
+            assert_eq!(
+                try_files_target(&["{path}/"], root.path().to_str(), request),
+                Some("/assets/".to_string()),
+                "`{{path}}/` must match the directory for {request}"
+            );
+        }
+        assert_eq!(
+            try_files_target(&["{path}/"], root.path().to_str(), "/index.html"),
+            None,
+            "`{{path}}/` must not match a regular file"
+        );
+    }
+
+    /// 🤡 The case a runtime comparison against Caddy v2.11.4 caught on
+    /// 2026-08-07, and reading the file matcher's source then explained: an
+    /// unslashed candidate must *not* match a directory. Treating "exists" as
+    /// "either kind" made `try_files {path} /index.html` rewrite a request for
+    /// `/assets/` to the directory itself, which the file server then answered
+    /// 404 for — where the format serves the application shell.
+    #[test]
+    fn an_unslashed_candidate_does_not_match_a_directory() {
+        let root = spa_root();
+        assert_eq!(
+            try_files_target(&["{path}", "/index.html"], root.path().to_str(), "/assets/"),
+            Some("/index.html".to_string()),
+            "a directory must fall through to the shell, not be rewritten to"
+        );
+    }
+
+    /// 🍃 On HTTP/3 the caller's path still carries its query, and a query is
+    /// not part of any filename.
+    #[test]
+    fn the_query_string_is_not_part_of_the_lookup() {
+        let root = spa_root();
+        assert_eq!(
+            try_files_target(&["{path}"], root.path().to_str(), "/assets/app.js?v=2"),
+            Some("/assets/app.js".to_string())
+        );
+    }
+
+    // MARK: - Placeholders and globs
+
+    /// 🧭 A candidate may name any placeholder the request can answer, not
+    /// only `{path}`. `try_files {uri}` was refused outright until 2026-08-11.
+    #[test]
+    fn file_matcher_expands_more_than_the_path_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("example.com")).unwrap();
+        std::fs::write(dir.path().join("example.com/home.html"), "host page").unwrap();
+        std::fs::write(dir.path().join("GET.html"), "method page").unwrap();
+        let root = dir.path().to_str();
+
+        assert_eq!(
+            try_files_target(&["/{host}{path}"], root, "/home.html"),
+            Some("/example.com/home.html".to_string()),
+            "{{host}} must resolve to the request host"
+        );
+        assert_eq!(
+            try_files_target(&["/{method}.html"], root, "/whatever"),
+            Some("/GET.html".to_string())
+        );
+        assert_eq!(
+            try_files_target(&["{uri}"], root, "/GET.html?v=1"),
+            None,
+            "{{uri}} keeps the query, so it names no file here"
+        );
+    }
+
+    /// 🔍 A configured glob expands against the filesystem; the first result
+    /// that satisfies the file-or-directory demand is the match.
+    #[test]
+    fn file_matcher_expands_a_configured_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("build")).unwrap();
+        std::fs::write(dir.path().join("build/app.9f3c2a.js"), "bundle").unwrap();
+        let root = dir.path().to_str();
+
+        assert_eq!(
+            try_files_target(&["/build/app.*.js"], root, "/anything"),
+            Some("/build/app.9f3c2a.js".to_string())
+        );
+        assert_eq!(
+            try_files_target(&["/build/style.*.css"], root, "/anything"),
+            None,
+            "a glob that matches nothing must fall through, not match itself"
+        );
+    }
+
+    /// 🛡️ A request must never be able to introduce a glob metacharacter.
+    ///
+    /// Without escaping, `try_files /build/{path}` under a request for `/*`
+    /// would list the directory and rewrite to whatever came first — the
+    /// client choosing the file. The escaped form looks for a file whose name
+    /// really does contain an asterisk, which is what was asked for.
+    #[test]
+    fn a_request_cannot_inject_a_glob_metacharacter() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("build")).unwrap();
+        std::fs::write(dir.path().join("build/secret.txt"), "secret").unwrap();
+        let root = dir.path().to_str();
+
+        assert_eq!(
+            try_files_target(&["/build{path}"], root, "/*"),
+            None,
+            "a wildcard from the request must not expand"
+        );
+        assert_eq!(
+            try_files_target(&["/build{path}"], root, "/secret.txt"),
+            Some("/build/secret.txt".to_string()),
+            "the ordinary case still resolves"
         );
     }
 

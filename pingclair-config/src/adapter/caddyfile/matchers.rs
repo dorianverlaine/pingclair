@@ -91,6 +91,19 @@ pub(super) fn first_argument_is_data(d: &Directive) -> bool {
         // genuinely ambiguous stays on the extension's side. Until the conflict
         // is decided, this is the place that records it.
         "file_server" => !first.contains('*'),
+        // 🗂️ `try_files` accepts no matcher token at all — upstream registers
+        // it as a plain directive rather than a handler directive, so *every*
+        // argument is a candidate ("notice no matcher tokens accepted",
+        // `fileserver/caddyfile.go` at `ff6da121`).
+        //
+        // 🤡 Without this, `try_files /a.html /b.html` — the most ordinary
+        // spelling there is — became a route matched on the path `/a.html`
+        // that tried only `/b.html`, and dragged the rest of the site's
+        // handlers under that matcher with it. It compiled, and it did
+        // something the operator never wrote. `try_files /index.html` alone
+        // failed closed with "expected at least one candidate path", which is
+        // how this surfaced on 2026-08-11.
+        "try_files" => true,
         _ => false,
     }
 }

@@ -138,3 +138,33 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
 - 任何壓縮、retry、middleware 或觀測功能**都不得重新引入全量 body buffering**。
 - 大 body、SSE、range 與 client disconnect cancellation 必須維持 bounded memory。
 - 新增會碰 response body 的功能時，預設要問：**這在 20MB body 下會發生什麼？**
+
+---
+
+## 🔀 兩個 transport 的 parity，兩種走光的方式
+
+兩條路徑各自缺一塊的情形，2026-08-11 一次量到兩個，兩個都在 H3 這邊，
+而且兩個都是**「H1/H2 那一側的多做了一步，H3 這側沒做」**：
+
+- **rewrite 的目標是模板，H3 沒有展開它。** H1/H2 的 `HandlerConfig::Rewrite`
+  會先跑 `resolve_caddy_placeholders`；`quic.rs` 直接把 `replace` 原樣送進
+  `rewrite_request_uri`。於是 HTTP/3 把 URI 改寫成字面上的
+  `{http.matchers.file.relative}`，後面的 file server 對每個請求都 404
+  ——整個單頁應用寫法，無聲，而且只在 HTTP/3 上。
+- **matcher 的第三種答案，H3 只認兩種。** `file` matcher 的 `=404` 候選回傳的是
+  `MatcherVerdict::Error`，H3 的 element matcher helper 回傳 `bool`，
+  於是 `Error` 塌成 no-match：同一份設定 HTTP/2 回 404、HTTP/3 往下一個 handler 走。
+
+  > 🎯 **可操作的規則**：讓一個 helper 回傳 `bool`，就是在宣稱這個問題只有兩種
+  > 答案。哪天多出第三種（這裡是「拋出狀態」），編譯器**不會**去問所有呼叫端
+  > ——`bool` 版本會安靜地繼續編譯。共用型別要共用到**回傳型別**那一層。
+
+兩個都不是「H3 忘了實作某個 handler」——那種缺口很顯眼，會回 501。
+這兩個是**同一個 handler 在兩邊做的事情不一樣**，兩邊都回 200 或 404，
+差別只在內容。所以：
+
+> 🎯 **可操作的規則**：碰 `server.rs` 裡任何一個 `HandlerConfig::` arm 時，
+> 把 `quic.rs` 的同名 arm 並排讀一次。兩邊都存在**不代表**兩邊做一樣的事，
+> 而測試只有在真的送出請求、真的比對 body 的時候才看得出來
+> （`h3_end_to_end.rs` 要走 `pingclair_config::compile`，不要手寫 `HandlerConfig`
+> ——手寫的那份會跳過 adapter，而 adapter 正是差異的來源）。

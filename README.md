@@ -636,20 +636,52 @@ A candidate ending in `/` matches only a directory, and one without matches
 only a regular file — the trailing slash that decides is the one in the
 configuration, not the one the request arrived with.
 
-Four differences from Caddy, all of which **fail closed** with a message
-naming the reason rather than compiling into something subtly different:
-
-| Not supported | Why |
-| --- | --- |
-| Placeholders other than `{path}` | Only `{path}` is expanded; anything else would be looked up as a literal directory name. |
-| A candidate with a query string (`/index.php?{query}`) | The query would be dropped silently. |
-| Glob characters in a candidate | Caddy expands globs; Pingclair matches literally. |
-| The `{ policy … }` block | Only first-match is implemented. |
-| A `..` segment in a candidate | Confinement is lexical, so a candidate that could leave the root is refused outright. |
-
 `try_files {path} {path}/ /index.html` works too: the second candidate matches
 a directory, so a request for `/docs` finds `/docs/` and the file server takes
 it from there.
+
+The directive is shorthand rather than a handler of its own. It expands to a
+`file` matcher plus a rewrite to whatever that matcher picked, which is where
+the rest of its behaviour comes from:
+
+```caddyfile
+example.com {
+    root * /srv
+
+    # 🔍 A glob names the one hashed bundle on disk without knowing its hash.
+    try_files /build/app.*.js
+
+    # 🎲 A selection policy, when "the first one that exists" is not the rule.
+    try_files {path} {path}.html {
+        policy most_recently_modified
+    }
+
+    # 🚨 A candidate that is a status code raises it instead of matching.
+    try_files {path} =404
+
+    file_server
+}
+```
+
+The five policies are `first_exist` (the default), `first_exist_fallback`,
+`smallest_size`, `largest_size`, and `most_recently_modified`. A candidate may
+name any placeholder the request can answer — `{path}`, `{uri}`, `{query}`,
+`{host}`, `{method}`, `{http.request.header.*}`, `{http.vars.*}`, `{re.*}` and
+the rest — and a candidate carrying a query string (`/index.php?{query}`)
+replaces the request's query when it is the one that matched.
+
+Three things still **fail closed**, with a message naming the reason rather
+than compiling into something subtly different:
+
+| Refused | Why |
+| --- | --- |
+| A `..` segment in a candidate | Confinement is lexical, so a candidate that could leave the root is refused outright rather than checked per request. |
+| A placeholder the matcher cannot resolve (`{env.HOME}`, `{scheme}`) | It would be looked up as a filename containing braces — a misconfiguration indistinguishable from a missing file. |
+| An unrecognised `policy`, or any other subdirective | An unknown policy matches nothing, which on a live site reads as "none of these files exist". |
+
+🛡️ Glob metacharacters that arrive *in a placeholder value* are escaped, so a
+request for `/*` cannot turn `try_files /files/{path}` into a directory
+listing. Only the configured text decides whether a candidate globs.
 
 ### Path surgery: `uri`
 

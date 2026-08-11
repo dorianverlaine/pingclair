@@ -643,20 +643,54 @@ Un candidat terminé par `/` ne correspond qu'à un répertoire, et un candidat
 sans `/` qu'à un fichier ordinaire — la barre oblique qui tranche est celle
 écrite dans la configuration, pas celle portée par la requête.
 
-Quatre différences avec Caddy, toutes en **échec fermé**, avec un message qui
-nomme la raison plutôt qu'une compilation au sens subtilement différent :
-
-| Non pris en charge | Pourquoi |
-| --- | --- |
-| Les placeholders autres que `{path}` | Seul `{path}` est développé ; le reste serait cherché comme un nom de répertoire littéral. |
-| Un candidat avec query string (`/index.php?{query}`) | La query serait supprimée sans le dire. |
-| Les caractères glob dans un candidat | Caddy développe les globs ; Pingclair compare littéralement. |
-| Le bloc `{ policy … }` | Seule la première correspondance est implémentée. |
-| Un segment `..` dans un candidat | Le confinement est lexical : un candidat pouvant sortir du root est refusé d'emblée. |
-
 `try_files {path} {path}/ /index.html` fonctionne aussi : le second candidat
 correspond à un répertoire, si bien qu'une requête vers `/docs` trouve `/docs/`
 et que le serveur de fichiers prend le relais.
+
+La directive est un raccourci plutôt qu'un handler à part entière. Elle se
+développe en un matcher `file` suivi d'une réécriture vers le candidat que ce
+matcher a retenu, d'où vient tout le reste de son comportement :
+
+```caddyfile
+example.com {
+    root * /srv
+
+    # 🔍 Un glob nomme l'unique bundle haché sur le disque sans connaître son hachage.
+    try_files /build/app.*.js
+
+    # 🎲 Une politique de sélection, quand « le premier qui existe » n'est pas la règle.
+    try_files {path} {path}.html {
+        policy most_recently_modified
+    }
+
+    # 🚨 Un candidat qui est un code de statut lève ce statut au lieu de correspondre.
+    try_files {path} =404
+
+    file_server
+}
+```
+
+Les cinq politiques sont `first_exist` (par défaut), `first_exist_fallback`,
+`smallest_size`, `largest_size` et `most_recently_modified`. Un candidat peut
+nommer n'importe quel placeholder auquel la requête sait répondre — `{path}`,
+`{uri}`, `{query}`, `{host}`, `{method}`, `{http.request.header.*}`,
+`{http.vars.*}`, `{re.*}` et les autres — et un candidat portant une query
+string (`/index.php?{query}`) remplace celle de la requête lorsque c'est lui
+qui a correspondu.
+
+Trois choses restent en **échec fermé**, avec un message qui nomme la raison
+plutôt qu'une compilation au sens subtilement différent :
+
+| Refusé | Pourquoi |
+| --- | --- |
+| Un segment `..` dans un candidat | Le confinement est lexical : un candidat pouvant sortir du root est refusé d'emblée plutôt que vérifié à chaque requête. |
+| Un placeholder que le matcher ne sait pas résoudre (`{env.HOME}`, `{scheme}`) | Il serait cherché comme un nom de fichier contenant des accolades — une erreur de configuration impossible à distinguer d'un fichier manquant. |
+| Une `policy` inconnue, ou toute autre sous-directive | Une politique inconnue ne correspond à rien, ce qui se lit en production comme « aucun de ces fichiers n'existe ». |
+
+🛡️ Les métacaractères de glob arrivant *dans la valeur d'un placeholder* sont
+échappés : une requête vers `/*` ne peut pas transformer
+`try_files /files/{path}` en listage de répertoire. Seul le texte de la
+configuration décide si un candidat est développé comme un glob.
 
 ### Chirurgie de chemin : `uri`
 

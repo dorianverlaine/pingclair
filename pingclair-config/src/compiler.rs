@@ -16,7 +16,10 @@ use pingclair_core::config::{
     RateLimitKey as CoreRateLimitKey, ReverseProxyConfig, RouteConfig, ServerConfig, TlsConfig,
     default_encodings, default_gzip_types,
 };
-use pingclair_core::server::{MAX_BCRYPT_COST, argon2id_hash_valid, bcrypt_hash_cost};
+use pingclair_core::server::{
+    FILE_MATCHER_PLACEHOLDER_PREFIXES, FILE_MATCHER_PLACEHOLDERS, MAX_BCRYPT_COST,
+    argon2id_hash_valid, bcrypt_hash_cost,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use thiserror::Error;
 
@@ -859,12 +862,20 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
             validate_basic_auth_credentials(&route.handler)?;
             validate_subrequest_handler(&route.handler)?;
             reject_unimplemented_handler(&route.handler)?;
+            if let Some(matcher) = &route.matcher {
+                validate_file_matcher(matcher)?;
+            }
+            validate_file_matchers_under(&route.handler)?;
         }
         for error_route in &server.error_routes {
             for element in &error_route.handlers {
                 validate_basic_auth_credentials(&element.handler)?;
                 validate_subrequest_handler(&element.handler)?;
                 reject_unimplemented_handler(&element.handler)?;
+                if let Some(matcher) = &element.matcher {
+                    validate_file_matcher(matcher)?;
+                }
+                validate_file_matchers_under(&element.handler)?;
             }
         }
 
@@ -1551,21 +1562,104 @@ fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<(
     Ok(())
 }
 
-/// 🛡️ Rejects a `try_files` candidate that could leave the document root or
-/// that names a placeholder nothing expands.
+/// 🛡️ Walks a handler tree and validates every `file` matcher it guards.
 ///
-/// Both rules exist so the request path never has to be re-examined. The
+/// The matcher is what `try_files` compiles to, so the rules that used to sit
+/// on the `try_files` handler have to live here or the Pingclairfile path
+/// would lose them entirely.
+fn validate_file_matchers_under(handler: &HandlerConfig) -> CompileResult<()> {
+    match handler {
+        HandlerConfig::Pipeline { handlers }
+        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::HandlePath { handlers, .. } => {
+            for element in handlers {
+                if let Some(matcher) = &element.matcher {
+                    validate_file_matcher(matcher)?;
+                }
+                validate_file_matchers_under(&element.handler)?;
+            }
+        }
+        HandlerConfig::HandleErrors { errors } => {
+            for handlers in errors.values() {
+                for handler in handlers {
+                    validate_file_matchers_under(handler)?;
+                }
+            }
+        }
+        HandlerConfig::TryFiles {
+            files, fallback, ..
+        } => {
+            for candidate in files {
+                validate_try_files_candidate(candidate)?;
+            }
+            if let Some(fallback) = fallback {
+                validate_file_matchers_under(fallback)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// 🛡️ Validates the candidates of every `file` matcher in one matcher tree.
+fn validate_file_matcher(matcher: &pingclair_core::config::Matcher) -> CompileResult<()> {
+    match matcher {
+        pingclair_core::config::Matcher::File {
+            try_files,
+            try_policy,
+            ..
+        } => {
+            for candidate in try_files {
+                validate_try_files_candidate(candidate)?;
+            }
+            // 🚫 An unrecognised policy matches nothing at all, which reads as
+            // "no candidate exists" — the same symptom as a typo in a filename.
+            if let Some(policy) = try_policy
+                && !matches!(
+                    policy.as_str(),
+                    "" | "first_exist"
+                        | "first_exist_fallback"
+                        | "largest_size"
+                        | "smallest_size"
+                        | "most_recently_modified"
+                )
+            {
+                return Err(CompileError::InvalidRoute {
+                    message: format!(
+                        "file matcher policy `{policy}` is not one of first_exist, \
+                         first_exist_fallback, largest_size, smallest_size, \
+                         most_recently_modified"
+                    ),
+                });
+            }
+            Ok(())
+        }
+        pingclair_core::config::Matcher::And(left, right)
+        | pingclair_core::config::Matcher::Or(left, right) => {
+            validate_file_matcher(left)?;
+            validate_file_matcher(right)
+        }
+        pingclair_core::config::Matcher::Not(inner) => validate_file_matcher(inner),
+        _ => Ok(()),
+    }
+}
+
+/// 🛡️ Rejects a candidate that could leave the document root or that names a
+/// placeholder nothing expands.
+///
+/// The `..` rule exists so the request path never has to be re-examined. The
 /// candidates come from configuration and the request path is normalized long
-/// before a handler sees it, so if no candidate can spell `..` then no request
+/// before a matcher sees it, so if no candidate can spell `..` then no request
 /// can produce one either — confinement stays lexical and costs nothing per
-/// request, which is the same bargain the static file server makes.
+/// request, which is the same bargain the static file server makes. The
+/// matcher refuses `..` again at request time; this is the half that tells the
+/// operator, rather than silently never matching.
 ///
-/// 🚫 The placeholder rule is the fail-closed half. `{path}` is the only name
-/// the handler substitutes, so a candidate containing `{uri}` would be looked
-/// up as a directory literally called `{uri}`, find nothing, and fall through —
-/// a misconfiguration that behaves exactly like a missing file. The core type
-/// documented `{uri}` support that never existed, which is how a wrong comment
-/// becomes a wrong configuration.
+/// 🚫 The placeholder rule is the fail-closed half. A name the matcher cannot
+/// resolve would be looked up as a file whose name contains braces, find
+/// nothing, and fall through — a misconfiguration that behaves exactly like a
+/// missing file. The set it checks against is the matcher's own, so the two
+/// cannot drift: see `FILE_MATCHER_PLACEHOLDERS`.
 fn validate_try_files_candidate(candidate: &str) -> CompileResult<()> {
     if candidate.split('/').any(|segment| segment == "..") {
         return Err(CompileError::InvalidRoute {
@@ -1575,29 +1669,31 @@ fn validate_try_files_candidate(candidate: &str) -> CompileResult<()> {
             ),
         });
     }
-    // 🚫 Upstream expands glob patterns in a candidate; this crate would take
-    // the metacharacter literally and look for a file with a `*` in its name.
-    // Both "compile" — one of them just never matches, and the operator has
-    // no way to tell which they got.
-    if let Some(glob) = candidate.chars().find(|c| matches!(c, '*' | '[' | ']')) {
-        return Err(CompileError::InvalidRoute {
-            message: format!(
-                "try_files candidate `{candidate}` contains the glob character `{glob}`, and \
-                 Pingclair matches candidate paths literally"
-            ),
-        });
-    }
-    let remainder = candidate.replace("{path}", "");
-    if let Some(start) = remainder.find('{') {
-        let placeholder = remainder[start..]
-            .split_once('}')
-            .map_or(&remainder[start..], |(name, _)| name);
-        return Err(CompileError::InvalidRoute {
-            message: format!(
-                "try_files candidate `{candidate}` uses `{placeholder}}}`, and `{{path}}` is the \
-                 only placeholder it expands"
-            ),
-        });
+    let mut rest = candidate;
+    while let Some(start) = rest.find('{') {
+        let Some(end) = rest[start..].find('}') else {
+            return Err(CompileError::InvalidRoute {
+                message: format!(
+                    "try_files candidate `{candidate}` has an unclosed `{{`, so part of it would \
+                     be taken as a literal filename"
+                ),
+            });
+        };
+        let name = &rest[start + 1..start + end];
+        let known = FILE_MATCHER_PLACEHOLDERS.contains(&name)
+            || FILE_MATCHER_PLACEHOLDER_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix));
+        if !known {
+            return Err(CompileError::InvalidRoute {
+                message: format!(
+                    "try_files candidate `{candidate}` uses `{{{name}}}`, which a file matcher \
+                     cannot resolve; it understands {}",
+                    FILE_MATCHER_PLACEHOLDERS.join(", ")
+                ),
+            });
+        }
+        rest = &rest[start + end + 1..];
     }
     Ok(())
 }
@@ -2386,14 +2482,17 @@ fn compile_handler(
             })
         }
 
-        // 🗂️ The site root is captured here rather than looked up per request:
-        // it is known at configuration time and the handler needs it on every
-        // candidate of every request.
-        Handler::TryFiles(candidates) => Ok(HandlerConfig::TryFiles {
-            files: candidates.clone(),
-            root: root.map(str::to_string),
-            fallback: None,
-        }),
+        // 🗂️ `try_files` is a mutually exclusive group of file-matcher rewrites,
+        // so it compiles to the same shape a `handle` block does. The site root
+        // reaches the matchers through `apply_site_root_to_matcher`, which is
+        // where every other `file` matcher gets it too.
+        Handler::TryFiles(elements) => {
+            let handlers = elements
+                .iter()
+                .map(|element| compile_handler_element(element, matchers, root))
+                .collect::<CompileResult<Vec<_>>>()?;
+            Ok(HandlerConfig::Handle { handlers })
+        }
 
         Handler::Cors(cors) => Ok(HandlerConfig::Cors {
             allowed_origins: cors.allowed_origins.clone(),

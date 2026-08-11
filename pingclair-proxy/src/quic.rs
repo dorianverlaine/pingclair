@@ -65,7 +65,9 @@ use crate::http_policy::{
 };
 use crate::server::{PingclairProxy, ProxyState, error_reason, resolve_caddy_placeholders};
 use crate::server::{is_streaming_content_type, wants_immediate_flush};
-use pingclair_core::server::{MatcherPrecompile, MatcherRequest, evaluate};
+use pingclair_core::server::{
+    MatcherPrecompile, MatcherRequest, MatcherVerdict, evaluate, evaluate_verdict,
+};
 
 /// Maximum UDP payload we ask quiche to send (standard Ethernet MTU-safe).
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -1731,15 +1733,25 @@ struct H3ImmediateResponse {
 }
 
 /// 🎯 Evaluates one H3 pipeline element's precompiled matcher.
-fn h3_element_matcher_matches(
+///
+/// 🚨 Returns the *verdict*, not a boolean, because a `file` matcher can raise
+/// a status rather than answer yes or no: `try_files {path} =404` says "serve
+/// the request path, and 404 if it is not there." This used to collapse to
+/// no-match here while H1/H2 raised the status, so the same site answered 404
+/// over HTTP/2 and fell through to the next handler over HTTP/3 — a difference
+/// no operator wrote and none could see from the configuration. It was only
+/// reachable through a `php_fastcgi` expansion until 2026-08-11, when
+/// `try_files` started expanding into this matcher and made it a documented
+/// spelling.
+fn h3_element_matcher_verdict(
     element_precompile: Option<&MatcherPrecompile>,
     request_header: &RequestHeader,
     effective_uri: &str,
     verified_client_ip: &str,
     request_vars: &mut crate::http_policy::RequestVars,
-) -> bool {
+) -> MatcherVerdict {
     let Some(compiled) = element_precompile.and_then(|node| node.element_matcher.as_ref()) else {
-        return true;
+        return MatcherVerdict::Match;
     };
     let host = request_header
         .headers
@@ -1756,7 +1768,45 @@ fn h3_element_matcher_matches(
         protocol: "https",
         vars: Some(request_vars.values_mut()),
     };
-    evaluate(compiled, &mut request)
+    evaluate_verdict(compiled, &mut request)
+}
+
+/// 🗂️ Runs the `file` matcher for the JSON-only `try_files` handler.
+///
+/// The H1/H2 twin is `ProxyService::resolve_try_files`. Both call the same
+/// matcher with the same arguments, which is the only reason the two
+/// transports cannot answer differently — the resolver they used to share was
+/// itself the second implementation of a lookup the matcher already did.
+fn h3_resolve_try_files(
+    files: &[String],
+    root: Option<&str>,
+    request_header: &RequestHeader,
+    effective_uri: &str,
+    verified_client_ip: &str,
+    request_vars: &mut crate::http_policy::RequestVars,
+) -> Option<String> {
+    let host = request_header
+        .headers
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .map(authority_host)
+        .unwrap_or("");
+    let mut request = MatcherRequest {
+        path: effective_uri,
+        method: request_header.method.as_str(),
+        headers: &request_header.headers,
+        host,
+        remote_ip: verified_client_ip,
+        protocol: "https",
+        vars: Some(request_vars.values_mut()),
+    };
+    match pingclair_core::server::evaluate_file_matcher(&mut request, files, root, None, &[]) {
+        MatcherVerdict::Match => request_vars
+            .values_mut()
+            .get("http.matchers.file.relative")
+            .cloned(),
+        MatcherVerdict::NoMatch | MatcherVerdict::Error(_) => None,
+    }
 }
 
 /// 🔁 Executes one inline proxy while leaving QUIC framing to the caller.
@@ -1785,6 +1835,47 @@ async fn plan_h3_subrequest(
     }
 }
 
+/// 🚨 Raises a status a `file` matcher asked for, through the error routes.
+///
+/// Going back through `HandlerConfig::Error` rather than answering here is the
+/// point: a raised status has to meet `handle_errors` and the site's error
+/// pages, which is what H1/H2 does when it sets `ctx.error_status`. Answering
+/// inline would give the two transports different bodies for the same status.
+#[allow(clippy::too_many_arguments)]
+async fn h3_raise_status(
+    status: u16,
+    state: &ProxyState,
+    connector: Option<&pingora_core::connectors::http::Connector>,
+    route_index: usize,
+    request_header: &mut RequestHeader,
+    effective_uri: &mut String,
+    response_policy: &mut ResponseHeaderPolicy,
+    verified_client_ip: &str,
+    handling_error: bool,
+    request_vars: &mut crate::http_policy::RequestVars,
+    response_handlers: &mut Option<Vec<pingclair_core::config::ResponseHandlerConfig>>,
+) -> Result<H3Plan, HandlerError> {
+    let raised = HandlerConfig::Error {
+        status,
+        message: None,
+    };
+    plan_h3_handler_with_connector(
+        &raised,
+        state,
+        connector,
+        route_index,
+        request_header,
+        effective_uri,
+        response_policy,
+        verified_client_ip,
+        None,
+        handling_error,
+        request_vars,
+        response_handlers,
+    )
+    .await
+}
+
 /// 🧩 Executes non-terminal middleware before selecting an H3 terminal handler.
 #[async_recursion::async_recursion]
 #[allow(clippy::too_many_arguments)]
@@ -1810,14 +1901,31 @@ async fn plan_h3_handler_with_connector(
             for (index, element) in handlers.iter().enumerate() {
                 let handler = &element.handler;
                 let element_precompile = precompile.and_then(|node| node.children.get(index));
-                if !h3_element_matcher_matches(
+                match h3_element_matcher_verdict(
                     element_precompile,
                     request_header,
                     effective_uri,
                     verified_client_ip,
                     request_vars,
                 ) {
-                    continue;
+                    MatcherVerdict::Match => {}
+                    MatcherVerdict::NoMatch => continue,
+                    MatcherVerdict::Error(status) => {
+                        return h3_raise_status(
+                            status,
+                            state,
+                            connector,
+                            route_index,
+                            request_header,
+                            effective_uri,
+                            response_policy,
+                            verified_client_ip,
+                            handling_error,
+                            request_vars,
+                            response_handlers,
+                        )
+                        .await;
+                    }
                 }
                 if has_proxy && matches!(handler, HandlerConfig::FileServer { .. }) {
                     continue;
@@ -1850,14 +1958,31 @@ async fn plan_h3_handler_with_connector(
                 .any(|element| crate::server::contains_reverse_proxy(&element.handler));
             for (index, element) in handlers.iter().enumerate() {
                 let element_precompile = precompile.and_then(|node| node.children.get(index));
-                if !h3_element_matcher_matches(
+                match h3_element_matcher_verdict(
                     element_precompile,
                     request_header,
                     effective_uri,
                     verified_client_ip,
                     request_vars,
                 ) {
-                    continue;
+                    MatcherVerdict::Match => {}
+                    MatcherVerdict::NoMatch => continue,
+                    MatcherVerdict::Error(status) => {
+                        return h3_raise_status(
+                            status,
+                            state,
+                            connector,
+                            route_index,
+                            request_header,
+                            effective_uri,
+                            response_policy,
+                            verified_client_ip,
+                            handling_error,
+                            request_vars,
+                            response_handlers,
+                        )
+                        .await;
+                    }
                 }
                 if has_proxy && matches!(&element.handler, HandlerConfig::FileServer { .. }) {
                     continue;
@@ -1899,14 +2024,31 @@ async fn plan_h3_handler_with_connector(
                 .any(|element| crate::server::contains_reverse_proxy(&element.handler));
             for (index, element) in handlers.iter().enumerate() {
                 let element_precompile = precompile.and_then(|node| node.children.get(index));
-                if !h3_element_matcher_matches(
+                match h3_element_matcher_verdict(
                     element_precompile,
                     request_header,
                     effective_uri,
                     verified_client_ip,
                     request_vars,
                 ) {
-                    continue;
+                    MatcherVerdict::Match => {}
+                    MatcherVerdict::NoMatch => continue,
+                    MatcherVerdict::Error(status) => {
+                        return h3_raise_status(
+                            status,
+                            state,
+                            connector,
+                            route_index,
+                            request_header,
+                            effective_uri,
+                            response_policy,
+                            verified_client_ip,
+                            handling_error,
+                            request_vars,
+                            response_handlers,
+                        )
+                        .await;
+                    }
                 }
                 if has_proxy && matches!(&element.handler, HandlerConfig::FileServer { .. }) {
                     continue;
@@ -1987,13 +2129,37 @@ async fn plan_h3_handler_with_connector(
             regex,
             regex_replace,
         } => {
+            // 🧭 A rewrite target is a template, and it has to be resolved on
+            // this transport too. `try_files` and `php_fastcgi` both rewrite to
+            // `{http.matchers.file.relative}`, and operators write `{host}` and
+            // friends; H1/H2 has resolved these since the handler was written.
+            //
+            // 🤡 Until 2026-08-11 this arm passed the template through
+            // verbatim, so HTTP/3 rewrote the URI to the literal text
+            // `{http.matchers.file.relative}` and the file server behind it
+            // answered 404 for every request — the whole single-page
+            // application pattern, silent, and only over HTTP/3.
+            let verified = replace
+                .as_deref()
+                .is_some_and(|value| value.contains('{'))
+                .then_some(verified_client_ip);
+            let resolved_replace = replace.as_deref().map(|template| {
+                resolve_caddy_placeholders(
+                    template,
+                    request_header,
+                    verified,
+                    "https",
+                    request_vars,
+                )
+                .into_owned()
+            });
             *effective_uri = state
                 .rewrite_request_uri(
                     route_index,
                     effective_uri,
                     strip_prefix.as_deref(),
                     strip_suffix.as_deref(),
-                    replace.as_deref(),
+                    resolved_replace.as_deref(),
                     regex.as_deref(),
                     regex_replace.as_deref(),
                 )
@@ -2207,7 +2373,14 @@ async fn plan_h3_handler_with_connector(
             files,
             root,
             fallback,
-        } => match crate::http_policy::resolve_try_files(files, root.as_deref(), effective_uri) {
+        } => match h3_resolve_try_files(
+            files,
+            root.as_deref(),
+            request_header,
+            effective_uri,
+            verified_client_ip,
+            request_vars,
+        ) {
             Some(target) => {
                 *effective_uri =
                     rewrite_uri(effective_uri, None, None, Some(target.as_str()), None, None);

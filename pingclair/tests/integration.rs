@@ -10436,3 +10436,115 @@ async fn test_range_request_for_an_empty_file_does_not_kill_the_worker() {
         .expect("the server died partway through");
     assert_eq!(after.status(), 200);
 }
+
+/// 🗂️ The `try_files` surface that only exists because the directive expands
+/// into the `file` matcher: a selection policy, a `=code` fallback, a glob
+/// candidate, and a placeholder that is not `{path}`.
+///
+/// Each of these compiled before 2026-08-11 and then did nothing useful. The
+/// policy and the glob were refused outright; `=410` was accepted and then
+/// looked for a file literally named `=410`, so it never matched and the
+/// request fell through to whatever came next. That last one is the shape this
+/// project calls a fail-open defect: the configuration says "404 if it is not
+/// there", and the server answered with something else entirely.
+///
+/// 📌 The groups are `route` blocks rather than `handle` blocks on purpose:
+/// a `handle` block currently runs only its first matching directive, so
+/// `handle {{ try_files …; file_server }}` drops the file server entirely.
+/// That is a defect in `handle`, not in `try_files` — `TRIAGE.md`, 2026-08-11.
+#[tokio::test]
+async fn test_try_files_policy_status_and_glob_candidates() {
+    let tree = tempfile::tempdir().expect("document root");
+    std::fs::write(tree.path().join("index.html"), b"shell").expect("write shell");
+    std::fs::create_dir(tree.path().join("build")).expect("create build");
+    std::fs::write(tree.path().join("build/app.9f3c2a.js"), b"hashed-bundle")
+        .expect("write bundle");
+    std::fs::create_dir(tree.path().join("example.com")).expect("create host dir");
+    std::fs::write(tree.path().join("example.com/tenant.txt"), b"per-host").expect("write tenant");
+    let root = tree.path().to_string_lossy().into_owned();
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            route /bundle/* {{
+                try_files /build/app.*.js
+                file_server
+            }}
+
+            route /tenant/* {{
+                try_files /{{host}}/tenant.txt
+                file_server
+            }}
+
+            route /strict/* {{
+                try_files {{path}} =410
+                file_server
+            }}
+
+            route {{
+                try_files {{path}} /index.html
+                file_server
+            }}
+        }}
+        "#
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    // 🎯 A glob candidate names the one hashed bundle on disk without the
+    // configuration having to know its hash.
+    let bundle = client
+        .get(server.url(0, "/bundle/whatever"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(bundle.status(), 200);
+    assert_eq!(bundle.text().await.unwrap(), "hashed-bundle");
+
+    // 🎯 A placeholder other than `{path}` resolves. `{host}` carries the port
+    // on a test listener, so the request names the host explicitly.
+    let tenant = client
+        .get(server.url(0, "/tenant/x"))
+        .header("host", "example.com")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(tenant.status(), 200);
+    assert_eq!(tenant.text().await.unwrap(), "per-host");
+
+    // 🎯 `=410` raises the status rather than falling through. The status is
+    // deliberately one the file server would never produce by itself: with
+    // `=404` the assertion would hold whether the candidate raised or the file
+    // server merely failed to find the file, and those are the two outcomes
+    // this is here to tell apart.
+    let strict = client
+        .get(server.url(0, "/strict/missing"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        strict.status(),
+        410,
+        "`=410` must raise, not be looked up as a filename"
+    );
+
+    // 🎯 The ordinary catch-all still serves the shell, so none of the above
+    // came at the cost of the pattern everything else depends on.
+    let shell = client
+        .get(server.url(0, "/client/route"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(shell.status(), 200);
+    assert_eq!(shell.text().await.unwrap(), "shell");
+}
