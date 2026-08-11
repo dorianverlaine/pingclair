@@ -47,6 +47,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
+use std::borrow::Cow;
 use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc, watch};
@@ -124,7 +125,7 @@ impl StreamPacer {
 
 /// 📥 Drains one local H3 request through bounded streaming policy.
 async fn drain_local_h3_body(
-    body_rx: &mut mpsc::Receiver<Vec<u8>>,
+    body_rx: &mut mpsc::Receiver<Bytes>,
     body_notify: &Arc<Notify>,
     body_limit: u64,
     body_timeout_ms: Option<u64>,
@@ -523,7 +524,7 @@ enum RespMsg {
     /// 📋 Carries response headers and whether they end the stream.
     Headers(Vec<quiche::h3::Header>, bool),
     /// 🌊 Carries one body chunk and whether it ends the stream.
-    Body(Vec<u8>, bool),
+    Body(Bytes, bool),
     /// 🧾 Carries response trailers that end the stream.
     Trailers(Vec<quiche::h3::Header>),
     /// 🏁 Marks that the handler task finished and dropped its request-body
@@ -650,7 +651,7 @@ struct StreamState {
     /// through a `VecDeque<u8>` ring: the handler's `Vec<u8>` moves in, and
     /// `flush_stream` hands the front slice to quiche. `pending_body_head`
     /// tracks partial progress through the front chunk.
-    pending_body: VecDeque<Vec<u8>>,
+    pending_body: VecDeque<Bytes>,
     /// 🌊 Total unconsumed bytes across all queued chunks.
     pending_body_bytes: usize,
     /// 🌊 Bytes already handed to quiche from the front chunk.
@@ -662,7 +663,7 @@ struct StreamState {
     /// 🏁 Records that the response FIN reached the QUIC stream.
     fin_sent: bool,
     /// 📥 Feeds bounded request-body chunks to the handler task.
-    req_body_tx: Option<mpsc::Sender<Vec<u8>>>,
+    req_body_tx: Option<mpsc::Sender<Bytes>>,
     /// 🧹 Records that quiche reported the request stream as finished.
     req_stream_finished: bool,
     /// ⏳ Records that request-body draining is waiting for channel capacity.
@@ -947,7 +948,7 @@ fn reject_request_trailers(stream: &mut StreamState) -> TrailerRejection {
         ],
         false,
     ));
-    stream.pending_body = VecDeque::from([body.to_vec()]);
+    stream.pending_body = VecDeque::from([Bytes::copy_from_slice(body)]);
     stream.pending_body_bytes = body.len();
     stream.body_fin = true;
     stream.fin_sent = false;
@@ -1160,7 +1161,7 @@ impl QuicServer {
 /// capacity once the receiver is gone — so the drain loop clears the
 /// channel and discards the remaining bytes to keep QUIC flow control
 /// moving. Returns true when the channel was cleared.
-fn drop_closed_handler_channel(tx: &mut Option<mpsc::Sender<Vec<u8>>>) -> bool {
+fn drop_closed_handler_channel(tx: &mut Option<mpsc::Sender<Bytes>>) -> bool {
     if tx.as_ref().is_some_and(|sender| sender.is_closed()) {
         *tx = None;
         true
@@ -1309,7 +1310,7 @@ impl H3App {
             req.path = normalized;
         }
 
-        let (req_body_tx, req_body_rx) = mpsc::channel::<Vec<u8>>(REQ_BODY_CHANNEL_CAPACITY);
+        let (req_body_tx, req_body_rx) = mpsc::channel::<Bytes>(REQ_BODY_CHANNEL_CAPACITY);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         self.streams.insert(
             stream_id,
@@ -1378,7 +1379,7 @@ impl H3App {
             stream_id,
             StreamState {
                 pending_headers: Some((headers, false)),
-                pending_body: VecDeque::from([body.as_bytes().to_vec()]),
+                pending_body: VecDeque::from([Bytes::copy_from_slice(body.as_bytes())]),
                 pending_body_bytes: body.len(),
                 body_fin: true,
                 ..Default::default()
@@ -1427,7 +1428,7 @@ impl H3App {
                         // Capacity was checked above and this task is the
                         // only sender, so try_send can only fail if the
                         // handler is gone.
-                        if tx.try_send(tmp[..n].to_vec()).is_err() {
+                        if tx.try_send(Bytes::copy_from_slice(&tmp[..n])).is_err() {
                             ss.req_body_tx = None;
                         }
                     }
@@ -1619,7 +1620,7 @@ impl H3App {
         }
 
         while ss.pending_body_bytes > 0 {
-            let chunk_len = ss.pending_body.front().map_or(0, Vec::len);
+            let chunk_len = ss.pending_body.front().map_or(0, Bytes::len);
             let head = ss.pending_body_head;
             let sent = {
                 let Some(chunk) = ss.pending_body.front() else {
@@ -2484,7 +2485,7 @@ async fn handle_request(
     req: H3Request,
     remote_addr: SocketAddr,
     stream_id: u64,
-    mut body_rx: mpsc::Receiver<Vec<u8>>,
+    mut body_rx: mpsc::Receiver<Bytes>,
     resp_tx: RespSender,
     body_notify: Arc<Notify>,
     mut cancel_rx: watch::Receiver<bool>,
@@ -2654,7 +2655,7 @@ async fn handle_request_inner(
     peer_ip: IpAddr,
     peer_port: u16,
     stream_id: u64,
-    body_rx: &mut mpsc::Receiver<Vec<u8>>,
+    body_rx: &mut mpsc::Receiver<Bytes>,
     resp_tx: &ResponseSink,
     body_notify: &Arc<Notify>,
     request_id: &str,
@@ -2914,7 +2915,7 @@ async fn handle_request_inner(
                 response_handlers.as_deref(),
                 status,
                 hdrs,
-                H3LocalBody::Bytes(body.into_bytes()),
+                H3LocalBody::Bytes(Bytes::from(body)),
                 response_policy,
                 request_id,
                 request_deadline,
@@ -2939,7 +2940,7 @@ async fn handle_request_inner(
                 response_handlers.as_deref(),
                 code,
                 hdrs,
-                H3LocalBody::Bytes(Vec::new()),
+                H3LocalBody::Bytes(Bytes::new()),
                 response_policy,
                 request_id,
                 request_deadline,
@@ -2978,7 +2979,7 @@ async fn handle_request_inner(
                 response_handlers.as_deref(),
                 200,
                 hdrs,
-                H3LocalBody::Bytes(body.into_bytes()),
+                H3LocalBody::Bytes(Bytes::from(body)),
                 response_policy,
                 request_id,
                 request_deadline,
@@ -3025,7 +3026,7 @@ async fn handle_request_inner(
                         response_handlers.as_deref(),
                         308,
                         hdrs,
-                        H3LocalBody::Bytes(Vec::new()),
+                        H3LocalBody::Bytes(Bytes::new()),
                         response_policy,
                         request_id,
                         request_deadline,
@@ -3095,7 +3096,7 @@ async fn handle_request_inner(
                         response_handlers.as_deref(),
                         file.status,
                         hdrs,
-                        H3LocalBody::Bytes(file.content),
+                        H3LocalBody::Bytes(Bytes::from(file.content)),
                         response_policy,
                         request_id,
                         request_deadline,
@@ -3115,7 +3116,7 @@ async fn handle_request_inner(
                         response_handlers.as_deref(),
                         404,
                         http::HeaderMap::new(),
-                        H3LocalBody::Bytes(Vec::new()),
+                        H3LocalBody::Bytes(Bytes::new()),
                         response_policy,
                         request_id,
                         request_deadline,
@@ -3340,7 +3341,7 @@ async fn stream_h3_subrequest_response(
                     None,
                     replacement.status,
                     headers,
-                    H3LocalBody::Bytes(replacement.body),
+                    H3LocalBody::Bytes(Bytes::from(replacement.body)),
                     response_policy,
                     request_id,
                     request_deadline,
@@ -3381,9 +3382,9 @@ async fn stream_h3_subrequest_response(
         status.to_string().as_bytes(),
     )];
     for (name, value) in &upstream_headers {
-        let lower = name.as_str().to_ascii_lowercase();
+        let lower = name.as_str();
         if matches!(
-            lower.as_str(),
+            lower,
             "connection"
                 | "proxy-connection"
                 | "keep-alive"
@@ -3410,7 +3411,7 @@ async fn stream_h3_subrequest_response(
         match response.session.read_response_body().await {
             Ok(Some(bytes)) => {
                 pace_h3_body(download_pacer, request_deadline, bytes.len()).await?;
-                send_body(resp_tx, stream_id, bytes.to_vec(), false).await;
+                send_body(resp_tx, stream_id, bytes, false).await;
             }
             Ok(None) => break,
             Err(error) => {
@@ -3427,9 +3428,9 @@ async fn stream_h3_subrequest_response(
             Ok(Some(values)) => {
                 let mut converted = Vec::with_capacity(values.len());
                 for (name, value) in &values {
-                    let lower = name.as_str().to_ascii_lowercase();
+                    let lower = name.as_str();
                     if !matches!(
-                        lower.as_str(),
+                        lower,
                         "connection"
                             | "proxy-connection"
                             | "keep-alive"
@@ -3453,7 +3454,7 @@ async fn stream_h3_subrequest_response(
     if let Some(trailers) = trailers.filter(|trailers| !trailers.is_empty()) {
         send_trailers(resp_tx, stream_id, trailers).await;
     } else {
-        send_body(resp_tx, stream_id, Vec::new(), true).await;
+        send_body(resp_tx, stream_id, Bytes::new(), true).await;
     }
     if clean {
         connector
@@ -3481,7 +3482,7 @@ async fn fastcgi_upstream(
     response_policy: &ResponseHeaderPolicy,
     body_limit: u64,
     stream_id: u64,
-    body_rx: &mut mpsc::Receiver<Vec<u8>>,
+    body_rx: &mut mpsc::Receiver<Bytes>,
     resp_tx: &ResponseSink,
     body_notify: &Arc<Notify>,
     request_started: Instant,
@@ -3775,7 +3776,7 @@ async fn fastcgi_upstream(
                 None,
                 replacement.status,
                 local_headers,
-                H3LocalBody::Bytes(replacement.body),
+                H3LocalBody::Bytes(Bytes::from(replacement.body)),
                 &effective_response_policy,
                 request_id,
                 request_deadline,
@@ -3815,9 +3816,9 @@ async fn fastcgi_upstream(
         status.to_string().as_bytes(),
     )];
     for (name, value) in &headers {
-        let lower = name.as_str().to_ascii_lowercase();
+        let lower = name.as_str();
         if matches!(
-            lower.as_str(),
+            lower,
             "connection"
                 | "proxy-connection"
                 | "keep-alive"
@@ -3843,7 +3844,7 @@ async fn fastcgi_upstream(
         match exchange.read_body_chunk().await {
             Ok(Some(bytes)) => {
                 pace_h3_body(&mut download_pacer, request_deadline, bytes.len()).await?;
-                send_body(resp_tx, stream_id, bytes.to_vec(), false).await;
+                send_body(resp_tx, stream_id, bytes, false).await;
             }
             Ok(None) => break,
             Err(error) => {
@@ -3852,7 +3853,7 @@ async fn fastcgi_upstream(
             }
         }
     }
-    send_body(resp_tx, stream_id, Vec::new(), true).await;
+    send_body(resp_tx, stream_id, Bytes::new(), true).await;
     let stderr = exchange.take_stderr();
     if !stderr.is_empty() {
         let text = String::from_utf8_lossy(&stderr);
@@ -3882,7 +3883,7 @@ async fn reverse_proxy_upstream(
     response_policy: &ResponseHeaderPolicy,
     body_limit: u64,
     stream_id: u64,
-    body_rx: &mut mpsc::Receiver<Vec<u8>>,
+    body_rx: &mut mpsc::Receiver<Bytes>,
     resp_tx: &ResponseSink,
     body_notify: &Arc<Notify>,
     request_started: Instant,
@@ -4112,7 +4113,7 @@ async fn reverse_proxy_upstream(
         // 🧹 Forward the mutable policy header map so an authorizing
         // subrequest's identity fields reach the backend on H3 too.
         for (key, value) in &client_header.headers {
-            let name = key.as_str().to_ascii_lowercase();
+            let name = key.as_str();
             if name == "te" {
                 if upstream_is_h2
                     && value
@@ -4126,7 +4127,7 @@ async fn reverse_proxy_upstream(
                 continue;
             }
             if matches!(
-                name.as_str(),
+                name,
                 "host"
                     | "connection"
                     | "keep-alive"
@@ -4252,7 +4253,7 @@ async fn reverse_proxy_upstream(
                 }
                 tokio::time::sleep(delay).await;
             }
-            if let Err(error) = session.write_request_body(Bytes::from(chunk), false).await {
+            if let Err(error) = session.write_request_body(chunk, false).await {
                 tracing::error!("❌ H3 upstream write body failed: {}", error);
                 session.shutdown().await;
                 return Err((502, "Upstream Write Failed"));
@@ -4543,9 +4544,9 @@ async fn reverse_proxy_upstream(
                 effective_status.to_string().as_bytes(),
             ));
             for (name, value) in resp.headers.iter() {
-                let lower = name.as_str().to_ascii_lowercase();
+                let lower = name.as_str();
                 if matches!(
-                    lower.as_str(),
+                    lower,
                     "connection"
                         | "keep-alive"
                         | "transfer-encoding"
@@ -4554,7 +4555,7 @@ async fn reverse_proxy_upstream(
                         | "upgrade"
                 ) || intercept_remove
                     .iter()
-                    .any(|removed| removed.eq_ignore_ascii_case(&lower))
+                    .any(|removed| removed.eq_ignore_ascii_case(lower))
                 {
                     continue;
                 }
@@ -4621,11 +4622,11 @@ async fn reverse_proxy_upstream(
                 }
                 tokio::time::sleep(delay).await;
             }
-            send_body(resp_tx, stream_id, chunk, last).await;
+            send_body(resp_tx, stream_id, Bytes::from(chunk), last).await;
             fin_sent = last;
         }
         if !fin_sent {
-            send_body(resp_tx, stream_id, Vec::new(), true).await;
+            send_body(resp_tx, stream_id, Bytes::new(), true).await;
         }
         session.shutdown().await;
         return Ok(());
@@ -4643,7 +4644,13 @@ async fn reverse_proxy_upstream(
                     // bounded by the replacement, not the upstream body.
                     if !replacement_sent {
                         replacement_sent = true;
-                        send_body(resp_tx, stream_id, replacement.body.clone(), false).await;
+                        send_body(
+                            resp_tx,
+                            stream_id,
+                            Bytes::from(replacement.body.clone()),
+                            false,
+                        )
+                        .await;
                     }
                     continue;
                 }
@@ -4658,13 +4665,19 @@ async fn reverse_proxy_upstream(
                     }
                     tokio::time::sleep(delay).await;
                 }
-                send_body(resp_tx, stream_id, bytes.to_vec(), false).await;
+                send_body(resp_tx, stream_id, bytes, false).await;
             }
             Ok(None) => {
                 if let Some(replacement) = &intercept_replacement
                     && !replacement_sent
                 {
-                    send_body(resp_tx, stream_id, replacement.body.clone(), false).await;
+                    send_body(
+                        resp_tx,
+                        stream_id,
+                        Bytes::from(replacement.body.clone()),
+                        false,
+                    )
+                    .await;
                 }
                 break;
             }
@@ -4685,9 +4698,9 @@ async fn reverse_proxy_upstream(
             Ok(Some(headers)) => {
                 let mut trailers = Vec::with_capacity(headers.len());
                 for (name, value) in headers.iter() {
-                    let lower = name.as_str().to_ascii_lowercase();
+                    let lower = name.as_str();
                     if matches!(
-                        lower.as_str(),
+                        lower,
                         "connection"
                             | "keep-alive"
                             | "transfer-encoding"
@@ -4712,7 +4725,7 @@ async fn reverse_proxy_upstream(
     if let Some(trailers) = response_trailers.filter(|trailers| !trailers.is_empty()) {
         send_trailers(resp_tx, stream_id, trailers).await;
     } else {
-        send_body(resp_tx, stream_id, Vec::new(), true).await;
+        send_body(resp_tx, stream_id, Bytes::new(), true).await;
     }
 
     if clean {
@@ -4729,7 +4742,7 @@ async fn reverse_proxy_upstream(
 
 /// 🌊 A local HTTP/3 body that stays bounded while response policy runs.
 enum H3LocalBody {
-    Bytes(Vec<u8>),
+    Bytes(Bytes),
     File(pingclair_static::StreamingFile),
 }
 
@@ -4838,7 +4851,7 @@ async fn send_h3_local_response(
                         headers.insert(name, value);
                     }
                 }
-                body = H3LocalBody::Bytes(replacement.body);
+                body = H3LocalBody::Bytes(Bytes::from(replacement.body));
             } else {
                 if let Some(replacement_status) = outcome.passthrough_status {
                     status = replacement_status;
@@ -4880,9 +4893,9 @@ async fn send_h3_local_response(
         status.to_string().as_bytes(),
     )];
     for (name, value) in &headers {
-        let lower = name.as_str().to_ascii_lowercase();
+        let lower = name.as_str();
         if matches!(
-            lower.as_str(),
+            lower,
             "connection" | "keep-alive" | "transfer-encoding" | "te" | "trailer" | "upgrade"
         ) {
             continue;
@@ -4907,11 +4920,11 @@ async fn send_h3_local_response(
             {
                 let last = stream.is_complete();
                 pace_h3_body(download_pacer, request_deadline, chunk.len()).await?;
-                send_body(resp_tx, stream_id, chunk, last).await;
+                send_body(resp_tx, stream_id, Bytes::from(chunk), last).await;
                 fin_sent = last;
             }
             if !fin_sent && content_length > 0 {
-                send_body(resp_tx, stream_id, Vec::new(), true).await;
+                send_body(resp_tx, stream_id, Bytes::new(), true).await;
             }
         }
     }
@@ -4919,8 +4932,21 @@ async fn send_h3_local_response(
 }
 
 /// 🧩 Replaces one H3 response header while preserving unrelated values.
+///
+/// 🍃 The lowercase copy is only made when the name is not already lowercase,
+/// which it almost never is: every call site inside this file passes a literal
+/// (`server`, `x-request-id`, the security headers), and a `HeaderName` is
+/// stored lowercase to begin with. `apply_h3_response_policy` calls this
+/// roughly ten times per response, so the unconditional `to_ascii_lowercase`
+/// this replaces was ten allocations per response, each byte-identical to its
+/// input. HTTP/3 still requires the lowercase form, so the conversion stays —
+/// it just stops running when there is nothing to convert.
 fn set_h3_header(headers: &mut Vec<quiche::h3::Header>, name: &str, value: &str) {
-    let normalized = name.to_ascii_lowercase();
+    let normalized = if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(name)
+    };
     headers.retain(|header| !header.name().eq_ignore_ascii_case(normalized.as_bytes()));
     headers.push(quiche::h3::Header::new(
         normalized.as_bytes(),
@@ -5046,7 +5072,7 @@ async fn send_immediate_response(
         response_handlers,
         response.status,
         headers,
-        H3LocalBody::Bytes(body),
+        H3LocalBody::Bytes(Bytes::from(body)),
         policy,
         request_id,
         request_deadline,
@@ -5071,7 +5097,7 @@ async fn send_headers(
         .await;
 }
 
-async fn send_body(resp_tx: &ResponseSink, stream_id: u64, bytes: Vec<u8>, fin: bool) {
+async fn send_body(resp_tx: &ResponseSink, stream_id: u64, bytes: Bytes, fin: bool) {
     resp_tx.observe_body(bytes.len());
     let _ = resp_tx
         .tx
@@ -5106,7 +5132,10 @@ async fn send_error_response(
 ) {
     let (body, content_type) = state
         .and_then(|state| state.read_error_page(status))
-        .unwrap_or_else(|| (msg.as_bytes().to_vec(), "text/plain"));
+        .map_or_else(
+            || (Bytes::copy_from_slice(msg.as_bytes()), "text/plain"),
+            |(page, content_type)| (Bytes::from(page), content_type),
+        );
     let mut headers = vec![
         quiche::h3::Header::new(b":status", status.to_string().as_bytes()),
         quiche::h3::Header::new(b"content-type", content_type.as_bytes()),
@@ -5281,7 +5310,7 @@ mod tests {
         let mut stream = StreamState {
             cancel_tx: Some(cancel_tx),
             req_body_tx: Some(mpsc::channel(1).0),
-            pending_body: VecDeque::from([b"stale".to_vec()]),
+            pending_body: VecDeque::from([Bytes::from_static(b"stale")]),
             pending_body_bytes: 5,
             ..Default::default()
         };
@@ -5323,8 +5352,8 @@ mod tests {
         // drain loop must detect the closed channel and clear it even when
         // `capacity() == 0`, or the deferred drain never resumes and the
         // client's upload hangs forever on closed QUIC flow control.
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
-        tx.try_send(vec![0x42]).unwrap();
+        let (tx, rx) = mpsc::channel::<Bytes>(1);
+        tx.try_send(Bytes::from_static(&[0x42])).unwrap();
         drop(rx);
 
         let mut stream = StreamState {
@@ -5343,8 +5372,8 @@ mod tests {
         // 🧠 A live handler may still be draining: dropping its channel now
         // would discard bytes the handler still needs. Only a closed
         // receiver may be cleared.
-        let (tx, _rx) = mpsc::channel::<Vec<u8>>(1);
-        tx.try_send(vec![0x42]).unwrap();
+        let (tx, _rx) = mpsc::channel::<Bytes>(1);
+        tx.try_send(Bytes::from_static(&[0x42])).unwrap();
 
         let mut stream = StreamState {
             req_body_tx: Some(tx),
@@ -5549,7 +5578,7 @@ mod tests {
         let body = resp_rx.recv().await.unwrap();
         assert!(matches!(
             body.msg,
-            RespMsg::Body(ref bytes, false) if bytes == b"ok"
+            RespMsg::Body(ref bytes, false) if bytes.as_ref() == b"ok"
         ));
         upstream_task.await.unwrap();
     }
@@ -5893,7 +5922,7 @@ mod tests {
         let body = resp_rx.recv().await.unwrap();
         assert!(matches!(
             body.msg,
-            RespMsg::Body(ref bytes, false) if bytes == b"\0\0\0\0\0"
+            RespMsg::Body(ref bytes, false) if bytes.as_ref() == b"\0\0\0\0\0"
         ));
         let trailers = resp_rx.recv().await.unwrap();
         let RespMsg::Trailers(trailers) = trailers.msg else {
@@ -6248,7 +6277,7 @@ mod tests {
             Some(&handlers),
             418,
             http::HeaderMap::new(),
-            H3LocalBody::Bytes(b"original".to_vec()),
+            H3LocalBody::Bytes(Bytes::from_static(b"original")),
             &ResponseHeaderPolicy::default(),
             "request-id",
             None,
@@ -6269,7 +6298,7 @@ mod tests {
         let body = resp_rx.recv().await.unwrap();
         assert!(matches!(
             body.msg,
-            RespMsg::Body(ref bytes, true) if bytes == b"wrapped-local"
+            RespMsg::Body(ref bytes, true) if bytes.as_ref() == b"wrapped-local"
         ));
     }
 
