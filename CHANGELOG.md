@@ -439,6 +439,26 @@ lets the rest converge.
 
 ### 🐛 Fixed
 
+- 🧯 **Running out of file descriptors no longer takes a healthy backend out
+  of rotation.** When this process cannot create a socket, `socket()` fails
+  before a packet leaves the machine — the backend is healthy, idle, and has
+  no idea anything happened. Every connect failure was nonetheless treated as
+  evidence about the backend, so a local resource shortage marked it down for
+  a ten-second cooldown. On a route with one backend there is nothing to fail
+  over to, and the whole route stopped answering: measured on a burst that
+  produced five local socket failures, **139 requests were rejected** with
+  `no upstream available`, and a single request against a completely healthy
+  backend kept returning 502 for nine seconds after the load had stopped and
+  every descriptor had been returned. Connect failures are now classified by
+  origin — a refused, unroutable, timed-out or TLS-failed backend still drives
+  passive health and failover exactly as before, while descriptor exhaustion,
+  ephemeral port exhaustion, and the other local shortages leave the backend
+  in rotation. The same classification applies on HTTP/1.1, HTTP/2 and
+  HTTP/3, and to both reverse-proxy and FastCGI upstreams.
+- 🏷️ **A local resource failure now answers 503 instead of 502.** 502 claims
+  the backend gave a bad answer, which is untrue when this server never
+  reached it. 503 is what the overload path already returns, so capacity
+  alerting does not need a second signal to watch.
 - 🔀 **HTTP/3 now resolves a rewrite target's placeholders.** `HandlerConfig::Rewrite`
   ran `resolve_caddy_placeholders` on HTTP/1.1 and HTTP/2 and passed the
   template through verbatim on HTTP/3, so a site using `try_files` or

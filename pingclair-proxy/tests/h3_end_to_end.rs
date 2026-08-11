@@ -648,6 +648,53 @@ async fn h3_forward_auth_mutates_the_backend_request_and_streams_denials() {
     backend_task.await.unwrap();
 }
 
+/// 🔻 A backend that refuses the connection must still fail closed on H3.
+///
+/// This is the other half of the local/remote split introduced in
+/// `pingclair_proxy::upstream_failure`. That change makes the proxy stop
+/// blaming a backend for failures this process caused — and the way to get
+/// that wrong is to stop blaming the backend for anything, which would silently
+/// disable passive health checking and failover on a transport whose tests
+/// nobody runs by hand.
+///
+/// ⚠️ The matching **local**-failure case is not tested here, and that is a
+/// known gap rather than an oversight: driving a real descriptor exhaustion
+/// needs `setrlimit`, and these tests run the H3 server *in process*, so
+/// lowering the limit would poison every other test in this binary. The local
+/// path is covered by `upstream_failure`'s unit tests and by
+/// `test_local_descriptor_exhaustion_does_not_mark_the_backend_down` in
+/// `pingclair/tests/integration.rs`, which spawns the real binary and proves
+/// the error shape that both transports receive from the shared connector.
+/// Recorded in TRIAGE.
+#[tokio::test]
+async fn h3_refused_backend_still_fails_closed() {
+    // 🚪 Bind and immediately drop, so the address is real, local, and closed.
+    // Nothing is listening, so `connect()` gets `ECONNREFUSED` — a genuine
+    // remote failure rather than a local one.
+    let dead_address = {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        listener.local_addr().unwrap()
+    };
+
+    let source = format!(
+        r#":443 {{
+            reverse_proxy http://{dead_address}
+        }}"#
+    );
+    let config = pingclair_config::compile(&source).unwrap();
+    let handler = config.servers[0].routes[0].handler.clone();
+    let server = spawn_h3_server(handler).await;
+
+    let refused = h3_get(server, "/anything").await.unwrap();
+    assert_eq!(
+        refused.status, 502,
+        "a refused backend is the backend's failure and must still surface as \
+         a bad gateway"
+    );
+}
+
 /// 🐘 HTTP/3 reaches the same FastCGI exchange and streams a 20 MiB response.
 #[tokio::test]
 async fn h3_fastcgi_streams_a_large_response_and_builds_h3_cgi_variables() {

@@ -33,6 +33,33 @@ pub(crate) enum ExchangeError {
     InvalidTarget,
 }
 
+impl ExchangeError {
+    /// 🩺 Whether this failure is evidence about the responder, or about us.
+    ///
+    /// FastCGI dials the responder itself rather than going through Pingora's
+    /// connector, so the original errno survives intact and needs none of the
+    /// cause-chain archaeology documented in
+    /// [`crate::upstream_failure::classify_connect_error`]. The two paths must
+    /// still agree: an operator reading the log cannot be expected to know
+    /// which upstream kind rewrote their error on the way out.
+    pub(crate) fn origin(&self) -> crate::upstream_failure::FailureOrigin {
+        use crate::upstream_failure::FailureOrigin;
+        match self {
+            Self::Dial(error) => crate::upstream_failure::classify_dial_error(error),
+            // ⏱️ A deadline that elapsed is the responder failing to answer in
+            // time, which is exactly what a health signal is for.
+            Self::DialTimedOut => FailureOrigin::Remote,
+            // 📡 Framing errors happen after the connection is up, so the
+            // responder is the one that misbehaved.
+            Self::Protocol(_) => FailureOrigin::Remote,
+            // 🏗️ A backend with no usable socket path is a configuration
+            // problem on this side. Benching it would not make the next
+            // request find a path that was never there.
+            Self::InvalidTarget => FailureOrigin::Local,
+        }
+    }
+}
+
 impl std::fmt::Display for ExchangeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

@@ -3045,16 +3045,27 @@ impl PingclairProxy {
                 if let Some(admission) = &mut upstream_admission {
                     admission.report_failure();
                 }
-                // 🩺 The health map is keyed by `std::net::SocketAddr`, so a
-                // Unix-socket responder cannot be marked down. A php-fpm
-                // socket that stops accepting therefore keeps its turn in the
-                // rotation; the dial failure still fails this request closed.
-                if let pingora_core::protocols::l4::socket::SocketAddr::Inet(address) =
-                    &upstream.addr
+                // 🩺 Two separate reasons a dial failure may leave the
+                // responder in rotation. The first: the health map is keyed by
+                // `std::net::SocketAddr`, so a Unix-socket responder cannot be
+                // marked down at all — a php-fpm socket that stops accepting
+                // keeps its turn, and the dial failure still fails this request
+                // closed. The second: the failure was ours, not the
+                // responder's, and benching a healthy backend for our own
+                // descriptor exhaustion is how a local failure becomes a
+                // route-wide outage.
+                if error.origin().implicates_backend()
+                    && let pingora_core::protocols::l4::socket::SocketAddr::Inet(address) =
+                        &upstream.addr
                 {
                     self.mark_upstream_unhealthy(&state, route_index, address);
                 }
-                tracing::warn!(%error, upstream = %upstream.addr, "🔌 FastCGI dial failed");
+                tracing::warn!(
+                    %error,
+                    upstream = %upstream.addr,
+                    origin = ?error.origin(),
+                    "🔌 FastCGI dial failed"
+                );
                 return Err(match error {
                     crate::fastcgi::ExchangeError::DialTimedOut => {
                         proxy_error(504, "FastCGI upstream connection timed out")
@@ -6839,15 +6850,46 @@ impl ProxyHttp for PingclairProxy {
             pingora_core::ErrorType::ConnectTimedout
                 | pingora_core::ErrorType::TLSHandshakeTimedout
         );
+        // 🩺 A connect failure this process caused says nothing about the
+        // backend. Descriptor exhaustion fails `socket()` before a packet
+        // leaves the machine, so the backend is healthy, idle, and unaware —
+        // and taking it out of rotation for that turns one local failure into
+        // an outage for every request that arrives during the cooldown.
+        // Measured on 2026-08-11 at `4ed66ec`: five local `socket()` failures
+        // produced 139 rejected requests, and a single probe against a
+        // completely healthy backend kept returning 502 for nine seconds after
+        // the load stopped. Evidence in
+        // `benchmarks/results/20260811_fd_exhaustion_4ed66ec/`.
+        let origin = crate::upstream_failure::classify_connect_error(&e);
         if let pingora_core::protocols::l4::socket::SocketAddr::Inet(address) = peer.address() {
-            ctx.retry_excluded.insert(*address);
-            if let (Some(state), Some(route_index)) = (ctx.state.as_ref(), ctx.route_index) {
+            if origin.implicates_backend() {
+                // 🚫 Excluding the peer from this request's retries is the same
+                // claim as marking it down — that this address is the problem —
+                // so the two travel together.
+                ctx.retry_excluded.insert(*address);
+                if let (Some(state), Some(route_index)) = (ctx.state.as_ref(), ctx.route_index) {
+                    tracing::warn!(
+                        error_type = ?e.etype(),
+                        cause = %e,
+                        "🔻 Marking upstream {} down after connect failure (cooldown {:?})",
+                        address,
+                        crate::FAIL_COOLDOWN
+                    );
+                    self.mark_upstream_unhealthy(state, route_index, address);
+                }
+            } else if let Some(suppressed) = crate::upstream_failure::LOCAL_FAILURE_LOG.admit_now()
+            {
+                // 🧯 Rate limited, because running out of descriptors does not
+                // fail one request — it fails every request arriving while the
+                // budget is empty. The suppressed count rides along so the
+                // scale of the event is not the thing the rate limit hides.
                 tracing::warn!(
-                    "🔻 Marking upstream {} down after connect failure (cooldown {:?})",
-                    address,
-                    crate::FAIL_COOLDOWN
+                    upstream = %address,
+                    error_type = ?e.etype(),
+                    suppressed,
+                    cause = %e,
+                    "🧯 Local resource failure on connect — backend left in rotation"
                 );
-                self.mark_upstream_unhealthy(state, route_index, address);
             }
         }
 
@@ -6983,6 +7025,18 @@ impl ProxyHttp for PingclairProxy {
                         | ErrorType::TLSHandshakeTimedout
                         | ErrorType::ReadTimedout
                         | ErrorType::WriteTimedout => 504,
+                        // 🧯 502 means "the backend gave me a bad answer", and
+                        // that is a lie when this process ran out of
+                        // descriptors before reaching it. 503 says what is
+                        // actually true — this server cannot serve the request
+                        // right now — and it is the same code the overload
+                        // path already uses, so an operator alerting on
+                        // capacity does not need to learn a second signal.
+                        _ if !crate::upstream_failure::classify_connect_error(e)
+                            .implicates_backend() =>
+                        {
+                            503
+                        }
                         _ => 502,
                     },
                     ErrorSource::Downstream => match e.etype() {

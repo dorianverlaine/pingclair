@@ -62,11 +62,18 @@ impl TestServer {
             readiness_path,
             readiness_token,
             reservations,
+            None,
         )
     }
 
     /// 📄 Starts the real binary from the extensionless production configuration path.
     fn new_pingclairfile(config_template: &str) -> Self {
+        Self::new_pingclairfile_with_nofile(config_template, None)
+    }
+
+    /// 🔻 As [`Self::new_pingclairfile`], with a descriptor budget small enough
+    /// that load can exhaust it. Only the classification test needs this.
+    fn new_pingclairfile_with_nofile(config_template: &str, nofile_limit: Option<u64>) -> Self {
         let temp_dir = tempfile::tempdir().expect("failed to create the test directory");
         let config_path = temp_dir.path().join("Pingclairfile");
         let readiness_id = uuid::Uuid::new_v4();
@@ -114,6 +121,7 @@ impl TestServer {
             readiness_path,
             readiness_token,
             reservations,
+            nofile_limit,
         )
     }
 
@@ -127,6 +135,10 @@ impl TestServer {
         readiness_path: String,
         readiness_token: String,
         reservations: Vec<TcpListener>,
+        // 🔻 Lowers the child's `RLIMIT_NOFILE` so a test can drive the process
+        // into a real descriptor exhaustion. `None` inherits, which is what
+        // every test but one wants.
+        nofile_limit: Option<u64>,
     ) -> Self {
         let tls_store_path = temp_dir.path().join("tls");
         let stdout_path = temp_dir.path().join("stdout.log");
@@ -154,6 +166,28 @@ impl TestServer {
         {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
+
+            // 🔻 The limit is applied in the child between fork and exec, so it
+            // constrains the server without touching the test harness — which
+            // needs its own descriptors to generate the load that exhausts the
+            // server's.
+            if let Some(limit) = nofile_limit {
+                // SAFETY: `setrlimit` is async-signal-safe and the closure
+                // allocates nothing, which is the entire contract `pre_exec`
+                // asks for in a process that may be multi-threaded at fork.
+                unsafe {
+                    command.pre_exec(move || {
+                        let rlimit = libc::rlimit {
+                            rlim_cur: limit as libc::rlim_t,
+                            rlim_max: limit as libc::rlim_t,
+                        };
+                        if libc::setrlimit(libc::RLIMIT_NOFILE, &rlimit) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
         }
 
         // 🔓 Release reservations only when the child is ready to bind the ports.
@@ -3400,6 +3434,137 @@ async fn test_pingclairfile_replaceable_upstream_uses_request_captures() {
 
     first_task.await.unwrap();
     second_task.await.unwrap();
+}
+
+/// 🧯 Running out of file descriptors must not take a healthy backend down.
+///
+/// When this process cannot create a socket, `socket()` fails before a single
+/// packet leaves the machine. The backend is healthy, idle, and has no idea
+/// anything happened — so treating that as "the backend is down" evicts a
+/// working backend because *we* ran out of something. On a route with one
+/// backend there is nothing to fail over to, and the entire route stops
+/// answering for the length of the cooldown.
+///
+/// 🎯 This test exists because the unit tests in
+/// `pingclair-proxy/src/upstream_failure.rs` assert on an error value **they
+/// construct themselves**. That proves the classifier, not the assumption the
+/// classifier rests on: that a real `EMFILE` really does arrive from Pingora's
+/// connector as a collapsed `InternalError`. Only a real descriptor exhaustion
+/// through the real connector can check that, and if a future Pingora changes
+/// the shape, this is the test that goes red.
+///
+/// Measured before the fix, on 2026-08-11 at `4ed66ec`: five local `socket()`
+/// failures produced 139 rejected requests, and a single probe against a
+/// completely healthy backend returned 502 for nine seconds after the load had
+/// stopped and every descriptor had been returned. Evidence in
+/// `benchmarks/results/20260811_fd_exhaustion_4ed66ec/`.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_local_descriptor_exhaustion_does_not_mark_the_backend_down() {
+    use tokio::io::AsyncWriteExt;
+
+    // 🗄️ Unlike the single-shot upstreams elsewhere in this file, this one
+    // keeps accepting: the whole point is to hammer it and have it survive,
+    // so that anything the proxy decides about its health is provably wrong.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let backend = listener.local_addr().unwrap();
+    let backend_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let _ = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await;
+            });
+        }
+    });
+
+    let config = r#"
+        {
+            admin off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            reverse_proxy __PINGCLAIR_TEST_BACKEND__
+        }
+    "#
+    .replace("__PINGCLAIR_TEST_BACKEND__", &backend.to_string());
+
+    // 🔻 Small enough that a modest burst exhausts it: each downstream
+    // connection costs a descriptor and each upstream connection costs another,
+    // so the budget binds at roughly half the concurrency.
+    let mut server = TestServer::new_pingclairfile_with_nofile(&config, Some(96));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    // 🔨 A separate client for the burst, dropped afterwards, so its pooled
+    // connections do not keep holding the descriptors the probe needs.
+    {
+        let burst_client = no_proxy_client();
+        let mut in_flight = Vec::new();
+        for _ in 0..64 {
+            let client = burst_client.clone();
+            let url = server.url(0, "/probe");
+            in_flight.push(tokio::spawn(async move { client.get(url).send().await }));
+        }
+        for handle in in_flight {
+            let _ = handle.await;
+        }
+    }
+
+    let log = std::fs::read_to_string(&server.stdout_path).unwrap_or_default();
+
+    // 🚫 Guards against a vacuous pass. If the burst never exhausted the
+    // budget, the assertion below holds for a reason that has nothing to do
+    // with the behaviour under test, and the test would keep passing after a
+    // regression reintroduced it.
+    assert!(
+        log.contains("Local resource failure"),
+        "the burst never exhausted the descriptor budget, so this test proved \
+         nothing — raise the concurrency or lower the limit:\n{log}"
+    );
+
+    // 🩺 The assertion that matters, and it does not depend on any timing.
+    assert!(
+        !log.contains("Marking upstream"),
+        "a local descriptor failure marked a healthy backend down:\n{log}"
+    );
+
+    // 🕰️ And the behaviour an operator would see. Three seconds is chosen to
+    // sit well above how long the burst's sockets take to close and well below
+    // the ten-second `FAIL_COOLDOWN`, so a backend that had been marked down
+    // could not pass this no matter how patient the loop is.
+    let probe_client = no_proxy_client();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut last = None;
+    while std::time::Instant::now() < deadline {
+        match probe_client.get(server.url(0, "/probe")).send().await {
+            Ok(response) if response.status() == 200 => {
+                last = Some(200);
+                break;
+            }
+            Ok(response) => last = Some(response.status().as_u16()),
+            Err(_) => last = None,
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        last,
+        Some(200),
+        "the backend was healthy and the descriptors were free, so a single \
+         request must be served rather than waiting out a cooldown"
+    );
+
+    backend_task.abort();
 }
 
 #[tokio::test]

@@ -141,6 +141,73 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
 
 ---
 
+## 🩺 上游健康：只有遠端失敗可以把 backend 標成不健康
+
+反向代理是靠「連不上」來認識後端的，所以連線失敗會讓那個後端被踢出輪替十秒
+——這件事本身完全正確。**但不是每一次連線失敗都是關於後端的證據。**
+
+本機沒有檔案描述符的時候，`socket()` 在任何一個封包離開這台機器之前就失敗了。
+後端是健康的、閒著的、而且完全不知道發生過什麼事。把這個當成「後端掛了」，
+等於**因為我們自己耗盡了資源而懲罰一個正常的後端**——而單一後端的路由沒有東西
+可以 failover，於是整條路由在冷卻期內停止服務。
+
+2026-08-11 在 `4ed66ec` 上實測（證據 `benchmarks/results/20260811_fd_exhaustion_4ed66ec/`，本地）：
+**5 次**本機 `socket()` 失敗造成 **139 次**請求被拒，而且負載停止、描述符全數歸還、
+後端完全閒置之後，單一探測請求**連續九秒**回 502。放大 27 倍。
+
+> 🎯 **規則**：任何新的「連線失敗 → 標記後端」站點，都必須先問
+> `crate::upstream_failure::classify_*` 拿到的 `FailureOrigin`，
+> 而且只在 `implicates_backend()` 為真時才標記。
+
+政策放在 `pingclair-proxy/src/upstream_failure.rs`，**一份**，兩個 transport
+共用，reverse proxy 與 FastCGI 也共用。目前五個站點：
+`server.rs` 的 `fail_to_connect` 與 FastCGI 撥接、`quic.rs` 的 H3 上游連線、
+h2 ALPN 不符、與 H3 FastCGI 撥接。
+
+### 🪤 照直覺寫的修法是死程式碼
+
+```rust
+// ❌ 永遠不會 match。
+match error.etype() {
+    ErrorType::SocketError | ErrorType::BindError => { /* 本機問題，跳過 */ }
+    _ => mark_down(),
+}
+```
+
+`pingora-core` 0.8.1 的 `connectors/l4.rs:151` **在回傳之前**就把
+`SocketError` 與 `BindError` 改寫成 `InternalError`，真正的名字只留在 cause chain 裡：
+
+```text
+Upstream InternalError context: Fail to connect to addr: 127.0.0.1:19000
+  cause: SocketError context: failed to create socket
+  cause: Too many open files (os error 24)
+```
+
+所以要 match 的是 **`InternalError`**。上面那個寫法會通過 review、會編譯、
+會出貨，然後什麼都不改變——而下一個人會因此結論說「分類理論本來就是錯的」。
+
+📌 **`InternalError` 涵蓋的不只有 EMFILE**：ephemeral port 耗盡走 `BindError`，
+在忙碌的代理上比 EMFILE 更常見；`EACCES`／`EADDRINUSE` 與 TLS **設定**類錯誤
+（讀不到憑證庫、client key 無效）也在同一格。
+
+⚠️ **未知的 errno 維持判成 remote**（`ConnectError` 是 connector 的 catch-all）。
+這是刻意的保守選擇：判錯的代價是後端多留在輪替裡一下子，而不是健康的後端
+因為不是它的錯而被踢掉。
+
+### 🧪 為什麼單元測試不夠
+
+`upstream_failure.rs` 的單元測試斷言的是**它自己造出來的**錯誤值。那證明了分類器，
+沒有證明分類器依賴的那個前提：真正的 `EMFILE` 真的會以塌掉的 `InternalError`
+形狀從 Pingora 的 connector 送過來。只有真的把描述符耗盡、真的穿過 connector
+才驗得到——`pingclair/tests/integration.rs` 的
+`test_local_descriptor_exhaustion_does_not_mark_the_backend_down` 用
+`pre_exec` 對**子行程**設 `RLIMIT_NOFILE` 做這件事，所以測試框架自己的描述符不受影響。
+
+⚠️ **H3 目前沒有對應的執行期負向測試**，因為 `h3_end_to_end.rs` 是 in-process 的，
+降 `RLIMIT_NOFILE` 會毒害同一個二進位裡的每一個測試。H3 那半目前靠共用分類器 ＋
+H1/H2 那支證出來的錯誤形狀 ＋ `h3_refused_backend_still_fails_closed`（遠端那半）。
+這個缺口記在 TRIAGE，不要當成已驗證。
+
 ## 🔀 兩個 transport 的 parity，兩種走光的方式
 
 兩條路徑各自缺一塊的情形，2026-08-11 一次量到兩個，兩個都在 H3 這邊，

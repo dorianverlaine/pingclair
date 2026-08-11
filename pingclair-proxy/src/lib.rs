@@ -34,6 +34,7 @@ pub mod server;
 mod subrequest;
 pub mod tls_identity;
 pub mod upstream;
+pub mod upstream_failure;
 pub mod upstream_tls;
 
 // MARK: - Exports

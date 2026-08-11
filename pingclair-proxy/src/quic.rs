@@ -3543,13 +3543,23 @@ async fn fastcgi_upstream(
             if let Some(admission) = &mut upstream_admission {
                 admission.report_failure();
             }
-            // 🩺 Same limit as the H1/H2 path: the health map is keyed by
-            // `std::net::SocketAddr`, so a Unix-socket responder cannot be
-            // marked down and keeps its turn in the rotation.
-            if let pingora_core::protocols::l4::socket::SocketAddr::Inet(address) = &upstream.addr {
+            // 🩺 Same two limits as the H1/H2 path, from the same function:
+            // the health map is keyed by `std::net::SocketAddr`, so a
+            // Unix-socket responder cannot be marked down and keeps its turn;
+            // and a failure this process caused is not evidence about the
+            // responder at all.
+            if error.origin().implicates_backend()
+                && let pingora_core::protocols::l4::socket::SocketAddr::Inet(address) =
+                    &upstream.addr
+            {
                 proxy.mark_upstream_unhealthy(state, route_index, address);
             }
-            tracing::warn!(%error, upstream = %upstream.addr, "🔌 H3 FastCGI dial failed");
+            tracing::warn!(
+                %error,
+                upstream = %upstream.addr,
+                origin = ?error.origin(),
+                "🔌 H3 FastCGI dial failed"
+            );
             return Err(match error {
                 crate::fastcgi::ExchangeError::DialTimedOut => {
                     (504, "FastCGI Upstream Connection Timed Out")
@@ -4066,16 +4076,36 @@ async fn reverse_proxy_upstream(
                     error = %error,
                     "🔌 H3 upstream connection attempt failed"
                 );
+                // 🩺 Same policy as H1/H2, from the same function, because
+                // these two paths reach the identical error: H3 dials through
+                // Pingora's connector too, so a local `EMFILE` arrives here as
+                // the same collapsed `InternalError`. Two copies of this rule
+                // would be two chances for the transports to disagree about
+                // whether a backend is healthy.
+                let origin = crate::upstream_failure::classify_connect_error(&error);
                 if let pingora_core::protocols::l4::socket::SocketAddr::Inet(address) =
                     &upstream.addr
                 {
-                    excluded.insert(*address);
-                    proxy.mark_upstream_unhealthy(state, route_index, address);
-                    tracing::warn!(
-                        "🔻 Marking H3 upstream {} down after connect failure (cooldown {:?})",
-                        address,
-                        crate::FAIL_COOLDOWN
-                    );
+                    if origin.implicates_backend() {
+                        excluded.insert(*address);
+                        proxy.mark_upstream_unhealthy(state, route_index, address);
+                        tracing::warn!(
+                            error_type = ?error.etype(),
+                            "🔻 Marking H3 upstream {} down after connect failure (cooldown {:?})",
+                            address,
+                            crate::FAIL_COOLDOWN
+                        );
+                    } else if let Some(suppressed) =
+                        crate::upstream_failure::LOCAL_FAILURE_LOG.admit_now()
+                    {
+                        tracing::warn!(
+                            upstream = %address,
+                            error_type = ?error.etype(),
+                            suppressed,
+                            cause = %error,
+                            "🧯 Local resource failure on H3 connect — backend left in rotation"
+                        );
+                    }
                 }
                 if crate::retry::permits_another_attempt(&retry_policy, attempts, retry_deadline) {
                     continue;
