@@ -20,6 +20,20 @@ fail() {
     exit 1
 }
 
+# 🔐 Prints one path's permission bits as an octal number, on either platform.
+#
+# ⚠️ The order of the two attempts is the whole point, and it is not
+# interchangeable. GNU `stat -c` fails outright on BSD, so trying it first
+# falls through cleanly on macOS. The reverse does not hold: on GNU, `-f` means
+# `--file-system` and **succeeds**, printing a block of filesystem statistics.
+# A `stat -f … || stat -c …` chain therefore never reaches its fallback on
+# Linux, and hands back "Block size: 4096 …" where the caller expected `700` —
+# which is exactly how this failed in CI on 2026-08-11, on a check whose whole
+# job is to notice when these files stop being private.
+file_mode() {
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
 mkdir -p "${fixture_root}/scripts" "${fixture_root}/docs"
 cp "${source_script}" "${fixture_root}/scripts/snapshot-sensitive-plans.sh"
 printf '# Plan\nfirst\n' >"${fixture_root}/docs/TODO.md"
@@ -32,10 +46,8 @@ first_snapshot="$(find "${snapshot_root}" -mindepth 1 -maxdepth 1 -type d \
 [[ -n "${first_snapshot}" ]] || fail "the start snapshot was not created"
 (cd "${first_snapshot}" && shasum -a 256 -c SHA256SUMS >/dev/null) \
     || fail "the start snapshot manifest did not verify"
-snapshot_mode="$(stat -f '%Lp' "${first_snapshot}" 2>/dev/null \
-    || stat -c '%a' "${first_snapshot}")"
-todo_mode="$(stat -f '%Lp' "${first_snapshot}/TODO.md" 2>/dev/null \
-    || stat -c '%a' "${first_snapshot}/TODO.md")"
+snapshot_mode="$(file_mode "${first_snapshot}")"
+todo_mode="$(file_mode "${first_snapshot}/TODO.md")"
 [[ "${snapshot_mode}" == 700 ]] || fail "the snapshot directory mode is ${snapshot_mode}"
 [[ "${todo_mode}" == 600 ]] || fail "the snapshot file mode is ${todo_mode}"
 
