@@ -532,6 +532,13 @@ enum RespMsg {
     /// drain observe the closed channel even when the client is blocked by
     /// QUIC flow control and sends no packets.
     HandlerDone,
+    /// 🔪 Reset this stream and write nothing (`abort`).
+    ///
+    /// The handler task cannot touch the QUIC connection — only the worker
+    /// owns it — so aborting has to travel as an event like everything else.
+    /// It is a distinct variant rather than a status because every status is
+    /// an answer, and `abort` exists to give none.
+    Abort,
 }
 
 /// One handler task's output, on this connection's own channel.
@@ -672,6 +679,8 @@ struct StreamState {
     cancel_tx: Option<watch::Sender<bool>>,
     /// 🚫 Prevents a rejected request from accepting late handler responses.
     handler_cancelled: bool,
+    /// 🔪 An `abort` handler asked for this stream to end with no response.
+    abort_requested: bool,
     /// 🧹 Marks a terminated stream so later response messages are ignored.
     dead: bool,
 }
@@ -1497,6 +1506,12 @@ impl H3App {
                     ss.pending_trailers = Some(headers);
                 }
                 RespMsg::HandlerDone => {}
+                RespMsg::Abort => {
+                    // 🔪 Marked, not shut down here: this function only
+                    // collects handler events, and the connection is not
+                    // available to it. `flush_stream` performs the reset.
+                    ss.abort_requested = true;
+                }
             }
         }
     }
@@ -1572,6 +1587,28 @@ impl H3App {
             return;
         };
         if ss.dead {
+            return;
+        }
+
+        // 🔪 `abort` resets this stream in both directions and writes nothing.
+        // Only this stream: an HTTP/3 connection carries other requests that
+        // did nothing wrong, and tearing the connection down would abort them
+        // too. That is the one place this transport must differ from H1/H2,
+        // where the request and the connection are the same thing.
+        if ss.abort_requested {
+            let _ = conn.stream_shutdown(
+                stream_id,
+                quiche::Shutdown::Write,
+                quiche::h3::WireErrorCode::RequestCancelled as u64,
+            );
+            if !ss.req_stream_finished {
+                let _ = conn.stream_shutdown(
+                    stream_id,
+                    quiche::Shutdown::Read,
+                    quiche::h3::WireErrorCode::RequestCancelled as u64,
+                );
+            }
+            ss.dead = true;
             return;
         }
 
@@ -1702,6 +1739,13 @@ enum H3Plan {
     Continue,
     Terminal(H3Terminal),
     Respond(H3ImmediateResponse),
+    /// 🔪 Write nothing and reset the stream (`abort`).
+    ///
+    /// Distinct from every other plan because every other plan produces a
+    /// status, and a status is an answer. On HTTP/3 the connection carries
+    /// other streams that must survive, so this resets one stream rather than
+    /// tearing down the connection the way the H1/H2 path does.
+    Abort,
 }
 
 /// 🎯 Retains only transport-relevant data after middleware planning completes.
@@ -1873,6 +1917,11 @@ async fn h3_raise_status(
         handling_error,
         request_vars,
         response_handlers,
+        // 📥 An error route runs after the request body is finished with, so a
+        // `request_body` handler inside one has nothing left to bound. The
+        // limit it would set is discarded rather than leaking back into the
+        // request that raised the status.
+        &mut None,
     )
     .await
 }
@@ -1893,6 +1942,9 @@ async fn plan_h3_handler_with_connector(
     handling_error: bool,
     request_vars: &mut crate::http_policy::RequestVars,
     response_handlers: &mut Option<Vec<pingclair_core::config::ResponseHandlerConfig>>,
+    // 📥 Raised by a `request_body` handler for this request only; `None`
+    // leaves the site's `client_max_body_size` in charge.
+    request_body_limit: &mut Option<u64>,
 ) -> Result<H3Plan, HandlerError> {
     match handler {
         HandlerConfig::Pipeline { handlers } => {
@@ -1944,6 +1996,7 @@ async fn plan_h3_handler_with_connector(
                     handling_error,
                     request_vars,
                     response_handlers,
+                    request_body_limit,
                 )
                 .await?
                 {
@@ -2003,6 +2056,7 @@ async fn plan_h3_handler_with_connector(
                     handling_error,
                     request_vars,
                     response_handlers,
+                    request_body_limit,
                 )
                 .await;
             }
@@ -2069,6 +2123,7 @@ async fn plan_h3_handler_with_connector(
                     handling_error,
                     request_vars,
                     response_handlers,
+                    request_body_limit,
                 )
                 .await;
             }
@@ -2086,6 +2141,87 @@ async fn plan_h3_handler_with_connector(
             }
             Ok(H3Plan::Continue)
         }
+        HandlerConfig::RequestHeaders {
+            set,
+            add,
+            remove,
+            replace,
+        } => {
+            // 🏷️ Same order as H1/H2: sets and adds, then replacements over
+            // what is now there, then removals last.
+            for (name, template, is_add) in set
+                .iter()
+                .map(|(name, value)| (name, value, false))
+                .chain(add.iter().map(|(name, value)| (name, value, true)))
+            {
+                let value = if template.contains('{') {
+                    resolve_caddy_placeholders(
+                        template,
+                        request_header,
+                        Some(verified_client_ip),
+                        "https",
+                        request_vars,
+                    )
+                    .into_owned()
+                } else {
+                    template.clone()
+                };
+                let failed = if is_add {
+                    request_header.append_header(name.clone(), value).is_err()
+                } else {
+                    request_header.insert_header(name.clone(), value).is_err()
+                };
+                if failed {
+                    tracing::warn!(header = %name, "🚫 request_header names an invalid header");
+                }
+            }
+            for replacement in replace {
+                // ⚡ Compiled at load, like every other route pattern.
+                let Some(regex) = state.route_regex(route_index, &replacement.search_regexp) else {
+                    tracing::warn!(
+                        pattern = %replacement.search_regexp,
+                        "🚫 request_header replace pattern missing from the active configuration"
+                    );
+                    continue;
+                };
+                let existing: Vec<String> = request_header
+                    .headers
+                    .get_all(&replacement.field)
+                    .iter()
+                    .filter_map(|value| value.to_str().ok().map(str::to_owned))
+                    .collect();
+                if existing.is_empty() {
+                    continue;
+                }
+                let _ = request_header.remove_header(&replacement.field);
+                for value in existing {
+                    let rewritten = regex.replace_all(&value, replacement.replace.as_str());
+                    if request_header
+                        .append_header(replacement.field.clone(), rewritten.as_ref())
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            header = %replacement.field,
+                            "🚫 request_header replacement produced an invalid value"
+                        );
+                    }
+                }
+            }
+            for name in remove {
+                let _ = request_header.remove_header(name.as_str());
+            }
+            Ok(H3Plan::Continue)
+        }
+        HandlerConfig::RequestBody { max_size } => {
+            if let Some(limit) = max_size {
+                *request_body_limit = Some(*limit);
+            }
+            Ok(H3Plan::Continue)
+        }
+        // 🔪 No status, no body — the stream is reset and the peer learns
+        // nothing. `H3Plan::Abort` is the only plan that writes nothing at all;
+        // every status-carrying plan would be an answer.
+        HandlerConfig::Abort => Ok(H3Plan::Abort),
         HandlerConfig::LogSkip => Ok(H3Plan::Continue),
         HandlerConfig::Intercept { handlers } => {
             *response_handlers = Some(handlers.clone());
@@ -2129,7 +2265,25 @@ async fn plan_h3_handler_with_connector(
             replace,
             regex,
             regex_replace,
+            method,
         } => {
+            // 🔤 Same setter as H1/H2, upper-cased after the template is
+            // resolved: a method is case-sensitive on the wire, so `method
+            // post` has to reach the upstream as `POST`.
+            if let Some(template) = method {
+                let verified = template.contains('{').then_some(verified_client_ip);
+                let resolved = resolve_caddy_placeholders(
+                    template,
+                    request_header,
+                    verified,
+                    "https",
+                    request_vars,
+                );
+                request_header.set_method(
+                    http::Method::from_bytes(resolved.to_ascii_uppercase().as_bytes())
+                        .map_err(|_| (500, "Rewritten Method Is Not A Method"))?,
+                );
+            }
             // 🧭 A rewrite target is a template, and it has to be resolved on
             // this transport too. `try_files` and `php_fastcgi` both rewrite to
             // `{http.matchers.file.relative}`, and operators write `{host}` and
@@ -2284,6 +2438,7 @@ async fn plan_h3_handler_with_connector(
                         true,
                         request_vars,
                         response_handlers,
+                        request_body_limit,
                     )
                     .await?;
                     return Ok(match plan {
@@ -2406,6 +2561,7 @@ async fn plan_h3_handler_with_connector(
                         handling_error,
                         request_vars,
                         response_handlers,
+                        request_body_limit,
                     )
                     .await
                 }
@@ -2435,6 +2591,9 @@ async fn plan_h3_handler(
     handling_error: bool,
     request_vars: &mut crate::http_policy::RequestVars,
     response_handlers: &mut Option<Vec<pingclair_core::config::ResponseHandlerConfig>>,
+    // 📥 Raised by a `request_body` handler for this request only; `None`
+    // leaves the site's `client_max_body_size` in charge.
+    request_body_limit: &mut Option<u64>,
 ) -> Result<H3Plan, HandlerError> {
     plan_h3_handler_with_connector(
         handler,
@@ -2449,6 +2608,7 @@ async fn plan_h3_handler(
         handling_error,
         request_vars,
         response_handlers,
+        request_body_limit,
     )
     .await
 }
@@ -2787,14 +2947,25 @@ async fn handle_request_inner(
     }
 
     // 📦 Rejects declared oversized bodies before opening an upstream connection.
-    let body_limit = state.config.client_max_body_size;
-    if body_limit > 0
+    // 📥 A route can raise this for itself with `request_body`, and that
+    // handler has not run yet — planning happens below. So the early rejection
+    // uses the widest limit this route could grant, precomputed at load; the
+    // exact per-request limit is applied to `body_limit` once planning is
+    // done, and it is what the streaming checks enforce. Same reasoning, same
+    // precomputed value, as the H1/H2 path.
+    let site_body_limit = state.config.client_max_body_size;
+    let declared_limit = match state.route_body_ceiling(route_index) {
+        Some(ceiling) if ceiling > site_body_limit => ceiling,
+        Some(0) => 0,
+        _ => site_body_limit,
+    };
+    if declared_limit > 0
         && let Some(content_length) = header
             .headers
             .get("content-length")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
-        && content_length > body_limit
+        && content_length > declared_limit
     {
         return Err((413, "Request Entity Too Large"));
     }
@@ -2828,6 +2999,7 @@ async fn handle_request_inner(
         .compiled_route(route_index)
         .map(|route| &route.matcher_precompile);
     let mut response_handlers = None;
+    let mut request_body_limit = None;
     let plan = plan_h3_handler_with_connector(
         handler,
         &state,
@@ -2841,8 +3013,13 @@ async fn handle_request_inner(
         false,
         &mut request_vars,
         &mut response_handlers,
+        &mut request_body_limit,
     )
     .await?;
+
+    // 📥 Planning is done, so whichever `request_body` handler actually ran
+    // has had its say. Everything that reads the body from here on uses this.
+    let body_limit = request_body_limit.unwrap_or(site_body_limit);
 
     let request_deadline = state
         .config
@@ -2869,6 +3046,12 @@ async fn handle_request_inner(
             return Ok(());
         }
         H3Plan::Continue => return Err((501, "Handler Pipeline Produced No Response")),
+        H3Plan::Abort => {
+            // 🔪 The worker owns the connection, so the reset travels as an
+            // event. Nothing is written before it, which is the point.
+            send_abort(resp_tx, stream_id).await;
+            return Ok(());
+        }
     };
 
     if !matches!(&handler, H3Terminal::ReverseProxy | H3Terminal::FastCgi) {
@@ -3929,8 +4112,13 @@ async fn reverse_proxy_upstream(
     let base_request_deadline = request_timeout_ms
         .filter(|value| *value > 0)
         .map(|value| request_started + Duration::from_millis(value));
-    let method =
-        http::Method::from_bytes(req.method.as_bytes()).map_err(|_| (400, "Bad Request"))?;
+    // 🔤 Taken from the planned request, not from the raw QUIC one. A `method`
+    // handler rewrites the request before it is proxied, and re-reading
+    // `req.method` here would quietly discard that: the upstream would be
+    // asked with whatever verb the client used, on HTTP/3 only, while
+    // HTTP/1.1 and HTTP/2 honoured the rewrite. `client_header` is the request
+    // as the handler chain left it.
+    let method = client_header.method.clone();
     // 📦 Preserves a trusted content length while selecting framing for the upstream protocol.
     let client_content_length: Option<u64> = req
         .headers
@@ -5138,6 +5326,21 @@ async fn send_body(resp_tx: &ResponseSink, stream_id: u64, bytes: Bytes, fin: bo
         .await;
 }
 
+/// 🔪 Asks the worker to reset this stream without writing a response.
+///
+/// Deliberately does not call `observe_headers`/`observe_body`: nothing goes
+/// out, so the access log records a status of zero — which is the truthful
+/// record of an aborted request, and is how the H1/H2 side logs it too.
+async fn send_abort(resp_tx: &ResponseSink, stream_id: u64) {
+    let _ = resp_tx
+        .tx
+        .send(RespEvent {
+            stream_id,
+            msg: RespMsg::Abort,
+        })
+        .await;
+}
+
 /// 🧾 Queues H3 response trailers after every response body chunk.
 async fn send_trailers(resp_tx: &ResponseSink, stream_id: u64, headers: Vec<quiche::h3::Header>) {
     let _ = resp_tx
@@ -5653,6 +5856,7 @@ mod tests {
                     replace: Some("/500.html".to_string()),
                     regex: None,
                     regex_replace: None,
+                    method: None,
                 },
                 HandlerConfig::FileServer {
                     root: root.path().to_string_lossy().into_owned(),
@@ -5732,7 +5936,7 @@ mod tests {
                             break;
                         }
                     }
-                    RespMsg::Trailers(_) | RespMsg::HandlerDone => {}
+                    RespMsg::Trailers(_) | RespMsg::HandlerDone | RespMsg::Abort => {}
                 }
             }
             (status, body)
@@ -5991,6 +6195,7 @@ mod tests {
                     replace: None,
                     regex: Some(r"^/old/(.*)$".to_string()),
                     regex_replace: Some("/new/$1".to_string()),
+                    method: None,
                 }),
                 HandlerElement::plain(HandlerConfig::Respond {
                     status: 200,
@@ -6018,6 +6223,7 @@ mod tests {
             None,
             false,
             &mut crate::http_policy::RequestVars::default(),
+            &mut None,
             &mut None,
         )
         .await
@@ -6079,6 +6285,7 @@ mod tests {
             false,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
+            &mut None,
         )
         .await
         .unwrap();
@@ -6119,6 +6326,7 @@ mod tests {
             None,
             false,
             &mut crate::http_policy::RequestVars::default(),
+            &mut None,
             &mut None,
         )
         .await
@@ -6169,6 +6377,7 @@ mod tests {
             false,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
+            &mut None,
         )
         .await
         .unwrap();
@@ -6208,6 +6417,7 @@ mod tests {
             None,
             false,
             &mut crate::http_policy::RequestVars::default(),
+            &mut None,
             &mut None,
         )
         .await
@@ -6254,6 +6464,7 @@ mod tests {
             false,
             &mut crate::http_policy::RequestVars::default(),
             &mut registered,
+            &mut None,
         )
         .await
         .unwrap();
@@ -6357,6 +6568,7 @@ mod tests {
             false,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
+            &mut None,
         )
         .await
         .unwrap();
@@ -6395,6 +6607,7 @@ mod tests {
             None,
             false,
             &mut crate::http_policy::RequestVars::default(),
+            &mut None,
             &mut None,
         )
         .await
@@ -6450,6 +6663,7 @@ mod tests {
             false,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
+            &mut None,
         )
         .await
         .unwrap();
@@ -6472,6 +6686,7 @@ mod tests {
             precompile,
             false,
             &mut crate::http_policy::RequestVars::default(),
+            &mut None,
             &mut None,
         )
         .await

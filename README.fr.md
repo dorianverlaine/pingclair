@@ -782,10 +782,10 @@ utilise ne démarre pas.
 
 Directives :
 
-  `abort` `acme_server` `copy_response` `copy_response_headers`
-  `fs` `intercept` `invoke` `log_append` `log_name`
-  `map` `method` `metrics` `push`
-  `request_body` `request_header` `skip_log` `tracing`
+  `acme_server` `copy_response` `copy_response_headers` `fs`
+  `intercept` `invoke` `log_append` `log_name`
+  `map` `metrics` `push` `skip_log`
+  `tracing`
 
 Options globales :
 

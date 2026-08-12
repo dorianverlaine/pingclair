@@ -648,6 +648,125 @@ async fn h3_forward_auth_mutates_the_backend_request_and_streams_denials() {
     backend_task.await.unwrap();
 }
 
+/// 🔤🏷️ `method` and `request_header` change the upstream request on H3 too.
+///
+/// Both are request setters, and this repository has shipped two defects where
+/// a setter ran on one transport and not the other — silently, because both
+/// answered 200 and only the bytes differed. So the check is what the backend
+/// received, not what the client got back.
+#[tokio::test]
+async fn h3_method_and_request_header_reach_the_upstream() {
+    use tokio::io::AsyncWriteExt;
+
+    let backend_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let backend_address = backend_listener.local_addr().unwrap();
+    let backend_task = tokio::spawn(async move {
+        let (mut stream, _) = backend_listener.accept().await.unwrap();
+        let request = read_http_head(&mut stream).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+        request
+    });
+
+    // 🧾 Through the real adapter, because the adapter is where the two
+    // transports' handler trees could diverge in the first place.
+    let source = format!(
+        r#":443 {{
+            method post
+            request_header X-Set first
+            request_header +X-Added second
+            request_header -X-Dropped
+            request_header X-Edit ^before$ after
+            reverse_proxy http://{backend_address}
+        }}"#
+    );
+    let config = pingclair_config::compile(&source).unwrap();
+    let handler = config.servers[0].routes[0].handler.clone();
+    let server = spawn_h3_server(handler).await;
+
+    let response = h3_get_with_headers(
+        server,
+        "/probe",
+        &[("x-dropped", "please-remove-me"), ("x-edit", "before")],
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status, 200);
+
+    let request = backend_task.await.unwrap();
+    let lines: Vec<&str> = request.lines().collect();
+    assert!(
+        lines[0].starts_with("POST "),
+        "`method post` must reach the upstream upper-cased: {}",
+        lines[0]
+    );
+    let has = |name: &str, value: &str| {
+        lines
+            .iter()
+            .any(|line| line.eq_ignore_ascii_case(&format!("{name}: {value}")))
+    };
+    assert!(has("X-Set", "first"), "a set header must arrive: {request}");
+    assert!(
+        has("X-Added", "second"),
+        "an added header must arrive: {request}"
+    );
+    assert!(
+        !request.to_ascii_lowercase().contains("x-dropped"),
+        "a removed header must not arrive: {request}"
+    );
+    assert!(
+        has("X-Edit", "after"),
+        "a replacement must rewrite the value the client sent: {request}"
+    );
+}
+
+/// 🔪 `abort` writes nothing on H3 either — and takes only its own stream.
+///
+/// The transports must differ here, and the difference is the point. On
+/// HTTP/1.1 the request and the connection are the same thing, so ending one
+/// ends the other. An HTTP/3 connection carries other requests that did
+/// nothing wrong, so `abort` resets one stream and leaves the rest alone.
+#[tokio::test]
+async fn h3_abort_resets_only_its_own_stream() {
+    let source = r#":443 {
+            @doomed path /doomed*
+            abort @doomed
+            respond "fine" 200
+        }"#;
+    // 🧾 The whole site, not one route: `abort @doomed` and the catch-all
+    // `respond` compile to two routes, and mounting only the first would make
+    // every request abort — which looks exactly like the defect this test is
+    // supposed to catch.
+    let compiled = pingclair_config::compile(source).unwrap();
+    let site = compiled.servers[0].clone();
+    let server = spawn_h3_server_with(|address| ServerConfig {
+        listen: vec![address.to_string()],
+        ..site
+    })
+    .await;
+
+    let fine = h3_get(server, "/fine").await.unwrap();
+    assert_eq!(fine.status, 200);
+    assert_eq!(fine.body, b"fine");
+
+    let aborted = h3_get(server, "/doomed").await;
+    assert!(
+        aborted.is_err(),
+        "`abort` must produce no response at all; got {:?}",
+        aborted.map(|response| response.status)
+    );
+
+    // 🧭 The listener and the rest of the server survive a reset stream: the
+    // failure mode worth guarding against is an abort that takes the whole
+    // connection, or the whole server, with it.
+    let after = h3_get(server, "/fine").await.unwrap();
+    assert_eq!(after.status, 200, "an abort must not poison the listener");
+}
+
 /// 🔻 A backend that refuses the connection must still fail closed on H3.
 ///
 /// This is the other half of the local/remote split introduced in

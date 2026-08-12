@@ -240,6 +240,10 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             replace,
             regex: _,
             regex_replace: _,
+            // 🔤 The method setter belongs to the transports, which hold the
+            // request being rewritten. This function only signals intent
+            // through headers and has no request to change.
+            method: _,
         } => {
             // Rewrite handler modifies the request path
             // This is a signal to the proxy layer to modify the URI before forwarding
@@ -294,6 +298,17 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
 
         HandlerConfig::LogSkip => Ok(HandlerResponse::status(200)),
         HandlerConfig::Vars { .. } => Ok(HandlerResponse::status(200)),
+
+        // 🧭 These three act on the request or the connection, and this
+        // function only builds a response out of a handler. The transports
+        // own them; reaching here means the handler ran somewhere it cannot
+        // do its job, so answering 200 keeps the shape this function promises
+        // rather than inventing a failure.
+        HandlerConfig::RequestHeaders { .. } | HandlerConfig::RequestBody { .. } => {
+            Ok(HandlerResponse::status(200))
+        }
+        // 🔪 There is no response to build: `abort` exists to write nothing.
+        HandlerConfig::Abort => Ok(HandlerResponse::status(200)),
 
         HandlerConfig::HandleErrors { errors: _ } => {
             // HandleErrors is a configuration directive that attaches error handlers to the route.

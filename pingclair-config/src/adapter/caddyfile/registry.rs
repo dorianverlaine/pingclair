@@ -74,6 +74,7 @@ const fn recognised(name: &'static str) -> Spec {
 /// about names.
 pub(super) static DIRECTIVES: &[Spec] = &[
     // MARK: - Implemented
+    implemented("abort"),
     implemented("access_control"),
     implemented("acme_server"),
     implemented("basic_auth"),
@@ -97,10 +98,13 @@ pub(super) static DIRECTIVES: &[Spec] = &[
     implemented("listen"),
     implemented("log"),
     implemented("log_skip"),
+    implemented("method"),
     implemented("php_fastcgi"),
     implemented("rate_limit"),
     implemented("redir"),
     implemented("redirect"),
+    implemented("request_body"),
+    implemented("request_header"),
     implemented("respond"),
     implemented("reverse_proxy"),
     implemented("rewrite"),
@@ -112,7 +116,6 @@ pub(super) static DIRECTIVES: &[Spec] = &[
     implemented("uri"),
     implemented("vars"),
     // MARK: - Recognised, not implemented
-    recognised("abort"),
     recognised("copy_response"),
     recognised("copy_response_headers"),
     recognised("fs"),
@@ -120,11 +123,8 @@ pub(super) static DIRECTIVES: &[Spec] = &[
     recognised("log_append"),
     recognised("log_name"),
     recognised("map"),
-    recognised("method"),
     recognised("metrics"),
     recognised("push"),
-    recognised("request_body"),
-    recognised("request_header"),
     recognised("skip_log"),
     recognised("tracing"),
 ];
@@ -328,6 +328,10 @@ mod tests {
             ("try_files", "try_files {path} /index.html"),
             ("uri", "uri strip_prefix /api"),
             ("vars", "vars foo bar"),
+            ("abort", "abort"),
+            ("method", "method POST"),
+            ("request_body", "request_body {\n max_size 1MB\n }"),
+            ("request_header", "request_header X-Trace probe"),
         ];
 
         for spec in DIRECTIVES

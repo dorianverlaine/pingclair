@@ -413,6 +413,20 @@ pub(super) fn parse_caddy_roll_block(
 /// it means bytes — so unlike durations it is accepted. What is *not*
 /// accepted is an unrecognised suffix: `100mbb` must fail loudly rather than
 /// silently parse as 100.
+///
+/// 🔢 **`MB` is a million bytes and `MiB` is 1,048,576**, and the two are not
+/// interchangeable here. That distinction is the whole reason this function
+/// looks the way it does: the format this DSL is compatible with parses sizes
+/// with the SI/IEC split, so a configuration that says `max_size 1MB` means
+/// 1,000,000 to the person who wrote it. Rounding that up to a mebibyte is a
+/// 4.9 % larger limit than the author asked for, silently, in the one setting
+/// whose entire job is to be a limit.
+///
+/// > 🤡 This function used to map `kb`/`mb`/`gb` onto the 1024-based values,
+/// > which made every `roll_size` 4.9 % (or 7.4 %, at `gb`) larger than
+/// > written. Corrected 2026-08-11; a fractional value like `1.5mb` is also
+/// > accepted now, because the format accepts one and a size that fails to
+/// > parse is a configuration that will not load.
 pub(super) fn parse_byte_size(directive: &Directive) -> Result<u64, AdapterError> {
     let raw = directive.args.first().ok_or_else(|| {
         AdapterError::ArgumentCount(directive.name.clone(), 1, directive.args.len())
@@ -424,27 +438,48 @@ pub(super) fn parse_byte_size(directive: &Directive) -> Result<u64, AdapterError
             directive.args.len(),
         ));
     }
-    let lower = raw.to_ascii_lowercase();
-    let digits = lower.trim_end_matches(|c: char| c.is_ascii_alphabetic());
-    let suffix = &lower[digits.len()..];
-    let value: u64 = digits.parse().map_err(|_| {
+    let lower = raw.trim().to_ascii_lowercase();
+    let digits = lower.trim_end_matches(|c: char| c.is_ascii_alphabetic() || c.is_whitespace());
+    let suffix = lower[digits.len()..].trim();
+    let value: f64 = digits.trim().parse().map_err(|_| {
         AdapterError::InvalidArgument(directive.name.clone(), format!("`{raw}` is not a size"))
     })?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(AdapterError::InvalidArgument(
+            directive.name.clone(),
+            format!("`{raw}` is not a size"),
+        ));
+    }
     let multiplier: u64 = match suffix {
         "" | "b" => 1,
-        "k" | "kb" | "kib" => 1024,
-        "m" | "mb" | "mib" => 1024 * 1024,
-        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        // 📏 SI: powers of a thousand, which is what a plain `kb` means.
+        "k" | "kb" => 1_000,
+        "m" | "mb" => 1_000_000,
+        "g" | "gb" => 1_000_000_000,
+        "t" | "tb" => 1_000_000_000_000,
+        // 📐 IEC: powers of 1024, spelled with the `i`.
+        "ki" | "kib" => 1 << 10,
+        "mi" | "mib" => 1 << 20,
+        "gi" | "gib" => 1 << 30,
+        "ti" | "tib" => 1 << 40,
         other => {
             return Err(AdapterError::InvalidArgument(
                 directive.name.clone(),
-                format!("unknown size unit `{other}` (expected b, kb, mb or gb)"),
+                format!(
+                    "unknown size unit `{other}` (expected b, kb/mb/gb/tb for powers \
+                     of 1000, or kib/mib/gib/tib for powers of 1024)"
+                ),
             ));
         }
     };
-    value.checked_mul(multiplier).ok_or_else(|| {
-        AdapterError::InvalidArgument(directive.name.clone(), format!("`{raw}` overflows"))
-    })
+    let bytes = value * multiplier as f64;
+    if bytes > u64::MAX as f64 {
+        return Err(AdapterError::InvalidArgument(
+            directive.name.clone(),
+            format!("`{raw}` overflows"),
+        ));
+    }
+    Ok(bytes as u64)
 }
 
 #[cfg(test)]

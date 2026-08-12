@@ -1183,6 +1183,9 @@ fn reject_unimplemented_handler(handler: &HandlerConfig) -> CompileResult<()> {
         | HandlerConfig::Respond { .. }
         | HandlerConfig::Error { .. }
         | HandlerConfig::Headers { .. }
+        | HandlerConfig::RequestHeaders { .. }
+        | HandlerConfig::RequestBody { .. }
+        | HandlerConfig::Abort
         | HandlerConfig::LogSkip
         | HandlerConfig::Vars { .. }
         | HandlerConfig::BasicAuth { .. }
@@ -1259,6 +1262,9 @@ fn validate_basic_auth_credentials(handler: &HandlerConfig) -> CompileResult<()>
         | HandlerConfig::Respond { .. }
         | HandlerConfig::Error { .. }
         | HandlerConfig::Headers { .. }
+        | HandlerConfig::RequestHeaders { .. }
+        | HandlerConfig::RequestBody { .. }
+        | HandlerConfig::Abort
         | HandlerConfig::LogSkip
         | HandlerConfig::Vars { .. }
         | HandlerConfig::RateLimit { .. }
@@ -2383,6 +2389,33 @@ fn compile_handler(
             remove: headers.remove.clone(),
         }),
 
+        Handler::RequestHeaders(headers) => {
+            // 🛡️ A bad pattern is refused while compiling, not discovered on
+            // the request path — the same rule `rewrite` follows one arm over.
+            for replacement in &headers.replace {
+                regex::Regex::new(&replacement.search_regexp).map_err(|error| {
+                    CompileError::InvalidRoute {
+                        message: format!(
+                            "invalid request_header replace regex `{}`: {error}",
+                            replacement.search_regexp
+                        ),
+                    }
+                })?;
+            }
+            Ok(HandlerConfig::RequestHeaders {
+                set: headers.set.clone(),
+                add: headers.add.clone(),
+                remove: headers.remove.clone(),
+                replace: headers.replace.clone(),
+            })
+        }
+
+        Handler::RequestBody(config) => Ok(HandlerConfig::RequestBody {
+            max_size: config.max_size,
+        }),
+
+        Handler::Abort => Ok(HandlerConfig::Abort),
+
         Handler::LogSkip => Ok(HandlerConfig::LogSkip),
 
         Handler::Vars(config) => Ok(HandlerConfig::Vars {
@@ -2479,6 +2512,7 @@ fn compile_handler(
                 replace: rewrite.replace.clone(),
                 regex: rewrite.regex.clone(),
                 regex_replace: rewrite.regex_replace.clone(),
+                method: rewrite.method.clone(),
             })
         }
 

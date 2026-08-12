@@ -616,6 +616,16 @@ pub enum Handler {
     /// Headers modification only
     Headers(HeadersConfig),
 
+    /// 🏷️ Request-header rewriting (`request_header`), as opposed to the
+    /// response rewriting [`Handler::Headers`] does.
+    RequestHeaders(RequestHeadersConfig),
+
+    /// 📥 Per-route request body bound (`request_body`).
+    RequestBody(RequestBodyConfig),
+
+    /// 🔪 Closes the connection without writing a response (`abort`).
+    Abort,
+
     /// 🚫 Excludes the request from access logging (`log_skip`).
     LogSkip,
 
@@ -841,6 +851,8 @@ pub struct RewriteConfig {
     pub replace: Option<String>,
     pub regex: Option<String>,
     pub regex_replace: Option<String>,
+    /// 🔤 Replacement request method. Only the `method` directive sets it.
+    pub method: Option<String>,
     /// 🏷️ Which directive produced this rewrite, `rewrite` or `uri`.
     ///
     /// Both compile to the same handler, and the shared directive order runs
@@ -859,6 +871,7 @@ impl Default for RewriteConfig {
             replace: None,
             regex: None,
             regex_replace: None,
+            method: None,
             directive: "rewrite",
         }
     }
@@ -1045,6 +1058,26 @@ pub struct HeadersConfig {
     pub set: BTreeMap<String, String>,
     pub add: BTreeMap<String, String>,
     pub remove: Vec<String>,
+}
+
+/// 🏷️ Request-header edits from one or more `request_header` lines.
+///
+/// Kept apart from [`HeadersConfig`] rather than growing a `replace` field on
+/// it, because the response side does not implement replacement — a shared
+/// struct would advertise an operation one of its two users silently drops.
+#[derive(Debug, Clone, Default)]
+pub struct RequestHeadersConfig {
+    pub set: BTreeMap<String, String>,
+    pub add: BTreeMap<String, String>,
+    pub remove: Vec<String>,
+    pub replace: Vec<pingclair_core::config::HeaderReplacement>,
+}
+
+/// 📥 One route's request-body bound, from `request_body { max_size … }`.
+#[derive(Debug, Clone, Default)]
+pub struct RequestBodyConfig {
+    /// Maximum body size in bytes; `None` leaves the site's limit in place.
+    pub max_size: Option<u64>,
 }
 
 /// File server configuration (placeholder)

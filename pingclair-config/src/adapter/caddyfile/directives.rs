@@ -6,6 +6,8 @@ use super::args::{
     expect_no_arguments, expect_one_argument, parse_duration_ms, parse_positive_u64,
     parse_positive_usize, parse_required_duration,
 };
+use super::logs::parse_byte_size;
+use super::matchers::data_args;
 use super::matchers::{
     parse_matcher_definition, parse_route_matcher_and_block, resolve_matcher_token,
 };
@@ -189,6 +191,10 @@ pub(super) fn adapt_handler(
             super::tls::parse_acme_server(&d)?,
         ))),
         "header" => adapt_header_directive(&d),
+        "request_header" => adapt_request_header_directive(&d),
+        "request_body" => adapt_request_body_directive(&d),
+        "method" => adapt_method_directive(&d),
+        "abort" => adapt_abort_directive(&d),
         "log_skip" => Ok(Handler::LogSkip),
         "route" => adapt_subroute_block(&d, matchers, order, false),
         "handle" => adapt_subroute_block(&d, matchers, order, true),
@@ -1363,6 +1369,188 @@ pub(super) fn adapt_header_directive(d: &Directive) -> Result<Handler, AdapterEr
     }
 
     Ok(Handler::Headers(config))
+}
+
+/// 🔤 Adapts `method <verb>`, which replaces the request's method.
+///
+/// It compiles to a rewrite rather than a handler of its own because that is
+/// what it is: a setter for one field of the request every later handler
+/// reads. The value stays a template — `method {http.request.header.X-Verb}`
+/// is legal — and is upper-cased at request time, after resolution.
+pub(super) fn adapt_method_directive(d: &Directive) -> Result<Handler, AdapterError> {
+    if d.block.is_some() {
+        return Err(AdapterError::BlockNotAllowed("method".into()));
+    }
+    let args = data_args(d);
+    let [verb] = args else {
+        return Err(AdapterError::ArgumentCount("method".into(), 1, args.len()));
+    };
+    Ok(Handler::Rewrite(RewriteConfig {
+        method: Some(verb.clone()),
+        // 🏷️ `method`, `rewrite` and `uri` all compile to a rewrite and rank
+        // one apart in the shared directive order, so the handler alone cannot
+        // say which position this one belongs at.
+        directive: "method",
+        ..Default::default()
+    }))
+}
+
+/// 🏷️ Adapts `request_header [<matcher>] [+|-]<field> [<value>]`.
+///
+/// The response-side sibling is `header`. They are different directives
+/// because they act at different moments: a request header changes what the
+/// rest of the pipeline sees and what the upstream is asked, while a response
+/// header only changes what the client is told afterwards.
+pub(super) fn adapt_request_header_directive(d: &Directive) -> Result<Handler, AdapterError> {
+    // 🚫 Upstream registers this as a plain directive with no block form: one
+    // field per line, and a block is a misunderstanding worth naming.
+    if d.block.is_some() {
+        return Err(AdapterError::BlockNotAllowed("request_header".into()));
+    }
+    let args = data_args(d);
+    let Some(field) = args.first() else {
+        return Err(AdapterError::ArgumentCount("request_header".into(), 1, 0));
+    };
+
+    // 🖋️ A trailing colon is a habit carried over from writing curl commands,
+    // and upstream forgives it rather than producing a header whose name ends
+    // in `:` — which no client would ever match.
+    let field = field.strip_suffix(':').unwrap_or(field);
+    // 📌 A missing value is an empty value, not an error. That is the format's
+    // own reading, and a configuration written for it has to keep meaning the
+    // same thing here — `request_header X-Trace` sets the header to "".
+    let value = args.get(1).cloned().unwrap_or_default();
+    let replacement = args.get(2);
+    if args.len() > 3 {
+        return Err(AdapterError::ArgumentCount(
+            "request_header".into(),
+            3,
+            args.len(),
+        ));
+    }
+
+    let mut config = RequestHeadersConfig::default();
+    // 🧭 The order of these arms is not a style choice, it is the semantics.
+    // Upstream tests the `+`/`-`/`?` prefixes **before** it tests for a third
+    // argument, so a prefix always wins and the replacement argument beside
+    // one is discarded: `request_header +Foo bar baz` appends `Foo: bar` and
+    // `baz` is never read. Deciding by argument count instead — which reads
+    // more naturally — would turn that line into a search-and-replace, and a
+    // configuration carried over from upstream would quietly do something
+    // else. (`modules/caddyhttp/headers/caddyfile.go`, `applyHeaderOp`.)
+    match field.chars().next() {
+        Some('+') => {
+            config.add.insert(field[1..].to_string(), value);
+        }
+        Some('-') => {
+            // 📌 A value beside a removal is ignored upstream rather than
+            // refused, and a configuration that loads there has to load here.
+            config.remove.push(field[1..].to_string());
+        }
+        // 🚫 Upstream refuses `?` on request headers, and says why: it means
+        // "set this only if absent", which needs a response to inspect. The
+        // request-side equivalent is a matcher.
+        Some('?') => {
+            return Err(AdapterError::InvalidArgument(
+                "request_header".into(),
+                "the `?` default modifier works on response headers only; use a \
+                 matcher to set a request header conditionally"
+                    .into(),
+            ));
+        }
+        _ => match replacement {
+            Some(replacement) => {
+                config
+                    .replace
+                    .push(pingclair_core::config::HeaderReplacement {
+                        // 🏷️ Only `>` can still be here; the other prefixes
+                        // were taken by the arms above. On a request it means
+                        // nothing — deferral is a response-side concept — so
+                        // it is stripped rather than honoured.
+                        field: field.trim_start_matches('>').to_string(),
+                        search_regexp: value,
+                        replace: replacement.clone(),
+                    });
+            }
+            None => {
+                config
+                    .set
+                    .insert(field.trim_start_matches('>').to_string(), value);
+            }
+        },
+    }
+    Ok(Handler::RequestHeaders(config))
+}
+
+/// 📥 Adapts `request_body { max_size <size> }`.
+///
+/// This is the per-route exception to the site's `client_max_body_size`: the
+/// site sets the floor once, and the one route that accepts uploads raises it
+/// for itself. A matcher can narrow it further, which is the thing a per-site
+/// number cannot express.
+pub(super) fn adapt_request_body_directive(d: &Directive) -> Result<Handler, AdapterError> {
+    if !data_args(d).is_empty() {
+        return Err(AdapterError::ArgumentCount(
+            "request_body".into(),
+            0,
+            data_args(d).len(),
+        ));
+    }
+    let mut config = RequestBodyConfig::default();
+    let Some(block) = &d.block else {
+        return Err(AdapterError::InvalidArgument(
+            "request_body".into(),
+            "a block is required; `request_body { max_size <size> }`".into(),
+        ));
+    };
+    for sub in &block.directives {
+        match sub.name.as_str() {
+            "max_size" => config.max_size = Some(parse_byte_size(sub)?),
+            // 🚩 Named individually rather than falling through to "unknown".
+            // An operator who wrote `read_timeout` spelled it correctly, and
+            // "unknown subdirective" would send them hunting for a typo.
+            "read_timeout" | "write_timeout" => {
+                return Err(AdapterError::UnsupportedFeature(
+                    format!("request_body {}", sub.name),
+                    "per-route body read and write deadlines are not implemented yet; \
+                     the site-level `limits` block bounds them for now"
+                        .into(),
+                ));
+            }
+            "set" => {
+                return Err(AdapterError::UnsupportedFeature(
+                    "request_body set".into(),
+                    "replacing the request body with a fixed string is not implemented yet".into(),
+                ));
+            }
+            other => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "request_body: {other}"
+                )));
+            }
+        }
+    }
+    if config.max_size.is_none() {
+        return Err(AdapterError::InvalidArgument(
+            "request_body".into(),
+            "the block sets nothing; `max_size <size>` is the only option this \
+             build implements"
+                .into(),
+        ));
+    }
+    Ok(Handler::RequestBody(config))
+}
+
+/// 🔪 Adapts `abort`, which closes the connection without writing anything.
+pub(super) fn adapt_abort_directive(d: &Directive) -> Result<Handler, AdapterError> {
+    if d.block.is_some() {
+        return Err(AdapterError::BlockNotAllowed("abort".into()));
+    }
+    let args = data_args(d);
+    if !args.is_empty() {
+        return Err(AdapterError::ArgumentCount("abort".into(), 0, args.len()));
+    }
+    Ok(Handler::Abort)
 }
 
 /// 🧱 Adapts one fail-closed downstream resource-limit block.

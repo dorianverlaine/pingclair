@@ -1822,6 +1822,10 @@ fn adapt_response_handler(
                 replace: config.replace,
                 regex: config.regex,
                 regex_replace: config.regex_replace,
+                // 🔤 A response subroute rewrites where the error page comes
+                // from, not how the request was made — the request is already
+                // finished by the time it runs.
+                method: None,
             })
         }
         // 📂 `file_server` in a response subroute serves the rewritten path

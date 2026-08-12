@@ -1214,6 +1214,60 @@ pub enum HandlerConfig {
         /// Replacement string for regex (supports capture groups $1, $2, etc)
         #[serde(default)]
         regex_replace: Option<String>,
+
+        /// 🔤 Replaces the request method, which is what the `method`
+        /// directive compiles to.
+        ///
+        /// A rewrite is a setter for the parts of a request a later handler
+        /// reads, and the method is one of those parts — so it lives here
+        /// rather than in a handler of its own, exactly as upstream models it.
+        /// The value is a template and is upper-cased after resolution, so
+        /// `method {http.request.header.X-Verb}` behaves.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        method: Option<String>,
+    },
+
+    /// 🔪 Closes the connection without writing anything at all.
+    ///
+    /// Not an error page, not an empty 200 — no response. The client sees a
+    /// connection that ended. This is what an operator reaches for when the
+    /// right answer to a request is to give the sender nothing to learn from,
+    /// which is why it must never be confused with a 444-style empty status:
+    /// a status line is still an answer.
+    Abort,
+
+    /// 🏷️ Rewrites headers on the **request**, before later handlers read it.
+    ///
+    /// Distinct from [`HandlerConfig::Headers`], which rewrites the response.
+    /// The two are separate directives upstream for the same reason they are
+    /// separate variants here: a request header is an input to routing,
+    /// authentication and the upstream call, so changing it changes what
+    /// happens next — while a response header only changes what the client is
+    /// told about something that already happened.
+    RequestHeaders {
+        #[serde(default)]
+        set: BTreeMap<String, String>,
+        #[serde(default)]
+        add: BTreeMap<String, String>,
+        #[serde(default)]
+        remove: Vec<String>,
+        /// 🔁 Regex search-and-replace over a header's existing values, in
+        /// the order written.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        replace: Vec<HeaderReplacement>,
+    },
+
+    /// 📥 Bounds this route's request body, overriding the site's limit.
+    ///
+    /// The site-wide `client_max_body_size` is the floor an operator sets
+    /// once; this is the exception for the one route that uploads. It is a
+    /// handler rather than a setting because the format makes it one — and
+    /// because a matcher can then decide *which* requests get the exception,
+    /// which a per-site number cannot express.
+    RequestBody {
+        /// Maximum body size in bytes. `None` leaves the site's limit alone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_size: Option<u64>,
     },
 
     /// Respond with static content
@@ -1484,6 +1538,21 @@ pub enum BasicAuthAlgorithm {
     Bcrypt,
     /// 🔒 Argon2id, chosen with `basic_auth argon2id { … }`.
     Argon2id,
+}
+
+/// 🔁 One regex search-and-replace over the values of a request header.
+///
+/// The `request_header <field> <find> <replace>` form. It edits values that
+/// are already there rather than setting a new one, which is why it cannot be
+/// expressed as a `set`: the result depends on what the client sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeaderReplacement {
+    /// Header name whose values are rewritten.
+    pub field: String,
+    /// Regular expression matched against each existing value.
+    pub search_regexp: String,
+    /// Replacement text; `$1`-style capture references are honoured.
+    pub replace: String,
 }
 
 /// 🔐 Basic Auth credential.

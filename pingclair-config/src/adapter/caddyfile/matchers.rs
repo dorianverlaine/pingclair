@@ -52,6 +52,21 @@ pub(super) fn matcher_token(d: &Directive) -> Option<Matcher> {
     }
 }
 
+/// 🧭 A directive's own arguments, with a leading matcher token removed.
+///
+/// [`matcher_token`] answers *what* the matcher is; this answers *what is
+/// left*. Directives that accept both a matcher and positional data need both
+/// halves, and doing it by filtering out anything starting with `@` — which
+/// some of the older adapters do — quietly removes a legitimate argument that
+/// happens to begin with that character, anywhere in the list.
+pub(super) fn data_args(d: &Directive) -> &[String] {
+    // 🌐 A bare `*` is not a matcher and not data either: it exists purely to
+    // say "the next argument is data", so it is consumed the same way.
+    let leading_token = matcher_token(d).is_some()
+        || (d.args.first().is_some_and(|arg| arg == "*") && !first_argument_is_data(d));
+    if leading_token { &d.args[1..] } else { &d.args }
+}
+
 /// 🧭 Whether a directive's first argument is its own data despite looking like
 /// a matcher.
 ///

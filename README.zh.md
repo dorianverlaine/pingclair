@@ -726,10 +726,10 @@ Pingclair 對外宣稱相容 Caddyfile，那麼這個宣稱誠實的另一半，
 
 Directive：
 
-  `abort` `acme_server` `copy_response` `copy_response_headers`
-  `fs` `intercept` `invoke` `log_append` `log_name`
-  `map` `method` `metrics` `push`
-  `request_body` `request_header` `skip_log` `tracing`
+  `acme_server` `copy_response` `copy_response_headers` `fs`
+  `intercept` `invoke` `log_append` `log_name`
+  `map` `metrics` `push` `skip_log`
+  `tracing`
 
 全域選項：
 

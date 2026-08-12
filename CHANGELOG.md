@@ -179,6 +179,22 @@ lets the rest converge.
 
 ### ✨ Added
 
+- 🔤 **`method <verb>`** replaces the request method before later handlers and
+  the upstream see it. The argument is a template and is upper-cased after
+  resolution, so `method post` asks the upstream `POST`.
+- 🏷️ **`request_header [<matcher>] [+|-]<field> [<value>] [<replacement>]`**
+  edits headers on the *request*, where `header` edits the response. Set, add,
+  remove, and the three-argument regex search-and-replace all work, on
+  HTTP/1.1, HTTP/2 and HTTP/3. Patterns are compiled when the configuration is
+  published, never per request.
+- 📥 **`request_body { max_size <size> }`** bounds one route's request body,
+  overriding the site's limit — which is how the format models it, and which
+  a Pingclairfile previously had no way to express at all. `read_timeout`,
+  `write_timeout` and `set` are named as unimplemented rather than ignored.
+- 🔪 **`abort`** ends the request with no response at all: no status, no body.
+  On HTTP/1.1 and HTTP/2 the connection ends; on HTTP/3 the stream is reset and
+  the other requests sharing that connection are untouched.
+
 - 📝 **Caddyfile compatibility.** Complete directive syntax and matcher
   semantics, Caddy's directive ordering, `handle`/`handle_path` containers, a
   redirect DSL, response templates, and dual-stack (IPv4 + IPv6) wildcard
@@ -439,6 +455,18 @@ lets the rest converge.
 
 ### 🐛 Fixed
 
+- 🔢 **`1MB` is now a million bytes, not 1,048,576.** Sizes follow the SI/IEC
+  split the configuration format uses: `kb`/`mb`/`gb`/`tb` are powers of a
+  thousand and `kib`/`mib`/`gib`/`tib` are powers of 1024. Every size the DSL
+  reads was 4.9 % larger than written (7.4 % at `gb`), which in practice meant
+  `log { roll_size 10mb }` rotated at 10,485,760 bytes rather than the
+  10,000,000 the author asked for. Fractional sizes such as `1.5mb` now parse
+  as well. ⚠️ This changes the effective value of existing `roll_size`
+  settings; a deployment that depended on the old number should write `10mib`.
+- 🔤 **HTTP/3 no longer discards a rewritten request method when proxying.**
+  The HTTP/3 upstream call re-read the method from the raw QUIC request rather
+  than from the request the handler chain had produced, so a `method` rewrite
+  applied on HTTP/1.1 and HTTP/2 and was silently dropped on HTTP/3.
 - 🧯 **Running out of file descriptors no longer takes a healthy backend out
   of rotation.** When this process cannot create a socket, `socket()` fails
   before a packet leaves the machine — the backend is healthy, idle, and has

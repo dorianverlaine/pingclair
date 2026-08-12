@@ -191,6 +191,9 @@ pub struct RequestContext {
     retry_pending: bool,
     /// 🔁 Backends already attempted during the current redispatch cycle.
     retry_excluded: HashSet<SocketAddr>,
+    /// 📥 Per-route override of the site's `client_max_body_size`, set by the
+    /// `request_body` handler. `None` means the site's limit still applies.
+    request_body_limit: Option<u64>,
     /// 🚦 Route execution slot retained until this request context is dropped.
     route_admission: Option<RouteAdmission>,
     /// 🔌 Selected backend capacity and circuit admission for the active attempt.
@@ -248,6 +251,7 @@ impl Default for RequestContext {
             retry_deadline: None,
             retry_pending: false,
             retry_excluded: HashSet::new(),
+            request_body_limit: None,
             route_admission: None,
             upstream_admission: None,
             preadmitted_upstream: None,
@@ -813,7 +817,9 @@ pub struct ProxyState {
     /// Pre-compiled per-route access policies.
     access_controls: Vec<Option<Arc<RouteAccessControl>>>,
     /// Pre-compiled regular expressions used by route rewrite handlers.
-    rewrite_regexes: Vec<HashMap<String, Arc<Regex>>>,
+    route_regexes: Vec<HashMap<String, Arc<Regex>>>,
+    /// 📥 Per route, the widest `request_body` limit it could grant.
+    route_body_ceilings: Vec<Option<u64>>,
     /// 🪵 Every access-log destination this server can reach, already narrowed
     /// by each logger's `hostnames`.
     ///
@@ -1235,7 +1241,8 @@ impl ProxyState {
         let mut hash_key_sources = Vec::new();
         let mut upstream_tls = Vec::new();
         let mut access_controls = Vec::new();
-        let mut rewrite_regexes = Vec::new();
+        let mut route_regexes = Vec::new();
+        let mut route_body_ceilings = Vec::new();
 
         for (route_index, route) in config.routes.iter().enumerate() {
             let mut route_subrequests = Vec::new();
@@ -1522,9 +1529,10 @@ impl ProxyState {
                     .map(|config| Arc::new(RouteAccessControl::from_config(config))),
             );
 
-            let mut route_regexes = HashMap::new();
-            collect_rewrite_regexes(&route.handler, &mut route_regexes);
-            rewrite_regexes.push(route_regexes);
+            let mut compiled = HashMap::new();
+            collect_route_regexes(&route.handler, &mut compiled);
+            route_regexes.push(compiled);
+            route_body_ceilings.push(collect_request_body_ceiling(&route.handler));
         }
 
         // A misconfigured log sink must not take the whole server down at
@@ -1620,7 +1628,8 @@ impl ProxyState {
             hash_key_sources,
             upstream_tls,
             access_controls,
-            rewrite_regexes,
+            route_regexes,
+            route_body_ceilings,
             log_targets,
         }
     }
@@ -1682,6 +1691,32 @@ impl ProxyState {
             .is_none_or(|policy| policy.allows(remote_ip, headers))
     }
 
+    /// 📥 The most permissive body limit this route's `request_body` handlers
+    /// could grant, or `None` when it has none.
+    ///
+    /// Needed because the `Content-Length` rejection happens before handlers
+    /// run, so it cannot know which of a route's matcher-guarded
+    /// `request_body` blocks will apply. Taking the maximum is the fail-safe
+    /// direction: a request that would have been allowed is never refused
+    /// early, and one that should be refused still is — by the streaming
+    /// check, which runs with the real limit.
+    pub(crate) fn route_body_ceiling(&self, route_index: usize) -> Option<u64> {
+        self.route_body_ceilings.get(route_index).copied().flatten()
+    }
+
+    /// ⚡ One of this route's patterns, compiled when the configuration was
+    /// published rather than when the request arrived.
+    ///
+    /// Every regular expression a route can need is built once, at load, and
+    /// looked up here by the pattern text that named it. A request path is not
+    /// a place to compile a regex: the answer can never differ from the one
+    /// configuration already decided.
+    pub(crate) fn route_regex(&self, route_index: usize, pattern: &str) -> Option<&Regex> {
+        self.route_regexes
+            .get(route_index)
+            .and_then(|regexes| regexes.get(pattern).map(AsRef::as_ref))
+    }
+
     /// 🧭 Applies one precompiled route rewrite without transport-specific state.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn rewrite_request_uri(
@@ -1696,9 +1731,7 @@ impl ProxyState {
     ) -> Result<String, &'static str> {
         let compiled = if let Some(pattern) = regex_pattern {
             Some(
-                self.rewrite_regexes
-                    .get(route_index)
-                    .and_then(|regexes| regexes.get(pattern).map(AsRef::as_ref))
+                self.route_regex(route_index, pattern)
                     .ok_or("invalid rewrite regex in active configuration")?,
             )
         } else {
@@ -3273,7 +3306,9 @@ impl PingclairProxy {
         Self::enforce_retry_deadline(ctx)?;
         ctx.request_body_bytes = ctx.request_body_bytes.saturating_add(bytes as u64);
         if ctx.state.as_ref().is_some_and(|state| {
-            let limit = state.config.client_max_body_size;
+            let limit = ctx
+                .request_body_limit
+                .unwrap_or(state.config.client_max_body_size);
             limit > 0 && ctx.request_body_bytes > limit
         }) {
             session.as_mut().set_keepalive(None);
@@ -3521,6 +3556,106 @@ impl PingclairProxy {
     /// Apply an internal rewrite to the downstream request before Pingora
     /// clones it for the upstream connection. Existing query parameters are
     /// preserved unless the replacement supplies its own query string.
+    /// 🏷️ Applies one `request_header` handler to the request being routed.
+    ///
+    /// Order matters and follows upstream: additions and sets first, then
+    /// replacements over whatever is now there, then removals last — so
+    /// `-Foo` beside a `Foo` set in the same block removes it, rather than the
+    /// two racing on declaration order.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_request_headers(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestContext,
+        route_index: usize,
+        set: &std::collections::BTreeMap<String, String>,
+        add: &std::collections::BTreeMap<String, String>,
+        remove: &[String],
+        replace: &[pingclair_core::config::HeaderReplacement],
+    ) -> PingoraResult<()> {
+        // 🧭 Values are templates, the same as they are on the response side.
+        // Resolved against the request as it stands now, so a later
+        // `request_header` sees what an earlier one wrote.
+        let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
+        let scheme = ctx.request_scheme;
+        let mut resolved: Vec<(String, String, bool)> = Vec::new();
+        for (name, template, is_add) in set
+            .iter()
+            .map(|(name, value)| (name, value, false))
+            .chain(add.iter().map(|(name, value)| (name, value, true)))
+        {
+            let value = if template.contains('{') {
+                resolve_caddy_placeholders(
+                    template,
+                    session.req_header(),
+                    verified_client_ip.as_deref(),
+                    scheme,
+                    &ctx.request_vars,
+                )
+                .into_owned()
+            } else {
+                template.clone()
+            };
+            resolved.push((name.clone(), value, is_add));
+        }
+
+        let header = session.req_header_mut();
+        for (name, value, is_add) in resolved {
+            let failed = if is_add {
+                header.append_header(name.clone(), value).is_err()
+            } else {
+                header.insert_header(name.clone(), value).is_err()
+            };
+            if failed {
+                tracing::warn!(header = %name, "🚫 request_header names an invalid header");
+            }
+        }
+
+        for replacement in replace {
+            // ⚡ The pattern was compiled when the configuration was published,
+            // so this is a lookup rather than a compile. Compiling here would
+            // put a regex build on every request that touches this route.
+            let Some(regex) = ctx
+                .state
+                .as_ref()
+                .and_then(|state| state.route_regex(route_index, &replacement.search_regexp))
+            else {
+                tracing::warn!(
+                    pattern = %replacement.search_regexp,
+                    "🚫 request_header replace pattern missing from the active configuration"
+                );
+                continue;
+            };
+            let existing: Vec<String> = header
+                .headers
+                .get_all(&replacement.field)
+                .iter()
+                .filter_map(|value| value.to_str().ok().map(str::to_owned))
+                .collect();
+            if existing.is_empty() {
+                continue;
+            }
+            let _ = header.remove_header(&replacement.field);
+            for value in existing {
+                let rewritten = regex.replace_all(&value, replacement.replace.as_str());
+                if header
+                    .append_header(replacement.field.clone(), rewritten.as_ref())
+                    .is_err()
+                {
+                    tracing::warn!(
+                        header = %replacement.field,
+                        "🚫 request_header replacement produced an invalid value"
+                    );
+                }
+            }
+        }
+
+        for name in remove {
+            let _ = header.remove_header(name.as_str());
+        }
+        Ok(())
+    }
+
     fn apply_rewrite(
         &self,
         session: &mut Session,
@@ -4317,6 +4452,39 @@ impl PingclairProxy {
                 }
                 Ok(false)
             }
+            HandlerConfig::RequestHeaders {
+                set,
+                add,
+                remove,
+                replace,
+            } => {
+                self.apply_request_headers(session, ctx, route_index, set, add, remove, replace)?;
+                Ok(false)
+            }
+            HandlerConfig::RequestBody { max_size } => {
+                // 📥 Recorded rather than enforced here: the body has not been
+                // read yet, and the places that do read it already know how to
+                // stop. Enforcing twice would mean two limits to keep in step.
+                if let Some(limit) = max_size {
+                    ctx.request_body_limit = Some(*limit);
+                }
+                Ok(false)
+            }
+            HandlerConfig::Abort => {
+                // 🔪 No status line, no body, no error page — the connection
+                // ends. `fail_to_proxy` maps a downstream `ConnectionClosed`
+                // to error code 0, which is its established spelling for "do
+                // not write a response", and refuses reuse. Anything with a
+                // status would be an answer, and an answer is the one thing
+                // `abort` exists not to give.
+                session.as_mut().set_keepalive(None);
+                Err(pingora_core::Error::create(
+                    pingora_core::ErrorType::ConnectionClosed,
+                    pingora_core::ErrorSource::Downstream,
+                    Some("aborted by configuration".into()),
+                    None,
+                ))
+            }
             HandlerConfig::LogSkip => {
                 ctx.log_skip = true;
                 Ok(false)
@@ -4351,7 +4519,40 @@ impl PingclairProxy {
                 replace,
                 regex,
                 regex_replace,
+                method,
             } => {
+                // 🔤 The method is a template too, and is upper-cased after
+                // resolution — `method post` and `method POST` are the same
+                // instruction, and an HTTP method is case-sensitive on the
+                // wire, so the lower-case spelling would otherwise reach the
+                // upstream verbatim and be refused.
+                if let Some(template) = method {
+                    let verified_client_ip = if template.contains('{') {
+                        ctx.verified_client_ip.map(|ip| ip.to_string())
+                    } else {
+                        None
+                    };
+                    let resolved = resolve_caddy_placeholders(
+                        template,
+                        session.req_header(),
+                        verified_client_ip.as_deref(),
+                        ctx.request_scheme,
+                        &ctx.request_vars,
+                    );
+                    match http::Method::from_bytes(resolved.to_ascii_uppercase().as_bytes()) {
+                        Ok(parsed) => session.req_header_mut().set_method(parsed),
+                        Err(_) => {
+                            tracing::warn!(
+                                method = %resolved,
+                                "🚫 `method` resolved to something that is not a method"
+                            );
+                            return Err(pingora_core::Error::explain(
+                                pingora_core::ErrorType::HTTPStatus(500),
+                                "rewritten method is not a valid HTTP method",
+                            ));
+                        }
+                    }
+                }
                 // 🧭 A rewrite target is a template: `php_fastcgi` writes
                 // `{http.matchers.file.relative}`, and operators write
                 // `{host}` and friends. Resolving here keeps `apply_rewrite`
@@ -5852,7 +6053,28 @@ impl ProxyHttp for PingclairProxy {
 
         // Check request body size (Content-Length)
         if let Some(state) = &ctx.state {
-            let limit = state.config.client_max_body_size;
+            // 📥 A route can raise this for itself with `request_body`, but
+            // that handler runs during dispatch, and for a locally answered
+            // route the body is drained even earlier than that. So the route's
+            // declared ceiling — the widest limit any `request_body` in its
+            // tree could grant, computed at load — is seeded here, before
+            // anything reads a byte. The handler overwrites it with the exact
+            // value when it runs, which is what a proxied body is measured
+            // against.
+            //
+            // ⚖️ Seeding the *widest* value is deliberate. When a route holds
+            // several matcher-guarded `request_body` blocks, this cannot know
+            // which one applies until the matchers run, and refusing an upload
+            // the operator explicitly configured the route to accept is the
+            // worse of the two errors. The ceiling is still a number that
+            // operator wrote.
+            let site_limit = state.config.client_max_body_size;
+            if let Some(ceiling) = route_index.and_then(|index| state.route_body_ceiling(index))
+                && (ceiling == 0 || ceiling > site_limit)
+            {
+                ctx.request_body_limit = Some(ceiling);
+            }
+            let limit = ctx.request_body_limit.unwrap_or(site_limit);
             if limit > 0
                 && let Some(content_length) = session
                     .req_header()
@@ -7495,7 +7717,34 @@ fn collect_subrequest_plans(
     }
 }
 
-fn collect_rewrite_regexes(handler: &HandlerConfig, regexes: &mut HashMap<String, Arc<Regex>>) {
+/// 📥 The widest limit any `request_body` handler in this tree could set.
+///
+/// A route may hold several, each behind its own matcher, and which one runs
+/// is a per-request answer. This is the load-time answer to a different
+/// question — "what is the most this route could ever allow?" — which is
+/// exactly what a check that runs before the matchers do is able to use.
+fn collect_request_body_ceiling(handler: &HandlerConfig) -> Option<u64> {
+    match handler {
+        HandlerConfig::RequestBody { max_size } => *max_size,
+        HandlerConfig::Pipeline { handlers }
+        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::HandlePath { handlers, .. } => handlers
+            .iter()
+            .filter_map(|element| collect_request_body_ceiling(&element.handler))
+            // 🔓 Zero means unlimited, so it outranks every finite ceiling
+            // rather than losing the comparison to one.
+            .reduce(|left, right| {
+                if left == 0 || right == 0 {
+                    0
+                } else {
+                    left.max(right)
+                }
+            }),
+        _ => None,
+    }
+}
+
+fn collect_route_regexes(handler: &HandlerConfig, regexes: &mut HashMap<String, Arc<Regex>>) {
     match handler {
         HandlerConfig::Rewrite {
             regex: Some(pattern),
@@ -7506,11 +7755,28 @@ fn collect_rewrite_regexes(handler: &HandlerConfig, regexes: &mut HashMap<String
             }
             Err(error) => tracing::error!(pattern, %error, "Invalid rewrite regex"),
         },
+        // 🏷️ `request_header <field> <find> <replace>` searches with a regex
+        // too, and it is compiled here for the same reason: the pattern is
+        // known at load and can never change per request.
+        HandlerConfig::RequestHeaders { replace, .. } => {
+            for replacement in replace {
+                match Regex::new(&replacement.search_regexp) {
+                    Ok(regex) => {
+                        regexes.insert(replacement.search_regexp.clone(), Arc::new(regex));
+                    }
+                    Err(error) => tracing::error!(
+                        pattern = %replacement.search_regexp,
+                        %error,
+                        "Invalid request_header replace regex"
+                    ),
+                }
+            }
+        }
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::Handle { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
             for element in handlers {
-                collect_rewrite_regexes(&element.handler, regexes);
+                collect_route_regexes(&element.handler, regexes);
             }
         }
         _ => {}

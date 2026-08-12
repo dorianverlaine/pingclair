@@ -142,6 +142,14 @@ pub fn evaluate_response_handlers(
                 }
                 outcome.header_remove.extend(remove.iter().cloned());
             }
+            // 🧭 A response subroute runs after the request is finished, so
+            // editing the request or bounding its body has nothing left to act
+            // on, and `abort` cannot take back a response already decided.
+            // Named rather than left to a wildcard so a future handler variant
+            // has to be thought about here instead of silently doing nothing.
+            HandlerConfig::RequestHeaders { .. }
+            | HandlerConfig::RequestBody { .. }
+            | HandlerConfig::Abort => {}
             HandlerConfig::CopyResponseHeaders { include, exclude } => {
                 copied = collect_copied_headers(upstream_headers, include, exclude);
             }

@@ -3567,6 +3567,188 @@ async fn test_local_descriptor_exhaustion_does_not_mark_the_backend_down() {
     backend_task.abort();
 }
 
+/// 🔤🏷️ `method` and `request_header` both change what the upstream is asked.
+///
+/// Asserted together because they are one observation: the request head the
+/// backend actually received. Splitting them would mean capturing the same
+/// bytes twice to check two lines of it.
+#[tokio::test]
+async fn test_pingclairfile_method_and_request_header_reach_upstream() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let upstream_address = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&request).to_string()
+    });
+
+    // 🔤 `method post` is written lower case on purpose: an HTTP method is
+    // case-sensitive on the wire, so the upstream must still be asked `POST`.
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            method post
+            request_header X-Set first
+            request_header +X-Added second
+            request_header -X-Dropped
+            request_header X-Edit ^before$ after
+            reverse_proxy http://{upstream_address}
+        }}
+    "#
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/probe"))
+        .header("X-Dropped", "please-remove-me")
+        .header("X-Edit", "before")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let request = upstream_task.await.unwrap();
+    let lines: Vec<&str> = request.lines().collect();
+    assert!(
+        lines[0].starts_with("POST "),
+        "`method post` must reach the upstream upper-cased: {}",
+        lines[0]
+    );
+    let has = |name: &str, value: &str| {
+        lines
+            .iter()
+            .any(|line| line.eq_ignore_ascii_case(&format!("{name}: {value}")))
+    };
+    assert!(has("X-Set", "first"), "a set header must arrive: {request}");
+    assert!(
+        has("X-Added", "second"),
+        "an added header must arrive: {request}"
+    );
+    assert!(
+        !request.to_ascii_lowercase().contains("x-dropped"),
+        "a removed header must not arrive: {request}"
+    );
+    assert!(
+        has("X-Edit", "after"),
+        "a replacement must rewrite the value the client sent: {request}"
+    );
+}
+
+/// 📥 A route may raise the body limit for itself.
+///
+/// The site's limit is one megabyte and no Pingclairfile can change it, so
+/// this is the only way an operator accepts a larger upload — which is also
+/// how the format models it. The uploading route accepts what the plain route
+/// refuses, and the two differ by nothing but the `request_body` block.
+#[tokio::test]
+async fn test_pingclairfile_request_body_max_size_raises_the_route_limit() {
+    let config = r#"
+        {
+            admin off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            route /upload/* {
+                request_body {
+                    max_size 8MB
+                }
+                respond "uploaded" 200
+            }
+
+            respond "plain" 200
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    // 📏 Two mebibytes: over the one-megabyte site default, under the route's
+    // eight-megabyte allowance.
+    let body = vec![b'x'; 2 * 1024 * 1024];
+
+    // 🔌 A client each, because the rejection closes its connection: a pooled
+    // socket carried over from the accepted upload would be torn down while
+    // the second request was still writing, and the test would fail for a
+    // reason that has nothing to do with the limit.
+    let raised = no_proxy_client()
+        .post(server.url(0, "/upload/thing"))
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        raised.status(),
+        200,
+        "the route raised its own limit, so this upload must be accepted"
+    );
+
+    let plain = no_proxy_client()
+        .post(server.url(0, "/plain"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        plain.status(),
+        413,
+        "a route without `request_body` keeps the site limit"
+    );
+}
+
+/// 🔪 `abort` gives the client nothing at all — not even a status.
+#[tokio::test]
+async fn test_pingclairfile_abort_answers_with_no_response() {
+    let config = r#"
+        {
+            admin off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            @doomed path /doomed*
+            abort @doomed
+
+            respond "fine" 200
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    // 🧭 The unmatched path proves the site is otherwise healthy, so the
+    // failure below is the directive rather than a server that never started.
+    let fine = client.get(server.url(0, "/fine")).send().await.unwrap();
+    assert_eq!(fine.status(), 200);
+    assert_eq!(fine.text().await.unwrap(), "fine");
+
+    let aborted = client.get(server.url(0, "/doomed")).send().await;
+    assert!(
+        aborted.is_err(),
+        "`abort` must not produce a response of any kind; got {:?}",
+        aborted.map(|response| response.status())
+    );
+}
+
 #[tokio::test]
 async fn test_pingclairfile_reverse_proxy_method_and_rewrite_reach_upstream() {
     use tokio::io::AsyncWriteExt;

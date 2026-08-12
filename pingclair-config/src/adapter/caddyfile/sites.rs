@@ -785,6 +785,9 @@ pub(super) fn handler_directive_name(handler: &Handler) -> &'static str {
     match handler {
         Handler::AcmeServer(_) => "acme_server",
         Handler::Headers(_) => "header",
+        Handler::RequestHeaders(_) => "request_header",
+        Handler::RequestBody(_) => "request_body",
+        Handler::Abort => "abort",
         Handler::LogSkip => "log_skip",
         Handler::Vars(_) => "vars",
         Handler::Redirect(_) => "redir",
@@ -848,6 +851,11 @@ pub(super) fn handler_has_terminal(handler: &Handler) -> bool {
         // route the same way `respond` does.
         | Handler::AcmeServer(_)
         | Handler::Templates
+        // 🔪 `abort` writes no response, but it does end the request — the
+        // connection is gone. So it terminates a route in the sense that
+        // matters here: nothing composed after it could ever run, and the
+        // format ranks it among the directives that answer.
+        | Handler::Abort
         | Handler::ForwardAuth(_) => true,
         Handler::Pipeline(handlers)
         | Handler::Handle(handlers)
@@ -858,6 +866,8 @@ pub(super) fn handler_has_terminal(handler: &Handler) -> bool {
         // changes which path is asked for, and a site whose route ends there
         // has answered nothing. The `file_server` after it is the terminal.
         Handler::Headers(_)
+        | Handler::RequestHeaders(_)
+        | Handler::RequestBody(_)
         | Handler::BasicAuth(_)
         | Handler::RateLimit(_)
         | Handler::Rewrite(_)

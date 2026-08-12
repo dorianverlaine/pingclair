@@ -841,10 +841,30 @@ mod global_tests {
 /// dropping part of what the operator asked for must now fail loudly.
 #[cfg(test)]
 mod fail_closed_tests {
+    use pingclair_core::config::HandlerConfig;
+
     fn compile_err(source: &str) -> String {
         match crate::compile(source) {
             Ok(_) => panic!("config unexpectedly compiled:\n{source}"),
             Err(e) => e.to_string(),
+        }
+    }
+
+    /// 🧭 Every handler in a route's tree, flattened.
+    ///
+    /// A site with more than one directive compiles to a pipeline, so a test
+    /// that matched the route's handler directly would only ever see the
+    /// wrapper — and would pass or fail for reasons that have nothing to do
+    /// with the directive it is about.
+    fn handlers_of(handler: &HandlerConfig) -> Vec<&HandlerConfig> {
+        match handler {
+            HandlerConfig::Pipeline { handlers }
+            | HandlerConfig::Handle { handlers }
+            | HandlerConfig::HandlePath { handlers, .. } => handlers
+                .iter()
+                .flat_map(|element| handlers_of(&element.handler))
+                .collect(),
+            other => vec![other],
         }
     }
 
@@ -888,7 +908,11 @@ mod fail_closed_tests {
             .expect("log block")
             .rotation
             .clone();
-        assert_eq!(rotation.max_size_bytes, Some(1024 * 1024));
+        // 🔢 A million bytes, not a mebibyte. `mb` is SI in this format — the
+        // upstream parser is `humanize.ParseBytes` — and this assertion used
+        // to say 1,048,576, which was our own size parser's bug written down
+        // as an expectation. Corrected 2026-08-11 along with the parser.
+        assert_eq!(rotation.max_size_bytes, Some(1_000_000));
         assert_eq!(rotation.keep, Some(3));
         // 📌 Caddy compresses rotated files unless told not to, so a `roll_`
         // block without `roll_uncompressed` means compression on.
@@ -1844,6 +1868,180 @@ mod fail_closed_tests {
             error.contains("header"),
             "`header X-Only` without a value must fail; got {error}"
         );
+    }
+
+    /// 🔤 `method` is a rewrite of one field, not a handler of its own.
+    #[test]
+    fn method_directive_sets_the_request_method() {
+        let config = crate::compile("example.com {\n    method FOO\n    respond \"x\"\n}").unwrap();
+        let route = &config.servers[0].routes[0];
+        let found = handlers_of(&route.handler).into_iter().any(|handler| {
+            matches!(
+                handler,
+                HandlerConfig::Rewrite {
+                    method: Some(verb),
+                    ..
+                } if verb == "FOO"
+            )
+        });
+        assert!(found, "`method FOO` must compile to a method rewrite");
+    }
+
+    #[test]
+    fn method_directive_needs_exactly_one_verb() {
+        for source in [
+            "example.com {\n    method\n}",
+            "example.com {\n    method GET POST\n}",
+        ] {
+            let error = compile_err(source);
+            assert!(error.contains("method"), "got {error}");
+        }
+    }
+
+    /// 🏷️ The three operations `request_header` offers, in one site.
+    #[test]
+    fn request_header_directive_sets_adds_and_removes() {
+        let config = crate::compile(
+            "example.com {\n    request_header Denis Ritchie\n    \
+             request_header +Edsger Dijkstra\n    request_header -Wolfram\n    respond \"x\"\n}",
+        )
+        .unwrap();
+        let route = &config.servers[0].routes[0];
+        let mut saw_set = false;
+        let mut saw_add = false;
+        let mut saw_remove = false;
+        for handler in handlers_of(&route.handler) {
+            if let HandlerConfig::RequestHeaders {
+                set, add, remove, ..
+            } = handler
+            {
+                saw_set |= set.get("Denis").is_some_and(|value| value == "Ritchie");
+                saw_add |= add.get("Edsger").is_some_and(|value| value == "Dijkstra");
+                saw_remove |= remove.iter().any(|name| name == "Wolfram");
+            }
+        }
+        assert!(saw_set && saw_add && saw_remove, "all three forms compile");
+    }
+
+    /// 📌 A field with no value sets it to the empty string, which is what a
+    /// configuration written for the upstream format means by it. Refusing
+    /// would make a working configuration stop working on the way over.
+    #[test]
+    fn request_header_without_a_value_sets_an_empty_one() {
+        let config =
+            crate::compile("example.com {\n    request_header X-Trace\n    respond \"x\"\n}")
+                .unwrap();
+        let route = &config.servers[0].routes[0];
+        let found = handlers_of(&route.handler).into_iter().any(|handler| {
+            matches!(handler, HandlerConfig::RequestHeaders { set, .. }
+                if set.get("X-Trace").is_some_and(String::is_empty))
+        });
+        assert!(found, "`request_header X-Trace` sets an empty value");
+    }
+
+    /// 🧭 The prefix wins over the argument count, because that is the order
+    /// the upstream parser tests them in. Deciding by arity instead would turn
+    /// this line into a search-and-replace and silently change what it does.
+    #[test]
+    fn request_header_prefix_beats_a_third_argument() {
+        let config =
+            crate::compile("example.com {\n    request_header +Foo bar baz\n    respond \"x\"\n}")
+                .unwrap();
+        let route = &config.servers[0].routes[0];
+        let found = handlers_of(&route.handler).into_iter().any(|handler| {
+            matches!(handler, HandlerConfig::RequestHeaders { add, replace, .. }
+                if add.get("Foo").is_some_and(|value| value == "bar") && replace.is_empty())
+        });
+        assert!(found, "`+Foo bar baz` appends `bar` and ignores `baz`");
+    }
+
+    #[test]
+    fn request_header_three_arguments_are_a_replacement() {
+        let config =
+            crate::compile("example.com {\n    request_header Foo ^old$ new\n    respond \"x\"\n}")
+                .unwrap();
+        let route = &config.servers[0].routes[0];
+        let found = handlers_of(&route.handler).into_iter().any(|handler| {
+            matches!(handler, HandlerConfig::RequestHeaders { replace, .. }
+                if replace.len() == 1
+                    && replace[0].field == "Foo"
+                    && replace[0].search_regexp == "^old$"
+                    && replace[0].replace == "new")
+        });
+        assert!(found, "three arguments are a search-and-replace");
+    }
+
+    /// 🛡️ A bad pattern is refused while compiling, not on the request path.
+    #[test]
+    fn request_header_rejects_an_invalid_replacement_pattern() {
+        let error = compile_err("example.com {\n    request_header Foo ( new\n}");
+        assert!(error.contains("request_header"), "got {error}");
+    }
+
+    /// 📥 `max_size` is a per-route override of the site's body limit.
+    #[test]
+    fn request_body_directive_sets_a_max_size() {
+        let config =
+            crate::compile("example.com {\n    request_body {\n        max_size 1MB\n    }\n}")
+                .unwrap();
+        let route = &config.servers[0].routes[0];
+        let found = handlers_of(&route.handler).into_iter().any(|handler| {
+            // 🔢 A million bytes, not a mebibyte: `MB` is SI in this format,
+            // and rounding it up to 1,048,576 would grant a 4.9 % larger limit
+            // than the author asked for.
+            matches!(
+                handler,
+                HandlerConfig::RequestBody {
+                    max_size: Some(1_000_000)
+                }
+            )
+        });
+        assert!(found, "`max_size 1MB` is 1,000,000 bytes");
+    }
+
+    #[test]
+    fn request_body_mebibytes_are_distinct_from_megabytes() {
+        let config =
+            crate::compile("example.com {\n    request_body {\n        max_size 1MiB\n    }\n}")
+                .unwrap();
+        let route = &config.servers[0].routes[0];
+        let found = handlers_of(&route.handler).into_iter().any(|handler| {
+            matches!(
+                handler,
+                HandlerConfig::RequestBody {
+                    max_size: Some(1_048_576)
+                }
+            )
+        });
+        assert!(found, "`max_size 1MiB` is 1,048,576 bytes");
+    }
+
+    #[test]
+    fn request_body_names_the_options_it_does_not_implement() {
+        for option in ["read_timeout 5s", "write_timeout 5s", "set hello"] {
+            let error = compile_err(&format!(
+                "example.com {{\n request_body {{\n {option}\n }}\n}}"
+            ));
+            assert!(
+                error.contains("request_body"),
+                "`{option}` must be named, not dropped; got {error}"
+            );
+        }
+    }
+
+    /// 🔪 `abort` takes nothing at all.
+    #[test]
+    fn abort_directive_compiles_and_takes_no_arguments() {
+        let config = crate::compile("example.com {\n    abort\n}").unwrap();
+        let route = &config.servers[0].routes[0];
+        assert!(
+            handlers_of(&route.handler)
+                .into_iter()
+                .any(|handler| matches!(handler, HandlerConfig::Abort)),
+            "`abort` compiles to the abort handler"
+        );
+        let error = compile_err("example.com {\n    abort 503\n}");
+        assert!(error.contains("abort"), "got {error}");
     }
 
     #[test]
