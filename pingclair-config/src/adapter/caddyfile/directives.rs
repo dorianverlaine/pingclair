@@ -1330,44 +1330,87 @@ pub(super) fn adapt_vars_directive(d: &Directive) -> Result<Handler, AdapterErro
 /// - `header -Server` (inline remove, prefix `-`)
 pub(super) fn adapt_header_directive(d: &Directive) -> Result<Handler, AdapterError> {
     let mut config = HeadersConfig::default();
+    let args = data_args(d);
+
+    // 🚫 Upstream refuses a directive that writes headers both ways at once,
+    // "because it would be weird" — and because the two would have no defined
+    // order. Refusing is also what stops a block from being silently ignored.
+    if !args.is_empty() && d.block.is_some() {
+        return Err(AdapterError::InvalidArgument(
+            "header".into(),
+            "headers cannot be given both as arguments and in a block; pick one".into(),
+        ));
+    }
 
     if let Some(block) = &d.block {
         for sub in &block.directives {
-            if sub.name.starts_with('-') {
-                // `-Header` → remove
-                config.remove.push(sub.name[1..].to_string());
-            } else if sub.name.starts_with('+') {
-                // `+Header Value` → add
-                if let Some(val) = sub.args.first() {
-                    config.add.insert(sub.name[1..].to_string(), val.clone());
+            match sub.name.as_str() {
+                // ⏭️ Response headers are already applied once, against the
+                // finished response, so asking for that explicitly changes
+                // nothing. Accepted rather than refused: a configuration
+                // carried over from upstream must keep loading, and it does
+                // here mean what it says.
+                "defer" => {
+                    if !sub.args.is_empty() {
+                        return Err(AdapterError::ArgumentCount(
+                            "header defer".into(),
+                            0,
+                            sub.args.len(),
+                        ));
+                    }
+                    continue;
                 }
-            } else {
-                // `Header Value` → set
-                if let Some(val) = sub.args.first() {
-                    config.set.insert(sub.name.clone(), val.clone());
+                // 🚩 A response matcher gating the whole block. Same reason.
+                "match" => {
+                    return Err(AdapterError::UnsupportedFeature(
+                        "header match".into(),
+                        "a response matcher on a header block is not implemented yet".into(),
+                    ));
                 }
+                _ => {}
             }
-        }
-    } else {
-        // Inline form: `header @matcher Key "Value"` or `header -Server`
-        // Skip @matcher argument
-        let args: Vec<&String> = d.args.iter().filter(|a| !a.starts_with('@')).collect();
-
-        if let Some(key) = args.first() {
-            if let Some(stripped) = key.strip_prefix('-') {
-                config.remove.push(stripped.to_string());
-            } else if let Some(val) = args.get(1) {
-                config.set.insert((*key).clone(), (*val).clone());
-            } else {
-                // 🚩 `header X-Only` used to compile into an empty header
-                // operation: no set, no remove, no add. A header key without
-                // a value is either a typo or a request to remove — make the
-                // author say which.
-                return Err(AdapterError::ArgumentCount("header".into(), 2, args.len()));
+            if sub.args.len() > 2 {
+                return Err(AdapterError::ArgumentCount(
+                    "header".into(),
+                    2,
+                    sub.args.len(),
+                ));
             }
+            apply_header_op(
+                "header",
+                &mut config,
+                &sub.name,
+                sub.args.first().cloned().unwrap_or_default(),
+                sub.args.get(1),
+                true,
+            )?;
         }
+        return Ok(Handler::Headers(config));
     }
 
+    let Some(field) = args.first() else {
+        return Err(AdapterError::ArgumentCount("header".into(), 1, 0));
+    };
+    if args.len() > 3 {
+        return Err(AdapterError::ArgumentCount("header".into(), 3, args.len()));
+    }
+    // 🚩 `header X-Only` with no value stays refused on the response side, and
+    // this is a deliberate divergence from upstream, which would set an empty
+    // value. A response header whose value is empty is almost always a typo
+    // for a removal, and the two are one keystroke apart. The request side
+    // does accept it, because there the empty value is what the format's own
+    // corpus relies on.
+    if args.len() == 1 && !field.starts_with(['-', '+', '?', '>']) {
+        return Err(AdapterError::ArgumentCount("header".into(), 2, 1));
+    }
+    apply_header_op(
+        "header",
+        &mut config,
+        field,
+        args.get(1).cloned().unwrap_or_default(),
+        args.get(2),
+        true,
+    )?;
     Ok(Handler::Headers(config))
 }
 
@@ -1395,6 +1438,95 @@ pub(super) fn adapt_method_directive(d: &Directive) -> Result<Handler, AdapterEr
     }))
 }
 
+/// 🏷️ Applies one header instruction — the shape both `header` and
+/// `request_header` are written in — to an accumulating set of operations.
+///
+/// One function because the format has one grammar here: `header` and
+/// `request_header` differ in *which message* they edit, never in how a line
+/// is read. Two parsers would be two chances to disagree, and they already had
+/// — the response side silently dropped a third argument, so
+/// `header X-Foo old new` set `X-Foo: old` where the format means a regex
+/// search-and-replace.
+///
+/// 🧭 The arm order is the semantics, not a style choice. Upstream tests the
+/// `+`/`-`/`?` prefixes **before** it tests for a third argument, so a prefix
+/// always wins and a replacement argument beside one is discarded:
+/// `+Foo bar baz` appends `bar` and never reads `baz`
+/// (`modules/caddyhttp/headers/caddyfile.go`, `applyHeaderOp`).
+fn apply_header_op(
+    directive: &str,
+    config: &mut HeadersConfig,
+    field: &str,
+    value: String,
+    replacement: Option<&String>,
+    response_side: bool,
+) -> Result<(), AdapterError> {
+    // 🖋️ A trailing colon is a habit carried over from writing curl commands,
+    // and the format forgives it rather than producing a header whose name
+    // ends in `:` — which no client would ever match.
+    let field = field.strip_suffix(':').unwrap_or(field);
+
+    match field.chars().next() {
+        Some('+') => {
+            config.add.insert(field[1..].to_string(), value);
+        }
+        Some('-') => {
+            // 📌 A value beside a removal is ignored rather than refused, and
+            // a configuration that loads upstream has to load here.
+            config.remove.push(field[1..].to_string());
+        }
+        // ❓ "Set this only if it is not already there", which needs a message
+        // to inspect — so it is a response operation, and upstream refuses it
+        // on requests for the same reason.
+        Some('?') => {
+            if !response_side {
+                return Err(AdapterError::InvalidArgument(
+                    directive.into(),
+                    "the `?` default modifier works on response headers only; use a \
+                     matcher to set a request header conditionally"
+                        .into(),
+                ));
+            }
+            config.default_set.insert(field[1..].to_string(), value);
+        }
+        // ⏭️ `>` asks for the operation to be applied after the handler chain
+        // rather than during it. This server has no other moment to apply
+        // response headers in: the policy is collected while handlers run and
+        // executed once, against the finished response, which is what deferral
+        // asks for. So the prefix is honoured by being what already happens,
+        // and is stripped rather than becoming part of the header's name.
+        Some('>') => match replacement {
+            Some(replacement) => {
+                config
+                    .replace
+                    .push(pingclair_core::config::HeaderReplacement {
+                        field: field[1..].to_string(),
+                        search_regexp: value,
+                        replace: replacement.clone(),
+                    });
+            }
+            None => {
+                config.set.insert(field[1..].to_string(), value);
+            }
+        },
+        _ => match replacement {
+            Some(replacement) => {
+                config
+                    .replace
+                    .push(pingclair_core::config::HeaderReplacement {
+                        field: field.to_string(),
+                        search_regexp: value,
+                        replace: replacement.clone(),
+                    });
+            }
+            None => {
+                config.set.insert(field.to_string(), value);
+            }
+        },
+    }
+    Ok(())
+}
+
 /// 🏷️ Adapts `request_header [<matcher>] [+|-]<field> [<value>]`.
 ///
 /// The response-side sibling is `header`. They are different directives
@@ -1411,16 +1543,6 @@ pub(super) fn adapt_request_header_directive(d: &Directive) -> Result<Handler, A
     let Some(field) = args.first() else {
         return Err(AdapterError::ArgumentCount("request_header".into(), 1, 0));
     };
-
-    // 🖋️ A trailing colon is a habit carried over from writing curl commands,
-    // and upstream forgives it rather than producing a header whose name ends
-    // in `:` — which no client would ever match.
-    let field = field.strip_suffix(':').unwrap_or(field);
-    // 📌 A missing value is an empty value, not an error. That is the format's
-    // own reading, and a configuration written for it has to keep meaning the
-    // same thing here — `request_header X-Trace` sets the header to "".
-    let value = args.get(1).cloned().unwrap_or_default();
-    let replacement = args.get(2);
     if args.len() > 3 {
         return Err(AdapterError::ArgumentCount(
             "request_header".into(),
@@ -1428,57 +1550,18 @@ pub(super) fn adapt_request_header_directive(d: &Directive) -> Result<Handler, A
             args.len(),
         ));
     }
-
-    let mut config = RequestHeadersConfig::default();
-    // 🧭 The order of these arms is not a style choice, it is the semantics.
-    // Upstream tests the `+`/`-`/`?` prefixes **before** it tests for a third
-    // argument, so a prefix always wins and the replacement argument beside
-    // one is discarded: `request_header +Foo bar baz` appends `Foo: bar` and
-    // `baz` is never read. Deciding by argument count instead — which reads
-    // more naturally — would turn that line into a search-and-replace, and a
-    // configuration carried over from upstream would quietly do something
-    // else. (`modules/caddyhttp/headers/caddyfile.go`, `applyHeaderOp`.)
-    match field.chars().next() {
-        Some('+') => {
-            config.add.insert(field[1..].to_string(), value);
-        }
-        Some('-') => {
-            // 📌 A value beside a removal is ignored upstream rather than
-            // refused, and a configuration that loads there has to load here.
-            config.remove.push(field[1..].to_string());
-        }
-        // 🚫 Upstream refuses `?` on request headers, and says why: it means
-        // "set this only if absent", which needs a response to inspect. The
-        // request-side equivalent is a matcher.
-        Some('?') => {
-            return Err(AdapterError::InvalidArgument(
-                "request_header".into(),
-                "the `?` default modifier works on response headers only; use a \
-                 matcher to set a request header conditionally"
-                    .into(),
-            ));
-        }
-        _ => match replacement {
-            Some(replacement) => {
-                config
-                    .replace
-                    .push(pingclair_core::config::HeaderReplacement {
-                        // 🏷️ Only `>` can still be here; the other prefixes
-                        // were taken by the arms above. On a request it means
-                        // nothing — deferral is a response-side concept — so
-                        // it is stripped rather than honoured.
-                        field: field.trim_start_matches('>').to_string(),
-                        search_regexp: value,
-                        replace: replacement.clone(),
-                    });
-            }
-            None => {
-                config
-                    .set
-                    .insert(field.trim_start_matches('>').to_string(), value);
-            }
-        },
-    }
+    let mut config = HeadersConfig::default();
+    apply_header_op(
+        "request_header",
+        &mut config,
+        field,
+        // 📌 A missing value is an empty value, not an error. That is the
+        // format's own reading, and a configuration written for it has to keep
+        // meaning the same thing here.
+        args.get(1).cloned().unwrap_or_default(),
+        args.get(2),
+        false,
+    )?;
     Ok(Handler::RequestHeaders(config))
 }
 

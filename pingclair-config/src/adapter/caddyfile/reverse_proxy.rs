@@ -1766,6 +1766,9 @@ fn adapt_response_handler(
                 set: config.set,
                 add: config.add,
                 remove: config.remove,
+                // 🔁 The response-subroute form takes set/add/remove only.
+                replace: Vec::new(),
+                default_set: std::collections::BTreeMap::new(),
             })
         }
         "error" => {

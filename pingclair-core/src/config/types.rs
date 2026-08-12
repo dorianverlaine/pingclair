@@ -1289,7 +1289,7 @@ pub enum HandlerConfig {
         message: Option<String>,
     },
 
-    /// Headers modification
+    /// Headers modification, on the **response**.
     Headers {
         #[serde(default)]
         set: BTreeMap<String, String>,
@@ -1297,6 +1297,18 @@ pub enum HandlerConfig {
         add: BTreeMap<String, String>,
         #[serde(default)]
         remove: Vec<String>,
+        /// 🔁 Regex search-and-replace over values the response already
+        /// carries, in the order written. Distinct from `set`, which decides
+        /// the value without looking at what was there.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        replace: Vec<HeaderReplacement>,
+        /// ❓ Values written only when the response does not already carry
+        /// that header — the `?` modifier.
+        ///
+        /// Response-only, because "is it already there" needs a message to
+        /// look at. The request-side equivalent is a matcher.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        default_set: BTreeMap<String, String>,
     },
 
     /// 🚫 Marks the request as excluded from access logging (`log_skip`).

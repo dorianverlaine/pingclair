@@ -2383,16 +2383,46 @@ fn compile_handler(
             code: redir.code,
         }),
 
-        Handler::Headers(headers) => Ok(HandlerConfig::Headers {
-            set: headers.set.clone(),
-            add: headers.add.clone(),
-            remove: headers.remove.clone(),
-        }),
+        Handler::Headers(headers) => {
+            // 🛡️ A bad pattern is refused while compiling, not discovered on
+            // the request path — the same rule `request_header` follows.
+            for replacement in &headers.replace {
+                // 🧭 A pattern carrying a placeholder is not a pattern yet —
+                // `:{http.request.local.port}` is not valid regex syntax and is
+                // not meant to be. It becomes one per request, once the
+                // placeholder has a value, so it cannot be checked here.
+                if replacement.search_regexp.contains('{') {
+                    continue;
+                }
+                regex::Regex::new(&replacement.search_regexp).map_err(|error| {
+                    CompileError::InvalidRoute {
+                        message: format!(
+                            "invalid header replace regex `{}`: {error}",
+                            replacement.search_regexp
+                        ),
+                    }
+                })?;
+            }
+            Ok(HandlerConfig::Headers {
+                set: headers.set.clone(),
+                add: headers.add.clone(),
+                remove: headers.remove.clone(),
+                replace: headers.replace.clone(),
+                default_set: headers.default_set.clone(),
+            })
+        }
 
         Handler::RequestHeaders(headers) => {
             // 🛡️ A bad pattern is refused while compiling, not discovered on
             // the request path — the same rule `rewrite` follows one arm over.
             for replacement in &headers.replace {
+                // 🧭 A pattern carrying a placeholder is not a pattern yet —
+                // `:{http.request.local.port}` is not valid regex syntax and is
+                // not meant to be. It becomes one per request, once the
+                // placeholder has a value, so it cannot be checked here.
+                if replacement.search_regexp.contains('{') {
+                    continue;
+                }
                 regex::Regex::new(&replacement.search_regexp).map_err(|error| {
                     CompileError::InvalidRoute {
                         message: format!(

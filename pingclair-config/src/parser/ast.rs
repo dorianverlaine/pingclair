@@ -618,7 +618,7 @@ pub enum Handler {
 
     /// 🏷️ Request-header rewriting (`request_header`), as opposed to the
     /// response rewriting [`Handler::Headers`] does.
-    RequestHeaders(RequestHeadersConfig),
+    RequestHeaders(HeadersConfig),
 
     /// 📥 Per-route request body bound (`request_body`).
     RequestBody(RequestBodyConfig),
@@ -1058,19 +1058,10 @@ pub struct HeadersConfig {
     pub set: BTreeMap<String, String>,
     pub add: BTreeMap<String, String>,
     pub remove: Vec<String>,
-}
-
-/// 🏷️ Request-header edits from one or more `request_header` lines.
-///
-/// Kept apart from [`HeadersConfig`] rather than growing a `replace` field on
-/// it, because the response side does not implement replacement — a shared
-/// struct would advertise an operation one of its two users silently drops.
-#[derive(Debug, Clone, Default)]
-pub struct RequestHeadersConfig {
-    pub set: BTreeMap<String, String>,
-    pub add: BTreeMap<String, String>,
-    pub remove: Vec<String>,
+    /// 🔁 Regex search-and-replace over values already present.
     pub replace: Vec<pingclair_core::config::HeaderReplacement>,
+    /// ❓ Values written only if the response does not already carry them.
+    pub default_set: BTreeMap<String, String>,
 }
 
 /// 📥 One route's request-body bound, from `request_body { max_size … }`.

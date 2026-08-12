@@ -136,7 +136,17 @@ pub fn evaluate_response_handlers(
     let mut copied: Vec<(String, String)> = Vec::new();
     for handler in &entry.handlers {
         match handler {
-            HandlerConfig::Headers { set, add, remove } => {
+            HandlerConfig::Headers {
+                set,
+                add,
+                remove,
+                // 🔁 A response subroute collects flat name/value edits for the
+                // caller to apply; a replacement needs the compiled pattern
+                // table, which this evaluation does not carry, and `?` needs the
+                // finished response to look at.
+                replace: _,
+                default_set: _,
+            } => {
                 for (name, value) in set.iter().chain(add.iter()) {
                     outcome.header_set.push((name.clone(), value.clone()));
                 }
@@ -380,6 +390,8 @@ mod response_interception_tests {
                     set: BTreeMap::from([("X-Reason".to_string(), "auth".to_string())]),
                     add: BTreeMap::new(),
                     remove: vec![],
+                    replace: Vec::new(),
+                    default_set: Default::default(),
                 },
                 HandlerConfig::Respond {
                     status: 403,
@@ -531,9 +543,43 @@ pub(crate) struct ResponseHeaderPolicy {
     set: HashMap<String, SetHeader>,
     add: Vec<AddedHeader>,
     remove: Vec<String>,
+    /// ❓ Values written only when the finished response lacks them (`?`).
+    default_set: HashMap<String, String>,
+    /// 🔁 Search-and-replace over values the response already carries.
+    ///
+    /// Unlike `set`, this cannot be decided in advance: the result depends on
+    /// what the upstream — or the local responder — actually wrote. So it is
+    /// carried as an instruction and executed against the finished response.
+    replace: Vec<HeaderReplacement>,
     suppress_server: bool,
     suppress_via: bool,
 }
+
+/// 🔁 One compiled header replacement, ready to run against a response.
+///
+/// The pattern arrives already compiled, from the per-route table built when
+/// the configuration was published. Building it here would put a regex compile
+/// on every response that touches the route.
+#[derive(Debug, Clone)]
+pub(crate) struct HeaderReplacement {
+    pub(crate) field: String,
+    pub(crate) pattern: std::sync::Arc<Regex>,
+    pub(crate) replacement: String,
+}
+
+/// 🧭 `Regex` has no `Eq`, so equality compares the pattern text instead —
+/// which is what the policy's own comparisons are asking about anyway: two
+/// replacements are the same instruction when they name the same header,
+/// the same pattern and the same replacement.
+impl PartialEq for HeaderReplacement {
+    fn eq(&self, other: &Self) -> bool {
+        self.field == other.field
+            && self.replacement == other.replacement
+            && self.pattern.as_str() == other.pattern.as_str()
+    }
+}
+
+impl Eq for HeaderReplacement {}
 
 impl ResponseHeaderPolicy {
     /// 📝 Replaces a downstream header with one normalized value.
@@ -574,6 +620,37 @@ impl ResponseHeaderPolicy {
         }
     }
 
+    /// ❓ Writes a value only if the finished response does not carry one.
+    ///
+    /// Deliberately not folded into `set`: whether it applies depends on what
+    /// the upstream — or a local responder — ends up sending, which is not
+    /// known while handlers run.
+    pub(crate) fn set_if_absent(&mut self, name: impl AsRef<str>, value: impl Into<String>) {
+        let name = name.as_ref().to_ascii_lowercase();
+        self.default_set.insert(name, value.into());
+    }
+
+    /// 🌐 Exposes conditional defaults to protocol adapters.
+    pub(crate) fn default_headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.default_set
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+
+    /// 🔁 Queues a search-and-replace over one header's existing values.
+    pub(crate) fn replace(
+        &mut self,
+        field: impl Into<String>,
+        pattern: std::sync::Arc<Regex>,
+        replacement: impl Into<String>,
+    ) {
+        self.replace.push(HeaderReplacement {
+            field: field.into().to_ascii_lowercase(),
+            pattern,
+            replacement: replacement.into(),
+        });
+    }
+
     /// 🧩 Adds proxy-owned replacements without overriding outer middleware.
     pub(crate) fn merge_proxy_set(&mut self, headers: &BTreeMap<String, String>) {
         for (name, value) in headers {
@@ -592,6 +669,8 @@ impl ResponseHeaderPolicy {
     pub(crate) fn merge(&mut self, other: ResponseHeaderPolicy) {
         self.set.extend(other.set);
         self.add.extend(other.add);
+        self.replace.extend(other.replace);
+        self.default_set.extend(other.default_set);
         for name in other.remove {
             self.remove(name);
         }
@@ -624,6 +703,40 @@ impl ResponseHeaderPolicy {
                 None => {
                     response.append_header(added.name_bytes.clone(), added.value.as_str())?;
                 }
+            }
+        }
+        // 🔁 After set and add, before remove: a replacement edits whatever is
+        // there by now, and a header the configuration asked to remove should
+        // not be rewritten on its way out.
+        for entry in &self.replace {
+            let existing: Vec<String> = response
+                .headers
+                .get_all(&entry.field)
+                .iter()
+                .filter_map(|value| value.to_str().ok().map(str::to_owned))
+                .collect();
+            if existing.is_empty() {
+                continue;
+            }
+            let _ = response.remove_header(&entry.field);
+            for value in existing {
+                let rewritten = entry
+                    .pattern
+                    .replace_all(&value, entry.replacement.as_str());
+                if response
+                    .append_header(entry.field.clone(), rewritten.as_ref())
+                    .is_err()
+                {
+                    tracing::warn!(
+                        header = %entry.field,
+                        "🚫 header replacement produced an invalid value"
+                    );
+                }
+            }
+        }
+        for (name, value) in &self.default_set {
+            if response.headers.get(name.as_str()).is_none() {
+                let _ = response.insert_header(name.clone(), value.as_str());
             }
         }
         for name in &self.remove {
@@ -669,6 +782,17 @@ impl ResponseHeaderPolicy {
     /// 🌐 Exposes normalized removals to protocol adapters.
     pub(crate) fn removed_headers(&self) -> impl Iterator<Item = &str> {
         self.remove.iter().map(String::as_str)
+    }
+
+    /// 🌐 Exposes queued replacements to protocol adapters, already compiled.
+    pub(crate) fn replacements(&self) -> impl Iterator<Item = (&str, &Regex, &str)> {
+        self.replace.iter().map(|entry| {
+            (
+                entry.field.as_str(),
+                entry.pattern.as_ref(),
+                entry.replacement.as_str(),
+            )
+        })
     }
 
     /// 🌐 Reports whether middleware suppresses the default server header.

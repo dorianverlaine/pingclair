@@ -1717,6 +1717,19 @@ impl ProxyState {
             .and_then(|regexes| regexes.get(pattern).map(AsRef::as_ref))
     }
 
+    /// ⚡ The same lookup, handing out a shared reference the response policy
+    /// can outlive this borrow with.
+    ///
+    /// A response header replacement is queued during handler dispatch and run
+    /// when the response is written, which is later and elsewhere — so the
+    /// policy has to own its patterns rather than borrow them from a snapshot
+    /// it does not hold.
+    pub(crate) fn route_regex_arc(&self, route_index: usize, pattern: &str) -> Option<Arc<Regex>> {
+        self.route_regexes
+            .get(route_index)
+            .and_then(|regexes| regexes.get(pattern).cloned())
+    }
+
     /// 🧭 Applies one precompiled route rewrite without transport-specific state.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn rewrite_request_uri(
@@ -3615,15 +3628,17 @@ impl PingclairProxy {
             // ⚡ The pattern was compiled when the configuration was published,
             // so this is a lookup rather than a compile. Compiling here would
             // put a regex build on every request that touches this route.
-            let Some(regex) = ctx
-                .state
-                .as_ref()
-                .and_then(|state| state.route_regex(route_index, &replacement.search_regexp))
-            else {
-                tracing::warn!(
-                    pattern = %replacement.search_regexp,
-                    "🚫 request_header replace pattern missing from the active configuration"
-                );
+            let Some((regex, resolved_replacement)) = ctx.state.as_ref().and_then(|state| {
+                compiled_header_replacement(
+                    state,
+                    route_index,
+                    replacement,
+                    header,
+                    verified_client_ip.as_deref(),
+                    scheme,
+                    &ctx.request_vars,
+                )
+            }) else {
                 continue;
             };
             let existing: Vec<String> = header
@@ -3637,7 +3652,7 @@ impl PingclairProxy {
             }
             let _ = header.remove_header(&replacement.field);
             for value in existing {
-                let rewritten = regex.replace_all(&value, replacement.replace.as_str());
+                let rewritten = regex.replace_all(&value, resolved_replacement.as_str());
                 if header
                     .append_header(replacement.field.clone(), rewritten.as_ref())
                     .is_err()
@@ -4394,7 +4409,33 @@ impl PingclairProxy {
                     Ok(true)
                 }
             }
-            HandlerConfig::Headers { set, add, remove } => {
+            HandlerConfig::Headers {
+                set,
+                add,
+                remove,
+                replace,
+                default_set,
+            } => {
+                // 🔁 Patterns come from the per-route table compiled when the
+                // configuration was published, so this is a lookup.
+                let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
+                for entry in replace {
+                    let resolved = ctx.state.as_ref().and_then(|state| {
+                        compiled_header_replacement(
+                            state,
+                            route_index,
+                            entry,
+                            session.req_header(),
+                            verified_client_ip.as_deref(),
+                            ctx.request_scheme,
+                            &ctx.request_vars,
+                        )
+                    });
+                    if let Some((pattern, replacement)) = resolved {
+                        ctx.response_headers
+                            .replace(entry.field.clone(), pattern, replacement);
+                    }
+                }
                 // 🏷️ `header X-Trace {host}` is ordinary syntax, and the value used
                 // to reach the client verbatim — Day 26 measured `x-probe: {host}`
                 // where the hostname belonged.
@@ -4449,6 +4490,9 @@ impl PingclairProxy {
                 }
                 for name in remove {
                     ctx.response_headers.remove(name);
+                }
+                for (name, value) in default_set {
+                    ctx.response_headers.set_if_absent(name, value.clone());
                 }
                 Ok(false)
             }
@@ -7744,6 +7788,72 @@ fn collect_request_body_ceiling(handler: &HandlerConfig) -> Option<u64> {
     }
 }
 
+/// 🔁 Resolves one header replacement into a pattern and a replacement string.
+///
+/// Almost every pattern is a literal, and those were compiled when the
+/// configuration was published — this is a lookup. A pattern that carries a
+/// placeholder is a different thing: it is not a regex until the request
+/// supplies the value, so it is built here, per request. That cost is real and
+/// it is the price of the feature; a configuration that does not ask for a
+/// per-request pattern never pays it.
+///
+/// Returns `None` when the pattern is missing or does not compile, having said
+/// so — a replacement that cannot run must not silently rewrite nothing.
+pub(crate) fn compiled_header_replacement(
+    state: &ProxyState,
+    route_index: usize,
+    entry: &pingclair_core::config::HeaderReplacement,
+    request_header: &pingora_http::RequestHeader,
+    verified_client_ip: Option<&str>,
+    scheme: &'static str,
+    vars: &crate::http_policy::RequestVars,
+) -> Option<(Arc<Regex>, String)> {
+    let replacement = if entry.replace.contains('{') {
+        resolve_caddy_placeholders(
+            &entry.replace,
+            request_header,
+            verified_client_ip,
+            scheme,
+            vars,
+        )
+        .into_owned()
+    } else {
+        entry.replace.clone()
+    };
+
+    if !entry.search_regexp.contains('{') {
+        return match state.route_regex_arc(route_index, &entry.search_regexp) {
+            Some(pattern) => Some((pattern, replacement)),
+            None => {
+                tracing::warn!(
+                    pattern = %entry.search_regexp,
+                    "🚫 header replace pattern missing from the active configuration"
+                );
+                None
+            }
+        };
+    }
+
+    let resolved = resolve_caddy_placeholders(
+        &entry.search_regexp,
+        request_header,
+        verified_client_ip,
+        scheme,
+        vars,
+    );
+    match Regex::new(&resolved) {
+        Ok(pattern) => Some((Arc::new(pattern), replacement)),
+        Err(error) => {
+            tracing::warn!(
+                pattern = %resolved,
+                %error,
+                "🚫 header replace pattern did not compile once its placeholders were resolved"
+            );
+            None
+        }
+    }
+}
+
 fn collect_route_regexes(handler: &HandlerConfig, regexes: &mut HashMap<String, Arc<Regex>>) {
     match handler {
         HandlerConfig::Rewrite {
@@ -7755,11 +7865,18 @@ fn collect_route_regexes(handler: &HandlerConfig, regexes: &mut HashMap<String, 
             }
             Err(error) => tracing::error!(pattern, %error, "Invalid rewrite regex"),
         },
-        // 🏷️ `request_header <field> <find> <replace>` searches with a regex
-        // too, and it is compiled here for the same reason: the pattern is
-        // known at load and can never change per request.
-        HandlerConfig::RequestHeaders { replace, .. } => {
+        // 🏷️ Both header directives search with a regex, and both are compiled
+        // here for the same reason: the pattern is known at load and can never
+        // change per request.
+        HandlerConfig::RequestHeaders { replace, .. } | HandlerConfig::Headers { replace, .. } => {
             for replacement in replace {
+                // 🧭 A pattern with a placeholder in it only becomes a pattern
+                // once the request supplies the value, so there is nothing to
+                // compile here. Those are built per request instead — the cost
+                // of a feature that asks for a different pattern each time.
+                if replacement.search_regexp.contains('{') {
+                    continue;
+                }
                 match Regex::new(&replacement.search_regexp) {
                     Ok(regex) => {
                         regexes.insert(replacement.search_regexp.clone(), Arc::new(regex));

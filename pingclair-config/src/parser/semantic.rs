@@ -237,6 +237,8 @@ impl SemanticAnalyzer {
                     .map(|(k, v)| (k.clone(), self.substitute_string(v, subs)))
                     .collect(),
                 remove: headers.remove.clone(),
+                replace: headers.replace.clone(),
+                default_set: headers.default_set.clone(),
             }),
             Directive::Setting { key, value } => Directive::Setting {
                 key: key.clone(),

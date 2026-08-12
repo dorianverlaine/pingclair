@@ -648,6 +648,58 @@ async fn h3_forward_auth_mutates_the_backend_request_and_streams_denials() {
     backend_task.await.unwrap();
 }
 
+/// 🔁 A response header replacement runs on HTTP/3 too.
+///
+/// The two transports write response headers through different code — one
+/// through Pingora's `ResponseHeader`, one by building a quiche header list —
+/// so an operation added to the shared policy has to be applied twice, and the
+/// second one is easy to forget. Both have to end at the same bytes.
+#[tokio::test]
+async fn h3_header_replace_rewrites_an_upstream_value() {
+    use tokio::io::AsyncWriteExt;
+
+    let backend_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let backend_address = backend_listener.local_addr().unwrap();
+    let backend_task = tokio::spawn(async move {
+        let (mut stream, _) = backend_listener.accept().await.unwrap();
+        let _ = read_http_head(&mut stream).await;
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nX-Backend: internal-host-7\r\nContent-Length: 2\r\n\
+                  Connection: close\r\n\r\nok",
+            )
+            .await
+            .unwrap();
+    });
+
+    let source = format!(
+        r#":443 {{
+            header X-Backend ^internal- external-
+            reverse_proxy http://{backend_address}
+        }}"#
+    );
+    let config = pingclair_config::compile(&source).unwrap();
+    let handler = config.servers[0].routes[0].handler.clone();
+    let server = spawn_h3_server(handler).await;
+
+    let response = h3_get(server, "/probe").await.unwrap();
+    assert_eq!(response.status, 200);
+    let value = response
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-backend"))
+        .map(|(_, value)| value.as_str());
+    assert_eq!(
+        value,
+        Some("external-host-7"),
+        "HTTP/3 must apply the same replacement as HTTP/1.1 and HTTP/2"
+    );
+
+    backend_task.await.unwrap();
+}
+
 /// 🔤🏷️ `method` and `request_header` change the upstream request on H3 too.
 ///
 /// Both are request setters, and this repository has shipped two defects where

@@ -3662,6 +3662,68 @@ async fn test_pingclairfile_sibling_handle_blocks_remain_exclusive() {
     assert_eq!(fell_through.text().await.unwrap(), "second");
 }
 
+/// 🔁 `header <field> <find> <replace>` rewrites a value the upstream sent.
+///
+/// The point of the three-argument form is that the result depends on what was
+/// there — which is why it cannot be expressed as a `set`, and why the version
+/// that silently dropped the third argument was doing something else entirely.
+/// Hiding an internal hostname is the ordinary use, so that is what this does.
+#[tokio::test]
+async fn test_pingclairfile_header_replace_rewrites_an_upstream_value() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let upstream_address = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nX-Backend: internal-host-7\r\nContent-Length: 2\r\n\
+                  Connection: close\r\n\r\nok",
+            )
+            .await
+            .unwrap();
+    });
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            header X-Backend ^internal- external-
+            reverse_proxy http://{upstream_address}
+        }}
+    "#
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/probe"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-backend")
+            .map(|v| v.to_str().unwrap()),
+        Some("external-host-7"),
+        "the replacement must run against what the upstream actually sent"
+    );
+
+    upstream_task.await.unwrap();
+}
+
 /// 🧵 The shape most Caddy configurations are actually written in.
 ///
 /// Middleware and a terminal in one `handle` block is the ordinary way to

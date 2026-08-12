@@ -1870,6 +1870,111 @@ mod fail_closed_tests {
         );
     }
 
+    /// 🔁 `header <field> <find> <replace>` is a search-and-replace.
+    ///
+    /// It used to compile to `set <field> <find>` with the third argument read
+    /// and discarded — a configuration that loaded, started, and did something
+    /// else. The regression this test guards is that silence, not the feature.
+    #[test]
+    fn header_three_arguments_are_a_replacement_not_a_dropped_argument() {
+        let config =
+            crate::compile("example.com {\n    header X-Foo ^old$ new\n    respond \"x\"\n}")
+                .unwrap();
+        let route = &config.servers[0].routes[0];
+        let found = handlers_of(&route.handler).into_iter().any(|handler| {
+            matches!(handler, HandlerConfig::Headers { set, replace, .. }
+                if set.is_empty()
+                    && replace.len() == 1
+                    && replace[0].field == "X-Foo"
+                    && replace[0].search_regexp == "^old$"
+                    && replace[0].replace == "new")
+        });
+        assert!(found, "the third argument is the replacement");
+    }
+
+    /// 🧭 The prefix wins over the argument count on the response side too,
+    /// because both directives read a line through the same function.
+    #[test]
+    fn header_inline_plus_appends_rather_than_naming_a_header_plus_foo() {
+        let config =
+            crate::compile("example.com {\n    header +X-Foo bar\n    respond \"x\"\n}").unwrap();
+        let route = &config.servers[0].routes[0];
+        let found = handlers_of(&route.handler).into_iter().any(|handler| {
+            matches!(handler, HandlerConfig::Headers { add, set, .. }
+                if add.get("X-Foo").is_some_and(|value| value == "bar") && set.is_empty())
+        });
+        assert!(
+            found,
+            "`+X-Foo bar` appends, and does not name a header `+X-Foo`"
+        );
+    }
+
+    /// ❓ `?X-Foo bar` sets the header only if the response lacks one.
+    #[test]
+    fn header_question_mark_is_a_conditional_default() {
+        let config =
+            crate::compile("example.com {\n    header ?X-Foo bar\n    respond \"x\"\n}").unwrap();
+        let route = &config.servers[0].routes[0];
+        let found = handlers_of(&route.handler).into_iter().any(|handler| {
+            matches!(handler, HandlerConfig::Headers { default_set, set, .. }
+                if default_set.get("X-Foo").is_some_and(|value| value == "bar") && set.is_empty())
+        });
+        assert!(found, "`?X-Foo` is a default, not an unconditional set");
+    }
+
+    /// 🚫 …and on a request it is refused, because "already there" needs a
+    /// response to look at. Upstream refuses it for the same reason.
+    #[test]
+    fn request_header_question_mark_is_refused() {
+        let error = compile_err("example.com {\n request_header ?X-Foo bar\n}");
+        assert!(error.contains("request_header"), "got {error}");
+    }
+
+    /// ⏭️ `>` and `defer` ask for the operation to happen after the handler
+    /// chain, which is the only moment this server applies response headers
+    /// anyway. Accepted, and the prefix must not end up in the header's name.
+    #[test]
+    fn header_defer_spellings_are_accepted_and_do_not_rename_the_header() {
+        let config = crate::compile(
+            "example.com {\n    header >X-Foo bar\n    header {\n        defer\n        \
+             X-Baz qux\n    }\n    respond \"x\"\n}",
+        )
+        .unwrap();
+        let route = &config.servers[0].routes[0];
+        let sets: Vec<_> = handlers_of(&route.handler)
+            .into_iter()
+            .filter_map(|handler| match handler {
+                HandlerConfig::Headers { set, .. } => Some(set),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            sets.iter().any(|set| set.contains_key("X-Foo")),
+            "`>X-Foo` sets `X-Foo`, not `>X-Foo`"
+        );
+        assert!(
+            sets.iter().any(|set| set.contains_key("X-Baz")),
+            "a `defer` line must not swallow the rest of its block"
+        );
+    }
+
+    #[test]
+    fn header_names_the_shapes_it_cannot_express() {
+        for source in [
+            // 🚩 A response matcher gating the block: not implemented, and
+            // named rather than treated as a header called `match`.
+            "example.com {\n header {\n match {\n status 2xx\n }\n }\n}",
+            // 🚩 Both at once has no defined order, so upstream refuses it.
+            "example.com {\n header X-Foo bar {\n X-Baz qux\n }\n}",
+        ] {
+            let error = compile_err(source);
+            assert!(
+                error.contains("header"),
+                "must be named rather than mangled; got {error} for {source}"
+            );
+        }
+    }
+
     /// 🔤 `method` is a rewrite of one field, not a handler of its own.
     #[test]
     fn method_directive_sets_the_request_method() {

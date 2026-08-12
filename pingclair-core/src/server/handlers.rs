@@ -154,6 +154,12 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             set,
             add,
             remove: _,
+            // 🔁 A replacement rewrites values a response already carries, and
+            // this function builds a response from nothing — there is no
+            // existing value to search, and nothing already present for `?` to
+            // defer to either.
+            replace: _,
+            default_set,
         } => {
             // Headers handler modifies existing response
             // Return a passthrough response
@@ -163,6 +169,11 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             }
             for (k, v) in add {
                 response.headers.insert(k.clone(), v.clone());
+            }
+            // ❓ Nothing was there before this response existed, so a default
+            // always applies.
+            for (k, v) in default_set {
+                response.headers.entry(k.clone()).or_insert_with(|| v.clone());
             }
             Ok(response)
         }
@@ -573,6 +584,8 @@ mod tests {
             set: headers,
             add: BTreeMap::new(),
             remove: Vec::new(),
+            replace: Vec::new(),
+            default_set: BTreeMap::new(),
         };
 
         let response = execute_handler(&config, &empty_headers()).unwrap();

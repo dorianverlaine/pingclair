@@ -475,6 +475,19 @@ lets the rest converge.
   never proxied. Sibling blocks are still mutually exclusive, because each one
   answers. The exclusive container survives under its own name for `try_files`,
   which is the one construct that genuinely needs it.
+- 🔁 **`header <field> <find> <replace>` performs the search-and-replace it
+  describes.** The third argument was read and discarded, so the line set the
+  header to the *search* text — a configuration that loaded, started, and did
+  something else. The response side now supports what the request side does:
+  `+` append, `-` remove, three-argument regex replacement, and a trailing
+  colon on the field name. `?field` sets a value only when the response does
+  not already carry one, and `>field` and a block's `defer` line are accepted:
+  they ask for the operation to be applied after the handler chain, which is
+  the only moment this server applies response headers. Patterns and
+  replacements may contain placeholders, resolved per request. Both header
+  directives now read a line through one function, so they cannot drift apart
+  again. `header { match { … } }` is refused by name rather than treated as a
+  header called `match`.
 - 🔢 **`1MB` is now a million bytes, not 1,048,576.** Sizes follow the SI/IEC
   split the configuration format uses: `kb`/`mb`/`gb`/`tb` are powers of a
   thousand and `kib`/`mib`/`gib`/`tib` are powers of 1024. Every size the DSL

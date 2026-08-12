@@ -2129,12 +2129,32 @@ async fn plan_h3_handler_with_connector(
             }
             Ok(H3Plan::Continue)
         }
-        HandlerConfig::Headers { set, add, remove } => {
+        HandlerConfig::Headers {
+            set,
+            add,
+            remove,
+            replace,
+            default_set,
+        } => {
+            for entry in replace {
+                match state.route_regex_arc(route_index, &entry.search_regexp) {
+                    Some(pattern) => {
+                        response_policy.replace(entry.field.clone(), pattern, entry.replace.clone())
+                    }
+                    None => tracing::warn!(
+                        pattern = %entry.search_regexp,
+                        "🚫 header replace pattern missing from the active configuration"
+                    ),
+                }
+            }
             for (name, value) in set {
                 response_policy.set(name, value.clone());
             }
             for (name, value) in add {
                 response_policy.add(name, value.clone());
+            }
+            for (name, value) in default_set {
+                response_policy.set_if_absent(name, value.clone());
             }
             for name in remove {
                 response_policy.remove(name);
@@ -2176,12 +2196,19 @@ async fn plan_h3_handler_with_connector(
                 }
             }
             for replacement in replace {
-                // ⚡ Compiled at load, like every other route pattern.
-                let Some(regex) = state.route_regex(route_index, &replacement.search_regexp) else {
-                    tracing::warn!(
-                        pattern = %replacement.search_regexp,
-                        "🚫 request_header replace pattern missing from the active configuration"
-                    );
+                // ⚡ A literal pattern is a lookup into the per-route table
+                // built at load; one carrying a placeholder is compiled here.
+                let Some((regex, resolved_replacement)) =
+                    crate::server::compiled_header_replacement(
+                        state,
+                        route_index,
+                        replacement,
+                        request_header,
+                        Some(verified_client_ip),
+                        "https",
+                        request_vars,
+                    )
+                else {
                     continue;
                 };
                 let existing: Vec<String> = request_header
@@ -2195,7 +2222,7 @@ async fn plan_h3_handler_with_connector(
                 }
                 let _ = request_header.remove_header(&replacement.field);
                 for value in existing {
-                    let rewritten = regex.replace_all(&value, replacement.replace.as_str());
+                    let rewritten = regex.replace_all(&value, resolved_replacement.as_str());
                     if request_header
                         .append_header(replacement.field.clone(), rewritten.as_ref())
                         .is_err()
@@ -5185,6 +5212,31 @@ fn apply_h3_response_policy(
     for (name, value) in policy.add_headers() {
         headers.push(quiche::h3::Header::new(name.as_bytes(), value.as_bytes()));
     }
+    // 🔁 After set and add, before remove — the same order the H1/H2 policy
+    // applies, so the same configuration cannot mean two things.
+    for (field, pattern, replacement) in policy.replacements() {
+        let mut rewritten = Vec::new();
+        headers.retain(|header| {
+            if !header.name().eq_ignore_ascii_case(field.as_bytes()) {
+                return true;
+            }
+            if let Ok(value) = std::str::from_utf8(header.value()) {
+                rewritten.push(pattern.replace_all(value, replacement).into_owned());
+            }
+            false
+        });
+        for value in rewritten {
+            headers.push(quiche::h3::Header::new(field.as_bytes(), value.as_bytes()));
+        }
+    }
+    for (name, value) in policy.default_headers() {
+        if !headers
+            .iter()
+            .any(|header| header.name().eq_ignore_ascii_case(name.as_bytes()))
+        {
+            headers.push(quiche::h3::Header::new(name.as_bytes(), value.as_bytes()));
+        }
+    }
     for name in policy.removed_headers() {
         headers.retain(|header| !header.name().eq_ignore_ascii_case(name.as_bytes()));
     }
@@ -6348,6 +6400,8 @@ mod tests {
                     set: BTreeMap::from([("x-policy".to_string(), "active".to_string())]),
                     add: BTreeMap::new(),
                     remove: Vec::new(),
+                    replace: Vec::new(),
+                    default_set: Default::default(),
                 }),
                 HandlerElement::plain(HandlerConfig::BasicAuth {
                     realm: "Restricted".to_string(),
