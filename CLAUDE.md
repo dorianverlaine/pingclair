@@ -186,8 +186,10 @@ genuinely no DSL equivalent, and say which case that was.
 
 ### 🏎️ Write it fast the first time
 
-This is a web server whose comparison point is nginx. That is not an aspiration
-to be revisited later; it is the standing constraint on how new code is shaped.
+This is a web server measured in CPU microseconds per request against the best
+of its class — `benchmarks/README.md` holds the methodology and names the
+candidates. That target is not an aspiration to be revisited later; it is the
+standing constraint on how new code is shaped.
 The rule below about fixing problems you walk past is about code that already
 exists. This one is about code you are writing now: **the first version should
 already have the right shape**, because a request path is not somewhere you get

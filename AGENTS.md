@@ -306,8 +306,9 @@ POST bodies with and without Content-Length, 413, and upstream keepalive.
 
 ### Hot paths
 
-**The comparison point is nginx, and that shapes new code, not just reviews of
-old code.** Before a new function goes on a request path, answer four
+**The bar is CPU microseconds per request against the best of its class, and it
+shapes new code, not just reviews of old code.** Before a new function goes on a
+request path, answer four
 questions: could configuration have decided this (then precompute it into
 `ProxyState`); does it allocate (borrow, or own it at startup); does it lock,
 and does the lock cross an `await` (the second is a defect); is it bounded
@@ -331,8 +332,8 @@ Performance is a correctness requirement:
 
 Static confinement is lexical. `..` escaping the document root must be
 rejected without per-request canonicalization. Symlinks inside the root are
-followed, matching nginx/Caddy defaults; the document root is not a security
-boundary against a user who can plant symlinks.
+followed, matching the Caddy default this project tracks; the document root is
+not a security boundary against a user who can plant symlinks.
 
 ### TLS and admin API
 
