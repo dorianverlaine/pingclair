@@ -798,10 +798,25 @@ pub struct ClientAuthConfig {
     pub trusted_ca_cert_files: Vec<String>,
 
     /// 🍃 Leaf certificates pinned individually, rather than by their issuer.
+    ///
+    /// Pinning a leaf answers a different question from trusting a CA: not
+    /// "was this signed by someone I trust" but "is this the exact
+    /// certificate I was told to expect". Both can apply at once, and when
+    /// they do the client must satisfy both.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_leaf_certs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_leaf_cert_files: Vec<String>,
+
+    /// 🍃 Directories scanned for pinned leaf certificates.
+    ///
+    /// Every `.pem` file underneath, recursively. Kept as directories rather
+    /// than expanded into paths while adapting, for two reasons: adapting a
+    /// configuration must not depend on the filesystem it is adapted on, and
+    /// an operator who drops a certificate into the folder expects the next
+    /// reload to see it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_leaf_cert_folders: Vec<String>,
 }
 
 /// Route configuration

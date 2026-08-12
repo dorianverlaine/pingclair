@@ -89,15 +89,16 @@ fn parse_client_auth(d: &Directive) -> Result<ClientAuthConfig, AdapterError> {
                 .trusted_leaf_cert_files
                 .push(expect_single(sub, "client_auth trusted_leaf_cert_file")?),
             "trust_pool" => auth.trust_pool = Some(parse_trust_pool(sub, 0)?),
-            // 🚫 `verifier` selects a pluggable module, and we have no module
-            // registry. Accepting the word would mean an operator's custom
-            // verification silently never running.
-            "verifier" => {
-                return Err(AdapterError::UnsupportedFeature(
-                    "tls client_auth verifier".into(),
-                    "client-certificate verifier modules are not implemented".into(),
-                ));
-            }
+            // 🍃 `verifier <module>` selects an extra check run against the
+            // client's certificate, on top of chain verification. `leaf` is
+            // the one the format ships and the one implemented here: the
+            // presented leaf must be one of a known set.
+            //
+            // 🚫 Any other module name is refused. There is no module registry
+            // here, and accepting the word would mean an operator's custom
+            // verification silently never running — which for an authentication
+            // control is the worst possible way to be wrong.
+            "verifier" => parse_leaf_verifier(sub, &mut auth)?,
             other => {
                 return Err(AdapterError::UnknownDirective(format!(
                     "client_auth: {other}"
@@ -434,6 +435,95 @@ mod client_auth_tests {
             .expect("tls")
             .client_auth
             .expect("client_auth")
+    }
+
+    /// 🍃 The four spellings of `verifier leaf` are one instruction.
+    ///
+    /// The one-liner exists to accommodate the common case and the block to
+    /// hold several loaders; a configuration written either way has to compile
+    /// to the same thing, or carrying one over from upstream changes what it
+    /// does.
+    #[test]
+    fn every_leaf_verifier_spelling_reaches_the_same_configuration() {
+        let auth = |body: &str| {
+            client_auth_of(&format!(
+                "localhost {{\n tls {{\n client_auth {{\n mode request\n {body}\n }}\n }}\n \
+                 respond \"x\"\n}}"
+            ))
+        };
+
+        let inline_file = auth("verifier leaf file /a.pem /b.pem");
+        assert_eq!(inline_file.trusted_leaf_cert_files, ["/a.pem", "/b.pem"]);
+
+        let block_file = auth("verifier leaf {\n file /a.pem\n file /b.pem\n }");
+        assert_eq!(
+            block_file.trusted_leaf_cert_files, inline_file.trusted_leaf_cert_files,
+            "the block and the one-liner mean the same thing"
+        );
+
+        let inline_folder = auth("verifier leaf folder /certs");
+        assert_eq!(inline_folder.trusted_leaf_cert_folders, ["/certs"]);
+        assert!(inline_folder.trusted_leaf_cert_files.is_empty());
+
+        let block_folder = auth("verifier leaf {\n folder /certs\n }");
+        assert_eq!(
+            block_folder.trusted_leaf_cert_folders,
+            inline_folder.trusted_leaf_cert_folders
+        );
+
+        // 🧩 A block may mix loaders, and both kinds land in their own list.
+        let mixed = auth("verifier leaf {\n file /a.pem\n folder /certs\n }");
+        assert_eq!(mixed.trusted_leaf_cert_files, ["/a.pem"]);
+        assert_eq!(mixed.trusted_leaf_cert_folders, ["/certs"]);
+    }
+
+    /// 🚫 An unknown verifier module is refused rather than accepted and
+    /// ignored.
+    ///
+    /// This is the arm that matters most: `verifier` names an *authentication*
+    /// check, so a name we accept and never run is a site that believes it is
+    /// verifying clients and is not. Upstream's own corpus has a `dummy`
+    /// verifier that only its test binary registers — accepting arbitrary
+    /// names to match that fixture would be trading a real guarantee for a
+    /// point on a scoreboard.
+    #[test]
+    fn an_unknown_verifier_module_is_refused() {
+        for body in [
+            "verifier dummy",
+            "verifier leaf pem",
+            "verifier leaf storage",
+        ] {
+            let error = compile(&format!(
+                "localhost {{\n tls {{\n client_auth {{\n mode request\n {body}\n }}\n }}\n \
+                 respond \"x\"\n}}"
+            ))
+            .expect_err("must be refused");
+            assert!(
+                error.to_string().contains("verifier"),
+                "must be named; got {error} for `{body}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_leaf_verifier_that_names_no_certificates_is_refused() {
+        for body in [
+            "verifier leaf",
+            "verifier leaf {\n }",
+            "verifier leaf {\n file\n }",
+            // 🚫 A loader on the line and a block have no defined order.
+            "verifier leaf file /a.pem {\n file /b.pem\n }",
+        ] {
+            let error = compile(&format!(
+                "localhost {{\n tls {{\n client_auth {{\n mode request\n {body}\n }}\n }}\n \
+                 respond \"x\"\n}}"
+            ))
+            .expect_err("must be refused");
+            assert!(
+                error.to_string().contains("leaf") || error.to_string().contains("verifier"),
+                "must be named; got {error} for `{body}`"
+            );
+        }
     }
 
     /// 🎚️ Each mode keeps its own meaning; none collapses into a weaker one.
@@ -1094,4 +1184,96 @@ mod pki_tests {
             }
         );
     }
+}
+
+/// 🍃 Reads `verifier leaf …`, in every spelling the format allows.
+///
+/// Four shapes, and they are the same instruction written four ways:
+///
+/// ```text
+/// verifier leaf file /a.pem /b.pem        # one-liner, one loader
+/// verifier leaf folder /certs
+/// verifier leaf { file /a.pem }           # block, one loader
+/// verifier leaf { file /a.pem            # block, repeated
+///                 file /b.pem }
+/// ```
+///
+/// The one-liner and the block are not two features: upstream accepts a
+/// one-liner "to accommodate" the common case and otherwise reads a block, and
+/// a configuration written either way has to mean the same thing here.
+///
+/// 🧭 What `leaf` *does* is pin the client's leaf certificate — the presented
+/// certificate must be one of these, byte for byte. That is a different
+/// question from the trust pool, which asks who signed it, and both apply when
+/// both are configured.
+fn parse_leaf_verifier(
+    directive: &Directive,
+    auth: &mut ClientAuthConfig,
+) -> Result<(), AdapterError> {
+    let Some(kind) = directive.args.first() else {
+        return Err(AdapterError::ArgumentCount(
+            "tls client_auth verifier".into(),
+            1,
+            0,
+        ));
+    };
+    if kind != "leaf" {
+        return Err(AdapterError::UnsupportedFeature(
+            format!("tls client_auth verifier {kind}"),
+            "`leaf` is the only client-certificate verifier this build has;              there is no module registry, and accepting the name would mean              the verification never runs"
+                .into(),
+        ));
+    }
+
+    // 📥 One loader named on the same line, or a block of them.
+    let mut loaders: Vec<(&str, &[String])> = Vec::new();
+    if directive.args.len() > 1 {
+        if directive.block.is_some() {
+            return Err(AdapterError::InvalidArgument(
+                "tls client_auth verifier leaf".into(),
+                "a loader on the same line and a block cannot both be given".into(),
+            ));
+        }
+        loaders.push((directive.args[1].as_str(), &directive.args[2..]));
+    } else if let Some(block) = &directive.block {
+        for sub in &block.directives {
+            loaders.push((sub.name.as_str(), sub.args.as_slice()));
+        }
+    }
+
+    if loaders.is_empty() {
+        return Err(AdapterError::InvalidArgument(
+            "tls client_auth verifier leaf".into(),
+            "names no certificates; add `file <path>` or `folder <dir>`".into(),
+        ));
+    }
+
+    for (loader, paths) in loaders {
+        if paths.is_empty() {
+            return Err(AdapterError::ArgumentCount(
+                format!("tls client_auth verifier leaf {loader}"),
+                1,
+                0,
+            ));
+        }
+        match loader {
+            "file" => auth.trusted_leaf_cert_files.extend(paths.iter().cloned()),
+            "folder" => auth.trusted_leaf_cert_folders.extend(paths.iter().cloned()),
+            // 🚩 `pem` and `storage` are real loaders in the format. Named
+            // individually so an operator who spelled one correctly is told it
+            // is missing rather than sent hunting for a typo.
+            "pem" | "storage" => {
+                return Err(AdapterError::UnsupportedFeature(
+                    format!("tls client_auth verifier leaf {loader}"),
+                    "only the `file` and `folder` leaf loaders are implemented".into(),
+                ));
+            }
+            other => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "client_auth verifier leaf: {other}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }

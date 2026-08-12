@@ -315,6 +315,16 @@ fn compile_pinned_leaves(config: &ClientAuthConfig) -> Result<Vec<Vec<u8>>, Stri
             );
         }
     }
+    for folder in &config.trusted_leaf_cert_folders {
+        for path in pem_files_under(folder)? {
+            let display = path.display().to_string();
+            for certificate in read_pem_bundle(&display)? {
+                pinned.push(certificate.to_der().map_err(|error| {
+                    format!("re-encoding a leaf from {display} failed: {error}")
+                })?);
+            }
+        }
+    }
     pinned.sort_unstable();
     pinned.dedup();
     Ok(pinned)
@@ -414,6 +424,42 @@ fn add_trust_pool(
         }
     }
     Ok(())
+}
+
+/// 📁 Every `.pem` file under a directory, recursively, in a stable order.
+///
+/// Sorted because the pinned set is compared by content and a directory's
+/// iteration order is not stable across filesystems — an unsorted walk would
+/// make two identical deployments produce two different configurations, and
+/// only one of them would match a reload's.
+///
+/// 🚫 A directory that does not exist is an error rather than an empty set.
+/// This is an authentication control: "no pinned certificates" and "the folder
+/// of pinned certificates is missing" must not look the same, because the
+/// first one is a policy and the second one is a mistake that would quietly
+/// admit clients the operator meant to exclude.
+fn pem_files_under(folder: &str) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut found = Vec::new();
+    let mut pending = vec![std::path::PathBuf::from(folder)];
+    while let Some(directory) = pending.pop() {
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|error| format!("cannot read leaf certificate folder {folder}: {error}"))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("cannot read an entry under {folder}: {error}"))?;
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("pem"))
+            {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 /// 📜 Reads a PEM bundle from disk, refusing an empty one.
@@ -600,6 +646,55 @@ mod tests {
             ..Default::default()
         });
         assert!(garbage.is_err(), "a bad certificate must be named at start");
+    }
+
+    /// 📁 A folder of pinned leaves is walked recursively, and only `.pem`
+    /// files count.
+    ///
+    /// This is what `verifier leaf { folder … }` compiles to. The recursion is
+    /// upstream's behaviour; the extension filter is what keeps a `README` or a
+    /// stray private key in the same directory from failing the load.
+    #[test]
+    fn a_leaf_folder_is_walked_recursively_for_pem_files() {
+        let (_, leaf_pem) = ca_and_leaf();
+        let directory = tempfile::tempdir().expect("temp dir");
+        let nested = directory.path().join("nested");
+        std::fs::create_dir(&nested).expect("nested dir");
+        std::fs::write(directory.path().join("top.pem"), &leaf_pem).expect("top");
+        std::fs::write(nested.join("deep.pem"), &leaf_pem).expect("deep");
+        // 🙈 Neither of these is a certificate, and neither may break the load.
+        std::fs::write(directory.path().join("README"), "not a certificate").expect("readme");
+        std::fs::write(directory.path().join("key.txt"), "not a certificate").expect("txt");
+
+        let compiled = CompiledClientAuth::compile(&ClientAuthConfig {
+            mode: ClientAuthMode::RequireAndVerify,
+            trusted_leaf_cert_folders: vec![directory.path().display().to_string()],
+            ..Default::default()
+        })
+        .expect("a folder of leaves compiles");
+
+        // 🧮 One entry, not two: both files hold the same certificate, and the
+        // pinned set is de-duplicated.
+        assert_eq!(compiled.pinned_leaves.len(), 1);
+    }
+
+    /// 🚫 A missing folder is an error, not an empty pinned set.
+    ///
+    /// The two must not look alike: one is a policy that pins nothing, the
+    /// other is a mistake that would admit clients the operator meant to
+    /// exclude. Failing to start is the only way an operator finds out.
+    #[test]
+    fn a_missing_leaf_folder_fails_the_load_rather_than_pinning_nothing() {
+        let error = CompiledClientAuth::compile(&ClientAuthConfig {
+            mode: ClientAuthMode::RequireAndVerify,
+            trusted_leaf_cert_folders: vec!["/nonexistent/leaf/folder".to_string()],
+            ..Default::default()
+        })
+        .expect_err("a missing folder must be named");
+        assert!(
+            error.contains("/nonexistent/leaf/folder"),
+            "the message must name the folder; got {error}"
+        );
     }
 
     /// 🍃 Pinned leaves are sorted and de-duplicated once so the handshake can

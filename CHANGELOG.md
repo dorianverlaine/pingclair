@@ -188,6 +188,16 @@ lets the rest converge.
 
 ### ✨ Added
 
+- 🍃 **`tls { client_auth { verifier leaf … } }`** pins the client's leaf
+  certificate: the certificate presented must be one of a known set, checked
+  after the chain is verified. Every spelling the format allows is read —
+  `verifier leaf file <path…>`, `verifier leaf folder <dir…>`, and the block
+  form holding one or several loaders. A folder is walked recursively for
+  `.pem` files and rescanned on reload, so dropping a certificate in is
+  enough. ⚠️ Any other verifier module name is refused rather than accepted:
+  a name we take and never act on is a site that believes it is authenticating
+  clients and is not.
+
 - 🔄 **`renewal_window_ratio <fraction>`** decides how early a certificate is
   renewed, as a fraction of its own lifetime rather than a fixed number of
   days. The default is a third, which on today's 90-day certificates is the
