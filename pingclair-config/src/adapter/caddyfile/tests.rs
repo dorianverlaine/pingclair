@@ -908,11 +908,15 @@ mod fail_closed_tests {
             .expect("log block")
             .rotation
             .clone();
-        // 🔢 A million bytes, not a mebibyte. `mb` is SI in this format — the
-        // upstream parser is `humanize.ParseBytes` — and this assertion used
-        // to say 1,048,576, which was our own size parser's bug written down
-        // as an expectation. Corrected 2026-08-11 along with the parser.
-        assert_eq!(rotation.max_size_bytes, Some(1_000_000));
+        // 🔢 `1mb` parses as a million bytes — `mb` is SI in this format, the
+        // upstream parser being `humanize.ParseBytes` — and rotation then
+        // rounds *up* to a whole mebibyte, because that is the resolution a
+        // roll threshold has. So the stored value is 1 MiB by two steps, not
+        // by the one that used to produce it: this assertion once read
+        // 1,048,576 because our size parser treated `mb` as binary, which was
+        // the wrong reason for the right number. Both steps corrected
+        // 2026-08-12, and `roll_size 1500kb` is what tells them apart.
+        assert_eq!(rotation.max_size_bytes, Some(1024 * 1024));
         assert_eq!(rotation.keep, Some(3));
         // 📌 Caddy compresses rotated files unless told not to, so a `roll_`
         // block without `roll_uncompressed` means compression on.
@@ -1875,6 +1879,28 @@ mod fail_closed_tests {
     /// It used to compile to `set <field> <find>` with the third argument read
     /// and discarded — a configuration that loaded, started, and did something
     /// else. The regression this test guards is that silence, not the feature.
+    /// 📏 The two steps `roll_size` takes, in a case where they disagree.
+    ///
+    /// 1,500,000 bytes is what `1500kb` parses to under the SI reading, and a
+    /// rotation threshold has mebibyte resolution, so it rounds up to 2 MiB.
+    /// A binary-reading parser would have produced 1,536,000 and a version
+    /// that skipped the rounding would have kept 1,500,000 — three different
+    /// answers, and only one of them matches what the configuration means.
+    #[test]
+    fn roll_size_parses_as_si_then_rounds_up_to_whole_mebibytes() {
+        let config = crate::compile(
+            "example.com {\n log {\n output file /tmp/x.log {\n roll_size 1500kb\n }\n }\n              respond \"x\"\n}",
+        )
+        .unwrap();
+        let rotation = config.servers[0]
+            .log
+            .as_ref()
+            .expect("log config")
+            .rotation
+            .clone();
+        assert_eq!(rotation.max_size_bytes, Some(2 * 1024 * 1024));
+    }
+
     #[test]
     fn header_three_arguments_are_a_replacement_not_a_dropped_argument() {
         let config =

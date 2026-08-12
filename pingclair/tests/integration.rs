@@ -3923,17 +3923,27 @@ async fn test_pingclairfile_request_body_max_size_raises_the_route_limit() {
         "the route raised its own limit, so this upload must be accepted"
     );
 
+    // 🚫 The rejection can reach the client two ways, and which one depends on
+    // timing that is not part of the contract: the server answers 413 and
+    // closes, and if it does so while the client is still writing the two
+    // megabytes, the client sees the write fail before it sees the response.
+    // Both are the route refusing the upload. What must never happen is 200.
     let plain = no_proxy_client()
         .post(server.url(0, "/plain"))
         .body(body)
         .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        plain.status(),
-        413,
-        "a route without `request_body` keeps the site limit"
-    );
+        .await;
+    match plain {
+        Ok(response) => assert_eq!(
+            response.status(),
+            413,
+            "a route without `request_body` keeps the site limit"
+        ),
+        Err(error) => assert!(
+            !error.is_timeout(),
+            "the upload should be refused, not left hanging: {error}"
+        ),
+    }
 }
 
 /// 🔪 `abort` gives the client nothing at all — not even a status.

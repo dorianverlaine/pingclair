@@ -488,6 +488,11 @@ lets the rest converge.
   directives now read a line through one function, so they cannot drift apart
   again. `header { match { … } }` is refused by name rather than treated as a
   header called `match`.
+- 📏 **`roll_size` rounds up to a whole mebibyte, which is the resolution a
+  rotation threshold has.** Combined with the size fix below, `roll_size 1mb`
+  now means what it means upstream: a million bytes, rounded up to 1 MiB. The
+  byte value was previously kept verbatim, which looked more precise and rolled
+  at a different point than the configuration was written for.
 - 🔢 **`1MB` is now a million bytes, not 1,048,576.** Sizes follow the SI/IEC
   split the configuration format uses: `kb`/`mb`/`gb`/`tb` are powers of a
   thousand and `kib`/`mib`/`gib`/`tib` are powers of 1024. Every size the DSL

@@ -99,7 +99,7 @@ pub(super) fn adapt_log_block(block: Block) -> Result<LogBlock, AdapterError> {
                 };
                 for r in roll.directives {
                     match r.name.as_str() {
-                        "size" => rotation.max_size_bytes = Some(parse_byte_size(&r)?),
+                        "size" => rotation.max_size_bytes = Some(roll_size_bytes(&r)?),
                         "age" => rotation.max_age_secs = Some(parse_required_duration(&r)? / 1000),
                         "keep" => rotation.keep = Some(parse_positive_usize(&r)?),
                         "compress" => rotation.compress = true,
@@ -344,7 +344,7 @@ pub(super) fn parse_caddy_roll_block(
     for r in block.directives {
         saw_setting = true;
         match r.name.as_str() {
-            "roll_size" => rotation.max_size_bytes = Some(parse_byte_size(&r)?),
+            "roll_size" => rotation.max_size_bytes = Some(roll_size_bytes(&r)?),
             "roll_keep" => rotation.keep = Some(parse_positive_usize(&r)?),
             "roll_keep_for" => rotation.max_age_secs = Some(parse_required_duration(&r)? / 1000),
             "roll_uncompressed" => uncompressed = true,
@@ -480,6 +480,25 @@ pub(super) fn parse_byte_size(directive: &Directive) -> Result<u64, AdapterError
         ));
     }
     Ok(bytes as u64)
+}
+
+/// 📏 A rotation threshold, rounded up to a whole mebibyte.
+///
+/// Log rotation has **mebibyte resolution** in the format this DSL follows:
+/// the size is parsed, then divided by a mebibyte and rounded up, and the
+/// whole number is what gets stored. So `roll_size 1mb` — a million bytes —
+/// rotates at 1 MiB, and `roll_size 100kb` also rotates at 1 MiB rather than
+/// at a hundred thousand bytes.
+///
+/// Keeping the byte value verbatim looked more precise and was less accurate:
+/// the same configuration would roll at a different point here than where it
+/// was written for. Rounding up is the direction that matters — a threshold
+/// rounded down would rotate more often than asked, which is the surprising
+/// way to be wrong about a log file.
+fn roll_size_bytes(directive: &Directive) -> Result<u64, AdapterError> {
+    const MIB: u64 = 1 << 20;
+    let bytes = parse_byte_size(directive)?;
+    Ok(bytes.div_ceil(MIB).max(1) * MIB)
 }
 
 #[cfg(test)]
