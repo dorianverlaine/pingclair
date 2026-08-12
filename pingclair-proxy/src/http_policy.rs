@@ -247,7 +247,7 @@ pub fn evaluate_response_handlers(
             | HandlerConfig::Plugin { .. }
             | HandlerConfig::AcmeServer(_)
             | HandlerConfig::HandleErrors { .. }
-            | HandlerConfig::Handle { .. }
+            | HandlerConfig::FirstMatch { .. }
             | HandlerConfig::HandlePath { .. }
             | HandlerConfig::Pipeline { .. } => {}
         }

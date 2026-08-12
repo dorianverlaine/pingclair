@@ -591,7 +591,7 @@ fn apply_site_root(handler: &mut pingclair_core::config::HandlerConfig, site_roo
             }
         }
         pingclair_core::config::HandlerConfig::Pipeline { handlers }
-        | pingclair_core::config::HandlerConfig::Handle { handlers }
+        | pingclair_core::config::HandlerConfig::FirstMatch { handlers }
         | pingclair_core::config::HandlerConfig::HandlePath { handlers, .. } => {
             for element in handlers {
                 if let Some(matcher) = &mut element.matcher {
@@ -1058,7 +1058,7 @@ fn validate_subrequest_handler(handler: &HandlerConfig) -> CompileResult<()> {
         // 🔐 Legacy JSON is normalized before applying the exact same rules.
         HandlerConfig::ForwardAuth(config) => validate(&config.as_reverse_proxy_subrequest()),
         HandlerConfig::Pipeline { handlers }
-        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::FirstMatch { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
             for element in handlers {
                 validate_subrequest_handler(&element.handler)?;
@@ -1150,7 +1150,7 @@ fn reject_unimplemented_handler(handler: &HandlerConfig) -> CompileResult<()> {
         }),
         HandlerConfig::Templates { .. } => Ok(()),
         HandlerConfig::Pipeline { handlers }
-        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::FirstMatch { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
             for element in handlers {
                 reject_unimplemented_handler(&element.handler)?;
@@ -1230,7 +1230,7 @@ fn validate_basic_auth_credentials(handler: &HandlerConfig) -> CompileResult<()>
             Ok(())
         }
         HandlerConfig::Pipeline { handlers }
-        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::FirstMatch { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
             for element in handlers {
                 validate_basic_auth_credentials(&element.handler)?;
@@ -1550,7 +1550,7 @@ fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<(
             }
         }
         HandlerConfig::Pipeline { handlers }
-        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::FirstMatch { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
             for element in handlers {
                 validate_proxy_protection_handler(&element.handler)?;
@@ -1576,7 +1576,7 @@ fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<(
 fn validate_file_matchers_under(handler: &HandlerConfig) -> CompileResult<()> {
     match handler {
         HandlerConfig::Pipeline { handlers }
-        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::FirstMatch { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
             for element in handlers {
                 if let Some(matcher) = &element.matcher {
@@ -2459,12 +2459,28 @@ fn compile_handler(
             })
         }
 
+        // 🧵 A `handle` block's *contents* are sequential, exactly like a
+        // `route`'s. The two differ only in how the adapter arranged them:
+        // `handle` sorted its directives into the format's order, `route` kept
+        // the order they were written in. Both arrive here already arranged,
+        // so there is nothing left for the request path to decide.
+        //
+        // 🧭 The mutual exclusion `handle` is known for is between *sibling*
+        // blocks, and it lives one level up — each block became its own route,
+        // and a request reaches one of them. Upstream draws the line in the
+        // same place: the block's contents become a `subroute`, and the
+        // sibling routes share a `group`.
+        //
+        // > 🤡 Compiling the contents as a first-match group instead is what
+        // > made `handle /x/* { header X-A b; respond "ok" }` set the header
+        // > and then answer nothing at all — the `header` matched, so it
+        // > "owned" the request, and `respond` never ran.
         Handler::Handle(elements) => {
             let handlers = elements
                 .iter()
                 .map(|element| compile_handler_element(element, matchers, root))
                 .collect::<CompileResult<Vec<_>>>()?;
-            Ok(HandlerConfig::Handle { handlers })
+            Ok(HandlerConfig::Pipeline { handlers })
         }
 
         Handler::BasicAuth(config) => {
@@ -2525,7 +2541,7 @@ fn compile_handler(
                 .iter()
                 .map(|element| compile_handler_element(element, matchers, root))
                 .collect::<CompileResult<Vec<_>>>()?;
-            Ok(HandlerConfig::Handle { handlers })
+            Ok(HandlerConfig::FirstMatch { handlers })
         }
 
         Handler::Cors(cors) => Ok(HandlerConfig::Cors {
@@ -3345,7 +3361,7 @@ mod fail_closed_handler_tests {
             ),
             (
                 "handle",
-                HandlerConfig::Handle {
+                HandlerConfig::FirstMatch {
                     handlers: vec![CoreHandlerElement::plain(plugin())],
                 },
             ),
@@ -3375,7 +3391,7 @@ mod fail_closed_handler_tests {
             ),
             (
                 "two containers deep",
-                HandlerConfig::Handle {
+                HandlerConfig::FirstMatch {
                     handlers: vec![CoreHandlerElement::plain(HandlerConfig::Pipeline {
                         handlers: vec![
                             CoreHandlerElement::plain(harmless()),

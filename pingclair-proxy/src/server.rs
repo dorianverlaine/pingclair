@@ -4268,7 +4268,7 @@ impl PingclairProxy {
                 }
                 Ok(false)
             }
-            HandlerConfig::Handle { handlers } => {
+            HandlerConfig::FirstMatch { handlers } => {
                 let has_proxy = handlers
                     .iter()
                     .any(|element| contains_reverse_proxy(&element.handler));
@@ -7586,7 +7586,7 @@ pub(crate) fn find_reverse_proxy_config(handler: &HandlerConfig) -> Option<&Reve
     match handler {
         HandlerConfig::ReverseProxy(config) if config.subrequest.is_none() => Some(config),
         HandlerConfig::Pipeline { handlers }
-        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::FirstMatch { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => handlers
             .iter()
             .find_map(|element| find_reverse_proxy_config(&element.handler)),
@@ -7653,7 +7653,7 @@ fn find_access_control_config(handler: &HandlerConfig) -> Option<&AccessControlC
     match handler {
         HandlerConfig::AccessControl(config) => Some(config),
         HandlerConfig::Pipeline { handlers }
-        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::FirstMatch { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => handlers
             .iter()
             .find_map(|element| find_access_control_config(&element.handler)),
@@ -7667,7 +7667,7 @@ pub(crate) fn contains_reverse_proxy(handler: &HandlerConfig) -> bool {
     match handler {
         HandlerConfig::ReverseProxy(config) => config.subrequest.is_none(),
         HandlerConfig::Pipeline { handlers }
-        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::FirstMatch { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => handlers
             .iter()
             .any(|element| contains_reverse_proxy(&element.handler)),
@@ -7696,7 +7696,7 @@ fn collect_subrequest_plans(
             }
         }
         HandlerConfig::Pipeline { handlers }
-        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::FirstMatch { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
             for element in handlers {
                 collect_subrequest_plans(&element.handler, prepared);
@@ -7727,7 +7727,7 @@ fn collect_request_body_ceiling(handler: &HandlerConfig) -> Option<u64> {
     match handler {
         HandlerConfig::RequestBody { max_size } => *max_size,
         HandlerConfig::Pipeline { handlers }
-        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::FirstMatch { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => handlers
             .iter()
             .filter_map(|element| collect_request_body_ceiling(&element.handler))
@@ -7773,7 +7773,7 @@ fn collect_route_regexes(handler: &HandlerConfig, regexes: &mut HashMap<String, 
             }
         }
         HandlerConfig::Pipeline { handlers }
-        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::FirstMatch { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
             for element in handlers {
                 collect_route_regexes(&element.handler, regexes);
@@ -7886,7 +7886,7 @@ fn find_file_server_config(handler: &HandlerConfig) -> Option<&HandlerConfig> {
     match handler {
         HandlerConfig::FileServer { .. } => Some(handler),
         HandlerConfig::Pipeline { handlers }
-        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::FirstMatch { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => handlers
             .iter()
             .find_map(|element| find_file_server_config(&element.handler)),
@@ -7919,7 +7919,7 @@ fn find_rate_limit_config(
             route: route.to_string(),
         }),
         HandlerConfig::Pipeline { handlers }
-        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::FirstMatch { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
             for element in handlers {
                 if let Some(config) = find_rate_limit_config(&element.handler, route) {

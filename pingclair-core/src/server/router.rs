@@ -418,7 +418,7 @@ impl Router {
 fn precompile_handler(handler: &HandlerConfig) -> MatcherPrecompile {
     match handler {
         HandlerConfig::Pipeline { handlers }
-        | HandlerConfig::Handle { handlers }
+        | HandlerConfig::FirstMatch { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => MatcherPrecompile {
             element_matcher: None,
             children: handlers.iter().map(precompile_element).collect(),
@@ -433,7 +433,7 @@ fn precompile_element(element: &HandlerElement) -> MatcherPrecompile {
         element_matcher: element.matcher.as_ref().map(CompiledMatcher::compile),
         children: match &element.handler {
             HandlerConfig::Pipeline { handlers }
-            | HandlerConfig::Handle { handlers }
+            | HandlerConfig::FirstMatch { handlers }
             | HandlerConfig::HandlePath { handlers, .. } => {
                 handlers.iter().map(precompile_element).collect()
             }

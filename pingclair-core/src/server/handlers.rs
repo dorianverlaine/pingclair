@@ -221,7 +221,7 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             Ok(final_response)
         }
 
-        HandlerConfig::Handle { handlers } => {
+        HandlerConfig::FirstMatch { handlers } => {
             // Treat Handle as a pipeline for now
             execute_handler(
                 &HandlerConfig::Pipeline {

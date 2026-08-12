@@ -580,7 +580,7 @@ mod global_tests {
                 matches!(
                     &r.handler,
                     pingclair_core::config::HandlerConfig::ReverseProxy(_)
-                        | pingclair_core::config::HandlerConfig::Handle { .. }
+                        | pingclair_core::config::HandlerConfig::FirstMatch { .. }
                         | pingclair_core::config::HandlerConfig::Pipeline { .. }
                 )
             })
@@ -859,7 +859,7 @@ mod fail_closed_tests {
     fn handlers_of(handler: &HandlerConfig) -> Vec<&HandlerConfig> {
         match handler {
             HandlerConfig::Pipeline { handlers }
-            | HandlerConfig::Handle { handlers }
+            | HandlerConfig::FirstMatch { handlers }
             | HandlerConfig::HandlePath { handlers, .. } => handlers
                 .iter()
                 .flat_map(|element| handlers_of(&element.handler))
@@ -1759,8 +1759,8 @@ mod fail_closed_tests {
             route.path, "/ws",
             "the container matcher must stay on the route"
         );
-        let pingclair_core::config::HandlerConfig::Handle { handlers } = &route.handler else {
-            panic!("handle must compile to a Handle group");
+        let pingclair_core::config::HandlerConfig::Pipeline { handlers } = &route.handler else {
+            panic!("a handle block compiles to a sequential group");
         };
         let element = handlers
             .iter()
@@ -2573,7 +2573,7 @@ mod uri_and_try_files_tests {
     /// `TryFiles` handler left to look for. Recognising it by *shape* is the
     /// price of having one implementation instead of two.
     fn try_files_groups(handler: &HandlerConfig) -> Option<Vec<TryFilesGroup>> {
-        let HandlerConfig::Handle { handlers } = handler else {
+        let HandlerConfig::FirstMatch { handlers } = handler else {
             return None;
         };
         handlers
@@ -3211,15 +3211,23 @@ mod handle_errors_tests {
         assert!(routes[0].matches(404) && routes[0].matches(503));
     }
 
+    /// 🧵 Nested `handle` blocks each become their own sequential group.
+    ///
+    /// They stay mutually exclusive with one another, but that comes from each
+    /// block *answering* rather than from the block swallowing its own
+    /// contents: the enclosing group stops at the first element that writes a
+    /// response. Asserting the container variant here is what would catch a
+    /// regression back to the first-match reading, which used to make a block
+    /// whose first directive was non-terminal answer nothing at all.
     #[test]
-    fn handle_blocks_inside_keep_their_exclusive_semantics() {
+    fn handle_blocks_inside_error_routes_are_sequential_groups() {
         let routes = error_routes_of(
             "example.com {\n\thandle_errors 404 {\n\t\thandle /en/* {\n\t\t\trespond \"en\"\n\t\t}\n\t\thandle {\n\t\t\trespond \"default\"\n\t\t}\n\t}\n}",
         );
         assert_eq!(routes[0].handlers.len(), 2);
         assert!(matches!(
             routes[0].handlers[0].handler,
-            HandlerConfig::Handle { .. }
+            HandlerConfig::Pipeline { .. }
         ));
     }
 
@@ -3364,7 +3372,7 @@ mod matcher_inside_route_body_tests {
         let config = compile(source).unwrap_or_else(|error| panic!("must compile: {error}"));
         match &config.servers[0].routes[0].handler {
             HandlerConfig::Pipeline { handlers }
-            | HandlerConfig::Handle { handlers }
+            | HandlerConfig::FirstMatch { handlers }
             | HandlerConfig::HandlePath { handlers, .. } => handlers.clone(),
             other => panic!("expected a container handler, got {other:?}"),
         }
@@ -3546,9 +3554,15 @@ mod matcher_inside_route_body_tests {
             path_matcher(&handlers[0]),
             Some(&["/foo/*".to_string()][..])
         );
-        assert!(matches!(handlers[0].handler, HandlerConfig::Handle { .. }));
+        assert!(matches!(
+            handlers[0].handler,
+            HandlerConfig::Pipeline { .. }
+        ));
         assert!(handlers[1].matcher.is_none());
-        assert!(matches!(handlers[1].handler, HandlerConfig::Handle { .. }));
+        assert!(matches!(
+            handlers[1].handler,
+            HandlerConfig::Pipeline { .. }
+        ));
     }
 
     /// 📌 A directive whose first argument merely looks like a matcher stays

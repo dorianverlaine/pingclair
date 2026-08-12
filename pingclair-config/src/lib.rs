@@ -2014,7 +2014,7 @@ mod tests {
         "#;
 
         let config = compile(source).unwrap();
-        let HandlerConfig::Handle { handlers } = &config.servers[0].routes[0].handler else {
+        let HandlerConfig::Pipeline { handlers } = &config.servers[0].routes[0].handler else {
             panic!("expected handler group");
         };
         assert!(handlers.iter().any(|element| matches!(&element.handler, HandlerConfig::Cors {
@@ -2101,7 +2101,7 @@ mod tests {
             ) {
                 match handler {
                     HandlerConfig::Pipeline { handlers }
-                    | HandlerConfig::Handle { handlers }
+                    | HandlerConfig::FirstMatch { handlers }
                     | HandlerConfig::HandlePath { handlers, .. } => {
                         for element in handlers {
                             visit(

@@ -131,7 +131,7 @@ private.example {
                   ]
                 }
               },
-              "type": "handle",
+              "type": "pipeline",
               "handlers": [
                 {
                   "type": "respond",
@@ -142,7 +142,7 @@ private.example {
               ]
             },
             {
-              "type": "handle",
+              "type": "pipeline",
               "handlers": [
                 {
                   "type": "respond",

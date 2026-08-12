@@ -2006,7 +2006,7 @@ async fn plan_h3_handler_with_connector(
             }
             Ok(H3Plan::Continue)
         }
-        HandlerConfig::Handle { handlers } => {
+        HandlerConfig::FirstMatch { handlers } => {
             let has_proxy = handlers
                 .iter()
                 .any(|element| crate::server::contains_reverse_proxy(&element.handler));

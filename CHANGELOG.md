@@ -28,6 +28,15 @@ lets the rest converge.
 
 ### ⚠️ Breaking
 
+- 🧩 **The JSON handler `{"type": "handle"}` is now `{"type": "pipeline"}`,
+  and a separate `{"type": "first_match"}` carries the exclusive behaviour.**
+  One container was doing two jobs under one name. Configurations written by
+  hand keep loading — `"handle"` is accepted as an alias for `"pipeline"`,
+  which is the corrected reading of what those documents always meant — but a
+  configuration exported from this version spells it the new way, and anything
+  matching on the old string needs updating. Only `try_files` compiles to
+  `first_match`.
+
 - 🪵 **`log <name> { … }` now configures a named per-site logger.** This is
   the spelling upstream Caddy gives the same tokens: the block is the
   logger's configuration, and the name is its handle. It used to be refused
@@ -455,6 +464,17 @@ lets the rest converge.
 
 ### 🐛 Fixed
 
+- 🧵 **A `handle` block now runs every directive in it, not just the first.**
+  The exclusivity `handle` is known for is between *sibling* blocks; the
+  directives inside one block are a sequence. The two meanings shared one
+  container, so any block whose first directive did not write a response
+  swallowed the rest of the block —
+  `handle /x/* { header X-A b; respond "ok" }` set the header and then
+  answered nothing, arriving at the client as a 502, and
+  `handle /api/* { request_header … ; reverse_proxy … }` set the header and
+  never proxied. Sibling blocks are still mutually exclusive, because each one
+  answers. The exclusive container survives under its own name for `try_files`,
+  which is the one construct that genuinely needs it.
 - 🔢 **`1MB` is now a million bytes, not 1,048,576.** Sizes follow the SI/IEC
   split the configuration format uses: `kb`/`mb`/`gb`/`tb` are powers of a
   thousand and `kib`/`mib`/`gib`/`tib` are powers of 1024. Every size the DSL

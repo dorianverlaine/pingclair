@@ -1308,11 +1308,39 @@ pub enum HandlerConfig {
         values: BTreeMap<String, String>,
     },
 
-    /// Pipeline of matcher-guarded elements
+    /// 🧵 A sequential group: every element whose matcher accepts the request
+    /// runs, in order, until one of them answers.
+    ///
+    /// Both `route` and `handle` compile to this. They differ only in how the
+    /// block's contents were arranged — `route` keeps the order they were
+    /// written in, `handle` sorts them into the format's directive order — and
+    /// that difference is settled while adapting, not at request time.
+    ///
+    /// 🧭 `handle` blocks are still mutually exclusive **with each other**;
+    /// that exclusivity lives one level up, in the route each block became,
+    /// which is also where upstream puts it.
+    ///
+    /// 📌 The `handle` alias is for configurations serialised before
+    /// 2026-08-12, when a `handle` block compiled to a first-match group by
+    /// mistake. Loading them as sequential is the corrected reading of what
+    /// they always meant.
+    #[serde(alias = "handle")]
     Pipeline { handlers: Vec<HandlerElement> },
 
-    /// Exclusive routing group of matcher-guarded elements
-    Handle { handlers: Vec<HandlerElement> },
+    /// 🎯 A mutually exclusive group: the **first matching** element owns the
+    /// request and the rest never run, even if it passes through.
+    ///
+    /// This is what `try_files` needs — a list of candidate rewrites of which
+    /// exactly one may apply — and it is *not* what the `handle` directive
+    /// means, despite the name this variant used to carry.
+    ///
+    /// > 🤡 The two were the same variant until 2026-08-12, and the conflation
+    /// > cost real behaviour: a `handle` block ran only its first matching
+    /// > directive, so `handle /x/* { header X-A b; respond "ok" }` set the
+    /// > header and then answered nothing. A container whose name means two
+    /// > things will eventually be given the wrong one.
+    #[serde(rename = "first_match")]
+    FirstMatch { handlers: Vec<HandlerElement> },
 
     /// HTTP Basic Authentication
     /// Requires valid credentials before allowing access

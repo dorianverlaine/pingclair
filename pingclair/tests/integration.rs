@@ -3567,6 +3567,167 @@ async fn test_local_descriptor_exhaustion_does_not_mark_the_backend_down() {
     backend_task.abort();
 }
 
+/// 🧵 A `handle` block runs every directive in it, not just the first.
+///
+/// The exclusivity `handle` is known for is between *sibling* blocks, not
+/// between the directives inside one. Conflating the two meant any block whose
+/// first directive did not write a response swallowed the rest of the block:
+/// `handle /x/* { header X-A b; respond "ok" }` set the header and then
+/// answered nothing, which arrived at the client as a 502.
+#[tokio::test]
+async fn test_pingclairfile_handle_block_runs_every_directive() {
+    let config = r#"
+        {
+            admin off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            handle /x/* {
+                header X-A b
+                respond "ok" 200
+            }
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/x/thing"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "a non-terminal directive must not swallow the rest of its block"
+    );
+    assert_eq!(
+        response.headers().get("x-a").map(|v| v.to_str().unwrap()),
+        Some("b"),
+        "and the directive that ran first must still have run"
+    );
+    assert_eq!(response.text().await.unwrap(), "ok");
+}
+
+/// 🎯 Sibling `handle` blocks stay mutually exclusive.
+///
+/// The half of `handle`'s meaning that was always right, and the half a fix
+/// for the other half could plausibly break: once one block matches, no other
+/// block runs — even one whose matcher would also have accepted the request.
+#[tokio::test]
+async fn test_pingclairfile_sibling_handle_blocks_remain_exclusive() {
+    let config = r#"
+        {
+            admin off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            handle /shared/* {
+                header X-Which first
+                respond "first" 200
+            }
+
+            handle {
+                header X-Which second
+                respond "second" 200
+            }
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    let matched = client
+        .get(server.url(0, "/shared/thing"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        matched
+            .headers()
+            .get("x-which")
+            .map(|v| v.to_str().unwrap()),
+        Some("first"),
+        "the catch-all block must not also run"
+    );
+    assert_eq!(matched.text().await.unwrap(), "first");
+
+    let fell_through = client.get(server.url(0, "/other")).send().await.unwrap();
+    assert_eq!(fell_through.text().await.unwrap(), "second");
+}
+
+/// 🧵 The shape most Caddy configurations are actually written in.
+///
+/// Middleware and a terminal in one `handle` block is the ordinary way to
+/// write a reverse proxy, and it was exactly the shape that did not work: the
+/// `request_header` matched, took ownership of the request, and the proxy
+/// never ran. Kept as its own test because it is the thing an operator would
+/// hit first, not a corner.
+#[tokio::test]
+async fn test_pingclairfile_handle_block_runs_middleware_then_proxies() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let upstream_address = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nproxied")
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&request).to_string()
+    });
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            handle /api/* {{
+                request_header X-Probe middleware-ran
+                reverse_proxy http://{upstream_address}
+            }}
+        }}
+    "#
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    // 🏷️ `X-Probe` rather than something like `X-Real-IP`: the proxy sets its
+    // own forwarding headers on the upstream request, so a name it owns would
+    // be overwritten and the test would fail for a reason that has nothing to
+    // do with whether the middleware ran.
+    let response = no_proxy_client()
+        .get(server.url(0, "/api/thing"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "proxied");
+
+    let request = upstream_task.await.unwrap();
+    assert!(
+        request
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("X-Probe: middleware-ran")),
+        "the middleware must run as well as the proxy: {request}"
+    );
+}
+
 /// 🔤🏷️ `method` and `request_header` both change what the upstream is asked.
 ///
 /// Asserted together because they are one observation: the request head the
@@ -3667,7 +3828,7 @@ async fn test_pingclairfile_request_body_max_size_raises_the_route_limit() {
             @readiness path __PINGCLAIR_TEST_READINESS_PATH__
             respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
 
-            route /upload/* {
+            handle /upload/* {
                 request_body {
                     max_size 8MB
                 }
