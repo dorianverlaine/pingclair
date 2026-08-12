@@ -51,6 +51,19 @@ pub fn compile_ast(ast: &Ast) -> CompileResult<PingclairConfig> {
     for server_node in &ast.servers {
         let block = &server_node.inner;
         let mut server_config = compile_server(block)?;
+        // 🌐 A site that named no `bind` of its own inherits the global
+        // default. Applied here rather than inside `compile_server` because
+        // this is where the global block is in scope, and because "the site
+        // said nothing" is only knowable next to what it did say.
+        //
+        // 📌 Only the first address is taken. Upstream accepts a list, and
+        // this server binds one host per listener — see the startup line that
+        // says which one was used when a configuration names several.
+        if server_config.bind.is_none()
+            && let Some(first) = config.global.default_bind.first()
+        {
+            server_config.bind = Some(first.clone());
+        }
         // 🌐 Caddy serves any named site over HTTPS by default: a bare
         // hostname with no explicit scheme/listen and automatic HTTPS
         // enabled gets `tls auto` (localhost/IP sites already get the
@@ -216,6 +229,20 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
     }
     if global.skip_install_trust {
         config.global.skip_install_trust = true;
+    }
+
+    // 🔄 The renewal window, and the bind addresses sites inherit.
+    if let Some(ratio) = global.renewal_window_ratio {
+        config.global.renewal_window_ratio = Some(ratio);
+    }
+    if !global.default_bind.is_empty() {
+        config.global.default_bind = global.default_bind.clone();
+    }
+    // 🔗 Recorded so the configuration round-trips; `run.rs` says at startup
+    // that it is not acted on, because the ACME client cannot ask for a
+    // particular chain.
+    if let Some(preference) = &global.preferred_chains {
+        config.global.preferred_chains = Some(preference.clone());
     }
 
     // 🔐 Caddy's `local_certs` option selects the built-in local authority

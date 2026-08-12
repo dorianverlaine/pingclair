@@ -46,6 +46,11 @@ pub struct AutoHttpsConfig {
     /// How often to scan for certificates needing renewal.
     pub renewal_interval: Duration,
 
+    /// 🔄 Fraction of a certificate's lifetime that must remain before it is
+    /// renewed. How *early* to renew, where `renewal_interval` is how often to
+    /// look — two different questions that are easy to confuse.
+    pub renewal_window_ratio: f64,
+
     /// Whether to enforce HTTP Strict Transport Security (HSTS).
     pub hsts: bool,
 
@@ -66,6 +71,7 @@ impl Default for AutoHttpsConfig {
             staging: false,
             email: None,
             renewal_interval: Duration::from_secs(12 * 60 * 60), // Check every 12 hours
+            renewal_window_ratio: crate::acme::DEFAULT_RENEWAL_WINDOW_RATIO,
             hsts: true,
             hsts_max_age: 31536000, // 1 year recommendation
             hsts_include_subdomains: true,
@@ -177,7 +183,7 @@ impl AutoHttps {
     ) -> Result<Certificate, AutoHttpsError> {
         // 1. Fast Path: Check Store
         if let Some(cert) = self.store.get(domain).await {
-            if !cert.needs_renewal() {
+            if !cert.needs_renewal(self.store.renewal_window_ratio()) {
                 tracing::debug!("✅ Cache Hit: Valid certificate found for {}", domain);
                 return Ok(cert);
             }

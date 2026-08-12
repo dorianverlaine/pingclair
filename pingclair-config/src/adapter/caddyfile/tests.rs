@@ -2198,14 +2198,102 @@ mod fail_closed_tests {
         );
     }
 
+    /// 🧭 A global option the format defines and this build does not have
+    /// must say so, rather than reading as a typo.
+    ///
+    /// `default_bind` used to be the example here; it is implemented now, so
+    /// the test moved to one that is still missing. Keeping a *live* example
+    /// is the point — a test pinned to an option that later gets implemented
+    /// stops testing the property it was written for.
     #[test]
     fn known_caddy_global_options_are_reported_as_unsupported() {
         let error =
-            compile_err("{\n    default_bind 127.0.0.1\n}\nexample.com {\n    respond \"x\"\n}");
+            compile_err("{\n    shutdown_delay 10s\n}\nexample.com {\n    respond \"x\"\n}");
         assert!(
             error.contains("not supported by Pingclair"),
-            "default_bind must be reported as unsupported Caddy syntax; got {error}"
+            "shutdown_delay must be reported as unsupported Caddy syntax; got {error}"
         );
+    }
+
+    /// 🌐 `default_bind` reaches the sites that named no bind of their own,
+    /// and leaves alone the ones that did.
+    #[test]
+    fn default_bind_fills_in_only_the_sites_that_named_none() {
+        let config = crate::compile(
+            "{\n default_bind 127.0.0.1\n}\nexample.com {\n respond \"a\"\n}\n             other.example {\n bind 10.0.0.1\n respond \"b\"\n}",
+        )
+        .unwrap();
+        let bind_of = |name: &str| {
+            config
+                .servers
+                .iter()
+                .find(|server| server.names.iter().any(|host| host == name))
+                .and_then(|server| server.bind.clone())
+        };
+        assert_eq!(bind_of("example.com").as_deref(), Some("127.0.0.1"));
+        assert_eq!(
+            bind_of("other.example").as_deref(),
+            Some("10.0.0.1"),
+            "a site's own bind wins over the global default"
+        );
+    }
+
+    /// 🔄 A renewal window is a fraction, and the ends of the range are not
+    /// fractions anyone means: zero renews after expiry, one renews always.
+    #[test]
+    fn renewal_window_ratio_takes_a_fraction_and_refuses_the_ends() {
+        let config =
+            crate::compile("{\n renewal_window_ratio 0.1666\n}\nexample.com {\n respond \"x\"\n}")
+                .unwrap();
+        assert_eq!(config.global.renewal_window_ratio, Some(0.1666));
+        for bad in ["0", "1", "-0.5", "1.5", "soon"] {
+            let error = compile_err(&format!(
+                "{{\n renewal_window_ratio {bad}\n}}\nexample.com {{\n respond \"x\"\n}}"
+            ));
+            assert!(
+                error.contains("renewal_window_ratio"),
+                "`{bad}` must be refused; got {error}"
+            );
+        }
+    }
+
+    /// 🔗 The two `preferred_chains` spellings, and the combinations upstream
+    /// refuses because they contradict each other.
+    #[test]
+    fn preferred_chains_reads_both_spellings_and_refuses_the_contradictions() {
+        use pingclair_core::config::PreferredChains;
+
+        let smallest =
+            crate::compile("{\n preferred_chains smallest\n}\nexample.com {\n respond \"x\"\n}")
+                .unwrap();
+        assert_eq!(
+            smallest.global.preferred_chains,
+            Some(PreferredChains::Smallest)
+        );
+
+        let named = crate::compile(
+            "{\n preferred_chains {\n root_common_name \"ISRG Root X1\"\n }\n}\n             example.com {\n respond \"x\"\n}",
+        )
+        .unwrap();
+        assert_eq!(
+            named.global.preferred_chains,
+            Some(PreferredChains::RootCommonName(vec![
+                "ISRG Root X1".to_string()
+            ]))
+        );
+
+        for bad in [
+            "{\n preferred_chains largest\n}\nexample.com {\n respond \"x\"\n}",
+            "{\n preferred_chains smallest {\n root_common_name X\n }\n}\nexample.com {\n respond \"x\"\n}",
+            "{\n preferred_chains {\n root_common_name X\n any_common_name Y\n }\n}\nexample.com {\n respond \"x\"\n}",
+            "{\n preferred_chains {\n }\n}\nexample.com {\n respond \"x\"\n}",
+        ] {
+            let error = compile_err(bad);
+            assert!(
+                error.contains("preferred_chains"),
+                "must be refused with its own name; got {error}"
+            );
+        }
     }
 
     #[test]

@@ -83,6 +83,12 @@ pub struct GlobalBlock {
     pub pki: Vec<pingclair_core::config::PkiAuthority>,
     /// 🤝 `skip_install_trust`, which describes what this build already does.
     pub skip_install_trust: bool,
+    /// 🔄 How early to renew, as a fraction of the certificate's lifetime.
+    pub renewal_window_ratio: Option<f64>,
+    /// 🌐 Bind addresses inherited by sites that name none of their own.
+    pub default_bind: Vec<String>,
+    /// 🔗 The issuer chain an operator prefers. Recorded, never acted on.
+    pub preferred_chains: Option<pingclair_core::config::PreferredChains>,
     pub directives: Vec<Directive>,
 }
 

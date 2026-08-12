@@ -188,6 +188,18 @@ lets the rest converge.
 
 ### ✨ Added
 
+- 🔄 **`renewal_window_ratio <fraction>`** decides how early a certificate is
+  renewed, as a fraction of its own lifetime rather than a fixed number of
+  days. The default is a third, which on today's 90-day certificates is the
+  30 days this server used before.
+- 🌐 **`default_bind <address>`** gives every site that names no `bind` of its
+  own one to inherit. A site's own `bind` still wins.
+- 🔗 **`preferred_chains smallest`** and the `any_common_name` /
+  `root_common_name` block are parsed and validated. ⚠️ They are **recorded
+  and reported at startup, never acted on**: the ACME client this build uses
+  takes whichever chain the authority offers and exposes no way to ask for
+  another. The certificate works; the chain is simply not the one requested.
+
 - 🔤 **`method <verb>`** replaces the request method before later handlers and
   the upstream see it. The argument is a template and is upper-cased after
   resolution, so `method post` asks the upstream `POST`.
@@ -488,6 +500,13 @@ lets the rest converge.
   directives now read a line through one function, so they cannot drift apart
   again. `header { match { … } }` is refused by name rather than treated as a
   header called `match`.
+- 🔄 **A short-lived certificate is no longer renewed the moment it is
+  issued.** Renewal triggered whenever fewer than 30 days remained, full stop.
+  For the 90-day certificates public CAs issue that is a third of the
+  lifetime, which is why it looked right; for a 7-day certificate it is true
+  from the second it is signed, so every scan would re-request every
+  certificate, forever, against the authority's rate limits. The window is now
+  a fraction of each certificate's own validity period.
 - 📏 **`roll_size` rounds up to a whole mebibyte, which is the resolution a
   rotation threshold has.** Combined with the size fix below, `roll_size 1mb`
   now means what it means upstream: a million bytes, rounded up to 1 MiB. The

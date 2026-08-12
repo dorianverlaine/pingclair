@@ -733,11 +733,12 @@ Directive：
 
 全域選項：
 
-  `acme_ca` `acme_ca_root` `acme_dns` `acme_eab` `cert_issuer` `cert_lifetime`
-  `default_bind` `default_sni` `dns` `ech` `events` `fallback_sni`
-  `filesystem` `frankenphp` `key_type` `ocsp_interval` `ocsp_stapling`
-  `on_demand_tls` `pki` `preferred_chains` `renew_interval` `renewal_window_ratio`
-  `shutdown_delay` `skip_install_trust` `storage` `storage_clean_interval`
+  `acme_ca` `acme_ca_root` `acme_dns` `acme_eab`
+  `cert_issuer` `cert_lifetime` `default_sni` `dns`
+  `ech` `events` `fallback_sni` `filesystem`
+  `frankenphp` `key_type` `ocsp_interval` `ocsp_stapling`
+  `on_demand_tls` `pki` `renew_interval` `shutdown_delay`
+  `skip_install_trust` `storage` `storage_clean_interval`
 
 其中三件值得直接講明白，因為它們決定的是「Pingclair 適不適合你」，
 而不是之後才會踩到的細節：

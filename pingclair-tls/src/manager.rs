@@ -66,7 +66,10 @@ impl TlsManager {
             Arc::new(PersistentChallengeHandler::new(challenge_storage_path).await?);
 
         let auto_https = if let Some(config) = config {
-            let store = Arc::new(CertStore::new(store_path));
+            let store = Arc::new(CertStore::with_renewal_window(
+                store_path,
+                config.renewal_window_ratio,
+            ));
             // 📁 A fresh process must see certificates persisted by earlier
             // runs; without this the in-memory cache stays empty, eager
             // issuance re-requests every domain, and the first TLS handshakes
@@ -99,7 +102,10 @@ impl TlsManager {
         let challenge_handler = Arc::new(MemoryChallengeHandler::new());
 
         let auto_https = if let Some(config) = config {
-            let store = Arc::new(CertStore::new(store_path));
+            let store = Arc::new(CertStore::with_renewal_window(
+                store_path,
+                config.renewal_window_ratio,
+            ));
             Some(Arc::new(AutoHttps::new(config, store)))
         } else {
             None
@@ -129,7 +135,10 @@ impl TlsManager {
             Arc::new(PersistentChallengeHandler::new(challenge_storage_path.to_path_buf()).await?);
 
         let auto_https = if let Some(config) = config {
-            let store = Arc::new(CertStore::new(store_path));
+            let store = Arc::new(CertStore::with_renewal_window(
+                store_path,
+                config.renewal_window_ratio,
+            ));
             // 📁 Hydrate the persisted certificate cache like the main
             // constructor does; a custom challenge path must not change
             // certificate discovery semantics.

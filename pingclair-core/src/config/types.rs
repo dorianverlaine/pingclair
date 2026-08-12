@@ -142,6 +142,46 @@ pub struct GlobalConfig {
     /// rolling restart did that to every download in progress.
     #[serde(default)]
     pub grace_period_secs: Option<u64>,
+
+    /// 🔄 How early a certificate is renewed, as a fraction of its lifetime.
+    ///
+    /// `0.3333` means "renew once a third of the validity remains" — for a
+    /// 90-day certificate, at 30 days left. Expressed as a ratio rather than a
+    /// duration because that is the only form that survives the certificate
+    /// lifetime changing: a fixed 30-day window renews a 7-day certificate
+    /// immediately, forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewal_window_ratio: Option<f64>,
+
+    /// 🌐 Bind addresses every site inherits when it names none of its own.
+    ///
+    /// A site's own `bind` wins. This exists so a machine with several
+    /// interfaces can say once which one the server belongs on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_bind: Vec<String>,
+
+    /// 🔗 The ACME issuer chain an operator prefers, from `preferred_chains`.
+    ///
+    /// ⚠️ Recorded and reported at startup, never acted on: `instant-acme`
+    /// 0.8.5 — checked 2026-08-12, no `alternate`/`preferred_chain` in its
+    /// public API — downloads the default chain the CA offers and exposes no
+    /// way to ask for another. Stored rather than refused because serving the
+    /// default chain still works, and refused-at-startup would turn a
+    /// preference into an outage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_chains: Option<PreferredChains>,
+}
+
+/// 🔗 Which issuer chain to prefer when a CA offers more than one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreferredChains {
+    /// The chain with the fewest certificates in it.
+    Smallest,
+    /// Any chain whose issuers include one of these common names.
+    AnyCommonName(Vec<String>),
+    /// Any chain whose root has one of these common names.
+    RootCommonName(Vec<String>),
 }
 
 /// 🌐 Default plaintext HTTP port, matching Caddy's default.
@@ -182,6 +222,9 @@ impl Default for GlobalConfig {
             // 🚰 `None` is "wait for in-flight requests however long they
             // take", which is Caddy's behaviour rather than a missing value.
             grace_period_secs: None,
+            renewal_window_ratio: None,
+            default_bind: Vec::new(),
+            preferred_chains: None,
         }
     }
 }

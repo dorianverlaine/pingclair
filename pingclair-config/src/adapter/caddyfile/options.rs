@@ -361,6 +361,41 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                 "default_sni" => {
                     global.default_sni = Some(super::tls::parse_default_sni(&sub)?);
                 }
+                // 🔄 A fraction of the certificate's lifetime, not a duration.
+                // That distinction is the whole point of the option: a fixed
+                // window renews a short-lived certificate the moment it is
+                // issued, over and over.
+                "renewal_window_ratio" => {
+                    let raw = expect_one_argument(&sub)?;
+                    let ratio = raw.parse::<f64>().ok().filter(|value| {
+                        // 🚫 Zero would mean "renew when it has already
+                        // expired", and one would mean "renew continuously".
+                        // Both are configurations nobody means to write.
+                        value.is_finite() && *value > 0.0 && *value < 1.0
+                    });
+                    match ratio {
+                        Some(ratio) => global.renewal_window_ratio = Some(ratio),
+                        None => {
+                            return Err(AdapterError::InvalidArgument(
+                                "renewal_window_ratio".into(),
+                                format!(
+                                    "`{raw}` is not a fraction between 0 and 1; \
+                                     0.3333 renews once a third of the lifetime remains"
+                                ),
+                            ));
+                        }
+                    }
+                }
+                // 🌐 Addresses every site without its own `bind` inherits.
+                "default_bind" => {
+                    if sub.args.is_empty() {
+                        return Err(AdapterError::ArgumentCount("default_bind".into(), 1, 0));
+                    }
+                    global.default_bind = sub.args.clone();
+                }
+                "preferred_chains" => {
+                    global.preferred_chains = Some(parse_preferred_chains(&sub)?);
+                }
                 "protocols" => {
                     for arg in &sub.args {
                         match arg.to_lowercase().as_str() {
@@ -435,6 +470,76 @@ pub(super) fn expand_servers_block(directives: Vec<Directive>) -> Vec<Directive>
         }
     }
     result
+}
+
+/// 🔗 Reads `preferred_chains smallest` or a block naming issuer common names.
+///
+/// The two spellings are exclusive, and so are the two block keys — a chain
+/// cannot be both "any of these issuers" and "rooted at one of these". Upstream
+/// refuses the combinations for the same reason, and refusing here keeps a
+/// configuration from meaning one thing on paper and another once loaded.
+///
+/// ⚠️ What is read here is never acted on; see `GlobalConfig::preferred_chains`
+/// for why, and `run.rs` for the startup line that says so out loud.
+fn parse_preferred_chains(
+    directive: &Directive,
+) -> Result<pingclair_core::config::PreferredChains, AdapterError> {
+    use pingclair_core::config::PreferredChains;
+
+    if let Some(argument) = directive.args.first() {
+        if argument != "smallest" {
+            return Err(AdapterError::InvalidArgument(
+                "preferred_chains".into(),
+                format!("`{argument}` is not a chain preference; expected `smallest`"),
+            ));
+        }
+        if directive.args.len() > 1 || directive.block.is_some() {
+            return Err(AdapterError::InvalidArgument(
+                "preferred_chains".into(),
+                "`smallest` takes nothing else".into(),
+            ));
+        }
+        return Ok(PreferredChains::Smallest);
+    }
+
+    let Some(block) = &directive.block else {
+        return Err(AdapterError::ArgumentCount("preferred_chains".into(), 1, 0));
+    };
+    let mut any_common_name: Option<Vec<String>> = None;
+    let mut root_common_name: Option<Vec<String>> = None;
+    for sub in &block.directives {
+        let target = match sub.name.as_str() {
+            "any_common_name" => &mut any_common_name,
+            "root_common_name" => &mut root_common_name,
+            other => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "preferred_chains: {other}"
+                )));
+            }
+        };
+        if sub.args.is_empty() {
+            return Err(AdapterError::ArgumentCount(
+                format!("preferred_chains {}", sub.name),
+                1,
+                0,
+            ));
+        }
+        target
+            .get_or_insert_with(Vec::new)
+            .extend(sub.args.iter().cloned());
+    }
+    match (any_common_name, root_common_name) {
+        (Some(names), None) => Ok(PreferredChains::AnyCommonName(names)),
+        (None, Some(names)) => Ok(PreferredChains::RootCommonName(names)),
+        (Some(_), Some(_)) => Err(AdapterError::InvalidArgument(
+            "preferred_chains".into(),
+            "`any_common_name` and `root_common_name` cannot both be set".into(),
+        )),
+        (None, None) => Err(AdapterError::InvalidArgument(
+            "preferred_chains".into(),
+            "the block sets nothing; name `any_common_name` or `root_common_name`".into(),
+        )),
+    }
 }
 
 #[cfg(test)]

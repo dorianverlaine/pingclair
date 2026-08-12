@@ -84,7 +84,11 @@ impl InternalCa {
         let authority = self.ensure_authority(&mut state).await?;
 
         if let Some(certificate) = self.certificates.get(domain).await
-            && !certificate.needs_renewal()
+            // 🏠 The internal authority issues its own certificates with a
+            // lifetime it chooses, so the default window is the right question
+            // here — an operator's `renewal_window_ratio` is about the public
+            // CA's certificates, which this path never touches.
+            && !certificate.needs_renewal(crate::acme::DEFAULT_RENEWAL_WINDOW_RATIO)
         {
             return Ok(certificate);
         }

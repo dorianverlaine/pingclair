@@ -191,6 +191,9 @@ fn merge_globals(
         worker_threads,
         dns_refresh_secs,
         grace_period_secs,
+        renewal_window_ratio,
+        default_bind,
+        preferred_chains,
     } = from;
 
     // 📝 Scalars: a file that said something overrides one that did not. The
@@ -213,6 +216,15 @@ fn merge_globals(
     }
     if !tls_resolvers.is_empty() {
         into.tls_resolvers = tls_resolvers;
+    }
+    if renewal_window_ratio.is_some() {
+        into.renewal_window_ratio = renewal_window_ratio;
+    }
+    if !default_bind.is_empty() {
+        into.default_bind = default_bind;
+    }
+    if preferred_chains.is_some() {
+        into.preferred_chains = preferred_chains;
     }
     if http_port != default.http_port {
         into.http_port = http_port;

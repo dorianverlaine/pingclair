@@ -244,6 +244,20 @@ pub(crate) fn run_server(
     if config.global.auto_https == pingclair_core::config::AutoHttpsMode::Off {
         auto_https_config.enabled = false;
     }
+    // 🔄 How early to renew, as a fraction of each certificate's own lifetime.
+    if let Some(ratio) = config.global.renewal_window_ratio {
+        auto_https_config.renewal_window_ratio = ratio;
+    }
+    // 🔗 Said once, at startup, rather than silently: the ACME client this
+    // build uses downloads whichever chain the authority offers first and has
+    // no way to ask for another (`instant-acme` 0.8.5, verified 2026-08-12).
+    // The certificate still works; the chain simply is not the one requested.
+    if config.global.preferred_chains.is_some() {
+        tracing::warn!(
+            "🔗 `preferred_chains` is recorded but not applied: this build's ACME \
+             client cannot request an alternate issuer chain"
+        );
+    }
 
     // 🧰 Reuse one temporary runtime for manager initialization and eager local issuance.
     let tls_runtime = tokio::runtime::Runtime::new()

@@ -101,19 +101,52 @@ pub struct Certificate {
     pub expires_at: i64,
 }
 
+/// 🔄 The fraction of a certificate's lifetime that must remain before it is
+/// renewed, when the configuration names none.
+///
+/// A third, which is what the format this server follows defaults to. On the
+/// 90-day certificates public CAs issue today that is 30 days.
+pub const DEFAULT_RENEWAL_WINDOW_RATIO: f64 = 1.0 / 3.0;
+
 impl Certificate {
-    /// Checks if the certificate is nearing expiration.
+    /// 🔄 Whether this certificate is close enough to expiry to renew.
     ///
-    /// - Returns: `true` if expiration is within 30 days.
-    pub fn needs_renewal(&self) -> bool {
+    /// The window is a **fraction of the certificate's own lifetime**, not a
+    /// fixed number of days, and that distinction is the whole point:
+    ///
+    /// > 🤡 This used to renew whenever fewer than 30 days remained, full
+    /// > stop. For the 90-day certificates public CAs issue that happens to be
+    /// > a third, which is why it looked right. For a 7-day certificate — the
+    /// > direction the ACME world is moving — it is true from the moment of
+    /// > issuance, so every scan would renew every certificate, forever,
+    /// > against the CA's rate limits.
+    ///
+    /// Falls back to the fixed 30 days only when the lifetime cannot be read
+    /// from the certificate, which means a stored PEM this build cannot parse.
+    /// Renewing on a fixed window is wrong in one direction; never renewing is
+    /// wrong in the worse one.
+    pub fn needs_renewal(&self, ratio: f64) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
+        let remaining = self.expires_at - now;
 
-        // Renew if less than 30 days remaining (standard practice)
-        self.expires_at - now < 30 * 24 * 60 * 60
+        match certificate_lifetime_seconds(&self.cert_pem) {
+            Some(lifetime) if lifetime > 0 => {
+                remaining < (lifetime as f64 * ratio.clamp(0.0, 1.0)) as i64
+            }
+            _ => remaining < 30 * 24 * 60 * 60,
+        }
     }
+}
+
+/// 📅 How long the leaf certificate is valid for, in seconds.
+fn certificate_lifetime_seconds(cert_pem: &str) -> Option<i64> {
+    let (_, pem) = parse_x509_pem(cert_pem.as_bytes()).ok()?;
+    let (_, certificate) = parse_x509_certificate(&pem.contents).ok()?;
+    let validity = certificate.validity();
+    Some(validity.not_after.timestamp() - validity.not_before.timestamp())
 }
 
 // MARK: - Challenge Handler Trait
@@ -603,7 +636,7 @@ mod tests {
             domains: vec![],
             expires_at: now - 3600,
         };
-        assert!(expired.needs_renewal());
+        assert!(expired.needs_renewal(DEFAULT_RENEWAL_WINDOW_RATIO));
 
         // Case 2: Fresh (60 days left)
         let fresh = Certificate {
@@ -612,7 +645,7 @@ mod tests {
             domains: vec![],
             expires_at: now + 60 * 86400,
         };
-        assert!(!fresh.needs_renewal());
+        assert!(!fresh.needs_renewal(DEFAULT_RENEWAL_WINDOW_RATIO));
 
         // Case 3: Nearing expiry (29 days left)
         let near = Certificate {
@@ -621,7 +654,55 @@ mod tests {
             domains: vec![],
             expires_at: now + 29 * 86400,
         };
-        assert!(near.needs_renewal());
+        assert!(near.needs_renewal(DEFAULT_RENEWAL_WINDOW_RATIO));
+    }
+
+    /// 🔄 A short-lived certificate must not be renewed the moment it is
+    /// issued.
+    ///
+    /// The fixed thirty-day window this replaced said "renew" for every
+    /// certificate valid for less than a month, from the second it was signed
+    /// — so a seven-day certificate would be re-requested on every scan,
+    /// forever, until the CA's rate limit stopped it. The window has to be a
+    /// fraction of the certificate's own lifetime for the answer to change
+    /// with the certificate.
+    #[test]
+    fn a_short_lived_certificate_is_not_renewed_the_day_it_is_issued() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // 📅 Seven days of validity, issued moments ago.
+        let mut parameters =
+            rcgen::CertificateParams::new(vec!["short.example".to_string()]).unwrap();
+        parameters.not_before = std::time::SystemTime::now().into();
+        parameters.not_after =
+            (std::time::SystemTime::now() + std::time::Duration::from_secs(7 * 86400)).into();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let issued = parameters.self_signed(&key).unwrap();
+
+        let certificate = Certificate {
+            cert_pem: issued.pem(),
+            key_pem: key.serialize_pem(),
+            domains: vec!["short.example".to_string()],
+            expires_at: now + 7 * 86400,
+        };
+
+        assert!(
+            !certificate.needs_renewal(DEFAULT_RENEWAL_WINDOW_RATIO),
+            "a week-old-at-most certificate with a week to run is not due"
+        );
+
+        // 🕰️ Two thirds through its life, it is.
+        let past_two_thirds = Certificate {
+            expires_at: now + 2 * 86400,
+            ..certificate
+        };
+        assert!(
+            past_two_thirds.needs_renewal(DEFAULT_RENEWAL_WINDOW_RATIO),
+            "under a third of a seven-day lifetime remaining is due"
+        );
     }
 
     #[test]

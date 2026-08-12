@@ -776,11 +776,12 @@ Directives:
 
 Global options:
 
-  `acme_ca` `acme_ca_root` `acme_dns` `acme_eab` `cert_issuer` `cert_lifetime`
-  `default_bind` `default_sni` `dns` `ech` `events` `fallback_sni`
-  `filesystem` `frankenphp` `key_type` `ocsp_interval` `ocsp_stapling`
-  `on_demand_tls` `pki` `preferred_chains` `renew_interval` `renewal_window_ratio`
-  `shutdown_delay` `skip_install_trust` `storage` `storage_clean_interval`
+  `acme_ca` `acme_ca_root` `acme_dns` `acme_eab`
+  `cert_issuer` `cert_lifetime` `default_sni` `dns`
+  `ech` `events` `fallback_sni` `filesystem`
+  `frankenphp` `key_type` `ocsp_interval` `ocsp_stapling`
+  `on_demand_tls` `pki` `renew_interval` `shutdown_delay`
+  `skip_install_trust` `storage` `storage_clean_interval`
 
 Three consequences worth stating plainly, because they decide whether
 Pingclair fits at all rather than being details you discover later:

@@ -52,15 +52,33 @@ pub struct CertStore {
     /// Write-through cache of loaded certificates.
     /// Key: Domain name (each SAN entry points to the cert).
     cache: Arc<RwLock<HashMap<String, Certificate>>>,
+
+    /// 🔄 Fraction of a certificate's lifetime that must remain before it is
+    /// renewed. Lives on the store because the store is what decides which
+    /// certificates need attention.
+    renewal_window_ratio: f64,
 }
 
 impl CertStore {
     /// Creates a new `CertStore` backed by the specified directory.
     pub fn new(path: impl AsRef<Path>) -> Self {
+        Self::with_renewal_window(path, crate::acme::DEFAULT_RENEWAL_WINDOW_RATIO)
+    }
+
+    /// 🔄 As [`Self::new`], with an explicit renewal window.
+    pub fn with_renewal_window(path: impl AsRef<Path>, renewal_window_ratio: f64) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
             cache: Arc::new(RwLock::new(HashMap::new())),
+            renewal_window_ratio,
         }
+    }
+
+    /// 🔄 The renewal window this store applies, so callers that hold a
+    /// certificate can ask the same question the scan does rather than
+    /// inventing a second threshold.
+    pub fn renewal_window_ratio(&self) -> f64 {
+        self.renewal_window_ratio
     }
 
     /// Returns the root directory backing this store.
@@ -198,7 +216,7 @@ impl CertStore {
     /// Checks if a non-expired certificate exists for the domain.
     pub async fn has_valid(&self, domain: &str) -> bool {
         if let Some(cert) = self.get(domain).await {
-            !cert.needs_renewal()
+            !cert.needs_renewal(self.renewal_window_ratio)
         } else {
             false
         }
@@ -218,7 +236,7 @@ impl CertStore {
 
             if !primary_key.is_empty()
                 && !seen_primary_keys.contains(&primary_key)
-                && cert.needs_renewal()
+                && cert.needs_renewal(self.renewal_window_ratio)
             {
                 seen_primary_keys.insert(primary_key);
                 candidates.push(cert.clone());
