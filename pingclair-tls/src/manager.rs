@@ -28,6 +28,20 @@ struct CachedCert {
     cached_at: u64,
 }
 
+/// 📜 A complete manual-certificate table validated but not yet published.
+pub struct PreparedManualCerts {
+    entries: HashMap<String, (String, String)>,
+}
+
+impl PreparedManualCerts {
+    /// 📜 Borrows the validated PEM set for another transport's preparation.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &str, &str)> {
+        self.entries
+            .iter()
+            .map(|(name, (cert, key))| (name.as_str(), cert.as_str(), key.as_str()))
+    }
+}
+
 /// 🛡️ TLS Manager for Pingclair
 pub struct TlsManager {
     /// 🌐 Manages automatic public certificates.
@@ -203,6 +217,15 @@ impl TlsManager {
         &self,
         entries: &[(String, String, String)],
     ) -> Result<usize, Vec<String>> {
+        let prepared = self.prepare_manual_certs(entries)?;
+        Ok(self.publish_manual_certs(prepared))
+    }
+
+    /// 🧪 Reads and validates every manual pair without changing active TLS.
+    pub fn prepare_manual_certs(
+        &self,
+        entries: &[(String, String, String)],
+    ) -> Result<PreparedManualCerts, Vec<String>> {
         let mut prepared: HashMap<String, (String, String)> = HashMap::new();
         let mut problems = Vec::new();
 
@@ -232,9 +255,14 @@ impl TlsManager {
             return Err(problems);
         }
 
-        let count = prepared.len();
-        *self.manual_pem_certs.write() = prepared;
-        Ok(count)
+        Ok(PreparedManualCerts { entries: prepared })
+    }
+
+    /// 📣 Publishes a table whose files and key pairs already passed validation.
+    pub fn publish_manual_certs(&self, prepared: PreparedManualCerts) -> usize {
+        let count = prepared.entries.len();
+        *self.manual_pem_certs.write() = prepared.entries;
+        count
     }
 
     /// 📜 Whether a manual certificate is installed for `domain`.

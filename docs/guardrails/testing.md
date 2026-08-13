@@ -92,43 +92,15 @@
   `docker run ... validate` 一份真 Pingclairfile）。這是「一份沒人跑的建置
   腳本等於沒測試過的程式碼」這句話的直接對策——上面那次 Dockerfile 漂移,
   如果這個 job 當時存在,第一次 push 就會紅。
-- 🧑‍🔧 **在容器裡跑整合測試必須加
-  `--sysctl net.ipv4.ip_unprivileged_port_start=1024`**。
-  `test_admin_adapt_export_and_load`、
-  `test_admin_config_for_an_unknown_listener_applies_nothing`、
-  `test_admin_config_traversal_unbindable_listener_rolls_back` 這三支證明的是
-  「設定裡有綁不上的 listener 就要拒絕並回滾」，而它們把「綁不上」寫成
-  `127.0.0.1:1`。**Docker 預設把這個 sysctl 設成 `0`**，於是容器裡的**任何**使用者
-  都綁得上 port 1；設定被接受，三支同時以 `200 != 400` 失敗。
-
-  > 🤡 2026-08-10 的除錯順序值得記下來，因為第一個結論是錯的：先看到容器以 root
-  > 執行，判斷是 `CAP_NET_BIND_SERVICE`，於是 `useradd` 一個使用者用 `runuser` 重跑
-  > ——**三支照樣紅**。真正的機制是那個 sysctl，跟使用者是誰無關。
-  > 「以 root 執行」是個看起來足以解釋現象、而且改起來很自然的假設，
-  > 這正是它耗掉一整輪的原因。
-  >
-  > 非 root 仍然該做（那才是產品實際跑的樣子，也是過去 Linux 證據的取得方式），
-  > 但它不是這件事的解法。
-
-  > 🪤 **2026-08-10 補正：上面那句「跟使用者是誰無關」只對了一半，害我又踩一次。**
-  > K3 那輪為了讓 `CARGO_HOME` 可寫，改回以 root 跑、**只**帶那個 sysctl
-  > ——三支又紅了。原因是 root 有 `CAP_NET_BIND_SERVICE`，
-  > 那個 capability 直接**繞過** `ip_unprivileged_port_start`（顧名思義：
-  > 它只管 unprivileged）。
-  >
-  > 📌 正確的說法是**兩個條件缺一不可**：
-  > **非 root 使用者 ＋ `--sysctl net.ipv4.ip_unprivileged_port_start=1024`**。
-  > 上一輪先試非 root（沒帶 sysctl）失敗、這一輪先試 sysctl（用 root）失敗，
-  > 兩次都得到「那不是原因」的結論——**逐一排除法在需要兩個條件的情況下
-  > 會把兩個真原因都判成無關**。
-  >
-  > 以非 root 跑時記得 `chown` `CARGO_HOME`、`CARGO_TARGET_DIR` 與 workspace，
-  > 否則 `cargo` 直接 `Permission denied`（`rust:1.97-bookworm` 的
-  > `/usr/local/cargo` 是 root 所有）。
+- 🚫 **listener topology 回滾測試不可再靠「port 1 一定綁不上」。**
+  2026-08-13 起，Admin 與 signal reload 對新增／刪除 listener 在任何
+  bind 之前就回 `restart_required`；測試應使用真正的空閒動態 port，
+  並斷言該 port 仍未被程式取走。這樣驗的是產品契約，不是
+  Docker 的 `ip_unprivileged_port_start`、執行使用者或
+  `CAP_NET_BIND_SERVICE`。
 
   > 📌 更一般的形狀：**任何用「這個操作會失敗」當斷言的測試，都隱含一個環境前提**。
-  > 前提沒寫下來時，換一個環境就從「證明了某件事」變成「證明不了任何事」，
-  > 而且失敗訊息不會提到那個前提。
+  > 能直接斷言穩定的 API 結果時，不要把環境偶然當成 oracle。
 
 - ⚖️ **round-robin 測試不可斷言「誰先」**。負載平衡保證的是相鄰請求交替、
   總量平均；**起始的那一台由共用計數器的初始值決定**，設定裡沒有任何東西釘住它。

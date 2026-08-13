@@ -38,7 +38,6 @@ use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use crate::encoding::{ResponseEncoder, negotiate, stream_chunk};
@@ -55,32 +54,81 @@ use ipnet::IpNet;
 use pingclair_core::config::Encoding;
 use regex::Regex;
 
-/// 🧭 Runtime listener callbacks used by the Admin API to create and tear
-/// down listeners on `/load`, matching Caddy's dynamic listener behavior.
-pub trait DynamicListeners: Send + Sync {
-    /// Binds `addr` and starts serving `server` on it. The listener becomes
-    /// visible in the shared proxy map before the accept loop runs.
-    fn start_listener(
+/// 🚦 Why a prepared control-plane transaction could not be published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigApplyErrorKind {
+    /// 🚫 The document or its external trust material is invalid.
+    Invalid,
+    /// 🔁 A listener/process setting cannot safely change without rebuilding sockets.
+    RestartRequired,
+    /// 🔐 The request authenticated against an Admin policy that has since changed.
+    StaleAuthorization,
+    /// 💥 The runtime publisher needed by this process is unavailable.
+    Unavailable,
+}
+
+/// 🚫 A fail-closed control-plane publication error.
+#[derive(Debug, Clone)]
+pub struct ConfigApplyError {
+    /// 🧭 Stable category used by the Admin API to choose an HTTP status.
+    pub kind: ConfigApplyErrorKind,
+    /// 📝 Operator-facing reason naming the setting that did not apply.
+    pub message: String,
+}
+
+impl ConfigApplyError {
+    /// 🚫 Creates an invalid-policy rejection.
+    pub fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            kind: ConfigApplyErrorKind::Invalid,
+            message: message.into(),
+        }
+    }
+
+    /// 🔁 Creates an explicit restart-required rejection.
+    pub fn restart_required(message: impl Into<String>) -> Self {
+        Self {
+            kind: ConfigApplyErrorKind::RestartRequired,
+            message: message.into(),
+        }
+    }
+
+    /// 🔐 Creates a stale-authorization rejection.
+    pub fn stale_authorization(message: impl Into<String>) -> Self {
+        Self {
+            kind: ConfigApplyErrorKind::StaleAuthorization,
+            message: message.into(),
+        }
+    }
+
+    /// 💥 Creates a rejection when no complete runtime publisher is available.
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            kind: ConfigApplyErrorKind::Unavailable,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigApplyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ConfigApplyError {}
+
+/// 📣 The one publication path used by Admin and signal reloads.
+pub trait ConfigPublisher: Send + Sync {
+    /// 🧪 Prepares the complete document, then publishes every listener and Admin
+    /// policy or none. `expected_admin_revision` binds a mutation to the policy
+    /// that authenticated it, preventing an old key's queued request from
+    /// landing after key rotation.
+    fn publish_config(
         &self,
-        addr: &str,
-        server: &pingclair_core::config::ServerConfig,
-    ) -> Result<(), String>;
-
-    /// Stops a listener that was started at runtime and removes it from the
-    /// shared proxy map.
-    fn stop_listener(&self, addr: &str);
-
-    /// Whether `addr` was started at runtime (and can therefore be stopped).
-    fn is_dynamic(&self, addr: &str) -> bool;
-
-    /// 🔎 Checks that `addr` could be bound, without starting anything.
-    ///
-    /// Exists so a reload can find out whether *every* new listener is
-    /// bindable before it publishes *any* of them. Without it the only way to
-    /// discover that port 8443 is taken is to try it — by which point the
-    /// earlier ports are already serving the new configuration and the reload
-    /// has produced a half-applied state nobody asked for.
-    fn probe_listener(&self, addr: &str) -> Result<(), String>;
+        config: &pingclair_core::config::PingclairConfig,
+        expected_admin_revision: Option<u64>,
+    ) -> Result<usize, ConfigApplyError>;
 }
 
 // MARK: - Context
@@ -333,6 +381,25 @@ fn merge_listener_limit<T: Ord + Copy>(target: &mut Option<T>, candidate: Option
     if let Some(candidate) = candidate {
         *target = Some(target.map_or(candidate, |current| current.min(candidate)));
     }
+}
+
+/// 🧱 Derives the transport-captured ceiling from a set of virtual hosts.
+fn merged_listener_limits<'a>(
+    configured: impl Iterator<Item = &'a ResourceLimitsConfig>,
+) -> ResourceLimitsConfig {
+    let mut limits = ResourceLimitsConfig::default();
+    for candidate in configured {
+        merge_listener_limit(&mut limits.header_timeout_ms, candidate.header_timeout_ms);
+        merge_listener_limit(&mut limits.max_header_count, candidate.max_header_count);
+        merge_listener_limit(&mut limits.max_header_bytes, candidate.max_header_bytes);
+        merge_listener_limit(&mut limits.max_connections, candidate.max_connections);
+        merge_listener_limit(&mut limits.idle_timeout_ms, candidate.idle_timeout_ms);
+        merge_listener_limit(
+            &mut limits.long_connections.idle_timeout_ms,
+            candidate.long_connections.idle_timeout_ms,
+        );
+    }
+    limits
 }
 
 /// ⏱️ Selects the stricter of two optional time budgets.
@@ -1885,15 +1952,12 @@ pub struct PingclairProxy {
     proxy_protocol_registry: Arc<crate::proxy_protocol::ProxyProtocolRegistry>,
     /// 🚫 Rejects TCP requests that bypass the required external PROXY ingress.
     proxy_protocol_required: bool,
-    /// 🪪 Requires a request's `Host` to be the name its handshake asked for.
+    /// 🔐 The versioned handshake policy shared by H1, H2, and H3.
     ///
-    /// Turned on for any listener where a site demands a client certificate,
-    /// because routing happens on `Host` while admission happened on SNI. Left
-    /// off everywhere else: it is one relaxed atomic load per request, and the
-    /// check it guards would reject perfectly ordinary traffic — a browser
-    /// following a redirect, an IP-address request — on a listener that never
-    /// asked anyone to prove anything.
-    strict_sni_host: Arc<AtomicBool>,
+    /// Routing publication and client-auth rotation close this policy's gate,
+    /// swap every prepared snapshot, and reopen it. Requests therefore never
+    /// run against a half-published security generation.
+    listener_policy: Arc<crate::client_auth::PublishedListenerPolicy>,
     /// 🔌 Shared upstream connector for inline sub-requests (`forward_auth`),
     /// with the same keepalive pool the H3 path uses.
     pub connector: Arc<pingora_core::connectors::http::Connector>,
@@ -1911,7 +1975,9 @@ impl Default for PingclairProxy {
                 crate::proxy_protocol::ProxyProtocolRegistry::default(),
             ),
             proxy_protocol_required: false,
-            strict_sni_host: Arc::new(AtomicBool::new(false)),
+            listener_policy: Arc::new(crate::client_auth::PublishedListenerPolicy::new(Arc::new(
+                crate::client_auth::ClientAuthTable::default(),
+            ))),
             connector: Arc::new(pingora_core::connectors::http::Connector::new(Some(
                 pingora_core::connectors::ConnectorOptions::new(512),
             ))),
@@ -1923,6 +1989,16 @@ impl PingclairProxy {
     /// Create a new proxy
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 🔐 Creates a proxy around an already published listener policy.
+    pub fn with_published_listener_policy(
+        listener_policy: Arc<crate::client_auth::PublishedListenerPolicy>,
+    ) -> Self {
+        Self {
+            listener_policy,
+            ..Self::default()
+        }
     }
 
     /// Create a new proxy with TLS manager
@@ -1937,7 +2013,9 @@ impl PingclairProxy {
                 crate::proxy_protocol::ProxyProtocolRegistry::default(),
             ),
             proxy_protocol_required: false,
-            strict_sni_host: Arc::new(AtomicBool::new(false)),
+            listener_policy: Arc::new(crate::client_auth::PublishedListenerPolicy::new(Arc::new(
+                crate::client_auth::ClientAuthTable::default(),
+            ))),
             connector: Arc::new(pingora_core::connectors::http::Connector::new(Some(
                 pingora_core::connectors::ConnectorOptions::new(512),
             ))),
@@ -1950,6 +2028,23 @@ impl PingclairProxy {
         trusted_proxies: &[String],
         proxy_protocol_required: bool,
     ) -> Self {
+        Self::with_listener_policy(
+            tls_manager,
+            trusted_proxies,
+            proxy_protocol_required,
+            Arc::new(crate::client_auth::PublishedListenerPolicy::new(Arc::new(
+                crate::client_auth::ClientAuthTable::default(),
+            ))),
+        )
+    }
+
+    /// 🔐 Creates a proxy bound to one prepared listener-security policy.
+    pub fn with_listener_policy(
+        tls_manager: Arc<pingclair_tls::manager::TlsManager>,
+        trusted_proxies: &[String],
+        proxy_protocol_required: bool,
+        listener_policy: Arc<crate::client_auth::PublishedListenerPolicy>,
+    ) -> Self {
         Self {
             hosts: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             default: Arc::new(ArcSwap::from_pointee(None)),
@@ -1960,7 +2055,7 @@ impl PingclairProxy {
                 crate::proxy_protocol::ProxyProtocolRegistry::default(),
             ),
             proxy_protocol_required,
-            strict_sni_host: Arc::new(AtomicBool::new(false)),
+            listener_policy,
             connector: Arc::new(pingora_core::connectors::http::Connector::new(Some(
                 pingora_core::connectors::ConnectorOptions::new(512),
             ))),
@@ -2034,16 +2129,14 @@ impl PingclairProxy {
             .store(Arc::new(Some(crate::alt_svc::alt_svc_value(port))));
     }
 
-    /// 🪪 Requires `Host` to name the same site the handshake asked for.
-    ///
-    /// Startup turns this on for any listener carrying a site that demands a
-    /// client certificate. The reason is that admission and routing look at
-    /// different fields: BoringSSL decided what to demand from the SNI, and the
-    /// router picks a site from `Host`. A client that sends an unprotected name
-    /// in the ClientHello and a protected one in the header would otherwise
-    /// reach the protected site having proved nothing.
-    pub fn set_strict_sni_host(&self, required: bool) {
-        self.strict_sni_host.store(required, Ordering::Relaxed);
+    /// 🔐 Returns the listener policy used by both TLS transports and routing.
+    pub fn listener_policy(&self) -> Arc<crate::client_auth::PublishedListenerPolicy> {
+        Arc::clone(&self.listener_policy)
+    }
+
+    /// ⚡ Borrows the listener policy on request paths that need no ownership.
+    pub(crate) fn listener_policy_ref(&self) -> &crate::client_auth::PublishedListenerPolicy {
+        &self.listener_policy
     }
 
     /// 🪪 Reports whether this listener enforces SNI against the routed host.
@@ -2052,7 +2145,7 @@ impl PingclairProxy {
     /// handshake name off and so has to decide per connection whether to
     /// record one at all.
     pub(crate) fn requires_strict_sni_host(&self) -> bool {
-        self.strict_sni_host.load(Ordering::Relaxed)
+        self.listener_policy.requires_client_auth()
     }
 
     /// 🚫 Reports whether this request may name the host it named.
@@ -2064,7 +2157,7 @@ impl PingclairProxy {
     /// listeners this check runs on, so its absence is a bug, not a client
     /// that happens to be fine.
     fn strict_sni_host_rejection(&self, session: &Session, hostname: &str) -> Option<&'static str> {
-        if !self.strict_sni_host.load(Ordering::Relaxed) {
+        if !self.listener_policy.requires_client_auth() {
             return None;
         }
         let Some(ssl) = session
@@ -2080,7 +2173,15 @@ impl PingclairProxy {
             .extension
             .get::<crate::tls_identity::DownstreamTlsIdentity>()
         {
-            Some(identity) if identity.may_request_host(hostname) => None,
+            Some(identity)
+                if identity.security_revision == self.listener_policy.revision()
+                    && identity.may_request_host(hostname) =>
+            {
+                None
+            }
+            Some(identity) if identity.security_revision != self.listener_policy.revision() => {
+                Some("TLS client-auth policy changed; reconnect")
+            }
             Some(_) => Some("TLS server name and Host header name differ"),
             None => Some("TLS handshake recorded no server name"),
         }
@@ -2135,35 +2236,19 @@ impl PingclairProxy {
 
     /// 🧱 Returns the strictest pre-routing limits shared by a listener's virtual hosts.
     pub fn listener_limits(&self) -> ResourceLimitsConfig {
-        let mut limits = ResourceLimitsConfig::default();
         let hosts = self.hosts.load();
-        for state in hosts.values().chain(self.default.load().iter()) {
-            merge_listener_limit(
-                &mut limits.header_timeout_ms,
-                state.config.limits.header_timeout_ms,
-            );
-            merge_listener_limit(
-                &mut limits.max_header_count,
-                state.config.limits.max_header_count,
-            );
-            merge_listener_limit(
-                &mut limits.max_header_bytes,
-                state.config.limits.max_header_bytes,
-            );
-            merge_listener_limit(
-                &mut limits.max_connections,
-                state.config.limits.max_connections,
-            );
-            merge_listener_limit(
-                &mut limits.idle_timeout_ms,
-                state.config.limits.idle_timeout_ms,
-            );
-            merge_listener_limit(
-                &mut limits.long_connections.idle_timeout_ms,
-                state.config.limits.long_connections.idle_timeout_ms,
-            );
-        }
-        limits
+        let default = self.default.load();
+        merged_listener_limits(
+            hosts
+                .values()
+                .chain(default.iter())
+                .map(|state| &state.config.limits),
+        )
+    }
+
+    /// 🏗️ Derives listener limits before a proxy publishes its prepared routes.
+    pub fn listener_limits_for_servers(servers: &[ServerConfig]) -> ResourceLimitsConfig {
+        merged_listener_limits(servers.iter().map(|server| &server.limits))
     }
 
     /// Replace all server configurations with a new list
@@ -5815,6 +5900,16 @@ impl ProxyHttp for PingclairProxy {
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> pingora_core::Result<bool> {
+        // 🚧 A control-plane transaction closes every affected listener before
+        // swapping routing and handshake snapshots. Refuse during that narrow
+        // window so no request can observe a half-published security policy.
+        if self.listener_policy.is_publishing() {
+            session.as_mut().set_keepalive(None);
+            Self::write_simple_response(session, ctx, 503, "Configuration Reload In Progress")
+                .await?;
+            return Ok(true);
+        }
+
         if self.proxy_protocol_required && self.proxy_protocol_identity(session).is_none() {
             tracing::warn!("🚫 Rejected a TCP request that bypassed the PROXY protocol ingress");
             session.as_mut().set_keepalive(None);
@@ -5894,7 +5989,7 @@ impl ProxyHttp for PingclairProxy {
         // certificate. 421 is the status for "this connection is not the right
         // one for that host", and the connection is closed so the client opens
         // a new one with honest SNI rather than reusing this one.
-        if self.strict_sni_host.load(Ordering::Relaxed) {
+        if self.listener_policy.requires_client_auth() {
             // 🏠 Owned only on the listeners that enforce this; every other
             // request never reaches past the atomic load above.
             let requested_host =

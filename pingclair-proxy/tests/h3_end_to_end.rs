@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pingclair_core::config::{HandlerConfig, RouteConfig, ServerConfig};
-use pingclair_proxy::client_auth::{ClientAuthTable, CompiledClientAuth};
+use pingclair_proxy::client_auth::{ClientAuthTable, CompiledClientAuth, PublishedListenerPolicy};
 use pingclair_proxy::quic::{CertTable, QuicServer};
 use pingclair_proxy::server::PingclairProxy;
 // 🔗 Through `tokio-quiche`, so the test client and the server under test are
@@ -64,6 +64,17 @@ async fn spawn_h3_listener(
     certificate_names: &[&str],
     client_auth: Option<Arc<ClientAuthTable>>,
 ) -> SocketAddr {
+    spawn_h3_listener_with_policy(build, certificate_names, client_auth)
+        .await
+        .0
+}
+
+/// 🔐 Starts an H3 listener and returns its shared publication handle.
+async fn spawn_h3_listener_with_policy(
+    build: impl FnOnce(SocketAddr) -> Vec<ServerConfig>,
+    certificate_names: &[&str],
+    client_auth: Option<Arc<ClientAuthTable>>,
+) -> (SocketAddr, Arc<PublishedListenerPolicy>) {
     let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
     // 🔌 Bind first so the test knows the port; `QuicServer` rebinds the same
@@ -72,7 +83,10 @@ async fn spawn_h3_listener(
     let address = probe.local_addr().unwrap();
     drop(probe);
 
-    let proxy = PingclairProxy::new();
+    let listener_policy = Arc::new(PublishedListenerPolicy::new(
+        client_auth.unwrap_or_else(|| Arc::new(ClientAuthTable::default())),
+    ));
+    let proxy = PingclairProxy::with_published_listener_policy(Arc::clone(&listener_policy));
     proxy.update_config(build(address));
 
     let certs = Arc::new(CertTable::new());
@@ -81,7 +95,7 @@ async fn spawn_h3_listener(
         certs.upsert_pem(name, &cert, &key).unwrap();
     }
 
-    let server = QuicServer::new(address, Arc::new(proxy), certs, client_auth, 8, Vec::new());
+    let server = QuicServer::new(address, Arc::new(proxy), certs, 8, Vec::new());
     tokio::spawn(async move {
         if let Err(e) = server.run().await {
             eprintln!("H3 server stopped: {e}");
@@ -90,7 +104,7 @@ async fn spawn_h3_listener(
 
     // 🕰️ The listener binds inside `run()`; give it a moment before probing.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    address
+    (address, listener_policy)
 }
 
 #[derive(Debug)]
@@ -1688,6 +1702,108 @@ async fn h3_client_auth_admits_only_the_trusted_client() {
     .expect("a site without client_auth started demanding certificates over HTTP/3");
     assert_eq!(open.status, 200);
     assert_eq!(open.body, b"open-ok");
+}
+
+/// 🔄 A published H3 trust-pool rotation applies to the first new handshake.
+#[tokio::test]
+async fn h3_client_auth_ca_rotation_rejects_the_previous_authority() {
+    use pingclair_core::config::{ClientAuthConfig, ClientAuthMode, TrustPool};
+
+    let first = H3Authority::new("First H3 Client CA");
+    let second = H3Authority::new("Second H3 Client CA");
+    let material = tempfile::tempdir().expect("trust material dir");
+    let first_path = material.path().join("first.pem");
+    let second_path = material.path().join("second.pem");
+    std::fs::write(&first_path, &first.ca_pem).unwrap();
+    std::fs::write(&second_path, &second.ca_pem).unwrap();
+    let table_for = |path: &std::path::Path| {
+        let compiled = Arc::new(
+            CompiledClientAuth::compile(&ClientAuthConfig {
+                mode: ClientAuthMode::RequireAndVerify,
+                trust_pool: Some(TrustPool::File {
+                    pem_files: vec![path.to_string_lossy().into_owned()],
+                }),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let mut table = ClientAuthTable::default();
+        table.insert(&["secure.h3.test"], compiled);
+        Arc::new(table)
+    };
+    let (address, listener_policy) = spawn_h3_listener_with_policy(
+        |address| {
+            vec![ServerConfig {
+                name: Some("secure.h3.test".to_string()),
+                listen: vec![address.to_string()],
+                routes: vec![RouteConfig {
+                    path: "/*".to_string(),
+                    handler: HandlerConfig::Respond {
+                        status: 200,
+                        body: Some("secure-ok".to_string()),
+                        headers: Default::default(),
+                    },
+                    methods: None,
+                    matcher: None,
+                }],
+                ..Default::default()
+            }]
+        },
+        &["secure.h3.test"],
+        Some(table_for(&first_path)),
+    )
+    .await;
+    let first_identity = first.issue("client.h3.test");
+    let second_identity = second.issue("client.h3.test");
+    fn attempt<'a>(address: SocketAddr, identity: (&'a str, &'a str)) -> H3Attempt<'a> {
+        H3Attempt {
+            sni: "secure.h3.test",
+            authority: "secure.h3.test",
+            identity: Some(identity),
+            ..H3Attempt::to(address, "/probe")
+        }
+    }
+    assert_eq!(
+        h3_attempt(
+            attempt(address, (&first_identity.0, &first_identity.1)),
+            None,
+        )
+        .await
+        .unwrap()
+        .status,
+        200
+    );
+    assert_handshake_refused(
+        h3_attempt(
+            attempt(address, (&second_identity.0, &second_identity.1)),
+            None,
+        )
+        .await,
+        "the not-yet-trusted H3 client was accepted before rotation",
+    );
+
+    listener_policy.begin_publish();
+    listener_policy.publish_client_auth(table_for(&second_path));
+    listener_policy.finish_publish();
+
+    assert_handshake_refused(
+        h3_attempt(
+            attempt(address, (&first_identity.0, &first_identity.1)),
+            None,
+        )
+        .await,
+        "the old H3 client CA remained trusted after publication",
+    );
+    assert_eq!(
+        h3_attempt(
+            attempt(address, (&second_identity.0, &second_identity.1)),
+            None,
+        )
+        .await
+        .unwrap()
+        .status,
+        200
+    );
 }
 
 /// 🛡️ SNI and `:authority` must name the same site, exactly as `Host` must on

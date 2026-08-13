@@ -414,6 +414,17 @@ both phases there. The H3 bridge switches timers after receiving the response
 header. Changing the H1/H2 pre-routing `header_timeout`, H2 field-section cap,
 or H1/H2 connection limit currently requires a listener restart.
 
+Admin `/load`, `pingclair reload`, SIGUSR1, and `run --watch` publish compatible
+changes as one prepared transaction. API keys, origins, Admin disablement,
+existing-listener routes, manual certificate contents, and an existing mTLS
+trust pool take effect before success is reported; connections admitted by an
+older mTLS generation must reconnect. A change that needs sockets or TLS
+contexts rebuilt — including adding/removing a listener, adding a TLS hostname,
+changing captured transport policy, or enabling mTLS on a previously resumable
+listener — is rejected with the last-known-good configuration intact. The
+Admin API returns `409` with `"restart_required": true`, and does not autosave
+the rejected document.
+
 ### Routing and matching
 
 Pingclair has a powerful matcher system — route requests by path, host, headers, and more.

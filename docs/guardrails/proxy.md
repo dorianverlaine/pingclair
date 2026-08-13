@@ -77,8 +77,10 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
   迴圈一起刪除,但要求本身沒變。）
 - H3 憑證表以 `ArcSwap` 發佈，透過 `TlsManager::peek_pem` 讀取既有憑證並每 60 秒刷新。
   **`peek_pem` 不可觸發 ACME 簽發**。
-- listener port、憑證 domain 清單等 topology 主要在啟動時擷取；
-  新增項目**不得假設 hot reload 已完整生效**。
+- 🚫 listener port、憑證 domain 清單等 topology 在啟動時擷取。
+  Admin／signal reload 若新增或刪除它們，必須整份回
+  `restart_required`，不得啟動只有 TCP 而缺 H3／mTLS／resumption 政策的
+  side listener，也不得 autosave 或回報成功。
 
 ### 資源
 

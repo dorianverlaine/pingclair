@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use pingclair_proxy::client_auth::{ClientAuthTable, PublishedListenerPolicy};
 use pingclair_proxy::quic::{CertTable, CertTableSslHook, IN_MEMORY_CERT_SENTINEL};
 // 🔗 Through `tokio-quiche`, so the test client and the server under test are
 // provably the same quiche. See the note in `quic.rs`.
@@ -100,7 +101,12 @@ async fn spawn_listener(table: Arc<CertTable>) -> SocketAddr {
     quic_settings.enable_dgram = false;
 
     let hooks = Hooks {
-        connection_hook: Some(Arc::new(CertTableSslHook::new(table, None))),
+        connection_hook: Some(Arc::new(CertTableSslHook::new(
+            table,
+            Arc::new(PublishedListenerPolicy::new(Arc::new(
+                ClientAuthTable::default(),
+            ))),
+        ))),
     };
 
     let mut listeners = tokio_quiche::listen(

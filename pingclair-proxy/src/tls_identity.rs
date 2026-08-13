@@ -9,8 +9,9 @@
 //! one slot for exactly this — `SslDigest::extension`, an `Arc<dyn Any>` the
 //! acceptor fills in and the request handler downcasts.
 //!
-//! Only one fact travels through it today, and it is the one that makes mutual
-//! TLS mean anything: **the name the client asked for during the handshake**.
+//! Two facts travel through it, and together they make mutual TLS mean
+//! anything: **the name the client asked for during the handshake**, and the
+//! listener-security generation that admitted the connection.
 //! Routing happens on the `Host` header, and a client is free to send one name
 //! in the ClientHello and a different one in `Host`. On a listener where some
 //! site demands a client certificate and another does not, that difference is a
@@ -25,13 +26,20 @@ pub struct DownstreamTlsIdentity {
     /// Stored lowercase, because SNI is case-insensitive and the comparison
     /// against `Host` should not pay for a conversion per request.
     pub server_name: Box<str>,
+    /// 🔢 The listener-security generation that admitted this connection.
+    ///
+    /// A reload that rotates a trust pool increments the generation. Requests
+    /// on older keep-alive or QUIC connections are then refused and must make a
+    /// new handshake against the new trust material.
+    pub security_revision: u64,
 }
 
 impl DownstreamTlsIdentity {
     /// 🏷️ Records the name a client asked for, normalised once.
-    pub fn new(server_name: &str) -> Self {
+    pub fn new(server_name: &str, security_revision: u64) -> Self {
         Self {
             server_name: server_name.to_ascii_lowercase().into(),
+            security_revision,
         }
     }
 
@@ -66,7 +74,7 @@ mod tests {
     /// has to compare the whole name, not a prefix of it.
     #[test]
     fn host_matches_the_handshake_name_regardless_of_case() {
-        let identity = DownstreamTlsIdentity::new("Secure.Example");
+        let identity = DownstreamTlsIdentity::new("Secure.Example", 7);
         assert!(identity.may_request_host("secure.example"));
         assert!(identity.may_request_host("SECURE.EXAMPLE"));
         assert!(!identity.may_request_host("other.example"));
@@ -79,7 +87,7 @@ mod tests {
     /// 🚫 No SNI means the client named nothing, so it authorised nothing.
     #[test]
     fn a_client_that_sent_no_sni_may_not_name_a_host() {
-        let identity = DownstreamTlsIdentity::new("");
+        let identity = DownstreamTlsIdentity::new("", 7);
         assert!(!identity.may_request_host("secure.example"));
         assert!(!identity.may_request_host(""));
     }

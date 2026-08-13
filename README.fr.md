@@ -415,6 +415,20 @@ phases. Le bridge H3 change de timer après réception de l'en-tête de réponse
 La modification du `header_timeout` avant routage, de la limite de section H2
 ou du nombre de connexions H1/H2 exige actuellement un redémarrage du listener.
 
+Admin `/load`, `pingclair reload`, SIGUSR1 et `run --watch` publient les
+changements compatibles dans une seule transaction préparée. Les clés API,
+les origines, la désactivation d'Admin, les routes des listeners existants, le
+contenu des certificats manuels et un trust pool mTLS existant prennent effet
+avant que le succès soit annoncé ; une connexion admise par une ancienne
+génération mTLS doit se reconnecter. Un changement qui exige de reconstruire
+les sockets ou les contextes TLS — ajout ou suppression d'un listener, ajout
+d'un nom TLS, modification d'une politique capturée par le transport, ou
+activation de mTLS sur un listener qui autorisait auparavant la reprise de
+session — est refusé en
+conservant la dernière configuration valide. L'API Admin renvoie `409` avec
+`"restart_required": true` et n'enregistre pas automatiquement le document
+refusé.
+
 ### Routage et matchers
 
 Pingclair dispose d'un système de matchers puissant : routez les requêtes selon le chemin, le domaine, les en-têtes, etc.

@@ -27,7 +27,9 @@ use boring::pkey::{PKey, Private};
 use boring::ssl::NameType;
 use boring::x509::X509;
 use parking_lot::RwLock;
-use pingclair_proxy::client_auth::ClientAuthTable;
+use pingclair_proxy::client_auth::{
+    PublishedListenerPolicy, listener_security_revision, record_listener_security_revision,
+};
 use pingclair_proxy::tls_identity::DownstreamTlsIdentity;
 use pingclair_tls::manager::TlsManager;
 use pingora_core::listeners::TlsAccept;
@@ -48,6 +50,8 @@ struct CachedSslCert {
     pkey: PKey<Private>,
     /// Unix timestamp when this cache entry expires
     expires_at: u64,
+    /// 🔢 Records the listener-policy generation that resolved this certificate.
+    security_revision: u64,
 }
 
 /// Cache TTL for parsed certificates (1 hour)
@@ -66,12 +70,12 @@ pub(crate) struct DynamicCertResolver {
     /// allocating — the branch that reaches it is already the slow one for the
     /// client, and there is no reason to make it slower for the server.
     default_sni: Option<Arc<str>>,
-    /// 🪪 What this listener's sites ask of a client's own certificate.
+    /// 🔐 The versioned handshake policy shared with routing and HTTP/3.
     ///
-    /// `None` on the overwhelming majority of listeners, which is what keeps
-    /// the ordinary handshake free of any mutual-TLS cost: the branch below is
-    /// a null check, not a lookup.
-    client_auth: Option<Arc<ClientAuthTable>>,
+    /// `None` only for standalone resolver tests. Production listeners all
+    /// carry the handle so the publication gate can reject a handshake while
+    /// routing changes; an ordinary generation still has an empty auth table.
+    listener_policy: Option<Arc<PublishedListenerPolicy>>,
 }
 
 // Manual Debug because TlsManager might not implement it
@@ -90,7 +94,7 @@ impl DynamicCertResolver {
             tls_manager,
             ssl_cache: Arc::new(RwLock::new(HashMap::new())),
             default_sni: None,
-            client_auth: None,
+            listener_policy: None,
         }
     }
 
@@ -105,12 +109,15 @@ impl DynamicCertResolver {
         self
     }
 
-    /// 🪪 Installs what this listener's sites ask of a client certificate.
+    /// 🔐 Installs the policy snapshot shared by both TLS transports.
     ///
     /// The table is built once at startup — trust stores parsed, files read —
     /// so a handshake only looks a name up and hands BoringSSL a pointer.
-    pub(crate) fn with_client_auth(mut self, client_auth: Option<Arc<ClientAuthTable>>) -> Self {
-        self.client_auth = client_auth.filter(|table| !table.is_empty());
+    pub(crate) fn with_listener_policy(
+        mut self,
+        listener_policy: Arc<PublishedListenerPolicy>,
+    ) -> Self {
+        self.listener_policy = Some(listener_policy);
         self
     }
 
@@ -188,11 +195,25 @@ impl TlsAccept for DynamicCertResolver {
         // from `default_sni`. A client that named nothing has authorised
         // nothing, so it falls to the catch-all policy — and the SNI-against-
         // Host check at the HTTP layer refuses it any named site afterwards.
-        if let Some(table) = &self.client_auth
-            && let Some(policy) = table.policy_for(offered.as_deref().unwrap_or(""))
-        {
-            policy.install(ssl);
-        }
+        let security_revision = if let Some(listener_policy) = &self.listener_policy {
+            let Some(snapshot) = listener_policy.handshake_snapshot() else {
+                tracing::warn!("🚧 Refused a TLS handshake during policy publication");
+                return;
+            };
+            if let Err(error) = record_listener_security_revision(ssl, snapshot.revision()) {
+                tracing::error!(%error, "❌ Failed to record the listener-security generation");
+                return;
+            }
+            if let Some(policy) = snapshot
+                .client_auth()
+                .policy_for(offered.as_deref().unwrap_or(""))
+            {
+                policy.install(ssl);
+            }
+            snapshot.revision()
+        } else {
+            0
+        };
 
         let sni: &str = match (&offered, self.default_sni.as_deref()) {
             (Some(sni), _) => sni,
@@ -216,6 +237,7 @@ impl TlsAccept for DynamicCertResolver {
             let cache = self.ssl_cache.read();
             if let Some(cached) = cache.get(sni)
                 && cached.expires_at > current_time
+                && cached.security_revision == security_revision
             {
                 // Cache hit - use cached BoringSSL objects
                 tracing::debug!("🚀 Using cached cert for {}", sni);
@@ -256,6 +278,7 @@ impl TlsAccept for DynamicCertResolver {
                 chain,
                 pkey,
                 expires_at,
+                security_revision,
             };
 
             self.ssl_cache.write().insert(sni.to_string(), cached_entry);
@@ -277,9 +300,16 @@ impl TlsAccept for DynamicCertResolver {
         &self,
         ssl: &TlsRef,
     ) -> Option<Arc<dyn Any + Send + Sync>> {
-        self.client_auth.as_ref()?;
+        let listener_policy = self.listener_policy.as_ref()?;
+        if !listener_policy.requires_client_auth() {
+            return None;
+        }
+        let security_revision = listener_security_revision(ssl)?;
         let server_name = ssl.servername(NameType::HOST_NAME).unwrap_or("");
-        Some(Arc::new(DownstreamTlsIdentity::new(server_name)))
+        Some(Arc::new(DownstreamTlsIdentity::new(
+            server_name,
+            security_revision,
+        )))
     }
 }
 

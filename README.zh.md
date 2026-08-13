@@ -392,6 +392,15 @@ Pingora 0.8 對 H1/H2 僅提供一個上游 read timer，因此兩個階段會�
 `header_timeout`、H2 field-section cap 或 H1/H2 connection limit 後，
 需要重新啟動 listener。
 
+Admin `/load`、`pingclair reload`、SIGUSR1 與 `run --watch` 會先完整準備
+相容變更，再以單一 transaction 發佈。API key、origin、Admin 關閉、
+既有 listener 的 route、手動憑證內容與既有 mTLS trust pool，都會在
+回報成功前生效；由舊 mTLS generation 放行的連線必須重新握手。需要
+重建 socket 或 TLS context 的變更——包含新增／刪除 listener、新增 TLS
+hostname、變更 transport 已擷取的政策，或在原本允許 session resumption
+的 listener 上啟用 mTLS——會保留 last-known-good 設定並拒絕。Admin API
+回傳 `409` 與 `"restart_required": true`，且不會 autosave 被拒絕的文件。
+
 ### 路由與匹配
 
 Pingclair 提供強大的路由匹配能力，你可以依照路徑、網域、標頭等條件分流請求。

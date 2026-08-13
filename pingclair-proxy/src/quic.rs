@@ -67,7 +67,9 @@ use pingora_http::RequestHeader;
 use tokio_quiche::quiche;
 use tokio_quiche::quiche::h3::NameValue;
 
-use crate::client_auth::ClientAuthTable;
+use crate::client_auth::{
+    PublishedListenerPolicy, listener_security_revision, record_listener_security_revision,
+};
 use crate::connection_filter::PingclairConnectionFilter;
 use crate::http_policy::{
     CorsDecision, ResponseHeaderPolicy, authority_host, evaluate_cors, resolve_request_id,
@@ -244,6 +246,12 @@ pub struct CertTable {
     inner: ArcSwap<CertTableSnapshot>,
 }
 
+/// 📜 Parsed manual-certificate changes awaiting one table publication.
+pub struct PreparedCertTableUpdate {
+    entries: HashMap<String, Arc<CertEntry>>,
+    removed: HashSet<String>,
+}
+
 impl CertTable {
     /// Create an empty table.
     pub fn new() -> Self {
@@ -258,17 +266,7 @@ impl CertTable {
     /// the SNI name has no exact or wildcard match); use
     /// [`CertTable::set_default`] to override.
     pub fn upsert_pem(&self, name: &str, cert_pem: &str, key_pem: &str) -> Result<(), QuicError> {
-        let chain = boring::x509::X509::stack_from_pem(cert_pem.as_bytes()).map_err(|e| {
-            QuicError::Tls(format!("failed to parse certificate PEM for {name}: {e}"))
-        })?;
-        if chain.is_empty() {
-            return Err(QuicError::Tls(format!("no certificates in PEM for {name}")));
-        }
-        let key = boring::pkey::PKey::private_key_from_pem(key_pem.as_bytes()).map_err(|e| {
-            QuicError::Tls(format!("failed to parse private key PEM for {name}: {e}"))
-        })?;
-
-        let entry = Arc::new(CertEntry { chain, key });
+        let entry = parse_cert_entry(name, cert_pem, key_pem)?;
         self.inner.rcu(|current| {
             let mut next = (**current).clone();
             next.certs.insert(name.to_string(), entry.clone());
@@ -278,6 +276,49 @@ impl CertTable {
             Arc::new(next)
         });
         Ok(())
+    }
+
+    /// 🧪 Parses a complete manual-certificate delta without publishing it.
+    pub fn prepare_manual_update<'a>(
+        &self,
+        previous_names: impl IntoIterator<Item = &'a str>,
+        next_entries: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+    ) -> Result<PreparedCertTableUpdate, QuicError> {
+        let mut entries = HashMap::new();
+        for (name, cert_pem, key_pem) in next_entries {
+            entries.insert(name.to_string(), parse_cert_entry(name, cert_pem, key_pem)?);
+        }
+        let next_names: HashSet<&str> = entries.keys().map(String::as_str).collect();
+        let removed = previous_names
+            .into_iter()
+            .filter(|name| !next_names.contains(name))
+            .map(str::to_string)
+            .collect();
+        Ok(PreparedCertTableUpdate { entries, removed })
+    }
+
+    /// 📣 Publishes a manual-certificate delta after all parsing has succeeded.
+    pub fn publish_manual_update(&self, prepared: PreparedCertTableUpdate) {
+        self.inner.rcu(|current| {
+            let mut next = (**current).clone();
+            for name in &prepared.removed {
+                next.certs.remove(name);
+                if next.default_name.as_ref() == Some(name) {
+                    next.default_name = None;
+                }
+            }
+            for (name, entry) in &prepared.entries {
+                next.certs.insert(name.clone(), Arc::clone(entry));
+            }
+            if next
+                .default_name
+                .as_ref()
+                .is_none_or(|name| !next.certs.contains_key(name))
+            {
+                next.default_name = next.certs.keys().next().cloned();
+            }
+            Arc::new(next)
+        });
     }
 
     /// Choose which table entry serves as the default certificate.
@@ -324,6 +365,28 @@ impl CertTable {
     }
 }
 
+/// 🔐 Parses one certificate pair before it reaches the handshake table.
+fn parse_cert_entry(
+    name: &str,
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<Arc<CertEntry>, QuicError> {
+    let chain = boring::x509::X509::stack_from_pem(cert_pem.as_bytes()).map_err(|error| {
+        QuicError::Tls(format!(
+            "failed to parse certificate PEM for {name}: {error}"
+        ))
+    })?;
+    if chain.is_empty() {
+        return Err(QuicError::Tls(format!("no certificates in PEM for {name}")));
+    }
+    let key = boring::pkey::PKey::private_key_from_pem(key_pem.as_bytes()).map_err(|error| {
+        QuicError::Tls(format!(
+            "failed to parse private key PEM for {name}: {error}"
+        ))
+    })?;
+    Ok(Arc::new(CertEntry { chain, key }))
+}
+
 impl Default for CertTable {
     fn default() -> Self {
         Self::new()
@@ -339,7 +402,7 @@ impl Default for CertTable {
 /// socket, so that indirection is the only thing that makes reload work.
 fn build_ssl_context_builder(
     certs: Arc<CertTable>,
-    client_auth: Option<Arc<ClientAuthTable>>,
+    listener_policy: Arc<PublishedListenerPolicy>,
 ) -> Result<boring::ssl::SslContextBuilder, QuicError> {
     use boring::ssl::{NameType, SelectCertError, SslContext, SslMethod, SslVersion};
 
@@ -367,7 +430,7 @@ fn build_ssl_context_builder(
     // quiche never clears them. A comment claiming two protections where one
     // is silently reverted is worse than the single one that works, so the
     // call is gone and the reason is here.
-    if client_auth.is_some() {
+    if listener_policy.client_auth_reload_capable() {
         builder.set_options(boring::ssl::SslOptions::NO_TICKET);
     }
 
@@ -386,9 +449,16 @@ fn build_ssl_context_builder(
         // The policy is picked from the name the client actually sent, so a
         // client that named nothing gets the catch-all and is then refused any
         // named site by the SNI-against-`:authority` check below.
-        if let Some(policies) = &client_auth
-            && let Some(policy) = policies.policy_for(&sni)
+        let Some(snapshot) = listener_policy.handshake_snapshot() else {
+            tracing::warn!("🚧 H3: refused a TLS handshake during policy publication");
+            return Err(SelectCertError::ERROR);
+        };
+        if let Err(error) = record_listener_security_revision(hello.ssl_mut(), snapshot.revision())
         {
+            tracing::error!(%error, "❌ H3: failed to record the listener-security generation");
+            return Err(SelectCertError::ERROR);
+        }
+        if let Some(policy) = snapshot.client_auth().policy_for(&sni) {
             policy.install(hello.ssl_mut());
         }
 
@@ -444,16 +514,16 @@ pub const IN_MEMORY_CERT_SENTINEL: &str = "<pingclair:in-memory-cert-table>";
 /// Serves certificates to `tokio_quiche` from an in-memory [`CertTable`].
 pub struct CertTableSslHook {
     certs: Arc<CertTable>,
-    /// 🪪 What this listener's sites ask of a client's own certificate.
-    ///
-    /// `None` on the overwhelming majority of listeners, and the context is
-    /// built once per socket, so an ordinary HTTP/3 listener pays nothing.
-    client_auth: Option<Arc<ClientAuthTable>>,
+    /// 🔐 The versioned handshake policy shared with routing and TCP TLS.
+    listener_policy: Arc<PublishedListenerPolicy>,
 }
 
 impl CertTableSslHook {
-    pub fn new(certs: Arc<CertTable>, client_auth: Option<Arc<ClientAuthTable>>) -> Self {
-        Self { certs, client_auth }
+    pub fn new(certs: Arc<CertTable>, listener_policy: Arc<PublishedListenerPolicy>) -> Self {
+        Self {
+            certs,
+            listener_policy,
+        }
     }
 }
 
@@ -463,7 +533,8 @@ impl tokio_quiche::quic::ConnectionHook for CertTableSslHook {
         _settings: tokio_quiche::settings::TlsCertificatePaths<'_>,
     ) -> Option<boring::ssl::SslContextBuilder> {
         // The paths are deliberately ignored; see `IN_MEMORY_CERT_SENTINEL`.
-        match build_ssl_context_builder(Arc::clone(&self.certs), self.client_auth.clone()) {
+        match build_ssl_context_builder(Arc::clone(&self.certs), Arc::clone(&self.listener_policy))
+        {
             Ok(builder) => Some(builder),
             Err(e) => {
                 // Returning `None` makes tokio-quiche fall back to reading the
@@ -781,9 +852,13 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
         // against the other. Only on listeners that ask for a certificate —
         // elsewhere there is nothing to enforce and nothing to pay for.
         if self.proxy.requires_strict_sni_host() {
-            self.tls_identity = Some(crate::tls_identity::DownstreamTlsIdentity::new(
-                qconn.server_name().unwrap_or(""),
-            ));
+            let server_name = qconn.server_name().unwrap_or("").to_string();
+            if let Some(security_revision) = listener_security_revision(qconn.as_mut()) {
+                self.tls_identity = Some(crate::tls_identity::DownstreamTlsIdentity::new(
+                    &server_name,
+                    security_revision,
+                ));
+            }
         }
         // 🚀 Tracked here rather than at socket accept: a QUIC connection that
         // never completes its handshake is not one this server is serving, and
@@ -981,8 +1056,6 @@ pub struct QuicServer {
     listen: SocketAddr,
     proxy: Arc<PingclairProxy>,
     certs: Arc<CertTable>,
-    /// 🪪 What this listener's sites ask of a client certificate, or `None`.
-    client_auth: Option<Arc<ClientAuthTable>>,
     connector: Arc<pingora_core::connectors::http::Connector>,
     filter: PingclairConnectionFilter,
 }
@@ -1001,23 +1074,14 @@ impl QuicServer {
         listen: SocketAddr,
         proxy: Arc<PingclairProxy>,
         certs: Arc<CertTable>,
-        client_auth: Option<Arc<ClientAuthTable>>,
         upstream_keepalive_pool_size: usize,
         blocked_ips: Vec<String>,
     ) -> Self {
         let options = pingora_core::connectors::ConnectorOptions::new(upstream_keepalive_pool_size);
-        // 🪪 Derived here rather than asked of the caller, so the two halves of
-        // the rule cannot be wired up separately and disagree: a listener that
-        // demands a client certificate is exactly a listener that must insist
-        // `:authority` names the site the handshake asked for.
-        if client_auth.as_ref().is_some_and(|table| !table.is_empty()) {
-            proxy.set_strict_sni_host(true);
-        }
         Self {
             listen,
             proxy,
             certs,
-            client_auth,
             connector: Arc::new(pingora_core::connectors::http::Connector::new(Some(
                 options,
             ))),
@@ -1092,7 +1156,7 @@ impl QuicServer {
             // see `IN_MEMORY_CERT_SENTINEL`.
             connection_hook: Some(Arc::new(CertTableSslHook::new(
                 self.certs.clone(),
-                self.client_auth.clone(),
+                self.proxy.listener_policy(),
             ))),
         };
 
@@ -1282,6 +1346,14 @@ impl H3App {
             return;
         };
 
+        // 🚧 Match the TCP path's publication gate: a request waits by being
+        // refused, not by observing routing from one generation and client
+        // authentication from another.
+        if self.proxy.listener_policy_ref().is_publishing() {
+            self.queue_simple_response(qconn, stream_id, 503, "Configuration Reload In Progress");
+            return;
+        }
+
         // 🛡️ HTTP/3 carries its own framing, so `Transfer-Encoding` is forbidden
         // outright here rather than merely discouraged, and `Content-Length`
         // still has to be `1*DIGIT`. Same rule set as H1/H2, one implementation
@@ -1304,20 +1376,29 @@ impl H3App {
         //
         // 🛡️ Parity is the whole point of doing this here. If HTTP/3 skipped
         // the check, an attacker would simply use HTTP/3.
-        if let Some(identity) = &self.tls_identity
-            && !identity.may_request_host(crate::http_policy::authority_host(&req.authority))
-        {
-            tracing::warn!(
-                authority = %req.authority,
-                "🚫 H3: rejected a request whose :authority is not the name its handshake asked for"
-            );
-            self.queue_simple_response(
-                qconn,
-                stream_id,
-                421,
-                "TLS server name and :authority values differ",
-            );
-            return;
+        if self.proxy.requires_strict_sni_host() {
+            let current_revision = self.proxy.listener_policy_ref().revision();
+            let rejection = match &self.tls_identity {
+                Some(identity) if identity.security_revision != current_revision => {
+                    Some("TLS client-auth policy changed; reconnect")
+                }
+                Some(identity)
+                    if !identity
+                        .may_request_host(crate::http_policy::authority_host(&req.authority)) =>
+                {
+                    Some("TLS server name and :authority values differ")
+                }
+                Some(_) => None,
+                None => Some("TLS handshake recorded no server name"),
+            };
+            if let Some(reason) = rejection {
+                tracing::warn!(
+                    authority = %req.authority,
+                    "🚫 H3: rejected a request on a mutual-TLS listener: {reason}"
+                );
+                self.queue_simple_response(qconn, stream_id, 421, reason);
+                return;
+            }
         }
 
         // 🧭 Same resolution as H1/H2, from the same function, so the two

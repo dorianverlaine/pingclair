@@ -28,6 +28,16 @@ lets the rest converge.
 
 ### ⚠️ Breaking
 
+- 🔁 **Control-plane changes that need a new listener now return
+  `409 restart_required`.** The former Admin path started a side TCP listener
+  after startup, but that listener omitted HTTP/3, mutual TLS, strict SNI/Host,
+  and session-resumption policy. `/load` no longer reports that partial
+  listener as active or autosaves the rejected document. Adding or removing a
+  bind address, adding a TLS hostname, changing process-wide or
+  transport-captured settings, and enabling mTLS on a previously resumable TLS
+  context require a process restart. Compatible changes on existing listeners
+  remain hot-reloadable.
+
 - 📊 **Request metrics no longer carry a `host` label unless the configuration
   asks for one.** `pingclair_requests_total`, the request duration/size
   histograms, `pingclair_active_connections` and `pingclair_cache_requests_total`
@@ -335,8 +345,9 @@ lets the rest converge.
   directive. `..`, an unresolvable placeholder, and an unrecognised policy
   still fail closed.
 - 🌐 **Admin API.** `/load`, `/adapt` and `/stop`, Caddy-style config traversal
-  with `@id` addressing, dynamic listeners, autosave and resume, and graceful
-  stop.
+  with `@id` addressing, atomic reload of compatible listener policy,
+  restart-required responses for listener topology, autosave and resume, and
+  graceful stop.
 - ⌨️ **Command line.** `reload`, `start`, `stop`, `respond`, `run --watch`,
   HTTPS quick commands, shell completion, `environ`, `list-modules`,
   `build-info`, `manpage`, `storage` and `trust`.
@@ -807,14 +818,21 @@ lets the rest converge.
   volume. Values beyond a fixed ceiling now collapse into `other`, which keeps
   the totals correct. A host already seen keeps its own series, so a flood of
   junk cannot displace real traffic.
-- 🔄 **A reload could apply half a configuration.** Bind addresses were published
-  one at a time, so a new listener that could not be bound left the addresses
-  handled before it already serving the new configuration — the reload
-  reported itself "partially reloaded" and left a state nobody had asked for.
-  Every new listener is now probed before anything is published, and a single
-  failure rejects the whole reload with the previous configuration untouched.
-  A site removed from the configuration also stops serving, instead of staying
-  reachable on its old listener until the next restart.
+- 🔐 **Control-plane success could leave the old authorization policy
+  active.** Startup, Admin reload, signal reload, and HTTP/3 derived different
+  subsets of listener policy. Rotating an Admin key or origin policy, disabling
+  Admin, rotating an mTLS CA, or deleting a virtual host could return success
+  while old credentials or routes still worked. Compatible reloads now compile
+  one `PreparedListenerPolicy`, close versioned H1/H2/H3 and Admin publication
+  gates, then publish routing, manual certificates, client-auth trust, the
+  active Admin document, and Admin authorization before reopening them. Old
+  keep-alive and QUIC connections carry their handshake generation and are
+  refused after a trust-pool rotation. Whole-document replacement replaces the
+  host table, so a deleted virtual host stops answering immediately. Admin
+  ownership is committed under the same publication lock, so a queued SIGUSR1
+  cannot overwrite a successful key rotation with the file's older policy. Any
+  listener or TLS topology that cannot be rebuilt safely is rejected as
+  restart-required with the last-known-good policy and autosave untouched.
 - 🔐 **Rotating a manual certificate needed a restart, and nothing said so.**
   Certificate files were read once at startup, so writing a new pair on disk
   changed nothing until the process was restarted. A reload now re-reads them.

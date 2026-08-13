@@ -21,13 +21,14 @@ use crate::certs::{DynamicCertResolver, eager_issuance_domains, refresh_h3_cert_
 use crate::listen::{
     automatic_http_companion, can_bind_automatic_http_port, explicit_http_names,
     normalize_listen_addr, reserve_private_listener_address, server_requires_tls,
-    servers_by_bind_address,
 };
 use crate::paths::tls_store_dir;
-use crate::runtime_listeners::RuntimeListeners;
+use crate::runtime_listeners::{
+    RuntimeListeners, RuntimePublisherInputs, prepare_listener_policies,
+};
 use crate::systemd::{notify_systemd_ready, notify_systemd_stopping};
 use parking_lot::RwLock;
-use pingclair_proxy::client_auth::{ClientAuthTable, CompiledClientAuth};
+use pingclair_proxy::client_auth::PublishedListenerPolicy;
 use pingora_core::listeners::tls::TlsSettings;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -228,8 +229,6 @@ pub(crate) fn run_server(
         }),
         server_conf,
     );
-    let server_conf_arc = server.configuration.clone();
-
     server.bootstrap();
     // 🩺 One Pingora-owned driver follows weak pool registrations across hot reloads.
     server.add_service(pingora::services::background::background_service(
@@ -438,42 +437,27 @@ pub(crate) fn run_server(
         tls_manager.set_challenge_policy(policy);
     }
 
-    // 🏗️ Every client trust pool is read, parsed and turned into a BoringSSL
-    // store right here, keyed by the listen address the site named. Doing it at
-    // startup is the whole point: a handshake then costs one map lookup and an
-    // `Arc` clone, and a missing or malformed CA file is a message the operator
-    // reads now instead of a handshake failure a user reports later.
-    let mut client_auth_by_address: HashMap<String, ClientAuthTable> = HashMap::new();
-    for server_config in &config.servers {
-        let Some(client_auth) = server_config
-            .tls
-            .as_ref()
-            .and_then(|tls| tls.client_auth.as_ref())
-        else {
-            continue;
-        };
-        let names: Vec<&str> = if server_config.names.is_empty() {
-            server_config.name.as_deref().into_iter().collect()
-        } else {
-            server_config.names.iter().map(String::as_str).collect()
-        };
-        let policy = Arc::new(CompiledClientAuth::compile(client_auth).map_err(|problem| {
-            anyhow::anyhow!(
-                "site {} asks for `tls client_auth` that cannot be honoured: {problem}",
-                names.first().copied().unwrap_or("_")
-            )
-        })?);
-        for address in &server_config.listen {
-            client_auth_by_address
-                .entry(address.clone())
-                .or_default()
-                .insert(&names, Arc::clone(&policy));
-        }
-    }
-    let client_auth_by_address: HashMap<String, Arc<ClientAuthTable>> = client_auth_by_address
-        .into_iter()
-        .map(|(address, table)| (address, Arc::new(table)))
-        .collect();
+    // 🏗️ Startup and every later reload compile listener policy through this
+    // same path. Trust files are read now; handshakes only load one published
+    // generation and never parse configuration or PEM material.
+    let automatic_http_available = config.global.auto_https
+        != pingclair_core::config::AutoHttpsMode::Off
+        && config.servers.iter().any(|server| server.tls.is_some())
+        && can_bind_automatic_http_port(config.global.http_port);
+    let prepared_listener_policies = prepare_listener_policies(&config, automatic_http_available)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let listener_security_by_address: HashMap<String, Arc<PublishedListenerPolicy>> =
+        prepared_listener_policies
+            .iter()
+            .map(|(address, policy)| {
+                (
+                    address.clone(),
+                    Arc::new(PublishedListenerPolicy::new(Arc::clone(
+                        &policy.client_auth,
+                    ))),
+                )
+            })
+            .collect();
 
     match tls_manager.refresh_manual_certs(&manual_certs) {
         Ok(count) if count > 0 => {
@@ -519,6 +503,22 @@ pub(crate) fn run_server(
         .filter_map(|s| s.name.clone())
         .filter(|n| !n.is_empty() && n != "_" && n != "*" && !n.starts_with(':'))
         .collect();
+    let manual_h3_domains: HashSet<&str> = config
+        .servers
+        .iter()
+        .filter(|server| {
+            server
+                .tls
+                .as_ref()
+                .is_some_and(|tls| tls.cert.is_some() && tls.key.is_some())
+        })
+        .filter_map(|server| server.name.as_deref())
+        .collect();
+    let h3_periodic_domains: Vec<String> = h3_domains
+        .iter()
+        .filter(|name| !manual_h3_domains.contains(name.as_str()))
+        .cloned()
+        .collect();
     let h3_pool_size = config.global.upstream_keepalive_pool_size.unwrap_or(512);
     let h3_blocked_ips = config.global.blocked_ips.clone();
     let trusted_proxies = config.global.trusted_proxies.clone();
@@ -546,9 +546,6 @@ pub(crate) fn run_server(
     let http_port = config.global.http_port;
     let https_port = config.global.https_port;
     let explicit_http_names = explicit_http_names(&config);
-    let automatic_http_available = auto_https_mode != pingclair_core::config::AutoHttpsMode::Off
-        && config.servers.iter().any(|server| server.tls.is_some())
-        && can_bind_automatic_http_port(http_port);
 
     for server_config in &config.servers {
         tracing::debug!(
@@ -609,12 +606,17 @@ pub(crate) fn run_server(
             if server_requires_tls(server_config, &addr, http_port, https_port) {
                 tls_listeners.insert(addr.clone());
             }
+            let listener_policy = listener_security_by_address
+                .get(&addr)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no prepared listener policy for {addr}"))?;
             let mut proxies_guard = port_proxies.write();
             let proxy = proxies_guard.entry(addr.clone()).or_insert_with(|| {
-                pingclair_proxy::server::PingclairProxy::with_tls_and_trusted_proxies(
+                pingclair_proxy::server::PingclairProxy::with_listener_policy(
                     tls_manager.clone(),
                     &trusted_proxies,
                     proxy_protocol_addresses.contains(&addr),
+                    listener_policy,
                 )
             });
 
@@ -633,12 +635,17 @@ pub(crate) fn run_server(
 
         if let Some(companion) = companion {
             let addr = format!("[::]:{http_port}");
+            let listener_policy = listener_security_by_address
+                .get(&addr)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no prepared listener policy for {addr}"))?;
             let mut proxies_guard = port_proxies.write();
             let proxy = proxies_guard.entry(addr.clone()).or_insert_with(|| {
-                pingclair_proxy::server::PingclairProxy::with_tls_and_trusted_proxies(
+                pingclair_proxy::server::PingclairProxy::with_listener_policy(
                     tls_manager.clone(),
                     &trusted_proxies,
                     proxy_protocol_addresses.contains(&addr),
+                    listener_policy,
                 )
             });
             binding_info.entry(addr).or_default().push(format!(
@@ -654,20 +661,6 @@ pub(crate) fn run_server(
     for (addr, sites) in &binding_info {
         tracing::info!("   📍 {} -> [{}]", addr, sites.join(", "));
     }
-
-    // 🏷️ Listen address → the name to serve when a client sends no SNI, built
-    // once here. The alternative is a lookup inside BoringSSL's SNI callback,
-    // which runs on every handshake and cannot get a different answer than it
-    // would have got at startup.
-    let default_sni_by_address: std::collections::HashMap<&str, &str> = config
-        .servers
-        .iter()
-        .filter_map(|server| {
-            let sni = server.tls.as_ref()?.default_sni.as_deref()?;
-            Some((server, sni))
-        })
-        .flat_map(|(server, sni)| server.listen.iter().map(move |addr| (addr.as_str(), sni)))
-        .collect();
 
     // Create services for each proxy
     let mut https_ports = Vec::new();
@@ -724,14 +717,15 @@ pub(crate) fn run_server(
                 // the SNI-against-Host check, the other records the name that
                 // check reads — and a listener where only the first fires would
                 // answer 421 to every request.
-                let client_auth = client_auth_by_address
-                    .get(addr.as_str())
-                    .filter(|table| !table.is_empty())
-                    .cloned();
-                let requires_client_auth = client_auth.is_some();
+                let listener_policy = proxy_logic.listener_policy();
+                let requires_client_auth = listener_policy.client_auth_reload_capable();
                 let acceptor = DynamicCertResolver::new(tls_manager.clone())
-                    .with_default_sni(default_sni_by_address.get(addr.as_str()).copied())
-                    .with_client_auth(client_auth);
+                    .with_default_sni(
+                        prepared_listener_policies
+                            .get(addr)
+                            .and_then(|policy| policy.default_sni.as_deref()),
+                    )
+                    .with_listener_policy(listener_policy);
                 match TlsSettings::with_callbacks(Box::new(acceptor)) {
                     Ok(mut tls_settings) => {
                         tls_settings.enable_h2();
@@ -751,10 +745,6 @@ pub(crate) fn run_server(
                             tls_settings.set_options(boring::ssl::SslOptions::NO_TICKET);
                             tls_settings
                                 .set_session_cache_mode(boring::ssl::SslSessionCacheMode::OFF);
-                            // 🪪 Admission was decided from the ClientHello and
-                            // routing is decided from `Host`; make the request
-                            // path insist they name the same site.
-                            proxy_logic.set_strict_sni_host(true);
                             tracing::info!(
                                 "🪪 Mutual TLS is enforced on {} (session resumption off, \
                                  SNI must match Host)",
@@ -832,8 +822,13 @@ pub(crate) fn run_server(
         }
     }
 
+    // 📜 One certificate table is retained by the runtime publisher so a
+    // manual rotation reaches QUIC in the same transaction as TCP TLS.
+    let h3_cert_table =
+        (!https_ports.is_empty()).then(|| Arc::new(pingclair_proxy::quic::CertTable::new()));
+
     // Start HTTP/3 (QUIC) servers for HTTPS ports
-    if !https_ports.is_empty() {
+    if let Some(cert_table) = h3_cert_table.clone() {
         tracing::info!(
             "🚀 Starting HTTP/3 (quiche) servers for {} port(s)",
             https_ports.len()
@@ -842,23 +837,20 @@ pub(crate) fn run_server(
         // Shared SNI certificate table: populated from the TLS manager
         // (manual certs + already-issued ACME certs), then refreshed
         // periodically so renewals reach new handshakes without a restart.
-        let cert_table = std::sync::Arc::new(pingclair_proxy::quic::CertTable::new());
+        // 🔐 Seed synchronously before Admin can publish a rotation; an
+        // asynchronous startup read could otherwise overwrite the first new
+        // manual generation after `/load` had already reported success.
+        tls_runtime.block_on(refresh_h3_cert_table(
+            &cert_table,
+            &tls_manager,
+            &h3_domains,
+        ));
         let table_for_task = cert_table.clone();
         let tls_for_task = tls_manager.clone();
         let proxies_for_task = port_proxies.clone();
-        let domains_for_task = h3_domains.clone();
+        let periodic_domains_for_task = h3_periodic_domains.clone();
         let blocked_for_task = h3_blocked_ips.clone();
-        // 🪪 The same compiled policies the TCP acceptor uses. Built once at
-        // startup and shared, so the two transports cannot answer differently
-        // — a client-auth policy that held on one and not the other would be
-        // an invitation to use the other.
-        let client_auth_for_task = client_auth_by_address.clone();
-
         bg_handle.spawn(async move {
-            // Populate the table before serving so the first handshake can
-            // already find its certificate.
-            refresh_h3_cert_table(&table_for_task, &tls_for_task, &domains_for_task).await;
-
             for addr_str in &https_ports {
                 let Ok(socket_addr) = addr_str.parse::<std::net::SocketAddr>() else {
                     tracing::error!("❌ Invalid HTTP/3 listen address: {}", addr_str);
@@ -878,10 +870,6 @@ pub(crate) fn run_server(
                     socket_addr,
                     proxy,
                     table_for_task.clone(),
-                    client_auth_for_task
-                        .get(addr_str.as_str())
-                        .filter(|table| !table.is_empty())
-                        .cloned(),
                     h3_pool_size,
                     blocked_for_task.clone(),
                 );
@@ -893,10 +881,14 @@ pub(crate) fn run_server(
                 });
             }
 
-            // Periodic refresh: picks up ACME issuances and renewals.
+            // 🔁 Periodic refresh picks up ACME and internal renewals. Manual
+            // pairs are excluded because the synchronous config publisher
+            // installs them under its generation gate; an older periodic read
+            // must never overwrite a completed rotation.
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                refresh_h3_cert_table(&table_for_task, &tls_for_task, &domains_for_task).await;
+                refresh_h3_cert_table(&table_for_task, &tls_for_task, &periodic_domains_for_task)
+                    .await;
             }
         });
     }
@@ -906,57 +898,65 @@ pub(crate) fn run_server(
     // 🚫 Caddy disables SIGUSR1 reloads once the Admin API has changed the
     // config; this flag records that transition.
     let api_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // 🧭 `/load` can create listeners at runtime; the manager is handed to
-    // the admin server so a document naming a new address is honored.
-    let dynamic_listeners: Arc<dyn pingclair_proxy::server::DynamicListeners> =
-        Arc::new(RuntimeListeners {
-            port_proxies: port_proxies.clone(),
-            server_conf: server_conf_arc,
-            tls_manager: tls_manager.clone(),
-            trusted_proxies: trusted_proxies.clone(),
-            blocked_ips: h3_blocked_ips.clone(),
-            proxy_protocol_addresses: proxy_protocol_addresses.clone(),
-            http_port,
-            https_port,
-            running: RwLock::new(HashMap::new()),
-            shutdowns: RwLock::new(HashMap::new()),
-            dynamic_addrs: RwLock::new(HashSet::new()),
-        });
+    // 🔐 Admin access and every data-plane listener share one transaction
+    // publisher. A reload therefore either publishes all prepared policy or
+    // leaves the startup generation untouched.
+    let admin_listen = config
+        .admin
+        .as_ref()
+        .map(|admin| admin.listen.clone())
+        .unwrap_or_else(|| "localhost:2019".to_string());
+    let admin_listener_available = config.admin.as_ref().is_some_and(|admin| admin.enabled);
+    // 🧭 Signal reload and Admin mutations publish the same active document;
+    // `/config` can therefore never describe a generation older than runtime.
+    let active_document = Arc::new(RwLock::new(
+        serde_json::to_value(config.clone())
+            .unwrap_or_else(|_| serde_json::Value::Object(Default::default())),
+    ));
+    let admin_policy = Arc::new(pingclair_api::AdminPolicy::new(
+        admin_listen,
+        config.admin.as_ref(),
+        admin_listener_available,
+    ));
+    let config_publisher: Arc<dyn pingclair_proxy::server::ConfigPublisher> =
+        Arc::new(RuntimeListeners::new(
+            RuntimePublisherInputs {
+                port_proxies: port_proxies.clone(),
+                tls_manager: tls_manager.clone(),
+                h3_cert_table,
+                admin_policy: admin_policy.clone(),
+                document: active_document.clone(),
+                listener_policies: listener_security_by_address,
+                automatic_http_available,
+                api_changed: api_changed.clone(),
+            },
+            config.clone(),
+            prepared_listener_policies,
+        ));
 
     // Start Admin API if enabled
     if let Some(admin_config) = &config.admin
         && admin_config.enabled
     {
         let listen = admin_config.listen.clone();
-        let admin_origins = admin_config.origins.clone();
-        let admin_enforce_origin = admin_config.enforce_origin;
-        let api_key = admin_config.api_key.clone();
-        let proxies = port_proxies.clone();
         let shutdown_for_admin = admin_shutdown.clone();
         let autosave = tls_store_dir().join("autosave.json");
         // 🧭 The admin traversal endpoints read and write one shared config
         // document; it starts as the exact configuration that was loaded.
-        let document = Arc::new(RwLock::new(
-            serde_json::to_value(config.clone())
-                .unwrap_or_else(|_| serde_json::Value::Object(Default::default())),
-        ));
-        let dynamic_listeners_for_admin = dynamic_listeners.clone();
-        let api_changed_for_admin = api_changed.clone();
+        let document = active_document.clone();
+        let publisher_for_admin = config_publisher.clone();
+        let policy_for_admin = admin_policy.clone();
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create admin runtime");
             rt.block_on(async {
                 let addr = listen.parse().expect("Invalid admin listen address");
                 let options = pingclair_api::AdminServerOptions {
-                    proxies,
                     document,
                     shutdown: shutdown_for_admin,
                     autosave: Some(autosave),
-                    listeners: Some(dynamic_listeners_for_admin),
-                    api_changed: api_changed_for_admin,
-                    api_key,
-                    origins: admin_origins,
-                    enforce_origin: admin_enforce_origin,
+                    publisher: Some(publisher_for_admin),
+                    policy: policy_for_admin,
                 };
                 if let Err(e) = pingclair_api::run_admin_server(addr, options).await {
                     tracing::error!("Admin server error: {}", e);
@@ -971,16 +971,11 @@ pub(crate) fn run_server(
     #[cfg(unix)]
     if !config_path.is_empty() {
         let config_path = config_path.clone();
-        let port_proxies = port_proxies.clone();
-        let dynamic_listeners_for_reload = dynamic_listeners.clone();
+        let publisher_for_reload = config_publisher.clone();
         let api_changed_for_reload = api_changed.clone();
-        // 🧭 Snapshot the global settings the process started with, so a
-        // reload that changes them can say so instead of silently ignoring
-        // the difference.
-        let original_global = config.global.clone();
 
         bg_handle.spawn(async move {
-            use tokio::signal::unix::{signal, SignalKind};
+            use tokio::signal::unix::{SignalKind, signal};
 
             // 🚦 SIGUSR1 is Caddy's reload signal; SIGHUP is deliberately
             // ignored, matching Caddy's signal table.
@@ -1001,7 +996,10 @@ pub(crate) fn run_server(
                 }
             };
 
-            tracing::info!("📡 Reload listener active (SIGUSR1, Config: {})", config_path);
+            tracing::info!(
+                "📡 Reload listener active (SIGUSR1, Config: {})",
+                config_path
+            );
 
             loop {
                 let signal_name = tokio::select! {
@@ -1015,12 +1013,10 @@ pub(crate) fn run_server(
                     continue;
                 }
                 let reload_start = std::time::Instant::now();
-                tracing::info!("🔔 Received {signal_name}, reloading configuration from: {}", config_path);
-                // 🛑 Let the new configuration start its own ACME transactions
-                // immediately instead of waiting on the old config's in-flight
-                // issuance markers.
-                tls_manager.cancel_pending_issuance().await;
-
+                tracing::info!(
+                    "🔔 Received {signal_name}, reloading configuration from: {}",
+                    config_path
+                );
                 // Step 1: Validate and load new configuration
                 tracing::info!("📋 Step 1/3: Validating configuration...");
                 let result = if std::path::Path::new(&config_path).is_dir() {
@@ -1031,217 +1027,45 @@ pub(crate) fn run_server(
 
                 match result {
                     Ok(new_config) => {
-                        // 🚩 Global options (email, auto_https, trusted
-                        // proxies, ports, ...) only take effect at startup.
-                        // Detecting the difference here keeps a reload from
-                        // looking successful while the operator's global
-                        // change silently never happened.
-                        if new_config.global != original_global {
-                            tracing::warn!(
-                                "🚫 Reloaded configuration changes global options; \
-                                 global settings only take effect after a restart \
-                                 (old={:?}, new={:?})",
-                                original_global,
-                                new_config.global
-                            );
-                        }
                         tracing::info!("✅ Step 1/3: Configuration validation successful");
                         tracing::info!("📋 Step 2/3: Preparing configuration update...");
-
-                        // 🪵 Register any channel the reload introduced before
-                        // the servers that reference it are published, or the
-                        // first requests after a reload would resolve to no
-                        // channel and their lines would go nowhere.
-                        pingclair_proxy::access_log::register_channels(
-                            &new_config.logging.channels,
-                        );
-                        pingclair_proxy::metrics::CONFIG_VERSION.inc();
-
-                        // 📊 A reload can add or remove sites, so the set of
-                        // hosts worth their own series changes with it.
-                        // Republished before the new routes go live, so no
-                        // request is ever labelled against the old answer.
-                        pingclair_proxy::metrics::configure_host_labels(
-                            &new_config.global.metrics_options,
-                            new_config
-                                .servers
-                                .iter()
-                                .flat_map(|s| s.names.iter().map(String::as_str)),
-                        );
-
-                        // 🧭 Derive every bind address the same way startup
-                        // does (including the automatic HTTP companion), so a
-                        // hostname site updates its TLS listener and not just
-                        // a phantom `:80` entry.
-                        let new_config_by_port = servers_by_bind_address(&new_config);
-
-                        // 🧭 Phase 1 — prepare. Work out what each bind
-                        // address needs and prove every fallible step can
-                        // succeed, touching nothing.
-                        //
-                        // The old loop published each port as it went, so a
-                        // port that could not be bound left the earlier ones
-                        // already serving the new configuration and the
-                        // reload reported "partially reloaded" — a state no
-                        // operator asked for and none can reason about. Now
-                        // the only fallible step (binding) happens for all
-                        // new addresses first, and a single failure means
-                        // nothing changed at all.
-                        let existing: std::collections::HashSet<String> =
-                            port_proxies.read().keys().cloned().collect();
-                        let mut to_update: Vec<(String, Vec<pingclair_core::config::ServerConfig>)> =
-                            Vec::new();
-                        let mut to_start: Vec<(String, Vec<pingclair_core::config::ServerConfig>)> =
-                            Vec::new();
-                        let mut rejected: Vec<String> = Vec::new();
-
-                        for (addr, servers) in new_config_by_port {
-                            if existing.contains(&addr) {
-                                to_update.push((addr, servers));
-                            } else {
-                                match dynamic_listeners_for_reload.probe_listener(&addr) {
-                                    Ok(()) => to_start.push((addr, servers)),
-                                    Err(error) => rejected.push(format!("{addr}: {error}")),
-                                }
+                        tracing::info!("📋 Step 3/3: Publishing prepared configuration...");
+                        match publisher_for_reload.publish_config(&new_config, None) {
+                            Ok(success_count) => {
+                                let reload_duration = reload_start.elapsed();
+                                tracing::info!(
+                                    "✅ Configuration reload completed successfully in {:?}",
+                                    reload_duration
+                                );
+                                tracing::info!("   📊 {} listener(s) updated", success_count);
+                                println!(
+                                    "✅ Configuration reloaded successfully ({success_count} \
+                                     listeners updated in {reload_duration:?})"
+                                );
                             }
-                        }
-
-                        // 🔐 Certificates are part of the configuration, so a
-                        // reload must pick up a rotation on disk — before this
-                        // they were read once at startup and swapping a cert
-                        // needed a restart that nothing told the operator
-                        // about. Collected here so a bad pair joins the same
-                        // rejection set as an unbindable listener: either the
-                        // whole reload lands or none of it does.
-                        let mut reloaded_certs: Vec<(String, String, String)> = Vec::new();
-                        for server in &new_config.servers {
-                            let (Some(tls), Some(name)) =
-                                (server.tls.as_ref(), server.name.as_deref())
-                            else {
-                                continue;
-                            };
-                            if let (Some(cert), Some(key)) = (&tls.cert, &tls.key)
-                                && !name.is_empty()
-                                && name != "_"
-                            {
-                                reloaded_certs.push((
-                                    name.to_string(),
-                                    cert.clone(),
-                                    key.clone(),
-                                ));
+                            Err(error) => {
+                                let reload_duration = reload_start.elapsed();
+                                tracing::error!(
+                                    kind = ?error.kind,
+                                    "❌ Configuration reload rejected after {:?}: {}",
+                                    reload_duration,
+                                    error
+                                );
+                                tracing::error!(
+                                    "   💡 Previous configuration remains active, unchanged"
+                                );
+                                eprintln!("❌ Configuration reload rejected: {error}");
+                                eprintln!("   💡 Previous configuration remains active, unchanged");
                             }
-                        }
-                        if let Err(problems) = tls_manager.refresh_manual_certs(&reloaded_certs) {
-                            // 🛡️ The previous certificates keep serving. An
-                            // operator halfway through copying a new pair sees
-                            // exactly which file is wrong instead of a site
-                            // that starts failing handshakes.
-                            rejected.extend(
-                                problems
-                                    .into_iter()
-                                    .map(|problem| format!("certificate: {problem}")),
-                            );
-                        }
-
-                        if !rejected.is_empty() {
-                            let reload_duration = reload_start.elapsed();
-                            for reason in &rejected {
-                                tracing::error!("❌ Reload rejected: {reason}");
-                            }
-                            tracing::error!(
-                                "❌ Configuration reload rejected after {:?}: {} problem(s)",
-                                reload_duration,
-                                rejected.len()
-                            );
-                            tracing::error!("   💡 Previous configuration remains active, unchanged");
-                            eprintln!(
-                                "❌ Configuration reload rejected: {}",
-                                rejected.join("; ")
-                            );
-                            eprintln!("   💡 Previous configuration remains active, unchanged");
-                            continue;
-                        }
-
-                        // 🧭 Phase 2 — publish. Nothing below can fail, so the
-                        // configuration lands whole.
-                        tracing::info!(
-                            "📋 Step 3/3: Applying configuration to {} port(s)...",
-                            to_update.len() + to_start.len()
-                        );
-                        let mut success_count = 0;
-                        let mut warnings: Vec<String> = Vec::new();
-
-                        // 🔄 Updates are an ArcSwap store each, so an in-flight
-                        // request sees either the old snapshot or the new one
-                        // and never a mixture.
-                        let mut published: std::collections::HashSet<String> =
-                            std::collections::HashSet::new();
-                        for (addr, servers) in to_update {
-                            if let Some(proxy) = port_proxies.read().get(&addr).cloned() {
-                                proxy.update_config(servers);
-                                success_count += 1;
-                                published.insert(addr.clone());
-                                tracing::debug!("   ✓ Updated configuration for {}", addr);
-                            }
-                        }
-
-                        for (addr, servers) in to_start {
-                            match dynamic_listeners_for_reload.start_listener(&addr, &servers[0]) {
-                                Ok(()) => {
-                                    for extra in &servers[1..] {
-                                        if let Some(proxy) = port_proxies.read().get(&addr) {
-                                            proxy.add_server(extra.clone());
-                                        }
-                                    }
-                                    success_count += 1;
-                                    published.insert(addr.clone());
-                                }
-                                // 🚩 The probe passed and the real bind still
-                                // failed: something else took the port in the
-                                // gap. Rare, and reported rather than hidden.
-                                Err(error) => warnings.push(format!("{addr}: {error}")),
-                            }
-                        }
-
-                        // 🧹 Addresses the new configuration no longer names.
-                        // Without this the old configuration kept serving on
-                        // them forever — a site deleted from the Pingclairfile
-                        // stayed reachable until the next restart, which is the
-                        // most dangerous direction for this bug to fail in.
-                        for stale in existing.difference(&published) {
-                            if dynamic_listeners_for_reload.is_dynamic(stale) {
-                                tracing::info!("🧹 Stopping listener {stale}: no longer configured");
-                                dynamic_listeners_for_reload.stop_listener(stale);
-                            } else {
-                                // 📌 A listener created at startup cannot be
-                                // unbound without a restart, so say so rather
-                                // than leaving the operator to discover that
-                                // the deleted site still answers.
-                                warnings.push(format!(
-                                    "{stale}: no longer in the configuration, but it was bound at \
-                                     startup and needs a restart to release"
-                                ));
-                            }
-                        }
-
-                        let reload_duration = reload_start.elapsed();
-
-                        if warnings.is_empty() {
-                            tracing::info!("✅ Configuration reload completed successfully in {:?}", reload_duration);
-                            tracing::info!("   📊 {} server(s) updated", success_count);
-                            println!("✅ Configuration reloaded successfully ({success_count} servers updated in {reload_duration:?})");
-                        } else {
-                            for warning in &warnings {
-                                tracing::warn!("⚠️ Reload listener warning: {warning}");
-                            }
-                            tracing::warn!("⚠️ Configuration reload completed with warnings in {:?}", reload_duration);
-                            tracing::warn!("   📊 {} server(s) updated, {} warning(s)", success_count, warnings.len());
-                            println!("⚠️ Configuration partially reloaded ({success_count} servers updated, {} warnings in {reload_duration:?})", warnings.len());
                         }
                     }
                     Err(e) => {
                         let reload_duration = reload_start.elapsed();
-                        tracing::error!("❌ Configuration reload failed after {:?}: {}", reload_duration, e);
+                        tracing::error!(
+                            "❌ Configuration reload failed after {:?}: {}",
+                            reload_duration,
+                            e
+                        );
                         tracing::error!("   💡 Previous configuration remains active");
                         eprintln!("❌ Configuration reload failed: {e}");
                         eprintln!("   💡 Previous configuration remains active");

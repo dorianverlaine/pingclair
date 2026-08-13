@@ -1,5 +1,16 @@
 # ⚠️ Pingclair 實作守則 — 設定與相容性
 
+## 🔐 控制面發佈
+
+- **Admin 與 signal 的設定所有權，必須在同一把 publication lock 裡決定。**
+  不可等 `/load` handler 收到 publisher 的成功結果後，才在外面標記
+  `api_changed`：SIGUSR1 可能已通過外層檢查並排在鎖後面，接著用磁碟上的舊
+  API key／route 覆蓋剛成功的 Admin transaction。Admin 發佈必須在釋放鎖前
+  提交來源標記；signal 取得同一把鎖後還要重查，不能只靠 signal loop 的快路徑。
+
+  > 🎯 **可操作的規則**：凡是決定「下一個 writer 還能不能寫」的狀態，都和
+  > 被保護的 snapshot 一起提交，不要在 caller 收到 success 之後補記。
+
 ## 📏 量測與查證
 
 > 🧭 這一節整段來自 2026-08-05 的 M4.5。那一天有九次「以為量到產品的缺陷，

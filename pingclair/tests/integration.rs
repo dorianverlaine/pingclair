@@ -87,6 +87,9 @@ impl TestServer {
         let http_companion_address = config_template
             .contains("__PINGCLAIR_TEST_HTTP_PORT__")
             .then(|| reserve_loopback_listener(&mut reservations));
+        let admin_address = config_template
+            .contains("__PINGCLAIR_TEST_ADMIN_LISTEN__")
+            .then(|| reserve_loopback_listener(&mut reservations));
         let config = config_template
             .replace("__PINGCLAIR_TEST_LISTEN__", &address.to_string())
             .replace("__PINGCLAIR_TEST_PORT__", &address.port().to_string())
@@ -97,6 +100,12 @@ impl TestServer {
                     .unwrap_or_else(|| "80".to_string()),
             )
             .replace("__PINGCLAIR_TEST_HTTPS_PORT__", &address.port().to_string())
+            .replace(
+                "__PINGCLAIR_TEST_ADMIN_LISTEN__",
+                &admin_address
+                    .map(|address| address.to_string())
+                    .unwrap_or_else(|| "127.0.0.1:2019".to_string()),
+            )
             .replace("__PINGCLAIR_TEST_READINESS_PATH__", &readiness_path)
             .replace("__PINGCLAIR_TEST_READINESS_TOKEN__", &readiness_token);
         assert!(
@@ -117,7 +126,7 @@ impl TestServer {
             temp_dir,
             config_path,
             server_addresses,
-            None,
+            admin_address,
             readiness_path,
             readiness_token,
             reservations,
@@ -326,7 +335,7 @@ impl TestServer {
         false
     }
 
-    /// 🔐 Waits for the exact readiness token through a real TLS handshake.
+    /// 🔐 Waits for TLS readiness and the configured Admin listener together.
     async fn wait_until_tls_ready(&mut self, host: &str) -> bool {
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -336,6 +345,12 @@ impl TestServer {
             .build()
             .unwrap();
         let url = self.tls_url(0, host, &self.readiness_path);
+        let admin_url = self
+            .admin_address
+            .map(|address| format!("http://{address}/health"));
+        let admin_client = no_proxy_client();
+        let mut tls_ready = false;
+        let mut admin_ready = admin_url.is_none();
         for _ in 0..50 {
             if let Some(status) = self.exit_status() {
                 eprintln!("❌ Server exited unexpectedly with status: {status}");
@@ -344,11 +359,24 @@ impl TestServer {
                 return false;
             }
 
-            if let Ok(response) = client.get(&url).send().await
+            if !tls_ready
+                && let Ok(response) = client.get(&url).send().await
                 && response.status().is_success()
                 && let Ok(body) = response.text().await
                 && body == self.readiness_token
             {
+                tls_ready = true;
+            }
+            if !admin_ready
+                && let Some(url) = &admin_url
+                && let Ok(response) = admin_client.get(url).send().await
+                && response.status() == reqwest::StatusCode::OK
+                && let Ok(body) = response.text().await
+                && body == ADMIN_HEALTH_BODY
+            {
+                admin_ready = true;
+            }
+            if tls_ready && admin_ready {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -5315,7 +5343,8 @@ async fn test_directive_order_does_not_change_behavior() {
 /// document, and replaces a server via POST /load.
 #[tokio::test]
 async fn test_admin_adapt_export_and_load() {
-    let mut server = TestServer::new(&admin_test_config("/ready-a", "ready-a"));
+    let mut server =
+        TestServer::new_pingclairfile(&admin_test_pingclairfile("/ready-a", "ready-a"));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
 
@@ -5346,6 +5375,10 @@ async fn test_admin_adapt_export_and_load() {
 
     // 📤 POST /load replaces a server with a full document.
     let document = serde_json::json!({
+        "admin": {
+            "enabled": true,
+            "listen": server.admin_address.unwrap().to_string()
+        },
         "servers": [{
             "name": "_",
             "names": [],
@@ -5370,9 +5403,13 @@ async fn test_admin_adapt_export_and_load() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(response.text().await.unwrap(), "loaded-ok");
 
-    // 🛡️ A document referencing an unbindable listener must be refused
-    // wholesale (runtime listener creation probes the bind synchronously).
+    // 🛡️ A document changing listener topology is restart-required; the
+    // process must not claim that only its TCP subset took effect.
     let bad = serde_json::json!({
+        "admin": {
+            "enabled": true,
+            "listen": server.admin_address.unwrap().to_string()
+        },
         "servers": [{
             "name": "bad",
             "listen": ["127.0.0.1:1"],
@@ -5385,7 +5422,9 @@ async fn test_admin_adapt_export_and_load() {
         .send()
         .await
         .unwrap();
-    assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(refused.status(), reqwest::StatusCode::CONFLICT);
+    let refusal: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(refusal["restart_required"], true);
     // 🧭 The previous config must still be live.
     let response = client.get(server.url(0, "/")).send().await.unwrap();
     assert_eq!(response.text().await.unwrap(), "loaded-ok");
@@ -5403,7 +5442,10 @@ async fn test_admin_adapt_export_and_load() {
 /// binary and the real admin socket.
 #[tokio::test]
 async fn test_admin_load_rejects_caddy_json() {
-    let mut server = TestServer::new(&admin_test_config("/__ready_caddy_json", "still-ready"));
+    let mut server = TestServer::new_pingclairfile(&admin_test_pingclairfile(
+        "/__ready_caddy_json",
+        "still-ready",
+    ));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
@@ -5437,7 +5479,8 @@ async fn test_admin_load_rejects_caddy_json() {
 /// `/config/<path>` mutate the active document and the running listener.
 #[tokio::test]
 async fn test_admin_config_traversal_end_to_end() {
-    let mut server = TestServer::new(&admin_test_config("/__ready_traversal", "initial"));
+    let mut server =
+        TestServer::new_pingclairfile(&admin_test_pingclairfile("/__ready_traversal", "initial"));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
     let readiness_path = server.readiness_path.clone();
@@ -5550,7 +5593,8 @@ async fn test_admin_config_traversal_end_to_end() {
 /// 🧭 POST with a trailing `...` appends every element of an array body.
 #[tokio::test]
 async fn test_admin_config_traversal_expand_appends() {
-    let mut server = TestServer::new(&admin_test_config("/__ready_expand", "expand"));
+    let mut server =
+        TestServer::new_pingclairfile(&admin_test_pingclairfile("/__ready_expand", "expand"));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
@@ -5571,15 +5615,15 @@ async fn test_admin_config_traversal_expand_appends() {
     assert_eq!(resp.text().await.unwrap(), "extra");
 }
 
-/// 🚫 A traversal that introduces an unbound listener is refused wholesale.
+/// 🚫 A traversal that changes listener topology is refused wholesale.
 #[tokio::test]
 async fn test_admin_config_traversal_unbindable_listener_rolls_back() {
-    let mut server = TestServer::new(&admin_test_config("/__ready_rb", "rb"));
+    let mut server = TestServer::new_pingclairfile(&admin_test_pingclairfile("/__ready_rb", "rb"));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
-    // 🚫 Port 1 cannot be bound by an unprivileged test process; the failure
-    // must surface to the caller and roll the document back.
+    // 🚫 No new socket is attempted: all H1, H2, H3, and TLS topology
+    // changes are explicitly restart-required and roll the document back.
     let new_server = serde_json::json!({"listen": ["127.0.0.1:1"], "routes": []});
     let resp = client
         .post(server.admin_url("/config/servers/..."))
@@ -5587,7 +5631,9 @@ async fn test_admin_config_traversal_unbindable_listener_rolls_back() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let refusal = resp.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(refusal["restart_required"], true);
 
     // 🧭 The document and the running server are both unchanged.
     let resp = client
@@ -5605,11 +5651,11 @@ async fn test_admin_config_traversal_unbindable_listener_rolls_back() {
     assert_eq!(resp.text().await.unwrap(), "rb");
 }
 
-/// 🧭 `/load` creates listeners at runtime and whole-document replacement
-/// removes them again, like Caddy.
+/// 🚫 `/load` rejects listener topology changes without autosaving them.
 #[tokio::test]
-async fn test_admin_load_creates_and_removes_listeners() {
-    let mut server = TestServer::new(&admin_test_config("/__ready_dyn", "dyn"));
+async fn test_admin_load_marks_listener_topology_restart_required() {
+    let mut server =
+        TestServer::new_pingclairfile(&admin_test_pingclairfile("/__ready_dyn", "dyn"));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
@@ -5634,57 +5680,250 @@ async fn test_admin_load_creates_and_removes_listeners() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let refusal = resp.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(refusal["restart_required"], true);
 
-    // 🧭 The new listener serves before we assert, since the accept task
-    // binds asynchronously after the response.
-    let new_url = format!("http://{new_addr}/");
-    let mut ready = false;
-    for _ in 0..30 {
-        if client
-            .get(&new_url)
-            .send()
-            .await
-            .map(|response| response.status() == reqwest::StatusCode::OK)
-            .unwrap_or(false)
+    // 🧭 Neither the active route nor the autosave may contain a rejected
+    // transaction, and the proposed socket must remain unbound by Pingclair.
+    let old = client
+        .get(server.url(0, "/__ready_dyn"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(old.text().await.unwrap(), "dyn");
+    assert!(
+        std::net::TcpListener::bind(new_addr).is_ok(),
+        "a restart-required transaction must not bind its proposed listener"
+    );
+    assert!(!server._temp_dir.path().join("tls/autosave.json").exists());
+
+    // 🔐 The same restart boundary covers a proposed TLS listener: it
+    // cannot start only TCP/ALPN while omitting its H3 and handshake policy.
+    let mut tls_document = client
+        .get(server.admin_url("/config"))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    tls_document["servers"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "name": "new.secure.test",
+            "names": ["new.secure.test"],
+            "listen": [new_addr.to_string()],
+            "tls": {"internal": true, "http3": true},
+            "routes": [{"path": "/*", "handler": {"type": "respond", "status": 200, "body": "tls-new"}}]
+        }));
+    let response = client
+        .post(server.admin_url("/load"))
+        .json(&tls_document)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    let refusal = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(refusal["restart_required"], true);
+    let reason = refusal["error"].as_str().unwrap_or_default();
+    assert!(
+        ["H1", "H2", "H3", "TLS"]
+            .into_iter()
+            .all(|protocol| reason.contains(protocol)),
+        "the restart response must name every transport being kept together: {reason}"
+    );
+    assert!(!server._temp_dir.path().join("tls/autosave.json").exists());
+}
+
+/// 🧹 Whole-document Admin replacement deletes virtual hosts, not only routes.
+#[tokio::test]
+async fn test_admin_load_removes_a_virtual_host_from_shared_listener() {
+    let mut server =
+        TestServer::new_pingclairfile(&admin_test_pingclairfile("/__ready_hosts", "hosts"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+    let mut document = client
+        .get(server.admin_url("/config"))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let address = server.address(0).to_string();
+    document["servers"] = serde_json::json!([
         {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(ready, "runtime-created listener did not come up");
-    let resp = client.get(&new_url).send().await.unwrap();
-    assert_eq!(resp.text().await.unwrap(), "new");
-
-    // 📤 Whole-document replacement without the second server closes it.
-    let document = serde_json::json!({
-        "admin": {"enabled": true, "listen": admin_listen},
-        "servers": [{
+            "name": "kept.test",
+            "names": ["kept.test"],
+            "listen": [address],
+            "routes": [{"path": "/*", "handler": {"type": "respond", "status": 200, "body": "kept"}}]
+        },
+        {
+            "name": "gone.test",
+            "names": ["gone.test"],
             "listen": [server.address(0).to_string()],
-            "routes": [{"path": "/*", "handler": {"type": "respond", "status": 200, "body": "only"}}]
-        }]
-    });
-    let resp = client
+            "routes": [{"path": "/*", "handler": {"type": "respond", "status": 200, "body": "gone"}}]
+        }
+    ]);
+    let loaded = client
         .post(server.admin_url("/load"))
         .json(&document)
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(loaded.status(), reqwest::StatusCode::OK);
+    let gone = client
+        .get(server.url(0, "/"))
+        .header("Host", "gone.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.text().await.unwrap(), "gone");
 
-    // 🧭 Existing keep-alive connections may drain (Caddy does the same), so
-    // prove the *socket* is gone with a fresh TCP connect instead.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let mut closed = false;
-    for _ in 0..10 {
-        if std::net::TcpStream::connect(new_addr).is_err() {
-            closed = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    assert!(closed, "removed runtime listener socket must close");
+    document["servers"].as_array_mut().unwrap().pop();
+    let loaded = client
+        .post(server.admin_url("/load"))
+        .json(&document)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(loaded.status(), reqwest::StatusCode::OK);
+
+    let gone = client
+        .get(server.url(0, "/"))
+        .header("Host", "gone.test")
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(gone.text().await.unwrap(), "gone");
+    let kept = client
+        .get(server.url(0, "/"))
+        .header("Host", "kept.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(kept.text().await.unwrap(), "kept");
+}
+
+/// 🔐 Admin key rotation and disablement apply to the next request.
+#[tokio::test]
+async fn test_admin_load_rotates_key_and_disables_the_active_listener() {
+    let mut server =
+        TestServer::new_pingclairfile(&admin_test_pingclairfile("/__ready_admin_policy", "policy"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+    let mut document = client
+        .get(server.admin_url("/config"))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+
+    document["admin"]["api_key"] = serde_json::json!("old-key");
+    let rotated = client
+        .post(server.admin_url("/load"))
+        .json(&document)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rotated.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        client
+            .get(server.admin_url("/config"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    document["admin"]["api_key"] = serde_json::json!("new-key");
+    let rotated = client
+        .post(server.admin_url("/load"))
+        .bearer_auth("old-key")
+        .json(&document)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rotated.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        client
+            .get(server.admin_url("/config"))
+            .bearer_auth("old-key")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .get(server.admin_url("/config"))
+            .bearer_auth("new-key")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+
+    let allowed_origin = format!("http://{}", server.admin_address.unwrap());
+    document["admin"]["origins"] = serde_json::json!([allowed_origin.clone()]);
+    document["admin"]["enforce_origin"] = serde_json::json!(true);
+    let origins_changed = client
+        .post(server.admin_url("/load"))
+        .bearer_auth("new-key")
+        .json(&document)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(origins_changed.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        client
+            .get(server.admin_url("/config"))
+            .bearer_auth("new-key")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        client
+            .get(server.admin_url("/config"))
+            .bearer_auth("new-key")
+            .header("Origin", &allowed_origin)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+
+    document["admin"]["enabled"] = serde_json::json!(false);
+    let disabled = client
+        .post(server.admin_url("/load"))
+        .bearer_auth("new-key")
+        .header("Origin", &allowed_origin)
+        .json(&document)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        client
+            .get(server.admin_url("/health"))
+            .bearer_auth("new-key")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
 }
 
 /// 🧭 `adapt -c -` and `validate -` read the config from stdin, like Caddy.
@@ -5900,14 +6139,18 @@ async fn test_cli_respond_serves_body() {
 async fn test_cli_reload_uses_admin_api() {
     use std::process::Command;
 
-    let mut server = TestServer::new(&admin_test_config("/__ready_cli_reload", "before"));
+    let mut server =
+        TestServer::new_pingclairfile(&admin_test_pingclairfile("/__ready_cli_reload", "before"));
     assert!(server.wait_until_ready().await, "server failed to start");
 
     let dir = tempfile::tempdir().unwrap();
     let caddyfile = dir.path().join("Caddyfile");
     std::fs::write(
         &caddyfile,
-        format!("{} {{\n    respond \"after-cli\"\n}}\n", server.address(0)),
+        format!(
+            "http://{} {{\n    respond \"after-cli\"\n}}\n",
+            server.address(0)
+        ),
     )
     .unwrap();
     let admin = server.admin_address.unwrap();
@@ -6213,12 +6456,13 @@ async fn test_file_server_charset_and_vary() {
 /// 🧭 `/load` accepts a Caddyfile when the client sends `text/caddyfile`.
 #[tokio::test]
 async fn test_admin_load_accepts_caddyfile_content_type() {
-    let mut server = TestServer::new(&admin_test_config("/__ready_adapter", "adapter"));
+    let mut server =
+        TestServer::new_pingclairfile(&admin_test_pingclairfile("/__ready_adapter", "adapter"));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
     let listen = server.address(0).to_string();
-    let caddyfile = format!("{listen} {{\n    respond \"adapted-ok\"\n}}\n");
+    let caddyfile = format!("http://{listen} {{\n    respond \"adapted-ok\"\n}}\n");
     let resp = client
         .post(server.admin_url("/load"))
         .header("Content-Type", "text/caddyfile")
@@ -6236,7 +6480,7 @@ async fn test_admin_load_accepts_caddyfile_content_type() {
 /// 🏷️ `@id` tags turn long traversal paths into `/id/<name>` shortcuts.
 #[tokio::test]
 async fn test_admin_id_tags_end_to_end() {
-    let mut server = TestServer::new(&admin_test_config("/__ready_id", "id"));
+    let mut server = TestServer::new_pingclairfile(&admin_test_pingclairfile("/__ready_id", "id"));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
@@ -6295,7 +6539,8 @@ async fn test_admin_id_tags_end_to_end() {
 /// 💾 API changes autosave; `run --resume` restores them after a restart.
 #[tokio::test]
 async fn test_admin_autosave_and_resume() {
-    let mut server = TestServer::new(&admin_test_config("/__ready_save", "save"));
+    let mut server =
+        TestServer::new_pingclairfile(&admin_test_pingclairfile("/__ready_save", "save"));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
@@ -6360,7 +6605,8 @@ async fn test_admin_autosave_and_resume() {
 /// 🛑 `POST /stop` answers 200 first, then the process exits gracefully.
 #[tokio::test]
 async fn test_admin_stop_returns_response_then_exits() {
-    let mut server = TestServer::new(&admin_test_config("/__ready_stop", "stop"));
+    let mut server =
+        TestServer::new_pingclairfile(&admin_test_pingclairfile("/__ready_stop", "stop"));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
@@ -6396,14 +6642,14 @@ async fn test_admin_stop_returns_response_then_exits() {
     assert!(exited, "server did not exit after /stop");
 }
 
-/// 🔔 SIGUSR1 reloads the running server from its config file, SIGHUP is
-/// ignored (Caddy semantics) — on any Unix, including macOS dev machines.
-/// Unix, including the macOS dev machines this suite runs on. The test edits
-/// the Pingclairfile, signals the real binary, and checks that the new route
-/// answers and that a global change is reported as requiring a restart.
+/// 🔔 SIGUSR1 reloads compatible policy and rejects process-wide changes.
+///
+/// SIGHUP remains ignored (Caddy semantics). A global change must leave the
+/// route untouched, while the same route change succeeds after the global
+/// setting is restored to its startup value.
 #[cfg(unix)]
 #[tokio::test]
-async fn test_signal_reload_applies_config_and_warns_on_global_changes() {
+async fn test_signal_reload_rejects_global_changes_then_applies_compatible_config() {
     let config = r#"
         {
             admin off
@@ -6444,35 +6690,54 @@ async fn test_signal_reload_applies_config_and_warns_on_global_changes() {
         "SIGHUP must be ignored"
     );
 
-    // 🚦 SIGUSR1 (Caddy's reload signal) applies the edited config.
+    // 🚫 SIGUSR1 refuses the whole document because the email is a
+    // process-wide setting; the route in the same document must not leak out.
     let status = std::process::Command::new("kill")
         .args(["-USR1", &server.process.id().to_string()])
         .status()
         .expect("kill must run");
     assert!(status.success());
 
-    // ⏳ Wait for the reloaded route to answer.
-    let mut reloaded = false;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let response = client.get(server.url(0, "/")).send().await.unwrap();
+    assert_eq!(response.text().await.unwrap(), "before-reload");
+
+    // 🚩 The global email change must be reported as restart-only.
+    // 🧭 TestServer sets RUST_LOG=info, so the rejection lands here.
+    let stderr = std::fs::read_to_string(&server.stdout_path).unwrap_or_default();
+    assert!(
+        stderr.contains("global options changed") && stderr.contains("remains active, unchanged"),
+        "the reload must reject global settings without partial publication:\n{stderr}"
+    );
+
+    // 🚦 Restore the startup email and keep the route change; this
+    // document is hot-compatible and must now publish.
+    std::fs::write(
+        &config_path,
+        std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("after@example.com", "before@example.com"),
+    )
+    .unwrap();
+    let status = std::process::Command::new("kill")
+        .args(["-USR1", &server.process.id().to_string()])
+        .status()
+        .expect("kill must run");
+    assert!(status.success());
+
+    let mut usr1_reloaded = false;
     for _ in 0..50 {
         if let Ok(response) = client.get(server.url(0, "/")).send().await
             && response.text().await.ok().as_deref() == Some("after-reload")
         {
-            reloaded = true;
+            usr1_reloaded = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    assert!(reloaded, "the server must answer with the reloaded body");
+    assert!(usr1_reloaded, "SIGUSR1 must reload the configuration");
 
-    // 🚩 The global email change must be reported as restart-only.
-    // 🧭 TestServer sets RUST_LOG=info, so the warning lands in this file.
-    let stderr = std::fs::read_to_string(&server.stdout_path).unwrap_or_default();
-    assert!(
-        stderr.contains("global options"),
-        "the reload must warn that global settings need a restart:\n{stderr}"
-    );
-
-    // 🚦 A second SIGUSR1 applies the next edit.
+    // 🚦 A second compatible SIGUSR1 applies the next route edit.
     std::fs::write(
         &config_path,
         std::fs::read_to_string(&config_path)
@@ -6485,25 +6750,25 @@ async fn test_signal_reload_applies_config_and_warns_on_global_changes() {
         .status()
         .expect("kill must run");
     assert!(status.success());
-
-    let mut usr1_reloaded = false;
+    let mut second_reload = false;
     for _ in 0..50 {
         if let Ok(response) = client.get(server.url(0, "/")).send().await
             && response.text().await.ok().as_deref() == Some("usr1-reload")
         {
-            usr1_reloaded = true;
+            second_reload = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    assert!(usr1_reloaded, "SIGUSR1 must reload the configuration");
+    assert!(second_reload, "a second compatible SIGUSR1 must reload");
 }
 
 /// 🏃 SIGQUIT forces an immediate exit with code 2, like Caddy.
 #[cfg(unix)]
 #[tokio::test]
 async fn test_sigquit_exits_with_code_2() {
-    let mut server = TestServer::new(&admin_test_config("/__ready_quit", "quit"));
+    let mut server =
+        TestServer::new_pingclairfile(&admin_test_pingclairfile("/__ready_quit", "quit"));
     assert!(server.wait_until_ready().await, "server failed to start");
 
     let status = std::process::Command::new("kill")
@@ -6528,7 +6793,8 @@ async fn test_sigquit_exits_with_code_2() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_api_change_disables_signal_reload() {
-    let mut server = TestServer::new(&admin_test_config("/__ready_apichange", "api"));
+    let mut server =
+        TestServer::new_pingclairfile(&admin_test_pingclairfile("/__ready_apichange", "api"));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
@@ -6542,7 +6808,7 @@ async fn test_api_change_disables_signal_reload() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
     // ✍️ Edit the config file so a (wrongly allowed) reload would be visible.
-    let config_path = server._temp_dir.path().join("config.json");
+    let config_path = server._temp_dir.path().join("Pingclairfile");
     let updated = std::fs::read_to_string(&config_path)
         .unwrap()
         .replace(&server.readiness_token, "file-changed");
@@ -6620,16 +6886,13 @@ async fn test_signal_reload_switches_handler_types() {
     assert!(switched, "reload must switch the handler type");
 }
 
-/// 🧱 **Day 25's atomicity property.**
+/// 🧱 Listener topology is an explicit restart boundary.
 ///
-/// A reload whose new configuration names a port something else already holds
-/// must change *nothing*. Before this, ports were published one at a time
-/// inside the apply loop, so the addresses handled before the failure were
-/// already serving the new configuration and the reload announced itself as
-/// "partially reloaded" — a state no operator asked for and none can reason
-/// about afterwards.
+/// A signal reload that names a new socket must change nothing even when that
+/// socket is free. Constructing only a side TCP listener would omit H3, mTLS,
+/// strict Host/SNI, and resumption policy, so the safe result is restart-required.
 #[tokio::test]
-async fn test_signal_reload_is_rejected_whole_when_a_new_listener_cannot_bind() {
+async fn test_signal_reload_marks_new_listener_restart_required() {
     let config = r#"
         {
             admin off
@@ -6655,22 +6918,20 @@ async fn test_signal_reload_is_rejected_whole_when_a_new_listener_cannot_bind() 
         "original"
     );
 
-    // 🧱 Hold a port so the reload's second site cannot bind it.
-    //
-    // 📌 The blocker binds the wildcard, because a bare `:port` site derives a
-    // wildcard listener — holding only `127.0.0.1:port` would leave `[::]:port`
-    // bindable on a dual-stack host and the test would prove nothing.
-    let blocker = std::net::TcpListener::bind("[::]:0").expect("bind blocker");
-    let taken = blocker.local_addr().unwrap().port();
+    // 🔓 Pick a genuinely free port: rejection is about incomplete
+    // transport construction, not whether this particular bind would work.
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+    let added = probe.local_addr().unwrap().port();
+    drop(probe);
 
     // 📝 The new configuration changes the existing site *and* adds one on the
-    // occupied port. If the reload were not atomic, the first change would
-    // land and the second would fail.
+    // free port. If the reload were not atomic, the first change could land
+    // while only a subset of protocols started for the second.
     let config_path = server._temp_dir.path().join("Pingclairfile");
     let updated = format!(
         "{{\n    admin off\n}}\n:{} {{\n    respond \"CHANGED\"\n}}\n:{} {{\n    respond \"second\"\n}}\n",
         server.address(0).port(),
-        taken
+        added
     );
     std::fs::write(&config_path, updated).unwrap();
 
@@ -6693,20 +6954,23 @@ async fn test_signal_reload_is_rejected_whole_when_a_new_listener_cannot_bind() 
         .unwrap();
     assert_eq!(
         body, "original",
-        "the reload could not bind one listener, so it must have changed nothing — \
-         instead the first site was already updated"
+        "a restart-required listener change must leave every existing route untouched"
     );
-    drop(blocker);
+    let output = std::fs::read_to_string(&server.stdout_path).unwrap_or_default();
+    assert!(
+        output.contains("listener topology changed")
+            && output.contains("Previous configuration remains active, unchanged"),
+        "signal rejection must name the restart boundary:\n{output}"
+    );
 }
 
-/// 🧹 A site removed from the configuration must stop answering.
+/// 🧹 Signal reload removes a virtual host from a retained listener.
 ///
-/// The old reload only ever added and updated, so a bind address that
-/// disappeared kept serving its previous configuration until the process
-/// restarted. Deleting a site and having it stay reachable is the most
-/// dangerous direction for this to fail in.
+/// Whole-document replacement must replace the host table rather than append
+/// to it. The socket remains, but the deleted authority may not keep serving
+/// the response authorised by the old document.
 #[tokio::test]
-async fn test_signal_reload_stops_a_listener_that_left_the_configuration() {
+async fn test_signal_reload_removes_a_virtual_host_from_shared_listener() {
     let config = r#"
         {
             admin off
@@ -6714,102 +6978,64 @@ async fn test_signal_reload_stops_a_listener_that_left_the_configuration() {
         :__PINGCLAIR_TEST_PORT__ {
             @readiness path __PINGCLAIR_TEST_READINESS_PATH__
             respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "default"
+        }
+        http://kept.test:__PINGCLAIR_TEST_PORT__ {
             respond "kept"
+        }
+        http://gone.test:__PINGCLAIR_TEST_PORT__ {
+            respond "gone"
         }
     "#;
     let mut server = TestServer::new_pingclairfile(config);
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
+    let gone = client
+        .get(server.url(0, "/"))
+        .header("Host", "gone.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.text().await.unwrap(), "gone");
 
-    // ➕ Add a second site by reload, so it is a *dynamic* listener — the kind
-    // this process bound itself and can therefore release.
-    let extra = {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-        port
-    };
+    // ➖ Remove only one authority while retaining the exact listen address.
     let config_path = server._temp_dir.path().join("Pingclairfile");
-    let with_extra = format!(
-        "{{\n    admin off\n}}\n:{} {{\n    respond \"kept\"\n}}\n:{} {{\n    respond \"temporary\"\n}}\n",
+    let updated = format!(
+        "{{\n    admin off\n}}\n:{} {{\n    respond \"default\"\n}}\nhttp://kept.test:{} {{\n    respond \"kept\"\n}}\n",
         server.address(0).port(),
-        extra
+        server.address(0).port()
     );
-    std::fs::write(&config_path, with_extra).unwrap();
-    let _ = std::process::Command::new("kill")
+    std::fs::write(&config_path, updated).unwrap();
+    let status = std::process::Command::new("kill")
         .args(["-USR1", &server.process.id().to_string()])
-        .status();
+        .status()
+        .expect("kill must run");
+    assert!(status.success());
 
-    let mut serving = false;
+    let mut removed = false;
     for _ in 0..50 {
-        if let Ok(response) = client
-            .get(format!("http://127.0.0.1:{extra}/"))
+        let response = client
+            .get(server.url(0, "/"))
+            .header("Host", "gone.test")
             .send()
             .await
-            && response.text().await.ok().as_deref() == Some("temporary")
-        {
-            serving = true;
+            .unwrap();
+        if response.text().await.unwrap_or_default() != "gone" {
+            removed = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(serving, "the added listener never started serving");
-
-    // ➖ Now remove it again.
-    let without_extra = format!(
-        "{{\n    admin off\n}}\n:{} {{\n    respond \"kept\"\n}}\n",
-        server.address(0).port()
-    );
-    std::fs::write(&config_path, without_extra).unwrap();
-    let _ = std::process::Command::new("kill")
-        .args(["-USR1", &server.process.id().to_string()])
-        .status();
-
-    let mut observed = String::new();
-    let mut stopped = false;
-    for _ in 0..50 {
-        // 🔌 A fresh client each time. The pooled one would keep reusing the
-        // connection it opened while the listener was up, which proves nothing
-        // about whether the listener is still accepting.
-        let probe = reqwest::Client::builder()
-            .no_proxy()
-            .pool_max_idle_per_host(0)
-            .build()
-            .unwrap();
-        match probe
-            .get(format!("http://127.0.0.1:{extra}/"))
-            .timeout(Duration::from_millis(500))
-            .send()
-            .await
-        {
-            Err(_) => {
-                stopped = true;
-                break;
-            }
-            Ok(response) => {
-                observed = format!(
-                    "{} {}",
-                    response.status(),
-                    response.text().await.unwrap_or_default()
-                );
-                if !observed.contains("temporary") {
-                    stopped = true;
-                    break;
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
     assert!(
-        stopped,
-        "the removed site is still serving its old configuration on :{extra} \
-         after the reload (last response: {observed})"
+        removed,
+        "the deleted virtual host is still serving its old response"
     );
 
-    // 🎯 The site that stayed must be untouched.
+    // 🎯 The authority that stayed on the socket remains live.
     assert_eq!(
         client
             .get(server.url(0, "/"))
+            .header("Host", "kept.test")
             .send()
             .await
             .unwrap()
@@ -6857,19 +7083,22 @@ async fn fetch_ordered_response(server: &mut TestServer) -> (reqwest::StatusCode
 /// `validate_config` directly. That distinction is the whole point: the
 /// function always rejected these configurations, and the *path* did not
 /// call the function.
-fn admin_test_config(readiness_path: &str, readiness_token: &str) -> String {
-    serde_json::json!({
-        "global": { "http3": false },
-        "admin": { "enabled": true, "listen": "127.0.0.1:0" },
-        "servers": [{
-            "listen": ["127.0.0.1:0"],
-            "routes": [{
-                "path": readiness_path,
-                "handler": { "type": "respond", "status": 200, "body": readiness_token }
-            }]
-        }]
-    })
-    .to_string()
+fn admin_test_pingclairfile(readiness_path: &str, readiness_token: &str) -> String {
+    format!(
+        r#"
+        {{
+            admin __PINGCLAIR_TEST_ADMIN_LISTEN__
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @process_readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @process_readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            @fixture_readiness path {readiness_path}
+            respond @fixture_readiness "{readiness_token}"
+        }}
+        "#
+    )
 }
 
 /// 🚫 An unimplemented handler must be refused at the Admin door.
@@ -6882,7 +7111,10 @@ fn admin_test_config(readiness_path: &str, readiness_token: &str) -> String {
 /// absent, and nothing ever said so.
 #[tokio::test]
 async fn test_admin_rejects_a_config_naming_an_unimplemented_plugin() {
-    let mut server = TestServer::new(&admin_test_config("/__ready_plugin", "ready-plugin-token"));
+    let mut server = TestServer::new_pingclairfile(&admin_test_pingclairfile(
+        "/__ready_plugin",
+        "ready-plugin-token",
+    ));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
@@ -6929,7 +7161,10 @@ async fn test_admin_rejects_a_config_naming_an_unimplemented_plugin() {
 /// was the one with no rules.
 #[tokio::test]
 async fn test_admin_runs_the_canonical_validator_on_posted_config() {
-    let mut server = TestServer::new(&admin_test_config("/__ready_retry", "ready-retry-token"));
+    let mut server = TestServer::new_pingclairfile(&admin_test_pingclairfile(
+        "/__ready_retry",
+        "ready-retry-token",
+    ));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
@@ -6994,14 +7229,14 @@ async fn test_admin_runs_the_canonical_validator_on_posted_config() {
     assert_eq!(still_serving.status(), 200);
 }
 
-/// 🧭 A config naming an unbound listener applies nothing at all.
+/// 🧭 A config naming another listener applies nothing at all.
 ///
 /// The old loop applied per listener as it walked the list, so a config naming
 /// a live address and a bogus one left the first on the new settings and the
 /// second on the old — a half-applied state that was never reported.
 #[tokio::test]
 async fn test_admin_config_for_an_unknown_listener_applies_nothing() {
-    let mut server = TestServer::new(&admin_test_config(
+    let mut server = TestServer::new_pingclairfile(&admin_test_pingclairfile(
         "/__ready_partial",
         "ready-partial-token",
     ));
@@ -7022,9 +7257,11 @@ async fn test_admin_config_for_an_unknown_listener_applies_nothing() {
         .send()
         .await
         .unwrap();
-    // 🚫 The unbindable second listener fails synchronously now (runtime
-    // listener creation probes the bind); nothing may be half-applied.
-    assert_eq!(response.status(), 400);
+    // 🚫 The second address changes transport topology, so it is rejected
+    // as restart-required before any route can be half-applied.
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    let refusal = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(refusal["restart_required"], true);
 
     // 🛡️ The live listener named first must not have been rewritten.
     let untouched = client
@@ -7043,7 +7280,8 @@ async fn test_admin_config_for_an_unknown_listener_applies_nothing() {
 /// importantly, that the server is still alive afterwards to answer anything.
 #[tokio::test]
 async fn test_admin_rejects_an_oversized_config_body() {
-    let mut server = TestServer::new(&admin_test_config("/__ready_big", "ready-big-token"));
+    let mut server =
+        TestServer::new_pingclairfile(&admin_test_pingclairfile("/__ready_big", "ready-big-token"));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
@@ -7091,7 +7329,10 @@ async fn test_admin_rejects_an_oversized_config_body() {
 async fn test_admin_survives_a_client_that_disconnects_mid_body() {
     use tokio::io::AsyncWriteExt;
 
-    let mut server = TestServer::new(&admin_test_config("/__ready_abort", "ready-abort-token"));
+    let mut server = TestServer::new_pingclairfile(&admin_test_pingclairfile(
+        "/__ready_abort",
+        "ready-abort-token",
+    ));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
@@ -10591,6 +10832,45 @@ fn mutual_tls_attempt(
     mutual_tls_attempt_capped(address, sni, host, identity, None)
 }
 
+/// 📜 Returns the DER certificate served to one fresh TLS connection.
+fn presented_server_certificate(address: SocketAddr, sni: &str) -> Vec<u8> {
+    use pingora_core::tls::ssl::{SslConnector, SslMethod, SslVerifyMode};
+
+    let mut builder = SslConnector::builder(SslMethod::tls()).expect("tls connector builder");
+    builder.set_verify(SslVerifyMode::NONE);
+    let connector = builder.build();
+    let stream = std::net::TcpStream::connect(address).expect("connect to the test server");
+    let stream = connector
+        .configure()
+        .expect("connect configuration")
+        .verify_hostname(false)
+        .connect(sni, stream)
+        .expect("complete TLS handshake");
+    stream
+        .ssl()
+        .peer_certificate()
+        .expect("server certificate")
+        .to_der()
+        .expect("encode server certificate")
+}
+
+/// 🪪 Builds a fresh HTTP/2 client carrying one downstream TLS identity.
+fn mutual_tls_http2_client(
+    address: SocketAddr,
+    certificate_pem: &str,
+    key_pem: &str,
+) -> reqwest::Client {
+    let identity_pem = format!("{certificate_pem}\n{key_pem}");
+    let identity = reqwest::Identity::from_pem(identity_pem.as_bytes()).expect("client identity");
+    reqwest::Client::builder()
+        .no_proxy()
+        .danger_accept_invalid_certs(true)
+        .identity(identity)
+        .resolve("secure.test", address)
+        .build()
+        .expect("HTTP/2 mutual-TLS client")
+}
+
 /// 🔢 The same attempt, with a ceiling on the protocol version.
 ///
 /// TLS 1.2 and TLS 1.3 handle the client certificate in entirely separate code
@@ -10674,6 +10954,41 @@ fn mutual_tls_attempt_capped(
     MutualTlsOutcome::Status(status)
 }
 
+/// 📨 Reads one Content-Length-framed response without closing the TLS stream.
+fn read_keepalive_response_status(stream: &mut impl Read) -> std::io::Result<u16> {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte)?;
+        head.push(byte[0]);
+        if head.len() > 64 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "response head exceeded the test limit",
+            ));
+        }
+    }
+    let head = String::from_utf8(head)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing status"))?;
+    let content_length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    let mut body = vec![0u8; content_length];
+    stream.read_exact(&mut body)?;
+    Ok(status)
+}
+
 /// 🧾 A listener carrying one mutual-TLS site next to one ordinary site.
 ///
 /// Sharing the socket is the point: it is the configuration where SNI decides
@@ -10731,6 +11046,440 @@ fn mutual_tls_fixture(mode: &str) -> (TestServer, TestAuthority, TestAuthority, 
 
     let server = TestServer::new_pingclairfile(&config);
     (server, authority, stranger, material)
+}
+
+/// 🔄 Builds a real TLS/Admin fixture whose client CA can rotate in place.
+fn reloadable_mutual_tls_fixture() -> (TestServer, TestAuthority, TestAuthority, tempfile::TempDir)
+{
+    let first = TestAuthority::new("First Pingclair Client CA");
+    let second = TestAuthority::new("Second Pingclair Client CA");
+    let (server_cert, server_key) = first.issue(&["open.test", "secure.test"]);
+    let material = tempfile::tempdir().expect("certificate material dir");
+    let cert_path = material.path().join("server.pem");
+    let key_path = material.path().join("server.key");
+    let first_ca_path = material.path().join("first-client-ca.pem");
+    let second_ca_path = material.path().join("second-client-ca.pem");
+    std::fs::write(&cert_path, &server_cert).expect("write server certificate");
+    std::fs::write(&key_path, &server_key).expect("write server key");
+    std::fs::write(&first_ca_path, &first.ca_pem).expect("write first client CA");
+    std::fs::write(&second_ca_path, &second.ca_pem).expect("write second client CA");
+
+    let config = format!(
+        r#"
+        {{
+            admin __PINGCLAIR_TEST_ADMIN_LISTEN__
+            auto_https off
+        }}
+
+        https://open.test:__PINGCLAIR_TEST_PORT__ {{
+            tls {{
+                cert {cert}
+                key {key}
+            }}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "open-ok"
+        }}
+
+        https://secure.test:__PINGCLAIR_TEST_PORT__ {{
+            tls {{
+                cert {cert}
+                key {key}
+                client_auth {{
+                    mode require_and_verify
+                    trust_pool file {{
+                        pem_file {first_ca}
+                    }}
+                }}
+            }}
+
+            respond "secure-ok"
+        }}
+        "#,
+        cert = cert_path.to_string_lossy(),
+        key = key_path.to_string_lossy(),
+        first_ca = first_ca_path.to_string_lossy(),
+    );
+    (
+        TestServer::new_pingclairfile(&config),
+        first,
+        second,
+        material,
+    )
+}
+
+/// 📜 A manual certificate changed at the same paths bypasses the old parsed cache.
+#[tokio::test]
+async fn test_admin_load_rotates_manual_certificate_for_the_first_new_connection() {
+    let first = TestAuthority::new("First Server CA");
+    let second = TestAuthority::new("Second Server CA");
+    let (first_cert, first_key) = first.issue(&["rotate.test"]);
+    let (second_cert, second_key) = second.issue(&["rotate.test"]);
+    let expected_second = boring::x509::X509::from_pem(second_cert.as_bytes())
+        .unwrap()
+        .to_der()
+        .unwrap();
+    let material = tempfile::tempdir().expect("certificate material dir");
+    let cert_path = material.path().join("server.pem");
+    let key_path = material.path().join("server.key");
+    std::fs::write(&cert_path, first_cert).expect("write first server certificate");
+    std::fs::write(&key_path, first_key).expect("write first server key");
+
+    let config = format!(
+        r#"
+        {{
+            admin __PINGCLAIR_TEST_ADMIN_LISTEN__
+            auto_https off
+        }}
+
+        https://rotate.test:__PINGCLAIR_TEST_PORT__ {{
+            tls {{
+                cert {cert}
+                key {key}
+            }}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "certificate-rotation"
+        }}
+        "#,
+        cert = cert_path.to_string_lossy(),
+        key = key_path.to_string_lossy(),
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_tls_ready("rotate.test").await);
+    let address = server.address(0);
+    let initial =
+        tokio::task::spawn_blocking(move || presented_server_certificate(address, "rotate.test"))
+            .await
+            .unwrap();
+    assert_ne!(initial, expected_second);
+
+    // ✍️ Keep the configured paths unchanged so only a policy-generation
+    // cache key can make the newly prepared certificate visible immediately.
+    std::fs::write(&cert_path, second_cert).expect("write second server certificate");
+    std::fs::write(&key_path, second_key).expect("write second server key");
+    let client = no_proxy_client();
+    let document = client
+        .get(server.admin_url("/config"))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let response = client
+        .post(server.admin_url("/load"))
+        .json(&document)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let rotated =
+        tokio::task::spawn_blocking(move || presented_server_certificate(address, "rotate.test"))
+            .await
+            .unwrap();
+    assert_eq!(
+        rotated, expected_second,
+        "the first post-success connection received a cached old certificate"
+    );
+}
+
+/// 🪪 A successful `/load` rotates the trust pool for the first new connection.
+#[tokio::test]
+async fn test_admin_load_rotates_client_auth_ca_without_stale_admission() {
+    let (mut server, first, second, material) = reloadable_mutual_tls_fixture();
+    assert!(
+        server.wait_until_tls_ready("open.test").await,
+        "server failed to start with reloadable client_auth"
+    );
+    let address = server.address(0);
+    let (first_cert, first_key) = first.issue(&["client.test"]);
+    let (second_cert, second_key) = second.issue(&["client.test"]);
+    let initial = tokio::task::spawn_blocking({
+        let first_cert = first_cert.clone();
+        let first_key = first_key.clone();
+        let second_cert = second_cert.clone();
+        let second_key = second_key.clone();
+        move || {
+            (
+                mutual_tls_attempt(
+                    address,
+                    "secure.test",
+                    "secure.test",
+                    Some((&first_cert, &first_key)),
+                ),
+                mutual_tls_attempt(
+                    address,
+                    "secure.test",
+                    "secure.test",
+                    Some((&second_cert, &second_key)),
+                ),
+            )
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(initial.0, MutualTlsOutcome::Status(200));
+    assert_eq!(initial.1, MutualTlsOutcome::HandshakeRejected);
+
+    // 🛣️ HTTP/2 negotiates through the same TCP acceptor, but asserting ALPN
+    // here prevents the H1 regression above from standing in for that path.
+    let secure_url = format!("https://secure.test:{}/probe", address.port());
+    let first_h2 = mutual_tls_http2_client(address, &first_cert, &first_key)
+        .get(&secure_url)
+        .send()
+        .await
+        .expect("the first CA must admit an H2 client");
+    assert_eq!(first_h2.status(), reqwest::StatusCode::OK);
+    assert_eq!(first_h2.version(), reqwest::Version::HTTP_2);
+    assert!(
+        mutual_tls_http2_client(address, &second_cert, &second_key)
+            .get(&secure_url)
+            .send()
+            .await
+            .is_err(),
+        "the second CA admitted an H2 connection before publication"
+    );
+
+    // 🔌 Keep one CA1-authenticated connection alive across publication.
+    // Its second request must be refused by the listener generation check,
+    // even though no new TLS handshake occurs.
+    let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
+    let (rotated_tx, rotated_rx) = std::sync::mpsc::channel();
+    let persistent_cert = first_cert.clone();
+    let persistent_key = first_key.clone();
+    let stale_connection = tokio::task::spawn_blocking(move || {
+        use pingora_core::tls::ssl::{SslConnector, SslMethod, SslVerifyMode};
+
+        let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+        builder.set_verify(SslVerifyMode::NONE);
+        let certificate = boring::x509::X509::from_pem(persistent_cert.as_bytes()).unwrap();
+        let key = boring::pkey::PKey::private_key_from_pem(persistent_key.as_bytes()).unwrap();
+        builder.set_certificate(&certificate).unwrap();
+        builder.set_private_key(&key).unwrap();
+        let connector = builder.build();
+        let stream = std::net::TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut stream = connector
+            .configure()
+            .unwrap()
+            .verify_hostname(false)
+            .connect("secure.test", stream)
+            .unwrap();
+        stream
+            .write_all(
+                b"GET /probe HTTP/1.1\r\nHost: secure.test\r\nConnection: keep-alive\r\n\r\n",
+            )
+            .unwrap();
+        let first_status = read_keepalive_response_status(&mut stream).unwrap();
+        connected_tx.send(first_status).unwrap();
+        rotated_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        stream
+            .write_all(b"GET /probe HTTP/1.1\r\nHost: secure.test\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        read_keepalive_response_status(&mut stream)
+    });
+    assert_eq!(connected_rx.await.unwrap(), 200);
+
+    let client = no_proxy_client();
+    let mut document = client
+        .get(server.admin_url("/config"))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let secure = document["servers"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|server| server["name"] == "secure.test")
+        .expect("secure site in exported config");
+    secure["tls"]["client_auth"]["trust_pool"]["pem_files"] = serde_json::json!([material
+        .path()
+        .join("second-client-ca.pem")
+        .to_string_lossy()]);
+    let loaded = client
+        .post(server.admin_url("/load"))
+        .json(&document)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(loaded.status(), reqwest::StatusCode::OK);
+    rotated_tx.send(()).unwrap();
+    assert_eq!(
+        stale_connection.await.unwrap().unwrap(),
+        421,
+        "a keep-alive admitted by the old CA remained authorized after rotation"
+    );
+
+    assert!(
+        mutual_tls_http2_client(address, &first_cert, &first_key)
+            .get(&secure_url)
+            .send()
+            .await
+            .is_err(),
+        "the old CA still admitted a fresh H2 connection after publication"
+    );
+    let second_h2 = mutual_tls_http2_client(address, &second_cert, &second_key)
+        .get(&secure_url)
+        .send()
+        .await
+        .expect("the rotated CA must admit the first fresh H2 connection");
+    assert_eq!(second_h2.status(), reqwest::StatusCode::OK);
+    assert_eq!(second_h2.version(), reqwest::Version::HTTP_2);
+
+    let rotated = tokio::task::spawn_blocking(move || {
+        (
+            mutual_tls_attempt(
+                address,
+                "secure.test",
+                "secure.test",
+                Some((&first_cert, &first_key)),
+            ),
+            mutual_tls_attempt(
+                address,
+                "secure.test",
+                "secure.test",
+                Some((&second_cert, &second_key)),
+            ),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        rotated.0,
+        MutualTlsOutcome::HandshakeRejected,
+        "the old CA was still accepted after `/load` returned success"
+    );
+    assert_eq!(rotated.1, MutualTlsOutcome::Status(200));
+}
+
+/// 🔔 Signal reload reaches the same client-auth publication transaction.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_signal_reload_rotates_client_auth_ca_without_stale_admission() {
+    let (mut server, first, second, _material) = reloadable_mutual_tls_fixture();
+    assert!(server.wait_until_tls_ready("open.test").await);
+    let address = server.address(0);
+    let (first_cert, first_key) = first.issue(&["client.test"]);
+    let (second_cert, second_key) = second.issue(&["client.test"]);
+
+    let config_path = server._temp_dir.path().join("Pingclairfile");
+    let updated = std::fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("first-client-ca.pem", "second-client-ca.pem");
+    std::fs::write(&config_path, updated).unwrap();
+    let status = std::process::Command::new("kill")
+        .args(["-USR1", &server.process.id().to_string()])
+        .status()
+        .expect("kill must run");
+    assert!(status.success());
+    let mut reloaded = false;
+    for _ in 0..50 {
+        let output = std::fs::read_to_string(&server.stdout_path).unwrap_or_default();
+        if output.contains("Configuration reload completed successfully") {
+            reloaded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(reloaded, "signal reload did not publish the new CA");
+
+    let outcomes = tokio::task::spawn_blocking(move || {
+        (
+            mutual_tls_attempt(
+                address,
+                "secure.test",
+                "secure.test",
+                Some((&first_cert, &first_key)),
+            ),
+            mutual_tls_attempt(
+                address,
+                "secure.test",
+                "secure.test",
+                Some((&second_cert, &second_key)),
+            ),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(outcomes.0, MutualTlsOutcome::HandshakeRejected);
+    assert_eq!(outcomes.1, MutualTlsOutcome::Status(200));
+}
+
+/// 🚫 Enabling mTLS on a resumable listener is explicitly restart-required.
+#[tokio::test]
+async fn test_admin_load_rejects_hot_enabling_client_auth() {
+    let authority = TestAuthority::new("Client CA");
+    let (server_cert, server_key) = authority.issue(&["secure.test"]);
+    let material = tempfile::tempdir().expect("certificate material dir");
+    let cert_path = material.path().join("server.pem");
+    let key_path = material.path().join("server.key");
+    let ca_path = material.path().join("client-ca.pem");
+    std::fs::write(&cert_path, server_cert).unwrap();
+    std::fs::write(&key_path, server_key).unwrap();
+    std::fs::write(&ca_path, &authority.ca_pem).unwrap();
+    let config = format!(
+        r#"
+        {{
+            admin __PINGCLAIR_TEST_ADMIN_LISTEN__
+            auto_https off
+        }}
+        https://secure.test:__PINGCLAIR_TEST_PORT__ {{
+            tls {{
+                cert {cert}
+                key {key}
+            }}
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "open"
+        }}
+        "#,
+        cert = cert_path.to_string_lossy(),
+        key = key_path.to_string_lossy(),
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_tls_ready("secure.test").await);
+    let address = server.address(0);
+    let client = no_proxy_client();
+    let mut document = client
+        .get(server.admin_url("/config"))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    document["servers"][0]["tls"]["client_auth"] = serde_json::json!({
+        "mode": "require_and_verify",
+        "trust_pool": {"provider": "file", "pem_files": [ca_path.to_string_lossy()]}
+    });
+    let response = client
+        .post(server.admin_url("/load"))
+        .json(&document)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    let refusal = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(refusal["restart_required"], true);
+    assert!(
+        !server._temp_dir.path().join("tls/autosave.json").exists(),
+        "a restart-required security change must not be autosaved"
+    );
+    let outcome = tokio::task::spawn_blocking(move || {
+        mutual_tls_attempt(address, "secure.test", "secure.test", None)
+    })
+    .await
+    .unwrap();
+    assert_eq!(outcome, MutualTlsOutcome::Status(200));
 }
 
 /// 🪪 `require_and_verify` has to mean all three of its words.

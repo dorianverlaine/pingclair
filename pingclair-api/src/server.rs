@@ -3,7 +3,6 @@
 
 //! Admin API Server
 
-use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -21,46 +20,164 @@ use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
-use pingclair_core::config::PingclairConfig;
+use pingclair_core::config::{AdminConfig, PingclairConfig};
 
 use crate::auth::{ApiKeyAuth, AuthDecision, OriginPolicy, authorize, origin_allowed};
 use crate::config_tree::{self, Mode, TreeError};
 
 /// 🧭 Shared state for one admin server connection.
 struct AdminState {
-    proxies:
-        Arc<RwLock<std::collections::HashMap<String, pingclair_proxy::server::PingclairProxy>>>,
     document: Arc<RwLock<Value>>,
     shutdown: Arc<Notify>,
     autosave: Option<PathBuf>,
-    listeners: Option<Arc<dyn pingclair_proxy::server::DynamicListeners>>,
-    api_changed: Arc<AtomicBool>,
+    publisher: Option<Arc<dyn pingclair_proxy::server::ConfigPublisher>>,
+    policy: Arc<AdminPolicy>,
+}
+
+/// 🔐 One immutable Admin access-policy generation.
+struct AdminPolicySnapshot {
+    enabled: bool,
     auth: Option<Arc<ApiKeyAuth>>,
     origins: Arc<OriginPolicy>,
+    revision: u64,
+}
+
+/// 🔐 A prepared Admin policy that has not been published yet.
+pub struct PreparedAdminPolicy {
+    snapshot: Arc<AdminPolicySnapshot>,
+}
+
+/// 🔐 Publishes API keys, origins, and disablement as one request-time snapshot.
+///
+/// Connections do not capture this policy. Every request loads it immediately
+/// before authorization, so a key rotation also applies to the next request on
+/// an already-open HTTP connection.
+pub struct AdminPolicy {
+    bound_listen: String,
+    listener_available: bool,
+    current: RwLock<Arc<AdminPolicySnapshot>>,
+    publishing: AtomicBool,
+}
+
+impl AdminPolicy {
+    /// 🏗️ Creates the policy installed before the Admin listener accepts traffic.
+    pub fn new(
+        bound_listen: String,
+        config: Option<&AdminConfig>,
+        listener_available: bool,
+    ) -> Self {
+        let enabled = config.is_some_and(|admin| admin.enabled) && listener_available;
+        let auth = config
+            .and_then(|admin| admin.api_key.as_ref())
+            .map(|key| Arc::new(ApiKeyAuth::new(key.clone())));
+        let origins = Arc::new(OriginPolicy {
+            allowed: config
+                .map(|admin| admin.origins.clone())
+                .unwrap_or_default(),
+            enforce: config.is_some_and(|admin| admin.enforce_origin),
+            listen: bound_listen.clone(),
+        });
+        Self {
+            bound_listen,
+            listener_available,
+            current: RwLock::new(Arc::new(AdminPolicySnapshot {
+                enabled,
+                auth,
+                origins,
+                revision: 0,
+            })),
+            publishing: AtomicBool::new(false),
+        }
+    }
+
+    /// 🧪 Builds the next policy without changing what any request sees.
+    pub fn prepare(
+        &self,
+        config: Option<&AdminConfig>,
+    ) -> Result<PreparedAdminPolicy, pingclair_proxy::server::ConfigApplyError> {
+        let enabled = config.is_some_and(|admin| admin.enabled);
+        if enabled && !self.listener_available {
+            return Err(pingclair_proxy::server::ConfigApplyError::restart_required(
+                "enabling the Admin API requires a restart because no Admin listener was started",
+            ));
+        }
+        if let Some(admin) = config
+            && admin.listen != self.bound_listen
+        {
+            return Err(pingclair_proxy::server::ConfigApplyError::restart_required(
+                format!(
+                    "changing the Admin listen address from {} to {} requires a restart",
+                    self.bound_listen, admin.listen
+                ),
+            ));
+        }
+
+        let current_revision = self.current.read().revision;
+        let auth = config
+            .and_then(|admin| admin.api_key.as_ref())
+            .map(|key| Arc::new(ApiKeyAuth::new(key.clone())));
+        let origins = Arc::new(OriginPolicy {
+            allowed: config
+                .map(|admin| admin.origins.clone())
+                .unwrap_or_default(),
+            enforce: config.is_some_and(|admin| admin.enforce_origin),
+            listen: self.bound_listen.clone(),
+        });
+        Ok(PreparedAdminPolicy {
+            snapshot: Arc::new(AdminPolicySnapshot {
+                enabled,
+                auth,
+                origins,
+                revision: current_revision.wrapping_add(1),
+            }),
+        })
+    }
+
+    /// 📣 Publishes a policy only after the data-plane transaction is ready.
+    pub fn publish(&self, prepared: PreparedAdminPolicy) {
+        *self.current.write() = prepared.snapshot;
+    }
+
+    /// 🔢 Returns the access-policy generation used to authorize new requests.
+    pub fn revision(&self) -> u64 {
+        self.current.read().revision
+    }
+
+    /// 🚦 Refuses new Admin requests while the complete transaction publishes.
+    pub fn begin_publish(&self) {
+        self.publishing.store(true, Ordering::Release);
+    }
+
+    /// 🚦 Reopens Admin only after data-plane and document state agree.
+    pub fn finish_publish(&self) {
+        self.publishing.store(false, Ordering::Release);
+    }
+
+    /// 🚧 Reports whether Admin access is between complete generations.
+    pub fn is_publishing(&self) -> bool {
+        self.publishing.load(Ordering::Acquire)
+    }
+
+    fn snapshot(&self) -> Arc<AdminPolicySnapshot> {
+        Arc::clone(&self.current.read())
+    }
 }
 
 /// 🧭 Everything the admin server needs beyond its socket address.
 pub struct AdminServerOptions {
-    pub proxies:
-        Arc<RwLock<std::collections::HashMap<String, pingclair_proxy::server::PingclairProxy>>>,
     pub document: Arc<RwLock<Value>>,
     pub shutdown: Arc<Notify>,
     pub autosave: Option<PathBuf>,
-    pub listeners: Option<Arc<dyn pingclair_proxy::server::DynamicListeners>>,
-    pub api_changed: Arc<AtomicBool>,
-    pub api_key: Option<String>,
-    pub origins: Vec<String>,
-    pub enforce_origin: bool,
+    pub publisher: Option<Arc<dyn pingclair_proxy::server::ConfigPublisher>>,
+    pub policy: Arc<AdminPolicy>,
 }
 
 /// 🧭 Read-only context threaded through the config mutation helpers.
 struct ApplyContext<'a> {
     document: &'a Arc<RwLock<Value>>,
-    proxies:
-        &'a Arc<RwLock<std::collections::HashMap<String, pingclair_proxy::server::PingclairProxy>>>,
     autosave: Option<&'a Path>,
-    listeners: Option<&'a dyn pingclair_proxy::server::DynamicListeners>,
-    changed: &'a AtomicBool,
+    publisher: Option<&'a dyn pingclair_proxy::server::ConfigPublisher>,
+    authorized_revision: u64,
 }
 
 /// Run the admin server
@@ -72,13 +189,8 @@ pub async fn run_admin_server(
         .await
         .map_err(|e| pingclair_core::Error::Server(format!("Failed to bind admin API: {e}")))?;
 
-    let origins = Arc::new(OriginPolicy {
-        allowed: options.origins,
-        enforce: options.enforce_origin,
-        listen: addr.to_string(),
-    });
-    let auth = options.api_key.map(|key| Arc::new(ApiKeyAuth::new(key)));
-    if auth.is_none() {
+    let initial_policy = options.policy.snapshot();
+    if initial_policy.auth.is_none() {
         tracing::warn!(
             "⚠️  Admin API is running WITHOUT authentication: no `api_key` configured. \
              Only loopback clients are allowed; set `admin.api_key` to enable remote access."
@@ -98,14 +210,11 @@ pub async fn run_admin_server(
 
         let io = TokioIo::new(stream);
         let state = Arc::new(AdminState {
-            proxies: options.proxies.clone(),
             document: options.document.clone(),
             shutdown: options.shutdown.clone(),
             autosave: options.autosave.clone(),
-            listeners: options.listeners.clone(),
-            api_changed: options.api_changed.clone(),
-            auth: auth.clone(),
-            origins: origins.clone(),
+            publisher: options.publisher.clone(),
+            policy: options.policy.clone(),
         });
 
         tokio::task::spawn(async move {
@@ -146,19 +255,36 @@ async fn handle_request_inner(
     state: &AdminState,
     peer_addr: SocketAddr,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let proxies = &state.proxies;
     let document = &state.document;
     let shutdown = &state.shutdown;
     let autosave = state.autosave.as_deref();
-    let listeners = state.listeners.as_deref();
-    let changed = state.api_changed.as_ref();
-    let auth = state.auth.as_deref();
+    let publisher = state.publisher.as_deref();
+    if state.policy.is_publishing() {
+        return Ok(response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"configuration publication in progress"}"#,
+        ));
+    }
+    let access_policy = state.policy.snapshot();
+    // 🚧 Recheck after loading the snapshot so a publication that began
+    // between the first gate read and this load cannot admit an Admin request.
+    if state.policy.is_publishing() {
+        return Ok(response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"configuration publication in progress"}"#,
+        ));
+    }
+    if !access_policy.enabled {
+        return Ok(response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"admin API disabled by the active configuration"}"#,
+        ));
+    }
     let ctx = ApplyContext {
         document,
-        proxies,
         autosave,
-        listeners,
-        changed,
+        publisher,
+        authorized_revision: access_policy.revision,
     };
     let authorization = req
         .headers()
@@ -173,14 +299,14 @@ async fn handle_request_inner(
         .headers()
         .get(hyper::header::ORIGIN)
         .and_then(|v| v.to_str().ok());
-    if !origin_allowed(&state.origins, origin, peer_addr.ip()) {
+    if !origin_allowed(&access_policy.origins, origin, peer_addr.ip()) {
         return Ok(response(
             StatusCode::FORBIDDEN,
             r#"{"error":"origin not allowed"}"#,
         ));
     }
 
-    match authorize(auth, authorization, peer_addr.ip()) {
+    match authorize(access_policy.auth.as_deref(), authorization, peer_addr.ip()) {
         AuthDecision::Allowed => {}
         AuthDecision::Unauthorized => {
             return Ok(response(
@@ -387,14 +513,13 @@ async fn handle_request_inner(
                 ));
             }
 
-            // 📤 `commit_document` creates listeners named in the document at
-            // runtime and applies whole-document replacement semantics, so
-            // `/load` behaves like Caddy's endpoint instead of duplicating a
-            // narrower apply path.
+            // 📤 `commit_document` reaches the same prepared publisher as a
+            // signal reload. Listener topology changes are rejected as
+            // restart-required until TCP, QUIC, and TLS can be rebuilt as one
+            // transaction.
             let value = serde_json::to_value(&config).unwrap_or_default();
-            match commit_document(&value, proxies, listeners) {
+            match commit_document(&value, publisher, access_policy.revision) {
                 Ok(()) => {
-                    changed.store(true, Ordering::SeqCst);
                     *document.write() = value;
                     if let Some(path) = autosave {
                         autosave_document(document, path);
@@ -557,9 +682,8 @@ async fn apply_full_document(
     ctx: &ApplyContext<'_>,
     value: Value,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    match commit_document(&value, ctx.proxies, ctx.listeners) {
+    match commit_document(&value, ctx.publisher, ctx.authorized_revision) {
         Ok(()) => {
-            ctx.changed.store(true, Ordering::SeqCst);
             *ctx.document.write() = value;
             if let Some(path) = ctx.autosave {
                 autosave_document(ctx.document, path);
@@ -689,9 +813,8 @@ async fn apply_segments(
             StatusCode::BAD_REQUEST,
             &format!(r#"{{"error":"{}"}}"#, TreeError::Invalid(reason).message()),
         )),
-        Ok(()) => match commit_document(&next, ctx.proxies, ctx.listeners) {
+        Ok(()) => match commit_document(&next, ctx.publisher, ctx.authorized_revision) {
             Ok(()) => {
-                ctx.changed.store(true, Ordering::SeqCst);
                 *ctx.document.write() = next;
                 if let Some(path) = ctx.autosave {
                     autosave_document(ctx.document, path);
@@ -717,18 +840,15 @@ fn autosave_document(document: &Arc<RwLock<Value>>, path: &Path) {
     }
 }
 
-/// 🛡️ Parses, validates, and applies a document to the listeners.
+/// 🛡️ Parses, validates, and publishes one complete control-plane document.
 ///
-/// Listeners the document names that are not bound yet are created at runtime
-/// when a dynamic-listener manager is available, matching Caddy's `/load`.
-/// After a successful apply, listeners the new document no longer mentions
-/// are stopped (dynamic) or emptied (startup sockets Pingora cannot close).
+/// Every mutation requires the same publisher as signal reload. An embedding
+/// without that runtime owner remains read-only instead of reporting success
+/// after publishing only a subset of security policy.
 fn commit_document(
     next: &Value,
-    proxies: &Arc<
-        RwLock<std::collections::HashMap<String, pingclair_proxy::server::PingclairProxy>>,
-    >,
-    listeners: Option<&dyn pingclair_proxy::server::DynamicListeners>,
+    publisher: Option<&dyn pingclair_proxy::server::ConfigPublisher>,
+    expected_admin_revision: u64,
 ) -> Result<(), (StatusCode, String)> {
     let config: PingclairConfig = serde_json::from_value(next.clone())
         .map_err(|error| (StatusCode::BAD_REQUEST, format!("Invalid config: {error}")))?;
@@ -736,96 +856,36 @@ fn commit_document(
         return Err((StatusCode::BAD_REQUEST, format!("Invalid config: {error}")));
     }
 
-    // 🧭 Whole-document replacement semantics: every address the document
-    // names must exist before anything is applied.
-    let desired: HashSet<String> = config
-        .servers
-        .iter()
-        .flat_map(|server| server.listen.iter().cloned())
-        .collect();
-    let mut started: Vec<String> = Vec::new();
-    for server in &config.servers {
-        if server.listen.is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                r#"{"error":"a server declares no listen address"}"#.to_string(),
-            ));
-        }
-        for addr in &server.listen {
-            if !proxies.read().contains_key(addr) {
-                let Some(listeners) = listeners else {
-                    return Err((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!(
-                            "listener {addr} is not bound and runtime listener creation is unavailable"
-                        ),
-                    ));
-                };
-                if let Err(error) = listeners.start_listener(addr, server) {
-                    for started_addr in &started {
-                        listeners.stop_listener(started_addr);
-                    }
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        format!("failed to create listener {addr}: {error}"),
-                    ));
-                }
-                started.push(addr.clone());
-            }
-        }
-    }
+    let publisher = publisher.ok_or_else(|| {
+        config_apply_response(pingclair_proxy::server::ConfigApplyError::unavailable(
+            "configuration mutation is unavailable without a complete runtime publisher",
+        ))
+    })?;
+    publisher
+        .publish_config(&config, Some(expected_admin_revision))
+        .map(|_| ())
+        .map_err(config_apply_response)
+}
 
-    // 🧭 Resolve every target before touching any of them, so a half-applied
-    // state is impossible.
-    {
-        let proxies_guard = proxies.read();
-        let mut targets = Vec::new();
-        for server in &config.servers {
-            for addr in &server.listen {
-                match proxies_guard.get(addr) {
-                    Some(proxy) => targets.push((addr, server, proxy)),
-                    None => {
-                        if let Some(listeners) = listeners {
-                            for started_addr in &started {
-                                listeners.stop_listener(started_addr);
-                            }
-                        }
-                        return Err((
-                            StatusCode::NOT_FOUND,
-                            format!(
-                                r#"{{"error":"no listener is bound to {addr}; nothing was applied"}}"#
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-        for (addr, server, proxy) in targets {
-            proxy.add_server(server.clone());
-            tracing::info!(listener = %addr, "♻️ Applied config document");
-        }
-    }
+/// 🚫 Maps runtime publication failures to stable Admin API responses.
+fn config_apply_response(error: pingclair_proxy::server::ConfigApplyError) -> (StatusCode, String) {
+    use pingclair_proxy::server::ConfigApplyErrorKind;
 
-    // 🧭 Whole-document replacement: remove (dynamic) or empty (startup)
-    // listeners the new document no longer mentions.
-    if let Some(listeners) = listeners {
-        let existing: Vec<String> = proxies.read().keys().cloned().collect();
-        for addr in existing {
-            if desired.contains(&addr) {
-                continue;
-            }
-            if listeners.is_dynamic(&addr) {
-                listeners.stop_listener(&addr);
-            } else if let Some(proxy) = proxies.read().get(&addr) {
-                proxy.update_config(Vec::new());
-                tracing::info!(
-                    "🧹 Emptied startup listener {} (a restart is required to close the socket)",
-                    addr
-                );
-            }
+    let status = match error.kind {
+        ConfigApplyErrorKind::Invalid => StatusCode::BAD_REQUEST,
+        ConfigApplyErrorKind::RestartRequired | ConfigApplyErrorKind::StaleAuthorization => {
+            StatusCode::CONFLICT
         }
+        ConfigApplyErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    let mut body = serde_json::json!({ "error": error.message });
+    if error.kind == ConfigApplyErrorKind::RestartRequired {
+        body["restart_required"] = Value::Bool(true);
     }
-    Ok(())
+    if error.kind == ConfigApplyErrorKind::StaleAuthorization {
+        body["reauthenticate"] = Value::Bool(true);
+    }
+    (status, body.to_string())
 }
 
 /// 🧱 Largest configuration document the Admin API will read into memory.

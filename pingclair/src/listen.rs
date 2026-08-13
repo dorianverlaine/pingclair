@@ -213,6 +213,7 @@ pub(crate) fn explicit_http_names(
 /// it — the reload reported success while behavior stayed frozen.
 pub(crate) fn servers_by_bind_address(
     config: &pingclair_core::config::PingclairConfig,
+    automatic_http_available: bool,
 ) -> HashMap<String, Vec<pingclair_core::config::ServerConfig>> {
     let http_port = config.global.http_port;
     let https_port = config.global.https_port;
@@ -244,14 +245,19 @@ pub(crate) fn servers_by_bind_address(
                 .or_default()
                 .push(server.clone());
         }
-        if let Some(companion) = automatic_http_companion(
-            server,
-            config.global.auto_https.clone(),
-            &addrs,
-            &explicit_http_names,
-            http_port,
-            https_port,
-        ) {
+        if let Some(companion) = automatic_http_available
+            .then(|| {
+                automatic_http_companion(
+                    server,
+                    config.global.auto_https.clone(),
+                    &addrs,
+                    &explicit_http_names,
+                    http_port,
+                    https_port,
+                )
+            })
+            .flatten()
+        {
             let addr = format!("[::]:{http_port}");
             by_port.entry(addr).or_default().push(companion);
         }

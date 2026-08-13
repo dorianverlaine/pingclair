@@ -49,14 +49,17 @@
 //! re-runs any of this. Both listeners therefore turn resumption off when a
 //! policy is present — see the notes in `run.rs` and `quic.rs`.
 
+use arc_swap::ArcSwap;
 use boring::error::ErrorStack;
-use boring::ssl::{SslAlert, SslRef, SslVerifyError, SslVerifyMode};
+use boring::ex_data::Index;
+use boring::ssl::{Ssl, SslAlert, SslRef, SslVerifyError, SslVerifyMode};
 use boring::stack::Stack;
 use boring::x509::store::{X509Store, X509StoreBuilder};
 use boring::x509::{X509, X509StoreContext};
 use pingclair_core::config::{ClientAuthConfig, ClientAuthMode, TrustPool};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use base64::Engine as _;
 
@@ -276,6 +279,149 @@ impl ClientAuthTable {
     pub fn is_empty(&self) -> bool {
         self.exact.is_empty() && self.wildcards.is_empty() && self.fallback.is_none()
     }
+}
+
+/// 🪪 One immutable listener-security generation used by every TLS transport.
+///
+/// The table and revision travel together so a connection cannot be admitted
+/// under one trust pool and later be mistaken for a connection admitted under
+/// another. Reload publishes a new generation only after every trust source
+/// has compiled successfully.
+#[derive(Debug)]
+pub struct ListenerSecuritySnapshot {
+    client_auth: Arc<ClientAuthTable>,
+    revision: u64,
+}
+
+impl ListenerSecuritySnapshot {
+    /// 🗺️ Returns the precompiled SNI-to-client-auth table for this generation.
+    pub fn client_auth(&self) -> &ClientAuthTable {
+        &self.client_auth
+    }
+
+    /// 🔢 Returns the generation recorded on a connection at its handshake.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+
+/// 🔐 Publishes one listener's handshake policy to H1, H2, and H3 together.
+///
+/// A short publication gate refuses new handshakes and requests while routing
+/// and TLS snapshots are swapped. Connections that began before the gate carry
+/// the old revision and are refused after it, so a trust-pool rotation cannot
+/// leave a keep-alive or QUIC connection authorised by stale credentials.
+pub struct PublishedListenerPolicy {
+    current: ArcSwap<ListenerSecuritySnapshot>,
+    publishing: AtomicBool,
+    client_auth_reload_capable: bool,
+}
+
+impl std::fmt::Debug for PublishedListenerPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PublishedListenerPolicy")
+            .field("revision", &self.revision())
+            .field("publishing", &self.is_publishing())
+            .field(
+                "client_auth_reload_capable",
+                &self.client_auth_reload_capable,
+            )
+            .finish()
+    }
+}
+
+impl PublishedListenerPolicy {
+    /// 🏗️ Creates the generation installed before the listener begins serving.
+    pub fn new(client_auth: Arc<ClientAuthTable>) -> Self {
+        let client_auth_reload_capable = !client_auth.is_empty();
+        Self {
+            current: ArcSwap::from_pointee(ListenerSecuritySnapshot {
+                client_auth,
+                revision: 0,
+            }),
+            publishing: AtomicBool::new(false),
+            client_auth_reload_capable,
+        }
+    }
+
+    /// 🚦 Closes the listener's publication gate before any snapshot changes.
+    pub fn begin_publish(&self) {
+        self.publishing.store(true, Ordering::Release);
+    }
+
+    /// 🚦 Reopens the listener after every routing and TLS snapshot is live.
+    pub fn finish_publish(&self) {
+        self.publishing.store(false, Ordering::Release);
+    }
+
+    /// 🚧 Reports whether the listener is between two complete generations.
+    pub fn is_publishing(&self) -> bool {
+        self.publishing.load(Ordering::Acquire)
+    }
+
+    /// 🔁 Reports whether resumption was disabled when this TLS context began.
+    ///
+    /// Enabling mTLS later is unsafe when the original context issued tickets:
+    /// a resumed handshake sends no `CertificateRequest`. Such a change is
+    /// therefore restart-required instead of being accepted without effect.
+    pub fn client_auth_reload_capable(&self) -> bool {
+        self.client_auth_reload_capable
+    }
+
+    /// 🪪 Reports whether the active generation asks any client for a certificate.
+    pub fn requires_client_auth(&self) -> bool {
+        !self.current.load().client_auth.is_empty()
+    }
+
+    /// 🔢 Returns the currently published listener-security generation.
+    pub fn revision(&self) -> u64 {
+        self.current.load().revision
+    }
+
+    /// 🤝 Loads one complete generation for a new handshake.
+    ///
+    /// `None` means publication is in progress; callers must fail the
+    /// handshake closed rather than fall back to a certificate-only context.
+    pub fn handshake_snapshot(&self) -> Option<Arc<ListenerSecuritySnapshot>> {
+        if self.is_publishing() {
+            None
+        } else {
+            Some(self.current.load_full())
+        }
+    }
+
+    /// 📣 Publishes a fully compiled client-auth table as the next generation.
+    pub fn publish_client_auth(&self, client_auth: Arc<ClientAuthTable>) {
+        let revision = self.current.load().revision.wrapping_add(1);
+        self.current.store(Arc::new(ListenerSecuritySnapshot {
+            client_auth,
+            revision,
+        }));
+    }
+}
+
+/// 🧷 BoringSSL slot carrying the listener-security generation through TLS.
+static LISTENER_SECURITY_REVISION_INDEX: OnceLock<Result<Index<Ssl, u64>, String>> =
+    OnceLock::new();
+
+fn listener_security_revision_index() -> Result<Index<Ssl, u64>, String> {
+    LISTENER_SECURITY_REVISION_INDEX
+        .get_or_init(|| Ssl::new_ex_index().map_err(|error| error.to_string()))
+        .clone()
+}
+
+/// 🧷 Records which listener-security generation admitted this connection.
+pub fn record_listener_security_revision(ssl: &mut SslRef, revision: u64) -> Result<(), String> {
+    let index = listener_security_revision_index()?;
+    ssl.set_ex_data(index, revision);
+    Ok(())
+}
+
+/// 🔎 Reads the listener-security generation recorded during the handshake.
+pub fn listener_security_revision(ssl: &SslRef) -> Option<u64> {
+    let index = listener_security_revision_index().ok()?;
+    ssl.ex_data(index).copied()
 }
 
 /// 🔗 Builds a trust path for the client's leaf using the certificates it sent.

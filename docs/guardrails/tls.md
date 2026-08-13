@@ -163,6 +163,14 @@
   `set_select_certificate_callback`——**QUIC 根本不跑 `cert_cb`**。
   兩邊都在「ClientHello 已知、`CertificateRequest` 未送」的那個窗口裡，
   所以同一份 `CompiledClientAuth` 可以直接掛上去。
+
+- 🔄 **mTLS trust pool reload 必須帶 generation，不是只換 callback。**
+  TCP keep-alive 與 QUIC 連線可以在 reload 前已完成握手；只讓新握手讀新
+  CA，就會讓舊憑證繼續在既有連線上授權。握手必須記住
+  listener-security generation，request 時與現行 generation 比對；不一致就回
+  `421` 並要求重新連線。啟動時沒有 mTLS 的 TLS context 已可能發出可
+  resume 的 ticket，所以後來啟用 mTLS 必須回 `restart_required`，不可假裝
+  hot-apply。
   📌 政策編譯層因此住在 `pingclair-proxy/src/client_auth.rs` 而不是 binary 裡：
   只在一個 transport 上成立的安全開關，等於給攻擊者一個「換傳輸」的選項，
   而 `Alt-Svc` 還會主動邀請他們換。
