@@ -808,19 +808,26 @@ utilise ne démarre pas.
 
 Directives :
 
-  `acme_server` `copy_response` `copy_response_headers` `fs`
-  `intercept` `invoke` `log_append` `log_name`
-  `map` `push` `skip_log`
-  `tracing`
+  `copy_response` `copy_response_headers` `fs` `invoke`
+  `log_append` `log_name` `map` `push`
+  `skip_log` `tracing`
 
 Options globales :
 
-  `acme_ca` `acme_ca_root` `acme_dns` `acme_eab`
-  `cert_issuer` `cert_lifetime` `default_sni` `dns`
-  `ech` `events` `fallback_sni` `filesystem`
-  `frankenphp` `key_type` `ocsp_interval` `ocsp_stapling`
-  `on_demand_tls` `pki` `renew_interval` `shutdown_delay`
-  `skip_install_trust` `storage` `storage_clean_interval`
+  `acme_ca` `acme_ca_root` `acme_eab` `cert_issuer`
+  `cert_lifetime` `ech` `events` `fallback_sni`
+  `filesystem` `frankenphp` `key_type` `ocsp_interval`
+  `ocsp_stapling` `on_demand_tls` `renew_interval` `shutdown_delay`
+  `storage` `storage_clean_interval`
+
+Deux noms se situent entre les listes ci-dessus et la prise en charge complète,
+et sont donc nommés ici plutôt que dans l'une ou l'autre. `pki` et
+`acme_server` s'analysent, se valident et se sérialisent — une configuration
+qui les contient se charge et s'exécute — mais Pingclair n'agira pas comme
+autorité de certification pour d'autres clients, et le dit au lieu de n'émettre
+silencieusement rien. `dns` et `acme_dns` sont implémentés pour Cloudflare ;
+tout autre nom de fournisseur est refusé au démarrage plutôt qu'accepté et
+ignoré.
 
 Trois conséquences méritent d'être énoncées franchement, car elles décident si
 Pingclair convient, plutôt que d'être des détails découverts plus tard :

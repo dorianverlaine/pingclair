@@ -216,6 +216,20 @@ pub fn recognised_but_unimplemented() -> impl Iterator<Item = &'static str> {
         .map(|spec| spec.name)
 }
 
+/// ✅ Every directive and global option this crate implements, in table order.
+///
+/// 📌 The counterpart of [`recognised_but_unimplemented`], and exposed for the
+/// same reason read from the other end: a limits list goes stale in *both*
+/// directions, and only one of them was being checked. It kept naming seven
+/// working features as unsupported, in three languages, until 2026-08-13.
+pub fn implemented_names() -> impl Iterator<Item = &'static str> {
+    DIRECTIVES
+        .iter()
+        .chain(GLOBAL_OPTIONS.iter())
+        .filter(|spec| spec.support == Support::Implemented)
+        .map(|spec| spec.name)
+}
+
 /// Looks a global-block option up by name.
 pub(super) fn global_option(name: &str) -> Option<&'static Spec> {
     GLOBAL_OPTIONS.iter().find(|spec| spec.name == name)

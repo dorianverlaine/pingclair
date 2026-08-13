@@ -743,19 +743,23 @@ Pingclair 對外宣稱相容 Caddyfile，那麼這個宣稱誠實的另一半，
 
 Directive：
 
-  `acme_server` `copy_response` `copy_response_headers` `fs`
-  `intercept` `invoke` `log_append` `log_name`
-  `map` `push` `skip_log`
-  `tracing`
+  `copy_response` `copy_response_headers` `fs` `invoke`
+  `log_append` `log_name` `map` `push`
+  `skip_log` `tracing`
 
 全域選項：
 
-  `acme_ca` `acme_ca_root` `acme_dns` `acme_eab`
-  `cert_issuer` `cert_lifetime` `default_sni` `dns`
-  `ech` `events` `fallback_sni` `filesystem`
-  `frankenphp` `key_type` `ocsp_interval` `ocsp_stapling`
-  `on_demand_tls` `pki` `renew_interval` `shutdown_delay`
-  `skip_install_trust` `storage` `storage_clean_interval`
+  `acme_ca` `acme_ca_root` `acme_eab` `cert_issuer`
+  `cert_lifetime` `ech` `events` `fallback_sni`
+  `filesystem` `frankenphp` `key_type` `ocsp_interval`
+  `ocsp_stapling` `on_demand_tls` `renew_interval` `shutdown_delay`
+  `storage` `storage_clean_interval`
+
+有兩個名字落在「上面兩張清單」與「完整支援」之間，所以寫在這裡而不是塞進任何一張。
+`pki` 與 `acme_server` 能解析、能驗證、能序列化——帶著它們的設定載入得了也跑得起來
+——但 Pingclair **不會**作為憑證機構對其他客戶端簽發憑證，而且它會明說，不會安靜地
+什麼都不簽。`dns` 與 `acme_dns` 只實作了 Cloudflare；其餘 provider 名稱在啟動時
+指名拒絕，不會被收下然後忽略。
 
 其中三件值得直接講明白，因為它們決定的是「Pingclair 適不適合你」，
 而不是之後才會踩到的細節：

@@ -790,19 +790,24 @@ typo and never quietly ignored. A configuration using them does not start.
 
 Directives:
 
-  `acme_server` `copy_response` `copy_response_headers` `fs`
-  `intercept` `invoke` `log_append` `log_name`
-  `map` `push` `skip_log`
-  `tracing`
+  `copy_response` `copy_response_headers` `fs` `invoke`
+  `log_append` `log_name` `map` `push`
+  `skip_log` `tracing`
 
 Global options:
 
-  `acme_ca` `acme_ca_root` `acme_dns` `acme_eab`
-  `cert_issuer` `cert_lifetime` `default_sni` `dns`
-  `ech` `events` `fallback_sni` `filesystem`
-  `frankenphp` `key_type` `ocsp_interval` `ocsp_stapling`
-  `on_demand_tls` `pki` `renew_interval` `shutdown_delay`
-  `skip_install_trust` `storage` `storage_clean_interval`
+  `acme_ca` `acme_ca_root` `acme_eab` `cert_issuer`
+  `cert_lifetime` `ech` `events` `fallback_sni`
+  `filesystem` `frankenphp` `key_type` `ocsp_interval`
+  `ocsp_stapling` `on_demand_tls` `renew_interval` `shutdown_delay`
+  `storage` `storage_clean_interval`
+
+Two names sit between the lists above and full support, so they are named here
+rather than in either. `pki` and `acme_server` parse, validate and serialize —
+a configuration carrying them loads and runs — but Pingclair will not act as a
+certificate authority for other clients, and says so instead of silently
+issuing nothing. `dns` and `acme_dns` are implemented for Cloudflare; any other
+provider name is refused at startup rather than accepted and ignored.
 
 Three consequences worth stating plainly, because they decide whether
 Pingclair fits at all rather than being details you discover later:

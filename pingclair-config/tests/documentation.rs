@@ -189,3 +189,68 @@ fn the_readme_limits_match_the_registry() {
         missing.join("\n  ")
     );
 }
+
+/// 🚩 And nothing the parser implements may still be listed as unsupported.
+///
+/// 🤡 The doc comment above already named this failure — "the list keeps naming
+/// things that have since been implemented" — and then only checked the other
+/// direction. It drifted exactly as predicted: on 2026-08-13 the lists were
+/// still refusing `acme_server`, `intercept`, `acme_dns`, `default_sni`, `dns`,
+/// `pki` and `skip_install_trust`, all seven of them working, in all three
+/// languages. A test that names a risk it does not cover reads like coverage.
+///
+/// 📏 Unlike its counterpart this one reads the *list block* rather than the
+/// whole file, because an implemented directive is supposed to appear elsewhere
+/// in the README — `intercept` has its own section. The block is found by shape
+/// rather than by heading: an indented line made only of backticked names. That
+/// is the one thing the English, Chinese and French files have in common.
+#[test]
+fn the_readme_limits_do_not_name_implemented_features() {
+    let root = workspace_root();
+    let implemented: std::collections::HashSet<String> =
+        pingclair_config::adapter::implemented_names()
+            .map(str::to_string)
+            .collect();
+
+    let stale: Vec<String> = ["README.md", "README.zh.md", "README.fr.md"]
+        .into_iter()
+        .flat_map(|name| {
+            let markdown = std::fs::read_to_string(root.join(name)).unwrap_or_default();
+            let implemented = implemented.clone();
+            listed_limit_names(&markdown)
+                .into_iter()
+                .filter(move |listed| implemented.contains(listed))
+                .map(move |listed| format!("{name}: `{listed}`"))
+        })
+        .collect();
+
+    assert!(
+        stale.is_empty(),
+        "these are implemented, and the README still lists them as unsupported:\n  {}\n\
+         (remove them from the \"not supported yet\" list)",
+        stale.join("\n  ")
+    );
+}
+
+/// 🧭 The names inside the "not supported yet" lists, found by their shape.
+///
+/// A list line is indented and holds nothing but backticked names. Prose
+/// mentioning a directive always has words around it, so it never matches.
+fn listed_limit_names(markdown: &str) -> Vec<String> {
+    markdown
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            line.starts_with("  ")
+                && trimmed.starts_with('`')
+                && trimmed.ends_with('`')
+                && trimmed
+                    .split_whitespace()
+                    .all(|token| token.starts_with('`') && token.ends_with('`') && token.len() > 2)
+        })
+        .flat_map(|line| {
+            line.split_whitespace()
+                .map(|token| token.trim_matches('`').to_string())
+        })
+        .collect()
+}
