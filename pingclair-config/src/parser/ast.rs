@@ -977,6 +977,8 @@ pub struct RetryConfig {
     pub methods: Vec<String>,
     pub path_patterns: Vec<String>,
     pub expressions: Vec<String>,
+    /// 🔁 One predicate per `lb_retry_match`; any of them permits a retry.
+    pub retry_match: Vec<pingclair_core::config::RetryPredicate>,
 }
 
 impl Default for RetryConfig {
@@ -992,6 +994,7 @@ impl Default for RetryConfig {
                 .collect(),
             path_patterns: Vec::new(),
             expressions: Vec::new(),
+            retry_match: Vec::new(),
         }
     }
 }

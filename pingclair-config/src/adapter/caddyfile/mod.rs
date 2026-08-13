@@ -42,6 +42,7 @@ mod matchers;
 mod options;
 mod order;
 pub mod registry;
+mod retry_expr;
 mod reverse_proxy;
 mod sites;
 mod tls;

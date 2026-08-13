@@ -1326,24 +1326,41 @@ fn parse_signed_duration(directive: &Directive) -> Result<i64, AdapterError> {
 
 // MARK: - Retry Match
 
-/// 🔁 Folds one `lb_retry_match` into the route's retry policy.
+/// 🔁 Turns one `lb_retry_match` into one predicate on the route's retry policy.
 ///
-/// Caddy spells the same setting three ways: a bare expression
+/// Three spellings, one meaning: a bare expression
 /// (`lb_retry_match \`{rp.status_code} == 504\``), a named form
-/// (`lb_retry_match expression \`...\`` / `path /foo*`), and a block mixing
-/// `method`, `path`, `header`, and `expression`. Method and path forms map
-/// onto runtime fields; status and method expressions are folded into the
-/// status/method lists; anything the runtime cannot evaluate (response
-/// headers, transport errors, request functions) is kept verbatim in
-/// `expressions` and logged at startup.
+/// (`lb_retry_match expression \`…\`` / `path /foo*`), and a block mixing
+/// `method`, `path`, `header` and `expression`.
+///
+/// 🧭 **Conditions inside one block are AND'd; separate blocks are OR'd.** That
+/// is upstream's model — each `lb_retry_match` compiles to one matcher set and
+/// the sets are alternatives — and getting it wrong is not a subtle
+/// difference. Until 2026-08-13 every block was folded into flat
+/// `methods`/`path_patterns`/`status_codes` lists on the policy, so two blocks
+/// reading "retry POSTs" and "retry anything under /foo" became a single rule
+/// demanding both at once, and a later block's `method` line silently replaced
+/// an earlier one's.
 fn apply_retry_match(retry: &mut RetryConfig, directive: &Directive) -> Result<(), AdapterError> {
-    let mut apply = |kind: &str, args: &[String]| -> Result<(), AdapterError> {
+    let mut conditions: Vec<pingclair_core::config::RetryPredicate> = Vec::new();
+
+    let mut apply = |kind: &str,
+                     args: &[String],
+                     conditions: &mut Vec<pingclair_core::config::RetryPredicate>|
+     -> Result<(), AdapterError> {
+        use pingclair_core::config::RetryPredicate;
         match kind {
             "path" => {
-                let pattern = args.first().ok_or_else(|| {
-                    AdapterError::ArgumentCount("lb_retry_match path".into(), 1, args.len())
-                })?;
-                retry.path_patterns.push(pattern.clone());
+                if args.is_empty() {
+                    return Err(AdapterError::ArgumentCount(
+                        "lb_retry_match path".into(),
+                        1,
+                        0,
+                    ));
+                }
+                conditions.push(RetryPredicate::Path {
+                    any_of: args.to_vec(),
+                });
             }
             "method" => {
                 if args.is_empty() {
@@ -1353,10 +1370,12 @@ fn apply_retry_match(retry: &mut RetryConfig, directive: &Directive) -> Result<(
                         args.len(),
                     ));
                 }
-                retry.methods = args
-                    .iter()
-                    .map(|method| method.to_ascii_uppercase())
-                    .collect();
+                conditions.push(RetryPredicate::Method {
+                    any_of: args
+                        .iter()
+                        .map(|method| method.to_ascii_uppercase())
+                        .collect(),
+                });
             }
             "header" => {
                 if args.len() != 2 {
@@ -1366,15 +1385,16 @@ fn apply_retry_match(retry: &mut RetryConfig, directive: &Directive) -> Result<(
                         args.len(),
                     ));
                 }
-                retry
-                    .expressions
-                    .push(format!("header({{'{}': '{}'}})", args[0], args[1]));
+                conditions.push(RetryPredicate::RequestHeader {
+                    name: args[0].clone(),
+                    any_of: vec![args[1].clone()],
+                });
             }
             "expression" => {
                 let expression = args.first().ok_or_else(|| {
                     AdapterError::ArgumentCount("lb_retry_match expression".into(), 1, args.len())
                 })?;
-                fold_retry_expression(retry, expression);
+                conditions.push(parse_retry_expression(retry, expression)?);
             }
             other => {
                 return Err(AdapterError::InvalidArgument(
@@ -1388,89 +1408,66 @@ fn apply_retry_match(retry: &mut RetryConfig, directive: &Directive) -> Result<(
 
     if let Some(block) = &directive.block {
         for sub in &block.directives {
-            apply(&sub.name, &sub.args)?;
+            apply(&sub.name, &sub.args, &mut conditions)?;
         }
-        return Ok(());
-    }
-
-    // 🧭 One-line spellings: `lb_retry_match <form> <arg>` or a bare CEL
-    // expression when the first argument is not a known form name.
-    if directive.args.len() >= 2
+    } else if directive.args.len() >= 2
         && matches!(
             directive.args[0].as_str(),
             "path" | "method" | "header" | "expression"
         )
     {
-        apply(&directive.args[0], &directive.args[1..])?;
+        // 🧭 One-line named form: `lb_retry_match <form> <arg…>`.
+        apply(&directive.args[0], &directive.args[1..], &mut conditions)?;
     } else if let Some(expression) = directive.args.first() {
-        fold_retry_expression(retry, expression);
+        // 🧭 One-line bare expression, when the first argument is not a form name.
+        conditions.push(parse_retry_expression(retry, expression)?);
     }
-    Ok(())
+
+    match conditions.len() {
+        0 => Err(AdapterError::InvalidArgument(
+            "lb_retry_match".into(),
+            "needs at least one condition; an empty one would permit every retry".into(),
+        )),
+        1 => {
+            retry
+                .retry_match
+                .push(conditions.pop().expect("length checked immediately above"));
+            Ok(())
+        }
+        _ => {
+            retry
+                .retry_match
+                .push(pingclair_core::config::RetryPredicate::All { of: conditions });
+            Ok(())
+        }
+    }
 }
 
-/// 🧾 Folds one CEL retry expression into the mappable fields, keeping the
-/// raw text when the runtime cannot evaluate it.
-fn fold_retry_expression(retry: &mut RetryConfig, raw: &str) {
-    let expression = raw.trim().trim_matches('`');
-    let mut mapped = false;
-
-    if let Some((_, rest)) = expression.split_once("method('")
-        && let Some(method) = rest.split('\'').next()
-    {
-        retry.methods = vec![method.to_ascii_uppercase()];
-        mapped = true;
-    }
-
-    if let Some((_, rest)) = expression.split_once("{rp.status_code} in [") {
-        if let Some(codes) = rest.strip_suffix(']') {
-            retry.status_codes.extend(
-                codes
-                    .split(',')
-                    .filter_map(|code| code.trim().parse::<u16>().ok()),
-            );
-            mapped = true;
-        }
-    } else if let Some((_, rest)) = expression.split_once("{rp.status_code} == ") {
-        if let Some(code) = rest
-            .split_whitespace()
-            .next()
-            .and_then(|code| code.parse::<u16>().ok())
-        {
-            retry.status_codes.push(code);
-            mapped = true;
-        }
-    } else if let Some((_, rest)) = expression.split_once("{rp.status_code} >= ")
-        && let Some(bound) = rest
-            .split_whitespace()
-            .next()
-            .and_then(|code| code.parse::<u16>().ok())
-    {
-        retry.status_codes.extend(bound..=599);
-        mapped = true;
-    }
-
-    // 🧭 A pure status/method expression is fully represented by the folds
-    // above. Anything mentioning response headers, transport errors, or the
-    // request functions stays verbatim so startup can say it is not evaluated.
-    let unmappable = [
-        "{rp.header.",
-        "{rp.is_transport_error",
-        "header(",
-        "query(",
-        "protocol(",
-        "path(",
-        "host(",
-    ]
-    .iter()
-    .any(|needle| expression.contains(needle));
-    if !mapped || unmappable {
-        retry.expressions.push(expression.to_string());
-    }
-    // 🧭 Several expressions may fold the same status ranges (`>= 500` and
-    // `in [502, 503]` overlap); the compiled list stays unique so validation
-    // and runtime selection agree on one set.
-    retry.status_codes.sort_unstable();
-    retry.status_codes.dedup();
+/// 🔁 Parses one retry expression, keeping the original text for diagnostics.
+///
+/// 🚫 A refusal here stops the configuration loading, which is the point. The
+/// previous behaviour — store the text, log once at startup, retry anyway — is
+/// the worst available answer for a directive whose job is to *restrict*
+/// retries: an operator writing one to protect non-idempotent requests got a
+/// server that kept duplicating them.
+fn parse_retry_expression(
+    retry: &mut RetryConfig,
+    expression: &str,
+) -> Result<pingclair_core::config::RetryPredicate, AdapterError> {
+    let predicate = super::retry_expr::parse(expression).map_err(|error| {
+        AdapterError::InvalidArgument(
+            "lb_retry_match expression".into(),
+            format!(
+                "`{}`: {}",
+                expression.trim().trim_matches('`'),
+                error.message
+            ),
+        )
+    })?;
+    retry
+        .expressions
+        .push(expression.trim().trim_matches('`').to_string());
+    Ok(predicate)
 }
 
 /// 🧱 Parses a Caddy buffer size (`4KB`, `10MB`, `unlimited`) into bytes,

@@ -4550,14 +4550,44 @@ async fn reverse_proxy_upstream(
         if let Some(admission) = &mut admission {
             admission.report_status(upstream_status);
         }
-        if crate::retry::permits_status_retry(
+        // 🔁 The same facts and the same predicates the H1/H2 path builds. The
+        // two transports have shipped "fixed, but only on one protocol" often
+        // enough that a policy layer they do not literally share is a defect
+        // waiting to be reported — so the evaluation lives in `retry.rs` and
+        // only the fact-gathering is written twice, because only the
+        // fact-gathering is genuinely transport-shaped.
+        let (path, query) = match effective_uri.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (effective_uri, None),
+        };
+        let facts = crate::retry::AttemptFacts {
+            method: &method,
+            path,
+            host: client_header
+                .uri
+                .host()
+                .or_else(|| {
+                    client_header
+                        .headers
+                        .get(http::header::HOST)
+                        .and_then(|value| value.to_str().ok())
+                })
+                .unwrap_or(""),
+            // 🔐 HTTP/3 only ever runs over QUIC, so the scheme is not in doubt.
+            scheme: "https",
+            query,
+            request_headers: &client_header.headers,
+            status: Some(upstream_status),
+            response_headers: session.response_header().map(|response| &response.headers),
+        };
+        let resolve_regex = |pattern: &str| state.route_regex_arc(route_index, pattern);
+        if crate::retry::permits_retry(
             &retry_policy,
-            &method,
+            &facts,
             counted == 0,
-            effective_uri.split('?').next().unwrap_or(effective_uri),
-            upstream_status,
             attempts,
             retry_deadline,
+            &resolve_regex,
         ) {
             tracing::warn!(
                 status = upstream_status,

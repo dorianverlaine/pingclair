@@ -537,6 +537,31 @@ lets the rest converge.
 
 ### 🐛 Fixed
 
+- 🔁 **`lb_retry_match` decides retries instead of being logged and ignored.**
+  Expressions used to be kept as text, scanned for a few substrings, and
+  announced at startup as "accepted but not evaluated". For a directive whose
+  job is to *restrict* retries that is the worst available answer: someone
+  writing one to stop non-idempotent requests being replayed got a server that
+  kept replaying them, with a single log line as the only warning.
+
+  Two things change for anyone already using it:
+
+  - **Separate `lb_retry_match` blocks are alternatives, not one merged rule.**
+    Each block is now its own condition and any of them permits a retry, with
+    the conditions *inside* one block joined by AND — which is what upstream
+    does. Previously every block was folded into shared `methods`,
+    `path_patterns` and `status_codes` lists, so two blocks reading "retry
+    POSTs" and "retry anything under /foo" became one rule demanding both, and a
+    later block's `method` line silently replaced an earlier one's.
+  - **An expression this server cannot evaluate now fails to load.** Response
+    headers, transport errors, and the `method()`, `path()`, `host()`,
+    `protocol()`, `query()`, `header()`, `path_regexp()` and `header_regexp()`
+    conditions are all evaluated; anything else is refused by name at startup
+    rather than accepted and ignored.
+
+  A request carrying a body is still never replayed, and the attempt cap and
+  deadline still bound every retry, whichever condition matched.
+
 - 🧾 **`health_headers` sends every value written for a header, not one.** The
   block's signature is `<field> [<values...>]`, and three of the four shapes it
   allows were losing data while the configuration compiled: `X-Keys a b` sent

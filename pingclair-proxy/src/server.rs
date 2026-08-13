@@ -1338,14 +1338,6 @@ impl ProxyState {
                         "🧭 Request/response buffer ceilings are informational; bodies always stream"
                     );
                 }
-                if !proxy_config.retry.expressions.is_empty() {
-                    let expressions = &proxy_config.retry.expressions;
-                    tracing::warn!(
-                        route = %route.path,
-                        ?expressions,
-                        "🧭 Retry-match expressions are accepted but not evaluated"
-                    );
-                }
 
                 // 🔐 Compile the route policy before its probe peer so health and
                 // ordinary traffic use identical trust roots, client identity, and SNI.
@@ -6825,14 +6817,47 @@ impl ProxyHttp for PingclairProxy {
         if let Some(admission) = &mut ctx.upstream_admission {
             admission.report_status(status);
         }
-        if crate::retry::permits_status_retry(
+        // 🔁 Built here rather than inside the retry module so every borrow of
+        // `session` ends before the decision is acted on — and built only on
+        // the failure path, which is the only place it is ever asked for.
+        let request_header = session.req_header();
+        let facts = crate::retry::AttemptFacts {
+            method: &method,
+            path: request_header.uri.path(),
+            host: request_header
+                .uri
+                .host()
+                .or_else(|| {
+                    request_header
+                        .headers
+                        .get(http::header::HOST)
+                        .and_then(|value| value.to_str().ok())
+                })
+                .unwrap_or(""),
+            scheme: ctx.request_scheme,
+            query: request_header.uri.query(),
+            request_headers: &request_header.headers,
+            status: Some(status),
+            response_headers: Some(&upstream_response.headers),
+        };
+        let route_index = ctx.route_index;
+        let state = ctx.state.as_ref();
+        // 🔤 Hands out the shared copy compiled at load. Cloning an `Arc` costs
+        // one atomic increment and only happens when a regex predicate is
+        // actually reached; compiling one here would cost microseconds at the
+        // moment an upstream is already failing.
+        let resolve_regex = |pattern: &str| {
+            state
+                .zip(route_index)
+                .and_then(|(state, index)| state.route_regex_arc(index, pattern))
+        };
+        if crate::retry::permits_retry(
             &retry_policy,
-            &method,
+            &facts,
             body_is_empty,
-            session.req_header().uri.path(),
-            status,
             ctx.retry_attempts,
             ctx.retry_deadline,
+            &resolve_regex,
         ) {
             if let Some(upstream) = ctx.upstream.as_ref()
                 && let pingora_core::protocols::l4::socket::SocketAddr::Inet(address) =
@@ -7913,6 +7938,22 @@ fn collect_route_regexes(handler: &HandlerConfig, regexes: &mut HashMap<String, 
                         "Invalid request_header replace regex"
                     ),
                 }
+            }
+        }
+        // 🔁 A retry predicate's regex is compiled here for a sharper reason
+        // than the rest: it is only ever consulted *after* an attempt has
+        // already failed, so compiling it lazily would put the cost exactly
+        // where the machine can least afford it.
+        HandlerConfig::ReverseProxy(proxy) => {
+            for predicate in &proxy.retry.retry_match {
+                predicate.for_each_regex(&mut |pattern| match Regex::new(pattern) {
+                    Ok(regex) => {
+                        regexes.insert(pattern.to_string(), Arc::new(regex));
+                    }
+                    Err(error) => {
+                        tracing::error!(pattern, %error, "Invalid lb_retry_match regex")
+                    }
+                });
             }
         }
         HandlerConfig::Pipeline { handlers }

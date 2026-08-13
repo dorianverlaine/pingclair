@@ -1433,6 +1433,43 @@ fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<(
                 });
             }
 
+            // 🧱 The predicate tree is recursive and reachable from the Admin
+            // API, so both its depth and its width are bounded here rather than
+            // in the DSL adapter — a config posted as JSON never passes through
+            // the adapter at all. 64 alternatives is already more retry rules
+            // than anyone has written on purpose.
+            if retry.retry_match.len() > 64 {
+                return Err(CompileError::InvalidRoute {
+                    message: "retry_match accepts at most 64 alternatives".to_string(),
+                });
+            }
+            for predicate in &retry.retry_match {
+                if predicate.depth() > pingclair_core::config::MAX_RETRY_PREDICATE_DEPTH {
+                    return Err(CompileError::InvalidRoute {
+                        message: format!(
+                            "a retry_match condition nests deeper than {} levels",
+                            pingclair_core::config::MAX_RETRY_PREDICATE_DEPTH
+                        ),
+                    });
+                }
+                // 🔤 Compiled here so an invalid pattern is a load error rather
+                // than a surprise on the first failed attempt — the moment the
+                // server is least able to absorb one.
+                let mut invalid = None;
+                predicate.for_each_regex(&mut |pattern| {
+                    if invalid.is_none()
+                        && let Err(error) = regex::Regex::new(pattern)
+                    {
+                        invalid = Some(format!("`{pattern}` is not a valid regex: {error}"));
+                    }
+                });
+                if let Some(message) = invalid {
+                    return Err(CompileError::InvalidRoute {
+                        message: format!("retry_match {message}"),
+                    });
+                }
+            }
+
             let overload = &proxy.overload;
             if overload
                 .max_in_flight
@@ -2331,6 +2368,7 @@ fn compile_handler(
                     methods: proxy.retry.methods.clone(),
                     path_patterns: proxy.retry.path_patterns.clone(),
                     expressions: proxy.retry.expressions.clone(),
+                    retry_match: proxy.retry.retry_match.clone(),
                 }),
                 overload: Box::new(pingclair_core::config::OverloadConfig {
                     max_in_flight: proxy.overload.max_in_flight,

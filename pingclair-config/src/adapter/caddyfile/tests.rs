@@ -1417,10 +1417,20 @@ mod fail_closed_tests {
         }
     }
 
-    /// 🔁 `lb_retry_match` folds method, path, and status expressions into the
-    /// runtime retry policy while keeping unmappable CEL visible.
+    /// 🔁 Each `lb_retry_match` is its own alternative, and its contents are
+    /// joined with AND.
+    ///
+    /// 🤡 This test used to assert the opposite, and passed. It pinned
+    /// `methods == ["POST","PUT"]` and `path_patterns == ["/foo*","/bar*"]`
+    /// from a configuration whose six blocks are six *independent* reasons to
+    /// retry — so it was recording, as correct, a policy that demanded a POST
+    /// **and** a `/foo*` path **and** a 5xx all at once, and that would have
+    /// let a later block's method line overwrite an earlier one's. The shape
+    /// below is what upstream compiles the same text into: a list of matcher
+    /// sets, any of which is enough.
     #[test]
-    fn lb_retry_match_folds_mappable_forms_and_keeps_expressions() {
+    fn each_lb_retry_match_is_an_independent_alternative() {
+        use pingclair_core::config::RetryPredicate;
         let config = crate::compile(
             r#":8884 {
                 reverse_proxy 127.0.0.1:65535 {
@@ -1429,16 +1439,10 @@ mod fail_closed_tests {
                         method POST PUT
                     }
                     lb_retry_match {
+                        method GET
                         path /foo*
                     }
-                    lb_retry_match {
-                        expression `{rp.status_code} in [502, 503, 504]`
-                    }
-                    lb_retry_match {
-                        expression `{rp.header.X-Retry} == "true"`
-                    }
-                    lb_retry_match `{rp.status_code} >= 500`
-                    lb_retry_match path /bar*
+                    lb_retry_match `{rp.is_transport_error} || {rp.status_code} == 502`
                 }
             }"#,
         )
@@ -1448,17 +1452,73 @@ mod fail_closed_tests {
         else {
             panic!("expected a proxy handler");
         };
-        assert_eq!(proxy.retry.methods, ["POST", "PUT"]);
-        assert_eq!(proxy.retry.path_patterns, ["/foo*", "/bar*"]);
-        assert!(
-            proxy.retry.status_codes.contains(&502)
-                && proxy.retry.status_codes.contains(&503)
-                && proxy.retry.status_codes.contains(&504)
-                && proxy.retry.status_codes.contains(&599),
-            "the folded set must cover both the `in [...]` and `>= 500` forms"
+        let matchers = &proxy.retry.retry_match;
+        assert_eq!(matchers.len(), 3, "three blocks, three alternatives");
+
+        assert_eq!(
+            matchers[0],
+            RetryPredicate::Method {
+                any_of: vec!["POST".into(), "PUT".into()]
+            }
         );
-        assert_eq!(proxy.retry.status_codes.len(), 100);
-        assert_eq!(proxy.retry.expressions, ["{rp.header.X-Retry} == \"true\""]);
+        // 🧭 Two conditions in one block are AND'd — the only place AND comes
+        // from, and the difference this test exists to hold.
+        assert_eq!(
+            matchers[1],
+            RetryPredicate::All {
+                of: vec![
+                    RetryPredicate::Method {
+                        any_of: vec!["GET".into()]
+                    },
+                    RetryPredicate::Path {
+                        any_of: vec!["/foo*".into()]
+                    },
+                ]
+            }
+        );
+        assert_eq!(
+            matchers[2],
+            RetryPredicate::Any {
+                of: vec![
+                    RetryPredicate::TransportError,
+                    RetryPredicate::Status { any_of: vec![502] },
+                ]
+            }
+        );
+    }
+
+    /// 🚫 An expression this server cannot evaluate stops the configuration
+    /// loading instead of being stored and ignored.
+    ///
+    /// The old behaviour logged one line at startup and retried anyway, which
+    /// is the worst answer available for a directive whose job is to *limit*
+    /// retries: someone writing it to protect non-idempotent requests got a
+    /// server that kept duplicating them.
+    #[test]
+    fn an_unevaluatable_retry_expression_is_refused_at_load() {
+        let error = compile_err(
+            r#":8884 {
+                reverse_proxy 127.0.0.1:65535 {
+                    lb_retry_match `remote_ip('10.0.0.0/8')`
+                }
+            }"#,
+        );
+        assert!(
+            error.contains("remote_ip") && error.contains("lb_retry_match"),
+            "the refusal must name the condition and the directive; got {error}"
+        );
+
+        let error = compile_err(
+            r#":8884 {
+                reverse_proxy 127.0.0.1:65535 {
+                    lb_retry_match `path_regexp('([')`
+                }
+            }"#,
+        );
+        assert!(
+            error.contains("regex"),
+            "an invalid pattern must fail at load, not on the first failed attempt; got {error}"
+        );
     }
 
     /// ⚖️ `weighted_round_robin` carries one inline weight per upstream and

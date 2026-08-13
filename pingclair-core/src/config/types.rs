@@ -2199,12 +2199,108 @@ pub struct RetryConfig {
     /// redispatch to be permitted, mirroring Caddy's `lb_retry_match path`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path_patterns: Vec<String>,
-    /// 🧾 Retry-match expressions accepted for Caddyfile compatibility. The
-    /// runtime cannot evaluate arbitrary CEL, so every expression is surfaced
-    /// in the compiled configuration and logged at startup; the mappable
-    /// status/method forms are folded into the fields above.
+    /// 🧾 Retry-match expressions, kept verbatim for diagnostics only.
+    ///
+    /// ⚠️ Not evaluated — [`RetryConfig::retry_match`] is what decides. This
+    /// field exists so an operator can see the text they wrote next to the
+    /// predicate it became, and so a spelling nobody has taught the parser yet
+    /// is visible rather than absent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expressions: Vec<String>,
+
+    /// 🔁 One entry per `lb_retry_match`, **any** of which permits a retry.
+    ///
+    /// Each `lb_retry_match` upstream is an independent matcher set and they
+    /// are OR'd; conditions written *inside* one are AND'd. Folding them all
+    /// into flat `status_codes`/`methods`/`path_patterns` lists — which is what
+    /// this did until 2026-08-13 — loses that structure completely: two blocks
+    /// saying "retry POSTs" and "retry anything under /foo" became one rule
+    /// demanding both at once, and a third block could overwrite the method
+    /// list of the first.
+    ///
+    /// 🏎️ Evaluated only after an attempt has already failed, so this is not a
+    /// per-request cost; it is a per-retry-decision cost. Regexes are still
+    /// compiled at load — `ProxyState` holds them — because "only on failure"
+    /// is exactly when the machine is least able to afford compiling one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retry_match: Vec<RetryPredicate>,
+}
+
+/// 🧱 Deepest predicate tree accepted.
+///
+/// A retry rule this deep is not a configuration anyone wrote on purpose, and
+/// an unbounded one is a stack overflow reachable from whoever can post a
+/// config to the Admin API. This repository has already shipped that exact
+/// shape once through `#[serde(untagged)]` on a recursive type, which is why
+/// the enum below is tagged and why the limit is checked in `validate_config`
+/// rather than trusted to a caller.
+pub const MAX_RETRY_PREDICATE_DEPTH: usize = 8;
+
+/// 🔁 One condition on whether a failed attempt may be retried.
+///
+/// This is a deliberately small language, not CEL. It carries exactly the
+/// shapes `lb_retry_match` can express, each as a named case the runtime knows
+/// how to answer — so "the configuration parsed" and "the runtime will act on
+/// it" stop being two different questions. An expression the parser does not
+/// recognise is refused at load rather than stored and ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum RetryPredicate {
+    /// Every condition must hold (`&&`).
+    All { of: Vec<RetryPredicate> },
+    /// Any condition may hold (`||`).
+    Any { of: Vec<RetryPredicate> },
+    /// The upstream answered with one of these statuses.
+    Status { any_of: Vec<u16> },
+    /// The upstream answered with this status or higher (`>= 500`).
+    StatusAtLeast { code: u16 },
+    /// 🔌 The attempt never produced a status — a dial, TLS or read failure.
+    TransportError,
+    /// A response header equals this value, or exists at all when `value` is
+    /// `*`.
+    ResponseHeader { name: String, value: String },
+    /// The request method is one of these, compared case-insensitively.
+    Method { any_of: Vec<String> },
+    /// The request path matches one of these globs (`/foo*`).
+    Path { any_of: Vec<String> },
+    /// The request path matches this regular expression.
+    PathRegexp { pattern: String },
+    /// The request `Host` is one of these.
+    Host { any_of: Vec<String> },
+    /// The request arrived over this scheme (`http` / `https`).
+    Protocol { name: String },
+    /// A query parameter has one of these values, or exists when `*`.
+    Query { key: String, any_of: Vec<String> },
+    /// A request header has one of these values, or exists when `*`.
+    RequestHeader { name: String, any_of: Vec<String> },
+    /// A request header matches this regular expression.
+    HeaderRegexp { name: String, pattern: String },
+}
+
+impl RetryPredicate {
+    /// 🧱 How deeply this tree nests, counting itself as one.
+    pub fn depth(&self) -> usize {
+        match self {
+            Self::All { of } | Self::Any { of } => {
+                1 + of.iter().map(Self::depth).max().unwrap_or(0)
+            }
+            _ => 1,
+        }
+    }
+
+    /// 🔤 Visits every regular expression in the tree, so the caller can
+    /// compile them once at load instead of once per retry decision.
+    pub fn for_each_regex(&self, visit: &mut impl FnMut(&str)) {
+        match self {
+            Self::All { of } | Self::Any { of } => {
+                for child in of {
+                    child.for_each_regex(visit);
+                }
+            }
+            Self::PathRegexp { pattern } | Self::HeaderRegexp { pattern, .. } => visit(pattern),
+            _ => {}
+        }
+    }
 }
 
 impl Default for RetryConfig {
@@ -2217,6 +2313,7 @@ impl Default for RetryConfig {
             methods: default_retry_methods(),
             path_patterns: Vec::new(),
             expressions: Vec::new(),
+            retry_match: Vec::new(),
         }
     }
 }
