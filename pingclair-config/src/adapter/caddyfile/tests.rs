@@ -1542,8 +1542,79 @@ mod fail_closed_tests {
             .expect("a health check")
             .headers
             .clone();
-        assert_eq!(headers.get("Host").map(String::as_str), Some("example.com"));
-        assert_eq!(headers.get("X-Probe").map(String::as_str), Some("probe"));
+        assert_eq!(headers.get("Host"), Some(&vec!["example.com".to_string()]));
+        assert_eq!(headers.get("X-Probe"), Some(&vec!["probe".to_string()]));
+    }
+
+    /// 🧾 `health_headers { <field> [<values...>] }` — every part of that
+    /// signature, taken from the upstream fixture that names all four shapes.
+    ///
+    /// The old reading kept `args[0]` and put it in a one-value-per-name map,
+    /// so three of the four shapes lost data and the configuration still
+    /// compiled. That is why this is written against the fixture rather than
+    /// invented: the shapes that break are the ones nobody thinks to test.
+    #[test]
+    fn health_headers_keeps_every_value_written_for_a_name() {
+        let config = crate::compile(
+            r#":8884
+            reverse_proxy 127.0.0.1:65535 {
+                health_headers {
+                    Host example.com
+                    X-Header-Key 95ca39e3cbe7
+                    X-Header-Keys VbG4NZwWnipo 335Q9/MhqcNU3s2TO
+                    X-Empty-Value
+                    Same-Key 1
+                    Same-Key 2
+                }
+                health_uri /health
+            }"#,
+        )
+        .expect("the upstream fixture must compile");
+        let pingclair_core::config::HandlerConfig::ReverseProxy(proxy) =
+            &config.servers[0].routes[0].handler
+        else {
+            panic!("expected a proxy handler");
+        };
+        let headers = &proxy.health_check.as_ref().expect("a health check").headers;
+
+        let expect = |name: &str, values: &[&str]| {
+            let want: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+            assert_eq!(headers.get(name), Some(&want), "header `{name}`");
+        };
+        expect("Host", &["example.com"]);
+        expect("X-Header-Key", &["95ca39e3cbe7"]);
+        // 🎯 Several values on one line: `args[1..]` used to be dropped.
+        expect("X-Header-Keys", &["VbG4NZwWnipo", "335Q9/MhqcNU3s2TO"]);
+        // 🎯 A bare name is an empty value, not an absent header.
+        expect("X-Empty-Value", &[""]);
+        // 🎯 A repeated name accumulates; it used to be last-one-wins.
+        expect("Same-Key", &["1", "2"]);
+    }
+
+    /// 🧾 A JSON configuration written before multi-value support still loads.
+    ///
+    /// The single-string spelling is what every exported config says today, so
+    /// refusing it would turn a fix into an upgrade that stops the server. Both
+    /// spellings have to mean the same thing.
+    #[test]
+    fn legacy_single_valued_probe_headers_still_deserialize() {
+        let one: pingclair_core::config::HealthCheckConfig =
+            serde_json::from_str(r#"{"path":"/health","headers":{"X-Probe":"yes"}}"#).unwrap();
+        let many: pingclair_core::config::HealthCheckConfig =
+            serde_json::from_str(r#"{"path":"/health","headers":{"X-Probe":["yes"]}}"#).unwrap();
+        assert_eq!(one.headers, many.headers);
+        assert_eq!(one.headers.get("X-Probe"), Some(&vec!["yes".to_string()]));
+
+        // 🚫 A value that is neither must still be refused by name rather than
+        // silently becoming an empty list.
+        let error = serde_json::from_str::<pingclair_core::config::HealthCheckConfig>(
+            r#"{"path":"/health","headers":{"X-Probe":7}}"#,
+        )
+        .expect_err("a number is not a header value");
+        assert!(
+            error.to_string().contains("header value"),
+            "the message must say what was expected; got {error}"
+        );
     }
 
     /// 🧭 `handle_response` and `intercept` compile into the response-handler

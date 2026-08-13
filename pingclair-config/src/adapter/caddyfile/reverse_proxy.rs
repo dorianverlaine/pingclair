@@ -380,9 +380,29 @@ pub(super) fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError>
                                     "expected a block of header names and values".into(),
                                 ));
                             };
+                            // 🧾 `<field> [<values...>]`, and every part of that
+                            // signature was being thrown away. Only the first
+                            // argument was read, so `X-Keys a b` sent `a`; the
+                            // map held one value per name, so `Same-Key 1` /
+                            // `Same-Key 2` sent `2` alone. Upstream takes every
+                            // remaining argument and *appends* on a repeat, so
+                            // both spellings build the same list.
                             for header in &block.directives {
-                                let value = header.args.first().cloned().unwrap_or_default();
-                                check.headers.insert(header.name.clone(), value);
+                                let values = if header.args.is_empty() {
+                                    // 🏷️ A bare name is a header with an empty
+                                    // value, not a header with no value —
+                                    // upstream substitutes `""` here, and a
+                                    // probe that omitted the field entirely
+                                    // would be testing something else.
+                                    vec![String::new()]
+                                } else {
+                                    header.args.clone()
+                                };
+                                check
+                                    .headers
+                                    .entry(header.name.clone())
+                                    .or_default()
+                                    .extend(values);
                             }
                         }
                         other => {
@@ -684,9 +704,14 @@ pub(super) fn adapt_health_check(directive: &Directive) -> Result<HealthCheckCon
                         sub.args.len(),
                     ));
                 }
+                // 🔁 Appends, so writing the same name twice sends it twice —
+                // the same reading `health_headers` gives, rather than two
+                // spellings of one idea disagreeing about what a repeat means.
                 health
                     .headers
-                    .insert(sub.args[0].clone(), sub.args[1].clone());
+                    .entry(sub.args[0].clone())
+                    .or_default()
+                    .push(sub.args[1].clone());
             }
             "status" => {
                 if sub.args.is_empty() {

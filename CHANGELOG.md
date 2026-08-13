@@ -537,6 +537,19 @@ lets the rest converge.
 
 ### 🐛 Fixed
 
+- 🧾 **`health_headers` sends every value written for a header, not one.** The
+  block's signature is `<field> [<values...>]`, and three of the four shapes it
+  allows were losing data while the configuration compiled: `X-Keys a b` sent
+  only `a`, and `Same-Key 1` followed by `Same-Key 2` sent only `2`. A probe
+  therefore did not carry what the operator wrote — and since a health check
+  decides whether a backend receives traffic, a probe that is subtly not the
+  request you configured is worth more than it looks. Values now accumulate in
+  the order written, on both the `health_headers` block and the
+  `health_check { header … }` spelling.
+
+  JSON configurations keep loading either way: `{"X-Probe": "yes"}` and
+  `{"X-Probe": ["yes"]}` mean the same thing.
+
 - 🧵 **A `handle` block now runs every directive in it, not just the first.**
   The exclusivity `handle` is known for is between *sibling* blocks; the
   directives inside one block are a sequence. The two meanings shared one

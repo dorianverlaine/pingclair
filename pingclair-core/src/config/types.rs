@@ -193,6 +193,89 @@ pub enum PreferredChains {
     RootCommonName(Vec<String>),
 }
 
+/// 🧾 Reads probe headers written either as one value or as several.
+///
+/// `{"X-Probe": "yes"}` and `{"X-Probe": ["yes"]}` mean the same thing, and both
+/// have to keep loading: the single-string spelling is what every JSON
+/// configuration written before multi-value support says, and a config that
+/// stops loading on upgrade is a worse defect than the one this fixes.
+///
+/// 📌 Hand-written rather than `#[serde(untagged)]` on a helper enum. Untagged
+/// works here — the shape is not recursive — but its failure message names
+/// neither branch, so a malformed value reports "data did not match any
+/// variant" and the operator has to guess which of two spellings they got
+/// wrong. Startup errors are read exactly once, by someone in a hurry.
+fn deserialize_probe_headers<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{MapAccess, Visitor};
+
+    struct Values;
+
+    impl<'de> Visitor<'de> for Values {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a header value, or a list of header values")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            Ok(vec![value.to_string()])
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut values = Vec::with_capacity(seq.size_hint().unwrap_or(1));
+            while let Some(value) = seq.next_element::<String>()? {
+                values.push(value);
+            }
+            Ok(values)
+        }
+    }
+
+    struct Headers;
+
+    impl<'de> Visitor<'de> for Headers {
+        type Value = BTreeMap<String, Vec<String>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a map of header names to values")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut headers = BTreeMap::new();
+            while let Some(name) = map.next_key::<String>()? {
+                let values = map.next_value_seed(ValuesSeed)?;
+                // 🔁 Extend rather than replace: a JSON object should not have
+                // a duplicate key, but if one arrives, dropping the earlier
+                // values is the exact bug this field exists to fix.
+                headers.entry(name).or_insert_with(Vec::new).extend(values);
+            }
+            Ok(headers)
+        }
+    }
+
+    struct ValuesSeed;
+
+    impl<'de> serde::de::DeserializeSeed<'de> for ValuesSeed {
+        type Value = Vec<String>;
+
+        fn deserialize<D2: serde::Deserializer<'de>>(
+            self,
+            deserializer: D2,
+        ) -> Result<Self::Value, D2::Error> {
+            deserializer.deserialize_any(Values)
+        }
+    }
+
+    deserializer.deserialize_map(Headers)
+}
+
 /// 📊 How much detail the collected metrics carry.
 ///
 /// Every field here buys resolution with cardinality. A Prometheus series is
@@ -2415,8 +2498,13 @@ pub struct HealthCheckConfig {
     pub host: Option<String>,
 
     /// 🧾 Additional request headers sent by the probe.
-    #[serde(default)]
-    pub headers: BTreeMap<String, String>,
+    ///
+    /// One name maps to *several* values because HTTP allows it and the format
+    /// above uses it: `health_headers { Same-Key 1; Same-Key 2 }` sends both
+    /// lines, and a single-valued map silently kept only the second. Order
+    /// within a name is preserved and is the order they were written.
+    #[serde(default, deserialize_with = "deserialize_probe_headers")]
+    pub headers: BTreeMap<String, Vec<String>>,
 
     /// ✅ Exact response statuses accepted as healthy.
     #[serde(default = "default_health_statuses")]

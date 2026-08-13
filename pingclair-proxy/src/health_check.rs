@@ -125,7 +125,8 @@ pub struct HealthCheckConfig {
     /// 🔐 `tls_server_name` written by the operator, which outranks each
     /// backend's own name because it states what the certificate actually says.
     pub sni_override: Option<String>,
-    pub headers: BTreeMap<String, String>,
+    /// 🧾 Extra probe headers, each name carrying its values in written order.
+    pub headers: BTreeMap<String, Vec<String>>,
     pub port_override: Option<u16>,
     pub reuse_connection: bool,
     pub max_response_body_bytes: usize,
@@ -151,12 +152,24 @@ impl HealthChecker {
         let mut request = RequestHeader::build(
             config.method.as_str(),
             config.path.as_bytes(),
-            Some(config.headers.len() + 2),
+            Some(config.headers.values().map(Vec::len).sum::<usize>() + 2),
         )?;
         request.append_header("Host", &config.host)?;
         request.append_header("User-Agent", "Pingclair-HealthCheck/0.2")?;
-        for (name, value) in &config.headers {
-            request.insert_header(name.clone(), value.clone())?;
+        for (name, values) in &config.headers {
+            // 🧾 The first value replaces anything already set for that name;
+            // the rest are added beside it. Using `append` throughout would let
+            // a probe header written twice in two places pile up instead of the
+            // later block winning, and `insert` throughout would collapse the
+            // list this field exists to carry.
+            let mut values = values.iter();
+            let Some(first) = values.next() else {
+                continue;
+            };
+            request.insert_header(name.clone(), first.clone())?;
+            for value in values {
+                request.append_header(name.clone(), value.clone())?;
+            }
         }
         if !config.reuse_connection {
             request.insert_header("Connection", "close")?;
@@ -419,6 +432,65 @@ mod tests {
         assert!(
             request.contains("\r\nhost: second.internal\r\n"),
             "the probe must carry the backend's own name, not the template's:\n{request}"
+        );
+        origin.await.unwrap();
+    }
+
+    /// 🧾 A header written twice reaches the probe endpoint twice.
+    ///
+    /// The whole point of carrying a list instead of a value is what arrives on
+    /// the wire, and nothing before this test looked there. A config-level
+    /// assertion would have passed just as happily against a probe that sent
+    /// only the last value, which is exactly what it used to do.
+    #[tokio::test]
+    async fn every_value_written_for_one_header_reaches_the_probe() {
+        // Setup scenarios
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen, request_rx) = tokio::sync::oneshot::channel();
+        let origin = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 2048];
+            let read = stream.read(&mut buffer).await.unwrap();
+            seen.send(String::from_utf8_lossy(&buffer[..read]).to_string())
+                .unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let mut config = config("probe.internal".to_string());
+        config.headers.insert(
+            "Same-Key".to_string(),
+            vec!["1".to_string(), "2".to_string()],
+        );
+        config
+            .headers
+            .insert("X-Empty-Value".to_string(), vec![String::new()]);
+
+        let target = Backend::new(&address.to_string()).unwrap();
+        let recovery = Arc::new(RecoveryState::default());
+        recovery.rebuild([address]);
+        let checker = HealthChecker::new(
+            config,
+            HttpPeer::new(address, false, "probe.internal".to_string()),
+            recovery,
+        )
+        .unwrap();
+
+        // Verification
+        checker.check(&target).await.expect("probe succeeds");
+        let request = request_rx.await.unwrap().to_ascii_lowercase();
+        assert!(
+            request.contains("\r\nsame-key: 1\r\n") && request.contains("\r\nsame-key: 2\r\n"),
+            "both values must be sent, not just the last one:\n{request}"
+        );
+        assert!(
+            request.contains("\r\nx-empty-value: \r\n"),
+            "a bare name is a header with an empty value, not an absent header:\n{request}"
         );
         origin.await.unwrap();
     }

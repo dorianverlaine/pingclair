@@ -823,7 +823,8 @@ pub struct HealthCheckConfig {
     pub timeout_secs: u64,
     pub method: String,
     pub host: Option<String>,
-    pub headers: BTreeMap<String, String>,
+    /// 🧾 Probe headers, each name carrying every value written for it.
+    pub headers: BTreeMap<String, Vec<String>>,
     pub expected_statuses: Vec<u16>,
     pub expected_body: Option<String>,
     pub port: Option<u16>,

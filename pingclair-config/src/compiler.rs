@@ -1771,10 +1771,17 @@ fn validate_health_check(health: &pingclair_core::config::HealthCheckConfig) -> 
             message: "health_check host must be a non-empty, control-free hostname".to_string(),
         });
     }
+    // 🛡️ Both the number of names and the total number of values are bounded.
+    // Counting names alone was enough while a name held one value; now that a
+    // name holds a list, 64 names could carry any number of lines and the
+    // ceiling would say nothing about the size of the probe request.
+    let total_values: usize = health.headers.values().map(Vec::len).sum();
     if health.headers.len() > 64
-        || health.headers.iter().any(|(name, value)| {
+        || total_values > 256
+        || health.headers.iter().any(|(name, values)| {
             name.is_empty()
                 || name.len() > 256
+                || values.is_empty()
                 || !name.bytes().all(|byte| {
                     byte.is_ascii_alphanumeric()
                         || matches!(
@@ -1795,8 +1802,10 @@ fn validate_health_check(health: &pingclair_core::config::HealthCheckConfig) -> 
                                 | b'~'
                         )
                 })
-                || value.len() > 8_192
-                || value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+                || values.iter().any(|value| {
+                    value.len() > 8_192
+                        || value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+                })
         })
     {
         return Err(CompileError::InvalidRoute {
@@ -2920,8 +2929,8 @@ mod tests {
         assert_eq!(health.method, "GET");
         assert_eq!(health.host.as_deref(), Some("health.internal"));
         assert_eq!(
-            health.headers.get("X-Probe").map(String::as_str),
-            Some("pingclair")
+            health.headers.get("X-Probe"),
+            Some(&vec!["pingclair".to_string()])
         );
         assert_eq!(health.expected_statuses, [200, 204]);
         assert_eq!(health.expected_body.as_deref(), Some("ready"));
