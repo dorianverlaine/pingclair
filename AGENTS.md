@@ -10,11 +10,13 @@ Read it together with the planning documents before changing anything:
   list. Publish the fix, not the queue. If you are working from a clone and
   this file is missing, that is expected — ask the maintainer for it.
 - `TRIAGE.md` — the inbox for problems found while working on something else,
-  one row each with a severity and a status. Read it before starting so you do
+  one entry each with a severity and a status. Read it before starting so you do
   not spend a session re-discovering something already written down, and write
-  to it instead of widening the diff in hand. 🔒 **Kept local, deliberately not
-  in the repository**: a row is only useful when it names the exact input that
-  breaks something, which makes a well-written row a working reproduction for a
+  to it instead of widening the diff in hand; its own "How to add one" section
+  shows the shape, and the open count lives in that section's heading rather
+  than being left to be tallied. 🔒 **Kept local, deliberately not
+  in the repository**: an entry is only useful when it names the exact input
+  that breaks something, which makes a well-written one a working reproduction for a
   defect that is by definition still unfixed. Saying the inbox exists is fine —
   that is why this bullet is public. Its contents are not. If you are working
   from a clone and this file is missing, that is expected; ask the maintainer.
@@ -106,7 +108,7 @@ window. These are the limits:
   cannot tell which.
 - **Newly discovered problems go to `TRIAGE.md`, never straight into the
   current diff.** The fix will be small and obviously right and it will be
-  right there. Write the row anyway. The exceptions are a security defect
+  right there. Write the entry anyway. The exceptions are a security defect
   under active exploitation, and a problem that makes the change in hand wrong
   regardless — nothing else. The file is local and absent from a fresh clone;
   if it is not there, create it rather than treating its absence as permission
