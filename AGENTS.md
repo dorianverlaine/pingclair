@@ -464,3 +464,47 @@ configuration load or hot reload. Invalid security policy should fail closed.
 When a result changes, update the narrowest source of truth and any summary
 that would otherwise become misleading. Never move an item to “remote
 verified” without preserving enough evidence to reproduce the claim.
+
+# Development Environment
+
+## Available tools
+
+The following tools are installed and should be preferred when appropriate:
+
+### General CLI
+
+- `rg`: use instead of `grep -R` for searching source code
+- `fd`: use instead of `find` for locating files
+- `bat`: use instead of `cat` for viewing source files
+- `jq`: use for JSON parsing and manipulation
+
+### Rust
+
+- `cargo-nextest`: use instead of `cargo test` for running tests **locally**.
+  ⚠️ CI still runs `cargo test`, so when the question is "will CI pass", run
+  `cargo test` — that is what CI actually executes. Switching CI over is a
+  separate, deliberate step with its own TRIAGE entry.
+- `cargo-watch`: use for continuous checking during development
+
+### Text processing
+
+- `gsed`: use when GNU sed behavior is needed, especially for portable Linux-style scripts.
+- Avoid relying on macOS BSD sed differences when writing scripts intended for Linux CI.
+
+## Tool selection
+
+When a task is inefficient with available tools:
+
+1. Consider whether a specialized tool exists.
+2. If the tool is commonly used in software development, install it when appropriate.
+3. Prefer:
+   - Homebrew for macOS system tools
+   - cargo install for Rust CLI tools
+   - npm for Node.js CLI tools
+   - official installers when required
+
+## Preferences
+
+- Prefer fast specialized tools over traditional Unix tools when available.
+- Respect `.gitignore` when searching source files.
+- Avoid searching generated directories such as `target/` unless explicitly needed.
