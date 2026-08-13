@@ -213,6 +213,40 @@ lets the rest converge.
 
 ### ✨ Added
 
+- 🧱 **`request_buffers` and `response_buffers` now take effect**, on HTTP/1.1,
+  HTTP/2 and HTTP/3 alike. Both were parsed and stored before this release and
+  read by nothing; bodies always streamed. They now read that side's body into
+  memory before passing it on, so a slow client or a slow reader occupies this
+  proxy rather than a backend worker.
+
+  ```
+  :80 {
+      reverse_proxy localhost:8080 {
+          request_buffers 1MB
+          response_buffers unlimited
+      }
+  }
+  ```
+
+  🛡️ **`unlimited` does not mean unbounded memory here, and that is a
+  deliberate difference.** The format this DSL follows reads the whole body
+  into memory for `unlimited` and warns at load that doing so can crash the
+  process out of memory. Pingclair buffers up to a fixed 8 MiB ceiling and then
+  streams the remainder — which is also what a positive size does once the body
+  outgrows it. Bodies arrive complete either way; what changes is when they
+  start moving. The ceiling is reported at startup, and the fall back to
+  streaming is logged once, when it actually happens.
+
+  📏 Sizes follow the SI/IEC split, so `1MB` is a million bytes and `1MiB` is
+  1,048,576. This corrects a third instance of a units defect already fixed in
+  `request_body max_size` and `log roll_size`: `1MB` used to compile to
+  1,048,576 here, 4.86 % larger than written. Verified value-for-value against
+  Caddy v2.11.4's own `adapt`.
+
+  🧵 Buffering has no effect on a `fastcgi` transport, which reads and writes
+  its own records without entering either HTTP body path. The server says so at
+  startup rather than leaving the knob looking effective.
+
 - 📊 **`metrics [<matcher>]`** serves the Prometheus scrape endpoint from a
   site route, so a scraper can reach the numbers without the admin API being
   exposed at all. Metrics and administration are different trust boundaries,

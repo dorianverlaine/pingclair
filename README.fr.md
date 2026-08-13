@@ -586,6 +586,18 @@ compilée et sont journalisées au démarrage. `lb_policy weighted_round_robin`
 porte un poids par amont, et un bloc `method`/`rewrite` de reverse_proxy modifie
 la requête amont avant son envoi.
 
+`request_buffers <taille>` et `response_buffers <taille>` lisent le corps de ce
+côté en mémoire avant de le transmettre, de sorte qu'un pair lent occupe ce
+proxy plutôt qu'un worker du backend. Les tailles suivent la distinction
+SI/IEC — `1MB` vaut un million d'octets, `1MiB` vaut 1 048 576 — et `unlimited`
+est accepté. **Ici, `unlimited` ne signifie pas mémoire illimitée** : la mise en
+tampon s'arrête à un plafond fixe de 8 Mio et le reste du corps continue en
+flux, ce qui est signalé au démarrage puis une fois de plus, une seule, quand un
+corps dépasse réellement son tampon. Dans les deux cas le corps arrive complet ;
+ce qui change, c'est le moment où il commence à circuler. La mise en tampon n'a
+aucun effet sur un transport `fastcgi`, ce que le serveur signale aussi au
+démarrage.
+
 `reverse_proxy` accepte aussi les blocs `handle_response` avec des matchers de
 réponse (`@name status …` / `@name header …`), `replace_status`,
 `copy_response` et `copy_response_headers`. La décision se prend à partir de

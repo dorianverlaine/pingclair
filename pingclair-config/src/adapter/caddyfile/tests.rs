@@ -1571,8 +1571,67 @@ mod fail_closed_tests {
         };
         assert_eq!(proxy.rewrite_method.as_deref(), Some("GET"));
         assert_eq!(proxy.rewrite_uri.as_deref(), Some("/rewritten?uri={uri}"));
-        assert_eq!(proxy.request_buffer_bytes, Some(4 * 1024));
+        assert_eq!(proxy.request_buffer_bytes, Some(4_000));
         assert_eq!(proxy.response_buffer_bytes, Some(-1));
+    }
+
+    /// 🔢 `KB` is a thousand bytes and `KiB` is 1,024, and a buffer ceiling has
+    /// to know the difference for the same reason a size limit does: the
+    /// operator wrote a number, and 4.86 % more than that number is not it.
+    ///
+    /// This is the third place in this codebase where the two were confused
+    /// (`request_body max_size` in `18e63ad`, `log roll_size` in `e327d03`).
+    /// It stayed wrong longest because nothing read the value — so this test
+    /// exists as much to hold the third fix as to prove it.
+    #[test]
+    fn buffer_sizes_split_si_from_iec() {
+        let cases = [
+            ("1KB", 1_000),
+            ("1KiB", 1_024),
+            ("1MB", 1_000_000),
+            ("1MiB", 1_048_576),
+            ("2048", 2_048),
+            ("unlimited", -1),
+        ];
+        for (written, expected) in cases {
+            let config = crate::compile(&format!(
+                r#"example.com {{
+                    reverse_proxy 127.0.0.1:65535 {{
+                        request_buffers {written}
+                    }}
+                }}"#
+            ))
+            .expect("the buffer ceiling must compile");
+            let pingclair_core::config::HandlerConfig::ReverseProxy(proxy) =
+                &config.servers[0].routes[0].handler
+            else {
+                panic!("expected a proxy handler");
+            };
+            assert_eq!(
+                proxy.request_buffer_bytes,
+                Some(expected),
+                "`request_buffers {written}` was read as the wrong number of bytes"
+            );
+        }
+    }
+
+    /// 🚫 A unit nobody defined must fail the load rather than parse as its
+    /// leading digits — `100mbb` is a typo, and a server that reads it as 100
+    /// bytes has silently made the ceiling ten million times too small.
+    #[test]
+    fn an_unknown_buffer_unit_fails_the_load() {
+        let error = crate::compile(
+            r#"example.com {
+                reverse_proxy 127.0.0.1:65535 {
+                    request_buffers 100mbb
+                }
+            }"#,
+        )
+        .expect_err("an unknown unit must not compile");
+        assert!(
+            format!("{error}").contains("mbb"),
+            "the error must name the unit it rejected: {error}"
+        );
     }
 
     /// 🩺 A health probe may set the Host header: that is how an operator asks

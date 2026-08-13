@@ -581,6 +581,16 @@ compiled configuration and logged at startup. `lb_policy weighted_round_robin`
 carries one weight per upstream, and a reverse_proxy `method`/`rewrite` block
 changes the upstream request before it is sent.
 
+`request_buffers <size>` and `response_buffers <size>` read that side's body
+into memory before passing it on, so a slow peer occupies this proxy instead of
+a backend worker. Sizes follow the SI/IEC split — `1MB` is a million bytes,
+`1MiB` is 1,048,576 — and `unlimited` is accepted. **`unlimited` does not mean
+unbounded memory here.** Buffering stops at a fixed 8 MiB ceiling and the rest
+of the body streams, which is reported at startup and again, once, when a body
+actually outgrows its buffer. Bodies always arrive complete either way; what
+changes is when they start moving. Buffering has no effect on a `fastcgi`
+transport, which the server also says at startup.
+
 `reverse_proxy` also accepts `handle_response` blocks with response matchers
 (`@name status …` / `@name header …`), `replace_status`, `copy_response`, and
 `copy_response_headers`. The decision is made from the response header alone;

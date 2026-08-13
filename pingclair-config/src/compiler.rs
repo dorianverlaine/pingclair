@@ -1470,6 +1470,24 @@ fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<(
                 }
             }
 
+            // 🧱 `-1` is the encoding for `unlimited` and `0` means "stream";
+            // every other negative number is a value nobody can have meant.
+            // The DSL can only produce `-1` or a non-negative size, so this
+            // guards the JSON path — which is exactly the path that reaches
+            // the runtime without passing the adapter.
+            for (name, value) in [
+                ("request_buffers", proxy.request_buffer_bytes),
+                ("response_buffers", proxy.response_buffer_bytes),
+            ] {
+                if value.is_some_and(|bytes| bytes < -1) {
+                    return Err(CompileError::InvalidRoute {
+                        message: format!(
+                            "{name} must be a size in bytes, 0 to stream, or -1 for unlimited"
+                        ),
+                    });
+                }
+            }
+
             let overload = &proxy.overload;
             if overload
                 .max_in_flight

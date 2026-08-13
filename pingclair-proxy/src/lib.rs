@@ -13,6 +13,7 @@
 
 pub mod access_log;
 pub mod alt_svc;
+mod body_buffer;
 pub mod client_auth;
 pub mod connection_filter;
 pub mod dns;

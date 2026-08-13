@@ -535,9 +535,10 @@ pub(super) fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError>
                 "rewrite" => {
                     proxy.rewrite_uri = Some(expect_one_argument(&sub)?.to_string());
                 }
-                // 🧱 Buffer ceilings are accepted for Caddyfile compatibility
-                // and kept visible in the compiled config; Pingclair streams
-                // bodies and never buffers them whole.
+                // 🧱 Buffer ceilings decide how much of a body is read into
+                // memory before any of it moves on. `unlimited` is accepted
+                // and encoded as `-1`, but the runtime bounds it — see
+                // `pingclair-proxy/src/body_buffer.rs`.
                 "request_buffers" => {
                     proxy.request_buffer_bytes = Some(parse_buffer_size(&sub)?);
                 }
@@ -1470,32 +1471,30 @@ fn parse_retry_expression(
     Ok(predicate)
 }
 
-/// 🧱 Parses a Caddy buffer size (`4KB`, `10MB`, `unlimited`) into bytes,
-/// with `-1` standing for unlimited.
+/// 🧱 Parses a buffer size (`4KB`, `10MiB`, `unlimited`) into bytes, with
+/// `-1` standing for unlimited — the same encoding the JSON form uses.
+///
+/// 🔢 **`KB` is a thousand bytes and `KiB` is 1,024**, which is why this
+/// defers to the one size parser this crate already has instead of keeping
+/// its own table. It used to keep one, and that table read `kb` as 1,024:
+/// every `request_buffers 1MB` came out 4.86 % larger than the operator
+/// wrote. That was the third instance of the same defect in this codebase
+/// (`request_body max_size` fixed in `18e63ad`, `log roll_size` in `e327d03`),
+/// and it survived the first two sweeps because nothing read the value yet.
+/// Corrected 2026-08-13, in the change that made the value take effect —
+/// a unit error is at its most dangerous on the day a setting starts working,
+/// because everything looks right and only the number is wrong.
 fn parse_buffer_size(directive: &Directive) -> Result<i64, AdapterError> {
-    let value = expect_one_argument(directive)?;
-    if value == "unlimited" {
+    if expect_one_argument(directive)? == "unlimited" {
         return Ok(-1);
     }
-    let split = value
-        .find(|character: char| !character.is_ascii_digit())
-        .unwrap_or(value.len());
-    let number: i64 = value[..split]
-        .parse()
-        .map_err(|_| AdapterError::InvalidArgument(directive.name.clone(), value.to_string()))?;
-    let multiplier = match value[split..].to_ascii_lowercase().as_str() {
-        "" | "b" => 1,
-        "k" | "kb" => 1_024,
-        "m" | "mb" => 1_024 * 1_024,
-        "g" | "gb" => 1_024 * 1_024 * 1_024,
-        unit => {
-            return Err(AdapterError::InvalidArgument(
-                directive.name.clone(),
-                format!("`{unit}` is not a byte unit (b/kb/mb/gb)"),
-            ));
-        }
-    };
-    Ok(number * multiplier)
+    let bytes = super::logs::parse_byte_size(directive)?;
+    i64::try_from(bytes).map_err(|_| {
+        AdapterError::InvalidArgument(
+            directive.name.clone(),
+            format!("`{bytes}` is too large to be a buffer size"),
+        )
+    })
 }
 
 // MARK: - Response Handling

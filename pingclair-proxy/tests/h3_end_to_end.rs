@@ -310,6 +310,11 @@ struct H3Attempt<'a> {
     extra_headers: &'a [(&'a str, &'a str)],
     /// 🪪 A client certificate and key, in PEM.
     identity: Option<(&'a str, &'a str)>,
+    /// 🔤 The `:method` pseudo-header.
+    method: &'a str,
+    /// 📦 A request body, sent after the headers. Empty means the request
+    /// finishes with its headers, which is what every GET here does.
+    body: &'a [u8],
 }
 
 impl<'a> H3Attempt<'a> {
@@ -322,8 +327,28 @@ impl<'a> H3Attempt<'a> {
             authority: "h3.pingclair.test",
             extra_headers: &[],
             identity: None,
+            method: "GET",
+            body: &[],
         }
     }
+}
+
+/// 📦 Performs one HTTP/3 POST carrying a body of a known size.
+///
+/// Deliberately sends no `content-length`: HTTP/3 has no chunked encoding, so
+/// a body without a declared length is the case where this proxy has to choose
+/// the upstream framing itself — and that framing is what a buffering test can
+/// actually see on the wire.
+async fn h3_post(server: SocketAddr, path: &str, body: &[u8]) -> Result<H3Response, String> {
+    h3_attempt(
+        H3Attempt {
+            method: "POST",
+            body,
+            ..H3Attempt::to(server, path)
+        },
+        None,
+    )
+    .await
 }
 
 async fn h3_attempt(
@@ -337,6 +362,8 @@ async fn h3_attempt(
         authority,
         extra_headers,
         identity,
+        method,
+        body: request_body,
     } = attempt;
 
     let mut ssl = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()).unwrap();
@@ -377,6 +404,8 @@ async fn h3_attempt(
     let mut buf = [0u8; 65535];
     let mut h3: Option<quiche::h3::Connection> = None;
     let mut sent = false;
+    let mut request_stream: Option<u64> = None;
+    let mut body_sent = 0usize;
     let mut status = None;
     let mut response_headers = Vec::new();
     let mut body = Vec::new();
@@ -429,7 +458,7 @@ async fn h3_attempt(
         if let Some(h3) = h3.as_mut() {
             if !sent {
                 let mut request = vec![
-                    quiche::h3::Header::new(b":method", b"GET"),
+                    quiche::h3::Header::new(b":method", method.as_bytes()),
                     quiche::h3::Header::new(b":scheme", b"https"),
                     quiche::h3::Header::new(b":authority", authority.as_bytes()),
                     quiche::h3::Header::new(b":path", path.as_bytes()),
@@ -437,10 +466,28 @@ async fn h3_attempt(
                 request.extend(extra_headers.iter().map(|(name, value)| {
                     quiche::h3::Header::new(name.as_bytes(), value.as_bytes())
                 }));
-                match h3.send_request(&mut conn, &request, true) {
-                    Ok(_) => sent = true,
+                match h3.send_request(&mut conn, &request, request_body.is_empty()) {
+                    Ok(id) => {
+                        sent = true;
+                        request_stream = Some(id);
+                    }
                     Err(quiche::h3::Error::StreamBlocked) => {}
                     Err(e) => return Err(format!("send_request: {e}")),
+                }
+            }
+
+            // 📦 A body is written across as many turns of this loop as the
+            // stream's flow-control window needs, which is what makes it a
+            // useful test subject: a large body genuinely arrives at the
+            // server in several pieces, so a buffer that coalesces them is
+            // visible on the upstream's wire and one that does not is too.
+            if let Some(stream_id) = request_stream
+                && body_sent < request_body.len()
+            {
+                match h3.send_body(&mut conn, stream_id, &request_body[body_sent..], true) {
+                    Ok(written) => body_sent += written,
+                    Err(quiche::h3::Error::Done) => {}
+                    Err(e) => return Err(format!("send_body: {e}")),
                 }
             }
 
@@ -863,6 +910,208 @@ async fn h3_abort_resets_only_its_own_stream() {
     // connection, or the whole server, with it.
     let after = h3_get(server, "/fine").await.unwrap();
     assert_eq!(after.status, 200, "an abort must not poison the listener");
+}
+
+/// 🧾 Reads one whole chunked HTTP/1 request from a backend socket and returns
+/// its body frames.
+///
+/// A chunk boundary is one write this proxy made, which is the only place a
+/// buffering decision is visible: the request that arrives and the response
+/// that leaves are byte-for-byte identical whether the body was held or not.
+async fn read_chunked_request_frames(stream: &mut tokio::net::TcpStream) -> Vec<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut raw = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let read = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut chunk))
+            .await
+            .expect("the backend read stalled")
+            .expect("the backend read failed");
+        assert!(read > 0, "the request ended before its last chunk");
+        raw.extend_from_slice(&chunk[..read]);
+        if raw.ends_with(b"\r\n0\r\n\r\n") {
+            break;
+        }
+    }
+
+    let head_end = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("the request head must end")
+        + 4;
+    let mut rest = &raw[head_end..];
+    let mut frames = Vec::new();
+    loop {
+        let line_end = rest
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .expect("every chunk starts with a size line");
+        let size = usize::from_str_radix(
+            std::str::from_utf8(&rest[..line_end]).expect("a chunk size is ASCII"),
+            16,
+        )
+        .expect("a chunk size is hexadecimal");
+        rest = &rest[line_end + 2..];
+        if size == 0 {
+            break;
+        }
+        frames.push(rest[..size].to_vec());
+        rest = &rest[size + 2..];
+    }
+    frames
+}
+
+/// 🧱 `request_buffers` holds the body on HTTP/3 too, and holds it the same way.
+///
+/// The two transports write the upstream request body through entirely
+/// separate code — Pingora's filters on one side, this crate's own QUIC loop
+/// on the other — so a setting implemented once is implemented on one
+/// protocol. The observation is the backend's wire: a quarter-megabyte body
+/// crosses several QUIC frames, and the buffered route must still hand the
+/// backend a single chunk while the streaming route hands it several.
+#[tokio::test]
+async fn h3_request_buffers_hold_the_body_until_the_client_finishes() {
+    use tokio::io::AsyncWriteExt;
+
+    let backend_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let backend_address = backend_listener.local_addr().unwrap();
+    let backend_task = tokio::spawn(async move {
+        let mut observed = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = backend_listener.accept().await.unwrap();
+            observed.push(read_chunked_request_frames(&mut stream).await);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        }
+        observed
+    });
+
+    let source = format!(
+        r#":443 {{
+            handle /buffered/* {{
+                reverse_proxy http://{backend_address} {{
+                    request_buffers unlimited
+                }}
+            }}
+
+            reverse_proxy http://{backend_address}
+        }}"#
+    );
+    let site = pingclair_config::compile(&source).unwrap().servers[0].clone();
+    let server = spawn_h3_server_with(|address| ServerConfig {
+        listen: vec![address.to_string()],
+        ..site
+    })
+    .await;
+
+    let body = vec![b'x'; 256 * 1024];
+    for path in ["/buffered/upload", "/streamed/upload"] {
+        let response = h3_post(server, path, &body).await.unwrap();
+        assert_eq!(response.status, 200, "the proxied POST must succeed");
+    }
+
+    let observed = backend_task.await.unwrap();
+    assert_eq!(
+        observed[0].len(),
+        1,
+        "`request_buffers` must hand the backend one chunk, saw {} on HTTP/3",
+        observed[0].len()
+    );
+    assert_eq!(
+        observed[0][0].len(),
+        body.len(),
+        "the buffered chunk must be the whole body"
+    );
+    assert!(
+        observed[1].len() > 1,
+        "without buffering the backend must see the stream as it arrived, saw {} chunk(s)",
+        observed[1].len()
+    );
+    assert_eq!(
+        observed[1].iter().map(Vec::len).sum::<usize>(),
+        body.len(),
+        "streaming must deliver the same number of bytes"
+    );
+}
+
+/// 🧱 `response_buffers` holds the backend's body on HTTP/3 too.
+///
+/// The backend writes half its body, pauses, then writes the rest. What the
+/// client eventually receives is identical either way, so the assertion is on
+/// the *first* body chunk the client sees: buffered, it already contains both
+/// halves; streaming, it contains only the first.
+#[tokio::test]
+async fn h3_response_buffers_hold_the_body_until_the_upstream_finishes() {
+    use tokio::io::AsyncWriteExt;
+
+    let backend_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let backend_address = backend_listener.local_addr().unwrap();
+    let backend_task = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = backend_listener.accept().await.unwrap();
+            let _ = read_http_head(&mut stream).await;
+            // 📏 No `Content-Length`: the body ends with the connection, which
+            // is what lets the backend pause in the middle of one.
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                      Connection: close\r\n\r\nfirst",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            stream.write_all(b"second").await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+    });
+
+    let source = format!(
+        r#":443 {{
+            handle /buffered/* {{
+                reverse_proxy http://{backend_address} {{
+                    response_buffers unlimited
+                }}
+            }}
+
+            reverse_proxy http://{backend_address}
+        }}"#
+    );
+    let site = pingclair_config::compile(&source).unwrap().servers[0].clone();
+    let server = spawn_h3_server_with(|address| ServerConfig {
+        listen: vec![address.to_string()],
+        ..site
+    })
+    .await;
+
+    let first_chunk_of = |path: &'static str| async move {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let response = h3_get_observing_first_chunk(server, path, &[], Some(tx))
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"firstsecond", "the whole body must arrive");
+        rx.await.expect("a body chunk must have been observed")
+    };
+
+    assert_eq!(
+        first_chunk_of("/streamed/probe").await,
+        b"first".to_vec(),
+        "without buffering the client must see the first half before the second exists"
+    );
+    assert_eq!(
+        first_chunk_of("/buffered/probe").await,
+        b"firstsecond".to_vec(),
+        "`response_buffers` must withhold the body until the backend finishes"
+    );
+
+    backend_task.await.unwrap();
 }
 
 /// 🔻 A backend that refuses the connection must still fail closed on H3.

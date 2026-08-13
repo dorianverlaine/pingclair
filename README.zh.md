@@ -553,6 +553,14 @@ retry 政策接受 Caddy 的 `lb_retry_match` 拼法：`method`、`path`、`head
 `lb_policy weighted_round_robin` 支援每個 upstream 一個權重；reverse_proxy
 區塊裡的 `method`／`rewrite` 會在請求送往上游前改寫請求。
 
+`request_buffers <size>` 與 `response_buffers <size>` 會先把該方向的 body 讀進
+記憶體再往下送，慢速的一端因此佔住這台 proxy，而不是佔住後端的 worker。
+大小遵循 SI／IEC 之分——`1MB` 是一百萬 bytes，`1MiB` 是 1,048,576——也接受
+`unlimited`。**這裡的 `unlimited` 不等於無上限的記憶體**：緩衝到固定的 8 MiB
+上限就停，其餘照舊串流；上限一事在啟動時會說，body 真的超過時再說一次
+（只說一次）。兩種情況下 body 都會完整送達，差別只在什麼時候開始送。
+`fastcgi` transport 不受緩衝影響，這件事啟動時同樣會說。
+
 `reverse_proxy` 也接受 `handle_response` 區塊，搭配 response matcher
 （`@name status …`／`@name header …`）、`replace_status`、`copy_response` 與
 `copy_response_headers`。決策只讀回應標頭；替換回應只發一次靜態 body，

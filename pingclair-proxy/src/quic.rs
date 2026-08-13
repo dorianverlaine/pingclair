@@ -4487,6 +4487,15 @@ async fn reverse_proxy_upstream(
         // 🌊 Streams request chunks after the upstream has accepted the headers.
         let mut counted = 0u64;
         let mut upload_pacer = limits.upload_bytes_per_sec.map(StreamPacer::new);
+        // 🧱 `request_buffers` on this route holds the body here instead of on
+        // the Pingora path, but it is the same state machine with the same
+        // ceiling, so the two transports overflow into streaming at the same
+        // byte. Built per attempt: a buffer half-drained by a failed attempt
+        // must not be reused, or the replay would start mid-body.
+        let mut request_buffer = state
+            .buffering(route_index)
+            .request
+            .map(crate::body_buffer::BufferedBody::new);
         loop {
             let next = match limits.body_timeout_ms {
                 Some(timeout_ms) => {
@@ -4517,11 +4526,33 @@ async fn reverse_proxy_upstream(
                 }
                 tokio::time::sleep(delay).await;
             }
+            // 🧱 The limit, the deadline and the pacer all ran against the
+            // bytes as they arrived, above; only the write is deferred.
+            let outgoing = match request_buffer.as_mut() {
+                Some(buffer) => {
+                    let was_streaming = buffer.overflowed();
+                    let released = buffer.offer(chunk);
+                    if !was_streaming && buffer.overflowed() {
+                        crate::body_buffer::report_overflow("request", buffer.limit());
+                    }
+                    released
+                }
+                None => Some(chunk),
+            };
+            let Some(chunk) = outgoing else { continue };
             if let Err(error) = session.write_request_body(chunk, false).await {
                 tracing::error!("❌ H3 upstream write body failed: {}", error);
                 session.shutdown().await;
                 return Err((502, "Upstream Write Failed"));
             }
+        }
+        // 🧱 Whatever the buffer still holds is the whole point of holding it.
+        if let Some(chunk) = request_buffer.as_mut().and_then(|buffer| buffer.finish())
+            && let Err(error) = session.write_request_body(chunk, false).await
+        {
+            tracing::error!("❌ H3 upstream write buffered body failed: {}", error);
+            session.shutdown().await;
+            return Err((502, "Upstream Write Failed"));
         }
         // 📏 Rejects a body length mismatch before it can poison a reused connection.
         if let Some(content_length) = client_content_length
@@ -4929,6 +4960,11 @@ async fn reverse_proxy_upstream(
     // 🌊 Streams the upstream response without committing the final H3 frame early.
     let mut clean = true;
     let mut replacement_sent = false;
+    // 🧱 `response_buffers`, the same state machine the Pingora path uses.
+    let mut response_buffer = state
+        .buffering(route_index)
+        .response
+        .map(crate::body_buffer::BufferedBody::new);
     loop {
         match session.read_response_body().await {
             Ok(Some(bytes)) => {
@@ -4948,6 +4984,18 @@ async fn reverse_proxy_upstream(
                     }
                     continue;
                 }
+                let outgoing = match response_buffer.as_mut() {
+                    Some(buffer) => {
+                        let was_streaming = buffer.overflowed();
+                        let released = buffer.offer(bytes);
+                        if !was_streaming && buffer.overflowed() {
+                            crate::body_buffer::report_overflow("response", buffer.limit());
+                        }
+                        released
+                    }
+                    None => Some(bytes),
+                };
+                let Some(bytes) = outgoing else { continue };
                 if let Some(delay) = download_pacer
                     .as_mut()
                     .and_then(|pacer| pacer.delay_for(bytes.len()))
@@ -4980,6 +5028,31 @@ async fn reverse_proxy_upstream(
                 clean = false;
                 break;
             }
+        }
+    }
+
+    // 🧱 Release what the response buffer held. This runs on the failed path
+    // too: the bytes are already in hand, and dropping them would hand the
+    // client a body that is short but framed as complete — a worse failure
+    // than the truncation the error path already reports.
+    if let Some(bytes) = response_buffer.as_mut().and_then(|buffer| buffer.finish()) {
+        let delay = download_pacer
+            .as_mut()
+            .and_then(|pacer| pacer.delay_for(bytes.len()));
+        match delay {
+            Some(delay)
+                if request_deadline.is_some_and(|deadline| Instant::now() + delay >= deadline) =>
+            {
+                tracing::warn!(
+                    "⏱️ H3 whole-request timeout reached before the buffered response could be sent"
+                );
+                clean = false;
+            }
+            Some(delay) => {
+                tokio::time::sleep(delay).await;
+                send_body(resp_tx, stream_id, bytes, false).await;
+            }
+            None => send_body(resp_tx, stream_id, bytes, false).await,
         }
     }
 

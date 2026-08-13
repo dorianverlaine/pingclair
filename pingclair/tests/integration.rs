@@ -3873,6 +3873,354 @@ async fn test_pingclairfile_method_and_request_header_reach_upstream() {
     );
 }
 
+/// 🧾 Reads one whole chunked HTTP/1 message and returns its body frames.
+///
+/// The frames are the observation a buffering test needs. A chunk boundary on
+/// the wire is exactly one write this proxy made, so a body that arrived in
+/// several pieces and left as a single frame was held, and one that left as
+/// several was streamed. Nothing else about the request distinguishes the two.
+async fn read_chunked_frames(stream: &mut tokio::net::TcpStream) -> Vec<Vec<u8>> {
+    let raw = read_until_marker(stream, b"\r\n0\r\n\r\n", Duration::from_secs(10)).await;
+    let head_end = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("the request head must end")
+        + 4;
+    let mut rest = &raw[head_end..];
+    let mut frames = Vec::new();
+    loop {
+        let line_end = rest
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .expect("every chunk starts with a size line");
+        let size = usize::from_str_radix(
+            std::str::from_utf8(&rest[..line_end]).expect("a chunk size is ASCII"),
+            16,
+        )
+        .expect("a chunk size is hexadecimal");
+        rest = &rest[line_end + 2..];
+        if size == 0 {
+            break;
+        }
+        frames.push(rest[..size].to_vec());
+        rest = &rest[size + 2..];
+    }
+    frames
+}
+
+/// 📏 Reads one HTTP/1 request head and counts the `Content-Length` body after
+/// it, without keeping the body.
+///
+/// A twenty-mebibyte body is why this exists rather than a marker scan: the
+/// scan re-reads everything received so far on every read, which is quadratic
+/// and turns a two-second transfer into a test timeout.
+async fn count_declared_body(stream: &mut tokio::net::TcpStream) -> usize {
+    use tokio::io::AsyncReadExt;
+
+    let head = read_until_marker(stream, b"\r\n\r\n", Duration::from_secs(10)).await;
+    let text = String::from_utf8_lossy(&head);
+    let (head_text, overread) = text.split_once("\r\n\r\n").expect("the head must end");
+    let declared: usize = head_text
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("content-length: ")
+                .or_else(|| line.strip_prefix("Content-Length: "))
+        })
+        .expect("the proxied request must declare a length")
+        .trim()
+        .parse()
+        .expect("a content length is a number");
+
+    let mut counted = overread.len();
+    let mut chunk = vec![0u8; 256 * 1024];
+    while counted < declared {
+        let read = tokio::time::timeout(Duration::from_secs(30), stream.read(&mut chunk))
+            .await
+            .expect("the upload stalled")
+            .expect("the upload failed");
+        if read == 0 {
+            break;
+        }
+        counted += read;
+    }
+    counted
+}
+
+/// 🧱 `request_buffers` holds the client's body until the client has finished.
+///
+/// Asserted on the upstream's wire rather than on the response, because the
+/// response is identical either way — which is precisely why a buffering
+/// setting that quietly did nothing went unnoticed here for two releases. The
+/// client sends two chunks separated in time; the buffered route hands the
+/// backend one frame containing both, and the streaming route hands it two.
+#[tokio::test]
+async fn test_pingclairfile_request_buffers_hold_the_body_until_the_client_finishes() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let upstream_address = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let mut observed = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            observed.push(read_chunked_frames(&mut stream).await);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        }
+        observed
+    });
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            handle /buffered/* {{
+                reverse_proxy http://{upstream_address} {{
+                    request_buffers unlimited
+                }}
+            }}
+
+            reverse_proxy http://{upstream_address}
+        }}
+        "#
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    // 🧵 A hand-written client because the body has to be trickled: two
+    // chunks, far enough apart in time that they cannot arrive in one read,
+    // and with no `Content-Length` so the framing stays chunked end to end.
+    let trickle = |path: &'static str| {
+        let address = server.address(0);
+        async move {
+            let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+            client
+                .write_all(
+                    format!(
+                        "POST {path} HTTP/1.1\r\nHost: {address}\r\n\
+                         Transfer-Encoding: chunked\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            client.write_all(b"5\r\nfirst\r\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            client.write_all(b"6\r\nsecond\r\n").await.unwrap();
+            client.write_all(b"0\r\n\r\n").await.unwrap();
+            let response = read_until_marker(&mut client, b"ok", Duration::from_secs(10)).await;
+            assert!(
+                String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"),
+                "the proxied request must succeed"
+            );
+        }
+    };
+    trickle("/buffered/upload").await;
+    trickle("/streamed/upload").await;
+
+    let observed = upstream_task.await.unwrap();
+    assert_eq!(
+        observed[0],
+        vec![b"firstsecond".to_vec()],
+        "`request_buffers` must hand the backend one frame holding the whole body"
+    );
+    assert_eq!(
+        observed[1],
+        vec![b"first".to_vec(), b"second".to_vec()],
+        "without buffering the backend must see the client's own pacing"
+    );
+}
+
+/// 🛡️ `unlimited` buffering stops at this server's ceiling and keeps streaming.
+///
+/// The security property of this whole feature in one test: the format's own
+/// implementation reads the entire body into memory here and warns that doing
+/// so can crash the process, so a 20 MiB upload against `unlimited` is the
+/// case that has to *not* be held whole. The proof is twofold — every byte
+/// still reaches the backend, and the server says out loud that it fell back
+/// to streaming, which it only says on the transition.
+#[tokio::test]
+async fn test_pingclairfile_unlimited_buffering_streams_past_the_server_ceiling() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let upstream_address = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let counted = count_declared_body(&mut stream).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+        counted
+    });
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            request_body {{
+                max_size 32MB
+            }}
+
+            reverse_proxy http://{upstream_address} {{
+                request_buffers unlimited
+            }}
+        }}
+        "#
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    // 📏 Declared with `Content-Length` rather than trickled: this test is
+    // about the ceiling, not about framing, and a declared length lets the
+    // backend count the body without reassembling twenty mebibytes of chunk
+    // headers to do it.
+    const UPLOAD: usize = 20 * 1024 * 1024;
+    let response = no_proxy_client()
+        .post(server.url(0, "/upload"))
+        .body(vec![b'x'; UPLOAD])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "a 20 MiB buffered upload must still succeed"
+    );
+
+    assert_eq!(
+        upstream_task.await.unwrap(),
+        UPLOAD,
+        "every uploaded byte must reach the backend"
+    );
+    // 🪵 `tracing`'s fmt layer writes to stdout, and `TestServer` sets
+    // `RUST_LOG=info`, so a warning the runtime emits lands in this file.
+    let log = std::fs::read_to_string(&server.stdout_path).unwrap_or_default();
+    assert!(
+        log.contains("outgrew its buffer"),
+        "the server must report the fall back to streaming: {log}"
+    );
+}
+
+/// 🧱 `response_buffers` holds the upstream's body until the upstream finishes.
+///
+/// The mirror of the request test, and the reason it is written as a timing
+/// assertion: what buffering changes on this side is *when* the client sees
+/// the first byte, not what it eventually receives. The backend writes half
+/// its body, pauses, then writes the rest — so a buffered route cannot answer
+/// before the pause is over and a streaming one must.
+#[tokio::test]
+async fn test_pingclairfile_response_buffers_hold_the_body_until_the_upstream_finishes() {
+    use tokio::io::AsyncWriteExt;
+
+    const PAUSE: Duration = Duration::from_millis(600);
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let upstream_address = listener.local_addr().unwrap();
+    // 🧵 One task per connection, not one loop: the second request must not
+    // wait for the first backend pause to finish, or its "time to first byte"
+    // would measure this test's own scheduling instead of the proxy's.
+    let upstream_task = tokio::spawn(async move {
+        let mut connections = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            connections.push(tokio::spawn(async move {
+                let _ = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(5)).await;
+                // 📏 No `Content-Length`: the body ends when the connection
+                // does, which is what lets the backend pause mid-body.
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                          Connection: close\r\n\r\nfirst",
+                    )
+                    .await
+                    .unwrap();
+                tokio::time::sleep(PAUSE).await;
+                stream.write_all(b"second").await.unwrap();
+                stream.shutdown().await.unwrap();
+            }));
+        }
+        for connection in connections {
+            connection.await.unwrap();
+        }
+    });
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            handle /buffered/* {{
+                reverse_proxy http://{upstream_address} {{
+                    response_buffers unlimited
+                }}
+            }}
+
+            reverse_proxy http://{upstream_address}
+        }}
+        "#
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    // ⏱️ Measured from the raw socket rather than from reqwest, so "the first
+    // byte of the body" means the first byte on the wire and not whatever a
+    // client library chose to buffer on our behalf.
+    let first_body_byte_at = |path: &'static str| {
+        let address = server.address(0);
+        async move {
+            let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+            client
+                .write_all(format!("GET {path} HTTP/1.1\r\nHost: {address}\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let started = std::time::Instant::now();
+            let _ = read_until_marker(&mut client, b"first", Duration::from_secs(10)).await;
+            started.elapsed()
+        }
+    };
+
+    let streamed = first_body_byte_at("/streamed/probe").await;
+    let buffered = first_body_byte_at("/buffered/probe").await;
+
+    assert!(
+        streamed < PAUSE,
+        "an unbuffered response must reach the client before the backend finishes, took {streamed:?}"
+    );
+    assert!(
+        buffered >= PAUSE,
+        "`response_buffers` must withhold the body until the backend finishes, took {buffered:?}"
+    );
+
+    upstream_task.await.unwrap();
+}
+
 /// 📥 A route may raise the body limit for itself.
 ///
 /// The site's limit is one megabyte and no Pingclairfile can change it, so

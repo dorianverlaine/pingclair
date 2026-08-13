@@ -139,6 +139,37 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
 - 大 body、SSE、range 與 client disconnect cancellation 必須維持 bounded memory。
 - 新增會碰 response body 的功能時，預設要問：**這在 20MB body 下會發生什麼？**
 
+### 🧱 唯一一個刻意緩衝的地方，以及它為什麼不會變成同一個 bug
+
+`request_buffers`／`response_buffers`（`pingclair-proxy/src/body_buffer.rs`，
+2026-08-13）是這份文件唯一允許的例外，條件是**上限由我們決定，不是由設定決定**：
+
+- **`unlimited` 不是無上限。** 上游對 `-1` 的語意是整份讀進記憶體，它自己在載入
+  時就印 `UNLIMITED BUFFERING … can result in OOM crashes`。我們把 `-1` 讀成
+  「緩衝到 `MAX_BUFFERED_BODY_BYTES`（8 MiB）為止」，超過就**回到串流**。設定
+  能調的是這個數字以下的值，不能調到以上。
+- **超過上限要退回串流，不是拒絕。** 緩衝是相容性與延遲的旋鈕，不是限制；會
+  拒絕過大 body 的是 `request_body max_size`，它自己 fail closed。把緩衝旋鈕
+  變成 413 產生器，是往貴的那個方向給操作者驚喜。
+- **限制、deadline、pacer 都跑在「收到的位元組」上，不是跑在「決定送出的位元組」
+  上。** 順序寫反的話，打開緩衝就等於把整條路由的 `client_max_body_size` 悄悄
+  調高了。
+
+> 🪤 **request 側扣住 chunk 要交回空的 `Bytes`，不能交 `None`。**
+> `pingora-proxy 0.8.1` 的 `proxy_h1.rs:774` 在 filter 跑完之後才用
+> `end_of_body || data.is_none()` 重算結束旗標，所以 `None` 會被讀成「客戶端送完了」
+> ——upstream 的 body 提早結束，沒有任何錯誤，後端拿到一份被截斷的 body。
+> response 側的結束旗標是隨 task 傳的（`lib.rs:382`），`None` 在那邊安全，
+> 但兩側一律寫空 `Bytes`：有例外的規則就是會被記錯的規則。
+
+> 🚫 **不要再設計「溢出到暫存檔」。** 2026-08-13 查過：filter 一次只能交回一塊，
+> 而 downstream body 結束後（`proxy_h1.rs:411` 的
+> `DownstreamStateMachine::maybe_finished`）filter 就不會再被呼叫。所以溢出到檔案
+> 的 body 仍然得整份讀回記憶體才交得出去，**尖峰記憶體和不寫檔完全一樣**，只多
+> 一個檔案描述符與權限面。從 filter 裡直接寫 session 也否決了：downstream body
+> writer 的 framing 狀態屬於 `proxy_h1.rs:1209` 的 task pipeline，插進第二個 writer
+> 會壞掉 chunked framing，而且壞得不會有測試穩定抓到。
+
 ---
 
 ## 🩺 上游健康：只有遠端失敗可以把 backend 標成不健康

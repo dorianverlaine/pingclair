@@ -1909,15 +1909,20 @@ pub struct ReverseProxyConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rewrite_uri: Option<String>,
 
-    /// 🧱 Request body buffer ceiling in bytes (`-1` means unlimited).
-    /// Accepted for Caddyfile compatibility; Pingclair streams request bodies
-    /// and never buffers them whole, so this is informational.
+    /// 🧱 How much of the request body to read into memory before writing any
+    /// of it to the upstream. `None` or `0` streams, which is the default;
+    /// `-1` is `unlimited`.
+    ///
+    /// 🛡️ `unlimited` does not mean unbounded memory here: the runtime holds
+    /// up to its own ceiling and streams the rest. See
+    /// `pingclair-proxy/src/body_buffer.rs` for why, including why nothing
+    /// spills to a temporary file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_buffer_bytes: Option<i64>,
 
-    /// 🧱 Response body buffer ceiling in bytes (`-1` means unlimited).
-    /// Accepted for Caddyfile compatibility; Pingclair streams response
-    /// bodies, so this is informational.
+    /// 🧱 The same ceiling for the response body, applied between the upstream
+    /// and the client. `None` or `0` streams; `-1` is `unlimited`, bounded by
+    /// the runtime's own ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_buffer_bytes: Option<i64>,
 

@@ -145,6 +145,12 @@ pub struct RequestContext {
     pub rewritten_path: Option<String>,
     /// 📦 Request-body bytes observed incrementally by the streaming filter.
     pub request_body_bytes: u64,
+    /// 🧱 `request_buffers` state for this request, created only when the
+    /// matched route configured a ceiling. `None` is the streaming default,
+    /// and it is the cheap case: no allocation, one `Option` test per chunk.
+    request_buffer: Option<crate::body_buffer::BufferedBody>,
+    /// 🧱 `response_buffers` state, on the upstream-to-client half.
+    response_buffer: Option<crate::body_buffer::BufferedBody>,
     /// 🚨 Status raised by an `error` handler, awaiting error-route dispatch.
     pub error_status: Option<u16>,
     /// 💬 Message carried with the raised error status.
@@ -230,6 +236,8 @@ impl Default for RequestContext {
             active_connection_metric: None,
             rewritten_path: None,
             request_body_bytes: 0,
+            request_buffer: None,
+            response_buffer: None,
             error_status: None,
             error_message: None,
             request_vars: crate::http_policy::RequestVars::default(),
@@ -820,6 +828,12 @@ pub struct ProxyState {
     route_regexes: Vec<HashMap<String, Arc<Regex>>>,
     /// 📥 Per route, the widest `request_body` limit it could grant.
     route_body_ceilings: Vec<Option<u64>>,
+    /// 🧱 Per route, how many body bytes `request_buffers`/`response_buffers`
+    /// hold before the rest streams. Resolved once here because the answer
+    /// cannot differ between two requests on the same route, and because the
+    /// body filters run per chunk — the one place a per-request `min()` would
+    /// be paid a hundred thousand times a second.
+    pub(crate) route_buffering: Vec<RouteBuffering>,
     /// 🪵 Every access-log destination this server can reach, already narrowed
     /// by each logger's `hostnames`.
     ///
@@ -837,6 +851,25 @@ impl ProxyState {
     pub(crate) fn log_targets(&self) -> &crate::access_log::LogTargets {
         &self.log_targets
     }
+
+    /// 🧱 This route's resolved buffering ceilings, or the streaming default
+    /// for a route index that has none.
+    pub(crate) fn buffering(&self, route_index: usize) -> RouteBuffering {
+        self.route_buffering
+            .get(route_index)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+/// 🧱 One route's buffering answer, resolved at load time.
+///
+/// `None` on either side means that direction streams, which is both the
+/// default and what `0` means in the configuration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RouteBuffering {
+    pub(crate) request: Option<usize>,
+    pub(crate) response: Option<usize>,
 }
 
 /// 🔐 A route's upstream TLS posture, resolved once per configuration load.
@@ -1243,6 +1276,7 @@ impl ProxyState {
         let mut access_controls = Vec::new();
         let mut route_regexes = Vec::new();
         let mut route_body_ceilings = Vec::new();
+        let mut route_buffering = Vec::new();
 
         for (route_index, route) in config.routes.iter().enumerate() {
             let mut route_subrequests = Vec::new();
@@ -1330,13 +1364,36 @@ impl ProxyState {
                         "🧭 These transport options are accepted but have no runtime effect yet"
                     );
                 }
-                if proxy_config.request_buffer_bytes.is_some()
-                    || proxy_config.response_buffer_bytes.is_some()
-                {
-                    tracing::warn!(
-                        route = %route.path,
-                        "🧭 Request/response buffer ceilings are informational; bodies always stream"
-                    );
+                // 🧱 A ceiling this server will not honour verbatim is said out
+                // loud at load, naming the number it will use instead. The
+                // format's own implementation warns here too — that unlimited
+                // buffering can crash the process out of memory — and the only
+                // thing worse than that warning is our version of it being
+                // silent about the cap that replaces it.
+                for (name, configured) in [
+                    ("request_buffers", proxy_config.request_buffer_bytes),
+                    ("response_buffers", proxy_config.response_buffer_bytes),
+                ] {
+                    if let Some(explanation) = crate::body_buffer::describe_clamp(configured) {
+                        tracing::warn!(
+                            route = %route.path,
+                            directive = name,
+                            "🧱 {explanation}"
+                        );
+                    }
+                    // 🧵 FastCGI never enters either HTTP proxy body path — it
+                    // reads and writes its own records — so buffering does not
+                    // reach it. Saying so is the whole rule this project has
+                    // about knobs: an operator is never left believing a
+                    // setting took effect when it did not.
+                    if configured.is_some() && proxy_config.fastcgi.is_some() {
+                        tracing::warn!(
+                            route = %route.path,
+                            directive = name,
+                            "🧵 Body buffering has no effect on a FastCGI transport; \
+                             that body streams"
+                        );
+                    }
                 }
 
                 // 🔐 Compile the route policy before its probe peer so health and
@@ -1525,6 +1582,16 @@ impl ProxyState {
             collect_route_regexes(&route.handler, &mut compiled);
             route_regexes.push(compiled);
             route_body_ceilings.push(collect_request_body_ceiling(&route.handler));
+            // 🧱 Found by the same recursive walk as every other proxy slot,
+            // so a `reverse_proxy` nested inside `handle { … }` buffers too.
+            route_buffering.push(
+                find_reverse_proxy_config(&route.handler)
+                    .map(|proxy| RouteBuffering {
+                        request: crate::body_buffer::resolve_limit(proxy.request_buffer_bytes),
+                        response: crate::body_buffer::resolve_limit(proxy.response_buffer_bytes),
+                    })
+                    .unwrap_or_default(),
+            );
         }
 
         // A misconfigured log sink must not take the whole server down at
@@ -1622,6 +1689,7 @@ impl ProxyState {
             access_controls,
             route_regexes,
             route_body_ceilings,
+            route_buffering,
             log_targets,
         }
     }
@@ -6174,6 +6242,16 @@ impl ProxyHttp for PingclairProxy {
                 Self::activate_long_connection(session, ctx, &state);
             }
 
+            // 🧱 Arm the body buffers here, where the route is finally known
+            // and before any body chunk has been read. The limits themselves
+            // were resolved at load time; this only decides whether this
+            // request gets a buffer at all.
+            let buffering = state.buffering(index);
+            ctx.request_buffer = buffering.request.map(crate::body_buffer::BufferedBody::new);
+            ctx.response_buffer = buffering
+                .response
+                .map(crate::body_buffer::BufferedBody::new);
+
             // Access rules run before authentication, static-file lookup, or
             // an upstream connection. This keeps denied traffic out of every
             // later request path and makes the policy apply uniformly to all
@@ -6268,21 +6346,51 @@ impl ProxyHttp for PingclairProxy {
         Ok(false)
     }
 
-    /// 📦 Enforces streamed body size, timeout, and upload rate without replay buffering.
+    /// 📦 Enforces streamed body size, timeout, and upload rate, then applies
+    /// `request_buffers` if the route asked for it.
+    ///
+    /// Order matters: the limits are enforced against the bytes as they arrive
+    /// from the client, not against what this filter chooses to forward. A
+    /// 413 has to fire on the chunk that crosses `client_max_body_size` even
+    /// when that chunk is about to be withheld — otherwise turning buffering
+    /// on would quietly raise every size limit on the route.
     async fn request_body_filter(
         &self,
         session: &mut Session,
         body: &mut Option<Bytes>,
-        _end_of_stream: bool,
+        end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> pingora_core::Result<()>
     where
         Self::CTX: Send + Sync,
     {
-        let Some(bytes) = body.as_ref() else {
+        if let Some(bytes) = body.as_ref() {
+            Self::enforce_request_body_chunk(session, ctx, bytes.len()).await?;
+        }
+
+        let Some(buffer) = ctx.request_buffer.as_mut() else {
             return Ok(());
         };
-        Self::enforce_request_body_chunk(session, ctx, bytes.len()).await
+
+        // 🪤 Withholding is spelled `Some(Bytes::new())`, never `None`.
+        // `pingora-proxy 0.8.1` recomputes end-of-body from `data.is_none()`
+        // after this filter returns (`proxy_h1.rs:774`), so a `None` here ends
+        // the upstream request body early — silently, and with the client's
+        // remaining bytes discarded.
+        let was_streaming = buffer.overflowed();
+        let held = match body.take() {
+            Some(chunk) => buffer.offer(chunk),
+            None => None,
+        };
+        *body = match held {
+            Some(released) => Some(released),
+            None if end_of_stream => Some(buffer.finish().unwrap_or_default()),
+            None => Some(Bytes::new()),
+        };
+        if !was_streaming && buffer.overflowed() {
+            crate::body_buffer::report_overflow("request", buffer.limit());
+        }
+        Ok(())
     }
 
     /// 🚦 Decides the first attempt's admission before the request is committed
@@ -7070,11 +7178,16 @@ impl ProxyHttp for PingclairProxy {
 
     /// Filter upstream response body chunks through the negotiated coding.
     ///
-    /// 🏗️ ARCHITECTURE: Streaming, never full-body buffering — see
+    /// 🏗️ ARCHITECTURE: Streaming by default — see
     /// [`crate::encoding::stream_chunk`]. Every chunk is written in,
     /// sync-flushed and drained immediately, so memory use is bounded by one
     /// chunk's worth of compressed output rather than by response size.
     /// `end_of_stream` finalizes the encoder (trailer + final flush).
+    ///
+    /// 🧱 A route that configured `response_buffers` holds the body first, and
+    /// even then memory is bounded by the configured ceiling rather than by
+    /// the response — the two rules do not conflict, which is the point of
+    /// [`crate::body_buffer`].
     fn upstream_response_body_filter(
         &self,
         _session: &mut Session,
@@ -7098,6 +7211,31 @@ impl ProxyHttp for PingclairProxy {
                 *body = None;
             }
             return Ok(None);
+        }
+
+        // 🧱 `response_buffers` holds the upstream body before the client sees
+        // any of it, so a slow reader stops holding the upstream connection
+        // open. It runs before compression and before the byte accounting:
+        // what those measure is what actually leaves this filter.
+        //
+        // Unlike the request side, `None` is a safe way to withhold here —
+        // `pingora-proxy 0.8.1` carries end-of-stream past this filter in the
+        // task itself (`lib.rs:382`) instead of recomputing it from the data.
+        // An empty `Bytes` is used anyway, so the two directions read the same.
+        if let Some(buffer) = ctx.response_buffer.as_mut() {
+            let was_streaming = buffer.overflowed();
+            let held = match body.take() {
+                Some(chunk) => buffer.offer(chunk),
+                None => None,
+            };
+            *body = match held {
+                Some(released) => Some(released),
+                None if end_of_stream => Some(buffer.finish().unwrap_or_default()),
+                None => Some(Bytes::new()),
+            };
+            if !was_streaming && buffer.overflowed() {
+                crate::body_buffer::report_overflow("response", buffer.limit());
+            }
         }
 
         // Track response bytes for access log
