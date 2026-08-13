@@ -2955,7 +2955,6 @@ dependencies = [
  "pingora-proxy",
  "prometheus 0.14.0",
  "proptest",
- "quiche",
  "rcgen",
  "regex",
  "serde",

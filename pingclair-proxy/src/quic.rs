@@ -56,7 +56,16 @@ use pingclair_core::config::HandlerConfig;
 use pingclair_static::ServedResponse;
 use pingora_core::protocols::http::client::HttpSession;
 use pingora_http::RequestHeader;
-use quiche::h3::NameValue;
+// 🔗 quiche comes through `tokio-quiche` rather than as a dependency of our
+// own. The HTTP/3 protocol types below belong to quiche while the transport
+// belongs to tokio-quiche, and `ApplicationOverQuic` is defined in terms of
+// quiche's types — so the two crates must be looking at the *same* quiche.
+// Declaring it separately made that a promise a human had to keep; taking the
+// re-export makes it a fact the compiler enforces. Two quiche versions would
+// mean two BoringSSLs, which collide on libcrypto symbols and have crashed
+// this binary at startup before.
+use tokio_quiche::quiche;
+use tokio_quiche::quiche::h3::NameValue;
 
 use crate::client_auth::ClientAuthTable;
 use crate::connection_filter::PingclairConnectionFilter;

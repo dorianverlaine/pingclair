@@ -83,8 +83,18 @@ x509-parser = "0.18"
 # ⚠️ The cost is not free — `tokio-quiche` depends unconditionally on
 # `foundations` (feature `server-client-common-default`), which adds 86 crates
 # to the lock file, `tonic`/`prost` (gRPC, for OTLP export) among them.
-quiche = "0.29"
-boring = "4.22"   # must stay on the same release quiche 0.29 links against
+# 🔗 quiche is *not* declared here. It arrives through `tokio-quiche`, which
+# re-exports it (`pub extern crate quiche`), and code reaches it as
+# `tokio_quiche::quiche`. Declaring it separately would let the two drift onto
+# different quiche releases the day tokio-quiche bumps its own — and two quiche
+# releases mean two BoringSSLs, which collide on libcrypto symbols and have
+# crashed this binary at startup.
+#
+# ⚠️ `boring` has no such protection: tokio-quiche does not re-export it and we
+# call the BoringSSL API directly in 21 places, so this version is still a
+# promise a human has to keep. It must stay on the release quiche links
+# against; `cargo tree -i boring-sys` must show exactly one.
+boring = "4.22"
 # Pinned: the ConnectionHook/tls_cert behaviour documented above was read from
 # 0.19.1's source. A minor bump could start reading the sentinel paths.
 tokio-quiche = { version = "=0.19.1", default-features = false }

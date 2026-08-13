@@ -14,7 +14,10 @@ use pingclair_core::config::{HandlerConfig, RouteConfig, ServerConfig};
 use pingclair_proxy::client_auth::{ClientAuthTable, CompiledClientAuth};
 use pingclair_proxy::quic::{CertTable, QuicServer};
 use pingclair_proxy::server::PingclairProxy;
-use quiche::h3::NameValue;
+// 🔗 Through `tokio-quiche`, so the test client and the server under test are
+// provably the same quiche. See the note in `quic.rs`.
+use tokio_quiche::quiche;
+use tokio_quiche::quiche::h3::NameValue;
 
 const ALPN: &[u8] = b"h3";
 

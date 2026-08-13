@@ -13,6 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pingclair_proxy::quic::{CertTable, CertTableSslHook, IN_MEMORY_CERT_SENTINEL};
+// 🔗 Through `tokio-quiche`, so the test client and the server under test are
+// provably the same quiche. See the note in `quic.rs`.
+use tokio_quiche::quiche;
 use tokio_quiche::settings::{CertificateKind, Hooks, QuicSettings, TlsCertificatePaths};
 use tokio_quiche::{ApplicationOverQuic, ConnectionParams};
 
