@@ -788,6 +788,7 @@ pub(super) fn handler_directive_name(handler: &Handler) -> &'static str {
         Handler::RequestHeaders(_) => "request_header",
         Handler::RequestBody(_) => "request_body",
         Handler::Abort => "abort",
+        Handler::Metrics { .. } => "metrics",
         Handler::LogSkip => "log_skip",
         Handler::Vars(_) => "vars",
         Handler::Redirect(_) => "redir",
@@ -856,6 +857,9 @@ pub(super) fn handler_has_terminal(handler: &Handler) -> bool {
         // matters here: nothing composed after it could ever run, and the
         // format ranks it among the directives that answer.
         | Handler::Abort
+        // 📊 Terminal: it writes a whole scrape response and there is nothing
+        // sensible for a later handler to add to it.
+        | Handler::Metrics { .. }
         | Handler::ForwardAuth(_) => true,
         Handler::Pipeline(handlers)
         | Handler::Handle(handlers)

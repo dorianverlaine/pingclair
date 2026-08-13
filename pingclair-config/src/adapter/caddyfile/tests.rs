@@ -2175,6 +2175,109 @@ mod fail_closed_tests {
         assert!(error.contains("abort"), "got {error}");
     }
 
+    /// 📊 The path in `metrics /metrics` is a matcher, not an argument.
+    ///
+    /// Upstream's handler parser refuses every positional argument and lets the
+    /// registration helper claim the matcher token first, so a route matched on
+    /// `/metrics` is the only reading. Written down because the two spellings
+    /// look identical and mean opposite things: a path *argument* would make
+    /// this endpoint answer every request on the site.
+    #[test]
+    fn metrics_directive_takes_a_path_matcher_and_not_an_argument() {
+        let config = crate::compile(":80 {\n    metrics /metrics\n}").unwrap();
+        let route = &config.servers[0].routes[0];
+        assert_eq!(route.path, "/metrics", "the path became the route matcher");
+        assert!(
+            handlers_of(&route.handler)
+                .into_iter()
+                .any(|handler| matches!(
+                    handler,
+                    HandlerConfig::Metrics {
+                        disable_openmetrics: false
+                    }
+                )),
+            "`metrics` compiles to the metrics handler"
+        );
+
+        let config =
+            crate::compile(":80 {\n    metrics /metrics {\n        disable_openmetrics\n    }\n}")
+                .unwrap();
+        assert!(
+            handlers_of(&config.servers[0].routes[0].handler)
+                .into_iter()
+                .any(|handler| matches!(
+                    handler,
+                    HandlerConfig::Metrics {
+                        disable_openmetrics: true
+                    }
+                )),
+            "the subdirective reaches the handler"
+        );
+
+        let error = compile_err(":80 {\n    metrics /metrics extra\n}");
+        assert!(error.contains("metrics"), "got {error}");
+        let error = compile_err(":80 {\n    metrics {\n        disable_open_metrics\n    }\n}");
+        assert!(
+            error.contains("disable_open_metrics"),
+            "a misspelled subdirective is named, not dropped; got {error}"
+        );
+    }
+
+    /// 📊 A `metrics` block written twice merges instead of replacing.
+    ///
+    /// The same option can be written globally and again inside `servers`, and
+    /// they are read at different points. Merging is what makes the order they
+    /// appear in irrelevant; last-one-wins would make the meaning depend on the
+    /// layout. Both fixtures upstream ships for this expect one merged answer.
+    #[test]
+    fn metrics_options_merge_across_global_and_servers_blocks() {
+        let config = crate::compile(
+            "{\n    metrics\n    servers :80 {\n        metrics {\n            per_host\n\
+                     }\n    }\n}\n:80 {\n    respond \"Hello\"\n}",
+        )
+        .unwrap();
+        assert!(config.global.metrics, "bare `metrics` still means collect");
+        assert!(
+            config.global.metrics_options.per_host,
+            "the nested block's answer survived the flattening"
+        );
+
+        let config = crate::compile(
+            "{\n    metrics {\n        observe_catchall_hosts\n        otlp\n    }\n}\n\
+             :80 {\n    respond \"Hello\"\n}",
+        )
+        .unwrap();
+        assert!(config.global.metrics_options.observe_catchall_hosts);
+        assert!(config.global.metrics_options.otlp);
+        assert!(
+            !config.global.metrics_options.per_host,
+            "an option nobody wrote stays off"
+        );
+    }
+
+    /// 🚫 Inside `servers`, only `per_host` exists — and saying so beats
+    /// "unrecognized", which sends an operator hunting for a typo that is not
+    /// there. Flattening is what destroys the distinction, so the check has to
+    /// happen before it.
+    #[test]
+    fn nested_servers_metrics_block_accepts_only_per_host() {
+        for option in ["otlp", "observe_catchall_hosts"] {
+            let error = compile_err(&format!(
+                "{{\n    servers :80 {{\n        metrics {{\n            {option}\n\
+                         }}\n    }}\n}}\n:80 {{\n    respond \"x\"\n}}"
+            ));
+            assert!(
+                error.contains(option) && error.contains("servers"),
+                "`{option}` must be refused by name and by place; got {error}"
+            );
+        }
+        let error = compile_err(
+            "{\n    servers :80 {\n        metrics {\n            per_hosts\n        }\n    }\n}\n\
+             :80 {\n    respond \"x\"\n}",
+        );
+        assert!(error.contains("per_hosts"), "got {error}");
+    }
+
     #[test]
     fn admin_block_rejects_unknown_subdirectives() {
         // 🌐 `origins` and `enforce_origin` are implemented as of Day 24, so
@@ -2298,11 +2401,19 @@ mod fail_closed_tests {
 
     #[test]
     fn known_caddy_directives_are_reported_as_unsupported() {
-        let error = compile_err("example.com {\n    metrics\n}");
-        assert!(
-            error.contains("not supported by Pingclair") || error.contains("Unknown directive"),
-            "a recognised-but-unimplemented directive must be rejected; got {error}"
-        );
+        // 🧭 Driven from the registry rather than naming one directive, because
+        // the hand-picked example goes stale the day it gets implemented — and
+        // then this test proves nothing while still passing. It named `metrics`
+        // until `metrics` was implemented, at which point it was asserting that
+        // a working directive fails.
+        for directive in crate::adapter::recognised_but_unimplemented() {
+            let error = compile_err(&format!("example.com {{\n    {directive}\n}}"));
+            assert!(
+                error.contains("not supported by Pingclair") || error.contains("Unknown directive"),
+                "`{directive}` is recognised but unimplemented, so writing it must be \
+                 refused by name; got {error}"
+            );
+        }
     }
 
     #[test]

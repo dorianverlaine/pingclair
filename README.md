@@ -771,7 +771,7 @@ Directives:
 
   `acme_server` `copy_response` `copy_response_headers` `fs`
   `intercept` `invoke` `log_append` `log_name`
-  `map` `metrics` `push` `skip_log`
+  `map` `push` `skip_log`
   `tracing`
 
 Global options:

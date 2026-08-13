@@ -182,6 +182,7 @@ fn merge_globals(
         http_port,
         https_port,
         metrics,
+        metrics_options,
         auto_https,
         local_certs,
         blocked_ips,
@@ -235,6 +236,11 @@ fn merge_globals(
     if metrics != default.metrics {
         into.metrics = metrics;
     }
+    // 📊 Merged rather than overridden, for the same reason two `metrics`
+    // blocks in one file merge: each imported file states what *it* needs
+    // observed, and a later file that happens not to mention `per_host` is not
+    // asking for it to be switched off.
+    into.metrics_options.merge(&metrics_options);
     if auto_https != default.auto_https {
         into.auto_https = auto_https;
     }

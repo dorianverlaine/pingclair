@@ -510,6 +510,49 @@ async fn h3_serves_a_request_end_to_end() {
     );
 }
 
+/// 📊 The scrape endpoint answers over HTTP/3 with the same body and the same
+/// media type it answers with over HTTP/1 and HTTP/2.
+///
+/// Worth its own test because the two transports are separate execution paths
+/// here, and "implemented, but only on one protocol" is this codebase's most
+/// repeated defect. A monitoring endpoint that silently disappears for
+/// HTTP/3-capable scrapers is exactly the shape that goes unnoticed.
+#[tokio::test]
+async fn h3_metrics_directive_serves_the_same_scrape() {
+    pingclair_proxy::metrics::init();
+    let server = spawn_h3_server(HandlerConfig::Metrics {
+        disable_openmetrics: false,
+    })
+    .await;
+
+    let response = h3_get(server, "/metrics")
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.as_str()),
+        Some("text/plain; version=0.0.4; charset=utf-8"),
+        "HTTP/3 must not invent a different media type for the same body"
+    );
+    let body = String::from_utf8_lossy(&response.body);
+    // 🧭 A plain counter rather than one of the labelled families: the text
+    // encoder omits a family that has no series yet, and in this in-process
+    // test nothing has driven the labelled ones. Asserting on those would make
+    // the test pass or fail on what else ran, not on the exporter.
+    assert!(
+        body.contains("# HELP pingclair_access_log_dropped_total")
+            && body.contains("# TYPE pingclair_access_log_dropped_total counter")
+            && body.contains("\npingclair_access_log_dropped_total 0"),
+        "the exposition format must arrive intact — HELP, TYPE and sample; got {}",
+        &body[..body.len().min(400)]
+    );
+}
+
 #[tokio::test]
 async fn h3_reuses_one_connection_for_several_requests() {
     // 🔁 A second request on the same connection proves stream state is torn

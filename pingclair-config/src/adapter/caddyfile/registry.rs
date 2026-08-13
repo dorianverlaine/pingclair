@@ -99,6 +99,7 @@ pub(super) static DIRECTIVES: &[Spec] = &[
     implemented("log"),
     implemented("log_skip"),
     implemented("method"),
+    implemented("metrics"),
     implemented("php_fastcgi"),
     implemented("rate_limit"),
     implemented("redir"),
@@ -123,7 +124,6 @@ pub(super) static DIRECTIVES: &[Spec] = &[
     recognised("log_append"),
     recognised("log_name"),
     recognised("map"),
-    recognised("metrics"),
     recognised("push"),
     recognised("skip_log"),
     recognised("tracing"),
@@ -153,6 +153,10 @@ pub(super) static GLOBAL_OPTIONS: &[Spec] = &[
     implemented("preferred_chains"),
     implemented("protocols"),
     implemented("renewal_window_ratio"),
+    // 🧭 Consumed before the option loop runs — its children are lifted to this
+    // level — so it never reaches validation and is listed here to describe
+    // what is accepted rather than to enforce it.
+    implemented("servers"),
     implemented("skip_install_trust"),
     implemented("tls_resolvers"),
     implemented("trusted_proxies"),
@@ -332,6 +336,7 @@ mod tests {
             ("method", "method POST"),
             ("request_body", "request_body {\n max_size 1MB\n }"),
             ("request_header", "request_header X-Trace probe"),
+            ("metrics", "metrics /metrics"),
         ];
 
         for spec in DIRECTIVES

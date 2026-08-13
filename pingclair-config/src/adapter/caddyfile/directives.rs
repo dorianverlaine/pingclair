@@ -33,6 +33,7 @@ pub(super) fn adapt_handler(
         "intercept" => adapt_intercept(d),
         "forward_auth" => adapt_forward_auth(d),
         "respond" => adapt_respond(d),
+        "metrics" => adapt_metrics_directive(&d),
         "redir" | "redirect" => adapt_redirect(d),
         "file_server" => {
             let mut root = ".".to_string();
@@ -1634,6 +1635,50 @@ pub(super) fn adapt_abort_directive(d: &Directive) -> Result<Handler, AdapterErr
         return Err(AdapterError::ArgumentCount("abort".into(), 0, args.len()));
     }
     Ok(Handler::Abort)
+}
+
+/// 📊 Adapts `metrics [<matcher>] { disable_openmetrics }`.
+///
+/// The path in `metrics /metrics` is an ordinary inline matcher, handled by
+/// [`data_args`] before this runs — upstream's handler parser likewise rejects
+/// every positional argument and lets the registration helper take the matcher
+/// token first. So anything still here is a genuine surplus argument.
+pub(super) fn adapt_metrics_directive(d: &Directive) -> Result<Handler, AdapterError> {
+    let args = data_args(d);
+    if !args.is_empty() {
+        return Err(AdapterError::ArgumentCount("metrics".into(), 0, args.len()));
+    }
+
+    let mut disable_openmetrics = false;
+    if let Some(block) = &d.block {
+        for sub in &block.directives {
+            match sub.name.as_str() {
+                "disable_openmetrics" => {
+                    if !sub.args.is_empty() {
+                        return Err(AdapterError::ArgumentCount(
+                            "metrics disable_openmetrics".into(),
+                            0,
+                            sub.args.len(),
+                        ));
+                    }
+                    disable_openmetrics = true;
+                }
+                other => {
+                    return Err(AdapterError::InvalidArgument(
+                        "metrics".into(),
+                        format!(
+                            "`{other}` is not a metrics subdirective; expected \
+                             `disable_openmetrics`"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(Handler::Metrics {
+        disable_openmetrics,
+    })
 }
 
 /// 🧱 Adapts one fail-closed downstream resource-limit block.

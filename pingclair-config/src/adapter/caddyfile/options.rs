@@ -5,7 +5,7 @@ use super::AdapterError;
 use super::args::{expect_one_argument, parse_dns_refresh, parse_required_duration};
 use super::logs::adapt_log_block;
 use crate::parser::ast::*;
-use crate::parser::caddy_ast::Directive;
+use crate::parser::caddy_ast::{Block, Directive};
 use pingclair_core::config::DnsProviderConfig;
 
 // MARK: - Global Block
@@ -13,9 +13,10 @@ use pingclair_core::config::DnsProviderConfig;
 pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
     let mut global = GlobalBlock::default();
     if let Some(block) = d.block {
-        // ⚡ OPTIMIZATION: Flatten nested `servers { ... }` block into the
-        // global config, matching Caddy's { servers { protocols h1 h2 } } syntax.
-        let directives = expand_servers_block(block.directives);
+        // 🧭 Lift any nested `servers { … }` children to this level first, so
+        // the loop below sees one flat list of options regardless of how the
+        // operator chose to group them.
+        let directives = expand_servers_block(block.directives)?;
 
         for sub in directives {
             match sub.name.as_str() {
@@ -105,15 +106,6 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                     })?);
                 }
                 "metrics" => {
-                    // 📊 `metrics` is a bare toggle; the block form
-                    // (`per_host`, `otlp`) is deferred.
-                    if sub.block.is_some() {
-                        // TODO(v0.3): implement metrics { per_host; otlp }.
-                        return Err(AdapterError::UnsupportedFeature(
-                            "metrics block".into(),
-                            "metrics per_host/otlp options are not implemented yet".into(),
-                        ));
-                    }
                     if !sub.args.is_empty() {
                         return Err(AdapterError::ArgumentCount(
                             "metrics".into(),
@@ -121,7 +113,14 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                             sub.args.len(),
                         ));
                     }
+                    // 📊 Bare `metrics` still means "collect", which is what it
+                    // has always meant here. The block only adds detail, so an
+                    // empty one is not an error and does not switch anything off.
                     global.metrics = Some(true);
+                    if let Some(block) = &sub.block {
+                        let parsed = parse_metrics_options(block, MetricsScope::Global)?;
+                        global.metrics_options.merge(&parsed);
+                    }
                 }
                 "auto_https" => {
                     let arg = sub
@@ -447,29 +446,109 @@ pub(super) fn is_wildcard_host(host: &str) -> bool {
     matches!(host, "[::]" | "::" | "0.0.0.0" | "[::0]")
 }
 
-/// Flatten Caddy's nested `servers { ... }` block.
+/// Flatten Caddy's nested `servers [<address>] { ... }` block.
 ///
-/// Caddy allows:
 /// ```text
 /// {
-///     servers {
+///     servers :80 {
 ///         protocols h1 h2
 ///     }
 /// }
 /// ```
-/// We flatten `servers` children up to the parent level.
-pub(super) fn expand_servers_block(directives: Vec<Directive>) -> Vec<Directive> {
+///
+/// The children are lifted to the global level, which means the optional
+/// address is **dropped**: an option written for one listener applies to every
+/// listener here. For `metrics` that is exactly right — upstream hoists it to
+/// the app either way, so the address never selected anything to begin with.
+/// For the rest it is an approximation, and one worth knowing about before
+/// writing two `servers` blocks that disagree.
+///
+/// 🚫 The nested `metrics` block is checked here rather than after flattening,
+/// because flattening is what destroys the distinction: upstream accepts only
+/// `per_host` in this position, and once the block has been lifted it is
+/// indistinguishable from a global one that accepts three more names. Checking
+/// afterwards would silently widen what a `servers` block may say.
+pub(super) fn expand_servers_block(
+    directives: Vec<Directive>,
+) -> Result<Vec<Directive>, AdapterError> {
     let mut result = Vec::new();
     for d in directives {
         if d.name == "servers" {
             if let Some(block) = d.block {
+                for child in &block.directives {
+                    if child.name == "metrics"
+                        && let Some(inner) = &child.block
+                    {
+                        parse_metrics_options(inner, MetricsScope::Server)?;
+                    }
+                }
                 result.extend(block.directives);
             }
         } else {
             result.push(d);
         }
     }
-    result
+    Ok(result)
+}
+
+/// 📊 Where a `metrics` block was written, which decides what it may say.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MetricsScope {
+    /// Directly in the global block, where all three options are available.
+    Global,
+    /// Nested inside `servers`, where upstream accepts only `per_host` — and
+    /// warns that the whole nesting is deprecated in favour of the global form.
+    Server,
+}
+
+/// 📊 Reads `metrics { per_host | observe_catchall_hosts | otlp }`.
+///
+/// Every option is a bare flag with no arguments, so an argument is a typo
+/// rather than a value and is refused as one. Unknown names are refused too:
+/// a metrics option that quietly does nothing is the worst kind of silence,
+/// because the configuration and the dashboards both look correct and only the
+/// data disagrees.
+fn parse_metrics_options(
+    block: &Block,
+    scope: MetricsScope,
+) -> Result<pingclair_core::config::MetricsOptions, AdapterError> {
+    let mut options = pingclair_core::config::MetricsOptions::default();
+    for option in &block.directives {
+        if !option.args.is_empty() {
+            return Err(AdapterError::ArgumentCount(
+                format!("metrics {}", option.name),
+                0,
+                option.args.len(),
+            ));
+        }
+        match (option.name.as_str(), scope) {
+            ("per_host", _) => options.per_host = true,
+            ("observe_catchall_hosts", MetricsScope::Global) => {
+                options.observe_catchall_hosts = true;
+            }
+            ("otlp", MetricsScope::Global) => options.otlp = true,
+            // 🚫 Real names, wrong place. Saying so beats "unrecognized",
+            // which would send an operator looking for a spelling mistake.
+            ("observe_catchall_hosts" | "otlp", MetricsScope::Server) => {
+                return Err(AdapterError::InvalidArgument(
+                    format!("metrics {}", option.name),
+                    "only `per_host` may appear inside a `servers` block; write this one in \
+                     the global `metrics` block instead"
+                        .into(),
+                ));
+            }
+            (other, _) => {
+                return Err(AdapterError::InvalidArgument(
+                    "metrics".into(),
+                    format!(
+                        "`{other}` is not a metrics option; expected `per_host`, \
+                         `observe_catchall_hosts` or `otlp`"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(options)
 }
 
 /// 🔗 Reads `preferred_chains smallest` or a block naming issuer common names.

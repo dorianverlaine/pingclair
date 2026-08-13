@@ -89,6 +89,82 @@ pub fn capped_label(label: &'static str, value: &str) -> String {
     value.to_string()
 }
 
+// MARK: - Host Label Policy
+
+/// 🏷️ What the `host` label is allowed to say, decided once per configuration.
+///
+/// All three answers exist because "break the numbers down by host" and "let a
+/// stranger decide how many series this process holds" are the same request
+/// unless something bounds the host set. The three differ only in what does the
+/// bounding.
+enum HostLabelPolicy {
+    /// No breakdown at all: every request shares one series per method and
+    /// status. The default, and the only shape that costs nothing to produce.
+    Off,
+    /// Only hosts this configuration serves get their own series; everything
+    /// else folds into one. The Pingclairfile decides the ceiling, so a
+    /// stranger cannot move it.
+    Configured(HashSet<Box<str>>),
+    /// Every host gets a series until [`MAX_LABEL_VALUES`] of them exist. What
+    /// an operator gets by asking for `observe_catchall_hosts`: the sender
+    /// chooses the values, and this cap is all that stands behind it.
+    Capped,
+}
+
+/// 🏷️ The live policy, republished on reload.
+///
+/// [`ArcSwap`] rather than a lock because this is read on every request and
+/// written approximately never — the same reason `ProxyState` is published this
+/// way. Readers never block and never wait on a writer.
+static HOST_LABEL_POLICY: LazyLock<arc_swap::ArcSwap<HostLabelPolicy>> =
+    LazyLock::new(|| arc_swap::ArcSwap::from_pointee(HostLabelPolicy::Off));
+
+/// 📊 Applies a configuration's `metrics` block to the label policy.
+///
+/// `configured_hosts` is every host name the configuration serves. It is only
+/// consulted when the operator asked for per-host numbers without asking for
+/// catch-all hosts — which is the default pairing, and the one where the
+/// configuration rather than the client decides how many series exist.
+pub fn configure_host_labels<'a>(
+    options: &pingclair_core::config::MetricsOptions,
+    configured_hosts: impl Iterator<Item = &'a str>,
+) {
+    let policy = match (options.per_host, options.observe_catchall_hosts) {
+        (false, _) => HostLabelPolicy::Off,
+        (true, true) => HostLabelPolicy::Capped,
+        (true, false) => HostLabelPolicy::Configured(
+            configured_hosts
+                .filter(|host| !host.is_empty())
+                .map(Box::from)
+                .collect(),
+        ),
+    };
+    HOST_LABEL_POLICY.store(std::sync::Arc::new(policy));
+}
+
+/// 🏷️ The `host` label value for one request.
+///
+/// 🏎️ Borrows in the two common cases. `Off` returns a `'static` empty string
+/// and `Configured` returns the caller's own slice, so the default request path
+/// does a single hash lookup and no allocation at all — where the previous
+/// unconditional [`capped_label`] took a read lock and built a `String` on every
+/// request, whether or not anyone had asked to see hosts broken out.
+#[inline]
+pub fn host_label(host: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    match &**HOST_LABEL_POLICY.load() {
+        HostLabelPolicy::Off => Cow::Borrowed(""),
+        HostLabelPolicy::Configured(hosts) => {
+            if hosts.contains(host) {
+                Cow::Borrowed(host)
+            } else {
+                Cow::Borrowed(OVERFLOW_LABEL)
+            }
+        }
+        HostLabelPolicy::Capped => Cow::Owned(capped_label("host", host)),
+    }
+}
+
 // MARK: - Metrics Definitions
 
 /// Total requests processed
@@ -551,20 +627,21 @@ pub fn enabled() -> bool {
 
 /// 📥 Increments and returns the active-request gauge used by this request.
 ///
-/// 🛡️ The host is client-controlled, so it goes through [`capped_label`] like
+/// 🛡️ The host is client-controlled, so it goes through [`host_label`] like
 /// every other per-request label. It did not, until Day 26 measured it: with
 /// 1600 distinct `Host` headers every other host-labelled family stopped at
-/// 1025 series while this one grew to 1600, unauthenticated. Pairing is safe
-/// because the admitted set only ever grows — a value that maps to itself on
-/// the way in still maps to itself on the way out, and one that collapsed to
-/// `other` stays collapsed, so the gauge is never decremented on a different
-/// series than it was incremented on.
+/// 1025 series while this one grew to 1600, unauthenticated.
+///
+/// 🔁 The *gauge handle* is returned rather than the label, so the decrement
+/// lands on the series that was incremented even if a reload changes the policy
+/// in between. Re-deriving the label at the end would leak a count every time a
+/// host left the configuration mid-request.
 pub fn request_started(host: &str) -> Option<IntGauge> {
     if !enabled() {
         return None;
     }
-    let host = capped_label("host", host);
-    let metric = ACTIVE_CONNECTIONS.with_label_values(&[host.as_str()]);
+    let host = host_label(host);
+    let metric = ACTIVE_CONNECTIONS.with_label_values(&[host.as_ref()]);
     metric.inc();
     Some(metric)
 }
@@ -637,6 +714,14 @@ fn process_usage() -> (f64, f64, i64) {
 
 // MARK: - Export
 
+/// 📊 The media type every Pingclair scrape response carries.
+///
+/// The version number is part of the Prometheus text exposition contract, not
+/// decoration: a scraper reads it to know how to parse the body. This is the
+/// only format written here — no OpenMetrics negotiation happens, which is what
+/// [`pingclair_core::config::HandlerConfig::Metrics`] records.
+pub const SCRAPE_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
 /// Gather metrics in Prometheus text format
 ///
 /// Use this to expose metrics via an HTTP endpoint.
@@ -648,6 +733,70 @@ pub fn gather() -> String {
     let metric_families = REGISTRY.gather();
     encoder.encode(&metric_families, &mut buffer).unwrap();
     String::from_utf8(buffer).unwrap()
+}
+
+#[cfg(test)]
+mod host_label_tests {
+    use super::*;
+    use pingclair_core::config::MetricsOptions;
+
+    /// 🏷️ The three policies, and what each one does with a host nobody
+    /// configured.
+    ///
+    /// One test rather than three because the interesting property is the
+    /// *difference* between them: the same unconfigured host has to come back
+    /// as three different answers, and a bug that collapses two of them into
+    /// one would still pass a test that only looked at one policy.
+    ///
+    /// ⚠️ Serialized by being a single test — the policy is process-global, so
+    /// two tests mutating it in parallel would each see the other's answer.
+    #[test]
+    fn each_policy_gives_the_configured_and_unconfigured_host_its_own_answer() {
+        let configured = ["a.example", "b.example"];
+
+        // 📉 Default: no breakdown at all. This is the behaviour change — the
+        // host label used to be emitted unconditionally, and upstream's default
+        // is off, so a Pingclairfile that never mentions `per_host` gets one
+        // series per method and status.
+        configure_host_labels(&MetricsOptions::default(), configured.iter().copied());
+        assert_eq!(host_label("a.example"), "");
+        assert_eq!(host_label("stranger.example"), "");
+
+        // 🛡️ `per_host` alone: the configuration decides the ceiling. A host
+        // nobody set up folds away no matter how many distinct ones arrive, so
+        // the series count cannot be moved from outside at all.
+        configure_host_labels(
+            &MetricsOptions {
+                per_host: true,
+                ..MetricsOptions::default()
+            },
+            configured.iter().copied(),
+        );
+        assert_eq!(host_label("a.example"), "a.example");
+        assert_eq!(host_label("b.example"), "b.example");
+        assert_eq!(host_label("stranger.example"), OVERFLOW_LABEL);
+
+        // ⚠️ `observe_catchall_hosts`: the sender decides, and only
+        // `MAX_LABEL_VALUES` stands behind it. Still bounded, which is why it
+        // is offered at all — but bounded far above what the configuration
+        // knows about.
+        configure_host_labels(
+            &MetricsOptions {
+                per_host: true,
+                observe_catchall_hosts: true,
+                ..MetricsOptions::default()
+            },
+            configured.iter().copied(),
+        );
+        assert_eq!(
+            host_label("stranger.example"),
+            "stranger.example",
+            "a catch-all host must get its own series once it has been asked for"
+        );
+
+        // 🧹 Leave the process in its default state for whatever runs next.
+        configure_host_labels(&MetricsOptions::default(), std::iter::empty());
+    }
 }
 
 #[cfg(test)]

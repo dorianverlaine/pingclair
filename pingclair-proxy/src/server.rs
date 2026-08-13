@@ -3974,6 +3974,32 @@ impl PingclairProxy {
                 .await?;
                 Ok(true)
             }
+            // 📊 The Prometheus scrape, served from a normal route.
+            //
+            // The body is encoded on demand rather than cached: a scrape is
+            // supposed to observe the registry at the moment it is asked, and
+            // scrapes arrive every fifteen seconds or so, not every
+            // millisecond. This is one of the few local responses where doing
+            // the work per request is the point rather than a defect.
+            HandlerConfig::Metrics { .. } => {
+                let body_bytes = Bytes::from(crate::metrics::gather());
+                let mut response = ResponseHeader::build(200, Some(2)).unwrap();
+                response
+                    .insert_header("Content-Type", crate::metrics::SCRAPE_CONTENT_TYPE)
+                    .unwrap();
+                response
+                    .insert_header("Content-Length", body_bytes.len().to_string())
+                    .unwrap();
+                self.write_local_response(
+                    session,
+                    ctx,
+                    response,
+                    LocalResponseBody::Bytes(body_bytes),
+                    false,
+                )
+                .await?;
+                Ok(true)
+            }
             // 🧭 Response handlers only make sense against an upstream
             // response; a configuration that reaches the request dispatcher
             // with one is inert here by construction.
@@ -5045,9 +5071,9 @@ fn record_cache_outcome(session: &Session, host: &str, route: &str) {
         _ => return,
     };
     // 🛡️ Same reasoning as the request metrics: `host` comes from the client.
-    let host = metrics::capped_label("host", host);
+    let host = metrics::host_label(host);
     metrics::CACHE_REQUESTS_TOTAL
-        .with_label_values(&[host.as_str(), route, outcome])
+        .with_label_values(&[host.as_ref(), route, outcome])
         .inc();
 
     if let Some(eviction) = CACHE_EVICTION.get() {
@@ -7409,11 +7435,11 @@ impl ProxyHttp for PingclairProxy {
             // 🛡️ `host` is the request's `Host`/`:authority`, so it is entirely
             // client-controlled. Prometheus keeps one time series per label
             // combination, so feeding it raw would let anyone grow this
-            // process without bound by varying the header. Values beyond the
-            // ceiling collapse to `other`, which keeps the totals right while
-            // fixing the memory.
-            let capped_host = metrics::capped_label("host", host);
-            let host = capped_host.as_str();
+            // process without bound by varying the header. The `metrics` block
+            // decides what is safe to say here; by default nothing is, and the
+            // label is empty.
+            let capped_host = metrics::host_label(host);
+            let host = capped_host.as_ref();
             let labels = [method, status.as_str(), host];
             let request_size = req_header
                 .headers

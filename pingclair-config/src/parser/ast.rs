@@ -54,6 +54,12 @@ pub struct GlobalBlock {
     pub grace_period_secs: Option<u64>,
     /// 📊 Metrics toggle (Caddy `metrics`).
     pub metrics: Option<bool>,
+    /// 📊 What the collected series are labelled with (`metrics { … }`).
+    ///
+    /// Accumulated rather than assigned: the same options can be written in the
+    /// global block and again inside `servers`, and upstream folds both into one
+    /// answer. See [`pingclair_core::config::MetricsOptions::merge`].
+    pub metrics_options: pingclair_core::config::MetricsOptions,
     pub auto_https: Option<AutoHttpsMode>,
     pub admin: Option<AdminDirective>,
     /// 🔐 Caddy's global `local_certs` toggle: default automation uses the
@@ -631,6 +637,13 @@ pub enum Handler {
 
     /// 🔪 Closes the connection without writing a response (`abort`).
     Abort,
+
+    /// 📊 Serves the Prometheus scrape endpoint from a site route (`metrics`).
+    Metrics {
+        /// See [`pingclair_core::config::HandlerConfig::Metrics`] for why this
+        /// is stored rather than acted on.
+        disable_openmetrics: bool,
+    },
 
     /// 🚫 Excludes the request from access logging (`log_skip`).
     LogSkip,

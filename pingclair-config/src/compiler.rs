@@ -262,6 +262,7 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
     if let Some(enabled) = global.metrics {
         config.global.metrics = enabled;
     }
+    config.global.metrics_options.merge(&global.metrics_options);
 
     // Set global auto-HTTPS mode
     if let Some(mode) = global.auto_https {
@@ -1213,6 +1214,7 @@ fn reject_unimplemented_handler(handler: &HandlerConfig) -> CompileResult<()> {
         | HandlerConfig::RequestHeaders { .. }
         | HandlerConfig::RequestBody { .. }
         | HandlerConfig::Abort
+        | HandlerConfig::Metrics { .. }
         | HandlerConfig::LogSkip
         | HandlerConfig::Vars { .. }
         | HandlerConfig::BasicAuth { .. }
@@ -1292,6 +1294,7 @@ fn validate_basic_auth_credentials(handler: &HandlerConfig) -> CompileResult<()>
         | HandlerConfig::RequestHeaders { .. }
         | HandlerConfig::RequestBody { .. }
         | HandlerConfig::Abort
+        | HandlerConfig::Metrics { .. }
         | HandlerConfig::LogSkip
         | HandlerConfig::Vars { .. }
         | HandlerConfig::RateLimit { .. }
@@ -2472,6 +2475,11 @@ fn compile_handler(
         }),
 
         Handler::Abort => Ok(HandlerConfig::Abort),
+        Handler::Metrics {
+            disable_openmetrics,
+        } => Ok(HandlerConfig::Metrics {
+            disable_openmetrics: *disable_openmetrics,
+        }),
 
         Handler::LogSkip => Ok(HandlerConfig::LogSkip),
 

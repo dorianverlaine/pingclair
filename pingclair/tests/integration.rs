@@ -3982,6 +3982,77 @@ async fn test_pingclairfile_abort_answers_with_no_response() {
     );
 }
 
+/// 📊 The scrape endpoint on a site route, reachable without the admin socket.
+///
+/// The point of the directive is that metrics and administration are different
+/// trust boundaries: `admin off` here is not incidental, it is the property
+/// being tested. If the numbers only ever came from the admin API, an operator
+/// would have to expose the API to get them.
+#[tokio::test]
+async fn test_pingclairfile_metrics_directive_serves_the_scrape() {
+    let config = r#"
+        {
+            admin off
+            metrics {
+                per_host
+            }
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            metrics /metrics
+
+            # 🧭 Scoped rather than catch-all on purpose. A bare `respond` sorts
+            # *before* `metrics` in the directive order, so upstream would answer
+            # every path with it and never reach the scrape — while this server's
+            # router picks the more specific route instead. That difference is
+            # real and recorded in TRIAGE; a test about the metrics handler must
+            # not be standing on it.
+            respond /hello "hello" 200
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    // 🧭 One ordinary request first, so the counters below have something to
+    // report and the assertion is about the exporter rather than an empty
+    // registry that would pass either way.
+    let hello = client.get(server.url(0, "/hello")).send().await.unwrap();
+    assert_eq!(hello.status(), 200);
+
+    let scrape = client.get(server.url(0, "/metrics")).send().await.unwrap();
+    assert_eq!(scrape.status(), 200);
+    assert_eq!(
+        scrape
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain; version=0.0.4; charset=utf-8"),
+        "a scraper reads the version out of this header to know how to parse the body"
+    );
+    let body = scrape.text().await.unwrap();
+    assert!(
+        body.contains("# HELP pingclair_requests_total"),
+        "the exposition format carries HELP lines; got {}",
+        &body[..body.len().min(400)]
+    );
+    assert!(
+        body.contains("pingclair_requests_total{"),
+        "the request this test made must appear; got {}",
+        &body[..body.len().min(400)]
+    );
+
+    // 🚫 The path is a matcher, so nothing else on the site turned into a
+    // scrape. Without this, `metrics /metrics` reading its argument as data
+    // would answer every request with the exposition format and still pass
+    // every assertion above.
+    let hello = client.get(server.url(0, "/hello")).send().await.unwrap();
+    assert_eq!(hello.text().await.unwrap(), "hello");
+}
+
 #[tokio::test]
 async fn test_pingclairfile_reverse_proxy_method_and_rewrite_reach_upstream() {
     use tokio::io::AsyncWriteExt;

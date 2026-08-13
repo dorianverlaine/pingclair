@@ -216,6 +216,14 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             "this handler needs an upstream exchange, which the pure request executor cannot provide".to_string(),
         )),
 
+        // 📊 The metric registry lives in the proxy crate, which this one sits
+        // below. Answering here would mean either a second registry or an empty
+        // scrape, and an empty scrape is worse than no answer: it reads as "the
+        // server is up and idle" on every dashboard that consumes it.
+        HandlerConfig::Metrics { .. } => Err(HandlerError::Config(
+            "the metrics endpoint needs the proxy runtime's registry".to_string(),
+        )),
+
         HandlerConfig::Pipeline { handlers } => {
             // Execute handlers in order, combining results
             let mut final_response = HandlerResponse::status(200);

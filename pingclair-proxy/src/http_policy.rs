@@ -206,6 +206,29 @@ pub fn evaluate_response_handlers(
                     body: body.into_bytes(),
                 });
             }
+            // 📊 Discards whatever the upstream said and answers with the
+            // scrape instead. Reachable, if unusual: `handle_response` is where
+            // an operator turns one upstream reply into another, and there is
+            // no reason the replacement cannot be this server's own numbers.
+            HandlerConfig::Metrics { .. } => {
+                let mut response_headers: BTreeMap<String, String> = copied
+                    .iter()
+                    .chain(outcome.header_set.iter())
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect();
+                response_headers.insert(
+                    "Content-Type".into(),
+                    crate::metrics::SCRAPE_CONTENT_TYPE.into(),
+                );
+                for name in &outcome.header_remove {
+                    response_headers.remove(name);
+                }
+                outcome.replacement = Some(InterceptedResponse {
+                    status: 200,
+                    headers: response_headers,
+                    body: crate::metrics::gather().into_bytes(),
+                });
+            }
             HandlerConfig::CopyResponse { status_code } => {
                 outcome.passthrough_status = *status_code;
             }

@@ -2249,6 +2249,16 @@ async fn plan_h3_handler_with_connector(
         // nothing. `H3Plan::Abort` is the only plan that writes nothing at all;
         // every status-carrying plan would be an answer.
         HandlerConfig::Abort => Ok(H3Plan::Abort),
+        // 📊 Same numbers, same registry, same media type as H1/H2 — the
+        // scrape is a local response and nothing about it is transport-shaped.
+        HandlerConfig::Metrics { .. } => Ok(H3Plan::Respond(H3ImmediateResponse {
+            status: 200,
+            body: crate::metrics::gather(),
+            headers: vec![(
+                "content-type".to_string(),
+                crate::metrics::SCRAPE_CONTENT_TYPE.to_string(),
+            )],
+        })),
         HandlerConfig::LogSkip => Ok(H3Plan::Continue),
         HandlerConfig::Intercept { handlers } => {
             *response_handlers = Some(handlers.clone());

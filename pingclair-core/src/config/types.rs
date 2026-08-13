@@ -89,6 +89,15 @@ pub struct GlobalConfig {
     #[serde(default = "default_bool_true")]
     pub metrics: bool,
 
+    /// 📊 How much detail the collected metrics carry.
+    ///
+    /// Separate from [`GlobalConfig::metrics`], which decides *whether* to
+    /// collect at all. This decides *what the series look like* — and the split
+    /// matters because the expensive question in a metrics system is never
+    /// "how many counters" but "how many label combinations".
+    #[serde(default, skip_serializing_if = "MetricsOptions::is_default")]
+    pub metrics_options: MetricsOptions,
+
     /// Global auto-HTTPS setting
     #[serde(default)]
     pub auto_https: AutoHttpsMode,
@@ -184,6 +193,64 @@ pub enum PreferredChains {
     RootCommonName(Vec<String>),
 }
 
+/// 📊 How much detail the collected metrics carry.
+///
+/// Every field here buys resolution with cardinality. A Prometheus series is
+/// created per distinct combination of label values, so a label whose value
+/// comes from the request — and `Host` does — is a label an outsider can inflate
+/// by sending requests. That is why none of these are on by default and why
+/// [`MetricsOptions::observe_catchall_hosts`] carries a warning rather than a
+/// default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricsOptions {
+    /// 🏷️ Breaks the request metrics down by `Host`.
+    ///
+    /// Off by default: without it every request folds into one series per
+    /// method and status, which is both the cheaper shape and the one that
+    /// cannot be inflated from outside.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub per_host: bool,
+
+    /// ⚠️ Gives a host its own label even when no site is configured for it.
+    ///
+    /// With `per_host` on and this off, only hosts this configuration actually
+    /// serves get their own series and everything else folds into one — so the
+    /// number of series is decided by the Pingclairfile, not by whoever is
+    /// sending requests. Turning it on hands that decision to the sender, which
+    /// on a public listener is an unbounded-memory lever; upstream documents it
+    /// as not recommended, and this is why.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub observe_catchall_hosts: bool,
+
+    /// 📡 Asks for OTLP push in addition to the scrape endpoint.
+    ///
+    /// Parsed so a configuration written for upstream still loads and still
+    /// says what it meant, but Pingclair has no OTLP exporter — `run` refuses
+    /// to start rather than collect metrics that silently go nowhere.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub otlp: bool,
+}
+
+impl MetricsOptions {
+    /// 🧾 True when nothing has been asked for, so serialization can omit it.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// 🔀 Folds another block's answers into this one, keeping every `true`.
+    ///
+    /// Upstream merges rather than replaces because the same option can be
+    /// written twice — once globally and once inside a `servers` block — and
+    /// the two are read at different points in adaptation. Merging makes the
+    /// order they appear in irrelevant; last-one-wins would make a
+    /// configuration's meaning depend on how it happens to be laid out.
+    pub fn merge(&mut self, other: &Self) {
+        self.per_host |= other.per_host;
+        self.observe_catchall_hosts |= other.observe_catchall_hosts;
+        self.otlp |= other.otlp;
+    }
+}
+
 /// 🌐 Default plaintext HTTP port, matching Caddy's default.
 fn default_http_port() -> u16 {
     80
@@ -203,6 +270,7 @@ impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
             email: None,
+            metrics_options: MetricsOptions::default(),
             pki: Vec::new(),
             skip_install_trust: false,
             dns: None,
@@ -1293,6 +1361,32 @@ pub enum HandlerConfig {
     /// which is why it must never be confused with a 444-style empty status:
     /// a status line is still an answer.
     Abort,
+
+    /// 📊 Serves the Prometheus scrape endpoint from inside a site.
+    ///
+    /// The admin API has always exposed `/metrics`; this puts the same numbers
+    /// on a normal route, so a scrape can reach them without the admin socket
+    /// being reachable at all. That is the whole point of the directive
+    /// upstream: metrics and administration are different trust boundaries, and
+    /// wiring them to the same listener forces an operator to expose one to get
+    /// the other.
+    ///
+    /// 🛡️ Nothing here restricts who may scrape. The route is as open as the
+    /// site it sits in, so an endpoint on a public site wants a matcher or a
+    /// `basic_auth` in front of it — the same as upstream, which also leaves
+    /// that to the operator.
+    Metrics {
+        /// 📉 Records that the operator does not want OpenMetrics negotiation.
+        ///
+        /// ⚠️ Pingclair's exporter only ever writes the Prometheus text
+        /// exposition format, so setting this asks for the behaviour already in
+        /// effect and leaving it unset does **not** buy negotiation. It is read
+        /// and kept so the configuration round-trips and so this divergence has
+        /// somewhere to be written down, rather than a name the parser throws
+        /// away. See `TRIAGE.md`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        disable_openmetrics: bool,
+    },
 
     /// 🏷️ Rewrites headers on the **request**, before later handlers read it.
     ///

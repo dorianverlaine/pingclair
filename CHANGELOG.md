@@ -28,6 +28,31 @@ lets the rest converge.
 
 ### ⚠️ Breaking
 
+- 📊 **Request metrics no longer carry a `host` label unless the configuration
+  asks for one.** `pingclair_requests_total`, the request duration/size
+  histograms, `pingclair_active_connections` and `pingclair_cache_requests_total`
+  used to break down by `Host` unconditionally. They now report one series per
+  method and status until a `metrics { per_host }` block says otherwise, which
+  is the upstream default and the reason for the change.
+
+  **A dashboard or alert that groups by `host` will show one empty group after
+  upgrading.** Restore the old breakdown by adding to the global block:
+
+  ```
+  {
+      metrics {
+          per_host
+      }
+  }
+  ```
+
+  With `per_host` alone, only hosts the configuration actually serves get their
+  own series and every other `Host` value folds into `other` — so the series
+  count is decided by your Pingclairfile rather than by whoever is sending
+  requests. Add `observe_catchall_hosts` to give unconfigured hosts their own
+  series too; that hands the decision to the sender, bounded only by the 1024
+  distinct-value ceiling, and is not recommended on a public listener.
+
 - 🧩 **The JSON handler `{"type": "handle"}` is now `{"type": "pipeline"}`,
   and a separate `{"type": "first_match"}` carries the exclusive behaviour.**
   One container was doing two jobs under one name. Configurations written by
@@ -187,6 +212,32 @@ lets the rest converge.
   difference on TCP handshakes.
 
 ### ✨ Added
+
+- 📊 **`metrics [<matcher>]`** serves the Prometheus scrape endpoint from a
+  site route, so a scraper can reach the numbers without the admin API being
+  exposed at all. Metrics and administration are different trust boundaries,
+  and wiring them to one listener forces an operator to open one to get the
+  other. Available on HTTP/1, HTTP/2 and HTTP/3 alike.
+
+  ```
+  :80 {
+      metrics /metrics
+      reverse_proxy localhost:8080
+  }
+  ```
+
+  🛡️ Nothing about the directive restricts who may scrape — the route is as
+  open as the site it sits in, so an endpoint on a public site wants a matcher
+  or a `basic_auth` in front of it.
+
+- 📊 **A global `metrics { … }` block** decides what the collected series are
+  labelled with: `per_host`, `observe_catchall_hosts` and `otlp`. The same
+  options may also be written inside a `servers` block, where only `per_host`
+  is accepted; both spellings merge rather than overwrite, so the order they
+  appear in does not change the answer. See the breaking note above for what
+  `per_host` now controls. ⚠️ `otlp` is parsed but refused at startup: there is
+  no OTLP exporter here, and starting with one configured would mean a
+  dashboard that silently never receives anything.
 
 - 🍃 **`tls { client_auth { verifier leaf … } }`** pins the client's leaf
   certificate: the certificate presented must be one of a known set, checked

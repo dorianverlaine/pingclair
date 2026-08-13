@@ -61,6 +61,29 @@ pub(crate) fn run_server(
         pingclair_proxy::metrics::init();
     }
 
+    // 📡 OTLP push is parsed so a configuration written elsewhere still loads
+    // and still says what it meant, but nothing here exports it. Refusing beats
+    // starting: an operator who asked for push and got a silent scrape-only
+    // server finds out when an incident needs the dashboard that was never
+    // receiving anything.
+    if config.global.metrics_options.otlp {
+        anyhow::bail!(
+            "🚫 `metrics {{ otlp }}` is configured, but Pingclair has no OTLP exporter — \
+             metrics are exposed by scraping only. Remove `otlp` to start."
+        );
+    }
+
+    // 📊 Publish the label policy before any request path reads it, and give it
+    // every host this configuration serves so `per_host` can tell a host it was
+    // set up for from one a stranger typed into the `Host` header.
+    pingclair_proxy::metrics::configure_host_labels(
+        &config.global.metrics_options,
+        config
+            .servers
+            .iter()
+            .flat_map(|s| s.names.iter().map(String::as_str)),
+    );
+
     // 🪵 Named log channels must exist before any ProxyState resolves a
     // reference to one. Registration is idempotent, so a reload that keeps a
     // channel keeps its writer thread and its queue rather than spawning a
@@ -1033,6 +1056,18 @@ pub(crate) fn run_server(
                             &new_config.logging.channels,
                         );
                         pingclair_proxy::metrics::CONFIG_VERSION.inc();
+
+                        // 📊 A reload can add or remove sites, so the set of
+                        // hosts worth their own series changes with it.
+                        // Republished before the new routes go live, so no
+                        // request is ever labelled against the old answer.
+                        pingclair_proxy::metrics::configure_host_labels(
+                            &new_config.global.metrics_options,
+                            new_config
+                                .servers
+                                .iter()
+                                .flat_map(|s| s.names.iter().map(String::as_str)),
+                        );
 
                         // 🧭 Derive every bind address the same way startup
                         // does (including the automatic HTTP companion), so a
