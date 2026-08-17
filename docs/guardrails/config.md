@@ -128,3 +128,33 @@
 
   > 🎯 **可操作的規則**：`first_argument_is_data` 新增條目時，理由要引上游的
   > **註冊函式**，不要引某一份設定看起來像什麼。
+
+## 📁 `file_server` 的 index 也是不可信的 path component（2026-08-17）
+
+- 💀 **`Path::join` 遇到絕對路徑會「取代」而不是「延伸」。**
+  `root.join("/etc/passwd")` == `/etc/passwd`，整個 root 被丟掉。
+  這不是 Rust 的怪癖而是所有主流路徑 API 的共同語意，
+  但它把「設定寫錯」變成「逃出 root」而不是「找不到檔案」。
+  ⚠️ **呼叫點完全看不出來**，所以只能在載入時攔。
+
+- 🎯 **「request path 不可信」不等於「resolved path 安全」。**
+  request path 早就有 lexical confinement，index 是在**那之後**才 join 上去的，
+  於是它成了整條路徑上最後一個沒被檢查的 component。
+  判準：**問「這條路徑是由幾個來源組成的」**，不是「不可信的那個擋住了嗎」。
+  來源有兩個（request path、設定的 index），就要檢查兩個。
+
+- 🛡️ **兩層都要做，而且第二層不能依賴第一層跑過。**
+  載入時拒絕（絕對路徑、`..`、反斜線、冒號、空字串）是操作者會看到的那一層；
+  執行期把 index 丟回 `resolve_path` 做同樣的 confinement 是第二層。
+  📌 測試因此要**用程式直接建 `FileServerConfig`** 繞過驗證——
+  只靠「設定被拒絕」測不到第二層，而一個只在第一層跑過時才成立的第二層不是第二層。
+
+- 🙈 **`hide` 與 regular-file 檢查也要跟著搬。**
+  `hide` 檢查原本只套在 resolved request path 上，index 選出來之後沒有重跑,
+  所以 index 可以指名操作者明確 `hide` 掉的檔案。
+  而 `exists()` 對目錄是 true——目錄被當成 index 接受，然後被當檔案讀,
+  失敗會出現在離決策很遠的地方。要用 `is_file()`。
+
+- 🧭 **驗證要寫在 `validate_config`，不是只寫在 adapter。**
+  Admin API 直接把文件反序列化進 canonical types，完全不經過 adapter。
+  這條規則這個倉庫已經付過兩次代價（見「安全預設」節）。

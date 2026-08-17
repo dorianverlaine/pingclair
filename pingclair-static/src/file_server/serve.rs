@@ -161,8 +161,29 @@ impl FileServer {
             // Try index files
             let mut index_found = false;
             for index in &self.config.index {
-                let index_path = file_path.join(index);
-                if index_path.exists() {
+                // 🛡️ The index goes through the same confinement the request
+                // path did, and for the same reason: it is a configured value
+                // joined onto a directory, which makes it a path component like
+                // any other. `file_path.join(index)` is not enough — `Path::join`
+                // *replaces* the left side when the right is absolute, so an
+                // index of `/etc/passwd` resolved to `/etc/passwd` rather than
+                // to something under the root. `..` in an index escaped just as
+                // plainly. Load-time validation refuses both, and this is the
+                // second line that does not depend on it having run.
+                let Some(index_path) = self.resolve_path(&format!("{path}/{index}")) else {
+                    continue;
+                };
+                // 🙈 Hidden the same way anything else is. The check above this
+                // block applied to the directory; without repeating it here, an
+                // index could name a file the operator had explicitly hidden.
+                if self.config.hide.hides(&index_path) {
+                    continue;
+                }
+                // 📄 A regular file, not merely something that exists. A
+                // directory named as an index used to be accepted by `exists()`
+                // and then read as a file, and the failure surfaced far from
+                // here.
+                if index_path.is_file() {
                     file_path = index_path;
                     index_found = true;
                     break;
@@ -679,6 +700,150 @@ mod traversal_tests {
         assert_eq!(nested.content, b"nested");
         let streamed = fs.serve_streaming("/sub/page.txt").await.unwrap().unwrap();
         assert_eq!(streamed.file_size, 6);
+    }
+
+    // MARK: - The index is a path component too
+
+    /// 🛡️ A configured index cannot reach outside the document root.
+    ///
+    /// The request path had always been treated as untrusted; the index had not,
+    /// because it comes from the configuration. But it is joined onto a directory
+    /// *after* the request path has been confined, which makes it the last
+    /// unchecked component in the resolved path.
+    ///
+    /// `Path::join` is what turns carelessness into an escape rather than an
+    /// error: joining an absolute path **discards the left side**, so an index of
+    /// `/…/secret.txt` did not resolve under the root, it replaced the root. The
+    /// `..` form needs no such quirk — it simply walked out.
+    ///
+    /// 📌 These configurations are refused at load now, so reaching them means
+    /// building the config in code. That is deliberate: this is the second line,
+    /// and a second line that only works when the first one ran is not one.
+    #[tokio::test]
+    async fn a_configured_index_cannot_escape_the_document_root() {
+        let f = fixture().await;
+        let outside = f.base.path().join("secret.txt");
+        assert!(outside.is_file(), "the fixture's sentinel must exist");
+
+        for index in [
+            // 💀 Absolute: `join` throws the root away.
+            outside.to_string_lossy().into_owned(),
+            // 💀 Parent-relative.
+            "../secret.txt".to_string(),
+            // 💀 Nested, so the `..` is not the first segment.
+            "sub/../../secret.txt".to_string(),
+        ] {
+            let fs = FileServer::new(FileServerConfig {
+                root: f.root.clone(),
+                index: vec![index.clone()],
+                browse: false,
+                browse_limit: None,
+                compress: false,
+                ..FileServerConfig::default()
+            });
+
+            let served = fs.serve("/sub/", None, None).await.unwrap();
+            let body = served.map(|file| file.content);
+            assert_ne!(
+                body.as_deref(),
+                Some(b"top secret".as_slice()),
+                "index `{index}` served a file from outside the document root"
+            );
+        }
+    }
+
+    /// 🙈 An index is hidden on the same terms as anything else.
+    ///
+    /// The `hide` check runs on the resolved request path, before the index is
+    /// chosen. Without repeating it, an index could name exactly the file the
+    /// operator wrote `hide` to keep unreachable.
+    #[tokio::test]
+    async fn a_hidden_file_is_not_served_because_an_index_named_it() {
+        let f = fixture().await;
+        tokio::fs::write(f.root.join("sub/.env"), b"SECRET=1")
+            .await
+            .unwrap();
+
+        let fs = FileServer::new(FileServerConfig {
+            root: f.root.clone(),
+            index: vec![".env".to_string()],
+            hide: super::super::HidePolicy::new(&[".env".to_string()], &f.root),
+            browse: false,
+            browse_limit: None,
+            compress: false,
+            ..FileServerConfig::default()
+        });
+
+        let served = fs.serve("/sub/", None, None).await.unwrap();
+        assert_ne!(
+            served.map(|file| file.content).as_deref(),
+            Some(b"SECRET=1".as_slice()),
+            "a hidden file was served because an index named it"
+        );
+    }
+
+    /// 📄 An index has to be a regular file, not merely something that exists.
+    ///
+    /// `exists()` is true for a directory, so a directory named as an index was
+    /// accepted and then read as a file — and the failure surfaced somewhere far
+    /// from the decision that caused it.
+    #[tokio::test]
+    async fn a_directory_named_as_an_index_is_not_accepted() {
+        let f = fixture().await;
+        tokio::fs::create_dir_all(f.root.join("sub/index.html"))
+            .await
+            .unwrap();
+
+        let fs = FileServer::new(FileServerConfig {
+            root: f.root.clone(),
+            index: vec!["index.html".to_string()],
+            browse: false,
+            browse_limit: None,
+            compress: false,
+            ..FileServerConfig::default()
+        });
+
+        // 🧭 No index found and browsing is off, so the directory is simply not
+        // served — the same answer as a directory with no index at all.
+        assert!(fs.serve("/sub/", None, None).await.unwrap().is_none());
+    }
+
+    /// 🧭 An ordinary index still works, in a subdirectory and with a path.
+    ///
+    /// The control for every assertion above: a filter that refused every index
+    /// would satisfy all of them and break every static site.
+    #[tokio::test]
+    async fn an_ordinary_index_still_resolves() {
+        let f = fixture().await;
+        tokio::fs::write(f.root.join("sub/index.html"), b"sub index")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(f.root.join("sub/deep"))
+            .await
+            .unwrap();
+        tokio::fs::write(f.root.join("sub/deep/default.html"), b"deep default")
+            .await
+            .unwrap();
+
+        let fs = FileServer::new(FileServerConfig {
+            root: f.root.clone(),
+            index: vec!["index.html".to_string(), "deep/default.html".to_string()],
+            browse: false,
+            browse_limit: None,
+            compress: false,
+            ..FileServerConfig::default()
+        });
+
+        let served = fs.serve("/sub/", None, None).await.unwrap().unwrap();
+        assert_eq!(served.content, b"sub index");
+
+        // 📁 A nested index path is legitimate and must keep working; only `..`
+        // and absolute forms are refused.
+        tokio::fs::remove_file(f.root.join("sub/index.html"))
+            .await
+            .unwrap();
+        let served = fs.serve("/sub/", None, None).await.unwrap().unwrap();
+        assert_eq!(served.content, b"deep default");
     }
 }
 

@@ -1687,6 +1687,14 @@ fn validate_file_matchers_under(handler: &HandlerConfig) -> CompileResult<()> {
                 validate_file_matchers_under(fallback)?;
             }
         }
+        // 📁 The index is joined onto a directory after the request path has
+        // already been confined, so it is the one path component nothing else
+        // was treating as untrusted.
+        HandlerConfig::FileServer { index, .. } => {
+            for entry in index {
+                validate_file_server_index(entry)?;
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -1751,6 +1759,63 @@ fn validate_file_matcher(matcher: &pingclair_core::config::Matcher) -> CompileRe
 /// nothing, and fall through — a misconfiguration that behaves exactly like a
 /// missing file. The set it checks against is the matcher's own, so the two
 /// cannot drift: see `FILE_MATCHER_PLACEHOLDERS`.
+/// 🚫 Refuses a `file_server` index that could name something outside the root.
+///
+/// An index is a **filename**, not a path to go looking with — `index.html`,
+/// maybe `index/default.html`. The reason it needs its own validation is that it
+/// is joined onto a directory *after* the request path has already been confined,
+/// so nothing downstream was treating it as untrusted. And `Path::join` has a
+/// rule that turns a careless value into an escape rather than an error: joining
+/// an **absolute** path discards everything on the left, so an index of
+/// `/etc/passwd` does not resolve under the root, it *replaces* the root.
+///
+/// Rejected here, at load, because a misconfiguration that fails closed at the
+/// first request is still a site that serves the wrong file until somebody
+/// notices. The runtime keeps its own containment check as a second line — see
+/// `pingclair-static`'s `resolve_path` — but this is where an operator gets told.
+///
+/// 📌 In `validate_config` rather than only in the Caddyfile adapter, because the
+/// Admin API deserialises straight into the canonical types and never sees the
+/// adapter. A rule that lives only in the DSL is a rule with a JSON-shaped hole
+/// in it — this codebase has paid for that one twice.
+fn validate_file_server_index(index: &str) -> CompileResult<()> {
+    let reject = |reason: &str| {
+        Err(CompileError::InvalidRoute {
+            message: format!("file_server index `{index}` {reason}"),
+        })
+    };
+    if index.is_empty() {
+        return reject("is empty, so it names the directory itself rather than a file in it");
+    }
+    // 🪟 A leading `/` — or a Windows drive or UNC prefix — makes `Path::join`
+    // throw the document root away entirely.
+    if index.starts_with('/') || index.starts_with('\\') {
+        return reject(
+            "is absolute; an index is a filename resolved inside the directory, and an \
+             absolute value would replace the document root instead of extending it",
+        );
+    }
+    if index.contains(':') {
+        return reject(
+            "contains `:`, which some platforms read as a drive or stream prefix and would \
+             resolve outside the document root",
+        );
+    }
+    // 🪟 Backslash is a separator on Windows and an ordinary filename character
+    // on Unix, so a value containing one means two different files depending on
+    // where the server runs. Neither reading is worth guessing at.
+    if index.contains('\\') {
+        return reject(
+            "contains a backslash, which is a path separator on some platforms and a \
+             filename character on others",
+        );
+    }
+    if index.split('/').any(|segment| segment == "..") {
+        return reject("contains `..`, which would resolve outside the document root");
+    }
+    Ok(())
+}
+
 fn validate_try_files_candidate(candidate: &str) -> CompileResult<()> {
     if candidate.split('/').any(|segment| segment == "..") {
         return Err(CompileError::InvalidRoute {
@@ -3198,6 +3263,73 @@ mod fail_closed_handler_tests {
             }],
             ..Default::default()
         }
+    }
+
+    /// 🚫 A `file_server` index that could name something outside the root is
+    /// refused at load, on the path the Admin API actually takes.
+    ///
+    /// The absolute case is the one worth naming: `Path::join` **discards the
+    /// left side** when the right is absolute, so an index of `/etc/passwd` did
+    /// not resolve under the document root, it replaced it. Nothing about that
+    /// looks like an error at the call site, which is exactly why it has to be
+    /// caught where an operator is told.
+    ///
+    /// 📌 Asserted through `validate_config`, not through the Caddyfile adapter.
+    /// The Admin API deserialises straight into these types and never sees the
+    /// adapter, so a rule tested only against the DSL is a rule with a
+    /// JSON-shaped hole in it.
+    #[test]
+    fn a_file_server_index_that_could_leave_the_root_is_refused() {
+        let file_server = |index: Vec<String>| HandlerConfig::FileServer {
+            root: "/srv/www".to_string(),
+            index,
+            browse: false,
+            browse_limit: None,
+            compress: false,
+            precompressed: Vec::new(),
+            hide: Vec::new(),
+            status: None,
+            pass_thru: false,
+            canonical_uris: true,
+            etag_file_extensions: Vec::new(),
+        };
+
+        for bad in [
+            "/etc/passwd",
+            "../../etc/passwd",
+            "sub/../../escape.html",
+            "\\\\server\\share\\index.html",
+            "sub\\index.html",
+            "C:/windows/win.ini",
+            "",
+        ] {
+            let outcome = validate_config(&config_with(file_server(vec![bad.to_string()])));
+            assert!(
+                outcome.is_err(),
+                "index `{bad}` was accepted; it can name something outside the root"
+            );
+        }
+
+        // 🧭 The ordinary forms stay valid, including a nested path — only the
+        // escaping and ambiguous shapes are refused.
+        for good in ["index.html", "index.htm", "deep/default.html", "a.b.c.html"] {
+            let outcome = validate_config(&config_with(file_server(vec![good.to_string()])));
+            assert!(
+                outcome.is_ok(),
+                "index `{good}` is legitimate but was refused: {outcome:?}"
+            );
+        }
+
+        // 🧾 A list is checked entry by entry: one bad entry among good ones is
+        // still a configuration that can serve the wrong file.
+        assert!(
+            validate_config(&config_with(file_server(vec![
+                "index.html".to_string(),
+                "/etc/passwd".to_string(),
+            ])))
+            .is_err(),
+            "a bad entry hidden behind a good one was accepted"
+        );
     }
 
     #[test]

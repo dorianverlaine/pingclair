@@ -115,6 +115,14 @@ lets the rest converge.
   to the certificate is the fix in all three cases. See the Security entry
   below.
 
+- 📁 **A `file_server` index must be a relative filename.** An index that is
+  absolute (`/var/www/index.html`), contains `..`, contains a backslash or a
+  colon, or is empty is now refused when the configuration loads rather than
+  resolved at the first request. `index.html`, `index.htm` and a nested
+  `deep/default.html` are unaffected — the refused shapes are the ones that
+  resolve somewhere other than inside the served directory, or that mean two
+  different files depending on the platform. See the Security entry below.
+
 - 🃏 **A `*.example.com` site now covers one label, not any depth.** Routing used
   to match a wildcard site with `ends_with(".example.com")`, so
   `a.b.example.com` reached `*.example.com` as well as `a.example.com` did. One
@@ -853,6 +861,20 @@ lets the rest converge.
   wrong); upstream and internal failures are untouched and still ERROR.
 
 ### 🔐 Security
+
+- 📁 **A configured `file_server` index could name a file outside the document
+  root.** The request path has always been confined — `..` is rejected before
+  anything is opened — but the directory index was joined on *afterwards*, and
+  nothing treated it as untrusted because it comes from the configuration. It is
+  still a path component. `Path::join` is what makes that dangerous rather than
+  merely wrong: joining an **absolute** path discards the left side, so an index
+  of `/etc/passwd` did not resolve under the root, it replaced the root. A
+  `../` form needed no such quirk. The resolved index also skipped the `hide`
+  list and was accepted on `exists()`, which is true for a directory.
+
+  Indexes are now refused at load if they could leave the root, and the runtime
+  puts the index through the same confinement the request path gets, plus the
+  `hide` check and a regular-file check. Found by review.
 
 - 🔐 **An inline subrequest ignored the upstream TLS policy it was configured
   with.** A route's own reverse proxy compiles its `upstream_tls` block at load
