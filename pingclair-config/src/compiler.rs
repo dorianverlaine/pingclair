@@ -821,6 +821,43 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
             });
         }
     }
+    // 🚧 An Admin listen address that cannot be parsed is a typo, and a typo has
+    // to be reported here rather than at bind time. It used to reach a
+    // `.parse().expect()` on the Admin startup thread: in release, where the
+    // profile sets `panic = "abort"`, that is the whole process dying over a
+    // setting; in debug it killed only that thread, so the server came up and
+    // served traffic with no Admin API and nothing but one panic line to say so.
+    // 📌 Only when it is actually going to bind. `admin off` compiles to a
+    // disabled block with an empty listen string, which never reaches a socket
+    // and must not be judged as though it did.
+    if let Some(admin) = &config.admin
+        && admin.enabled
+        && pingclair_core::config::parse_listen_addr(&admin.listen).is_none()
+    {
+        return Err(CompileError::InvalidServer {
+            message: format!(
+                "admin listen address `{}` is not a port or an address and port \
+                 (the Admin listener binds a socket, it does not resolve a name)",
+                admin.listen
+            ),
+        });
+    }
+
+    // 🔗 Refused rather than warned about. This build's ACME client downloads
+    // whichever chain the authority offers first and cannot ask for another
+    // (`instant-acme` 0.8.5, verified 2026-08-12), so honouring the setting is
+    // not possible — and an operator who asked for a specific issuer chain,
+    // received a different one, and got a single startup log line has not been
+    // told anything they will notice. Misconfiguration fails closed here.
+    if config.global.preferred_chains.is_some() {
+        return Err(CompileError::InvalidServer {
+            message: "`preferred_chains` cannot be honoured by this build: its ACME client \
+                      takes whichever issuer chain the authority offers first. Remove the \
+                      setting rather than leaving a preference that does not apply."
+                .to_string(),
+        });
+    }
+
     validate_proxy_protocol_listeners(config)?;
     validate_plaintext_listeners(config)?;
     validate_cache_ceiling_agrees(config)?;
@@ -3152,6 +3189,89 @@ mod tests {
         .unwrap();
 
         assert!(validate_config(&config).is_err());
+    }
+
+    fn admin_listening_on(listen: &str) -> pingclair_core::config::AdminConfig {
+        pingclair_core::config::AdminConfig {
+            listen: listen.to_string(),
+            enabled: true,
+            api_key: None,
+            origins: Vec::new(),
+            enforce_origin: false,
+        }
+    }
+
+    /// 🚧 An Admin listen address that cannot be parsed is refused at load.
+    ///
+    /// 🤡 It used to reach a `.parse().expect()` on the Admin startup thread. In
+    /// release, where the profile sets `panic = "abort"`, that is the whole
+    /// process dying on a typo; in debug it killed only that thread, so the data
+    /// plane came up and served traffic with **no Admin API and no error** past
+    /// one panic line. Neither is a way to report a bad setting.
+    #[test]
+    fn an_unparseable_admin_listen_address_is_refused() {
+        let mut config = PingclairConfig {
+            admin: Some(admin_listening_on("not-an-address")),
+            ..Default::default()
+        };
+        assert!(
+            validate_config(&config).is_err(),
+            "a listen address nothing can bind must not reach startup"
+        );
+
+        config.admin = Some(admin_listening_on("127.0.0.1:2019"));
+        assert!(validate_config(&config).is_ok());
+
+        // 🎯 A host name is not a socket address either — the Admin listener
+        // binds, it does not resolve.
+        config.admin = Some(admin_listening_on("localhost:2019"));
+        assert!(validate_config(&config).is_err());
+
+        // 🎯 A port with no colon is a typo; `:2019` is the ordinary spelling and
+        // has to keep working — it is what this repository's own fixtures use, and
+        // it is exactly what used to panic.
+        config.admin = Some(admin_listening_on("2019"));
+        assert!(validate_config(&config).is_err());
+
+        config.admin = Some(admin_listening_on(":2019"));
+        assert!(
+            validate_config(&config).is_ok(),
+            "the bare-port spelling is valid Caddy and must not be refused"
+        );
+
+        // 🎯 `admin off` compiles to a disabled block with an empty listen. It
+        // binds nothing, so there is nothing to judge — refusing it would make
+        // turning the Admin API off impossible.
+        config.admin = Some(pingclair_core::config::AdminConfig {
+            listen: String::new(),
+            enabled: false,
+            api_key: None,
+            origins: Vec::new(),
+            enforce_origin: false,
+        });
+        assert!(validate_config(&config).is_ok());
+    }
+
+    /// 🔗 `preferred_chains` is refused rather than warned about.
+    ///
+    /// The setting parsed, compiled and was stored, and the only sign it did
+    /// nothing was one line in the log at startup. This project's rule is that a
+    /// setting which cannot be honoured fails closed — an operator who asked for a
+    /// specific issuer chain and got whichever one the authority offered first has
+    /// not been told anything they will notice.
+    #[test]
+    fn preferred_chains_is_refused_while_it_cannot_be_honoured() {
+        let mut config = PingclairConfig::default();
+        assert!(validate_config(&config).is_ok());
+
+        config.global.preferred_chains =
+            Some(pingclair_core::config::PreferredChains::RootCommonName(
+                vec!["ISRG Root X1".to_string()],
+            ));
+        assert!(
+            validate_config(&config).is_err(),
+            "a chain preference this build cannot request must be refused, not logged"
+        );
     }
 
     #[test]

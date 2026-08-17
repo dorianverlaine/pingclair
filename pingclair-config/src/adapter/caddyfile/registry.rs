@@ -150,7 +150,6 @@ pub(super) static GLOBAL_OPTIONS: &[Spec] = &[
     implemented("order"),
     implemented("persist_config"),
     implemented("pki"),
-    implemented("preferred_chains"),
     implemented("protocols"),
     implemented("renewal_window_ratio"),
     // 🧭 Consumed before the option loop runs — its children are lifted to this
@@ -175,6 +174,7 @@ pub(super) static GLOBAL_OPTIONS: &[Spec] = &[
     recognised("ocsp_interval"),
     recognised("ocsp_stapling"),
     recognised("on_demand_tls"),
+    recognised("preferred_chains"),
     recognised("renew_interval"),
     recognised("shutdown_delay"),
     recognised("storage"),

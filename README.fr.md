@@ -817,8 +817,8 @@ Options globales :
   `acme_ca` `acme_ca_root` `acme_eab` `cert_issuer`
   `cert_lifetime` `ech` `events` `fallback_sni`
   `filesystem` `frankenphp` `key_type` `ocsp_interval`
-  `ocsp_stapling` `on_demand_tls` `renew_interval` `shutdown_delay`
-  `storage` `storage_clean_interval`
+  `ocsp_stapling` `on_demand_tls` `preferred_chains` `renew_interval`
+  `shutdown_delay` `storage` `storage_clean_interval`
 
 Deux noms se situent entre les listes ci-dessus et la prise en charge complète,
 et sont donc nommés ici plutôt que dans l'une ou l'autre. `pki` et

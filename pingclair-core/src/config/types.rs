@@ -2745,6 +2745,31 @@ pub struct AdminConfig {
     pub enforce_origin: bool,
 }
 
+/// 🎧 Reads a listen address the way this project spells them.
+///
+/// A bare `:2019` means "every interface", which is the ordinary Caddy spelling
+/// and what the data plane's own listeners use — Pingora accepts it directly.
+/// `SocketAddr` does not, so anything that needs a real `SocketAddr` has to fill
+/// the host in first.
+///
+/// 🤡 The Admin listener did not. It called `.parse().expect()`, so `admin :2019`
+/// — a correct, documented configuration, and the spelling this repository's own
+/// test fixtures use — panicked at startup. In release, where the profile sets
+/// `panic = "abort"`, that is the whole process; in debug it killed only the
+/// Admin thread, so the server came up serving traffic with no Admin API and one
+/// panic line to explain it.
+///
+/// `None` means nothing can bind this. A host *name* is `None` on purpose: this
+/// binds a socket, it does not resolve, and quietly picking one of several
+/// resolved addresses would be a listener the operator did not choose.
+pub fn parse_listen_addr(listen: &str) -> Option<std::net::SocketAddr> {
+    if let Some(port) = listen.strip_prefix(':') {
+        let port: u16 = port.parse().ok()?;
+        return Some(std::net::SocketAddr::from(([0, 0, 0, 0], port)));
+    }
+    listen.parse().ok()
+}
+
 fn default_admin_enabled() -> bool {
     true
 }

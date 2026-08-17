@@ -752,8 +752,8 @@ Directive：
   `acme_ca` `acme_ca_root` `acme_eab` `cert_issuer`
   `cert_lifetime` `ech` `events` `fallback_sni`
   `filesystem` `frankenphp` `key_type` `ocsp_interval`
-  `ocsp_stapling` `on_demand_tls` `renew_interval` `shutdown_delay`
-  `storage` `storage_clean_interval`
+  `ocsp_stapling` `on_demand_tls` `preferred_chains` `renew_interval`
+  `shutdown_delay` `storage` `storage_clean_interval`
 
 有兩個名字落在「上面兩張清單」與「完整支援」之間，所以寫在這裡而不是塞進任何一張。
 `pki` 與 `acme_server` 能解析、能驗證、能序列化——帶著它們的設定載入得了也跑得起來

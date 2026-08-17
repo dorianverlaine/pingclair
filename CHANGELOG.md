@@ -28,6 +28,18 @@ lets the rest converge.
 
 ### ⚠️ Breaking
 
+- 🔗 **`preferred_chains` is now refused instead of accepted and ignored.** The
+  setting parsed, compiled and was stored, and the only sign it did nothing was
+  one warning at startup — so an operator who asked for a specific issuer chain
+  got whichever one the authority offered first and a log line they read once.
+  This build's ACME client cannot request an alternate chain at all
+  (`instant-acme` 0.8.5, verified 2026-08-12), so the setting fails closed like
+  every other one that cannot be honoured. **A configuration carrying
+  `preferred_chains` no longer starts**; remove the setting. The compatibility
+  table listed it as implemented, which was the second half of the same defect,
+  and all three READMEs now name it among what is not supported yet.
+
+
 - 🔁 **Control-plane changes that need a new listener now return
   `409 restart_required`.** The former Admin path started a side TCP listener
   after startup, but that listener omitted HTTP/3, mutual TLS, strict SNI/Host,
@@ -667,6 +679,22 @@ lets the rest converge.
   so upgrading changes nothing on its own.
 
 ### 🐛 Fixed
+
+- 🚧 **`admin :2019` — the ordinary spelling, and the one this repository's own
+  fixtures use — panicked at startup.** The Admin listener called
+  `.parse().expect()` on its configured address, and `SocketAddr` cannot read a
+  bare `:port`, which the data plane's own listeners accept and Pingora binds
+  directly. In release, where the profile sets `panic = "abort"`, that turned a
+  correct configuration into a dead process; in debug it killed only the Admin
+  thread, so the server came up serving traffic with no Admin API and one panic
+  line to explain it. The same `.expect()` did the same thing for a genuine typo.
+
+  A bare port now resolves to every interface, exactly as it does elsewhere, and
+  an address that cannot be bound is refused at load with a message naming it.
+  Startup no longer panics even if one reaches it, because the check that would
+  have caught it is not the same code as the bind. `admin off`, which compiles to
+  a disabled block with an empty address it never binds, is unaffected.
+
 
 - 🔤 **A file whose name was not plain ASCII could not be fetched at all.**
   Nothing decoded percent-escapes on the way to the filesystem, and every client

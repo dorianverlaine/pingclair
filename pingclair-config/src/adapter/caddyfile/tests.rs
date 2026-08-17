@@ -2553,38 +2553,39 @@ mod fail_closed_tests {
     /// 🔗 The two `preferred_chains` spellings, and the combinations upstream
     /// refuses because they contradict each other.
     #[test]
-    fn preferred_chains_reads_both_spellings_and_refuses_the_contradictions() {
-        use pingclair_core::config::PreferredChains;
+    fn preferred_chains_is_refused_whichever_way_it_is_spelled() {
+        // 🔗 Every spelling is refused now, because this build's ACME client
+        // cannot request an alternate issuer chain at all. The two failure modes
+        // still have to be told apart, though: a *well-formed* preference is
+        // refused for being unimplementable, and a contradictory one is refused
+        // for being contradictory — an operator who wrote `largest` needs to hear
+        // about `largest`, not about a limitation they did not hit.
+        for well_formed in [
+            "{\n preferred_chains smallest\n}\nexample.com {\n respond \"x\"\n}",
+            "{\n preferred_chains {\n root_common_name \"ISRG Root X1\"\n }\n}\nexample.com {\n respond \"x\"\n}",
+            "{\n preferred_chains {\n any_common_name \"R11\"\n }\n}\nexample.com {\n respond \"x\"\n}",
+        ] {
+            let error = compile_err(well_formed);
+            assert!(
+                error.contains("cannot be honoured"),
+                "a well-formed preference must be refused as unimplementable; got {error}"
+            );
+        }
 
-        let smallest =
-            crate::compile("{\n preferred_chains smallest\n}\nexample.com {\n respond \"x\"\n}")
-                .unwrap();
-        assert_eq!(
-            smallest.global.preferred_chains,
-            Some(PreferredChains::Smallest)
-        );
-
-        let named = crate::compile(
-            "{\n preferred_chains {\n root_common_name \"ISRG Root X1\"\n }\n}\n             example.com {\n respond \"x\"\n}",
-        )
-        .unwrap();
-        assert_eq!(
-            named.global.preferred_chains,
-            Some(PreferredChains::RootCommonName(vec![
-                "ISRG Root X1".to_string()
-            ]))
-        );
-
-        for bad in [
+        for contradictory in [
             "{\n preferred_chains largest\n}\nexample.com {\n respond \"x\"\n}",
             "{\n preferred_chains smallest {\n root_common_name X\n }\n}\nexample.com {\n respond \"x\"\n}",
             "{\n preferred_chains {\n root_common_name X\n any_common_name Y\n }\n}\nexample.com {\n respond \"x\"\n}",
             "{\n preferred_chains {\n }\n}\nexample.com {\n respond \"x\"\n}",
         ] {
-            let error = compile_err(bad);
+            let error = compile_err(contradictory);
             assert!(
                 error.contains("preferred_chains"),
                 "must be refused with its own name; got {error}"
+            );
+            assert!(
+                !error.contains("cannot be honoured"),
+                "a contradiction must be reported as one, not as a missing feature; got {error}"
             );
         }
     }

@@ -272,16 +272,12 @@ pub(crate) fn run_server(
     if let Some(ratio) = config.global.renewal_window_ratio {
         auto_https_config.renewal_window_ratio = ratio;
     }
-    // 🔗 Said once, at startup, rather than silently: the ACME client this
-    // build uses downloads whichever chain the authority offers first and has
-    // no way to ask for another (`instant-acme` 0.8.5, verified 2026-08-12).
-    // The certificate still works; the chain simply is not the one requested.
-    if config.global.preferred_chains.is_some() {
-        tracing::warn!(
-            "🔗 `preferred_chains` is recorded but not applied: this build's ACME \
-             client cannot request an alternate issuer chain"
-        );
-    }
+    // 🔗 `preferred_chains` is refused by `validate_config` — the ACME client
+    // this build uses downloads whichever chain the authority offers first and
+    // cannot ask for another (`instant-acme` 0.8.5, verified 2026-08-12), so a
+    // preference here is a setting that silently does nothing. A warning used to
+    // live at this point instead; it went into a log an operator reads once, and
+    // the certificate they got was not the one they asked for.
 
     // 🧰 Reuse one temporary runtime for manager initialization and eager local issuance.
     let tls_runtime = tokio::runtime::Runtime::new()
@@ -966,7 +962,17 @@ pub(crate) fn run_server(
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create admin runtime");
             rt.block_on(async {
-                let addr = listen.parse().expect("Invalid admin listen address");
+                // 🚧 The second line, which does not depend on the first having
+                // run: `validate_config` refuses an unbindable Admin address, and
+                // this refuses to panic if one ever reaches here anyway. With
+                // `panic = "abort"` in the release profile, the previous
+                // `.expect()` turned a setting into a dead process.
+                let Some(addr) = pingclair_core::config::parse_listen_addr(&listen) else {
+                    tracing::error!(
+                        "🚫 Admin API not started: `{listen}` is not an address it can bind"
+                    );
+                    return;
+                };
                 let options = pingclair_api::AdminServerOptions {
                     document,
                     shutdown: shutdown_for_admin,
