@@ -86,12 +86,10 @@ run_one() {
     # the throughput column reports as a *win*. Measured on 2026-08-11: 30000
     # 4xx read as "four times faster than nginx". The succeeded count is the
     # only thing that caught it, so it travels beside every number.
-    local rps succeeded
+    local rps
     rps="$(awk '/finished in/ {print $4}' "${dest}" | tr -d ',')"
-    succeeded="$(awk '/^requests:/ {print $8}' "${dest}")"
-    if [[ "${succeeded}" != "${requests}" ]]; then
-        printf '   %-10s %-11s r%s  🚫 VOID — %s/%s succeeded\n' \
-            "${cand}" "${workload}" "${round}" "${succeeded:-0}" "${requests}"
+    if ! assert_h2load_clean "${dest}" "${cand} ${workload} r${round}" "${requests}"; then
+        mv "${dest}" "${dest%.txt}.VOID.txt" 2>/dev/null || true
         return
     fi
     printf '   %-10s %-11s r%s  %s\n' "${cand}" "${workload}" "${round}" "${rps:-FAILED}"

@@ -23,6 +23,9 @@
 # Usage: ./run_m2_ab_regression.sh [results_dir]
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# 📏 Every row is checked before it counts; see the file for why.
+source "$(dirname "$0")/lib.sh"
+require_quiet_machine
 
 RESULTS_DIR="${1:-results/m2_ab_$(date +%Y%m%d_%H%M%S)}"
 case "$RESULTS_DIR" in
@@ -131,6 +134,13 @@ run_side() { # run_side <label> <image>
         wrk -t"$THREADS" -c"$CONNS" -d5s "http://127.0.0.1:$PORT$route" >/dev/null 2>&1 || true
         wrk -t"$THREADS" -c"$CONNS" -d"$DURATION" --latency \
             "http://127.0.0.1:$PORT$route" > "$RESULTS_DIR/${label}_${name}.txt" 2>&1 || true
+        # 🚫 A row that was entirely errors still reports a throughput, and a
+        # better one than a correct row, because an error is cheap to serve.
+        if ! assert_wrk_clean "$RESULTS_DIR/${label}_${name}.txt" "$label $route"; then
+            mv "$RESULTS_DIR/${label}_${name}.txt" "$RESULTS_DIR/${label}_${name}.VOID.txt"
+            log "  $label $route → 🚫 VOID"
+            continue
+        fi
         local rps p99
         rps=$(awk '/Requests\/sec/ {print $2}' "$RESULTS_DIR/${label}_${name}.txt")
         p99=$(awk '/^ *99%/ {print $2}' "$RESULTS_DIR/${label}_${name}.txt")

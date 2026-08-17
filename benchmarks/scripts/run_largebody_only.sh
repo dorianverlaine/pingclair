@@ -5,6 +5,9 @@
 # instead of grinding for 16 minutes.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# 📏 Every row is checked before it counts; see the file for why.
+source "$(dirname "$0")/lib.sh"
+require_quiet_machine
 
 RESULTS_DIR="${1:-results/largebody_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$RESULTS_DIR"
@@ -41,8 +44,14 @@ for name in "${SERVERS[@]}"; do
     ) &
     sampler=$!
     log "=== ${name}: wrk -t2 -c20 -d20s /large.html (gzip) ==="
+    large_out="${RESULTS_DIR}/${name}_large_gzip_c20.txt"
     wrk -t2 -c20 -d20s --latency -H "$HOST_HDR" -H "Accept-Encoding: gzip" \
-        "http://127.0.0.1:${port}/large.html" | tee "${RESULTS_DIR}/${name}_large_gzip_c20.txt"
+        "http://127.0.0.1:${port}/large.html" | tee "${large_out}"
+    # 🚫 This run is about the memory ceiling, so an all-error row is the easiest
+    # possible way to appear to pass it: no bytes moved, no memory used.
+    if ! assert_wrk_clean "${large_out}" "${name} large_gzip"; then
+        mv "${large_out}" "${large_out%.txt}.VOID.txt"
+    fi
     wait "$sampler" || true
 done
 

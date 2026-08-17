@@ -11,6 +11,8 @@
 # Usage: ./run_local_matrix.sh [results_dir]
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# 📏 Every row is checked before it counts; see the file for why.
+source "$(dirname "$0")/lib.sh"
 
 RESULTS_DIR="${1:-results/$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$RESULTS_DIR"
@@ -56,12 +58,21 @@ run_wrk() {
     log "wrk -t${THREADS} -c${conns} -d${DURATION} ${name}${path} [${label}] ${extra_hdr}"
     wrk -t"$THREADS" -c"$conns" -d"$DURATION" --latency "${hdrs[@]}" \
         "http://127.0.0.1:${port}${path}" | tee "$out"
+    # 🚫 A row that was entirely 404s reports a throughput, and a faster one than
+    # a correct row. Void it here rather than leaving it to be noticed later.
+    if ! assert_wrk_clean "$out" "${name} ${label} c${conns}"; then
+        mv "$out" "${out%.txt}.VOID.txt"
+        VOIDED=$((VOIDED + 1))
+    fi
 }
 
 memory_sample() {
     local container=$1 out=$2
     docker stats --no-stream --format '{{.Container}}\t{{.MemUsage}}\t{{.CPUPerc}}' "$container" >> "$out" 2>/dev/null || true
 }
+
+VOIDED=0
+require_quiet_machine
 
 log "Building and starting all three servers + shared backend..."
 docker compose build pingclair
@@ -112,6 +123,9 @@ for name in "${SERVERS[@]}"; do
     wait "$SAMPLER_PID" || true
 done
 
+if [[ "${VOIDED}" -gt 0 ]]; then
+    log "🚫 ${VOIDED} row(s) voided — renamed to *.VOID.txt and must not be quoted."
+fi
 log "Done. Results in ${RESULTS_DIR}"
 log "Bringing the stack down..."
 docker compose down
