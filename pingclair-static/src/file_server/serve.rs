@@ -255,16 +255,6 @@ impl FileServer {
             content_range = Some(format!("bytes {s}-{e}/{file_size}"));
         }
 
-        // Streaming branch: large, complete, uncompressed responses are
-        // handed back as an open file for chunked writing — the body is
-        // never held in memory. Checked before the compression cache path,
-        // which only ever applies to buffered responses.
-        if self.should_stream_response(file_size, range_header, accept_encoding) {
-            return Ok(Some(ServedResponse::Stream(Self::open_stream(
-                self, file_path, &metadata,
-            )?)));
-        }
-
         // Cache-key ingredients. Only full-file (200, non-range) responses
         // with compression enabled are cacheable; the negotiated encoding and
         // the file mtime (so an edit invalidates the stale entry) form the key.
@@ -317,15 +307,43 @@ impl FileServer {
         // file entirely.
         if !self.config.precompressed.is_empty()
             && content_range.is_none()
-            && let Some((precompressed_content, encoding)) =
+            && let Some((sidecar, sidecar_metadata, encoding)) =
                 self.try_precompressed(&file_path, accept_encoding).await
         {
-            let precompressed_len = precompressed_content.len() as u64;
+            let sidecar_len = sidecar_metadata.len();
             tracing::debug!(
-                "✅ Using pre-compressed file: {} ({})",
+                "✅ Using pre-compressed file: {} ({}, {} bytes)",
                 file_path.display(),
-                encoding
+                encoding,
+                sidecar_len
             );
+            // 🌊 A sidecar's bytes on disk *are* the response body, so a large
+            // one never needed to be in memory. Reading it whole — which this
+            // used to do unconditionally — made a 500 MB `.br` a 500 MB
+            // allocation on the path that exists to avoid exactly that.
+            if sidecar_len > Self::STREAMING_THRESHOLD {
+                let window = super::stream::StreamWindow {
+                    start: 0,
+                    length: Some(sidecar_len),
+                    status,
+                    content_range: None,
+                    content_encoding: HeaderValue::from_str(encoding).ok(),
+                };
+                let mut stream =
+                    Self::open_stream_window(self, sidecar, &sidecar_metadata, window)?;
+                // 🏷️ The content type and validators describe the *resource*,
+                // which is the uncompressed file the client asked for — not the
+                // sidecar, whose own MIME type would be `application/gzip`.
+                stream.content_type = meta.content_type.clone();
+                stream.last_modified = meta.last_modified.clone();
+                stream.etag = Some(meta.etag.clone());
+                stream.path = file_path;
+                return Ok(Some(ServedResponse::Stream(stream)));
+            }
+            let Some(precompressed_content) = Self::read_precompressed(&sidecar) else {
+                return Ok(None);
+            };
+            let precompressed_len = precompressed_content.len() as u64;
             return Ok(Some(ServedResponse::Buffered(ServedFile {
                 content: precompressed_content,
                 content_type: meta.content_type.clone(),
@@ -338,6 +356,36 @@ impl FileServer {
                 content_encoding: Some(encoding.to_string()),
                 vary_accept_encoding: self.config.compress,
             })));
+        }
+
+        // 🌊 Streaming branch: any large response that is not being compressed
+        // on the fly, complete or partial. The body is never held in memory.
+        //
+        // 📌 After the sidecar check on purpose. A `.br`/`.gz` sidecar is
+        // strictly better than streaming the identity file — a smaller body
+        // and no compression cost — and it streams too, so preferring it
+        // costs nothing. Checking streaming first meant a site that had built
+        // sidecars got the large uncompressed file instead of the small
+        // compressed one it had prepared.
+        //
+        // 🪟 `length` rather than `file_size`, because the memory cost is the
+        // size of the body being sent. A `Range` used to disable streaming
+        // outright, which made `Range: bytes=0-` on a large file the single most
+        // expensive request this server could be asked for — the one shape
+        // guaranteed to allocate the whole file.
+        if self.should_stream_response(length, file_size, accept_encoding) {
+            let window = super::stream::StreamWindow {
+                start,
+                length: Some(length),
+                status,
+                content_range: content_range
+                    .as_deref()
+                    .and_then(|value| HeaderValue::from_str(value).ok()),
+                content_encoding: None,
+            };
+            return Ok(Some(ServedResponse::Stream(Self::open_stream_window(
+                self, file_path, &metadata, window,
+            )?)));
         }
 
         // In-flight request coalescing: when this request will produce a
@@ -444,7 +492,7 @@ impl FileServer {
             Some(ServedResponse::Buffered(file)) => Ok(Some(file)),
             Some(ServedResponse::Redirect(_)) => Ok(None),
             Some(ServedResponse::Stream(mut stream)) => {
-                let mut content = Vec::with_capacity(stream.file_size as usize);
+                let mut content = Vec::with_capacity(stream.body_len as usize);
                 while let Some(chunk) = stream.read_chunk()? {
                     content.extend_from_slice(&chunk);
                 }
@@ -699,7 +747,7 @@ mod traversal_tests {
             .unwrap();
         assert_eq!(nested.content, b"nested");
         let streamed = fs.serve_streaming("/sub/page.txt").await.unwrap().unwrap();
-        assert_eq!(streamed.file_size, 6);
+        assert_eq!(streamed.body_len, 6);
     }
 
     // MARK: - The index is a path component too

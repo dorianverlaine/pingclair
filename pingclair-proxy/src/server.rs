@@ -1259,7 +1259,9 @@ enum LocalResponseBody {
     /// 📄 A bounded in-memory response is emitted in one write.
     Bytes(Bytes),
     /// 📂 A file response is emitted in fixed-size chunks.
-    File(pingclair_static::StreamingFile),
+    /// 📂 Boxed: `StreamingFile` carries a file handle and its response
+    /// metadata, and the bytes variant should not pay for that in padding.
+    File(Box<pingclair_static::StreamingFile>),
 }
 
 impl ProxyState {
@@ -3535,7 +3537,7 @@ impl PingclairProxy {
         }
 
         let body = if let Some(stream) = ctx.intercepted_file.take() {
-            LocalResponseBody::File(stream)
+            LocalResponseBody::File(Box::new(stream))
         } else if let Some(replacement) = ctx.intercepted_response.take() {
             LocalResponseBody::Bytes(Bytes::from(replacement.body))
         } else {
@@ -4268,14 +4270,31 @@ impl PingclairProxy {
                             return Ok(true);
                         }
                         Ok(Some(pingclair_static::ServedResponse::Stream(stream))) => {
+                            // 🪟 The stream's own status: 206 for a range, or a
+                            // configured override such as a maintenance tree's 503.
+                            // Hardcoding 200 would tell a range request it received
+                            // the whole file.
                             let mut header =
-                                Self::build_downstream_header(session, 200, Some(5)).unwrap();
+                                Self::build_downstream_header(session, stream.status, Some(7))
+                                    .unwrap();
                             header
                                 .insert_header("Content-Type", stream.content_type.clone())
                                 .unwrap();
                             header
                                 .insert_header("Content-Length", stream.content_length.clone())
                                 .unwrap();
+                            if let Some(range) = &stream.content_range {
+                                header
+                                    .insert_header("Content-Range", range.clone())
+                                    .unwrap();
+                            }
+                            // 🗜️ Set when the bytes on disk are already compressed —
+                            // a streamed `.br`/`.gz`/`.zst` sidecar.
+                            if let Some(encoding) = &stream.content_encoding {
+                                header
+                                    .insert_header("Content-Encoding", encoding.clone())
+                                    .unwrap();
+                            }
                             if let Some(lm) = &stream.last_modified {
                                 header.insert_header("Last-Modified", lm.clone()).unwrap();
                             }
@@ -4294,7 +4313,7 @@ impl PingclairProxy {
                                 session,
                                 ctx,
                                 header,
-                                LocalResponseBody::File(stream),
+                                LocalResponseBody::File(Box::new(stream)),
                                 false,
                             )
                             .await?;

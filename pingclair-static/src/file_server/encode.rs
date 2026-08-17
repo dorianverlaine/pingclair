@@ -77,7 +77,7 @@ impl FileServer {
         &self,
         original_path: &std::path::Path,
         accept_encoding: Option<&str>,
-    ) -> Option<(Vec<u8>, &'static str)> {
+    ) -> Option<(std::path::PathBuf, std::fs::Metadata, &'static str)> {
         let accept = accept_encoding?;
 
         for format in &self.config.precompressed {
@@ -98,13 +98,28 @@ impl FileServer {
                 continue;
             }
 
-            // (synchronous read — same rationale as read_and_maybe_compress)
-            if let Ok(content) = std::fs::read(&sidecar) {
-                return Some((content, format.encoding));
+            // 📏 Stat first so the caller can decide between streaming the
+            // sidecar and buffering it. Reading it outright — which this used to
+            // do — made a 500 MB `.br` a 500 MB allocation, and a sidecar is
+            // exactly the case where the bytes on disk are already the response
+            // body and never needed to be in memory at all.
+            if let Ok(metadata) = std::fs::metadata(&sidecar)
+                && metadata.is_file()
+            {
+                return Some((sidecar, metadata, format.encoding));
             }
         }
 
         None
+    }
+
+    /// 🗜️ Reads a sidecar whole, for the buffered path.
+    ///
+    /// Only reached for a sidecar small enough that buffering is the cheaper
+    /// answer; the streaming threshold decides which.
+    pub(super) fn read_precompressed(sidecar: &std::path::Path) -> Option<Vec<u8>> {
+        // (synchronous read — same rationale as read_and_maybe_compress)
+        std::fs::read(sidecar).ok()
     }
 
     // MARK: - Negotiation

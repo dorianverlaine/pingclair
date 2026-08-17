@@ -408,3 +408,43 @@ H1/H2 那支證出來的錯誤形狀 ＋ `h3_refused_backend_still_fails_closed`
   刻意不配置。所以正規化要在它外面做——`request_host()` 把兩步合成一個，
   免得有呼叫端只做一半。H1/H2 有五處、H3 有一處在取 host，
   每一處都拿它去和某個東西比對。
+
+---
+
+## 🌊 靜態檔案的三條緩衝路徑（2026-08-17）
+
+- 💀 **「有 streaming」不等於「不會整檔配置」。** streaming 原本只有一種形狀
+  （完整、未壓縮、>256 KiB），**其餘全部緩衝**。於是這台伺服器最貴的請求是
+  `Range: bytes=0-` 打在 root 裡最大的檔案上——任何 `Range` 都停用 streaming，
+  而 range 會被 clamp 到檔案大小，所以整個檔案進一個 `Vec`。
+  🎯 判準：**列出所有「不走 streaming」的分支，每一條都問「這條的記憶體上限是什麼」。**
+  三條分支（Range、dynamic compression、precompressed sidecar）的答案都是「檔案大小」。
+
+- 🪟 **Range 要串流就得讓 stream 帶「窗口」而不只是檔案。**
+  `StreamingFile` 的大小欄位因此從 `file_size` 改名 `body_len`——它是**這個回應要送
+  幾個 byte**，完整回應剛好等於檔案大小，部分回應不等於。
+  ⚠️ 而且 `status`／`content_range`／`content_encoding` 必須跟著 stream 走，
+  不能讓 transport 自己重建：原本兩個 transport 都硬寫 `200`，
+  **對 range 請求回 200 且沒有 `Content-Range`，等於告訴客戶端它收到了整個檔案**。
+  修記憶體的時候很容易順手製造出這個正確性缺陷。
+
+- 🗜️ **dynamic compression 選了「上限」而不是「streaming compression」。**
+  壓縮器吃一個 slice 回一個 `Vec`，而壓縮後的快取要完整 buffer——
+  所以成本天生正比於檔案。`MAX_COMPRESSIBLE = 8 MiB`，**刻意低於 64 MiB 的
+  快取預算**：預算決定的是「配置之後要不要留」，那是決策的錯誤那一端。
+  📌 streaming compression 能同時保住編碼與上限，但它意味著每個 in-flight 回應
+  一個壓縮器、以及一個長度到結束才知道的 body——快取與 framing 都要重新設計。
+  這條是保守的那一半，另一半值得單獨做，不要夾帶。
+
+- 🤡 **順序也是缺陷的一部分：streaming 分支原本排在 sidecar 檢查前面。**
+  於是有建 `.gz` sidecar 的站台，大檔案會拿到**串流的未壓縮檔**而不是它準備好的
+  小壓縮檔。sidecar 現在排在前面——它嚴格更好（body 更小、沒有壓縮成本）
+  而且現在也能串流，所以偏好它不花任何代價。
+  🎯 **這個是紅測探針意外抓到的**：拿掉 sidecar streaming 之後測試竟然還綠，
+  才發現那條斷言根本沒走到 sidecar 路徑。**紅測不只驗證修正，也驗證測試自己。**
+
+- 🧪 **這條的測試要量「最大單次配置」，不是「有沒有回應」。**
+  做法：把回應排空，streamed 的回報 chunk 大小、buffered 的回報整個 body 長度。
+  四條路徑（identity／range／dynamic／sidecar）一個測試一起斷言，
+  因為它們是同一個缺陷的四張臉——分開測會讓「修好一條」被讀成「修好一類」。
+  📌 三條分別驗過紅，每條都報 `left: 16777216`（16 MiB）。

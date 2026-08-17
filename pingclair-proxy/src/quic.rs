@@ -3352,12 +3352,23 @@ async fn handle_request_inner(
                     hdrs.insert("content-type", stream.content_type.clone());
                     hdrs.insert("content-length", stream.content_length.clone());
                     hdrs.insert("accept-ranges", http::HeaderValue::from_static("bytes"));
+                    // 🪟 A streamed body can be partial or already compressed, so
+                    // its status and these two headers come from the stream rather
+                    // than being assumed. Answering 200 with no `Content-Range` to
+                    // a range request tells the client it received the whole file.
+                    if let Some(range) = &stream.content_range {
+                        hdrs.insert("content-range", range.clone());
+                    }
+                    if let Some(encoding) = &stream.content_encoding {
+                        hdrs.insert("content-encoding", encoding.clone());
+                    }
                     if let Some(lm) = &stream.last_modified {
                         hdrs.insert("last-modified", lm.clone());
                     }
                     if let Some(etag) = &stream.etag {
                         hdrs.insert("etag", etag.clone());
                     }
+                    let stream_status = stream.status;
                     send_h3_local_response(
                         resp_tx,
                         stream_id,
@@ -3367,9 +3378,9 @@ async fn handle_request_inner(
                         &verified_client_ip_text,
                         &request_vars,
                         response_handlers.as_deref(),
-                        200,
+                        stream_status,
                         hdrs,
-                        H3LocalBody::File(stream),
+                        H3LocalBody::File(Box::new(stream)),
                         response_policy,
                         request_id,
                         request_deadline,
@@ -3617,7 +3628,7 @@ async fn stream_h3_subrequest_response(
                     None,
                     200,
                     headers,
-                    H3LocalBody::File(stream),
+                    H3LocalBody::File(Box::new(stream)),
                     response_policy,
                     request_id,
                     request_deadline,
@@ -4061,7 +4072,7 @@ async fn fastcgi_upstream(
                 None,
                 200,
                 local_headers,
-                H3LocalBody::File(stream),
+                H3LocalBody::File(Box::new(stream)),
                 &effective_response_policy,
                 request_id,
                 request_deadline,
@@ -5226,7 +5237,9 @@ async fn reverse_proxy_upstream(
 /// 🌊 A local HTTP/3 body that stays bounded while response policy runs.
 enum H3LocalBody {
     Bytes(Bytes),
-    File(pingclair_static::StreamingFile),
+    /// 📂 Boxed: `StreamingFile` carries a file handle and its response
+    /// metadata, and the bytes variant should not pay for that in padding.
+    File(Box<pingclair_static::StreamingFile>),
 }
 
 /// 🧭 Evaluates and sends one local HTTP/3 response through shared interception policy.
@@ -5315,7 +5328,7 @@ async fn send_h3_local_response(
                 if stream.vary_accept_encoding {
                     headers.insert("vary", http::HeaderValue::from_static("Accept-Encoding"));
                 }
-                body = H3LocalBody::File(stream);
+                body = H3LocalBody::File(Box::new(stream));
             } else if let Some(replacement) = outcome.replacement {
                 status = replacement.status;
                 headers.clear();

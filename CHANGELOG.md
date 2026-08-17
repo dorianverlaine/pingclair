@@ -115,6 +115,16 @@ lets the rest converge.
   to the certificate is the fix in all three cases. See the Security entry
   below.
 
+- 🗜️ **Static files larger than 8 MiB are no longer compressed on the fly.**
+  Dynamic compression needs the whole body in memory, so its cost was
+  proportional to the largest file in the document root and the choice belonged
+  to whoever sent `Accept-Encoding`. Above the bound the response now streams
+  uncompressed: bounded in memory, and the kind of file that is that large — an
+  archive, a video, an image — compresses to roughly its own size anyway. Build a
+  `.br`/`.gz`/`.zst` sidecar and enable `precompressed` to serve a large file
+  compressed; those stream too, and are now preferred over streaming the
+  uncompressed file. See the Security entry below.
+
 - 📁 **A `file_server` index must be a relative filename.** An index that is
   absolute (`/var/www/index.html`), contains `..`, contains a backslash or a
   colon, or is empty is now refused when the configuration loads rather than
@@ -861,6 +871,23 @@ lets the rest converge.
   wrong); upstream and internal failures are untouched and still ERROR.
 
 ### 🔐 Security
+
+- 🌊 **Three ways to ask a static file server for a large file allocated the
+  whole file.** Streaming had one shape — a complete, uncompressed response above
+  256 KiB — and everything else buffered. So the most expensive request this
+  server could be asked for was `Range: bytes=0-` on the largest file in the
+  document root: any `Range` header disabled streaming outright, and the range
+  was clamped to the file, so the whole thing went into one `Vec`. A negotiated
+  `Accept-Encoding` did the same, plus the compression CPU. And a pre-compressed
+  `.br`/`.gz`/`.zst` sidecar was read whole even though its bytes on disk *are*
+  the response body. The 64 MiB compressed-body budget only decided what to keep
+  after the allocation had already happened.
+
+  All three now stream. A `Range` streams from an offset with the reads bounded by
+  the window; a sidecar streams as-is; and a file past a new 8 MiB compressible
+  bound streams uncompressed rather than being buffered and compressed. Per-request
+  memory is the 64 KiB chunk size in every case, whatever the file size and
+  whatever the client asked for. Found by review.
 
 - 📁 **A configured `file_server` index could name a file outside the document
   root.** The request path has always been confined — `..` is rejected before

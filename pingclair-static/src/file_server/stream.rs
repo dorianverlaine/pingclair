@@ -28,8 +28,17 @@ use super::{FileServerConfig, ServedResponse};
 
 // MARK: - The streaming response
 
-/// Streaming file response for zero-copy large file transfer
-/// Use this for files larger than 5MB to avoid memory pressure
+/// 🌊 A response body read from disk in chunks rather than held in memory.
+///
+/// Carries a *window* of the file, not necessarily all of it: a `Range` request
+/// streams `body_len` bytes from an offset, and the file handle has already been
+/// seeked there. That is why the size field is called `body_len` and not
+/// `file_size` — it is how many bytes this response sends, which for a complete
+/// response happens to equal the file size and for a partial one does not.
+///
+/// It also carries the response metadata a partial or pre-compressed body needs
+/// (`status`, `content_range`, `content_encoding`), because otherwise every
+/// transport would have to reconstruct it and the two transports would drift.
 pub struct StreamingFile {
     /// Synchronous file handle. Synchronous I/O is intentional: reads of
     /// local regular files effectively never block (a page-cache hit is
@@ -38,8 +47,8 @@ pub struct StreamingFile {
     /// `spawn_blocking` cross-thread round trip per chunk — several per
     /// request on this hot path.
     pub file: std::fs::File,
-    /// Total file size in bytes
-    pub file_size: u64,
+    /// 🪟 Bytes this response body carries — the window, not the file.
+    pub body_len: u64,
     /// Chunk size for streaming (default 64KB)
     pub chunk_size: usize,
     /// Prebuilt Content-Type header value (clone is a shared-bytes bump).
@@ -52,9 +61,17 @@ pub struct StreamingFile {
     pub last_modified: Option<HeaderValue>,
     /// ETag header value
     pub etag: Option<HeaderValue>,
-    /// 🧊 See [`ServedFile::vary_accept_encoding`]. A streamed response is by
-    /// definition the uncompressed variant, so this is exactly the case that
-    /// used to reach a shared cache with no `Vary` at all.
+    /// 🔢 The status this body answers with: 200, 206 for a range, or a
+    /// configured override such as the 503 a maintenance tree serves.
+    pub status: u16,
+    /// 🪟 `Content-Range`, present exactly when this is a partial response.
+    pub content_range: Option<HeaderValue>,
+    /// 🗜️ `Content-Encoding`, present when the bytes on disk are already
+    /// compressed — a `.br`/`.gz`/`.zst` sidecar streamed as-is.
+    pub content_encoding: Option<HeaderValue>,
+    /// 🧊 See [`ServedFile::vary_accept_encoding`]. A streamed response is
+    /// usually the uncompressed variant of a compressible resource, which is
+    /// exactly the case that used to reach a shared cache with no `Vary`.
     pub vary_accept_encoding: bool,
     /// Bytes read so far
     bytes_read: u64,
@@ -63,13 +80,15 @@ pub struct StreamingFile {
 impl StreamingFile {
     /// Read the next chunk of data (synchronous — see the `file` field for
     /// why blocking I/O is deliberate here).
-    /// Returns None when EOF is reached
+    /// Returns None when the window has been sent.
     pub fn read_chunk(&mut self) -> std::io::Result<Option<Vec<u8>>> {
-        if self.bytes_read >= self.file_size {
+        if self.bytes_read >= self.body_len {
             return Ok(None);
         }
 
-        let remaining = (self.file_size - self.bytes_read) as usize;
+        // 🪟 Bounded by what is left of the *window*, so a range response stops
+        // at its end instead of running on to the end of the file.
+        let remaining = (self.body_len - self.bytes_read) as usize;
         let to_read = remaining.min(self.chunk_size);
 
         let mut buf = vec![0u8; to_read];
@@ -87,21 +106,52 @@ impl StreamingFile {
 
     /// Get progress as a fraction (0.0 - 1.0)
     pub fn progress(&self) -> f64 {
-        if self.file_size == 0 {
+        if self.body_len == 0 {
             1.0
         } else {
-            self.bytes_read as f64 / self.file_size as f64
+            self.bytes_read as f64 / self.body_len as f64
         }
     }
 
     /// Check if streaming is complete
     pub fn is_complete(&self) -> bool {
-        self.bytes_read >= self.file_size
+        self.bytes_read >= self.body_len
     }
 
     /// Get Content-Length header value
     pub fn content_length(&self) -> u64 {
-        self.file_size
+        self.body_len
+    }
+}
+
+/// 🪟 Which bytes of a file a stream should send, and how to describe them.
+///
+/// Exists so `open_stream_window` does not grow five positional arguments that
+/// a caller can transpose. A complete, uncompressed 200 is
+/// [`StreamWindow::whole_file`]; everything else says explicitly what it is.
+pub(super) struct StreamWindow {
+    /// 📍 Byte offset to seek to before the first read.
+    pub start: u64,
+    /// 📏 Bytes to send, or `None` for "to the end of the file".
+    pub length: Option<u64>,
+    /// 🔢 The status this body answers with.
+    pub status: u16,
+    /// 🪟 `Content-Range`, for a partial response.
+    pub content_range: Option<HeaderValue>,
+    /// 🗜️ `Content-Encoding`, when the bytes on disk are already compressed.
+    pub content_encoding: Option<HeaderValue>,
+}
+
+impl StreamWindow {
+    /// 📄 The whole file, uncompressed, answered 200.
+    pub(super) fn whole_file() -> Self {
+        Self {
+            start: 0,
+            length: None,
+            status: 200,
+            content_range: None,
+            content_encoding: None,
+        }
     }
 }
 
@@ -118,31 +168,71 @@ impl FileServer {
     /// t3.small, see benchmarks/results/20260803_aws_h3perf/). Streaming
     /// never applies to Range or negotiated-compression responses, so the
     /// compression cache and byte-range behavior are unchanged.
-    const STREAMING_THRESHOLD: u64 = 256 * 1024;
+    pub(super) const STREAMING_THRESHOLD: u64 = 256 * 1024;
 
-    /// Cheap pre-check for the streaming path, without any I/O: streaming
-    /// is only ever possible for non-Range requests that won't be
-    /// compressed. The caller uses this to skip the stat+open that
-    /// `serve_streaming` would otherwise do on every request just to
-    /// discover streaming doesn't apply (notably every compressed
-    /// response — the hot path of the compression cache).
-    pub fn could_stream(&self, range: Option<&str>, accept_encoding: Option<&str>) -> bool {
-        range.is_none()
-            && !(self.config.compress && Self::negotiate_encoding(accept_encoding).is_some())
+    /// 🗜️ Largest file this server will compress on the fly.
+    ///
+    /// Dynamic compression needs the whole body in memory — the compressor is
+    /// fed a slice and returns a `Vec`, and the compressed-body cache wants a
+    /// complete buffer to store. So the cost of compressing is proportional to
+    /// the file, and until this bound existed it was proportional to the
+    /// *largest file in the document root*, chosen by whichever client sent
+    /// `Accept-Encoding: gzip`.
+    ///
+    /// 8 MiB, and deliberately below the 64 MiB compressed-body cache budget:
+    /// the budget decided what to *keep* after the allocation had already
+    /// happened, which is the wrong end of the decision. Above this bound the
+    /// response streams uncompressed instead — worse on the wire, bounded in
+    /// memory, and the kind of file (an archive, a video, an image) that
+    /// compresses to about its own size anyway.
+    ///
+    /// 📌 A ceiling rather than streaming compression on purpose. Streaming
+    /// compression would keep the encoding *and* the bound, but it means a
+    /// compressor per in-flight response and a body whose length is unknown
+    /// until it ends — a different design for the cache and the framing both.
+    /// This is the conservative half of the fix; the other half is worth doing
+    /// on its own terms, not smuggled in here.
+    const MAX_COMPRESSIBLE: u64 = 8 * 1024 * 1024;
+
+    /// 🗜️ Whether this response would be compressed on the fly.
+    ///
+    /// Reads the negotiation without doing I/O, so a caller can find out
+    /// before deciding whether streaming is available.
+    fn would_compress(&self, file_size: u64, accept_encoding: Option<&str>) -> bool {
+        self.config.compress
+            && file_size <= Self::MAX_COMPRESSIBLE
+            && Self::negotiate_encoding(accept_encoding).is_some()
     }
 
-    /// 🧭 Whether a request for a file of `file_size` bytes should be
-    /// answered by chunked streaming instead of the buffered+cached path:
-    /// only complete (non-Range), uncompressed responses above
-    /// [`Self::STREAMING_THRESHOLD`]. Compressed responses stay buffered so
-    /// the compression cache keeps working regardless of file size.
+    /// Cheap pre-check for the streaming path, without any I/O.
+    ///
+    /// 🪟 A `Range` no longer disqualifies a response: the stream carries a
+    /// window, so a partial response streams from an offset like any other. The
+    /// one thing that still does is on-the-fly compression, because the
+    /// compressor needs the whole body — and a file too large to compress is one
+    /// this returns `true` for, which is the point.
+    pub fn could_stream(&self, _range: Option<&str>, accept_encoding: Option<&str>) -> bool {
+        // 📏 No size here, so assume the file is small enough to compress: this
+        // predicate exists to answer "is streaming *impossible*", and a caller
+        // with a size uses `should_stream_response` instead.
+        !(self.config.compress && Self::negotiate_encoding(accept_encoding).is_some())
+    }
+
+    /// 🧭 Whether a response of `body_len` bytes should be streamed rather than
+    /// buffered.
+    ///
+    /// `body_len` is the size of the body being sent — the range length for a
+    /// partial response, the file size for a complete one — because that is what
+    /// the memory cost is proportional to. Passing the file size for a range
+    /// would stream a one-byte range out of a large file, which is the opposite
+    /// of the intended trade.
     pub fn should_stream_response(
         &self,
+        body_len: u64,
         file_size: u64,
-        range: Option<&str>,
         accept_encoding: Option<&str>,
     ) -> bool {
-        self.could_stream(range, accept_encoding) && file_size > Self::STREAMING_THRESHOLD
+        !self.would_compress(file_size, accept_encoding) && body_len > Self::STREAMING_THRESHOLD
     }
 
     /// 🌊 Serve a large file using zero-copy streaming.
@@ -175,21 +265,52 @@ impl FileServer {
         file_path: PathBuf,
         metadata: &std::fs::Metadata,
     ) -> Result<StreamingFile> {
-        let file_size = metadata.len();
+        Self::open_stream_window(server, file_path, metadata, StreamWindow::whole_file())
+    }
+
+    /// 🪟 Opens a stream over part of a file, with the response metadata that
+    /// part needs.
+    ///
+    /// The window is what makes a `Range` streamable at all. Before this, any
+    /// `Range` header disabled streaming outright, so `Range: bytes=0-` on a
+    /// two-gigabyte file allocated two gigabytes — the request that costs the
+    /// most was the one guaranteed to be buffered. Seeking once and bounding
+    /// the reads costs one `lseek` and makes per-request memory the chunk size
+    /// again, whatever the client asked for.
+    pub(super) fn open_stream_window(
+        server: &FileServer,
+        file_path: PathBuf,
+        metadata: &std::fs::Metadata,
+        window: StreamWindow,
+    ) -> Result<StreamingFile> {
+        let body_len = window.length.unwrap_or(metadata.len());
 
         // Open file handle (no reading yet - zero-copy preparation)
-        let file = std::fs::File::open(&file_path)?;
+        let mut file = std::fs::File::open(&file_path)?;
+        if window.start > 0 {
+            use std::io::Seek as _;
+            file.seek(std::io::SeekFrom::Start(window.start))?;
+        }
         let meta = server.file_meta(&file_path, metadata)?;
 
         Ok(StreamingFile {
             file,
-            file_size,
+            body_len,
             chunk_size: 64 * 1024, // 64KB chunks
             content_type: meta.content_type.clone(),
-            content_length: meta.content_length.clone(),
+            // 🔢 The window's length, not the file's: `Content-Length` describes
+            // the body being sent, and a range response that advertised the whole
+            // file would hang the client waiting for bytes that never come.
+            content_length: match window.length {
+                Some(length) => HeaderValue::from(length),
+                None => meta.content_length.clone(),
+            },
             path: file_path,
             last_modified: meta.last_modified.clone(),
             etag: Some(meta.etag.clone()),
+            status: window.status,
+            content_range: window.content_range,
+            content_encoding: window.content_encoding,
             vary_accept_encoding: server.config.compress,
             bytes_read: 0,
         })
@@ -248,7 +369,7 @@ mod serve_auto_tests {
             .unwrap()
         {
             ServedResponse::Stream(mut stream) => {
-                assert_eq!(stream.file_size, body.len() as u64);
+                assert_eq!(stream.body_len, body.len() as u64);
                 let mut got = Vec::new();
                 while let Some(chunk) = stream.read_chunk().unwrap() {
                     got.extend_from_slice(&chunk);
@@ -279,7 +400,7 @@ mod serve_auto_tests {
             .unwrap()
         {
             ServedResponse::Stream(mut stream) => {
-                assert_eq!(stream.file_size, body.len() as u64);
+                assert_eq!(stream.body_len, body.len() as u64);
                 let mut got = Vec::new();
                 while let Some(chunk) = stream.read_chunk().unwrap() {
                     got.extend_from_slice(&chunk);
@@ -350,10 +471,10 @@ mod stream_decision_tests {
 
     #[test]
     fn large_plain_response_streams() {
-        assert!(server(true).should_stream_response(BIG, None, None));
-        assert!(server(false).should_stream_response(BIG, None, None));
+        assert!(server(true).should_stream_response(BIG, BIG, None));
+        assert!(server(false).should_stream_response(BIG, BIG, None));
         assert!(
-            server(false).should_stream_response(ONE_MIB, None, None),
+            server(false).should_stream_response(ONE_MIB, ONE_MIB, None),
             "1 MiB files must stream so high concurrency cannot buffer GiB"
         );
     }
@@ -361,29 +482,67 @@ mod stream_decision_tests {
     #[test]
     fn threshold_boundary_is_strictly_greater() {
         let fs = server(false);
-        assert!(!fs.should_stream_response(THRESHOLD, None, None));
-        assert!(fs.should_stream_response(THRESHOLD + 1, None, None));
+        assert!(!fs.should_stream_response(THRESHOLD, THRESHOLD, None));
+        assert!(fs.should_stream_response(THRESHOLD + 1, THRESHOLD + 1, None));
     }
 
     #[test]
-    fn small_range_or_compressed_responses_stay_buffered() {
+    fn small_or_compressed_responses_stay_buffered() {
         let fs = server(true);
         assert!(
-            !fs.should_stream_response(SMALL, None, None),
+            !fs.should_stream_response(SMALL, SMALL, None),
             "below threshold"
         );
         assert!(
-            !fs.should_stream_response(BIG, Some("bytes=0-99"), None),
-            "range request"
-        );
-        assert!(
-            !fs.should_stream_response(BIG, None, Some("gzip, br")),
+            !fs.should_stream_response(BIG, BIG, Some("gzip, br")),
             "compression negotiated"
         );
         // Compression disabled in config: nothing to cache, streaming is fine.
-        assert!(server(false).should_stream_response(BIG, None, Some("gzip")));
+        assert!(server(false).should_stream_response(BIG, BIG, Some("gzip")));
         // Unsupported encodings don't count as negotiated.
-        assert!(fs.should_stream_response(BIG, None, Some("identity")));
+        assert!(fs.should_stream_response(BIG, BIG, Some("identity")));
+    }
+
+    /// 🪟 A range decides on the size of the *range*, not of the file.
+    ///
+    /// Both directions matter. A large range out of a large file must stream —
+    /// that is the case that used to allocate the whole window and is the reason
+    /// `Range: bytes=0-` on a big file was the most expensive request this server
+    /// could be asked for. A one-byte range out of the same file must not, because
+    /// streaming a byte is pure overhead.
+    #[test]
+    fn a_range_is_judged_by_its_own_length() {
+        let fs = server(true);
+        assert!(
+            fs.should_stream_response(BIG, BIG, Some("bytes=0-")),
+            "a whole-file range must stream rather than allocate the file"
+        );
+        assert!(
+            !fs.should_stream_response(SMALL, BIG, None),
+            "a small range out of a large file has nothing to gain from streaming"
+        );
+    }
+
+    /// 🗜️ A file too large to compress streams uncompressed instead of being
+    /// buffered and compressed.
+    ///
+    /// This is the third of the buffering paths. Dynamic compression needs the
+    /// whole body in memory, so its cost was proportional to the largest file in
+    /// the document root — chosen by whichever client sent `Accept-Encoding`.
+    /// Above the bound the answer is a bounded stream, which is also the right
+    /// answer for the kind of file that is that large.
+    #[test]
+    fn a_file_too_large_to_compress_streams_instead() {
+        let fs = server(true);
+        const HUGE: u64 = 64 * 1024 * 1024;
+        assert!(
+            fs.should_stream_response(HUGE, HUGE, Some("gzip")),
+            "a file past the compressible bound must stream, not buffer and compress"
+        );
+        // 🧭 And one inside the bound still compresses, so the assertion above is
+        // about the size and not about compression having been switched off.
+        const COMPRESSIBLE: u64 = 4 * 1024 * 1024;
+        assert!(!fs.should_stream_response(COMPRESSIBLE, COMPRESSIBLE, Some("gzip")));
     }
 }
 
@@ -419,5 +578,220 @@ mod should_stream_tests {
             !fs.should_stream("/../secret.bin").await.unwrap(),
             "a traversal reached outside the document root"
         );
+    }
+}
+
+#[cfg(test)]
+mod bounded_memory_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// 📏 Sixteen mebibytes: over the streaming threshold, over the compressible
+    /// bound, and small enough to write in a test without being slow.
+    const LARGE: usize = 16 * 1024 * 1024;
+
+    fn fixture(compress: bool, precompressed: bool) -> (tempfile::TempDir, FileServer) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = std::fs::File::create(dir.path().join("big.bin")).unwrap();
+        // 🗜️ Highly compressible on purpose: if a compression path is still
+        // buffering, a body of zeroes makes the difference obvious rather than
+        // hiding it behind an incompressible payload.
+        file.write_all(&vec![0u8; LARGE]).unwrap();
+        file.flush().unwrap();
+        if precompressed {
+            // 📦 A sidecar of the same size. Its contents do not have to be real
+            // gzip — nothing in this test decompresses it, and what is being
+            // measured is how many bytes reach memory.
+            let mut sidecar = std::fs::File::create(dir.path().join("big.bin.gz")).unwrap();
+            sidecar.write_all(&vec![0u8; LARGE]).unwrap();
+            sidecar.flush().unwrap();
+        }
+        let server = FileServer::new(FileServerConfig {
+            root: dir.path().to_path_buf(),
+            index: vec![],
+            browse: false,
+            browse_limit: None,
+            compress,
+            precompressed: if precompressed {
+                vec![super::super::PrecompressedFormat {
+                    encoding: "gzip",
+                    suffix: ".gz",
+                }]
+            } else {
+                Vec::new()
+            },
+            ..FileServerConfig::default()
+        });
+        (dir, server)
+    }
+
+    /// 📏 The largest single allocation a response makes, measured by draining it.
+    ///
+    /// A streamed response reports its chunk size; a buffered one reports the
+    /// whole body, because that is what it allocated. This is the number the
+    /// finding asks about — it must not grow with the file.
+    async fn largest_chunk(response: ServedResponse) -> usize {
+        match response {
+            ServedResponse::Stream(mut stream) => {
+                let mut largest = 0;
+                while let Some(chunk) = stream.read_chunk().unwrap() {
+                    largest = largest.max(chunk.len());
+                }
+                largest
+            }
+            ServedResponse::Buffered(file) => file.content.len(),
+            ServedResponse::Redirect(_) => 0,
+        }
+    }
+
+    /// 🌊 None of the four ways to ask for a large file allocates it.
+    ///
+    /// One test over all four because the finding is one defect with four faces,
+    /// and asserting them together is what stops a fix to one from being read as
+    /// a fix to the class. The bound is the chunk size, which does not depend on
+    /// the file: that is the whole property.
+    #[tokio::test]
+    async fn no_large_response_allocates_the_whole_body() {
+        const CHUNK: usize = 64 * 1024;
+
+        // 1️⃣ Identity — the case that already streamed, as the control.
+        let (_dir, fs) = fixture(false, false);
+        let response = fs
+            .serve_auto("/big.bin", "/big.bin", None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(largest_chunk(response).await, CHUNK, "identity");
+
+        // 2️⃣ A whole-file Range — previously the most expensive request this
+        // server could be asked for, because any Range disabled streaming.
+        let (_dir, fs) = fixture(false, false);
+        let response = fs
+            .serve_auto("/big.bin", "/big.bin", Some("bytes=0-"), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(largest_chunk(response).await, CHUNK, "whole-file range");
+
+        // 3️⃣ Dynamic compression negotiated on a file past the compressible
+        // bound: streams uncompressed rather than buffering and compressing.
+        let (_dir, fs) = fixture(true, false);
+        let response = fs
+            .serve_auto("/big.bin", "/big.bin", None, Some("gzip"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(largest_chunk(response).await, CHUNK, "dynamic compression");
+
+        // 4️⃣ A pre-compressed sidecar: its bytes on disk are already the body.
+        let (_dir, fs) = fixture(true, true);
+        let response = fs
+            .serve_auto("/big.bin", "/big.bin", None, Some("gzip"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            largest_chunk(response).await,
+            CHUNK,
+            "precompressed sidecar"
+        );
+    }
+
+    /// 🪟 A streamed range sends the right bytes and says so.
+    ///
+    /// Bounded memory is worthless if the body is wrong. The `Content-Range` and
+    /// the 206 are asserted too, because a streamed range that answered 200 with
+    /// no `Content-Range` would tell the client it had received the whole file —
+    /// a correctness regression the memory fix could easily have introduced.
+    #[tokio::test]
+    async fn a_streamed_range_carries_the_right_bytes_and_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        // 🔢 A recognisable pattern, so an off-by-one in the seek or the window
+        // shows up as wrong bytes rather than as the right count of zeroes.
+        let body: Vec<u8> = (0..LARGE).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.path().join("big.bin"), &body).unwrap();
+        let fs = FileServer::new(FileServerConfig {
+            root: dir.path().to_path_buf(),
+            index: vec![],
+            browse: false,
+            browse_limit: None,
+            compress: false,
+            ..FileServerConfig::default()
+        });
+
+        let start = 1_000_000usize;
+        let end = start + 5_000_000;
+        let response = fs
+            .serve_auto(
+                "/big.bin",
+                "/big.bin",
+                Some(&format!("bytes={start}-{end}")),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let ServedResponse::Stream(mut stream) = response else {
+            panic!("a 5 MB range must stream, not buffer");
+        };
+        assert_eq!(stream.status, 206);
+        assert_eq!(
+            stream.content_range.as_ref().map(|v| v.to_str().unwrap()),
+            Some(format!("bytes {start}-{end}/{LARGE}").as_str())
+        );
+        assert_eq!(
+            stream.content_length.to_str().unwrap(),
+            (end - start + 1).to_string(),
+            "Content-Length must describe the window, not the file"
+        );
+
+        let mut received = Vec::new();
+        while let Some(chunk) = stream.read_chunk().unwrap() {
+            received.extend_from_slice(&chunk);
+        }
+        assert_eq!(received.len(), end - start + 1);
+        assert_eq!(
+            received.as_slice(),
+            &body[start..=end],
+            "the streamed window is not the bytes that were asked for"
+        );
+    }
+
+    /// 🧭 A small file is still buffered, and a small range still works.
+    ///
+    /// The control for the whole module: a change that streamed everything would
+    /// satisfy every assertion above and add a syscall per small response, which
+    /// is most of them.
+    #[tokio::test]
+    async fn small_responses_are_still_buffered() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("small.txt"), b"0123456789").unwrap();
+        let fs = FileServer::new(FileServerConfig {
+            root: dir.path().to_path_buf(),
+            index: vec![],
+            browse: false,
+            browse_limit: None,
+            compress: false,
+            ..FileServerConfig::default()
+        });
+
+        let whole = fs
+            .serve_auto("/small.txt", "/small.txt", None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(whole, ServedResponse::Buffered(_)));
+
+        let ranged = fs
+            .serve_auto("/small.txt", "/small.txt", Some("bytes=2-5"), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let ServedResponse::Buffered(file) = ranged else {
+            panic!("a four-byte range must stay buffered");
+        };
+        assert_eq!(file.status, 206);
+        assert_eq!(file.content, b"2345");
     }
 }
