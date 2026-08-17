@@ -13311,3 +13311,134 @@ async fn test_percent_encoded_filenames_are_reachable() {
     assert_eq!(spelled.status(), 200);
     assert_eq!(spelled.text().await.unwrap(), "plain");
 }
+
+/// 🔐 The reported request scheme must come from the handshake, not from a
+/// number the client wrote in its own `Host` header.
+///
+/// The scheme was decided by looking for port 443 or 8443 in the authority when
+/// the URI carried no scheme and no trusted `X-Forwarded-Proto` said otherwise.
+/// That is wrong in both directions, and the dangerous one is not the one it
+/// looks like: a cleartext client that writes `Host: x:443` was reported as
+/// `https`, so `{http.request.scheme}`, the `X-Forwarded-Proto` sent upstream and
+/// the access log all claimed a secure connection that never happened. Anything
+/// behind this proxy that reads the scheme to mean "already encrypted, no
+/// redirect needed" could be told so over plain HTTP.
+#[tokio::test]
+async fn test_request_scheme_comes_from_the_handshake_not_the_host_header() {
+    let config = r#"
+        {
+            admin off
+        }
+
+        :__PINGCLAIR_TEST_PORT__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "scheme={http.request.scheme}"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    // 🚫 Raw requests, because a client library will not let the authority
+    // disagree with the socket it dialled — which is the whole trick.
+    for authority in [
+        "evil.test:443",
+        "evil.test:8443",
+        "evil.test:80",
+        "evil.test",
+    ] {
+        let response = raw_get_with_host(server.address(0), "/probe", authority).await;
+        // 🧾 Checked for the *absence* of `https` rather than the presence of
+        // `http`, because `scheme=https` contains `scheme=http` — the first
+        // version of this assertion passed against the defect it was written for.
+        assert!(
+            !response.contains("scheme=https"),
+            "a cleartext connection claiming {authority} was reported as secure: {response}"
+        );
+        assert!(
+            response.contains("scheme=http"),
+            "no scheme was reported at all for {authority}: {response}"
+        );
+    }
+}
+
+/// 🔐 …and the same fact read the other way: TLS on a port that is neither 443
+/// nor 8443 is still TLS.
+///
+/// The port heuristic reported `http` for a genuine handshake here, so an origin
+/// behind this proxy was told the request arrived in cleartext and would answer
+/// by redirecting a browser that was already secure.
+#[tokio::test]
+async fn test_tls_on_an_unusual_port_still_reports_https() {
+    let config = r#"
+        {
+            admin off
+        }
+
+        https://scheme.test:__PINGCLAIR_TEST_PORT__ {
+            tls internal
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "scheme={http.request.scheme}"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(
+        server.wait_until_tls_ready("scheme.test").await,
+        "server failed to start with an internal certificate"
+    );
+
+    // 🎯 The reserved test port is an arbitrary high port, never 443 or 8443, so
+    // the old heuristic could only have answered `http` here.
+    let port = server.address(0).port();
+    assert!(
+        port != 443 && port != 8443,
+        "this test is only meaningful on a port the heuristic did not special-case"
+    );
+
+    let root_path = server._temp_dir.path().join("tls/internal/root.crt");
+    let root = reqwest::Certificate::from_pem(&std::fs::read(&root_path).unwrap()).unwrap();
+
+    // 🎯 Both versions, and HTTP/1.1 is the one that matters. An HTTP/2 request
+    // target is absolute, so `:scheme` maps into the URI and carries the truth
+    // whatever the heuristic thinks — which is why an H2-only test passed against
+    // the defect. HTTP/1.1 sends only a path, so the scheme had nowhere to come
+    // from but the port.
+    for http1_only in [true, false] {
+        let mut builder = reqwest::Client::builder()
+            .no_proxy()
+            .add_root_certificate(root.clone())
+            .resolve("scheme.test", server.address(0));
+        if http1_only {
+            builder = builder.http1_only();
+        }
+        let client = builder.build().unwrap();
+        let response = client
+            .get(server.tls_url(0, "scheme.test", "/probe"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.text().await.unwrap(),
+            "scheme=https",
+            "a real handshake was reported as cleartext (http1_only={http1_only})"
+        );
+    }
+}
+
+/// 🧾 One raw HTTP/1 GET whose `Host` need not match the socket it was sent to.
+async fn raw_get_with_host(address: SocketAddr, target: &str, authority: &str) -> String {
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    stream
+        .write_all(
+            format!("GET {target} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    String::from_utf8_lossy(&read_http1_to_end(&mut stream).await).to_string()
+}

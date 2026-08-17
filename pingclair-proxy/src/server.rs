@@ -1228,12 +1228,6 @@ fn session_inet_addresses(session: &Session) -> Option<(SocketAddr, SocketAddr)>
     Some((peer, listener))
 }
 
-fn authority_port(authority: &str) -> Option<u16> {
-    authority
-        .rsplit_once(':')
-        .and_then(|(_, port)| port.parse::<u16>().ok())
-}
-
 fn host_matches_rule(host: &str, rule: &str) -> bool {
     let host = host.to_ascii_lowercase();
     if let Some(suffix) = rule.strip_prefix("*.") {
@@ -6165,31 +6159,48 @@ impl ProxyHttp for PingclairProxy {
                 self.downstream_identity(session, &request_header.headers);
             let remote_ip = verified_client_ip.to_string();
 
-            // ⚡ OPTIMIZATION: Identify protocol via URI scheme, forwarding header, or port.
-            // Pingora 0.6 removed the per-request TLS flag; we detect HTTPS by:
-            //   (a) checking the HTTP/2 `:scheme` mapped into the URI,
-            //   (b) checking X-Forwarded-Proto, or
-            //   (c) checking whether the authority uses port 443 / 8443.
-            let protocol = {
-                let via_header = if self.is_trusted_proxy(transport_peer_ip) {
-                    request_header
-                        .headers
-                        .get("x-forwarded-proto")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                } else {
-                    ""
-                };
-                if request_header.uri.scheme_str() == Some("https") || via_header == "https" {
-                    "https"
-                } else {
-                    let port_in_host = authority_port(authority).unwrap_or(80);
-                    if port_in_host == 443 || port_in_host == 8443 {
-                        "https"
-                    } else {
-                        "http"
-                    }
-                }
+            // 🔐 The request scheme comes from the handshake, never from a number
+            // the client chose.
+            //
+            // 🤡 This used to guess: if the URI carried no scheme and no trusted
+            // `X-Forwarded-Proto` said otherwise, it looked for port 443 or 8443
+            // in the *authority* — which on HTTP/1.1 is the client's own `Host`
+            // header. Both directions were wrong, and the dangerous one is not
+            // the obvious one. `Host: x:443` over cleartext was reported as
+            // `https`, so `{http.request.scheme}`, the `X-Forwarded-Proto` sent
+            // upstream, and the access log all claimed a secure connection that
+            // never happened — and anything behind this proxy that reads the
+            // scheme as "already encrypted, no redirect needed" believed it. The
+            // other direction merely broke things: a genuine handshake on any
+            // other port was reported as `http`, which is why HTTP/1.1 over TLS
+            // on a high port told its origin the request arrived in cleartext.
+            //
+            // The old comment blamed Pingora for removing a per-request TLS flag.
+            // `Session::digest()` carries `ssl_digest`, which is `Some` exactly
+            // when this connection completed a handshake here — the same field
+            // `strict_sni_host_rejection` already reads. Nothing had to be
+            // guessed (`pingora-core` 0.8.1, `protocols/mod.rs:31`, 2026-08-17).
+            let protocol = if session
+                .digest()
+                .is_some_and(|digest| digest.ssl_digest.is_some())
+            {
+                "https"
+            } else if self.is_trusted_proxy(transport_peer_ip)
+                && request_header
+                    .headers
+                    .get("x-forwarded-proto")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.eq_ignore_ascii_case("https"))
+            {
+                // 🤝 Cleartext to us, but a trusted ingress may have terminated
+                // TLS and told us so. This is the one case where a header is the
+                // authority, and it is gated on the peer being trusted — the same
+                // gate every other forwarded fact goes through. A PROXY-protocol
+                // ingress that terminates TLS elsewhere leaves `ssl_digest`
+                // empty, so without this branch it would look like cleartext.
+                "https"
+            } else {
+                "http"
             };
 
             // 🧰 Site-level `vars` rules run before route matching, so a
@@ -8651,7 +8662,6 @@ mod p0_regression_tests {
             .unwrap();
         assert_eq!(request_authority(&h1), "api.example.com:8443");
         assert_eq!(authority_host(request_authority(&h1)), "api.example.com");
-        assert_eq!(authority_port(request_authority(&h1)), Some(8443));
 
         let mut h2 = RequestHeader::build_no_case("GET", b"/ready", None).unwrap();
         h2.uri = "https://h2.example.com:443/ready".parse().unwrap();
@@ -8659,13 +8669,11 @@ mod p0_regression_tests {
             .unwrap();
         assert_eq!(request_authority(&h2), "h2.example.com:443");
         assert_eq!(authority_host(request_authority(&h2)), "h2.example.com");
-        assert_eq!(authority_port(request_authority(&h2)), Some(443));
     }
 
     #[test]
     fn authority_host_supports_bracketed_ipv6() {
         assert_eq!(authority_host("[2001:db8::1]:443"), "2001:db8::1");
-        assert_eq!(authority_port("[2001:db8::1]:443"), Some(443));
     }
 
     // ---- Fix 1: streaming compression stays bounded regardless of body size

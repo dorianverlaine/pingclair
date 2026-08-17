@@ -4322,11 +4322,16 @@ async fn reverse_proxy_upstream(
             upstream_method = rewritten;
         }
         if let Some(template) = &proxy_config.rewrite_uri {
+            // 🔐 `https`, like every other placeholder site on this transport.
+            // This one said `http`, so a `rewrite` template resolving
+            // `{http.request.scheme}` disagreed with the eight sites around it
+            // about the same request. HTTP/3 runs on QUIC, which carries TLS by
+            // construction — there is no cleartext H3 for this to have described.
             let resolved = crate::server::resolve_caddy_placeholders(
                 template,
                 client_header,
                 Some(verified_client_ip),
-                "http",
+                "https",
                 request_vars,
             );
             upstream_uri = resolved.into_owned();

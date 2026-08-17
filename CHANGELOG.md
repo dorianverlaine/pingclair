@@ -940,6 +940,34 @@ lets the rest converge.
 
 ### 🔐 Security
 
+- 🔐 **A cleartext client could make this proxy report its connection as
+  secure.** The request scheme was decided by looking for port 443 or 8443 in the
+  authority when the URI carried no scheme and no trusted `X-Forwarded-Proto` said
+  otherwise — and on HTTP/1.1 the authority is the client's own `Host` header. So
+  `Host: anything:443` over plain HTTP was reported as `https`, which is what
+  `{http.request.scheme}` resolved to, what the `X-Forwarded-Proto` sent upstream
+  said, and what the access log recorded. Anything behind this proxy that reads
+  the scheme as "already encrypted, no redirect needed" believed it.
+
+  The same guess was wrong in the other direction, and that half only broke
+  things: a genuine handshake on any other port was reported as `http`, so
+  HTTP/1.1 over TLS on a high port told its origin the request arrived in
+  cleartext. HTTP/2 was unaffected there, because its request target is absolute
+  and `:scheme` carried the truth regardless.
+
+  The scheme now comes from the handshake — `Session::digest()`'s `ssl_digest` is
+  `Some` exactly when TLS was terminated here, the same field the strict-SNI check
+  already read. A trusted peer's `X-Forwarded-Proto` is still honoured, because a
+  PROXY-protocol ingress that terminates TLS elsewhere leaves no local handshake
+  to observe; an untrusted peer's is not. The port is never consulted, and
+  `authority_port` is gone with it.
+
+  Separately, one HTTP/3 placeholder site passed `http` where its eight
+  neighbours passed `https`, so a `reverse_proxy` `rewrite` template resolving
+  `{http.request.scheme}` disagreed with the rest of the same request. HTTP/3 runs
+  on QUIC and cannot be cleartext. Found by review.
+
+
 - 📊 **Anyone who could reach the Admin listener decided how many metric series
   this process held.** `pingclair_admin_http_requests_total` was labelled with the
   raw request path and the raw method, both copied off the wire. A Prometheus

@@ -166,6 +166,16 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        # 🔐 Echoes the path back, so a `rewrite` template's resolved
+        # placeholders are observable from outside the proxy.
+        if self.path.startswith("/echo/"):
+            body = self.path.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if "/big/" in self.path:
             size = int(self.path.rsplit("/", 1)[-1])
             body = bytes((i % 251) for i in range(size))
@@ -246,6 +256,17 @@ cat >"${run_dir}/config.json" <<JSON
             "type": "reverse_proxy",
             "upstreams": ["http://127.0.0.1:${upstream_port}"],
             "load_balance": { "strategy": "round_robin" },
+            "headers_up": {},
+            "headers_down": {}
+          }
+        },
+        {
+          "path": "/scheme/*",
+          "handler": {
+            "type": "reverse_proxy",
+            "upstreams": ["http://127.0.0.1:${upstream_port}"],
+            "load_balance": { "strategy": "round_robin" },
+            "rewrite_uri": "/echo/{http.request.scheme}",
             "headers_up": {},
             "headers_down": {}
           }
@@ -431,6 +452,15 @@ multi="$(h3 "${primary_host}" -fsS \
     "https://${primary_host}:${h3_port}/who" \
     "https://${primary_host}:${h3_port}/who" | tr -d '\n')"
 check_eq "three requests on one connection" "primaryprimaryprimary" "${multi}"
+
+log ""
+log "🔎 Placeholder scheme on the rewrite path — H3 is QUIC, so never cleartext"
+# 🔐 The `rewrite` template is the one H3 placeholder site that passed "http"
+# while its eight neighbours passed "https". The upstream echoes the path it was
+# asked for, so the resolved scheme is visible from outside.
+scheme_path="$(h3 "${primary_host}" -sS \
+    "https://${primary_host}:${h3_port}/scheme/anything" | tr -d '\n')"
+check_eq "rewrite placeholder resolved the real scheme" "/echo/https" "${scheme_path}"
 
 log ""
 log "🔎 Percent-decoding on the templates path — H3's own code, not the file server's"
