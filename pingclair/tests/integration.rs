@@ -22,6 +22,10 @@ struct TestServer {
     watchdog: Option<Child>,
     server_addresses: Vec<Vec<SocketAddr>>,
     admin_address: Option<SocketAddr>,
+    /// 🔐 The `api_key` the readiness probe must present, when the fixture
+    /// configured one. Without it a key-protected `/health` answers 401 and the
+    /// probe would wait out its budget on a listener that is already up.
+    admin_key: Option<String>,
     readiness_path: String,
     readiness_token: String,
     stdout_path: PathBuf,
@@ -215,6 +219,7 @@ impl TestServer {
             watchdog,
             server_addresses,
             admin_address,
+            admin_key: None,
             readiness_path,
             readiness_token,
             stdout_path,
@@ -222,6 +227,13 @@ impl TestServer {
             stopped: false,
             _temp_dir: temp_dir,
         }
+    }
+
+    /// 🔐 Declares the `api_key` this fixture configured, so the readiness probe
+    /// can authenticate. Call it before [`Self::wait_until_ready`].
+    fn with_admin_key(mut self, key: &str) -> Self {
+        self.admin_key = Some(key.to_string());
+        self
     }
 
     fn url(&self, server_index: usize, path: &str) -> String {
@@ -285,6 +297,15 @@ impl TestServer {
         self.stopped = true;
     }
 
+    /// 🔐 A probe request carrying the fixture's `api_key`, if it declared one.
+    fn admin_probe(&self, client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
+        let request = client.get(url);
+        match &self.admin_key {
+            Some(key) => request.header("Authorization", format!("Bearer {key}")),
+            None => request,
+        }
+    }
+
     async fn wait_until_ready(&mut self) -> bool {
         let client = no_proxy_client();
         let url = self.url(0, &self.readiness_path);
@@ -315,7 +336,7 @@ impl TestServer {
             // the exact readiness token.
             if !admin_ready
                 && let Some(url) = &admin_url
-                && let Ok(response) = client.get(url).send().await
+                && let Ok(response) = self.admin_probe(&client, url).send().await
                 && response.status() == reqwest::StatusCode::OK
                 && let Ok(body) = response.text().await
             {
@@ -13062,4 +13083,98 @@ async fn raw_get(address: SocketAddr, target: &str) -> String {
         .await
         .unwrap();
     String::from_utf8_lossy(&read_http1_to_end(&mut stream).await).to_string()
+}
+
+/// 📊 An unauthenticated admin caller must not be able to decide how many
+/// metric series this process holds.
+///
+/// The admin counter was labelled with the raw request path and the raw method,
+/// both copied straight off the wire before authentication ran. So a client that
+/// could reach the listener but not authenticate still got one permanent series
+/// per distinct path it invented — the series outlive the request, the 401 does
+/// not stop them, and nothing bounded the set.
+#[tokio::test]
+async fn test_admin_metric_labels_are_a_fixed_set() {
+    const KEY: &str = "sec013-test-key";
+
+    let config = format!(
+        r#"
+        {{
+            admin __PINGCLAIR_TEST_ADMIN_LISTEN__ {KEY}
+            metrics
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+        }}
+    "#
+    );
+    let mut server = TestServer::new_pingclairfile(&config).with_admin_key(KEY);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    // 🚫 Sixty distinct paths, none of them a route and none of them
+    // authenticated. Under the old labelling this is sixty series.
+    for index in 0..60 {
+        let refused = client
+            .get(server.admin_url(&format!("/nope/{index}/{index}")))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(refused.status(), 401, "the probe must not be authorized");
+    }
+
+    // 🚫 …and an extension method, which hyper accepts as a token, so the
+    // `method` label was unbounded on its own terms too.
+    for index in 0..20 {
+        let _ = client
+            .request(
+                reqwest::Method::from_bytes(format!("WIBBLE{index}").as_bytes()).unwrap(),
+                server.admin_url("/config"),
+            )
+            .send()
+            .await;
+    }
+
+    let scrape = client
+        .get(server.admin_url("/metrics"))
+        .header("Authorization", format!("Bearer {KEY}"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(scrape.status(), 200);
+    let body = scrape.text().await.unwrap();
+
+    let series: Vec<&str> = body
+        .lines()
+        .filter(|line| line.starts_with("pingclair_admin_http_requests_total{"))
+        .collect();
+
+    assert!(
+        !series.is_empty(),
+        "the counter must still record something: {body}"
+    );
+    assert!(
+        series.len() <= 12,
+        "80 synthetic requests produced {} series, so the label set is not bounded:\n{}",
+        series.len(),
+        series.join("\n")
+    );
+
+    // 🎯 …and the counter got *more* useful, not less: the sixty attempts are
+    // one number instead of sixty series each holding 1. A classifier that
+    // answered `unknown` for everything would satisfy the bound above and tell
+    // an operator nothing, so the classes have to be told apart here too.
+    let joined = series.join("\n");
+    for expected in [
+        r#"endpoint="unknown",method="GET",status="401"} 60"#,
+        r#"endpoint="config",method="other",status="401"} 20"#,
+        r#"endpoint="health",method="GET",status="200"#,
+    ] {
+        assert!(
+            joined.contains(expected),
+            "missing {expected}\nin:\n{joined}"
+        );
+    }
 }

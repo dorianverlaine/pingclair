@@ -236,18 +236,83 @@ async fn handle_request(
     state: Arc<AdminState>,
     peer_addr: SocketAddr,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    // 🍃 Avoid allocating metric labels when collection is disabled.
-    let metric_labels = pingclair_proxy::metrics::enabled()
-        .then(|| (req.method().to_string(), req.uri().path().to_string()));
+    // 🍃 Classified before the request is consumed, and skipped entirely when
+    // collection is off so nothing touches the registry. Both labels are
+    // `&'static str`, so this allocates nothing either way.
+    let metric_labels = pingclair_proxy::metrics::enabled().then(|| {
+        (
+            metric_method(req.method()),
+            metric_endpoint(req.uri().path()),
+        )
+    });
     let response = handle_request_inner(req, &state, peer_addr).await?;
-    if let Some((method, path)) = metric_labels {
-        // 📊 Count every admin request by endpoint and status (MT-3).
-        let status = response.status().as_u16().to_string();
+    if let Some((method, endpoint)) = metric_labels {
+        // 📊 Count every admin request by endpoint class and status (MT-3).
+        // Deliberately *including* the rejected ones: a spike in 401s is the
+        // signal an operator most wants from this metric, and it is safe to
+        // record before authentication precisely because the label set is fixed.
         pingclair_proxy::metrics::ADMIN_REQUESTS_TOTAL
-            .with_label_values(&[&method, &path, &status])
+            .with_label_values(&[method, endpoint, response.status().as_str()])
             .inc();
     }
     Ok(response)
+}
+
+// MARK: - Metric labels
+
+/// 📊 The endpoint class for a request path — one of a fixed set.
+///
+/// 🛡️ This exists because the label used to be the raw request path. A
+/// Prometheus label value becomes a permanent series, and the series outlives
+/// the request that created it, so anything that can reach this listener and
+/// invent paths decides how much memory the process holds. Authentication is no
+/// defence: the counter records the 401 too, and it has to, because a spike in
+/// rejections is the thing worth alerting on. The fix is therefore not "count
+/// later" but "count something the request cannot choose".
+///
+/// 📌 The arms below mirror the router in [`handle_request_inner`], and they are
+/// kept next to it for that reason. They are not derived from it, so a route
+/// added there and forgotten here reports as `unknown` — less informative, still
+/// bounded, which is the right way round for this to fail.
+fn metric_endpoint(path: &str) -> &'static str {
+    match path {
+        "/health" => "health",
+        "/live" => "live",
+        "/ready" => "ready",
+        "/metrics" => "metrics",
+        "/config" | "/config/" => "config",
+        "/cache" | "/cache/" => "cache",
+        "/cache/purge" => "cache_purge",
+        "/load" => "load",
+        "/adapt" => "adapt",
+        "/stop" => "stop",
+        // 🌲 Everything under `/config` is one class whatever the traversal
+        // names, and the same for `/id`. The prefix — not the suffix — is what
+        // the router keys on, so a class per prefix is the honest summary.
+        _ if path.starts_with("/config") => "config_path",
+        _ if path.starts_with("/id/") => "id_path",
+        _ => "unknown",
+    }
+}
+
+/// 📊 The method label, bounded to what this API routes on.
+///
+/// 🛡️ Also a fix, and one the review did not name: an HTTP method is a token,
+/// not an enumeration. `hyper` accepts an extension method, so `WIBBLE7 /config`
+/// arrived with `method = "WIBBLE7"` and made a series of its own — the same
+/// unbounded-label defect as the path, through a header nobody thinks of as
+/// free-form.
+fn metric_method(method: &Method) -> &'static str {
+    match *method {
+        Method::GET => "GET",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::PATCH => "PATCH",
+        Method::DELETE => "DELETE",
+        Method::HEAD => "HEAD",
+        Method::OPTIONS => "OPTIONS",
+        _ => "other",
+    }
 }
 
 async fn handle_request_inner(
@@ -990,4 +1055,121 @@ fn response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
         .status(status)
         .body(Full::new(Bytes::from(body.to_string())))
         .unwrap()
+}
+
+#[cfg(test)]
+mod metric_label_tests {
+    use super::*;
+
+    /// 📊 Every class the classifier can produce. A label value not in this list
+    /// is a series nobody planned for.
+    const ENDPOINT_CLASSES: &[&str] = &[
+        "health",
+        "live",
+        "ready",
+        "metrics",
+        "config",
+        "config_path",
+        "cache",
+        "cache_purge",
+        "load",
+        "adapt",
+        "stop",
+        "id_path",
+        "unknown",
+    ];
+
+    const METHOD_CLASSES: &[&str] = &[
+        "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "other",
+    ];
+
+    /// 🛡️ No path, however chosen, produces a label outside the fixed set.
+    ///
+    /// The integration test proves this for the eighty requests it sends; this
+    /// proves it for the shapes an attacker would actually reach for, including
+    /// the ones that look like a route and are not.
+    #[test]
+    fn no_path_escapes_the_endpoint_classes() {
+        let probes = [
+            "/",
+            "",
+            "/health",
+            "/health/",
+            "/healthz",
+            "/config",
+            "/config/",
+            "/config/apps/http/servers",
+            "/config/../../etc/passwd",
+            "/configfoo",
+            "/id/abc123",
+            "/id",
+            "/cache",
+            "/cache/purge",
+            "/cache/purge/extra",
+            "/nope/1",
+            "/../..",
+            "/%00",
+            "/一二三",
+            "/a?b#c",
+            &"/x".repeat(4096),
+        ];
+        for probe in probes {
+            let class = metric_endpoint(probe);
+            assert!(
+                ENDPOINT_CLASSES.contains(&class),
+                "{probe:?} produced an unplanned class {class:?}"
+            );
+        }
+    }
+
+    /// 🛡️ An extension method is a token, so it must land on `other` rather than
+    /// becoming its own series.
+    #[test]
+    fn an_extension_method_is_not_its_own_label() {
+        for name in ["WIBBLE", "PROPFIND", "X", &"M".repeat(512)] {
+            let method = Method::from_bytes(name.as_bytes()).expect("a valid token");
+            let class = metric_method(&method);
+            assert_eq!(class, "other", "{name} became its own label");
+            assert!(METHOD_CLASSES.contains(&class));
+        }
+    }
+
+    /// 👍 The routed methods keep their own names, or the metric would say
+    /// `other` for every real request and be useless.
+    #[test]
+    fn the_routed_methods_keep_their_names() {
+        for method in [
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ] {
+            assert_eq!(metric_method(&method), method.as_str());
+        }
+    }
+
+    /// 🎯 The classes are distinct where the router is distinct — a classifier
+    /// that answered `unknown` for everything would satisfy the bound above and
+    /// tell an operator nothing.
+    #[test]
+    fn the_real_endpoints_are_told_apart() {
+        for (path, expected) in [
+            ("/health", "health"),
+            ("/live", "live"),
+            ("/ready", "ready"),
+            ("/metrics", "metrics"),
+            ("/config", "config"),
+            ("/config/apps", "config_path"),
+            ("/cache", "cache"),
+            ("/cache/purge", "cache_purge"),
+            ("/load", "load"),
+            ("/adapt", "adapt"),
+            ("/stop", "stop"),
+            ("/id/xyz", "id_path"),
+            ("/nothing", "unknown"),
+        ] {
+            assert_eq!(metric_endpoint(path), expected, "for {path}");
+        }
+    }
 }

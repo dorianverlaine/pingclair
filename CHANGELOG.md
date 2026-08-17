@@ -880,6 +880,28 @@ lets the rest converge.
 
 ### 🔐 Security
 
+- 📊 **Anyone who could reach the Admin listener decided how many metric series
+  this process held.** `pingclair_admin_http_requests_total` was labelled with the
+  raw request path and the raw method, both copied off the wire. A Prometheus
+  series outlives the request that created it, so 200 invented paths meant 200
+  permanent series, and nothing bounded the set. Authentication was no defence:
+  the counter records rejected requests too, and it should — a spike in 401s is
+  the thing worth alerting on — so an unauthenticated client got a series per
+  path it made up.
+
+  The method was the same defect through a header nobody thinks of as free-form:
+  an HTTP method is a token, not an enumeration, so `WIBBLE7 /config` arrived and
+  became its own series.
+
+  Both labels are now a fixed set decided by this server rather than by the
+  caller: an endpoint class (`config`, `config_path`, `id_path`, `unknown`, and
+  one per remaining route) and a method class that folds anything unrouted into
+  `other`. The `path` label is accordingly spelled `endpoint`, because it names a
+  class and not a path — the metric is new in this release, so nothing published
+  was relying on the old spelling. The counter also got *more* useful: 60
+  unauthorized probes are now one series reading 60 instead of 60 series each
+  reading 1. Found by review.
+
 - 📁 **A directory listing named the files `hide` was told to conceal, and did
   not encode the names it printed.** `hide` was applied when a file was asked
   for directly and when a pre-compressed sidecar was looked up, but not when a

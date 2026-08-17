@@ -548,14 +548,20 @@ pub static CIRCUIT_STATE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("metric can be created")
 });
 
-/// 🧑‍💻 Admin API request counter, labelled by endpoint and status.
+/// 🧑‍💻 Admin API request counter, labelled by endpoint class and status.
+///
+/// 🛡️ `endpoint` is a class name, not a path, and the label is spelled
+/// `endpoint` to say so. It used to be `path` carrying the raw request target,
+/// which let anyone who could reach the Admin listener — authenticated or not —
+/// mint one permanent series per path they invented. The classifier lives beside
+/// the Admin router in `pingclair-api`, because it has to agree with it.
 pub static ADMIN_REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(
             "pingclair_admin_http_requests_total",
             "Requests made to the admin API endpoints",
         ),
-        &["method", "path", "status"],
+        &["method", "endpoint", "status"],
     )
     .expect("metric can be created")
 });
