@@ -563,31 +563,99 @@ struct H3Request {
 }
 
 /// Parse the pseudo-headers of an HTTP/3 request into an [`H3Request`].
+///
+/// # 🛡️ Why this validates rather than merely extracts
+///
+/// `None` becomes a 400, and a request this cannot read unambiguously has to get
+/// one. The previous version took the last copy of a repeated pseudo-header,
+/// never looked at `:scheme`, accepted pseudo-headers interleaved with regular
+/// fields, and let `:authority` silently outrank a contradicting `Host` that it
+/// then left in the field list. Every one of those is a way for this proxy and
+/// something behind it to reach different conclusions about the same request,
+/// which is the ground request smuggling grows in. RFC 9114 §4.3.1's answer to
+/// all of them is the same: the request is malformed, so nobody has to choose.
+///
+/// Five rules, in the order they are cheapest to check:
+///
+/// 1. **No duplicates.** A repeated pseudo-header is malformed.
+/// 2. **Pseudo-headers first.** One appearing after a regular field is malformed
+///    (§4.3).
+/// 3. **Lowercase field names** (§4.2). An uppercase name is malformed, and
+///    treating it as data would let two parsers disagree about whether a header
+///    was even present.
+/// 4. **`:scheme` is required and must be `https`.** There is no cleartext
+///    HTTP/3, so a request claiming `http` here would be treated as secure by
+///    everything downstream of this function — the same disagreement about one
+///    request that the TCP path's port-guessed scheme produced.
+/// 5. **`:authority` and `Host` must agree** when both are sent.
+///
+/// 📌 Classic `CONNECT` — which omits `:scheme` and `:path` — is still refused,
+/// exactly as before this change, because `path` was already mandatory. Extended
+/// CONNECT (RFC 9220) sends both and keeps working.
 fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
     let mut method = None;
     let mut protocol = None;
     let mut path = None;
     let mut authority = None;
+    let mut scheme = None;
     let mut headers = Vec::new();
+    let mut seen_regular_field = false;
 
     for h in list {
-        let value = String::from_utf8_lossy(h.value()).into_owned();
-        match h.name() {
-            b":method" => method = Some(value),
-            b":path" => path = Some(value),
-            b":authority" => authority = Some(value),
-            b":protocol" => protocol = Some(value),
-            b":scheme" => {}
-            name if name.starts_with(b":") => return None, // unknown pseudo-header
-            name => headers.push((String::from_utf8_lossy(name).into_owned(), value)),
+        let name = h.name();
+        if name.starts_with(b":") {
+            if seen_regular_field {
+                return None;
+            }
+            let slot = match name {
+                b":method" => &mut method,
+                b":path" => &mut path,
+                b":authority" => &mut authority,
+                b":protocol" => &mut protocol,
+                b":scheme" => &mut scheme,
+                // 🚫 An unknown pseudo-header is malformed, and refusing it was
+                // already the one thing this function got right.
+                _ => return None,
+            };
+            if slot.is_some() {
+                return None;
+            }
+            // 🛡️ Refused rather than lossily repaired: these decide which site
+            // and which resource, and U+FFFD would route somewhere nobody asked
+            // for.
+            *slot = Some(std::str::from_utf8(h.value()).ok()?.to_owned());
+            continue;
         }
+
+        seen_regular_field = true;
+        if name.iter().any(|byte| byte.is_ascii_uppercase()) {
+            return None;
+        }
+        headers.push((
+            String::from_utf8_lossy(name).into_owned(),
+            String::from_utf8_lossy(h.value()).into_owned(),
+        ));
     }
 
-    if authority.is_none() {
-        authority = headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("host"))
-            .map(|(_, v)| v.clone());
+    // 🔐 A scheme is case-insensitive per RFC 3986, so `HTTPS` is the same
+    // request and refusing it would be stricter than the specification.
+    if !scheme
+        .as_deref()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
+    {
+        return None;
+    }
+
+    // 🌐 `Host` is already lowercase here, because an uppercase field name was
+    // refused above.
+    let host = headers
+        .iter()
+        .find(|(name, _)| name == "host")
+        .map(|(_, value)| value.as_str());
+    match (authority.as_deref(), host) {
+        (Some(authority), Some(host)) if !authority.eq_ignore_ascii_case(host) => return None,
+        (None, Some(host)) => authority = Some(host.to_owned()),
+        _ => {}
     }
 
     Some(H3Request {
@@ -5818,10 +5886,18 @@ mod tests {
         );
     }
 
+    /// 🌐 A request with no `:authority` takes its host from `Host`.
+    ///
+    /// 📌 `:scheme` was added to this fixture when the parser started requiring
+    /// it. The subject here is the authority fallback, not scheme omission — the
+    /// original list happened to omit `:scheme` because nothing looked at it, and
+    /// a request without one is malformed per RFC 9114 §4.3.1 whatever else it
+    /// carries.
     #[test]
     fn parse_h3_request_falls_back_to_host_header() {
         let list = vec![
             quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
             quiche::h3::Header::new(b":path", b"/"),
             quiche::h3::Header::new(b"host", b"fallback.example.com"),
         ];
@@ -5842,6 +5918,138 @@ mod tests {
         let req = parse_h3_request(&list).unwrap();
 
         assert_eq!(req.protocol.as_deref(), Some("websocket"));
+    }
+
+    /// 🛡️ A duplicate pseudo-header is malformed (RFC 9114 §4.3.1) and must be
+    /// refused, not resolved.
+    ///
+    /// The loop assigned into a slot, so the *last* copy won. Whether an
+    /// intermediary and an origin pick the same copy is exactly the ambiguity
+    /// request smuggling lives in, and the specification's answer is that nobody
+    /// picks: the request is malformed.
+    #[test]
+    fn parse_h3_request_refuses_duplicate_pseudo_headers() {
+        for duplicate in [
+            &b":method"[..],
+            &b":path"[..],
+            &b":authority"[..],
+            &b":scheme"[..],
+        ] {
+            let mut list = vec![
+                quiche::h3::Header::new(b":method", b"GET"),
+                quiche::h3::Header::new(b":scheme", b"https"),
+                quiche::h3::Header::new(b":authority", b"example.com"),
+                quiche::h3::Header::new(b":path", b"/"),
+            ];
+            list.push(quiche::h3::Header::new(duplicate, b"second"));
+            assert!(
+                parse_h3_request(&list).is_none(),
+                "a duplicate {} was accepted",
+                String::from_utf8_lossy(duplicate)
+            );
+        }
+    }
+
+    /// 🛡️ Pseudo-headers must precede the regular fields (RFC 9114 §4.3).
+    #[test]
+    fn parse_h3_request_refuses_a_pseudo_header_after_a_regular_one() {
+        let list = vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"example.com"),
+            quiche::h3::Header::new(b"content-type", b"text/plain"),
+            quiche::h3::Header::new(b":path", b"/late"),
+        ];
+        assert!(parse_h3_request(&list).is_none());
+    }
+
+    /// 🔐 `:scheme` is required, and on this transport it can only be `https`.
+    ///
+    /// It used to be matched and thrown away, so a request could claim `http` on a
+    /// QUIC connection and every other part of the stack would treat it as
+    /// secure — the same disagreement about one request that the port-guessing
+    /// scheme bug produced on the TCP path.
+    #[test]
+    fn parse_h3_request_requires_an_https_scheme() {
+        let base = |scheme: Option<&[u8]>| {
+            let mut list = vec![quiche::h3::Header::new(b":method", b"GET")];
+            if let Some(scheme) = scheme {
+                list.push(quiche::h3::Header::new(b":scheme", scheme));
+            }
+            list.push(quiche::h3::Header::new(b":authority", b"example.com"));
+            list.push(quiche::h3::Header::new(b":path", b"/"));
+            list
+        };
+
+        assert!(
+            parse_h3_request(&base(None)).is_none(),
+            "a request with no :scheme was accepted"
+        );
+        assert!(
+            parse_h3_request(&base(Some(b"http"))).is_none(),
+            "a cleartext scheme was accepted on QUIC"
+        );
+        assert!(parse_h3_request(&base(Some(b"https"))).is_some());
+        // 🔤 A scheme is case-insensitive per RFC 3986, so this is a real request
+        // and refusing it would be stricter than the specification.
+        assert!(parse_h3_request(&base(Some(b"HTTPS"))).is_some());
+    }
+
+    /// 🌐 `:authority` and `Host` must agree when both are present.
+    ///
+    /// `:authority` silently won and `Host` stayed in the field list, so a handler
+    /// reading `Host` and the router reading `:authority` could disagree about
+    /// which site was addressed.
+    #[test]
+    fn parse_h3_request_refuses_a_host_that_contradicts_the_authority() {
+        let conflicting = vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"real.example.com"),
+            quiche::h3::Header::new(b":path", b"/"),
+            quiche::h3::Header::new(b"host", b"other.example.com"),
+        ];
+        assert!(parse_h3_request(&conflicting).is_none());
+
+        // 👍 Agreeing is fine, including in a different case — a host name is
+        // case-insensitive and refusing that would break real clients.
+        let agreeing = vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"real.example.com"),
+            quiche::h3::Header::new(b":path", b"/"),
+            quiche::h3::Header::new(b"host", b"REAL.example.com"),
+        ];
+        assert!(parse_h3_request(&agreeing).is_some());
+    }
+
+    /// 🔤 A field name must be lowercase (RFC 9114 §4.2); an uppercase one is
+    /// malformed, and treating it as data would let two parsers disagree about
+    /// whether a header was present.
+    #[test]
+    fn parse_h3_request_refuses_an_uppercase_field_name() {
+        let list = vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"example.com"),
+            quiche::h3::Header::new(b":path", b"/"),
+            quiche::h3::Header::new(b"Content-Type", b"text/plain"),
+        ];
+        assert!(parse_h3_request(&list).is_none());
+    }
+
+    /// 🛡️ A pseudo-header that is not valid UTF-8 is refused rather than
+    /// lossily repaired — these decide routing, and U+FFFD would route somewhere
+    /// nobody asked for.
+    #[test]
+    fn parse_h3_request_refuses_invalid_utf8_in_a_pseudo_header() {
+        let list = vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"example.com"),
+            quiche::h3::Header::new(b":path", &[b'/', 0xff, 0xfe]),
+        ];
+        assert!(parse_h3_request(&list).is_none());
     }
 
     #[test]

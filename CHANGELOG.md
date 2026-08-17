@@ -940,6 +940,27 @@ lets the rest converge.
 
 ### 🔐 Security
 
+- 🛡️ **The HTTP/3 request parser resolved ambiguous requests instead of refusing
+  them.** A repeated pseudo-header overwrote the earlier copy, so the last one
+  won; pseudo-headers interleaved with regular fields were accepted; an uppercase
+  field name was taken as data; `:scheme` was matched and thrown away; and a
+  `Host` contradicting `:authority` was silently outranked and then left in the
+  field list for a handler to read. RFC 9114 §4.3.1 gives the same answer to all
+  of them — the request is malformed — precisely so that no two implementations
+  have to agree on which copy to believe. That disagreement is the ground request
+  smuggling grows in.
+
+  All five are now refused with 400, which is what an unparseable request already
+  received. The `:scheme` rule is the one with teeth beyond framing: there is no
+  cleartext HTTP/3, so a request claiming `http` was previously treated as secure
+  by everything downstream of the parser.
+
+  ⚠️ **This is stricter than before.** A client sending no `:scheme`, a duplicate
+  pseudo-header, or an uppercase field name now gets 400 where it used to be
+  served. Real HTTP/3 clients send none of those — verified against a curl built
+  on ngtcp2, which still passes the full 27-check functional matrix — but a
+  hand-written client that relied on the leniency will notice. Found by review.
+
 - 🔐 **The Admin API key comparison was labelled constant-time and was not.** The
   comment above it said `Constant-time comparison`; the implementation was
   `.all()`, which short-circuits, so it returned as soon as two bytes differed and
