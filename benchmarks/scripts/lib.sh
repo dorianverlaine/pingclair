@@ -84,3 +84,43 @@ assert_wrk_clean() {
     fi
     return 0
 }
+
+# 🔐 The TLS 1.3 suite both candidates must negotiate.
+#
+# 🤡 It was never pinned, and on a CPU without AES-NI the two servers picked
+# differently: Pingclair (BoringSSL) got `TLS_CHACHA20_POLY1305_SHA256` and the
+# comparison point (OpenSSL) got `TLS_AES_256_GCM_SHA384`. Those are very
+# different amounts of work without hardware AES, so every TLS ratio measured on
+# that machine had a second uncontrolled variable — and the reading was
+# ambiguous in both directions at once: neither "we lost anyway" nor "we won
+# fairly" could be claimed.
+#
+# ChaCha20 by default because it is fast in software on every machine, so the
+# comparison is not dominated by an instruction one of them lacks. What matters
+# is that both sides use the same one; override to measure something else.
+BENCH_TLS13_CIPHER="${BENCH_TLS13_CIPHER:-TLS_CHACHA20_POLY1305_SHA256}"
+
+# 🔐 The h2load arguments that pin the suite.
+tls13_pin_args() {
+    printf '%s' "--tls13-ciphers=${BENCH_TLS13_CIPHER}"
+}
+
+# 🔐 Voids a row whose handshake did not use the pinned suite.
+#
+# Pinning alone is not enough to trust: a client that silently ignores the flag,
+# or a server with no suite in common, would fall back and the number would look
+# ordinary. h2load prints `Cipher:` in every run, so the check is free.
+assert_cipher_pinned() {
+    local file=$1 label=$2
+    local negotiated
+    negotiated="$(awk '/^Cipher:/ {print $2}' "${file}")"
+    if [[ -z "${negotiated}" ]]; then
+        echo "   🚫 VOID ${label} — no cipher reported; the handshake is unverified" >&2
+        return 1
+    fi
+    if [[ "${negotiated}" != "${BENCH_TLS13_CIPHER}" ]]; then
+        echo "   🚫 VOID ${label} — negotiated ${negotiated}, not the pinned ${BENCH_TLS13_CIPHER}" >&2
+        return 1
+    fi
+    return 0
+}

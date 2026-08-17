@@ -63,12 +63,12 @@ run_one() {
     local port path args
     port="$(cand_port "${cand}")"
     case "${workload}" in
-        static-h2)  path=/small.txt        ; args=(-t"${threads}" -c"${conns}" -m10 -n"${requests}" --alpn-list=h2) ;;
-        static-h1s) path=/small.txt        ; args=(-t"${threads}" -c"${conns}" -n"${requests}" --alpn-list=http/1.1) ;;
-        proxy-h2)   path=/proxy/small      ; args=(-t"${threads}" -c"${conns}" -m10 -n"${requests}" --alpn-list=h2) ;;
-        proxy-h1s)  path=/proxy/small      ; args=(-t"${threads}" -c"${conns}" -n"${requests}" --alpn-list=http/1.1) ;;
+        static-h2)  path=/small.txt        ; args=(-t"${threads}" -c"${conns}" -m10 -n"${requests}" --alpn-list=h2 "$(tls13_pin_args)") ;;
+        static-h1s) path=/small.txt        ; args=(-t"${threads}" -c"${conns}" -n"${requests}" --alpn-list=http/1.1 "$(tls13_pin_args)") ;;
+        proxy-h2)   path=/proxy/small      ; args=(-t"${threads}" -c"${conns}" -m10 -n"${requests}" --alpn-list=h2 "$(tls13_pin_args)") ;;
+        proxy-h1s)  path=/proxy/small      ; args=(-t"${threads}" -c"${conns}" -n"${requests}" --alpn-list=http/1.1 "$(tls13_pin_args)") ;;
         # 🗜️ The row every earlier matrix was blind to.
-        gzip-h2)    path=/small.json       ; args=(-t"${threads}" -c"${conns}" -m10 -n"${requests}" --alpn-list=h2 -H "accept-encoding: gzip") ;;
+        gzip-h2)    path=/small.json       ; args=(-t"${threads}" -c"${conns}" -m10 -n"${requests}" --alpn-list=h2 "$(tls13_pin_args)" -H "accept-encoding: gzip") ;;
     esac
 
     local dest="${out}/${cand}-${workload}-r${round}.txt"
@@ -88,7 +88,8 @@ run_one() {
     # only thing that caught it, so it travels beside every number.
     local rps
     rps="$(awk '/finished in/ {print $4}' "${dest}" | tr -d ',')"
-    if ! assert_h2load_clean "${dest}" "${cand} ${workload} r${round}" "${requests}"; then
+    if ! assert_h2load_clean "${dest}" "${cand} ${workload} r${round}" "${requests}" \
+        || ! assert_cipher_pinned "${dest}" "${cand} ${workload} r${round}"; then
         mv "${dest}" "${dest%.txt}.VOID.txt" 2>/dev/null || true
         return
     fi

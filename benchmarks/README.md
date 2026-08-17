@@ -32,10 +32,22 @@ voided file must never be quoted.
 nothing but the machine — and the cipher counts.** Concurrency, client threads
 and container CPU limits all varied between two hosts once and the difference
 was read as a generational effect. On a CPU without AES-NI the two servers also
-negotiated different ciphers (ChaCha20-Poly1305 against AES-256-GCM), which is
-not a fair comparison in either direction: it is neither "we lost anyway" nor "we
-won fairly" until both sides are pinned to the same suite.
+negotiated *different* ciphers — Pingclair on BoringSSL got
+`TLS_CHACHA20_POLY1305_SHA256`, the comparison point on OpenSSL got
+`TLS_AES_256_GCM_SHA384` — which are very different amounts of work without
+hardware AES. That is not a fair comparison in either direction: neither "we lost
+anyway" nor "we won fairly" can be claimed until both sides are pinned.
 
-The first two are enforced by `scripts/lib.sh`, which every load-generating
-script sources. The third cannot be enforced by a script and is why this section
-exists.
+The TLS half of rule 3 is now enforced. `BENCH_TLS13_CIPHER` (default
+`TLS_CHACHA20_POLY1305_SHA256`, chosen because it is fast in software on every
+machine) is passed to the client, and `assert_cipher_pinned` voids any row whose
+handshake did not actually use it — pinning alone is not enough, because a client
+that ignored the flag would produce an ordinary-looking number.
+
+⚠️ **Any TLS ratio measured on a machine without AES-NI before this was in place
+is not quotable.** The suite was uncontrolled, so those numbers answer a question
+nobody asked. They need re-measuring on that hardware, which is the one part of
+these three rules a script cannot do for you.
+
+The rest of rule 3 — matching concurrency, client threads and CPU limits — cannot
+be enforced by a script either, and is why this section exists.
