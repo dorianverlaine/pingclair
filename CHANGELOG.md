@@ -710,6 +710,24 @@ lets the rest converge.
   Found while fixing the browse listing, whose corrected link encoding made it
   visible.
 
+- 🔤 **`templates` and FastCGI named files by their encoded spelling too.** Both
+  turn a request path into a filename on code paths of their own, so both needed
+  the same decode as the file server, and both went without it.
+
+  For `templates` the failure was worse than a 404: an encoded template name did
+  not match, so the request fell through to `file_server` and the template was
+  served as **source**, `{{ … }}` and all. A template that misses leaks rather
+  than fails. For FastCGI, `SCRIPT_FILENAME` and `PATH_TRANSLATED` are filesystem
+  paths — CGI keeps `SCRIPT_NAME` and `PATH_INFO` encoded and these two decoded —
+  so a script whose name was not plain ASCII was handed to the backend under a
+  name it could not find.
+
+  All three sites now share one confinement helper, which also closed a gap that
+  was not about encoding at all: the H3 `templates` terminal joined the request
+  path with **no `..` check of its own**, relying entirely on the plan that
+  selects it having checked first. It has its own now, for the same reason the
+  file server re-checks a configured index.
+
 - 🔁 **`lb_retry_match` decides retries instead of being logged and ignored.**
   Expressions used to be kept as text, scanned for a few substrings, and
   announced at startup as "accepted but not evaluated". For a directive whose

@@ -207,6 +207,13 @@ class Handler(BaseHTTPRequestHandler):
 ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 PY
 
+# 🔤 A template whose name only a percent-encoded request can spell. The
+# `templates` handler turns a request path into a filename of its own, on a code
+# path separate from the file server's, so H3 needs its own evidence that the
+# decode happens there too — and that an escaped traversal still does not.
+mkdir -p "${run_dir}/tpl"
+printf 'Rendered: {{now | date "2006"}}\n' >"${run_dir}/tpl/範本.html"
+
 python3 "${run_dir}/upstream.py" "${upstream_port}" >"${run_dir}/upstream.log" 2>&1 &
 upstream_pid=$!
 
@@ -223,6 +230,16 @@ cat >"${run_dir}/config.json" <<JSON
         { "path": "/ready", "handler": { "type": "respond", "status": 200, "body": "ready" } },
         { "path": "/who", "handler": { "type": "respond", "status": 200, "body": "primary" } },
         { "path": "/static/*", "handler": { "type": "file_server", "root": "${run_dir}" } },
+        {
+          "path": "/tpl/*",
+          "handler": {
+            "type": "pipeline",
+            "handlers": [
+              { "type": "templates", "root": "${run_dir}" },
+              { "type": "file_server", "root": "${run_dir}" }
+            ]
+          }
+        },
         {
           "path": "/proxy/*",
           "handler": {
@@ -414,6 +431,24 @@ multi="$(h3 "${primary_host}" -fsS \
     "https://${primary_host}:${h3_port}/who" \
     "https://${primary_host}:${h3_port}/who" | tr -d '\n')"
 check_eq "three requests on one connection" "primaryprimaryprimary" "${multi}"
+
+log ""
+log "🔎 Percent-decoding on the templates path — H3's own code, not the file server's"
+# 🔤 Only an encoded request can name this template. Rendering it proves the
+# decode happens on the H3 templates path; `{{` in the body would mean the
+# handler missed the file and `file_server` served the source instead, which
+# leaks the template rather than failing.
+tpl_body="$(h3 "${primary_host}" -sS \
+    "https://${primary_host}:${h3_port}/tpl/%E7%AF%84%E6%9C%AC.html")"
+if [[ "${tpl_body}" == *"Rendered:"* && "${tpl_body}" != *"{{"* ]]; then
+    pass "escaped template name rendered over H3"
+else
+    fail "escaped template name over H3: got '${tpl_body}'"
+fi
+# 🚫 …and an escaped traversal is refused rather than joined.
+tpl_escape="$(h3 "${primary_host}" -o /dev/null -w '%{http_code}' -sS \
+    "https://${primary_host}:${h3_port}/tpl/%2e%2e%2f%2e%2e%2fetc%2fpasswd")"
+check_eq "escaped traversal refused on the H3 templates path" "404" "${tpl_escape}"
 
 log ""
 log "═══════════════════════════════════════════"

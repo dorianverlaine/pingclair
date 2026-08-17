@@ -2604,15 +2604,15 @@ async fn plan_h3_handler_with_connector(
             // 🧭 Only files that actually contain template syntax are
             // intercepted; everything else falls through to FileServer.
             let root = root.clone().unwrap_or_else(|| ".".to_string());
-            let relative = effective_uri
-                .split('?')
-                .next()
-                .unwrap_or("/")
-                .trim_start_matches('/');
-            if relative.split('/').any(|segment| segment == "..") {
+            let relative = effective_uri.split('?').next().unwrap_or("/");
+            // 🔤 The same helper the H1/H2 path uses, so both transports decode
+            // and confine identically — this pair is exactly where "fixed it, but
+            // only on one protocol" happens.
+            let Some(mut file_path) =
+                pingclair_core::percent::resolve_under_root(std::path::Path::new(&root), relative)
+            else {
                 return Ok(H3Plan::Continue);
-            }
-            let mut file_path = std::path::Path::new(&root).join(relative);
+            };
             if file_path.is_dir() {
                 file_path = file_path.join("index.html");
             }
@@ -3264,12 +3264,17 @@ async fn handle_request_inner(
 
         H3Terminal::Templates { root } => {
             let root = root.unwrap_or_else(|| ".".to_string());
-            let relative = effective_uri
-                .split('?')
-                .next()
-                .unwrap_or("/")
-                .trim_start_matches('/');
-            let mut file_path = std::path::Path::new(&root).join(relative);
+            let relative = effective_uri.split('?').next().unwrap_or("/");
+            // 🛡️ Confined here as well as in the plan that selected this
+            // terminal. The plan always runs first today, so this is the second
+            // line that does not depend on the first having run — the same reason
+            // the static file server re-checks a configured index. It used to
+            // join the request path with no `..` check of its own at all.
+            let Some(mut file_path) =
+                pingclair_core::percent::resolve_under_root(std::path::Path::new(&root), relative)
+            else {
+                return Err((404, "Not Found"));
+            };
             if file_path.is_dir() {
                 file_path = file_path.join("index.html");
             }

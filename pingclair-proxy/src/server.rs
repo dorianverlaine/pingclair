@@ -4174,11 +4174,15 @@ impl PingclairProxy {
                 // Non-template files fall through so `file_server` handles
                 // them unchanged.
                 let root = root.clone().unwrap_or_else(|| ".".to_string());
-                let relative = path.trim_start_matches('/');
-                if relative.split('/').any(|segment| segment == "..") {
+                // 🔤 Decoded and confined by the same helper the H3 path uses, so
+                // a template named in escapes resolves and a `..` — encoded or
+                // not — does not. Falling through on `None` is the existing
+                // answer for a path this handler will not open.
+                let Some(mut file_path) =
+                    pingclair_core::percent::resolve_under_root(std::path::Path::new(&root), path)
+                else {
                     return Ok(false);
-                }
-                let mut file_path = std::path::Path::new(&root).join(relative);
+                };
                 if file_path.is_dir() {
                     file_path = file_path.join("index.html");
                 }

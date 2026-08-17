@@ -66,6 +66,72 @@ pub fn decode_path_component(component: &str, out: &mut Vec<u8>) -> bool {
     true
 }
 
+/// 📂 Resolves a request path to a file below `root`, decoding escapes and
+/// refusing anything that would leave.
+///
+/// `None` means "this names no file this handler may serve": a `..` component
+/// either before or after decoding, a component that decodes to a separator or a
+/// NUL, or — off Unix — bytes that are not valid text. Callers answer that as
+/// absent rather than trying to repair it.
+///
+/// The `..` check runs twice on purpose. Once on the encoded component, so a
+/// plain `../` is refused without doing any work, and once on the decoded bytes,
+/// because `%2e%2e` does not look like a traversal until it has been decoded.
+///
+/// 📌 Three callers share this: the `templates` handler on both transports, and
+/// the FastCGI script-filename join. The static file server does *not* — it
+/// resolves `..` by popping rather than refusing, because a request path may
+/// legitimately climb back down inside the document root, and the `file` matcher
+/// does not because it has to skip decoding for globbing patterns. What all of
+/// them share is [`decode_path_component`], which is where the rule about
+/// untrusted bytes actually lives.
+pub fn resolve_under_root(root: &std::path::Path, path: &str) -> Option<std::path::PathBuf> {
+    let mut resolved = root.to_path_buf();
+    let mut decoded = Vec::new();
+    for component in path.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            return None;
+        }
+        if !component.contains('%') {
+            resolved.push(component);
+            continue;
+        }
+        decoded.clear();
+        if !decode_path_component(component, &mut decoded) {
+            return None;
+        }
+        match decoded.as_slice() {
+            b"" | b"." => {}
+            b".." => return None,
+            other => resolved.push(component_os_str(other)?),
+        }
+    }
+    Some(resolved)
+}
+
+/// 📁 Views decoded bytes as a path component.
+///
+/// On Unix a filename *is* bytes, so a name that is not valid UTF-8 is a real
+/// name and resolving it is the point.
+#[cfg(unix)]
+fn component_os_str(component: &[u8]) -> Option<&std::ffi::OsStr> {
+    use std::os::unix::ffi::OsStrExt as _;
+    Some(std::ffi::OsStr::from_bytes(component))
+}
+
+/// 🪟 Elsewhere a path is text, so bytes that are not valid UTF-8 name nothing
+/// and the request is refused rather than lossily repaired — a lossy conversion
+/// would open a *different* file than the one asked for.
+#[cfg(not(unix))]
+fn component_os_str(component: &[u8]) -> Option<&std::ffi::OsStr> {
+    std::str::from_utf8(component)
+        .ok()
+        .map(std::ffi::OsStr::new)
+}
+
 /// 🔤 The byte a three-character escape at `index` stands for, or `None` when
 /// there is no well-formed escape there.
 ///

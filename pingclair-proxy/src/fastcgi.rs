@@ -402,15 +402,88 @@ fn split_position(path: &str, split_path: &[String]) -> Option<usize> {
 }
 
 /// 📂 Joins a CGI path below its document root without allowing `..` escape.
+///
+/// 🔤 Percent-escapes are decoded here because this produces a *filename*.
+/// CGI draws that line itself: `SCRIPT_NAME` and `PATH_INFO` are URI parts and
+/// stay encoded, while `SCRIPT_FILENAME` and `PATH_TRANSLATED` name files on
+/// disk. Without decoding, a script whose name is not plain ASCII was handed to
+/// the backend under its encoded spelling and simply could not be found.
+///
+/// A path this cannot resolve falls back to the document root, which is the
+/// answer this function has always given for a plain `..`. The backend then
+/// fails to execute a directory — a clear failure rather than one chosen by
+/// whoever wrote the escapes.
 fn join_root(root: &str, path: &str) -> String {
-    if path.split('/').any(|segment| segment == "..") {
-        return root.to_string();
+    let root_path = std::path::Path::new(root.trim_end_matches('/'));
+    match pingclair_core::percent::resolve_under_root(root_path, path) {
+        Some(resolved) => resolved.to_string_lossy().into_owned(),
+        None => {
+            tracing::warn!("🚫 Refused a CGI script path that could not stay under the root");
+            root.to_string()
+        }
     }
-    let trimmed = path.trim_start_matches('/');
-    if trimmed.is_empty() {
-        root.to_string()
-    } else {
-        format!("{}/{}", root.trim_end_matches('/'), trimmed)
+}
+
+#[cfg(test)]
+mod join_root_tests {
+    use super::join_root;
+
+    /// 🔤 `SCRIPT_FILENAME` is a filesystem path, not a URI, so the escapes are
+    /// decoded before the backend is told which file to execute.
+    ///
+    /// CGI draws this line itself: `SCRIPT_NAME` and `PATH_INFO` are URI parts
+    /// and stay encoded, while `SCRIPT_FILENAME` and `PATH_TRANSLATED` name
+    /// files. Without decoding, a PHP file whose name is not plain ASCII was
+    /// handed to the backend under its encoded spelling and could not be found.
+    #[test]
+    fn an_escaped_script_name_becomes_the_file_it_spells() {
+        assert_eq!(
+            join_root("/srv/www", "/文件.php"),
+            "/srv/www/文件.php",
+            "an unencoded name must still work"
+        );
+        assert_eq!(
+            join_root("/srv/www", "/%E6%96%87%E4%BB%B6.php"),
+            "/srv/www/文件.php"
+        );
+        assert_eq!(
+            join_root("/srv/www", "/my%20app/index.php"),
+            "/srv/www/my app/index.php"
+        );
+    }
+
+    /// 🚫 An escaped traversal or separator does not become one.
+    ///
+    /// A refused path falls back to the document root, which is the same answer
+    /// this function has always given for a plain `..` — the backend then fails
+    /// to execute a directory, rather than executing something chosen by escape.
+    #[test]
+    fn escaped_structure_never_reaches_the_backend() {
+        for path in [
+            "/%2e%2e/%2e%2e/etc/passwd",
+            "/a%2fb.php",
+            "/a%00.php",
+            "/../../etc/passwd",
+        ] {
+            assert_eq!(
+                join_root("/srv/www", path),
+                "/srv/www",
+                "{path} must not resolve to a script"
+            );
+        }
+    }
+
+    /// 👍 An ordinary path is untouched, or the decode would have been bought by
+    /// breaking every request that needed none.
+    #[test]
+    fn an_ordinary_script_path_is_unchanged() {
+        assert_eq!(join_root("/srv/www", "/index.php"), "/srv/www/index.php");
+        assert_eq!(
+            join_root("/srv/www/", "/app/index.php"),
+            "/srv/www/app/index.php"
+        );
+        assert_eq!(join_root("/srv/www", "/"), "/srv/www");
+        assert_eq!(join_root("/srv/www", ""), "/srv/www");
     }
 }
 

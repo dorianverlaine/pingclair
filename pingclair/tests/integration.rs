@@ -6824,6 +6824,37 @@ async fn test_templates_directive_renders_caddy_templates() {
         .await
         .unwrap();
     assert_eq!(plain.text().await.unwrap(), "<h1>plain</h1>");
+
+    // 🔤 A template whose name is not plain ASCII is reachable too. This handler
+    // turns a request path into a filename of its own, so it needs the decode as
+    // much as the file server does — and it had none, so an encoded name fell
+    // through to `file_server` and was served with its `{{ … }}` unrendered,
+    // which leaks the template source rather than failing.
+    std::fs::write(
+        site.path().join("範本.html"),
+        "Rendered: {{now | date \"2006\"}}\n",
+    )
+    .unwrap();
+    let encoded = client
+        .get(server.url(0, "/%E7%AF%84%E6%9C%AC.html"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(encoded.status(), 200);
+    let encoded_body = encoded.text().await.unwrap();
+    assert!(
+        !encoded_body.contains("{{"),
+        "an escaped template name must still be rendered, got: {encoded_body}"
+    );
+    assert!(encoded_body.contains("Rendered:"), "got: {encoded_body}");
+
+    // 🚫 …and an escaped traversal is refused by this handler rather than joined.
+    let escaped = client
+        .get(server.url(0, "/%2e%2e%2f%2e%2e%2fetc%2fpasswd"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(escaped.status(), 404);
 }
 
 /// 🧭 `file-server --templates` renders templates like `caddy file-server
