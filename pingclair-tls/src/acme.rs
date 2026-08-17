@@ -266,6 +266,32 @@ impl ChallengeSolver {
     }
 }
 
+/// 🃏 Whether a configured pattern covers `name`.
+///
+/// An exact match, or a wildcard filling exactly one label: `*.example.com`
+/// covers `a.example.com` and neither `a.b.example.com` nor `example.com`
+/// itself, which is how a TLS wildcard has always worked and what a client will
+/// accept.
+///
+/// 📌 One rule with two callers — this policy and the manager's certificate
+/// lookup. It was written twice before, and the copy here was the one that got
+/// it wrong, which is the argument for there being one.
+pub(crate) fn pattern_covers(pattern: &str, name: &str) -> bool {
+    if pattern == name {
+        return true;
+    }
+    let Some(suffix) = pattern.strip_prefix("*.") else {
+        return false;
+    };
+    let Some(label) = name
+        .strip_suffix(suffix)
+        .and_then(|rest| rest.strip_suffix('.'))
+    else {
+        return false;
+    };
+    !label.is_empty() && !label.contains('.')
+}
+
 /// 🗺️ Which challenge proves which name.
 ///
 /// Almost every deployment has one answer for everything, and a few have two:
@@ -275,9 +301,9 @@ impl ChallengeSolver {
 pub struct ChallengePolicy {
     /// 🌐 What a name gets when it asked for nothing in particular.
     default: ChallengeSolver,
-    /// 📡 Names that asked for something else, by the exact string the
-    /// configuration used — including the leading `*.` of a wildcard, because
-    /// that is the identifier the certificate is ordered under.
+    /// 📡 Names that asked for something else, by the string the configuration
+    /// used — including the leading `*.` of a wildcard, which is matched against
+    /// the concrete names it covers rather than compared literally.
     overrides: std::collections::HashMap<String, ChallengeSolver>,
 }
 
@@ -297,8 +323,30 @@ impl ChallengePolicy {
     }
 
     /// 🔎 The solver that proves this name.
+    ///
+    /// An exact entry wins, then a wildcard that covers the name by one label.
+    ///
+    /// 🤡 This used to be the exact lookup alone, justified in a comment by "the
+    /// identifier the certificate is ordered under". That premise was false: a
+    /// `*.example.com` site orders a certificate for each concrete SNI it sees,
+    /// so the order is for `a.example.com` and the lookup missed — a site the
+    /// operator had explicitly put on DNS-01 quietly fell back to HTTP-01. It
+    /// sometimes even worked, where port 80 was reachable, which is the worst
+    /// version: a different challenge than the one configured and no signal at
+    /// all. Where it did not work, the renewal error never mentioned the option
+    /// they set.
+    ///
+    /// 📌 Linear over the overrides, which is correct here rather than lazy: this
+    /// runs once per issuance, not per request, and the map holds one entry per
+    /// configured site name. An exact hit still short-circuits.
     pub fn solver_for(&self, domain: &str) -> &ChallengeSolver {
-        self.overrides.get(domain).unwrap_or(&self.default)
+        if let Some(solver) = self.overrides.get(domain) {
+            return solver;
+        }
+        self.overrides
+            .iter()
+            .find_map(|(pattern, solver)| pattern_covers(pattern, domain).then_some(solver))
+            .unwrap_or(&self.default)
     }
 
     /// 🧾 Whether any name uses something other than the default.
@@ -840,6 +888,86 @@ mod tests {
             AcmeClient::load_account_credentials(&staging)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// 📡 A wildcard site's DNS-01 choice has to reach the concrete name that is
+    /// actually ordered.
+    ///
+    /// 🤡 The override map was an exact lookup keyed by the configured name, and
+    /// its doc comment justified that with "the identifier the certificate is
+    /// ordered under". That premise is false: a `*.example.com` site orders a
+    /// certificate for the concrete SNI — `a.example.com` — one per subdomain, as
+    /// the manager's own wildcard test shows. So `solver_for("a.example.com")`
+    /// missed the override and returned the HTTP-01 default.
+    ///
+    /// The failure was silent and, worse, sometimes worked: HTTP-01 for a
+    /// concrete subdomain can succeed where port 80 is reachable, so the operator
+    /// who explicitly configured DNS-01 got a different challenge and no signal.
+    /// Where port 80 is not reachable they got a renewal error that never
+    /// mentions the option they set — which is the exact sentence written above
+    /// the code that builds this policy.
+    #[tokio::test]
+    async fn a_wildcard_override_covers_the_concrete_names_it_is_ordered_for() {
+        let policy = ChallengePolicy::uniform(ChallengeSolver::http01(std::sync::Arc::new(
+            MemoryChallengeHandler::new(),
+        )))
+        .with_override(
+            "*.example.com",
+            ChallengeSolver::dns01(std::sync::Arc::new(MemoryChallengeHandler::new())),
+        );
+
+        // 🎯 The name an order is actually placed for.
+        assert_eq!(
+            policy.solver_for("a.example.com").challenge_type,
+            ChallengeType::Dns01,
+            "a wildcard site's DNS-01 choice must reach the subdomain it is ordered for"
+        );
+        // 👍 …and the pattern itself, if an order is ever placed under it.
+        assert_eq!(
+            policy.solver_for("*.example.com").challenge_type,
+            ChallengeType::Dns01
+        );
+
+        // 🚫 One label and no more, matching the certificate lookup and what a
+        // TLS client will accept.
+        assert_eq!(
+            policy.solver_for("a.b.example.com").challenge_type,
+            ChallengeType::Http01
+        );
+        assert_eq!(
+            policy.solver_for("example.com").challenge_type,
+            ChallengeType::Http01
+        );
+        assert_eq!(
+            policy.solver_for("notexample.com").challenge_type,
+            ChallengeType::Http01
+        );
+    }
+
+    /// 👍 An exact override still wins over a wildcard that would also match, so
+    /// naming one subdomain specifically keeps meaning what it says.
+    #[tokio::test]
+    async fn an_exact_override_beats_a_wildcard_that_also_covers_it() {
+        let policy = ChallengePolicy::uniform(ChallengeSolver::http01(std::sync::Arc::new(
+            MemoryChallengeHandler::new(),
+        )))
+        .with_override(
+            "*.example.com",
+            ChallengeSolver::dns01(std::sync::Arc::new(MemoryChallengeHandler::new())),
+        )
+        .with_override(
+            "a.example.com",
+            ChallengeSolver::http01(std::sync::Arc::new(MemoryChallengeHandler::new())),
+        );
+
+        assert_eq!(
+            policy.solver_for("a.example.com").challenge_type,
+            ChallengeType::Http01
+        );
+        assert_eq!(
+            policy.solver_for("b.example.com").challenge_type,
+            ChallengeType::Dns01
         );
     }
 }

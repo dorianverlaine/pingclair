@@ -694,10 +694,11 @@ fn matching_pattern(patterns: &HashSet<String>, normalized: &str) -> Option<Stri
     if patterns.contains(normalized) {
         return Some(normalized.to_string());
     }
+    // 🃏 The one-label rule lives in `acme::pattern_covers`, shared with the
+    // challenge policy — the two used to answer this question separately, and the
+    // other copy got it wrong.
     patterns.iter().find_map(|pattern| {
-        let suffix = pattern.strip_prefix("*.")?;
-        let label = normalized.strip_suffix(suffix)?.strip_suffix('.')?;
-        (!label.is_empty() && !label.contains('.')).then(|| pattern.clone())
+        crate::acme::pattern_covers(pattern, normalized).then(|| pattern.clone())
     })
 }
 

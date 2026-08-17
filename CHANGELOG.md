@@ -680,6 +680,26 @@ lets the rest converge.
 
 ### 🐛 Fixed
 
+- 📡 **A wildcard site configured for DNS-01 silently used HTTP-01.** The
+  challenge override was an exact map lookup keyed by the configured name, and
+  its comment justified that with "the identifier the certificate is ordered
+  under". That premise was false: a `*.example.com` site orders a certificate for
+  each concrete name it is asked for, so the order is for `a.example.com` and the
+  lookup missed `*.example.com` entirely.
+
+  The failure was silent, and sometimes it even worked — HTTP-01 for a concrete
+  subdomain succeeds wherever port 80 is reachable, so an operator who explicitly
+  configured DNS-01 got a different challenge and no signal. Where port 80 was not
+  reachable they got a renewal error that never mentions the option they set,
+  which is word for word the failure the comment above that configuration code
+  already warned about.
+
+  The override now matches a wildcard against the concrete names it covers, by
+  one label, with an exact entry still winning. The rule is shared with the
+  certificate lookup that already had it right — it existed twice, and the copy
+  here was the one that was wrong. Found by review.
+
+
 - 📦 **`storage-export` followed by `storage-import` restored the store one level
   below itself, and reported success.** Export wrote every entry under a
   `pingclair/` directory; import unpacked straight into the store root. So a round
