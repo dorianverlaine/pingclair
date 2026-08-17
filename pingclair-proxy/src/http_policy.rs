@@ -481,6 +481,76 @@ pub(crate) fn authority_host(authority: &str) -> &str {
         .map_or(authority, |(host, _)| host)
 }
 
+/// 🔤 Puts a DNS name into the one form everything compares against.
+///
+/// Two facts about the domain name system that HTTP hands to a proxy as raw
+/// bytes. Names are case-insensitive, so `EXAMPLE.com` and `example.com` are the
+/// same host — and a trailing dot marks a name as absolute, so `example.com.` is
+/// that same host again, spelled fully qualified. A `HashMap` keyed on the bytes
+/// disagrees with all three, and the bytes are the client's to choose.
+///
+/// 🎯 Applied on both sides of every comparison: configured names are put through
+/// this once when a configuration is published, and a request's authority goes
+/// through it once per lookup. Doing only one side is worse than doing neither,
+/// because it looks correct in the direction somebody happened to test.
+///
+/// ⚡ `Cow` rather than `String`: the overwhelmingly common case is a name that is
+/// already lowercase with no trailing dot, and that case borrows. Only the
+/// request that actually spells its host unusually pays for a copy — which is
+/// also the request nobody should be optimising for.
+///
+/// 📌 Deliberately *not* touching anything else. No IDNA, no percent-decoding, no
+/// port handling: the port is already gone by the time this is called (see
+/// [`authority_host`]), and a name this server cannot canonicalize is a name it
+/// should fail to match rather than guess at.
+pub(crate) fn canonical_host(host: &str) -> std::borrow::Cow<'_, str> {
+    // 🧭 One dot, not `trim_end_matches`: `example.com..` is not a valid name,
+    // and quietly accepting it would invent a spelling the DNS never had.
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(host.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(host)
+    }
+}
+
+/// 🏠 The virtual-host name one request is addressing, in canonical form.
+///
+/// The whole of "extract the authority's host, then put it in the one form
+/// everything compares against", so no caller can do half of it. There were five
+/// places on the HTTP/1.1 and HTTP/2 path and one on HTTP/3 that each took the
+/// host out of the authority; every one of them then compared it against
+/// something — the virtual-host map, a route's `host` matcher, the TLS handshake
+/// name on a mutual-TLS listener — and a site that disagreed with any single one
+/// of them was a site the request got the wrong policy from.
+pub(crate) fn request_host(authority: &str) -> std::borrow::Cow<'_, str> {
+    canonical_host(authority_host(authority))
+}
+
+/// 🃏 Whether a canonical request host is covered by a canonical `*.suffix`
+/// pattern.
+///
+/// One label, never more: `*.example.com` answers for `a.example.com` and not
+/// for `a.b.example.com` or for `example.com` itself. That is what a TLS wildcard
+/// certificate covers, what upstream matches an SNI against, and — the reason it
+/// matters here — what this codebase already does in two other places, the
+/// client-auth policy table and the access-log host patterns. Routing was the
+/// one that disagreed, which meant a request could be routed by a wildcard site
+/// while being admitted under the catch-all's mutual-TLS policy.
+///
+/// ⚡ No `format!`. Building `".{suffix}"` to call `ends_with` allocated once per
+/// registered pattern per request, on the path taken by every request that is
+/// not an exact hit.
+pub(crate) fn wildcard_host_matches(pattern_suffix: &str, host: &str) -> bool {
+    let Some(label) = host
+        .strip_suffix(pattern_suffix)
+        .and_then(|rest| rest.strip_suffix('.'))
+    else {
+        return false;
+    };
+    !label.is_empty() && !label.contains('.')
+}
+
 /// 🔀 The `Via` protocol-version token for one hop, per RFC 9110 §7.6.3.
 ///
 /// The token describes the protocol the message was **received** over, not the
@@ -2176,5 +2246,82 @@ mod outbound_filter_tests {
         assert!(plain.blocks("connection"));
         assert!(plain.blocks("upgrade"));
         assert!(plain.blocks("te"));
+    }
+}
+
+// MARK: - Host canonicalization
+
+#[cfg(test)]
+mod canonical_host_tests {
+    use super::*;
+
+    /// 🔤 The three spellings of one name all land on the same string.
+    ///
+    /// Case and a trailing dot are both spellings, not different hosts. The
+    /// borrow/own split is asserted too, because the whole reason this returns
+    /// `Cow` is that the ordinary request must not allocate — a version that
+    /// always allocated would pass every correctness assertion here.
+    #[test]
+    fn one_name_has_one_canonical_form() {
+        use std::borrow::Cow;
+
+        for spelling in [
+            "example.com",
+            "EXAMPLE.COM",
+            "Example.Com",
+            "example.com.",
+            "EXAMPLE.com.",
+        ] {
+            assert_eq!(
+                canonical_host(spelling),
+                "example.com",
+                "`{spelling}` did not canonicalize"
+            );
+        }
+
+        assert!(
+            matches!(canonical_host("example.com"), Cow::Borrowed(_)),
+            "an already-canonical name must not allocate"
+        );
+        assert!(matches!(canonical_host("EXAMPLE.com"), Cow::Owned(_)));
+    }
+
+    /// 🧭 Only one trailing dot, and nothing else is touched.
+    ///
+    /// `example.com..` is not a name the DNS has, and inventing a reading for it
+    /// would mean matching a site the operator never configured.
+    #[test]
+    fn canonicalization_does_not_invent_spellings() {
+        assert_eq!(canonical_host("example.com.."), "example.com.");
+        assert_eq!(canonical_host("."), "");
+        assert_eq!(canonical_host(""), "");
+        // 🔢 Address literals pass through: no case to fold, no dot to strip.
+        assert_eq!(canonical_host("2001:db8::1"), "2001:db8::1");
+        assert_eq!(canonical_host("192.0.2.7"), "192.0.2.7");
+    }
+
+    /// 🏠 Port removal and canonicalization are one step for every caller.
+    #[test]
+    fn a_requests_host_is_extracted_and_canonicalized_together() {
+        assert_eq!(request_host("EXAMPLE.com:8443"), "example.com");
+        assert_eq!(request_host("Example.Com."), "example.com");
+        assert_eq!(request_host("[2001:DB8::1]:443"), "2001:db8::1");
+        assert_eq!(request_host("192.0.2.7:80"), "192.0.2.7");
+    }
+
+    /// 🃏 A wildcard covers one label, the same as everywhere else here.
+    ///
+    /// `*.example.com` is a TLS wildcard's reach, upstream's SNI rule, and what
+    /// the client-auth table and the access-log patterns already do. Routing
+    /// used to accept any depth, which meant a request could be routed by a
+    /// wildcard site while being admitted under the catch-all's mutual-TLS
+    /// policy — two answers to one question about the same request.
+    #[test]
+    fn a_wildcard_covers_exactly_one_label() {
+        assert!(wildcard_host_matches("example.com", "a.example.com"));
+        assert!(!wildcard_host_matches("example.com", "a.b.example.com"));
+        assert!(!wildcard_host_matches("example.com", "example.com"));
+        assert!(!wildcard_host_matches("example.com", "notexample.com"));
+        assert!(!wildcard_host_matches("example.com", ".example.com"));
     }
 }

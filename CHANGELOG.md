@@ -115,6 +115,18 @@ lets the rest converge.
   to the certificate is the fix in all three cases. See the Security entry
   below.
 
+- 🃏 **A `*.example.com` site now covers one label, not any depth.** Routing used
+  to match a wildcard site with `ends_with(".example.com")`, so
+  `a.b.example.com` reached `*.example.com` as well as `a.example.com` did. One
+  label is what a wildcard TLS certificate covers, what Caddy matches an SNI
+  against, and what two other parts of this server — the client-auth policy table
+  and the access-log host patterns — already did. Routing was the one that
+  disagreed, which meant a request could be **routed** by a wildcard site while
+  being **admitted** under the catch-all's mutual-TLS policy.
+
+  A request two labels deep now reaches the catch-all site, or 404s if there is
+  none. Configure the deeper name explicitly, or add a `*.b.example.com` site.
+
 - 🌐 **Automatic public certificates are now issued only for the hostnames a
   site actually names.** Automatic HTTPS used to decide what to ask a
   certificate authority about from the server name in the handshake: an
@@ -841,6 +853,23 @@ lets the rest converge.
   wrong); upstream and internal failures are untouched and still ERROR.
 
 ### 🔐 Security
+
+- 🏠 **One capital letter in `Host` could move a request to a different site.**
+  Virtual hosts were looked up by comparing the bytes of the client's `Host` or
+  `:authority` against the bytes of the configured name. DNS names are
+  case-insensitive and a trailing dot marks a name as absolute, so
+  `SECURE.example.com` and `secure.example.com.` are the same host as
+  `secure.example.com` — but the map disagreed, and the bytes are the client's to
+  choose. The consequence was not a failed lookup: a miss falls through to the
+  catch-all site, so a request addressed to a protected host with its name
+  spelled unusually was served by whatever the default site allows — its routes,
+  its access rules, its handlers.
+
+  Configured names are now canonicalized once when a configuration is published,
+  and a request's authority once per lookup, so both sides of every comparison
+  are in the same form. This also fixes the same class of mismatch further in: a
+  route's `host` matcher and the SNI-against-`Host` check on a mutual-TLS
+  listener were each comparing a differently normalised name. Found by review.
 
 - 🧹 **Four places decided what a client may hand to an origin, and they
   disagreed.** The HTTP/1.1 and HTTP/2 upstream path, the HTTP/3 one, inline

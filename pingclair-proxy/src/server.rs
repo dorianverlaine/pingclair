@@ -42,8 +42,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::encoding::{ResponseEncoder, negotiate, stream_chunk};
 use crate::http_policy::{
-    CorsDecision, ResponseHeaderPolicy, authority_host, evaluate_cors, generate_request_id,
-    is_websocket_upgrade, rewrite_uri, sanitize_request_id, via_value,
+    CorsDecision, ResponseHeaderPolicy, evaluate_cors, generate_request_id, is_websocket_upgrade,
+    rewrite_uri, sanitize_request_id, via_value,
 };
 use crate::metrics;
 use crate::overload::{AdmissionError, RouteAdmission, RouteProtection, UpstreamAdmission};
@@ -2180,10 +2180,16 @@ impl PingclairProxy {
                 ));
                 self.default.store(Arc::new(Some(state)));
             } else {
+                // 🔤 Canonical at publication, so a lookup never has to guess
+                // which spelling the operator used. Done here rather than in the
+                // parser because this map is the thing being keyed, and both
+                // publication paths — this one and `update_config` — have to
+                // agree with `get_state` or the agreement is decorative.
+                let domain = crate::http_policy::canonical_host(domain).into_owned();
                 let current = self.hosts.load();
                 let state = Arc::new(ProxyState::new_with_previous(
                     config.clone(),
-                    current.get(domain).map(Arc::as_ref),
+                    current.get(&domain).map(Arc::as_ref),
                 ));
                 // Read-Copy-Update: clone the current map, insert into the
                 // copy, then publish it atomically. add_server is a rare,
@@ -2191,7 +2197,7 @@ impl PingclairProxy {
                 // fair trade for wait-free reads on the request hot path.
                 self.hosts.rcu(|current| {
                     let mut next = (**current).clone();
-                    next.insert(domain.to_string(), state.clone());
+                    next.insert(domain.clone(), state.clone());
                     next
                 });
             }
@@ -2244,11 +2250,13 @@ impl PingclairProxy {
                     ));
                     new_default = Some(state);
                 } else {
+                    // 🔤 Same canonicalisation as `add_server` and `get_state`.
+                    let domain = crate::http_policy::canonical_host(domain).into_owned();
                     let state = Arc::new(ProxyState::new_with_previous(
                         config.clone(),
-                        old_hosts.get(domain).map(Arc::as_ref),
+                        old_hosts.get(&domain).map(Arc::as_ref),
                     ));
-                    new_hosts.insert(domain.to_string(), state);
+                    new_hosts.insert(domain, state);
                 }
             }
         }
@@ -2322,22 +2330,27 @@ impl PingclairProxy {
     /// 2. Wildcard match (`*.example.com`) — checks all registered wildcard hosts
     /// 3. Default catch-all server
     pub(crate) fn get_state(&self, host: &str) -> Option<Arc<ProxyState>> {
+        // 🔤 The one door to the host map, so the canonicalisation lives here
+        // rather than at each caller. A name arrives as whatever bytes the client
+        // typed — `EXAMPLE.com`, `example.com.` — and the map is keyed on the
+        // canonical form written at publication. Comparing raw bytes meant
+        // `Host: EXAMPLE.com` missed its own site and fell through to the
+        // catch-all, picking up whatever policy that site has.
+        let host = crate::http_policy::canonical_host(host);
         let hosts = self.hosts.load();
 
         // 1. Exact match (fast path)
-        if let Some(state) = hosts.get(host) {
+        if let Some(state) = hosts.get(host.as_ref()) {
             return Some(state.clone());
         }
 
-        // 2. ⚡ OPTIMIZATION: Wildcard match — iterate registered patterns like *.example.com
-        // Only hosts whose registered key starts with "*." are wildcard entries.
-        // For a request to "foo.example.com" we check if "*.example.com" is registered.
+        // 2. 🃏 Wildcard patterns, registered as `*.example.com`. One label, the
+        // same rule the client-auth table and the access-log patterns use.
         for (pattern, state) in hosts.iter() {
-            if let Some(wildcard_suffix) = pattern.strip_prefix("*.") {
-                // The request host must end with ".{suffix}" to match *.{suffix}
-                if host.ends_with(&format!(".{wildcard_suffix}")) {
-                    return Some(state.clone());
-                }
+            if let Some(suffix) = pattern.strip_prefix("*.")
+                && crate::http_policy::wildcard_host_matches(suffix, host.as_ref())
+            {
+                return Some(state.clone());
             }
         }
 
@@ -3960,13 +3973,13 @@ impl PingclairProxy {
         let Some(compiled) = precompile.and_then(|node| node.element_matcher.as_ref()) else {
             return MatcherVerdict::Match;
         };
-        let host = authority_host(request_authority(session.req_header()));
+        let host = crate::http_policy::request_host(request_authority(session.req_header()));
         let remote_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
         let mut request = MatcherRequest {
             path,
             method: session.req_header().method.as_str(),
             headers: &session.req_header().headers,
-            host,
+            host: host.as_ref(),
             remote_ip: remote_ip.as_deref().unwrap_or(""),
             protocol: ctx.request_scheme,
             vars: Some(ctx.request_vars.values_mut()),
@@ -3989,13 +4002,13 @@ impl PingclairProxy {
         root: Option<&str>,
         path: &str,
     ) -> Option<String> {
-        let host = authority_host(request_authority(session.req_header()));
+        let host = crate::http_policy::request_host(request_authority(session.req_header()));
         let remote_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
         let mut request = MatcherRequest {
             path,
             method: session.req_header().method.as_str(),
             headers: &session.req_header().headers,
-            host,
+            host: host.as_ref(),
             remote_ip: remote_ip.as_deref().unwrap_or(""),
             protocol: ctx.request_scheme,
             vars: Some(ctx.request_vars.values_mut()),
@@ -5654,8 +5667,8 @@ impl ProxyHttp for PingclairProxy {
         _ctx: &mut Self::CTX,
     ) -> pingora_core::Result<()> {
         let request = session.req_header();
-        let host = authority_host(request_authority(request));
-        let Some(state) = self.get_state(host) else {
+        let host = crate::http_policy::request_host(request_authority(request));
+        let Some(state) = self.get_state(host.as_ref()) else {
             return Ok(());
         };
         let limits = &state.config.limits;
@@ -5972,9 +5985,11 @@ impl ProxyHttp for PingclairProxy {
         if self.listener_policy.requires_client_auth() {
             // 🏠 Owned only on the listeners that enforce this; every other
             // request never reaches past the atomic load above.
+            // 🔤 Canonical, so `Host: EXAMPLE.com.` is compared as the name it
+            // is rather than refused for its spelling.
             let requested_host =
-                crate::http_policy::authority_host(request_authority(session.req_header()))
-                    .to_string();
+                crate::http_policy::request_host(request_authority(session.req_header()))
+                    .into_owned();
             if let Some(reason) = self.strict_sni_host_rejection(session, &requested_host) {
                 tracing::warn!(
                     host = %requested_host,
@@ -6090,7 +6105,8 @@ impl ProxyHttp for PingclairProxy {
 
             // 🌐 Prefer URI authority so HTTP/2 virtual hosts match the HTTP/1.1 Host path.
             let authority = request_authority(request_header);
-            let host = authority_host(authority);
+            let host = crate::http_policy::request_host(authority);
+            let host = host.as_ref();
 
             // Get state for this host
             let state = match self.get_state(host) {
@@ -8552,6 +8568,7 @@ mod forwarded_headers_tests {
 #[cfg(test)]
 mod p0_regression_tests {
     use super::*;
+    use crate::http_policy::authority_host;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -8735,6 +8752,113 @@ mod p0_regression_tests {
         proxy.add_server(minimal_server_config("api.example.com"));
         assert!(proxy.get_state("api.example.com").is_some());
         assert!(proxy.get_state("other.example.com").is_none());
+    }
+
+    // MARK: - Virtual-host name canonicalization
+
+    /// 🏠 A site answers to its own name however the client spells it.
+    ///
+    /// The consequence of getting this wrong is not "no match" — it is
+    /// **the wrong match**. A miss falls through to the catch-all, so a request
+    /// for a protected site with one capital letter in the `Host` header used to
+    /// be served by whatever the permissive default site allows.
+    ///
+    /// Both directions are asserted: the configured name is spelled unusually in
+    /// one case and the request is in the other, because canonicalizing only one
+    /// side looks correct from whichever end somebody happened to test.
+    #[test]
+    fn a_site_answers_to_its_name_however_it_is_spelled() {
+        let proxy = PingclairProxy::new();
+        proxy.add_server(minimal_server_config("api.example.com"));
+
+        for spelling in [
+            "api.example.com",
+            "API.EXAMPLE.COM",
+            "Api.Example.Com",
+            "api.example.com.",
+            "API.Example.com.",
+        ] {
+            assert!(
+                proxy.get_state(spelling).is_some(),
+                "`{spelling}` did not reach its own site"
+            );
+        }
+
+        // 🔤 And with the *configuration* spelled unusually instead.
+        let shouty = PingclairProxy::new();
+        shouty.add_server(minimal_server_config("API.Example.COM."));
+        assert!(shouty.get_state("api.example.com").is_some());
+        assert!(shouty.get_state("API.EXAMPLE.COM").is_some());
+
+        // 🧭 Still no accidental matches.
+        assert!(proxy.get_state("other.example.com").is_none());
+        assert!(proxy.get_state("api.example.com.evil.test").is_none());
+    }
+
+    /// 🕳️ A miss lands on the catch-all, which is exactly why a miss must be a
+    /// real miss.
+    ///
+    /// The test that makes the bug visible rather than merely absent: with a
+    /// catch-all registered, a case-sensitive lookup does not fail loudly, it
+    /// silently serves the wrong site's configuration.
+    #[test]
+    fn a_differently_spelled_host_does_not_fall_through_to_the_catch_all() {
+        let proxy = PingclairProxy::new();
+        proxy.add_server(minimal_server_config("secure.example.com"));
+        proxy.add_server(minimal_server_config("_"));
+
+        let secure = proxy.get_state("secure.example.com").expect("named site");
+        let shouted = proxy.get_state("SECURE.EXAMPLE.COM").expect("catch-all");
+        assert!(
+            Arc::ptr_eq(&secure, &shouted),
+            "a capital letter in Host moved the request to a different site"
+        );
+
+        let dotted = proxy.get_state("secure.example.com.").expect("catch-all");
+        assert!(
+            Arc::ptr_eq(&secure, &dotted),
+            "a fully qualified Host moved the request to a different site"
+        );
+
+        // 🧭 A genuinely different name still reaches the catch-all, so the
+        // assertions above are about spelling and not about the catch-all being
+        // unreachable.
+        let stranger = proxy.get_state("stranger.test").expect("catch-all");
+        assert!(!Arc::ptr_eq(&secure, &stranger));
+    }
+
+    /// 🃏 A wildcard site covers one label, whatever the case.
+    #[test]
+    fn wildcard_sites_cover_one_label_in_any_case() {
+        let proxy = PingclairProxy::new();
+        proxy.add_server(minimal_server_config("*.example.com"));
+
+        assert!(proxy.get_state("a.example.com").is_some());
+        assert!(proxy.get_state("A.EXAMPLE.COM").is_some());
+        assert!(proxy.get_state("a.example.com.").is_some());
+        // 🧭 Two labels deep is not covered by a wildcard certificate, so it is
+        // not covered here either — and with no catch-all registered that is
+        // visible as a miss.
+        assert!(proxy.get_state("a.b.example.com").is_none());
+        assert!(proxy.get_state("example.com").is_none());
+    }
+
+    /// 🔢 Address literals are hosts too, and they must keep working.
+    ///
+    /// A request to a bare IP has an authority with no name to fold, and an IPv6
+    /// literal arrives bracketed with hex that may be upper or lower case.
+    #[test]
+    fn address_literal_hosts_still_resolve() {
+        let proxy = PingclairProxy::new();
+        proxy.add_server(minimal_server_config("192.0.2.7"));
+        proxy.add_server(minimal_server_config("2001:db8::1"));
+
+        assert!(proxy.get_state("192.0.2.7").is_some());
+        assert!(proxy.get_state("2001:db8::1").is_some());
+        assert!(
+            proxy.get_state("2001:DB8::1").is_some(),
+            "an IPv6 literal's hex digits are case-insensitive too"
+        );
     }
 
     #[test]

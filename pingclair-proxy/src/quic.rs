@@ -2977,7 +2977,10 @@ async fn handle_request_inner(
     let verified_client_ip = proxy.verified_client_ip(peer_address, &header.headers);
     let verified_client_ip_text = verified_client_ip.to_string();
 
-    let host_bare = authority_host(&req.authority).to_string();
+    // 🔤 Canonical once, then used for the virtual-host map, the route matchers
+    // and the access log alike — the three had to agree and only the first was
+    // ever normalised.
+    let host_bare = crate::http_policy::request_host(&req.authority).into_owned();
 
     // 🧭 Routes through the shared matcher used by the H1 and H2 path. The
     // state is resolved by host first so site-level `vars` rules can run

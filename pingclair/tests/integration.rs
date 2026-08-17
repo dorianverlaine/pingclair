@@ -829,6 +829,92 @@ async fn test_active_health_check_removes_idle_failed_upstream() {
     let _ = second_task.await;
 }
 
+/// 🏠 One capital letter in `Host` must not move a request to another site.
+///
+/// The failure this pins is not "no match" but **the wrong match**. A miss on
+/// the virtual-host map falls through to the catch-all, so a request addressed
+/// to a protected site with its name spelled `SECURE.…` used to be served by
+/// whatever the default site allows. Two sites answering differently is what
+/// makes it visible from outside: the body says which one replied.
+#[tokio::test]
+async fn test_host_spelling_cannot_move_a_request_to_another_site() {
+    let config = r#"
+        {
+            admin off
+        }
+
+        :__PINGCLAIR_TEST_PORT__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            respond "catch-all"
+        }
+
+        http://secure.pingclair.test:__PINGCLAIR_TEST_PORT__ {
+            respond "secure"
+        }
+
+        http://*.wild.pingclair.test:__PINGCLAIR_TEST_PORT__ {
+            respond "wild"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let body_for = |host: &str| {
+        let url = server.url(0, "/probe");
+        let host = host.to_string();
+        let client = client.clone();
+        async move {
+            client
+                .get(url)
+                .header("Host", host)
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        }
+    };
+
+    // 🔤 Every spelling of the protected site's name reaches the protected site.
+    for spelling in [
+        "secure.pingclair.test",
+        "SECURE.PINGCLAIR.TEST",
+        "Secure.Pingclair.Test",
+        "secure.pingclair.test.",
+        "SECURE.Pingclair.test.",
+    ] {
+        assert_eq!(
+            body_for(spelling).await,
+            "secure",
+            "`Host: {spelling}` was served by a different site"
+        );
+    }
+
+    // 🃏 A wildcard site, same question.
+    for spelling in [
+        "a.wild.pingclair.test",
+        "A.WILD.PINGCLAIR.TEST",
+        "a.wild.pingclair.test.",
+    ] {
+        assert_eq!(
+            body_for(spelling).await,
+            "wild",
+            "`Host: {spelling}` missed its wildcard site"
+        );
+    }
+
+    // 🧭 The catch-all is still reachable, so the assertions above are about
+    // spelling rather than about the default site being unreachable. Two labels
+    // under the wildcard is not a wildcard match — that is what a wildcard
+    // certificate covers, and routing now agrees with it.
+    assert_eq!(body_for("stranger.test").await, "catch-all");
+    assert_eq!(body_for("a.b.wild.pingclair.test").await, "catch-all");
+}
+
 /// 🛡️ The origin is only ever told things this server can vouch for.
 ///
 /// The same matrix the HTTP/3 script probes, on the HTTP/1.1 path — plus the one

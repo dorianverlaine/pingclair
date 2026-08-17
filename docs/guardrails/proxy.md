@@ -366,3 +366,45 @@ H1/H2 那支證出來的錯誤形狀 ＋ `h3_refused_backend_still_fails_closed`
   📌 矩陣裡**必須有「該通過」的案例**（`expect_blocked: false`）：
   只有壞案例的矩陣，對著一個「全部擋掉」的 filter 會全過，
   而那個 filter 會弄壞每一個被代理的請求。
+
+---
+
+## 🏠 Virtual host 名稱比對（2026-08-17）
+
+- 🚫 **DNS 名稱的比對只有一種正確做法，而它必須套在比較的「兩邊」。**
+  名稱大小寫不敏感，結尾的點代表 fully qualified——所以 `EXAMPLE.com`、
+  `example.com.`、`example.com` 是同一個 host。`HashMap` 用 bytes 當 key 三個都不同意，
+  **而 bytes 是客戶端選的**。
+  🎯 做法：`http_policy::canonical_host`（去一個結尾點 + ASCII 小寫），
+  設定發布時套一次、請求查詢時套一次。**只套一邊比兩邊都不套更糟**，
+  因為從剛好有人測的那個方向看它是對的。
+
+- 💀 **後果不是「查不到」，是「查到別人的」。**
+  查不到會落到 catch-all，所以 `Host: SECURE.example.com` 不會失敗，
+  它會被**寬鬆的預設站台**服務——它的 routes、它的 access 規則、它的 handler。
+  🎯 所以測試一定要註冊一個 catch-all 並且斷言「回的是哪一個站台」，
+  不能只斷言「有回應」。紅測那次的輸出是 `left: "catch-all"`，
+  沒有那個 catch-all 就只會看到 404，看起來像另一種問題。
+
+- ⚡ **請求那一側用 `Cow` 不用 `String`。**
+  絕大多數請求的 host 本來就是小寫、沒有結尾點——那個情況要 borrow。
+  「反正都 to_ascii_lowercase()」會通過每一條正確性斷言，
+  然後在每一個請求上配置一次記憶體。測試裡有斷言 `Cow::Borrowed`／`Cow::Owned`，
+  就是因為正確性測不出這件事。
+
+- 🃏 **wildcard 是一個標籤，不是任意深度。**
+  `*.example.com` 覆蓋 `a.example.com`，不覆蓋 `a.b.example.com`，
+  也不覆蓋 `example.com` 自己。那是 wildcard 憑證的覆蓋範圍，
+  也是這個倉庫在**另外兩個地方**早就在做的事（`ClientAuthTable::policy_for`
+  與 access-log 的 `HostPattern::matches`，兩個都用 `eq_ignore_ascii_case`
+  加精確標籤數）。**routing 是唯一不同意的那個**——於是同一個請求可以被
+  wildcard 站台 route、卻被 catch-all 的 mTLS 政策 admit。
+  📌 判準：**同一個問題在這個倉庫裡已經有幾個答案了？** 有兩個一致的、
+  第三個不一樣，那第三個就是缺陷，不需要再論證哪個對。
+  ⚡ 順手修掉的：舊版用 `host.ends_with(&format!(".{suffix}"))`，
+  **每個註冊的 pattern、每個請求配置一次字串**，而且是在非 exact-hit 的路徑上。
+
+- 🤡 **`authority_host` 只拿掉 port，不做正規化。** 它回傳 `&str` 借用輸入，
+  刻意不配置。所以正規化要在它外面做——`request_host()` 把兩步合成一個，
+  免得有呼叫端只做一半。H1/H2 有五處、H3 有一處在取 host，
+  每一處都拿它去和某個東西比對。

@@ -107,9 +107,19 @@ readonly upstream_port="$(reserve_tcp_port)"
 log "🔧 curl: $("${curl_bin}" --version | head -1)"
 log "🔧 H3 port ${h3_port}, upstream ${upstream_port}"
 
-if [[ ! -x "${binary}" ]]; then
+# 🔨 Always, not only when the binary is missing.
+#
+# 🤡 This used to be `if [[ ! -x "${binary}" ]]`, and the failure mode is the
+# worst kind: the script runs, reports red, and the red is about a binary from
+# before your change. Diagnosing that costs more than the rebuild ever will —
+# and when it reports *green* against a stale binary, nothing tells you at all.
+# `cargo build` is a no-op when nothing changed.
+if [[ -z "${PINGCLAIR_BINARY:-}" ]]; then
     log "🔨 Building Pingclair."
     cargo build --manifest-path "${repository_root}/Cargo.toml" -p pingclair
+elif [[ ! -x "${binary}" ]]; then
+    log "❌ PINGCLAIR_BINARY=${binary} is not executable."
+    exit 2
 fi
 
 mkdir -p "${run_dir}/tls" "${run_dir}/static"
@@ -269,6 +279,18 @@ check_eq "primary SNI routes to its own vhost" "primary" \
     "$(h3 "${primary_host}" "https://${primary_host}:${h3_port}/who")"
 check_eq "secondary SNI routes to its own vhost" "secondary" \
     "$(h3 "${secondary_host}" "https://${secondary_host}:${h3_port}/who")"
+
+log ""
+log "🔎 Host spelling — one name, however the client writes it"
+# 🔤 `:authority` is the client's to spell. A miss on the virtual-host map falls
+# through to the catch-all, so getting this wrong serves the wrong site rather
+# than failing loudly. The two vhosts answer differently, which is what makes it
+# visible from out here.
+for spelling in "${primary_host}" "$(tr '[:lower:]' '[:upper:]' <<<"${primary_host}")" "${primary_host}."; do
+    got="$(h3 "${primary_host}" -sS -H "Host: ${spelling}:${h3_port}" \
+        "https://${primary_host}:${h3_port}/who" 2>/dev/null || true)"
+    check_eq "authority '${spelling}' reaches its own vhost" "primary" "${got}"
+done
 
 log ""
 log "🔎 Negotiated protocol"

@@ -92,9 +92,15 @@ readonly curl_bin="$(find_h3_curl)"
 readonly h3_port="$(reserve_tcp_udp_port)"
 readonly upstream_port="$(reserve_tcp_port)"
 
-if [[ ! -x "${binary}" ]]; then
+# 🔨 Always, not only when the binary is missing — the same reason spelled out
+# in `test-h3-day28-local.sh`: a stale binary makes this script report on a
+# change that is not in it. `cargo build` is a no-op when nothing changed.
+if [[ -z "${PINGCLAIR_BINARY:-}" ]]; then
     log "🔨 Building the local Pingclair binary."
     cargo build --manifest-path "${repository_root}/Cargo.toml" -p pingclair
+elif [[ ! -x "${binary}" ]]; then
+    log "❌ PINGCLAIR_BINARY=${binary} is not executable."
+    exit 2
 fi
 
 mkdir -p "${run_dir}/tls"
