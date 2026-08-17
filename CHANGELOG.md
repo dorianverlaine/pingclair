@@ -680,6 +680,31 @@ lets the rest converge.
 
 ### 🐛 Fixed
 
+- 🗜️ **A `file_server` compressed bodies too small for compression to win, and
+  the behaviour could not be turned off.** There was no size floor anywhere on
+  that path, and every browser sends `Accept-Encoding`. Measured against the real
+  binary: an 80-byte JSON came back with `Content-Encoding: gzip` and
+  `Content-Length: 97` — **21% larger than the file**, having spent CPU to get
+  there. Below the size where compression can win, it loses on both axes at once.
+
+  There is now a 512-byte floor, matching the `minimum_length` of the `encode`
+  directive that does this job upstream, and the decision goes through the same
+  predicate as the streaming choice so a body cannot be judged compressible by one
+  and not the other.
+
+  `file_server` also gained a `compress` subdirective, because the adapter
+  hardcoded it on and offered no way to say no — reaching `compress: false` meant
+  writing the configuration in JSON. That is how this survived a whole performance
+  campaign unnoticed: the benchmark configuration was JSON and set it false, and
+  the load generators send no `Accept-Encoding`, so nothing measured what every
+  browser actually gets.
+
+  📌 The **default is unchanged**. Upstream's `file_server` compresses nothing at
+  all — that is the separate `encode` directive — so flipping ours to off is a
+  compatibility decision to take with the parity goal in view, not a bug fix to
+  smuggle in beside one.
+
+
 - 🔑 **A certificate and a private key that did not belong together passed
   validation.** `tls site.crt other.key` was accepted: the check proved the
   certificate PEM parsed, the key PEM parsed, and the key's type was supported,

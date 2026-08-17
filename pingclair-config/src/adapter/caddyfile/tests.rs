@@ -2706,6 +2706,58 @@ mod fail_closed_tests {
         );
     }
 
+    /// 🗜️ `file_server` compression must be turnable off from the DSL.
+    ///
+    /// 🤡 The adapter hardcoded `compress: true` and offered no subdirective, so
+    /// on-the-fly compression could not be switched off from a Pingclairfile at
+    /// all. That is a divergence from upstream — where `file_server` compresses
+    /// nothing and `encode` is a separate directive — and it was one an operator
+    /// could not opt out of. The benchmark configuration had to be written in
+    /// JSON to set `compress: false`, which is how the divergence stayed hidden
+    /// through a whole performance campaign.
+    #[test]
+    fn file_server_compression_can_be_turned_off() {
+        let off = crate::compile(":80\nfile_server {\n    compress off\n}")
+            .expect("`compress off` must be accepted inside file_server");
+        assert!(
+            !file_server_compress(&off),
+            "`compress off` must disable it"
+        );
+
+        // 👍 The default is unchanged: turning it off has to be possible, but
+        // whether it *should* be off by default is a compatibility decision and
+        // not this change.
+        let default = crate::compile(":80\nfile_server").expect("a bare file_server compiles");
+        assert!(
+            file_server_compress(&default),
+            "the default must not change"
+        );
+
+        let on = crate::compile(":80\nfile_server {\n    compress\n}")
+            .expect("a bare `compress` means on");
+        assert!(file_server_compress(&on));
+    }
+
+    /// 🔎 The `compress` flag of the first `file_server` handler in a config.
+    fn file_server_compress(config: &pingclair_core::config::PingclairConfig) -> bool {
+        fn find(handler: &pingclair_core::config::HandlerConfig) -> Option<bool> {
+            use pingclair_core::config::HandlerConfig;
+            match handler {
+                HandlerConfig::FileServer { compress, .. } => Some(*compress),
+                HandlerConfig::Pipeline { handlers } | HandlerConfig::FirstMatch { handlers } => {
+                    handlers.iter().find_map(|element| find(&element.handler))
+                }
+                _ => None,
+            }
+        }
+        config
+            .servers
+            .iter()
+            .flat_map(|server| server.routes.iter())
+            .find_map(|route| find(&route.handler))
+            .expect("the config must contain a file_server handler")
+    }
+
     /// 🎯 The braceless shorthand takes directives that carry their own block.
     ///
     /// This one shape was a quarter of the format's own corpus. Nothing about a

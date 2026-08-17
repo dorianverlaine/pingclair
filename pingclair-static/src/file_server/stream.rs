@@ -194,13 +194,27 @@ impl FileServer {
     /// on its own terms, not smuggled in here.
     const MAX_COMPRESSIBLE: u64 = 8 * 1024 * 1024;
 
+    /// 🗜️ The floor below which compressing is pure loss.
+    ///
+    /// 🤡 There was none, and every browser sends `Accept-Encoding`. Measured on
+    /// 2026-08-11 against the real binary: an 80-byte JSON came back
+    /// `Content-Encoding: gzip` with `Content-Length: 97` — **21% larger than the
+    /// file**, having spent CPU to get there. Below the size where compression
+    /// can win it loses on both axes at once.
+    ///
+    /// 512 bytes, matching upstream's `encode` `minimum_length`, which is the
+    /// directive that does this job there. nginx uses 20 for `gzip_min_length`,
+    /// but only ever with gzip explicitly turned on; 512 is the more careful of
+    /// the two and this path is on by default.
+    const MIN_COMPRESSIBLE: u64 = 512;
+
     /// 🗜️ Whether this response would be compressed on the fly.
     ///
     /// Reads the negotiation without doing I/O, so a caller can find out
     /// before deciding whether streaming is available.
-    fn would_compress(&self, file_size: u64, accept_encoding: Option<&str>) -> bool {
+    pub(super) fn would_compress(&self, file_size: u64, accept_encoding: Option<&str>) -> bool {
         self.config.compress
-            && file_size <= Self::MAX_COMPRESSIBLE
+            && (Self::MIN_COMPRESSIBLE..=Self::MAX_COMPRESSIBLE).contains(&file_size)
             && Self::negotiate_encoding(accept_encoding).is_some()
     }
 

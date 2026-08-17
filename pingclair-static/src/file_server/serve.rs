@@ -299,11 +299,15 @@ impl FileServer {
         // Cache-key ingredients. Only full-file (200, non-range) responses
         // with compression enabled are cacheable; the negotiated encoding and
         // the file mtime (so an edit invalidates the stale entry) form the key.
-        let cache_encoding = if self.config.compress && content_range.is_none() {
-            Self::negotiate_encoding(accept_encoding)
-        } else {
-            None
-        };
+        // 🗜️ One predicate decides this and the streaming question, so a body can
+        // never be judged compressible by one and not the other. It carries the
+        // size floor and the size ceiling both.
+        let cache_encoding =
+            if content_range.is_none() && self.would_compress(file_size, accept_encoding) {
+                Self::negotiate_encoding(accept_encoding)
+            } else {
+                None
+            };
         let mtime_ns = metadata
             .modified()
             .ok()
@@ -1108,6 +1112,78 @@ mod serve_cache_tests {
         assert!(
             fs.in_flight.lock().unwrap().is_empty(),
             "in-flight entry must be removed after use"
+        );
+    }
+}
+
+#[cfg(test)]
+mod compression_floor_tests {
+    use super::*;
+
+    async fn serve_bytes(size: usize) -> ServedResponse {
+        let dir = tempfile::tempdir().unwrap();
+        // 🗜️ Highly compressible, so a body that comes back *larger* can only be
+        // the framing overhead of compressing something too small to win.
+        std::fs::write(dir.path().join("small.json"), "a".repeat(size)).unwrap();
+        let fs = FileServer::new(FileServerConfig {
+            root: dir.path().to_path_buf(),
+            compress: true,
+            ..Default::default()
+        });
+        fs.serve_auto("/small.json", "/small.json", None, Some("gzip"))
+            .await
+            .unwrap()
+            .expect("the file must be served")
+    }
+
+    fn encoding_of(served: &ServedResponse) -> Option<String> {
+        match served {
+            ServedResponse::Buffered(file) => file.content_encoding.clone(),
+            ServedResponse::Stream(stream) => stream
+                .content_encoding
+                .as_ref()
+                .map(|value| value.to_str().unwrap_or_default().to_string()),
+            ServedResponse::Redirect(target) => panic!("unexpected redirect to {target}"),
+        }
+    }
+
+    fn body_len(served: &ServedResponse) -> usize {
+        match served {
+            ServedResponse::Buffered(file) => file.content.len(),
+            ServedResponse::Stream(stream) => stream.body_len as usize,
+            ServedResponse::Redirect(target) => panic!("unexpected redirect to {target}"),
+        }
+    }
+
+    /// 🗜️ Below the floor, compression is pure loss and must not happen.
+    ///
+    /// 🤡 Measured against the real binary on 2026-08-11: an 80-byte JSON served
+    /// by a default `file_server` came back with `Content-Encoding: gzip` and
+    /// `Content-Length: 97` — **21% larger than the file**, having spent CPU to
+    /// get there. Every browser sends `Accept-Encoding`, so this was the ordinary
+    /// case, not an edge one. Both comparison points refuse it: upstream's
+    /// `encode` has a 512-byte `minimum_length`, and nginx's `gzip_min_length`
+    /// defaults to 20 when gzip is on at all.
+    #[tokio::test]
+    async fn a_body_too_small_to_win_is_not_compressed() {
+        let served = serve_bytes(80).await;
+        assert_eq!(
+            encoding_of(&served),
+            None,
+            "an 80-byte body was compressed, which can only make it bigger"
+        );
+        assert_eq!(body_len(&served), 80, "the body must be the file");
+    }
+
+    /// 👍 Above the floor it still compresses, or the floor would have been
+    /// bought by turning the feature off.
+    #[tokio::test]
+    async fn a_body_large_enough_to_win_is_still_compressed() {
+        let served = serve_bytes(4096).await;
+        assert_eq!(encoding_of(&served).as_deref(), Some("gzip"));
+        assert!(
+            body_len(&served) < 4096,
+            "a 4 KiB run of one byte must compress to less than itself"
         );
     }
 }

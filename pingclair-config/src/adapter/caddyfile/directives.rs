@@ -72,6 +72,21 @@ pub(super) fn adapt_handler(
                             }
                         }
                         "index" => config.index = sub.args.clone(),
+                        // 🗜️ On-the-fly compression, which this server does and
+                        // upstream's `file_server` does not — there it is the
+                        // separate `encode` directive. Since we compress by
+                        // default, there has to be a way to say no; without this
+                        // subdirective the only way to reach `compress: false`
+                        // was to write the configuration in JSON, which is how the
+                        // divergence survived a whole performance campaign
+                        // unnoticed.
+                        "compress" => {
+                            config.compress = sub
+                                .args
+                                .first()
+                                .map(|value| !matches!(value.as_str(), "off" | "false"))
+                                .unwrap_or(true);
+                        }
                         "browse" => {
                             config.browse =
                                 browse || sub.args.first().map(|s| s == "true").unwrap_or(true)
