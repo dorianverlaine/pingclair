@@ -4,6 +4,33 @@
 //! Configuration type definitions
 //!
 //! These types represent the runtime configuration for Pingclair.
+//!
+//! # 🚫 Strict schemas on the trust surface
+//!
+//! Serde's default is to ignore a field it does not recognise. For most
+//! settings that is merely annoying — you misspell `max_size`, nothing
+//! happens, and you notice. For a setting that decides *who is trusted*, it is
+//! a silent downgrade: the field you thought you set is gone, and what remains
+//! is the type's default.
+//!
+//! The concrete failure this guards against: writing `"modde":
+//! "require_and_verify"` inside `client_auth` used to deserialise cleanly and
+//! validate cleanly, leaving [`ClientAuthMode::Require`] in force — a mode that
+//! demands a client certificate and then never checks who signed it. The
+//! operator asked for verified mutual TLS and got "any certificate at all".
+//!
+//! So every type below that names key material, names a trust anchor, or
+//! decides how hard an identity is checked carries
+//! `#[serde(deny_unknown_fields)]`: [`TlsConfig`], [`ClientAuthConfig`],
+//! [`TrustPool`], [`UpstreamTlsConfig`], [`AdminConfig`], the `pki` and
+//! `acme_server` types, and the DNS-01 types that hold provider credentials.
+//! A typo there is a load failure, not a weaker server.
+//!
+//! Two consequences worth knowing before adding a field. Renaming one is a
+//! breaking change, so a spelling that shipped has to stay reachable through
+//! an explicit `#[serde(alias = "…")]` rather than by leniency. And
+//! `deny_unknown_fields` cannot coexist with `#[serde(flatten)]`, which is why
+//! [`HandlerElement`] and [`NamedLogConfig`] are not on the list.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -685,6 +712,7 @@ pub struct LongConnectionLimits {
 
 /// 🔐 Configures downstream TLS for one server.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// 🌐 Enables automatic public certificate management.
     #[serde(default)]
@@ -737,6 +765,7 @@ pub struct TlsConfig {
 /// shape means a configuration written for upstream still translates, which is
 /// what `adapt` is for; it does not mean the server will act as a CA.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PkiAuthority {
     /// 🏷️ The identifier a site's `acme_server { ca … }` refers to.
     /// Upstream calls the unnamed one `local`.
@@ -765,6 +794,7 @@ pub struct PkiAuthority {
 
 /// 🔑 A certificate and key an authority signs with, loaded from disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PkiKeyPair {
     pub cert: Option<String>,
     pub key: Option<String>,
@@ -777,6 +807,7 @@ pub struct PkiKeyPair {
 
 /// 🏛️ A site acting as an ACME server for other clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AcmeServerConfig {
     /// 🏷️ Which `pki` authority signs what this server issues.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -807,6 +838,7 @@ pub struct AcmeServerConfig {
 
 /// 🧭 One half of an ACME server's issuance policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AcmeServerPolicy {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domains: Vec<String>,
@@ -821,6 +853,7 @@ pub struct AcmeServerPolicy {
 /// and a Route 53 hosted-zone ID have nothing in common. Keeping them as an
 /// opaque list is what lets the parser stay honest about not knowing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DnsProviderConfig {
     /// 🏷️ The provider's module name, for example `cloudflare`.
     pub name: String,
@@ -836,6 +869,7 @@ pub struct DnsProviderConfig {
 /// why it is worth its own configuration rather than a boolean: a certificate
 /// for `*.example.com` cannot be obtained any other way.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DnsChallengeConfig {
     /// 🏢 The provider that publishes the TXT record. `None` means "whatever
     /// the global `dns` option named", which is how upstream's bare
@@ -899,7 +933,7 @@ pub enum ClientAuthMode {
 /// already — the Admin API deserialises straight into these types, so the
 /// nesting an attacker can express is the nesting the parser has to survive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "provider", rename_all = "snake_case")]
+#[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TrustPool {
     /// 📜 Certificates given directly, base64 DER as upstream spells them.
     Inline {
@@ -932,6 +966,7 @@ pub enum TrustPool {
 
 /// 🪪 Mutual TLS configuration for one site.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ClientAuthConfig {
     /// 🎚️ How strictly the certificate is demanded and checked.
     #[serde(default)]
@@ -2437,6 +2472,7 @@ fn default_breaker_half_open_requests() -> usize {
 /// store and present no client certificate, which is what a plain
 /// `reverse_proxy https://host` already did before this block existed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamTlsConfig {
     /// 🔒 Speaks TLS even when the upstream address declares no scheme.
     #[serde(default)]
@@ -2671,6 +2707,7 @@ fn default_health_body_limit() -> usize {
 
 /// Admin API configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdminConfig {
     /// Listen address
     pub listen: String,
@@ -3532,6 +3569,214 @@ mod tests {
             parsed.servers[0].routes[0].matcher.as_ref().unwrap(),
             &Matcher::Not(Box::new(path("/admin/*"))),
             "\n{toml_text}"
+        );
+    }
+
+    // MARK: - Strict schemas on the trust surface
+
+    /// 🚫 A misspelled `mode` inside `client_auth` must fail the whole load.
+    ///
+    /// This is the shape that made the rule necessary. Serde used to drop the
+    /// unrecognised key, `mode` fell back to its default, and the default is
+    /// [`ClientAuthMode::Require`] — demand a certificate, then never ask who
+    /// signed it. The operator wrote `require_and_verify`, the config loaded
+    /// without a complaint, and the site accepted any certificate a client
+    /// cared to present. The document below is that config with one letter
+    /// added.
+    #[test]
+    fn a_misspelled_client_auth_mode_fails_the_load() {
+        let document = r#"{
+            "servers": [{
+                "name": "mtls.example.com",
+                "tls": {
+                    "auto": true,
+                    "client_auth": {
+                        "modde": "require_and_verify",
+                        "trust_pool": {"provider": "file", "pem_files": ["/etc/ca.pem"]}
+                    }
+                }
+            }]
+        }"#;
+
+        let error = serde_json::from_str::<PingclairConfig>(document)
+            .expect_err("a misspelled client_auth field must not load");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown field `modde`"),
+            "the error must name the field the operator mistyped; got: {message}"
+        );
+
+        // 🧭 The same document with the spelling corrected still loads, so the
+        // rule refuses typos rather than the feature.
+        let corrected = document.replace("modde", "mode");
+        let config: PingclairConfig =
+            serde_json::from_str(&corrected).expect("the corrected document must load");
+        let client_auth = config.servers[0]
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.client_auth.as_ref())
+            .expect("client_auth survives the round trip");
+        assert_eq!(client_auth.mode, ClientAuthMode::RequireAndVerify);
+    }
+
+    /// 🚫 Every type that names key material, names a trust anchor, or decides
+    /// how hard an identity is checked refuses a field it does not know.
+    ///
+    /// Each probe below is a plausible typo — a singular where the field is
+    /// plural, a plural where it is singular — chosen so that swallowing it
+    /// would leave something weaker in force: an empty trust pool, the system
+    /// store instead of a private CA, an admin API with no key.
+    #[test]
+    fn the_trust_surface_refuses_unknown_fields() {
+        fn refuses<T: serde::de::DeserializeOwned>(label: &str, probe: &str, field: &str) {
+            let Err(error) = serde_json::from_str::<T>(probe) else {
+                panic!("{label} accepted an unknown field: {probe}");
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("unknown field `{field}`")),
+                "{label} must name the unknown field; got: {message}"
+            );
+        }
+
+        refuses::<TlsConfig>("TlsConfig", r#"{"clientauth": {}}"#, "clientauth");
+        refuses::<ClientAuthConfig>(
+            "ClientAuthConfig",
+            r#"{"modde": "require_and_verify"}"#,
+            "modde",
+        );
+        refuses::<TrustPool>(
+            "TrustPool",
+            r#"{"provider": "file", "pem_file": ["/etc/ca.pem"]}"#,
+            "pem_file",
+        );
+        refuses::<UpstreamTlsConfig>(
+            "UpstreamTlsConfig",
+            r#"{"trusted_ca_cert": ["-----BEGIN CERTIFICATE-----"]}"#,
+            "trusted_ca_cert",
+        );
+        refuses::<AdminConfig>(
+            "AdminConfig",
+            r#"{"listen": "localhost:2019", "api_keys": "s3cret"}"#,
+            "api_keys",
+        );
+        refuses::<PkiAuthority>("PkiAuthority", r#"{"id": "local", "roots": {}}"#, "roots");
+        refuses::<PkiKeyPair>(
+            "PkiKeyPair",
+            r#"{"certificate": "/root.pem"}"#,
+            "certificate",
+        );
+        refuses::<AcmeServerConfig>(
+            "AcmeServerConfig",
+            r#"{"allowed": {"domains": ["internal.test"]}}"#,
+            "allowed",
+        );
+        refuses::<AcmeServerPolicy>(
+            "AcmeServerPolicy",
+            r#"{"domain": ["internal.test"]}"#,
+            "domain",
+        );
+        refuses::<DnsProviderConfig>(
+            "DnsProviderConfig",
+            r#"{"name": "cloudflare", "argument": ["{env.CF_API_TOKEN}"]}"#,
+            "argument",
+        );
+        refuses::<DnsChallengeConfig>(
+            "DnsChallengeConfig",
+            r#"{"resolver": ["1.1.1.1"]}"#,
+            "resolver",
+        );
+    }
+
+    /// 🔁 The strict types still read back exactly what they write.
+    ///
+    /// Rejecting unknown fields is only safe if none of our own output counts
+    /// as unknown — an admin `GET /config` followed by a `POST /load` of the
+    /// same bytes has to survive, and so does an autosaved config on restart.
+    #[test]
+    fn the_trust_surface_round_trips_through_its_own_output() {
+        fn round_trips<T>(label: &str, value: T)
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+        {
+            let rendered = serde_json::to_string(&value).expect("serialize");
+            let parsed: T = serde_json::from_str(&rendered)
+                .unwrap_or_else(|error| panic!("{label} cannot read its own output: {error}"));
+            assert_eq!(parsed, value, "{label} changed across a round trip");
+        }
+
+        round_trips(
+            "ClientAuthConfig",
+            ClientAuthConfig {
+                mode: ClientAuthMode::RequireAndVerify,
+                trust_pool: Some(TrustPool::Combined {
+                    sources: vec![
+                        TrustPool::System,
+                        TrustPool::File {
+                            pem_files: vec!["/etc/ca.pem".into()],
+                        },
+                        TrustPool::PkiRoot {
+                            authority: "local".into(),
+                        },
+                    ],
+                }),
+                trusted_leaf_cert_folders: vec!["/etc/pinned".into()],
+                ..Default::default()
+            },
+        );
+        round_trips(
+            "UpstreamTlsConfig",
+            UpstreamTlsConfig {
+                enable: true,
+                server_name: Some("origin.internal".into()),
+                trusted_ca_certs: vec!["/etc/origin-ca.pem".into()],
+                client_cert: Some("/etc/client.pem".into()),
+                client_key: Some("/etc/client.key".into()),
+                insecure_skip_verify: false,
+            },
+        );
+        round_trips(
+            "PkiAuthority",
+            PkiAuthority {
+                id: "local".into(),
+                name: Some("Pingclair Local".into()),
+                root_cn: Some("Pingclair Local Root".into()),
+                intermediate_cn: Some("Pingclair Local Intermediate".into()),
+                root: Some(PkiKeyPair {
+                    cert: Some("/root.pem".into()),
+                    key: Some("/root.key".into()),
+                    format: Some("pem_file".into()),
+                }),
+                intermediate: None,
+            },
+        );
+        round_trips(
+            "AcmeServerConfig",
+            AcmeServerConfig {
+                ca: Some("local".into()),
+                lifetime_secs: Some(86_400),
+                sign_with_root: true,
+                challenges: Some(vec!["http-01".into()]),
+                allow: Some(AcmeServerPolicy {
+                    domains: vec!["internal.test".into()],
+                    ip_ranges: vec!["10.0.0.0/8".into()],
+                }),
+                deny: None,
+            },
+        );
+        round_trips(
+            "DnsChallengeConfig",
+            DnsChallengeConfig {
+                provider: Some(DnsProviderConfig {
+                    name: "cloudflare".into(),
+                    arguments: vec!["{env.CF_API_TOKEN}".into()],
+                }),
+                resolvers: vec!["1.1.1.1".into()],
+                ttl_secs: Some(60),
+                propagation_delay_secs: Some(10),
+                propagation_timeout_secs: Some(120),
+                challenge_override_domain: Some("acme.example.net".into()),
+            },
         );
     }
 }

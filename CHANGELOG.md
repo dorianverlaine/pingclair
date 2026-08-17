@@ -88,6 +88,15 @@ lets the rest converge.
   an explicit `http://` scheme, an explicit port, or an IP literal. An address
   that already named a listener is unaffected.
 
+- 🚫 **An unrecognised field inside a TLS, mutual-TLS, `pki`, `acme_server`,
+  DNS-01 or `admin` block now fails the load.** Those types used to drop a key
+  they did not know, which left the type's own default in force and reported
+  success — so the part of the schema where a typo costs the most was the part
+  with no typo check. A JSON or TOML document with a stray key in one of those
+  blocks is now refused, and the error names the key. Correctly spelled fields
+  behave exactly as before, and the rest of the schema is unchanged. See the
+  Security entry below for what the old leniency actually cost.
+
 ### 🔄 Changed
 
 - 🌐 **Dynamic DNS now honors source policy.** Empty `resolvers` uses the
@@ -793,6 +802,20 @@ lets the rest converge.
   wrong); upstream and internal failures are untouched and still ERROR.
 
 ### 🔐 Security
+
+- 🪪 **A misspelled key in a `client_auth` block silently downgraded mutual
+  TLS.** `mode` decides how hard a client certificate is checked, and its four
+  values are not interchangeable: `require` demands a certificate and then
+  never builds a trust path for it, while `require_and_verify` checks the chain
+  against the configured pool. Writing `require_and_verify` under a mistyped
+  key deserialised cleanly and validated cleanly, leaving `require` in force —
+  the site asked every client for a certificate and then accepted whichever one
+  arrived, self-signed included. Nothing in the load said so, and the running
+  server looked identical either way. The types that name key material, name a
+  trust anchor, or decide how hard an identity is checked now refuse fields
+  they do not recognise, so the same document is a load error that names the
+  key. Found by review, and `0.2.0-dev` only: `v0.1.7` had no mutual TLS to
+  downgrade.
 
 - 📡 **`hickory-resolver` moved from 0.24 to 0.26 for RUSTSEC-2026-0119.**
   `hickory-proto` 0.24.4 can be driven into quadratic work while compressing

@@ -5475,6 +5475,52 @@ async fn test_admin_load_rejects_caddy_json() {
     assert_eq!(response.text().await.unwrap(), "still-ready");
 }
 
+/// 🚫 POST /load must refuse a mistyped `client_auth` field rather than
+/// installing a weaker mutual-TLS mode than the operator asked for.
+///
+/// The document below says `require_and_verify` — verify the client's chain
+/// against the named CA — but spells the key `modde`. Serde used to drop the
+/// unrecognised key and fall back to the default mode, which demands a
+/// certificate and then never checks who signed it. The load succeeded, the
+/// admin API answered "Config loaded", and the site accepted any certificate
+/// at all. Nothing in the response told the operator which of those two
+/// things they had running.
+#[tokio::test]
+async fn test_admin_load_rejects_mistyped_client_auth_field() {
+    let mut server = TestServer::new_pingclairfile(&admin_test_pingclairfile(
+        "/__ready_client_auth_typo",
+        "still-ready",
+    ));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let document = r#"{"servers":[{"name":"mtls.example.com","tls":{"auto":true,"client_auth":{"modde":"require_and_verify","trust_pool":{"provider":"system"}}},"routes":[{"path":"/*","handler":{"type":"respond","status":200}}]}]}"#;
+    let response = client
+        .post(server.admin_url("/load"))
+        .header("Content-Type", "application/json")
+        .body(document)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains("unknown field `modde`"),
+        "error must name the field the operator mistyped; got: {body}"
+    );
+
+    // 🧭 The running configuration is untouched, so a refused load leaves the
+    // previous policy in force rather than a half-applied one.
+    let response = client
+        .get(server.url(0, "/__ready_client_auth_typo"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "still-ready");
+}
+
 /// 🧭 Caddy-style config traversal: GET/POST/PUT/PATCH/DELETE on
 /// `/config/<path>` mutate the active document and the running listener.
 #[tokio::test]
