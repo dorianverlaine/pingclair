@@ -115,6 +115,27 @@ lets the rest converge.
   to the certificate is the fix in all three cases. See the Security entry
   below.
 
+- 🌐 **Automatic public certificates are now issued only for the hostnames a
+  site actually names.** Automatic HTTPS used to decide what to ask a
+  certificate authority about from the server name in the handshake: an
+  unrecognised name was read as "we must not have a certificate for this yet".
+  It is now decided from the configuration, resolved before any listener
+  accepts and again on every reload.
+
+  **What changes for a working setup.** A site with a concrete hostname, a
+  list of hostnames, or a `*.suffix` wildcard proved by DNS-01 is unaffected.
+  Two shapes stop getting automatic certificates and need an explicit
+  hostname or a manual `tls <cert> <key>` instead: a **catch-all site** (`_`,
+  `*`, or an address-only label such as `:8443`) with `tls auto`, and a
+  wildcard that is not `*.suffix`. Catch-all is about which requests a site
+  answers, not about which names deserve a certificate, and it was only ever
+  the latter by accident.
+
+  Alongside it, `auto_https off` now actually stops issuance — it was recorded
+  in the configuration and never read at runtime, so a server told not to
+  manage certificates would still go and manage them. Certificates already
+  issued are still served either way; the switch stops acquiring, not serving.
+
 ### 🔄 Changed
 
 - 🌐 **Dynamic DNS now honors source policy.** Empty `resolvers` uses the

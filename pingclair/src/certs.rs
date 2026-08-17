@@ -187,9 +187,17 @@ impl TlsAccept for DynamicCertResolver {
         // through `&mut ssl`, which is why the name is copied out. Only the
         // path that has an SNI allocates; the no-SNI path borrows the
         // configured default, so the fix below costs nothing on the hot path.
+        // 🔤 Normalized here, once, because everything downstream keys on it.
+        // DNS names are case-insensitive and may carry the trailing dot of an
+        // absolute name, so `Example.com` and `example.com.` are the same site
+        // — but a `HashMap` keyed on the raw bytes disagrees, and the bytes
+        // are the client's to choose. Left raw, one configured hostname could
+        // be spelled a thousand ways and fill the cache below with a thousand
+        // entries, none of them wrong and all of them the same certificate.
         let offered = {
             let sni = ssl.servername(NameType::HOST_NAME).unwrap_or("");
-            (!sni.is_empty()).then(|| sni.to_string())
+            let sni = sni.strip_suffix('.').unwrap_or(sni);
+            (!sni.is_empty()).then(|| sni.to_ascii_lowercase())
         };
         // 🪪 Mutual TLS is decided from the name the client actually sent, not
         // from `default_sni`. A client that named nothing has authorised
@@ -313,10 +321,22 @@ impl TlsAccept for DynamicCertResolver {
     }
 }
 
-/// 🚀 Collects the hostnames that need eager ACME issuance: `tls auto` sites
-/// that are not covered by the internal authority or manual certificates, are
-/// concretely named, and are not wildcards (which would need DNS-01).
-pub(crate) fn eager_issuance_domains(
+/// 🌐 Every hostname this configuration authorises a public CA to be asked
+/// about: `tls auto` sites not covered by the internal authority or a manual
+/// certificate.
+///
+/// This is the allowlist the resolver checks before any ACME work, and the
+/// reason it exists is that the name in a handshake is chosen by whoever
+/// dialled the socket. Without a list, an unrecognised name went straight to a
+/// public CA — so a stranger picked the name and the server did the work.
+///
+/// 🃏 Wildcards stay in, spelled as written, because a `*.example.com` site
+/// proved by DNS-01 legitimately covers the names underneath it. The catch-all
+/// spellings — `_`, `*`, and a bare `:port` label — stay out: "this site
+/// answers to anything" says which requests to route, not which names are
+/// worth asking a certificate authority about, and reading it as the latter is
+/// the whole defect.
+pub(crate) fn public_issuance_domains(
     config: &pingclair_core::config::PingclairConfig,
 ) -> Vec<String> {
     config
@@ -337,7 +357,34 @@ pub(crate) fn eager_issuance_domains(
                 server.names.clone()
             }
         })
-        .filter(|name| !name.is_empty() && name != "_" && !name.contains('*'))
+        .filter(|name| {
+            !name.is_empty()
+                && name != "_"
+                && name != "*"
+                && !name.starts_with(':')
+                // 🃏 A wildcard is allowed, but only the one shape a
+                // certificate can actually carry: `*.suffix`, never `a.*.b`.
+                && name.strip_prefix("*.").is_none_or(|suffix| {
+                    !suffix.is_empty() && !suffix.contains('*')
+                })
+                && !name.trim_start_matches("*.").contains('*')
+        })
+        .collect()
+}
+
+/// 🚀 Collects the hostnames that need eager ACME issuance: the authorised
+/// names above, minus the wildcards.
+///
+/// A wildcard is excluded here and not from the allowlist because the two
+/// answer different questions. "May we ask about this name" is yes for
+/// `*.example.com`; "should we ask at startup" is no, because a wildcard needs
+/// DNS-01 and there is nothing to issue until a concrete name appears.
+pub(crate) fn eager_issuance_domains(
+    config: &pingclair_core::config::PingclairConfig,
+) -> Vec<String> {
+    public_issuance_domains(config)
+        .into_iter()
+        .filter(|name| !name.contains('*'))
         .collect()
 }
 
@@ -430,6 +477,55 @@ mod tests {
             eager_issuance_domains(&config),
             vec!["auto.example", "json.example"]
         );
+
+        // 🃏 The allowlist keeps the wildcard: `*.example.com` is a name a
+        // DNS-01 site legitimately serves, it just is not something to issue
+        // at startup.
+        assert_eq!(
+            public_issuance_domains(&config),
+            vec!["auto.example", "*.example.com", "json.example"]
+        );
+    }
+
+    /// 🕳️ A catch-all site authorises no public issuance.
+    ///
+    /// This is the difference between routing and issuance, and conflating the
+    /// two is the whole defect. `_` means "answer for whatever arrives", which
+    /// is a statement about which requests this site handles. Read as a
+    /// certificate policy it says "ask a public CA about any name a stranger
+    /// cares to put in a ClientHello" — which is not something any operator
+    /// ever asked for.
+    #[test]
+    fn catch_all_sites_authorise_no_public_issuance() {
+        use pingclair_core::config::{ServerConfig, TlsConfig};
+
+        let auto_tls = || {
+            Some(TlsConfig {
+                auto: true,
+                ..Default::default()
+            })
+        };
+        let named = |name: &str| ServerConfig {
+            name: Some(name.to_string()),
+            tls: auto_tls(),
+            ..Default::default()
+        };
+
+        let config = pingclair_core::config::PingclairConfig {
+            servers: vec![
+                named("_"),
+                named("*"),
+                named(":8443"),
+                named(""),
+                // 🚫 A wildcard that is not `*.suffix` cannot be issued for and
+                // must not widen the list either.
+                named("a.*.example.com"),
+                named("real.example"),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(public_issuance_domains(&config), vec!["real.example"]);
     }
 
     /// 🔗 A CA bundle carries the leaf and its intermediates; keep all of them.

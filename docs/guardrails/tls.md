@@ -234,6 +234,58 @@
 
 ---
 
+## 🌐 公開簽發（ACME，2026-08-17）
+
+- 🚫 **ClientHello 裡的名字是連線方選的，不是設定檔選的。**
+  這條是這一節存在的理由。resolver 同時負責「查憑證」與「查不到就去簽一張」，
+  而查不到的判斷來自 SNI——於是**陌生人挑一個主機名，這台機器就去跟公開 CA
+  做一次外連工作**：帳號、訂單、挑戰、速率額度，全部由對方觸發。
+  做法是 `TlsManager` 多一份 `public_issuance_domains` allowlist，
+  和既有的 `internal_domains` 完全對稱，在碰到 CA 之前擋掉。
+  📌 **空的 allowlist 代表「誰都不簽」**，不是「都可以」。還沒讀設定檔的行程、
+  或未來忘了發布清單的路徑，都必須落在拒絕那一邊。
+  ⚠️ 這也表示 **catch-all 站台（`_`、`*`、`:port`）不再授權任何公開簽發**。
+  「這個站台什麼都接」講的是路由，不是憑證政策；把它讀成後者正是缺陷本身。
+  上游用 `on_demand_tls` 搭一個明確的 `ask` endpoint 來做這件事，我們沒有實作
+  （registry 裡是 `recognised`），所以無限制的 on-demand 簽發是意外不是功能。
+
+- 🔤 **名字要在進 store／in-flight 集合／CA 之前正規化。**
+  `CertStore` 與 in-flight 集合都用字串當 key，而 SNI 大小寫不敏感、還可以帶
+  結尾的點。allowlist 正規化了但下游沒有，等於**同一個站台可以被拼成上千種寫法**，
+  每一種都是一次 cache miss、一次 claim、一次真的 ACME 訂單——而拼法是客戶端選的。
+  同樣的道理讓 `certs.rs` 的 `ssl_cache` 也必須用正規化後的名字當 key，
+  否則那個 `HashMap` 會被大小寫排列組合灌大。
+
+- 🎟️ **in-flight 標記必須是 RAII guard，不能是「呼叫完再移除」。**
+  ACME 呼叫是在 TLS 握手裡 await 的。客戶端斷線 → future 被 drop →
+  **後面那行移除永遠不會執行**，於是那個名字被永久標成「簽發中」，
+  之後每一次嘗試都被拒絕——一次斷線換一個永久壞掉的站台。
+  順帶修掉的是原本 check 與 insert 分兩把鎖的 race：`HashSet::insert`
+  的回傳值一次回答「本來有沒有」和「現在是我的了」。
+
+- 🚦 **per-name 的去重說不了「有幾個不同名字同時在跑」。**
+  所以另外有一個 process 級的 `Semaphore`（`MAX_CONCURRENT_ISSUANCES = 4`）。
+  用 `try_acquire` 直接拒絕而不是排隊：**佇列是由發問者撐開的記憶體與延遲**，
+  拒絕只賠掉一次握手，而 renewal daemon 和下一次握手都會重試。
+  📌 正常流量碰不到這個上限——eager issuance 與 renewal 都是循序的，
+  唯一的併發來源是同時握手。它是 allowlist 後面的第二道，不是第一道。
+
+- 🤡 **`enabled` 被寫進設定、被 `auto_https off` 設成 false、然後沒有任何執行期
+  程式碼讀它。** 全 repo 搜尋確認過。
+  📌 判準和 K3 那條 mTLS 的一模一樣：**新增任何安全開關時，找出真正執行它的
+  那一行**。這已經是同一個錯誤在這個檔案裡的第二次。
+  🎯 現在的位置在 store fast path **之後**：關掉自動 HTTPS 要擋的是「去拿一張」，
+  不是「用已經有的那張」——後者不外連、不花額度，擋了只會讓站台白白掛掉。
+
+- 🎯 **這一節的每一條都先驗過 red。** 拿掉 allowlist → 3 紅；拿掉 `enabled` 閘門
+  → 1 紅；把 semaphore 放大 → 1 紅（8 ≠ 4）；把 drop guard 清空 → 2 紅。
+  ⚠️ 寫這種測試有個陷阱我踩了兩次：mock issuer 進去之後會等 release 訊號，
+  所以閘門一拿掉，「本來不該走到 issuer」的測試會**卡住而不是失敗**。
+  每一個等待都要有上限（`expect_entered`／`expect_refused`），
+  否則紅的表現形式是整個測試跑不完，那是最沒用的說不。
+
+---
+
 ## 📡 DNS-01（`tls { dns … }`，2026-08-10 K5）
 
 - 🤡 **rustls 的 crypto provider 必須指名，否則第一次連線直接 panic。**

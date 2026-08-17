@@ -17,7 +17,9 @@
 //! captured values. That is a change worth reviewing on its own terms, so it
 //! has a TRIAGE row instead of being smuggled in here.
 
-use crate::certs::{DynamicCertResolver, eager_issuance_domains, refresh_h3_cert_table};
+use crate::certs::{
+    DynamicCertResolver, eager_issuance_domains, public_issuance_domains, refresh_h3_cert_table,
+};
 use crate::listen::{
     automatic_http_companion, can_bind_automatic_http_port, explicit_http_names,
     normalize_listen_addr, reserve_private_listener_address, server_requires_tls,
@@ -289,6 +291,20 @@ pub(crate) fn run_server(
             .await
             .expect("Failed to create TLS manager with persistent challenge handler")
     }));
+
+    // 🌐 Publish the names a public CA may be asked about, before anything can
+    // accept a handshake.
+    //
+    // The server name in a ClientHello is chosen by whoever dialled the
+    // socket, and the resolver used to hand an unrecognised one straight to a
+    // public CA. Setting this first means the window where that is possible is
+    // not "until the configuration is read" but "never".
+    let authorised_issuance = public_issuance_domains(&config);
+    tls_manager.set_public_issuance_domains(&authorised_issuance);
+    tracing::info!(
+        "🌐 Automatic public certificates authorised for {} hostname(s)",
+        authorised_issuance.len()
+    );
 
     // 🔐 Prepare configured certificate sources before any listener can accept a handshake.
     let mut manual_certs: Vec<(String, String, String)> = Vec::new();

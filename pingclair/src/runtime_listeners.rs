@@ -467,6 +467,12 @@ impl ConfigPublisher for RuntimeListeners {
             table.publish_manual_update(prepared);
         }
         self.tls_manager.publish_manual_certs(prepared_manual_certs);
+        // 🌐 Republish the names a public CA may be asked about. Without this a
+        // reload that adds a `tls auto` site would fail closed forever — the
+        // site would serve, the resolver would decline to ask for its
+        // certificate, and nothing would say why.
+        self.tls_manager
+            .set_public_issuance_domains(crate::certs::public_issuance_domains(config));
         for (address, policy) in &next {
             self.listener_policies[address].publish_client_auth(Arc::clone(&policy.client_auth));
         }

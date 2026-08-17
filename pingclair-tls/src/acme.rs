@@ -307,6 +307,43 @@ impl ChallengePolicy {
     }
 }
 
+// MARK: - Certificate issuer
+
+/// 🏛️ Whatever actually goes and gets a certificate.
+///
+/// One method, and it exists so the thing above it can be tested. Certificate
+/// issuance is the part of this server that reaches out to a stranger's
+/// machine and is counted against a quota when it does, which makes it exactly
+/// the part where "we believe it only runs when it should" is not good enough
+/// — and also the part a test cannot exercise for real. Behind this trait a
+/// test can hand [`AutoHttps`](crate::auto_https::AutoHttps) an issuer that
+/// records what it was asked for and answers instantly, so questions like "did
+/// an unconfigured name reach a CA" and "how many orders ran at once" have
+/// measured answers rather than arguments.
+///
+/// [`AcmeClient`] is the real implementation and the only one outside tests.
+#[async_trait::async_trait]
+pub trait CertificateIssuer: Send + Sync {
+    /// 📜 Obtains one certificate covering `domains`, proving control with
+    /// `solver`.
+    async fn obtain_certificate(
+        &self,
+        domains: &[String],
+        solver: &ChallengeSolver,
+    ) -> Result<Certificate, AcmeError>;
+}
+
+#[async_trait::async_trait]
+impl CertificateIssuer for AcmeClient {
+    async fn obtain_certificate(
+        &self,
+        domains: &[String],
+        solver: &ChallengeSolver,
+    ) -> Result<Certificate, AcmeError> {
+        AcmeClient::obtain_certificate(self, domains, solver).await
+    }
+}
+
 // MARK: - ACME Client
 
 /// The high-level client for ACME operations.

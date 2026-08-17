@@ -54,6 +54,21 @@ pub struct TlsManager {
     internal_ca: Arc<InternalCa>,
     /// 🧭 Limits local issuance to domains selected by configuration.
     internal_domains: RwLock<HashSet<String>>,
+    /// 🌐 Limits *public* issuance to domains selected by configuration.
+    ///
+    /// The exact counterpart of [`Self::internal_domains`], and it exists for
+    /// a sharper reason. A TLS handshake carries a server name chosen by
+    /// whoever dialled the socket, and this resolver used to hand any
+    /// unrecognised name straight to a public CA — so a stranger could pick
+    /// the name and the process would go and do outbound ACME work about it.
+    /// Names get here from the configuration only, normalized once at
+    /// publication, and a name that is not covered never reaches a CA.
+    ///
+    /// 🚫 Empty means "issue for nothing", which is the right answer for a
+    /// process that was never told what it serves. This is not the same as
+    /// automatic HTTPS being off — that is a separate switch, checked further
+    /// in — and both have to say yes.
+    public_issuance_domains: RwLock<HashSet<String>>,
     /// ⚡ Avoids repeated PEM parsing for generated certificates.
     cached_certs: RwLock<HashMap<String, CachedCert>>,
     /// ⏳ Limits parsed certificate lifetime so rotations become visible.
@@ -100,6 +115,7 @@ impl TlsManager {
             manual_pem_certs: RwLock::new(HashMap::new()),
             internal_ca: Arc::new(InternalCa::new(store_path)),
             internal_domains: RwLock::new(HashSet::new()),
+            public_issuance_domains: RwLock::new(HashSet::new()),
             cached_certs: RwLock::new(HashMap::new()),
             cache_ttl: Duration::from_secs(3600),
             challenge_policy: ArcSwap::from_pointee(ChallengePolicy::uniform(
@@ -131,12 +147,33 @@ impl TlsManager {
             manual_pem_certs: RwLock::new(HashMap::new()),
             internal_ca: Arc::new(InternalCa::new(store_path)),
             internal_domains: RwLock::new(HashSet::new()),
+            public_issuance_domains: RwLock::new(HashSet::new()),
             cached_certs: RwLock::new(HashMap::new()),
             cache_ttl: Duration::from_secs(3600),
             challenge_policy: ArcSwap::from_pointee(ChallengePolicy::uniform(
                 ChallengeSolver::http01(challenge_handler as Arc<dyn ChallengeHandler>),
             )),
         }
+    }
+
+    /// 🧪 Creates a TLS manager whose public issuance goes to a given issuer.
+    ///
+    /// The same shape as [`Self::new_with_memory_challenges`] and for the same
+    /// reason: it lets a test drive the real resolver — allowlist, precedence
+    /// between manual, internal and public certificates, the lot — without a
+    /// single packet leaving the machine.
+    pub fn new_with_issuer(
+        config: AutoHttpsConfig,
+        store_path: &std::path::Path,
+        issuer: Arc<dyn crate::acme::CertificateIssuer>,
+    ) -> Self {
+        let store = Arc::new(CertStore::with_renewal_window(
+            store_path,
+            config.renewal_window_ratio,
+        ));
+        let mut manager = Self::new_with_memory_challenges(None, store_path);
+        manager.auto_https = Some(Arc::new(AutoHttps::with_issuer(config, store, issuer)));
+        manager
     }
 
     /// 🧰 Creates a TLS manager with a custom persistent challenge path.
@@ -168,6 +205,7 @@ impl TlsManager {
             manual_pem_certs: RwLock::new(HashMap::new()),
             internal_ca: Arc::new(InternalCa::new(store_path)),
             internal_domains: RwLock::new(HashSet::new()),
+            public_issuance_domains: RwLock::new(HashSet::new()),
             cached_certs: RwLock::new(HashMap::new()),
             cache_ttl: Duration::from_secs(3600),
             challenge_policy: ArcSwap::from_pointee(ChallengePolicy::uniform(
@@ -286,16 +324,73 @@ impl TlsManager {
     /// the concrete SNI. `None` means the name has no local issuer.
     fn internal_issuance_domain(&self, domain: &str) -> Option<String> {
         let normalized = normalize_internal_domain(domain);
-        let domains = self.internal_domains.read();
-        if domains.contains(&normalized) {
-            return Some(normalized);
+        matching_pattern(&self.internal_domains.read(), &normalized)
+    }
+
+    /// 🌐 Names this process may ask a public CA about.
+    ///
+    /// Published once from the configuration, before any listener accepts a
+    /// handshake. Wildcards are kept as written (`*.example.com`) so a DNS-01
+    /// site still covers the names underneath it; the catch-all spellings are
+    /// the caller's job to exclude, because "this site answers to anything" is
+    /// not a statement about which names are worth a certificate.
+    pub fn set_public_issuance_domains<I, S>(&self, domains: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        // 🔤 Normalized here rather than per handshake: the comparison happens
+        // inside a TLS handshake and the answer cannot change between them.
+        *self.public_issuance_domains.write() = domains
+            .into_iter()
+            .map(|domain| normalize_internal_domain(domain.as_ref()))
+            .filter(|domain| !domain.is_empty())
+            .collect();
+    }
+
+    /// 🚦 Reports whether the configuration authorised public issuance for
+    /// this server name.
+    fn public_issuance_allowed(&self, domain: &str) -> bool {
+        let normalized = normalize_internal_domain(domain);
+        matching_pattern(&self.public_issuance_domains.read(), &normalized).is_some()
+    }
+
+    /// 🌐 The single door to a public certificate authority.
+    ///
+    /// Both resolvers go through here so the allowlist cannot hold on one and
+    /// not the other — the two used to call `get_certificate` directly, side
+    /// by side, and a check added to one of them would have looked complete.
+    async fn issue_public_certificate(&self, domain: &str) -> Option<crate::Certificate> {
+        let auto = self.auto_https.as_ref()?;
+        // 🔤 Normalized before anything downstream sees it, not just for the
+        // allowlist comparison. The certificate store, the in-flight claim and
+        // the renewal daemon all key on this string, so `Example.com`,
+        // `example.com.` and `EXAMPLE.COM` reaching them as three different
+        // names means three cache misses, three claims and three ACME orders
+        // for one site — and the spelling is the client's to choose. DNS is
+        // case-insensitive and the CA normalizes anyway, so the only thing
+        // varied capitalisation could ever buy is repeated work here.
+        let domain = normalize_internal_domain(domain);
+        if !self.public_issuance_allowed(&domain) {
+            // 📉 `debug`, not `warn`: on a public listener this fires once per
+            // stranger scanning the address, and a log line an unauthenticated
+            // client can emit at will is its own denial of service.
+            tracing::debug!(
+                "🚫 {} is not a name this configuration serves; no certificate was requested",
+                domain
+            );
+            return None;
         }
-        domains.iter().find_map(|pattern| {
-            let suffix = pattern.strip_prefix("*.")?;
-            normalized
-                .ends_with(&format!(".{suffix}"))
-                .then(|| pattern.clone())
-        })
+        match auto
+            .get_certificate(&domain, self.challenge_policy.load().solver_for(&domain))
+            .await
+        {
+            Ok(cert) => Some(cert),
+            Err(error) => {
+                tracing::warn!("❌ Failed to obtain cert for {}: {}", domain, error);
+                None
+            }
+        }
     }
 
     /// 🌳 Returns the public root certificate for trust-store installation.
@@ -361,21 +456,10 @@ impl TlsManager {
             };
         }
 
-        // 🌐 Remaining names may use automatic public HTTPS.
-        if let Some(auto) = &self.auto_https {
-            match auto
-                .get_certificate(domain, self.challenge_policy.load().solver_for(domain))
-                .await
-            {
-                Ok(cert) => {
-                    return Some((cert.cert_pem, cert.key_pem));
-                }
-                Err(e) => {
-                    tracing::warn!("❌ Failed to obtain cert for {}: {}", domain, e);
-                }
-            }
-        }
-        None
+        // 🌐 Remaining names may use automatic public HTTPS — if the
+        // configuration named them.
+        let cert = self.issue_public_certificate(domain).await?;
+        Some((cert.cert_pem, cert.key_pem))
     }
 
     /// 🔍 Resolves a parsed rustls certificate for a client hello.
@@ -438,20 +522,10 @@ impl TlsManager {
             };
         }
 
-        // 🌐 Remaining names may use automatic public HTTPS.
-        if let Some(auto) = &self.auto_https {
-            match auto
-                .get_certificate(domain, self.challenge_policy.load().solver_for(domain))
-                .await
-            {
-                Ok(cert) => return self.cache_rustls_certificate(domain, &cert),
-                Err(e) => {
-                    tracing::warn!("❌ Failed to obtain cert for {}: {}", domain, e);
-                }
-            }
-        }
-
-        None
+        // 🌐 Remaining names may use automatic public HTTPS — if the
+        // configuration named them.
+        let cert = self.issue_public_certificate(domain).await?;
+        self.cache_rustls_certificate(domain, &cert)
     }
 
     /// ⚡ Parses and caches one generated certificate for rustls consumers.
@@ -607,14 +681,161 @@ fn normalize_internal_domain(domain: &str) -> String {
     domain.trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// 🧭 Finds the configured pattern that covers `normalized`: an exact name
+/// first, then a wildcard whose one label it fills.
+///
+/// `*.example.com` answers for `a.example.com` and not for `a.b.example.com`
+/// or for `example.com` itself, which is how a TLS wildcard has always worked
+/// and how upstream matches an SNI. The remainder is checked for a dot rather
+/// than the suffix being rebuilt with `format!`, because this runs inside a
+/// handshake — including the handshakes that turn out not to match, which is
+/// exactly the traffic a stranger can generate.
+fn matching_pattern(patterns: &HashSet<String>, normalized: &str) -> Option<String> {
+    if patterns.contains(normalized) {
+        return Some(normalized.to_string());
+    }
+    patterns.iter().find_map(|pattern| {
+        let suffix = pattern.strip_prefix("*.")?;
+        let label = normalized.strip_suffix(suffix)?.strip_suffix('.')?;
+        (!label.is_empty() && !label.contains('.')).then(|| pattern.clone())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::acme::{AcmeError, Certificate, CertificateIssuer, ChallengeSolver};
+    use parking_lot::Mutex;
 
     fn test_manager() -> TlsManager {
         let dir =
             std::env::temp_dir().join(format!("pingclair-tls-manager-test-{}", std::process::id()));
         TlsManager::new_with_memory_challenges(None, &dir)
+    }
+
+    // MARK: - Public issuance allowlist
+
+    /// 🧪 An issuer that never contacts anyone and remembers who asked.
+    #[derive(Default)]
+    struct RecordingIssuer {
+        calls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CertificateIssuer for RecordingIssuer {
+        async fn obtain_certificate(
+            &self,
+            domains: &[String],
+            _solver: &ChallengeSolver,
+        ) -> Result<Certificate, AcmeError> {
+            let domain = domains.first().cloned().unwrap_or_default();
+            self.calls.lock().push(domain.clone());
+            Ok(Certificate {
+                cert_pem: format!("CERT for {domain}"),
+                key_pem: format!("KEY for {domain}"),
+                domains: domains.to_vec(),
+                // ⏳ Far enough out that the store never calls it renewable.
+                expires_at: 4_102_444_800,
+            })
+        }
+    }
+
+    fn issuing_manager(directory: &std::path::Path) -> (TlsManager, Arc<RecordingIssuer>) {
+        let issuer = Arc::new(RecordingIssuer::default());
+        let manager = TlsManager::new_with_issuer(
+            AutoHttpsConfig::default(),
+            directory,
+            issuer.clone() as Arc<dyn CertificateIssuer>,
+        );
+        (manager, issuer)
+    }
+
+    /// 🚫 A name the configuration never mentioned must not reach a CA.
+    ///
+    /// This is the finding in one test. The server name in a ClientHello is
+    /// chosen by whoever dialled the socket, and this resolver used to hand an
+    /// unrecognised one straight to a public certificate authority — outbound
+    /// work, account quota, and rate-limit pressure, all triggered by a
+    /// stranger picking a hostname. The recording issuer below is how "no
+    /// certificate was returned" is separated from "nobody was contacted":
+    /// only the second one is the fix.
+    #[tokio::test]
+    async fn an_unconfigured_name_never_reaches_the_certificate_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, issuer) = issuing_manager(directory.path());
+        manager.set_public_issuance_domains(["configured.example"]);
+
+        assert!(manager.resolve_pem("stranger.example").await.is_none());
+        assert!(manager.resolve_cert("stranger.example").await.is_none());
+        assert!(
+            issuer.calls.lock().is_empty(),
+            "an unconfigured name reached the issuer: {:?}",
+            issuer.calls.lock()
+        );
+
+        // 🧭 The configured name still works, so the gate refuses strangers
+        // rather than refusing everyone.
+        let resolved = manager.resolve_pem("configured.example").await;
+        assert_eq!(
+            resolved,
+            Some((
+                "CERT for configured.example".to_string(),
+                "KEY for configured.example".to_string()
+            ))
+        );
+        assert_eq!(issuer.calls.lock().as_slice(), ["configured.example"]);
+    }
+
+    /// 🕳️ An empty allowlist authorises nothing.
+    ///
+    /// The state a process is in before it has read its configuration, and the
+    /// state it stays in if a future change forgets to publish the list. Both
+    /// have to mean "ask nobody", because the alternative — an unset list
+    /// meaning "anything" — is the defect this replaced.
+    #[tokio::test]
+    async fn an_empty_allowlist_authorises_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, issuer) = issuing_manager(directory.path());
+
+        assert!(manager.resolve_pem("anything.example").await.is_none());
+        assert!(issuer.calls.lock().is_empty());
+    }
+
+    /// 🃏 A wildcard site covers one label under it, and no more.
+    ///
+    /// `*.example.com` is a name a DNS-01 site legitimately serves, so it has
+    /// to authorise `a.example.com`. It must not authorise `a.b.example.com`
+    /// or `example.com` itself — no TLS client accepts a wildcard certificate
+    /// for either, so issuing one would spend quota on something unusable.
+    #[tokio::test]
+    async fn a_wildcard_authorises_exactly_one_label_under_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, issuer) = issuing_manager(directory.path());
+        manager.set_public_issuance_domains(["*.example.com"]);
+
+        assert!(manager.resolve_pem("a.example.com").await.is_some());
+        assert!(manager.resolve_pem("a.b.example.com").await.is_none());
+        assert!(manager.resolve_pem("example.com").await.is_none());
+        assert!(manager.resolve_pem("notexample.com").await.is_none());
+        assert_eq!(issuer.calls.lock().as_slice(), ["a.example.com"]);
+    }
+
+    /// 🔤 A name is compared after normalisation, not as it arrived.
+    ///
+    /// SNI is case-insensitive and may carry the trailing dot of an absolute
+    /// name. Comparing raw bytes would let `EXAMPLE.COM.` slip past a list
+    /// that says `example.com` — refusing a legitimate client — and, worse,
+    /// would make the allowlist depend on how the client spelled it.
+    #[tokio::test]
+    async fn names_are_compared_after_normalisation() {
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, issuer) = issuing_manager(directory.path());
+        manager.set_public_issuance_domains(["Configured.Example."]);
+
+        assert!(manager.resolve_pem("configured.example").await.is_some());
+        assert!(manager.resolve_pem("CONFIGURED.EXAMPLE.").await.is_some());
+        assert_eq!(issuer.calls.lock().len(), 1, "the second call was cached");
     }
 
     #[tokio::test]
