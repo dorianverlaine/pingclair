@@ -927,7 +927,7 @@ pub(crate) enum RouteUpstreamTls {
 /// other upstream failure. A failure marks the route [`RouteUpstreamTls::Broken`]
 /// rather than aborting the process: one misconfigured route should not take
 /// down the server's other routes, but it must not serve either.
-fn compile_route_upstream_tls(
+pub(crate) fn compile_route_upstream_tls(
     route_path: &str,
     config: &pingclair_core::config::UpstreamTlsConfig,
 ) -> RouteUpstreamTls {

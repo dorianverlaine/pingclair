@@ -8813,6 +8813,164 @@ async fn test_upstream_tls_verifies_by_default_and_honours_configured_trust() {
     }
 }
 
+/// 🔐 An inline subrequest dials under the TLS policy it was configured with.
+///
+/// The route's own reverse proxy has had a compiled upstream TLS policy for a
+/// while; an inline subrequest — what `forward_auth` becomes — went out with
+/// none. The configuration parsed, validated, and was then ignored, so a
+/// subrequest told to trust one private CA dialled with the system trust store
+/// instead, and one told to present a client certificate presented nothing.
+///
+/// The origin here is self-signed, which makes the two cases separable from
+/// outside: with the policy ignored the handshake cannot succeed at all, and with
+/// it applied the subrequest's 2xx lets the pipeline continue. That the *same*
+/// configuration used to fail is what makes this a regression test rather than a
+/// demonstration.
+///
+/// 🧾 JSON rather than a Pingclairfile, and that is a finding in itself — see the
+/// note at the end of the test.
+#[tokio::test]
+async fn test_an_inline_subrequest_dials_under_its_configured_tls_policy() {
+    let mut params = rcgen::CertificateParams::new(vec!["auth.test".to_string()])
+        .expect("certificate parameters");
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "auth.test");
+    let key = rcgen::KeyPair::generate().expect("key pair");
+    let certificate = params.self_signed(&key).expect("self-signed auth service");
+    let certificate_pem = certificate.pem();
+    let key_pem = key.serialize_pem();
+    let trust_store = tempfile::tempdir().expect("trust store dir");
+    let trust_path = trust_store.path().join("auth-ca.pem");
+    std::fs::write(&trust_path, &certificate_pem).expect("publish trust root");
+
+    // 🔁 A pipeline whose first element is the inline subrequest and whose
+    // second answers only if the subrequest authorised it. The body therefore
+    // reports whether the exchange happened at all.
+    let subrequest_config = |origin: SocketAddr, upstream_tls: serde_json::Value| {
+        serde_json::json!({
+            "global": { "http3": false },
+            "servers": [{
+                "listen": ["127.0.0.1:0"],
+                "routes": [{
+                    "path": "/*",
+                    "handler": {
+                        "type": "pipeline",
+                        // 🧩 A pipeline element flattens its handler into the
+                        // same map, so there is no nested `handler` key.
+                        "handlers": [
+                            {
+                                "type": "reverse_proxy",
+                                "upstreams": [format!("https://{origin}")],
+                                "rewrite_method": "GET",
+                                "rewrite_uri": "/auth",
+                                "subrequest": { "continue_status_classes": [2] },
+                                "upstream_tls": upstream_tls
+                            },
+                            {
+                                "type": "respond",
+                                "status": 200,
+                                "body": "allowed"
+                            }
+                        ]
+                    }
+                }]
+            }]
+        })
+        .to_string()
+    };
+
+    // 🚫 Nothing tells the subrequest to trust this auth service, so the
+    // handshake must fail and the pipeline must not continue.
+    {
+        let (origin, origin_task) =
+            spawn_self_signed_tls_origin(&certificate_pem, &key_pem, 2).await;
+        let mut server = TestServer::new(&subrequest_config(origin, serde_json::json!({})));
+        assert!(server.wait_until_ready().await, "server failed to start");
+
+        let response = no_proxy_client()
+            .get(server.url(0, "/private"))
+            .send()
+            .await
+            .expect("the proxy must answer, not hang");
+        assert!(
+            response.status().is_server_error(),
+            "an unverifiable auth service must not authorise the request, got {}",
+            response.status()
+        );
+        assert_ne!(
+            response.text().await.unwrap(),
+            "allowed",
+            "the pipeline continued past a subrequest that never completed"
+        );
+        origin_task.abort();
+    }
+
+    // ✅ The same auth service, with its certificate pinned as the subrequest's
+    // trust root and its name overridden — the exact configuration that used to
+    // be parsed and then discarded.
+    {
+        let (origin, origin_task) =
+            spawn_self_signed_tls_origin(&certificate_pem, &key_pem, 2).await;
+        let mut server = TestServer::new(&subrequest_config(
+            origin,
+            serde_json::json!({
+                "server_name": "auth.test",
+                "trusted_ca_certs": [trust_path.to_string_lossy()]
+            }),
+        ));
+        assert!(server.wait_until_ready().await, "server failed to start");
+
+        let response = no_proxy_client()
+            .get(server.url(0, "/private"))
+            .send()
+            .await
+            .expect("the proxy must answer");
+        assert_eq!(
+            response.status(),
+            200,
+            "the configured trust root and SNI override did not reach the subrequest's dial"
+        );
+        assert_eq!(response.text().await.unwrap(), "allowed");
+        origin_task.abort();
+    }
+
+    // 🚫 Trust material that cannot be loaded refuses the exchange rather than
+    // quietly dialling with system trust and no identity.
+    {
+        let (origin, origin_task) =
+            spawn_self_signed_tls_origin(&certificate_pem, &key_pem, 2).await;
+        let mut server = TestServer::new(&subrequest_config(
+            origin,
+            serde_json::json!({ "trusted_ca_certs": ["/nonexistent/pingclair-subrequest-ca.pem"] }),
+        ));
+        assert!(server.wait_until_ready().await, "server failed to start");
+
+        let response = no_proxy_client()
+            .get(server.url(0, "/private"))
+            .send()
+            .await
+            .expect("the proxy must answer");
+        assert!(
+            response.status().is_server_error(),
+            "a subrequest whose trust material is missing must refuse, got {}",
+            response.status()
+        );
+        assert_ne!(response.text().await.unwrap(), "allowed");
+        origin_task.abort();
+    }
+
+    // 🧾 Why this test is JSON and not a Pingclairfile: the DSL's `forward_auth`
+    // accepts `uri` and `copy_headers` and rejects every other subdirective, so
+    // there is no way to write upstream TLS for a subrequest in the DSL at all.
+    // That is a real gap — an internal auth service behind a private CA is an
+    // ordinary shape — and it fails closed rather than silently, which is why it
+    // is a missing feature rather than a second instance of this defect. It is
+    // recorded as its own item; this test covers the JSON and Admin paths, which
+    // are the ones that accepted the configuration.
+}
+
 #[tokio::test]
 async fn test_active_health_check_uses_the_route_pinned_ca() {
     let mut params = rcgen::CertificateParams::new(vec!["origin.test".to_string()])

@@ -20,6 +20,17 @@ pub(crate) struct PreparedSubrequest {
     spec: UpstreamSpec,
     pool: std::sync::Arc<LoadBalancer>,
     config: ReverseProxyConfig,
+    /// 🔐 The compiled `upstream_tls` block, resolved at load exactly as a main
+    /// reverse-proxy route's is.
+    ///
+    /// It has to be compiled and stored, not read from `config` per request:
+    /// compiling means reading CA bundles and key pairs off disk, and doing that
+    /// inside a request would put file I/O on the dial path and would report a
+    /// missing certificate to a client rather than to the operator at load.
+    /// Sharing [`RouteUpstreamTls`] with the main path is the point — an inline
+    /// subrequest that carried its own idea of upstream TLS is how this came to
+    /// accept the configuration and then ignore it.
+    tls: crate::server::RouteUpstreamTls,
 }
 
 impl PreparedSubrequest {
@@ -36,21 +47,50 @@ impl PreparedSubrequest {
             Strategy::RoundRobin,
         ));
         crate::dns::register(&pool);
+        // 🔐 The label reaches the operator's log, so it names the thing they
+        // wrote rather than a route index they would have to count to.
+        let tls = crate::server::compile_route_upstream_tls(
+            &format!("subrequest -> {source}"),
+            &config.upstream_tls,
+        );
         Some(Self {
             spec,
             pool,
             source,
             config,
+            tls,
         })
     }
 
+    /// 🔐 The upstream TLS policy this exchange must dial under.
+    ///
+    /// `Err(())` means the configured material could not be loaded. There is
+    /// deliberately no fallback: a subrequest told to pin a private CA or to
+    /// present a client certificate, whose material is missing, must not quietly
+    /// dial with system trust and no identity — that is exactly the connection
+    /// the block was written to forbid. For a `forward_auth` exchange it is also
+    /// the connection whose answer decides whether the request is allowed.
+    fn tls_policy(&self) -> Result<Option<&std::sync::Arc<crate::upstream_tls::UpstreamTls>>, ()> {
+        match &self.tls {
+            crate::server::RouteUpstreamTls::Default => Ok(None),
+            crate::server::RouteUpstreamTls::Compiled(policy) => Ok(Some(policy)),
+            crate::server::RouteUpstreamTls::Broken => Err(()),
+        }
+    }
+
     /// 🎯 Reports whether this plan belongs to the normalized runtime handler.
+    ///
+    /// 🔐 `upstream_tls` is part of the comparison because it is part of what
+    /// makes two exchanges different. Two inline subrequests on one route that
+    /// differ only in their trust material would otherwise both match the first
+    /// prepared plan, and the second would dial under the first one's policy.
     pub(crate) fn matches_reverse_proxy(&self, config: &ReverseProxyConfig) -> bool {
         self.config.upstreams == config.upstreams
             && self.config.rewrite_method == config.rewrite_method
             && self.config.rewrite_uri == config.rewrite_uri
             && self.config.headers_up == config.headers_up
             && self.config.subrequest == config.subrequest
+            && self.config.upstream_tls == config.upstream_tls
     }
 
     /// 🔐 Matches legacy JSON without allocating its normalized replacement per request.
@@ -97,7 +137,16 @@ pub(crate) async fn execute(
         .pool
         .select(None)
         .ok_or((502, "Subrequest Upstream Did Not Resolve"))?;
-    let peer = PingclairProxy::build_http_peer(&upstream, Some(config), None, None, None)
+    // 🔐 Refused, not downgraded. The alternative to dialling under the
+    // configured policy is not "dial without it" — it is "do not dial".
+    let tls_policy = prepared.tls_policy().map_err(|()| {
+        tracing::error!(
+            upstream = %prepared.source,
+            "🚫 Refusing an inline subrequest whose upstream TLS material failed to load"
+        );
+        (500, "Subrequest Upstream TLS Material Failed To Load")
+    })?;
+    let peer = PingclairProxy::build_http_peer(&upstream, Some(config), None, None, tls_policy)
         .map_err(|_| (500, "Subrequest Peer Configuration Error"))?;
     let (mut session, _reused) = connector.get_http_session(&peer).await.map_err(|error| {
         tracing::warn!(%error, "🔌 Subrequest upstream connection failed");
@@ -280,6 +329,72 @@ mod tests {
         assert!(!destination.headers.contains_key("x-hop"));
         assert!(!destination.headers.contains_key("x_gateway"));
         assert_eq!(destination.headers.get_all("x-end").iter().count(), 2);
+    }
+
+    /// 🔐 Two subrequests that differ only in their TLS policy are two plans.
+    ///
+    /// The prepared plan for a request is found by comparing it against the
+    /// handler, and `upstream_tls` had been left out of that comparison. On a
+    /// route with two inline subrequests to the same upstream — one pinning a
+    /// private CA, one not — both would have matched the first plan, and the
+    /// second would have dialled under a policy it was never given. Nothing else
+    /// in the codebase notices, because the wrong plan still works.
+    #[test]
+    fn a_plan_is_not_reused_for_a_different_tls_policy() {
+        use pingclair_core::config::{ReverseProxySubrequestConfig, UpstreamTlsConfig};
+
+        let base = ReverseProxyConfig {
+            upstreams: vec!["https://127.0.0.1:9443".to_string()],
+            rewrite_method: Some("GET".to_string()),
+            rewrite_uri: Some("/auth".to_string()),
+            subrequest: Some(Box::new(ReverseProxySubrequestConfig {
+                continue_status_classes: vec![2],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let pinned = ReverseProxyConfig {
+            upstream_tls: Box::new(UpstreamTlsConfig {
+                trusted_ca_certs: vec!["/etc/private-ca.pem".to_string()],
+                ..Default::default()
+            }),
+            ..base.clone()
+        };
+
+        let plain_plan = PreparedSubrequest::new(base.clone()).expect("the plain plan prepares");
+        assert!(plain_plan.matches_reverse_proxy(&base));
+        assert!(
+            !plain_plan.matches_reverse_proxy(&pinned),
+            "a plan with no trust material answered for one that pins a CA"
+        );
+
+        // 🚫 The pinned plan's material does not exist, so it prepares but
+        // refuses — the same fail-closed answer a main route gives.
+        let pinned_plan = PreparedSubrequest::new(pinned.clone()).expect("the plan still prepares");
+        assert!(pinned_plan.matches_reverse_proxy(&pinned));
+        assert!(
+            pinned_plan.tls_policy().is_err(),
+            "missing trust material must refuse rather than fall back to system trust"
+        );
+
+        // 🧭 And a policy that loads cleanly resolves to an applied one, so the
+        // assertion above is about the missing file and not about every policy
+        // being rejected.
+        let insecure = ReverseProxyConfig {
+            upstream_tls: Box::new(UpstreamTlsConfig {
+                server_name: Some("auth.internal".to_string()),
+                ..Default::default()
+            }),
+            ..base.clone()
+        };
+        let insecure_plan = PreparedSubrequest::new(insecure).expect("plan");
+        assert!(
+            insecure_plan
+                .tls_policy()
+                .expect("a loadable policy resolves")
+                .is_some(),
+            "an SNI override must reach the dial as a compiled policy"
+        );
     }
 
     /// 🛡️ The authorization service sees the same sanitized matrix every other

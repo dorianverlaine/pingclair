@@ -319,3 +319,35 @@
   設定期拒絕會讓 12 份上游語料失敗——它們用 `dns mock`，而上游那是測試模組。
   `adapt` 說「我翻譯得了」是誠實的，拒絕**服務**才是該畫的線；
   跟 K3 的 `client_auth` 同一條理由。
+
+---
+
+## 🔁 Inline subrequest 的上游 TLS（2026-08-17）
+
+- 🤡 **設定被解析、被驗證、然後被丟掉——這是最糟的一種失敗。**
+  主 reverse-proxy route 早就有 `CompiledUpstreamTls`，但 inline subrequest
+  （`forward_auth` 編譯後的形狀）走另一套 prepared shape，
+  `build_http_peer(..., None)` 那個 `None` 就是整個缺陷。
+  操作者寫了 `trusted_ca_certs`、設定通過、然後用系統信任池撥號。
+  📌 判準和 K3 那條 mTLS、SEC-004 的 `enabled` 完全一樣，這已經是第三次：
+  **新增任何安全開關時，找出真正執行它的那一行**。找不到就別接受那個設定。
+
+- 🛡️ **fail-closed 也要一起搬過去，不是只搬 happy path。**
+  `RouteUpstreamTls::Broken` 的存在理由是「設定要求 pin 一個私有 CA，
+  但材料讀不到，那就不要撥號」——subrequest 更需要這條，
+  因為 `forward_auth` 那個連線的答案**決定請求准不准過**。
+  所以 subrequest 直接共用 `RouteUpstreamTls` 而不是自己一個 `Option`：
+  三個狀態（Default／Compiled／Broken）少一個就會變成靜默降級。
+
+- 🎯 **prepared plan 的比對條件必須包含所有「讓兩個 exchange 不同」的欄位。**
+  `matches_reverse_proxy` 原本不比 `upstream_tls`，所以同一個 route 上兩個
+  subrequest 只差信任材料時，兩個都會命中第一份 plan，第二個用第一個的政策撥號。
+  ⚠️ 這種缺陷**沒有任何測試會自然抓到**，因為用錯的 plan 還是「能用」。
+
+- 🧾 **DSL 表達不出這件事，而這本身是一條缺口。**
+  Caddyfile 的 `forward_auth` 只收 `uri` 與 `copy_headers`，
+  其餘 subdirective 一律 `UnknownDirective`。所以這條的暴露面只有 JSON／Admin。
+  🎯 它**fail closed**（拒絕）而不是靜默忽略，所以是「缺功能」不是「第二個缺陷」——
+  但「內部 auth service 放在私有 CA 後面」是很普通的形狀，該補。
+  📌 測試因此只能用 JSON。房規說「我只能用 JSON」要當成發現而不是變通，
+  這條就是那個發現，記在 TRIAGE。

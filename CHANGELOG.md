@@ -854,6 +854,26 @@ lets the rest converge.
 
 ### 🔐 Security
 
+- 🔐 **An inline subrequest ignored the upstream TLS policy it was configured
+  with.** A route's own reverse proxy compiles its `upstream_tls` block at load
+  and dials under it. An inline subrequest — what `forward_auth` becomes — did
+  not: the configuration parsed, passed validation, and was then discarded, so a
+  subrequest told to trust one private CA dialled with the system trust store
+  instead, one told to override the SNI sent the upstream's own name, and one
+  told to present a client certificate presented none. For a `forward_auth`
+  exchange that is the connection whose answer decides whether a request is
+  allowed through.
+
+  Subrequests now compile and apply the same policy through the same code as a
+  main route, including its fail-closed case: trust material that cannot be
+  loaded refuses the exchange rather than quietly dialling with system trust and
+  no identity. Found by review, and `0.2.0-dev` only.
+
+  📌 Only the JSON and Admin paths could reach this. The Caddyfile's
+  `forward_auth` accepts `uri` and `copy_headers` and rejects anything else, so
+  upstream TLS for a subrequest cannot be written in the DSL at all — a gap worth
+  closing separately, but one that fails closed today.
+
 - 🏠 **One capital letter in `Host` could move a request to a different site.**
   Virtual hosts were looked up by comparing the bytes of the client's `Host` or
   `:authority` against the bytes of the configured name. DNS names are
