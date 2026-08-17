@@ -612,6 +612,28 @@ impl TlsManager {
 
         rustls::crypto::ring::sign::any_supported_type(&key)
             .map_err(|_| "private key type is not supported".to_string())?;
+
+        // 🔑 …and that the two actually belong together.
+        //
+        // 🤡 Everything above this proves the files are well formed, and that is
+        // all this used to check. So `tls site.crt other.key` passed validation,
+        // the reload reported success, and every handshake for that site failed
+        // afterwards with an error far from the configuration that caused it.
+        // Validation that says yes to something which cannot serve one request
+        // moves the failure away from the person able to fix it.
+        //
+        // The comparison is on the SubjectPublicKeyInfo: the public key the
+        // certificate carries, against the public key derived from the private
+        // one. Equal bytes mean the key can sign what the certificate claims.
+        use rcgen::PublicKeyData as _;
+        let key_spki = rcgen::KeyPair::from_pem(key_pem)
+            .map_err(|error| format!("private key cannot be read: {error}"))?
+            .subject_public_key_info();
+        let (_, parsed) = x509_parser::parse_x509_certificate(&certs[0])
+            .map_err(|error| format!("certificate cannot be parsed: {error}"))?;
+        if parsed.tbs_certificate.subject_pki.raw != key_spki.as_slice() {
+            return Err("the private key does not match the certificate's public key".to_string());
+        }
         Ok(())
     }
 
@@ -801,6 +823,96 @@ mod tests {
 
         assert!(manager.resolve_pem("anything.example").await.is_none());
         assert!(issuer.calls.lock().is_empty());
+    }
+
+    /// 🔄 A rotated manual certificate is used by the very next handshake.
+    ///
+    /// 📌 The review expected this to be broken — the parsed-certificate cache has
+    /// a one-hour TTL and nothing invalidates it on publish. It is not, and the
+    /// reason is worth pinning: `resolve_cert` reads the manual table *before* the
+    /// cache and converts the PEM fresh each time, so a manual pair never enters
+    /// that cache at all. The TTL only ever holds internally-issued and ACME
+    /// certificates, which the issuing paths overwrite as they renew.
+    ///
+    /// This test exists to keep that ordering. Moving the cache lookup above the
+    /// manual table would be an easy tidy-up, and it would silently reintroduce an
+    /// hour of serving a key the operator believes they have retired.
+    #[tokio::test]
+    async fn a_rotated_manual_certificate_is_served_immediately() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = TlsManager::new(None, directory.path()).await.unwrap();
+
+        let (first_pem, first_key) = self_signed("rotate.example");
+        let (second_pem, second_key) = self_signed("rotate.example");
+        assert_ne!(first_pem, second_pem, "the fixture must be two real keys");
+
+        let write = |name: &str, contents: &str| {
+            let path = directory.path().join(name);
+            std::fs::write(&path, contents).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+
+        manager
+            .refresh_manual_certs(&[(
+                "rotate.example".to_string(),
+                write("a.crt", &first_pem),
+                write("a.key", &first_key),
+            )])
+            .unwrap();
+        let before = manager
+            .resolve_cert("rotate.example")
+            .await
+            .expect("the first certificate must serve");
+
+        manager
+            .refresh_manual_certs(&[(
+                "rotate.example".to_string(),
+                write("b.crt", &second_pem),
+                write("b.key", &second_key),
+            )])
+            .unwrap();
+        let after = manager
+            .resolve_cert("rotate.example")
+            .await
+            .expect("the second certificate must serve");
+
+        assert_ne!(
+            before.cert, after.cert,
+            "a handshake is still using the retired certificate"
+        );
+    }
+
+    /// 🔑 A certificate and a key that do not belong together must not pass
+    /// validation.
+    ///
+    /// 🤡 `validate_pem_pair` checked that the certificate parsed, that the key
+    /// parsed, and that the key's type was supported — never that the two match.
+    /// So `tls site.crt other.key` was accepted, the reload reported success, and
+    /// every handshake for that site failed afterwards. Validation that says yes
+    /// to a configuration which cannot serve a single request is worse than no
+    /// validation: it moves the failure away from the person who can fix it.
+    #[test]
+    fn a_certificate_and_a_stranger_key_are_refused() {
+        let (cert_pem, key_pem) = self_signed("match.example");
+        let (_, other_key_pem) = self_signed("other.example");
+
+        TlsManager::validate_pem_pair_impl(&cert_pem, &key_pem)
+            .expect("a matching pair must still be accepted");
+
+        let error = TlsManager::validate_pem_pair_impl(&cert_pem, &other_key_pem)
+            .expect_err("a key that does not belong to the certificate must be refused");
+        assert!(
+            error.contains("does not match"),
+            "the message must say what is wrong; got {error}"
+        );
+    }
+
+    /// 🧪 A self-signed certificate and its own key, as PEM.
+    fn self_signed(name: &str) -> (String, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        (cert.pem(), key.serialize_pem())
     }
 
     /// 🃏 A wildcard site covers one label under it, and no more.

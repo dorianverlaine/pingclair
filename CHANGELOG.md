@@ -680,6 +680,16 @@ lets the rest converge.
 
 ### 🐛 Fixed
 
+- 🔑 **A certificate and a private key that did not belong together passed
+  validation.** `tls site.crt other.key` was accepted: the check proved the
+  certificate PEM parsed, the key PEM parsed, and the key's type was supported,
+  and stopped there. The reload reported success and every handshake for that site
+  failed afterwards, with an error nowhere near the configuration that caused it.
+  Validation now compares the certificate's SubjectPublicKeyInfo against the
+  public key derived from the private one, so a pair that cannot serve a single
+  request is refused where the operator can still act on it. Found by review.
+
+
 - 📡 **A wildcard site configured for DNS-01 silently used HTTP-01.** The
   challenge override was an exact map lookup keyed by the configured name, and
   its comment justified that with "the identifier the certificate is ordered
