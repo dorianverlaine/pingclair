@@ -11,6 +11,17 @@
   鏈結設計；過去曾因 OpenSSL／BoringSSL 符號衝突造成**啟動 SIGBUS 與 Linux link error**。
   這三條不是偏好而是 H3 的前提，理由見下方「為什麼 H3 釘在 quiche／BoringSSL」。
 
+- 🔓 **`boring-sys` 是直接依賴，而且版本必須跟著 `boring` 一起動。**
+  `boring` 4.22 沒有包裝 `X509_STORE_CTX_set_purpose`，而下游 mTLS 需要它
+  （理由見「下游 mTLS」那節），所以 workspace 直接宣告
+  `boring-sys = "4.22"` 與 `foreign-types = "0.5"`——後者是為了拿到
+  `ForeignTypeRef::as_ptr`，`boring` 只 `extern crate` 沒有 re-export。
+  ⚠️ **兩份 `boring-sys` 就是兩份 BoringSSL**，也就是上一條講的那種符號衝突。
+  兩邊都用 caret range 是刻意的：它們會一起解析到同一版。`boring` 需要換大
+  版本的那天，這一行必須同時換。
+  📌 檢查方式跟原本一樣，沒有新增：`cargo tree -i boring-sys` 必須只有一份，
+  `cargo tree -i openssl-sys` 必須什麼都不符合。
+
 - **fork 上游 crate 前，先量到數字，而且要量在它是瓶頸的環境。**
   2026-08-04 一次砍掉兩個 fork（`pingora-core`、`pingora-http`，共 38,532 行）。
   兩者機制論證都成立，但都沒有一次「被 patch 的東西是飽和資源」的量測撐著：
@@ -129,6 +140,33 @@
   `require_and_verify` = `PEER|FAIL_IF_NO_PEER_CERT` ＋ callback 驗。
   空憑證由 mode 位元自己處理（`tls13_server.cc:1102` 的 `allow_anonymous`），
   callback 只在客戶端**真的送了憑證**時才會被呼叫。
+
+- 🎯 **自訂 verify callback 的代價：purpose 檢查不會自己跑，要自己開。**
+  上一條選了 custom callback，這條是它的帳單。`X509_verify_cert` 只有在
+  **有人指定 purpose** 的時候才會查憑證自己宣告的用途
+  （`x509_vfy.c:570`：`if (ctx->param->purpose > 0 && X509_check_purpose(...))`），
+  而新建的 `X509_STORE_CTX` 的 purpose 是 0。於是「這條鏈建得起來嗎」的答案
+  被當成「這張憑證可以當 client 嗎」的答案。
+  **後果**：私有 CA 最常見的用法就是一個 CA 簽全公司——那麼每一台
+  `serverAuth` 的伺服器憑證，都是一張可用的 client 身分。
+  做法是在 `verify_cert()` 之前呼叫
+  `X509_STORE_CTX_set_purpose(ctx, X509_PURPOSE_SSL_CLIENT)`。
+  ⚠️ `boring` 4.22 沒有包裝它，`X509VerifyParamRef` 有 `set_flags`／`set_host`／
+  `set_depth` 就是沒有 `set_purpose`，而它的 `boring_sys` 是私有
+  `extern crate`——所以這裡直接依賴 `boring-sys` 與 `foreign-types`。
+  版本必須跟著 `boring` 走，否則樹裡會有兩份 BoringSSL。
+  📌 順手查過但**沒有**改變的一件事：`set_purpose` 同時會把 context 的 trust
+  設成該 purpose 的預設值 `X509_TRUST_SSL_CLIENT`。對一般 PEM 載進來的 CA
+  來說結果一樣——舊值與新值都落到 `x509_trs.c` 的 `trust_compat`，
+  自簽就信、其餘不信。只有帶 `X509_CERT_AUX`（罕見的
+  `TRUSTED CERTIFICATE` 區塊）的 PEM 才分得出兩者。
+  🤡 有一個會讓人愣住的邊界：只寫 `anyExtendedKeyUsage` 的 leaf **會被拒**。
+  BoringSSL 給 `any` 自己的 bit（`XKU_ANYEKU` 0x100），而 SSL-client 檢查看的是
+  `XKU_SSL_CLIENT`（0x2）。這是照抄函式庫的行為，不是我們的選擇——要在這裡
+  特判，就等於在人家的 purpose 邏輯旁邊再寫一份自己的。
+  🎯 四個回歸測試（`client_auth.rs`）先驗過 red：拿掉那一行 `set_purpose`，
+  四個全紅、其餘八個全綠。另有一個真握手的 H3 測試
+  `h3_client_auth_refuses_a_certificate_issued_only_for_servers`。
 
 - **信任 store 要在啟動時建好，握手只借用。**
   `SslRef::set_verify_cert_store` 走 `SSL_set0_verify_cert_store`，

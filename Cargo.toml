@@ -95,6 +95,25 @@ x509-parser = "0.18"
 # promise a human has to keep. It must stay on the release quiche links
 # against; `cargo tree -i boring-sys` must show exactly one.
 boring = "4.22"
+# 🔓 The raw bindings, for the one thing `boring` does not wrap.
+#
+# BoringSSL can check that a certificate is actually allowed to be a *client*
+# certificate — extended key usage, key usage, the Netscape type — and it is
+# `X509_STORE_CTX_set_purpose` that turns that check on. `boring` 4.22 exposes
+# no wrapper for it: `X509VerifyParamRef` has `set_flags`, `set_host`,
+# `set_depth` and no `set_purpose`, and its `boring_sys` is a private
+# `extern crate`. Verified against boring 4.22.0 on 2026-08-17.
+#
+# 🛡️ The version tracks `boring` above deliberately. Two `boring-sys` in one
+# tree means two BoringSSLs, which collide on libcrypto symbols and have
+# crashed this binary at startup — so `cargo tree -i boring-sys` must still
+# show exactly one. Matching caret ranges make them move together; the day
+# `boring` needs a new major, this line has to move with it.
+boring-sys = "4.22"
+# 🔗 `boring` builds its types with this crate's macros but re-exports none of
+# it, so reaching a raw `X509_STORE_CTX *` needs the trait in scope. Version
+# tracks the one `boring` itself depends on.
+foreign-types = "0.5"
 # Pinned: the ConnectionHook/tls_cert behaviour documented above was read from
 # 0.19.1's source. A minor bump could start reading the sentinel paths.
 tokio-quiche = { version = "=0.19.1", default-features = false }

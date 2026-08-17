@@ -97,6 +97,24 @@ lets the rest converge.
   behave exactly as before, and the rest of the schema is unchanged. See the
   Security entry below for what the old leniency actually cost.
 
+- 🪪 **A client certificate must now be allowed to be a client certificate.**
+  `client_auth` in a verifying mode used to ask only whether the certificate
+  chained to a trusted CA. It now also honours what the certificate says about
+  itself, which is BoringSSL's own SSL-client check: an extended key usage that
+  excludes `clientAuth`, a key usage permitting neither digital signature nor
+  key agreement, or a Netscape certificate type ruling out SSL client use each
+  end the handshake, at every level of the chain rather than only at the leaf.
+
+  **A certificate carrying no usage extensions is unaffected** — no restriction
+  is not a restriction — so most private CAs see no change. Two shapes stop
+  working, both deliberately: a leaf issued `serverAuth`-only, and an
+  intermediate restricted to `serverAuth` issuing client identities. One shape
+  is a surprise worth naming: a leaf whose only extended key usage is
+  `anyExtendedKeyUsage` is refused, because BoringSSL gives `any` its own bit
+  and the SSL-client check looks for the `clientAuth` bit. Adding `clientAuth`
+  to the certificate is the fix in all three cases. See the Security entry
+  below.
+
 ### 🔄 Changed
 
 - 🌐 **Dynamic DNS now honors source policy.** Empty `resolvers` uses the
@@ -802,6 +820,24 @@ lets the rest converge.
   wrong); upstream and internal failures are untouched and still ERROR.
 
 ### 🔐 Security
+
+- 🎯 **Mutual TLS trusted a CA and then trusted everything it had ever
+  signed.** A certificate says what it is for: a web server's carries an
+  extended key usage of `serverAuth`, a client's carries `clientAuth`, and a CA
+  grants those as separate permissions. The verification here built a trust
+  path and stopped, never asking the question — BoringSSL runs its purpose
+  check only when a purpose has been requested, and none was. So the answer to
+  "is this chain valid" was being read as the answer to "may this certificate
+  act as a client". Under the ordinary private-CA arrangement, where one
+  authority issues certificates for a whole fleet, every server in that fleet
+  held a working client identity for every other, and any host with a
+  certificate from the CA could authenticate as any user of it. The verifier
+  now asks BoringSSL for the SSL-client purpose before building the path, so
+  the restrictions the CA wrote into its certificates are enforced — on
+  HTTP/1.1, HTTP/2 and HTTP/3 alike, which matters because HTTP/3 gets its TLS
+  from a different stack. Found by review, and `0.2.0-dev` only: `v0.1.7` had
+  no mutual TLS. See the Breaking entry above for which certificates change
+  status.
 
 - 🪪 **A misspelled key in a `client_auth` block silently downgraded mutual
   TLS.** `mode` decides how hard a client certificate is checked, and its four

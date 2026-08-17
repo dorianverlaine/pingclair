@@ -48,6 +48,10 @@ hickory-resolver.workspace = true
 # this crate's HTTP/3 layer is written against; see the workspace manifest.
 tokio-quiche.workspace = true
 boring.workspace = true
+# 🪪 Only `client_auth.rs` reaches past `boring`, and only to turn on
+# BoringSSL's SSL-client purpose check; see the note in the workspace manifest.
+boring-sys.workspace = true
+foreign-types.workspace = true
 thiserror.workspace = true
 minijinja = "2"
 chrono = "0.4"

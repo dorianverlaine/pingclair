@@ -1535,11 +1535,26 @@ impl H3Authority {
     }
 
     fn issue(&self, name: &str) -> (String, String) {
+        self.issue_for(name, &[])
+    }
+
+    /// 🪪 Issues a leaf carrying the extended key usages given, or none at all.
+    ///
+    /// The empty slice is what [`Self::issue`] uses and what every other test
+    /// here wants: a certificate that states no restriction is usable for
+    /// anything. Naming usages explicitly is how a test can produce two leaves
+    /// from the same CA that differ in exactly one extension.
+    fn issue_for(
+        &self,
+        name: &str,
+        extended: &[rcgen::ExtendedKeyUsagePurpose],
+    ) -> (String, String) {
         let mut params =
             rcgen::CertificateParams::new(vec![name.to_string()]).expect("leaf params");
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, name);
+        params.extended_key_usages = extended.to_vec();
         let key = rcgen::KeyPair::generate().expect("leaf key");
         let certificate = params
             .signed_by(&key, &rcgen::Issuer::from_params(&self.params, &self.key))
@@ -1702,6 +1717,69 @@ async fn h3_client_auth_admits_only_the_trusted_client() {
     .expect("a site without client_auth started demanding certificates over HTTP/3");
     assert_eq!(open.status, 200);
     assert_eq!(open.body, b"open-ok");
+}
+
+/// 🪪 Trusting a CA is not the same as trusting everything it ever signed.
+///
+/// Both certificates below come from the configured CA and both build a valid
+/// trust path, so "does it chain" cannot tell them apart. What separates them
+/// is the extended key usage the CA wrote in: one says `clientAuth`, the other
+/// says `serverAuth` and nothing else. The second is a certificate its own
+/// issuer said must not be used as a client identity, and the handshake has to
+/// be where that is enforced — a check that only ran later would already have
+/// admitted the connection.
+///
+/// Over QUIC specifically because HTTP/3 gets its TLS from `tokio-quiche`
+/// rather than Pingora, so "enforced on H1/H2" says nothing about this path.
+#[tokio::test]
+async fn h3_client_auth_refuses_a_certificate_issued_only_for_servers() {
+    let authority = H3Authority::new("H3 Purpose CA");
+    let (address, _material) = spawn_h3_mtls_listener(
+        pingclair_core::config::ClientAuthMode::RequireAndVerify,
+        &authority.ca_pem,
+    )
+    .await;
+
+    let client = authority.issue_for(
+        "client.h3.test",
+        &[rcgen::ExtendedKeyUsagePurpose::ClientAuth],
+    );
+    let server_only = authority.issue_for(
+        "server.h3.test",
+        &[rcgen::ExtendedKeyUsagePurpose::ServerAuth],
+    );
+
+    let refused = h3_attempt(
+        H3Attempt {
+            sni: "secure.h3.test",
+            authority: "secure.h3.test",
+            identity: Some((&server_only.0, &server_only.1)),
+            ..H3Attempt::to(address, "/probe")
+        },
+        None,
+    )
+    .await;
+    assert_handshake_refused(
+        refused,
+        "a certificate issued only for server authentication was accepted as a client identity \
+         over HTTP/3",
+    );
+
+    // 🧭 The same CA, the same site, one extension different — so the refusal
+    // above is about the purpose and not about the trust pool.
+    let admitted = h3_attempt(
+        H3Attempt {
+            sni: "secure.h3.test",
+            authority: "secure.h3.test",
+            identity: Some((&client.0, &client.1)),
+            ..H3Attempt::to(address, "/probe")
+        },
+        None,
+    )
+    .await
+    .expect("a certificate issued for client authentication was turned away over HTTP/3");
+    assert_eq!(admitted.status, 200);
+    assert_eq!(admitted.body, b"secure-ok");
 }
 
 /// 🔄 A published H3 trust-pool rotation applies to the first new handshake.

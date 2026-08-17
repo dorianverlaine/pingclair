@@ -53,9 +53,10 @@ use arc_swap::ArcSwap;
 use boring::error::ErrorStack;
 use boring::ex_data::Index;
 use boring::ssl::{Ssl, SslAlert, SslRef, SslVerifyError, SslVerifyMode};
-use boring::stack::Stack;
+use boring::stack::{Stack, StackRef};
 use boring::x509::store::{X509Store, X509StoreBuilder};
-use boring::x509::{X509, X509StoreContext};
+use boring::x509::{X509, X509StoreContext, X509StoreContextRef};
+use foreign_types::ForeignTypeRef as _;
 use pingclair_core::config::{ClientAuthConfig, ClientAuthMode, TrustPool};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -439,8 +440,77 @@ fn verify_chain(ssl: &SslRef, trust: &X509Store, leaf: &X509) -> Result<bool, Er
             &empty
         }
     };
+    verify_client_chain(trust, leaf, intermediates)
+}
+
+/// 🪪 Verifies one chain *as a client identity*, not merely as a valid chain.
+///
+/// Split out from [`verify_chain`] so the decision can be exercised with real
+/// certificates and no handshake. Everything a client controls arrives here as
+/// an argument; nothing is read back off the connection.
+fn verify_client_chain(
+    trust: &X509Store,
+    leaf: &X509,
+    intermediates: &StackRef<X509>,
+) -> Result<bool, ErrorStack> {
     let mut context = X509StoreContext::new()?;
-    context.init(trust, leaf, intermediates, |context| context.verify_cert())
+    context.init(trust, leaf, intermediates, |context| {
+        set_ssl_client_purpose(context)?;
+        context.verify_cert()
+    })
+}
+
+/// 🎯 Tells BoringSSL the chain is being checked for *client* authentication.
+///
+/// A certificate says what it may be used for. A web server's certificate
+/// carries an extended key usage of `serverAuth`, a client's carries
+/// `clientAuth`, and the two are different permissions granted by the same CA.
+/// Without this call BoringSSL never looks: `X509_verify_cert` runs its purpose
+/// check only when a purpose has been asked for, so the answer to "is this
+/// chain valid" was being taken as the answer to "may this certificate act as a
+/// client". Under a private CA that issues both — the common shape, one CA for
+/// the fleet — every server in the fleet could log in as a client of every
+/// other.
+///
+/// With the purpose set, BoringSSL enforces what the certificates themselves
+/// say, at every level of the chain: an extended key usage that excludes
+/// `clientAuth`, a key usage that permits neither digital signature nor key
+/// agreement, or a Netscape certificate type that rules out SSL client use,
+/// each end the handshake. A certificate that carries no such extension is
+/// still accepted — an unrestricted certificate is exactly what "no
+/// restrictions" means, and refusing it would break every CA that leaves the
+/// extension out.
+///
+/// 📌 The one side effect, checked rather than assumed: `set_purpose` also sets
+/// the context's *trust* to the purpose's default, `X509_TRUST_SSL_CLIENT`.
+/// For a trust anchor loaded from an ordinary PEM this changes nothing. Both
+/// the old value and the new one land in `trust_compat`, which trusts a
+/// self-signed anchor and refuses anything else — the same answer this code got
+/// before. Only a PEM carrying explicit trust settings (`X509_CERT_AUX`, the
+/// rare `TRUSTED CERTIFICATE` block) could tell the two apart. Read from
+/// BoringSSL's `x509_trs.c` as vendored by `boring-sys 4.22.0` on 2026-08-17.
+fn set_ssl_client_purpose(context: &mut X509StoreContextRef) -> Result<(), ErrorStack> {
+    // SAFETY: The pointer belongs to a context that `X509StoreContext::init`
+    // has already initialised and will not clean up until this closure returns,
+    // so it is live for the call. `X509_STORE_CTX_set_purpose` only writes the
+    // context's own verification parameters — no ownership crosses the
+    // boundary, and nothing is retained after it returns.
+    let accepted = unsafe {
+        boring_sys::X509_STORE_CTX_set_purpose(
+            context.as_ptr(),
+            boring_sys::X509_PURPOSE_SSL_CLIENT,
+        )
+    };
+    // 🚫 The only documented failure is a purpose id the library does not know,
+    // and the id is a constant from the very headers it was built from. So a
+    // zero here means the library underneath is not the one this was written
+    // against — which is a reason to refuse the handshake, not to verify
+    // without the check and call it a pass.
+    if accepted == 1 {
+        Ok(())
+    } else {
+        Err(ErrorStack::get())
+    }
 }
 
 /// 🍃 Decodes the leaves a policy pins, sorted for binary search at handshake.
@@ -861,6 +931,243 @@ mod tests {
                 .pinned_leaves
                 .windows(2)
                 .all(|pair| pair[0] < pair[1])
+        );
+    }
+
+    // MARK: - Client purpose
+
+    use rcgen::ExtendedKeyUsagePurpose as Eku;
+    use rcgen::KeyUsagePurpose as Ku;
+
+    /// 🏛️ A throwaway CA that issues leaves with whatever usages a test asks
+    /// for, so two certificates can differ in exactly one extension.
+    struct TestAuthority {
+        params: rcgen::CertificateParams,
+        key: rcgen::KeyPair,
+        pem: String,
+    }
+
+    impl TestAuthority {
+        fn new(common_name: &str) -> Self {
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, common_name);
+            let key = rcgen::KeyPair::generate().expect("ca key");
+            let pem = params.self_signed(&key).expect("ca").pem();
+            Self { params, key, pem }
+        }
+
+        fn issuer(&self) -> rcgen::Issuer<'_, &rcgen::KeyPair> {
+            rcgen::Issuer::from_params(&self.params, &self.key)
+        }
+
+        /// 🍃 Issues one leaf carrying exactly the usages given, and no others.
+        fn issue(&self, name: &str, extended: &[Eku], usages: &[Ku]) -> X509 {
+            let mut params =
+                rcgen::CertificateParams::new(vec![name.to_string()]).expect("leaf params");
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, name);
+            params.extended_key_usages = extended.to_vec();
+            params.key_usages = usages.to_vec();
+            let key = rcgen::KeyPair::generate().expect("leaf key");
+            let leaf = params
+                .signed_by(&key, &self.issuer())
+                .expect("leaf certificate");
+            X509::from_pem(leaf.pem().as_bytes()).expect("leaf parses")
+        }
+
+        /// 🏛️ Builds the trust store through the production path, so the test
+        /// exercises the same store construction a real configuration gets.
+        fn trust_store(&self) -> X509Store {
+            CompiledClientAuth::compile(&ClientAuthConfig {
+                mode: ClientAuthMode::RequireAndVerify,
+                trust_pool: Some(TrustPool::Inline {
+                    trust_der: vec![der_base64(&self.pem)],
+                }),
+                ..Default::default()
+            })
+            .expect("the trust pool compiles")
+            .trust
+            .expect("require_and_verify builds a store")
+        }
+    }
+
+    /// 🔍 Runs one leaf through the real verifier and reports the verdict.
+    fn admits(trust: &X509Store, leaf: &X509, intermediates: &StackRef<X509>) -> bool {
+        verify_client_chain(trust, leaf, intermediates).expect("verification runs")
+    }
+
+    fn no_intermediates() -> Stack<X509> {
+        Stack::new().expect("empty stack")
+    }
+
+    /// 🪪 A certificate issued to be a *server* must not be usable to log in
+    /// as a client.
+    ///
+    /// This is the whole finding in one test. Both leaves below are signed by
+    /// the same CA and both build a perfectly valid trust path, so chain
+    /// verification alone cannot separate them — and chain verification alone
+    /// is what this code used to do. The only difference is the extended key
+    /// usage the CA wrote into each one. Under the common private-CA shape,
+    /// where one authority issues certificates for the whole fleet, that gap
+    /// meant every server in the fleet held a working client identity for
+    /// every other.
+    #[test]
+    fn a_server_only_certificate_cannot_log_in_as_a_client() {
+        let authority = TestAuthority::new("Purpose Test CA");
+        let trust = authority.trust_store();
+        let empty = no_intermediates();
+
+        let client = authority.issue("client.test", &[Eku::ClientAuth], &[]);
+        assert!(
+            admits(&trust, &client, &empty),
+            "a certificate issued for client authentication was turned away"
+        );
+
+        let server = authority.issue("server.test", &[Eku::ServerAuth], &[]);
+        assert!(
+            !admits(&trust, &server, &empty),
+            "a certificate issued only for server authentication was accepted as a client identity"
+        );
+
+        // 🧩 A certificate allowed to be both is allowed to be either.
+        let both = authority.issue("both.test", &[Eku::ClientAuth, Eku::ServerAuth], &[]);
+        assert!(
+            admits(&trust, &both, &empty),
+            "a certificate naming clientAuth alongside serverAuth was turned away"
+        );
+    }
+
+    /// 🧭 A certificate that restricts nothing is still admitted.
+    ///
+    /// Plenty of private CAs leave both extensions out, and an absent
+    /// restriction is not a restriction — reading it as one would reject
+    /// clients that every previous release admitted, for no security gain.
+    #[test]
+    fn a_certificate_with_no_stated_usage_is_still_admitted() {
+        let authority = TestAuthority::new("Unrestricted CA");
+        let trust = authority.trust_store();
+        let empty = no_intermediates();
+
+        let plain = authority.issue("plain.test", &[], &[]);
+        assert!(
+            admits(&trust, &plain, &empty),
+            "a certificate that states no usage restriction was refused"
+        );
+    }
+
+    /// 🔑 Key usage is checked too: a client has to be able to sign or agree.
+    ///
+    /// A certificate whose key may only encipher cannot produce the
+    /// `CertificateVerify` signature that proves possession, so admitting it
+    /// would mean admitting a client that cannot actually prove anything.
+    #[test]
+    fn a_key_usage_that_permits_neither_signing_nor_agreement_is_refused() {
+        let authority = TestAuthority::new("Key Usage CA");
+        let trust = authority.trust_store();
+        let empty = no_intermediates();
+
+        let signing = authority.issue("signing.test", &[Eku::ClientAuth], &[Ku::DigitalSignature]);
+        assert!(
+            admits(&trust, &signing, &empty),
+            "a client certificate allowed to sign was turned away"
+        );
+
+        let encipher_only =
+            authority.issue("encipher.test", &[Eku::ClientAuth], &[Ku::KeyEncipherment]);
+        assert!(
+            !admits(&trust, &encipher_only, &empty),
+            "a certificate whose key may neither sign nor agree was accepted as a client identity"
+        );
+    }
+
+    /// 🧬 `anyExtendedKeyUsage` on its own does **not** count as clientAuth.
+    ///
+    /// Recorded because it surprises people rather than because it is a
+    /// choice this code made: BoringSSL gives `anyExtendedKeyUsage` its own
+    /// bit and the SSL-client check tests for the clientAuth bit, so a leaf
+    /// carrying only `any` is refused. Deferring to the library is the point
+    /// of doing the check this way — special-casing it here would mean writing
+    /// our own purpose logic beside theirs. An operator hitting this adds
+    /// `clientAuth` to the certificate.
+    #[test]
+    fn any_extended_key_usage_alone_does_not_grant_client_use() {
+        let authority = TestAuthority::new("Any EKU CA");
+        let trust = authority.trust_store();
+        let empty = no_intermediates();
+
+        let any = authority.issue("any.test", &[Eku::Any], &[]);
+        assert!(
+            !admits(&trust, &any, &empty),
+            "BoringSSL's anyExtendedKeyUsage handling changed; re-read v3_purp.c before \
+             relaxing this"
+        );
+    }
+
+    /// 🧱 The check applies at every level, not just the leaf.
+    ///
+    /// An intermediate restricted to `serverAuth` is an intermediate its own
+    /// CA said must not issue client identities. Honouring that only at the
+    /// leaf would let the restriction be escaped by the very certificates it
+    /// was written to constrain.
+    #[test]
+    fn an_intermediate_restricted_to_servers_cannot_issue_client_identities() {
+        let root = TestAuthority::new("Nesting Root CA");
+        let trust = root.trust_store();
+
+        let issue_intermediate = |extended: &[Eku]| {
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "Nesting Intermediate");
+            params.extended_key_usages = extended.to_vec();
+            let key = rcgen::KeyPair::generate().expect("intermediate key");
+            let certificate = params
+                .signed_by(&key, &root.issuer())
+                .expect("intermediate certificate");
+            (params, key, certificate.pem())
+        };
+
+        let sign_leaf = |params: &rcgen::CertificateParams, key: &rcgen::KeyPair| {
+            let mut leaf_params =
+                rcgen::CertificateParams::new(vec!["deep.test".to_string()]).expect("params");
+            leaf_params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "deep.test");
+            leaf_params.extended_key_usages = vec![Eku::ClientAuth];
+            let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
+            let leaf = leaf_params
+                .signed_by(&leaf_key, &rcgen::Issuer::from_params(params, key))
+                .expect("leaf certificate");
+            X509::from_pem(leaf.pem().as_bytes()).expect("leaf parses")
+        };
+
+        let stack_of = |pem: &str| {
+            let mut stack = Stack::new().expect("stack");
+            stack
+                .push(X509::from_pem(pem.as_bytes()).expect("intermediate parses"))
+                .expect("push");
+            stack
+        };
+
+        // 🧭 An unrestricted intermediate still works, so the test below is
+        // about the restriction and not about chain depth.
+        let (open_params, open_key, open_pem) = issue_intermediate(&[]);
+        let under_open = sign_leaf(&open_params, &open_key);
+        assert!(
+            admits(&trust, &under_open, &stack_of(&open_pem)),
+            "a client certificate under an unrestricted intermediate was turned away"
+        );
+
+        let (server_params, server_key, server_pem) = issue_intermediate(&[Eku::ServerAuth]);
+        let under_server = sign_leaf(&server_params, &server_key);
+        assert!(
+            !admits(&trust, &under_server, &stack_of(&server_pem)),
+            "an intermediate restricted to serverAuth was allowed to issue a client identity"
         );
     }
 }
