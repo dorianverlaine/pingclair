@@ -829,6 +829,192 @@ async fn test_active_health_check_removes_idle_failed_upstream() {
     let _ = second_task.await;
 }
 
+/// 🛡️ An upstream that dies *after* reading the request must not make this
+/// server send the request again.
+///
+/// The shape is the most ordinary failure a reverse proxy sees: an origin closes
+/// a pooled keep-alive connection, and the request that was travelling on it
+/// gets no reply. What this server cannot know is how far the request got. The
+/// origin may have read every byte, committed the transaction, and died on the
+/// way back — from here that is indistinguishable from the request never
+/// arriving.
+///
+/// So the `POST` below must reach the origin exactly once. Every other signal in
+/// that decision says "retry": the connection was reused, the retry buffer was
+/// not truncated, the attempt budget is untouched, and Pingora marks the read
+/// error retryable and will happily replay a body it still holds. Only the
+/// presence of a body says no.
+///
+/// The bodyless `GET` is the control, and it is what stops the fix from being
+/// "turn this path off". Same origin, same failure, same connection reuse — it
+/// *is* retried, because a request line with nothing after it has nothing to
+/// perform twice.
+#[tokio::test]
+async fn test_a_response_phase_failure_never_replays_a_request_body() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = listener.local_addr().unwrap();
+    let post_hits = Arc::new(AtomicUsize::new(0));
+    let get_hits = Arc::new(AtomicUsize::new(0));
+    let post_bytes = Arc::new(AtomicUsize::new(0));
+
+    let origin_post = post_hits.clone();
+    let origin_get = get_hits.clone();
+    let origin_bytes = post_bytes.clone();
+    let upstream_task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let origin_post = origin_post.clone();
+            let origin_get = origin_get.clone();
+            let origin_bytes = origin_bytes.clone();
+            tokio::spawn(async move {
+                // 🔁 One connection serves several requests, because the whole
+                // failure depends on the proxy having a *reused* upstream
+                // connection to fail on. A `Connection: close` origin would
+                // make every attempt a fresh dial, and Pingora refuses to
+                // retry those anyway — the test would pass without testing
+                // anything.
+                loop {
+                    let request =
+                        read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+                    if request.is_empty() {
+                        return;
+                    }
+                    let header_end = match request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|position| position + 4)
+                    {
+                        Some(end) => end,
+                        None => return,
+                    };
+                    let headers =
+                        String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+                    let mut line = headers
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .split_whitespace();
+                    let method = line.next().unwrap_or_default().to_string();
+                    let path = line.next().unwrap_or_default().to_string();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+
+                    // 📥 Drain the whole body before dying, which is what makes
+                    // the failure ambiguous: the origin demonstrably had every
+                    // byte of the request.
+                    let mut received = request.len() - header_end;
+                    while received < content_length {
+                        let mut chunk = [0u8; 2048];
+                        let read = match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => read,
+                        };
+                        received += read;
+                    }
+
+                    if path == "/warm" {
+                        stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nwarm")
+                            .await
+                            .unwrap();
+                        continue;
+                    }
+
+                    if method == "post" {
+                        origin_bytes.store(received, Ordering::SeqCst);
+                        origin_post.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        origin_get.fetch_add(1, Ordering::SeqCst);
+                    }
+                    // 💀 No response at all: close mid-exchange, which is what
+                    // a keep-alive origin restarting looks like from here.
+                    return;
+                }
+            });
+        }
+    });
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            reverse_proxy http://{upstream_address} {{
+                lb_retries 3
+            }}
+        }}
+        "#
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    // 🔥 Warm the upstream pool so the failing attempt runs on a reused
+    // connection. Without this, `client_reused` is false and Pingora declines
+    // the retry for its own reasons, which would hide whatever this code does.
+    let warm = client.get(server.url(0, "/warm")).send().await.unwrap();
+    assert_eq!(warm.status(), 200);
+    assert_eq!(warm.text().await.unwrap(), "warm");
+
+    let body = "x".repeat(4096);
+    let response = client
+        .post(server.url(0, "/charge"))
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_server_error(),
+        "the client should see the failure, not a silently retried success: {}",
+        response.status()
+    );
+    assert_eq!(
+        post_hits.load(Ordering::SeqCst),
+        1,
+        "a request body was replayed to the origin after an ambiguous failure"
+    );
+    assert_eq!(
+        post_bytes.load(Ordering::SeqCst),
+        body.len(),
+        "the origin received a partial body, so this run does not prove the \
+         failure was ambiguous"
+    );
+
+    // 🧭 Control: the same origin, the same failure, no body. This one must be
+    // retried, or the fix is just "stop retrying".
+    //
+    // 🔌 A fresh client, because the failure above also closed the *downstream*
+    // connection and reqwest would otherwise reuse the dead one and report the
+    // proxy's close as an incomplete message.
+    let control = no_proxy_client();
+    let warm = control.get(server.url(0, "/warm")).send().await.unwrap();
+    assert_eq!(warm.status(), 200);
+
+    let response = control.get(server.url(0, "/read")).send().await.unwrap();
+    assert!(response.status().is_server_error());
+    assert!(
+        get_hits.load(Ordering::SeqCst) >= 2,
+        "a bodyless request was not retried, so the gate is refusing more than \
+         it should: saw {} attempt(s)",
+        get_hits.load(Ordering::SeqCst)
+    );
+
+    upstream_task.abort();
+    let _ = upstream_task.await;
+}
+
 #[tokio::test]
 async fn test_bounded_upstream_status_retry_preserves_request_body_safety() {
     use std::sync::Arc;

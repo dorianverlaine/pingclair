@@ -842,6 +842,32 @@ lets the rest converge.
 
 ### 🔐 Security
 
+- 🔁 **An upstream that died after reading a request could make this server
+  send it again.** The most ordinary failure a reverse proxy sees is an origin
+  closing a pooled keep-alive connection, and the request travelling on it
+  getting no reply. What this server cannot know is how far that request got:
+  the origin may have read every byte, committed the transaction, and died on
+  the way back, which from here is indistinguishable from the request never
+  arriving. The retry decision for that phase consulted only whether the
+  connection had been reused and whether the attempt budget was spent — so a
+  `POST` whose body still sat in Pingora's retry buffer was replayed, and the
+  origin performed the operation twice. A request carrying a body is now never
+  repeated once the connection was established, whatever else says yes.
+  Bodyless requests still retry: a request line with nothing after it has
+  nothing to perform twice.
+
+  **The trade-off is deliberate.** A body-bearing request that would previously
+  have been rescued by a retry now surfaces the failure to the client instead.
+  Failing to charge a card once is recoverable; charging it twice is not.
+
+  Alongside it, HTTP/3 evaluated `lb_retry_match` against the request the
+  *client* sent rather than the one the origin received. With
+  `reverse_proxy { method … }` or `rewrite` on the route those differ, so a
+  policy saying "GETs are safe to repeat" could be deciding about a request the
+  origin saw as a `DELETE`. Both transports now match on the request as sent
+  upstream, which is what HTTP/1.1 and HTTP/2 already did by side effect of
+  rewriting the header in place. Found by review, and `0.2.0-dev` only.
+
 - 🎯 **Mutual TLS trusted a CA and then trusted everything it had ever
   signed.** A certificate says what it is for: a web server's carries an
   extended key usage of `serverAuth`, a client's carries `clientAuth`, and a CA

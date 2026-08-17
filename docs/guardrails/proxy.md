@@ -268,3 +268,48 @@ H1/H2 那支證出來的錯誤形狀 ＋ `h3_refused_backend_still_fails_closed`
 > 而測試只有在真的送出請求、真的比對 body 的時候才看得出來
 > （`h3_end_to_end.rs` 要走 `pingclair_config::compile`，不要手寫 `HandlerConfig`
 > ——手寫的那份會跳過 adapter，而 adapter 正是差異的來源）。
+
+---
+
+## 🔁 重送上游請求（2026-08-17）
+
+- 🛡️ **「重試」和「重複」的分界線就是 request body。**
+  一旦 body 已經串流上去，這台機器就**不知道** origin 讀了多少、解析了多少、
+  對它做了什麼。此時第二次嘗試不是修補，是把同一個操作做兩次。
+  刷兩次卡比刷不成一次糟。所以 `retry::body_is_replay_safe` 只有一條規則：
+  **帶 body 的請求一律不重送**，而它是一個具名函式而不是一個 `&&`，
+  就是為了讓每個新的重試路徑都得顯式地經過它。
+
+- 🤡 **這條之前只有 status 那條路遵守。** `upstream_response_filter`
+  （回了狀態碼但不喜歡）走 `permits_retry`，有 body 閘門；
+  而 `error_while_proxy`（連上了、送出去了、回應沒回來）只看
+  「連線是不是 reuse 的」加「attempt 額度」——**沒有看 body**。
+  📌 `retry_buffer_truncated` 不是這個閘門：它只回答「body 大到塞不進 buffer」。
+  **塞得進的 body 會被 Pingora 快樂地重播**，一個 `POST` 就變成兩個。
+  🎯 這就是為什麼規則要放在一個地方：一份**每個呼叫端各自抄一次**的安全規則，
+  等於每個呼叫端都有一次漏掉它的機會。
+
+- ⚖️ **這個閘門的代價是刻意付的。** 帶 body 的請求本來可能被重試救回來，
+  現在直接把失敗吐給客戶端。這是對的方向——不可逆的副作用比一次失敗貴。
+  ⚠️ 目前**沒有** opt-in 讓操作者宣告某條路線是幂等的（例如帶 idempotency key
+  的 API）。所以答案永遠是「不重送」。要不要開這個旋鈕是未決定的事，
+  不是漏掉的功能。
+
+- 🎯 **retry predicate 必須描述「實際送出去的那個請求」，不是客戶端送來的那個。**
+  `reverse_proxy { method DELETE }` 會把客戶端的 `GET` 變成上游的 `DELETE`。
+  拿 `GET` 去問「這個可以重送嗎」，答案是關於一個不存在的請求。
+  `AttemptFacts` 的欄位因此叫 `upstream_method`／`upstream_path`／`upstream_query`
+  ——名字自己帶著要求，下一個呼叫端沒辦法安靜地弄錯。
+  🤡 **H1/H2 是靠副作用做對的**：`proxy_upstream_filter` 直接改
+  `session.req_header_mut()`，所以之後讀回來就是上游版本。
+  H3 不動客戶端的 header，另外組 `upstream_method`／`upstream_uri`——
+  於是 facts 少走了一層 rewrite。**「一邊靠副作用做對」不是 parity，是巧合。**
+
+- 🧪 **這條的回歸測試必須讓 origin 數次數，而且必須用 keep-alive origin。**
+  整個失敗情境的前提是 proxy 有一條**可重用的**上游連線可以失敗在上面；
+  `Connection: close` 的 origin 會讓每次嘗試都是新連線，而 Pingora 本來就不重試
+  新連線——測試會通過，但什麼都沒測到。
+  📌 也要斷言 origin 收到的 body **長度完整**：沒有這一條，
+  「失敗是模稜兩可的」這個前提就沒有被證明，測的可能只是「送一半就斷」。
+  🔌 失敗之後 downstream 連線也會被關掉，所以控制組要用**新的 client**，
+  否則 reqwest 重用死連線、回報 `IncompleteMessage`，看起來像伺服器的錯。

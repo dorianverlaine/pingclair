@@ -4677,13 +4677,21 @@ async fn reverse_proxy_upstream(
         // waiting to be reported — so the evaluation lives in `retry.rs` and
         // only the fact-gathering is written twice, because only the
         // fact-gathering is genuinely transport-shaped.
-        let (path, query) = match effective_uri.split_once('?') {
+        // 📤 Split from `upstream_uri`, not from `effective_uri`, and paired with
+        // `upstream_method` rather than `method`. Those are the values that went
+        // out on the wire — `reverse_proxy { method … }` and `rewrite` change
+        // both, and H1/H2 gets the post-rewrite view for free because it mutates
+        // the request header in place. Reading the client's version here is how
+        // HTTP/3 came to evaluate `lb_retry_match method GET` against a request
+        // the origin received as a DELETE.
+        let (upstream_path, upstream_query) = match upstream_uri.split_once('?') {
             Some((path, query)) => (path, Some(query)),
-            None => (effective_uri, None),
+            None => (upstream_uri.as_str(), None),
         };
         let facts = crate::retry::AttemptFacts {
-            method: &method,
-            path,
+            upstream_method: &upstream_method,
+            upstream_path,
+            upstream_query,
             host: client_header
                 .uri
                 .host()
@@ -4696,7 +4704,6 @@ async fn reverse_proxy_upstream(
                 .unwrap_or(""),
             // 🔐 HTTP/3 only ever runs over QUIC, so the scheme is not in doubt.
             scheme: "https",
-            query,
             request_headers: &client_header.headers,
             status: Some(upstream_status),
             response_headers: session.response_header().map(|response| &response.headers),
@@ -4712,7 +4719,10 @@ async fn reverse_proxy_upstream(
         ) {
             tracing::warn!(
                 status = upstream_status,
-                method = %method,
+                // 📤 The method the origin saw, which is the one the policy
+                // just reasoned about. Logging the client's would make a
+                // rewritten route impossible to debug from the log alone.
+                method = %upstream_method,
                 attempt = attempts,
                 max_attempts = retry_policy.max_attempts,
                 "🔁 Redispatching a bodyless H3 request after an upstream status"

@@ -5625,27 +5625,39 @@ macro_rules! log_at_level {
     };
 }
 
-/// 🔁 Applies Pingora's reuse-safety rule and the route retry budget to an
-/// upstream error before the retry loop reads it.
+/// 🔁 Applies Pingora's reuse-safety rule, the replay-safety rule, and the route
+/// retry budget to an upstream error before the retry loop reads it.
 ///
 /// Pingora marks response-phase errors `ReusedOnly`; the default
 /// `error_while_proxy` resolves that marker with `decide_reuse`, and the
 /// retry loop panics ("Retry is not decided") when a custom override returns
 /// the error unchanged. This helper restores that contract, then caps the
-/// final decision with the configured attempt budget.
+/// final decision.
+///
+/// 🛡️ `body_is_empty` is the important one, and it is why this failure phase
+/// needs its own gate rather than inheriting Pingora's answer. An error here
+/// means the connection was already established and the request was already
+/// going out, so the origin may have received all of it and acted on it — the
+/// failure could be nothing more than the reply going missing on the way back.
+/// Pingora's `retry_buffer_truncated` only reports whether the body was *too
+/// large to buffer*; a body that fits is replayed happily, which turns one
+/// `POST` into two. "Ambiguous" has to resolve to "do not repeat it".
 fn decide_upstream_error_retry(
     e: &mut pingora_core::Error,
     client_reused: bool,
     retry_buffer_truncated: bool,
+    body_is_empty: bool,
     retry_policy: &RetryConfig,
     attempts: usize,
     retry_deadline: Option<std::time::Instant>,
 ) -> bool {
+    // 🧭 Always decided, whatever the answer: leaving the marker unresolved is
+    // what makes the retry loop panic.
     e.retry
         .decide_reuse(client_reused && !retry_buffer_truncated);
     let budget_allows =
         crate::retry::permits_another_attempt(retry_policy, attempts, retry_deadline);
-    let retry = budget_allows && e.retry();
+    let retry = crate::retry::body_is_replay_safe(body_is_empty) && budget_allows && e.retry();
     e.retry = retry.into();
     retry
 }
@@ -7023,10 +7035,16 @@ impl ProxyHttp for PingclairProxy {
         // 🔁 Built here rather than inside the retry module so every borrow of
         // `session` ends before the decision is acted on — and built only on
         // the failure path, which is the only place it is ever asked for.
+        // 📤 These are already the upstream view: `proxy_upstream_filter`
+        // applies `reverse_proxy { method … }` and `rewrite` by mutating
+        // `session.req_header_mut()` in place, so reading the header back here
+        // reads what went out. H3 has to assemble the same thing by hand
+        // because it leaves the client's header alone.
         let request_header = session.req_header();
         let facts = crate::retry::AttemptFacts {
-            method: &method,
-            path: request_header.uri.path(),
+            upstream_method: &method,
+            upstream_path: request_header.uri.path(),
+            upstream_query: request_header.uri.query(),
             host: request_header
                 .uri
                 .host()
@@ -7038,7 +7056,6 @@ impl ProxyHttp for PingclairProxy {
                 })
                 .unwrap_or(""),
             scheme: ctx.request_scheme,
-            query: request_header.uri.query(),
             request_headers: &request_header.headers,
             status: Some(status),
             response_headers: Some(&upstream_response.headers),
@@ -7488,14 +7505,28 @@ impl ProxyHttp for PingclairProxy {
             .and_then(|(state, route_index)| self.get_proxy_config(state, route_index))
             .map(|config| config.retry)
             .unwrap_or_default();
+        let retry_buffer_truncated = session.as_ref().retry_buffer_truncated();
+        let body_is_empty = session.as_mut().is_body_empty();
         let retry = decide_upstream_error_retry(
             &mut e,
             client_reused,
-            session.as_ref().retry_buffer_truncated(),
+            retry_buffer_truncated,
+            body_is_empty,
             &retry_policy,
             ctx.retry_attempts,
             ctx.retry_deadline,
         );
+        if !retry && !body_is_empty {
+            // 🚫 Worth saying out loud: a body-bearing request that failed after
+            // the connection was up is exactly the case an operator will come
+            // asking about, and "we chose not to repeat it" is a different
+            // answer from "we ran out of attempts".
+            tracing::warn!(
+                peer = %peer,
+                method = %session.req_header().method,
+                "🛡️ Not repeating a request that carried a body; the origin may already have acted on it"
+            );
+        }
         ctx.retry_pending = retry;
         e
     }
@@ -9546,11 +9577,30 @@ mod upstream_error_retry_tests {
         error
     }
 
+    /// 🧭 The bodyless case, which is the one every pre-existing test meant.
+    fn decide(
+        error: &mut pingora_core::Error,
+        client_reused: bool,
+        retry_buffer_truncated: bool,
+        policy: &RetryConfig,
+        attempts: usize,
+    ) -> bool {
+        decide_upstream_error_retry(
+            error,
+            client_reused,
+            retry_buffer_truncated,
+            true,
+            policy,
+            attempts,
+            None,
+        )
+    }
+
     #[test]
     fn reused_connection_within_budget_is_decided_and_retryable() {
         let policy = RetryConfig::default();
         let mut error = reused_only_error();
-        let retry = decide_upstream_error_retry(&mut error, true, false, &policy, 0, None);
+        let retry = decide(&mut error, true, false, &policy, 0);
 
         assert!(retry, "a reused connection within budget must retry");
         assert!(
@@ -9563,7 +9613,7 @@ mod upstream_error_retry_tests {
     fn fresh_connection_never_retries_a_response_phase_error() {
         let policy = RetryConfig::default();
         let mut error = reused_only_error();
-        let retry = decide_upstream_error_retry(&mut error, false, false, &policy, 0, None);
+        let retry = decide(&mut error, false, false, &policy, 0);
 
         assert!(!retry, "a fresh connection must not retry");
         assert!(!error.retry());
@@ -9573,14 +9623,7 @@ mod upstream_error_retry_tests {
     fn exhausted_retry_budget_caps_the_decision() {
         let policy = RetryConfig::default();
         let mut error = reused_only_error();
-        let retry = decide_upstream_error_retry(
-            &mut error,
-            true,
-            false,
-            &policy,
-            policy.max_attempts,
-            None,
-        );
+        let retry = decide(&mut error, true, false, &policy, policy.max_attempts);
 
         assert!(!retry, "the attempt cap must win over a reused connection");
         assert!(!error.retry());
@@ -9590,10 +9633,69 @@ mod upstream_error_retry_tests {
     fn truncated_retry_buffer_disables_reuse_retries() {
         let policy = RetryConfig::default();
         let mut error = reused_only_error();
-        let retry = decide_upstream_error_retry(&mut error, true, true, &policy, 0, None);
+        let retry = decide(&mut error, true, true, &policy, 0);
 
         assert!(!retry, "a truncated retry buffer must disable retry");
         assert!(!error.retry());
+    }
+
+    /// 🛡️ A request that carried a body is not repeated after a response-phase
+    /// failure, however happy every other signal is.
+    ///
+    /// This is the case the gate was added for, and the arguments below are
+    /// deliberately the *most* permissive ones: a reused connection, an
+    /// untruncated retry buffer, a fresh attempt budget, and an error Pingora
+    /// marks retryable. Every one of those says yes. The body says no, and the
+    /// body wins — because at this point the connection was already up and the
+    /// request was already on its way out, so the origin may have received the
+    /// whole thing and acted on it. Repeating it would perform the operation
+    /// twice, and Pingora will happily replay a buffered body if allowed to.
+    #[test]
+    fn a_body_bearing_request_is_never_repeated_after_a_response_phase_failure() {
+        let policy = RetryConfig::default();
+        let mut error = reused_only_error();
+        let retry = decide_upstream_error_retry(&mut error, true, false, false, &policy, 0, None);
+
+        assert!(
+            !retry,
+            "a request that carried a body was replayed to the origin"
+        );
+        assert!(
+            !error.retry(),
+            "the retry marker must also say no, or the loop will retry anyway"
+        );
+    }
+
+    /// 🧭 The gate is about the body, not about the failure being unretryable.
+    ///
+    /// Same error, same connection, same budget — only the body differs. Having
+    /// both directions in one test is what stops a future change from making
+    /// this path never retry at all and still passing.
+    #[test]
+    fn only_the_body_separates_a_repeatable_failure_from_an_unrepeatable_one() {
+        let policy = RetryConfig::default();
+
+        let mut bodyless = reused_only_error();
+        assert!(decide_upstream_error_retry(
+            &mut bodyless,
+            true,
+            false,
+            true,
+            &policy,
+            0,
+            None
+        ));
+
+        let mut with_body = reused_only_error();
+        assert!(!decide_upstream_error_retry(
+            &mut with_body,
+            true,
+            false,
+            false,
+            &policy,
+            0,
+            None
+        ));
     }
 }
 

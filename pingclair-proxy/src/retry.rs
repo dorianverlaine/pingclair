@@ -39,12 +39,39 @@ pub(crate) fn permits_another_attempt(
 /// attempt fails, and every field already exists somewhere the caller holds.
 /// Copying them to ask a question that is usually "no" would be paying for the
 /// unhappy path on the happy one.
+///
+/// # 🎯 Which request these describe
+///
+/// The fields split into two groups, and the split is the point rather than an
+/// accident of naming.
+///
+/// The `upstream_*` fields describe **the request that was actually sent to the
+/// origin**, after every rewrite. That is the only version a retry decision may
+/// reason about: a route with `method DELETE` turns a client's `GET` into a
+/// `DELETE` on the way out, and a policy that reads the `GET` would conclude
+/// "this is safe to repeat" about an operation that deletes something. The two
+/// transports arrive at these values differently — H1/H2 rewrites
+/// `session.req_header_mut()` in place, so reading it back after the rewrite is
+/// already the upstream view, while H3 leaves the client's header alone and
+/// builds a separate upstream method and URI — which is exactly how HTTP/3 came
+/// to be answering with the pre-rewrite method. The names carry the requirement
+/// so the next caller cannot get it wrong quietly.
+///
+/// The remaining fields describe **the client's request**, because that is what
+/// the operator is selecting on: `lb_retry_match host secure.example` asks which
+/// site was addressed, not which backend was dialled.
 pub(crate) struct AttemptFacts<'a> {
-    pub method: &'a Method,
-    pub path: &'a str,
+    /// 📤 The method the origin actually received.
+    pub upstream_method: &'a Method,
+    /// 📤 The path the origin actually received, after `rewrite`.
+    pub upstream_path: &'a str,
+    /// 📤 The query the origin actually received, after `rewrite`.
+    pub upstream_query: Option<&'a str>,
+    /// 🏠 The site the client addressed.
     pub host: &'a str,
+    /// 🔐 The scheme the client used.
     pub scheme: &'a str,
-    pub query: Option<&'a str>,
+    /// 🧾 The client's request headers.
     pub request_headers: &'a http::HeaderMap,
     /// 🔌 `None` when the attempt never produced a response — a dial, TLS or
     /// read failure. That is what `{rp.is_transport_error}` asks about, and it
@@ -104,18 +131,18 @@ fn evaluate(
             .is_some_and(|found| value == "*" || found.as_bytes() == value.as_bytes()),
         RetryPredicate::Method { any_of } => any_of
             .iter()
-            .any(|configured| configured.eq_ignore_ascii_case(facts.method.as_str())),
+            .any(|configured| configured.eq_ignore_ascii_case(facts.upstream_method.as_str())),
         RetryPredicate::Path { any_of } => any_of
             .iter()
-            .any(|pattern| glob_matches(pattern, facts.path)),
+            .any(|pattern| glob_matches(pattern, facts.upstream_path)),
         RetryPredicate::PathRegexp { pattern } => {
-            regex(pattern).is_some_and(|compiled| compiled.is_match(facts.path))
+            regex(pattern).is_some_and(|compiled| compiled.is_match(facts.upstream_path))
         }
         RetryPredicate::Host { any_of } => any_of
             .iter()
             .any(|configured| configured.eq_ignore_ascii_case(facts.host)),
         RetryPredicate::Protocol { name } => name.eq_ignore_ascii_case(facts.scheme),
-        RetryPredicate::Query { key, any_of } => query_values(facts.query, key)
+        RetryPredicate::Query { key, any_of } => query_values(facts.upstream_query, key)
             .is_some_and(|found| any_of.iter().any(|want| want == "*" || want == found)),
         RetryPredicate::RequestHeader { name, any_of } => facts
             .request_headers
@@ -145,15 +172,36 @@ fn query_values<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
     })
 }
 
+/// 🛡️ Whether the request bytes may be sent to an origin a second time.
+///
+/// The one question every retry path has to answer, and the reason it is a named
+/// function rather than a `&&`: it is the difference between a retry and a
+/// duplicate. Once a body has been streamed upstream, this server does not know
+/// how much of it the origin read, parsed, or acted on — so a second attempt is
+/// not a repair, it is the same operation performed twice. Charging a card twice
+/// is worse than failing to charge it once.
+///
+/// A request carrying a body is therefore never replayed. `lb_retry_match method
+/// POST` says the operator considers POSTs the retryable *kind* of failure; it
+/// does not say they are willing to have one happen twice, and this build has no
+/// setting that says so. A bodyless request has nothing to duplicate — the
+/// origin either received the request line or it did not.
+///
+/// 📌 One place, on purpose. Every transport and every failure phase has to
+/// answer this, and a per-caller copy of the rule is a per-caller chance to
+/// leave it out. That is precisely how the response-phase path came to retry
+/// without it.
+pub(crate) fn body_is_replay_safe(body_is_empty: bool) -> bool {
+    body_is_empty
+}
+
 /// 🛡️ The same decision, asked with everything a `lb_retry_match` can inspect.
 ///
 /// Two gates survive whichever matcher answers, because neither is about *when*
 /// an operator wants a retry:
 ///
-/// - **A request carrying a body is never replayed.** `lb_retry_match method
-///   POST` says the operator considers POSTs retryable, and the attempt cap
-///   still applies, but resending bytes this server has already streamed
-///   upstream is a different and worse failure than not retrying.
+/// - **A request carrying a body is never replayed** — see
+///   [`body_is_replay_safe`], which owns that argument.
 /// - **The attempt cap and deadline still bound it.** A predicate decides
 ///   whether this failure is the retryable kind, not how many times.
 pub(crate) fn permits_retry(
@@ -164,7 +212,9 @@ pub(crate) fn permits_retry(
     retry_deadline: Option<Instant>,
     regex: &dyn Fn(&str) -> Option<std::sync::Arc<regex::Regex>>,
 ) -> bool {
-    if !body_is_empty || !permits_another_attempt(policy, attempts, retry_deadline) {
+    if !body_is_replay_safe(body_is_empty)
+        || !permits_another_attempt(policy, attempts, retry_deadline)
+    {
         return false;
     }
     if !policy.retry_match.is_empty() {
@@ -179,12 +229,12 @@ pub(crate) fn permits_retry(
         && policy
             .methods
             .iter()
-            .any(|configured| configured.eq_ignore_ascii_case(facts.method.as_str()))
+            .any(|configured| configured.eq_ignore_ascii_case(facts.upstream_method.as_str()))
         && (policy.path_patterns.is_empty()
             || policy
                 .path_patterns
                 .iter()
-                .any(|pattern| glob_matches(pattern, facts.path)))
+                .any(|pattern| glob_matches(pattern, facts.upstream_path)))
 }
 
 /// 🧭 Matches one Caddy-style path glob (`/foo*`) against a request path.
@@ -226,11 +276,11 @@ mod tests {
         headers: &'a http::HeaderMap,
     ) -> AttemptFacts<'a> {
         AttemptFacts {
-            method,
-            path,
+            upstream_method: method,
+            upstream_path: path,
+            upstream_query: None,
             host: "example.test",
             scheme: "https",
-            query: None,
             request_headers: headers,
             status: Some(503),
             response_headers: None,
