@@ -1338,7 +1338,10 @@ mod tests {
         let admin = config.admin.as_ref().expect("admin config");
         assert_eq!(admin.listen, "127.0.0.1:2019");
         assert!(admin.enabled);
-        assert_eq!(admin.api_key.as_deref(), Some("s3cret-token"));
+        assert_eq!(
+            admin.api_key.as_ref().map(|key| key.expose()),
+            Some("s3cret-token")
+        );
     }
 
     #[test]

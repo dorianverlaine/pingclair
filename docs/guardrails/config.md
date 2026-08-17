@@ -158,3 +158,37 @@
 - 🧭 **驗證要寫在 `validate_config`，不是只寫在 adapter。**
   Admin API 直接把文件反序列化進 canonical types，完全不經過 adapter。
   這條規則這個倉庫已經付過兩次代價（見「安全預設」節）。
+
+## 🙈 秘密落地與落 log（2026-08-17）
+
+- 💀 **`std::fs::write` 建檔是 `0666 & !umask`，一般預設就是 `0644`。**
+  所以「寫個檔案」對含秘密的內容而言，預設是**全機器可讀**。
+  中招的兩個：Admin autosave 的文件（帶 admin key 與 DNS 憑證）、
+  `storage-export` 的 archive（帶內部 CA 私鑰、每張憑證的私鑰、ACME 帳號金鑰）。
+  🎯 判準：**問「這個檔案的內容如果被同機器其他使用者讀到，會怎樣」**，
+  而不是「這段程式碼有沒有 bug」。
+
+- 🛡️ **要「建立時就 0600」，不是「建完再 chmod」。**
+  先建再 chmod 留下一個窗口：另一個使用者可以在那個窗口 `open()`，
+  而**描述符在 mode 改掉之後照樣能讀**。`OpenOptions::mode(0o600)` 才是對的。
+  ⚠️ 而且 `mode` **只在建立時生效**——覆寫一個既有的 `0644` 檔案會保留 `0644`。
+  `storage-export` 因此會在這種情況下警告，不是靜默接受。
+
+- 🧬 **一份 atomic writer，不要第二份。** `pingclair-tls::secure_file` 早就做對了
+  五件事：unique 暫存名、建立即 0600、`sync_all`、rename、fsync 父目錄。
+  autosave 沒用它——它自己 `fs::write` 加一個**固定的** `<path>.tmp`
+  （兩個 writer 會撞）而且完全不 fsync。
+  📌 這是 SEC-006 那個教訓的同一類：**一份安全規則抄第二遍，就是第二次漏掉某一步的機會。**
+  現在 writer 住在 `pingclair-tls`（core 依賴它，反向會成環），
+  由 `pingclair_core::secure_file` re-export 給上面的 crate。
+
+- 🙈 **秘密要包起來，因為漏出去的 `{:?}` 不會寫在秘密旁邊。**
+  `SecretString` 的全部價值就是那個 `Debug`。derive `Debug` 的型別裡放一個
+  `String` 秘密，就離一行 log 只差一個 `{:?}`——而那個 `{:?}` 可以在
+  **任何包含它的型別上、任何地方**，包括 panic 訊息。
+  🎯 刻意**不**實作 `Display` 也不實作 `AsRef<str>`：兩者都會讓它被意外格式化。
+  真的要值就叫 `.expose()`——那是一個可以 grep 的詞，`rg 'expose\(\)'` 就是稽核清單。
+  🧭 `serde(transparent)`，所以 wire format 完全沒變，舊設定照樣載入與 round-trip。
+  **這條是關於什麼進 log，不是關於什麼進磁碟**——後者是上面那條。
+  📌 `dns01::cloudflare::ApiToken` 本來就是這個模式，所以這不是新發明，
+  是把既有的做法補到漏掉的兩個欄位上。

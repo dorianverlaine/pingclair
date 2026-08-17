@@ -280,7 +280,7 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
         config.admin = Some(AdminConfig {
             listen: admin.listen.clone(),
             enabled: admin.enabled,
-            api_key: admin.api_key.clone(),
+            api_key: admin.api_key.as_deref().map(Into::into),
             origins: admin.origins.clone(),
             enforce_origin: admin.enforce_origin,
         });

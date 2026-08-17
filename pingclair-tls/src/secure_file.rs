@@ -1,7 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dorian Verlaine
 
-//! 🔐 Atomic persistence for files containing private TLS material.
+//! 🔐 Atomic persistence for files that must not be readable by anyone else.
+//!
+//! Written for TLS private material and now shared with everything else that
+//! puts a secret on disk — the Admin API's autosaved document carries the admin
+//! key and DNS credentials, and a store export is an archive of private keys.
+//! One implementation on purpose: a second copy of "0600, unique temporary,
+//! fsync, rename, fsync the parent" is a second chance to leave a step out, and
+//! every step here is one that a plain `fs::write` gets wrong.
+//!
+//! What a plain `std::fs::write` does instead: creates the file with `0666 &
+//! !umask`, which is `0644` under the ordinary default, so the secret is
+//! world-readable for its whole life. It also does not fsync, so a crash can
+//! leave a truncated file where a complete one is expected, and a fixed
+//! temporary name makes two writers collide.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -15,7 +28,7 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 ///
 /// 🛡️ The temporary file is owner-only from creation on Unix, synchronized
 /// before publication, and atomically renamed over the destination.
-pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+pub fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

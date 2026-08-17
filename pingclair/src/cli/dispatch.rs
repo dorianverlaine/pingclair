@@ -306,15 +306,50 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                     .finish()
                     .map_err(|error| anyhow::anyhow!("❌ Export failed: {error}"))?;
             } else {
-                let file = std::fs::File::create(&output)
+                // 🔐 Owner-only from creation, not from a later `chmod`. This
+                // archive contains the TLS store — the internal CA's private key,
+                // every issued certificate's key, and the ACME account key. A
+                // plain `File::create` makes it `0644` under the ordinary umask,
+                // and even a `chmod` straight afterwards leaves a window in which
+                // another local user can open it and keep reading through the
+                // descriptor after the mode changes.
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create(true).truncate(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let file = options
+                    .open(&output)
                     .map_err(|error| anyhow::anyhow!("❌ Cannot create {output}: {error}"))?;
+                // 🧹 An existing file keeps its own mode, because `mode` only
+                // applies at creation. Say so rather than leaving the operator to
+                // discover that overwriting a `0644` file kept it readable.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let mode = file
+                        .metadata()
+                        .map(|metadata| metadata.permissions().mode() & 0o777)
+                        .unwrap_or(0);
+                    if mode & 0o077 != 0 {
+                        eprintln!(
+                            "⚠️ {output} already existed with mode {mode:o}; it holds private                              keys and is readable beyond its owner. Remove it and export again,                              or chmod 600 it now."
+                        );
+                    }
+                }
                 let mut builder = tar::Builder::new(file);
                 builder
                     .append_dir_all("pingclair", &dir)
                     .map_err(|error| anyhow::anyhow!("❌ Export failed: {error}"))?;
-                builder
-                    .finish()
+                let file = builder
+                    .into_inner()
                     .map_err(|error| anyhow::anyhow!("❌ Export failed: {error}"))?;
+                // 💾 Durable before the success line: an operator who is told the
+                // export succeeded will delete the source.
+                file.sync_all()
+                    .map_err(|error| anyhow::anyhow!("❌ Export could not be flushed: {error}"))?;
                 println!("✅ Store exported to {output}");
             }
         }

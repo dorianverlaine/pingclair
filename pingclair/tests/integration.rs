@@ -6498,6 +6498,19 @@ fn test_cli_surface_commands() {
         "{}",
         String::from_utf8_lossy(&export.stderr)
     );
+    // 🔐 The archive is the TLS store: the internal CA's private key, every
+    // issued certificate's key, and the ACME account key. `File::create` made it
+    // `0644` under the ordinary umask, so an export left every one of those
+    // readable by any local user until somebody noticed.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&out).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "an export archive holds private keys and must be owner-only; got mode {mode:o}"
+        );
+    }
     let store2 = tls.path().join("store2");
     let import = Command::new(bin)
         .args(["storage-import", "-i", out.to_str().unwrap()])
@@ -7002,6 +7015,38 @@ async fn test_admin_autosave_and_resume() {
 
     let autosave = server._temp_dir.path().join("tls/autosave.json");
     assert!(autosave.is_file(), "autosave must exist after /load");
+
+    // 🔐 The autosaved document is a secret: it carries the admin key and any
+    // DNS credentials the configuration named. `std::fs::write` would have made
+    // it `0666 & !umask` — `0644` under the ordinary default — so every local
+    // user could read the key for as long as the file existed.
+    //
+    // 🧭 Asserted on the *real* file written by the *real* binary rather than on
+    // the writer in isolation, because the defect was not in the writer: it was
+    // that this path did not use one.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&autosave).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the autosaved document holds the admin key and must not be readable \
+             beyond its owner; got mode {mode:o}"
+        );
+        // 🧬 And no temporary file left behind — the old writer used a fixed
+        // `<path>.tmp`, which both collided between writers and could survive a
+        // failure with the secret in it at whatever mode the umask gave.
+        let leftovers: Vec<_> = std::fs::read_dir(server._temp_dir.path().join("tls"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a temporary file survived the autosave: {leftovers:?}"
+        );
+    }
     let listen_addr = server.address(0);
     let tls_dir = server._temp_dir.path().join("tls");
     server.stop();

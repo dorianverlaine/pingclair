@@ -115,6 +115,14 @@ lets the rest converge.
   to the certificate is the fix in all three cases. See the Security entry
   below.
 
+- 🔐 **The autosaved config document and `storage-export` archives are now mode
+  `0600`.** Both hold secrets — the admin key and DNS credentials in one, private
+  keys in the other — and both used to be created `0644`. A process running as a
+  different user that reads either file will now be denied; run it as the owner,
+  or copy the file deliberately. `storage-export` warns rather than silently
+  keeping a looser mode when the destination already exists, because `mode` only
+  applies at creation. See the Security entry below.
+
 - 🗜️ **Static files larger than 8 MiB are no longer compressed on the fly.**
   Dynamic compression needs the whole body in memory, so its cost was
   proportional to the largest file in the document root and the choice belonged
@@ -871,6 +879,27 @@ lets the rest converge.
   wrong); upstream and internal failures are untouched and still ERROR.
 
 ### 🔐 Security
+
+- 🙈 **Two files holding secrets were written world-readable.** The Admin API's
+  autosaved document carries the admin key and any DNS provider credentials the
+  configuration named; a `storage-export` archive carries the internal CA's
+  private key, every issued certificate's key, and the ACME account key. Both
+  went through a plain create, which produces `0666 & !umask` — `0644` under the
+  ordinary default — so every local user could read them. Both are now owner-only
+  from creation rather than from a later `chmod`, which would leave a window in
+  which the file is open and readable.
+
+  The autosave also went through a fixed `<path>.tmp` with no `fsync`, so two
+  writers collided and a crash could leave a truncated document where the next
+  start expects a complete one. It now uses the same atomic writer the TLS store
+  has always used: unique temporary, owner-only at creation, fsync, rename, fsync
+  the parent.
+
+  Alongside it, the admin key and DNS provider arguments are now held in a
+  `SecretString` whose `Debug` prints `SecretString(redacted)`. Nothing prints
+  them today; a derived `Debug` on a type containing a secret is one `{:?}`
+  anywhere — including in a panic message — away from a log line, and no amount of
+  care at each call site fixes that. Found by review.
 
 - 🌊 **Three ways to ask a static file server for a large file allocated the
   whole file.** Streaming had one shape — a complete, uncompressed response above

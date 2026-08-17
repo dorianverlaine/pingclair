@@ -4,7 +4,9 @@
 //! Configuration types and management
 
 mod loader;
+pub mod secret;
 mod types;
 
 pub use loader::ConfigLoader;
+pub use secret::SecretString;
 pub use types::*;

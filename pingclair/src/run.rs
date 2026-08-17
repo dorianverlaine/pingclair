@@ -1215,8 +1215,9 @@ fn build_dns_provider(
                     "the cloudflare provider needs an API token: `dns cloudflare <token>`"
                 )
             })?;
-            let provider =
-                pingclair_tls::dns01::cloudflare::CloudflareProvider::new(token.clone())?;
+            let provider = pingclair_tls::dns01::cloudflare::CloudflareProvider::new(
+                token.expose().to_string(),
+            )?;
             Ok(Arc::new(provider))
         }
         other => anyhow::bail!(

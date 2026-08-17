@@ -69,7 +69,7 @@ impl AdminPolicy {
         let enabled = config.is_some_and(|admin| admin.enabled) && listener_available;
         let auth = config
             .and_then(|admin| admin.api_key.as_ref())
-            .map(|key| Arc::new(ApiKeyAuth::new(key.clone())));
+            .map(|key| Arc::new(ApiKeyAuth::new(key.expose())));
         let origins = Arc::new(OriginPolicy {
             allowed: config
                 .map(|admin| admin.origins.clone())
@@ -115,7 +115,7 @@ impl AdminPolicy {
         let current_revision = self.current.read().revision;
         let auth = config
             .and_then(|admin| admin.api_key.as_ref())
-            .map(|key| Arc::new(ApiKeyAuth::new(key.clone())));
+            .map(|key| Arc::new(ApiKeyAuth::new(key.expose())));
         let origins = Arc::new(OriginPolicy {
             allowed: config
                 .map(|admin| admin.origins.clone())
@@ -832,10 +832,17 @@ fn autosave_document(document: &Arc<RwLock<Value>>, path: &Path) {
     let Ok(json) = serde_json::to_string_pretty(&*document.read()) else {
         return;
     };
-    let temporary = path.with_extension("tmp");
-    if let Err(error) =
-        std::fs::write(&temporary, json).and_then(|_| std::fs::rename(&temporary, path))
-    {
+    // 🔐 Through the owner-only atomic writer, because this document is a
+    // secret: it carries the admin key and any DNS provider credentials the
+    // configuration named. A plain `fs::write` creates the file `0666 & !umask`
+    // — `0644` under the ordinary default — so every local user could read the
+    // key for as long as the file existed.
+    //
+    // 🧬 It also fixes two things that were wrong even without the secrets: the
+    // temporary name was `<path>.tmp`, fixed rather than unique, so two writers
+    // collided; and nothing was fsynced, so a crash could leave a truncated
+    // document where the next start expects a complete one.
+    if let Err(error) = pingclair_core::secure_file::write_private_file(path, json.as_bytes()) {
         tracing::warn!(%error, "⚠️ Failed to autosave config document");
     }
 }

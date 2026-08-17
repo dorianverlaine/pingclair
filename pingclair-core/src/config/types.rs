@@ -859,8 +859,13 @@ pub struct DnsProviderConfig {
     pub name: String,
 
     /// 🎛️ Everything written after the name, in order.
+    ///
+    /// 🙈 Secrets, as far as this server is concerned. The arguments are the
+    /// provider's own and this code cannot tell which of them is a credential —
+    /// for Cloudflare the whole thing is an API token — so all of them are
+    /// treated as one. Guessing would mean guessing wrong for the next provider.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub arguments: Vec<String>,
+    pub arguments: Vec<crate::config::SecretString>,
 }
 
 /// 📡 The DNS-01 challenge settings for one site, or for the whole server.
@@ -2716,8 +2721,11 @@ pub struct AdminConfig {
     #[serde(default = "default_admin_enabled")]
     pub enabled: bool,
 
-    /// API key for authentication
-    pub api_key: Option<String>,
+    /// 🔑 API key for authentication.
+    ///
+    /// 🙈 Wrapped so a `{:?}` on this struct — or on anything containing it,
+    /// which includes the whole configuration — cannot print the key.
+    pub api_key: Option<crate::config::SecretString>,
 
     /// 🌐 `Origin`/`Host` values allowed to reach the admin API.
     ///

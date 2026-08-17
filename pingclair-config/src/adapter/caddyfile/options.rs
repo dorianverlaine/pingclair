@@ -324,7 +324,10 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                         .ok_or_else(|| AdapterError::ArgumentCount("dns".into(), 1, 0))?;
                     global.dns = Some(DnsProviderConfig {
                         name: name.clone(),
-                        arguments: sub.args[1..].to_vec(),
+                        arguments: sub.args[1..]
+                            .iter()
+                            .map(|arg| arg.as_str().into())
+                            .collect(),
                     });
                 }
                 // 📡 `acme_dns [<provider> [args…]]` moves automatic issuance
@@ -335,9 +338,14 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                 // answers, and only the second one is an error when no `dns`
                 // option exists.
                 "acme_dns" => {
-                    global.acme_dns = Some(sub.args.first().map(|name| DnsProviderConfig {
-                        name: name.clone(),
-                        arguments: sub.args[1..].to_vec(),
+                    global.acme_dns = Some(sub.args.first().map(|name| {
+                        DnsProviderConfig {
+                            name: name.clone(),
+                            arguments: sub.args[1..]
+                                .iter()
+                                .map(|arg| arg.as_str().into())
+                                .collect(),
+                        }
                     }));
                 }
                 // 🔎 `tls_resolvers <ip…>` — which resolvers a propagation

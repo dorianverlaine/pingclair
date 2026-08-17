@@ -17,7 +17,9 @@ pub mod dns01;
 pub mod internal_ca;
 pub mod manager;
 pub mod persistent_challenge_handler;
-mod secure_file;
+/// 🔐 The owner-only atomic writer, shared with everything that puts a
+/// secret on disk. See the module docs for why there is exactly one.
+pub mod secure_file;
 
 pub use acme::{
     AcmeClient, AcmeError, Certificate, ChallengeHandler, ChallengeResponse, ChallengeType,

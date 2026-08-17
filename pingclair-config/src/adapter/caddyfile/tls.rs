@@ -306,7 +306,10 @@ pub(super) fn adapt_tls_directive(d: &Directive) -> Result<TlsDirective, Adapter
                         .ok_or_else(|| AdapterError::ArgumentCount("tls dns".into(), 1, 0))?;
                     tls.dns_challenge.get_or_insert_default().provider = Some(DnsProviderConfig {
                         name: name.clone(),
-                        arguments: sub.args[1..].to_vec(),
+                        arguments: sub.args[1..]
+                            .iter()
+                            .map(|arg| arg.as_str().into())
+                            .collect(),
                     });
                 }
                 "resolvers" => {
@@ -635,6 +638,12 @@ mod client_auth_tests {
 #[cfg(test)]
 mod dns_challenge_tests {
 
+    /// 🔓 A secret does not compare with `&str` on purpose, so a test that
+    /// wants the values has to say so.
+    fn exposed(args: &[pingclair_core::config::SecretString]) -> Vec<&str> {
+        args.iter().map(|arg| arg.expose()).collect()
+    }
+
     fn config_of(source: &str) -> pingclair_core::config::PingclairConfig {
         crate::compile(source).expect("the configuration compiles")
     }
@@ -668,7 +677,7 @@ mod dns_challenge_tests {
         );
         let provider = challenge.provider.expect("a provider");
         assert_eq!(provider.name, "cloudflare");
-        assert_eq!(provider.arguments, vec!["secret-token"]);
+        assert_eq!(exposed(&provider.arguments), vec!["secret-token"]);
         assert_eq!(challenge.resolvers, vec!["1.1.1.1", "8.8.8.8"]);
         // ⏱️ Upstream writes durations with units; 5m10s is 310 seconds.
         assert_eq!(challenge.ttl_secs, Some(310));
@@ -712,14 +721,17 @@ mod dns_challenge_tests {
         // 🌐 `acme_dns` moved a site that said nothing at all onto DNS-01.
         let inherited = challenge("inherits.test");
         assert_eq!(
-            inherited.provider.as_ref().unwrap().arguments,
+            exposed(&inherited.provider.as_ref().unwrap().arguments),
             ["global-token"]
         );
         assert_eq!(inherited.resolvers, vec!["1.1.1.1", "8.8.8.8"]);
 
         // 🎯 The site that spoke for itself is not overwritten by the global.
         let own = challenge("overrides.test");
-        assert_eq!(own.provider.as_ref().unwrap().arguments, ["own-token"]);
+        assert_eq!(
+            exposed(&own.provider.as_ref().unwrap().arguments),
+            ["own-token"]
+        );
         assert_eq!(own.resolvers, vec!["9.9.9.9"]);
     }
 
