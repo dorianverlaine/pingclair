@@ -1027,6 +1027,188 @@ pub(crate) fn rewrite_uri(
     }
 }
 
+// MARK: - Outbound request sanitizing
+
+/// 🚫 Client request fields that must never reach anything behind this proxy.
+///
+/// Not "hop-by-hop" — that is one of the reasons a field is on this list, not
+/// the organising idea. The organising idea is that each of these lets a client
+/// assert something only this server is in a position to know, or hands
+/// something addressed to this server to somebody else:
+///
+/// - `proxy-connection`, `keep-alive`: connection-scoped by RFC 9110 §7.6.1.
+/// - `proxy-authorization`, `proxy-authenticate`: credentials addressed to *this*
+///   proxy (RFC 9110 §11.7.1). Relaying them is only correct between proxies
+///   that cooperatively authenticate, which this server does not do — so the
+///   safe reading is that they stop here rather than being handed to an origin.
+/// - `forwarded`: RFC 7239 forwarding identity. A client can write any value it
+///   likes, so the only trustworthy version is the one rebuilt from the verified
+///   socket peer. The client's copy is dropped and replaced, never appended to.
+/// - `proxy`: not a real HTTP field at all. It exists because a CGI runtime maps
+///   request fields to `HTTP_*` environment variables, so `Proxy: http://evil`
+///   arrives as `HTTP_PROXY` — which libraries then use to route their own
+///   outbound requests. The field has no legitimate sender, so it is refused
+///   everywhere rather than only at the CGI sink.
+///
+/// `te` is handled separately because a genuine protocol upgrade may negotiate
+/// transfer codings, and `connection`/`upgrade` because that same upgrade needs
+/// them to survive.
+pub(crate) const NEVER_FORWARDED_TO_ORIGIN: &[&str] = &[
+    "proxy-connection",
+    "keep-alive",
+    "proxy-authorization",
+    "proxy-authenticate",
+    "forwarded",
+    "proxy",
+];
+
+/// 🧹 The single answer to "may this client field be passed along?"
+///
+/// Four sinks need it — the HTTP/1.1 and HTTP/2 upstream path, the HTTP/3 one,
+/// inline authorization subrequests, and the FastCGI environment — and before
+/// this existed each kept its own list. They disagreed, which is the ordinary
+/// fate of four copies of a security rule: HTTP/3 forwarded proxy credentials
+/// and a client's `Forwarded`, the subrequest did the same, and FastCGI turned a
+/// client's `Proxy` field into `HTTP_PROXY`.
+///
+/// 🎯 Deliberately a *predicate* rather than a procedure, because the four sinks
+/// do genuinely different things with the answer: two of them copy fields into a
+/// new header map, one removes fields from a map already copied, and one decides
+/// which environment variables to define. Sharing the decision is what matters;
+/// sharing the loop would have meant contorting three callers to match a fourth.
+///
+/// 📌 What this does *not* cover, on purpose: `host`, `content-length`,
+/// `transfer-encoding` and `trailer`. Those are message framing, and framing is
+/// legitimately per-sink — Pingora re-frames the body for an HTTP/1 upstream,
+/// HTTP/3 has no chunked encoding to speak of, and a CGI script is told the
+/// length through `CONTENT_LENGTH`. Each sink keeps its own framing exclusions
+/// next to the code that does the framing.
+pub(crate) struct OutboundRequestFilter<'a> {
+    /// 🎯 Borrowed rather than collected into a `Vec<String>`: the tokens are
+    /// re-read per candidate field instead of being lowercased once into a fresh
+    /// allocation. `Connection` almost always carries a single token, and this
+    /// runs on every proxied request, so the allocation is the expensive half.
+    client_headers: &'a http::HeaderMap,
+    /// 🔌 A WebSocket tunnel needs `Connection`, `Upgrade` and possibly `TE` to
+    /// reach the origin; stripping them would not harden anything, it would
+    /// simply break tunnelling.
+    upgrading: bool,
+}
+
+impl<'a> OutboundRequestFilter<'a> {
+    /// 🏗️ Reads the client's request once to decide the two things that vary.
+    pub(crate) fn for_client(client_headers: &'a http::HeaderMap) -> Self {
+        Self {
+            upgrading: is_websocket_upgrade(client_headers),
+            client_headers,
+        }
+    }
+
+    /// 🔌 Whether this request is a protocol upgrade that must be tunnelled.
+    pub(crate) fn is_upgrading(&self) -> bool {
+        self.upgrading
+    }
+
+    /// 🚫 Whether this client field must not be passed to whatever is behind us.
+    ///
+    /// `name` is compared case-insensitively, so a caller may pass the field
+    /// name exactly as the client spelled it.
+    pub(crate) fn blocks(&self, name: &str) -> bool {
+        if NEVER_FORWARDED_TO_ORIGIN
+            .iter()
+            .any(|blocked| blocked.eq_ignore_ascii_case(name))
+        {
+            return true;
+        }
+        if name.eq_ignore_ascii_case("te")
+            || name.eq_ignore_ascii_case("connection")
+            || name.eq_ignore_ascii_case("upgrade")
+        {
+            return !self.upgrading;
+        }
+        self.connection_names(name)
+    }
+
+    /// 🎯 Whether the client's `Connection` field names this field.
+    ///
+    /// RFC 9110 §7.6.1: `Connection` lists fields that apply to this hop only,
+    /// and a proxy has to remove every one of them. It is also an attack
+    /// surface pointed the other way — a client naming a header this server is
+    /// about to set could otherwise delete it — which is why the sinks consult
+    /// this *before* adding anything of their own.
+    pub(crate) fn connection_names(&self, name: &str) -> bool {
+        self.connection_tokens()
+            .any(|token| token.eq_ignore_ascii_case(name))
+    }
+
+    /// 🔎 The field names the client's `Connection` header lists.
+    ///
+    /// `close`, `keep-alive` and `upgrade` are skipped: the first two describe
+    /// the connection rather than naming a field, and `upgrade` is the tunnel
+    /// exception handled above.
+    pub(crate) fn connection_tokens(&self) -> impl Iterator<Item = &'a str> + '_ {
+        self.client_headers
+            .get_all("connection")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .map(str::trim)
+            .filter(|token| {
+                !token.is_empty()
+                    && !token.eq_ignore_ascii_case("close")
+                    && !token.eq_ignore_ascii_case("keep-alive")
+                    && !token.eq_ignore_ascii_case("upgrade")
+            })
+    }
+}
+
+/// 🧪 The one header matrix every sink is tested against.
+///
+/// Lives beside the filter rather than in a test module because four different
+/// files assert with it, and a matrix each of them copies would drift exactly
+/// the way the exclusion lists did. Each entry is a field a client can send and
+/// the answer the filter must give.
+///
+/// The `expect_blocked` flag is the whole point: a matrix of only bad cases
+/// passes trivially against a filter that blocks everything, which would break
+/// every proxied request while looking like a hardened one.
+#[cfg(test)]
+pub(crate) const SANITIZER_MATRIX: &[(&str, &str, bool)] = &[
+    // 🔑 Credentials addressed to this proxy.
+    ("proxy-authorization", "Basic c3B5Om11Y2g=", true),
+    ("proxy-authenticate", "Basic realm=\"x\"", true),
+    // 🌐 Forwarding identity a client must not be able to assert.
+    ("forwarded", "for=203.0.113.9;host=evil.test", true),
+    // 🕳️ Not a real HTTP field; becomes `HTTP_PROXY` at a CGI sink.
+    ("proxy", "http://attacker.test:3128", true),
+    // 🔗 Connection-scoped by RFC 9110 §7.6.1.
+    ("proxy-connection", "keep-alive", true),
+    ("keep-alive", "timeout=5", true),
+    // ✅ Ordinary end-to-end fields, which must survive.
+    ("authorization", "Bearer real-token", false),
+    ("cookie", "session=abc", false),
+    ("accept", "text/html", false),
+    ("user-agent", "probe/1.0", false),
+    ("x-forwarded-for", "203.0.113.9", false),
+    ("content-type", "application/json", false),
+];
+
+/// 🔌 Detects an HTTP/1 WebSocket upgrade before the response enters tunnel mode.
+pub(crate) fn is_websocket_upgrade(headers: &http::HeaderMap) -> bool {
+    headers
+        .get("upgrade")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+        && headers
+            .get("connection")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+            })
+}
+
 // MARK: - Request framing
 
 /// 🚫 Why a request's message framing cannot be trusted.
@@ -1888,5 +2070,111 @@ mod tests {
         inner.remove("via");
         outer.merge(inner);
         assert!(outer.suppresses_via());
+    }
+}
+
+// MARK: - Outbound request sanitizing
+
+#[cfg(test)]
+mod outbound_filter_tests {
+    use super::*;
+
+    fn client_headers(extra: &[(&str, &str)]) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        for (name, value) in extra {
+            headers.append(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                http::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    /// 🛡️ The shared matrix, asked of the shared decision.
+    ///
+    /// Every sink is wired to this function, so this is where the rule itself is
+    /// pinned; the per-sink tests only have to prove they call it. Both
+    /// directions are asserted, because a filter that refuses everything would
+    /// satisfy a bad-cases-only matrix while breaking every proxied request.
+    #[test]
+    fn the_matrix_is_answered_the_same_way_for_every_sink() {
+        let headers = client_headers(&[]);
+        let filter = OutboundRequestFilter::for_client(&headers);
+
+        for (name, _value, expect_blocked) in SANITIZER_MATRIX {
+            assert_eq!(
+                filter.blocks(name),
+                *expect_blocked,
+                "`{name}` was answered the wrong way"
+            );
+        }
+    }
+
+    /// 🔤 Field names are compared without regard to case.
+    ///
+    /// A client picks the spelling, so a filter that matches bytes would be
+    /// bypassed by `Proxy-Authorization` when it blocks `proxy-authorization`.
+    #[test]
+    fn spelling_does_not_get_a_field_past_the_filter() {
+        let headers = client_headers(&[]);
+        let filter = OutboundRequestFilter::for_client(&headers);
+
+        for name in [
+            "Proxy-Authorization",
+            "PROXY-AUTHORIZATION",
+            "Forwarded",
+            "PrOxY",
+        ] {
+            assert!(filter.blocks(name), "`{name}` slipped past on spelling");
+        }
+    }
+
+    /// 🔗 A field named by `Connection` is dropped, whatever it is called.
+    ///
+    /// This works in both directions and the second one is the reason it
+    /// matters: a client naming a header this server is about to set could
+    /// otherwise have it deleted on the way out.
+    #[test]
+    fn connection_named_fields_are_dropped() {
+        let headers = client_headers(&[
+            ("connection", "keep-alive, X-Secret-Hop, x-forwarded-for"),
+            ("x-secret-hop", "gone"),
+        ]);
+        let filter = OutboundRequestFilter::for_client(&headers);
+
+        assert!(filter.blocks("x-secret-hop"));
+        assert!(
+            filter.blocks("X-Forwarded-For"),
+            "a client naming one of our own fields in Connection must have it dropped"
+        );
+        assert!(!filter.blocks("cookie"), "an unnamed field must survive");
+    }
+
+    /// 🔌 A WebSocket upgrade keeps the three fields it needs to be a tunnel.
+    ///
+    /// Stripping them would harden nothing and break tunnelling, which is the
+    /// one case where "remove every connection-scoped field" is the wrong
+    /// reading of RFC 9110.
+    #[test]
+    fn a_websocket_upgrade_keeps_what_a_tunnel_needs() {
+        let headers = client_headers(&[("connection", "Upgrade"), ("upgrade", "websocket")]);
+        let filter = OutboundRequestFilter::for_client(&headers);
+        assert!(filter.is_upgrading());
+
+        assert!(!filter.blocks("connection"));
+        assert!(!filter.blocks("upgrade"));
+        assert!(!filter.blocks("te"));
+        // 🔑 The exception is about tunnelling, not about trust: credentials and
+        // forged identity are still refused.
+        assert!(filter.blocks("proxy-authorization"));
+        assert!(filter.blocks("forwarded"));
+
+        // 🧭 Without the upgrade, the same three are removed again.
+        let plain = client_headers(&[("connection", "keep-alive")]);
+        let plain = OutboundRequestFilter::for_client(&plain);
+        assert!(!plain.is_upgrading());
+        assert!(plain.blocks("connection"));
+        assert!(plain.blocks("upgrade"));
+        assert!(plain.blocks("te"));
     }
 }

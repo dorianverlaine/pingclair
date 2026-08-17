@@ -144,6 +144,18 @@ class Handler(BaseHTTPRequestHandler):
         return connections[key]
 
     def do_GET(self):
+        # 🛡️ Reports exactly which request fields survived the proxy, so the
+        # sanitizer can be asserted against a real HTTP/3 request rather than
+        # against a unit test's idea of one.
+        if self.path.endswith("/echo-headers"):
+            seen = sorted(name.lower() for name in self.headers.keys())
+            body = ("\n".join(f"{n}={self.headers[n]}" for n in seen)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if "/big/" in self.path:
             size = int(self.path.rsplit("/", 1)[-1])
             body = bytes((i % 251) for i in range(size))
@@ -322,6 +334,48 @@ check_eq "5 MiB body is rejected" "413" \
     "$(h3 "${primary_host}" -o /dev/null -w '%{http_code}' --data-binary "@${big_payload}" \
         -H 'Content-Type: application/octet-stream' \
         "https://${primary_host}:${h3_port}/proxy/echo")"
+
+log ""
+log "🔎 Outbound header sanitizing — what the origin is allowed to be told"
+sanitized="$(h3 "${primary_host}" -fsS \
+    -H 'Proxy-Authorization: Basic c3B5Om11Y2g=' \
+    -H 'Proxy-Authenticate: Basic realm="x"' \
+    -H 'Proxy-Connection: keep-alive' \
+    -H 'Forwarded: for=203.0.113.9;host=evil.test' \
+    -H 'Proxy: http://attacker.test:3128' \
+    -H 'Authorization: Bearer real-token' \
+    -H 'Cookie: session=abc' \
+    "https://${primary_host}:${h3_port}/proxy/echo-headers")"
+# 🧭 `Connection` and the fields it names are deliberately not probed here:
+# HTTP/3 forbids the field, so curl never sends one and there is nothing for it
+# to name. That half of the filter is exercised on the HTTP/1.1 path, where a
+# client can actually send it — see the integration test of the same name.
+for blocked in proxy-authorization proxy-authenticate proxy-connection proxy; do
+    if grep -qi "^${blocked}=" <<<"${sanitized}"; then
+        fail "${blocked} reached the origin"
+    else
+        pass "${blocked} stopped at the proxy"
+    fi
+done
+for kept in authorization cookie; do
+    if grep -qi "^${kept}=" <<<"${sanitized}"; then
+        pass "${kept} still reaches the origin"
+    else
+        fail "${kept} was dropped; the filter is refusing more than it should"
+    fi
+done
+# 🌐 The client's Forwarded must be gone *and* replaced by ours, so a present
+# header is not enough — the value has to be the one this server wrote.
+forwarded_line="$(grep -i '^forwarded=' <<<"${sanitized}" || true)"
+if [[ -z "${forwarded_line}" ]]; then
+    fail "Forwarded is absent; HTTP/3 dropped the client's copy but rebuilt nothing"
+elif [[ "${forwarded_line}" == *evil.test* ]]; then
+    fail "the client's own Forwarded reached the origin: ${forwarded_line}"
+elif [[ "${forwarded_line}" == *for=127.0.0.1* ]]; then
+    pass "Forwarded was rebuilt from the verified peer (${forwarded_line})"
+else
+    fail "Forwarded carries neither the client's value nor ours: ${forwarded_line}"
+fi
 
 log ""
 log "🔎 Upstream keepalive — several H3 requests must share one upstream connection"

@@ -43,7 +43,7 @@ use std::time::{Duration, SystemTime};
 use crate::encoding::{ResponseEncoder, negotiate, stream_chunk};
 use crate::http_policy::{
     CorsDecision, ResponseHeaderPolicy, authority_host, evaluate_cors, generate_request_id,
-    rewrite_uri, sanitize_request_id, via_value,
+    is_websocket_upgrade, rewrite_uri, sanitize_request_id, via_value,
 };
 use crate::metrics;
 use crate::overload::{AdmissionError, RouteAdmission, RouteProtection, UpstreamAdmission};
@@ -411,87 +411,51 @@ fn shortest_duration(left: Option<Duration>, right: Option<Duration>) -> Option<
     }
 }
 
-/// 🧹 Fields that never cross a hop, whatever the client says.
+/// 🧹 Removes everything a client must not hand to the origin.
 ///
-/// `Transfer-Encoding` is deliberately absent: HTTP/1 framing belongs to
-/// Pingora, which re-frames the body for the upstream, and removing the field
+/// The list itself lives in `http_policy::OutboundRequestFilter`, shared with
+/// HTTP/3, inline subrequests and the FastCGI environment — four sinks that each
+/// used to carry their own copy and each disagreed with the others.
+///
+/// This is the removing variant: Pingora has already cloned the client's request
+/// into `upstream_request`, so the work is deletion rather than selection. The
+/// `Connection`-named fields are removed by walking the tokens, because the list
+/// of what to delete lives in the very field being deleted.
+///
+/// 📌 `Transfer-Encoding` is deliberately left alone here: HTTP/1 framing belongs
+/// to Pingora, which re-frames the body for the upstream, and removing the field
 /// underneath it would describe a body that is not what gets sent.
-const ALWAYS_HOP_BY_HOP: &[&str] = &[
-    "proxy-connection",
-    "keep-alive",
-    "te",
-    // 🔑 RFC 9110 §11.7.1: consumed by the first inbound proxy. Relaying it is
-    // only correct when proxies cooperatively authenticate, which is not a
-    // thing this server does, so the safe default is to consume it.
-    "proxy-authorization",
-    "proxy-authenticate",
-];
-
-/// 🧹 Removes connection-scoped fields from a request about to be forwarded.
-///
-/// RFC 9110 §7.6.1 requires removing `Connection`, every field it names, and
-/// the connection-specific fields. The one exception is a genuine protocol
-/// upgrade: Pingora detects a WebSocket tunnel by seeing `Connection: upgrade`
-/// together with `Upgrade`, so stripping those would not harden anything — it
-/// would simply break WebSocket.
 fn strip_hop_by_hop_headers(
     session: &Session,
     upstream_request: &mut RequestHeader,
 ) -> pingora_core::Result<()> {
     let downstream = session.req_header();
-    let upgrading = is_websocket_upgrade(&downstream.headers);
+    let filter = crate::http_policy::OutboundRequestFilter::for_client(&downstream.headers);
 
-    // 🎯 Collected before anything is removed, since the list lives in the very
-    // field being removed.
-    let named: Vec<String> = downstream
-        .headers
-        .get_all("connection")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(|token| token.trim().to_ascii_lowercase())
-        .filter(|token| !token.is_empty())
-        .collect();
+    // 🎯 Collected before anything is removed, since the names live in the very
+    // field about to be removed. This is the one place an allocation is
+    // unavoidable: the borrow of `downstream` has to end before
+    // `upstream_request` is mutated, and both alias the same session.
+    let named: Vec<Box<str>> = filter.connection_tokens().map(Box::from).collect();
+    let upgrading = filter.is_upgrading();
 
     for name in &named {
-        // `close` and `keep-alive` describe the connection, not a field, and
-        // `upgrade` is handled by the exception below.
-        if matches!(name.as_str(), "close" | "keep-alive" | "upgrade") {
-            continue;
-        }
-        upstream_request.remove_header(name.as_str());
+        upstream_request.remove_header(name.as_ref());
     }
 
-    for name in ALWAYS_HOP_BY_HOP {
-        if upgrading && *name == "te" {
-            // A tunnelling client may legitimately negotiate transfer codings.
-            continue;
-        }
+    for name in crate::http_policy::NEVER_FORWARDED_TO_ORIGIN {
         upstream_request.remove_header(*name);
     }
 
     if upgrading {
+        // 🔌 A tunnelling client may legitimately negotiate transfer codings,
+        // and needs `Connection`/`Upgrade` to reach the origin at all.
         return Ok(());
     }
+    upstream_request.remove_header("te");
     upstream_request.remove_header("connection");
     upstream_request.remove_header("upgrade");
     Ok(())
-}
-
-/// 🔌 Detects an HTTP/1 WebSocket upgrade before the response enters tunnel mode.
-fn is_websocket_upgrade(headers: &http::HeaderMap) -> bool {
-    headers
-        .get("upgrade")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
-        && headers
-            .get("connection")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| {
-                value
-                    .split(',')
-                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
-            })
 }
 
 /// 🔐 Records the protocol selected by an upstream TLS handshake.
@@ -5403,7 +5367,11 @@ fn ip_header_value(ip: IpAddr) -> http::HeaderValue {
 }
 
 /// 🔀 Formats the `Forwarded` `for=` parameter for one client IP.
-fn forwarded_header_value(ip: IpAddr) -> http::HeaderValue {
+///
+/// 🛡️ Shared with HTTP/3, which has to rebuild the same field: the client's own
+/// `Forwarded` is dropped as unverifiable, so something has to put the verified
+/// identity back or the origin simply loses it.
+pub(crate) fn forwarded_header_value(ip: IpAddr) -> http::HeaderValue {
     let mut buf = [0u8; 96];
     let len = {
         let mut out = StackBuf {

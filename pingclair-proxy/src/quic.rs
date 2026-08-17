@@ -4457,9 +4457,20 @@ async fn reverse_proxy_upstream(
 
         // 🧹 Forward the mutable policy header map so an authorizing
         // subrequest's identity fields reach the backend on H3 too.
+        //
+        // 🛡️ The same filter the HTTP/1.1 and HTTP/2 path uses, rather than a
+        // list maintained here. This loop used to have its own, and it was
+        // missing the ones that matter: proxy credentials addressed to this
+        // server, the fields a client's `Connection` header names, and the
+        // client's own `Forwarded` — which the origin has no way to tell from
+        // one this server wrote.
+        let outbound_filter =
+            crate::http_policy::OutboundRequestFilter::for_client(&client_header.headers);
         for (key, value) in &client_header.headers {
             let name = key.as_str();
             if name == "te" {
+                // 🎫 HTTP/2 upstreams accept exactly one `TE` value, and only
+                // this one; anything else is refused by the h2 crate.
                 if upstream_is_h2
                     && value
                         .to_str()
@@ -4471,16 +4482,16 @@ async fn reverse_proxy_upstream(
                 }
                 continue;
             }
+            // 🧾 Framing fields, which are this sink's own business: QUIC has no
+            // chunked encoding, and the length is set from
+            // `client_content_length` below.
             if matches!(
                 name,
-                "host"
-                    | "connection"
-                    | "keep-alive"
-                    | "transfer-encoding"
-                    | "trailer"
-                    | "upgrade"
-                    | "content-length"
+                "host" | "transfer-encoding" | "trailer" | "content-length"
             ) {
+                continue;
+            }
+            if outbound_filter.blocks(name) {
                 continue;
             }
             up_req.append_header(key.clone(), value.clone()).ok();
@@ -4546,6 +4557,17 @@ async fn reverse_proxy_upstream(
         }
         if !has_header_up("X-Real-IP") {
             up_req.insert_header("X-Real-IP", verified_client_ip).ok();
+        }
+        // 🛡️ Rebuilt from the verified identity, because the client's own
+        // `Forwarded` was dropped as unverifiable. HTTP/1.1 and HTTP/2 have
+        // always set this; HTTP/3 dropped the client's copy and put nothing
+        // back, which left the origin with no forwarding identity at all in the
+        // one format RFC 7239 actually standardises.
+        if !has_header_up("Forwarded") {
+            let identity = verified_client_ip.parse::<IpAddr>().unwrap_or(peer_ip);
+            up_req
+                .insert_header("Forwarded", crate::server::forwarded_header_value(identity))
+                .ok();
         }
         if !has_header_up("X-Request-Id") {
             up_req.insert_header("X-Request-Id", request_id).ok();

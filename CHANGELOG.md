@@ -842,6 +842,32 @@ lets the rest converge.
 
 ### 🔐 Security
 
+- 🧹 **Four places decided what a client may hand to an origin, and they
+  disagreed.** The HTTP/1.1 and HTTP/2 upstream path, the HTTP/3 one, inline
+  authorization subrequests, and the FastCGI environment each carried their own
+  list of fields to drop. Only the first was complete. The other three passed
+  through `Proxy-Authorization` and `Proxy-Authenticate` — credentials addressed
+  to *this* proxy, handed to somebody else — and the client's own `Forwarded`,
+  which an origin has no way to distinguish from one this server wrote. HTTP/3
+  additionally ignored the fields a client's `Connection` header names, and
+  FastCGI turned a client's `Proxy` field into the `HTTP_PROXY` environment
+  variable, which libraries inside a CGI script read to decide where to route
+  their own outbound requests.
+
+  All four now share one filter. HTTP/3 also rebuilds `Forwarded` from the
+  verified socket peer, which HTTP/1.1 and HTTP/2 already did — previously it
+  dropped nothing and added nothing, so the origin received whatever the client
+  claimed.
+
+  **What changes for a working setup.** Ordinary end-to-end fields —
+  `Authorization`, `Cookie`, `X-Forwarded-For`, everything an application
+  actually reads — are unaffected. A CGI script that was reading
+  `HTTP_PROXY`, `HTTP_FORWARDED`, or `HTTP_PROXY_AUTHORIZATION` from a client
+  will no longer see them; `REMOTE_ADDR` carries the verified client address and
+  is the field to use instead. An authorization service behind `forward_auth`
+  likewise stops receiving the client's `Forwarded`; give it what it needs with
+  an explicit `header_up`.
+
 - 🔁 **An upstream that died after reading a request could make this server
   send it again.** The most ordinary failure a reverse proxy sees is an origin
   closing a pooled keep-alive connection, and the request travelling on it

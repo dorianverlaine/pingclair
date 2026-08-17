@@ -325,20 +325,28 @@ pub(crate) fn build_environment(
     }
 
     // 🧾 End-to-end fields exclude hop-by-hop and dedicated CGI variables.
+    //
+    // 🛡️ CGI is the sink where a forwarded field stops being data and becomes
+    // configuration: every request header arrives as an `HTTP_*` environment
+    // variable, and environment variables are what libraries read to decide how
+    // to behave. `Proxy: http://attacker` becomes `HTTP_PROXY`, which an HTTP
+    // client inside the script will then route its own outbound requests
+    // through. That is why the shared filter refuses `proxy` outright rather
+    // than only here — but here is where it would have done the damage.
+    let filter = crate::http_policy::OutboundRequestFilter::for_client(&request.headers);
     for name in request.headers.keys() {
         let lower = name.as_str().to_ascii_lowercase();
+        // 🧾 Framing and CGI-reserved names: the script is told the length
+        // through `CONTENT_LENGTH` and the host through `HTTP_HOST`, and an
+        // underscore in a field name would alias a variable the server sets.
         if matches!(
             lower.as_str(),
-            "host"
-                | "content-length"
-                | "connection"
-                | "keep-alive"
-                | "transfer-encoding"
-                | "te"
-                | "trailer"
-                | "upgrade"
+            "host" | "content-length" | "transfer-encoding" | "trailer"
         ) || lower.contains('_')
         {
+            continue;
+        }
+        if filter.blocks(&lower) {
             continue;
         }
         let variable = format!(
@@ -450,6 +458,52 @@ mod tests {
         assert_eq!(environment["REQUEST_URI"], "/original.php?x=1");
         assert_eq!(environment["REMOTE_PORT"], "44321");
         assert_eq!(environment["HTTP_X_ROLE"], "admin");
+    }
+
+    /// 🛡️ No client field becomes an environment variable it should not.
+    ///
+    /// The `HTTP_PROXY` case is the one worth naming. CGI turns every request
+    /// field into an `HTTP_*` variable, and environment variables are how
+    /// libraries are configured rather than how they are told about data — so
+    /// `Proxy: http://attacker` used to arrive as `HTTP_PROXY`, and an HTTP
+    /// client inside the script would route its own outbound calls through it.
+    /// The field has no legitimate sender; there is nothing to preserve.
+    #[test]
+    fn the_shared_matrix_becomes_only_the_variables_it_should() {
+        let mut request = RequestHeader::build(http::Method::GET, b"/index.php", None).unwrap();
+        request.insert_header("host", "example.test").unwrap();
+        for (name, value, _) in crate::http_policy::SANITIZER_MATRIX {
+            request.append_header(*name, *value).unwrap();
+        }
+        let config = FastCgiTransportConfig {
+            root: Some("/srv/www".to_string()),
+            ..Default::default()
+        };
+        let environment = build_environment(
+            EnvironmentInput {
+                request: &request,
+                remote_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 4)),
+                remote_port: Some(44321),
+                scheme: "https",
+                original_uri: "/index.php",
+                request_vars: &RequestVars::default(),
+            },
+            &config,
+        )
+        .unwrap();
+
+        for (name, _value, expect_blocked) in crate::http_policy::SANITIZER_MATRIX {
+            let variable = format!("HTTP_{}", name.to_ascii_uppercase().replace('-', "_"));
+            assert_eq!(
+                !environment.contains_key(&variable),
+                *expect_blocked,
+                "`{name}` became `{variable}` the wrong way"
+            );
+        }
+
+        // 🧭 The verified identity is still what the script is told, and it
+        // comes from the socket rather than from anything the client wrote.
+        assert_eq!(environment["REMOTE_ADDR"], "192.0.2.4");
     }
 
     /// 🧰 Header templates are resolved once before they become CGI variables.

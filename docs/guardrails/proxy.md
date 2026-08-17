@@ -313,3 +313,56 @@ H1/H2 那支證出來的錯誤形狀 ＋ `h3_refused_backend_still_fails_closed`
   「失敗是模稜兩可的」這個前提就沒有被證明，測的可能只是「送一半就斷」。
   🔌 失敗之後 downstream 連線也會被關掉，所以控制組要用**新的 client**，
   否則 reqwest 重用死連線、回報 `IncompleteMessage`，看起來像伺服器的錯。
+
+---
+
+## 🧹 出站 header sanitizing（2026-08-17）
+
+- 🤡 **四個 sink 各自維護一份排除清單，結果只有一份是對的。**
+  H1/H2 上游、H3 上游、inline authorization subrequest、FastCGI environment
+  ——四個地方都在回答同一個問題「客戶端這個欄位可以交給後面嗎」，
+  四份清單，三份漏東西。漏的都不是小的：`Proxy-Authorization`
+  （**寄給這台 proxy 的憑證，被交給別人**）、客戶端自己的 `Forwarded`
+  （origin 分不出是不是我們寫的）、`Connection` 指名的欄位。
+  🎯 現在只有一份：`http_policy::OutboundRequestFilter`。
+
+- 🎯 **它刻意是一個 predicate，不是一個 procedure。**
+  四個 sink 對答案做的事真的不一樣：兩個是「把欄位複製進新的 header map」、
+  一個是「從已經複製好的 map 裡刪」、一個是「決定要定義哪些環境變數」。
+  共用**決定**是重點；共用**迴圈**會變成把三個呼叫端扭來配合第四個。
+
+- 🕳️ **`Proxy` 不是一個真的 HTTP 欄位，它只因為攻擊而存在。**
+  CGI 把每個 request 欄位變成 `HTTP_*` 環境變數，而環境變數是**設定**函式庫
+  用的、不是傳資料用的。所以 `Proxy: http://attacker` 到了 CGI 就是
+  `HTTP_PROXY`，腳本裡的 HTTP client 會拿它當出站代理。
+  📌 因此它是在**共用清單**裡拒絕，不是只在 FastCGI 拒絕——
+  這個欄位沒有合法的寄件者，沒有東西需要保留。
+
+- 🛡️ **hop-by-hop 要在加上自己的欄位之前清掉，順序是安全性的一部分。**
+  客戶端可以在 `Connection` 裡指名**我們即將設定的** header
+  （測試裡用 `Connection: X-Real-IP` 釘住這件事）。先清再加，
+  那個嘗試就失敗；反過來就會讓客戶端刪掉我們的欄位。
+
+- ⚖️ **`Forwarded` 是「丟掉」加「重建」，不是只丟掉。**
+  只丟掉的話，origin 什麼都收不到——RFC 7239 那個唯一標準化的格式整個消失。
+  H3 原本兩件都沒做（既不丟也不建），所以 origin 收到的是客戶端說的。
+  🎯 所以測試不能只斷言「header 不見了」或「header 在」，
+  要斷言**值是我們寫的那個**：`forwarded=for=127.0.0.1` 而不是 `evil.test`。
+
+- 🧭 **framing 欄位刻意不放進共用清單**（`host`、`content-length`、
+  `transfer-encoding`、`trailer`）。那是訊息分幀，而分幀本來就每個 sink 不同：
+  Pingora 會替 H1 上游重新分幀、H3 沒有 chunked、CGI 用 `CONTENT_LENGTH` 告知長度。
+  每個 sink 把自己的 framing 排除留在做分幀的那段程式碼旁邊。
+
+- 🤡 **`Connection` 那一格在 H3 上測不到，因為 HTTP/3 禁止這個欄位。**
+  curl 根本不會送，所以沒有 token 可以指名任何東西——
+  第一版探針就是這樣「紅」的，而那個紅是測試錯不是程式錯。
+  那一格屬於 H1/H2 整合測試。**寫 parity 測試時要先問：這個輸入在那個
+  protocol 上表達得出來嗎？**
+
+- 🧪 **測試矩陣只有一份，放在 `http_policy.rs` 的 `SANITIZER_MATRIX`。**
+  四個檔案都拿它斷言——如果每個檔案各抄一份，它們會和當初那四份排除清單
+  以完全一樣的方式漂移。
+  📌 矩陣裡**必須有「該通過」的案例**（`expect_blocked: false`）：
+  只有壞案例的矩陣，對著一個「全部擋掉」的 filter 會全過，
+  而那個 filter 會弄壞每一個被代理的請求。

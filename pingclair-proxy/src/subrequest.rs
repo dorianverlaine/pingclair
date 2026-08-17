@@ -205,36 +205,30 @@ pub(crate) async fn execute(
 }
 
 /// 🧹 Copies only end-to-end request fields into a bodyless subrequest.
+///
+/// 🛡️ The authorization service is a sink like any origin, and arguably a more
+/// sensitive one: it exists to make a yes/no decision about this request, so a
+/// field the client forged is a field the client got to vote with. The filter is
+/// therefore the shared one — this function used to keep its own list, which
+/// omitted the proxy credentials and the client's `Forwarded`.
 fn copy_end_to_end_headers(
     source: &RequestHeader,
     destination: &mut RequestHeader,
 ) -> Result<(), (u16, &'static str)> {
-    let connection_fields: Vec<String> = source
-        .headers
-        .get_all("connection")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| !value.is_empty())
-        .collect();
+    let filter = crate::http_policy::OutboundRequestFilter::for_client(&source.headers);
     for (name, value) in &source.headers {
-        let lower = name.as_str().to_ascii_lowercase();
+        // 🧾 Framing fields, plus underscore-bearing names: a subrequest carries
+        // no body, and an underscore alias can collide with a CGI variable at
+        // whatever the auth service is built on.
         if name.as_str().contains('_')
-            || connection_fields.iter().any(|field| field == &lower)
             || matches!(
-                lower.as_str(),
-                "host"
-                    | "connection"
-                    | "proxy-connection"
-                    | "keep-alive"
-                    | "transfer-encoding"
-                    | "te"
-                    | "trailer"
-                    | "upgrade"
-                    | "content-length"
+                name.as_str(),
+                "host" | "transfer-encoding" | "trailer" | "content-length"
             )
         {
+            continue;
+        }
+        if filter.blocks(name.as_str()) {
             continue;
         }
         destination
@@ -286,6 +280,32 @@ mod tests {
         assert!(!destination.headers.contains_key("x-hop"));
         assert!(!destination.headers.contains_key("x_gateway"));
         assert_eq!(destination.headers.get_all("x-end").iter().count(), 2);
+    }
+
+    /// 🛡️ The authorization service sees the same sanitized matrix every other
+    /// sink sees.
+    ///
+    /// It is the sink where a forged field costs the most: the service exists to
+    /// answer yes or no about this request, so anything the client can plant is
+    /// something the client gets to vote with. This used to copy proxy
+    /// credentials and the client's own `Forwarded` straight through.
+    #[test]
+    fn the_shared_matrix_reaches_the_authorization_service_sanitized() {
+        let mut source = RequestHeader::build("POST", b"/private", None).unwrap();
+        for (name, value, _) in crate::http_policy::SANITIZER_MATRIX {
+            source.append_header(*name, *value).unwrap();
+        }
+        let mut destination = RequestHeader::build("GET", b"/auth", None).unwrap();
+
+        copy_end_to_end_headers(&source, &mut destination).unwrap();
+
+        for (name, _value, expect_blocked) in crate::http_policy::SANITIZER_MATRIX {
+            assert_eq!(
+                !destination.headers.contains_key(*name),
+                *expect_blocked,
+                "`{name}` reached the authorization service the wrong way"
+            );
+        }
     }
 
     #[tokio::test]

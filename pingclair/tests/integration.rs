@@ -829,6 +829,126 @@ async fn test_active_health_check_removes_idle_failed_upstream() {
     let _ = second_task.await;
 }
 
+/// 🛡️ The origin is only ever told things this server can vouch for.
+///
+/// The same matrix the HTTP/3 script probes, on the HTTP/1.1 path — plus the one
+/// case only HTTP/1.1 can express. HTTP/3 forbids the `Connection` field, so a
+/// client there cannot name headers for removal; here it can, and it cuts both
+/// ways. A client naming its own smuggled header gets it dropped, and a client
+/// naming one of *ours* must not be able to delete it on the way out.
+#[tokio::test]
+async fn test_the_origin_only_sees_headers_this_server_vouches_for() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let request =
+                    read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+                // 📋 Echo back the field names, one per line, so the assertions
+                // read against what the origin actually received.
+                let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                let names: Vec<&str> = text
+                    .lines()
+                    .skip(1)
+                    .filter(|line| !line.trim().is_empty())
+                    .collect();
+                let body = names.join("\n");
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            reverse_proxy http://{upstream_address}
+        }}
+        "#
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let echoed = client
+        .get(server.url(0, "/echo"))
+        .header("Proxy-Authorization", "Basic c3B5Om11Y2g=")
+        .header("Proxy-Authenticate", "Basic realm=\"x\"")
+        .header("Proxy-Connection", "keep-alive")
+        .header("Forwarded", "for=203.0.113.9;host=evil.test")
+        .header("Proxy", "http://attacker.test:3128")
+        .header("Connection", "X-Secret-Hop, X-Real-IP")
+        .header("X-Secret-Hop", "gone")
+        .header("Authorization", "Bearer real-token")
+        .header("Cookie", "session=abc")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    for blocked in [
+        "proxy-authorization",
+        "proxy-authenticate",
+        "proxy-connection",
+        "proxy:",
+        "x-secret-hop",
+    ] {
+        assert!(
+            !echoed.contains(blocked),
+            "`{blocked}` reached the origin:\n{echoed}"
+        );
+    }
+    for kept in ["authorization: bearer real-token", "cookie: session=abc"] {
+        assert!(
+            echoed.contains(kept),
+            "`{kept}` was dropped; the filter refuses more than it should:\n{echoed}"
+        );
+    }
+
+    // 🌐 Dropped *and* replaced. A present `Forwarded` is not enough — the value
+    // has to be the one this server wrote from the verified socket peer.
+    assert!(
+        !echoed.contains("evil.test"),
+        "the client's own Forwarded reached the origin:\n{echoed}"
+    );
+    assert!(
+        echoed.contains("forwarded: for=127.0.0.1"),
+        "Forwarded was not rebuilt from the verified peer:\n{echoed}"
+    );
+
+    // 🛡️ The client named `X-Real-IP` in `Connection`, trying to delete a field
+    // this server sets. Removing hop-by-hop fields before adding our own is what
+    // makes that fail.
+    assert!(
+        echoed.contains("x-real-ip: 127.0.0.1"),
+        "a client deleted one of our own headers by naming it in Connection:\n{echoed}"
+    );
+
+    upstream_task.abort();
+    let _ = upstream_task.await;
+}
+
 /// 🛡️ An upstream that dies *after* reading the request must not make this
 /// server send the request again.
 ///
