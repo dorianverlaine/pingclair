@@ -183,6 +183,23 @@ impl HidePolicy {
 }
 
 impl FileServerConfig {
+    /// 🗜️ Whether a response from this configuration can differ by
+    /// `Accept-Encoding`, and therefore has to carry `Vary: Accept-Encoding`.
+    ///
+    /// 🤡 This used to be the `compress` flag alone, which missed the other way a
+    /// body varies. A site serving `.gz` sidecars with dynamic compression off
+    /// returned two different bodies for one URL and told caches nothing, so a
+    /// shared cache stored whichever it saw first and handed a gzip body to a
+    /// client that never asked for one.
+    ///
+    /// 📌 Computed per response rather than precomputed into a field: it is two
+    /// `is_empty` checks against a `readdir`-and-`stat` request, and the
+    /// alternative is a new field on a struct built by literal in twelve places
+    /// across both transports — where the real risk is one of them being missed.
+    pub fn varies_by_accept_encoding(&self) -> bool {
+        self.compress || !self.precompressed.is_empty()
+    }
+
     /// 🧾 Builds the runtime configuration from what a `file_server` handler
     /// declared, resolving everything that a request would otherwise redo.
     ///

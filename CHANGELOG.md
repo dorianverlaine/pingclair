@@ -940,6 +940,22 @@ lets the rest converge.
 
 ### 🔐 Security
 
+- 🔐 **The Admin API key comparison was labelled constant-time and was not.** The
+  comment above it said `Constant-time comparison`; the implementation was
+  `.all()`, which short-circuits, so it returned as soon as two bytes differed and
+  the time it took revealed how many leading bytes were correct. That is how a
+  secret is recovered one byte at a time. The comment was the worst part — it told
+  every later reader the property had been handled. It now goes through
+  `subtle::ConstantTimeEq`, already in the dependency tree via `bcrypt`.
+
+- 🗜️ **A site serving pre-compressed sidecars did not send `Vary:
+  Accept-Encoding`.** The header was tied to the dynamic `compress` flag alone, so
+  a site with `precompressed` and compression off returned two different bodies
+  for one URL — one gzip, one not, chosen by `Accept-Encoding` — while telling
+  caches nothing. A shared cache stores whichever it saw first and serves it to
+  everyone, so a client that never asked for gzip receives a gzip body it cannot
+  read. The header now follows either way a body can vary. Found by review.
+
 - ☁️ **The DNS-01 client's response ceiling described a bound it did not enforce,
   and it had no deadline at all.** The 1 MiB limit was checked *after*
   `.collect()` had already buffered the whole body, under a comment saying it was

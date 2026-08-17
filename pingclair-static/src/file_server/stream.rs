@@ -311,7 +311,7 @@ impl FileServer {
             status: window.status,
             content_range: window.content_range,
             content_encoding: window.content_encoding,
-            vary_accept_encoding: server.config.compress,
+            vary_accept_encoding: server.config.varies_by_accept_encoding(),
             bytes_read: 0,
         })
     }

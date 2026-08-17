@@ -9,6 +9,9 @@ rust-version.workspace = true
 description = "Admin REST API for Pingclair"
 
 [dependencies]
+# 🔐 Constant-time comparison for the Admin API key. Already in the tree at one
+# version through `bcrypt`; naming it only makes the API reachable.
+subtle = "2.6"
 pingclair-core = { path = "../pingclair-core" }
 # 🛡️ The Admin API must reach the canonical validator, not re-implement
 # a second set of rules that drifts from the Pingclairfile path.

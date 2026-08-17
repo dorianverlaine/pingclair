@@ -254,7 +254,7 @@ impl FileServer {
                         last_modified: None,
                         etag: None,
                         content_encoding: encoding,
-                        vary_accept_encoding: self.config.compress,
+                        vary_accept_encoding: self.config.varies_by_accept_encoding(),
                     })));
                 } else {
                     return Ok(None);
@@ -336,7 +336,7 @@ impl FileServer {
                     last_modified: meta.last_modified.clone(),
                     etag: Some(meta.etag.clone()),
                     content_encoding: Some(enc.to_string()),
-                    vary_accept_encoding: self.config.compress,
+                    vary_accept_encoding: self.config.varies_by_accept_encoding(),
                 })));
             }
         }
@@ -395,7 +395,7 @@ impl FileServer {
                 last_modified: meta.last_modified.clone(),
                 etag: Some(meta.etag.clone()),
                 content_encoding: Some(encoding.to_string()),
-                vary_accept_encoding: self.config.compress,
+                vary_accept_encoding: self.config.varies_by_accept_encoding(),
             })));
         }
 
@@ -471,7 +471,7 @@ impl FileServer {
                     last_modified: meta.last_modified.clone(),
                     etag: Some(meta.etag.clone()),
                     content_encoding: Some(enc.to_string()),
-                    vary_accept_encoding: self.config.compress,
+                    vary_accept_encoding: self.config.varies_by_accept_encoding(),
                 })));
             }
             Some((key, lock, guard))
@@ -509,7 +509,7 @@ impl FileServer {
             last_modified: meta.last_modified.clone(),
             etag: Some(meta.etag.clone()),
             content_encoding,
-            vary_accept_encoding: self.config.compress,
+            vary_accept_encoding: self.config.varies_by_accept_encoding(),
         })))
     }
 
@@ -547,7 +547,7 @@ impl FileServer {
                     last_modified: stream.last_modified,
                     etag: stream.etag,
                     content_encoding: None,
-                    vary_accept_encoding: self.config.compress,
+                    vary_accept_encoding: self.config.varies_by_accept_encoding(),
                 }))
             }
             None => Ok(None),
@@ -1109,6 +1109,89 @@ mod serve_cache_tests {
             fs.in_flight.lock().unwrap().is_empty(),
             "in-flight entry must be removed after use"
         );
+    }
+}
+
+#[cfg(test)]
+mod vary_tests {
+    use super::*;
+
+    /// 🗜️ `Vary: Accept-Encoding` has to follow whatever *can* vary the body.
+    ///
+    /// It was tied to `compress` alone. A site serving `.gz` sidecars with
+    /// dynamic compression off therefore returned two different bodies for the
+    /// same URL — one gzip, one not, chosen by `Accept-Encoding` — and told
+    /// caches nothing. A shared cache stores whichever it saw first and hands it
+    /// to everyone, so a client that never asked for gzip gets a gzip body it
+    /// cannot read.
+    #[tokio::test]
+    async fn a_sidecar_site_still_says_it_varies() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.js"), "plain").unwrap();
+        std::fs::write(dir.path().join("app.js.gz"), "gzipped").unwrap();
+
+        let fs = FileServer::new(FileServerConfig {
+            root: dir.path().to_path_buf(),
+            // 🎯 Dynamic compression off: the sidecar is the only thing that can
+            // change the body, which is exactly the case that was missed.
+            compress: false,
+            precompressed: vec![super::super::PrecompressedFormat {
+                encoding: "gzip",
+                suffix: ".gz",
+            }],
+            ..Default::default()
+        });
+
+        let served = fs
+            .serve_auto("/app.js", "/app.js", None, Some("gzip"))
+            .await
+            .unwrap()
+            .expect("the sidecar must be served");
+        let (encoding, varies) = match served {
+            ServedResponse::Buffered(file) => (file.content_encoding, file.vary_accept_encoding),
+            ServedResponse::Stream(stream) => (
+                stream
+                    .content_encoding
+                    .as_ref()
+                    .map(|value| value.to_str().unwrap_or_default().to_string()),
+                stream.vary_accept_encoding,
+            ),
+            ServedResponse::Redirect(target) => panic!("unexpected redirect to {target}"),
+        };
+
+        assert_eq!(
+            encoding.as_deref(),
+            Some("gzip"),
+            "the sidecar must actually have been chosen, or this proves nothing"
+        );
+        assert!(
+            varies,
+            "the body varies by Accept-Encoding and the response did not say so"
+        );
+    }
+
+    /// 👍 A site that can never vary must not claim it does — a needless `Vary`
+    /// splits every cache key and costs hit rate for nothing.
+    #[tokio::test]
+    async fn a_plain_site_does_not_claim_to_vary() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.js"), "plain").unwrap();
+
+        let fs = FileServer::new(FileServerConfig {
+            root: dir.path().to_path_buf(),
+            compress: false,
+            ..Default::default()
+        });
+        let served = fs
+            .serve_auto("/app.js", "/app.js", None, Some("gzip"))
+            .await
+            .unwrap()
+            .expect("the file must be served");
+        match served {
+            ServedResponse::Buffered(file) => assert!(!file.vary_accept_encoding),
+            ServedResponse::Stream(stream) => assert!(!stream.vary_accept_encoding),
+            ServedResponse::Redirect(target) => panic!("unexpected redirect to {target}"),
+        }
     }
 }
 

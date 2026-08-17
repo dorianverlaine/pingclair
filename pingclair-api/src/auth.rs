@@ -16,11 +16,23 @@ impl ApiKeyAuth {
         Self { key: key.into() }
     }
 
-    /// Validate an API key
+    /// 🔐 Validates a presented API key in constant time with respect to its
+    /// contents.
+    ///
+    /// 🤡 The previous implementation was commented `Constant-time comparison`
+    /// and was not one: `.all()` short-circuits, so it returned as soon as two
+    /// bytes differed and the time it took revealed how many leading bytes were
+    /// right. That is the classic way a secret is recovered one byte at a time,
+    /// and the comment was the worst part — it told the next reader the property
+    /// had been handled, so nobody looked.
+    ///
+    /// `subtle::ConstantTimeEq` reads every byte whatever it finds. Length is
+    /// still compared normally, by `subtle` itself: a key's length is not the
+    /// secret, and no implementation hides it.
     pub fn validate(&self, provided: &str) -> bool {
-        // Constant-time comparison
-        self.key.len() == provided.len()
-            && self.key.bytes().zip(provided.bytes()).all(|(a, b)| a == b)
+        use subtle::ConstantTimeEq as _;
+
+        self.key.as_bytes().ct_eq(provided.as_bytes()).into()
     }
 }
 
@@ -127,6 +139,42 @@ pub fn origin_allowed(policy: &OriginPolicy, origin: Option<&str>, peer: IpAddr)
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    /// 🔐 The comparison must not stop at the first differing byte.
+    ///
+    /// ⚠️ What this test proves is behaviour, not timing. It cannot show that the
+    /// comparison is constant-time — a timing assertion would be flaky on a
+    /// shared runner and worthless anyway. The constant-time property comes from
+    /// `subtle::ConstantTimeEq`; this test only guards the answers, so that
+    /// switching to it did not quietly break authentication.
+    ///
+    /// 🤡 The comment above the old implementation said `constant-time` while the
+    /// implementation was `.all()`, which short-circuits. A comment claiming a
+    /// security property the code does not have is worse than no comment: it stops
+    /// the next reader from checking.
+    #[test]
+    fn key_validation_answers_correctly_at_every_length() {
+        let auth = ApiKeyAuth::new("s3cret-token");
+
+        assert!(auth.validate("s3cret-token"));
+        // 🎯 Differs at the first byte, the last byte, and in length — the three
+        // shapes a short-circuiting comparison treats differently.
+        assert!(!auth.validate("X3cret-token"));
+        assert!(!auth.validate("s3cret-tokeX"));
+        assert!(!auth.validate("s3cret-toke"));
+        assert!(!auth.validate("s3cret-tokenn"));
+        assert!(!auth.validate(""));
+        assert!(!auth.validate("completely different and longer"));
+    }
+
+    /// 🔐 An empty configured key matches only an empty presentation — it must not
+    /// become a key that matches everything.
+    #[test]
+    fn an_empty_configured_key_does_not_match_everything() {
+        let auth = ApiKeyAuth::new("");
+        assert!(!auth.validate("anything"));
+        assert!(auth.validate(""));
+    }
 
     fn policy(allowed: &[&str], enforce: bool) -> OriginPolicy {
         OriginPolicy {
