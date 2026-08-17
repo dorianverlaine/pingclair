@@ -21,6 +21,10 @@ httpdate = "1.0"
 # 🙈 `hide` patterns are globs, matched exactly as upstream matches them.
 # Already in the dependency tree; naming it only makes the API reachable.
 glob = "0.3"
+# 🔗 Link targets in a browse listing are percent-encoded, which is what stops a
+# filename from being read as a scheme or cutting the URL short. Already in the
+# tree at one version; naming it only makes the API reachable.
+percent-encoding = "2.3"
 anyhow.workspace = true
 async-compression = { version = "0.4", features = ["gzip", "brotli", "zstd", "tokio"] }
 

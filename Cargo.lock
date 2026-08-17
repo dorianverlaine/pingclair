@@ -2983,6 +2983,7 @@ dependencies = [
  "http",
  "httpdate",
  "mime_guess",
+ "percent-encoding",
  "pingclair-core",
  "tempfile",
  "tokio",

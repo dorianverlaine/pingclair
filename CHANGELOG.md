@@ -880,6 +880,34 @@ lets the rest converge.
 
 ### 🔐 Security
 
+- 📁 **A directory listing named the files `hide` was told to conceal, and did
+  not encode the names it printed.** `hide` was applied when a file was asked
+  for directly and when a pre-compressed sidecar was looked up, but not when a
+  browse listing enumerated the directory holding it. So `hide *.env` answered
+  `/api.env` with a 404 and then named `api.env` in the index of `/` — which is
+  not concealment, it is a list of what to go and ask for. The listing now
+  filters each entry through the same policy, and does it before the entry limit
+  so the row count cannot disclose how many hidden names a directory holds.
+
+  A listing is also the one page this server builds out of bytes it did not
+  choose, and those bytes went in raw. A filename is now HTML-escaped where it is
+  displayed and percent-encoded where it is a link target; the request path
+  reflected into the title and heading is escaped as well. Encoding the link
+  target is what stops a name from being read as something other than a path: a
+  file called `javascript:alert(1)` is a legal filename, and its leading segment
+  would have been taken for a URL scheme.
+
+  Two side effects worth knowing about. A link now spells a name the way a URL
+  has to — `hello%20world.txt` rather than `hello world.txt` — which is correct
+  and also *visibly* correct, so it exposes a separate gap: this server does not
+  percent-decode request paths, so a file whose name is not plain ASCII cannot be
+  fetched at all. That was equally true before, because a browser encodes the
+  link before sending it; it is now easy to see rather than easy to miss. And a
+  listing has ceilings: 10,000 entries when the operator names no limit (matching
+  `--file-limit`, where the previous default was unbounded) and a 1 MiB page,
+  because the whole listing is built in memory and then compressed. A truncated
+  listing says so on the page. Found by review.
+
 - 🙈 **Two files holding secrets were written world-readable.** The Admin API's
   autosaved document carries the admin key and any DNS provider credentials the
   configuration named; a `storage-export` archive carries the internal CA's

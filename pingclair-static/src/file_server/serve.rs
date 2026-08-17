@@ -513,38 +513,6 @@ impl FileServer {
         }
     }
 
-    /// Generate HTML directory listing
-    async fn generate_listing(&self, dir_path: &std::path::Path, req_path: &str) -> Result<String> {
-        // Synchronous directory read — a readdir on a local filesystem is a
-        // cheap syscall, not worth a spawn_blocking round trip.
-        let entries = std::fs::read_dir(dir_path)?;
-        let mut html = format!(
-            "<html><head><title>Index of {req_path}</title></head><body><h1>Index of {req_path}</h1><hr><pre>"
-        );
-
-        // Parent link
-        if req_path != "/" {
-            html.push_str("<a href=\"..\">../</a>\n");
-        }
-
-        for entry in entries.take(self.config.browse_limit.unwrap_or(usize::MAX)) {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            let is_dir = entry.file_type()?.is_dir();
-            let display_name = if is_dir {
-                format!("{name_str}/")
-            } else {
-                name_str.to_string()
-            };
-
-            html.push_str(&format!("<a href=\"{display_name}\">{display_name}</a>\n"));
-        }
-
-        html.push_str("</pre><hr></body></html>");
-        Ok(html)
-    }
-
     /// Parse Range header (bytes=start-end)
     /// 📏 Reads a single-range `Range` header, or `None` to serve the whole
     /// file.
@@ -1099,6 +1067,114 @@ mod serve_cache_tests {
         assert!(
             fs.in_flight.lock().unwrap().is_empty(),
             "in-flight entry must be removed after use"
+        );
+    }
+}
+
+#[cfg(test)]
+mod browse_disclosure_tests {
+    use super::*;
+
+    fn browsing(root: &std::path::Path, hide: &[&str]) -> FileServer {
+        let hide: Vec<String> = hide.iter().map(|pattern| (*pattern).to_string()).collect();
+        FileServer::new(FileServerConfig {
+            root: root.to_path_buf(),
+            browse: true,
+            hide: super::super::HidePolicy::new(&hide, root),
+            ..Default::default()
+        })
+    }
+
+    /// 🙈 `hide` means the same thing to a listing as to a direct request.
+    ///
+    /// Answering `/secret.txt` with a 404 while naming it in the index of `/`
+    /// is not concealment — it is a directory of what to go and ask for.
+    #[tokio::test]
+    async fn a_hidden_entry_is_absent_from_the_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("visible.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("secret.env"), "x").unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+
+        let fs = browsing(dir.path(), &["*.env", ".git"]);
+        let listing = fs.generate_listing(dir.path(), "/").await.unwrap();
+
+        assert!(
+            listing.contains("visible.txt"),
+            "the fix must not hide everything: {listing}"
+        );
+        assert!(
+            !listing.contains("secret.env"),
+            "a hidden file was named in the listing: {listing}"
+        );
+        assert!(
+            !listing.contains(".git"),
+            "a hidden directory was named in the listing: {listing}"
+        );
+    }
+
+    /// 🛡️ A filename is data, and a listing is HTML — so the name is escaped.
+    ///
+    /// This needs somebody able to create a filename (an upload directory, a
+    /// shared host), which is why it is not the severe half of this finding.
+    /// It is still the half that executes script in a visitor's browser.
+    #[tokio::test]
+    async fn an_html_shaped_filename_cannot_open_a_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        // 🧾 No slash anywhere: a closing tag would need one, and no filename
+        // can hold one. `onerror` needs no closing tag to run.
+        std::fs::write(dir.path().join("a<img src=x onerror=alert(1)>b"), "x").unwrap();
+
+        let fs = browsing(dir.path(), &[]);
+        let listing = fs.generate_listing(dir.path(), "/").await.unwrap();
+
+        assert!(
+            !listing.contains("<img"),
+            "a filename opened a tag: {listing}"
+        );
+        assert!(
+            listing.contains("&lt;img"),
+            "the name must still be readable, as text: {listing}"
+        );
+    }
+
+    /// 🛡️ The request path is reflected into the page, so it is escaped too.
+    ///
+    /// This is the half that needs no filesystem access at all: `resolve_path`
+    /// applies `..` by popping, so `/dir/<script>/..` resolves to `/dir` — an
+    /// existing directory — while the path reflected into the title still
+    /// carries the tag.
+    #[tokio::test]
+    async fn the_reflected_request_path_cannot_open_a_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = browsing(dir.path(), &[]);
+        let listing = fs
+            .generate_listing(dir.path(), "/d/<script>alert(1)</script>/..")
+            .await
+            .unwrap();
+
+        assert!(
+            !listing.contains("<script>"),
+            "the request path opened a tag: {listing}"
+        );
+    }
+
+    /// 🚫 A relative link cannot become a `javascript:` URL.
+    ///
+    /// A first segment containing a colon is read as a scheme, so a file named
+    /// `javascript:alert(1)` would have produced a link that runs script on
+    /// click rather than fetching anything.
+    #[tokio::test]
+    async fn a_colon_in_a_name_cannot_become_a_scheme() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("javascript:alert(1)"), "x").unwrap();
+
+        let fs = browsing(dir.path(), &[]);
+        let listing = fs.generate_listing(dir.path(), "/").await.unwrap();
+
+        assert!(
+            !listing.contains("\"javascript:"),
+            "a name became an executable URL: {listing}"
         );
     }
 }

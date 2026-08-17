@@ -12937,3 +12937,129 @@ async fn test_try_files_policy_status_and_glob_candidates() {
     assert_eq!(shell.status(), 200);
     assert_eq!(shell.text().await.unwrap(), "shell");
 }
+
+/// 🙈 A browse listing must conceal what `hide` conceals, and must not let a
+/// name it prints become markup.
+///
+/// Both halves of this were live at once: a hidden file was named in the index
+/// of the directory holding it, which turns concealment into a directory of
+/// what to go and ask for, and neither the entry names nor the reflected
+/// request path were escaped on their way into an HTML page.
+#[tokio::test]
+async fn test_browse_listing_hides_and_escapes() {
+    let docroot = tempfile::tempdir().unwrap();
+    std::fs::write(docroot.path().join("visible.txt"), "public").unwrap();
+    std::fs::write(docroot.path().join("api.env"), "TOKEN=secret").unwrap();
+    std::fs::create_dir(docroot.path().join("d")).unwrap();
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            file_server {{
+                root {root}
+                browse
+                hide *.env
+            }}
+        }}
+    "#,
+        root = docroot.path().display()
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let listing = client
+        .get(server.url(0, "/"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(listing.status(), 200);
+    let body = listing.text().await.unwrap();
+
+    // 🎯 The listing still works, or everything below is satisfied by an empty
+    // page.
+    assert!(
+        body.contains("visible.txt"),
+        "the listing served nothing: {body}"
+    );
+    // 🙈 …and does not name what a direct request answers as absent.
+    assert!(
+        !body.contains("api.env"),
+        "a hidden file was named in the listing: {body}"
+    );
+
+    // 🚫 The same file is 404 when asked for directly. Both answers have to
+    // agree, which is the property this test exists for.
+    let direct = client
+        .get(server.url(0, "/api.env"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(direct.status(), 404);
+
+    // 🛡️ Two raw request lines, because a client library would normalise the
+    // `..` away and percent-encode the tag before either reached the server.
+    // Together they pin where the reflected-path half of this finding actually
+    // stops, which is not where it looked like it stopped.
+    //
+    // 🎯 A literal `<` never reaches the handler at all: the HTTP/1 parser
+    // refuses the request line. That is the first line of defence and it is not
+    // ours, which is exactly why the escaping below is worth having — if this
+    // ever loosens, the listing is what is left.
+    let refused = raw_get(server.address(0), "/d/<script>alert(1)</script>/..").await;
+    assert!(
+        refused.starts_with("HTTP/1.1 400"),
+        "a literal tag in the request line must be refused: {refused}"
+    );
+
+    // 🎯 Percent-encoded, it is accepted — and the path is dot-segment
+    // normalised before the file server sees it, so the component carrying the
+    // tag is gone by the time anything is reflected. Nothing decodes `%3C`
+    // either. Both of those would have to change for this to be markup, and the
+    // assertion says which page came back so a future change shows up here.
+    let encoded = raw_get(
+        server.address(0),
+        "/d/%3Cscript%3Ealert(1)%3C%2Fscript%3E/..",
+    )
+    .await;
+    assert!(encoded.starts_with("HTTP/1.1 200"), "{encoded}");
+    assert!(
+        encoded.contains("<title>Index of /d</title>"),
+        "the reflected path must be the normalised one: {encoded}"
+    );
+
+    // 🛡️ …and the escaping of the reflected path is exercised for real with the
+    // characters that *do* survive both the parser and the lack of decoding.
+    // Neither `&` nor `'` can open a tag, so this is not the injection — it is
+    // the proof that the escape runs on the path and not only on entry names.
+    std::fs::create_dir(docroot.path().join("a&b'c")).unwrap();
+    let reflected = raw_get(server.address(0), "/a&b'c/").await;
+    assert!(reflected.starts_with("HTTP/1.1 200"), "{reflected}");
+    assert!(
+        reflected.contains("Index of /a&amp;b&#39;c"),
+        "the reflected path was not escaped: {reflected}"
+    );
+}
+
+/// 🧾 One raw HTTP/1 GET, headers and body, for request lines no client library
+/// will send verbatim.
+async fn raw_get(address: SocketAddr, target: &str) -> String {
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    stream
+        .write_all(
+            format!("GET {target} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    String::from_utf8_lossy(&read_http1_to_end(&mut stream).await).to_string()
+}

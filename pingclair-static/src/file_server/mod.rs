@@ -20,14 +20,23 @@
 //! | --- | --- |
 //! | [`cache`] | Both caches and their keys: compressed bodies, and per-file response metadata. |
 //! | [`encode`] | Which coding to use, and producing it. |
+//! | [`listing`] | The browse page: what it may name, and how those names are encoded. |
 //! | [`stream`] | The chunked response: its type, its threshold, and the decision to take it. |
-//! | [`serve`] | The request handler, path resolution, Range parsing, and directory listings. |
+//! | [`serve`] | The request handler, path resolution, and Range parsing. |
 //!
-//! This module keeps only what all four need: the configuration, the server
+//! This module keeps only what all five need: the configuration, the server
 //! itself, and the two buffered response types.
+//!
+//! 🗺️ [`listing`] was the fifth to arrive, on 2026-08-17, and for the same
+//! reason as the original split rather than for length: a browse page is the
+//! only output this server builds out of bytes somebody else chose — filenames,
+//! and the request path — so its encoding rules are security rules, and they
+//! were sitting inside the request handler where nothing distinguished them
+//! from formatting.
 
 mod cache;
 mod encode;
+mod listing;
 mod serve;
 mod stream;
 
