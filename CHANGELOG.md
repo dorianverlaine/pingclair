@@ -940,6 +940,31 @@ lets the rest converge.
 
 ### 🔐 Security
 
+- ☁️ **The DNS-01 client's response ceiling described a bound it did not enforce,
+  and it had no deadline at all.** The 1 MiB limit was checked *after*
+  `.collect()` had already buffered the whole body, under a comment saying it was
+  bounded — so the amount of memory this process allocated was the DNS API's
+  choice, not ours. That is the same shape as the two static-file bugs already
+  fixed in this release, except the peer here is not even ours. The body is now
+  read frame by frame against a running total.
+
+  Nothing had a timeout, so an API that accepted the connection and then said
+  nothing held a certificate order open forever. Each round trip now has a 30
+  second budget covering connect, send and read together.
+
+  🧹 A third defect in the same file: record cleanup removed its local bookkeeping
+  *before* the remote delete, so a delete that failed orphaned the TXT record in
+  DNS permanently — the next cleanup found no local entry, returned success, and
+  the record stayed. A stale `_acme-challenge` record is not just litter; it
+  remains standing evidence of control over that name long after the order it
+  belonged to, and the operator cannot see it. The local entry is now dropped only
+  once the remote copy is gone, so a failure leaves something for the next attempt
+  to retry.
+
+  📌 Deliberately not added: retry. The report suggested it, but record creation
+  is not established as idempotent here, and a blind retry could publish duplicate
+  TXT records for one challenge. That needs its own change. Found by review.
+
 - 🔐 **A cleartext client could make this proxy report its connection as
   secure.** The request scheme was decided by looking for port 443 or 8443 in the
   authority when the URI carried no scheme and no trusted `X-Forwarded-Proto` said
