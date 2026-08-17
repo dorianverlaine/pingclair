@@ -62,14 +62,55 @@ impl FileServer {
     /// them, symlinks inside the docroot are *followed* (an attacker who
     /// can plant symlinks in the docroot already has filesystem access, so
     /// canonicalizing per request would only cost syscalls, not buy safety).
+    ///
+    /// # 🔤 This is where a URL becomes a filename
+    ///
+    /// A URL spells a name in percent-escapes and a filesystem does not, so the
+    /// escapes are decoded here. Without it this server answered 404 for files
+    /// that plainly existed: every client encodes a space, and every client
+    /// encodes a non-ASCII name, so `文件.txt` arrived as
+    /// `%E6%96%87%E4%BB%B6.txt` and was looked up under that literal name. An
+    /// entire class of filename — including every non-Latin one — was
+    /// unreachable.
+    ///
+    /// **The decode happens per segment, after the split and before the dot
+    /// check.** Both halves of that order are load-bearing:
+    ///
+    /// - Splitting first is what stops an escape from inventing structure. A
+    ///   decoded `/` stays inside the segment it came from, so `%2fetc%2fpasswd`
+    ///   can never become an absolute path — and `PathBuf::push` *replaces* the
+    ///   left side when the right is absolute, which is the same mechanism that
+    ///   once let a configured index escape the root. Rather than push a
+    ///   separator-bearing name that no file can have anyway, such a segment is
+    ///   refused outright.
+    /// - Decoding before the dot check is what stops `%2e%2e` from slipping past
+    ///   it. The URI layer already resolves encoded dots for routing, but this
+    ///   function must not depend on that having run.
+    ///
+    /// A malformed escape is data, not an error: `%zz` names a file called
+    /// `%zz`, which is what a client sending a literal percent produces.
     pub(super) fn resolve_path(&self, path: &str) -> Option<PathBuf> {
         let mut out = self.config.root.clone();
         // Components below the root; reaching for `..` at 0 escapes it.
         let mut depth: usize = 0;
+        // 🍃 One buffer for the whole path rather than one per segment, and
+        // untouched entirely by a path with no escapes in it — which is the
+        // common request.
+        let mut decoded = Vec::new();
         for comp in path.split('/') {
-            match comp {
-                "" | "." => {}
-                ".." => {
+            let segment: &[u8] = if comp.contains('%') {
+                decoded.clear();
+                if !pingclair_core::percent::decode_path_component(comp, &mut decoded) {
+                    tracing::warn!("🚫 Rejected path with an escaped separator: {}", path);
+                    return None;
+                }
+                &decoded
+            } else {
+                comp.as_bytes()
+            };
+            match segment {
+                b"" | b"." => {}
+                b".." => {
                     if depth == 0 {
                         tracing::warn!("🚫 Rejected path escaping docroot: {}", path);
                         return None;
@@ -77,8 +118,8 @@ impl FileServer {
                     out.pop();
                     depth -= 1;
                 }
-                c => {
-                    out.push(c);
+                other => {
+                    out.push(segment_os_str(other)?);
                     depth += 1;
                 }
             }
@@ -1072,6 +1113,157 @@ mod serve_cache_tests {
 }
 
 #[cfg(test)]
+mod percent_decoding_tests {
+    use super::*;
+
+    fn server(root: &std::path::Path) -> FileServer {
+        FileServer::new(FileServerConfig {
+            root: root.to_path_buf(),
+            ..Default::default()
+        })
+    }
+
+    /// 🔤 A URL spells a filename in escapes, and the filesystem does not.
+    ///
+    /// Every client encodes a space, and every client encodes a non-ASCII name.
+    /// Without decoding here, the resolver looks for a file literally called
+    /// `hello%20world.txt` and answers 404 for one that plainly exists — so an
+    /// entire class of filename, including every non-Latin one, was unreachable.
+    #[tokio::test]
+    async fn an_escaped_name_resolves_to_the_file_it_spells() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = server(dir.path());
+        for (target, expected) in [
+            ("/hello%20world.txt", "hello world.txt"),
+            ("/%E6%96%87%E4%BB%B6.txt", "文件.txt"),
+            ("/a%23b.txt", "a#b.txt"),
+            ("/a%3Fb.txt", "a?b.txt"),
+            ("/%25.txt", "%.txt"),
+            ("/plain.txt", "plain.txt"),
+        ] {
+            let resolved = fs.resolve_path(target).expect("must resolve");
+            assert_eq!(
+                resolved,
+                dir.path().join(expected),
+                "{target} resolved to {resolved:?}"
+            );
+        }
+    }
+
+    /// 🚫 An escaped separator is refused, never turned into one.
+    ///
+    /// This is the whole reason decoding happens per segment. Decoding first and
+    /// splitting afterwards would let `%2fetc%2fpasswd` become an absolute path,
+    /// and `PathBuf::push` *replaces* the left side when the right is absolute —
+    /// the same mechanism that made a configured index able to escape the root.
+    /// No filename can contain a separator, so refusing costs nothing.
+    #[tokio::test]
+    async fn an_escaped_separator_is_refused_rather_than_decoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = server(dir.path());
+        for target in [
+            "/a%2fb",
+            "/a%2Fb",
+            "/%2fetc%2fpasswd",
+            "/a%5Cb",
+            "/a%00b",
+            "/%00",
+        ] {
+            assert_eq!(
+                fs.resolve_path(target),
+                None,
+                "{target} must be refused, not resolved"
+            );
+        }
+    }
+
+    /// 🛡️ An escaped traversal is a traversal, because the decode happens before
+    /// the `..` check and not after it.
+    #[tokio::test]
+    async fn an_escaped_traversal_is_still_a_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let fs = server(&root);
+        for target in [
+            "/%2e%2e/secret.txt",
+            "/%2E%2E/secret.txt",
+            "/sub/%2e%2e/%2e%2e/secret.txt",
+            "/.%2e/secret.txt",
+            "/%2e./secret.txt",
+        ] {
+            assert_eq!(
+                fs.resolve_path(target),
+                None,
+                "{target} escaped the document root"
+            );
+        }
+    }
+
+    /// 👍 A malformed escape is data, not an error.
+    ///
+    /// `%zz` is not an escape, so it names a file called `%zz` — which is
+    /// exactly what a client that meant to send a literal percent would produce.
+    /// Refusing the request would be stricter than the filesystem is.
+    #[tokio::test]
+    async fn a_malformed_escape_is_taken_literally() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = server(dir.path());
+        for (target, expected) in [
+            ("/%zz.txt", "%zz.txt"),
+            ("/%.txt", "%.txt"),
+            ("/100%.txt", "100%.txt"),
+            ("/a%2.txt", "a%2.txt"),
+        ] {
+            assert_eq!(
+                fs.resolve_path(target).expect("must resolve"),
+                dir.path().join(expected),
+                "{target} was not taken literally"
+            );
+        }
+    }
+
+    /// 🙈 The `hide` policy sees the decoded name, or hiding `*.env` would miss
+    /// `/api%2Eenv` — an escape away from the rule it was told to enforce.
+    ///
+    /// 🎯 The unhidden half is what makes this test mean anything. Without it,
+    /// "the escaped spelling was refused" is satisfied by not decoding at all —
+    /// which is the defect, not the fix.
+    #[tokio::test]
+    async fn hide_matches_the_decoded_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("api.env"), "TOKEN=secret").unwrap();
+
+        let visible = FileServer::new(FileServerConfig {
+            root: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+        assert!(
+            visible
+                .serve_auto("/api%2Eenv", "/api%2Eenv", None, None)
+                .await
+                .unwrap()
+                .is_some(),
+            "the escaped spelling must reach the file when nothing hides it"
+        );
+
+        let hidden = FileServer::new(FileServerConfig {
+            root: dir.path().to_path_buf(),
+            hide: super::super::HidePolicy::new(&["*.env".to_string()], dir.path()),
+            ..Default::default()
+        });
+        assert!(
+            hidden
+                .serve_auto("/api%2Eenv", "/api%2Eenv", None, None)
+                .await
+                .unwrap()
+                .is_none(),
+            "an escaped spelling reached a hidden file"
+        );
+    }
+}
+
+#[cfg(test)]
 mod browse_disclosure_tests {
     use super::*;
 
@@ -1202,6 +1394,26 @@ mod browse_limit_tests {
             "listing must be capped at the configured limit: {listing}"
         );
     }
+}
+
+// MARK: - Percent-decoding one path segment
+
+/// 📁 Views decoded bytes as a path component.
+///
+/// On Unix a filename *is* bytes, so a name that is not valid UTF-8 is a real
+/// name and resolving it is the point — the same reason the browse listing
+/// builds its links from bytes rather than from lossy text.
+#[cfg(unix)]
+fn segment_os_str(segment: &[u8]) -> Option<&std::ffi::OsStr> {
+    use std::os::unix::ffi::OsStrExt as _;
+    Some(std::ffi::OsStr::from_bytes(segment))
+}
+
+/// 🪟 Elsewhere a path is text, so bytes that are not valid UTF-8 cannot name
+/// anything and the request is refused rather than lossily repaired.
+#[cfg(not(unix))]
+fn segment_os_str(segment: &[u8]) -> Option<&std::ffi::OsStr> {
+    std::str::from_utf8(segment).ok().map(std::ffi::OsStr::new)
 }
 
 /// 🔁 The last path element, the way `path.Base` means it.

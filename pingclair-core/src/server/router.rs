@@ -734,11 +734,12 @@ fn file_candidates(
     if wants_directory && !split_path_part.ends_with('/') {
         split_path_part.push('/');
     }
-    let Some(full_path) = join_under_root(root, &split_path_part) else {
+    let globs = pattern_globs(pattern);
+    let Some(full_path) = join_under_root(root, &split_path_part, !globs) else {
         return FileCandidates::Single(None);
     };
 
-    if !pattern_globs(pattern) {
+    if !globs {
         let relative = format!("/{}", split_path_part.trim_start_matches('/'));
         return FileCandidates::Single(Some(FileCandidate {
             full_path,
@@ -1059,15 +1060,54 @@ fn first_split(path: &str, split_path: &[String]) -> (String, String) {
 }
 
 /// 📂 Joins a filesystem root with a cleaned URI path, refusing `..` escape.
-fn join_under_root(root: &Path, path: &str) -> Option<String> {
+///
+/// 🔤 This is the second place a URL becomes a filename — the first is the static
+/// file server's `resolve_path` — so it decodes percent-escapes for the same
+/// reason and with the same shared rule. Only the path the filesystem is *asked
+/// about* is decoded; the caller's `relative` value stays encoded because it is a
+/// URI that goes back into the request line, and a raw space there is not a path,
+/// it is a malformed request.
+///
+/// `decode_escapes` is false when the configured pattern globs. Decoding would
+/// then hand the client a metacharacter inside a glob — `%2A` becoming `*` — and
+/// letting a request choose which files a pattern matches is the exact defect
+/// [`expand_file_pattern`] escapes placeholders to prevent. A globbing pattern
+/// keeps the older, literal behaviour rather than trading that away for encoded
+/// filename support it did not ask for.
+///
+/// 📌 A decoded name that is not valid UTF-8 does not match. On Unix such a file
+/// really exists and the static file server reaches it, because it works in
+/// bytes; this matcher works in `String` and cannot represent it. The gap is
+/// narrow and recorded rather than papered over with a lossy conversion, which
+/// would probe a *different* filename than the one requested.
+fn join_under_root(root: &Path, path: &str, decode_escapes: bool) -> Option<String> {
     if path.split('/').any(|segment| segment == "..") {
         return None;
     }
-    Some(
-        root.join(path.trim_start_matches('/'))
-            .to_string_lossy()
-            .into_owned(),
-    )
+    let relative = path.trim_start_matches('/');
+
+    // 🍃 Byte-for-byte the previous behaviour when there is nothing to decode,
+    // which is every request that does not carry an escape.
+    if !decode_escapes || !relative.contains('%') {
+        return Some(root.join(relative).to_string_lossy().into_owned());
+    }
+
+    let mut joined = root.to_path_buf();
+    let mut decoded = Vec::new();
+    for component in relative.split('/') {
+        decoded.clear();
+        if !crate::percent::decode_path_component(component, &mut decoded) {
+            return None;
+        }
+        match decoded.as_slice() {
+            b"" | b"." => {}
+            // 🛡️ Re-checked after decoding, not only before: the guard above ran
+            // on the encoded text, where `%2e%2e` does not look like a traversal.
+            b".." => return None,
+            other => joined.push(std::str::from_utf8(other).ok()?),
+        }
+    }
+    Some(joined.to_string_lossy().into_owned())
 }
 
 /// 📏 Strict existence: a trailing slash demands a directory, otherwise a
@@ -1886,6 +1926,58 @@ mod tests {
         match evaluate_file_matcher(&mut request, &candidates, root, None, &[]) {
             MatcherVerdict::Match => vars.get("http.matchers.file.relative").cloned(),
             MatcherVerdict::NoMatch | MatcherVerdict::Error(_) => None,
+        }
+    }
+
+    /// 🔤 The `file` matcher stats a request-derived path, so it has to spell the
+    /// name the way the filesystem does.
+    ///
+    /// `try_files {path} /index.html` is the canonical static configuration, and
+    /// without decoding here an encoded name never matched the first candidate —
+    /// so a file that plainly existed fell through to the shell, which looks
+    /// exactly like the file being missing.
+    #[test]
+    fn an_escaped_name_matches_the_file_it_spells() {
+        let root = spa_root();
+        std::fs::write(root.path().join("hello world.txt"), "spaced").unwrap();
+        std::fs::write(root.path().join("文件.txt"), "chinese").unwrap();
+
+        // 🎯 The rewrite target stays the *encoded* spelling, because it is a URI
+        // and goes back into the request line. Only the existence probe decodes.
+        assert_eq!(
+            try_files_target(
+                &["{path}", "/index.html"],
+                root.path().to_str(),
+                "/hello%20world.txt"
+            ),
+            Some("/hello%20world.txt".to_string())
+        );
+        assert_eq!(
+            try_files_target(
+                &["{path}", "/index.html"],
+                root.path().to_str(),
+                "/%E6%96%87%E4%BB%B6.txt"
+            ),
+            Some("/%E6%96%87%E4%BB%B6.txt".to_string())
+        );
+    }
+
+    /// 🚫 An escaped separator does not become one, and an escaped traversal is
+    /// still refused after decoding.
+    #[test]
+    fn escaped_structure_is_refused_by_the_file_matcher() {
+        let root = spa_root();
+        for request in [
+            "/a%2fb",
+            "/%2e%2e%2findex.html",
+            "/sub%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+            "/a%00b",
+        ] {
+            assert_eq!(
+                try_files_target(&["{path}"], root.path().to_str(), request),
+                None,
+                "{request} must not match a file"
+            );
         }
     }
 

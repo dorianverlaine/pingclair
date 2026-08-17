@@ -1465,17 +1465,40 @@ pub(crate) fn check_request_host(
 /// marginally stricter 400 that refusing would give. The security property is
 /// identical either way — routing decides on the same path the origin will.
 ///
-/// `%2e` and `%2E` are decoded to `.` first, because an origin that decodes
-/// before it normalizes sees `..` either way. Nothing else is decoded: turning
-/// `%2f` into a separator would change which resource is named, which is a
-/// documented footgun rather than a hardening measure.
+/// Escapes whose byte is *unreserved* — alphanumerics and `-._~` — are decoded
+/// first, because they carry no meaning: RFC 3986 §6.2.2.2 says a normalizer
+/// must decode them, so `%70rivate` and `private` are the same path spelled two
+/// ways. Leaving them encoded is how a matcher and the thing it guards come to
+/// disagree; `path /private/*` would miss `/%70rivate/x` while an origin that
+/// normalizes serves it. `%2e` falls out of this rule, which is why an encoded
+/// traversal is resolved like a plain one.
+///
+/// **Nothing else is decoded**, and that is a security property rather than an
+/// omission. Turning `%2f` into a separator would invent structure the client
+/// did not send, and decoding `%25` would let a double-encoded traversal
+/// collapse into a real one on a second pass. Decoding only unreserved bytes
+/// also keeps the result a valid URI, which matters because this rewrites the
+/// request that goes upstream — a decoded `%20` would put a raw space in a
+/// request line. Where a name has to become a *filename* rather than a URI, the
+/// remaining escapes are decoded at that boundary instead; see the static file
+/// server's `resolve_path`.
 ///
 /// `..` can never climb above the root; empty segments collapse, so `//a`
 /// becomes `/a`. Returns `None` when the path is already normal, so the common
 /// request pays for a scan and no allocation.
 pub(crate) fn normalize_request_path(path: &str) -> Option<String> {
-    let decoded = decode_encoded_dots(path);
-    let source = decoded.as_deref().unwrap_or(path);
+    // 🧾 The query comes off first, before anything is decoded or resolved. It
+    // is not a path, and normalizing it like one is wrong: `decode_encoded_dots`
+    // used to run over the whole target, so `?next=%2e%2e%2fetc` was rewritten
+    // to `?next=..%2fetc` on its way upstream — a value this proxy has no
+    // business editing.
+    let (raw_path, query) = match path.split_once('?') {
+        Some((raw_path, query)) => (raw_path, Some(query)),
+        None => (path, None),
+    };
+
+    let decoded = decode_unreserved_escapes(raw_path);
+    let source = decoded.as_deref().unwrap_or(raw_path);
 
     // 🍃 A cheap scan first, so an ordinary request allocates nothing. No
     // slicing by index: this reads attacker-controlled bytes, and `path[1..]`
@@ -1490,11 +1513,7 @@ pub(crate) fn normalize_request_path(path: &str) -> Option<String> {
         return None;
     }
 
-    let (raw_path, query) = match source.split_once('?') {
-        Some((raw_path, query)) => (raw_path, Some(query)),
-        None => (source, None),
-    };
-
+    let raw_path = source;
     let mut resolved: Vec<&str> = Vec::new();
     for segment in raw_path.split('/') {
         match segment {
@@ -1527,12 +1546,74 @@ pub(crate) fn normalize_request_path(path: &str) -> Option<String> {
     (out != path).then_some(out)
 }
 
-/// Decode only `%2e` and `%2E` into `.`, leaving every other escape alone.
-fn decode_encoded_dots(path: &str) -> Option<String> {
-    if !path.contains("%2e") && !path.contains("%2E") {
+/// 🔤 Decodes escapes whose byte is unreserved, leaving every other escape alone.
+///
+/// `None` when there was nothing to do, so the ordinary request allocates
+/// nothing. One pass and no recursion: an escape produced *by* this decode is
+/// never looked at again, which is what stops `%252e` from becoming `.` in two
+/// steps.
+fn decode_unreserved_escapes(path: &str) -> Option<String> {
+    if !path.contains('%') {
         return None;
     }
-    Some(path.replace("%2e", ".").replace("%2E", "."))
+
+    let bytes = path.as_bytes();
+    let mut out: Option<String> = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        match decoded_unreserved(bytes, index) {
+            Some(byte) => {
+                // 🧾 Seeded with everything before this first escape. Without
+                // that, a path whose first escape is not at the start loses its
+                // prefix — and the rebuild below hides it whenever the lost
+                // prefix is exactly the leading slash, which is most of them.
+                let out = out.get_or_insert_with(|| {
+                    let mut seeded = String::with_capacity(path.len());
+                    seeded.push_str(&path[..index]);
+                    seeded
+                });
+                out.push(byte as char);
+                index += 3;
+            }
+            None => {
+                if let Some(out) = out.as_mut() {
+                    // 🧾 Pushed byte by byte, and safe as UTF-8 because the only
+                    // bytes copied one at a time are ASCII: a multi-byte
+                    // character reaches here as its own bytes in sequence, and a
+                    // decoded byte is unreserved and therefore ASCII.
+                    out.push_str(&path[index..index + 1]);
+                }
+                index += 1;
+            }
+        }
+    }
+    out
+}
+
+/// 🔤 The byte a three-character escape at `index` stands for, when that byte is
+/// unreserved. `None` for anything else — a short window, a malformed escape, or
+/// a byte that is reserved and so must stay encoded.
+fn decoded_unreserved(bytes: &[u8], index: usize) -> Option<u8> {
+    let window = bytes.get(index..index + 3)?;
+    let [b'%', high, low] = window else {
+        return None;
+    };
+    let byte = (hex_digit(*high)? << 4) | hex_digit(*low)?;
+    // 🛡️ RFC 3986 §2.3 `unreserved`. Everything outside it — separators,
+    // sub-delimiters, `%`, spaces, and every non-ASCII byte — stays as it
+    // arrived.
+    let unreserved = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~');
+    unreserved.then_some(byte)
+}
+
+/// 🔢 One hex digit's value, either case.
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1704,6 +1785,68 @@ mod tests {
             Some("/admin/?x=1")
         );
         assert_eq!(normalize_request_path("/a/./b/").as_deref(), Some("/a/b/"));
+    }
+
+    /// 🔤 A percent-escape whose byte is *unreserved* means nothing — RFC 3986
+    /// §6.2.2.2 says a normalizer must decode it. Leaving it encoded is how a
+    /// path matcher and the thing it guards come to disagree: `path /private/*`
+    /// does not match `/%70rivate/x`, and an origin that normalizes serves
+    /// `/private/x` anyway.
+    #[test]
+    fn unreserved_escapes_are_decoded_because_they_carry_no_meaning() {
+        for (input, expected) in [
+            ("/%70rivate/x", "/private/x"),
+            ("/%41%42%43", "/ABC"),
+            ("/a%2Db", "/a-b"),
+            ("/a%5Fb", "/a_b"),
+            ("/a%7Eb", "/a~b"),
+            ("/%31%32%33", "/123"),
+        ] {
+            assert_eq!(
+                normalize_request_path(input).as_deref(),
+                Some(expected),
+                "{input:?} must normalize to {expected:?}"
+            );
+        }
+    }
+
+    /// 🛡️ Everything else stays encoded, and that is the security property.
+    ///
+    /// Decoding `%2f` would invent a path separator the client did not send, and
+    /// decoding `%25` would let a double-encoded traversal collapse into a real
+    /// one on a second pass. Both are refusals to guess, not omissions.
+    #[test]
+    fn reserved_escapes_are_never_decoded_into_the_uri() {
+        for path in [
+            "/api/a%2fb",
+            "/api/a%2Fb",
+            "/api/a%5Cb",
+            "/api/%252e%252e/x",
+            "/api/a%20b",
+            "/api/a%00b",
+            "/api/%E6%96%87.txt",
+        ] {
+            assert_eq!(
+                normalize_request_path(path),
+                None,
+                "{path:?} must reach the origin exactly as it arrived"
+            );
+        }
+    }
+
+    /// 🧾 The query is not a path and must not be normalized like one.
+    ///
+    /// `decode_encoded_dots` used to run over the whole path-and-query, so a
+    /// `%2e` inside a query value was rewritten to `.` on its way upstream —
+    /// changing a value this proxy has no business touching.
+    #[test]
+    fn the_query_string_is_left_untouched() {
+        assert_eq!(
+            normalize_request_path("/a/./b?next=%2e%2e%2fetc").as_deref(),
+            Some("/a/b?next=%2e%2e%2fetc")
+        );
+        assert_eq!(normalize_request_path("/ok?v=%2e"), None);
+        assert_eq!(normalize_request_path("/ok?v=%70"), None);
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub mod config;
 // implementations already shipped a defect — see the module's own header.
 pub mod encoding;
 pub mod error;
+pub mod percent;
 pub mod server;
 
 pub use error::{Error, Result};

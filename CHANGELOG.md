@@ -668,6 +668,48 @@ lets the rest converge.
 
 ### 🐛 Fixed
 
+- 🔤 **A file whose name was not plain ASCII could not be fetched at all.**
+  Nothing decoded percent-escapes on the way to the filesystem, and every client
+  encodes a space and every client encodes a non-ASCII name — so `文件.txt`
+  arrived as `%E6%96%87%E4%BB%B6.txt` and was looked up under that literal name.
+  An entire class of filename was unreachable, which on a site whose filenames
+  are not English means most of them.
+
+  Under `try_files {path} /index.html` — the shape almost every static site uses
+  — it was worse than a 404: the candidate simply did not match, so the request
+  fell through to the SPA shell and looked exactly like a missing file.
+
+  Escapes are now decoded in the two places a URL becomes a filename, through one
+  shared rule: the static file server's path resolution and the `file` matcher's
+  existence probe. Both decode **per path component, after the split and before
+  the dot-segment check**, which is what keeps an escape from inventing
+  structure — a decoded separator stays inside the component it came from, and a
+  component that decodes to one is refused, since no filename can contain it.
+  `%2e%2e` is a traversal and is refused as one. A malformed escape like `%zz` is
+  taken literally, because a file may be named that way.
+
+  Two things are deliberately *not* decoded. A link target the browse listing
+  writes stays encoded, because it is a URL. And the request URI itself is only
+  normalized as far as escapes whose byte is *unreserved* — `%70` to `p` — which
+  RFC 3986 §6.2.2.2 requires of a normalizer and which keeps the result a valid
+  URI that can go upstream. A reverse-proxied request therefore reaches its
+  origin with `%2f`, `%20` and non-ASCII escapes exactly as they arrived.
+
+  ⚠️ Two behaviour changes fall out of that. A proxied request now reaches the
+  origin with unreserved escapes decoded, so an upstream that distinguishes
+  `%41` from `A` — which RFC 3986 says it must not — sees the decoded spelling.
+  And a `path` matcher now matches through those escapes, which is the point:
+  `path /private/*` used to miss `/%70rivate/x` while an origin that normalizes
+  served it anyway, so a matcher used as a gate was one escape from a bypass.
+
+  📌 A remaining gap, recorded rather than hidden: the `file` matcher works in
+  `String` and cannot represent a name that is not valid UTF-8, so on Unix such a
+  file is reachable through `file_server` but not through `try_files`. Repairing
+  it lossily would probe a different filename than the one requested.
+
+  Found while fixing the browse listing, whose corrected link encoding made it
+  visible.
+
 - 🔁 **`lb_retry_match` decides retries instead of being logged and ignored.**
   Expressions used to be kept as text, scanned for a few substrings, and
   announced at startup as "accepted but not evaluated". For a directive whose

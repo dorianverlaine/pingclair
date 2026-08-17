@@ -13178,3 +13178,105 @@ async fn test_admin_metric_labels_are_a_fixed_set() {
         );
     }
 }
+
+/// 🔤 A file whose name is not plain ASCII must be reachable, through both the
+/// bare file server and the `try_files` shape almost every static site uses.
+///
+/// Every client percent-encodes a space and a non-ASCII name, and nothing here
+/// decoded them: the resolver looked for a file literally called
+/// `%E6%96%87%E4%BB%B6.txt` and answered 404 for one that plainly existed. Under
+/// `try_files` it was worse than a 404 — the candidate simply did not match, so
+/// the request fell through to the SPA shell and looked like a missing file.
+#[tokio::test]
+async fn test_percent_encoded_filenames_are_reachable() {
+    let docroot = tempfile::tempdir().unwrap();
+    std::fs::write(docroot.path().join("plain.txt"), "plain").unwrap();
+    std::fs::write(docroot.path().join("hello world.txt"), "spaced").unwrap();
+    std::fs::write(docroot.path().join("文件.txt"), "chinese").unwrap();
+    std::fs::write(docroot.path().join("index.html"), "shell").unwrap();
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            root * {root}
+
+            @spa path /spa/*
+            route @spa {{
+                uri strip_prefix /spa
+                try_files {{path}} /index.html
+                file_server
+            }}
+
+            file_server
+        }}
+    "#,
+        root = docroot.path().display()
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    // 🎯 Both shapes have to work, and for the same reason: each one turns a URL
+    // into a filename, and each one used to do it without decoding.
+    for prefix in ["", "/spa"] {
+        for (target, expected) in [
+            ("/plain.txt", "plain"),
+            ("/hello%20world.txt", "spaced"),
+            ("/%E6%96%87%E4%BB%B6.txt", "chinese"),
+        ] {
+            let response = client
+                .get(server.url(0, &format!("{prefix}{target}")))
+                .send()
+                .await
+                .expect("request");
+            assert_eq!(
+                response.status(),
+                200,
+                "{prefix}{target} was not found at all"
+            );
+            assert_eq!(
+                response.text().await.unwrap(),
+                expected,
+                "{prefix}{target} served the wrong file — under try_files a \
+                 non-matching candidate falls through to the shell, which looks \
+                 exactly like the file being missing"
+            );
+        }
+    }
+
+    // 🚫 An escaped separator is not decoded into one, so it names nothing.
+    // Through `try_files` that means the shell, and through the bare file server
+    // a 404 — in neither case a path this server assembled out of escapes.
+    let refused = client
+        .get(server.url(0, "/%2e%2e%2findex.html"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(refused.status(), 404);
+    let refused_separator = client
+        .get(server.url(0, "/a%2fb"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(refused_separator.status(), 404);
+
+    // 🔤 An escape whose byte is unreserved carries no meaning, so routing sees
+    // through it — the URI layer decodes those before anything matches. Without
+    // that, `@spa path /spa/*` would miss `/%73pa/...` while the file server
+    // resolved it anyway, and a path matcher used as a gate would be one escape
+    // away from being bypassed.
+    let spelled = client
+        .get(server.url(0, "/%73pa/plain.txt"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(spelled.status(), 200);
+    assert_eq!(spelled.text().await.unwrap(), "plain");
+}
