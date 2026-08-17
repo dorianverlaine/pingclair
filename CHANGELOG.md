@@ -680,6 +680,27 @@ lets the rest converge.
 
 ### 🐛 Fixed
 
+- 📦 **`storage-export` followed by `storage-import` restored the store one level
+  below itself, and reported success.** Export wrote every entry under a
+  `pingclair/` directory; import unpacked straight into the store root. So a round
+  trip produced `<store>/pingclair/internal/root.key`, and the server looks in
+  `<store>/internal`. The restore printed `✅ Store imported`, the next start found
+  no internal CA and minted a fresh one, and every client that trusted the old
+  root stopped trusting this server — a disaster-recovery path that reports
+  success and restores nothing.
+
+  The archive root is now the store root, matching the command this one is
+  modelled on. Import drops a single leading `pingclair/` when it sees one, so an
+  archive produced by the older export still restores correctly, and a store a
+  previous import nested is repaired the next time one runs.
+
+  Import also checks each entry's path itself now: every component must be an
+  ordinary name, which refuses `..`, absolute paths and drive prefixes. `tar`'s
+  own `unpack` already refused parent traversal, but rewriting the path means
+  unpacking entry by entry, which gives that check up — so the replacement is
+  stated and tested rather than inherited. Found by review.
+
+
 - 🚧 **`admin :2019` — the ordinary spelling, and the one this repository's own
   fixtures use — panicked at startup.** The Admin listener called
   `.parse().expect()` on its configured address, and `SocketAddr` cannot read a

@@ -20,6 +20,7 @@ use clap::{Parser, Subcommand};
 pub(crate) mod admin;
 pub(crate) mod dispatch;
 pub(crate) mod service;
+pub(crate) mod storage;
 
 // 🧾 `Field: value` arguments are parsed by the same helper the admin
 // commands use, so `--header` and `--header-up` cannot drift apart.

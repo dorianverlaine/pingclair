@@ -297,14 +297,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 anyhow::bail!("❌ No store found at {}", dir.display());
             }
             if output == "-" {
-                let stdout = std::io::stdout();
-                let mut builder = tar::Builder::new(stdout);
-                builder
-                    .append_dir_all("pingclair", &dir)
-                    .map_err(|error| anyhow::anyhow!("❌ Export failed: {error}"))?;
-                builder
-                    .finish()
-                    .map_err(|error| anyhow::anyhow!("❌ Export failed: {error}"))?;
+                crate::cli::storage::export_store(&dir, std::io::stdout())?;
             } else {
                 // 🔐 Owner-only from creation, not from a later `chmod`. This
                 // archive contains the TLS store — the internal CA's private key,
@@ -339,13 +332,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                         );
                     }
                 }
-                let mut builder = tar::Builder::new(file);
-                builder
-                    .append_dir_all("pingclair", &dir)
-                    .map_err(|error| anyhow::anyhow!("❌ Export failed: {error}"))?;
-                let file = builder
-                    .into_inner()
-                    .map_err(|error| anyhow::anyhow!("❌ Export failed: {error}"))?;
+                let file = crate::cli::storage::export_store(&dir, file)?;
                 // 💾 Durable before the success line: an operator who is told the
                 // export succeeded will delete the source.
                 file.sync_all()
@@ -366,10 +353,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                         .map_err(|error| anyhow::anyhow!("❌ Cannot open {input}: {error}"))?,
                 )
             };
-            let mut archive = tar::Archive::new(file);
-            archive
-                .unpack(&dir)
-                .map_err(|error| anyhow::anyhow!("❌ Import failed: {error}"))?;
+            crate::cli::storage::import_store(&dir, file)?;
             println!("✅ Store imported into {}", dir.display());
         }
 

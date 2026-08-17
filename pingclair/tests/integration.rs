@@ -6543,7 +6543,22 @@ fn test_cli_surface_commands() {
         "{}",
         String::from_utf8_lossy(&import.stderr)
     );
-    assert!(store2.join("pingclair/internal/root.crt").is_file());
+    // 📦 The restored store is the store, not the store one level down.
+    //
+    // 🤡 This assertion used to read `pingclair/internal/root.crt`, pinning the
+    // defect it was written over: export prefixed every entry with `pingclair/`
+    // and import unpacked into the store root, so a round trip nested the store
+    // inside itself. The server looks in `<store>/internal`, so the restore
+    // reported success and left nothing where anything reads — and the next start
+    // minted a fresh internal CA, breaking every client that trusted the old one.
+    assert!(
+        store2.join("internal/root.crt").is_file(),
+        "the imported store must be usable where the server looks for it"
+    );
+    assert!(
+        !store2.join("pingclair").exists(),
+        "the archive's own directory name must not survive into the store"
+    );
 }
 
 /// 🧪 `pingclair respond` serves a hard-coded response like `caddy respond`.
