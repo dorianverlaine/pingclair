@@ -36,27 +36,26 @@ an item between those without evidence under
 
 ## Commands
 
-The local gate is four commands, and **`+1.97.1` is not decoration** — CI pins
-that exact toolchain and the workspace declares `rust-version = "1.97"`. A
-different local compiler — newer or older — has different inference and
-rustfmt line breaking; all-green locally followed by all-red in CI has already
-happened in both directions (newer-than-CI on 2026-07-29, an older toolchain
-in the release image on 2026-08-02).
+The canonical gate is `just ci` — fmt-check, clippy, cargo-shear, repo-lint,
+docs-lint, the full nextest suite, and bench smoke — and CI runs the same
+recipes. **`+1.97.1` is not decoration**: the workspace declares
+`rust-version = "1.97"` and CI pins 1.97.1. A different local compiler —
+newer or older — has different inference and rustfmt line breaking;
+all-green locally followed by all-red in CI has already happened in both
+directions (newer-than-CI on 2026-07-29, an older toolchain in the release
+image on 2026-08-02).
 
 ```bash
-cargo +1.97.1 fmt --all -- --check
-cargo +1.97.1 clippy --locked --workspace --all-targets -- -D warnings
-cargo +1.97.1 build --locked --workspace
-cargo +1.97.1 test --locked --workspace
+just ci
 ```
 
 Narrower runs:
 
 ```bash
-cargo +1.97.1 test -p pingclair-proxy                      # one crate
-cargo +1.97.1 test -p pingclair --test integration          # one test binary
-cargo +1.97.1 test -p pingclair --test integration test_name -- --nocapture
-cargo +1.97.1 test -p pingclair-proxy --test h3_end_to_end  # H3 against a real QuicServer
+just test -p pingclair-proxy                               # one crate
+cargo +1.97.1 nextest run -p pingclair --test integration --no-fail-fast
+cargo +1.97.1 nextest run -p pingclair --test integration test_name -- --nocapture
+cargo +1.97.1 nextest run -p pingclair-proxy --test h3_end_to_end --no-fail-fast
 ```
 
 `pingclair/tests/integration.rs` spawns the real compiled binary and makes real
@@ -77,7 +76,7 @@ for i in $(seq 1 6); do "$BIN" > /tmp/full_$i.log 2>&1 & done; wait
 ### H3 verification
 
 macOS unit tests do not validate linking or QUIC behavior. After any change to
-H3 or the TLS dependency tree, run both scripts and the Linux half:
+H3 or the TLS dependency tree, run the three scripts and the Linux half:
 
 ```bash
 scripts/test-h3-day28-local.sh              # SNI, Alt-Svc, body sizes, POST, 413, keepalive
@@ -86,9 +85,10 @@ scripts/test-h3-client-auth-local.sh        # mutual TLS, and the SNI/:authority
 ```
 
 Both need a curl built with HTTP/3 (`brew install curl` provides one; the system
-curl does not). Linux runs in `rust:1.97-bookworm`, which needs `cmake` for
-BoringSSL and `clang`/`libclang-dev` for bindgen — without them `boring-sys`
-fails in its build script.
+curl does not). CI runs the Linux half post-merge on `ubuntu-24.04`; a manual
+Linux box can use `rust:1.97-bookworm`, which needs `cmake` for BoringSSL and
+`clang`/`libclang-dev` for bindgen — without them `boring-sys` fails in its
+build script.
 
 macOS has a system proxy on `127.0.0.1:1082`. Reqwest test clients must use
 `.no_proxy()`; curl needs `--noproxy '*'`.
@@ -334,10 +334,8 @@ The following tools are installed and should be preferred when appropriate:
 
 ### Rust
 
-- `cargo-nextest`: use instead of `cargo test` for running tests **locally**.
-  ⚠️ CI still runs `cargo test`, so when the question is "will CI pass", run
-  `cargo test` — that is what CI actually executes. Switching CI over is a
-  separate, deliberate step with its own TRIAGE entry.
+- `cargo-nextest`: the default runner for `just test`. CI runs the same
+  nextest recipes through the two-layer gates, so `just ci` is CI parity.
 - `cargo-watch`: use for continuous checking during development
 
 ### Text processing

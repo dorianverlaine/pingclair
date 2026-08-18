@@ -35,8 +35,6 @@ ignores:
   - "security-findings/**"
   - "todo-md-*.md"
   - "TRIAGE.md"
-  - "AGENTS.md"
-  - "CLAUDE.md"
   - "docs/TODO.md"
   - "docs/TODO_CADDYFILE.md"
   - "docs/TODO_CADDYFILE_FIXES.md"

@@ -26,8 +26,8 @@ clippy:
     cargo +{{ rust }} clippy --locked --workspace --all-targets -- -D warnings
 
 # 🧪 Run the full nextest suite without stopping at the first failure.
-test:
-    cargo +{{ rust }} nextest run --locked --no-fail-fast --profile ci
+test *args:
+    cargo +{{ rust }} nextest run --locked --no-fail-fast --no-tests pass --profile ci {{ args }}
 
 # 🧹 Fail on unused Cargo dependencies.
 shear:
@@ -53,7 +53,7 @@ ci: check bench-smoke
 
 # ⚡ Run all workspace microbenchmarks.
 bench *args:
-    cargo +{{ rust }} bench --locked --workspace --bench '*' {args}
+    cargo +{{ rust }} bench --locked --workspace --bench '*' {{ args }}
 
 # ⚡ Prove every benchmark target still compiles and starts.
 bench-smoke:
