@@ -667,6 +667,69 @@ fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
     })
 }
 
+/// 🧭 Builds the transport-neutral view of an HTTP/3 request.
+///
+/// Routing, matchers, placeholder resolution and every upstream client read the
+/// request through Pingora's [`RequestHeader`] rather than through
+/// [`H3Request`], so this conversion is on the path of every single HTTP/3
+/// request and is the only place it happens.
+///
+/// # 🏷️ Why `build_no_case` and not `build`
+///
+/// `build` attaches a side table that remembers the original spelling of each
+/// field name, so an `H1` upstream can be handed back exactly the case the
+/// client sent. HTTP/3 has no such thing to remember: RFC 9114 §4.2 requires
+/// lowercase field names on the wire, and [`parse_h3_request`] refuses a
+/// request that breaks the rule. So the table was being built, filled and
+/// carried to record an answer that is fixed by the specification.
+///
+/// It was not free. Per request it cost one map allocation, and per field a
+/// cloned name `String`, a cloned `HeaderName` and a hash insert.
+///
+/// 📌 This also closes a gap rather than opening one. Pingora builds its own
+/// HTTP/2 sessions with no case table (`header_name_map: None`), for the same
+/// reason — HTTP/2 has no header case either — and its own documentation says
+/// to use `build_no_case` "if reading from or writing to HTTP/2 sessions where
+/// header case doesn't matter anyway". So before this change the two transports
+/// disagreed about what an H1 upstream saw: an HTTP/2 request arrived as
+/// `Host:`, the identical HTTP/3 request as `host:`. Now both spell it the same
+/// way, because both now reach the wire through the same branch — the one that
+/// title-cases the twelve names Pingora keeps a table for and leaves every
+/// other name lowercase.
+///
+/// 🔤 Names go in as `HeaderName` rather than as cloned `String`s because a
+/// standard name — `host`, `accept`, `user-agent`, the ones real traffic is
+/// made of — resolves through `http`'s static table and allocates nothing at
+/// all. A name outside that table costs one allocation more than the clone did;
+/// that trade is deliberate, and it is the right way round for every request a
+/// browser sends.
+fn h3_request_header(req: &H3Request, method: http::Method) -> Result<RequestHeader, HandlerError> {
+    // 🧮 One slot for each field the client sent, plus the `host` this may have
+    // to synthesise from `:authority`, so the map is sized once instead of
+    // growing underneath the loop.
+    let mut header = RequestHeader::build_no_case(
+        method,
+        req.path.as_bytes(),
+        Some(req.headers.len().saturating_add(1)),
+    )
+    .map_err(|_| (400, "Bad Request"))?;
+    // 🏷️ `RequestHeader::build_no_case` defaults to HTTP/1.1, and this header is
+    // the transport-neutral view of the request that shared code reads. Leaving
+    // the default here made every HTTP/3 request describe itself as HTTP/1.1 —
+    // visible to a FastCGI application as `SERVER_PROTOCOL`.
+    header.set_version(http::Version::HTTP_3);
+    for (name, value) in &req.headers {
+        let Ok(name) = http::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        header.insert_header(name, value.as_str()).ok();
+    }
+    if !req.authority.is_empty() && !header.headers.contains_key("host") {
+        header.insert_header("host", &req.authority).ok();
+    }
+    Ok(header)
+}
+
 /// Messages from handler tasks back to the event loop.
 enum RespMsg {
     /// 📋 Carries response headers and whether they end the stream.
@@ -3026,19 +3089,7 @@ async fn handle_request_inner(
         http::Method::from_bytes(req.method.as_bytes()).map_err(|_| (400, "Bad Request"))?;
     let path_only = req.path.split('?').next().unwrap_or("/");
 
-    let mut header = RequestHeader::build(method.clone(), req.path.as_bytes(), None)
-        .map_err(|_| (400, "Bad Request"))?;
-    // 🏷️ `RequestHeader::build` defaults to HTTP/1.1, and this header is the
-    // transport-neutral view of the request that shared code reads. Leaving the
-    // default here made every HTTP/3 request describe itself as HTTP/1.1 —
-    // visible to a FastCGI application as `SERVER_PROTOCOL`.
-    header.set_version(http::Version::HTTP_3);
-    for (k, v) in &req.headers {
-        header.insert_header(k.clone(), v.as_str()).ok();
-    }
-    if !req.authority.is_empty() && !header.headers.contains_key("host") {
-        header.insert_header("host", &req.authority).ok();
-    }
+    let mut header = h3_request_header(req, method.clone())?;
 
     // 🛡️ QUIC uses the same trusted-proxy identity policy as H1 and H2.
     let peer_address = peer_ip;
@@ -6050,6 +6101,85 @@ mod tests {
             quiche::h3::Header::new(b":path", &[b'/', 0xff, 0xfe]),
         ];
         assert!(parse_h3_request(&list).is_none());
+    }
+
+    /// 🏷️ The transport-neutral view keeps no header case, because HTTP/3 has
+    /// none to keep — and because Pingora's own HTTP/2 sessions keep none
+    /// either, which is what makes the two transports hand an H1 upstream the
+    /// same bytes.
+    #[test]
+    fn h3_request_header_carries_no_case_table() {
+        let req = H3Request {
+            method: "GET".to_string(),
+            protocol: None,
+            path: "/resource?q=1".to_string(),
+            authority: "example.test".to_string(),
+            headers: vec![
+                ("user-agent".to_string(), "probe/1".to_string()),
+                ("x-custom-field".to_string(), "kept".to_string()),
+            ],
+        };
+
+        let header = h3_request_header(&req, http::Method::GET).expect("valid request");
+
+        assert!(
+            !header.has_case(),
+            "an HTTP/3 request has no field-name case to preserve, so building \
+             the table only costs allocations"
+        );
+        assert_eq!(header.version, http::Version::HTTP_3);
+        assert_eq!(header.uri.path(), "/resource");
+        assert_eq!(
+            header.headers.get("user-agent").map(|v| v.as_bytes()),
+            Some(b"probe/1".as_slice())
+        );
+        // 🔤 A name outside `http`'s static table still round-trips; it is only
+        // the allocation count that differs, never the value.
+        assert_eq!(
+            header.headers.get("x-custom-field").map(|v| v.as_bytes()),
+            Some(b"kept".as_slice())
+        );
+
+        // 🌐 `:authority` becomes `Host` when the client sent no `host` field,
+        // because everything downstream resolves the site by that name.
+        assert_eq!(
+            header.headers.get("host").map(|v| v.as_bytes()),
+            Some(b"example.test".as_slice())
+        );
+
+        // 📌 The property an operator actually sees. Without a case table the H1
+        // wire form goes through Pingora's own fallback, which title-cases the
+        // twelve names it keeps a table for and leaves the rest lowercase. That
+        // is not a rule this code chose — it is byte for byte what a request
+        // arriving over HTTP/2 already produced, which is the whole point.
+        let mut wire = bytes::BytesMut::new();
+        header.header_to_h1_wire(&mut wire);
+        let wire = String::from_utf8(wire.to_vec()).expect("valid UTF-8");
+        assert!(wire.contains("Host: example.test"), "{wire}");
+        assert!(wire.contains("user-agent: probe/1"), "{wire}");
+        assert!(wire.contains("x-custom-field: kept"), "{wire}");
+    }
+
+    /// 🌐 A client that sent its own `Host` keeps it; the `:authority` fallback
+    /// only fills a gap, and `parse_h3_request` already refused the case where
+    /// the two disagree.
+    #[test]
+    fn h3_request_header_keeps_a_client_sent_host() {
+        let req = H3Request {
+            method: "GET".to_string(),
+            protocol: None,
+            path: "/".to_string(),
+            authority: "example.test".to_string(),
+            headers: vec![("host".to_string(), "example.test".to_string())],
+        };
+
+        let header = h3_request_header(&req, http::Method::GET).expect("valid request");
+
+        assert_eq!(
+            header.headers.get_all("host").iter().count(),
+            1,
+            "the fallback must not append a second Host"
+        );
     }
 
     #[test]

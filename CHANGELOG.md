@@ -230,6 +230,19 @@ lets the rest converge.
 
 ### 🔄 Changed
 
+- 🏷️ **An HTTP/3 request now reaches an HTTP/1 upstream with the same field-name
+  spelling an HTTP/2 request does.** Both transports previously built the same
+  request two different ways: the HTTP/2 path kept no record of field-name case,
+  the HTTP/3 path built one and filled it with the lowercase names HTTP/3
+  requires on the wire. An upstream reading raw bytes therefore saw `Host:` from
+  one and `host:` from the other for the identical request. HTTP/3 now keeps no
+  record either, so the two agree.
+
+  The record it was keeping could never have held anything but lowercase — the
+  specification requires it and the parser refuses anything else — and building
+  it cost one map allocation per request plus a cloned name, a cloned key and a
+  hash insert per field.
+
 - 🌐 **Dynamic DNS now honors source policy.** Empty `resolvers` uses the
   host's system DNS configuration instead of Hickory's Google default. Each
   dynamic pool follows its own `refresh` interval, including when global
