@@ -466,6 +466,54 @@ mod response_interception_tests {
 }
 
 #[cfg(test)]
+mod h3_duplicate_framing_tests {
+    use super::*;
+
+    fn fields(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    /// 🚫 Two `Content-Length` fields make the message malformed.
+    ///
+    /// 🤡 Only each value's shape was checked, never how many there were, so a
+    /// request carrying two different lengths was accepted and silently
+    /// collapsed to whichever came last. HTTP/3 frames its own bodies, so this
+    /// had no known exploit here — but "two parties can reach different
+    /// conclusions about one request" is the ground request smuggling grows
+    /// in, and the answer RFC 9110 §8.6 gives is to refuse rather than choose.
+    #[test]
+    fn a_repeated_content_length_is_refused() {
+        assert!(check_h3_request_framing(&fields(&[("content-length", "5")])).is_ok());
+
+        for pair in [
+            [("content-length", "5"), ("content-length", "9")],
+            // 📌 Identical copies are refused too. §8.6 permits either answer,
+            // and one rule is easier to be sure of than two.
+            [("content-length", "5"), ("content-length", "5")],
+        ] {
+            assert!(
+                check_h3_request_framing(&fields(&pair)).is_err(),
+                "{pair:?} must be refused"
+            );
+        }
+    }
+
+    /// 🚫 So does a repeated `Host`: an HTTP/1 upstream would be handed two,
+    /// and which one it believes is not this proxy's to guess.
+    #[test]
+    fn a_repeated_host_is_refused() {
+        assert!(check_h3_request_framing(&fields(&[("host", "a.example")])).is_ok());
+        assert!(
+            check_h3_request_framing(&fields(&[("host", "a.example"), ("host", "b.example")]))
+                .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
 mod request_authority_tests {
     use super::*;
     use pingora_http::RequestHeader;
@@ -1379,6 +1427,9 @@ pub(crate) enum FramingRejection {
     TransferEncodingForbidden,
     /// `Content-Length` was not `1*DIGIT` (RFC 9110 §8.6).
     MalformedContentLength,
+    /// More than one `Content-Length`, so the body length is a matter of
+    /// opinion (RFC 9110 §8.6).
+    RepeatedContentLength,
     /// An HTTP/1.1 request arrived without a `Host` field.
     MissingHost,
     /// More than one `Host` field, so the virtual host is a matter of opinion.
@@ -1395,6 +1446,7 @@ impl FramingRejection {
             Self::AmbiguousLength => "Ambiguous Message Framing",
             Self::TransferEncodingForbidden => "Transfer-Encoding Not Allowed",
             Self::MalformedContentLength => "Malformed Content-Length",
+            Self::RepeatedContentLength => "Repeated Content-Length",
             Self::MissingHost => "Missing Host Header",
             Self::AmbiguousHost => "Ambiguous Host Header",
             Self::MalformedHost => "Malformed Host Header",
@@ -1444,13 +1496,21 @@ pub(crate) fn check_request_framing(
     }
 
     // 🔢 RFC 9110 §8.6: `Content-Length = 1*DIGIT`. No sign, no whitespace, no
-    // empty value — and every duplicate must independently satisfy that, since
-    // a lenient reader might take the first and a strict one the last.
+    // empty value.
+    let mut lengths = 0;
     for value in headers.get_all(http::header::CONTENT_LENGTH) {
-        let raw = value.as_bytes();
-        if content_length_value_invalid(raw) {
+        lengths += 1;
+        if content_length_value_invalid(value.as_bytes()) {
             return Err(FramingRejection::MalformedContentLength);
         }
+    }
+    // 🛡️ And exactly one of them. §8.6 requires refusing a message whose
+    // lengths disagree and permits refusing one that repeats the same value;
+    // this takes the single rule, because "how many bytes is this body" is not
+    // a question two readers may answer differently. Grammar was already
+    // checked per duplicate — that is not the same as checking there is one.
+    if lengths > 1 {
+        return Err(FramingRejection::RepeatedContentLength);
     }
 
     Ok(())
@@ -1465,26 +1525,45 @@ fn content_length_value_invalid(raw: &[u8]) -> bool {
 /// 🛡️ Rejects an HTTP/3 request whose raw header list carries untrustworthy
 /// framing, without materializing an [`http::HeaderMap`] just to validate it.
 ///
-/// `quiche` already enforces H3's wire framing, so the only fields this proxy
-/// still has to police are `Transfer-Encoding` (forbidden outright) and
-/// `Content-Length` (`1*DIGIT`, every duplicate). This is the same rule set as
-/// [`check_request_framing`], expressed over the header list `parse_h3_request`
-/// already owns, so the H3 event loop does not parse each header twice.
+/// `quiche` already enforces H3's wire framing, so what this proxy still has to
+/// police is `Transfer-Encoding` (forbidden outright), `Content-Length`
+/// (`1*DIGIT`, and exactly one of them) and `Host` (at most one). The same rule
+/// set as [`check_request_framing`] and [`check_request_host`], expressed over
+/// the header list `parse_h3_request` already owns, so the H3 event loop does
+/// not parse each header twice.
+///
+/// 🤡 Counting used to be missing here, and it mattered more than it looked.
+/// The HTTP/3 request builder put fields in with `insert_header`, which
+/// replaces, so a repeated `Content-Length` was silently collapsed to the last
+/// one and never reached anything that could object. Keeping every value —
+/// which is what a split `Cookie` needs — removes that accidental cover, so
+/// the rule has to be stated rather than relied upon.
 pub(crate) fn check_h3_request_framing(
     headers: &[(String, String)],
 ) -> Result<(), FramingRejection> {
-    let has_transfer_encoding = headers
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"));
-    if has_transfer_encoding {
-        return Err(FramingRejection::TransferEncodingForbidden);
-    }
+    let mut lengths = 0;
+    let mut hosts = 0;
     for (name, value) in headers {
-        if name.eq_ignore_ascii_case("content-length")
-            && content_length_value_invalid(value.as_bytes())
-        {
-            return Err(FramingRejection::MalformedContentLength);
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(FramingRejection::TransferEncodingForbidden);
         }
+        if name.eq_ignore_ascii_case("content-length") {
+            lengths += 1;
+            if content_length_value_invalid(value.as_bytes()) {
+                return Err(FramingRejection::MalformedContentLength);
+            }
+        } else if name.eq_ignore_ascii_case("host") {
+            hosts += 1;
+        }
+    }
+    if lengths > 1 {
+        return Err(FramingRejection::RepeatedContentLength);
+    }
+    // 🌐 `check_request_host` skips HTTP/3 because `:authority` is validated by
+    // its own parser — but a client may also send `Host` as an ordinary field,
+    // and two of them would leave an HTTP/1 upstream choosing a site.
+    if hosts > 1 {
+        return Err(FramingRejection::AmbiguousHost);
     }
     Ok(())
 }

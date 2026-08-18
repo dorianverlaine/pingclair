@@ -758,6 +758,27 @@ immediately after the `101`, both ends seeing EOF with no error.
 
 ### 🐛 Fixed
 
+- 🍪 **A cookie split across several field lines now arrives whole.** HTTP/3
+  lets a client send `Cookie` as separate lines — browsers do, because it
+  compresses better — and every field went into the request with a call that
+  *replaces* rather than adds, so only the last line survived. The origin
+  received a truncated cookie and nothing reported a problem. The pieces are
+  now rejoined with `"; "`, which is what RFC 9114 §4.2.1 requires before the
+  request reaches anything that is not HTTP/2 or HTTP/3.
+
+  The same defect silently discarded every other repeated field. A client
+  sending `Accept-Encoding: gzip` and `Accept-Encoding: br` on separate lines
+  had the first one dropped, so the origin was told the client accepts
+  something it never said. All values are now kept.
+
+- 🛡️ **A request carrying two `Content-Length` fields is refused** rather than
+  collapsed to one of them, on every protocol (RFC 9110 §8.6). How many bytes a
+  body has is not a question two readers may answer differently, and the
+  previous behaviour — validate each duplicate's grammar, then keep whichever
+  came last — is the disagreement request smuggling is built on. An HTTP/3
+  request with two `Host` fields is refused for the same reason; HTTP/1.1
+  already refused it.
+
 - 🔊 **The server now logs at a level someone can read.** With `RUST_LOG` unset
   — which is every deployment that does not know to set it — the subscriber
   emitted `ERROR` and nothing else. Fifty-eight informational lines across the

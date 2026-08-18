@@ -718,11 +718,46 @@ fn h3_request_header(req: &H3Request, method: http::Method) -> Result<RequestHea
     // the default here made every HTTP/3 request describe itself as HTTP/1.1 —
     // visible to a FastCGI application as `SERVER_PROTOCOL`.
     header.set_version(http::Version::HTTP_3);
+    // 🍪 `Cookie` is gathered rather than forwarded piece by piece. RFC 9114
+    // §4.2.1 lets a client split it across field lines — browsers do, because
+    // it compresses better — and requires the pieces to be rejoined with
+    // `"; "` before the request reaches anything that is not HTTP/2 or
+    // HTTP/3. An HTTP/1 upstream is exactly that.
+    //
+    // 🍃 Two variables rather than always building a `String`: one cookie is
+    // the overwhelmingly common case and it borrows, so the join allocates
+    // only for a request that actually split it.
+    let mut only_cookie: Option<&str> = None;
+    let mut joined_cookie: Option<String> = None;
     for (name, value) in &req.headers {
+        if name == "cookie" {
+            match (&mut joined_cookie, only_cookie) {
+                (Some(joined), _) => {
+                    joined.push_str("; ");
+                    joined.push_str(value);
+                }
+                (None, Some(first)) => {
+                    let mut joined = String::with_capacity(first.len() + value.len() + 2);
+                    joined.push_str(first);
+                    joined.push_str("; ");
+                    joined.push_str(value);
+                    joined_cookie = Some(joined);
+                }
+                (None, None) => only_cookie = Some(value),
+            }
+            continue;
+        }
         let Ok(name) = http::HeaderName::from_bytes(name.as_bytes()) else {
             continue;
         };
-        header.insert_header(name, value.as_str()).ok();
+        // 📋 Appended, not inserted. `insert_header` replaces every value under
+        // the name, so a field the client sent twice arrived as whichever copy
+        // came last — a list header such as `Accept-Encoding` reached the
+        // origin describing something the client never said.
+        header.append_header(name, value.as_str()).ok();
+    }
+    if let Some(cookie) = joined_cookie.as_deref().or(only_cookie) {
+        header.insert_header(http::header::COOKIE, cookie).ok();
     }
     if !req.authority.is_empty() && !header.headers.contains_key("host") {
         header.insert_header("host", &req.authority).ok();
@@ -6174,6 +6209,70 @@ mod tests {
         assert!(wire.contains("Host: example.test"), "{wire}");
         assert!(wire.contains("user-agent: probe/1"), "{wire}");
         assert!(wire.contains("x-custom-field: kept"), "{wire}");
+    }
+
+    /// 🍪 A cookie split across several field lines arrives whole.
+    ///
+    /// 🤡 It did not. Every field went in with `insert_header`, which replaces
+    /// rather than adds, so only the last line survived and the origin received
+    /// a truncated cookie with nothing reporting a problem. RFC 9114 §4.2.1
+    /// says a client MAY split `Cookie` — browsers do, because it compresses
+    /// better — and that the pieces MUST be rejoined with `"; "` before the
+    /// request reaches anything that is not HTTP/2 or HTTP/3. An HTTP/1
+    /// upstream is exactly that.
+    #[test]
+    fn a_cookie_split_across_field_lines_is_rejoined() {
+        let req = H3Request {
+            method: "GET".to_string(),
+            protocol: None,
+            path: "/".to_string(),
+            authority: "example.test".to_string(),
+            headers: vec![
+                ("cookie".to_string(), "a=1".to_string()),
+                ("cookie".to_string(), "b=2".to_string()),
+                ("cookie".to_string(), "c=3".to_string()),
+            ],
+        };
+
+        let header = h3_request_header(&req, http::Method::GET).expect("valid request");
+
+        assert_eq!(
+            header.headers.get_all("cookie").iter().count(),
+            1,
+            "the pieces must arrive as one field, not three"
+        );
+        assert_eq!(
+            header.headers.get("cookie").map(|v| v.as_bytes()),
+            Some(b"a=1; b=2; c=3".as_slice())
+        );
+    }
+
+    /// 📋 A field that may legitimately repeat keeps every value.
+    ///
+    /// `Accept-Encoding` and friends are lists; collapsing them to the last
+    /// line changes what the origin is told the client accepts.
+    #[test]
+    fn a_repeatable_field_keeps_every_value() {
+        let req = H3Request {
+            method: "GET".to_string(),
+            protocol: None,
+            path: "/".to_string(),
+            authority: "example.test".to_string(),
+            headers: vec![
+                ("accept-encoding".to_string(), "gzip".to_string()),
+                ("accept-encoding".to_string(), "br".to_string()),
+            ],
+        };
+
+        let header = h3_request_header(&req, http::Method::GET).expect("valid request");
+
+        let values: Vec<&[u8]> = header
+            .headers
+            .get_all("accept-encoding")
+            .iter()
+            .map(|v| v.as_bytes())
+            .collect();
+        assert_eq!(values, vec![b"gzip".as_slice(), b"br".as_slice()]);
     }
 
     /// 🌐 A client that sent its own `Host` keeps it; the `:authority` fallback
