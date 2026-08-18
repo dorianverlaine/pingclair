@@ -735,6 +735,24 @@ lets the rest converge.
 
 ### 🐛 Fixed
 
+- 🌐 **`{host}` and the placeholders beside it now resolve over HTTP/2.** They
+  read the `Host` header directly, and an HTTP/2 request does not have one —
+  the site name arrives in `:authority` and stays in the URI. So `{host}`,
+  `{hostport}`, `{port}` and `{labels.N}` all resolved to the empty string for
+  the transport browsers use by default, while the identical request over
+  HTTP/1.1 and HTTP/3 resolved them correctly.
+
+  What that looked like in practice: `redir https://{host}/landing` answered
+  `Location: https:///landing`, which no browser follows. Anything else built
+  from the site name — a `respond` body, a `header` value, a `vars` entry, a
+  `reverse_proxy` `header_up`, a log field — was empty the same way, and a
+  matcher written against `{host}` simply stopped matching, with no error.
+
+  `{uri}` was the same mistake seen from the other side: it rendered the whole
+  URI, so over HTTP/2 it returned `https://example.com/p?q=1` where HTTP/1.1
+  returned `/p?q=1`. It is now the request target on every protocol.
+
+
 - 🗜️ **A `file_server` compressed bodies too small for compression to win, and
   the behaviour could not be turned off.** There was no size floor anywhere on
   that path, and every browser sends `Accept-Encoding`. Measured against the real

@@ -5481,26 +5481,19 @@ fn resolve_single_placeholder(
             host.to_string()
         }
     };
+    // 🌐 Where the site name lives depends on the protocol: HTTP/1.1 sends a
+    // `Host` header, HTTP/2 and HTTP/3 send `:authority`, which Pingora keeps
+    // in the URI and does not copy into a header. `request_authority` already
+    // knows both and is the one place that rule is written down — reading the
+    // header directly here is what made every one of these placeholders
+    // resolve to nothing over HTTP/2.
+    let authority = request_authority(req);
     match name {
-        "host" | "http.request.host" => {
-            let host = req
-                .headers
-                .get("host")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            host_without_port(host)
-        }
-        "hostport" | "http.request.hostport" => req
-            .headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string(),
-        "port" | "http.request.port" => req
-            .headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|host| host.rsplit_once(':'))
+        "host" | "http.request.host" => host_without_port(authority),
+        "hostport" | "http.request.hostport" => authority.to_string(),
+        "port" | "http.request.port" => authority
+            .rsplit_once(':')
+            .filter(|_| !authority.starts_with('['))
             .map(|(_, port)| port.to_string())
             .unwrap_or_default(),
         // 🧭 `{query}` is the bare query string; `{?query}` keeps the leading
@@ -5524,12 +5517,7 @@ fn resolve_single_placeholder(
                 .strip_prefix("http.request.host.labels.")
                 .or_else(|| name.strip_prefix("labels."))
                 .unwrap_or("");
-            let host = req
-                .headers
-                .get("host")
-                .and_then(|v| v.to_str().ok())
-                .map(host_without_port)
-                .unwrap_or_default();
+            let host = host_without_port(authority);
             let labels: Vec<&str> = host.split('.').collect();
             raw.parse::<usize>()
                 .ok()
@@ -5552,7 +5540,15 @@ fn resolve_single_placeholder(
         "scheme" | "http.request.scheme" => scheme.to_string(),
         // 🧭 `{uri}` is Caddy's shorthand for the full request target, and it is
         // what `redir https://{host}{uri}` depends on.
-        "uri" | "http.request.uri" => req.uri.to_string(),
+        // 🧭 Path and query, never the scheme and authority. Rendering the
+        // whole URI hands back whatever the protocol put in it, and HTTP/2
+        // puts the site name there — so `{uri}` meant one thing on HTTP/1.1
+        // and another on HTTP/2 for the identical request.
+        "uri" | "http.request.uri" => req
+            .uri
+            .path_and_query()
+            .map(|target| target.as_str().to_string())
+            .unwrap_or_else(|| req.uri.path().to_string()),
         "path" | "http.request.uri.path" => req.uri.path().to_string(),
         _ => {
             // 🚧 Still missing: {dir}, {file}, {file.*}, {re.*}, {env.*},
@@ -8676,6 +8672,67 @@ mod p0_regression_tests {
             .unwrap();
         assert_eq!(request_authority(&h2), "h2.example.com:443");
         assert_eq!(authority_host(request_authority(&h2)), "h2.example.com");
+    }
+
+    /// 🌐 The placeholders that name the site must give the same answer on
+    /// HTTP/2 as on HTTP/1.1.
+    ///
+    /// 🤡 They did not. HTTP/2 carries the site name in `:authority`, which
+    /// Pingora keeps in the URI and does *not* copy into a `Host` header, and
+    /// every one of these read that header directly — so `{host}` resolved to
+    /// the empty string for the transport browsers actually use by default.
+    /// Measured on a public host: `redir https://{host}/landing` answered
+    /// `Location: https:///landing`, which no browser follows.
+    ///
+    /// `{uri}` was the same mistake from the other side: rendering the whole
+    /// URI gives back the scheme and authority that HTTP/2 put there, where
+    /// HTTP/1.1 has only the path.
+    #[test]
+    fn site_placeholders_agree_across_http1_and_http2() {
+        let vars = crate::http_policy::RequestVars::default();
+
+        let mut h1 = RequestHeader::build("GET", b"/landing?a=1", None).unwrap();
+        h1.insert_header(http::header::HOST, "api.example.com:8443")
+            .unwrap();
+
+        // 🌐 What an HTTP/2 request actually looks like once Pingora has built
+        // it: authority in the URI, no `Host` header at all.
+        let mut h2 = RequestHeader::build_no_case("GET", b"/landing?a=1", None).unwrap();
+        h2.uri = "https://api.example.com:8443/landing?a=1".parse().unwrap();
+
+        for placeholder in [
+            "{host}",
+            "{http.request.host}",
+            "{hostport}",
+            "{port}",
+            "{labels.0}",
+            "{uri}",
+            "{path}",
+            "{query}",
+        ] {
+            let over_h1 = resolve_caddy_placeholders(placeholder, &h1, None, "https", &vars);
+            let over_h2 = resolve_caddy_placeholders(placeholder, &h2, None, "https", &vars);
+            assert_eq!(
+                over_h1, over_h2,
+                "{placeholder} differs between HTTP/1.1 and HTTP/2"
+            );
+            assert!(
+                !over_h1.is_empty(),
+                "{placeholder} resolved to nothing on both transports, so the \
+                 comparison above proves nothing"
+            );
+        }
+
+        // 📌 The concrete failure that started this, pinned by value rather
+        // than only by agreement.
+        assert_eq!(
+            resolve_caddy_placeholders("https://{host}/landing", &h2, None, "https", &vars),
+            "https://api.example.com/landing"
+        );
+        assert_eq!(
+            resolve_caddy_placeholders("{uri}", &h2, None, "https", &vars),
+            "/landing?a=1"
+        );
     }
 
     #[test]
