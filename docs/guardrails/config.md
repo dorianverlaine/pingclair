@@ -11,6 +11,51 @@
   > 🎯 **可操作的規則**：凡是決定「下一個 writer 還能不能寫」的狀態，都和
   > 被保護的 snapshot 一起提交，不要在 caller 收到 success 之後補記。
 
+## 🚪 驗證放哪一層（2026-08-18）
+
+> 🧭 這一節本來只寫在 `docs/guardrails/tls.md` 裡。要碰 compiler 的人會先讀
+> `config.md`，而讀不到那條「寫在 adapter 裡的規則，就是 Admin API 繞得過的規則」
+> ——偏偏那是**最容易被重新弄壞的一條**。所以它在這裡。
+
+- **寫在 adapter 裡的規則，就是 Admin API 繞得過的規則。** Pingclairfile 走
+  `parser/` → `adapter/caddyfile.rs` → `compiler.rs`；JSON 設定（含 Admin API
+  `POST /load` 貼進來的文件）**整段跳過 adapter**，直接進 `compiler.rs`。所以只在
+  adapter 裡拒絕的東西，換成 JSON 就進得來。
+
+  > 🎯 **可操作的規則**：一條規則若是**安全性質**，放 `validate_config`；
+  > 只有**語法／拼寫**層面的東西才留在 adapter。判準很簡單：
+  > **「有人用 JSON 繞過這條，會不會變成安全問題？」** 會，就不能只放 adapter。
+
+  🤡 這條不是理論。SEC-002 就是它：JSON 裡把 mTLS 的欄位名拼錯，serde 靜默忽略，
+  於是「已驗證的 mTLS」降級成「只要求憑證」——因為那條檢查只長在 adapter 上。
+  修法是 `deny_unknown_fields` 加在型別上，也就是**兩條路徑共用的那一層**。
+
+- **不能被兌現的設定，fail closed，而且要在 `validate_config` fail。** 收下一個
+  執行期不看的旋鈕，不是相容，是說謊——差別只在操作者多久之後才發現。
+
+  > 🎯 **可操作的規則**：接受一個設定，就要在執行期用它；用不了就在載入時拒絕，
+  > 訊息裡寫出**這個 build 為什麼做不到**。啟動時印一行 warning **不算**——
+  > 那行字在開機日誌裡，而設定仍然被寫下來、仍然看起來生效了。
+
+  📌 2026-08-18 有三筆走的是這條：`preferred_chains`（ACME client 無法要求替代
+  chain）、十二個 `transport http` 旋鈕（Go `http.Transport` 的概念，這個 build 的
+  上游堆疊沒有同層等價物）、以及不合法的 `admin.listen`（原本在啟動執行緒上 panic）。
+  三筆都是 breaking，而那正是重點：另一個選項是伺服器回報成功、做別的事。
+
+  ⚠️ **近似語意比缺口更糟。** `read_buffer` 是 Go bufio 的大小，而
+  `PeerOptions::tcp_recv_buf` 是 socket 選項——名字像、層不同。把兩者接起來會在
+  「相容」的名義下改掉行為，比直接說「做不到」糟得多。
+
+- **一份設定的兩種寫法，必須在同一個地方收斂。** 同一件事有兩種拼法時，讓其中一種
+  是另一種的入口，不要讓兩條路各自解讀。
+
+  > 🎯 **可操作的規則**：新增第二種寫法之前，先問「它們在哪一行合流」。答不出來，
+  > 就是還沒設計完。
+
+  📌 例：`versions 2` 與 `h2c://` 都在講 prior-knowledge h2。實作時只讓 scheme
+  決定 pool group，`versions` 走同一個 `set_http_version`——所以兩者不可能對
+  「這條連線能不能重用」給出不同答案。
+
 ## 📏 量測與查證
 
 > 🧭 這一節整段來自 2026-08-05 的 M4.5。那一天有九次「以為量到產品的缺陷，

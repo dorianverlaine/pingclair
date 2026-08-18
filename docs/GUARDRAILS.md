@@ -9,7 +9,7 @@
 | 文件 | 涵蓋 |
 | --- | --- |
 | [`guardrails/testing.md`](guardrails/testing.md) | 測試與除錯環境、幽靈程序、本機工具鏈與代理、CI 工作流、驗證證據的存放規則 |
-| [`guardrails/config.md`](guardrails/config.md) | 量測與查證：量測工具自己的缺陷、「編得過」不等於「編對」、設定 adapter 與 compiler 的陷阱 |
+| [`guardrails/config.md`](guardrails/config.md) | **驗證放哪一層**（adapter 的規則 = Admin API 繞得過的規則）、不能兌現的設定要 fail closed、量測工具自己的缺陷、「編得過」不等於「編對」 |
 | [`guardrails/tls.md`](guardrails/tls.md) | 依賴與鏈結（BoringSSL 單一鏈結、`[patch.crates-io]` 對 audit 的影響）與安全預設（fail closed、遮罩、憑證與信任素材） |
 | [`guardrails/proxy.md`](guardrails/proxy.md) | HTTP/3 為什麼釘在 quiche／BoringSSL、`quic.rs` 的架構與正確性、串流與記憶體 |
 
