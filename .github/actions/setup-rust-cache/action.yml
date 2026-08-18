@@ -1,5 +1,5 @@
 name: setup-rust-cache
-description: Restore and save Cargo's registry and sccache object caches for one job.
+description: Restore Cargo's registry and enable the sccache GitHub Actions backend for one job.
 
 inputs:
   target:
@@ -24,9 +24,8 @@ runs:
         set -euo pipefail
         echo "hash=$(sha256sum Cargo.lock | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
-    - name: Restore cargo home
-      id: cargo_restore
-      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+    - name: Restore and save cargo home
+      uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
         path: |
           ~/.cargo/bin
@@ -37,50 +36,19 @@ runs:
         restore-keys: |
           cargo-home-${{ inputs.cache-scope }}-${{ inputs.target }}-${{ inputs.profile }}-
 
-    - name: Install sccache
-      uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+    - name: Install sccache and enable the GitHub Actions cache backend
+      uses: mozilla/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       with:
-        tool: sccache@0.17.0
+        version: v0.17.0
 
-    - name: Configure sccache backend
+    - name: Point Cargo at sccache
       shell: bash
       run: |
         set -euo pipefail
-        if [[ -n "${ACTIONS_CACHE_URL:-}" && -n "${ACTIONS_RUNTIME_TOKEN:-}" ]]; then
-          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-        else
-          echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
-          echo "SCCACHE_DIR=${CI_BUILD_ROOT:-$HOME/.cache/pingclair-ci}/sccache" >> "$GITHUB_ENV"
-        fi
+        # 🧊 The cache-service tokens are only visible inside JavaScript
+        # actions, so mozilla/sccache-action exports them for the rest of the
+        # job. A plain shell step cannot see them, which is why the previous
+        # detection always fell back to a local sccache directory that was
+        # never persisted.
+        echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
         echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-
-    - name: Restore sccache (fallback)
-      id: sccache_restore
-      if: ${{ env.SCCACHE_GHA_ENABLED != 'true' }}
-      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
-      with:
-        path: ${{ env.SCCACHE_DIR }}
-        key: sccache-${{ inputs.cache-scope }}-${{ inputs.target }}-${{ inputs.profile }}-${{ steps.lockhash.outputs.hash }}-${{ github.run_id }}
-        restore-keys: |
-          sccache-${{ inputs.cache-scope }}-${{ inputs.target }}-${{ inputs.profile }}-${{ steps.lockhash.outputs.hash }}-
-          sccache-${{ inputs.cache-scope }}-${{ inputs.target }}-${{ inputs.profile }}-
-
-    - name: Save cargo home
-      if: ${{ always() && !cancelled() && steps.cargo_restore.outputs.cache-hit != 'true' }}
-      continue-on-error: true
-      uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
-      with:
-        path: |
-          ~/.cargo/bin
-          ~/.cargo/registry/index
-          ~/.cargo/registry/cache
-          ~/.cargo/git/db
-        key: cargo-home-${{ inputs.cache-scope }}-${{ inputs.target }}-${{ inputs.profile }}-${{ steps.lockhash.outputs.hash }}
-
-    - name: Save sccache (fallback)
-      if: ${{ always() && !cancelled() && env.SCCACHE_GHA_ENABLED != 'true' && steps.sccache_restore.outputs.cache-hit != 'true' }}
-      continue-on-error: true
-      uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
-      with:
-        path: ${{ env.SCCACHE_DIR }}
-        key: sccache-${{ inputs.cache-scope }}-${{ inputs.target }}-${{ inputs.profile }}-${{ steps.lockhash.outputs.hash }}-${{ github.run_id }}
