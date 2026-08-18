@@ -4593,9 +4593,28 @@ async fn reverse_proxy_upstream(
             RequestHeader::build(upstream_method.clone(), upstream_uri.as_bytes(), None)
                 .map_err(|_| (400, "Bad Request"))?;
 
-        // 🏷️ Uses the selected upstream's authority instead of the downstream host.
+        // 🏷️ Forwards the name the client asked for, because that is the name
+        // the origin routes by.
+        //
+        // 🤡 This used to send the upstream's own dial address. An origin doing
+        // virtual-host routing therefore served the default site to every
+        // HTTP/3 request, while the identical request over HTTP/1.1 or HTTP/2 —
+        // which forward the downstream `Host` untouched — reached the right
+        // one. Nothing reported an error; the status stayed 200, so only a
+        // field-by-field comparison across the three transports could see it.
+        //
+        // 📌 `peer.sni` stays the name used for the TLS handshake. The two were
+        // one value here and they are not the same question: one is who the
+        // proxy is talking to, the other is which site the client wants.
+        // An explicit `header_up Host …` still wins — those are applied below.
+        let downstream_host = crate::server::request_authority(client_header);
+        let forwarded_host = if downstream_host.is_empty() {
+            peer.sni.as_str()
+        } else {
+            downstream_host
+        };
         up_req
-            .insert_header("Host", peer.sni.clone())
+            .insert_header(http::header::HOST, forwarded_host)
             .map_err(|_| (502, "Upstream Request Error"))?;
 
         // 🧹 Forward the mutable policy header map so an authorizing
@@ -6598,6 +6617,101 @@ mod tests {
         assert_eq!(status.as_deref(), Some(b"200".as_slice()));
         assert_eq!(body, replacement);
         upstream_task.await.unwrap();
+    }
+
+    /// 🏷️ The origin decides which site to serve by the name the client asked
+    /// for, so that name has to survive the proxy — on HTTP/3 exactly as it
+    /// does on HTTP/1.1 and HTTP/2.
+    ///
+    /// 🤡 It did not. This path set `Host` to the upstream's own dial address,
+    /// so an origin doing virtual-host routing served the default site to every
+    /// HTTP/3 request while the identical request over HTTP/1.1 reached the
+    /// right one. Measured on a public host: the origin saw
+    /// `Host: 127.0.0.1`. Nothing reported an error — the status stayed 200,
+    /// which is why a matrix that checked only status codes never saw it.
+    #[tokio::test]
+    async fn h3_bridge_forwards_the_host_the_client_asked_for() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream.accept().await.unwrap();
+            let mut connection = h2::server::handshake(stream).await.unwrap();
+            let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+            // 🌐 An h2 upstream carries the name in `:authority`, which is
+            // where Pingora puts the `Host` it was handed.
+            let seen = request
+                .uri()
+                .authority()
+                .map(|authority| authority.to_string())
+                .or_else(|| {
+                    request
+                        .headers()
+                        .get("host")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            let _ = seen_tx.send(seen);
+            let response = http::Response::builder().status(200).body(()).unwrap();
+            respond.send_response(response, true).unwrap();
+            while connection.accept().await.is_some() {}
+        });
+
+        let state = proxy_state(HandlerConfig::ReverseProxy(Box::new(ReverseProxyConfig {
+            upstreams: vec![format!("h2c://{upstream_address}")],
+            ..Default::default()
+        })));
+        let proxy = PingclairProxy::new();
+        let connector = pingora_core::connectors::http::Connector::new(Some(
+            pingora_core::connectors::ConnectorOptions::new(16),
+        ));
+        let request = H3Request {
+            method: "GET".to_string(),
+            protocol: None,
+            path: "/resource".to_string(),
+            authority: "shop.example.test".to_string(),
+            headers: vec![("host".to_string(), "shop.example.test".to_string())],
+        };
+        let client_header = h3_request_header(&request, http::Method::GET).unwrap();
+        let (body_tx, mut body_rx) = mpsc::channel(1);
+        drop(body_tx);
+        let (resp_tx, mut resp_rx) = mpsc::channel(8);
+        let resp_tx = ResponseSink::new(resp_tx, Instant::now());
+        let body_notify = Arc::new(Notify::new());
+
+        reverse_proxy_upstream(
+            &proxy,
+            &connector,
+            &state,
+            0,
+            &request,
+            &client_header,
+            &request.path,
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1",
+            "test-request-id",
+            &ResponseHeaderPolicy::default(),
+            0,
+            0,
+            &mut body_rx,
+            &resp_tx,
+            &body_notify,
+            Instant::now(),
+            &crate::http_policy::RequestVars::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let _ = resp_rx.recv().await;
+        let seen = seen_rx.await.unwrap();
+        assert_eq!(
+            seen, "shop.example.test",
+            "the origin must be told the site the client asked for, not the \
+             address this proxy happened to dial"
+        );
+        upstream_task.abort();
     }
 
     #[tokio::test]

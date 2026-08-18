@@ -1106,7 +1106,7 @@ fn referer_host(referer: &str) -> Option<&str> {
     Some(host.split(':').next().unwrap_or(host))
 }
 
-fn request_authority(request: &RequestHeader) -> &str {
+pub(crate) fn request_authority(request: &RequestHeader) -> &str {
     // 🌐 HTTP/2 carries the virtual host in `:authority`, which Pingora stores in the URI.
     request
         .uri

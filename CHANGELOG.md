@@ -735,6 +735,20 @@ lets the rest converge.
 
 ### 🐛 Fixed
 
+- 🏷️ **An HTTP/3 request now reaches the origin carrying the site name the
+  client asked for.** It carried the upstream's own dial address instead, so an
+  origin that routes by `Host` — another proxy, a PaaS router, any server with
+  several virtual hosts behind one address — served the default site to every
+  HTTP/3 request, while the identical request over HTTP/1.1 or HTTP/2 reached
+  the right one. Applications that check the host against an allowlist rejected
+  the request outright, and anything the origin built from `Host` (a redirect,
+  a link in an email) came out pointing at the proxy's own upstream address.
+
+  Nothing reported an error: the status stayed 200. An explicit
+  `header_up Host …` still overrides this, and the name used for the TLS
+  handshake is unchanged — those were one value here and they answer two
+  different questions.
+
 - 🌐 **`{host}` and the placeholders beside it now resolve over HTTP/2.** They
   read the `Host` header directly, and an HTTP/2 request does not have one —
   the site name arrives in `:authority` and stays in the URI. So `{host}`,
