@@ -111,8 +111,8 @@ jobs:
         with:
           name: pingclair-linux-${{ matrix.platform.key }}
           path: |
-            ${CARGO_TARGET_DIR}/${{ matrix.platform.target }}/release/pingclair-linux-${{ matrix.platform.key }}.tar.gz
-            ${CARGO_TARGET_DIR}/${{ matrix.platform.target }}/release/SHA256SUMS-${{ matrix.platform.key }}.txt
+            ${{ env.CARGO_TARGET_DIR }}/${{ matrix.platform.target }}/release/pingclair-linux-${{ matrix.platform.key }}.tar.gz
+            ${{ env.CARGO_TARGET_DIR }}/${{ matrix.platform.target }}/release/SHA256SUMS-${{ matrix.platform.key }}.txt
           retention-days: 7
 
   publish-release:
