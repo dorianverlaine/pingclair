@@ -79,8 +79,8 @@ jobs:
         with:
           name: pingclair-linux-${{ matrix.platform.key }}-dev
           path: |
-            ${CARGO_TARGET_DIR}/${{ matrix.platform.target }}/release/pingclair-linux-${{ matrix.platform.key }}-dev.tar.gz
-            ${CARGO_TARGET_DIR}/${{ matrix.platform.target }}/release/SHA256SUMS-dev-${{ matrix.platform.key }}.txt
+            ${{ env.CARGO_TARGET_DIR }}/${{ matrix.platform.target }}/release/pingclair-linux-${{ matrix.platform.key }}-dev.tar.gz
+            ${{ env.CARGO_TARGET_DIR }}/${{ matrix.platform.target }}/release/SHA256SUMS-dev-${{ matrix.platform.key }}.txt
           retention-days: 14
 
   publish-dev-release:
