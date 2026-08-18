@@ -250,7 +250,7 @@ impl TlsAccept for DynamicCertResolver {
                 // Cache hit - use cached BoringSSL objects
                 tracing::debug!("🚀 Using cached cert for {}", sni);
                 if let Err(e) = install_certificate_chain(ssl, &cached.chain, &cached.pkey) {
-                    tracing::error!("Failed to install cached certificate chain: {}", e);
+                    tracing::error!("🔐 Failed to install cached certificate chain: {}", e);
                 }
                 return;
             }
@@ -261,7 +261,7 @@ impl TlsAccept for DynamicCertResolver {
             let chain = match parse_certificate_chain(&cert_pem) {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::error!("Failed to parse cert PEM: {}", e);
+                    tracing::error!("🔐 Failed to parse cert PEM: {}", e);
                     return;
                 }
             };
@@ -269,14 +269,14 @@ impl TlsAccept for DynamicCertResolver {
             let pkey = match PKey::private_key_from_pem(key_pem.as_bytes()) {
                 Ok(k) => k,
                 Err(e) => {
-                    tracing::error!("Failed to parse key PEM: {}", e);
+                    tracing::error!("🔐 Failed to parse key PEM: {}", e);
                     return;
                 }
             };
 
             // Step 3: Set the leaf, its intermediates, and the key
             if let Err(e) = install_certificate_chain(ssl, &chain, &pkey) {
-                tracing::error!("Failed to install certificate chain: {}", e);
+                tracing::error!("🔐 Failed to install certificate chain: {}", e);
                 return;
             }
 

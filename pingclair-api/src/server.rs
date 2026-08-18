@@ -203,7 +203,7 @@ pub async fn run_admin_server(
         let (stream, peer_addr) = match listener.accept().await {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!("Admin accept error: {}", e);
+                tracing::warn!("🔧 Admin accept error: {}", e);
                 continue;
             }
         };
@@ -225,7 +225,7 @@ pub async fn run_admin_server(
                 )
                 .await
             {
-                tracing::error!("Error serving connection: {:?}", err);
+                tracing::error!("🔧 Error serving connection: {:?}", err);
             }
         });
     }
@@ -643,7 +643,7 @@ async fn handle_request_inner(
             }
         }
         (&Method::POST, "/stop") => {
-            tracing::info!("🛑 Admin API received /stop, shutting down");
+            tracing::info!("😴 Admin API received /stop, shutting down");
             // 🛑 Answer the request first, then ask the process supervisor to
             // run the same graceful path as SIGTERM. A hard exit here cut the
             // connection before the client ever saw the response.

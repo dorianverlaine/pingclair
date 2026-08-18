@@ -842,7 +842,7 @@ pub(crate) fn run_server(
     // Start HTTP/3 (QUIC) servers for HTTPS ports
     if let Some(cert_table) = h3_cert_table.clone() {
         tracing::info!(
-            "🚀 Starting HTTP/3 (quiche) servers for {} port(s)",
+            "🚀 Starting HTTP/3 servers for {} port(s)",
             https_ports.len()
         );
 
@@ -888,7 +888,7 @@ pub(crate) fn run_server(
 
                 tokio::spawn(async move {
                     if let Err(e) = server.run().await {
-                        tracing::error!("HTTP/3 server on {} failed: {}", socket_addr, e);
+                        tracing::error!("🌐 HTTP/3 server on {} failed: {}", socket_addr, e);
                     }
                 });
             }
@@ -981,7 +981,7 @@ pub(crate) fn run_server(
                     policy: policy_for_admin,
                 };
                 if let Err(e) = pingclair_api::run_admin_server(addr, options).await {
-                    tracing::error!("Admin server error: {}", e);
+                    tracing::error!("🔧 Admin server error: {}", e);
                 }
             });
         });

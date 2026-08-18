@@ -24,7 +24,7 @@ impl ApiRouter {
 
     /// Start the API server
     pub async fn start(&self) -> pingclair_core::Result<()> {
-        tracing::info!("Starting admin API on {}", self.listen);
+        tracing::info!("🔧 Starting admin API on {}", self.listen);
         // TODO: Implement HTTP server for admin API
         Ok(())
     }
@@ -38,6 +38,6 @@ impl ApiRouter {
     pub async fn update_config(&self, new_config: PingclairConfig) {
         let mut config = self.config.write().await;
         *config = new_config;
-        tracing::info!("Configuration updated");
+        tracing::info!("🔄 Configuration updated");
     }
 }

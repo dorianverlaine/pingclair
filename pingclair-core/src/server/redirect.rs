@@ -103,7 +103,7 @@ impl HttpRedirectServer {
                     });
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to accept redirect connection: {}", e);
+                    tracing::warn!("🔁 Failed to accept redirect connection: {}", e);
                 }
             }
         }

@@ -119,7 +119,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                     );
                 }
             }
-            tracing::info!("Starting Pingclair with config: {}", config_path);
+            tracing::info!("🚀 Starting Pingclair with config: {}", config_path);
 
             // Load configuration - support both single file and directory
             let config = if std::path::Path::new(&config_path).is_dir() {
@@ -408,7 +408,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
             // 🌐 Caddy expands `--to :9000-9003` into one peer per port; the
             // CLI must not ship an address the runtime cannot dial.
             let to = pingclair_config::adapter::expand_upstream_port_ranges(to);
-            tracing::info!("Starting reverse proxy: {} -> {:?}", from, to);
+            tracing::info!("🚀 Starting reverse proxy: {} -> {:?}", from, to);
             // Create dynamic config
             let mut config = pingclair_core::config::PingclairConfig::default();
             if disable_redirects {
@@ -531,7 +531,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
             templates,
         } => {
             tracing::info!(
-                "Starting file server on {} serving {} (browse: {})",
+                "🚀 Starting file server on {} serving {} (browse: {})",
                 listen,
                 root,
                 browse
@@ -678,7 +678,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 )
             } else {
                 let config = resolve_config_path(config.as_deref());
-                tracing::info!("Validating config: {}", config);
+                tracing::info!("🔍 Validating config: {}", config);
                 let result = if std::path::Path::new(&config).is_dir() {
                     tracing::info!("📁 Validating configuration directory: {}", config);
                     pingclair_config::compile_directory(&config)

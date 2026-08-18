@@ -990,7 +990,7 @@ impl RouteAccessControl {
                             tracing::error!(
                                 rule,
                                 %error,
-                                "Invalid access-control IP/CIDR rule"
+                                "🧯 Invalid access-control IP/CIDR rule"
                             );
                             *invalid = true;
                             None
@@ -1008,7 +1008,7 @@ impl RouteAccessControl {
                         tracing::error!(
                             rule,
                             %error,
-                            "Invalid access-control User-Agent regex"
+                            "🧯 Invalid access-control User-Agent regex"
                         );
                         *invalid = true;
                         None
@@ -8050,7 +8050,9 @@ fn build_weighted_upstreams(
                 spec,
                 weight: weight as usize,
             }),
-            None => tracing::warn!(upstream = %option.address, "Ignoring invalid upstream address"),
+            None => {
+                tracing::warn!(upstream = %option.address, "🧯 Ignoring invalid upstream address")
+            }
         }
     }
     (primary, backup, dynamic_templates)
@@ -8226,7 +8228,7 @@ fn collect_route_regexes(handler: &HandlerConfig, regexes: &mut HashMap<String, 
             Ok(regex) => {
                 regexes.insert(pattern.clone(), Arc::new(regex));
             }
-            Err(error) => tracing::error!(pattern, %error, "Invalid rewrite regex"),
+            Err(error) => tracing::error!(pattern, %error, "🧯 Invalid rewrite regex"),
         },
         // 🏷️ Both header directives search with a regex, and both are compiled
         // here for the same reason: the pattern is known at load and can never
@@ -8247,7 +8249,7 @@ fn collect_route_regexes(handler: &HandlerConfig, regexes: &mut HashMap<String, 
                     Err(error) => tracing::error!(
                         pattern = %replacement.search_regexp,
                         %error,
-                        "Invalid request_header replace regex"
+                        "🧯 Invalid request_header replace regex"
                     ),
                 }
             }
@@ -8263,7 +8265,7 @@ fn collect_route_regexes(handler: &HandlerConfig, regexes: &mut HashMap<String, 
                         regexes.insert(pattern.to_string(), Arc::new(regex));
                     }
                     Err(error) => {
-                        tracing::error!(pattern, %error, "Invalid lb_retry_match regex")
+                        tracing::error!(pattern, %error, "🧯 Invalid lb_retry_match regex")
                     }
                 });
             }

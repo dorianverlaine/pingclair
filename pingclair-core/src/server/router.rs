@@ -206,7 +206,7 @@ impl Router {
             }
 
             if let Err(e) = path_router.insert(&matchit_path, routes) {
-                tracing::warn!("Failed to insert route {}: {}", path, e);
+                tracing::warn!("🧭 Failed to insert route {}: {}", path, e);
             }
         }
 

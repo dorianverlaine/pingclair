@@ -1305,10 +1305,7 @@ impl QuicServer {
             tokio_quiche::metrics::DefaultMetrics,
         )?;
 
-        tracing::info!(
-            "🚀 HTTP/3 (tokio-quiche) server listening on {} (UDP)",
-            local_addr
-        );
+        tracing::info!("🚀 HTTP/3 server listening on {} (UDP)", local_addr);
 
         let live_connections = Arc::new(AtomicUsize::new(0));
         let mut incoming = listeners.remove(0);
@@ -1433,7 +1430,7 @@ impl H3App {
                 Ok((_, quiche::h3::Event::GoAway)) => (),
                 Err(quiche::h3::Error::Done) => break,
                 Err(e) => {
-                    tracing::error!("{} HTTP/3 error {:?}", qconn.trace_id(), e);
+                    tracing::error!("🌐 {} HTTP/3 error {:?}", qconn.trace_id(), e);
                     break;
                 }
             }
