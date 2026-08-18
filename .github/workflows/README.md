@@ -42,7 +42,7 @@ workflow, so a red result never masks another.
 2. Prefer a reusable workflow (`on: workflow_call`) and call it from
    `blocking-ci.yml` or `postmerge-ci.yml`.
 3. Pin every third-party action to a commit SHA with a human-readable version
-   comment (for example `# v5.1.0`); every checkout uses
+   comment (for example `# v7.0.1`); every checkout uses
    `persist-credentials: false`.
 4. Any job that can generate files ends with `check-clean-worktree`, so
    formatting, codegen, or lockfile updates cannot silently stay uncommitted.
