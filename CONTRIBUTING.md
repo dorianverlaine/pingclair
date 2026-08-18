@@ -33,24 +33,22 @@ is a real contribution and needs no agreement.
 
 ## 🚦 The gate
 
-Every commit on `main` passes all four. CI runs them on Rust 1.97; run them
-locally before pushing so you find failures faster than the runner does.
+Every commit on `main` passes the full CI gate. The canonical local command
+is the same one CI runs, pinned to Rust 1.97:
 
 ```bash
-cargo +1.97.1 fmt --all -- --check
+just ci
 ```
 
-```bash
-cargo +1.97.1 clippy --locked --workspace --all-targets -- -D warnings
-```
+That recipe runs formatting, Clippy, `cargo-shear`, repository invariant
+checks, documentation linting, the full `nextest` suite, and a benchmark
+smoke run. The individual recipes (`just fmt-check`, `just clippy`,
+`just test`, ...) are available when only one half is needed.
 
-```bash
-cargo +1.97.1 build --locked --workspace
-```
-
-```bash
-cargo +1.97.1 test --locked --workspace
-```
+CI is split into two layers: `blocking-ci.yml` is the fast pre-merge gate
+with a single required status, and `postmerge-ci.yml` runs the heavy
+verification (sharded nextest, release-profile Clippy, HTTP/3) after `main`
+changes. See `.github/workflows/README.md` for the full workflow map.
 
 Warnings are errors. **Never silence one with a broad `allow` attribute** — if
 a lint is wrong for a specific line, scope the `allow` to that line and say why
