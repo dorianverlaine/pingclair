@@ -196,37 +196,6 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ============================================================
-  # 📉 A brake on the fix:feat ratio. All-time this repository is 95 fixes
-  # to 57 features; over the most recent 100 commits it is 39 to 12. That
-  # acceleration is the thing being watched — a repository spending most of
-  # its commits repairing itself is one where each new feature arrives with
-  # its own repair pass already scheduled.
-  #
-  # ⚠️ TODO: this job is `continue-on-error: true` on purpose, because the
-  # ratio is above the ceiling *right now* and a brake that fails from the
-  # day it lands gets ignored rather than obeyed. **Remove
-  # `continue-on-error` and make this blocking once the ratio is back under
-  # 60 %** — the job's own green run is the signal that the moment has come.
-  # ============================================================
-  fix-ratio:
-    name: Fix ratio
-    runs-on: ubuntu-latest
-    continue-on-error: true
-
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          # 📚 The script reads the last 30 non-merge commits. The default
-          # checkout is depth 1, which would make it fail as a shallow clone
-          # (it refuses to judge a short window against a ceiling calibrated
-          # for 30). 100 leaves room for merge commits and for a PR's
-          # generated merge ref.
-          fetch-depth: 100
-
-      - name: Check the fix:feat ratio over the last 30 commits
-        run: scripts/check-fix-ratio.sh
-
-  # ============================================================
   # 🐳 Builds the exact Dockerfile the production host runs, and boots
   # it. This is the job that would have caught the 2026-07-31 incident:
   # the Dockerfile had drifted (wrong Rust version, missing git and

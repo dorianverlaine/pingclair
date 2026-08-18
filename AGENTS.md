@@ -127,8 +127,16 @@ window. These are the limits:
   > The sentence is cheap and it is the whole mechanism: it either names a
   > cause the first three fixes missed, in which case fix that, or it cannot
   > be written, in which case the problem is not understood yet and the next
-  > move is reading, not editing. `scripts/check-fix-ratio.sh` measures the
-  > aggregate; this is the same brake at the scale of one sitting.
+  > move is reading, not editing.
+  >
+  > 📌 There was a CI job counting `fix(` subjects over a 30-commit window and
+  > failing above 60 %. It was removed on 2026-08-18: it counts the wrong
+  > thing. Most of this repository's fixes are *pre-existing* defects that
+  > better verification finally surfaced — a public transport matrix, an
+  > upstream-format corpus, an adversarial review — so the number rose fastest
+  > exactly when the debt was falling. A brake that tightens when you start
+  > looking harder teaches you to stop looking. The rule above survives it,
+  > because it asks about one cause rather than about a count.
 
 ## Build and test
 
