@@ -54,6 +54,15 @@ just install          # install the pinned local tooling
 - Be patient with long Rust builds; never kill cargo or rustc by PID. The
   Cargo lock is expected to make builds slow.
 
+### Development environment
+
+Installed and preferred tools include `rg`, `fd`, `bat`, `jq`, `gsed`,
+`cargo-nextest`, `cargo-watch`, and `just`. When a task is inefficient with
+the available tools, prefer a specialized tool and install it when
+appropriate: Homebrew for macOS system tools, `cargo install` for Rust
+CLIs, npm for Node CLIs, official installers when required. `cargo-watch`
+is for continuous checking during development.
+
 ## 🦀 Rust toolchain is exact
 
 CI validation uses Rust **1.97.1**; the workspace declares
@@ -167,79 +176,11 @@ check.
 
 ## 🖋️ House style - non-negotiable
 
-These are the repository owner's standing requirements. They apply to every
-file, not only code you happen to be editing heavily.
-
-### 🎯 Emoji everywhere
-
-Every new or modified handwritten comment or doc comment carries a
-semantically appropriate emoji — in Rust, Cargo manifests, shell scripts,
-configuration, and Markdown alike. The emoji is a category marker: pick it
-for meaning and keep it stable (🛡️ safety or invariant, 🌊 streaming and flow
-control, 🔐 TLS/credentials/secrets, 🚫 rejection or deny path, 🧹 cleanup and
-teardown, 🔁 retry or reuse, ⚡ performance, 🧪 testing, 🧭 routing,
-🔌 connectivity). Runtime log messages carry one too, and it must not replace
-a structured field.
-
-Exempt: shebangs, license headers, generated files, and machine-required
-directives.
-
-### 📝 Commit style
-
-Commit subjects begin with a semantically appropriate emoji followed by a
-conventional imperative summary, for example `🐛 fix(proxy): ...` or
-`✨ feat(config): ...`. The subject describes the resulting change, not the
-development process. Bodies explain the reason and non-obvious invariants;
-they do not narrate every edited file.
-
-### ✅ Completion marker has one meaning
-
-`✅` means **completed work**. It does not mean good, correct, approved,
-recommended, or expected. Use `👍` for approval, `📌` for a standing rule,
-and `🎯` for a passing property. Planning checkboxes (`- [x]` / `- [ ]`)
-remain countable.
-
-### 🍎 Apple-style comments
-
-Comments and doc comments are English, capitalized, punctuated, and written
-as complete sentences. They explain intent, ownership, constraints, or
-failure modes — never what the code visibly does. `// Increment the counter`
-above `count += 1` is noise; say why the counter exists and what breaks if it
-drifts. Apple-style navigation labels (`// MARK: - Routing`) are encouraged
-when they improve navigation.
-
-### 🧠 Explain it the way Feynman would
-
-Descriptive prose — doc comments, module headers, commit bodies, Markdown,
-and chat explanations — must make sense to a smart reader who has not
-reverse-engineered the implementation:
-
-- Lead with the plain-language idea, then the mechanism.
-- Prefer concrete failures: "a 20 MB response gets buffered whole and can
-  exhaust a small host" beats "memory characteristics are suboptimal".
-- Jargon must earn its place; use it because it is precise, not because it
-  sounds expert.
-- Explain surprising constraints: if obvious code would be wrong, say what
-  failure it would cause.
-- Say plainly when something is uncertain, unverified, partially implemented,
-  or known broken. Confident prose must not outrun evidence.
-
-### 🌏 Language
-
-Code, identifiers, comments, commit messages, and runtime log strings remain
-English. Public documentation defaults to English. Chinese documentation
-uses Traditional Chinese and matches the vocabulary already established in
-`docs/`.
-
-### 🧾 Test live servers with a Pingclairfile
-
-Whenever a test, benchmark, verification run, or reproduction needs a live
-Pingclair server, configure it with the Pingclair DSL whenever an equivalent
-exists. JSON bypasses the Caddyfile adapter and skips part of the
-user-facing configuration path. Treat "I had to use JSON here" as a finding:
-ask whether the DSL lacks the directive, the directive parses incorrectly, or
-the adapter cannot represent valid runtime configuration. Use JSON only where
-there is genuinely no DSL equivalent and document the exception.
+House style is owned by `CLAUDE.md` and is authoritative there: the
+`🖋️ House style — non-negotiable` section is the source of truth for emoji
+use, commit subjects, `✅` semantics, Apple-style comments, Feynman-style
+prose, language, and the Pingclairfile testing rule. Read that section
+before writing anything and follow it verbatim; do not re-litigate it here.
 
 ## 🏎️ Write hot-path code fast the first time
 
@@ -350,6 +291,14 @@ to core merely because many crates already depend on it.
   changes should normally include real-binary or integration coverage;
   `pingclair/tests/integration.rs` launches the real compiled binary and
   performs real localhost HTTP requests.
+- Some integration tests are load-sensitive rather than flaky in isolation;
+  reproduce them with several concurrent full suites, not repeated single
+  runs:
+  ```bash
+  cargo +1.97.1 build --tests -p pingclair
+  BIN=$(find target/debug/deps -maxdepth 1 -name 'integration-*' -type f -perm -u+x ! -name '*.d' -exec ls -t {} + | head -1)
+  for i in $(seq 1 6); do "$BIN" > /tmp/full_$i.log 2>&1 & done; wait
+  ```
 - A regression test must fail against the broken behavior it prevents.
 - Prefer complete structured assertions (whole objects) over many
   field-by-field checks. Snapshot testing is appropriate for stable complex
@@ -445,6 +394,23 @@ These documents own different facts; mixing them is a defect:
 | `benchmarks/results/` | Local raw verification evidence |
 | `CHANGELOG.md` | Upgrade-relevant shipped changes |
 | `README*.md` | Current shipped user-facing behavior |
+
+Additional ownership semantics that prevent real mistakes:
+
+- `docs/TODO.md` is the v0.2.0 plan, one Day per sitting; it owns what to
+  work on. 🔒 Local only.
+- `docs/STATUS.md` owns which public claim has evidence behind it, at three
+  levels: code exists, local tests pass, verified on clean Linux. 🔒 Local.
+- `TRIAGE.md` owns "known and not being worked on right now". Add entries in
+  the shape its own "How to add one" section shows
+  (`### <severity> · <label>` with date, source, and status) and bump the
+  count in the section heading. 🔒 Local and absent from a fresh clone;
+  create it rather than reading its absence as permission to fold a stray
+  fix into the current diff.
+- `docs/CADDYFILE_*.md` are frozen 2026-08-01 audit records, deliberately
+  excluded from `documentation.rs` because they are full of configurations
+  that must not compile. Do not read them as current behavior — check the
+  code.
 
 User-facing documentation changes with the behavior it describes; update
 README.md, README.zh.md, README.fr.md, and CHANGELOG.md together when

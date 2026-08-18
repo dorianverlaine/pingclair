@@ -34,6 +34,10 @@ Implemented is not verified. The verification ledger deliberately separates
 an item between those without evidence under
 `benchmarks/results/<date>_<commit>/` (kept locally, not committed).
 
+When the maintainer planning files are present, run
+`scripts/snapshot-sensitive-plans.sh start` before and `end` after a session;
+a snapshot validation failure blocks handoff.
+
 ## Commands
 
 The canonical gate is `just ci` — fmt-check, clippy, cargo-shear, repo-lint,
@@ -76,7 +80,8 @@ for i in $(seq 1 6); do "$BIN" > /tmp/full_$i.log 2>&1 & done; wait
 ### H3 verification
 
 macOS unit tests do not validate linking or QUIC behavior. After any change to
-H3 or the TLS dependency tree, run the three scripts and the Linux half:
+H3 or the TLS dependency tree, run `just h3` (the three maintained scripts)
+and the Linux half:
 
 ```bash
 scripts/test-h3-day28-local.sh              # SNI, Alt-Svc, body sizes, POST, 413, keepalive
@@ -92,6 +97,19 @@ build script.
 
 macOS has a system proxy on `127.0.0.1:1082`. Reqwest test clients must use
 `.no_proxy()`; curl needs `--noproxy '*'`.
+
+## CI (two-layer)
+
+The merge gate is `blocking-ci.yml`: it runs the fast `rust-ci` (path-aware
+`just ci` plus the known-flaky retry policy), the Docker image build and
+smoke test, commit checks, security audit, cargo-deny, repo checks, codespell,
+docs lint, and the blob-size policy, then collapses them into one required
+status (`CI required`). After pushes to `main`, `postmerge-ci.yml` runs
+sharded nextest archives on x86_64 and aarch64, release-profile clippy, and
+the HTTP/3 suite; `dev.yml` publishes only after postmerge succeeds. Runners
+and the Dockerfile are pinned to Ubuntu 24.04, third-party actions are
+SHA-pinned, and `**full-ci**` branches or `workflow_dispatch` can run the
+full suite early. See `.github/workflows/README.md` for the workflow map.
 
 ## Architecture
 
@@ -152,6 +170,46 @@ preserve bounded memory. When adding anything that touches a response body, the
 default question is what happens with a 20 MB body, an SSE stream, or a client
 that disconnects mid-response. H3 request and response bodies must keep their
 bounded channels and QUIC flow control.
+
+## 🧱 Change discipline
+
+- One theme per change; a coherent change is explainable in one sentence.
+- Keep diffs under roughly 800 changed lines (500 for complex behavioral
+  changes) and split larger work into reviewable stages.
+- Modules target under 500 LoC; do not keep adding to files near 800.
+  Substantial test modules live in focused sibling files.
+- Unrelated findings belong in `TRIAGE.md`, not the current diff.
+- Three failed attempts at the same fix are a stop sign: write one sentence
+  explaining why the earlier fixes missed the root cause before a fourth.
+
+## 🦀 Rust API design
+
+- Keep APIs small: private modules, explicit public exports, and no
+  test-only production surface.
+- Prefer enums, newtypes, builders, and named methods over opaque positional
+  callsites such as `foo(false, None)`.
+- Prefer exhaustive `match` statements for protocol, transport, lifecycle,
+  and policy enums.
+- Document new traits: their role, ownership, lifecycle, and concurrency
+  expectations; do not create a trait around one concrete type without a real
+  abstraction boundary.
+- Avoid one-off helpers; prefer native RPITIT trait methods with explicit
+  `Send` bounds over `#[async_trait]` shortcuts.
+
+## 🧪 Test authoring
+
+- Prefer integration tests for runtime behavior; `pingclair/tests/integration.rs`
+  spawns the real binary over localhost with dynamic ports and a unique
+  readiness token.
+- A regression test must fail without the fix; prefer whole-object assertions;
+  do not add tests for statically defined values or for removed logic.
+- Reuse existing helpers and keep large test modules in sibling files.
+- 👻 Ghost-process trap: a stale listener can answer readiness after a new
+  binary fails to bind, producing misleading 404/502/old behavior. Check
+  listener ownership, binary path, and config path before debugging
+  application logic (see `docs/guardrails/testing.md`).
+- Load-sensitive tests reproduce with several concurrent full suites, not
+  repeated single runs.
 
 ## 🖋️ House style — non-negotiable
 
@@ -318,6 +376,31 @@ Code, identifiers, commit messages, and log strings stay English.
 - Verification evidence goes in `benchmarks/results/<date>_<commit-prefix>/` —
   kept locally, not committed — with the full commit SHA recorded. Failed
   evidence is never overwritten.
+
+## 🐧 Linux and remote verification
+
+- Use macOS for the fast edit loop; OrbStack or another Linux environment for
+  Linux-specific validation; the designated remote host only for remote,
+  release, or performance verification.
+- Inspect branch, HEAD, worktree status, running processes, and occupied
+  ports before reusing a remote directory; prefer clean validation worktrees.
+- Use release binaries when verifying performance, linking, TLS, QUIC,
+  process lifecycle, or Linux-specific behavior; avoid fat-LTO builds on
+  constrained shared hosts.
+
+## 📊 Benchmarks
+
+- Use `divan` through `just bench` for microbenchmarks and
+  `just bench-smoke` to prove targets start; the whole-server methodology
+  lives in `benchmarks/README.md`.
+- Do not turn a microbenchmark win into a published server-performance claim
+  without evidence under `benchmarks/results/`.
+
+## 🚫 Not adopted
+
+Bazel, Windows/macOS build matrices, code signing and R2 distribution, and
+self-hosted runners are deliberately out of scope; do not introduce them to
+"match" another project.
 
 # Development Environment
 
