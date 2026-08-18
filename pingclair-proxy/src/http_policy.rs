@@ -79,7 +79,11 @@ pub struct ResponseInterception {
 }
 
 /// 📂 The file server a response subroute asked for.
-#[derive(Debug, Clone)]
+///
+/// 📌 `Hash`/`Eq` so this can key the built server: every field here decides
+/// what `FileServer::new` produces, so two responses asking for the same one
+/// can share it instead of each building its own.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResponseFileServer {
     /// Document root; `"."` means read `{http.vars.root}` at request time.
     pub root: String,

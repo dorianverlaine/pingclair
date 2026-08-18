@@ -843,6 +843,31 @@ pub struct ProxyState {
     pub health_checkers: Vec<Option<Arc<HealthChecker>>>,
     /// File servers per route
     pub file_servers: Vec<Option<Arc<pingclair_static::FileServer>>>,
+    /// 📂 File servers for `handle_response { file_server }`, built once per
+    /// distinct configuration rather than once per response.
+    ///
+    /// 🤡 Each response used to build its own and throw it away. `FileServer::new`
+    /// is cheap, but the caches it carries are not: they started empty every
+    /// time, so a custom error page recomputed its content type, `ETag` and
+    /// `Last-Modified` on every single response — and, with `compress` on,
+    /// deflated the same file again for each one. Avoiding exactly that is the
+    /// only reason those caches exist.
+    ///
+    /// 🔒 A `Mutex` rather than `ArcSwap`: this is reached only when a
+    /// `handle_response` entry matched, which is an error path rather than the
+    /// request path, and the lock covers one map lookup and never spans an
+    /// `await`. Entries are bounded by the configuration — a root that comes
+    /// from `{http.vars.root}` is deliberately not cached, because that value
+    /// can be built from the request and an unbounded key is how a cache
+    /// becomes a memory-growth vector.
+    pub(crate) response_file_servers: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                crate::http_policy::ResponseFileServer,
+                Arc<pingclair_static::FileServer>,
+            >,
+        >,
+    >,
     /// Rate limiters per route
     pub rate_limiters: Vec<Option<Arc<crate::rate_limit::RateLimiter>>>,
     /// 🚦 Admission and circuit state per reverse-proxy route.
@@ -1680,6 +1705,9 @@ impl ProxyState {
             subrequests,
             health_checkers,
             file_servers,
+            response_file_servers: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             rate_limiters,
             route_protections,
             hash_key_sources,
@@ -1913,6 +1941,58 @@ impl Default for PingclairProxy {
                 pingora_core::connectors::ConnectorOptions::new(512),
             ))),
         }
+    }
+}
+
+impl ProxyState {
+    /// 📂 The file server a `handle_response { file_server }` asked for, built
+    /// once and shared.
+    ///
+    /// `root` is passed in already resolved, because the configured `"."` means
+    /// "read `{http.vars.root}` at request time" and only the caller knows what
+    /// that came out as.
+    ///
+    /// 🚫 A resolved root that did not come from the configuration is built
+    /// fresh and not remembered. `{http.vars.root}` can be assembled from the
+    /// request, and a map keyed on something a client can vary is a way to grow
+    /// this process without bound — the same shape as the metrics label this
+    /// repository already had to cap.
+    pub(crate) fn response_file_server(
+        &self,
+        wanted: &crate::http_policy::ResponseFileServer,
+        root: &str,
+    ) -> Arc<pingclair_static::FileServer> {
+        let build = || {
+            Arc::new(pingclair_static::FileServer::new(
+                pingclair_static::FileServerConfig {
+                    root: std::path::PathBuf::from(root),
+                    index: wanted.index.clone(),
+                    browse: wanted.browse,
+                    browse_limit: wanted.browse_limit,
+                    compress: wanted.compress,
+                    // 📄 A response subroute supports only a bare `file_server`,
+                    // so everything else keeps its default — sidecar lookup
+                    // included, which stays off.
+                    ..pingclair_static::FileServerConfig::default()
+                },
+            ))
+        };
+        if wanted.root == "." {
+            return build();
+        }
+        let mut cache = match self.response_file_servers.lock() {
+            Ok(cache) => cache,
+            // 🧯 A poisoned lock means another thread panicked holding it. The
+            // cache is only an optimisation, so answer without it rather than
+            // turning someone else's panic into this request's.
+            Err(_) => return build(),
+        };
+        if let Some(existing) = cache.get(wanted) {
+            return Arc::clone(existing);
+        }
+        let built = build();
+        cache.insert(wanted.clone(), Arc::clone(&built));
+        built
     }
 }
 
@@ -2881,18 +2961,10 @@ impl PingclairProxy {
             } else {
                 ctx.request_vars.get("root").unwrap_or(".").to_string()
             };
-            let fs_config = pingclair_static::FileServerConfig {
-                root: std::path::PathBuf::from(root.clone()),
-                index: file_server.index.clone(),
-                browse: file_server.browse,
-                browse_limit: file_server.browse_limit,
-                compress: file_server.compress,
-                // 📄 A response subroute only supports a bare `file_server`,
-                // so everything else takes its default — including sidecar
-                // lookup, which stays off.
-                ..pingclair_static::FileServerConfig::default()
+            let Some(state) = ctx.state.as_ref() else {
+                return Ok(false);
             };
-            let server = pingclair_static::FileServer::new(fs_config);
+            let server = state.response_file_server(&file_server, &root);
             let request_path = session.req_header().uri.path();
             if let Ok(Some(stream)) = server.serve_streaming(request_path).await {
                 let existing: Vec<String> = upstream_response
@@ -8774,6 +8846,75 @@ mod p0_regression_tests {
         assert_eq!(
             resolve_caddy_placeholders("{uri}", &h2, None, "https", &vars),
             "/landing?a=1"
+        );
+    }
+
+    /// 📂 Two responses asking for the same file server get the same one.
+    ///
+    /// 🤡 They used to get one each, built and thrown away per response. The
+    /// construction is cheap; the caches it carries are the point, and starting
+    /// them empty every time meant a custom error page recomputed its content
+    /// type, `ETag` and `Last-Modified` for every response — and, with
+    /// `compress` on, deflated the same file again each time.
+    #[test]
+    fn a_response_file_server_is_built_once_per_configuration() {
+        let state = ProxyState::new(ServerConfig::default());
+        let wanted = crate::http_policy::ResponseFileServer {
+            root: "/srv/errors".to_string(),
+            index: vec!["index.html".to_string()],
+            browse: false,
+            browse_limit: None,
+            compress: true,
+        };
+
+        let first = state.response_file_server(&wanted, "/srv/errors");
+        let second = state.response_file_server(&wanted, "/srv/errors");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the same configuration must yield the same file server, caches and all"
+        );
+
+        // 🔀 A different configuration is a different server, or one of them
+        // would be serving from the wrong root.
+        let elsewhere = crate::http_policy::ResponseFileServer {
+            root: "/srv/other".to_string(),
+            ..wanted.clone()
+        };
+        assert!(!Arc::ptr_eq(
+            &first,
+            &state.response_file_server(&elsewhere, "/srv/other")
+        ));
+    }
+
+    /// 🚫 A root that came from `{http.vars.root}` is never remembered.
+    ///
+    /// That value can be assembled from the request, so keying a map on it is
+    /// how a cache becomes a way to grow this process without bound — the same
+    /// shape as the metrics label this repository already had to cap.
+    #[test]
+    fn a_request_derived_root_is_not_cached() {
+        let state = ProxyState::new(ServerConfig::default());
+        let wanted = crate::http_policy::ResponseFileServer {
+            root: ".".to_string(),
+            index: vec![],
+            browse: false,
+            browse_limit: None,
+            compress: false,
+        };
+
+        let first = state.response_file_server(&wanted, "/srv/from-vars");
+        let second = state.response_file_server(&wanted, "/srv/from-vars");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a `.` root resolves per request and must not be keyed on"
+        );
+        assert!(
+            state
+                .response_file_servers
+                .lock()
+                .expect("uncontended")
+                .is_empty(),
+            "nothing derived from the request may enter the map"
         );
     }
 

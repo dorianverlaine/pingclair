@@ -758,6 +758,19 @@ immediately after the `101`, both ends seeing EOF with no error.
 
 ### 🐛 Fixed
 
+- ⚡ **A `handle_response { file_server }` no longer rebuilds its file server for
+  every response.** Each response constructed one and threw it away. The
+  construction itself is cheap; the caches it carries are the point, and
+  starting them empty every time meant a custom error page recomputed its
+  content type, `ETag` and `Last-Modified` on every single response — and, with
+  `compress` on, deflated the same file again for each one. Avoiding exactly
+  that is the only reason those caches exist.
+
+  Servers are now built once per distinct configuration and shared. A root that
+  comes from `{http.vars.root}` is still built per request and deliberately not
+  remembered, because that value can be assembled from the request and a map
+  keyed on it would grow without bound.
+
 - 🍪 **A cookie split across several field lines now arrives whole.** HTTP/3
   lets a client send `Cookie` as separate lines — browsers do, because it
   compresses better — and every field went into the request with a call that

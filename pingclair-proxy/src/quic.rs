@@ -3744,17 +3744,9 @@ async fn stream_h3_subrequest_response(
                 let root = if file_server.root == "." {
                     eval_vars.get("root").unwrap_or(".").to_string()
                 } else {
-                    file_server.root
+                    file_server.root.clone()
                 };
-                let server =
-                    pingclair_static::FileServer::new(pingclair_static::FileServerConfig {
-                        root: std::path::PathBuf::from(&root),
-                        index: file_server.index,
-                        browse: file_server.browse,
-                        browse_limit: file_server.browse_limit,
-                        compress: file_server.compress,
-                        ..pingclair_static::FileServerConfig::default()
-                    });
+                let server = state.response_file_server(&file_server, &root);
                 let Some(stream) = server
                     .serve_streaming(request_path.split('?').next().unwrap_or("/"))
                     .await
@@ -4185,19 +4177,9 @@ async fn fastcgi_upstream(
             let root = if file_server.root == "." {
                 eval_vars.get("root").unwrap_or(".").to_string()
             } else {
-                file_server.root
+                file_server.root.clone()
             };
-            let server = pingclair_static::FileServer::new(pingclair_static::FileServerConfig {
-                root: std::path::PathBuf::from(&root),
-                index: file_server.index,
-                browse: file_server.browse,
-                browse_limit: file_server.browse_limit,
-                compress: file_server.compress,
-                // 📄 A response subroute only supports a bare `file_server`,
-                // so everything else takes its default — including sidecar
-                // lookup, which stays off.
-                ..pingclair_static::FileServerConfig::default()
-            });
+            let server = state.response_file_server(&file_server, &root);
             let Some(stream) = server
                 .serve_streaming(request_path.split('?').next().unwrap_or("/"))
                 .await
@@ -5064,17 +5046,9 @@ async fn reverse_proxy_upstream(
                     let root = if file_server.root == "." {
                         eval_vars.get("root").unwrap_or(".").to_string()
                     } else {
-                        file_server.root
+                        file_server.root.clone()
                     };
-                    let server =
-                        pingclair_static::FileServer::new(pingclair_static::FileServerConfig {
-                            root: std::path::PathBuf::from(&root),
-                            index: file_server.index,
-                            browse: file_server.browse,
-                            browse_limit: file_server.browse_limit,
-                            compress: file_server.compress,
-                            ..pingclair_static::FileServerConfig::default()
-                        });
+                    let server = state.response_file_server(&file_server, &root);
                     intercept_file = server
                         .serve_streaming(request_path.split('?').next().unwrap_or("/"))
                         .await
@@ -5472,17 +5446,9 @@ async fn send_h3_local_response(
                 let root = if file_server.root == "." {
                     eval_vars.get("root").unwrap_or(".").to_string()
                 } else {
-                    file_server.root
+                    file_server.root.clone()
                 };
-                let server =
-                    pingclair_static::FileServer::new(pingclair_static::FileServerConfig {
-                        root: std::path::PathBuf::from(&root),
-                        index: file_server.index,
-                        browse: file_server.browse,
-                        browse_limit: file_server.browse_limit,
-                        compress: file_server.compress,
-                        ..pingclair_static::FileServerConfig::default()
-                    });
+                let server = state.response_file_server(&file_server, &root);
                 let Some(stream) = server
                     .serve_streaming(request_path.split('?').next().unwrap_or("/"))
                     .await
