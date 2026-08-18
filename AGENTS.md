@@ -435,10 +435,29 @@ or private benchmark evidence.
   changed lines (500 for complex behavioral changes). If a change exceeds
   the budget, identify the smallest independently useful stage and land it
   first.
-- **Module size.** Target handwritten modules under 500 LoC; once a file
-  approaches 800 LoC, do not add substantial new functionality to it.
-  Split by ownership (parsing, validation, policy, transport, lifecycle,
-  storage, protocol, formatting, test harness).
+- **Module size — Unix-style decomposition.** A module does one thing well
+  and stays small; prefer adding a new focused module over growing an
+  existing one.
+  - Target handwritten modules under 500 LoC, excluding tests.
+  - Once a file approaches 800 LoC, put new functionality in a new module
+    instead of extending the file, unless there is a strong documented
+    reason not to.
+  - Split by ownership and responsibility — parsing, validation, policy,
+    transport, lifecycle, storage, protocol, formatting, test harness — not
+    by mechanical line counts or meaningless names like `part1.rs`.
+  - Expose a minimal public surface and compose modules through it; keep
+    module internals private.
+  - When extracting code from a large module, move the related tests and
+    module/type docs with it, so the invariants stay close to the code that
+    owns them.
+  - High-touch files that already attract unrelated changes deserve extra
+    care: do not add new standalone functionality to them unless the change
+    is trivial. Current high-touch files:
+    `pingclair-proxy/src/server.rs`, `pingclair-proxy/src/quic.rs`,
+    `pingclair-proxy/src/http_policy.rs`,
+    `pingclair-config/src/compiler.rs`,
+    `pingclair-config/src/adapter/caddyfile/tests.rs`,
+    `pingclair-core/src/config/types.rs`, `pingclair/tests/integration.rs`.
 - **Unrelated findings** belong in `TRIAGE.md`, not the current diff, unless
   the defect makes the active change incorrect or is an actively exploited
   security issue.

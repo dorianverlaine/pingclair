@@ -176,8 +176,19 @@ bounded channels and QUIC flow control.
 - One theme per change; a coherent change is explainable in one sentence.
 - Keep diffs under roughly 800 changed lines (500 for complex behavioral
   changes) and split larger work into reviewable stages.
-- Modules target under 500 LoC; do not keep adding to files near 800.
-  Substantial test modules live in focused sibling files.
+- Modules follow Unix-style decomposition: one responsibility per module,
+  minimal public surface, composition over stuffing.
+  - Target under 500 LoC excluding tests; once a file approaches 800 LoC,
+    put new functionality in a new module unless there is a strong
+    documented reason not to.
+  - Split by ownership (parsing, validation, policy, transport, lifecycle,
+    storage, protocol, formatting, test harness), not by line counts.
+  - When extracting code, move the related tests and module/type docs with
+    it so invariants stay close to their owner.
+  - High-touch files (`server.rs`, `quic.rs`, `http_policy.rs`,
+    `compiler.rs`, `caddyfile/tests.rs`, `config/types.rs`,
+    `integration.rs`) should not grow with trivial additions; prefer new
+    modules.
 - Unrelated findings belong in `TRIAGE.md`, not the current diff.
 - Three failed attempts at the same fix are a stop sign: write one sentence
   explaining why the earlier fixes missed the root cause before a fourth.
