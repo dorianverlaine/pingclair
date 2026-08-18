@@ -22,14 +22,9 @@ thiserror.workspace = true
 # ACME (Let's Encrypt)
 instant-acme = "0.8"
 tokio-rustls = "0.26"
-webpki-roots = "0.26"
 
 # Certificate parsing
 rustls-pemfile = "2"
-
-# HTTP types
-http.workspace = true
-bytes.workspace = true
 
 # ☁️ The DNS-01 provider's HTTP client. Every one of these is already linked
 # into the binary through `instant-acme`, which depends on them unconditionally
@@ -56,3 +51,5 @@ arc-swap.workspace = true
 # Testing
 tempfile = "3"
 
+[lints]
+workspace = true

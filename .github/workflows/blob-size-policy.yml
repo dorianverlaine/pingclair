@@ -1,0 +1,22 @@
+name: Blob size policy
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check changed blob sizes
+        run: python3 scripts/check_blob_size.py --max-bytes 512000 --allowlist .github/blob-size-allowlist.txt
+
+      - uses: ./.github/actions/check-clean-worktree

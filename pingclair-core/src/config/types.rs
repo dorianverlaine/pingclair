@@ -245,7 +245,7 @@ where
     impl<'de> Visitor<'de> for Values {
         type Value = Vec<String>;
 
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str("a header value, or a list of header values")
         }
 
@@ -270,7 +270,7 @@ where
     impl<'de> Visitor<'de> for Headers {
         type Value = BTreeMap<String, Vec<String>>;
 
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str("a map of header names to values")
         }
 

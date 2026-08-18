@@ -1,0 +1,173 @@
+name: Rust CI full nextest platform
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        required: true
+        type: string
+      target:
+        required: true
+        type: string
+      profile:
+        required: true
+        type: string
+      artifact_id:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  archive:
+    name: Build nextest archive
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
+    env:
+      NEXTEST_ARCHIVE_FILE: nextest-${{ inputs.artifact_id }}.tar.zst
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-linux-deps
+
+      - uses: ./.github/actions/setup-ci
+
+      - name: Install Rust 1.97
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.97.1
+        with:
+          toolchain: 1.97.1
+          targets: ${{ inputs.target }}
+
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          target: ${{ inputs.target }}
+          profile: ${{ inputs.profile }}
+          cache-scope: nextest-${{ inputs.artifact_id }}
+
+      - name: Install nextest
+        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: nextest@0.9.143
+
+      - name: Build the real binary for integration tests
+        run: |
+          cargo +1.97.1 build --locked --profile ${{ inputs.profile }} --target ${{ inputs.target }} -p pingclair --bin pingclair
+
+      - name: Build nextest archive
+        run: |
+          cargo +1.97.1 nextest archive \
+            --locked \
+            --archive-file "${RUNNER_TEMP}/${NEXTEST_ARCHIVE_FILE}" \
+            --target ${{ inputs.target }} \
+            --cargo-profile ${{ inputs.profile }} \
+            --profile ci \
+            --timings
+
+      - name: Upload Cargo timings
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cargo-timings-nextest-${{ inputs.artifact_id }}
+          path: ${{ env.CARGO_TARGET_DIR }}/**/cargo-timings/cargo-timing.html
+          if-no-files-found: warn
+
+      - name: Upload nextest archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nextest-archive-${{ inputs.artifact_id }}
+          path: ${{ runner.temp }}/${{ env.NEXTEST_ARCHIVE_FILE }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload the real binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pingclair-bin-${{ inputs.artifact_id }}
+          path: ${{ env.CARGO_TARGET_DIR }}/${{ inputs.target }}/${{ inputs.profile }}/pingclair
+          if-no-files-found: error
+          retention-days: 1
+
+  shard:
+    name: Tests shard ${{ matrix.shard }}/4
+    needs: archive
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
+    env:
+      NEXTEST_ARCHIVE_FILE: nextest-${{ inputs.artifact_id }}.tar.zst
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-ci
+
+      - name: Install Rust 1.97
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.97.1
+        with:
+          toolchain: 1.97.1
+
+      - name: Install nextest
+        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: nextest@0.9.143
+
+      - name: Download nextest archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: nextest-archive-${{ inputs.artifact_id }}
+          path: ${{ runner.temp }}/nextest-archive
+
+      - name: Download the real binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pingclair-bin-${{ inputs.artifact_id }}
+          path: ${{ runner.temp }}/pingclair-bin
+
+      - name: Place the real binary where integration tests expect it
+        run: |
+          set -euo pipefail
+          bin_dir="${CARGO_TARGET_DIR}/${{ inputs.target }}/${{ inputs.profile }}"
+          mkdir -p "${bin_dir}"
+          cp "${RUNNER_TEMP}/pingclair-bin/pingclair" "${bin_dir}/pingclair"
+          chmod +x "${bin_dir}/pingclair"
+
+      - name: Run tests
+        env:
+          RUST_BACKTRACE: 1
+          RUST_MIN_STACK: "8388608"
+        run: |
+          cargo +1.97.1 nextest run \
+            --no-fail-fast \
+            --profile ci \
+            --archive-file "${RUNNER_TEMP}/nextest-archive/${NEXTEST_ARCHIVE_FILE}" \
+            --workspace-remap "${GITHUB_WORKSPACE}" \
+            --partition "hash:${{ matrix.shard }}/4"
+
+      - name: Upload nextest JUnit report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nextest-junit-${{ inputs.artifact_id }}-shard-${{ matrix.shard }}
+          path: ${{ env.CARGO_TARGET_DIR }}/nextest/ci/junit.xml
+          if-no-files-found: warn
+
+  result:
+    name: Platform result
+    needs: shard
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Confirm test shards passed
+        shell: bash
+        run: |
+          if [[ "${{ needs.shard.result }}" != "success" ]]; then
+            echo "Nextest shards finished with result: ${{ needs.shard.result }}" >&2
+            exit 1
+          fi

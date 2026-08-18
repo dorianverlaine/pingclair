@@ -12,3 +12,6 @@ description = "FastCGI 1.1 protocol client for Pingclair"
 tokio.workspace = true
 bytes.workspace = true
 tracing.workspace = true
+
+[lints]
+workspace = true

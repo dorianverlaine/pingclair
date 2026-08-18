@@ -1,0 +1,4 @@
+[codespell]
+skip = ./.git,./target,./vendor,./verification,./benchmarks,./examples/public,./.plan-snapshots,./security-findings,./node_modules,./TRIAGE.md,./docs/TODO.md,./docs/TODO_CADDYFILE.md,./docs/TODO_CADDYFILE_FIXES.md,./docs/CADDYFILE_COMPATIBILITY_MASTER.md,./docs/CADDYFILE_GLOBAL_OPTIONS.md,./todo-md-m5-day-27-witty-mitten.md,./README.fr.md,./Cargo.lock,*.rs,*.snap,*.json,*.log,*.diff,*.txt
+ignore-words = .codespellignore
+quiet-level = 3

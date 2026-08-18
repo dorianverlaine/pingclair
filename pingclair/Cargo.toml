@@ -16,10 +16,8 @@ path = "src/main.rs"
 pingclair-core = { path = "../pingclair-core" }
 pingclair-config = { path = "../pingclair-config" }
 pingclair-proxy = { path = "../pingclair-proxy" }
-pingclair-static = { path = "../pingclair-static" }
 pingclair-tls = { path = "../pingclair-tls" }
 pingclair-api = { path = "../pingclair-api" }
-pingclair-plugin = { path = "../pingclair-plugin" }
 
 # Single TLS stack: BoringSSL everywhere. quiche (HTTP/3) links BoringSSL
 # statically, so Pingora must use its boringssl backend — a second, OpenSSL
@@ -44,9 +42,7 @@ anyhow.workspace = true
 serde_json.workspace = true
 bcrypt.workspace = true
 argon2 = { version = "0.5", features = ["rand"] }
-password-hash = { version = "0.5", features = ["std", "getrandom"] }
 parking_lot = "0.12"
-futures = "0.3"
 
 
 [target.'cfg(unix)'.dependencies]
@@ -72,3 +68,6 @@ h2.workspace = true
 rcgen.workspace = true
 bytes.workspace = true
 http.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,30 @@
+name: Repo checks
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  repo-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-ci
+
+      - name: Test the repository lint helpers
+        run: python3 -m unittest discover -s scripts/repo_lint -p 'test_*.py'
+
+      - name: Run repository invariant checks
+        run: just repo-lint
+
+      - name: Run the blob-size policy
+        run: python3 scripts/check_blob_size.py --max-bytes 512000 --allowlist .github/blob-size-allowlist.txt
+
+      - uses: ./.github/actions/check-clean-worktree

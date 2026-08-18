@@ -1,0 +1,134 @@
+name: Rust CI
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  changed:
+    name: Detect changed areas
+    runs-on: ubuntu-24.04
+    outputs:
+      rust: ${{ steps.detect.outputs.rust }}
+      workflows: ${{ steps.detect.outputs.workflows }}
+      docs: ${{ steps.detect.outputs.docs }}
+      docker: ${{ steps.detect.outputs.docker }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detect changed paths
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+            mapfile -t files < <(git diff --name-only --no-renames "$base" "$head")
+          elif [[ "${{ github.event_name }}" == "push" ]]; then
+            mapfile -t files < <(git diff --name-only --no-renames "HEAD~1" "HEAD")
+          else
+            # Manual runs exercise the full fast gate.
+            files=("Cargo.toml" ".github/force")
+          fi
+
+          rust=false
+          workflows=false
+          docs=false
+          docker=false
+          for f in "${files[@]}"; do
+            [[ $f == Cargo.toml || $f == Cargo.lock || $f == justfile || $f == vendor/* || $f == pingclair*/** ]] && rust=true
+            [[ $f == .github/* ]] && workflows=true
+            [[ $f == README* || $f == CHANGELOG.md || $f == CONTRIBUTING.md || $f == docs/* || $f == examples/* ]] && docs=true
+            [[ $f == deployment/* ]] && docker=true
+          done
+
+          {
+            echo "rust=$rust"
+            echo "workflows=$workflows"
+            echo "docs=$docs"
+            echo "docker=$docker"
+          } >> "$GITHUB_OUTPUT"
+
+  general:
+    name: Format / lint / test / bench smoke
+    runs-on: ubuntu-24.04
+    needs: changed
+    if: ${{ needs.changed.outputs.rust == 'true' || needs.changed.outputs.workflows == 'true' }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-linux-deps
+
+      - uses: ./.github/actions/setup-ci
+
+      - name: Install Rust 1.97
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.97.1
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          target: x86_64-unknown-linux-gnu
+          profile: dev
+          cache-scope: rust-ci
+
+      - name: Install nextest
+        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: nextest@0.9.143
+
+      - name: Install cargo-shear
+        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: cargo-shear@1.13.4
+
+      - name: Install codespell
+        run: |
+          python3 -m venv /tmp/codespell-venv
+          /tmp/codespell-venv/bin/pip install --quiet codespell==2.4.3
+          echo "/tmp/codespell-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 22
+
+      - name: Install markdownlint-cli2
+        run: npm install --global markdownlint-cli2@0.23.2
+
+      - name: Run lint and benchmark smoke
+        run: |
+          just lint
+          just bench-smoke
+
+      - name: Run tests with the known-flaky retry policy
+        run: scripts/run-ci-tests.sh
+
+      - uses: ./.github/actions/check-clean-worktree
+
+  results:
+    name: CI results (required)
+    needs: [changed, general]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Summarize
+        shell: bash
+        run: |
+          echo "general: ${{ needs.general.result }}"
+          if [[ "${{ needs.changed.outputs.rust }}" != 'true' && "${{ needs.changed.outputs.workflows }}" != 'true' ]]; then
+            echo "No relevant changes -> CI not required."
+            exit 0
+          fi
+          [[ '${{ needs.general.result }}' == 'success' ]] || { echo 'general failed'; exit 1; }
+          echo "All fast CI dependencies succeeded."

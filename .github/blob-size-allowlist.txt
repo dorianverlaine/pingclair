@@ -1,0 +1,4 @@
+# 🧱 Deliberately large tracked artifacts: a 20 MiB benchmark payload and the
+# brand logo. Every entry must state why it is allowed to exceed the budget.
+benchmarks/payloads/large.html
+assets/logo.png

@@ -21,15 +21,22 @@ license = "Apache-2.0"
 repository = "https://github.com/dorianverlaine/pingclair"
 rust-version = "1.97"
 
+[workspace.lints.rust]
+# 🛡️ The lint table exists so every crate can opt in through
+# `[lints] workspace = true`; both entries are enforced by `-D warnings` in
+# CI. `rust_2018_idioms` keeps the tree on modern path/lifetime spelling, and
+# `unsafe_op_in_unsafe_fn` keeps unsafe blocks explicit. Adding lints here is
+# a deliberate policy change, not a way to silence a warning in one crate.
+rust_2018_idioms = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+
 [workspace.dependencies]
 # Pingora core
 pingora = "0.8"
 pingora-core = "0.8"
 pingora-proxy = "0.8"
 pingora-http = "0.8"
-pingora-timeout = "0.8"
 pingora-load-balancing = "0.8"
-pingora-limits = "0.8"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -39,10 +46,6 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
-
-# Configuration parsing
-logos = "0.16"
-ariadne = "0.6"      # error reporting
 
 # DNS (dynamic upstreams)
 hickory-resolver = "0.26"
@@ -138,14 +141,8 @@ anyhow = "1"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# Testing
-criterion = "0.8"
-
 # File system
 dirs = "6"
-
-# String handling
-smartstring = "1"
 
 # 🔐 Password hashing support.
 bcrypt = "0.19"
@@ -208,3 +205,9 @@ codegen-units = 1
 panic = "abort"
 strip = true
 opt-level = 3
+
+[profile.ci-test]
+# 🧪 CI's test profile inherits dev settings but disables incremental
+# compilation, which is wasted work on ephemeral runners with sccache.
+inherits = "dev"
+incremental = false

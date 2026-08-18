@@ -72,22 +72,22 @@
 - **壓縮測試的 payload 必須逐 chunk 唯一且不可壓縮**。重複同一塊資料會被
   zstd 的 window 去重（64MiB → 15KB），讓「輸出有在流動」這類斷言**假性失敗**。
 - **本機 gate 必須用 `cargo +1.97.1`,不是預設工具鏈**。CI 釘 `1.97.1`
-  （2026-08-02 拆分前是單一 `rust.yml`,現在分散在 `ci.yml`、`lint.yml`
-  等六個 workflow），workspace 也宣告 `rust-version = "1.97"`。工具鏈版本
-  一不對,型別推論與 rustfmt 換行決策就不同,本機四項全綠然後 CI 全紅——這個
-  坑兩個方向都踩過：2026-07-29 是本機比 CI 新（混型陣列 `&[&String, &String,
-  &str]` 在 1.88 是 `E0308`）；2026-08-02 反過來,release image 還釘 1.88.0
-  而 lockfile 已需要 ≥1.97（`rustc 1.88.0 is not supported`）。
-- 🎩 **2026-08-01 起 CI 的 `test` job 跑在 `ubuntu-latest` runner 上**（當天
-  在 `rust.yml`；2026-08-02 拆成六個 workflow 後在 `ci.yml`,`lint.yml`
-  環境相同）,跟 `deployment/Dockerfile` 同一個 base（Ubuntu）、同一份 rustup
-  釘版 1.97.1、同一份 `apt` 套件清單。這條規則源自 2026-07-31 的事故：那份
-  Dockerfile 從 H3 換 tokio-quiche 之後**從沒被建過**,線上跑的 image 是
-  依賴樹改變前建的,Rust 版本也早就跟 `Cargo.toml` 的宣告不一致。CI 跑在
-  別的發行版上會完全遮住這件事。**兩份套件清單必須手動保持同步**——CI 的
-  `apt-get install` 跟 Dockerfile builder stage 那份改一邊就要改另一邊,
-  目前沒有機制強制同步,這條本身就是下一個可能重犯的坑。
-- 🐳 **CI 新增 `docker-image` job（拆分後在 `ci.yml`）,真的建
+  （2026-08-02 拆分後,現在是 `blocking-ci.yml` 快速閘 + `postmerge-ci.yml`
+  全量閘,各自呼叫 reusable workflow）,workspace 也宣告 `rust-version = "1.97"`。
+  本機一律從 `just ci` 進入同一道閘；工具鏈版本一不對,型別推論與 rustfmt
+  換行決策就不同,本機全綠然後 CI 全紅——這個坑兩個方向都踩過：2026-07-29
+  是本機比 CI 新（混型陣列 `&[&String, &String, &str]` 在 1.88 是
+  `E0308`）；2026-08-02 反過來,release image 還釘 1.88.0 而 lockfile 已
+  需要 ≥1.97（`rustc 1.88.0 is not supported`）。
+- 🎩 **CI runner 固定 `ubuntu-24.04` / `ubuntu-24.04-arm`**（不再用浮動的
+  `ubuntu-latest`）,跟 `deployment/Dockerfile` 的 `ubuntu:24.04` 同一個
+  base、同一份 rustup 釘版 1.97.1、同一份 `apt` 套件清單。這條規則源自
+  2026-07-31 的事故：那份 Dockerfile 從 H3 換 tokio-quiche 之後**從沒被建過**,
+  線上跑的 image 是依賴樹改變前建的,Rust 版本也早就跟 `Cargo.toml` 的宣告
+  不一致。CI 跑在別的發行版上會完全遮住這件事。**兩份套件清單必須手動保持
+  同步**——CI 的 `apt-get install` 跟 Dockerfile builder stage 那份改一邊
+  就要改另一邊,目前沒有機制強制同步,這條本身就是下一個可能重犯的坑。
+- 🐳 **CI 的 `docker.yml` reusable workflow 真的建
   `deployment/Dockerfile` 並開機驗證**（`docker run ... version`、
   `docker run ... validate` 一份真 Pingclairfile）。這是「一份沒人跑的建置
   腳本等於沒測試過的程式碼」這句話的直接對策——上面那次 Dockerfile 漂移,
@@ -110,10 +110,10 @@
   （相鄰不重複 ＋ 各收到一半），不是寫成某一次觀察到的序列。
 
 - 🎲 **`test_websocket_upgrade_tunnels_bytes_in_both_directions` 是已知的
-  上游（Pingora）flaky**。`ci.yml` 的 `Run tests` 步驟會重跑整輪測試
-  （最多三次），但**僅限**該測試是唯一失敗項；其他測試失敗或三次都失敗
-  仍然直接紅。**不要為了這個 flake 改測試代碼**——它偶發失敗不代表有
-  回歸，用 retry 消掉雜訊就好。
+  上游（Pingora）flaky**。`scripts/run-ci-tests.sh`（`rust-ci` 快速閘呼叫）
+  會重跑整輪 nextest（最多三次），但**僅限**該測試是唯一失敗項；其他測試
+  失敗或三次都失敗仍然直接紅。**不要為了這個 flake 改測試代碼**——它偶發
+  失敗不代表有回歸，用 retry 消掉雜訊就好。
 
   > 📌 **依據**（2026-08-10 補；在此之前這條只有結論，沒有出處，
   > 而本倉庫的規則是「只寫結論的否決註解會變成一道沒人敢推的門」）：
@@ -126,10 +126,9 @@
   > `UnexpectedEof`。
   >
   > **這條的有效期綁在 #947**：合併並進入我們釘的 pingora 版本之後，
-  > 這個 flake 應該消失，屆時要拿掉 `ci.yml` 的 retry 並讓它恢復成一次
-  > 就該綠的測試。留著 retry 而 flake 已經修好，等於留一個永遠不會紅的
-  > 測試。
-- 🔒 **新增 `security-audit` job（`cargo audit`）,每次 push 都跑**,不只在
+  > 這個 flake 應該消失，屆時要拿掉 retry 並讓它恢復成一次就該綠的測試。
+  > 留著 retry 而 flake 已經修好，等於留一個永遠不會紅的測試。
+- 🔒 **`security-audit.yml`（`cargo audit`）在合併閘與每晚排程都跑**,不只在
   發布前跑一次。RustSec 公告的時間不受這個專案控制,一個已合併但後來被公告
   漏洞的依賴,只有持續跑才抓得到。真的出現 finding 時的例外處理是**書面風險
   接受**（既有的書面風險接受規則),不是把這個 job 改成

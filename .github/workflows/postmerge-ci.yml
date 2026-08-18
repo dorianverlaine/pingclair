@@ -1,0 +1,37 @@
+name: Postmerge CI
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: postmerge-ci-${{ github.ref_name }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  rust-ci-full:
+    name: Rust CI full
+    uses: ./.github/workflows/rust-ci-full.yml
+    secrets: inherit
+
+  h3:
+    name: HTTP/3
+    uses: ./.github/workflows/h3.yml
+    secrets: inherit
+
+  results:
+    name: Postmerge CI results
+    if: ${{ always() }}
+    needs: [rust-ci-full, h3]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Require successful dependencies
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: python3 .github/scripts/check_ci_results.py

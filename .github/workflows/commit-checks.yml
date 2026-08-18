@@ -1,0 +1,91 @@
+name: Commit checks
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  check-whitespace:
+    name: Check whitespace (git log --check)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: git log --check
+        run: |
+          if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+            range="${{ github.event.pull_request.base.sha }}..HEAD"
+          else
+            range="HEAD~1..HEAD"
+          fi
+          if ! git log --check --no-merges --format='%h %s' "$range"; then
+            echo "::error::whitespace errors found in commits $range"
+            exit 1
+          fi
+          echo "✅ no whitespace errors in $range"
+
+  check-commit-subjects:
+    name: Check commit subjects (emoji + conventional)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check commit subjects
+        run: |
+          if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+            range="${{ github.event.pull_request.base.sha }}..HEAD"
+          else
+            range="HEAD~1..HEAD"
+          fi
+          err=0
+          while read -r hash; do
+            subject="$(git log -1 --format=%s "$hash")"
+            if ! printf '%s' "$subject" | grep -qP '^[^\x00-\x7F]+ [a-z]+(\([a-z0-9_,/ -]+\))?: '; then
+              echo "::error::$hash subject does not start with an emoji and a conventional type: \"$subject\""
+              err=1
+            fi
+          done < <(git rev-list --no-merges "$range")
+          if [ "$err" -ne 0 ]; then
+            exit 1
+          fi
+          echo "✅ all commit subjects open with emoji + conventional type"
+
+  check-version-bump:
+    name: Workspace version is ahead of the newest release tag
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Compare the workspace version against the newest release tag
+        run: |
+          set -Eeuo pipefail
+          crate_version="$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"/\1/')"
+          git fetch --quiet --tags --force
+          latest_tag="$(git tag -l 'v*.*.*' | sed 's/^v//' | sort -V | tail -1)"
+          if [ -z "${latest_tag}" ]; then
+            echo "✅ no release tag yet; nothing to be ahead of"
+            exit 0
+          fi
+          echo "workspace: ${crate_version}    newest release tag: v${latest_tag}"
+          release_part="${crate_version%%-*}"
+          if [ "${release_part}" = "${latest_tag}" ]; then
+            echo "::error::the workspace release version ${release_part} is the newest release tag v${latest_tag}; bump it so a source build is distinguishable from the release"
+            exit 1
+          fi
+          newest="$(printf '%s\n%s\n' "${release_part}" "${latest_tag}" | sort -V | tail -1)"
+          if [ "${newest}" != "${release_part}" ]; then
+            echo "::error::the workspace version ${crate_version} is behind the newest release tag v${latest_tag}"
+            exit 1
+          fi
+          echo "✅ ${crate_version} is ahead of the newest release tag v${latest_tag}"

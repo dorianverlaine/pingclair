@@ -1,0 +1,29 @@
+name: Docs lint
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  docs-lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 22
+
+      - name: Install markdownlint-cli2
+        run: npm install --global markdownlint-cli2@0.23.2
+
+      - name: Run markdownlint
+        run: markdownlint-cli2 "**/*.md"
+
+      - uses: ./.github/actions/check-clean-worktree

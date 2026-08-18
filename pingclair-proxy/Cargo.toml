@@ -22,7 +22,6 @@ pingora-proxy.workspace = true
 # crate to the dependency tree.
 pingora-cache = { version = "0.8.1", default-features = false, features = ["boringssl"] }
 pingora-load-balancing.workspace = true
-pingora-limits.workspace = true
 pingora-core = { workspace = true, features = ["boringssl", "connection_filter"] }
 pingora-http.workspace = true
 tokio.workspace = true
@@ -66,3 +65,6 @@ tempfile = "3"
 rcgen.workspace = true
 h2.workspace = true
 proptest = "1"
+
+[lints]
+workspace = true
