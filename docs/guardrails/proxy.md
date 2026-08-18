@@ -97,7 +97,9 @@ pingora-core 預設 OpenSSL，兩者符號直接衝突。要 H3 就得把**整�
 - **macOS 單元測試不足以驗證鏈結與 QUIC 行為。**
 
 - 跑這一關用 `scripts/test-h3-day28-local.sh`（功能矩陣，需要支援 HTTP/3 的
-  curl）與 `scripts/test-h3-cancellation-local.sh`（SSE／取消／trailer）。
+  curl）與 `scripts/test-h3-cancellation-local.sh`（SSE／取消／trailer），
+  以及 `scripts/test-h3-client-auth-local.sh`（雙向 TLS，含握手名稱與
+  `:authority` 必須一致那條規則——那條規則在 2026-08-18 之前完全沒有測試）。
   Linux 那一半用 docker `rust:1.97-bookworm`。
 
 > ✅ **`ba37ffc` 的遷移已通過這一關**（2026-07-30，證據在

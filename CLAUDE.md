@@ -82,6 +82,7 @@ H3 or the TLS dependency tree, run both scripts and the Linux half:
 ```bash
 scripts/test-h3-day28-local.sh              # SNI, Alt-Svc, body sizes, POST, 413, keepalive
 scripts/test-h3-cancellation-local.sh       # SSE, downstream cancellation, trailer rejection
+scripts/test-h3-client-auth-local.sh        # mutual TLS, and the SNI/:authority rule that protects it
 ```
 
 Both need a curl built with HTTP/3 (`brew install curl` provides one; the system
