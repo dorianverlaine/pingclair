@@ -1,518 +1,1661 @@
-# AGENTS.md — Pingclair
+# AGENTS.md - Pingclair
 
-This is the operating manual for coding agents working in this repository.
-Read it together with the planning documents before changing anything:
+This file is the repository-wide operating contract for coding agents working on Pingclair.It applies regardless of which agent, editor, or development environment is used.Keep this file actionable. Detailed incident history, reproductions, and subsystem archaeology belong in `docs/guardrails/`, not here.
 
-- `docs/TODO.md` — the v0.2.0 execution plan, one Day per sitting. Read this
-  to know what to work on. 🔒 **Kept local, deliberately not in the
-  repository**: it tracks known-but-unfixed weaknesses day by day, and a
-  public, prioritised list of unpatched defects in released code is a target
-  list. Publish the fix, not the queue. If you are working from a clone and
-  this file is missing, that is expected — ask the maintainer for it.
-- `TRIAGE.md` — the inbox for problems found while working on something else,
-  one entry each with a severity and a status. Read it before starting so you do
-  not spend a session re-discovering something already written down, and write
-  to it instead of widening the diff in hand; its own "How to add one" section
-  shows the shape, and the open count lives in that section's heading rather
-  than being left to be tallied. 🔒 **Kept local, deliberately not
-  in the repository**: an entry is only useful when it names the exact input
-  that breaks something, which makes a well-written one a working reproduction for a
-  defect that is by definition still unfixed. Saying the inbox exists is fine —
-  that is why this bullet is public. Its contents are not. If you are working
-  from a clone and this file is missing, that is expected; ask the maintainer.
-- `benchmarks/README.md` — published performance claims and verification
-  methodology. The per-run evidence ledger lives locally under
-  `benchmarks/results/`, deliberately not committed; do not infer that
-  implemented code has passed Linux/VPS validation without a recorded run.
-- `docs/GUARDRAILS.md` — a one-page index over `docs/guardrails/`, which holds
-  the environment constraints and implementation rules split four ways:
-  `testing.md`, `config.md`, `tls.md`, `proxy.md`. Every entry is a real
-  failure that already happened once. Read the one or two files your change
-  touches before coding — the point of the split is that you no longer have to
-  read four hundred lines to find the twelve that apply to you.
+---
 
-## What Pingclair is
+## 🧰 Tools first
 
-Pingclair is a Rust web server and reverse proxy built on Cloudflare Pingora
-0.8. It provides a Caddy-like configuration language, static files, reverse
-proxying, load balancing, automatic HTTPS, HTTP/3 through quiche, metrics, and
-an admin API with hot reload.
+Use the repository's intended tools before falling back to slower generic workflows.If a common development tool required by this repository is missing, install it rather than silently replacing the workflow with a worse one.
 
-- Workspace version: `0.2.0-dev` (unreleased; the newest release tag is `v0.1.7`)
-- Rust edition: 2024
-- Minimum Rust: **1.97**
-- Upstream repository: `https://github.com/dorianverlaine/pingclair`
+### Canonical command interface
 
-The workspace has eight crates:
+Use `just` as the normal entry point for repository workflows.
+
+Agents should prefer:
+
+```bash
+just check
+just test
+just test -p pingclair-proxy
+just test -p pingclair --test integration
+just lint
+just fix
+just fmt
+just fmt-check
+just ci
+just shear
+just repo-lint
+just docs-lint
+just bench
+just bench-smoke
+just h3
+just disk
+just cache-report
+```
+
+Do not duplicate long Cargo command lines throughout documentation when a `just` recipe can own the behavior.
+
+When tooling behavior changes, update the `justfile` first and keep this document at the level of policy.
+
+### General CLI
+
+Prefer:
+
+- `rg` over `grep -R` for source searches.
+- `fd` over `find` for locating files.
+- `bat` over `cat` for interactive source inspection.
+- `jq` for JSON inspection and transformation.
+- `gsed` when GNU `sed` behavior is required.
+- `git diff --check` before handoff.
+
+Respect `.gitignore`.
+
+Do not search generated directories such as:
+
+- `target/`;
+- persistent Cargo build caches;
+- benchmark result caches;
+- vendored trees;
+- temporary build directories;
+
+unless the task specifically concerns them.
+
+Avoid relying on macOS BSD command behavior in scripts intended for Linux CI.
+
+---
+
+## 🦀 Rust toolchain is exact
+
+CI validation uses Rust **1.97.1**.
+
+The workspace declares Rust 1.97 compatibility, but formal local validation uses the exact CI toolchain:
+
+```bash
+cargo +1.97.1 ...
+```
+
+`+1.97.1` is not decoration.
+
+Different compiler or rustfmt versions may produce different inference, warnings, formatting, or build results.
+
+Use the exact toolchain for:
+
+- formatting checks;
+- Clippy;
+- formal builds;
+- CI-parity tests;
+- release validation.
+
+---
+
+## 🧪 Local tests use nextest
+
+`cargo-nextest` is the default local Rust test runner.
+
+Do not default to `cargo test` while iterating.
+
+Prefer:
+
+```bash
+just test -p <changed-crate>
+```
+
+then:
+
+```bash
+just test
+```
+
+near handoff.
+
+The repository's `just test` recipe should use:
+
+```text
+cargo nextest run --no-fail-fast
+```
+
+with the repository's local nextest profile.
+
+### Cargo test has a narrower role
+
+Use ordinary `cargo test` when:
+
+- checking CI parity;
+- running doctests;
+- testing behavior specific to Cargo's built-in harness;
+- reproducing a failure known to occur only there.
+
+The final CI-parity gate may use:
+
+```bash
+just ci
+```
+
+which should include the exact Cargo commands CI actually executes.
+
+Do not repeatedly run a full `cargo test --workspace` as an inner development loop.
+
+### Doctests
+
+Nextest does not replace doctests.
+
+When Rust documentation examples change, run the relevant doctests explicitly.
+
+---
+
+## 🔧 Development tools
+
+The repository should provide and prefer these tools.
+
+### `just`
+
+`just` owns repository workflows.
+
+Do not require agents to reconstruct multi-step validation commands from prose.
+
+### `cargo-nextest`
+
+Use for ordinary local tests.
+
+### `cargo-shear`
+
+Use to detect unused Cargo dependencies.
+
+Run:
+
+```bash
+just shear
+```
+
+before dependency-heavy changes are finalized and in CI.
+
+Unused dependencies are not harmless, especially around TLS, QUIC, and platform-specific native libraries.
+
+### `sccache`
+
+Use `sccache` when available for repeated compatible builds.
+
+Persistent incremental Cargo artifacts and `sccache` solve different problems and may be used together.
+
+Do not assume `sccache` can make an incompatible target/profile/toolchain cache reusable.
+
+### `divan`
+
+Use `divan` for focused Rust microbenchmarks.
+
+Appropriate targets include:
+
+- routing;
+- header policy;
+- matchers;
+- CIDR lookup;
+- request-ID handling;
+- URI rewriting;
+- upstream-key construction;
+- hot configuration lookup;
+- range parsing;
+- compression decisions.
+
+Run:
+
+```bash
+just bench-smoke
+```
+
+first to verify benchmark targets work.
+
+Run:
+
+```bash
+just bench
+```
+
+for actual measurement.
+
+Microbenchmarks complement, rather than replace, whole-server `wrk`, `h2load`, QUIC, and VPS measurements.
+
+### `insta` / `cargo-insta`
+
+Use snapshot tests selectively where a structured output is easier to review as a whole than field by field.
+
+Good candidates include:
+
+- Pingclairfile compiler output;
+- complex route trees;
+- configuration normalization;
+- nested matchers;
+- TLS policy representation;
+- header-policy compilation.
+
+Do not snapshot volatile values merely because snapshot testing is convenient.
+
+Review snapshot changes deliberately.
+
+### `markdownlint-cli2`
+
+Use for Markdown structure and style checks.
+
+Run through:
+
+```bash
+just docs-lint
+```
+
+### `codespell`
+
+Use for English comments and documentation.
+
+Configure project-specific ignores for valid technical terms, names, French text, and other known false positives.
+
+### Repository-specific lint
+
+Machine-checkable house rules belong in a repository lint tool rather than only in model instructions.
+
+The repository should provide:
+
+```bash
+just repo-lint
+```
+
+backed by a focused script or tool.
+
+It should enforce rules that can be checked reliably, including where practical:
+
+- file-size limits;
+- forbidden TLS dependencies;
+- known dependency-tree invariants;
+- repository-specific configuration fixture rules;
+- prohibited generated or sensitive files;
+- obvious house-style violations;
+- documentation ownership rules that can be detected mechanically.
+
+Do not implement unreliable source parsing with fragile regular expressions merely to claim a rule is automated.
+
+When normal linting is insufficient, improve the repository lint deliberately.
+
+### Not adopted by default
+
+Do not introduce Bazel merely to copy Codex.
+
+Cargo remains Pingclair's build system.
+
+Do not introduce Dylint until a repository rule genuinely requires Rust semantic analysis that ordinary Clippy or a small repository lint cannot provide.
+
+Tooling must remove work, not manufacture another build system to maintain. 🤡
+
+---
+
+## 💾 Persistent build caches
+
+Expensive Rust builds must reuse persistent build state.
+
+Do not put primary Cargo target directories inside:
+
+- disposable containers;
+- temporary directories;
+- short-lived build directories;
+- ephemeral OrbStack filesystems.
+
+Repeated cold recompilation caused by losing a valid cache is a development-environment defect.
+
+### Separate target caches
+
+Use stable architecture-specific target directories.
+
+Recommended layout:
+
+```text
+~/.cache/pingclair-build/
+├── macos-aarch64/
+├── linux-aarch64/
+└── linux-x86_64/
+```
+
+Linux x86_64:
+
+```bash
+export CARGO_TARGET_DIR="$HOME/.cache/pingclair-build/linux-x86_64"
+cargo +1.97.1 build --target x86_64-unknown-linux-gnu
+```
+
+Linux arm64:
+
+```bash
+export CARGO_TARGET_DIR="$HOME/.cache/pingclair-build/linux-aarch64"
+cargo +1.97.1 build --target aarch64-unknown-linux-gnu
+```
+
+Native macOS uses its own cache.
+
+Do not copy target trees between incompatible architectures.
+
+### OrbStack
+
+When building in OrbStack:
+
+- keep `CARGO_TARGET_DIR` on persistent storage;
+- reuse the same path between runs;
+- separate x86_64 and aarch64 caches;
+- preserve Cargo registry caches;
+- preserve Cargo git dependency caches;
+- preserve `sccache` state when used;
+- avoid compiling inside disposable container filesystems when persistent storage is available.
+
+Before concluding that a full rebuild is required, check whether any of these changed:
+
+1. `CARGO_TARGET_DIR`;
+2. target triple;
+3. Rust toolchain;
+4. Cargo feature set;
+5. build profile;
+6. `RUSTFLAGS`;
+7. linker settings;
+8. build environment;
+9. relevant dependency features;
+10. cache mount path.
+
+A path change alone can turn a warm build into a cold build.
+
+---
+
+## 💽 Build-cache disk budget
+
+Pingclair's debug, test, release, LTO, and multi-architecture artifacts can consume large amounts of disk.
+
+Observe build-cache size before the machine runs out of space.
+
+Use:
+
+```bash
+just disk
+```
+
+or inspect manually:
+
+```bash
+df -h .
+du -sh target 2>/dev/null || true
+du -sh "$HOME/.cache/pingclair-build" 2>/dev/null || true
+```
+
+### Budget
+
+The normal local build-cache budget is approximately **80 GiB**.
+
+Crossing **100 GiB** is a stop condition unless the retained artifacts are deliberately required for an active benchmark, comparison, or release.
+
+A cache silently reaching 130+ GiB is a workflow failure.
+
+### 🧹 Do not reflexively clean everything
+
+Do not default to:
+
+```bash
+cargo clean
+```
+
+A full clean destroys useful incremental state and often causes another expensive rebuild immediately afterward.
+
+Before deleting build artifacts:
+
+1. measure what is large;
+2. identify the architecture;
+3. identify the build profile;
+4. identify the owning worktree or task;
+5. preserve caches required by current work;
+6. remove stale trees selectively.
+
+Good cleanup candidates include:
+
+- abandoned temporary targets;
+- caches for deleted worktrees;
+- obsolete architecture caches;
+- old one-off benchmark builds;
+- release or fat-LTO output no longer needed.
+
+Do not delete Cargo registry or git dependency caches merely because a target tree is large.
+
+If normal development repeatedly requires full cleaning, fix the cache layout.
+
+---
+
+## 🗺️ Repository map
+
+Pingclair is a Rust web server and reverse proxy built on Cloudflare Pingora.
+
+It provides:
+
+- a Caddy-like configuration language;
+- static file serving;
+- reverse proxying;
+- load balancing;
+- automatic HTTPS;
+- HTTP/3 through quiche;
+- metrics;
+- an admin API;
+- hot reload.
+
+Repository baseline:
+
+- workspace version: `0.2.0-dev`;
+- Rust edition: 2024;
+- minimum Rust: 1.97;
+- validation toolchain: 1.97.1;
+- upstream: `https://github.com/dorianverlaine/pingclair`.
+
+Workspace crates:
 
 | Crate | Responsibility |
 | --- | --- |
 | `pingclair` | CLI, process lifecycle, listeners, runtime wiring |
-| `pingclair-core` | Shared configuration types, router, basic handlers |
-| `pingclair-config` | Pingclair DSL lexer/parser/adapter/compiler |
-| `pingclair-proxy` | Pingora proxy, middleware, LB, HTTP/3, metrics |
+| `pingclair-core` | Shared cross-cutting configuration and routing abstractions |
+| `pingclair-config` | Pingclair DSL lexer, parser, adapter, compiler |
+| `pingclair-proxy` | Pingora proxy, middleware, load balancing, HTTP/3, metrics |
 | `pingclair-static` | Static serving, ranges, compression, streaming |
-| `pingclair-tls` | Certificate store, ACME, auto-HTTPS |
-| `pingclair-api` | Admin API, auth, inspection, hot reload |
-| `pingclair-plugin` | Unwired plugin skeleton; not a shipped feature |
+| `pingclair-tls` | Certificate store, ACME, automatic HTTPS |
+| `pingclair-api` | Admin API, authentication, inspection, hot reload |
+| `pingclair-plugin` | Plugin infrastructure; unwired pieces are not shipped features |
 
-## Start every task this way
+---
 
-1. Run `scripts/snapshot-sensitive-plans.sh start`. It validates every existing
-   sensitive-plan snapshot before writing a new one; stop immediately if it
-   fails.
-2. Read `docs/TODO.md` and work the current Day. One Day per sitting; do not
-   merge a 🔨 coding Day with a ✅ verification Day.
-3. Read the relevant guardrail file before editing: `docs/guardrails/proxy.md`
-   for H3 or anything that streams a response body, `docs/guardrails/tls.md`
-   for TLS and dependencies, `docs/guardrails/config.md` for the DSL and the
-   compiler, `docs/guardrails/testing.md` for test and verification
-   infrastructure.
-4. Inspect `git status --short --branch`; preserve existing user changes.
-5. Locate the real execution path, not only the config type or AST.
-6. Decide the required verification level before editing:
-   unit, local real-binary integration, Linux/container, or remote VPS.
-7. Record verification evidence locally under `benchmarks/results/`, mark the
-   finished Day in `docs/TODO.md`, then run
-   `scripts/snapshot-sensitive-plans.sh end`. A failed final checksum validation
-   blocks handoff.
+## 🚦 Start every task this way
 
-### Sensitive planning snapshots
+Before editing:
 
-`scripts/snapshot-sensitive-plans.sh` copies `docs/TODO.md` and `TRIAGE.md`
-together into the gitignored `.plan-snapshots/` directory with a SHA-256
-manifest. It retains the newest 30 complete snapshot sets. Never stage or
-publish that directory: the files remain sensitive even though they are backup
-copies. Do not bypass a validation failure by deleting or regenerating the
-manifest; inspect the named snapshot and recover the intended source first.
+1. Inspect:
 
-Do not mark an item as remotely verified because unit tests or
-`cargo test --workspace` pass. The ledger deliberately distinguishes:
+   ```bash
+   git status --short --branch
+   ```
 
-- completed and verified on the Linux VPS;
-- implemented and locally tested, but still awaiting remote verification;
-- not implemented.
+2. Preserve unrelated user changes.
 
-## Change budget
+3. Locate the real execution path.
 
-A session has a budget, and it is much smaller than what fits in a context
-window. These are the limits:
+4. Read the narrowest relevant guardrail.
 
-- **One theme per session.** Everything committed should be answerable by the
-  same one-sentence description of what the session was for. A session that
-  needs two sentences was two sessions.
-- **At most one change to a core abstraction per session.** `ProxyState`, the
-  router, `HandlerConfig`, the `ProxyHttp` lifecycle wiring, `H3App`,
-  `http_policy.rs`. Two at once means neither can be bisected: when something
-  breaks next week, the commit that broke it moved two foundations and you
-  cannot tell which.
-- **Newly discovered problems go to `TRIAGE.md`, never straight into the
-  current diff.** The fix will be small and obviously right and it will be
-  right there. Write the entry anyway. The exceptions are a security defect
-  under active exploitation, and a problem that makes the change in hand wrong
-  regardless — nothing else. The file is local and absent from a fresh clone;
-  if it is not there, create it rather than treating its absence as permission
-  to fold the fix into the diff.
-- **Three fix commits in one session is a stop sign.** Before attempting a
-  fourth, write down why the first fix was insufficient. Not what the fourth
-  fix will be — why the first one did not hold.
+5. Decide the required verification level.
 
-  > 🤡 Why this is a rule: this repository is at 95 fixes to 57 features
-  > all-time, and 39 to 12 over the last hundred commits. The rate is
-  > climbing, which is what tells you the fixes are not landing on the cause.
-  > A fourth fix written without that sentence is a guess with three failed
-  > guesses behind it, and the reason it feels urgent is exactly the reason it
-  > is likely to be wrong.
-  >
-  > The sentence is cheap and it is the whole mechanism: it either names a
-  > cause the first three fixes missed, in which case fix that, or it cannot
-  > be written, in which case the problem is not understood yet and the next
-  > move is reading, not editing.
-  >
-  > 📌 There was a CI job counting `fix(` subjects over a 30-commit window and
-  > failing above 60 %. It was removed on 2026-08-18: it counts the wrong
-  > thing. Most of this repository's fixes are *pre-existing* defects that
-  > better verification finally surfaced — a public transport matrix, an
-  > upstream-format corpus, an adversarial review — so the number rose fastest
-  > exactly when the debt was falling. A brake that tightens when you start
-  > looking harder teaches you to stop looking. The rule above survives it,
-  > because it asks about one cause rather than about a count.
+6. Define one coherent theme for the change.
 
-## Build and test
+Relevant guardrails:
+
+```text
+docs/guardrails/testing.md
+docs/guardrails/config.md
+docs/guardrails/tls.md
+docs/guardrails/proxy.md
+```
+
+`docs/GUARDRAILS.md` is an index, not another place to duplicate rules.
+
+A config type, enum variant, parser entry, or compiler node is not evidence that runtime behavior exists.
+
+Trace the actual request path.
+
+---
+
+## 🔒 Maintainer planning workflow
+
+These files may exist only in the maintainer's local checkout:
+
+- `docs/TODO.md`;
+- `docs/STATUS.md`;
+- `TRIAGE.md`;
+- `docs/CADDYFILE_COMPATIBILITY_MASTER.md`;
+- `benchmarks/results/`;
+- `.plan-snapshots/`.
+
+Their absence in a public clone is expected.
+
+Do not block a user-scoped task merely because private planning data is absent.
+
+When the maintainer planning files are present:
+
+1. run:
+
+   ```bash
+   scripts/snapshot-sensitive-plans.sh start
+   ```
+
+2. read the active Day in `docs/TODO.md`;
+3. inspect `TRIAGE.md`;
+4. inspect `docs/STATUS.md` before changing verification claims;
+5. keep unrelated discoveries outside the active diff;
+6. record required evidence;
+7. finish with:
+
+   ```bash
+   scripts/snapshot-sensitive-plans.sh end
+   ```
+
+A snapshot validation failure blocks handoff.
+
+Never publish private planning snapshots, TRIAGE contents, private TODO contents, or private benchmark evidence.
+
+---
+
+## 📚 Documentation ownership
+
+These documents own different facts.
+
+Mixing them is a defect.
+
+| Document | Owns |
+| --- | --- |
+| `AGENTS.md` | Repository-wide agent, coding, style, review, and verification rules |
+| `docs/TODO.md` | Maintainer execution plan |
+| `docs/STATUS.md` | Verification state and evidence level |
+| `TRIAGE.md` | Known defects not currently being worked on |
+| `docs/GUARDRAILS.md` | Guardrail index |
+| `docs/guardrails/testing.md` | Testing environment and validation failures |
+| `docs/guardrails/config.md` | DSL, compiler, and validation invariants |
+| `docs/guardrails/tls.md` | TLS, ACME, certificate-store invariants |
+| `docs/guardrails/proxy.md` | Proxy lifecycle, H3, streaming, transport invariants |
+| `benchmarks/README.md` | Published benchmark methodology and claims |
+| `benchmarks/results/` | Local raw verification evidence |
+| `CHANGELOG.md` | Upgrade-relevant shipped changes |
+| `README*.md` | Current shipped user-facing behavior |
+
+Detailed incident history belongs in the owning guardrail.
+
+Keep the root operating manual concise enough that agents actually follow it.
+
+---
+
+## 📏 Change-size budget
+
+Unless a change is mechanical:
+
+- prefer total diffs below approximately **800 changed lines**;
+- keep complex behavioral changes below approximately **500 changed lines**.
+
+If a change exceeds those limits, identify the smallest independently useful stage that can be:
+
+- implemented;
+- tested;
+- reviewed;
+- landed;
+
+without leaving the repository in an incorrect intermediate state.
+
+Do not game the limit with meaningless file movement or generated output.
+
+---
+
+## 📐 File and module size
+
+Large files are maintenance debt.
+
+They increase:
+
+- agent context cost;
+- review cost;
+- merge conflicts;
+- accidental coupling;
+- pressure to put unrelated behavior into an already-central file.
+
+### Handwritten implementation and tests
+
+Target handwritten modules at **under 500 LoC**.
+
+Once a file approaches **800 LoC**, do not add substantial new functionality to it.
+
+Prefer a focused sibling module.
+
+Apply the same guidance to substantial handwritten test modules and shell tooling.
+
+### Documentation
+
+Handwritten Markdown should remain focused.
+
+When a technical or operational document approaches **800 lines**, split it by ownership or subsystem unless keeping the material contiguous protects a real invariant.
+
+`AGENTS.md` itself should follow this rule.
+
+### Split by ownership
+
+Good boundaries include:
+
+- parsing;
+- validation;
+- policy;
+- transport;
+- lifecycle;
+- state;
+- storage;
+- protocol;
+- formatting;
+- test harness;
+- platform integration.
+
+Do not create meaningless names such as:
+
+```text
+part1.rs
+part2.rs
+misc2.rs
+helpers_new.rs
+```
+
+merely to satisfy a line count.
+
+Generated files are exempt.
+
+Existing oversized files do not require mechanical rewrites solely because the rule was introduced, but they should stop growing.
+
+---
+
+## 🧠 Keep `pingclair-core` small
+
+Do not use `pingclair-core` as the default destination for concepts that lack an obvious home.
+
+Before adding a new abstraction there, ask whether it belongs to:
+
+- `pingclair-config`;
+- `pingclair-proxy`;
+- `pingclair-static`;
+- `pingclair-tls`;
+- `pingclair-api`;
+- the top-level `pingclair` runtime;
+- a new focused crate.
+
+Code belongs in `pingclair-core` when multiple crates genuinely share the abstraction and placing it elsewhere would invert ownership.
+
+Do not add code to core merely because many crates already depend on it.
+
+---
+
+## 🧱 Change discipline
+
+### One theme
+
+A coherent change should be explainable in one sentence.
+
+If two unrelated sentences are required, split the change.
+
+### Core abstractions
+
+Avoid changing several central abstractions simultaneously.
+
+High-risk examples include:
+
+- `ProxyState`;
+- the router;
+- `HandlerConfig`;
+- `ProxyHttp` lifecycle wiring;
+- `H3App`;
+- `http_policy.rs`.
+
+### Unrelated findings
+
+Newly discovered unrelated defects belong in TRIAGE when the maintainer workflow is present.
+
+Do not widen the current diff because a nearby fix looks easy.
+
+Exceptions:
+
+- the discovered defect makes the active change incorrect;
+- an actively exploited security issue requires immediate action;
+- the narrowly defined local performance exception below applies.
+
+### Repeated fixes
+
+Three failed fix attempts for the same problem are a stop sign.
+
+Before attempting a fourth, explain in one sentence why the earlier fixes did not address the root cause.
+
+If that sentence cannot be written, investigate instead of editing again.
+
+---
+
+# 🖋️ House style - non-negotiable
+
+These are standing repository-owner requirements.
+
+They apply to every agent and every change.
+
+---
+
+## 🎯 Emoji everywhere
+
+Every new or modified handwritten source comment or doc comment carries a semantically appropriate emoji.
+
+This applies to comments in:
+
+- Rust;
+- Cargo manifests;
+- shell;
+- configuration;
+- other handwritten source files.
+
+Emoji are semantic category markers, not random decoration.
+
+Prefer stable meanings.
+
+Examples:
+
+- 🛡️ safety or invariant;
+- 🌊 streaming and flow control;
+- 🔐 TLS, credentials, or secrets;
+- 🚫 rejection or deny path;
+- 🧹 cleanup and teardown;
+- 🔁 retry or reuse;
+- ⚡ performance;
+- 🧪 testing;
+- 🧭 routing or navigation;
+- 📦 ownership or packaging;
+- 🔌 connectivity or transport.
+
+Runtime log messages also carry a stable appropriate emoji.
+
+Emoji do not replace structured fields.
+
+Exempt:
+
+- shebangs;
+- license headers;
+- generated files;
+- machine-required directives.
+
+---
+
+## 📝 Commit style
+
+Commit subjects begin with a semantically appropriate emoji followed by a conventional imperative summary.
+
+The subject describes the resulting change, not the development process.
+
+Commit bodies explain the reason and non-obvious invariants.
+
+Do not narrate every edited file.
+
+---
+
+## ✅ Completion marker has one meaning
+
+`✅` means **completed work**.
+
+It does not mean:
+
+- good;
+- correct;
+- approved;
+- recommended;
+- expected.
+
+Use:
+
+- `👍` for approval;
+- `📌` for a standing rule;
+- `🎯` for a passing property.
+
+Planning checkboxes remain countable:
+
+```text
+- [x] completed
+- [ ] outstanding
+```
+
+Do not turn status markers into decoration.
+
+---
+
+## 🍎 Apple-style comments
+
+Comments and doc comments are English.
+
+They should:
+
+- begin with a capital letter;
+- use complete sentences where practical;
+- use punctuation;
+- explain intent, ownership, constraints, or failure modes;
+- avoid narrating what the code visibly does.
+
+Bad:
+
+```rust
+// 🔢 Increment the counter.
+count += 1;
+```
+
+Better:
+
+```rust
+// 🛡️ Keep the retry index monotonic so each attempt gets a unique slot.
+count += 1;
+```
+
+The important rule:
+
+> A comment explains why the code has this shape.
+
+Apple-style navigation labels are encouraged when they improve navigation:
+
+```rust
+// MARK: - Routing
+```
+
+Do not add section labels mechanically to tiny modules.
+
+---
+
+## 🧠 Explain it the way Feynman would
+
+Descriptive prose should make sense to a smart reader who has not already reverse-engineered the implementation.
+
+This applies to:
+
+- doc comments;
+- module headers;
+- Markdown;
+- commit bodies;
+- review explanations;
+- design notes.
+
+### Lead with the plain-language idea
+
+Explain behavior before mechanism.
+
+### Prefer concrete failures
+
+Prefer:
+
+> 🌊 A 20 MB response gets buffered whole and can exhaust a small host.
+
+over:
+
+> Memory characteristics are suboptimal.
+
+### Jargon must earn its place
+
+Use jargon because it is precise, not because it sounds architectural.
+
+### Explain surprising constraints
+
+If obvious code would be wrong, say what failure it would cause.
+
+### Do not decorate
+
+Use analogies only when they remove work for the reader.
+
+### Unclear prose is diagnostic
+
+If an invariant cannot be explained clearly, re-read the implementation.
+
+Say plainly when something is:
+
+- uncertain;
+- unverified;
+- partially implemented;
+- known broken.
+
+Confident prose must not outrun evidence.
+
+---
+
+## 🌏 Language
+
+Code, identifiers, comments, commit messages, and runtime log strings remain English.
+
+Chinese project documentation uses Traditional Chinese.
+
+Follow terminology already established in `docs/`.
+
+---
+
+## 🧾 Test live servers with a Pingclairfile
+
+When a test, benchmark, verification run, or reproduction needs a live Pingclair server, configure it with the Pingclair DSL whenever an equivalent exists.
+
+Prefer:
+
+```text
+Pingclairfile
+```
+
+over JSON.
+
+JSON bypasses the Caddyfile adapter and therefore skips part of the user-facing configuration path.
+
+Treat:
+
+> I had to use JSON here.
+
+as a possible finding.
+
+Ask whether:
+
+- the DSL lacks the required directive;
+- the directive parses incorrectly;
+- the adapter cannot represent valid runtime configuration.
+
+Use JSON only where there is genuinely no DSL equivalent, and document the exception.
+
+Repository linting should detect live-server JSON fixtures where this can be checked reliably.
+
+---
+
+## 🏎️ Write hot-path code fast the first time
+
+Pingclair is measured in CPU microseconds per request against mature servers.
+
+Performance is a design constraint on new request-path code, not a cleanup phase scheduled for later.
+
+Before a new function enters a request path, answer four questions.
+
+### 1. ⚡ Could configuration have decided this?
+
+If the answer cannot differ between requests, compute it during load or reload.
+
+Examples:
+
+- parsing;
+- regex compilation;
+- CIDR compilation;
+- trust-store construction;
+- header lookup tables;
+- stable route metadata;
+- deterministic policy state.
+
+Repeated request-time work that configuration already determined is a defect.
+
+### 2. 📦 Does it allocate?
+
+Look for:
+
+- temporary `String`;
+- temporary `Vec`;
+- avoidable `to_string()`;
+- avoidable clones;
+- values collected only to be immediately iterated.
+
+Borrow where practical.
+
+Precompute shared immutable state when appropriate.
+
+Do not sacrifice clarity for speculative allocation avoidance outside meaningful hot paths.
+
+### 3. 🔒 Does it lock?
+
+A request-path lock needs a reason.
+
+A lock held across `.await` is a defect.
+
+Prefer immutable snapshots and existing `ArcSwap` publication patterns where appropriate.
+
+### 4. 🌊 Is it bounded?
+
+Bodies stream.
+
+Queues have explicit capacity.
+
+Buffers have ceilings.
+
+Consider:
+
+- 20 MB bodies;
+- SSE;
+- slow readers;
+- cancellation;
+- upstream teardown;
+- downstream disconnects;
+- H3 flow control.
+
+"It works on 2 KB" does not prove a body path is correct.
+
+### 📌 Off the request path
+
+Startup, reload, admin, and CLI code optimize primarily for clarity.
+
+Do not transplant hot-path complexity into code that runs once.
+
+---
+
+## ⚡ Fix local performance defects you walk past
+
+Unrelated defects normally remain outside the current change.
+
+A local performance defect may be fixed in the same change only when:
+
+- it is inside code already being edited;
+- externally visible behavior does not change;
+- no new dependency is required;
+- no cross-module redesign is required;
+- the payoff is obvious without a separate benchmark campaign.
+
+Examples:
+
+- repeated request work already determined by configuration;
+- an avoidable clone in the hot loop being edited;
+- a whole response buffered instead of streamed;
+- a lock held across `.await`.
+
+If measurement is required to know whether a redesign helps, create a measurement task instead.
+
+---
+
+## 🦀 Rust API design
+
+### Keep APIs small
+
+Prefer private modules and explicit public exports.
+
+Do not expose production APIs merely to make tests easier.
+
+### Make call sites self-documenting
+
+Avoid APIs producing:
+
+```rust
+foo(false, None, true, 0)
+```
+
+Prefer:
+
+- enums;
+- newtypes;
+- builders;
+- named methods;
+- explicit policy types.
+
+### Prefer exhaustive matches
+
+Prefer exhaustive `match` statements for:
+
+- protocol enums;
+- configuration enums;
+- transport state;
+- lifecycle state;
+- policy enums.
+
+Avoid wildcard arms when a future variant should require a deliberate decision.
+
+### Document new traits
+
+New traits explain:
+
+- their role;
+- ownership;
+- lifecycle expectations;
+- concurrency requirements;
+- implementation invariants.
+
+Do not create a trait around one concrete type without a real abstraction boundary.
+
+### Avoid trivial abstraction
+
+Do not create a helper used once merely to shorten a caller.
+
+Helpers should isolate real:
+
+- invariants;
+- ownership;
+- behavior;
+- duplication;
+- lifecycle;
+- policy.
+
+---
+
+## 🧪 Test authoring
+
+Tests prove behavior at the layer where the contract exists.
+
+### Prefer integration for runtime behavior
+
+Runtime changes should normally include real-binary or integration coverage.
+
+`pingclair/tests/integration.rs` launches the real compiled binary and performs real localhost HTTP requests.
+
+### Regression tests must regress
+
+A regression test should fail against the broken behavior it prevents.
+
+### Prefer complete assertions
+
+Compare complete structured results when practical instead of asserting many fields separately.
+
+Snapshot testing may be appropriate for stable complex compiler output.
+
+### Reuse test infrastructure
+
+Before adding another:
+
+- process launcher;
+- test server;
+- certificate generator;
+- HTTP client;
+- fixture loader;
+- port allocator;
+
+look for an existing helper.
+
+Do not expand production public API for testing convenience.
+
+### Large tests
+
+New substantial test modules should use focused sibling files.
+
+Do not allow central implementation files to grow indefinitely because tests are embedded at the bottom.
+
+---
+
+## 👻 Ghost-process trap
+
+Real-binary tests may leave stale listeners after interruption, timeout, panic, or failed cleanup.
+
+A stale process may receive the readiness request after the new binary failed to bind, producing misleading 404, 502, or old behavior.
+
+Before instrumenting routing code, follow:
+
+```text
+docs/guardrails/testing.md
+```
+
+Check:
+
+1. listener ownership;
+2. spawned-child state;
+3. binary path;
+4. config path;
+
+before debugging application logic.
+
+Never use broad process-killing commands on a machine that may be serving real traffic.
+
+---
+
+## 🧭 Configuration becomes precomputed state once
+
+The configuration path is:
+
+```text
+Pingclairfile
+→ parser
+→ adapter
+→ compiler
+→ validation
+→ PingclairConfig
+→ ProxyState
+→ request execution
+```
+
+Shared validation belongs in the common validation path.
+
+Do not put validation only in the DSL adapter when JSON can bypass it.
+
+A `HandlerConfig` variant or parser entry is not an implementation.
+
+Trace user-facing features through:
+
+1. syntax;
+2. parsed form;
+3. compiled form;
+4. precomputed state;
+5. request execution;
+6. local responses;
+7. proxied responses.
+
+---
+
+## 🚦 Two transports, one policy layer
+
+H1/H2 and H3 are separate execution paths.
+
+### H1/H2
+
+`pingclair-proxy/src/server.rs` owns the Pingora `ProxyHttp` lifecycle.
+
+### H3
+
+`pingclair-proxy/src/quic.rs` owns the HTTP/3 application layer.
+
+`tokio-quiche` owns the QUIC transport responsibilities already provided by the upstream stack.
+
+Do not duplicate transport machinery in application code.
+
+### Shared policy
+
+Behavior needed by both transports should live in or converge through shared policy rather than being implemented twice.
+
+When parity is intentionally not required, say so explicitly.
+
+Read:
+
+```text
+docs/guardrails/proxy.md
+```
+
+before changing transport, body streaming, or cross-protocol middleware.
+
+---
+
+## 🔐 BoringSSL is a whole-tree commitment
+
+Pingclair's QUIC stack depends on the repository's BoringSSL arrangement.
+
+Do not accidentally introduce a competing OpenSSL tree.
+
+Do not casually add:
+
+- `pingora-openssl`;
+- `openssl-sys`;
+- reqwest `native-tls`;
+- other dependencies that pull incompatible native TLS linkage.
+
+This applies to development dependencies too.
+
+`just repo-lint` and CI should check known forbidden TLS dependencies.
+
+Dependency changes should also run:
 
 ```bash
-cargo build --workspace
-cargo test --workspace
-cargo test -p pingclair-config
-cargo test -p pingclair-proxy
-cargo test -p pingclair --test integration -- --nocapture
+just shear
+```
+
+and the relevant dependency-tree checks.
+
+---
+
+## 🌊 Streaming is correctness
+
+Streaming is not a later optimization.
+
+Compression, middleware, retry, observability, static serving, proxying, and protocol adaptation must preserve bounded memory.
+
+Any body-handling change considers:
+
+- large bodies;
+- SSE;
+- slow clients;
+- cancellation;
+- partial delivery;
+- upstream teardown;
+- H3 flow control.
+
+Do not collect a full body merely because it makes middleware easier to implement.
+
+Channels and queues remain bounded.
+
+---
+
+## 🛡️ Security conventions
+
+Misconfiguration fails closed.
+
+Do not silently ignore invalid security policy.
+
+Sensitive data is masked by default in:
+
+- logs;
+- metrics;
+- admin output;
+- diagnostics;
+- panic output where applicable.
+
+Sensitive values include:
+
+- authorization headers;
+- cookies;
+- API keys;
+- private keys;
+- ACME account credentials.
+
+Treat admin authentication and reload endpoints as security-critical.
+
+Never commit private certificate or account-key material.
+
+---
+
+## 🧬 Serde recursion rule
+
+Recursive types must not use `#[serde(untagged)]`.
+
+Use representations whose recursion behavior is explicit, bounded, and testable.
+
+---
+
+## 🧾 Rejection-note rule
+
+A comment saying an upstream API or alternative was evaluated and rejected must preserve enough evidence to re-check the conclusion.
+
+Record:
+
+- dependency/version;
+- symbol or API;
+- date;
+- concrete reason.
+
+Do not write:
+
+```text
+// 🚫 Upstream cannot do this.
+```
+
+without evidence.
+
+Stale rejection folklore has already cost this project unnecessary implementation work.
+
+---
+
+## 📖 Documentation changes with code
+
+User-facing documentation changes with the behavior it describes.
+
+Do not intentionally leave prose describing behavior that no longer exists.
+
+Update together when applicable:
+
+```text
+README.md
+README.zh.md
+README.fr.md
+CHANGELOG.md
+```
+
+Configuration examples may have automated coverage.
+
+Prose often does not.
+
+---
+
+## 🔎 Breaking-change checklist
+
+Before changing observable behavior, inspect applicable surfaces:
+
+- Pingclairfile syntax;
+- JSON configuration;
+- CLI parameters;
+- CLI exit behavior;
+- admin API;
+- hot reload;
+- H1 behavior;
+- H2 behavior;
+- H3 behavior;
+- persisted TLS data;
+- certificate precedence;
+- renewal behavior;
+- metric names;
+- metric labels;
+- integration fixtures;
+- published benchmark claims;
+- upgrade behavior.
+
+A private Rust symbol can still implement a public behavior contract.
+
+---
+
+## 🌐 H3 verification
+
+macOS unit tests do not prove Linux linkage or QUIC behavior.
+
+After relevant H3 or TLS dependency changes, run the applicable scripts:
+
+```bash
+just h3
+```
+
+The recipe should cover the maintained local H3 verification scripts, including:
+
+```text
+scripts/test-h3-day28-local.sh
 scripts/test-h3-cancellation-local.sh
+scripts/test-h3-client-auth-local.sh
 ```
 
-CI pins Rust 1.97 and runs `cargo fmt --all -- --check`,
-`cargo clippy --locked --workspace --all-targets -- -D warnings`,
-`cargo build --locked --workspace --verbose`, and
-`cargo test --locked --workspace --verbose`.
-Before handing off a code change, run at least `cargo test --workspace`; for
-changes to startup, listeners, proxying, static files, TLS, or middleware,
-also run `cargo build --workspace`.
+Use an HTTP/3-capable curl.
 
-`scripts/test-h3-cancellation-local.sh` requires a curl build with HTTP/3
-support. It uses dynamic TCP/UDP ports and a temporary certificate to verify
-real H3 SSE delivery, downstream cancellation, upstream teardown, explicit
-trailer rejection, and listener survival without touching the remote VPS.
+Read:
 
-`pingclair/tests/integration.rs` launches the real compiled binary and makes
-real localhost HTTP requests. It is the main end-to-end gate, not a mocked
-test.
+```text
+docs/guardrails/proxy.md
+docs/guardrails/tls.md
+docs/guardrails/testing.md
+```
 
-## The ghost-process trap
+before changing this area.
 
-Pingclair integration and benchmark tests frequently leave a process holding a
-test port after a failed, timed-out, or interrupted run. This can create a very
-misleading failure:
+---
 
-1. the new child fails to bind;
-2. the readiness request reaches the old listener;
-3. the test sees an HTTP response and assumes the new child is ready;
-4. assertions fail with an unrelated 404/502 from stale code.
+## 🌐 Local proxy environment
 
-Treat an unexpected fixed response as possible port contamination before
-debugging application logic.
+The maintainer's macOS environment may have a system proxy at:
 
-### Before a real-binary test
+```text
+127.0.0.1:1082
+```
 
-Check the exact ports used by the test:
+Local integration clients should bypass it where applicable.
+
+Reqwest localhost clients should use `.no_proxy()` when required.
+
+Curl localhost validation should bypass external proxies.
+
+Check proxy behavior before diagnosing localhost traffic as an application defect.
+
+---
+
+## 🐧 Linux and remote verification
+
+Use macOS for the fast edit loop.
+
+Use OrbStack or another Linux environment for Linux-specific validation.
+
+Use the designated remote host only when remote, release, or performance verification is required.
+
+Do not mutate a historical benchmark checkout blindly.
+
+Inspect:
+
+- branch;
+- HEAD;
+- worktree status;
+- running processes;
+- occupied ports;
+
+before using an existing remote directory.
+
+Prefer clean validation worktrees.
+
+Use release binaries when verifying:
+
+- performance;
+- linking;
+- TLS;
+- QUIC;
+- process lifecycle;
+- Linux-specific behavior.
+
+Do not perform expensive fat-LTO builds on constrained shared hosts merely to test ordinary functionality.
+
+---
+
+## 📊 Benchmark hierarchy
+
+Use the smallest benchmark capable of answering the performance question.
+
+### Microbenchmark
+
+Use `divan` through:
 
 ```bash
-# macOS
-lsof -nP -iTCP:9098 -sTCP:LISTEN
-
-# Linux
-ss -ltnp | grep ':9098'
-
-# Inspect candidate processes without killing anything.
-pgrep -af 'pingclair.*run'
+just bench
 ```
 
-If a listener exists, resolve its PID and command line. Kill only a confirmed
-test process and wait for it to exit. Never use a broad `pkill pingclair` on a
-machine that may be serving real traffic.
+for local algorithms and hot functions.
 
-### Readiness and cleanup rules
+### Whole-server benchmark
 
-- Readiness must check the expected status/body/header or a per-test token.
-  “Any HTTP response” is not proof that the spawned child is ready.
-- Check `child.try_wait()` while polling so an early bind failure is reported.
-- On timeout, kill and `wait()` for the child **before** reading piped
-  stdout/stderr to EOF. Reading a live process pipe to EOF blocks forever.
-- Keep a `Drop` cleanup guard around every child.
-- Prefer dynamically allocated ports for new tests. If a fixed port is
-  unavoidable, make ownership checks explicit.
-- After an interrupted test run, inspect the port table again.
-- The local macOS environment may have a system proxy on `127.0.0.1:1082`.
-  Reqwest integration clients must use `.no_proxy()`.
+Use the methodology in:
 
-When diagnosing a suspicious localhost failure, use this order:
+```text
+benchmarks/README.md
+```
 
-1. inspect listener ownership;
-2. confirm the spawned child is still alive;
-3. verify the exact config file and binary path;
-4. only then instrument request routing or handler code.
+for:
 
-## Linux and remote verification
+- static throughput;
+- proxy throughput;
+- latency;
+- TLS;
+- H2;
+- H3;
+- resource usage.
 
-Use local macOS for the fast edit/test loop. Use Docker or an OrbStack Linux
-machine for Linux-only behavior when that is sufficient. Remote verification
-runs on the owner's designated benchmark host; the ssh alias for it lives in
-the owner's local ssh config, not in this repository.
+Do not convert a microbenchmark win directly into a published server-performance claim.
 
-The historical benchmark checkout on that host holds past validation runs;
-benchmark data and the H3 smoke script sit beside it under the same root.
+Do not publish a performance claim without preserving the required evidence.
 
-Important: the historical benchmark checkout is a dirty validation workspace. Do
-not run `git pull`, `git reset`, `git clean`, or overwrite it blindly. Inspect
-its branch, HEAD, status, running processes, and occupied ports first. For a
-new verification run, prefer a separate clean clone/worktree or copy the exact
-committed source into a new directory. Record the commit hash, command, config,
-result path, and date in the local evidence ledger (`benchmarks/results/`,
-kept out of the repository) or `benchmarks/README.md`.
+---
 
-Remote testing is required before moving a runtime feature into the
-remotely-verified state of the ledger. A remote run should use the release
-binary when the change
-touches performance, linking, TLS, QUIC, process lifecycle, or Linux behavior.
-On small validation hosts, run `scripts/validate-linux-commit.sh` with its
-default low-memory release overrides and a persistent
-`PINGCLAIR_VALIDATION_TARGET_DIR`; the script records the exact profile in its
-metadata. Use the workspace's full fat-LTO release profile for performance
-claims and publication artifacts. Do not start a fresh fat-LTO build on the
-shared VPS merely to exercise functional behavior.
+## 📊 Verification evidence
 
-## Architecture constraints
+Implemented is not verified.
 
-### HTTP/1.1 and HTTP/2
+Use precise states:
 
-`pingclair-proxy/src/server.rs` implements Pingora's `ProxyHttp` lifecycle.
-Middleware has to be wired into the correct phase:
+1. code exists;
+2. local tests pass;
+3. Linux/container validation passes;
+4. clean Linux or designated remote verification passes;
+5. benchmark evidence exists.
 
-- request rejection and local responses: `request_filter`;
-- upstream selection: `upstream_peer`;
-- request mutation: before Pingora clones the upstream request;
-- downstream headers: local response construction and `response_filter`;
-- proxy failures: `fail_to_connect` / `fail_to_proxy`.
+Do not promote a claim without evidence.
 
-A `HandlerConfig` variant or DSL parser entry alone is not an implementation.
-Trace config → compiled type → `ProxyState` precomputation → request execution
-→ local and proxied response paths.
+When the local evidence ledger exists, store runs under:
 
-### HTTP/3
+```text
+benchmarks/results/<date>_<commit-prefix>/
+```
 
-HTTP/3 is a separate quiche path in `pingclair-proxy/src/quic.rs`. H1/H2
-middleware changes do not automatically apply to H3. Explicitly check whether
-parity is required and track missing H3 behavior in the TODO.
+Record the full commit SHA.
 
-The QUIC stack and Pingora must share BoringSSL. Do not reintroduce Pingora's
-OpenSSL feature: OpenSSL and quiche's BoringSSL collide on libcrypto symbols
-and have previously crashed the binary at startup.
+Do not overwrite failed evidence.
 
-Deferred request-body drains must be retried before the H3 event pump, not only
-after packet receipt. `recv_body` queues the `Finished` event internally once
-the last body bytes are consumed, so a drain that stopped on a full handler
-channel would otherwise never see end-of-body and a large POST would hang
-forever. `H3App::process_reads` is where that ordering lives.
+Failed runs are evidence too.
 
-The transport belongs to `tokio-quiche`: UDP socket, packet parsing, version
-negotiation, stateless retry and address validation, connection-ID routing,
-GSO, pacing, and per-connection timers. `quic.rs` keeps only the application
-layer, as `H3App`, this crate's `ApplicationOverQuic`. An earlier note claimed
-tokio-quiche's server accept path was not public; that was wrong, and it cost
-this project a hand-written QUIC transport that was deleted in `561d802`.
+---
 
-Two things tokio-quiche does not do, so they stay in the accept loop: the L4
-blocklist and the listener's `max_connections`. Request tasks return response
-events through bounded channels; preserve that backpressure and never buffer
-complete bodies to simplify middleware.
+## 🤖 CI should run only what changed
 
-H3 certificates never touch disk. `ConnectionParams` demands a
-`TlsCertificatePaths`, but the paths are only handed to the `ConnectionHook`,
-and the code that reads them runs only when the hook declines — so a sentinel
-path is enough and keys stay in the in-memory `CertTable`. Do not "fix" this by
-writing private keys to temporary files. `tokio-quiche` is pinned to `=0.19.1`
-because that behavior was read out of its source.
+CI should detect changed paths before launching expensive jobs.
 
-H3 certificates are published through an `ArcSwap` table. The refresh path
-uses `TlsManager::peek_pem`, which may read only certificates that already
-exist and must never trigger ACME issuance. Ports and the certificate-domain
-set are largely captured at startup, even though routes and certificate
-contents can be refreshed.
+Do not run the entire Rust matrix for unrelated documentation-only changes.
 
-Early data is deliberately disabled because the reverse-proxy path accepts
-non-idempotent methods and has no replay protection. Do not enable 0-RTT until
-route and method safety policy, replay behavior, and negative tests are
-explicit. Any H3 or TLS dependency change requires a Linux release build and
-quiche-client smoke coverage for SNI, Alt-Svc, streamed static/proxy bodies,
-POST bodies with and without Content-Length, 413, and upstream keepalive.
+The changed-path policy should remain conservative.
 
-### Hot paths
+Typical relationships:
 
-**The bar is CPU microseconds per request against the best of its class, and it
-shapes new code, not just reviews of old code.** Before a new function goes on a
-request path, answer four
-questions: could configuration have decided this (then precompute it into
-`ProxyState`); does it allocate (borrow, or own it at startup); does it lock,
-and does the lock cross an `await` (the second is a defect); is it bounded
-(bodies stream, queues have capacity). Off the request path — startup, reload,
-admin, CLI — optimise for clarity instead and say so. `CLAUDE.md` carries the
-long form.
+```text
+docs only
+→ docs lint
+→ documentation/config example tests when applicable
 
-Performance is a correctness requirement:
+pingclair-config
+→ config tests
+→ documentation tests
+→ affected integration tests
 
-- no per-request regex compilation, config parsing, DNS resolution, or
-  filesystem canonicalization;
-- avoid locks and allocations on request paths when configuration-time
-  precomputation is possible;
-- stream large request and response bodies;
-- never use `tokio::fs` on the static-file request path. Synchronous
-  `std::fs` page-cache reads are intentional and measured;
-- set and log framework defaults that determine runtime topology, especially
-  worker counts and connection-pool sizes.
+pingclair-proxy
+→ proxy tests
+→ integration tests
 
-### Static file security
+TLS or H3 paths
+→ relevant Rust tests
+→ H3/TLS validation
 
-Static confinement is lexical. `..` escaping the document root must be
-rejected without per-request canonicalization. Symlinks inside the root are
-followed, matching the Caddy default this project tracks; the document root is
-not a security boundary against a user who can plant symlinks.
+Cargo.toml / Cargo.lock
+→ workspace checks
+→ cargo-shear
+→ dependency guardrails
 
-### TLS and admin API
+pingclair-core or shared protocol/policy
+→ broader workspace validation
+```
 
-- Never commit certificate, account-key, or TLS-store material.
-- Keep ACME staging and production accounts separate.
-- `tls internal` persists an atomic CA certificate/key record below
-  `PINGCLAIR_TLS_STORE/internal/authority.json` and publishes the trust anchor
-  as `root.crt`. Preserve owner-only private material, deterministic manual →
-  internal → ACME precedence, eager startup issuance, and shared H1/H2/H3
-  renewal behavior. A corrupt authority must fail closed, never be silently
-  replaced.
-- Treat `pingclair-api/src/auth.rs` and config reload endpoints as
-  security-critical.
-- Keep the Linux jemalloc target guard intact.
+When uncertain whether a change affects runtime behavior, run the broader check.
 
-## Configuration work
+CI optimization must never become an excuse to skip a required invariant.
 
-Pingclair's configuration language is the Pingclair DSL; its conventional
-extensionless filename is `Pingclairfile`, like Caddy's `Caddyfile`. Pingclair
-also accepts `*.pingclair`, JSON, and directories of mixed config files. JSON
-deserializes directly into `PingclairConfig`.
+---
 
-Upstream address schemes are transport policy: bare addresses and `http://`
-select H1, `https://` negotiates H2/H1 with ALPN, `h2c://` selects plaintext
-H2-only, and `h2://` selects TLS H2-only. Keep their connection pools isolated.
+## 🧹 Editing discipline
 
-For every user-facing directive, test all applicable layers:
+Preserve unrelated dirty files.
 
-1. lexer/parser/adapter;
-2. compiler output;
-3. invalid input;
-4. JSON backward compatibility when config types change;
-5. runtime behavior with the real binary.
+Do not casually run repository-wide formatting in a dirty worktree.
 
-Regexes, CIDRs, and other expensive validation should be compiled once during
-configuration load or hot reload. Invalid security policy should fail closed.
+Rustfmt may follow child modules and alter files outside the intended diff.
 
-## Editing discipline
+Format deliberately.
 
-- Make scoped changes and preserve unrelated dirty files.
-- 🍎 Write every source comment and doc comment in English using Apple-style
-  prose: begin with a capital letter, use a complete sentence, explain intent
-  or constraints instead of restating the code, and end with punctuation.
-  Apple-style section labels such as `// MARK: - Routing` are encouraged.
-- 🧭 Every new or modified comment in Rust, Cargo, shell, configuration, and
-  other code files must include a semantically appropriate emoji. Shebangs,
-  generated files, license headers, and machine-required directives are
-  exempt.
-- 🪵 Runtime log messages must include an appropriate, stable emoji that
-  communicates the event category without replacing structured log fields.
-  Keep the wording in English.
-- 🧾 **Configure test servers with a Pingclairfile, not JSON.** When a test,
-  a verification run, or a reproduction needs a running server, write the
-  configuration in the DSL and let the adapter compile it. JSON bypasses the
-  Caddyfile adapter entirely, so a JSON-configured test exercises roughly half
-  the path a user's configuration takes and cannot catch a directive that
-  parses into the wrong shape.
+Before handoff:
 
-  This is also how DSL defects get found. A verification run that has to
-  reach for JSON because the DSL cannot express what it needs has discovered
-  something — write down which directive was missing or wrong, then fix it.
-  Reach for JSON only where the DSL genuinely has no equivalent, and say so.
-- ⚡ **Fix performance problems you walk past.** When you are already editing a
-  function and notice per-request work that belongs at configuration time, an
-  allocation in a hot loop, a clone of something you could borrow, or a lock
-  held across an await — fix it in the same change. The cost of a separate
-  pass is finding the code again and re-deriving why it is shaped that way,
-  which is most of the work.
+```bash
+git diff --check
+```
 
-  The limits: keep the fix inside what you are already touching, and keep it
-  provable. A change that alters behaviour is not a performance fix, it is a
-  behaviour change and needs its own reasoning. Anything whose payoff you
-  cannot demonstrate — a rewrite, a new dependency, a data-structure swap
-  across a module boundary — is a measurement task, not a drive-by; note it
-  and move on. This repository has already deleted 38,532 lines of vendored
-  forks that were plausible and never measured.
+must pass.
 
-  🌊 Two shapes are always worth stopping for, because both have shipped here
-  twice: a response body that gets buffered whole instead of streamed, and
-  work repeated per request that the configuration already determined.
-- ✅ **`✅` marks completed work and nothing else.** Not "good", not
-  "correct", not "this is the recommended way" — done, and ideally with the
-  commit or test that finished it. Use another emoji for approval (`👍`),
-  for a rule that holds (`📌`), or for a passing property (`🎯`). The same
-  applies to a planning document's own checkboxes: `- [x]` means shipped,
-  `- [ ]` means outstanding, and neither is decoration.
+Do not suppress warnings with broad `#[allow(...)]` attributes merely to make CI green.
 
-  > 🤡 Why this is a rule: on 2026-08-04 a status sweep counted `✅` to
-  > decide which Caddyfile tracking documents were current, concluded that
-  > `docs/TODO_CADDYFILE_FIXES.md` had **zero** completed items, and
-  > reported that upstream. The document was in fact 43-of-46 done — it
-  > tracked completion with `- [x]`, while its `✅` characters meant other
-  > things. **A marker that means two things cannot be counted**, and a
-  > status document whose status cannot be counted is decoration.
-- 📝 Git commit subjects must begin with an appropriate emoji, followed by a
-  conventional, imperative summary; for example,
-  `✨ feat(proxy): add weighted backup pools` or
-  `🐛 fix(test): reap stale integration children`.
-- Write Chinese documentation in Traditional Chinese, matching the vocabulary
-  already used in `docs/` rather than introducing another variant.
-- Update `README.md`, `README.zh.md`, and `README.fr.md` together for
-  user-facing behavior.
-- Do not run repository-wide formatting casually in a dirty worktree.
-  Rustfmt follows child modules and can rewrite untouched files. Format only
-  intended files, with child-module formatting disabled when appropriate.
-- `git diff --check` must pass.
-- Never hide warnings with broad `allow` attributes.
+Fix the problem or document a narrow justified exception.
 
-## Documentation ownership
+---
 
-- `docs/TODO.md`: the v0.2.0 execution plan. Day-by-day only — no status,
-  no evidence, no reference material.
-- `TRIAGE.md`: problems found and deliberately not fixed yet — date, source,
-  severity, one line, status. It is not a plan (`docs/TODO.md` is) and not a
-  record of what shipped (`CHANGELOG.md` is); the distinction it owns is
-  "known, and not being worked on right now". Local, not committed.
-- `docs/guardrails/{testing,config,tls,proxy}.md`: environment constraints and
-  implementation rules, one file per subsystem. A new rule goes in the file it
-  belongs to; `docs/GUARDRAILS.md` is only the index over them and must stay
-  that way, or it becomes a fifth file to keep in sync.
-- `benchmarks/README.md`: performance claims, methodology, and bugs discovered
-  under load. The per-run evidence ledger is local (`benchmarks/results/`),
-  not committed.
-- `README*.md`: shipped user-facing behavior only.
+## 📋 Handoff
 
-When a result changes, update the narrowest source of truth and any summary
-that would otherwise become misleading. Never move an item to “remote
-verified” without preserving enough evidence to reproduce the claim.
+Use the canonical tooling rather than rebuilding the validation procedure manually.
 
-# Development Environment
+Typical normal code handoff:
 
-## Available tools
+```bash
+just fmt-check
+just lint
+just test
+just shear
+just repo-lint
+just docs-lint
+git diff --check
+```
 
-The following tools are installed and should be preferred when appropriate:
+Run:
 
-### General CLI
+```bash
+just ci
+```
 
-- `rg`: use instead of `grep -R` for searching source code
-- `fd`: use instead of `find` for locating files
-- `bat`: use instead of `cat` for viewing source files
-- `jq`: use for JSON parsing and manipulation
+when CI parity is required.
 
-### Rust
+Run H3, Linux, remote, or performance validation only when the affected subsystem requires it.
 
-- `cargo-nextest`: use instead of `cargo test` for running tests **locally**.
-  ⚠️ CI still runs `cargo test`, so when the question is "will CI pass", run
-  `cargo test` — that is what CI actually executes. Switching CI over is a
-  separate, deliberate step with its own TRIAGE entry.
-- `cargo-watch`: use for continuous checking during development
+Before handoff, verify:
 
-### Text processing
+- [ ] 🎯 The change has one coherent theme.
+- [ ] 🧹 Unrelated dirty files were preserved.
+- [ ] 📏 New and expanded files respect the 500/800 LoC guidance.
+- [ ] 🧠 `pingclair-core` did not gain unrelated ownership.
+- [ ] ⚡ Request-path work avoids unnecessary repeated computation.
+- [ ] 📦 Request-path allocations were considered.
+- [ ] 🔒 No lock crosses `.await`.
+- [ ] 🌊 Buffers, bodies, channels, and queues remain bounded.
+- [ ] 🚦 H1/H2/H3 parity was consciously considered.
+- [ ] 🔐 TLS and security invariants remain intact.
+- [ ] 🧾 Live-server tests use a Pingclairfile where possible.
+- [ ] 🧪 Tests prove behavior at the correct layer.
+- [ ] 🦀 Focused nextest tests pass.
+- [ ] 🔍 Clippy passes for the required scope.
+- [ ] 🧹 `cargo-shear` does not reveal accidental dependency debt.
+- [ ] 🤖 Repository-specific lint passes.
+- [ ] 📚 Documentation lint passes where applicable.
+- [ ] 🏗️ Runtime changes build the real binary.
+- [ ] 🧹 `git diff --check` passes.
+- [ ] 💾 Active build caches were preserved.
+- [ ] 💽 Build-cache usage remains deliberate and below the stop threshold.
+- [ ] 📊 Verification claims match the evidence actually collected.
+- [ ] 📝 Commit subjects follow house style.
 
-- `gsed`: use when GNU sed behavior is needed, especially for portable Linux-style scripts.
-- Avoid relying on macOS BSD sed differences when writing scripts intended for Linux CI.
-
-## Tool selection
-
-When a task is inefficient with available tools:
-
-1. Consider whether a specialized tool exists.
-2. If the tool is commonly used in software development, install it when appropriate.
-3. Prefer:
-   - Homebrew for macOS system tools
-   - cargo install for Rust CLI tools
-   - npm for Node.js CLI tools
-   - official installers when required
-
-## Preferences
-
-- Prefer fast specialized tools over traditional Unix tools when available.
-- Respect `.gitignore` when searching source files.
-- Avoid searching generated directories such as `target/` unless explicitly needed.
+If maintainer planning files are present, complete their snapshot, TRIAGE, status, and evidence workflow before handoff.

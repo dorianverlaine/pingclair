@@ -771,13 +771,15 @@ immediately after the `101`, both ends seeing EOF with no error.
   remembered, because that value can be assembled from the request and a map
   keyed on it would grow without bound.
 
-- 🍪 **A cookie split across several field lines now arrives whole.** HTTP/3
-  lets a client send `Cookie` as separate lines — browsers do, because it
+- 🍪 **A cookie split across several field lines now arrives whole**, on HTTP/2
+  as well as HTTP/3. Both protocols let a client send `Cookie` as separate lines — browsers do, because it
   compresses better — and every field went into the request with a call that
   *replaces* rather than adds, so only the last line survived. The origin
   received a truncated cookie and nothing reported a problem. The pieces are
-  now rejoined with `"; "`, which is what RFC 9114 §4.2.1 requires before the
-  request reaches anything that is not HTTP/2 or HTTP/3.
+  now rejoined with `"; "` — what RFC 9114 §4.2.1 requires of HTTP/3 and RFC
+  9113 §8.2.3 requires, word for word, of HTTP/2, before the request reaches
+  anything that is neither. HTTP/1.1 is left alone: a client that sent three
+  lines there really did send three, and passing them through is faithful.
 
   The same defect silently discarded every other repeated field. A client
   sending `Accept-Encoding: gzip` and `Accept-Encoding: br` on separate lines

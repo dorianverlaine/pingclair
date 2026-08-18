@@ -3870,6 +3870,54 @@ impl PingclairProxy {
     ///
     /// Called once, before anything can rewrite. Nothing is overwritten: a
     /// request that already names itself keeps what it sent.
+    /// 🍪 Rejoins a cookie that HTTP/2 split across field lines.
+    ///
+    /// RFC 9113 §8.2.3 lets a client send `Cookie` as several field lines —
+    /// browsers do, because each piece then compresses against its own HPACK
+    /// entry — and requires the pieces to be concatenated with `"; "` before
+    /// the request is passed into a context that is not HTTP/2. An HTTP/1
+    /// upstream is exactly that context, and it was receiving three lines.
+    ///
+    /// 🤡 The identical rule for HTTP/3 (RFC 9114 §4.2.1) was fixed first, and
+    /// only there. Fixing one transport and leaving the other is the shape this
+    /// repository keeps rediscovering, and it survived a public comparison of
+    /// all three transports run on the day the HTTP/3 half shipped.
+    ///
+    /// 📌 HTTP/1.1 is deliberately untouched. A client that sent three lines
+    /// over HTTP/1.1 really did send three, and passing them through unchanged
+    /// is faithful — the requirement to join is about what HTTP/2 and HTTP/3
+    /// are allowed to do to a header on the wire, not about what an origin may
+    /// be shown.
+    ///
+    /// 🍃 Returns before allocating unless the request actually split it, which
+    /// no request does in the common case.
+    fn join_split_cookies(header: &mut RequestHeader) {
+        if header.version != http::Version::HTTP_2 {
+            return;
+        }
+        // 🍃 Nothing to do for the request that did not split it, which is
+        // almost every request — and counting is cheaper than building.
+        if header.headers.get_all(http::header::COOKIE).iter().count() < 2 {
+            return;
+        }
+        let mut joined = String::new();
+        for piece in header.headers.get_all(http::header::COOKIE) {
+            let Ok(piece) = piece.to_str() else {
+                // 🚫 A cookie that is not text is not one this proxy can join,
+                // and inventing bytes for it would be worse than leaving the
+                // request as the client sent it.
+                return;
+            };
+            if !joined.is_empty() {
+                joined.push_str("; ");
+            }
+            joined.push_str(piece);
+        }
+        header
+            .insert_header(http::header::COOKIE, joined.as_str())
+            .ok();
+    }
+
     fn pin_request_authority(header: &mut RequestHeader) {
         if header.headers.contains_key(http::header::HOST) {
             return;
@@ -6018,6 +6066,9 @@ impl ProxyHttp for PingclairProxy {
         // 🌐 Before any middleware can reshape the URI: HTTP/2 keeps the site
         // name there and a rewrite would take it with it.
         Self::pin_request_authority(session.req_header_mut());
+        // 🍪 Before any middleware reads a cookie, and before the request is
+        // written to an upstream that is not HTTP/2.
+        Self::join_split_cookies(session.req_header_mut());
 
         if self.proxy_protocol_required && self.proxy_protocol_identity(session).is_none() {
             tracing::warn!("🚫 Rejected a TCP request that bypassed the PROXY protocol ingress");
@@ -8757,6 +8808,50 @@ mod p0_regression_tests {
             .unwrap()
             .clone();
         assert!(!Arc::ptr_eq(&retained, &replaced));
+    }
+
+    /// 🍪 A cookie split across field lines is rejoined before it leaves for an
+    /// HTTP/1 upstream.
+    ///
+    /// 🤡 This was fixed on HTTP/3 first and only there, which is exactly the
+    /// shape this repository keeps finding: RFC 9113 §8.2.3 says the same thing
+    /// about HTTP/2 that RFC 9114 §4.2.1 says about HTTP/3, word for word — the
+    /// pieces MUST be joined with `"; "` before the request reaches a context
+    /// that is neither. Measured on a public host after the HTTP/3 fix shipped:
+    /// the origin still received three separate `Cookie` lines from an HTTP/2
+    /// client.
+    #[test]
+    fn a_split_cookie_is_rejoined_on_http2() {
+        let mut h2 = RequestHeader::build_no_case("GET", b"/", None).unwrap();
+        h2.set_version(http::Version::HTTP_2);
+        h2.uri = "https://shop.example/".parse().unwrap();
+        for piece in ["a=1", "b=2", "c=3"] {
+            h2.append_header(http::header::COOKIE, piece).unwrap();
+        }
+
+        PingclairProxy::join_split_cookies(&mut h2);
+
+        assert_eq!(h2.headers.get_all(http::header::COOKIE).iter().count(), 1);
+        assert_eq!(
+            h2.headers.get(http::header::COOKIE).map(|v| v.as_bytes()),
+            Some(b"a=1; b=2; c=3".as_slice())
+        );
+    }
+
+    /// 📌 HTTP/1.1 is left alone. A client that sent three lines over HTTP/1.1
+    /// really did send three, and forwarding them unchanged is faithful; the
+    /// rule that requires joining is about what HTTP/2 and HTTP/3 do to a
+    /// header, not about what an origin may receive.
+    #[test]
+    fn an_http1_request_keeps_the_lines_it_sent() {
+        let mut h1 = RequestHeader::build("GET", b"/", None).unwrap();
+        for piece in ["a=1", "b=2"] {
+            h1.append_header(http::header::COOKIE, piece).unwrap();
+        }
+
+        PingclairProxy::join_split_cookies(&mut h1);
+
+        assert_eq!(h1.headers.get_all(http::header::COOKIE).iter().count(), 2);
     }
 
     /// 🌐 Rewriting the path must not lose the site the request is for.
