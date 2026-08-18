@@ -24,5 +24,4 @@ runs:
     - name: Install just
       uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
       with:
-        tool: just
-        version: 1.58.0
+        tool: just@1.58.0

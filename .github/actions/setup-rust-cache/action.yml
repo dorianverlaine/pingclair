@@ -40,8 +40,7 @@ runs:
     - name: Install sccache
       uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
       with:
-        tool: sccache
-        version: 0.17.0
+        tool: sccache@0.17.0
 
     - name: Configure sccache backend
       shell: bash

@@ -77,6 +77,7 @@ jobs:
       - name: Install Rust 1.97
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.97.1
         with:
+          toolchain: 1.97.1
           components: rustfmt, clippy
 
       - uses: ./.github/actions/setup-rust-cache
@@ -88,14 +89,12 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
         with:
-          tool: nextest
-          version: 0.9.143
+          tool: nextest@0.9.143
 
       - name: Install cargo-shear
         uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
         with:
-          tool: cargo-shear
-          version: 1.13.4
+          tool: cargo-shear@1.13.4
 
       - name: Install codespell
         run: |
