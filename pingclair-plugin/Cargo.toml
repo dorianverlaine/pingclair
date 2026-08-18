@@ -12,4 +12,6 @@ description = "Plugin system for Pingclair"
 pingclair-core = { path = "../pingclair-core" }
 async-trait.workspace = true
 tracing.workspace = true
-serde.workspace = true
+
+[lints]
+workspace = true

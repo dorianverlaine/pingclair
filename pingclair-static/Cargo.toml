@@ -11,10 +11,8 @@ description = "Static file server module for Pingclair"
 [dependencies]
 pingclair-core = { path = "../pingclair-core" }
 tokio = { workspace = true, features = ["fs"] }
-async-trait.workspace = true
 tracing.workspace = true
 http.workspace = true
-bytes.workspace = true
 arc-swap.workspace = true
 mime_guess.workspace = true
 httpdate = "1.0"
@@ -25,10 +23,12 @@ glob = "0.3"
 # filename from being read as a scheme or cutting the URL short. Already in the
 # tree at one version; naming it only makes the API reachable.
 percent-encoding = "2.3"
-anyhow.workspace = true
 async-compression = { version = "0.4", features = ["gzip", "brotli", "zstd", "tokio"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["fs", "rt-multi-thread", "macros", "io-util", "time"] }
 tempfile = "3"
 flate2 = "1"
+
+[lints]
+workspace = true

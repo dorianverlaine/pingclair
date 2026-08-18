@@ -1,0 +1,46 @@
+# 🧹 Keep Markdown linting on structure rather than opinions the docs do not
+# share. Line length, duplicate headings, inline HTML, first-line headings,
+# fence styles, and trailing-newline strictness are all legitimate here.
+config:
+  default: true
+  MD013: false
+  MD024: false
+  MD033: false
+  MD041: false
+  MD046: false
+  MD047: false
+  MD004: false
+  MD005: false
+  MD009: false
+  MD012: false
+  MD022: false
+  MD025: false
+  MD028: false
+  MD030: false
+  MD031: false
+  MD032: false
+  MD034: false
+  MD036: false
+  MD040: false
+  MD042: false
+  MD060: false
+
+globs:
+  - "**/*.md"
+
+ignores:
+  - "vendor/**"
+  - "target/**"
+  - "verification/**"
+  - "security-findings/**"
+  - "todo-md-*.md"
+  - "TRIAGE.md"
+  - "AGENTS.md"
+  - "CLAUDE.md"
+  - "docs/TODO.md"
+  - "docs/TODO_CADDYFILE.md"
+  - "docs/TODO_CADDYFILE_FIXES.md"
+  - "docs/CADDYFILE_*.md"
+  - ".plan-snapshots/**"
+  - "benchmarks/results/**"
+  - "node_modules/**"

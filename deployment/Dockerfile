@@ -1,11 +1,12 @@
 # 🏗️ Build Stage
 #
-# Ubuntu rather than Fedora, with the toolchain from rustup rather than the
-# distribution: `rust-version = "1.97"` is pinned in Cargo.toml and CI verifies
-# exactly that, so whatever Rust Ubuntu happens to ship is the wrong one.
-# Building a release image with a compiler the tests never ran under is the
-# "green locally, red in CI" trap one layer further out.
-FROM ubuntu:latest AS builder
+# Ubuntu 24.04 LTS, pinned the same way CI pins `ubuntu-24.04` runners: a
+# floating `latest` tag lets the image drift to a newer release than the tests
+# ran under, which is the "green locally, red in production" trap one layer
+# further out. The toolchain comes from rustup rather than the distribution
+# because `rust-version = "1.97"` is pinned in Cargo.toml and CI verifies
+# exactly that.
+FROM ubuntu:24.04 AS builder
 
 # 🔨 What each of these is for, because a missing one fails far from its cause:
 #   cmake, make, g++     — BoringSSL's own build; cmake on Ubuntu does not
@@ -54,8 +55,8 @@ COPY . .
 # against, not whatever the registry offers today.
 RUN cargo build --release --locked
 
-# 🚀 Runtime Stage
-FROM ubuntu:latest
+# 🚀 Runtime Stage — same pinned LTS as the builder and the CI runners.
+FROM ubuntu:24.04
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \

@@ -94,6 +94,10 @@ examples/*.bin
 pingclair-linux-amd64
 bench_*
 
+# 🐍 Python bytecode from the repository lint helpers.
+__pycache__/
+*.pyc
+
 # Stray test output
 **/test_output.txt
 

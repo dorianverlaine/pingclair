@@ -1,0 +1,28 @@
+name: setup-ci
+description: Prepare the shared build paths and pinned tools every CI job needs.
+
+outputs:
+  cargo-target-dir:
+    description: Shared Cargo target directory for this job.
+    value: ${{ steps.configure.outputs.cargo-target-dir }}
+
+runs:
+  using: composite
+  steps:
+    - name: Configure CI build root
+      id: configure
+      shell: bash
+      run: |
+        set -euo pipefail
+        ci_root="${CI_BUILD_ROOT:-$HOME/.cache/pingclair-ci}"
+        mkdir -p "${ci_root}/tmp"
+        echo "CARGO_TARGET_DIR=${ci_root}/cargo-target" >> "$GITHUB_ENV"
+        echo "cargo-target-dir=${ci_root}/cargo-target" >> "$GITHUB_OUTPUT"
+        echo "TEMP=${ci_root}/tmp" >> "$GITHUB_ENV"
+        echo "TMP=${ci_root}/tmp" >> "$GITHUB_ENV"
+
+    - name: Install just
+      uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+      with:
+        tool: just
+        version: 1.58.0
