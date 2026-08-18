@@ -47,7 +47,11 @@ fi
 
 extract_failures() {
   local log="$1"
-  rg '^FAIL \[[^]]+\] (\S+)' -or '$1' "$log" | sort -u
+  # 🎨 Strip ANSI colour codes first: CI forces coloured nextest output, so a
+  # plain `^FAIL` match would see an escape sequence, not the letter F. Perl is
+  # present on every runner and the developer's macOS, so it is safer than
+  # depending on ripgrep being installed on the runner.
+  perl -ne 's/\e\[[0-9;]*m//g; if (/^\s*FAIL \[[^\]]+\]/) { my @fields = split; print "$fields[-1]\n" }' "$log" | sort -u
   awk '/^Failure list:/{f=1; next} f && /^[[:space:]]*[0-9]+\./{print $2}' "$log" | sort -u
 }
 
@@ -90,7 +94,7 @@ while [ "$attempt" -lt "$max_attempts" ]; do
   fi
 done
 
-rg -E 'Summary|test result|passed|failed' "$log" | tail -20 || true
+grep -E 'Summary|test result|passed|failed' "$log" | tail -20 || true
 if [ "$status" -ne 0 ]; then
   echo "::error::nextest failed on: $(printf '%s' "$failed" | tr '\n' ' ')"
   tail -n 80 "$log"
