@@ -17,16 +17,27 @@ runs:
           sudo sed -i 's|https://azure.archive.ubuntu.com/ubuntu/|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list.d/ubuntu.sources
         fi
 
-    - name: Update apt with retries and timeouts
+    - name: Update apt with a hard deadline and IPv4
       shell: bash
       run: |
-        sudo apt-get update \
-          -o Acquire::Retries=3 \
-          -o Acquire::http::Timeout=60 \
-          -o Acquire::https::Timeout=60
+        set -euo pipefail
+        # 🛡️ A hanging mirror must not stall the whole job. The hosted image
+        # ships current package lists, so a failed update is a warning, not a
+        # stop condition: installation below falls back to those lists.
+        if ! timeout 120 sudo apt-get update \
+          -o Acquire::ForceIPv4=true \
+          -o Acquire::Retries=2 \
+          -o Acquire::http::Timeout=30 \
+          -o Acquire::https::Timeout=30; then
+          echo "::warning::apt-get update failed or timed out; installing from the runner's existing package lists"
+        fi
 
     - name: Install build dependencies
       shell: bash
       run: |
-        sudo apt-get install -y --no-install-recommends \
+        timeout 300 sudo apt-get install -y --no-install-recommends \
+          -o Acquire::ForceIPv4=true \
+          -o Acquire::Retries=3 \
+          -o Acquire::http::Timeout=60 \
+          -o Acquire::https::Timeout=60 \
           cmake make g++ perl pkg-config clang libclang-dev git curl ca-certificates
