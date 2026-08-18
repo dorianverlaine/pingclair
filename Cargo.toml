@@ -23,9 +23,11 @@ rust-version = "1.97"
 
 [workspace.lints.rust]
 # 🛡️ The lint table exists so every crate can opt in through
-# `[lints] workspace = true`; the only entry is a default warning the codebase
-# already satisfies, so adding it changes no behavior today. Adding lints here
-# is a deliberate policy change, not a way to silence a warning in one crate.
+# `[lints] workspace = true`; both entries are enforced by `-D warnings` in
+# CI. `rust_2018_idioms` keeps the tree on modern path/lifetime spelling, and
+# `unsafe_op_in_unsafe_fn` keeps unsafe blocks explicit. Adding lints here is
+# a deliberate policy change, not a way to silence a warning in one crate.
+rust_2018_idioms = "warn"
 unsafe_op_in_unsafe_fn = "warn"
 
 [workspace.dependencies]

@@ -571,7 +571,7 @@ impl TlsManager {
 
         // 🔗 Parse the complete certificate chain in leaf-first order.
         let mut reader = std::io::Cursor::new(&cert.cert_pem);
-        let certs: Vec<CertificateDer> = rustls_pemfile::certs(&mut reader)
+        let certs: Vec<CertificateDer<'_>> = rustls_pemfile::certs(&mut reader)
             .filter_map(|r| r.ok())
             .collect();
 
