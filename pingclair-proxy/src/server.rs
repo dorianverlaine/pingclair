@@ -1106,21 +1106,6 @@ fn referer_host(referer: &str) -> Option<&str> {
     Some(host.split(':').next().unwrap_or(host))
 }
 
-pub(crate) fn request_authority(request: &RequestHeader) -> &str {
-    // 🌐 HTTP/2 carries the virtual host in `:authority`, which Pingora stores in the URI.
-    request
-        .uri
-        .authority()
-        .map(|authority| authority.as_str())
-        .or_else(|| {
-            request
-                .headers
-                .get(http::header::HOST)
-                .and_then(|value| value.to_str().ok())
-        })
-        .unwrap_or("")
-}
-
 /// 🌐 Canonicalises an IPv4-mapped IPv6 address into plain IPv4.
 ///
 /// 🛡️ This is a security fix, not cosmetics. A dual-stack listener — which is
@@ -3976,7 +3961,9 @@ impl PingclairProxy {
         let Some(compiled) = precompile.and_then(|node| node.element_matcher.as_ref()) else {
             return MatcherVerdict::Match;
         };
-        let host = crate::http_policy::request_host(request_authority(session.req_header()));
+        let host = crate::http_policy::request_host(crate::http_policy::request_authority(
+            session.req_header(),
+        ));
         let remote_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
         let mut request = MatcherRequest {
             path,
@@ -4005,7 +3992,9 @@ impl PingclairProxy {
         root: Option<&str>,
         path: &str,
     ) -> Option<String> {
-        let host = crate::http_policy::request_host(request_authority(session.req_header()));
+        let host = crate::http_policy::request_host(crate::http_policy::request_authority(
+            session.req_header(),
+        ));
         let remote_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
         let mut request = MatcherRequest {
             path,
@@ -5487,7 +5476,7 @@ fn resolve_single_placeholder(
     // knows both and is the one place that rule is written down — reading the
     // header directly here is what made every one of these placeholders
     // resolve to nothing over HTTP/2.
-    let authority = request_authority(req);
+    let authority = crate::http_policy::request_authority(req);
     match name {
         "host" | "http.request.host" => host_without_port(authority),
         "hostport" | "http.request.hostport" => authority.to_string(),
@@ -5687,7 +5676,7 @@ impl ProxyHttp for PingclairProxy {
         _ctx: &mut Self::CTX,
     ) -> pingora_core::Result<()> {
         let request = session.req_header();
-        let host = crate::http_policy::request_host(request_authority(request));
+        let host = crate::http_policy::request_host(crate::http_policy::request_authority(request));
         let Some(state) = self.get_state(host.as_ref()) else {
             return Ok(());
         };
@@ -5931,7 +5920,7 @@ impl ProxyHttp for PingclairProxy {
         }
 
         // 📊 Track in-flight requests per virtual host; released in `logging`.
-        let host = request_authority(session.req_header());
+        let host = crate::http_policy::request_authority(session.req_header());
         let host = if host.is_empty() { "-" } else { host };
         ctx.active_connection_metric = metrics::request_started(host);
 
@@ -6007,9 +5996,10 @@ impl ProxyHttp for PingclairProxy {
             // request never reaches past the atomic load above.
             // 🔤 Canonical, so `Host: EXAMPLE.com.` is compared as the name it
             // is rather than refused for its spelling.
-            let requested_host =
-                crate::http_policy::request_host(request_authority(session.req_header()))
-                    .into_owned();
+            let requested_host = crate::http_policy::request_host(
+                crate::http_policy::request_authority(session.req_header()),
+            )
+            .into_owned();
             if let Some(reason) = self.strict_sni_host_rejection(session, &requested_host) {
                 tracing::warn!(
                     host = %requested_host,
@@ -6124,7 +6114,7 @@ impl ProxyHttp for PingclairProxy {
             let method = request_header.method.as_str();
 
             // 🌐 Prefer URI authority so HTTP/2 virtual hosts match the HTTP/1.1 Host path.
-            let authority = request_authority(request_header);
+            let authority = crate::http_policy::request_authority(request_header);
             let host = crate::http_policy::request_host(authority);
             let host = host.as_ref();
 
@@ -6960,8 +6950,10 @@ impl ProxyHttp for PingclairProxy {
             upstream_request.insert_header("X-Forwarded-Proto", ctx.request_scheme)?;
         }
         if !has_header_up("X-Forwarded-Host") {
-            upstream_request
-                .insert_header("X-Forwarded-Host", request_authority(downstream_headers))?;
+            upstream_request.insert_header(
+                "X-Forwarded-Host",
+                crate::http_policy::request_authority(downstream_headers),
+            )?;
         }
 
         // 🛡️ Untrusted peers cannot smuggle a forged forwarding chain upstream.
@@ -7714,7 +7706,7 @@ impl ProxyHttp for PingclairProxy {
 
         let req_header = session.req_header();
         let method = req_header.method.as_str();
-        let host = match request_authority(req_header) {
+        let host = match crate::http_policy::request_authority(req_header) {
             "" => "-",
             authority => authority,
         };
@@ -8656,22 +8648,6 @@ mod p0_regression_tests {
             .unwrap()
             .clone();
         assert!(!Arc::ptr_eq(&retained, &replaced));
-    }
-
-    #[test]
-    fn request_authority_supports_http1_host_and_http2_authority() {
-        let mut h1 = RequestHeader::build("GET", b"/ready", None).unwrap();
-        h1.insert_header(http::header::HOST, "api.example.com:8443")
-            .unwrap();
-        assert_eq!(request_authority(&h1), "api.example.com:8443");
-        assert_eq!(authority_host(request_authority(&h1)), "api.example.com");
-
-        let mut h2 = RequestHeader::build_no_case("GET", b"/ready", None).unwrap();
-        h2.uri = "https://h2.example.com:443/ready".parse().unwrap();
-        h2.insert_header(http::header::HOST, "conflicting.example.com")
-            .unwrap();
-        assert_eq!(request_authority(&h2), "h2.example.com:443");
-        assert_eq!(authority_host(request_authority(&h2)), "h2.example.com");
     }
 
     /// 🌐 The placeholders that name the site must give the same answer on

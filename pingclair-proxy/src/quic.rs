@@ -4607,7 +4607,7 @@ async fn reverse_proxy_upstream(
         // one value here and they are not the same question: one is who the
         // proxy is talking to, the other is which site the client wants.
         // An explicit `header_up Host …` still wins — those are applied below.
-        let downstream_host = crate::server::request_authority(client_header);
+        let downstream_host = crate::http_policy::request_authority(client_header);
         let forwarded_host = if downstream_host.is_empty() {
             peer.sni.as_str()
         } else {

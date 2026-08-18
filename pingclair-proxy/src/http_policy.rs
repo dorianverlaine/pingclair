@@ -465,6 +465,90 @@ mod response_interception_tests {
     }
 }
 
+#[cfg(test)]
+mod request_authority_tests {
+    use super::*;
+    use pingora_http::RequestHeader;
+
+    /// 🌐 The same question, asked of a request from each protocol.
+    #[test]
+    fn the_site_name_is_found_wherever_the_protocol_keeps_it() {
+        // 🌐 HTTP/1.1: a `Host` header and a path-only target.
+        let mut h1 = RequestHeader::build("GET", b"/ready", None).unwrap();
+        h1.insert_header(http::header::HOST, "api.example.com:8443")
+            .unwrap();
+        assert_eq!(request_authority(&h1), "api.example.com:8443");
+        assert_eq!(authority_host(request_authority(&h1)), "api.example.com");
+
+        // 🌐 HTTP/2 and HTTP/3: `:authority`, which Pingora keeps in the URI.
+        let mut h2 = RequestHeader::build_no_case("GET", b"/ready", None).unwrap();
+        h2.uri = "https://h2.example.com:443/ready".parse().unwrap();
+        assert_eq!(request_authority(&h2), "h2.example.com:443");
+        assert_eq!(authority_host(request_authority(&h2)), "h2.example.com");
+    }
+
+    /// 🛡️ When a request carries both, the URI wins.
+    ///
+    /// A client that sends `:authority` and a contradicting `Host` is asking
+    /// two questions at once, and the danger is not that we answer the wrong
+    /// one — it is that two parts of this proxy answer differently and route
+    /// the same request to two different sites. One rule, one answer.
+    #[test]
+    fn the_uri_wins_when_a_request_carries_both() {
+        let mut both = RequestHeader::build_no_case("GET", b"/ready", None).unwrap();
+        both.uri = "https://h2.example.com:443/ready".parse().unwrap();
+        both.insert_header(http::header::HOST, "conflicting.example.com")
+            .unwrap();
+        assert_eq!(request_authority(&both), "h2.example.com:443");
+    }
+
+    /// 🕳️ A request naming no site at all answers empty rather than panicking;
+    /// callers decide what to do with that.
+    #[test]
+    fn a_request_that_names_no_site_answers_empty() {
+        let bare = RequestHeader::build("GET", b"/ready", None).unwrap();
+        assert_eq!(request_authority(&bare), "");
+    }
+}
+
+/// 🌐 The site name a request asks for, wherever its protocol keeps it.
+///
+/// HTTP/1.1 sends a `Host` header. HTTP/2 and HTTP/3 send `:authority`, which
+/// Pingora stores in the URI and does not copy into a header. Both spellings
+/// mean the same thing to everything downstream — routing, matchers,
+/// placeholders, the access log, what the origin is told — so this is the one
+/// place that decides where to look, and the URI wins when both are present.
+///
+/// # 🤡 Why this is emphatically one function
+///
+/// It was three, plus a fourth answer of a different shape, and one of them was
+/// wrong. `server.rs` and `fastcgi.rs` each held a byte-identical copy; the
+/// placeholder resolver skipped the question and read the `Host` header
+/// directly, so `{host}` was the empty string over HTTP/2 — the transport
+/// browsers use by default — and `redir https://{host}/x` answered
+/// `Location: https:///x`; and the HTTP/3 request builder solved it a fourth
+/// way, by synthesising the header from `:authority`.
+///
+/// None of those was written as a duplicate. Each was three obvious lines that
+/// were correct when only HTTP/1.1 existed, and each became wrong the moment a
+/// second protocol moved the name somewhere else. That is why this belongs
+/// here rather than beside any one caller: the half that parses an authority
+/// already lived at this layer, and splitting a rule in two is what let the
+/// harder half grow a copy per caller.
+pub(crate) fn request_authority(request: &pingora_http::RequestHeader) -> &str {
+    request
+        .uri
+        .authority()
+        .map(|authority| authority.as_str())
+        .or_else(|| {
+            request
+                .headers
+                .get(http::header::HOST)
+                .and_then(|value| value.to_str().ok())
+        })
+        .unwrap_or("")
+}
+
 /// 🌐 Extracts a hostname from HTTP authority syntax without breaking IPv6 literals.
 pub(crate) fn authority_host(authority: &str) -> &str {
     if let Some(bracketed) = authority.strip_prefix('[') {

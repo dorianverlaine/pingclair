@@ -232,7 +232,7 @@ pub(crate) fn build_environment(
         format!("/{script_name}")
     };
 
-    let authority = request_authority(request);
+    let authority = crate::http_policy::request_authority(request);
     let host = authority_host(authority);
     let port = http::uri::Authority::from_str(authority)
         .ok()
@@ -363,21 +363,6 @@ pub(crate) fn build_environment(
         environment.insert(variable, joined);
     }
     Ok(environment)
-}
-
-/// 🌐 Returns the authority carried by either HTTP/1 or HTTP/2/3.
-fn request_authority(request: &RequestHeader) -> &str {
-    request
-        .uri
-        .authority()
-        .map(|authority| authority.as_str())
-        .or_else(|| {
-            request
-                .headers
-                .get(http::header::HOST)
-                .and_then(|value| value.to_str().ok())
-        })
-        .unwrap_or("")
 }
 
 /// 🪚 Finds the first ASCII case-insensitive path split delimiter.
