@@ -4,19 +4,28 @@ description: Install the pinned Linux build dependencies with a resilient apt mi
 runs:
   using: composite
   steps:
-    - name: Pin apt to the global Ubuntu archive
+    - name: Pin apt to the architecture's Ubuntu archive
       shell: bash
       run: |
         set -euo pipefail
         # 🧭 GitHub-hosted runners resolve azure.archive.ubuntu.com through a
         # mirrorlist, and that mirror has repeatedly hung or crawled for
-        # minutes. Pin every source directly to the global archive.ubuntu.com
-        # CDN, and rewrite the mirrorlist too in case something re-reads it.
+        # minutes. Pin every source directly to a stable CDN, choosing the
+        # archive that actually carries the runner's architecture:
+        # archive.ubuntu.com serves amd64, while every other Ubuntu port
+        # (arm64 among them) lives on ports.ubuntu.com.
+        arch="$(dpkg --print-architecture 2>/dev/null || uname -m)"
+        if [[ "${arch}" == "amd64" ]]; then
+          ubuntu_url="http://archive.ubuntu.com/ubuntu/"
+        else
+          ubuntu_url="http://ports.ubuntu.com/ubuntu-ports/"
+        fi
+        echo "Using ${ubuntu_url} for ${arch}"
         if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
-          sudo sed -i 's|^URIs:.*|URIs: http://archive.ubuntu.com/ubuntu/|' /etc/apt/sources.list.d/ubuntu.sources
+          sudo sed -i "s|^URIs:.*|URIs: ${ubuntu_url}|" /etc/apt/sources.list.d/ubuntu.sources
         fi
         if [[ -f /etc/apt/apt-mirrors.txt ]]; then
-          sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' /etc/apt/apt-mirrors.txt
+          sudo sed -i -E "s|https?://azure\.archive\.ubuntu\.com/ubuntu/?|${ubuntu_url}|g" /etc/apt/apt-mirrors.txt
         fi
 
     - name: Update apt with a hard deadline and IPv4
@@ -42,4 +51,4 @@ runs:
           -o Acquire::Retries=3 \
           -o Acquire::http::Timeout=60 \
           -o Acquire::https::Timeout=60 \
-          cmake make g++ perl pkg-config clang libclang-dev git curl ca-certificates
+          cmake make g++ perl pkg-config clang libclang-dev git curl ca-certificates xz-utils
