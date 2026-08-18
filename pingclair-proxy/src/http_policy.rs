@@ -1576,14 +1576,25 @@ fn decode_unreserved_escapes(path: &str) -> Option<String> {
                 index += 3;
             }
             None => {
+                // 🧾 Advanced by a whole character, never by a byte.
+                //
+                // 🤡 This used to copy `&path[index..index + 1]`, under a comment
+                // arguing it was safe because the bytes copied one at a time are
+                // ASCII. That reasoned about the byte array while the code
+                // indexed the *string*: a one-byte slice inside a multi-byte
+                // character panics, and with `panic = "abort"` in release that is
+                // the process, not the request. `/%4A¡` was enough.
+                //
+                // `index` is always a character boundary here — it starts at 0
+                // and moves either by three ASCII bytes of a `%XX` or by one
+                // whole character — so `chars().next()` is never `None`.
+                let Some(character) = path[index..].chars().next() else {
+                    break;
+                };
                 if let Some(out) = out.as_mut() {
-                    // 🧾 Pushed byte by byte, and safe as UTF-8 because the only
-                    // bytes copied one at a time are ASCII: a multi-byte
-                    // character reaches here as its own bytes in sequence, and a
-                    // decoded byte is unreserved and therefore ASCII.
-                    out.push_str(&path[index..index + 1]);
+                    out.push(character);
                 }
-                index += 1;
+                index += character.len_utf8();
             }
         }
     }
@@ -1832,6 +1843,48 @@ mod tests {
                 "{path:?} must reach the origin exactly as it arrived"
             );
         }
+    }
+
+    /// 💥 A non-ASCII byte after an escape must not panic the process.
+    ///
+    /// 🤡 Found by the proptest beside this one, on a clean Linux run, after the
+    /// change had already been pushed. The decoder copied unmatched input with
+    /// `&path[index..index + 1]` — a one-*byte* slice of a `str`, which panics
+    /// when that byte is in the middle of a character. The comment above it
+    /// argued the copy was safe because "the only bytes copied one at a time are
+    /// ASCII", reasoning about the byte array while the code indexed the string.
+    ///
+    /// With `panic = "abort"` in the release profile this is not a bad request,
+    /// it is the whole process dying — and `/%4A¡` is nine bytes any client can
+    /// send. The proptest is kept randomized, so the exact input is pinned here
+    /// as well: a seed that finds it once must not be needed to find it again.
+    #[test]
+    fn a_multibyte_character_after_an_escape_does_not_panic() {
+        for path in [
+            "%4A¡",
+            "/%4A¡",
+            "/a/%41é/b",
+            "/%2e%2e/文件.txt",
+            "/前綴%41後綴",
+            "/%41\u{1F600}",
+            "/é%41",
+        ] {
+            // 🎯 The assertion is that this returns at all.
+            let _ = normalize_request_path(path);
+        }
+    }
+
+    /// 🔤 …and the characters survive the trip rather than being mangled.
+    #[test]
+    fn a_multibyte_character_is_copied_through_intact() {
+        assert_eq!(
+            normalize_request_path("/%41文件.txt").as_deref(),
+            Some("/A文件.txt")
+        );
+        assert_eq!(
+            normalize_request_path("/前綴/%2e%2e/後綴").as_deref(),
+            Some("/後綴")
+        );
     }
 
     /// 🧾 The query is not a path and must not be normalized like one.

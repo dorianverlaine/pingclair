@@ -231,6 +231,33 @@ mod tests {
         assert_eq!(decode_str("%252e%252e").as_deref(), Some("%2e%2e"));
     }
 
+    /// 💥 Escapes mixed with multi-byte characters must not panic.
+    ///
+    /// 📌 This decoder works in bytes and pushes into a `Vec<u8>`, so it never
+    /// indexes a `str` and cannot split a character. Its sibling in the proxy's
+    /// URI normalizer built a `String` and did exactly that, panicking on
+    /// `%4A¡` — a nine-byte path any client can send, and with `panic = "abort"`
+    /// in release that is the process. The property is pinned here too, because
+    /// the two are edited for the same reasons and the next person may copy the
+    /// wrong one.
+    #[test]
+    fn escapes_mixed_with_multibyte_characters_do_not_panic() {
+        for component in [
+            "%4A¡",
+            "文件%41.txt",
+            "%41文件",
+            "前綴%2e後綴",
+            "\u{1F600}%41\u{1F600}",
+            "é%zz",
+        ] {
+            let mut out = Vec::new();
+            let _ = decode_path_component(component, &mut out);
+        }
+        // 🔤 …and the characters survive intact rather than being mangled.
+        assert_eq!(decode_str("%41文件").as_deref(), Some("A文件"));
+        assert_eq!(decode_str("文件%41").as_deref(), Some("文件A"));
+    }
+
     /// 🔤 A name that is not valid UTF-8 is still a name on Unix, so the decode
     /// yields bytes and does not insist they are text.
     #[test]

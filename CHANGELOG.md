@@ -1044,6 +1044,19 @@ lets the rest converge.
 
 ### 🔐 Security
 
+- 💥 **A request path mixing a percent-escape with a non-ASCII character killed
+  the process.** The URI normalizer copied unmatched input with a one-*byte* slice
+  of a `str`, which panics when that byte falls inside a multi-byte character, and
+  the release profile sets `panic = "abort"` — so this was not a bad request, it
+  was the whole server. `/%4A¡` is enough, and any client can send it.
+
+  Introduced by the percent-decoding change earlier in this release and caught by
+  the property test that sits beside it, on a clean-Linux verification run, after
+  the change had already been pushed. The randomised test had passed several times
+  locally first; the input is now pinned as an ordinary test as well, so finding it
+  again does not depend on a seed. The decoder advances by whole characters now.
+
+
 - 🛡️ **The HTTP/3 request parser resolved ambiguous requests instead of refusing
   them.** A repeated pseudo-header overwrote the earlier copy, so the last one
   won; pseudo-headers interleaved with regular fields were accepted; an uppercase
