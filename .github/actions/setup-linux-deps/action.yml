@@ -1,0 +1,32 @@
+name: setup-linux-deps
+description: Install the pinned Linux build dependencies with a resilient apt mirror configuration.
+
+runs:
+  using: composite
+  steps:
+    - name: Prefer the global Ubuntu archive over the Azure mirror
+      shell: bash
+      run: |
+        set -euo pipefail
+        # 🧭 GitHub-hosted runners default to azure.archive.ubuntu.com, which
+        # has repeatedly hung apt-get update for minutes at a time. The global
+        # archive.ubuntu.com CDN is the same Noble repository on a healthier
+        # path, so rewrite the source list before any apt work.
+        if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu/|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list.d/ubuntu.sources
+          sudo sed -i 's|https://azure.archive.ubuntu.com/ubuntu/|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list.d/ubuntu.sources
+        fi
+
+    - name: Update apt with retries and timeouts
+      shell: bash
+      run: |
+        sudo apt-get update \
+          -o Acquire::Retries=3 \
+          -o Acquire::http::Timeout=60 \
+          -o Acquire::https::Timeout=60
+
+    - name: Install build dependencies
+      shell: bash
+      run: |
+        sudo apt-get install -y --no-install-recommends \
+          cmake make g++ perl pkg-config clang libclang-dev git curl ca-certificates

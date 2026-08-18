@@ -23,11 +23,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cmake make g++ perl pkg-config clang libclang-dev git curl ca-certificates
+      - uses: ./.github/actions/setup-linux-deps
 
       - uses: ./.github/actions/setup-ci
 
