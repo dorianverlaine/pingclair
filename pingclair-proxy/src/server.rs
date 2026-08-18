@@ -3781,6 +3781,37 @@ impl PingclairProxy {
         Ok(())
     }
 
+    /// 🌐 Writes the site name into a `Host` header, where reshaping the URI
+    /// cannot erase it.
+    ///
+    /// HTTP/1.1 already sends one. HTTP/2 sends `:authority` instead, which
+    /// Pingora keeps *in the URI* — and `set_raw_path`, which every `uri`
+    /// rewrite goes through, replaces the URI with a path-only one.
+    ///
+    /// 🤡 So a route with `uri strip_prefix` silently dropped the site name on
+    /// HTTP/2, and with no `Host` header to fall back to the origin received a
+    /// literal `Host:` with nothing after it. An origin that routes by name
+    /// served its default site; one that validates the header rejected the
+    /// request. The identical request over HTTP/1.1 and HTTP/3 was fine, which
+    /// is what made it invisible — HTTP/3 does exactly this, in
+    /// `quic.rs`'s request builder, and has done since it was written.
+    ///
+    /// Called once, before anything can rewrite. Nothing is overwritten: a
+    /// request that already names itself keeps what it sent.
+    fn pin_request_authority(header: &mut RequestHeader) {
+        if header.headers.contains_key(http::header::HOST) {
+            return;
+        }
+        let Some(authority) = header
+            .uri
+            .authority()
+            .map(|value| value.as_str().to_owned())
+        else {
+            return;
+        };
+        let _ = header.insert_header(http::header::HOST, authority);
+    }
+
     fn apply_rewrite(
         &self,
         session: &mut Session,
@@ -5911,6 +5942,10 @@ impl ProxyHttp for PingclairProxy {
                 .await?;
             return Ok(true);
         }
+
+        // 🌐 Before any middleware can reshape the URI: HTTP/2 keeps the site
+        // name there and a rewrite would take it with it.
+        Self::pin_request_authority(session.req_header_mut());
 
         if self.proxy_protocol_required && self.proxy_protocol_identity(session).is_none() {
             tracing::warn!("🚫 Rejected a TCP request that bypassed the PROXY protocol ingress");
@@ -8648,6 +8683,35 @@ mod p0_regression_tests {
             .unwrap()
             .clone();
         assert!(!Arc::ptr_eq(&retained, &replaced));
+    }
+
+    /// 🌐 Rewriting the path must not lose the site the request is for.
+    ///
+    /// 🤡 It did, on HTTP/2 only. `set_raw_path` replaces the whole URI with a
+    /// path-only one, and HTTP/2 keeps the site name *in* the URI — so a route
+    /// with `uri strip_prefix` threw it away, and because HTTP/2 sends no
+    /// `Host` header there was nothing to fall back to. Measured on a public
+    /// host: the origin received a literal `Host:` with no value, while the
+    /// identical request over HTTP/1.1 and HTTP/3 carried the right name.
+    ///
+    /// 📌 The fix is the one HTTP/3 already had: write the name into a header
+    /// before anything reshapes the URI, so the two places it can live cannot
+    /// disagree and a URI rewrite cannot erase it.
+    #[test]
+    fn a_uri_rewrite_keeps_the_site_the_request_named() {
+        // 🌐 An HTTP/2 request as Pingora builds it: authority in the URI, no
+        // `Host` header at all.
+        let mut h2 = RequestHeader::build_no_case("GET", b"/strip/thing", None).unwrap();
+        h2.uri = "https://shop.example.test/strip/thing".parse().unwrap();
+
+        PingclairProxy::pin_request_authority(&mut h2);
+        h2.set_raw_path(b"/thing").unwrap();
+
+        assert_eq!(
+            crate::http_policy::request_authority(&h2),
+            "shop.example.test",
+            "the site name must survive a path rewrite"
+        );
     }
 
     /// 🌐 The placeholders that name the site must give the same answer on

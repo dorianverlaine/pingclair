@@ -735,6 +735,18 @@ lets the rest converge.
 
 ### 🐛 Fixed
 
+- 🌐 **A `uri` rewrite no longer loses the site name on HTTP/2.** Every `uri`
+  rewrite replaces the request target with a path-only one, and HTTP/2 keeps
+  the site name inside that target rather than in a `Host` header. So a route
+  as ordinary as `uri strip_prefix /api` sent the origin a literal `Host:` with
+  no value after it — an origin that routes by name served its default site, and
+  one that validates the header rejected the request outright. The same route
+  over HTTP/1.1 and HTTP/3 was unaffected, which is what kept it hidden.
+
+  The site name is now written into a header before any middleware can reshape
+  the URI, so the two places it can live cannot disagree. A request that already
+  sends its own `Host` keeps it.
+
 - 🏷️ **An HTTP/3 request now reaches the origin carrying the site name the
   client asked for.** It carried the upstream's own dial address instead, so an
   origin that routes by `Host` — another proxy, a PaaS router, any server with
