@@ -859,6 +859,35 @@ Caddy.
 > consulte l'analyseur. Un README qui annonce une prise en charge que le
 > binaire n'a pas est pire qu'un README qui en annonce moins.
 
+### Un défaut connu : les upgrades WebSocket échouent sous charge
+
+Pingclair relaie le WebSocket, et environ **10 à 15 % des upgrades échouent
+lorsque la machine est chargée**. Ce point figure ici plutôt que dans la liste
+ci-dessus parce que la fonctionnalité n'est pas absente : elle fonctionne, puis
+par intermittence ne fonctionne plus.
+
+Le défaut se situe dans `pingora-proxy 0.8.1`, et non dans la manière dont ce
+projet traite l'upgrade : une trace confirme que la requête parvient à l'amont
+en portant `Connection: Upgrade` et `Upgrade: websocket`. Ticket amont :
+[cloudflare/pingora#946](https://github.com/cloudflare/pingora/issues/946),
+ouvert au 2026-08-18.
+
+Ce qui se passe, en une phrase : une requête d'upgrade est un `GET` sans corps,
+et la fin de *ce corps vide* est prise pour la fin du tunnel — mais uniquement
+lorsque le `101` de l'amont est lu en premier, une course que le proxy perd
+d'autant plus souvent que la machine est occupée.
+
+C'est cet ordonnancement qui rend le défaut invisible. Sur une machine à dix
+cœurs au repos, le test d'upgrade passe quarante fois sur quarante ; dans un
+conteneur à deux cœurs, il échoue six fois sur quarante ; et introduire le
+moindre délai avant le `101` de l'amont — même un simple yield — fait
+entièrement disparaître les échecs. Une machine de développement vous dira donc
+que ce défaut n'existe pas.
+
+Aucune configuration ne permet de l'éviter. Vu de l'extérieur, l'échec se
+manifeste par une connexion détruite immédiatement après le `101`, les deux
+extrémités voyant un EOF, sans erreur.
+
 ## 🏗️ Architecture
 
 Pingclair est organisé en workspace Cargo modulaire :

@@ -26,6 +26,29 @@ lets the rest converge.
 
 - TBD — Dorian to fill in during scope cut
 
+### 🐛 Known defect — WebSocket upgrades under load
+
+Pingclair proxies WebSocket, and roughly **10–15 % of upgrades fail when the
+machine is busy**. Stated here, in the release notes, because the feature is
+not missing: it works, and then intermittently does not.
+
+The fault is in `pingora-proxy 0.8.1` rather than in this project's handling of
+the upgrade — a trace confirms the request reaches the upstream carrying
+`Connection: Upgrade` and `Upgrade: websocket`. Upstream issue:
+[cloudflare/pingora#946](https://github.com/cloudflare/pingora/issues/946),
+open as of 2026-08-18.
+
+An upgrade request is a `GET` with no body, and the end of that empty body is
+mistaken for the end of the tunnel — but only when the upstream's `101` is read
+first. The proxy loses that race more often the less idle the machine is: forty
+of forty upgrades succeed on an idle ten-core machine, six of forty fail in a
+two-core container, and inserting any delay before the `101` — even a bare
+yield — removes the failures entirely. A developer machine will report that
+this defect does not exist.
+
+No configuration avoids it. From outside, a failure is a connection torn down
+immediately after the `101`, both ends seeing EOF with no error.
+
 ### ⚠️ Breaking
 
 - 🧱 **A block must now open at the end of its line.** `route { respond "hi" 200`

@@ -837,6 +837,33 @@ from `error_page`, which is a Pingclair directive rather than a Caddy one.
 > that claims support the binary does not have is worse than one that claims
 > less.
 
+### A known defect: WebSocket upgrades fail under load
+
+Pingclair proxies WebSocket, and roughly **10–15 % of upgrades fail when the
+machine is busy**. This is stated here rather than in the list above because
+the feature is not missing — it works, and then intermittently does not.
+
+The fault is in `pingora-proxy 0.8.1`, not in this project's own handling of
+the upgrade: a trace confirms the request reaches the upstream carrying
+`Connection: Upgrade` and `Upgrade: websocket`. Upstream issue:
+[cloudflare/pingora#946](https://github.com/cloudflare/pingora/issues/946),
+open as of 2026-08-18.
+
+What goes wrong, in one sentence: an upgrade request is a `GET` with no body,
+and the end of *that empty body* is mistaken for the end of the tunnel — but
+only when the upstream's `101` is read first, which is a race the proxy loses
+more often the less idle the machine is.
+
+That ordering is why it hides. On an idle ten-core machine the upgrade test
+passes forty times out of forty; in a two-core container it fails six times out
+of forty; and inserting any delay at all before the upstream's `101` — even a
+bare yield — makes the failures disappear entirely. So a developer machine will
+tell you this defect does not exist.
+
+There is no configuration that avoids it. What a failure looks like from
+outside is a connection torn down immediately after the `101`, with both ends
+seeing EOF and no error.
+
 ## 🏗️ Architecture
 
 Pingclair is organized as a modular Cargo workspace:
