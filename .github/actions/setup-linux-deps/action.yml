@@ -4,17 +4,19 @@ description: Install the pinned Linux build dependencies with a resilient apt mi
 runs:
   using: composite
   steps:
-    - name: Prefer the global Ubuntu archive over the Azure mirror
+    - name: Pin apt to the global Ubuntu archive
       shell: bash
       run: |
         set -euo pipefail
-        # 🧭 GitHub-hosted runners default to azure.archive.ubuntu.com, which
-        # has repeatedly hung apt-get update for minutes at a time. The global
-        # archive.ubuntu.com CDN is the same Noble repository on a healthier
-        # path, so rewrite the source list before any apt work.
+        # 🧭 GitHub-hosted runners resolve azure.archive.ubuntu.com through a
+        # mirrorlist, and that mirror has repeatedly hung or crawled for
+        # minutes. Pin every source directly to the global archive.ubuntu.com
+        # CDN, and rewrite the mirrorlist too in case something re-reads it.
         if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
-          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu/|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list.d/ubuntu.sources
-          sudo sed -i 's|https://azure.archive.ubuntu.com/ubuntu/|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list.d/ubuntu.sources
+          sudo sed -i 's|^URIs:.*|URIs: http://archive.ubuntu.com/ubuntu/|' /etc/apt/sources.list.d/ubuntu.sources
+        fi
+        if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+          sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' /etc/apt/apt-mirrors.txt
         fi
 
     - name: Update apt with a hard deadline and IPv4
@@ -35,7 +37,7 @@ runs:
     - name: Install build dependencies
       shell: bash
       run: |
-        timeout 300 sudo apt-get install -y --no-install-recommends \
+        timeout 600 sudo apt-get install -y --no-install-recommends \
           -o Acquire::ForceIPv4=true \
           -o Acquire::Retries=3 \
           -o Acquire::http::Timeout=60 \
