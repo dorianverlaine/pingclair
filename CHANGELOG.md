@@ -735,6 +735,20 @@ lets the rest converge.
 
 ### 🐛 Fixed
 
+- 🔊 **The server now logs at a level someone can read.** With `RUST_LOG` unset
+  — which is every deployment that does not know to set it — the subscriber
+  emitted `ERROR` and nothing else. Fifty-eight informational lines across the
+  workspace reached nobody, certificate issuance and renewal among them, so a
+  running server left no record that it had ever obtained a certificate.
+
+  On a public host the effect was worse than silence: the only lines that did
+  get through were strangers scanning port 80 and connections that opened and
+  left, so the log was 100 % errors, none of them this server's. `--verbose`
+  was inert for the same reason — it logged one line about itself at a level
+  nothing was listening to, and now raises the floor to `debug` instead.
+
+  The default is `info`, and `RUST_LOG` still wins outright when set.
+
 - 🌐 **A `uri` rewrite no longer loses the site name on HTTP/2.** Every `uri`
   rewrite replaces the request target with a path-only one, and HTTP/2 keeps
   the site name inside that target rather than in a `Host` header. So a route

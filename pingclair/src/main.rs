@@ -71,17 +71,35 @@ fn main() -> anyhow::Result<()> {
     // a library we depend on); that is fine, so the result is discarded.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    // Initialize tracing
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
-        .with(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
+    // 🧾 Parsed before tracing is installed, because `--verbose` decides what
+    // the subscriber is allowed to emit. `Cli::parse()` exits on `--help` and
+    // on a bad flag, which is the one thing that should happen before any
+    // logging exists anyway.
     let cli = Cli::parse();
 
-    if cli.verbose {
-        tracing::info!("Verbose mode enabled");
-    }
+    // 🔊 A level this process is actually allowed to say something at.
+    //
+    // 🤡 `EnvFilter::from_default_env()` alone means `ERROR` when `RUST_LOG` is
+    // unset, which is every deployment that does not know to set it. Measured
+    // on a public host: 58 `tracing::info!` calls across this workspace — the
+    // whole of certificate issuance and renewal among them — reached nobody,
+    // while the only lines that did get through were strangers scanning port
+    // 80. An operator saw a log that was 100 % errors, none of them this
+    // server's, and no record that a certificate had ever been obtained.
+    //
+    // `--verbose` was inert for the same reason: it logged one line about
+    // itself at a level nothing was listening to. It now raises the floor,
+    // which is what an operator typing it is asking for.
+    //
+    // 📌 `RUST_LOG` still wins outright when it is set, so the escape hatch for
+    // "quieter than this" and "one module louder" is unchanged.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(if cli.verbose { "debug" } else { "info" })
+    });
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(filter)
+        .init();
 
     cli::dispatch::run(cli.command)
 }
