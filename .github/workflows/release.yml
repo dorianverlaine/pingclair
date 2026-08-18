@@ -5,32 +5,25 @@ on:
     tags:
       - 'v*.*.*'
 
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  # ============================================================
-  # 🎯 Verify the tag before anything is built. Modelled on caddy's
-  # release.yml verify-tag job: a tag is the release contract, so the
-  # tag name must match the version the workspace declares — publishing
-  # a v0.2.0 artifact from a tree that still says 0.1.7 is the failure
-  # this step exists to make impossible. nginx's check-version-bump.yaml
-  # guards the same invariant from the other side (a version bump must
-  # follow every release tag).
-  # ============================================================
   verify-tag:
     name: Verify tag matches the workspace version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     outputs:
       version: ${{ steps.info.outputs.version }}
-
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Extract version information
         id: info
@@ -46,12 +39,8 @@ jobs:
           echo "✅ tag ${tag} matches workspace version ${crate_version}"
 
       - name: Verify the tag points at main
-        # 🧭 A release tag on a side branch would ship code that never
-        # passed the main CI gate; refuse it here rather than discover
-        # it after publication. A tag push only checks out the tag ref,
-        # so fetch main explicitly before comparing.
         run: |
-          tag_sha="$(git rev-list -1 ${GITHUB_REF#refs/tags/})"
+          tag_sha="$(git rev-list -1 "${GITHUB_REF#refs/tags/}")"
           git fetch --quiet origin main --depth=1
           main_sha="$(git rev-list -1 FETCH_HEAD)"
           if [ "$tag_sha" != "$main_sha" ]; then
@@ -60,113 +49,94 @@ jobs:
           fi
           echo "✅ tag points at the tip of main"
 
-  # ============================================================
-  # 🏗️ Build the release binaries natively per architecture, exactly
-  # like the dev-binaries job — no cross toolchain, no QEMU, and the
-  # smoke test executes the artifact it just built. The old workflow
-  # cross-compiled aarch64 on an x86_64 runner and could never run the
-  # resulting binary; a release artifact nobody has executed is not
-  # verified.
-  # ============================================================
   build-binaries:
     name: Build release binary (${{ matrix.platform.name }})
     needs: verify-tag
     runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         platform:
           - name: Linux x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             key: x86_64
           - name: Linux aarch64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             key: aarch64
-
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies
-        # 🧱 boring-sys needs cmake + g++ for BoringSSL, clang/libclang-dev
-        # for bindgen and perl for its scripts. Keep in sync with
-        # deployment/Dockerfile, see docs/GUARDRAILS.md.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake \
-            g++ \
-            perl \
-            pkg-config \
-            clang \
-            libclang-dev \
-            git \
-            curl
+            cmake make g++ perl pkg-config clang libclang-dev git curl ca-certificates
+
+      - uses: ./.github/actions/setup-ci
 
       - name: Install Rust 1.97
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.97.1
         with:
           targets: ${{ matrix.platform.target }}
 
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          target: ${{ matrix.platform.target }}
+          profile: release
+          cache-scope: release-binaries
+
       - name: Build the release binary
-        run: cargo build --release --locked --target ${{ matrix.platform.target }}
+        run: cargo +1.97.1 build --release --locked --target ${{ matrix.platform.target }}
 
       - name: Smoke test the binary
-        # 🏷️ The bare semver form printed by `version` since ca104ea.
         run: |
-          binary="target/${{ matrix.platform.target }}/release/pingclair"
+          binary="${CARGO_TARGET_DIR}/${{ matrix.platform.target }}/release/pingclair"
           version_output="$("$binary" version)"
           echo "$version_output"
           echo "$version_output" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'
-          # 🛡️ full_featured's manual-TLS block names /etc/pingclair/certs,
-          # and `validate` fails closed when those files are missing (by
-          # design); the check is existence only, so placeholders suffice.
           sudo mkdir -p /etc/pingclair/certs
           sudo touch /etc/pingclair/certs/example.com.pem /etc/pingclair/certs/example.com.key
           "$binary" validate examples/full_featured.pingclair
 
       - name: Package and checksum
         run: |
-          cd target/${{ matrix.platform.target }}/release
+          cd "${CARGO_TARGET_DIR}/${{ matrix.platform.target }}/release"
           tar -czf pingclair-linux-${{ matrix.platform.key }}.tar.gz pingclair
           shasum -a 256 pingclair-linux-${{ matrix.platform.key }}.tar.gz > SHA256SUMS-${{ matrix.platform.key }}.txt
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: pingclair-linux-${{ matrix.platform.key }}
           path: |
-            target/${{ matrix.platform.target }}/release/pingclair-linux-${{ matrix.platform.key }}.tar.gz
-            target/${{ matrix.platform.target }}/release/SHA256SUMS-${{ matrix.platform.key }}.txt
+            ${CARGO_TARGET_DIR}/${{ matrix.platform.target }}/release/pingclair-linux-${{ matrix.platform.key }}.tar.gz
+            ${CARGO_TARGET_DIR}/${{ matrix.platform.target }}/release/SHA256SUMS-${{ matrix.platform.key }}.txt
           retention-days: 7
 
-  # ============================================================
-  # 📦 Publish the GitHub release with the verified binaries. Notes are
-  # generated from commit subjects since the last tag — the same
-  # discipline as the commit-subject check, so the changelog reads
-  # cleanly.
-  # ============================================================
   publish-release:
     name: Publish GitHub release
-    needs: build-binaries
-    runs-on: ubuntu-latest
+    needs: [build-binaries, verify-tag]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: write
-
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Download release binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
 
       - name: Verify the checksums
-        # 🔒 A release page is a trust boundary: refuse to publish a
-        # tarball whose checksum does not match what the build produced.
         run: |
           shasum -a 256 -c SHA256SUMS-x86_64.txt
           shasum -a 256 -c SHA256SUMS-aarch64.txt
@@ -190,14 +160,11 @@ jobs:
             --title "Pingclair $version" \
             --notes "$notes"
 
-  # ============================================================
-  # 🐳 Release image: build both architectures natively and merge them
-  # into a multi-arch manifest tagged with the version and `latest`.
-  # ============================================================
   publish-image:
     name: Publish release image (${{ matrix.platform.name }})
     needs: verify-tag
     runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
@@ -206,29 +173,30 @@ jobs:
       matrix:
         platform:
           - name: amd64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             platform: linux/amd64
             tag: amd64
           - name: arm64
             runner: ubuntu-24.04-arm
             platform: linux/arm64
             tag: arm64
-
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push the ${{ matrix.platform.name }} image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@471d1dc4e07e5cdedd4c2171150001c434f0b7a4 # v6.15.0
         with:
           context: .
           file: deployment/Dockerfile
@@ -238,8 +206,6 @@ jobs:
             ghcr.io/dorianverlaine/pingclair:${{ needs.verify-tag.outputs.version }}-${{ matrix.platform.tag }}
 
       - name: Smoke the ${{ matrix.platform.name }} image
-        # 🧭 Runs the published per-architecture image natively on its own
-        # runner, so each arch is verified before the manifest merge.
         run: |
           image="ghcr.io/dorianverlaine/pingclair:${{ needs.verify-tag.outputs.version }}-${{ matrix.platform.tag }}"
           version_output="$(docker run --rm "$image" version)"
@@ -250,20 +216,22 @@ jobs:
 
   publish-image-manifest:
     name: Publish multi-arch release manifest
-    needs: publish-image
-    runs-on: ubuntu-latest
+    needs: [publish-image, verify-tag]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
-
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

@@ -1,0 +1,48 @@
+name: HTTP/3
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  h3:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake make g++ perl pkg-config clang libclang-dev git curl ca-certificates
+
+      - uses: ./.github/actions/setup-ci
+
+      - name: Install Rust 1.97
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.97.1
+
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          target: x86_64-unknown-linux-gnu
+          profile: release
+          cache-scope: h3
+
+      - name: Install HTTP/3-capable curl
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o /tmp/curl-amd64 \
+            https://github.com/moparisthebest/static-curl/releases/download/v8.21.0/curl-amd64
+          echo "e45ae1805ceb3f816e9768fbbaba05d98a2dc9c5577f66395f37660941d88e19  /tmp/curl-amd64" | sha256sum -c -
+          sudo install -m 0755 /tmp/curl-amd64 /usr/local/bin/curl
+          /usr/local/bin/curl --version | grep -qi 'http3'
+
+      - name: Run the HTTP/3 functional matrix
+        run: just h3
+
+      - uses: ./.github/actions/check-clean-worktree

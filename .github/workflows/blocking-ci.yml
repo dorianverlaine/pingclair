@@ -1,0 +1,84 @@
+name: Blocking CI
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+
+concurrency:
+  group: blocking-ci-${{ github.event.pull_request.number > 0 && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}${{ github.ref_name == 'main' && format('::{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # Reusable children are kept alphabetized; the `required` job is the single
+  # status the main-branch ruleset should require.
+  rust-ci:
+    name: Rust CI
+    uses: ./.github/workflows/rust-ci.yml
+    secrets: inherit
+
+  docker:
+    name: Docker
+    uses: ./.github/workflows/docker.yml
+    secrets: inherit
+
+  commit-checks:
+    name: Commit checks
+    uses: ./.github/workflows/commit-checks.yml
+    secrets: inherit
+
+  security-audit:
+    name: Security audit
+    uses: ./.github/workflows/security-audit.yml
+    secrets: inherit
+
+  cargo-deny:
+    name: Cargo deny
+    uses: ./.github/workflows/cargo-deny.yml
+    secrets: inherit
+
+  repo-checks:
+    name: Repo checks
+    uses: ./.github/workflows/repo-checks.yml
+    secrets: inherit
+
+  codespell:
+    name: Codespell
+    uses: ./.github/workflows/codespell.yml
+    secrets: inherit
+
+  docs-lint:
+    name: Docs lint
+    uses: ./.github/workflows/docs-lint.yml
+    secrets: inherit
+
+  blob-size-policy:
+    name: Blob size policy
+    uses: ./.github/workflows/blob-size-policy.yml
+    secrets: inherit
+
+  required:
+    name: CI required
+    if: ${{ always() }}
+    needs:
+      - rust-ci
+      - docker
+      - commit-checks
+      - security-audit
+      - cargo-deny
+      - repo-checks
+      - codespell
+      - docs-lint
+      - blob-size-policy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Require successful dependencies
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: python3 .github/scripts/check_ci_results.py

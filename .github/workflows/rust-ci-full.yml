@@ -1,0 +1,85 @@
+name: Rust CI full
+
+on:
+  workflow_call:
+  push:
+    branches: ["**full-ci**"]
+  workflow_dispatch:
+
+concurrency:
+  group: rust-ci-full-${{ github.event.pull_request.number > 0 && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}${{ github.ref_name == 'main' && format('::{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint-release:
+    name: Clippy (release profile)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake make g++ perl pkg-config clang libclang-dev git curl ca-certificates
+
+      - uses: ./.github/actions/setup-ci
+
+      - name: Install Rust 1.97
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.97.1
+        with:
+          components: rustfmt, clippy
+
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          target: x86_64-unknown-linux-gnu
+          profile: release
+          cache-scope: rust-ci-full
+
+      - name: Check formatting
+        run: cargo +1.97.1 fmt --all -- --check
+
+      - name: Run Clippy with the release profile
+        run: cargo +1.97.1 clippy --locked --workspace --all-targets --profile release -- -D warnings
+
+      - uses: ./.github/actions/check-clean-worktree
+
+  tests_x86_64:
+    name: Tests — Linux x86_64
+    uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
+    with:
+      runner: ubuntu-24.04
+      target: x86_64-unknown-linux-gnu
+      profile: ci-test
+      artifact_id: linux-x64
+    secrets: inherit
+
+  tests_aarch64:
+    name: Tests — Linux aarch64
+    uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
+    with:
+      runner: ubuntu-24.04-arm
+      target: aarch64-unknown-linux-gnu
+      profile: ci-test
+      artifact_id: linux-arm64
+    secrets: inherit
+
+  results:
+    name: Full CI results
+    needs: [lint-release, tests_x86_64, tests_aarch64]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Require successful dependencies
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: python3 .github/scripts/check_ci_results.py

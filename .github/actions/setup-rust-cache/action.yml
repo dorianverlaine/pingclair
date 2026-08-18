@@ -1,0 +1,87 @@
+name: setup-rust-cache
+description: Restore and save Cargo's registry and sccache object caches for one job.
+
+inputs:
+  target:
+    description: Rust target triple, or empty for the host target.
+    required: false
+    default: ""
+  profile:
+    description: Cargo profile used by this job.
+    required: false
+    default: "dev"
+  cache-scope:
+    description: Job-scoped cache namespace (for example "lint" or "nextest-archive").
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Compute lockfile hash
+      id: lockhash
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "hash=$(sha256sum Cargo.lock | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+    - name: Restore cargo home
+      id: cargo_restore
+      uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      with:
+        path: |
+          ~/.cargo/bin
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: cargo-home-${{ inputs.cache-scope }}-${{ inputs.target }}-${{ inputs.profile }}-${{ steps.lockhash.outputs.hash }}
+        restore-keys: |
+          cargo-home-${{ inputs.cache-scope }}-${{ inputs.target }}-${{ inputs.profile }}-
+
+    - name: Install sccache
+      uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+      with:
+        tool: sccache
+        version: 0.17.0
+
+    - name: Configure sccache backend
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ -n "${ACTIONS_CACHE_URL:-}" && -n "${ACTIONS_RUNTIME_TOKEN:-}" ]]; then
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+        else
+          echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
+          echo "SCCACHE_DIR=${CI_BUILD_ROOT:-$HOME/.cache/pingclair-ci}/sccache" >> "$GITHUB_ENV"
+        fi
+        echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+
+    - name: Restore sccache (fallback)
+      id: sccache_restore
+      if: ${{ env.SCCACHE_GHA_ENABLED != 'true' }}
+      uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      with:
+        path: ${{ env.SCCACHE_DIR }}
+        key: sccache-${{ inputs.cache-scope }}-${{ inputs.target }}-${{ inputs.profile }}-${{ steps.lockhash.outputs.hash }}-${{ github.run_id }}
+        restore-keys: |
+          sccache-${{ inputs.cache-scope }}-${{ inputs.target }}-${{ inputs.profile }}-${{ steps.lockhash.outputs.hash }}-
+          sccache-${{ inputs.cache-scope }}-${{ inputs.target }}-${{ inputs.profile }}-
+
+    - name: Save cargo home
+      if: ${{ always() && !cancelled() && steps.cargo_restore.outputs.cache-hit != 'true' }}
+      continue-on-error: true
+      uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      with:
+        path: |
+          ~/.cargo/bin
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: cargo-home-${{ inputs.cache-scope }}-${{ inputs.target }}-${{ inputs.profile }}-${{ steps.lockhash.outputs.hash }}
+
+    - name: Save sccache (fallback)
+      if: ${{ always() && !cancelled() && env.SCCACHE_GHA_ENABLED != 'true' && steps.sccache_restore.outputs.cache-hit != 'true' }}
+      continue-on-error: true
+      uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      with:
+        path: ${{ env.SCCACHE_DIR }}
+        key: sccache-${{ inputs.cache-scope }}-${{ inputs.target }}-${{ inputs.profile }}-${{ steps.lockhash.outputs.hash }}-${{ github.run_id }}

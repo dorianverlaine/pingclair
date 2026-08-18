@@ -1,0 +1,26 @@
+name: Codespell
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  codespell:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install codespell
+        run: |
+          python3 -m venv /tmp/codespell-venv
+          /tmp/codespell-venv/bin/pip install --quiet codespell==2.4.3
+
+      - name: Run codespell
+        run: /tmp/codespell-venv/bin/codespell
+
+      - uses: ./.github/actions/check-clean-worktree
