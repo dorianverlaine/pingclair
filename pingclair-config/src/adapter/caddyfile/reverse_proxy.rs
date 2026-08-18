@@ -200,22 +200,56 @@ pub(super) fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError>
                                         // are kept verbatim in the compiled config and
                                         // logged at startup; accepting them silently
                                         // would tell an operator a knob took effect.
+                                        // 🔢 The one transport knob with a
+                                        // precise equivalent: Pingora's peer
+                                        // takes a maximum and a minimum HTTP
+                                        // version, which is exactly what this
+                                        // selects.
+                                        "versions" => {
+                                            proxy.upstream_versions =
+                                                Some(parse_upstream_versions(&t_sub.args)?);
+                                        }
+                                        // 🚫 Refused rather than stored.
+                                        //
+                                        // 🤡 These were accepted into an untyped
+                                        // map, kept in the compiled config, and
+                                        // warned about once at startup. That is
+                                        // not the same as doing what they say: a
+                                        // warning in the boot log does not stop
+                                        // an operator believing the knob took
+                                        // effect, and the setting was still
+                                        // written down as though it had.
+                                        //
+                                        // Every one of them is a Go
+                                        // `http.Transport` concept with no
+                                        // equivalent at the same layer in this
+                                        // build's upstream stack, and answering
+                                        // with an approximate one would be worse
+                                        // than refusing — `read_buffer` is a
+                                        // bufio size, not the socket receive
+                                        // buffer that happens to be reachable.
                                         other @ ("read_buffer"
                                         | "write_buffer"
                                         | "max_response_header"
                                         | "dial_fallback_delay"
                                         | "expect_continue_timeout"
                                         | "resolvers"
-                                        | "versions"
                                         | "compression"
                                         | "max_conns_per_host"
                                         | "keepalive_idle_conns_per_host"
                                         | "keepalive_interval"
                                         | "tls_renegotiation"
                                         | "tls_except_ports") => {
-                                            proxy
-                                                .transport_options
-                                                .insert(other.to_string(), t_sub.args.join(" "));
+                                            return Err(AdapterError::UnsupportedFeature(
+                                                format!("transport http {other}"),
+                                                format!(
+                                                    "`{other}` has no equivalent in this build's \
+                                                     upstream stack, and honouring it \
+                                                     approximately would change behaviour without \
+                                                     saying so. Remove it rather than leaving a \
+                                                     setting that does nothing."
+                                                ),
+                                            ));
                                         }
                                         _ => {
                                             return Err(AdapterError::UnknownDirective(format!(
@@ -1007,6 +1041,61 @@ pub(super) fn adapt_circuit_breaker_policy(
 /// Both cases below are configurations where one directive silently cancels
 /// another, so the operator's stated intent and the resulting security posture
 /// differ. Refusing to load is the only outcome that cannot be misread.
+/// 🔢 Reads `versions 1.1 2` into the one typed choice it names.
+///
+/// Order does not matter — upstream treats the list as a set — but the contents
+/// do. `3` is refused because this build has no HTTP/3 client for an upstream,
+/// and `h2c` is refused because prior-knowledge cleartext h2 is spelled by the
+/// `h2c://` upstream scheme, where it also decides the connection-reuse group.
+/// Two ways to say one thing is how they come to disagree.
+fn parse_upstream_versions(
+    args: &[String],
+) -> Result<pingclair_core::config::UpstreamHttpVersions, AdapterError> {
+    use pingclair_core::config::UpstreamHttpVersions as Versions;
+
+    if args.is_empty() {
+        return Err(AdapterError::ArgumentCount(
+            "transport http versions".into(),
+            1,
+            0,
+        ));
+    }
+
+    let mut http11 = false;
+    let mut h2 = false;
+    for argument in args {
+        match argument.as_str() {
+            "1.1" | "1" => http11 = true,
+            "2" => h2 = true,
+            other => {
+                return Err(AdapterError::UnsupportedFeature(
+                    format!("transport http versions {other}"),
+                    match other {
+                        "3" => "this build has no HTTP/3 client for an upstream, and answering \
+                                with HTTP/2 would speak a different protocol than the one asked \
+                                for"
+                        .to_string(),
+                        "h2c" => "prior-knowledge cleartext HTTP/2 is spelled by the `h2c://` \
+                                  upstream scheme, which also decides connection reuse; two ways \
+                                  to say it is how they come to disagree"
+                            .to_string(),
+                        _ => format!("`{other}` is not an HTTP version this proxy can speak"),
+                    },
+                ));
+            }
+        }
+    }
+
+    Ok(match (h2, http11) {
+        (true, true) => Versions::H2AndHttp11,
+        (true, false) => Versions::H2,
+        (false, true) => Versions::Http11,
+        // 🕳️ Unreachable: an empty list was refused above and every accepted
+        // token sets one of the two flags.
+        (false, false) => Versions::Http11,
+    })
+}
+
 pub(super) fn validate_upstream_tls(tls: &UpstreamTlsConfig) -> Result<(), AdapterError> {
     if tls.insecure_skip_verify && !tls.trusted_ca_certs.is_empty() {
         return Err(AdapterError::InvalidArgument(

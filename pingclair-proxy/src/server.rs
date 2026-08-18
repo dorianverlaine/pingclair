@@ -1377,20 +1377,6 @@ impl ProxyState {
                 } else {
                     Some(Arc::new(DynamicDialPlan::new(dynamic_templates)))
                 });
-                // 🧭 Compatibility-only knobs are logged once at load so an
-                // operator is never silently told a setting took effect.
-                if !proxy_config.transport_options.is_empty() {
-                    let options: Vec<&str> = proxy_config
-                        .transport_options
-                        .keys()
-                        .map(String::as_str)
-                        .collect();
-                    tracing::warn!(
-                        route = %route.path,
-                        ?options,
-                        "🧭 These transport options are accepted but have no runtime effect yet"
-                    );
-                }
                 // 🧱 A ceiling this server will not honour verbatim is said out
                 // loud at load, naming the number it will use instead. The
                 // format's own implementation warns here too — that unlimited
@@ -2644,12 +2630,33 @@ impl PingclairProxy {
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or("unix_socket".to_string()),
             });
-        let (mut tls, max_http_version, min_http_version, mut protocol_group) = match scheme {
+        let (mut tls, mut max_http_version, mut min_http_version, mut protocol_group) = match scheme
+        {
             Scheme::Http => (false, 1, 1, PROTOCOL_GROUP_HTTP),
             Scheme::Https => (true, 2, 1, PROTOCOL_GROUP_HTTPS),
             Scheme::H2c => (false, 2, 2, PROTOCOL_GROUP_H2C),
             Scheme::H2 => (true, 2, 2, PROTOCOL_GROUP_H2),
         };
+        // 🔢 `transport http { versions … }` overrides what the scheme implied.
+        //
+        // The scheme is the ordinary way to say this and stays the default;
+        // this exists because the format has a second spelling and an operator
+        // who writes it means it. Applied before the protocol group is fixed,
+        // so two upstreams that differ only in the versions they may speak do
+        // not share a pooled connection — the group key is what keeps an HTTP/2
+        // connection from being handed to a route that asked for HTTP/1.1.
+        if let Some(versions) = config.and_then(|config| config.upstream_versions) {
+            let (max, min) = versions.version_bounds();
+            max_http_version = max;
+            min_http_version = min;
+            protocol_group = match (versions, tls) {
+                (pingclair_core::config::UpstreamHttpVersions::H2, false) => PROTOCOL_GROUP_H2C,
+                (pingclair_core::config::UpstreamHttpVersions::H2, true) => PROTOCOL_GROUP_H2,
+                (_, true) => PROTOCOL_GROUP_HTTPS,
+                (_, false) => PROTOCOL_GROUP_HTTP,
+            };
+        }
+
         // 🔒 A bare `tls` directive upgrades a scheme-less upstream, matching
         // Caddy. It adds encryption and nothing else — the offered ALPN stays
         // HTTP/1.1. Quietly widening it to h2 would let the same directive
@@ -9374,6 +9381,72 @@ mod caddy_parity_tests {
                 "127.0.0.1:8301",
                 "127.0.0.1:8302",
             ]
+        );
+    }
+
+    /// 🔢 `transport http { versions … }` reaches the peer, and changes the
+    /// pool group with it.
+    ///
+    /// 🤡 This knob used to be parsed into an untyped map, kept in the compiled
+    /// configuration, warned about once at startup, and read by nothing. Typing
+    /// it would have been half a fix: the point is that the peer speaks what was
+    /// asked for.
+    ///
+    /// The group key matters as much as the version. Two upstreams that differ
+    /// only in the versions they may speak must not share a pooled connection —
+    /// otherwise a route that asked for HTTP/1.1 is handed an HTTP/2 connection
+    /// somebody else opened.
+    #[test]
+    fn transport_versions_reach_the_peer_and_its_pool_group() {
+        use pingclair_core::config::UpstreamHttpVersions as V;
+
+        let proxy_with = |versions: Option<V>| pingclair_core::config::ReverseProxyConfig {
+            upstreams: vec!["http://127.0.0.1:9000".to_string()],
+            upstream_versions: versions,
+            ..Default::default()
+        };
+
+        // 🧭 The scheme still decides when the transport says nothing.
+        let upstream = create_upstream("http://127.0.0.1:9000").unwrap();
+        let default = PingclairProxy::build_http_peer(&upstream, None, None, None, None).unwrap();
+        assert_eq!(default.options.alpn.get_max_http_version(), 1);
+
+        for (versions, min, max) in [(V::Http11, 1, 1), (V::H2, 2, 2), (V::H2AndHttp11, 1, 2)] {
+            let config = proxy_with(Some(versions));
+            let peer = PingclairProxy::build_http_peer(&upstream, Some(&config), None, None, None)
+                .expect("peer builds");
+            assert_eq!(
+                peer.options.alpn.get_min_http_version(),
+                min,
+                "{versions:?} min"
+            );
+            assert_eq!(
+                peer.options.alpn.get_max_http_version(),
+                max,
+                "{versions:?} max"
+            );
+        }
+
+        // 🔁 Cleartext HTTP/2 is its own reuse group, not the HTTP/1.1 one.
+        let h2 = PingclairProxy::build_http_peer(
+            &upstream,
+            Some(&proxy_with(Some(V::H2))),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let plain = PingclairProxy::build_http_peer(
+            &upstream,
+            Some(&proxy_with(Some(V::Http11))),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_ne!(
+            h2.group_key, plain.group_key,
+            "an HTTP/2 peer must not share a pool with an HTTP/1.1 one"
         );
     }
 

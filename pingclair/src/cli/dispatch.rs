@@ -487,7 +487,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 rewrite_uri: None,
                 request_buffer_bytes: None,
                 response_buffer_bytes: None,
-                transport_options: std::collections::BTreeMap::new(),
+                upstream_versions: None,
                 upstream_options: Vec::new(),
                 // 🗄️ `pingclair reverse-proxy` is a throwaway one-liner; caching
                 // is a deliberate per-route decision, so it stays off here.

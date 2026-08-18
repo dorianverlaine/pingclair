@@ -1339,6 +1339,38 @@ pub enum RateLimitKey {
     Tenant(String),
 }
 
+/// 🔢 The HTTP versions a reverse proxy may speak upstream.
+///
+/// Only the combinations this build can actually produce exist here. Pingora's
+/// peer takes a maximum and a minimum version, so these three are exactly the
+/// reachable states — a fourth spelling would be a promise with nothing behind
+/// it.
+///
+/// 🚫 HTTP/3 to an upstream is not one of them and is refused at load: this
+/// build's upstream stack has no HTTP/3 client, and answering `versions 3` by
+/// speaking HTTP/2 would be a different protocol than the one asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamHttpVersions {
+    /// HTTP/1.1 only.
+    Http11,
+    /// HTTP/2 only — over TLS by ALPN, or prior-knowledge cleartext.
+    H2,
+    /// Offer HTTP/2, fall back to HTTP/1.1.
+    H2AndHttp11,
+}
+
+impl UpstreamHttpVersions {
+    /// 🔢 The (maximum, minimum) pair Pingora's peer wants.
+    pub fn version_bounds(self) -> (u8, u8) {
+        match self {
+            Self::Http11 => (1, 1),
+            Self::H2 => (2, 2),
+            Self::H2AndHttp11 => (2, 1),
+        }
+    }
+}
+
 /// Handler configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1966,11 +1998,14 @@ pub struct ReverseProxyConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_buffer_bytes: Option<i64>,
 
-    /// 🧭 Transport tuning options that have no runtime equivalent yet. They
-    /// stay visible in the compiled configuration and are logged at startup
-    /// so an operator is never silently told a knob took effect.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub transport_options: BTreeMap<String, String>,
+    /// 🔢 Which HTTP versions this proxy may speak to the upstream, when the
+    /// transport says so rather than the upstream scheme.
+    ///
+    /// `None` leaves the decision to the scheme, which is where it has always
+    /// lived: `http://` is HTTP/1.1, `https://` offers h2 and falls back,
+    /// `h2c://` is prior-knowledge h2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_versions: Option<UpstreamHttpVersions>,
 
     /// 🧭 Response handlers evaluated against the upstream response before
     /// the client sees it; the first matching entry wins, matcherless

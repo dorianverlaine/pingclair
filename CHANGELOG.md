@@ -28,6 +28,30 @@ lets the rest converge.
 
 ### ⚠️ Breaking
 
+- 🔢 **Twelve `transport http` tuning knobs are now refused instead of accepted
+  and ignored.** `read_buffer`, `write_buffer`, `max_response_header`,
+  `dial_fallback_delay`, `expect_continue_timeout`, `resolvers`, `compression`,
+  `max_conns_per_host`, `keepalive_idle_conns_per_host`, `keepalive_interval`,
+  `tls_renegotiation` and `tls_except_ports` parsed, were stored in an untyped
+  map inside the compiled configuration, produced one warning at startup, and
+  were read by nothing.
+
+  Every one is a Go `http.Transport` concept with no equivalent at the same layer
+  in this build's upstream stack, and the near-misses are worse than the gaps:
+  `read_buffer` is a buffered-reader size, not the socket receive buffer that
+  happens to be reachable, and `keepalive_interval` is an HTTP keepalive, not the
+  TCP one. Honouring either approximately would change behaviour without saying
+  so. **A configuration using any of them no longer loads**; remove the setting.
+
+  `versions` is the exception and is now implemented rather than ignored:
+  `1.1`, `2` and `1.1 2` compile to a typed choice that reaches the upstream peer
+  and its connection-reuse group, so a route that asked for HTTP/1.1 cannot be
+  handed an HTTP/2 connection somebody else opened. `versions 3` is refused —
+  there is no HTTP/3 client for an upstream here, and answering with HTTP/2 would
+  speak a different protocol than the one asked for — and `h2c` is refused because
+  the `h2c://` upstream scheme already spells it and also decides pool grouping.
+
+
 - 🔗 **`preferred_chains` is now refused instead of accepted and ignored.** The
   setting parsed, compiled and was stored, and the only sign it did nothing was
   one warning at startup — so an operator who asked for a specific issuer chain

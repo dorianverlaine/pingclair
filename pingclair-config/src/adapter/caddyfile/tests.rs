@@ -2706,6 +2706,98 @@ mod fail_closed_tests {
         );
     }
 
+    /// 🔢 `transport http { versions … }` reaches the upstream peer as a typed
+    /// choice, and the versions this build cannot speak are refused by name.
+    #[test]
+    fn transport_versions_compile_to_a_typed_choice() {
+        use pingclair_core::config::UpstreamHttpVersions as V;
+
+        for (written, expected) in [
+            ("1.1", V::Http11),
+            ("2", V::H2),
+            ("1.1 2", V::H2AndHttp11),
+            ("2 1.1", V::H2AndHttp11),
+        ] {
+            let config = crate::compile(&format!(
+                ":80\nreverse_proxy 127.0.0.1:9000 {{\n transport http {{\n versions {written}\n }}\n }}"
+            ))
+            .unwrap_or_else(|error| panic!("`versions {written}` must compile: {error}"));
+            assert_eq!(
+                proxy_versions(&config),
+                Some(expected),
+                "`versions {written}` compiled to the wrong choice"
+            );
+        }
+
+        // 🚫 No HTTP/3 client exists in this build's upstream stack, so asking
+        // for it must say so rather than quietly speaking HTTP/2.
+        let error = compile_err(
+            ":80\nreverse_proxy 127.0.0.1:9000 {\n transport http {\n versions 3\n }\n }",
+        );
+        assert!(error.contains("versions"), "got {error}");
+        assert!(
+            error.contains('3'),
+            "the message must name what was asked for: {error}"
+        );
+    }
+
+    /// 🚫 A transport knob with no precise equivalent is refused, not stored.
+    ///
+    /// 🤡 All thirteen used to be accepted into an untyped map and warned about
+    /// once at startup. A warning in a log an operator reads at boot is not the
+    /// same as a configuration that does what it says: the knob was still
+    /// written down, still visible in the compiled config, and still did
+    /// nothing. This project's rule is that a setting which cannot be honoured
+    /// fails closed.
+    #[test]
+    fn transport_knobs_without_a_runtime_equivalent_are_refused() {
+        for (knob, argument) in [
+            ("read_buffer", "4096"),
+            ("write_buffer", "4096"),
+            ("max_response_header", "1MB"),
+            ("dial_fallback_delay", "300ms"),
+            ("expect_continue_timeout", "1s"),
+            ("resolvers", "8.8.8.8"),
+            ("compression", "off"),
+            ("max_conns_per_host", "10"),
+            ("keepalive_idle_conns_per_host", "4"),
+            ("keepalive_interval", "30s"),
+            ("tls_renegotiation", "freely"),
+            ("tls_except_ports", "8080"),
+        ] {
+            let error = compile_err(&format!(
+                ":80\nreverse_proxy 127.0.0.1:9000 {{\n transport http {{\n {knob} {argument}\n }}\n }}"
+            ));
+            assert!(
+                error.contains(knob),
+                "`{knob}` must be refused by name; got {error}"
+            );
+        }
+    }
+
+    /// 🔎 The compiled `versions` choice of the first reverse_proxy handler.
+    fn proxy_versions(
+        config: &pingclair_core::config::PingclairConfig,
+    ) -> Option<pingclair_core::config::UpstreamHttpVersions> {
+        fn find(
+            handler: &pingclair_core::config::HandlerConfig,
+        ) -> Option<pingclair_core::config::UpstreamHttpVersions> {
+            use pingclair_core::config::HandlerConfig;
+            match handler {
+                HandlerConfig::ReverseProxy(proxy) => proxy.upstream_versions,
+                HandlerConfig::Pipeline { handlers } | HandlerConfig::FirstMatch { handlers } => {
+                    handlers.iter().find_map(|element| find(&element.handler))
+                }
+                _ => None,
+            }
+        }
+        config
+            .servers
+            .iter()
+            .flat_map(|server| server.routes.iter())
+            .find_map(|route| find(&route.handler))
+    }
+
     /// 🗜️ `file_server` compression must be turnable off from the DSL.
     ///
     /// 🤡 The adapter hardcoded `compress: true` and offered no subdirective, so

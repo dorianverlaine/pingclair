@@ -760,8 +760,8 @@ pub struct ProxyConfig {
     /// 🧱 Response body buffer ceiling in bytes (`-1` unlimited).
     pub response_buffer_bytes: Option<i64>,
 
-    /// 🧭 Transport tuning options without a runtime equivalent.
-    pub transport_options: BTreeMap<String, String>,
+    /// 🔢 HTTP versions the transport may speak upstream.
+    pub upstream_versions: Option<pingclair_core::config::UpstreamHttpVersions>,
 
     /// 🧵 FastCGI transport selected by `transport fastcgi` or
     /// `php_fastcgi`; `None` means the HTTP transports.
@@ -1233,7 +1233,7 @@ impl ProxyConfig {
             rewrite_uri: None,
             request_buffer_bytes: None,
             response_buffer_bytes: None,
-            transport_options: BTreeMap::new(),
+            upstream_versions: None,
             fastcgi: None,
             handle_response: Vec::new(),
             lb_policy: None,

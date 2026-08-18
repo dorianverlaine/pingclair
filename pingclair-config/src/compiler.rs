@@ -2435,7 +2435,7 @@ fn compile_handler(
                 rewrite_uri: proxy.rewrite_uri.clone(),
                 request_buffer_bytes: proxy.request_buffer_bytes,
                 response_buffer_bytes: proxy.response_buffer_bytes,
-                transport_options: proxy.transport_options.clone(),
+                upstream_versions: proxy.upstream_versions,
                 fastcgi: proxy.fastcgi.clone().map(Box::new),
                 upstream_options: proxy
                     .upstream_options
