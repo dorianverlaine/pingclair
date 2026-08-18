@@ -518,11 +518,11 @@ mod log_format_tests {
     #[test]
     fn plain_format_directives_compile() {
         assert!(matches!(
-            log_of(":80 {\n log { format json }\n respond \"ok\" 200\n}").format,
+            log_of(":80 {\n log {\n format json\n }\n respond \"ok\" 200\n}").format,
             CoreLogFormat::Json
         ));
         assert!(matches!(
-            log_of(":80 {\n log { format text }\n respond \"ok\" 200\n}").format,
+            log_of(":80 {\n log {\n format text\n }\n respond \"ok\" 200\n}").format,
             CoreLogFormat::Text
         ));
     }
@@ -533,7 +533,7 @@ mod log_format_tests {
     #[test]
     fn filter_block_honors_explicit_wrap() {
         let text = log_of(
-            ":80 {\n log { format filter { wrap text\n fields { user_agent delete } } }\n respond \"ok\" 200\n}",
+            ":80 {\n log {\n format filter {\n wrap text\n fields {\n user_agent delete\n }\n }\n }\n respond \"ok\" 200\n}",
         );
         assert!(
             matches!(text.format, CoreLogFormat::Text),
@@ -541,7 +541,7 @@ mod log_format_tests {
         );
 
         let json = log_of(
-            ":80 {\n log { format filter { wrap json\n fields { user_agent delete } } }\n respond \"ok\" 200\n}",
+            ":80 {\n log {\n format filter {\n wrap json\n fields {\n user_agent delete\n }\n }\n }\n respond \"ok\" 200\n}",
         );
         assert!(matches!(json.format, CoreLogFormat::Json));
     }
@@ -551,7 +551,7 @@ mod log_format_tests {
     #[test]
     fn filter_block_without_wrap_defaults_to_json() {
         let cfg = log_of(
-            ":80 {\n log { format filter { fields { referer delete } } }\n respond \"ok\" 200\n}",
+            ":80 {\n log {\n format filter {\n fields {\n referer delete\n }\n }\n }\n respond \"ok\" 200\n}",
         );
         assert!(matches!(cfg.format, CoreLogFormat::Json));
     }
@@ -561,7 +561,7 @@ mod log_format_tests {
     #[test]
     fn field_exclusions_survive_compilation() {
         let cfg = log_of(
-            ":80 {\n log { format filter { wrap json\n fields { user_agent delete\n referer delete } } }\n respond \"ok\" 200\n}",
+            ":80 {\n log {\n format filter {\n wrap json\n fields {\n user_agent delete\n referer delete\n }\n }\n }\n respond \"ok\" 200\n}",
         );
         assert!(
             cfg.exclude_fields.contains(&"user_agent".to_string()),
@@ -578,14 +578,16 @@ mod log_format_tests {
     #[test]
     fn output_targets_compile() {
         assert!(matches!(
-            log_of(":80 {\n log { output stdout }\n respond \"ok\" 200\n}").output,
+            log_of(":80 {\n log {\n output stdout\n }\n respond \"ok\" 200\n}").output,
             CoreLogOutput::Stdout
         ));
         assert!(matches!(
-            log_of(":80 {\n log { output stderr }\n respond \"ok\" 200\n}").output,
+            log_of(":80 {\n log {\n output stderr\n }\n respond \"ok\" 200\n}").output,
             CoreLogOutput::Stderr
         ));
-        match log_of(":80 {\n log { output file /var/log/x.log }\n respond \"ok\" 200\n}").output {
+        match log_of(":80 {\n log {\n output file /var/log/x.log\n }\n respond \"ok\" 200\n}")
+            .output
+        {
             CoreLogOutput::File(p) => assert_eq!(p, "/var/log/x.log"),
             other => panic!("expected file output, got {other:?}"),
         }

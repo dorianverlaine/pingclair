@@ -28,6 +28,24 @@ lets the rest converge.
 
 ### ⚠️ Breaking
 
+- 🧱 **A block must now open at the end of its line.** `route { respond "hi" 200`
+  and `to 10.0.0.1:8080 { weight 3 }` used to compile; they are refused now, as
+  the format refuses them — measured against v2.11.4, which answers
+  `Unexpected next token after '{' on same line`.
+
+  The relaxation was deliberate and temporary: it was introduced when the parser
+  front end was replaced, because enforcing the rule in the same change would
+  have meant a swap that also changed what compiles, hiding which of the two broke
+  something. Tightening it was left as its own change, and this is it.
+
+  ⚠️ **All three READMEs documented a configuration this rejects**, and so did
+  thirty-odd test fixtures. The README block used `to 10.0.0.1:8080 { weight 3 }`,
+  which upstream would not have accepted either — so the documentation was
+  describing a Pingclairfile that was not a valid Caddyfile, in a project whose
+  claim is that they are the same thing. Rewritten to the multi-line form in
+  English, French and Chinese.
+
+
 - 🔢 **Twelve `transport http` tuning knobs are now refused instead of accepted
   and ignored.** `read_buffer`, `write_buffer`, `max_response_header`,
   `dial_fallback_delay`, `expect_continue_timeout`, `resolvers`, `compression`,

@@ -1084,7 +1084,9 @@ mod pki_tests {
             r#"
             {
                 pki {
-                    ca custom-ca { name "Custom CA" }
+                    ca custom-ca {
+        name "Custom CA"
+    }
                 }
             }
 
@@ -1144,16 +1146,35 @@ mod pki_tests {
 
         let written = server_of(
             r#"
-            { pki { ca c { name "C" } } }
-            acme.example.com { acme_server { ca c
-                challenges
-            } }
+            {
+                pki {
+                    ca c {
+                        name "C"
+                    }
+                }
+            }
+            acme.example.com {
+                acme_server {
+                    ca c
+                    challenges
+                }
+            }
             "#,
         );
         let omitted = server_of(
             r#"
-            { pki { ca c { name "C" } } }
-            acme.example.com { acme_server { ca c } }
+            {
+                pki {
+                    ca c {
+                        name "C"
+                    }
+                }
+            }
+            acme.example.com {
+                acme_server {
+                    ca c
+                }
+            }
             "#,
         );
         assert_eq!(written.challenges, Some(Vec::new()));

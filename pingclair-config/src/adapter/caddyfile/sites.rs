@@ -1034,7 +1034,7 @@ mod directive_order_tests {
     #[test]
     fn exact_handle_precedes_glob_handle() {
         let config = compile(
-            "example.com {\n    handle /foo* { respond \"glob\" }\n    handle /foo { respond \"exact\" }\n}",
+            "example.com {\n    handle /foo* {\n respond \"glob\"\n }\n    handle /foo {\n respond \"exact\"\n }\n}",
         )
         .expect("compile");
         assert_eq!(config.servers[0].routes[0].path, "/foo");
@@ -1044,7 +1044,7 @@ mod directive_order_tests {
     #[test]
     fn middleware_route_precedes_terminal_route_with_same_matcher() {
         let config = compile(
-            "example.com {\n    @api path /api/*\n    handle /api/* { respond \"api\" }\n    header @api X-A b\n}",
+            "example.com {\n    @api path /api/*\n    handle /api/* {\n respond \"api\"\n }\n    header @api X-A b\n}",
         )
         .expect("compile");
         let routes = &config.servers[0].routes;

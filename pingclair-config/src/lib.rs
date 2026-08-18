@@ -659,7 +659,8 @@ mod tests {
     #[test]
     fn a_route_without_a_tls_block_carries_the_verifying_default() {
         // Setup scenarios
-        let config = compile(":8080 { reverse_proxy https://backend:8443 }").expect("compiles");
+        let config =
+            compile(":8080 {\n    reverse_proxy https://backend:8443\n}").expect("compiles");
 
         // Verification
         let HandlerConfig::ReverseProxy(proxy) = &config.servers[0].routes[0].handler else {
@@ -684,8 +685,8 @@ mod tests {
             ":8080 { reverse_proxy https://b:8443 { transport http { tls_server_name } } }",
             ":8080 { reverse_proxy https://b:8443 { transport http { tls_server_name a b } } }",
             ":8080 { reverse_proxy https://b:8443 { transport http { tls_insecure_skip_verify yes } } }",
-            ":8080 { reverse_proxy https://b:8443 { transport http { tls_trusted_ca_certs /ca.pem\n tls_insecure_skip_verify } } }",
-            ":8080 { reverse_proxy https://b:8443 { transport http { tls_server_name x\n tls_insecure_skip_verify } } }",
+            ":8080 {\n reverse_proxy https://b:8443 {\n transport http {\n tls_trusted_ca_certs /ca.pem\n tls_insecure_skip_verify\n }\n }\n }",
+            ":8080 {\n reverse_proxy https://b:8443 {\n transport http {\n tls_server_name x\n tls_insecure_skip_verify\n }\n }\n }",
             ":8080 { reverse_proxy https://b:8443 { transport http { tls_insecure_skip_verifyy } } }",
         ] {
             assert!(compile(source).is_err(), "{source} must fail");
@@ -931,8 +932,8 @@ mod tests {
     #[test]
     fn test_compile_tls_internal_rejects_malformed_wildcards() {
         for source in [
-            "*. { tls internal\n respond \"OK\" }",
-            "foo.*.bar { tls internal\n respond \"OK\" }",
+            "*. {\n tls internal\n respond \"OK\"\n }",
+            "foo.*.bar {\n tls internal\n respond \"OK\"\n }",
         ] {
             assert!(
                 compile(source).is_err(),
@@ -1086,7 +1087,9 @@ mod tests {
     fn mixed_schemes_preserve_auto_https_off_and_manual_certificates() {
         let automatic_off = compile(
             r#"
-                { auto_https off }
+                {
+                    auto_https off
+                }
                 http://plain.example, https://secure.example {
                     respond "shared"
                 }
@@ -1463,7 +1466,9 @@ mod tests {
         let source = r#"
             :8080 {
                 @admin_only path /admin/*
-                handle @admin_onlyy { respond "SECRET" 200 }
+                handle @admin_onlyy {
+        respond "SECRET" 200
+    }
                 respond "public"
             }"#;
 
@@ -1502,7 +1507,7 @@ mod tests {
         }
 
         // A realistic amount of nesting still works.
-        compile(":8080 {\n  @x not path /admin/*\n  handle @x { respond \"ok\" }\n}")
+        compile(":8080 {\n  @x not path /admin/*\n  handle @x {\n respond \"ok\"\n }\n}")
             .expect("one level of negation is ordinary and must still compile");
     }
 
@@ -2027,8 +2032,12 @@ mod tests {
                     rewrite "^/api/(.*)$" "/v1/$1"
                     reverse_proxy {
                         lb_policy least_conn
-                        to 127.0.0.1:3000 { weight 3 }
-                        to 127.0.0.1:3001 { backup }
+                        to 127.0.0.1:3000 {
+                            weight 3
+                        }
+                        to 127.0.0.1:3001 {
+                            backup
+                        }
                     }
                 }
             }

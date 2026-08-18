@@ -33,7 +33,9 @@ mod global_tests {
 
     #[test]
     fn test_multi_listener_adaptation() {
-        let source = ":8080 :8081 { respond \"Hello\" }";
+        // 🧾 A block opens at the end of its line; the one-line form is refused
+        // by the format too. The subject here is multi-listener addresses.
+        let source = ":8080 :8081 {\n    respond \"Hello\"\n}";
         let directives = parse(source).unwrap();
         let ast = adapt(directives).unwrap();
 
@@ -46,8 +48,13 @@ mod global_tests {
 
     #[test]
     fn mixed_site_schemes_split_before_host_matchers_are_built() {
+        // 🧾 Written across lines because a block opens at the end of its line;
+        // the one-line form this used to use is refused by the format too
+        // (`Unexpected '}' because no matching opening brace`, v2.11.4). The
+        // subject here is scheme splitting, not brace placement.
         let directives =
-            parse("http://plain.example, https://secure.example { respond \"shared\" }").unwrap();
+            parse("http://plain.example, https://secure.example {\n    respond \"shared\"\n}")
+                .unwrap();
         let ast = adapt(directives).unwrap();
 
         assert_eq!(ast.servers.len(), 2);
@@ -336,7 +343,9 @@ mod global_tests {
             r#"
             :80 {
                 reverse_proxy https://backend:8443 {
-                    transport http { tls_client_auth /only.crt }
+                    transport http {
+        tls_client_auth /only.crt
+    }
                 }
             }
         "#,
@@ -402,7 +411,9 @@ mod global_tests {
             r#"
             :80 {
                 reverse_proxy backend:8443 {
-                    transport http { tls off }
+                    transport http {
+        tls off
+    }
                 }
             }
         "#,
@@ -455,8 +466,8 @@ mod global_tests {
         // An IP literal *is* a bind address — only hostnames get the
         // bind-wildcard treatment.
         for (source, expected) in [
-            ("127.0.0.1:8080 { respond \"OK\" }", "127.0.0.1"),
-            ("192.168.1.10 { respond \"OK\" }", "192.168.1.10"),
+            ("127.0.0.1:8080 {\n    respond \"OK\"\n}", "127.0.0.1"),
+            ("192.168.1.10 {\n    respond \"OK\"\n}", "192.168.1.10"),
         ] {
             let directives = parse(source).unwrap();
             let ast = adapt(directives).unwrap();
@@ -725,9 +736,9 @@ mod global_tests {
     #[test]
     fn test_tls_internal_rejects_public_or_manual_issuers() {
         for source in [
-            "example.com { tls { internal auto } }",
-            "example.com { tls { internal acme_email admin@example.com } }",
-            "example.com { tls { internal cert cert.pem key key.pem } }",
+            "example.com {\n tls {\n internal auto\n }\n}",
+            "example.com {\n tls {\n internal acme_email admin@example.com\n }\n}",
+            "example.com {\n tls {\n internal cert cert.pem key key.pem\n }\n}",
         ] {
             let directives = parse(source).unwrap();
             assert!(matches!(
@@ -2025,7 +2036,7 @@ mod fail_closed_tests {
     #[test]
     fn method_matcher_rejects_unknown_verbs() {
         let error =
-            compile_err("example.com {\n    @x method FOO\n    handle @x { respond \"x\" }\n}");
+            compile_err("example.com {\n    @x method FOO\n    handle @x {\n respond \"x\"\n }\n}");
         assert!(
             error.contains("FOO"),
             "unknown method must be named; got {error}"
@@ -2037,7 +2048,9 @@ mod fail_closed_tests {
         let config = crate::compile(
             r#"example.com {
                 @x method GET POST PUT DELETE PATCH HEAD OPTIONS
-                handle @x { respond "x" }
+                handle @x {
+        respond "x"
+    }
             }"#,
         )
         .expect("all standard verbs must compile");
@@ -2047,7 +2060,7 @@ mod fail_closed_tests {
     #[test]
     fn header_matcher_rejects_extra_arguments() {
         let error = compile_err(
-            "example.com {\n    @x header Foo bar baz\n    handle @x { respond \"x\" }\n}",
+            "example.com {\n    @x header Foo bar baz\n    handle @x {\n respond \"x\"\n }\n}",
         );
         assert!(
             error.contains("header"),
@@ -3110,7 +3123,7 @@ mod p3_syntax_tests {
     #[test]
     fn header_matcher_understands_negation_and_single_stars() {
         let config = compile(
-            "example.com {\n    @a header !Foo\n    @b header Foo *.example\n    @c header Foo example*\n    @d header Foo *bar*\n    handle @a { respond \"a\" }\n    handle @b { respond \"b\" }\n    handle @c { respond \"c\" }\n    handle @d { respond \"d\" }\n}",
+            "example.com {\n    @a header !Foo\n    @b header Foo *.example\n    @c header Foo example*\n    @d header Foo *bar*\n    handle @a {\n respond \"a\"\n }\n    handle @b {\n respond \"b\"\n }\n    handle @c {\n respond \"c\"\n }\n    handle @d {\n respond \"d\"\n }\n}",
         )
         .expect("header matcher forms compile");
         let routes = &config.servers[0].routes;
@@ -3120,7 +3133,7 @@ mod p3_syntax_tests {
     #[test]
     fn same_field_header_matchers_are_ored() {
         let config = compile(
-            "example.com {\n    @foo {\n        header Foo bar\n        header Foo baz\n    }\n    handle @foo { respond \"hit\" }\n}",
+            "example.com {\n    @foo {\n        header Foo bar\n        header Foo baz\n    }\n    handle @foo {\n respond \"hit\"\n }\n}",
         )
         .expect("same-field header matchers compile");
         let matcher = config.servers[0].routes[0]
@@ -3137,7 +3150,7 @@ mod p3_syntax_tests {
     #[test]
     fn multi_path_matcher_creates_one_route_per_pattern() {
         let routes = routes(
-            "example.com {\n    @assets path /js/* /css/* /images/*\n    handle @assets { respond \"asset\" }\n}",
+            "example.com {\n    @assets path /js/* /css/* /images/*\n    handle @assets {\n respond \"asset\"\n }\n}",
         );
         let paths: Vec<&str> = routes.iter().map(|r| r.path.as_str()).collect();
         assert!(paths.contains(&"/js/*"), "got {paths:?}");
@@ -3148,7 +3161,7 @@ mod p3_syntax_tests {
     #[test]
     fn extended_matcher_vocabulary_compiles() {
         let config = compile(
-            "example.com {\n    @h host sub.example.com\n    @q query q=1\n    @p protocol https\n    @r remote_ip 10.0.0.0/8\n    @c client_ip 192.168.0.0/16\n    handle @h { respond \"h\" }\n    handle @q { respond \"q\" }\n    handle @p { respond \"p\" }\n    handle @r { respond \"r\" }\n    handle @c { respond \"c\" }\n}",
+            "example.com {\n    @h host sub.example.com\n    @q query q=1\n    @p protocol https\n    @r remote_ip 10.0.0.0/8\n    @c client_ip 192.168.0.0/16\n    handle @h {\n respond \"h\"\n }\n    handle @q {\n respond \"q\"\n }\n    handle @p {\n respond \"p\"\n }\n    handle @r {\n respond \"r\"\n }\n    handle @c {\n respond \"c\"\n }\n}",
         )
         .expect("host/query/protocol/remote_ip/client_ip compile");
         assert_eq!(config.servers[0].routes.len(), 5);
@@ -3158,7 +3171,7 @@ mod p3_syntax_tests {
     fn not_inline_multi_value_is_negated_or() {
         // `not path /css/* /js/*` must mean NOT(/css/* OR /js/*).
         let config = compile(
-            "example.com {\n    @na {\n        not path /css/* /js/*\n    }\n    handle @na { respond \"ok\" }\n}",
+            "example.com {\n    @na {\n        not path /css/* /js/*\n    }\n    handle @na {\n respond \"ok\"\n }\n}",
         )
         .expect("not path compiles");
         let matcher = format!(

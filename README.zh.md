@@ -492,10 +492,14 @@ server "shop.example.com" {
 :80 :8080 {
     reverse_proxy {
         lb_policy least_conn
-        to 10.0.0.1:8080 { weight 3 }
+        to 10.0.0.1:8080 {
+            weight 3
+        }
         to 10.0.0.2:8080
         # 🛟 僅在所有主要後端皆不可用時使用。
-        to 10.0.0.3:8080 { backup }
+        to 10.0.0.3:8080 {
+            backup
+        }
         health_check {
             path /health
             interval 5s

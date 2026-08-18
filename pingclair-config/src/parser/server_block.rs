@@ -200,6 +200,19 @@ impl<'a> Parser<'a> {
                 if matches!(self.peek().map(|t| &t.value), Some(Token::BlockClose)) {
                     return Err(BlockParseError::EmptyBraces { location: open });
                 }
+                // 🚫 A block opens at the end of its line and nowhere else.
+                //
+                // 🤡 This was accepted while the front end was being replaced,
+                // because two README examples here were written that way and
+                // changing the parser and what compiles in one step would have
+                // hidden which of the two broke something. Both have since been
+                // rewritten. Measured against the real binary, v2.11.4 answers
+                // `Unexpected next token after '{' on same line`, and the shape
+                // is ambiguous to a reader too — it looks like the block holds
+                // exactly one directive and nothing says where it ends.
+                if !matches!(self.peek().map(|t| &t.value), None | Some(Token::Newline)) {
+                    return Err(BlockParseError::TokenAfterOpenBrace { location: open });
+                }
                 let segments = self.parse_segments(open)?;
                 Ok(ServerBlock {
                     keys,
@@ -312,6 +325,15 @@ impl<'a> Parser<'a> {
                     // holding no arguments.
                     if matches!(self.peek().map(|t| &t.value), Some(Token::BlockClose)) {
                         return Err(BlockParseError::EmptyBraces { location: open });
+                    }
+                    // 🚫 …and a directive's block opens at the end of its line
+                    // too, exactly as a site block does. Tightened here as well
+                    // as in `parse_block` because a site block and a directive
+                    // block are parsed by different code, and enforcing the rule
+                    // in one of them is how `route { respond "hi" 200` kept
+                    // compiling after `a.example { respond "x"` stopped.
+                    if !matches!(self.peek().map(|t| &t.value), None | Some(Token::Newline)) {
+                        return Err(BlockParseError::TokenAfterOpenBrace { location: open });
                     }
                 }
                 Token::BlockClose => {
@@ -457,19 +479,32 @@ mod tests {
 
     // MARK: - Refusals
 
-    /// 🧭 A block opening with something after it on the same line is accepted
-    /// here, and the format does not accept it.
+    /// 🚫 A block must open at the end of its line.
     ///
-    /// The divergence is deliberate and temporary. This parser replaced one
-    /// that allowed the shape, and enforcing the rule in the same change would
-    /// have meant a front-end swap that also changed what compiles — including
-    /// two README examples in this repository. Tightening it is its own change,
-    /// with its own documentation updates.
+    /// 🤡 This was accepted for a while, and the test that used to sit here said
+    /// so — the divergence was introduced deliberately when this parser replaced
+    /// the previous one, because two README examples in this repository were
+    /// written that way and changing the front end and what compiles in one step
+    /// would have hidden which of the two broke something. Both READMEs have
+    /// since been rewritten, so the reason is gone and the rule can be enforced.
+    ///
+    /// Measured against the real binary, v2.11.4: `route { respond "hi" 200`
+    /// gives `Unexpected next token after '{' on same line`. Ours compiled it.
+    /// The shape is genuinely ambiguous to a reader — it looks like the block
+    /// holds one directive, and nothing says where it ends — which is why the
+    /// format refuses it rather than picking a reading.
     #[test]
-    fn a_token_after_the_opening_brace_is_accepted_for_now() {
-        let parsed = blocks("a.example { respond \"x\"\n}\n");
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(texts(&parsed[0].segments[0]), vec!["respond", "\"x\""]);
+    fn a_token_after_the_opening_brace_is_refused() {
+        let error = parse_server_blocks("a.example { respond \"x\"\n}\n")
+            .expect_err("a token after `{` must be refused");
+        assert!(
+            matches!(error, BlockParseError::TokenAfterOpenBrace { .. }),
+            "got {error:?}"
+        );
+
+        // 👍 The ordinary shape is untouched, and so is a nested block.
+        assert!(parse_server_blocks("a.example {\n\trespond \"x\"\n}\n").is_ok());
+        assert!(parse_server_blocks("a.example {\n\tfile_server {\n\t\tbrowse\n\t}\n}\n").is_ok());
     }
 
     #[test]
