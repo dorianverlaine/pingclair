@@ -31,6 +31,82 @@ is a real contribution and needs no agreement.
 
 ---
 
+## 🗂️ How work is tracked
+
+**Issues are the queue. Pull requests close them. Nothing else is a to-do
+list.**
+
+This replaced a maintainer-local plan file in August 2026, for reasons worth
+stating because they decide how the templates are shaped. That file went stale
+between sittings; the same problem accumulated three descriptions in three
+documents; and by the time anyone came back to an item, the thinking behind it
+had to be reconstructed from scratch. An issue fixes all three by construction
+— it has one canonical location, its state changes when a pull request merges
+rather than when somebody remembers, and the comment thread *is* the record of
+what you were thinking.
+
+### Opening one
+
+Three templates, and none of them is mandatory — blank issues stay enabled.
+
+| Template | For |
+|---|---|
+| 🔍 **Working note** | Something you noticed and do not want to lose. **Certainty is optional** — "this looks wrong, I have not checked" is a legitimate issue. |
+| 🐛 **Bug report** | Pingclair did something other than what it said it would. Wants a reproduction and the smallest Pingclairfile that shows it. |
+| 🧩 **Compatibility gap** | A Caddyfile that works with Caddy and does not work here. That is a defect on our side; you do not have to argue for it. |
+
+The working note deserves a word, because most projects have nothing like it.
+A suspicion you never wrote down is worth nothing, and forcing it through a
+form that demands reproduction steps guarantees it never gets written. So that
+template asks for the observation, **how sure you are**, and what would settle
+it — and nothing else. Under-claim when you are unsure; over-confident prose
+over shaky evidence is the failure mode this project guards against hardest.
+
+### Labels
+
+Labels carry the classification so the body does not have to. A severity
+written into prose goes stale the moment it changes and nobody notices; a label
+is visible in the list view and filterable.
+
+| Label | Meaning |
+|---|---|
+| `p0` | Data loss, a remotely triggerable crash, or a security defect. Interrupts whatever is in progress. |
+| `p1` | Wrong behaviour a user can reach. |
+| `p2` | Everything else: cleanups, missing coverage, papercuts, drifted documentation. |
+| `needs-triage` | Not yet classified. Both issue templates set it. |
+| `bug` / `compatibility` / `enhancement` / `documentation` | What kind of thing it is. |
+| `h1-h2` / `h3` | Which transport, when only one is affected. |
+| `blocked-upstream` | Waiting on a dependency. The body names the upstream issue and what unblocks it. |
+| `wontfix` | Investigated, understood, deliberately not changing. **The body says why.** |
+
+Severity is about the user's exposure, not about how annoying the problem is
+to whoever found it.
+
+`wontfix` is not a bin. A closed issue that records "we checked, this differs
+from Caddy, here is why we are keeping our behaviour" is one of the more
+valuable things in the tracker — it stops the same question being reopened in
+six months, and it stops somebody "fixing" a deliberate difference back.
+
+### Working on one
+
+Say so in the issue before you start, so two people do not write the same
+patch. For anything substantial, describe the approach there first — five
+minutes of that can save a weekend, especially around TLS, HTTP/3 or the
+configuration grammar, where the constraints are not obvious from the code.
+
+Put `Closes #123` in the pull request body. That is what makes the queue
+self-maintaining: the issue closes on merge, and nobody has to remember.
+
+### What issues are not for
+
+- **Security weaknesses.** Report privately, see below.
+- **Verification status.** Whether a claim has evidence behind it is a
+  cross-cutting map, not a work item, and it stays in its own ledger.
+- **Rules.** A constraint that will still be true after every open issue is
+  closed belongs in `docs/guardrails/`, not in the tracker.
+
+---
+
 ## 🚦 The gate
 
 Every commit on `main` passes the full CI gate. The canonical local command
@@ -126,7 +202,8 @@ misleading.
 
 | File | Owns |
 |---|---|
-| `docs/TODO.md` | The v0.2.0 execution plan, day by day. 🔒 Maintainer-local, not in this repository — it lists unfixed weaknesses, and publishing that queue would just hand out a target list. Ask if you need the current plan. |
+| GitHub issues | Everything outstanding: the plan, known defects, compatibility gaps. One item, one issue, one place. |
+| Milestones | Which release an issue is meant for. A milestone with no due date is a bucket, not a promise. |
 | `docs/guardrails/{testing,config,tls,proxy}.md` | Environment constraints and implementation rules, one file per subsystem. `docs/GUARDRAILS.md` indexes them. |
 | `benchmarks/README.md` | Performance claims, methodology, bugs found under load. Raw per-run evidence stays local under `benchmarks/results/`, never committed. |
 | `README.md` / `.zh.md` / `.fr.md` | **Shipped** user-facing behavior only — update all three together. |
