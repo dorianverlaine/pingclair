@@ -1,239 +1,314 @@
-# ⚠️ Pingclair 實作守則 — 設定與相容性
+# ⚠️ Pingclair implementation guardrails — configuration and compatibility
 
-## 🔐 控制面發佈
+## 🔐 Control-plane publication
 
-- **Admin 與 signal 的設定所有權，必須在同一把 publication lock 裡決定。**
-  不可等 `/load` handler 收到 publisher 的成功結果後，才在外面標記
-  `api_changed`：SIGUSR1 可能已通過外層檢查並排在鎖後面，接著用磁碟上的舊
-  API key／route 覆蓋剛成功的 Admin transaction。Admin 發佈必須在釋放鎖前
-  提交來源標記；signal 取得同一把鎖後還要重查，不能只靠 signal loop 的快路徑。
+- **Admin and signal must decide configuration ownership inside the same
+  publication lock.** Do not wait for the `/load` handler to receive the
+  publisher's success and then mark `api_changed` outside the lock: SIGUSR1 may
+  already have passed the outer check and be queued behind the lock, and it will
+  then overwrite the Admin transaction that just succeeded with the stale API key
+  and routes still sitting on disk. Admin publication must commit its ownership
+  marker before it releases the lock, and the signal path must re-check after it
+  acquires that same lock rather than trusting the signal loop's fast path.
 
-  > 🎯 **可操作的規則**：凡是決定「下一個 writer 還能不能寫」的狀態，都和
-  > 被保護的 snapshot 一起提交，不要在 caller 收到 success 之後補記。
+  > 🎯 **The operable rule**: any state that decides *whether the next writer is
+  > still allowed to write* gets committed together with the snapshot it
+  > protects. Never record it after the caller has been told "success".
 
-## 🚪 驗證放哪一層（2026-08-18）
+## 🚪 Which layer validation belongs in (2026-08-18)
 
-> 🧭 這一節本來只寫在 `docs/guardrails/tls.md` 裡。要碰 compiler 的人會先讀
-> `config.md`，而讀不到那條「寫在 adapter 裡的規則，就是 Admin API 繞得過的規則」
-> ——偏偏那是**最容易被重新弄壞的一條**。所以它在這裡。
+> 🧭 This section originally lived only in `docs/guardrails/tls.md`. Anyone about
+> to touch the compiler reads `config.md` first, and so never reached the rule
+> that a rule written in the adapter is a rule the Admin API walks straight past
+> — which happens to be **the single easiest one to break again**. So it lives
+> here now.
 
-- **寫在 adapter 裡的規則，就是 Admin API 繞得過的規則。** Pingclairfile 走
-  `parser/` → `adapter/caddyfile.rs` → `compiler.rs`；JSON 設定（含 Admin API
-  `POST /load` 貼進來的文件）**整段跳過 adapter**，直接進 `compiler.rs`。所以只在
-  adapter 裡拒絕的東西，換成 JSON 就進得來。
+- **A rule written in the adapter is a rule the Admin API walks straight past.**
+  A Pingclairfile goes `parser/` → `adapter/caddyfile.rs` → `compiler.rs`. JSON
+  configuration — including a document pasted in through the Admin API's
+  `POST /load` — **skips the adapter entirely** and lands directly in
+  `compiler.rs`. So anything rejected only in the adapter gets in the moment
+  somebody writes it as JSON.
 
-  > 🎯 **可操作的規則**：一條規則若是**安全性質**，放 `validate_config`；
-  > 只有**語法／拼寫**層面的東西才留在 adapter。判準很簡單：
-  > **「有人用 JSON 繞過這條，會不會變成安全問題？」** 會，就不能只放 adapter。
+  > 🎯 **The operable rule**: if a rule is **about security**, it belongs in
+  > `validate_config`; only **syntax and spelling** stay in the adapter. The test
+  > is one question: **"if somebody routes around this with JSON, is that a
+  > security problem?"** If yes, the adapter alone is not enough.
 
-  🤡 這條不是理論。SEC-002 就是它：JSON 裡把 mTLS 的欄位名拼錯，serde 靜默忽略，
-  於是「已驗證的 mTLS」降級成「只要求憑證」——因為那條檢查只長在 adapter 上。
-  修法是 `deny_unknown_fields` 加在型別上，也就是**兩條路徑共用的那一層**。
+  🤡 This is not theoretical. SEC-002 was exactly this: misspell an mTLS field
+  name in JSON, serde ignores it in silence, and "verified mTLS" quietly degrades
+  to "a certificate is requested" — because the check only existed in the
+  adapter. The fix was `deny_unknown_fields` on the type itself, which is
+  **the layer both paths share**.
 
-- **不能被兌現的設定，fail closed，而且要在 `validate_config` fail。** 收下一個
-  執行期不看的旋鈕，不是相容，是說謊——差別只在操作者多久之後才發現。
+- **Configuration that cannot be honoured fails closed, and it fails in
+  `validate_config`.** Accepting a knob that nothing reads at runtime is not
+  compatibility, it is a lie — the only variable is how long it takes the
+  operator to find out.
 
-  > 🎯 **可操作的規則**：接受一個設定，就要在執行期用它；用不了就在載入時拒絕，
-  > 訊息裡寫出**這個 build 為什麼做不到**。啟動時印一行 warning **不算**——
-  > 那行字在開機日誌裡，而設定仍然被寫下來、仍然看起來生效了。
+  > 🎯 **The operable rule**: if you accept a setting, use it at runtime. If you
+  > cannot, reject it at load time with a message that says **why this build
+  > cannot do it**. A warning line at startup **does not count** — that line is
+  > buried in the boot log while the setting is still written down and still
+  > looks like it took effect.
 
-  📌 2026-08-18 有三筆走的是這條：`preferred_chains`（ACME client 無法要求替代
-  chain）、十二個 `transport http` 旋鈕（Go `http.Transport` 的概念，這個 build 的
-  上游堆疊沒有同層等價物）、以及不合法的 `admin.listen`（原本在啟動執行緒上 panic）。
-  三筆都是 breaking，而那正是重點：另一個選項是伺服器回報成功、做別的事。
+  📌 Three cases went this way on 2026-08-18: `preferred_chains` (the ACME client
+  cannot ask for an alternate chain), twelve `transport http` knobs (concepts
+  from Go's `http.Transport` with no same-layer equivalent in this build's
+  upstream stack), and an invalid `admin.listen` (which used to panic on the
+  startup thread). All three are breaking changes, and that is the point: the
+  other option is a server that reports success and does something else.
 
-  ⚠️ **近似語意比缺口更糟。** `read_buffer` 是 Go bufio 的大小，而
-  `PeerOptions::tcp_recv_buf` 是 socket 選項——名字像、層不同。把兩者接起來會在
-  「相容」的名義下改掉行為，比直接說「做不到」糟得多。
+  ⚠️ **An approximation is worse than a gap.** `read_buffer` is the size of a Go
+  `bufio`; `PeerOptions::tcp_recv_buf` is a socket option. The names rhyme, the
+  layers do not. Wiring one to the other changes behaviour under the banner of
+  "compatibility", which is considerably worse than saying "we cannot do this".
 
-- **一份設定的兩種寫法，必須在同一個地方收斂。** 同一件事有兩種拼法時，讓其中一種
-  是另一種的入口，不要讓兩條路各自解讀。
+- **Two spellings of one setting must converge in one place.** When the same
+  thing can be written two ways, make one spelling an entry point into the other.
+  Never let two paths interpret it independently.
 
-  > 🎯 **可操作的規則**：新增第二種寫法之前，先問「它們在哪一行合流」。答不出來，
-  > 就是還沒設計完。
+  > 🎯 **The operable rule**: before you add the second spelling, ask "at which
+  > line do these two merge?" If you cannot answer, the design is not finished.
 
-  📌 例：`versions 2` 與 `h2c://` 都在講 prior-knowledge h2。實作時只讓 scheme
-  決定 pool group，`versions` 走同一個 `set_http_version`——所以兩者不可能對
-  「這條連線能不能重用」給出不同答案。
+  📌 Example: `versions 2` and `h2c://` both mean prior-knowledge h2. The
+  implementation lets only the scheme decide the pool group, and `versions` goes
+  through the same `set_http_version` — so it is not possible for the two to
+  disagree about whether a connection may be reused.
 
-## 📏 量測與查證
+## 📏 Measurement and verification
 
-> 🧭 這一節整段來自 2026-08-05 的 M4.5。那一天有九次「以為量到產品的缺陷，
-> 其實量到自己的工具」，以及三次「修好量測之後，底下露出真的缺陷」。
-> 這些規則的共同點是：**先懷疑量的方法，再懷疑被量的東西。**
+> 🧭 This whole section comes out of M4.5 on 2026-08-05. That day produced nine
+> instances of "I thought I had measured a defect in the product, and I had
+> measured my own tooling", plus three instances of "once the measurement was
+> fixed, a real defect surfaced underneath". What the rules share is this:
+> **doubt the method before you doubt the thing being measured.**
 
-- **量測工具的錯誤會偽裝成產品的錯誤，而且看起來更嚴重。** 2026-08-05 一天內
-  九次：語料 harness 把「預期被拒絕」算成失敗（得到假的 12% 覆蓋率）、
-  harness 從錯的工作目錄解相對 `import`（讓語料的 `testdata/` 永遠找不到）、
-  拿去對照的 bcrypt hash 不合法（於是「對照組也拒絕」被讀成我們一致）、
-  巢狀 `printf` 把引號吃掉，生出對照組不收的語法。
+- **A broken measuring tool disguises itself as a broken product, and it looks
+  worse than the real thing.** Nine times in one day on 2026-08-05: the corpus
+  harness counted "expected to be rejected" as a failure (producing a fake 12%
+  coverage number); the harness resolved relative `import` from the wrong working
+  directory (so the corpus's `testdata/` was never found); the bcrypt hash used
+  for comparison was invalid (so "the reference implementation rejects it too"
+  got read as agreement); and nested `printf` ate the quotes, generating syntax
+  the reference implementation would not accept.
 
-  > 🎯 **可操作的規則**：紅了先問「是不是測試錯」。對照測試會產生**假的勝利**，
-  > 跟假的失敗一樣要查。
+  > 🎯 **The operable rule**: when it goes red, ask "is the test wrong?" first.
+  > A differential test produces **false victories** as readily as false
+  > failures, and both need investigating.
 
-- **修好量測，會讓被遮蔽的缺陷露出來——那不是退步。** 同一天三次：
-  分類修好之後，四份語料從綠變紅，查出**三個從來不存在的位址檢查**
-  （port > 65535、未知 scheme、`ws://`）；harness 的路徑修好之後，一份假通過
-  底下是 `import name { … }` **區塊被整個丟掉**的 fail-open。
+- **Fixing the measurement surfaces the defects it was hiding — that is not a
+  regression.** Three times the same day: once classification was fixed, four
+  corpus files went from green to red and exposed **three address checks that had
+  never existed** (port > 65535, unknown scheme, `ws://`); once the harness's path
+  handling was fixed, one false pass turned out to be sitting on a fail-open
+  where an `import name { … }` **block was being dropped whole**.
 
-  > 🎯 **可操作的規則**：修量測之後出現的紅燈，**預設當成發現而不是回歸**，
-  > 逐一查證來源再決定。
+  > 🎯 **The operable rule**: a red light that appears after you fix the
+  > measurement is **a discovery until proven otherwise**, not a regression.
+  > Trace each one to its source before deciding.
 
-- **「編得過」分不出「正確編譯」與「安靜誤讀」。** 2026-08-05 拒絕四份原本被
-  安靜誤編的設定，語料分數**掉了 3**，行為卻是變好的。
+- **"It compiled" cannot tell correct compilation apart from a quiet
+  misreading.** On 2026-08-05 four configurations that had been silently
+  miscompiled were rejected. The corpus score **dropped by 3** while the
+  behaviour got better.
 
-  > 🎯 **可操作的規則**：純重構與相容性工作要拿**實際輸出**逐位元比對
-  > （`pingclair-config/tests/fixtures/` 的 golden），不能只看「四閘門全綠」。
-  > 這個倉庫演過兩次「編得過但語意錯」。
+  > 🎯 **The operable rule**: pure refactors and compatibility work get compared
+  > byte for byte against **actual output** (the goldens in
+  > `pingclair-config/tests/fixtures/`), not just "all four gates are green".
+  > This repository has staged "compiles but means the wrong thing" twice.
 
-- **型別在 ≠ 功能在 ≠ 功能可達。** `HandlerConfig::HandleErrors` 存在，但三條
-  路徑都什麼都不做（核心回 200、proxy 回 `Ok(false)`）；`HandlePath` 相反 ——
-  兩條服務路徑一直都能跑，只有 adapter 的一支 arm 缺席。
+- **The type exists ≠ the feature exists ≠ the feature is reachable.**
+  `HandlerConfig::HandleErrors` existed while all three paths did nothing (the
+  core returned 200, the proxy returned `Ok(false)`). `HandlePath` was the
+  reverse — both serving paths had always worked and only one adapter arm was
+  missing.
 
-  > 🎯 **可操作的規則**：判斷「有沒有實作」要**讀函式體**，不是數 match arm，
-  > 也不是看型別存不存在。2026-08-05 在同一份文件裡寫下這條規則之後十分鐘，
-  > 我又用數 arm 的方式下了一次結論，而且錯了。
+  > 🎯 **The operable rule**: decide "is this implemented?" by **reading the
+  > function body**, not by counting match arms and not by checking whether a
+  > type exists. Ten minutes after writing this rule into this very document on
+  > 2026-08-05, I reached another conclusion by counting arms, and it was wrong.
 
-- **「便宜實作」與「便宜的分數」是兩件事。** 同一天兩次照著錯誤訊息的**字串前綴**
-  猜成本都猜錯：「參數不合法」同時蓋住「我們的規則錯」與「這個功能沒做」；
-  `header_regexp` 接線只要一支 arm，但語料裡三份用的全是需要
-  capture placeholder 的具名形式，分數一格都沒動。
+- **"Cheap to implement" and "cheap points" are different things.** Twice in one
+  day, cost was estimated from the **string prefix of an error message** and both
+  estimates were wrong: "invalid argument" covered both "our rule is wrong" and
+  "this feature does not exist", and wiring up `header_regexp` needed only one
+  arm, but all three corpus files using it wanted the named form with capture
+  placeholders, so the score did not move at all.
 
-  > 🎯 **可操作的規則**：排優先序之前**打開實際的輸入看一眼**，
-  > 不要從錯誤訊息的分類推成本。
+  > 🎯 **The operable rule**: before you prioritise, **open the actual input and
+  > look at it**. Do not infer cost from how an error message is categorised.
 
-- **拿掉一道護欄之前先確認它在擋什麼。** 2026-08-05 刪掉舊的遞迴下降 parser 時，
-  把它的巢狀深度上限一起刪了，護欄測試**爆掉堆疊並 abort** —— release profile 下
-  那就是整個行程消失，而 admin API 是外部到得了那段程式碼的路。
+- **Before you remove a guardrail, find out what it was holding back.** When the
+  old recursive-descent parser was deleted on 2026-08-05, its nesting-depth limit
+  went with it, and the guardrail test **blew the stack and aborted** — which
+  under the release profile means the whole process disappears, and the admin API
+  is an externally reachable path into that code.
 
-  > 🎯 **可操作的規則**：刪實作時，先問它身上掛了哪些與主功能無關的限制。
-  > 「刪舊實作順手帶走護欄」比「刻意拿掉護欄」難察覺得多。
+  > 🎯 **The operable rule**: when deleting an implementation, ask which limits
+  > were attached to it that have nothing to do with its main job. "The guardrail
+  > left with the old implementation" is far harder to notice than "the guardrail
+  > was deliberately removed".
 
-- **註釋與實作不一致時，註釋不會自己叫。** 游標的取字函式回傳 `{host}` 裡面的
-  名字，而它正上方的 doc comment 寫著「placeholder 要保留大括號」。接上去之後
-  `header_up X-Host {host}` 會永遠往上游送四個字元 `host`。
+- **When a comment and the implementation disagree, the comment does not raise
+  its hand.** The cursor's text accessor returned the *name inside* `{host}`,
+  while the doc comment directly above it said placeholders keep their braces.
+  Wire that up and `header_up X-Host {host}` forever sends four characters,
+  `host`, upstream.
 
-  > 🎯 **可操作的規則**：改動有 doc comment 的函式時，把註釋當成**斷言**讀一遍。
+  > 🎯 **The operable rule**: when you change a function that carries a doc
+  > comment, read the comment as **an assertion** and check it.
 
-- **同一條規則的兩個方向要寫在一起，不然只有一邊會被實作。** lexer 對
-  `www.{host}` 是對的（word scanner 會把後面的 placeholder 吸進來），對
-  `{host}/x` 是錯的（開頭的 placeholder 直接發成 token 就停了）。同一個檔案、
-  同一條「placeholder 黏著的字屬於同一個 word」規則，兩個方向分開實作，
-  於是只有一邊活著。代價：`redir {host}/moved 302`（合法 Caddyfile）被拒，
-  而 `try_files {path} {path}/ …` **靜默**多出一個 `/` 候選，對每個請求都匹配
-  站台根目錄——看起來完全像在正常運作。
+- **Both directions of one rule go in together, or only one of them gets
+  implemented.** The lexer was right about `www.{host}` (the word scanner pulls
+  the trailing placeholder in) and wrong about `{host}/x` (a leading placeholder
+  was emitted as a token and scanning stopped). Same file, same "text glued to a
+  placeholder belongs to the same word" rule, two directions implemented
+  separately — so only one of them was alive. The cost: `redir {host}/moved 302`
+  (a legal Caddyfile) was rejected, while `try_files {path} {path}/ …`
+  **silently** grew an extra `/` candidate that matches the site root on every
+  request — which looks exactly like normal operation.
 
-  > 🎯 **可操作的規則**：實作「X 和 Y 相鄰時算同一個東西」這類規則時，
-  > 兩個方向要走**同一段程式碼或同一個常數**。2026-08-07 的修法是抽出
-  > `ENDS_A_WORD` 讓兩處共用，而不是在第二處再寫一份字元集合。
+  > 🎯 **The operable rule**: when implementing "X and Y adjacent count as one
+  > thing", both directions go through **the same code or the same constant**.
+  > The 2026-08-07 fix extracted `ENDS_A_WORD` for both call sites rather than
+  > writing a second character set at the second one.
 
-- **擋板要跟著它擋的東西一起消失。** 上面那個缺陷修好之前，compiler 加了一條
-  「拒絕 `/` 候選」的規則來把靜默錯誤變成明確錯誤。缺陷修掉之後那條規則就變成
-  「拒絕一份上游會收的合法設定」——留著它不是保守，是製造一條沒人知道為什麼
-  存在的相容性差異。
+- **A stopgap disappears together with the thing it was stopping.** Before the
+  defect above was fixed, the compiler carried a rule rejecting the `/` candidate
+  so the silent error would at least be a loud one. Once the defect was fixed
+  that rule became "reject a legal configuration the reference implementation
+  accepts" — keeping it is not caution, it is manufacturing a compatibility
+  difference nobody can explain.
 
-  > 🎯 **可操作的規則**：臨時擋板的註釋要寫出**它在等什麼**，並在移除那個原因的
-  > 同一個 commit 裡把擋板刪掉。
+  > 🎯 **The operable rule**: a stopgap's comment says **what it is waiting for**,
+  > and the stopgap is deleted in the same commit that removes that reason.
 
-- **一個設定的兩種拼法，不可以接受兩種值範圍。** `health_check { interval 10s }`
-  收整秒，新加的扁平 `health_interval 10s` 第一版直接吃毫秒 ——
-  變成一萬秒的探測間隔。
+- **Two spellings of one setting must not accept two ranges of values.**
+  `health_check { interval 10s }` takes whole seconds; the first version of the
+  new flat `health_interval 10s` read it as milliseconds — a probe interval of
+  ten thousand seconds.
 
-  > 🎯 **可操作的規則**：加別名或扁平拼法時，兩邊走**同一個解析 helper**，
-  > 不要各自呼叫底層。
+  > 🎯 **The operable rule**: when adding an alias or a flattened spelling, both
+  > sides go through **the same parsing helper**. Neither calls the primitive
+  > directly.
 
-- **一個「簡寫」指令，要展開成它所簡寫的那個東西，不要另寫一份實作。**
-  `try_files` 在上游不是 handler，是 `file` matcher 加一個 rewrite 的簡寫。
-  這個倉庫先寫了一份獨立的 `resolve_try_files`，之後又實作了 `file` matcher，
-  於是同一件事「找出第一個存在的候選」有了兩份程式碼——而它們對五種挑選策略、
-  `=404` 候選、glob、以及 `{path}` 以外的每一個 placeholder 都不同意。
-  兩份實作沒有「不同步」的問題，因為它們**從第一天就沒同步過**：
-  能力較弱的那一份把自己的缺口寫進了設定層的拒絕清單，讓缺口看起來像是設計。
+- **A "shorthand" directive expands into the thing it is shorthand for. You do
+  not write a second implementation.** Upstream, `try_files` is not a handler; it
+  is shorthand for a `file` matcher plus a rewrite. This repository first wrote a
+  standalone `resolve_try_files` and later implemented the `file` matcher, so
+  "find the first candidate that exists" had two implementations — and they
+  disagreed about all five selection policies, the `=404` candidate, globs, and
+  every placeholder except `{path}`. The two never had a drift problem because
+  **they were never in sync to begin with**: the weaker one had written its own
+  gaps into the configuration layer's rejection list, which made the gaps look
+  like design.
 
-  > 🎯 **可操作的規則**：adapter 遇到上游明講是簡寫的指令（`try_files`、
-  > `php_fastcgi`、`forward_auth`），先去讀上游把它展開成什麼，然後展開成同一個
-  > 東西。要另寫一份執行期實作，得先寫下為什麼那個展開在這裡行不通。
+  > 🎯 **The operable rule**: when the adapter meets a directive upstream openly
+  > calls a shorthand (`try_files`, `php_fastcgi`, `forward_auth`), go read what
+  > upstream expands it into, then expand into the same thing. Writing a separate
+  > runtime implementation requires first writing down why that expansion does
+  > not work here.
 
-- **驗證規則要掛在真正做事的那個型別上，不是掛在當初碰巧呼叫它的那個型別上。**
-  `try_files` 候選的 `..` 與 placeholder 檢查原本只對 `HandlerConfig::TryFiles`
-  跑。`try_files` 改成展開成 `file` matcher 之後，那些檢查一條都不會再被觸發，
-  而 `Matcher::File`（`php_fastcgi` 一直在產生它）從來就沒被檢查過。
+- **A validation rule attaches to the type that does the work, not to whichever
+  type happened to call it first.** The `..` and placeholder checks on `try_files`
+  candidates only ever ran for `HandlerConfig::TryFiles`. Once `try_files` was
+  changed to expand into a `file` matcher, not one of those checks fired again —
+  and `Matcher::File`, which `php_fastcgi` had been producing all along, had
+  never been checked at all.
 
-  > 🎯 **可操作的規則**：改變一個指令編譯出來的型別時，把它的驗證**一起搬過去**，
-  > 並且順手問一句：本來就會產生新型別的那些路徑，之前是不是也漏檢了。
+  > 🎯 **The operable rule**: when you change which type a directive compiles
+  > into, **move its validation with it**, and while you are there ask whether
+  > the paths that already produced the new type were missing those checks too.
 
-- **指令的第一個參數是不是 matcher，答案要去上游的註冊方式找。**
-  上游用 `RegisterDirective` 註冊 `try_files`（而不是 `RegisterHandlerDirective`），
-  它自己的註釋寫著「notice no matcher tokens accepted」——所以每一個參數都是候選。
-  這裡把第一個以 `/` 開頭的參數當成 inline path matcher，於是
-  `try_files /a.html /b.html` 變成「只在 `/a.html` 這條路徑上、只試 `/b.html`」，
-  而且把站台其餘的 handler 一起拖進那個 matcher 底下。它編得過，做的事卻是
-  操作者從來沒寫過的。`try_files /index.html` 單獨一個參數則 fail closed
-  ——這才是缺陷被發現的方式。
+- **Whether a directive's first argument is a matcher is a question for
+  upstream's registration, not for intuition.** Upstream registers `try_files`
+  with `RegisterDirective` (not `RegisterHandlerDirective`), and its own comment
+  reads "notice no matcher tokens accepted" — so every argument is a candidate.
+  This repository treated the first argument beginning with `/` as an inline path
+  matcher, so `try_files /a.html /b.html` became "only on the path `/a.html`, try
+  only `/b.html`" and dragged the rest of the site's handlers under that matcher
+  too. It compiled, and it did something the operator never wrote.
+  `try_files /index.html` on its own failed closed — which is how the defect was
+  found.
 
-  > 🎯 **可操作的規則**：`first_argument_is_data` 新增條目時，理由要引上游的
-  > **註冊函式**，不要引某一份設定看起來像什麼。
+  > 🎯 **The operable rule**: a new entry in `first_argument_is_data` cites
+  > upstream's **registration function** as its justification, never what some
+  > configuration happens to look like.
 
-## 📁 `file_server` 的 index 也是不可信的 path component（2026-08-17）
+## 📁 A `file_server` index is an untrusted path component too (2026-08-17)
 
-- 💀 **`Path::join` 遇到絕對路徑會「取代」而不是「延伸」。**
-  `root.join("/etc/passwd")` == `/etc/passwd`，整個 root 被丟掉。
-  這不是 Rust 的怪癖而是所有主流路徑 API 的共同語意，
-  但它把「設定寫錯」變成「逃出 root」而不是「找不到檔案」。
-  ⚠️ **呼叫點完全看不出來**，所以只能在載入時攔。
+- 💀 **`Path::join` given an absolute path *replaces* rather than extends.**
+  `root.join("/etc/passwd")` == `/etc/passwd`; the root is discarded entirely.
+  This is not a Rust quirk — every mainstream path API shares the semantics — but
+  it turns "the configuration has a typo" into "we escaped the root" instead of
+  "no such file". ⚠️ **Nothing at the call site shows it**, so it has to be caught
+  at load time.
 
-- 🎯 **「request path 不可信」不等於「resolved path 安全」。**
-  request path 早就有 lexical confinement，index 是在**那之後**才 join 上去的，
-  於是它成了整條路徑上最後一個沒被檢查的 component。
-  判準：**問「這條路徑是由幾個來源組成的」**，不是「不可信的那個擋住了嗎」。
-  來源有兩個（request path、設定的 index），就要檢查兩個。
+- 🎯 **"The request path is untrusted" is not the same as "the resolved path is
+  safe".** The request path already had lexical confinement; the index is joined
+  on **afterwards**, which made it the last unchecked component on the whole
+  path. The test: **ask how many sources this path is assembled from**, not
+  "is the untrusted one handled". Two sources (request path, configured index)
+  means two checks.
 
-- 🛡️ **兩層都要做，而且第二層不能依賴第一層跑過。**
-  載入時拒絕（絕對路徑、`..`、反斜線、冒號、空字串）是操作者會看到的那一層；
-  執行期把 index 丟回 `resolve_path` 做同樣的 confinement 是第二層。
-  📌 測試因此要**用程式直接建 `FileServerConfig`** 繞過驗證——
-  只靠「設定被拒絕」測不到第二層，而一個只在第一層跑過時才成立的第二層不是第二層。
+- 🛡️ **Do both layers, and the second must not depend on the first having run.**
+  Rejecting at load time (absolute paths, `..`, backslash, colon, empty string)
+  is the layer the operator sees; feeding the index back through `resolve_path`
+  for the same confinement at runtime is the second. 📌 The tests therefore
+  **construct `FileServerConfig` directly in code** to bypass validation — you
+  cannot reach the second layer through "the configuration was rejected", and a
+  second layer that only holds when the first one ran is not a second layer.
 
-- 🙈 **`hide` 與 regular-file 檢查也要跟著搬。**
-  `hide` 檢查原本只套在 resolved request path 上，index 選出來之後沒有重跑,
-  所以 index 可以指名操作者明確 `hide` 掉的檔案。
-  而 `exists()` 對目錄是 true——目錄被當成 index 接受，然後被當檔案讀,
-  失敗會出現在離決策很遠的地方。要用 `is_file()`。
+- 🙈 **The `hide` and regular-file checks move with it.** The `hide` check applied
+  only to the resolved request path and was not re-run after the index was
+  chosen, so an index could name a file the operator had explicitly hidden. And
+  `exists()` is true for directories — a directory would be accepted as an index
+  and then read as a file, with the failure surfacing a long way from the
+  decision. Use `is_file()`.
 
-- 🧭 **驗證要寫在 `validate_config`，不是只寫在 adapter。**
-  Admin API 直接把文件反序列化進 canonical types，完全不經過 adapter。
-  這條規則這個倉庫已經付過兩次代價（見「安全預設」節）。
+- 🧭 **The validation goes in `validate_config`, not only in the adapter.** The
+  Admin API deserialises straight into the canonical types with no adapter
+  involved. This repository has already paid for this rule twice (see the secure
+  defaults section).
 
-## 🙈 秘密落地與落 log（2026-08-17）
+## 🙈 Secrets landing on disk and in logs (2026-08-17)
 
-- 💀 **`std::fs::write` 建檔是 `0666 & !umask`，一般預設就是 `0644`。**
-  所以「寫個檔案」對含秘密的內容而言，預設是**全機器可讀**。
-  中招的兩個：Admin autosave 的文件（帶 admin key 與 DNS 憑證）、
-  `storage-export` 的 archive（帶內部 CA 私鑰、每張憑證的私鑰、ACME 帳號金鑰）。
-  🎯 判準：**問「這個檔案的內容如果被同機器其他使用者讀到，會怎樣」**，
-  而不是「這段程式碼有沒有 bug」。
+- 💀 **`std::fs::write` creates files as `0666 & !umask`, which normally lands on
+  `0644`.** So for anything containing a secret, "just write a file" defaults to
+  **readable by everyone on the box**. Two things were caught by this: the Admin
+  autosave document (carrying the admin key and DNS credentials) and the
+  `storage-export` archive (carrying the internal CA private key, every
+  certificate's private key, and the ACME account key). 🎯 The test: **ask what
+  happens if another user on this machine reads this file**, not "does this code
+  have a bug".
 
-- 🛡️ **要「建立時就 0600」，不是「建完再 chmod」。**
-  先建再 chmod 留下一個窗口：另一個使用者可以在那個窗口 `open()`，
-  而**描述符在 mode 改掉之後照樣能讀**。`OpenOptions::mode(0o600)` 才是對的。
-  ⚠️ 而且 `mode` **只在建立時生效**——覆寫一個既有的 `0644` 檔案會保留 `0644`。
-  `storage-export` 因此會在這種情況下警告，不是靜默接受。
+- 🛡️ **Create at 0600; do not create and then chmod.** Create-then-chmod leaves a
+  window in which another user can `open()` the file, and **the descriptor keeps
+  reading after the mode changes**. `OpenOptions::mode(0o600)` is the correct
+  form. ⚠️ Note that `mode` **applies only on creation** — overwriting an existing
+  `0644` file keeps `0644`. `storage-export` warns in that case rather than
+  accepting it silently.
 
-- 🧬 **一份 atomic writer，不要第二份。** `pingclair-tls::secure_file` 早就做對了
-  五件事：unique 暫存名、建立即 0600、`sync_all`、rename、fsync 父目錄。
-  autosave 沒用它——它自己 `fs::write` 加一個**固定的** `<path>.tmp`
-  （兩個 writer 會撞）而且完全不 fsync。
-  📌 這是 SEC-006 那個教訓的同一類：**一份安全規則抄第二遍，就是第二次漏掉某一步的機會。**
-  現在 writer 住在 `pingclair-tls`（core 依賴它，反向會成環），
-  由 `pingclair_core::secure_file` re-export 給上面的 crate。
+- 🧬 **One atomic writer, not a second one.** `pingclair-tls::secure_file` already
+  did five things right: a unique temporary name, created at 0600, `sync_all`,
+  rename, and fsync of the parent directory. Autosave did not use it — it called
+  `fs::write` with a **fixed** `<path>.tmp` (two writers collide) and never
+  fsynced at all. 📌 This is the same class as the SEC-006 lesson: **a security
+  rule written down a second time is a second chance to leave a step out.** The
+  writer now lives in `pingclair-tls` (core depends on it; the reverse would
+  cycle) and is re-exported as `pingclair_core::secure_file` for the crates above.
 
-- 🙈 **秘密要包起來，因為漏出去的 `{:?}` 不會寫在秘密旁邊。**
-  `SecretString` 的全部價值就是那個 `Debug`。derive `Debug` 的型別裡放一個
-  `String` 秘密，就離一行 log 只差一個 `{:?}`——而那個 `{:?}` 可以在
-  **任何包含它的型別上、任何地方**，包括 panic 訊息。
-  🎯 刻意**不**實作 `Display` 也不實作 `AsRef<str>`：兩者都會讓它被意外格式化。
-  真的要值就叫 `.expose()`——那是一個可以 grep 的詞，`rg 'expose\(\)'` 就是稽核清單。
-  🧭 `serde(transparent)`，所以 wire format 完全沒變，舊設定照樣載入與 round-trip。
-  **這條是關於什麼進 log，不是關於什麼進磁碟**——後者是上面那條。
-  📌 `dns01::cloudflare::ApiToken` 本來就是這個模式，所以這不是新發明，
-  是把既有的做法補到漏掉的兩個欄位上。
+- 🙈 **Wrap secrets, because the `{:?}` that leaks one is never written next to
+  the secret.** The entire value of `SecretString` is its `Debug`. A `String`
+  secret inside a type that derives `Debug` is one `{:?}` away from a log line —
+  and that `{:?}` can be **anywhere, on any type that contains it**, panic
+  messages included. 🎯 `Display` and `AsRef<str>` are deliberately **not**
+  implemented: either one lets it be formatted by accident. Getting the value
+  requires `.expose()`, which is a greppable word — `rg 'expose\(\)'` is the audit
+  list. 🧭 It is `serde(transparent)`, so the wire format is unchanged and old
+  configurations still load and round-trip. **This rule is about what reaches the
+  log, not about what reaches the disk** — that is the rule above.
+  📌 `dns01::cloudflare::ApiToken` already used this pattern, so this is not an
+  invention; it is an existing practice applied to the two fields that were
+  missing it.
