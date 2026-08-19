@@ -72,7 +72,11 @@ jobs:
           set -Eeuo pipefail
           crate_version="$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"/\1/')"
           git fetch --quiet --tags --force
-          latest_tag="$(git tag -l 'v*.*.*' | sed 's/^v//' | sort -V | tail -1)"
+          # 🏷️ Pre-release tags are excluded on purpose. `sort -V` orders
+          # `0.2.0-rc.1` *after* `0.2.0`, the opposite of SemVer, so leaving
+          # an rc tag in the list makes every PR fail with "behind the newest
+          # release tag" the moment a release candidate is cut.
+          latest_tag="$(git tag -l 'v*.*.*' | sed 's/^v//' | grep -v -- '-' | sort -V | tail -1)"
           if [ -z "${latest_tag}" ]; then
             echo "✅ no release tag yet; nothing to be ahead of"
             exit 0
