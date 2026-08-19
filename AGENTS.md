@@ -385,9 +385,8 @@ These documents own different facts; mixing them is a defect:
 
 | Document | Owns |
 | --- | --- |
-| `docs/TODO.md` | Maintainer execution plan |
+| GitHub issues | Everything outstanding: the plan, known defects, compatibility gaps |
 | `docs/STATUS.md` | Verification state and evidence level |
-| `TRIAGE.md` | Known defects not currently being worked on |
 | `docs/GUARDRAILS.md` | Guardrail index |
 | `docs/guardrails/*.md` | Environment constraints and implementation rules |
 | `benchmarks/README.md` | Published benchmark methodology and claims |
@@ -397,16 +396,19 @@ These documents own different facts; mixing them is a defect:
 
 Additional ownership semantics that prevent real mistakes:
 
-- `docs/TODO.md` is the v0.2.0 plan, one Day per sitting; it owns what to
-  work on. 🔒 Local only.
+- **GitHub issues own everything outstanding** — the plan, defects found and
+  left alone, compatibility gaps. One item, one issue, one place. Templates and
+  the label scheme are in `CONTRIBUTING.md`; `Closes #123` in a pull request is
+  what closes the item, so nobody has to remember.
+  📌 This replaced `docs/TODO.md` and `TRIAGE.md` in August 2026. Those two
+  files went stale between sittings and let one problem accumulate three
+  descriptions in three places. **If you find a stale copy in a checkout,
+  it is history — the issue tracker is the answer.**
 - `docs/STATUS.md` owns which public claim has evidence behind it, at three
   levels: code exists, local tests pass, verified on clean Linux. 🔒 Local.
-- `TRIAGE.md` owns "known and not being worked on right now". Add entries in
-  the shape its own "How to add one" section shows
-  (`### <severity> · <label>` with date, source, and status) and bump the
-  count in the section heading. 🔒 Local and absent from a fresh clone;
-  create it rather than reading its absence as permission to fold a stray
-  fix into the current diff.
+  It did **not** move to issues, and the distinction is worth holding on to:
+  it maps claims to evidence rather than listing work, so there is nothing
+  for a pull request to close.
 - `docs/CADDYFILE_*.md` are frozen 2026-08-01 audit records, deliberately
   excluded from `documentation.rs` because they are full of configurations
   that must not compile. Do not read them as current behavior — check the
@@ -418,13 +420,13 @@ applicable.
 
 ## 🔒 Maintainer planning workflow
 
-These files may exist only in the maintainer's local checkout: `docs/TODO.md`,
-`docs/STATUS.md`, `TRIAGE.md`, `docs/CADDYFILE_COMPATIBILITY_MASTER.md`,
+These files may exist only in the maintainer's local checkout:
+`docs/STATUS.md`, `docs/CADDYFILE_COMPATIBILITY_MASTER.md`,
 `benchmarks/results/`, and `.plan-snapshots/`. Their absence in a public
 clone is expected and must not block a user-scoped task. When present, run
 `scripts/snapshot-sensitive-plans.sh start` before reading the active Day and
 `end` after finishing; a snapshot validation failure blocks handoff. Never
-publish private planning snapshots, TRIAGE contents, private TODO contents,
+publish private planning snapshots, private verification-ledger contents,
 or private benchmark evidence.
 
 ## 🧱 Change discipline
@@ -458,7 +460,9 @@ or private benchmark evidence.
     `pingclair-config/src/compiler.rs`,
     `pingclair-config/src/adapter/caddyfile/tests.rs`,
     `pingclair-core/src/config/types.rs`, `pingclair/tests/integration.rs`.
-- **Unrelated findings** belong in `TRIAGE.md`, not the current diff, unless
+- **Unrelated findings** get their own issue — the 🔍 working-note template,
+  which exists precisely so that "noticed this, not chasing it now, not sure
+  it is real" has somewhere to go. They do not go in the current diff, unless
   the defect makes the active change incorrect or is an actively exploited
   security issue.
 - **Repeated fixes.** Three failed attempts at the same problem are a stop

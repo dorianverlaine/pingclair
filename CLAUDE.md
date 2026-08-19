@@ -15,9 +15,8 @@ defect:
 
 | Document | Owns |
 | --- | --- |
-| `docs/TODO.md` | The v0.2.0 plan, one Day per sitting. What to work on — **all of it**, including Caddyfile compatibility, which stopped being a separate track on 2026-08-04. 🔒 Local only. |
+| GitHub issues | Everything outstanding: the plan, defects found and left alone, compatibility gaps. One item, one issue, one place. Templates and labels are in `CONTRIBUTING.md`; `Closes #123` in a PR is what closes the item. **Replaced `docs/TODO.md` and `TRIAGE.md` in August 2026** — a stale copy of either in a checkout is history, not the answer. |
 | `docs/STATUS.md` | Which public claim has evidence behind it, and where. Three levels: code exists, local tests pass, verified on clean Linux. 🔒 Local only. |
-| `TRIAGE.md` | Problems found while working on something else and deliberately left alone: one `### <severity> · <label>` entry each, carrying date, source and status. It owns "known, and not being worked on right now" — which is neither the plan nor the changelog. Add entries in the shape its own "How to add one" section shows, and bump the count in the section heading. 🔒 Local only, and absent from a fresh clone; create it rather than reading its absence as permission to fold a stray fix into the current diff. |
 | `docs/guardrails/{testing,config,tls,proxy}.md` | Environment constraints and implementation rules, one file per subsystem. Every entry is a failure that already happened. `docs/GUARDRAILS.md` is the index over them, nothing more. |
 | `benchmarks/README.md` | Performance claims and methodology. Raw per-run evidence stays local under `benchmarks/results/`, never committed. |
 | `CHANGELOG.md` | What changed between releases, for someone upgrading. Written the same day as the change. |
@@ -147,7 +146,7 @@ They converge on `pingclair-proxy/src/http_policy.rs` — CORS evaluation,
 response-header policy, `Via`, request-id resolution, URI rewriting. **New
 middleware belongs there if both transports need it.** Reaching into an H1/H2
 `Session` from H3, or duplicating logic across the two, is how parity gaps get
-created; when parity is not required, say so explicitly in `docs/TODO.md`.
+created; when parity is not required, say so explicitly in the issue.
 
 Both paths use Pingora's `Connector` for upstreams, so the keepalive pool, TLS
 to upstream, and timeout semantics are shared. `HttpPeer::group_key` decides
@@ -189,7 +188,8 @@ bounded channels and QUIC flow control.
     `compiler.rs`, `caddyfile/tests.rs`, `config/types.rs`,
     `integration.rs`) should not grow with trivial additions; prefer new
     modules.
-- Unrelated findings belong in `TRIAGE.md`, not the current diff.
+- Unrelated findings get their own issue (🔍 working note — it accepts
+  "not sure this is real yet"), not the current diff.
 - Three failed attempts at the same fix are a stop sign: write one sentence
   explaining why the earlier fixes missed the root cause before a fourth.
 

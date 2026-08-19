@@ -1,0 +1,112 @@
+name: 🐛 Bug report
+description: Pingclair did something other than what it said it would do
+title: "🐛 "
+labels:
+  - 🐛 bug
+  - 🔬 needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for writing this up. Genuinely — a good bug report is a
+        contribution, and it is the kind nobody puts on a CV.
+
+        🔒 **If this is a security weakness, stop here** and use the
+        [private advisory form](https://github.com/dorianverlaine/pingclair/security/advisories/new)
+        instead, so the fix ships before the recipe does.
+
+        💡 The single most useful thing you can give us: **the smallest
+        Pingclairfile that still misbehaves.** A config trimmed to five lines
+        usually finds the bug faster than a stack trace, and it is much better
+        company.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 💥 What happened
+      description: What Pingclair actually did. Text rather than screenshots, please — text is searchable, quotable, and readable at 2am.
+      placeholder: A request to /assets/app.js returned 404 over HTTP/3 and 200 over HTTP/2.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 🎯 What you expected instead
+      description: If the expectation comes from Caddy, say so. Compatibility with Caddy is an explicit goal here, so "Caddy does X" is not a preference — it is close to a bug report on its own.
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: 📄 Pingclairfile
+      description: The smallest config that still reproduces it. Redact hostnames and credentials, but keep the structure — a helpfully rewritten "equivalent" config has a habit of losing the exact part that mattered.
+      render: Caddyfile
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 🔁 How to reproduce
+      description: The exact commands. `curl` lines are ideal. If it only happens under load, or only after a reload, or only on the second request — say that. Those clauses are usually the entire bug wearing a trench coat.
+      placeholder: |
+        1. pingclair run Pingclairfile
+        2. curl -sS -i --http3 https://localhost/assets/app.js
+        3. observe 404
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 🏷️ Version
+      description: Output of `pingclair version`. Built from source? The commit SHA.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: transport
+    attributes:
+      label: 🔀 Which protocols did you try?
+      description: H1/H2 and H3 are separate execution paths here, so "fails on both" and "I only tried one" are very different reports. Either is fine — we would just rather know which one you are handing us.
+      multiple: true
+      options:
+        - HTTP/1.1
+        - HTTP/2
+        - HTTP/3
+        - Did not check
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: 💻 Platform
+      description: OS, distribution, architecture. `uname -sm` plus the distribution name covers it.
+      placeholder: Ubuntu 24.04, aarch64
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 📜 Logs
+      description: Relevant output. Fair warning — the subscriber is built from `RUST_LOG`, so with it unset you get ERROR and nothing else, which looks a lot like "the server logged nothing". Try `RUST_LOG=info` or `debug`.
+      render: text
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: 🧩 Anything else
+      description: Workarounds, when it started, whether an older version behaved differently. Hunches welcome.
+
+  - type: input
+    id: assistance
+    attributes:
+      label: 🤖 Which AI helped?
+      description: 'We encourage using AI here — it finds real bugs. We just ask which model, so review can be calibrated. Name it: "Claude Opus 5 found the repro", "GPT-5.2 translated this from Japanese". If none, write "none" and enjoy your artisanal debugging.'
+      placeholder: none
+    validations:
+      required: true

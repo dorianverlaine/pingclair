@@ -15,8 +15,9 @@
 | [`guardrails/tls.md`](guardrails/tls.md) | Dependencies and linking (one BoringSSL for the whole tree, what `[patch.crates-io]` does to the audit) and secure defaults (fail closed, masking, certificates and trust material) |
 | [`guardrails/proxy.md`](guardrails/proxy.md) | Why HTTP/3 is pinned to quiche/BoringSSL, the architecture and correctness rules for `quic.rs`, and streaming and memory |
 
-- What to work on next → `docs/TODO.md` (🔒 maintainer-local, not in the repository)
-- Newly found problems that should not be fixed right now → `TRIAGE.md` (repository root)
+- What to work on next → [GitHub issues](https://github.com/dorianverlaine/pingclair/issues)
+- Newly found problems that should not be fixed right now → an issue, using the
+  🔍 working-note template, which accepts "I am not sure this is real yet"
 - Finished work and verification evidence → local `benchmarks/results/` (never committed)
 
 > 📌 When you add a rule, write it into the subsystem document it belongs to,
