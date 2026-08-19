@@ -36,14 +36,16 @@ is a real contribution and needs no agreement.
 **Issues are the queue. Pull requests close them. Nothing else is a to-do
 list.**
 
-This replaced a maintainer-local plan file in August 2026, for reasons worth
-stating because they decide how the templates are shaped. That file went stale
-between sittings; the same problem accumulated three descriptions in three
-documents; and by the time anyone came back to an item, the thinking behind it
-had to be reconstructed from scratch. An issue fixes all three by construction
-— it has one canonical location, its state changes when a pull request merges
-rather than when somebody remembers, and the comment thread *is* the record of
-what you were thinking.
+This replaced a maintainer-local plan file in August 2026. The reasons are
+worth stating, because they shaped the templates. That file went stale between
+sittings. The same problem quietly accumulated three descriptions in three
+documents, all subtly disagreeing. And by the time anyone returned to an item,
+the thinking behind it had to be excavated rather than read.
+
+An issue fixes all three by construction: one canonical location, a state that
+changes when a pull request merges rather than when somebody remembers, and a
+comment thread that *is* the record of what you were thinking. The bar for
+"better than a text file I have to update by hand" was, in fairness, not high.
 
 ### Opening one
 
@@ -56,17 +58,22 @@ Three templates, and none of them is mandatory — blank issues stay enabled.
 | 🧩 **Compatibility gap** | A Caddyfile that works with Caddy and does not work here. That is a defect on our side; you do not have to argue for it. |
 
 The working note deserves a word, because most projects have nothing like it.
-A suspicion you never wrote down is worth nothing, and forcing it through a
-form that demands reproduction steps guarantees it never gets written. So that
-template asks for the observation, **how sure you are**, and what would settle
-it — and nothing else. Under-claim when you are unsure; over-confident prose
-over shaky evidence is the failure mode this project guards against hardest.
+A suspicion you never wrote down is worth nothing, and a form demanding
+reproduction steps guarantees it never gets written — so the suspicion dies in
+somebody's short-term memory, which is where good bugs go to retire.
+
+That template therefore asks for three things: the observation, **how sure you
+are**, and what would settle it. "How sure" is its own field on purpose, with
+three legitimate answers (🟢 confirmed, 🟡 probable, 🔴 pure suspicion). Round
+down when in doubt. Confident prose over shaky evidence is the failure mode
+this project guards against hardest, and a form field is harder to bluff than a
+paragraph.
 
 ### Labels
 
-Labels carry the classification so the body does not have to. A severity
-written into prose goes stale the moment it changes and nobody notices; a label
-is visible in the list view and filterable.
+Labels carry the classification so the body does not have to. A severity buried
+in prose goes stale the instant it changes and nobody notices for a fortnight;
+a label is visible in the list view, filterable, and awkward to ignore.
 
 | Label | Meaning |
 |---|---|
@@ -80,12 +87,57 @@ is visible in the list view and filterable.
 | `wontfix` | Investigated, understood, deliberately not changing. **The body says why.** |
 
 Severity is about the user's exposure, not about how annoying the problem is
-to whoever found it.
+to whoever found it. The two correlate less often than you would hope.
+
+📌 The labels and the board are created by `scripts/setup-tracker.sh`, which is
+idempotent and treats this document as the source of truth. Change the scheme
+here, run the script, and the repository catches up — rather than the scheme
+living half in a document and half in somebody's browser tab, which is roughly
+the arrangement this tracker exists to escape.
 
 `wontfix` is not a bin. A closed issue that records "we checked, this differs
 from Caddy, here is why we are keeping our behaviour" is one of the more
 valuable things in the tracker — it stops the same question being reopened in
 six months, and it stops somebody "fixing" a deliberate difference back.
+
+### 📊 The board
+
+Issues also live on a [project board](https://github.com/dorianverlaine/pingclair/projects),
+because a flat list of open issues answers "what exists" and never answers
+"what is actually moving".
+
+```text
+📥 Inbox  →  🔬 Triage  →  📋 Ready  →  🔧 In Progress  →  👀 Review  →  ✅ Done
+```
+
+| Column | What it means | What gets it out |
+|---|---|---|
+| 📥 **Inbox** | Newly opened, nobody has looked yet. Everything lands here. | Somebody reads it. |
+| 🔬 **Triage** | Being assessed: is it real, how exposed is a user, which transport? | A severity label, or a close with a reason. |
+| 📋 **Ready** | Understood well enough that someone could start without asking a question first. | Somebody starts. |
+| 🔧 **In Progress** | Actively being worked on. **Say so in the issue** so two people do not write the same patch. | A pull request opens. |
+| 👀 **Review** | Pull request open, waiting on review or CI. | Merge, or back to 🔧. |
+| ✅ **Done** | Merged, or closed with a recorded reason. | Nothing. It rests. |
+
+Two rules keep this from becoming decoration:
+
+**📋 Ready is a promise, not a wish.** An issue in Ready means the next person
+can pick it up cold. If it still needs a decision, a measurement, or a "let me
+check what Caddy does first", it belongs in 🔬 Triage, however keen everyone is
+about it.
+
+**🔧 In Progress has a small ceiling.** Work in progress is work not shipped,
+and six half-finished branches are strictly worse than two finished ones. If
+the column is filling up, the honest move is to move something back rather
+than to widen the column.
+
+📌 `✅ Done` here means the same thing `✅` means everywhere else in this
+repository: **finished, with something to point at.** It is not a synonym for
+"good", "agreed", or "probably fine". That marker has exactly one meaning here,
+and it got that rule the hard way — a sweep once counted `✅` characters to
+decide which tracking documents were still current, concluded a 43-of-46
+complete document had been abandoned, and was confidently wrong about all of
+it.
 
 ### Working on one
 
@@ -224,6 +276,40 @@ An entry written while the change is fresh costs a minute.
 
 Never move an item to "verified" without leaving enough evidence for someone
 else to reproduce the claim.
+
+---
+
+## 🤖 AI assistance
+
+**Use it. We do.** This project is built with AI assistance and saying
+otherwise would be theatre — the commit history has the trailers to prove it.
+There is no penalty here for having had help, and no bonus points for
+artisanal, hand-forged, single-origin code.
+
+The one thing we ask is that you **name the model**. Both issue templates and
+the pull request template have a field for it.
+
+```text
+None.
+Claude Opus 5 wrote the tests, I wrote the fix.
+Written end to end by Claude Opus 5; I reviewed it and ran the suite.
+GPT-5.2 for the first draft, then rewritten by hand.
+```
+
+Why the model and not just "yes, AI": because it changes where a reviewer
+looks first. Different models fail in genuinely different ways, and knowing
+which one produced a change is a real prior — the same way "written at 3am by
+someone who had been debugging for nine hours" would be, if people declared
+that. A change that a model wrote end to end gets read differently from one
+where it only wrote the tests. Neither gets read *worse*; they get read
+*differently*, which is the entire point.
+
+📌 A model can write the change. It cannot sign for it. Submitting a pull
+request says **you** have read it and believe it is correct — including the
+parts that look plausible and confident, which is exactly the failure mode
+worth watching for. Confident prose over shaky evidence is the thing this
+repository guards against hardest, and language models are extremely good at
+confident prose.
 
 ---
 
