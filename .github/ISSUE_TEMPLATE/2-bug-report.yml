@@ -1,0 +1,110 @@
+name: 🐛 Bug report
+description: Pingclair did something other than what it said it would do
+title: "🐛 "
+labels:
+  - bug
+  - needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to write this up.
+
+        🔒 **If this is a security weakness, stop here** and report it privately
+        through the [security advisory form](https://github.com/dorianverlaine/pingclair/security/advisories/new)
+        instead, so a fix can ship before the details are public.
+
+        One request that saves the most time: give us the **smallest
+        Pingclairfile that still shows the problem**. A configuration cut down
+        to five lines usually locates a bug faster than a stack trace does.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What Pingclair actually did. Paste text rather than screenshots — text is searchable and quotable.
+      placeholder: A request to /assets/app.js returned 404 over HTTP/3 and 200 over HTTP/2.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+      description: If the expectation comes from Caddy's behaviour, say so — compatibility with Caddy is an explicit goal, so "Caddy does X" is a strong argument here.
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Pingclairfile
+      description: The smallest configuration that still reproduces it. Redact hostnames and credentials, but keep the structure — a rewritten "equivalent" config often loses the part that mattered.
+      render: Caddyfile
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to reproduce
+      description: The exact commands. `curl` lines are ideal. If it only happens under load, or only after a reload, or only on the second request, say that — those details are usually the whole bug.
+      placeholder: |
+        1. pingclair run Pingclairfile
+        2. curl -sS -i --http3 https://localhost/assets/app.js
+        3. observe 404
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `pingclair version`. If you built from source, the commit SHA.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Which protocols did you try?
+      description: H1/H2 and H3 are separate execution paths here, so "it fails on both" and "I only tried one" are very different reports — and we would rather know which.
+      multiple: true
+      options:
+        - HTTP/1.1
+        - HTTP/2
+        - HTTP/3
+        - Did not check
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: OS, distribution and architecture. `uname -sm` plus the distribution name is enough.
+      placeholder: Ubuntu 24.04, aarch64
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant output. Note that the log subscriber is built from `RUST_LOG`, so without it set you get ERROR only — `RUST_LOG=info` or `debug` usually shows far more.
+      render: text
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Workarounds you found, when it started, whether an older version behaved differently.
+
+  - type: input
+    id: assistance
+    attributes:
+      label: AI assistance
+      description: 'Using an AI tool here is fine and needs no apology — we just want to know, so review can be calibrated. Examples: "wrote the report myself", "Claude found the reproduction", "translated from my language".'
+      placeholder: none
+    validations:
+      required: true

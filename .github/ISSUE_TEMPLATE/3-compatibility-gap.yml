@@ -1,0 +1,72 @@
+name: 🧩 Caddy compatibility gap
+description: A Caddyfile that works with Caddy and does not work here
+title: "🧩 "
+labels:
+  - compatibility
+  - needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Pingclair aims to run a Caddyfile unchanged, so **a configuration that
+        Caddy accepts and Pingclair rejects is a defect on our side**, not a
+        request for a new feature. You do not need to argue for it.
+
+        The one thing worth checking first: does the reference implementation
+        really accept it? Our own tracking has been wrong in that direction
+        before — a difference was recorded against upstream behaviour that
+        upstream turned out not to have, and acting on it would have
+        *manufactured* an incompatibility. `caddy adapt` settles it in seconds.
+
+  - type: textarea
+    id: config
+    attributes:
+      label: The configuration
+      description: The directive or block, as small as you can make it while still showing the difference.
+      render: Caddyfile
+    validations:
+      required: true
+
+  - type: textarea
+    id: upstream
+    attributes:
+      label: What Caddy does
+      description: Paste the output of `caddy adapt`, or the actual response for a runtime difference. **Name the Caddy version** — behaviour has moved between releases, and an unversioned claim cannot be checked later.
+      placeholder: |
+        caddy v2.11.4
+        $ caddy adapt --config Caddyfile
+        ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: pingclair
+    attributes:
+      label: What Pingclair does
+      description: The error, or the differing output. `pingclair adapt` is the equivalent command.
+      placeholder: |
+        $ pingclair adapt -c Pingclairfile
+        ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: failure-mode
+    attributes:
+      label: How does it fail?
+      description: This matters more than it looks. A rejection is visible and annoying; silently doing something else is the dangerous one, because the operator never finds out.
+      options:
+        - Rejected at load time, with an error
+        - Accepted, then behaves differently at runtime
+        - Accepted, then silently does nothing
+    validations:
+      required: true
+
+  - type: input
+    id: assistance
+    attributes:
+      label: AI assistance
+      description: Fine to use, we just want to know. "none" is a complete answer.
+      placeholder: none
+    validations:
+      required: true

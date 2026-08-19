@@ -1,0 +1,11 @@
+# 🧭 Blank issues stay enabled on purpose. The templates are scaffolding for
+# people who want it, not a toll gate — and the maintainer's own notes are
+# often three lines that fit no form.
+blank_issues_enabled: true
+contact_links:
+  - name: 🔒 Report a security weakness privately
+    url: https://github.com/dorianverlaine/pingclair/security/advisories/new
+    about: Never open a public issue for a vulnerability. This form keeps it private until a fix ships.
+  - name: 📓 Read the implementation guardrails first
+    url: https://github.com/dorianverlaine/pingclair/blob/main/docs/GUARDRAILS.md
+    about: Every rule in there is a hole somebody already fell into. Your surprising behaviour may already be explained.
