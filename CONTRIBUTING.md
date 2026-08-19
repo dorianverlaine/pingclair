@@ -77,14 +77,20 @@ a label is visible in the list view, filterable, and awkward to ignore.
 
 | Label | Meaning |
 |---|---|
-| `p0` | Data loss, a remotely triggerable crash, or a security defect. Interrupts whatever is in progress. |
-| `p1` | Wrong behaviour a user can reach. |
-| `p2` | Everything else: cleanups, missing coverage, papercuts, drifted documentation. |
-| `needs-triage` | Not yet classified. Both issue templates set it. |
-| `bug` / `compatibility` / `enhancement` / `documentation` | What kind of thing it is. |
-| `h1-h2` / `h3` | Which transport, when only one is affected. |
-| `blocked-upstream` | Waiting on a dependency. The body names the upstream issue and what unblocks it. |
-| `wontfix` | Investigated, understood, deliberately not changing. **The body says why.** |
+| 💥 `p0` | Data loss, a remotely triggerable crash, or a security defect. Interrupts whatever is in progress. |
+| 🔥 `p1` | Wrong behaviour a user can reach. |
+| 🧹 `p2` | Everything else: cleanups, missing coverage, papercuts, drifted documentation. |
+| 🔬 `needs-triage` | Not yet classified. Both issue templates set it. |
+| 🐛 `bug` · 🧩 `compatibility` · ✨ `enhancement` · 📚 `documentation` | What kind of thing it is. |
+| 🔗 `h1-h2` · 🛰️ `h3` | Which transport, when only one is affected. |
+| ⏳ `blocked-upstream` | Waiting on a dependency. The body names the upstream issue and what unblocks it. |
+| 🚫 `wontfix` | Investigated, understood, deliberately not changing. **The body says why.** |
+
+The emoji is part of the name, not decoration on top of it — the templates
+reference these strings exactly, so `p0` alone will not match `💥 p0`. It earns
+its place in the list view, where a wall of same-shaped text is exactly as
+scannable as it sounds, and the severity you are hunting for is a glance rather
+than a read.
 
 Severity is about the user's exposure, not about how annoying the problem is
 to whoever found it. The two correlate less often than you would hope.

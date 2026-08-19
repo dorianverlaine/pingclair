@@ -21,20 +21,27 @@ readonly repository="${PINGCLAIR_REPO:-dorianverlaine/pingclair}"
 readonly owner="${repository%%/*}"
 readonly project_title="Pingclair"
 
-# 🏷️ label|colour|description — severity first, then kind, then routing.
+# 🏷️ name|colour|description|former-name — severity first, then kind, then
+# routing. The emoji is a category marker and is part of the name, so it must
+# match the issue templates character for character.
+#
+# The fourth field is the pre-emoji name, kept so this script can rename an
+# existing label rather than leaving a duplicate behind. It is also why the
+# names below are not free to churn: renaming a label breaks every saved
+# filter and every template referencing it, so pick one and keep it.
 readonly -a labels=(
-  "p0|b60205|Data loss, remotely triggerable crash, or security defect. Interrupts the current session."
-  "p1|d93f0b|Wrong behaviour a user can reach."
-  "p2|fbca04|Cleanups, missing coverage, papercuts, drifted documentation."
-  "needs-triage|ededed|Not classified yet. Both issue templates set this."
-  "bug|d73a4a|Something is not working"
-  "compatibility|1d76db|A Caddyfile that works with Caddy and does not work here"
-  "enhancement|a2eeef|New feature or request"
-  "documentation|0075ca|Improvements or additions to documentation"
-  "h1-h2|c5def5|Affects the H1/H2 path only (server.rs)"
-  "h3|bfd4f2|Affects the H3 path only (quic.rs)"
-  "blocked-upstream|5319e7|Waiting on a dependency. The body names the upstream issue."
-  "wontfix|ffffff|Investigated, understood, deliberately unchanged. The body says why."
+  "💥 p0|b60205|Data loss, remotely triggerable crash, or security defect. Interrupts the current session.|p0"
+  "🔥 p1|d93f0b|Wrong behaviour a user can reach.|p1"
+  "🧹 p2|fbca04|Cleanups, missing coverage, papercuts, drifted documentation.|p2"
+  "🔬 needs-triage|ededed|Not classified yet. Both issue templates set this.|needs-triage"
+  "🐛 bug|d73a4a|Something is not working|bug"
+  "🧩 compatibility|1d76db|A Caddyfile that works with Caddy and does not work here|compatibility"
+  "✨ enhancement|a2eeef|New feature or request|enhancement"
+  "📚 documentation|0075ca|Improvements or additions to documentation|documentation"
+  "🔗 h1-h2|c5def5|Affects the H1/H2 path only (server.rs)|h1-h2"
+  "🛰️ h3|bfd4f2|Affects the H3 path only (quic.rs)|h3"
+  "⏳ blocked-upstream|5319e7|Waiting on a dependency. The body names the upstream issue.|blocked-upstream"
+  "🚫 wontfix|ffffff|Investigated, understood, deliberately unchanged. The body says why.|wontfix"
 )
 
 # 📊 The board columns, in flow order. Kept identical to CONTRIBUTING.md.
@@ -49,12 +56,33 @@ readonly -a columns=(
 
 log() { printf '%s\n' "$*" >&2; }
 
+# 🔍 Is this label already on the repository?
+label_exists() {
+  gh label list --repo "${repository}" --limit 200 --json name \
+    --jq ".[] | select(.name == \"$1\") | .name" 2>/dev/null | grep -q .
+}
+
 create_labels() {
   log "🏷️  Labels on ${repository}"
-  local entry name colour description
+  local entry name colour description former
   for entry in "${labels[@]}"; do
-    IFS='|' read -r name colour description <<<"${entry}"
-    # 🔁 --force turns create into upsert, so the scheme here always wins.
+    IFS='|' read -r name colour description former <<<"${entry}"
+
+    # 🔁 Rename the pre-emoji label rather than creating a second one beside
+    # it. GitHub carries the issues across a rename; a delete-and-create would
+    # strip the label off every issue already wearing it.
+    if [[ -n "${former}" && "${former}" != "${name}" ]] &&
+      label_exists "${former}" && ! label_exists "${name}"; then
+      if gh label edit "${former}" --repo "${repository}" --name "${name}" \
+        --color "${colour}" --description "${description}" >/dev/null 2>&1; then
+        log "   🔁 ${former} → ${name}"
+        continue
+      fi
+      log "   ❌ ${former} — rename to ${name} failed"
+      return 1
+    fi
+
+    # 🆕 --force turns create into upsert, so the scheme here always wins.
     if gh label create "${name}" \
       --repo "${repository}" \
       --color "${colour}" \

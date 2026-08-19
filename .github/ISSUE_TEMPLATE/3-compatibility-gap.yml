@@ -2,8 +2,8 @@ name: 🧩 Caddy compatibility gap
 description: A Caddyfile that works with Caddy and does not work here
 title: "🧩 "
 labels:
-  - compatibility
-  - needs-triage
+  - 🧩 compatibility
+  - 🔬 needs-triage
 body:
   - type: markdown
     attributes:

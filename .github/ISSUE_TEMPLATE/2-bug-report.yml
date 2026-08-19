@@ -2,8 +2,8 @@ name: 🐛 Bug report
 description: Pingclair did something other than what it said it would do
 title: "🐛 "
 labels:
-  - bug
-  - needs-triage
+  - 🐛 bug
+  - 🔬 needs-triage
 body:
   - type: markdown
     attributes:

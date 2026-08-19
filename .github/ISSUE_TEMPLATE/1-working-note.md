@@ -2,7 +2,7 @@
 name: 🔍 Working note
 about: Something you noticed and do not want to lose. Certainty optional.
 title: "🔍 "
-labels: needs-triage
+labels: 🔬 needs-triage
 ---
 
 <!--
@@ -55,9 +55,9 @@ who will remember none of this and will be slightly annoyed at present-you. -->
 Written into prose they go stale silently, which is precisely how the file this
 tracker replaced ended up lying to us for a fortnight:
 
-  p0 / p1 / p2         how exposed a user is, not how much it annoyed you
-  h1-h2 / h3           which transport, when only one is affected
-  needs-triage         you have not decided yet (this template sets it)
+  💥 p0 / 🔥 p1 / 🧹 p2    how exposed a user is, not how much it annoyed you
+  🔗 h1-h2 / 🛰️ h3         which transport, when only one is affected
+  🔬 needs-triage          you have not decided yet (this template sets it)
 
 🔒 If this is a security weakness, close this tab and use the private form
 instead: https://github.com/dorianverlaine/pingclair/security/advisories/new
