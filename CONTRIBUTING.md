@@ -108,7 +108,7 @@ six months, and it stops somebody "fixing" a deliberate difference back.
 
 ### 📊 The board
 
-Issues also live on a [project board](https://github.com/dorianverlaine/pingclair/projects),
+Issues also live on a [project board](https://github.com/users/dorianverlaine/projects/1),
 because a flat list of open issues answers "what exists" and never answers
 "what is actually moving".
 

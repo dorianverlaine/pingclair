@@ -44,14 +44,17 @@ readonly -a labels=(
   "🚫 wontfix|ffffff|Investigated, understood, deliberately unchanged. The body says why.|wontfix"
 )
 
-# 📊 The board columns, in flow order. Kept identical to CONTRIBUTING.md.
+# 📊 name|colour|description — the board columns in flow order, kept identical
+# to CONTRIBUTING.md. Colours are the GitHub project palette (GRAY, BLUE,
+# GREEN, YELLOW, ORANGE, RED, PINK, PURPLE), and they run cool to warm so the
+# board reads as temperature before you read a single word.
 readonly -a columns=(
-  "📥 Inbox"
-  "🔬 Triage"
-  "📋 Ready"
-  "🔧 In Progress"
-  "👀 Review"
-  "✅ Done"
+  "📥 Inbox|GRAY|Newly opened, nobody has looked yet."
+  "🔬 Triage|PURPLE|Being assessed: is it real, how exposed is a user, which transport?"
+  "📋 Ready|BLUE|Understood well enough that someone could start cold."
+  "🔧 In Progress|YELLOW|Actively being worked on. Say so in the issue."
+  "👀 Review|ORANGE|Pull request open, waiting on review or CI."
+  "✅ Done|GREEN|Merged, or closed with a recorded reason."
 )
 
 log() { printf '%s\n' "$*" >&2; }
@@ -135,18 +138,63 @@ create_board() {
     log "   ↩️  project #${number} already exists"
   fi
 
-  log ""
-  log "📌 One manual step remains, and gh cannot do it: the built-in Status"
-  log "   field's options are not writable through the CLI. Open the project"
-  log "   settings and set Status to exactly these, in this order:"
-  log ""
-  local column
-  for column in "${columns[@]}"; do
-    log "        ${column}"
+  # 🔗 A user-owned project is not attached to the repository just because it
+  # was created by its owner. Without this, the repository's Projects tab
+  # cheerfully reports "No projects found" while the board sits there fully
+  # configured, which is a confusing ten minutes nobody needs twice.
+  if gh project link "${number}" --owner "${owner}" --repo "${repository}" >/dev/null 2>&1; then
+    log "   🔗 linked to ${repository}"
+  else
+    log "   ↩️  already linked to ${repository}"
+  fi
+
+  configure_status_field "${number}"
+}
+
+# 🎚️ Rewrite the built-in Status field's options to the columns above.
+#
+# `gh project field-list` can read them and no gh subcommand can write them,
+# so this drops to GraphQL. `updateProjectV2Field` replaces the option set
+# wholesale — options not named here are removed, which is the point: the
+# defaults (Todo / In Progress / Done) are not our columns.
+configure_status_field() {
+  local number="$1" field_id options entry name colour description
+  field_id="$(gh project field-list "${number}" --owner "${owner}" --format json |
+    python3 -c "
+import json, sys
+for field in json.load(sys.stdin)['fields']:
+    if field['name'] == 'Status':
+        print(field['id'])
+        break
+")"
+  if [[ -z "${field_id}" ]]; then
+    log "   ❌ no Status field on project #${number}"
+    return 1
+  fi
+
+  options=""
+  for entry in "${columns[@]}"; do
+    IFS='|' read -r name colour description <<<"${entry}"
+    options+="{name: \"${name}\", color: ${colour}, description: \"${description}\"} "
   done
+
+  if gh api graphql -f query="
+mutation {
+  updateProjectV2Field(input: {
+    fieldId: \"${field_id}\"
+    singleSelectOptions: [${options}]
+  }) { projectV2Field { ... on ProjectV2SingleSelectField { name } } }
+}" >/dev/null 2>&1; then
+    log "   ✅ Status field set to the six columns"
+  else
+    log "   ❌ could not write the Status field options"
+    return 1
+  fi
+
   log ""
-  log "   Then set the workflow 'Item added to project' → 📥 Inbox, and"
-  log "   'Pull request merged' → ✅ Done, so the board maintains itself."
+  log "📌 One step is still manual — project workflows are not scriptable:"
+  log "   set 'Item added to project' → 📥 Inbox and 'Pull request merged'"
+  log "   → ✅ Done, so the board maintains itself instead of you."
 }
 
 main() {
