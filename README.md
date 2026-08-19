@@ -33,7 +33,7 @@ Whether you need a simple static file server or an enterprise gateway with load 
 *   🔄 **Smart load balancing** — Several built-in algorithms (round-robin, least-connections, and more) with health checks and automatic failover.
 *   🔐 **Automatic and private HTTPS** — Built-in ACME (Let's Encrypt) support issues public certificates, while `tls internal` provides a persistent local CA for private origins and tunnels.
 *   📁 **Fast static file serving** — Gzip/Brotli compression, range requests, and efficient file transfer.
-*   📊 **Observability** — Prometheus metrics export and OpenTelemetry tracing out of the box.
+*   📊 **Observability** — Prometheus metrics export out of the box.
 
 ## ⚡ Benchmarks
 

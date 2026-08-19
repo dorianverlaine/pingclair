@@ -1,353 +1,435 @@
-# ⚠️ Pingclair 實作守則 — TLS、依賴與安全預設
+# ⚠️ Pingclair implementation guardrails — TLS, dependencies, and secure defaults
 
-## 🔗 依賴與鏈結
+## 🔗 Dependencies and linking
 
-- **CI 與 Dockerfile 使用 stable Rust**。nightly 曾在 release profile
-  （`panic="abort"` + fat LTO + `codegen-units=1`）編譯 tokio 時 ICE。
-- **reqwest dev dependency 必須維持 rustls**。native-tls／OpenSSL 會與 quiche 的
-  BoringSSL 產生連結衝突。
-- **禁止引入 `pingora-openssl`、`openssl-sys` 或 reqwest `native-tls`**。
-  `quiche 0.29`、`boring 4.22` 與 Pingora `boringssl` feature 是同一套 BoringSSL
-  鏈結設計；過去曾因 OpenSSL／BoringSSL 符號衝突造成**啟動 SIGBUS 與 Linux link error**。
-  這三條不是偏好而是 H3 的前提，理由見下方「為什麼 H3 釘在 quiche／BoringSSL」。
+- **CI and the Dockerfile use stable Rust.** nightly once ICE'd compiling tokio
+  under the release profile (`panic="abort"` + fat LTO + `codegen-units=1`).
+- **The reqwest dev dependency stays on rustls.** native-tls/OpenSSL collides at
+  link time with quiche's BoringSSL.
+- **Never introduce `pingora-openssl`, `openssl-sys`, or reqwest `native-tls`.**
+  `quiche 0.29`, `boring 4.22`, and Pingora's `boringssl` feature are one
+  BoringSSL linking design; OpenSSL/BoringSSL symbol collisions have previously
+  produced **a SIGBUS at startup and link errors on Linux**. These three rules are
+  not preferences, they are preconditions for H3 — see "why H3 is pinned to
+  quiche/BoringSSL" below.
 
-- 🔓 **`boring-sys` 是直接依賴，而且版本必須跟著 `boring` 一起動。**
-  `boring` 4.22 沒有包裝 `X509_STORE_CTX_set_purpose`，而下游 mTLS 需要它
-  （理由見「下游 mTLS」那節），所以 workspace 直接宣告
-  `boring-sys = "4.22"` 與 `foreign-types = "0.5"`——後者是為了拿到
-  `ForeignTypeRef::as_ptr`，`boring` 只 `extern crate` 沒有 re-export。
-  ⚠️ **兩份 `boring-sys` 就是兩份 BoringSSL**，也就是上一條講的那種符號衝突。
-  兩邊都用 caret range 是刻意的：它們會一起解析到同一版。`boring` 需要換大
-  版本的那天，這一行必須同時換。
-  📌 檢查方式跟原本一樣，沒有新增：`cargo tree -i boring-sys` 必須只有一份，
-  `cargo tree -i openssl-sys` 必須什麼都不符合。
+- 🔓 **`boring-sys` is a direct dependency, and its version moves with `boring`.**
+  `boring` 4.22 does not wrap `X509_STORE_CTX_set_purpose`, which downstream mTLS
+  needs (see the downstream mTLS section for why), so the workspace declares
+  `boring-sys = "4.22"` and `foreign-types = "0.5"` directly — the latter to get
+  `ForeignTypeRef::as_ptr`, which `boring` only `extern crate`s and never
+  re-exports. ⚠️ **Two `boring-sys` means two BoringSSL**, which is exactly the
+  symbol collision described above. Both using a caret range is deliberate: they
+  resolve to the same version together. The day `boring` needs a major bump, this
+  line changes with it. 📌 The check is unchanged from before, with nothing added:
+  `cargo tree -i boring-sys` must show exactly one, and
+  `cargo tree -i openssl-sys` must match nothing.
 
-- **fork 上游 crate 前，先量到數字，而且要量在它是瓶頸的環境。**
-  2026-08-04 一次砍掉兩個 fork（`pingora-core`、`pingora-http`，共 38,532 行）。
-  兩者機制論證都成立，但都沒有一次「被 patch 的東西是飽和資源」的量測撐著：
-  `pingora-core` 把累計配置砍掉 86 %，吞吐 +0.9 %（雜訊內）、RSS 區間完全重疊。
-  第一版壓測甚至是無效的——nginx 打滿 200 % 配額而 Pingclair 還有餘裕，量到的
-  是後端。**現在的規則：A/B 每輪都要記錄三方 CPU，proxy 不是飽和的那層就丟掉該輪。**
+- **Before forking an upstream crate, get a number — measured where the forked
+  thing is the bottleneck.** Two forks were deleted at once on 2026-08-04
+  (`pingora-core` and `pingora-http`, 38,532 lines). Both mechanisms were
+  plausible; neither had a single measurement taken under conditions where the
+  patched component was a saturated resource. `pingora-core` cut cumulative
+  allocation by 86% for +0.9% throughput (inside the noise) with completely
+  overlapping RSS ranges. The first load test was not even valid — nginx was
+  pinned at 200% of its quota while Pingclair still had headroom, so the backend
+  was what got measured. **The rule now: record CPU for all three parties on every
+  A/B round, and throw the round away when the proxy is not the saturated layer.**
 
-- **`[patch.crates-io]` 會讓 crate 對 `cargo audit` 隱形。**
-  patch 之後 lockfile 條目失去 `source` 與 `checksum`，而 cargo-audit 只回報
-  能追回 crates.io 的套件。2026-08-04 直接驗證過：`atty 0.2.14` 專案會報
-  RUSTSEC-2021-0145 與 RUSTSEC-2024-0375，同一個專案把 `atty` path-patch 之後
-  **什麼都不報、乾淨退出**。`security-audit.yml` 因此多跑一次「剝掉 patch
-  區塊、重產 lockfile、再 audit」——任何新的 `[patch]` 都必須同時確認這條路徑
-  仍然涵蓋它。
+- **`[patch.crates-io]` makes a crate invisible to `cargo audit`.** After a patch,
+  the lockfile entry loses its `source` and `checksum`, and cargo-audit only
+  reports packages it can trace back to crates.io. Verified directly on
+  2026-08-04: a project on `atty 0.2.14` reports RUSTSEC-2021-0145 and
+  RUSTSEC-2024-0375, and the same project with `atty` path-patched **reports
+  nothing and exits clean**. `security-audit.yml` therefore runs a second pass
+  that strips the patch sections, regenerates the lockfile, and audits again —
+  any new `[patch]` must be checked against that path still covering it.
 
-- **`target/` 會無聲長到吃光磁碟；cargo 從不回收舊產物。**
-  2026-08-04 量到 77 GB（`incremental` 41 GB、`deps` 44 GB／252,603 個檔案），
-  當時整顆磁碟只剩 12 GiB 可用。`cargo clean` 一次回收 113 GB。
-  **例行處置：`cargo sweep --time 7`**（已安裝 `cargo-sweep`），砍掉七天以上
-  沒被碰過的產物又不影響日常迭代；磁碟吃緊時才用 `cargo clean`。
-  注意 `target/integration-linux` 是 pingora#946 的重現 binary，clean 前要留。
-
----
-
-## 🔐 安全預設
-
-- 未受信來源**不得**偽造 `X-Forwarded-*`／`X-Real-IP`／`CF-Connecting-IP`。
-- 錯誤配置一律 **fail closed**，不是靜默忽略。
-- 敏感欄位（`Authorization`、`Cookie`、API key）在 log／metrics／Admin dump／panic
-  訊息中**預設遮罩**。
-- `insecure_skip_verify` 這類降級開關必須**顯眼且預設關閉**。
-- **遞迴型別禁止用 `#[serde(untagged)]`**。newtype variant（`Not(Box<Self>)`）
-  在 untagged 下會「把整個 payload 再當成一次自己解」而**不消耗任何輸入**，
-  任何對不上其他 variant 的值都會無限遞迴；serde 的 untagged replay 不會再經過
-  serde_json 的 parser，所以 serde_json 的 recursion limit 攔不到，`panic = "abort"`
-  的 release binary 直接中止。這在 `Matcher` 上是可由 Admin API 遠端觸發的
-  DoS（2026-07-28 修）。遞迴 enum 一律用 tag 表示。
-- **設定規則必須擋在 core config 層，不能只擋 Pingclairfile adapter**。
-  Admin API 直接把 config document 反序列化進 core 型別，**完全不經過 adapter**。
-  只寫在 `adapter/caddyfile.rs` 的檢查等於留了一條繞道。矛盾或半套的設定
-  （`insecure_skip_verify` ＋ pinned CA、只有 cert 沒有 key）兩條路都要拒。
-  2026-07-29 Day 11 上游 TLS 依此同時補了 `compiler::validate_config`。
-- 🎯 **把規則寫進 `validate_config` 不等於那條路徑會執行它。** 上面那條規則
-  被遵守了，結論卻仍然是假的：Day 11 與 per-listener `proxy_protocol` 都
-  正確地把規則加進 `compiler::validate_config`，並在 commit message 與這份
-  文件寫下「Admin 這條路也擋住了」——**而 Admin API 從來沒呼叫過那個函式**
-  （2026-07-30 Day 17 修）。測試呼叫的是**函式**，真正的**路徑**沒經過它。
-  加了規則之後，要沿著每一個入口追到底確認它真的被叫到；否定測試要打真正的
-  介面（真的 POST 進 Admin socket），不是呼叫驗證函式。
-- 🎯 **`panic = "abort"` 只設在 release profile，所以測試抓不到 abort。**
-  debug 是 unwind，一個 `unwrap()` 只會炸掉該連線的 task，伺服器照樣活著。
-  於是「伺服器還在嗎」這種斷言，對著它要抓的 panic 也會通過——2026-07-30
-  我就寫出過這種測試。要驗 panic，檢查子程序 stderr 有沒有 `panicked at`，
-  這個訊號在兩種 profile 下都成立。
-- **listener 層級的開關不要做成全域**。PROXY protocol 一度是 `global.proxy_protocol`，
-  開了之後每個 listener 都要求 header，直連的那個就全掛。nginx 是
-  `listen 443 proxy_protocol;`、Caddy 是 per-server listener wrapper，兩者都不是
-  全域，因為真實部署常常一個 port 在 L4 LB 後面、另一個直連。
-  順帶一提，`listen` 以前會**靜默丟棄多餘參數**，所以 `listen :443 proxy_protocol`
-  會產生一個「名字寫了但其實不要求」的 listener——跟 `encode gzipp` 同一類。
-  2026-07-30 在凍結 RC 前改掉:**已知是錯的設定介面不要拿去做遠端驗證**，
-  發布之後就改不動了。
-- **在 Pingora listener 前面再加一層自己的 ingress，會讓 Pingora 那層的
-  admission control 失去意義**。Day 14 的 PROXY protocol 把 Pingora app 搬到
-  私有 loopback listener，前面自建 ingress；`limits { max_connections }` 由
-  `ResourceGuardedProxy` 持有,於是它只再管**內部那一跳**，外部連線變成無上限。
-  Pingora 回的 503 也救不了——外部 socket 屬於 ingress 不屬於 Pingora。
-  **任何自建的 accept loop 都必須自己帶上同一個上限**，而且信任檢查要放在
-  取 permit **之前**，否則未受信的洪水會吃掉留給真流量的額度。
-  2026-07-30 Day 14 review 修，證據見
-  `benchmarks/results/20260730_day14_review_failed_ingress_limit/`。
-- **`HttpHealthCheck` 只替換位址，其他全部沿用 `peer_template`**。SNI、`Host`、
-  TLS 素材都來自那個 template，而 template 通常是用 **first backend** 建的。
-  所以 backend 名字不同的 pool（`to https://a.internal` ＋ `to https://b.internal`）
-  會用 a 的 SNI 去探 b，hostname 驗證必定失敗、b 被永久摘除，但它服務正常——
-  正常流量走 `build_http_peer`，用的是各自的 `HostName` ext。
-  探測時一定要讀 `target.ext.get::<HostName>()`。這個 bug 在單一 backend、
-  同名 backend 或純 HTTP pool 上**完全看不出來**，也就是幾乎所有既有測試。
-  2026-07-30 Day 12 review 修。
-- **Pingora 的 `HttpPeer` reuse hash 沒有算 `options.ca`**。它算了 client cert、
-  `verify_cert`／`verify_hostname`／`alternative_cn`、SNI 與 `group_key`，
-  但 **CA bundle 不在裡面**。同位址同 SNI、trust roots 不同的兩條 route 會共用
-  pooled connection，嚴格那條會沿用寬鬆那條驗過的 session（reuse 直接跳過
-  handshake）。任何新的「誰可以被信任」維度都必須自己打包進 `group_key`。
-  Pingclair 的做法：protocol group 佔低 8 bits，TLS identity hash 左移進高位，
-  用 `peer_protocol_group()` 取回協定，不要再直接比較 `group_key == 4`。
-- **BoringSSL 在設定期接受不匹配的 cert/key**，只有 handshake 才失敗，
-  而上游回的 `bad certificate` alert 跟十幾種無關的網路錯誤長得一樣。
-  載入 client identity 時一定要自己驗 `cert.public_key()?.public_eq(&key)`，
-  並在錯誤訊息裡**同時點名兩個檔案**——半套輪替（只換憑證沒換 key）就是靠這個抓的。
-- **`trusted_ca_certs` 是取代不是疊加**。Pingora 走
-  `SSL_set1_verify_cert_store`，會覆蓋整個 store 而非附加。這是我們要的語意
-  （pin 內部 CA 的 route 不該同時接受公開 CA 簽的同名憑證），但必須寫在文件裡，
-  否則會被誤讀成「額外信任」。
-- **untagged 也代表「不可還原」**。variant 只靠 payload 形狀辨識，形狀相同的
-  variant round-trip 後會變成別人——`Not` 甚至會整個消失，直接反轉路由決策。
-  凡是會被序列化回去的設定型別（Admin dump→post、config 檔）都必須有 tag。
+- **`target/` grows silently until the disk is gone; cargo never reclaims old
+  artefacts.** Measured at 77 GB on 2026-08-04 (`incremental` 41 GB, `deps` 44 GB
+  across 252,603 files) with 12 GiB left on the whole disk. One `cargo clean`
+  reclaimed 113 GB. **The routine treatment is `cargo sweep --time 7`**
+  (`cargo-sweep` is installed), which drops artefacts untouched for a week without
+  disturbing day-to-day iteration; `cargo clean` is for when the disk is actually
+  tight. Note that `target/integration-linux` holds the pingora#946 reproduction
+  binary and must be preserved across a clean.
 
 ---
 
-## 🪪 下游 mTLS（`tls client_auth`，2026-08-10 K3）
+## 🔐 Secure defaults
 
-- **設定解析得過不等於握手擋得住。** `client_auth` 一度完整解析、完整編譯，
-  而握手路徑上**沒有任何程式碼讀它**——站台在設定與日誌裡都宣稱雙向 TLS，
-  實際上放行整個網際網路。所以那段期間 `run.rs` 選擇**拒絕啟動**：
-  這類「宣稱有、實際沒有」的失敗，比乾脆不支援更糟。
-  📌 判準：新增任何安全開關時，找出**真正執行它的那一行**；找不到就別接受它。
-
-- **四個 mode 必須用 custom verify callback，不能用 BoringSSL 內建驗證。**
-  BoringSSL 內建只有一種答案（「建得出信任路徑，否則失敗」），
-  而 `request` 與 `require` 刻意不要驗。把它們交給內建驗證器，
-  會拒絕掉操作者明確要放行的客戶端。
-  對照表（`SSL_set_custom_verify` 的 mode 位元）：
-  `request` = `PEER`；`require` = `PEER|FAIL_IF_NO_PEER_CERT`；
-  `verify_if_given` = `PEER` ＋ callback 驗；
-  `require_and_verify` = `PEER|FAIL_IF_NO_PEER_CERT` ＋ callback 驗。
-  空憑證由 mode 位元自己處理（`tls13_server.cc:1102` 的 `allow_anonymous`），
-  callback 只在客戶端**真的送了憑證**時才會被呼叫。
-
-- 🎯 **自訂 verify callback 的代價：purpose 檢查不會自己跑，要自己開。**
-  上一條選了 custom callback，這條是它的帳單。`X509_verify_cert` 只有在
-  **有人指定 purpose** 的時候才會查憑證自己宣告的用途
-  （`x509_vfy.c:570`：`if (ctx->param->purpose > 0 && X509_check_purpose(...))`），
-  而新建的 `X509_STORE_CTX` 的 purpose 是 0。於是「這條鏈建得起來嗎」的答案
-  被當成「這張憑證可以當 client 嗎」的答案。
-  **後果**：私有 CA 最常見的用法就是一個 CA 簽全公司——那麼每一台
-  `serverAuth` 的伺服器憑證，都是一張可用的 client 身分。
-  做法是在 `verify_cert()` 之前呼叫
-  `X509_STORE_CTX_set_purpose(ctx, X509_PURPOSE_SSL_CLIENT)`。
-  ⚠️ `boring` 4.22 沒有包裝它，`X509VerifyParamRef` 有 `set_flags`／`set_host`／
-  `set_depth` 就是沒有 `set_purpose`，而它的 `boring_sys` 是私有
-  `extern crate`——所以這裡直接依賴 `boring-sys` 與 `foreign-types`。
-  版本必須跟著 `boring` 走，否則樹裡會有兩份 BoringSSL。
-  📌 順手查過但**沒有**改變的一件事：`set_purpose` 同時會把 context 的 trust
-  設成該 purpose 的預設值 `X509_TRUST_SSL_CLIENT`。對一般 PEM 載進來的 CA
-  來說結果一樣——舊值與新值都落到 `x509_trs.c` 的 `trust_compat`，
-  自簽就信、其餘不信。只有帶 `X509_CERT_AUX`（罕見的
-  `TRUSTED CERTIFICATE` 區塊）的 PEM 才分得出兩者。
-  🤡 有一個會讓人愣住的邊界：只寫 `anyExtendedKeyUsage` 的 leaf **會被拒**。
-  BoringSSL 給 `any` 自己的 bit（`XKU_ANYEKU` 0x100），而 SSL-client 檢查看的是
-  `XKU_SSL_CLIENT`（0x2）。這是照抄函式庫的行為，不是我們的選擇——要在這裡
-  特判，就等於在人家的 purpose 邏輯旁邊再寫一份自己的。
-  🎯 四個回歸測試（`client_auth.rs`）先驗過 red：拿掉那一行 `set_purpose`，
-  四個全紅、其餘八個全綠。另有一個真握手的 H3 測試
-  `h3_client_auth_refuses_a_certificate_issued_only_for_servers`。
-
-- **信任 store 要在啟動時建好，握手只借用。**
-  `SslRef::set_verify_cert_store` 走 `SSL_set0_verify_cert_store`，
-  **接管所有權**，而 boring 的 `X509Store` 沒有 `Clone`——照著寫就是每次握手
-  重建整個 store。改用 `X509StoreContext::init(&store, leaf, chain, …)`，
-  它只要 `&X509StoreRef`，於是每條連線只付一個 `Arc` clone。
-
-- **server 端的 `peer_cert_chain()` 不含 leaf，client 端含。**
-  BoringSSL 自己在 `ssl.h:1609` 用 `WARNING:` 標了這件事。
-  剛好就是 `X509_STORE_CTX_init(ctx, store, leaf, intermediates)` 要的那組參數，
-  搭配 `peer_certificate()` 取 leaf。寫成 client 端的直覺會少驗一層。
-
-- 🛡️ **有 mTLS 的 listener 必須強制 SNI 與 `Host` 同名。**
-  admission 由 ClientHello 決定，routing 由 `Host` 決定——兩者可以不同。
-  同一個 socket 上放一個要憑證的站台和一個不要的，攻擊者就用不要憑證的名字
-  握手、用要憑證的名字下 `Host`。上游偵測到 client auth 時會自動開啟
-  `strict_sni_host` 正是為此，回 `421` 並關連線。
-  ⚠️ **沒送 SNI 的客戶端在這種 listener 上一律拒絕**：它什麼都沒指名，
-  就不可能指名了現在要求的那個站台。
-
-- 🚫 **有 mTLS 的 listener 要關掉 session resumption。**
-  resumed handshake 不送 `CertificateRequest`（`tls13_server.cc:818`
-  只在 `!session_reused` 時設 `hs->cert_request`），BoringSSL 從 ticket
-  還原 peer chain 之後**不會重驗**。於是憑證過期、被撤銷，或 trust pool 換掉
-  之後，舊 ticket 仍然放行。代價是這個 listener 每條連線都走完整握手，
-  這是刻意付的。Go 的 `crypto/tls` 有同樣性質，上游是靠
-  `VerifyConnection`（每條連線都跑，含 resumed）補的；
-  BoringSSL 沒有等價 hook，所以我們關 resumption。
-
-- 🛡️ **兩個 transport 必須給同一個答案，而它們是兩套 TLS 設定。**
-  H1/H2 走 Pingora acceptor 的 `cert_cb`，H3 走 `tokio-quiche` 的
-  `set_select_certificate_callback`——**QUIC 根本不跑 `cert_cb`**。
-  兩邊都在「ClientHello 已知、`CertificateRequest` 未送」的那個窗口裡，
-  所以同一份 `CompiledClientAuth` 可以直接掛上去。
-
-- 🔄 **mTLS trust pool reload 必須帶 generation，不是只換 callback。**
-  TCP keep-alive 與 QUIC 連線可以在 reload 前已完成握手；只讓新握手讀新
-  CA，就會讓舊憑證繼續在既有連線上授權。握手必須記住
-  listener-security generation，request 時與現行 generation 比對；不一致就回
-  `421` 並要求重新連線。啟動時沒有 mTLS 的 TLS context 已可能發出可
-  resume 的 ticket，所以後來啟用 mTLS 必須回 `restart_required`，不可假裝
-  hot-apply。
-  📌 政策編譯層因此住在 `pingclair-proxy/src/client_auth.rs` 而不是 binary 裡：
-  只在一個 transport 上成立的安全開關，等於給攻擊者一個「換傳輸」的選項，
-  而 `Alt-Svc` 還會主動邀請他們換。
-  🚫 K3 落地時 H3 尚未驗，當時的 fail-closed 做法是**有 `client_auth` 的位址
-  不啟 QUIC、不發 `Alt-Svc`**；K4（`4e4b05e` 之後）補上之後這條已解除。
-
-- 🤡 **quiche 會覆寫你設的 session cache mode，所以在 QUIC 上關 resumption
-  只能靠 `SSL_OP_NO_TICKET`。**
-  `Context::from_boring`（quiche 0.29.3 `src/tls/mod.rs:155`）接手你的
-  `SslContextBuilder` 之後，**無條件**呼叫
-  `set_session_callback()` → `SSL_CTX_set_session_cache_mode(ctx,
-  SSL_SESS_CACHE_CLIENT)`（`:264`）來裝它自己的 client session callback。
-  你在 builder 上設的 `SslSessionCacheMode::OFF` 當場被蓋掉。
-  **options 則是累加的**，quiche 從不清除，所以 `NO_TICKET` 活得下來。
-  📌 我第一版兩個都設了，還寫了一段「雙保險」的註釋——**一個被默默還原的保護
-  比一個誠實的保護更糟**，因為它讓下一個讀的人以為有兩層。
-  🎯 這條是**測出來的不是讀出來的**：`h3_client_auth_turns_session_resumption_off`
-  先證明同一支 harness 對普通 listener **resume 得起來**（沒有這個對照組，
-  「沒 resume」也可能只是 harness 不會 resume），再證明 mTLS listener 不會。
-  H1/H2 那邊沒有這層覆寫——`TlsSettings::build()` 只是
-  `accept_builder.build()`，中間沒有人碰 options——所以那邊是靠推理成立的，
-  這個不對稱刻意寫下來。
+- Untrusted sources **must not** be able to forge `X-Forwarded-*`, `X-Real-IP`, or
+  `CF-Connecting-IP`.
+- Misconfiguration always **fails closed**, never gets ignored silently.
+- Sensitive fields (`Authorization`, `Cookie`, API keys) are **masked by default**
+  in logs, metrics, Admin dumps, and panic messages.
+- Downgrade switches such as `insecure_skip_verify` must be **conspicuous and off
+  by default**.
+- **Recursive types must never use `#[serde(untagged)]`.** Under untagged, a
+  newtype variant (`Not(Box<Self>)`) re-parses the entire payload as itself
+  **while consuming no input**, so any value that matches no other variant
+  recurses forever. serde's untagged replay never goes back through serde_json's
+  parser, so serde_json's recursion limit cannot catch it, and a release binary
+  with `panic = "abort"` simply dies. On `Matcher` this was a DoS remotely
+  triggerable through the Admin API (fixed 2026-07-28). Recursive enums are always
+  tagged.
+- **Configuration rules belong in the core config layer, not only in the
+  Pingclairfile adapter.** The Admin API deserialises a config document straight
+  into the core types **with no adapter involved**. A check written only in
+  `adapter/caddyfile.rs` is a check with a bypass. Contradictory or half-specified
+  settings (`insecure_skip_verify` together with a pinned CA; a cert with no key)
+  must be rejected on both paths. Day 11 upstream TLS on 2026-07-29 added the
+  matching `compiler::validate_config` for exactly this reason.
+- 🎯 **Writing the rule into `validate_config` is not the same as that path
+  running it.** The rule above was followed and the conclusion was still false:
+  Day 11 and per-listener `proxy_protocol` both correctly added their rules to
+  `compiler::validate_config` and both wrote "the Admin path is covered too" into
+  the commit message and this document — **while the Admin API had never called
+  that function** (fixed on Day 17, 2026-07-30). The tests called the **function**;
+  the actual **path** never went through it. After adding a rule, follow every
+  entry point all the way down and confirm it really is reached; negative tests hit
+  the real interface (an actual POST into the Admin socket), not the validation
+  function.
+- 🎯 **`panic = "abort"` is set only on the release profile, so tests cannot catch
+  an abort.** debug unwinds, so an `unwrap()` only kills that connection's task
+  and the server stays up. Which means an assertion like "is the server still
+  there?" passes against the very panic it was written to catch — I wrote exactly
+  that test on 2026-07-30. To verify a panic, check the child's stderr for
+  `panicked at`; that signal holds under both profiles.
+- **A listener-level switch must not be built as a global one.** PROXY protocol
+  was once `global.proxy_protocol`, so turning it on made every listener demand
+  the header and broke the directly-connected one. nginx spells it
+  `listen 443 proxy_protocol;` and Caddy uses a per-server listener wrapper —
+  neither is global, because real deployments routinely have one port behind an L4
+  load balancer and another taking direct connections. Incidentally, `listen` used
+  to **silently drop extra arguments**, so `listen :443 proxy_protocol` produced a
+  listener that named the feature without requiring it — the same class as
+  `encode gzipp`. Changed before the RC was frozen on 2026-07-30: **never take a
+  configuration interface you know is wrong into remote verification**, because
+  after release you cannot change it.
+- **Putting your own ingress in front of a Pingora listener makes Pingora's
+  admission control meaningless.** Day 14's PROXY protocol moved the Pingora app
+  onto a private loopback listener behind a hand-built ingress;
+  `limits { max_connections }` is held by `ResourceGuardedProxy`, so it then
+  governed only **the internal hop** while external connections became unbounded.
+  Pingora's 503 cannot help either — the external socket belongs to the ingress,
+  not to Pingora. **Any hand-built accept loop must carry the same limit itself**,
+  and the trust check goes **before** the permit is taken, or an untrusted flood
+  eats the allowance reserved for real traffic. Fixed in the Day 14 review on
+  2026-07-30; evidence in
+  `benchmarks/results/20260730_day14_review_failed_ingress_limit/`.
+- **`HttpHealthCheck` replaces only the address and inherits everything else from
+  `peer_template`.** SNI, `Host`, and TLS material all come from that template,
+  and the template is usually built from the **first backend**. So a pool whose
+  backends have different names (`to https://a.internal` + `to https://b.internal`)
+  probes b using a's SNI, hostname verification necessarily fails, and b is
+  permanently ejected while serving perfectly well — real traffic goes through
+  `build_http_peer`, which uses each backend's own `HostName` ext. Probes must
+  read `target.ext.get::<HostName>()`. This bug is **completely invisible** on a
+  single backend, on same-named backends, and on plain-HTTP pools, which is to say
+  on almost every pre-existing test. Fixed in the Day 12 review on 2026-07-30.
+- **Pingora's `HttpPeer` reuse hash does not include `options.ca`.** It hashes the
+  client cert, `verify_cert`/`verify_hostname`/`alternative_cn`, SNI, and
+  `group_key` — but **the CA bundle is not in there**. Two routes to the same
+  address with the same SNI and different trust roots share a pooled connection,
+  and the strict one inherits a session the permissive one verified (reuse skips
+  the handshake entirely). Any new "who may be trusted" dimension must pack itself
+  into `group_key`. Pingclair's approach: the protocol group occupies the low 8
+  bits and the TLS identity hash is shifted above it, with `peer_protocol_group()`
+  to recover the protocol — never compare `group_key == 4` directly again.
+- **BoringSSL accepts a mismatched cert/key at configuration time** and fails only
+  at handshake, where the upstream's `bad certificate` alert looks like a dozen
+  unrelated network errors. When loading a client identity, always verify
+  `cert.public_key()?.public_eq(&key)` yourself and **name both files** in the
+  error message — that is what catches a half-finished rotation where the
+  certificate was replaced and the key was not.
+- **`trusted_ca_certs` replaces, it does not add.** Pingora goes through
+  `SSL_set1_verify_cert_store`, which overwrites the whole store rather than
+  appending. That is the semantics we want (a route pinning an internal CA should
+  not simultaneously accept a same-named certificate signed by a public CA), but it
+  has to be documented or it reads as "additional trust".
+- **untagged also means "not round-trippable".** Variants are identified purely by
+  payload shape, so two variants with the same shape become each other after a
+  round trip — `Not` disappears entirely, inverting the routing decision. Any
+  configuration type that will be serialised back out (Admin dump → post, config
+  files) must be tagged.
 
 ---
 
-## 🌐 公開簽發（ACME，2026-08-17）
+## 🪪 Downstream mTLS (`tls client_auth`, K3, 2026-08-10)
 
-- 🚫 **ClientHello 裡的名字是連線方選的，不是設定檔選的。**
-  這條是這一節存在的理由。resolver 同時負責「查憑證」與「查不到就去簽一張」，
-  而查不到的判斷來自 SNI——於是**陌生人挑一個主機名，這台機器就去跟公開 CA
-  做一次外連工作**：帳號、訂單、挑戰、速率額度，全部由對方觸發。
-  做法是 `TlsManager` 多一份 `public_issuance_domains` allowlist，
-  和既有的 `internal_domains` 完全對稱，在碰到 CA 之前擋掉。
-  📌 **空的 allowlist 代表「誰都不簽」**，不是「都可以」。還沒讀設定檔的行程、
-  或未來忘了發布清單的路徑，都必須落在拒絕那一邊。
-  ⚠️ 這也表示 **catch-all 站台（`_`、`*`、`:port`）不再授權任何公開簽發**。
-  「這個站台什麼都接」講的是路由，不是憑證政策；把它讀成後者正是缺陷本身。
-  上游用 `on_demand_tls` 搭一個明確的 `ask` endpoint 來做這件事，我們沒有實作
-  （registry 裡是 `recognised`），所以無限制的 on-demand 簽發是意外不是功能。
+- **Configuration that parses is not a handshake that holds.** `client_auth` once
+  parsed completely and compiled completely while **no code on the handshake path
+  read it** — the site claimed mutual TLS in its configuration and its logs, and
+  admitted the entire internet. For that period `run.rs` chose to **refuse to
+  start**: this kind of "claimed but absent" failure is worse than not supporting
+  the feature at all. 📌 The test: when adding any security switch, find **the line
+  that actually enforces it**. If you cannot find it, do not accept the setting.
 
-- 🔤 **名字要在進 store／in-flight 集合／CA 之前正規化。**
-  `CertStore` 與 in-flight 集合都用字串當 key，而 SNI 大小寫不敏感、還可以帶
-  結尾的點。allowlist 正規化了但下游沒有，等於**同一個站台可以被拼成上千種寫法**，
-  每一種都是一次 cache miss、一次 claim、一次真的 ACME 訂單——而拼法是客戶端選的。
-  同樣的道理讓 `certs.rs` 的 `ssl_cache` 也必須用正規化後的名字當 key，
-  否則那個 `HashMap` 會被大小寫排列組合灌大。
+- **All four modes need a custom verify callback; BoringSSL's built-in
+  verification cannot express them.** The built-in has exactly one answer ("a
+  trust path exists, or fail"), while `request` and `require` deliberately do not
+  verify. Handing them to the built-in verifier rejects clients the operator
+  explicitly wanted admitted. The mapping (mode bits for `SSL_set_custom_verify`):
+  `request` = `PEER`; `require` = `PEER|FAIL_IF_NO_PEER_CERT`;
+  `verify_if_given` = `PEER` plus verification in the callback;
+  `require_and_verify` = `PEER|FAIL_IF_NO_PEER_CERT` plus verification in the
+  callback. The empty-certificate case is handled by the mode bits themselves
+  (`allow_anonymous` at `tls13_server.cc:1102`); the callback only runs when the
+  client **actually sent** a certificate.
 
-- 🎟️ **in-flight 標記必須是 RAII guard，不能是「呼叫完再移除」。**
-  ACME 呼叫是在 TLS 握手裡 await 的。客戶端斷線 → future 被 drop →
-  **後面那行移除永遠不會執行**，於是那個名字被永久標成「簽發中」，
-  之後每一次嘗試都被拒絕——一次斷線換一個永久壞掉的站台。
-  順帶修掉的是原本 check 與 insert 分兩把鎖的 race：`HashSet::insert`
-  的回傳值一次回答「本來有沒有」和「現在是我的了」。
+- 🎯 **The price of a custom verify callback: the purpose check no longer runs on
+  its own, and you must turn it on.** The rule above chose the custom callback;
+  this one is its bill. `X509_verify_cert` only consults what a certificate
+  declares it is *for* when **somebody has specified a purpose**
+  (`x509_vfy.c:570`: `if (ctx->param->purpose > 0 && X509_check_purpose(...))`),
+  and a freshly created `X509_STORE_CTX` has purpose 0. So the answer to "does
+  this chain build?" gets used as the answer to "may this certificate act as a
+  client?" **The consequence**: the most common private-CA deployment is one CA
+  signing the whole company — which makes every `serverAuth` server certificate a
+  usable client identity. The fix is to call
+  `X509_STORE_CTX_set_purpose(ctx, X509_PURPOSE_SSL_CLIENT)` before
+  `verify_cert()`. ⚠️ `boring` 4.22 does not wrap it —`X509VerifyParamRef` has
+  `set_flags`, `set_host`, and `set_depth`, but no `set_purpose` — and its
+  `boring_sys` is a private `extern crate`, which is why this depends on
+  `boring-sys` and `foreign-types` directly. Their versions must track `boring`, or
+  the tree gets two BoringSSLs.
+  📌 One thing checked along the way that changed **nothing**: `set_purpose` also
+  sets the context's trust to that purpose's default, `X509_TRUST_SSL_CLIENT`. For
+  a CA loaded from ordinary PEM the outcome is identical — old value and new both
+  land in `trust_compat` in `x509_trs.c`, trusting self-signed and nothing else.
+  Only PEM carrying `X509_CERT_AUX` (the rare `TRUSTED CERTIFICATE` block) can
+  tell the two apart.
+  🤡 One edge that stops you short: a leaf declaring only `anyExtendedKeyUsage`
+  **is rejected**. BoringSSL gives `any` its own bit (`XKU_ANYEKU`, 0x100) while
+  the SSL-client check looks at `XKU_SSL_CLIENT` (0x2). That is the library's
+  behaviour reproduced, not our choice — special-casing it here would mean writing
+  a second copy of somebody else's purpose logic beside theirs.
+  🎯 The four regression tests (`client_auth.rs`) were verified red first: remove
+  that one `set_purpose` line and those four go red while the other eight stay
+  green. There is also a real-handshake H3 test,
+  `h3_client_auth_refuses_a_certificate_issued_only_for_servers`.
 
-- 🚦 **per-name 的去重說不了「有幾個不同名字同時在跑」。**
-  所以另外有一個 process 級的 `Semaphore`（`MAX_CONCURRENT_ISSUANCES = 4`）。
-  用 `try_acquire` 直接拒絕而不是排隊：**佇列是由發問者撐開的記憶體與延遲**，
-  拒絕只賠掉一次握手，而 renewal daemon 和下一次握手都會重試。
-  📌 正常流量碰不到這個上限——eager issuance 與 renewal 都是循序的，
-  唯一的併發來源是同時握手。它是 allowlist 後面的第二道，不是第一道。
+- **Build the trust store at startup; the handshake only borrows it.**
+  `SslRef::set_verify_cert_store` goes through `SSL_set0_verify_cert_store`, which
+  **takes ownership**, and boring's `X509Store` is not `Clone` — so the obvious
+  code rebuilds the entire store on every handshake. Use
+  `X509StoreContext::init(&store, leaf, chain, …)` instead, which needs only an
+  `&X509StoreRef`, and each connection pays for one `Arc` clone.
 
-- 🤡 **`enabled` 被寫進設定、被 `auto_https off` 設成 false、然後沒有任何執行期
-  程式碼讀它。** 全 repo 搜尋確認過。
-  📌 判準和 K3 那條 mTLS 的一模一樣：**新增任何安全開關時，找出真正執行它的
-  那一行**。這已經是同一個錯誤在這個檔案裡的第二次。
-  🎯 現在的位置在 store fast path **之後**：關掉自動 HTTPS 要擋的是「去拿一張」，
-  不是「用已經有的那張」——後者不外連、不花額度，擋了只會讓站台白白掛掉。
+- **On the server side `peer_cert_chain()` excludes the leaf; on the client side
+  it includes it.** BoringSSL flags this itself with a `WARNING:` at `ssl.h:1609`.
+  It happens to be exactly the argument set
+  `X509_STORE_CTX_init(ctx, store, leaf, intermediates)` wants, with
+  `peer_certificate()` supplying the leaf. Writing it with client-side intuition
+  verifies one level too few.
 
-- 🎯 **這一節的每一條都先驗過 red。** 拿掉 allowlist → 3 紅；拿掉 `enabled` 閘門
-  → 1 紅；把 semaphore 放大 → 1 紅（8 ≠ 4）；把 drop guard 清空 → 2 紅。
-  ⚠️ 寫這種測試有個陷阱我踩了兩次：mock issuer 進去之後會等 release 訊號，
-  所以閘門一拿掉，「本來不該走到 issuer」的測試會**卡住而不是失敗**。
-  每一個等待都要有上限（`expect_entered`／`expect_refused`），
-  否則紅的表現形式是整個測試跑不完，那是最沒用的說不。
+- 🛡️ **A listener with mTLS must require SNI and `Host` to name the same site.**
+  Admission is decided by the ClientHello and routing is decided by `Host`, and
+  the two can differ. Put a site that requires certificates and one that does not
+  on the same socket, and an attacker handshakes under the name that requires
+  nothing and sends `Host` for the one that does. Upstream enables
+  `strict_sni_host` automatically when it detects client auth for exactly this
+  reason, answering `421` and closing the connection.
+  ⚠️ **A client that sends no SNI is always rejected on such a listener**: having
+  named nothing, it cannot have named the site now being demanded.
+
+- 🚫 **Turn session resumption off on a listener with mTLS.** A resumed handshake
+  sends no `CertificateRequest` (`tls13_server.cc:818` sets `hs->cert_request`
+  only when `!session_reused`), and BoringSSL **does not re-verify** the peer
+  chain it restores from the ticket. So an old ticket still admits a certificate
+  that has expired, been revoked, or fallen out of a replaced trust pool. The cost
+  is a full handshake on every connection to that listener, and it is paid
+  deliberately. Go's `crypto/tls` has the same property, and upstream covers it
+  with `VerifyConnection` (which runs on every connection, resumed included);
+  BoringSSL has no equivalent hook, so we turn resumption off.
+
+- 🛡️ **Both transports must give the same answer, and they are two separate TLS
+  configurations.** H1/H2 goes through the Pingora acceptor's `cert_cb`; H3 goes
+  through `tokio-quiche`'s `set_select_certificate_callback` — **QUIC never runs
+  `cert_cb` at all**. Both sit in the same window, where the ClientHello is known
+  and `CertificateRequest` has not been sent, so one `CompiledClientAuth` attaches
+  to both.
+
+- 🔄 **Reloading the mTLS trust pool must carry a generation, not just swap the
+  callback.** TCP keep-alive and QUIC connections may have completed their
+  handshake before the reload; letting only new handshakes read the new CA leaves
+  old certificates authorising traffic on existing connections. A handshake must
+  remember the listener-security generation and compare it against the current one
+  per request, answering `421` and demanding reconnection on a mismatch. A TLS
+  context that started without mTLS may already have issued resumable tickets, so
+  enabling mTLS later must return `restart_required` rather than pretending to
+  hot-apply. 📌 The policy compilation layer therefore lives in
+  `pingclair-proxy/src/client_auth.rs` rather than in the binary: a security switch
+  that holds on only one transport hands the attacker a "switch transports" option,
+  and `Alt-Svc` actively invites them to. 🚫 When K3 landed, H3 was not yet
+  verified, and the fail-closed measure at the time was **no QUIC and no `Alt-Svc`
+  for any address with `client_auth`**; K4 (after `4e4b05e`) supplied the missing
+  half and lifted it.
+
+- 🤡 **quiche overwrites whatever session cache mode you set, so turning
+  resumption off on QUIC works only through `SSL_OP_NO_TICKET`.**
+  `Context::from_boring` (quiche 0.29.3, `src/tls/mod.rs:155`) takes your
+  `SslContextBuilder` and then **unconditionally** calls `set_session_callback()`
+  → `SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT)` (`:264`) to
+  install its own client session callback. The `SslSessionCacheMode::OFF` you set
+  on the builder is overwritten on the spot. **Options, by contrast, accumulate**
+  and quiche never clears them, so `NO_TICKET` survives.
+  📌 My first version set both and carried a comment about "belt and braces" —
+  **a protection that is silently reverted is worse than an honest one**, because
+  it convinces the next reader there are two layers.
+  🎯 This one was **measured, not read**:
+  `h3_client_auth_turns_session_resumption_off` first proves the same harness
+  **can** resume against an ordinary listener (without that control, "no
+  resumption" might just mean the harness cannot resume) and then proves the mTLS
+  listener does not. There is no such overwrite on the H1/H2 side —
+  `TlsSettings::build()` is just `accept_builder.build()` with nobody touching
+  options in between — so that side holds by reasoning, and the asymmetry is
+  written down deliberately.
 
 ---
 
-## 📡 DNS-01（`tls { dns … }`，2026-08-10 K5）
+## 🌐 Public issuance (ACME, 2026-08-17)
 
-- 🤡 **rustls 的 crypto provider 必須指名，否則第一次連線直接 panic。**
-  這個 binary 同時鏈進了兩套：`instant-acme` 帶 aws-lc-rs，workspace 的
-  `rustls` 又釘 `ring`。rustls 拒絕猜，`ClientConfig` 一建就
-  `panic!("Could not automatically determine the process-level CryptoProvider")`。
-  **那是簽發當下對著真 API 的 panic，不是測試產物**——
-  用 `HttpsConnectorBuilder::with_provider_and_webpki_roots(provider)` 明確指定。
-  📌 這條是被那支打 mock server 的測試抓到的。如果當初偷懶只寫「打真 API 的
-  測試」，這個 panic 會第一次出現在正式環境。**provider 的測試要能離線跑。**
+- 🚫 **The name in a ClientHello is chosen by whoever connected, not by the
+  configuration file.** This is the reason the section exists. The resolver both
+  looks up a certificate and, on a miss, goes and gets one signed — and the miss is
+  decided by SNI, so **a stranger picks a hostname and this machine performs
+  outbound work against a public CA**: account, order, challenge, rate quota, all
+  triggered by them. The fix gives `TlsManager` a `public_issuance_domains`
+  allowlist, exactly symmetric to the existing `internal_domains`, checked before
+  anything touches the CA.
+  📌 **An empty allowlist means "sign for nobody"**, not "sign for anyone". A
+  process that has not read the configuration yet, and any future path that forgets
+  to publish the list, must land on the refusing side.
+  ⚠️ It also means **catch-all sites (`_`, `*`, `:port`) no longer authorise any
+  public issuance**. "This site accepts anything" is a statement about routing, not
+  about certificate policy, and reading it as the latter *is* the defect. Upstream
+  does this with `on_demand_tls` and an explicit `ask` endpoint, which we have not
+  implemented (the registry marks it `recognised`), so unlimited on-demand issuance
+  here was an accident rather than a feature.
 
-- 🏢 **zone 要由長到短試後綴，而且要快取。**
-  `_acme-challenge.a.example.com` 屬於哪個 zone，名字本身沒說，只有帳號知道。
-  長的先試，delegated 子 zone 才會贏過母 zone——那正是委派的意義。
+- 🔤 **Normalise names before the store, the in-flight set, and the CA.**
+  `CertStore` and the in-flight set are both keyed by string, while SNI is
+  case-insensitive and may carry a trailing dot. The allowlist normalised and
+  nothing downstream did, which means **one site can be spelled a thousand ways**,
+  each one a cache miss, a claim, and a real ACME order — with the spelling chosen
+  by the client. The same reasoning makes `ssl_cache` in `certs.rs` key on the
+  normalised name, or that `HashMap` inflates on case permutations alone.
 
-- 🧹 **TXT 記錄要「取代」不是「附加」。** 重試的訂單否則會留下上一次的挑戰值，
-  而一個名字帶兩筆 TXT，有些 CA 會直接判為無法判讀。
+- 🎟️ **The in-flight marker must be an RAII guard, never "remove it after the
+  call".** The ACME call is awaited inside the TLS handshake. Client disconnects →
+  the future is dropped → **the removal line below never runs**, so that name is
+  marked "issuing" forever and every later attempt is refused — one disconnect buys
+  a permanently broken site. Fixed alongside it: the original check-then-insert
+  race across two lock acquisitions. `HashSet::insert`'s return value answers "was
+  it there?" and "is it mine now?" in one step.
 
-- 🏷️ **萬用字元的挑戰記錄寫在母網域上。**
-  `*.example.com` 與 `example.com` 共用 `_acme-challenge.example.com`；
-  照字面組出 `_acme-challenge.*.example.com` 是任何 zone 都放不下的名字。
+- 🚦 **Per-name deduplication cannot say how many distinct names are running at
+  once.** So there is also a process-wide `Semaphore`
+  (`MAX_CONCURRENT_ISSUANCES = 4`). It uses `try_acquire` to refuse outright rather
+  than queue: **a queue is memory and latency the asker gets to inflate**, while a
+  refusal costs one handshake and both the renewal daemon and the next handshake
+  will retry. 📌 Normal traffic never reaches this limit — eager issuance and
+  renewal are both sequential, and simultaneous handshakes are the only source of
+  concurrency. It is the second line behind the allowlist, not the first.
 
-- 🔎 **傳播檢查的 resolver 必須關快取。** 檢查要觀察的就是「記錄出現了」這個
-  變化，而快取住的 NXDOMAIN 會在整個 propagation 窗口內一直說沒有。
+- 🤡 **`enabled` was written into the configuration, set to false by
+  `auto_https off`, and then read by no runtime code at all.** Confirmed by
+  searching the whole repository. 📌 The test is identical to the K3 mTLS one:
+  **when adding any security switch, find the line that actually enforces it.**
+  This is now the second appearance of the same mistake in this one file.
+  🎯 Its home is now **after** the store fast path: turning automatic HTTPS off
+  should block "go and get one", not "use the one we already have" — the latter
+  makes no outbound call and spends no quota, and blocking it only takes the site
+  down for nothing.
 
-- 🔐 **API token 是憑證。** 包在一個 `Debug` 什麼都不印的型別裡——
-  不是為了防人手寫 log，是為了防日後有人在外層結構加 `#[derive(Debug)]`。
-  連長度都不印：長度會洩漏 token 的種類。
-
-- 🚫 **沒實作的 provider 在啟動時指名拒絕，不在設定期。**
-  設定期拒絕會讓 12 份上游語料失敗——它們用 `dns mock`，而上游那是測試模組。
-  `adapt` 說「我翻譯得了」是誠實的，拒絕**服務**才是該畫的線；
-  跟 K3 的 `client_auth` 同一條理由。
+- 🎯 **Every rule in this section was verified red first.** Remove the allowlist →
+  3 red; remove the `enabled` gate → 1 red; widen the semaphore → 1 red (8 ≠ 4);
+  empty the drop guard → 2 red. ⚠️ There is a trap in writing these tests that I
+  fell into twice: once inside, the mock issuer waits for a release signal, so
+  removing a gate makes the test that "should never have reached the issuer"
+  **hang instead of fail**. Every wait needs a bound (`expect_entered` /
+  `expect_refused`), or the red manifests as a test that never finishes — the least
+  useful form of "no" there is.
 
 ---
 
-## 🔁 Inline subrequest 的上游 TLS（2026-08-17）
+## 📡 DNS-01 (`tls { dns … }`, K5, 2026-08-10)
 
-- 🤡 **設定被解析、被驗證、然後被丟掉——這是最糟的一種失敗。**
-  主 reverse-proxy route 早就有 `CompiledUpstreamTls`，但 inline subrequest
-  （`forward_auth` 編譯後的形狀）走另一套 prepared shape，
-  `build_http_peer(..., None)` 那個 `None` 就是整個缺陷。
-  操作者寫了 `trusted_ca_certs`、設定通過、然後用系統信任池撥號。
-  📌 判準和 K3 那條 mTLS、SEC-004 的 `enabled` 完全一樣，這已經是第三次：
-  **新增任何安全開關時，找出真正執行它的那一行**。找不到就別接受那個設定。
+- 🤡 **rustls's crypto provider must be named explicitly, or the first connection
+  panics.** This binary links two of them: `instant-acme` brings aws-lc-rs, and the
+  workspace pins `rustls` to `ring`. rustls refuses to guess and panics the moment
+  a `ClientConfig` is built:
+  `panic!("Could not automatically determine the process-level CryptoProvider")`.
+  **That is a panic against the real API at issuance time, not a test artefact** —
+  name it with `HttpsConnectorBuilder::with_provider_and_webpki_roots(provider)`.
+  📌 This was caught by the test that talks to a mock server. Had we taken the
+  shortcut of only writing "tests that hit the real API", this panic would have
+  made its first appearance in production. **Provider tests must run offline.**
 
-- 🛡️ **fail-closed 也要一起搬過去，不是只搬 happy path。**
-  `RouteUpstreamTls::Broken` 的存在理由是「設定要求 pin 一個私有 CA，
-  但材料讀不到，那就不要撥號」——subrequest 更需要這條，
-  因為 `forward_auth` 那個連線的答案**決定請求准不准過**。
-  所以 subrequest 直接共用 `RouteUpstreamTls` 而不是自己一個 `Option`：
-  三個狀態（Default／Compiled／Broken）少一個就會變成靜默降級。
+- 🏢 **Try zone suffixes longest to shortest, and cache the answer.** Which zone
+  `_acme-challenge.a.example.com` belongs to is not stated by the name; only the
+  account knows. Longest first is what lets a delegated child zone win over its
+  parent — which is the entire point of delegation.
 
-- 🎯 **prepared plan 的比對條件必須包含所有「讓兩個 exchange 不同」的欄位。**
-  `matches_reverse_proxy` 原本不比 `upstream_tls`，所以同一個 route 上兩個
-  subrequest 只差信任材料時，兩個都會命中第一份 plan，第二個用第一個的政策撥號。
-  ⚠️ 這種缺陷**沒有任何測試會自然抓到**，因為用錯的 plan 還是「能用」。
+- 🧹 **TXT records are replaced, not appended.** Otherwise a retried order leaves
+  the previous challenge value behind, and some CAs treat a name carrying two TXT
+  records as unreadable.
 
-- 🧾 **DSL 表達不出這件事，而這本身是一條缺口。**
-  Caddyfile 的 `forward_auth` 只收 `uri` 與 `copy_headers`，
-  其餘 subdirective 一律 `UnknownDirective`。所以這條的暴露面只有 JSON／Admin。
-  🎯 它**fail closed**（拒絕）而不是靜默忽略，所以是「缺功能」不是「第二個缺陷」——
-  但「內部 auth service 放在私有 CA 後面」是很普通的形狀，該補。
-  📌 測試因此只能用 JSON。房規說「我只能用 JSON」要當成發現而不是變通，
-  這條就是那個發現，記在 TRIAGE。
+- 🏷️ **A wildcard's challenge record goes on the parent domain.**
+  `*.example.com` and `example.com` share `_acme-challenge.example.com`; composing
+  `_acme-challenge.*.example.com` literally produces a name no zone can hold.
+
+- 🔎 **The propagation check's resolver must have caching off.** The check exists
+  to observe the record appearing, and a cached NXDOMAIN will keep saying "not
+  there" for the whole propagation window.
+
+- 🔐 **The API token is a credential.** It is wrapped in a type whose `Debug`
+  prints nothing — not to stop somebody hand-writing a log line, but to stop
+  somebody later adding `#[derive(Debug)]` to an enclosing struct. Not even the
+  length is printed: length leaks which kind of token it is.
+
+- 🚫 **An unimplemented provider is refused by name at startup, not at
+  configuration time.** Refusing at configuration time fails 12 upstream corpus
+  files — they use `dns mock`, which upstream has as a test module. `adapt` saying
+  "I can translate this" is honest; refusing to **serve** is where the line belongs.
+  Same reasoning as K3's `client_auth`.
+
+---
+
+## 🔁 Upstream TLS for inline subrequests (2026-08-17)
+
+- 🤡 **Configuration parsed, validated, and then thrown away — the worst kind of
+  failure.** The main reverse-proxy route had `CompiledUpstreamTls` all along, but
+  an inline subrequest (the shape `forward_auth` compiles into) goes through a
+  different prepared shape, and the `None` in `build_http_peer(..., None)` was the
+  whole defect. The operator wrote `trusted_ca_certs`, the configuration passed,
+  and the dial used the system trust pool. 📌 The test is identical to K3's mTLS one
+  and to SEC-004's `enabled`, making this the third occurrence: **when adding any
+  security switch, find the line that actually enforces it.** If you cannot find
+  it, do not accept the setting.
+
+- 🛡️ **Move the fail-closed path across too, not just the happy path.**
+  `RouteUpstreamTls::Broken` exists to say "the configuration demands a pinned
+  private CA and the material will not load, so do not dial" — and a subrequest
+  needs it more, because the answer from that `forward_auth` connection **decides
+  whether the request is allowed through**. So subrequests share `RouteUpstreamTls`
+  directly rather than carrying their own `Option`: with three states
+  (Default/Compiled/Broken), dropping one turns into a silent downgrade.
+
+- 🎯 **A prepared plan's match conditions must include every field that makes two
+  exchanges different.** `matches_reverse_proxy` did not compare `upstream_tls`, so
+  two subrequests on the same route differing only in trust material both matched
+  the first plan, and the second dialled under the first one's policy. ⚠️ **No test
+  catches this naturally**, because using the wrong plan still "works".
+
+- 🧾 **The DSL cannot express this, and that itself is a gap.** Caddyfile's
+  `forward_auth` accepts only `uri` and `copy_headers`; every other subdirective is
+  an `UnknownDirective`. So the exposure here is JSON and Admin only.
+  🎯 It **fails closed** (rejects) rather than ignoring silently, which makes it a
+  missing feature rather than a second defect — but "the internal auth service sits
+  behind a private CA" is a thoroughly ordinary shape and should be supported.
+  📌 The tests therefore have to use JSON. The house rule is that "I could only do
+  this in JSON" counts as a finding rather than a workaround; this is that finding,
+  recorded in TRIAGE.

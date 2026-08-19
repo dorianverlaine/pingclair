@@ -33,7 +33,7 @@
 *   🔄 **智慧負載平衡** — 內建多種演算法（輪詢、最少連線等），支援健康檢查與故障自動轉移。
 *   🔐 **自動與私有 HTTPS** — 整合 ACME（Let's Encrypt）申請公開憑證；`tls internal` 則提供持久化本機 CA，供私有源站與隧道使用。
 *   📁 **高效能靜態檔案服務** — 支援 Gzip/Brotli 壓縮、Range 請求與高效率的檔案傳輸。
-*   📊 **可觀測性** — 開箱即用的 Prometheus 指標匯出與 OpenTelemetry Tracing 支援。
+*   📊 **可觀測性** — 開箱即用的 Prometheus 指標匯出。
 
 ## ⚡ 效能基準測試
 

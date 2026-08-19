@@ -1,246 +1,324 @@
-# ⚠️ Pingclair 實作守則 — 測試與除錯
+# ⚠️ Pingclair implementation guardrails — testing and debugging
 
-## 🧪 測試與除錯
+## 🧪 Testing and debugging
 
-- **同一件事不要有兩份建置設定。** 2026-08-05 的 Day 22 發現：倉庫根目錄有一份
-  `Dockerfile`，`docker build .` —— 從乾淨 checkout 最顯然的那條命令 ——
-  **會失敗**，因為它逐項列出要 COPY 的 crate 而漏了 `[patch.crates-io]` 需要的
-  `vendor/`。CI 建的是 `deployment/Dockerfile`（`COPY . .`），所以根目錄那份
-  **從來沒有被任何工作流建過**，而 `benchmarks/docker-compose.yml` 正指著它。
+- **Never keep two build configurations for one thing.** Found on Day 22,
+  2026-08-05: there was a `Dockerfile` in the repository root, and
+  `docker build .` — the single most obvious command to run from a clean
+  checkout — **failed**, because it listed the crates to COPY one by one and
+  missed the `vendor/` that `[patch.crates-io]` needs. CI built
+  `deployment/Dockerfile` (`COPY . .`), so the root one had **never been built by
+  any workflow**, and `benchmarks/docker-compose.yml` was pointing straight at it.
 
-  更早的 2026-07-31 事故已經記過同一個形狀（見下方鏈結一節：Dockerfile 漂移
-  導致線上 image 與 CI 不同）。當時的結論是「改一邊就要改另一邊」，
-  **那個結論不夠**——需要人記得的一致性，遲早會有人不記得。
+  The earlier incident on 2026-07-31 had already recorded the same shape (see the
+  linking section below: Dockerfile drift left the production image different
+  from CI). The conclusion then was "change one, change the other", and **that
+  conclusion was not good enough** — consistency that depends on somebody
+  remembering will eventually meet somebody who does not.
 
-  > 🎯 **可操作的規則**：重複的建置設定要**刪掉**，不是靠紀律同步。
-  > 根目錄那份已於 2026-08-05 移除，`deployment/Dockerfile` 是唯一一份，
-  > 而 `ci.yml` 的 `docker-image` job 每次都建它。
+  > 🎯 **The operable rule**: duplicated build configuration gets **deleted**,
+  > not kept in sync by discipline. The root one was removed on 2026-08-05,
+  > `deployment/Dockerfile` is the only one left, and the `docker-image` job in
+  > `ci.yml` builds it every time.
 
-- **一個綠燈的單元測試，可能檢查的是對的東西、錯的層級。**
-  2026-08-04 加 `lb_policy header X-Session` 時，同時寫了
-  `an_absent_or_empty_value_yields_no_key`：請求沒帶那個 header 時，
-  `extract_hash_key` 必須回 `None`。它是綠的，而且**斷言本身完全正確**。
+- **A green unit test can be checking the right thing at the wrong layer.**
+  When `lb_policy header X-Session` was added on 2026-08-04, it came with
+  `an_absent_or_empty_value_yields_no_key`: when the request carries no such
+  header, `extract_hash_key` must return `None`. It was green, and **the
+  assertion itself was entirely correct**.
 
-  但沒有人問：**balancer 拿到那個 `None` 會做什麼？** 答案是
-  `key.unwrap_or(b"")`，然後雜湊空字串——完全一致，所以每一個沒帶 header
-  的請求都落到同一個後端。以 session header 而言那是所有尚未登入的使用者，
-  也就是站上最忙的流量全部打一台。
+  Nobody asked the next question: **what does the balancer do with that `None`?**
+  The answer was `key.unwrap_or(b"")`, hashing the empty string — perfectly
+  consistently, so every request without the header landed on the same backend.
+  For a session header that means every user who has not logged in yet, which is
+  the busiest traffic on the site, all going to one machine.
 
-  當天的 Day 22 驗證用四個真後端跑在容器裡，40 次請求全部落在同一台，
-  一眼就看見了。
+  The Day 22 verification that same day ran four real backends in containers, and
+  all 40 requests landed on one of them. It was visible at a glance.
 
-  > 🎯 **可操作的規則**：測「A 在某情況回傳哨兵值」時，**同一次一併測
-  > 「A 的呼叫端拿到那個哨兵值之後做了什麼」**。`None`／`""`／`0`／空集合
-  > 這些值的意義不在產生它的函式裡，在消費它的地方。單獨測產生端，
-  > 等於驗證了一半的合約然後宣稱整份成立。
+  > 🎯 **The operable rule**: when you test "A returns a sentinel in this case",
+  > **test in the same breath what A's caller does when it receives that
+  > sentinel**. The meaning of `None` / `""` / `0` / the empty set does not live
+  > in the function that produces it; it lives where it is consumed. Testing only
+  > the producer verifies half a contract and then claims the whole one holds.
 
-- **自簽憑證測不出憑證鏈的缺陷。** 自簽憑證自己就是自己的簽發者，它**沒有**
-  中繼憑證——「只送 leaf」和「送完整鏈」產生的位元組完全相同。所以任何用
-  自簽 fixture 的 TLS 測試，對「伺服器把中繼憑證丟掉了」這類 bug 是**物理上
-  不可觀測**的。2026-07-30 的雙區域公網驗證就是這樣抓到 H1／H2 只送 leaf：
-  在那之前 474 個測試沒有一個可能發現它。要驗憑證鏈，fixture 必須是
-  root → intermediate → leaf 的真實兩層信任路徑（`rcgen` 可以直接建，見
-  `pingclair/tests/integration.rs` 的 `build_two_level_chain`），
-  斷言用 client 端的 `peer_cert_chain().len()`。
-- **瀏覽器不能當 TLS 憑證鏈的驗收工具。** Chrome 與 Firefox 會快取中繼憑證，
-  也會用 AIA 自己去補抓缺少的那張，所以**伺服器少送中繼，瀏覽器照樣顯示綠鎖**。
-  curl、Go、Java、Python requests 則會直接以
-  `unable to get local issuer certificate (20)` 硬失敗。驗收要用嚴格 client，
-  不要用瀏覽器「看起來正常」當證據。
-- **本機 macOS 有系統代理 `127.0.0.1:1082`**；reqwest 整合測試必須 `.no_proxy()`，
-  否則請求會被代理攔截，症狀看起來像路由錯誤。
-- **本機 `dig` 會回假 IP。** 系統代理用 fake-IP DNS，直接 `dig example.com`
-  得到的是 `198.18.x.x`，看起來像 DNS 還沒生效。查真實解析必須指定公開
-  resolver：`dig @8.8.8.8 example.com`。
-- **遇到固定 404／502 或 readiness 異常**，先用 `lsof`／`ss` 查 port owner，
-  再查 child 是否已因 bind failure 退出。**不要先假設是路由邏輯錯誤**——
-  這個誤判浪費過整輪除錯。
-- **timeout 時必須先 kill＋wait，再讀 stdout/stderr 到 EOF**。
-  順序反了會永久阻塞並留下幽靈程序。
-- 真 binary 測試一律用**動態 port**與**唯一 readiness token**。固定 port 會讓
-  舊程序被誤判為 ready，測試看似通過實則測到別的東西。
-- **真 binary drill 必須設 `PINGCLAIR_TLS_STORE` 指向可寫目錄**，即使配置裡
-  完全沒有 TLS。TLS manager 在讀配置前就無條件初始化 store。預設路徑現在是
-  每使用者可寫的 `$XDG_DATA_HOME/pingclair`（`~/.local/share/pingclair`），
-  不可建立或不可寫時會在啟動時以**指名路徑的明確錯誤**失敗（write-probe，
-  見 `pingclair/src/main.rs`），不再是看不出來歷的一行 `PermissionDenied`
-  panic——但 drill 仍要設變數：CA、ACME 帳號金鑰與 autosave 文件才不會掉進
-  CI runner 的 HOME，測試之間也不會互相污染。
-- **`zsh` 不會對未加引號的變數做 word splitting**。`for x in "a 1" ...; set -- $x`
-  在 bash 能拆成兩個參數，在 zsh 只會得到一個——症狀是 `$2` 空白，很容易誤讀成
-  被測程式的問題。測試腳本改用明確參數的 function。
-- **壓縮測試的 payload 必須逐 chunk 唯一且不可壓縮**。重複同一塊資料會被
-  zstd 的 window 去重（64MiB → 15KB），讓「輸出有在流動」這類斷言**假性失敗**。
-- **本機 gate 必須用 `cargo +1.97.1`,不是預設工具鏈**。CI 釘 `1.97.1`
-  （2026-08-02 拆分後,現在是 `blocking-ci.yml` 快速閘 + `postmerge-ci.yml`
-  全量閘,各自呼叫 reusable workflow）,workspace 也宣告 `rust-version = "1.97"`。
-  本機一律從 `just ci` 進入同一道閘；工具鏈版本一不對,型別推論與 rustfmt
-  換行決策就不同,本機全綠然後 CI 全紅——這個坑兩個方向都踩過：2026-07-29
-  是本機比 CI 新（混型陣列 `&[&String, &String, &str]` 在 1.88 是
-  `E0308`）；2026-08-02 反過來,release image 還釘 1.88.0 而 lockfile 已
-  需要 ≥1.97（`rustc 1.88.0 is not supported`）。
-- 🎩 **CI runner 固定 `ubuntu-24.04` / `ubuntu-24.04-arm`**（不再用浮動的
-  `ubuntu-latest`）,跟 `deployment/Dockerfile` 的 `ubuntu:24.04` 同一個
-  base、同一份 rustup 釘版 1.97.1、同一份 `apt` 套件清單。這條規則源自
-  2026-07-31 的事故：那份 Dockerfile 從 H3 換 tokio-quiche 之後**從沒被建過**,
-  線上跑的 image 是依賴樹改變前建的,Rust 版本也早就跟 `Cargo.toml` 的宣告
-  不一致。CI 跑在別的發行版上會完全遮住這件事。**兩份套件清單必須手動保持
-  同步**——CI 的 `apt-get install` 跟 Dockerfile builder stage 那份改一邊
-  就要改另一邊,目前沒有機制強制同步,這條本身就是下一個可能重犯的坑。
-- 🐳 **CI 的 `docker.yml` reusable workflow 真的建
-  `deployment/Dockerfile` 並開機驗證**（`docker run ... version`、
-  `docker run ... validate` 一份真 Pingclairfile）。這是「一份沒人跑的建置
-  腳本等於沒測試過的程式碼」這句話的直接對策——上面那次 Dockerfile 漂移,
-  如果這個 job 當時存在,第一次 push 就會紅。
-- 🚫 **listener topology 回滾測試不可再靠「port 1 一定綁不上」。**
-  2026-08-13 起，Admin 與 signal reload 對新增／刪除 listener 在任何
-  bind 之前就回 `restart_required`；測試應使用真正的空閒動態 port，
-  並斷言該 port 仍未被程式取走。這樣驗的是產品契約，不是
-  Docker 的 `ip_unprivileged_port_start`、執行使用者或
-  `CAP_NET_BIND_SERVICE`。
+- **A self-signed certificate cannot detect a certificate-chain defect.** A
+  self-signed certificate is its own issuer and **has no** intermediate — "send
+  only the leaf" and "send the full chain" produce byte-identical output. So any
+  TLS test built on a self-signed fixture is **physically incapable** of observing
+  a bug like "the server dropped the intermediate". That is how the two-region
+  public-internet verification on 2026-07-30 caught H1/H2 sending only the leaf:
+  until then, not one of 474 tests could possibly have found it. To verify a
+  chain, the fixture needs a real two-level trust path, root → intermediate →
+  leaf (`rcgen` builds one directly; see `build_two_level_chain` in
+  `pingclair/tests/integration.rs`), asserted through the client's
+  `peer_cert_chain().len()`.
+- **A browser is not an acceptance tool for certificate chains.** Chrome and
+  Firefox cache intermediates and will fetch a missing one themselves over AIA,
+  so **a server that omits the intermediate still shows a green padlock**. curl,
+  Go, Java, and Python requests fail hard with
+  `unable to get local issuer certificate (20)`. Accept with a strict client;
+  never take "the browser looks fine" as evidence.
+- **The local macOS box has a system proxy on `127.0.0.1:1082`**; reqwest
+  integration tests must call `.no_proxy()`, or requests get intercepted and the
+  symptom looks like a routing error.
+- **Local `dig` returns fake addresses.** The system proxy uses fake-IP DNS, so a
+  plain `dig example.com` gives you `198.18.x.x`, which looks like DNS has not
+  propagated. To see real resolution, name a public resolver:
+  `dig @8.8.8.8 example.com`.
+- **On a persistent 404/502 or a readiness anomaly**, check the port owner with
+  `lsof`/`ss` first, then check whether the child already exited on a bind
+  failure. **Do not start from the assumption that routing logic is wrong** —
+  that misdiagnosis has cost a full debugging round.
+- **On timeout, kill and wait first, then read stdout/stderr to EOF.** The other
+  order blocks forever and leaves a ghost process behind.
+- Real-binary tests always use a **dynamic port** and a **unique readiness
+  token**. A fixed port lets an old process be mistaken for ready, and the test
+  appears to pass while measuring something else entirely.
+- **A real-binary drill must set `PINGCLAIR_TLS_STORE` to a writable directory**,
+  even when the configuration contains no TLS at all. The TLS manager initialises
+  the store unconditionally, before it reads the configuration. The default path
+  is now per-user writable at `$XDG_DATA_HOME/pingclair`
+  (`~/.local/share/pingclair`), and when it cannot be created or written it fails
+  at startup with **an explicit error naming the path** (a write probe; see
+  `pingclair/src/main.rs`) instead of the old unattributable `PermissionDenied`
+  panic — but drills still set the variable, so that the CA, the ACME account key
+  and the autosave document do not land in the CI runner's HOME and tests do not
+  contaminate each other.
+- **`zsh` does not word-split unquoted variables.** `for x in "a 1" ...;
+  set -- $x` splits into two arguments under bash and stays one under zsh — the
+  symptom is an empty `$2`, which reads very easily as a problem in the program
+  under test. Test scripts use functions with explicit parameters instead.
+- **A compression test's payload must be unique per chunk and incompressible.**
+  Repeating one block lets zstd's window deduplicate it (64 MiB → 15 KB), which
+  makes assertions like "output is flowing" **fail spuriously**.
+- **The local gate runs `cargo +1.97.1`, not the default toolchain.** CI pins
+  `1.97.1` (since the 2026-08-02 split that means the `blocking-ci.yml` fast gate
+  plus the `postmerge-ci.yml` full gate, each calling reusable workflows), and the
+  workspace declares `rust-version = "1.97"`. Locally, always enter through
+  `just ci` so it is the same gate. Get the toolchain version wrong and type
+  inference and rustfmt's line breaking both change, giving all-green locally
+  followed by all-red in CI — and this repository has fallen in from both
+  directions: on 2026-07-29 the local toolchain was newer than CI (a mixed array
+  `&[&String, &String, &str]` is `E0308` on 1.88), and on 2026-08-02 the reverse,
+  where the release image still pinned 1.88.0 while the lockfile already needed
+  ≥ 1.97 (`rustc 1.88.0 is not supported`).
+- 🎩 **CI runners are pinned to `ubuntu-24.04` / `ubuntu-24.04-arm`** (no more
+  floating `ubuntu-latest`), matching `deployment/Dockerfile`'s `ubuntu:24.04` —
+  same base, same rustup pin at 1.97.1, same `apt` package list. This rule comes
+  from the 2026-07-31 incident: that Dockerfile **had not been built since the H3
+  switch to tokio-quiche**, the image running in production had been built before
+  the dependency tree changed, and its Rust version had long since diverged from
+  what `Cargo.toml` declared. Running CI on a different distribution would hide
+  all of that. **The two package lists must be kept in sync by hand** — CI's
+  `apt-get install` and the Dockerfile builder stage's list have no mechanism
+  forcing agreement, so this rule is itself the next likely repeat.
+- 🐳 **CI's `docker.yml` reusable workflow really does build
+  `deployment/Dockerfile` and boot it** (`docker run ... version`, and
+  `docker run ... validate` against a real Pingclairfile). This is the direct
+  countermeasure to "a build script nobody runs is untested code" — had this job
+  existed at the time, the Dockerfile drift above would have gone red on the first
+  push.
+- 🚫 **Listener-topology rollback tests must no longer rely on "port 1 cannot be
+  bound".** Since 2026-08-13, Admin and signal reload return `restart_required`
+  for added or removed listeners before any bind is attempted; tests should use a
+  genuinely free dynamic port and assert that the program still has not taken it.
+  That verifies the product's contract rather than Docker's
+  `ip_unprivileged_port_start`, the running user, or `CAP_NET_BIND_SERVICE`.
 
-  > 📌 更一般的形狀：**任何用「這個操作會失敗」當斷言的測試，都隱含一個環境前提**。
-  > 能直接斷言穩定的 API 結果時，不要把環境偶然當成 oracle。
+  > 📌 The general shape: **any test whose assertion is "this operation will
+  > fail" carries a hidden environmental premise.** When you can assert a stable
+  > API result directly, do not use an accident of the environment as an oracle.
 
-- ⚖️ **round-robin 測試不可斷言「誰先」**。負載平衡保證的是相鄰請求交替、
-  總量平均；**起始的那一台由共用計數器的初始值決定**，設定裡沒有任何東西釘住它。
-  2026-08-10：`test_php_fastcgi_round_robins_across_multiple_responders` 斷言
-  `["first","second","first","second"]`，在 macOS 綠、在 Linux 紅成
-  `["second","first",…]`——同一個正確行為，差一個相位。斷言要寫成性質
-  （相鄰不重複 ＋ 各收到一半），不是寫成某一次觀察到的序列。
+- ⚖️ **A round-robin test must not assert who goes first.** Load balancing
+  guarantees that adjacent requests alternate and that the totals come out even;
+  **which backend starts is decided by the initial value of a shared counter**,
+  and nothing in the configuration pins it. On 2026-08-10,
+  `test_php_fastcgi_round_robins_across_multiple_responders` asserted
+  `["first","second","first","second"]`, was green on macOS and red on Linux with
+  `["second","first",…]` — the same correct behaviour, one phase apart. Assert the
+  property (no two adjacent alike, each got half), not a sequence you observed
+  once.
 
-- 🎲 **`test_websocket_upgrade_tunnels_bytes_in_both_directions` 是已知的
-  上游（Pingora）flaky**。`scripts/run-ci-tests.sh`（`rust-ci` 快速閘呼叫）
-  會重跑整輪 nextest（最多三次），但**僅限**該測試是唯一失敗項；其他測試
-  失敗或三次都失敗仍然直接紅。**不要為了這個 flake 改測試代碼**——它偶發
-  失敗不代表有回歸，用 retry 消掉雜訊就好。
+- 🎲 **`test_websocket_upgrade_tunnels_bytes_in_both_directions` is a known
+  upstream (Pingora) flake.** `scripts/run-ci-tests.sh` (called by the `rust-ci`
+  fast gate) re-runs the whole nextest round up to three times, but **only** when
+  that test is the sole failure; any other failure, or three failures in a row,
+  still goes red. **Do not change test code to chase this flake** — its occasional
+  failure is not evidence of a regression, and a retry is enough to remove the
+  noise.
 
-  > 📌 **依據**（2026-08-10 補；在此之前這條只有結論，沒有出處，
-  > 而本倉庫的規則是「只寫結論的否決註解會變成一道沒人敢推的門」）：
-  > 已回報上游 [cloudflare/pingora#946](https://github.com/cloudflare/pingora/issues/946)
-  > 〈HTTP/1 upgrade torn down when the upstream's 101 is read before the
-  > request's empty body〉（2026-07-30 開，仍 open），修正在
-  > [#947](https://github.com/cloudflare/pingora/pull/947)
-  > 〈Keep an upgraded tunnel open when the request body ends after 101〉
-  > （2026-08-04 開，**尚未合併**）。症狀是等 tunnel marker 時收到
-  > `UnexpectedEof`。
+  > 📌 **The citation** (added 2026-08-10; before that this rule had a conclusion
+  > and no source, and this repository's own rule is that a conclusion-only
+  > rejection note becomes a door nobody dares push):
+  > reported upstream as
+  > [cloudflare/pingora#946](https://github.com/cloudflare/pingora/issues/946),
+  > "HTTP/1 upgrade torn down when the upstream's 101 is read before the
+  > request's empty body" (opened 2026-07-30, still open), with the fix in
+  > [#947](https://github.com/cloudflare/pingora/pull/947), "Keep an upgraded
+  > tunnel open when the request body ends after 101" (opened 2026-08-04,
+  > **not yet merged**). The symptom is an `UnexpectedEof` while waiting for the
+  > tunnel marker.
   >
-  > **這條的有效期綁在 #947**：合併並進入我們釘的 pingora 版本之後，
-  > 這個 flake 應該消失，屆時要拿掉 retry 並讓它恢復成一次就該綠的測試。
-  > 留著 retry 而 flake 已經修好，等於留一個永遠不會紅的測試。
-- 🔒 **`security-audit.yml`（`cargo audit`）在合併閘與每晚排程都跑**,不只在
-  發布前跑一次。RustSec 公告的時間不受這個專案控制,一個已合併但後來被公告
-  漏洞的依賴,只有持續跑才抓得到。真的出現 finding 時的例外處理是**書面風險
-  接受**（既有的書面風險接受規則),不是把這個 job 改成
-  `continue-on-error`。
-- **要在容器 log 裡看到 ERROR 以下的內容必須設 `RUST_LOG`**。subscriber 是
-  `EnvFilter::from_default_env()` 建的，沒設等於只留 ERROR——症狀是功能明明
-  正常卻「什麼都沒 log」。
-- **grep 容器 log 前要先剝掉 ANSI**。tracing 的 fmt layer 即使 stdout 不是 tty
-  也會給欄位名上色，`from=1.2.3.4` 實際上是 `from<ESC>[0m<ESC>[2m=<ESC>[0m1.2.3.4`，
-  直接 grep 字面字串會**假性失敗**。
-- **改 bind-mount 的單一檔案禁止用 `sed -i`**。bind mount 綁的是 **inode 不是路徑**：
-  `sed -i` 寫新檔再改名蓋過去，宿主看到改動、**容器繼續讀舊 inode**。這個失敗
-  完全無聲——reload 會回報「成功」（它確實重載了，只是內容一模一樣），於是
-  「壞配置被拒」「last-known-good 還在」這類斷言**全部假性通過**。
-  一律用 `cat new > target` 這種**原地截斷改寫**，並在演練開頭斷言
-  `stat -c %i` 宿主與容器一致。2026-07-28 Day 7 實際踩到，兩條 ✅ 是假的。
-- **`grep -q` 不要放在 `set -o pipefail` 的 pipeline 尾端**。命中即提前退出會把
-  上游 SIGPIPE 掉，141 變成整條 pipeline 的狀態，**命中反而被讀成失敗**；
-  而且只有輸出夠長才輸掉這個 race，所以會間歇性假性失敗。先存檔再 grep 檔案。
-- **腳本收 results 目錄參數時要處理絕對路徑**。`-v "$(pwd)/$conf"` 遇到絕對路徑
-  會變成 `/tmp//tmp/...`，Docker 靜默建一個空目錄當掛載點，程式起不來。
-- **測 DNS 重解析時容器位址要用 `--ip` 明確指定**。讓 Docker 自己配，
-  「backend 有沒有跟著搬」就變成看 daemon 的位址回收策略；只有在剛好拿到新
-  IP 時才會過的測試不算測試。要製造「名稱解析不到但舊位址還健康」，用
-  `docker network disconnect` 後再 `connect --ip <同一個位址>`（不帶 alias）——
-  同一個容器、同一個位址，只是名稱查不到了。
+  > **This rule expires with #947**: once it merges and reaches the pingora
+  > version we pin, the flake should disappear, and the retry must come out so
+  > the test goes back to being one that is simply expected to pass. Keeping a
+  > retry after the flake is fixed means keeping a test that can never go red.
+- 🔒 **`security-audit.yml` (`cargo audit`) runs on the merge gate and on a
+  nightly schedule**, not once before a release. RustSec publishes on its own
+  schedule, not this project's, and a dependency that merged clean and was
+  disclosed afterwards is only caught by running continuously. When a finding does
+  appear, the exception process is **a written risk acceptance** (the existing
+  written-risk-acceptance rule), not switching this job to
+  `continue-on-error`.
+- **Seeing anything below ERROR in container logs requires `RUST_LOG`.** The
+  subscriber is built from `EnvFilter::from_default_env()`, so leaving it unset
+  means ERROR only — and the symptom is a feature that plainly works while
+  "logging nothing".
+- **Strip ANSI before grepping container logs.** tracing's fmt layer colours
+  field names even when stdout is not a tty, so `from=1.2.3.4` is really
+  `from<ESC>[0m<ESC>[2m=<ESC>[0m1.2.3.4`, and grepping the literal string
+  **fails spuriously**.
+- **Never use `sed -i` on a single bind-mounted file.** A bind mount binds
+  **an inode, not a path**: `sed -i` writes a new file and renames it over the
+  old one, so the host sees the change and **the container keeps reading the old
+  inode**. The failure is completely silent — reload reports success (it really
+  did reload; the content was simply identical), so assertions like "the bad
+  configuration was rejected" and "last-known-good is still live" **all pass
+  falsely**. Always rewrite in place by truncation, `cat new > target`, and assert
+  at the top of the drill that `stat -c %i` agrees between host and container.
+  Hit for real on Day 7, 2026-07-28; two ✅ marks were fictional.
+- **Do not put `grep -q` at the end of a `set -o pipefail` pipeline.** It exits
+  early on a match, which SIGPIPEs the upstream process; 141 becomes the
+  pipeline's status, so **a match reads as a failure**. And you only lose that
+  race when the output is long enough, so it fails intermittently. Save to a file
+  first, then grep the file.
+- **A script taking a results directory must handle absolute paths.**
+  `-v "$(pwd)/$conf"` turns an absolute path into `/tmp//tmp/...`, Docker
+  silently creates an empty directory as the mount point, and the program will
+  not start.
+- **When testing DNS re-resolution, pin container addresses with `--ip`.** Letting
+  Docker assign them turns "did the backend follow?" into a question about the
+  daemon's address-reuse policy, and a test that only passes when a new IP
+  happens to be handed out is not a test. To produce "the name no longer resolves
+  but the old address is still healthy", `docker network disconnect` and then
+  `connect --ip <the same address>` without an alias — same container, same
+  address, only the name is gone.
 
 ---
 
-## 📁 驗證證據
+## 📁 Verification evidence
 
-- 結果寫進本機 `benchmarks/results/<date>_<commit-prefix>/`（**不入倉庫**）。
-- **失敗的證據不可覆寫**。修好之後另開目錄，保留舊的失敗紀錄作為對照。
-- 驗證必須記錄**完整 commit SHA**，不能只寫「最新版」。
+- Results go to local `benchmarks/results/<date>_<commit-prefix>/`
+  (**never committed**).
+- **Failed evidence is never overwritten.** After a fix, open a new directory and
+  keep the old failure as the comparison.
+- Verification records the **full commit SHA**, never "latest".
 
-## 📊 效能量測：三種「成功的錯誤數字」
+## 📊 Performance measurement: three ways to succeed at the wrong number
 
-2026-08-11 重拉基準線時，三種都真的發生了，而且**沒有一種會讓程式報錯**——
-全部要靠事後檢查才發現。這一節存在的目的是讓下一次不必重新發現它們。
+All three really happened while re-establishing the baseline on 2026-08-11, and
+**none of them makes the program report an error** — every one needs an after-the-
+fact check to find. This section exists so the next person does not have to
+rediscover them.
 
-- **量測與建置不可並行。** 那天第一次跑基準線時，同一台機器上有一個
-  `--platform linux/amd64`（Rosetta 2）的 release 編譯在跑。而這份 harness 量的正是
-  **CPU/request**，所以背景負載直接就是被量的東西。污染在資料裡逐輪可見
-  （代理 H2 53,836 → 39,447 → 36,172 rps，單調衰退）。
+- **Never measure and build at the same time.** During the first baseline run
+  that day, a `--platform linux/amd64` (Rosetta 2) release compile was running on
+  the same machine. This harness measures **CPU per request**, so the background
+  load *is* the thing being measured. The contamination is visible round by round
+  in the data (proxied H2 at 53,836 → 39,447 → 36,172 rps, monotonically
+  decaying).
 
-  > 🎯 **可操作的規則**：先把所有二進位編完，確認機器安靜，再開始量。
-  > 「只是背景跑一下」不存在。作廢的那一組留在
-  > `benchmarks/results/20260811_baseline/contaminated/`，因為逐輪衰退的數字
-  > 比規則本身有說服力。
+  > 🎯 **The operable rule**: finish every binary, confirm the machine is quiet,
+  > then start measuring. There is no such thing as "just a little in the
+  > background". The voided run is kept at
+  > `benchmarks/results/20260811_baseline/contaminated/`, because the decaying
+  > numbers argue for the rule better than the rule does.
 
-- **每一列都要印 `succeeded`，對不上就作廢。** `h2load -H "host: bench.local"`
-  **設不了 HTTP/1.1 的 Host**——Host 取自 URL 的 authority。於是 nginx 和 Pingclair
-  都收到 `Host: 127.0.0.1`、都不匹配 vhost，**30000 個請求全是 4xx**；
-  而沒有虛擬主機概念的對照組照樣 200，看起來完全正常。
-  那張表會顯示我們「贏」四倍，真相是兩邊都在量 404 的成本。
+- **Print `succeeded` on every row and void the row when it does not match.**
+  `h2load -H "host: bench.local"` **cannot set the HTTP/1.1 Host** — Host comes
+  from the URL's authority. So nginx and Pingclair both received
+  `Host: 127.0.0.1`, neither matched a vhost, and **all 30,000 requests were
+  4xx** — while the comparison target, which has no concept of virtual hosts,
+  returned 200 and looked entirely normal. That table showed us "winning" by a
+  factor of four; the truth is that both sides were measuring the cost of a 404.
 
-  > 🎯 **可操作的規則**：`h2load` 自己會報 `succeeded/failed`，harness 必須把它
-  > 印在每一列旁邊，並在不等於請求總數時把該列當作沒有發生。
-  > 想改 Host 就用 `--connect-to=<ip>:<port>` 搭配 URL 裡的真實主機名，
-  > 不要用 `-H`。
+  > 🎯 **The operable rule**: `h2load` reports `succeeded/failed` itself; the
+  > harness must print it beside every row and treat any row where it differs
+  > from the request count as not having happened. To change the Host, use
+  > `--connect-to=<ip>:<port>` with the real hostname in the URL, never `-H`.
 
-- **跨機器比較，只能比「除了機器以外全部相同」的兩次執行。** 曾經拿 Mac 的靜態
-  結果（`--cpus=2`、`-t2 -c50 -n100000`）去比 athlon 的（`--cpus=1`、`-t1 -c25 -n30000`），
-  並把差異解讀成「機器世代的影響」——**那其實是在比較設定**。
-  同一次還漏掉一個變因：athlon 沒有 AES-NI，Pingclair 協商到 ChaCha20-Poly1305、
-  nginx 協商到 AES-256-GCM，**兩邊根本不是同一件工作**。
+- **Cross-machine comparison is only valid between two runs identical in
+  everything but the machine.** Static results from the Mac (`--cpus=2`,
+  `-t2 -c50 -n100000`) were once compared against athlon's (`--cpus=1`,
+  `-t1 -c25 -n30000`) and the difference read as a machine-generation effect —
+  **that was a comparison of settings**. The same run missed another variable:
+  athlon has no AES-NI, so Pingclair negotiated ChaCha20-Poly1305 while nginx
+  negotiated AES-256-GCM, and **the two were not doing the same work at all**.
 
-  > 🎯 **可操作的規則**：**cipher 也算變因**。跨機器前先確認兩邊協商到同一個
-  > cipher suite（`openssl s_client` 看得到），併發、client 執行緒、容器 CPU
-  > 配額全部固定，否則得到的是自己的方法而不是機器的性質。
+  > 🎯 **The operable rule**: **the cipher is a variable too.** Before comparing
+  > machines, confirm both negotiated the same cipher suite (`openssl s_client`
+  > shows it) and fix concurrency, client threads, and the container CPU quota.
+  > Otherwise the result describes your method rather than the machine.
 
-- **會飽和的客戶端不是客戶端。** `benchmarks/aws-h3/h3_bench.py` 與
-  `h3_bench_pipeline.py` 是 **aioquic——純 Python 的 QUIC 實作**，harness 自己的
-  README 就註明「單執行緒、~2k req/s、client-bound」。用它去比三台跑得到
-  15k–47k req/s 的伺服器，量到的是客戶端；而且**名次可以任意翻轉**，因為剩下的
-  差異來自各家對慢速客戶端的 pacing 與 ACK 行為，不是吞吐能力。
-  2026-08-11 換成 ngtcp2/nghttp3 版的 h2load 重量，結論和先前的印象相反。
+- **A client that saturates is not a client.** `benchmarks/aws-h3/h3_bench.py` and
+  `h3_bench_pipeline.py` are built on **aioquic — a pure-Python QUIC
+  implementation** — and the harness's own README notes it is single-threaded,
+  ~2k req/s, client-bound. Pointing it at three servers capable of 15k–47k req/s
+  measures the client; worse, **the ranking can invert arbitrarily**, because what
+  remains of the difference comes from each server's pacing and ACK behaviour
+  toward a slow client rather than from throughput. Re-measuring on 2026-08-11
+  with the ngtcp2/nghttp3 build of h2load produced the opposite of the earlier
+  impression.
 
-  > 🎯 **可操作的規則**：H3 的**效能**比較一律用 `goodideal/nghttp2` 映像裡的
-  > h2load（`--alpn-list=h3`）。aioquic 那兩支只保留給**語義 parity**——
-  > 它們讀得懂回應內容，這是 h2load 做不到的，那才是它們的用途。
-  > 另外 QUIC 對 UDP 緩衝極敏感，`net.core.rmem_max`／`wmem_max` 必須在所有候選
-  > 之間固定（這次用 7500000），否則量到的是核心設定。
+  > 🎯 **The operable rule**: H3 **performance** comparisons always use h2load
+  > from the `goodideal/nghttp2` image (`--alpn-list=h3`). Those two aioquic
+  > scripts are kept for **semantic parity** only — they can read response
+  > content, which h2load cannot, and that is what they are for. Also, QUIC is
+  > extremely sensitive to UDP buffers: `net.core.rmem_max` / `wmem_max` must be
+  > fixed across all candidates (7500000 for that round), or you are measuring
+  > kernel settings.
 
-## 🔨 H3 腳本一定要重建 binary（2026-08-17）
+## 🔨 H3 scripts must always rebuild the binary (2026-08-17)
 
-- 🤡 **`scripts/test-h3-*.sh` 原本寫的是 `if [[ ! -x "${binary}" ]]` 才建置。**
-  於是它會拿 `target/debug/pingclair` 的**舊版**跑，報出來的紅是關於你改之前的
-  程式。2026-08-17 就是這樣浪費了一輪：SEC-007 的 H3 探針報
-  `No Matching Virtual Host`，修正明明已經在原始碼裡了。
-  🎯 更糟的是反過來——**對著舊 binary 報綠，什麼都不會提醒你**。
-- 📌 現在兩支腳本都**無條件** `cargo build`（沒改東西時它是 no-op）。
-  要用自己指定的 binary 就設 `PINGCLAIR_BINARY`，那條路徑會檢查可執行並且不建置。
-- 🧭 判準：**一支驗證腳本的預設行為必須是「驗證現在的原始碼」。**
-  把重建做成選擇性的，等於把「你測到的是什麼版本」變成使用者要自己記得的事。
+- 🤡 **`scripts/test-h3-*.sh` used to build only `if [[ ! -x "${binary}" ]]`.** So
+  it ran the **stale** `target/debug/pingclair` and reported red about the code
+  as it was before your change. That cost a round on 2026-08-17: the SEC-007 H3
+  probe reported `No Matching Virtual Host` when the fix was already in the
+  source. 🎯 The reverse is worse — **reporting green against a stale binary
+  warns you about nothing**.
+- 📌 Both scripts now `cargo build` **unconditionally** (a no-op when nothing
+  changed). To use your own binary, set `PINGCLAIR_BINARY`; that path is checked
+  for executability and never built.
+- 🧭 The test: **a verification script's default behaviour must be to verify the
+  source as it is now.** Making the rebuild optional turns "which version did you
+  just test?" into something the user has to remember.
 
-## 🔬 換儀器的時候不要順手換受測對象（2026-08-18）
+## 🔬 Do not swap the subject while you are swapping the instrument (2026-08-18)
 
-公網驗證量到「HTTP/2 送給上游的 `Host` 是空的」。第一反應是懷疑儀器——那是對的反應，
-這份文件上面整節都在講量測工具的錯誤怎麼偽裝成產品的錯誤。於是換了一個會傾印原始位元組
-的上游重量，結果 `Host` 是正確的，就把先前那個空值判定成**回聲上游的解析問題**，寫進了
-報告，還寫了一句「一個儀器不夠」當教訓。
+Public-internet verification measured "the `Host` sent upstream over HTTP/2 is
+empty". The first reaction was to suspect the instrument — the correct reaction,
+and an entire section above is about how broken tooling disguises itself as a
+broken product. So the measurement was repeated against an upstream that dumps
+raw bytes, `Host` came back correct, and the earlier empty value was written up as
+**a parsing problem in the echo upstream**, along with a lesson that one
+instrument is not enough.
 
-**判定是錯的。** 那是真的缺陷：`uri strip_prefix` 會讓 H2 的站台名整個消失
-（`7d07f49` 修掉）。
+**That verdict was wrong.** It was a real defect: `uri strip_prefix` made the H2
+site name disappear entirely (fixed in `7d07f49`).
 
-錯在哪：換儀器的那一次，**順手也換了受測的路由**——舊儀器打的是 `/rewrite`（有
-`strip_prefix`），新儀器打的是 `/raw`（沒有）。兩個變數同時變了，而差異被全部記在儀器
-頭上。第三次量，同一個儀器、只差一個 `strip_prefix`，才看出真正的原因。
+Here is the mistake: swapping the instrument **also swapped the route under
+test** — the old instrument hit `/rewrite` (which has `strip_prefix`), the new one
+hit `/raw` (which does not). Two variables moved at once, and the whole difference
+was charged to the instrument. It took a third measurement, same instrument with
+only `strip_prefix` differing, to see the real cause.
 
-> 🎯 **可操作的規則**：懷疑儀器時，新儀器必須打**完全同一個目標**——同一條路由、同一份
-> 設定、同一個請求。只有這樣，兩次結果的差才只包含儀器本身。要換受測對象是另一次實驗。
+> 🎯 **The operable rule**: when you suspect the instrument, the new instrument
+> must hit **exactly the same target** — same route, same configuration, same
+> request. Only then does the difference between the two results contain nothing
+> but the instrument. Changing the subject is a separate experiment.
 
-📌 這條和上面「一個儀器不夠」不衝突，是它的必要配套：多一個儀器只有在**其他條件全部
-固定**時才會增加資訊，否則只是多一次會誤導人的量測。
+📌 This does not contradict "one instrument is not enough" above; it is the
+condition that rule needs. A second instrument only adds information when
+**everything else is held fixed**. Otherwise it is just one more misleading
+measurement.
