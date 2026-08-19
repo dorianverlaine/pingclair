@@ -33,7 +33,7 @@ Que vous ayez besoin d'un simple serveur de fichiers statiques ou d'une passerel
 *   🔄 **Répartition de charge intelligente** — Plusieurs algorithmes intégrés (round-robin, least-connections, etc.), avec health checks et bascule automatique.
 *   🔐 **HTTPS automatique et privé** — ACME intégré (Let's Encrypt) émet les certificats publics, tandis que `tls internal` fournit une autorité locale persistante pour les origines privées et les tunnels.
 *   📁 **Service de fichiers statiques performant** — Compression Gzip/Brotli, requêtes Range et transfert de fichiers efficace.
-*   📊 **Observabilité** — Export de métriques Prometheus et traçage OpenTelemetry prêts à l'emploi.
+*   📊 **Observabilité** — Export de métriques Prometheus prêt à l'emploi.
 
 ## ⚡ Benchmarks
 
