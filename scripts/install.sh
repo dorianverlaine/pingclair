@@ -134,7 +134,21 @@ elif [ "$INSTALL_MODE" = "dev" ]; then
 else
     echo "Fetching latest release from $REPO..."
 
-    LATEST_RELEASE_URL=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" | jq -r ".assets[] | select(.name | contains(\"$ASSET_KEY\") and contains(\"linux\")) | .browser_download_url" | head -n 1)
+    # 🧭 One fetch, not three: the release document names the tag and carries
+    # every asset URL, and asking the API again for each of them invites the
+    # anonymous rate limit to answer differently halfway through.
+    LATEST_RELEASE=$(curl -s "https://api.github.com/repos/$REPO/releases/latest")
+    LATEST_TAG=$(printf '%s' "$LATEST_RELEASE" | jq -r ".tag_name // empty")
+    LATEST_RELEASE_URL=$(printf '%s' "$LATEST_RELEASE" | jq -r ".assets[] | select(.name | contains(\"$ASSET_KEY\") and contains(\"linux\")) | .browser_download_url" | head -n 1)
+    LATEST_SUM_URL=$(printf '%s' "$LATEST_RELEASE" | jq -r ".assets[] | select(.name == \"SHA256SUMS-$ASSET_KEY.txt\") | .browser_download_url" | head -n 1)
+
+    # 🚧 A release candidate is the latest release while 0.2.0 is being cut.
+    # Say so at install time: the tag is the only thing that distinguishes it
+    # from a final release once the binary is on the box.
+    case "$LATEST_TAG" in
+        *-*) echo -e "${YELLOW}Installing $LATEST_TAG — a release candidate, not a final release.${NC}" ;;
+        ?*)  echo "Installing $LATEST_TAG..." ;;
+    esac
 
     if [ -z "$LATEST_RELEASE_URL" ] || [ "$LATEST_RELEASE_URL" == "null" ]; then
         echo -e "${YELLOW}No binary found for $ARCH in latest release.${NC}"
@@ -150,7 +164,26 @@ else
     else
         echo "Downloading $LATEST_RELEASE_URL..."
         curl -L -o /tmp/pingclair.tar.gz "$LATEST_RELEASE_URL"
-        tar -xzf /tmp/pingclair.tar.gz -C /usr/local/bin/
+        # 🔐 Verify against the published checksum before unpacking anything
+        # into /usr/local/bin. This runs as root from a piped script, so a
+        # truncated or substituted download must stop here, as it does on the
+        # `--dev` path. A release with no checksum file is refused rather than
+        # installed unverified.
+        if [ -z "$LATEST_SUM_URL" ] || [ "$LATEST_SUM_URL" == "null" ]; then
+            echo -e "${RED}Error: $LATEST_TAG publishes no SHA256SUMS-$ASSET_KEY.txt, so the download cannot be verified.${NC}"
+            rm -f /tmp/pingclair.tar.gz
+            exit 1
+        fi
+        TAR_NAME=$(basename "$LATEST_RELEASE_URL")
+        mv /tmp/pingclair.tar.gz "/tmp/$TAR_NAME"
+        curl -L -o "/tmp/SHA256SUMS-$ASSET_KEY.txt" "$LATEST_SUM_URL"
+        if command -v sha256sum >/dev/null 2>&1; then
+            (cd /tmp && sha256sum -c "SHA256SUMS-$ASSET_KEY.txt")
+        else
+            (cd /tmp && shasum -a 256 -c "SHA256SUMS-$ASSET_KEY.txt")
+        fi
+        tar -xzf "/tmp/$TAR_NAME" -C /usr/local/bin/
+        rm -f "/tmp/$TAR_NAME" "/tmp/SHA256SUMS-$ASSET_KEY.txt"
         chmod +x /usr/local/bin/pingclair
     fi
 fi

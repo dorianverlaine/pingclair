@@ -81,6 +81,18 @@ Une fois l'installation terminée, la commande `pingclair` est disponible dans v
 
 ### Installation en une ligne sur Linux
 
+> 📦 **L'installation par défaut est `v0.2.0-rc.1`, une version candidate.**
+> C'est délibérément ce que `releases/latest` désigne désormais : `v0.1.7` est
+> antérieure à la parité HTTP/3, au TLS mutuel, à l'API d'administration et à la
+> plupart des corrections de sécurité listées dans
+> [`CHANGELOG.md`](CHANGELOG.md), et n'est pas une version par laquelle
+> commencer. La version candidate a tourné deux jours sans redémarrage sur les
+> trois transports — voir les
+> [notes de version](https://github.com/dorianverlaine/pingclair/releases/tag/v0.2.0-rc.1)
+> pour les mesures et pour le seul défaut connu, l'échec des montées en
+> WebSocket sous charge. Le script affiche l'étiquette qu'il installe et vérifie
+> la somme de contrôle SHA-256 publiée avant de décompresser.
+
 Sur n'importe quelle distribution Linux, le script d'installation fonctionne : il télécharge (ou compile) le binaire, met en place un service `systemd` et crée un utilisateur `pingclair` non privilégié, autorisé à se lier aux ports bas via `setcap`. Après l'installation, la commande `pc` (abréviation de `pingclair`) permet de gérer le service.
 
 ```bash

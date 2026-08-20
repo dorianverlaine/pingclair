@@ -81,6 +81,16 @@ Once installed, the `pingclair` command is available on your `PATH`.
 
 ### One-line install on Linux
 
+> 📦 **The default install is `v0.2.0-rc.1`, a release candidate.** It is what
+> `releases/latest` now resolves to, deliberately: `v0.1.7` predates HTTP/3
+> parity, mutual TLS, the Admin API and most of the security fixes listed in
+> [`CHANGELOG.md`](CHANGELOG.md), and is not a version to start from. The rc has
+> run for two days without a restart on all three transports — see the
+> [release notes](https://github.com/dorianverlaine/pingclair/releases/tag/v0.2.0-rc.1)
+> for the soak evidence and for the one known defect, WebSocket upgrades failing
+> under load. The script prints the tag it is installing and verifies the
+> published SHA-256 checksum before unpacking.
+
 On any Linux distribution the install script works — it downloads (or builds) the binary, sets up a `systemd` service, and creates an unprivileged `pingclair` user that binds low ports via `setcap`. After installation, manage the service with the `pc` command (short for `pingclair`).
 
 ```bash

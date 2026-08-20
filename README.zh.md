@@ -79,6 +79,15 @@ cargo install --path ./pingclair
 
 ### Linux 一鍵安裝
 
+> 📦 **預設安裝的是 `v0.2.0-rc.1`，一個發行候選版。** 這是刻意讓
+> `releases/latest` 指過去的：`v0.1.7` 早於 HTTP/3 對等、雙向 TLS、管理 API，
+> 以及 [`CHANGELOG.md`](CHANGELOG.md) 裡大部分的安全修正，不適合當起點。這個
+> rc 已在三種傳輸協定上連續兩天未重啟——量測數據，以及唯一一個已知缺陷（高負載
+> 下 WebSocket 升級會失敗），都寫在
+> [發行說明](https://github.com/dorianverlaine/pingclair/releases/tag/v0.2.0-rc.1)
+> 裡。腳本會印出它正在安裝的版本標籤，並在解壓縮前驗證官方發佈的 SHA-256
+> 校驗和。
+
 任何 Linux 發行版都適用同一支安裝腳本：它會自動下載（或編譯）執行檔、設定 `systemd` 服務，並建立低權限的 `pingclair` 使用者（透過 `setcap` 綁定低號連接埠）。安裝完成後，可以使用 `pc`（pingclair 的縮寫）指令來管理服務。
 
 ```bash
