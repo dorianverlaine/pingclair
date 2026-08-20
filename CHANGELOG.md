@@ -14,8 +14,10 @@ fact.
 
 ## [Unreleased]
 
-Everything below is on `main` and unreleased; the workspace reports
-`0.2.0-dev`. The scope is large because it covers 173 commits since `v0.1.7`.
+Everything below is on `main` and not yet a final release; the workspace
+reports `0.2.0-rc.1`, tagged as a release candidate on 2026-08-20. The scope is
+large because it covers 173 commits since `v0.1.7`. This section becomes
+`## [0.2.0]` when the non-goals below are decided.
 
 ### 🚫 Non-goals for 0.2.0
 
