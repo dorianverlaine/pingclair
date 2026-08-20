@@ -8,7 +8,6 @@ yanked = "deny"
 ignore = [
     { id = "RUSTSEC-2024-0320", reason = "yaml-rust is unmaintained; pulled in via foundations -> serde_yaml under quiche/tokio-quiche; no upstream fix yet" },
     { id = "RUSTSEC-2024-0388", reason = "derivative is unmaintained; pulled in via pingora-core; no upstream fix yet" },
-    { id = "RUSTSEC-2024-0437", reason = "protobuf 2.28.0 remains via prometheus -> pingora-core; it encodes our own metrics and never parses untrusted input; remove when pingora drops protobuf 2" },
     { id = "RUSTSEC-2025-0069", reason = "daemonize is unmaintained; pulled in via pingora-core daemon mode; no upstream fix yet" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained; direct in pingclair-tls but only wraps rustls-pki-types; migrate to PemObject in a follow-up" },
     { id = "RUSTSEC-2026-0253", reason = "lru 0.16.4 is pulled in via pingora-cache and pingora-pool 0.8.1; the advisory concerns LruCache::pop() panic safety and Pingclair never calls lru directly; remove when pingora moves past lru 0.16" },
