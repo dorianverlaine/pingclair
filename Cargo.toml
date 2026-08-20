@@ -11,7 +11,11 @@ members = [
     "pingclair-api",
     "pingclair-plugin",
 ]
-exclude = ["vendor/h2"]
+exclude = [
+    "vendor/foundations-compat",
+    "vendor/h2",
+    "vendor/prometheus-compat",
+]
 
 [workspace.package]
 version = "0.2.0-dev"
@@ -197,7 +201,15 @@ arc-swap = "1"
 # in. Vendoring also removes `source`/`checksum` from the lockfile entry,
 # which makes the crate invisible to `cargo audit` — verified directly.
 [patch.crates-io]
+# 🛡️ These compatibility crates remove GHSA-2gh3-rmm4-6rq5 and
+# GHSA-w9wp-h8wv-79jx without carrying full forks. Pingora 0.8.1 still requests
+# Prometheus 0.13 even though upstream fixed its protobuf advisory by moving to
+# 0.14, and tokio-quiche 0.19.1 requests Foundations tracing even though it only
+# consumes the settings, logging, metrics, and testing APIs. Remove each shim
+# when the next upstream release exposes the safe dependency graph directly.
+foundations = { path = "vendor/foundations-compat" }
 h2 = { path = "vendor/h2" }
+prometheus = { path = "vendor/prometheus-compat" }
 
 [profile.release]
 lto = "fat"

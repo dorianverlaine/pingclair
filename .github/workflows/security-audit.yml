@@ -38,12 +38,12 @@ jobs:
       - name: Audit dependencies
         run: cargo audit
 
-      - name: Audit the crates hidden behind [patch.crates-io]
+      - name: Audit the registry h2 hidden behind [patch.crates-io]
         run: |
           set -Eeuo pipefail
-          python3 -c 'import io,sys; p="Cargo.toml"; m=open(p).read(); s=m.index("[patch.crates-io]"); e=m.index("[profile.release]"); open(p,"w").write(m[:s]+m[e:])'
-          if grep -q '^\[patch.crates-io\]' Cargo.toml; then
-              echo "::error::failed to strip the patch section; the audit below would be a no-op" >&2
+          python3 -c 'p="Cargo.toml"; m=open(p).read(); m=m.replace("h2 = { path = \"vendor/h2\" }\n", ""); open(p,"w").write(m)'
+          if grep -q '^h2 = { path = "vendor/h2" }' Cargo.toml; then
+              echo "::error::failed to remove the h2 patch; the audit below would miss the registry crate" >&2
               exit 1
           fi
           cargo generate-lockfile
