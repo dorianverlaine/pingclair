@@ -142,20 +142,44 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -Eeuo pipefail
           version="${{ needs.verify-tag.outputs.version }}"
+          assets=(
+            pingclair-linux-x86_64.tar.gz
+            pingclair-linux-aarch64.tar.gz
+            SHA256SUMS-x86_64.txt
+            SHA256SUMS-aarch64.txt
+          )
+
+          # 📝 A release worth announcing is written by hand before the tag is
+          # pushed, and this job must not destroy those notes or fail because
+          # they exist. So: attach the binaries to whatever is already there,
+          # and only write a release when nobody did.
+          if gh release view "$version" >/dev/null 2>&1; then
+            echo "📎 Release $version already exists — attaching binaries to it."
+            gh release upload "$version" "${assets[@]}" --clobber
+            exit 0
+          fi
+
           previous="$(git describe --abbrev=0 --tags --match 'v*.*.*' HEAD~1 2>/dev/null || true)"
           if [ -n "$previous" ]; then
             notes="$(git log --format='- %s' "${previous}..HEAD")"
           else
             notes="First release."
           fi
-          gh release create "$version" \
-            pingclair-linux-x86_64.tar.gz \
-            pingclair-linux-aarch64.tar.gz \
-            SHA256SUMS-x86_64.txt \
-            SHA256SUMS-aarch64.txt \
+
+          # 🚧 A semver pre-release tag carries a hyphen after the version
+          # triple (v0.2.0-rc.1). Such a build must not become the "Latest"
+          # release that a download link resolves to.
+          prerelease=()
+          case "$version" in
+            *-*) prerelease=(--prerelease) ;;
+          esac
+
+          gh release create "$version" "${assets[@]}" \
             --title "Pingclair $version" \
-            --notes "$notes"
+            --notes "$notes" \
+            "${prerelease[@]}"
 
   publish-image:
     name: Publish release image (${{ matrix.platform.name }})
@@ -204,11 +228,20 @@ jobs:
 
       - name: Smoke the ${{ matrix.platform.name }} image
         run: |
+          set -Eeuo pipefail
           image="ghcr.io/dorianverlaine/pingclair:${{ needs.verify-tag.outputs.version }}-${{ matrix.platform.tag }}"
           version_output="$(docker run --rm "$image" version)"
           echo "$version_output"
           echo "$version_output" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'
-          docker run --rm -v "$PWD/examples:/examples:ro" \
+          # 🔐 The example names a certificate and a key, and validation is
+          # fail-closed about paths it cannot open, so the smoke run needs the
+          # two files to exist. Empty stubs are enough: only their presence is
+          # checked here. The binary job above and dev.yml do the same.
+          certs="$(mktemp -d)"
+          touch "$certs/example.com.pem" "$certs/example.com.key"
+          docker run --rm \
+            -v "$PWD/examples:/examples:ro" \
+            -v "$certs:/etc/pingclair/certs:ro" \
             "$image" validate /examples/full_featured.pingclair
 
   publish-image-manifest:
