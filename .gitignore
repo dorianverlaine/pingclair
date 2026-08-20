@@ -105,11 +105,13 @@ __pycache__/
 # session but not part of the shipped repository.
 docs/CADDYFILE*.md
 
-# ⚡ Vendored crates: the h2 performance fork ships with the repository
-# (see vendor/h2/PINGCLAIR_PATCH.md); anything else under vendor/ is local
-# scratch space.
+# ⚡ Vendored crates: the h2 performance fork and the two security compatibility
+# crates ship with the repository; anything else under vendor/ is local scratch
+# space.
 vendor/*
+!vendor/foundations-compat/
 !vendor/h2/
+!vendor/prometheus-compat/
 vendor/h2/Cargo.lock
 
 # 🔬 Verification-day working material: the scripts a Day runs against a clean

@@ -1,0 +1,16 @@
+[package]
+name = "foundations"
+version = "5.9.2"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+logging = ["foundations-upstream/logging"]
+metrics = ["foundations-upstream/metrics"]
+server-client-common-default = ["logging", "metrics", "settings", "testing"]
+settings = ["foundations-upstream/settings"]
+testing = ["foundations-upstream/testing"]
+
+[dependencies]
+foundations-upstream = { package = "foundations", git = "https://github.com/cloudflare/foundations", rev = "11f10eb9b0c4f9b3b5e9744d998ffe2bcfd6aa6c", default-features = false }
