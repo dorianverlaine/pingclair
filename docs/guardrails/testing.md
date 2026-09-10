@@ -164,6 +164,12 @@
   > version we pin, the flake should disappear, and the retry must come out so
   > the test goes back to being one that is simply expected to pass. Keeping a
   > retry after the flake is fixed means keeping a test that can never go red.
+  >
+  > **Re-admission (2026-09-10):** upstream #946 is still open and #947 is still
+  > unmerged. A fresh comparison of Pingora 0.9.0 and `main` still finds no
+  > `request_body_end_handled` state in `pingora-proxy/src/proxy_h1.rs`, so the
+  > retry remains a bounded, evidence-backed exception rather than a permanent
+  > green button.
 - 🔒 **`security-audit.yml` (`cargo audit`) runs on the merge gate and on a
   nightly schedule**, not once before a release. RustSec publishes on its own
   schedule, not this project's, and a dependency that merged clean and was

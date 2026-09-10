@@ -16,7 +16,10 @@ readonly repository_root
 readonly max_age_days=30
 
 known_flaky=(
-  "test_websocket_upgrade_tunnels_bytes_in_both_directions 2026-08-01"
+  # 🔎 Re-admitted on 2026-09-10: cloudflare/pingora#946 remains open and
+  # #947 remains unmerged; Pingora 0.9.0/main still lacks the
+  # `request_body_end_handled` state in `pingora-proxy/src/proxy_h1.rs`.
+  "test_websocket_upgrade_tunnels_bytes_in_both_directions 2026-09-10"
 )
 
 now_epoch="$(date -u +%s)"
