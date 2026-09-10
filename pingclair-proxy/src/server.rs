@@ -754,7 +754,7 @@ fn parse_forwarded_ip(value: &str) -> Option<IpAddr> {
 /// as soon as it arrives from upstream" (configured as `-1`).
 ///
 /// Positive `flush_interval` values are deliberately not implemented as a
-/// timer: Pingora 0.8 has no timed downstream flush mechanism (the
+/// timer: Pingora 0.9.0 has no timed downstream flush mechanism (the
 /// `Option<Duration>` returned by its body filters is a *delay* before
 /// forwarding, not a flush schedule), and its transport layer already
 /// flushes every chunk for unknown-length bodies (see the buffering note in
@@ -2786,7 +2786,7 @@ impl PingclairProxy {
             .filter(|value| *value > 0)
             .map(|value| Duration::from_millis(value as u64))
             .or(legacy_read);
-        // ⏱️ Pingora 0.8 exposes one upstream read timer for both H1/H2 phases.
+        // ⏱️ Pingora 0.9.0 exposes one upstream read timer for both H1/H2 phases.
         // 🌊 Preserve explicit phase timers so a response can become SSE after its header.
         let phase_read_timeout = shortest_duration(first_byte, between_reads);
         peer.options.read_timeout = phase_read_timeout.or(read_budget);
@@ -2975,7 +2975,7 @@ impl PingclairProxy {
                 for name in existing {
                     upstream_response.remove_header(name.as_str());
                 }
-                upstream_response.status = http::StatusCode::OK;
+                upstream_response.set_status(http::StatusCode::OK)?;
                 upstream_response.insert_header("Content-Type", stream.content_type.clone())?;
                 upstream_response.insert_header("Content-Length", stream.content_length.clone())?;
                 if let Some(last_modified) = &stream.last_modified {
@@ -3033,8 +3033,10 @@ impl PingclairProxy {
                 .into_owned();
                 headers.insert(name, resolved);
             }
-            upstream_response.status = http::StatusCode::from_u16(replacement.status)
-                .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+            upstream_response.set_status(
+                http::StatusCode::from_u16(replacement.status)
+                    .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR),
+            )?;
             let existing: Vec<String> = upstream_response
                 .headers
                 .keys()
@@ -3063,7 +3065,7 @@ impl PingclairProxy {
         if let Some(code) = outcome.passthrough_status
             && let Ok(code) = http::StatusCode::from_u16(code)
         {
-            upstream_response.status = code;
+            upstream_response.set_status(code)?;
             ctx.response_status = code.as_u16();
         }
         let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
@@ -5277,27 +5279,47 @@ pub fn cache_status() -> CacheStatus {
 /// two ever disagree, purge silently stops working — which is why the caller
 /// gets a boolean rather than a cheerful unconditional success.
 pub async fn purge_cached_response(host: &str, path_and_query: &str) -> bool {
+    use pingora_cache::eviction::CacheEntryKeyRef;
     use pingora_cache::key::CacheKey;
-    use pingora_cache::storage::{PurgeType, Storage};
+    use pingora_cache::storage::{PurgeOutcome, PurgeTarget, PurgeType, Storage};
 
-    let key = CacheKey::new(host.to_ascii_lowercase(), path_and_query, "").to_compact();
-    let purged = Storage::purge(
+    let key = CacheKey::new(
+        cache_key_primary(&host.to_ascii_lowercase(), path_and_query),
+        "",
+    )
+    .to_compact();
+    let outcome = Storage::purge(
         response_cache_storage(),
-        &key,
+        PurgeTarget::Active(&key),
         PurgeType::Invalidation,
         &pingora_cache::trace::Span::inactive().handle(),
     )
     .await
-    .unwrap_or(false);
+    .ok();
+    let Some(PurgeOutcome::Purged(entry_id)) = outcome else {
+        return false;
+    };
 
     // 🧮 Keep the eviction manager's accounting in step with the store, or the
     // size gauge drifts upward forever and the ceiling starts evicting entries
     // that are no longer there.
-    if let Some(eviction) = CACHE_EVICTION.get().filter(|_| purged) {
-        eviction.remove(&key);
+    if let Some(eviction) = CACHE_EVICTION.get() {
+        eviction.remove(CacheEntryKeyRef::from_entry_id(&key, entry_id));
         metrics::CACHE_SIZE_BYTES.set(eviction.total_size() as i64);
     }
-    purged
+    true
+}
+
+/// 🔑 Frames the host and request target into the single primary component
+/// required by Pingora 0.9's cache-key API while preserving their old order.
+/// Length prefixes prevent an ambiguous pair from sharing a cache entry.
+fn cache_key_primary(host: &str, path_and_query: &str) -> Vec<u8> {
+    let mut primary = Vec::with_capacity(16 + host.len() + path_and_query.len());
+    primary.extend_from_slice(&(host.len() as u64).to_be_bytes());
+    primary.extend_from_slice(host.as_bytes());
+    primary.extend_from_slice(&(path_and_query.len() as u64).to_be_bytes());
+    primary.extend_from_slice(path_and_query.as_bytes());
+    primary
 }
 
 /// 🔮 Remembers which keys turned out to be uncacheable, so the next request
@@ -5937,7 +5959,7 @@ impl ProxyHttp for PingclairProxy {
             .map(|value| value.as_str())
             .unwrap_or("/");
 
-        Ok(CacheKey::new(host, path_and_query, ""))
+        Ok(CacheKey::new(cache_key_primary(&host, path_and_query), ""))
     }
 
     /// 🗄️ Decides whether an upstream response may be stored.
@@ -6330,7 +6352,7 @@ impl ProxyHttp for PingclairProxy {
             // `Session::digest()` carries `ssl_digest`, which is `Some` exactly
             // when this connection completed a handshake here — the same field
             // `strict_sni_host_rejection` already reads. Nothing had to be
-            // guessed (`pingora-core` 0.8.1, `protocols/mod.rs:31`, 2026-08-17).
+            // guessed (`pingora-core` 0.9.0, `protocols/mod.rs:62`, 2026-09-10).
             let protocol = if session
                 .digest()
                 .is_some_and(|digest| digest.ssl_digest.is_some())
@@ -6649,8 +6671,8 @@ impl ProxyHttp for PingclairProxy {
         };
 
         // 🪤 Withholding is spelled `Some(Bytes::new())`, never `None`.
-        // `pingora-proxy 0.8.1` recomputes end-of-body from `data.is_none()`
-        // after this filter returns (`proxy_h1.rs:774`), so a `None` here ends
+        // `pingora-proxy 0.9.0` recomputes end-of-body from `data.is_none()`
+        // after this filter returns (`proxy_h1.rs:1035`), so a `None` here ends
         // the upstream request body early — silently, and with the client's
         // remaining bytes discarded.
         let was_streaming = buffer.overflowed();
@@ -6705,7 +6727,7 @@ impl ProxyHttp for PingclairProxy {
             if let Some(rewritten) = &proxy_config.rewrite_method
                 && let Ok(rewritten) = http::Method::from_bytes(rewritten.as_bytes())
             {
-                session.req_header_mut().method = rewritten;
+                session.req_header_mut().set_method(rewritten);
             }
             if let Some(template) = &proxy_config.rewrite_uri {
                 let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
@@ -7502,8 +7524,8 @@ impl ProxyHttp for PingclairProxy {
         // what those measure is what actually leaves this filter.
         //
         // Unlike the request side, `None` is a safe way to withhold here —
-        // `pingora-proxy 0.8.1` carries end-of-stream past this filter in the
-        // task itself (`lib.rs:382`) instead of recomputing it from the data.
+        // `pingora-proxy 0.9.0` carries end-of-stream past this filter in the
+        // task itself (`lib.rs:802`) instead of recomputing it from the data.
         // An empty `Bytes` is used anyway, so the two directions read the same.
         if let Some(buffer) = ctx.response_buffer.as_mut() {
             let was_streaming = buffer.overflowed();
@@ -8016,20 +8038,12 @@ impl ProxyHttp for PingclairProxy {
                 host,
                 path: &logged_path,
                 status: response_code,
-                // Body bytes only, matching nginx's $body_bytes_sent.
-                //
-                // Deliberately NOT pingora's Session::body_bytes_sent(). On
-                // the H1 path that counter also adds the serialized response
-                // header (pingora-core 0.8.1, v1/server.rs:603), so a 21-byte
-                // body reports 281. H2 counts only in write_body, so the same
-                // response reports 21 there — the value changes meaning with
-                // the client's protocol.
-                //
-                // Fixed upstream in cloudflare/pingora e7de90a but not in the
-                // 0.8.1 release; see
-                // https://github.com/cloudflare/pingora/issues/846
-                // Keep our own counter even after upgrading — it is the
-                // body-only number an access log should report.
+                // 📏 Keep an explicit body-only counter, matching nginx's
+                // $body_bytes_sent, across H1, H2, and H3. Pingora 0.9.0's
+                // Session::body_bytes_sent() is body-only on H1 as well
+                // (`pingora-core` v1/server.rs:1101, regression test:2806),
+                // but this counter remains the cross-transport access-log
+                // contract owned by Pingclair.
                 bytes: ctx.response_bytes,
                 duration_ms: elapsed.as_millis(),
                 ttfb_ms: ctx
@@ -8824,7 +8838,7 @@ mod p0_regression_tests {
     fn a_split_cookie_is_rejoined_on_http2() {
         let mut h2 = RequestHeader::build_no_case("GET", b"/", None).unwrap();
         h2.set_version(http::Version::HTTP_2);
-        h2.uri = "https://shop.example/".parse().unwrap();
+        h2.set_uri("https://shop.example/".parse().unwrap());
         for piece in ["a=1", "b=2", "c=3"] {
             h2.append_header(http::header::COOKIE, piece).unwrap();
         }
@@ -8871,7 +8885,7 @@ mod p0_regression_tests {
         // 🌐 An HTTP/2 request as Pingora builds it: authority in the URI, no
         // `Host` header at all.
         let mut h2 = RequestHeader::build_no_case("GET", b"/strip/thing", None).unwrap();
-        h2.uri = "https://shop.example.test/strip/thing".parse().unwrap();
+        h2.set_uri("https://shop.example.test/strip/thing".parse().unwrap());
 
         PingclairProxy::pin_request_authority(&mut h2);
         h2.set_raw_path(b"/thing").unwrap();
@@ -8907,7 +8921,7 @@ mod p0_regression_tests {
         // 🌐 What an HTTP/2 request actually looks like once Pingora has built
         // it: authority in the URI, no `Host` header at all.
         let mut h2 = RequestHeader::build_no_case("GET", b"/landing?a=1", None).unwrap();
-        h2.uri = "https://api.example.com:8443/landing?a=1".parse().unwrap();
+        h2.set_uri("https://api.example.com:8443/landing?a=1".parse().unwrap());
 
         for placeholder in [
             "{host}",
@@ -10325,11 +10339,16 @@ mod failure_severity_tests {
 #[cfg(test)]
 mod response_cache_tests {
     use super::*;
+    use pingora_cache::eviction::{CacheEntryKey, CacheEntryKeyRef};
     use pingora_cache::key::CacheKey;
     use std::time::{Duration as StdDuration, SystemTime};
 
     fn key(path: &str) -> pingora_cache::key::CompactCacheKey {
-        CacheKey::new("example.com", path, "").to_compact()
+        CacheKey::new(cache_key_primary("example.com", path), "").to_compact()
+    }
+
+    fn entry(path: &str) -> CacheEntryKey {
+        CacheEntryKey::key_only(key(path))
     }
 
     fn fresh() -> SystemTime {
@@ -10348,20 +10367,20 @@ mod response_cache_tests {
         let manager = simple_lru::Manager::new(300);
 
         assert!(
-            manager.admit(key("/a"), 100, fresh()).is_empty(),
+            manager.admit(entry("/a"), 100, fresh()).is_empty(),
             "the first entry fits under the ceiling"
         );
-        assert!(manager.admit(key("/b"), 100, fresh()).is_empty());
-        assert!(manager.admit(key("/c"), 100, fresh()).is_empty());
+        assert!(manager.admit(entry("/b"), 100, fresh()).is_empty());
+        assert!(manager.admit(entry("/c"), 100, fresh()).is_empty());
         assert_eq!(manager.total_size(), 300, "the store is exactly full");
 
         // 🧹 One more entry cannot fit, so something has to go — and it must be
         // the oldest, or the cache is evicting whatever it happens to reach
         // rather than what is least useful.
-        let evicted = manager.admit(key("/d"), 100, fresh());
+        let evicted = manager.admit(entry("/d"), 100, fresh());
         assert_eq!(
             evicted,
-            vec![key("/a")],
+            vec![entry("/a")],
             "the oldest entry is the one dropped"
         );
         assert!(
@@ -10382,8 +10401,8 @@ mod response_cache_tests {
     #[test]
     fn an_entry_larger_than_the_ceiling_does_not_exceed_it() {
         let manager = simple_lru::Manager::new(300);
-        manager.admit(key("/small"), 50, fresh());
-        manager.admit(key("/huge"), 10_000, fresh());
+        manager.admit(entry("/small"), 50, fresh());
+        manager.admit(entry("/huge"), 10_000, fresh());
         assert!(
             manager.total_size() <= 10_000,
             "an oversized entry must not accumulate on top of the existing ones"
@@ -10396,11 +10415,12 @@ mod response_cache_tests {
     #[test]
     fn removing_an_entry_returns_its_bytes_to_the_budget() {
         let manager = simple_lru::Manager::new(300);
-        manager.admit(key("/a"), 100, fresh());
-        manager.admit(key("/b"), 100, fresh());
+        manager.admit(entry("/a"), 100, fresh());
+        manager.admit(entry("/b"), 100, fresh());
         assert_eq!(manager.total_size(), 200);
 
-        manager.remove(&key("/a"));
+        let key = key("/a");
+        manager.remove(CacheEntryKeyRef::from_entry_id(&key, None));
         assert_eq!(
             manager.total_size(),
             100,
@@ -10415,10 +10435,20 @@ mod response_cache_tests {
     /// would report success and the stale page would keep being served.
     #[test]
     fn purge_builds_the_same_key_the_request_path_builds() {
-        let from_request = CacheKey::new("example.com", "/a?b=1", "").to_compact();
-        let from_purge =
-            CacheKey::new("EXAMPLE.com".to_ascii_lowercase(), "/a?b=1", "").to_compact();
+        let from_request =
+            CacheKey::new(cache_key_primary("example.com", "/a?b=1"), "").to_compact();
+        let from_purge = CacheKey::new(
+            cache_key_primary(&"EXAMPLE.com".to_ascii_lowercase(), "/a?b=1"),
+            "",
+        )
+        .to_compact();
         assert_eq!(from_request, from_purge);
+    }
+
+    /// 🔐 Length prefixes keep host and target boundaries unambiguous.
+    #[test]
+    fn cache_key_primary_does_not_conflate_adjacent_fields() {
+        assert_ne!(cache_key_primary("ab", "c"), cache_key_primary("a", "bc"));
     }
 }
 

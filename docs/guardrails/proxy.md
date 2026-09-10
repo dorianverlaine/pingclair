@@ -198,22 +198,23 @@ gzip), both caused by buffering a body whole.
   raises `client_max_body_size` for the whole route.
 
 > 🪤 **On the request side, holding a chunk back means returning an empty `Bytes`,
-> never `None`.** `pingora-proxy 0.8.1` recomputes the end flag *after* filters
-> run, at `proxy_h1.rs:774`, as `end_of_body || data.is_none()` — so `None` reads
+> never `None`.** `pingora-proxy 0.9.0` recomputes the end flag *after* filters
+> run, at `proxy_h1.rs:1035`, as `end_of_body || data.is_none()` — so `None` reads
 > as "the client is finished". The upstream body ends early, no error is raised,
 > and the backend receives a truncated body. On the response side the end flag
-> travels with the task (`lib.rs:382`) and `None` is safe there, but always write
+> travels with the task (`lib.rs:802`) and `None` is safe there, but always write
 > an empty `Bytes` on both sides: a rule with an exception is a rule that will be
 > misremembered.
 
-> 🚫 **Stop designing "spill to a temporary file".** Checked on 2026-08-13: a
+> 🚫 **Stop designing "spill to a temporary file".** Checked on 2026-09-10: a
 > filter can return only one chunk at a time, and once the downstream body is
-> finished (`DownstreamStateMachine::maybe_finished` at `proxy_h1.rs:411`) the
+> finished (`DownstreamStateMachine::maybe_finished` at `proxy_h1.rs:605`) the
 > filter is never called again. So a body spilled to a file still has to be read
 > back into memory in full to be handed over — **peak memory is exactly the same
 > as not spilling**, plus a file descriptor and a permissions surface. Writing to
 > the session directly from inside a filter was rejected too: the downstream body
-> writer's framing state belongs to the task pipeline at `proxy_h1.rs:1209`, and
+> writer's framing state belongs to the task pipeline at
+> `pingora-core`'s `protocols/http/v1/server.rs:1535`, and
 > inserting a second writer breaks chunked framing — in a way no test would catch
 > reliably.
 
@@ -259,8 +260,8 @@ match error.etype() {
 }
 ```
 
-`pingora-core` 0.8.1 rewrites `SocketError` and `BindError` into `InternalError`
-**before returning**, at `connectors/l4.rs:151`; the real name survives only in
+`pingora-core` 0.9.0 rewrites `SocketError` and `BindError` into `InternalError`
+**before returning**, at `connectors/l4.rs:184`; the real name survives only in
 the cause chain:
 
 ```text

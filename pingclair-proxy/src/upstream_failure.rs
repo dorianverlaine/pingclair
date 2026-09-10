@@ -28,7 +28,7 @@
 //! # 🪤 Why this is not a two-line match on the obvious error types
 //!
 //! The error type that names the real problem **does not survive the trip**.
-//! `pingora-core` 0.8.1 (`connectors/l4.rs:151`) rewrites `SocketError` and
+//! `pingora-core` 0.9.0 (`connectors/l4.rs:184`) rewrites `SocketError` and
 //! `BindError` into `InternalError` before returning, so by the time the error
 //! reaches `fail_to_connect` the honest name is only in the cause chain:
 //!
@@ -73,10 +73,10 @@ impl FailureOrigin {
 
 /// Classifies a failure returned by Pingora's connector.
 ///
-/// Every local failure traced through `pingora-core` 0.8.1 arrives as
+/// Every local failure traced through `pingora-core` 0.9.0 arrives as
 /// `InternalError`: descriptor exhaustion and `setsockopt` faults come through
 /// `SocketError`, ephemeral port exhaustion through `BindError`, and both are
-/// collapsed by `connectors/l4.rs:151`. `wrap_os_connect_error` adds `EACCES`
+/// collapsed by `connectors/l4.rs:184`. `wrap_os_connect_error` adds `EACCES`
 /// and `EADDRINUSE` to the same bucket, and the BoringSSL connector reports
 /// local TLS *configuration* faults — an unreadable cert store, an invalid
 /// client key — the same way.
@@ -94,8 +94,8 @@ pub fn classify_connect_error(error: &pingora_core::Error) -> FailureOrigin {
         // two obvious names below are not enough on their own.
         ErrorType::InternalError => FailureOrigin::Local,
 
-        // 📌 Unreachable through Pingora 0.8.1's connector, and kept anyway.
-        // Verified 2026-08-11 by reading `connectors/l4.rs:151`, which rewrites
+        // 📌 Unreachable through Pingora 0.9.0's connector, and kept anyway.
+        // Verified 2026-09-10 by reading `connectors/l4.rs:184`, which rewrites
         // both into `InternalError` on the way out. If a later version stops
         // collapsing them, this arm starts carrying real traffic and the
         // classification stays correct without anyone noticing it had to.
@@ -267,7 +267,7 @@ mod tests {
         }
     }
 
-    /// The arms that Pingora 0.8.1 never produces. They are kept so a future
+    /// The arms that Pingora 0.9.0 never produces. They are kept so a future
     /// version that stops collapsing them is still classified correctly, and
     /// this test is what says so out loud.
     #[test]

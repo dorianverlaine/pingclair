@@ -420,7 +420,7 @@ ou la liste des upstreams repart d'un état neuf.
 
 Les dépassements d'en-têtes, de body et de durée totale reçoivent une erreur
 HTTP explicite tant que le protocole peut encore l'envoyer ; les transports
-inactifs et les connexions HTTP/2 ou HTTP/3 en excès sont fermés. Pingora 0.8
+inactifs et les connexions HTTP/2 ou HTTP/3 en excès sont fermés. Pingora 0.9.0
 n'expose qu'un seul timer de lecture amont en H1/H2 : la valeur la plus stricte
 entre `first_byte_timeout` et `between_reads_timeout` régit donc les deux
 phases. Le bridge H3 change de timer après réception de l'en-tête de réponse.
@@ -878,11 +878,13 @@ lorsque la machine est chargée**. Ce point figure ici plutôt que dans la liste
 ci-dessus parce que la fonctionnalité n'est pas absente : elle fonctionne, puis
 par intermittence ne fonctionne plus.
 
-Le défaut se situe dans `pingora-proxy 0.8.1`, et non dans la manière dont ce
+Le défaut se situe dans `pingora-proxy 0.9.0`, et non dans la manière dont ce
 projet traite l'upgrade : une trace confirme que la requête parvient à l'amont
 en portant `Connection: Upgrade` et `Upgrade: websocket`. Ticket amont :
 [cloudflare/pingora#946](https://github.com/cloudflare/pingora/issues/946),
-ouvert au 2026-08-18.
+ouvert au 2026-09-10. Le correctif proposé,
+[cloudflare/pingora#947](https://github.com/cloudflare/pingora/pull/947), attend
+encore une revue du mainteneur.
 
 Ce qui se passe, en une phrase : une requête d'upgrade est un `GET` sans corps,
 et la fin de *ce corps vide* est prise pour la fin du tunnel — mais uniquement

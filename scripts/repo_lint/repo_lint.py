@@ -79,15 +79,6 @@ def cargo_manifests() -> list[Path]:
     return sorted(p for p in candidates if "/vendor/" not in p.as_posix())
 
 
-def run_vendored_h2_check() -> list[str]:
-    """Return failure text when the vendored h2 fork is not wired correctly."""
-    script = ROOT / "scripts" / "check-vendored-h2.sh"
-    proc = subprocess.run([str(script)], cwd=ROOT, capture_output=True, text=True)
-    if proc.returncode == 0:
-        return []
-    return [f"scripts/check-vendored-h2.sh failed:\n{proc.stdout}{proc.stderr}"]
-
-
 def main() -> int:
     failures: dict[str, list[str]] = {}
     root_manifest = ROOT / "Cargo.toml"
@@ -98,9 +89,6 @@ def main() -> int:
         )
         if errors:
             failures[str(manifest.relative_to(ROOT))] = errors
-    h2_errors = run_vendored_h2_check()
-    if h2_errors:
-        failures["scripts/check-vendored-h2.sh"] = h2_errors
     if not failures:
         print("✅ repository invariants hold")
         return 0

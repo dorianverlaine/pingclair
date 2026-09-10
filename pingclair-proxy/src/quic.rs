@@ -84,16 +84,6 @@ use pingclair_core::server::{
 /// Maximum UDP payload we ask quiche to send (standard Ethernet MTU-safe).
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
-/// Size of the per-connection outbound packet buffer lent to tokio-quiche.
-///
-/// The worker writes as many QUIC packets as fit and flushes them in one
-/// GSO-backed `sendmsg` on Linux. A 1350-byte buffer caps every flush at one
-/// datagram, turning each packet into its own syscall. 16 KiB was measured
-/// against 64 KiB (tokio-quiche's `BufFactory::MAX_BUF_SIZE` and the kernel
-/// GSO ceiling): the large-file and small-file gains were identical, so the
-/// smaller fixed per-connection cost wins.
-const OUT_BUF_SIZE: usize = 16 * 1024;
-
 /// Bound for the per-stream request-body channel between the event loop
 /// and a handler task. When full, the event loop stops draining quiche so
 /// QUIC flow control pushes back on the client.
@@ -966,8 +956,6 @@ struct H3App {
     tls_identity: Option<crate::tls_identity::DownstreamTlsIdentity>,
     /// 🔢 Releases this connection's slot against `limits.max_connections`.
     _slot: ConnectionSlot,
-    /// 📦 Lent to the worker for outbound packets; see `ApplicationOverQuic::buffer`.
-    out: Vec<u8>,
 }
 
 impl Drop for H3App {
@@ -1035,10 +1023,6 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
 
     fn should_act(&self) -> bool {
         true
-    }
-
-    fn buffer(&mut self) -> &mut [u8] {
-        &mut self.out
     }
 
     /// ⏳ Waits for a handler task to produce output.
@@ -1390,7 +1374,6 @@ impl QuicServer {
                 deferred: None,
                 body_notify: Arc::new(Notify::new()),
                 _slot: ConnectionSlot(Arc::clone(&live_connections)),
-                out: vec![0u8; OUT_BUF_SIZE],
             });
         }
 

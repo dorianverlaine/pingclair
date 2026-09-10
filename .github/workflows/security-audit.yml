@@ -38,20 +38,4 @@ jobs:
       - name: Audit dependencies
         run: cargo audit
 
-      - name: Audit the registry h2 hidden behind [patch.crates-io]
-        run: |
-          set -Eeuo pipefail
-          python3 -c 'p="Cargo.toml"; m=open(p).read(); m=m.replace("h2 = { path = \"vendor/h2\" }\n", ""); open(p,"w").write(m)'
-          if grep -q '^h2 = { path = "vendor/h2" }' Cargo.toml; then
-              echo "::error::failed to remove the h2 patch; the audit below would miss the registry crate" >&2
-              exit 1
-          fi
-          cargo generate-lockfile
-          if ! grep -A3 'name = "h2"' Cargo.lock | grep -q 'registry+'; then
-              echo "::error::h2 did not resolve to the registry after stripping the patch" >&2
-              exit 1
-          fi
-          cargo audit
-          git restore Cargo.toml Cargo.lock
-
       - uses: ./.github/actions/check-clean-worktree

@@ -395,7 +395,7 @@ status 進行重試。
 
 header、body 與整體 request 超限時，只要協議仍能送出回應，就會回傳明確的
 HTTP 錯誤；idle transport 與超出上限的 HTTP/2、HTTP/3 連線則會關閉。
-Pingora 0.8 對 H1/H2 僅提供一個上游 read timer，因此兩個階段會採用
+Pingora 0.9.0 對 H1/H2 僅提供一個上游 read timer，因此兩個階段會採用
 `first_byte_timeout` 與 `between_reads_timeout` 中較嚴格者；H3 bridge
 則會在收到 response header 後切換 timer。目前修改 H1/H2 pre-routing
 `header_timeout`、H2 field-section cap 或 H1/H2 connection limit 後，
@@ -798,10 +798,12 @@ Directive：
 Pingclair 代理 WebSocket，而**機器忙碌時大約 10–15% 的升級會失敗**。這一條寫在
 這裡而不是上面那份清單裡，因為這個功能並不是缺席——它會動，然後間歇性地不動。
 
-問題出在 `pingora-proxy 0.8.1`，不是這個專案自己對升級的處理：trace 確認送往上游的
+問題出在 `pingora-proxy 0.9.0`，不是這個專案自己對升級的處理：trace 確認送往上游的
 請求**確實帶著** `Connection: Upgrade` 與 `Upgrade: websocket`。上游 issue：
 [cloudflare/pingora#946](https://github.com/cloudflare/pingora/issues/946)，
-截至 2026-08-18 仍開啟。
+截至 2026-09-10 仍開啟；提出修正的
+[cloudflare/pingora#947](https://github.com/cloudflare/pingora/pull/947)
+仍在等待 maintainer review。
 
 一句話說明壞在哪：升級請求是一個沒有 body 的 `GET`，而**那個空 body 的結束**被誤當成
 隧道的結束——但只在上游的 `101` 先被讀到時才會，而機器越不閒置，代理輸掉這個競態的

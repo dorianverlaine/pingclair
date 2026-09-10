@@ -36,30 +36,30 @@
 //! Buffering happens inside Pingora's body filters, and a filter is handed one
 //! chunk and may hand one chunk back. Releasing a body that was withheld means
 //! returning it from the *last* filter call, because after the downstream body
-//! is done — `pingora-proxy 0.8.1`, `proxy_h1.rs:411` feeding
+//! is done — `pingora-proxy 0.9.0`, `proxy_h1.rs:407` feeding
 //! `DownstreamStateMachine::maybe_finished` — the loop stops polling downstream
 //! and the filter is never called again. So a spilled body would have to be
 //! read back into one contiguous buffer to be released at all, and peak memory
 //! would be exactly what it was without the file. The disk write would buy
 //! nothing and cost a new file-descriptor and permissions surface.
 //!
-//! Checked against `pingora-proxy 0.8.1` and `pingora-core 0.8.1` on
-//! 2026-08-13: `ProxyHttp::request_body_filter` / `upstream_response_body_filter`
+//! Checked against `pingora-proxy 0.9.0` and `pingora-core 0.9.0` on
+//! 2026-09-10: `ProxyHttp::request_body_filter` / `upstream_response_body_filter`
 //! (`proxy_trait.rs`) are the only body hooks, and neither can emit more than
 //! one chunk per call. Writing directly to the session from inside a filter
 //! was considered and rejected on the same day: the task pipeline in
-//! `proxy_h1.rs:1209` (`response_duplex_vec` → `buffer_body_data`) owns the
-//! downstream body writer's framing state, and interleaving a second writer
+//! `protocols/http/v1/server.rs:1535` (`buffer_body_data`) owns the downstream
+//! body writer's framing state, and interleaving a second writer
 //! with it corrupts chunked framing in ways no test would catch reliably.
 //!
 //! # 🪤 The one that bites
 //!
 //! On the request side a filter withholds a chunk by handing back an **empty**
-//! `Bytes`, never `None`. `proxy_h1.rs:774` recomputes end-of-body as
+//! `Bytes`, never `None`. `proxy_h1.rs:1035` recomputes end-of-body as
 //! `end_of_body || data.is_none()` *after* the filter runs, so a `None` is read
 //! as "the client is finished" and the upstream request body ends early — with
 //! no error anywhere, and a truncated body at the backend. The response side
-//! carries its own end-of-stream flag past the filter (`lib.rs:382`), so
+//! carries its own end-of-stream flag past the filter (`lib.rs:802`), so
 //! `None` is safe there; this module hands back an empty `Bytes` on both sides
 //! anyway, because a rule with an exception is a rule that gets misremembered.
 

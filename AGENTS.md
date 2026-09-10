@@ -227,9 +227,10 @@ redesign helps, create a measurement task instead.
 
 - **🔐 BoringSSL is a whole-tree commitment.** Never add `openssl-sys`,
   `pingora-openssl`, or reqwest `native-tls`, including as dev-dependencies.
-  `cargo tree -i openssl-sys` must match nothing, and
-  `scripts/check-vendored-h2.sh` must pass (the h2 fork is wired through
-  `[patch.crates-io]` and a Pingora upgrade could silently drop it).
+  `cargo tree -i openssl-sys` must match nothing, and `cargo tree -i
+  boring-sys` must show exactly one BoringSSL graph. The h2 performance
+  optimization is now in the registry release; do not reintroduce a local
+  h2 fork without a new measurement and an upstream gap.
 - **🚦 Two transports, one policy layer.** H1/H2 lives in
   `pingclair-proxy/src/server.rs` (Pingora `ProxyHttp`); H3 lives in
   `pingclair-proxy/src/quic.rs` (`tokio-quiche` owns the transport). Behavior

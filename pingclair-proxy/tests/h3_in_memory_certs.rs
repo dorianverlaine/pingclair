@@ -35,13 +35,11 @@ fn self_signed_pem(names: &[&str]) -> (String, String) {
 /// The handshake is what's under test, so this deliberately implements the
 /// minimum: it proves the trait is implementable by us, and it lets the worker
 /// loop drive a connection to `established` without an H3 layer in the way.
-struct HandshakeOnlyApp {
-    buf: Vec<u8>,
-}
+struct HandshakeOnlyApp;
 
 impl HandshakeOnlyApp {
     fn new() -> Self {
-        Self { buf: vec![0; 1500] }
+        Self
     }
 }
 
@@ -56,10 +54,6 @@ impl ApplicationOverQuic for HandshakeOnlyApp {
 
     fn should_act(&self) -> bool {
         true
-    }
-
-    fn buffer(&mut self) -> &mut [u8] {
-        &mut self.buf
     }
 
     // Never resolves: the worker loop selects this against inbound packets and

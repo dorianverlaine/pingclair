@@ -34,11 +34,13 @@ Pingclair proxies WebSocket, and roughly **10–15 % of upgrades fail when the
 machine is busy**. Stated here, in the release notes, because the feature is
 not missing: it works, and then intermittently does not.
 
-The fault is in `pingora-proxy 0.8.1` rather than in this project's handling of
+The fault is in `pingora-proxy 0.9.0` rather than in this project's handling of
 the upgrade — a trace confirms the request reaches the upstream carrying
 `Connection: Upgrade` and `Upgrade: websocket`. Upstream issue:
 [cloudflare/pingora#946](https://github.com/cloudflare/pingora/issues/946),
-open as of 2026-08-18.
+open as of 2026-09-10. The proposed fix,
+[cloudflare/pingora#947](https://github.com/cloudflare/pingora/pull/947), is
+still awaiting maintainer review.
 
 An upgrade request is a `GET` with no body, and the end of that empty body is
 mistaken for the end of the tunnel — but only when the upstream's `101` is read

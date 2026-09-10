@@ -107,7 +107,13 @@ impl ResourceGuardedProxy {
                     }
                     stream = server::HttpSession::from_h2_conn(&mut connection, digest.clone()) => stream,
                 };
-                let stream = stream.ok()??;
+                let accepted = stream.ok()??;
+                let stream = match accepted {
+                    // 🛡️ Pingora 0.9 can reject one malformed H2 stream while
+                    // keeping sibling streams on the connection alive.
+                    server::H2Accept::Session(stream) => stream,
+                    server::H2Accept::Rejected => continue,
+                };
                 let proxy = self.proxy.clone();
                 let shutdown = shutdown.clone();
                 tokio::spawn(async move {

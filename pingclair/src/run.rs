@@ -161,7 +161,7 @@ pub(crate) fn run_server(
         .global
         .grace_period_secs
         .unwrap_or(DEFAULT_GRACE_SECS);
-    // 🕐 Which knob does what, read off pingora-core 0.8.1 `server/mod.rs:771`
+    // 🕐 Which knob does what, read off pingora-core 0.9.0 `server/mod.rs:803`
     // rather than guessed — the first attempt at this guessed wrong in both
     // directions and shipped a shutdown that hung:
     //

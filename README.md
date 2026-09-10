@@ -418,7 +418,7 @@ protection policy or configured upstream set starts fresh state.
 
 Exceeded header, body, and request budgets receive an explicit HTTP error when
 the protocol can still send one; idle transports and excess HTTP/2 or HTTP/3
-connections are closed. Pingora 0.8 exposes one upstream read timer for H1/H2,
+connections are closed. Pingora 0.9.0 exposes one upstream read timer for H1/H2,
 so the stricter of `first_byte_timeout` and `between_reads_timeout` governs
 both phases there. The H3 bridge switches timers after receiving the response
 header. Changing the H1/H2 pre-routing `header_timeout`, H2 field-section cap,
@@ -853,11 +853,13 @@ Pingclair proxies WebSocket, and roughly **10–15 % of upgrades fail when the
 machine is busy**. This is stated here rather than in the list above because
 the feature is not missing — it works, and then intermittently does not.
 
-The fault is in `pingora-proxy 0.8.1`, not in this project's own handling of
+The fault is in `pingora-proxy 0.9.0`, not in this project's own handling of
 the upgrade: a trace confirms the request reaches the upstream carrying
 `Connection: Upgrade` and `Upgrade: websocket`. Upstream issue:
 [cloudflare/pingora#946](https://github.com/cloudflare/pingora/issues/946),
-open as of 2026-08-18.
+open as of 2026-09-10. The proposed fix,
+[cloudflare/pingora#947](https://github.com/cloudflare/pingora/pull/947), is
+still awaiting maintainer review.
 
 What goes wrong, in one sentence: an upgrade request is a `GET` with no body,
 and the end of *that empty body* is mistaken for the end of the tunnel — but

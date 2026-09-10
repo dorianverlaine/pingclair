@@ -534,7 +534,7 @@ mod request_authority_tests {
 
         // 🌐 HTTP/2 and HTTP/3: `:authority`, which Pingora keeps in the URI.
         let mut h2 = RequestHeader::build_no_case("GET", b"/ready", None).unwrap();
-        h2.uri = "https://h2.example.com:443/ready".parse().unwrap();
+        h2.set_uri("https://h2.example.com:443/ready".parse().unwrap());
         assert_eq!(request_authority(&h2), "h2.example.com:443");
         assert_eq!(authority_host(request_authority(&h2)), "h2.example.com");
     }
@@ -548,7 +548,7 @@ mod request_authority_tests {
     #[test]
     fn the_uri_wins_when_a_request_carries_both() {
         let mut both = RequestHeader::build_no_case("GET", b"/ready", None).unwrap();
-        both.uri = "https://h2.example.com:443/ready".parse().unwrap();
+        both.set_uri("https://h2.example.com:443/ready".parse().unwrap());
         both.insert_header(http::header::HOST, "conflicting.example.com")
             .unwrap();
         assert_eq!(request_authority(&both), "h2.example.com:443");
@@ -1467,8 +1467,8 @@ impl FramingRejection {
 ///   forbidden to senders and "ought to be handled as an error" by recipients
 ///   (RFC 9112 §6.1). ⚠️ In practice this branch does not fire today: Pingora
 ///   settles the ambiguity while parsing, removing `Content-Length` and
-///   disabling keepalive (`pingora-core-0.8.1`
-///   `protocols/http/v1/server.rs:272`), so by the time any filter runs the
+///   disabling keepalive (`pingora-core-0.9.0`
+///   `protocols/http/v1/server.rs:404`), so by the time any filter runs the
 ///   evidence is already gone. The check stays as defence in depth for the day
 ///   that behaviour changes under us, and
 ///   `test_conflicting_length_headers_cannot_smuggle_a_second_request` is what

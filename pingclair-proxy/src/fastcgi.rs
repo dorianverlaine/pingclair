@@ -489,7 +489,7 @@ mod tests {
     fn h3_environment_uses_the_rewritten_script_and_original_uri() {
         let mut request =
             RequestHeader::build(http::Method::POST, b"/index.php/tail?x=1", None).unwrap();
-        request.version = http::Version::HTTP_3;
+        request.set_version(http::Version::HTTP_3);
         request.insert_header("host", "example.test:8443").unwrap();
         request.insert_header("x-role", "admin").unwrap();
         let config = FastCgiTransportConfig {

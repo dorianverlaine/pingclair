@@ -13,8 +13,6 @@ members = [
 ]
 exclude = [
     "vendor/foundations-compat",
-    "vendor/h2",
-    "vendor/prometheus-compat",
 ]
 
 [workspace.package]
@@ -36,11 +34,11 @@ unsafe_op_in_unsafe_fn = "warn"
 
 [workspace.dependencies]
 # Pingora core
-pingora = "0.8"
-pingora-core = "0.8"
-pingora-proxy = "0.8"
-pingora-http = "0.8"
-pingora-load-balancing = "0.8"
+pingora = "0.9"
+pingora-core = "0.9"
+pingora-proxy = "0.9"
+pingora-http = "0.9"
+pingora-load-balancing = "0.9"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -71,11 +69,11 @@ x509-parser = "0.18"
 # `ServerH3Controller`, `InitialQuicConnection` and `ApplicationOverQuic`.
 #
 # The dependency versions align exactly — it pulls `quiche 0.29.3` and
-# `boring 4.22.0`, the same ones below, with no `openssl-sys` anywhere — so the
-# single-BoringSSL invariant survives the migration. Verified in this workspace,
-# not in a probe crate: `cargo tree -i boring-sys` shows one `boring-sys 4.22.0`
+# `boring 5.x`, the same ones below, with no `openssl-sys` anywhere — so the
+# single-BoringSSL invariant survives the migration. Verify in this workspace,
+# not in a probe crate: `cargo tree -i boring-sys` must show one BoringSSL graph
 # shared by `pingora-boringssl`, `quiche` and `tokio-quiche`, and
-# `cargo tree -i openssl-sys` matches no package at all.
+# `cargo tree -i openssl-sys` must match no package at all.
 #
 # 🔐 The blocker was TLS, not the accept API: `ConnectionParams` demands a
 # `TlsCertificatePaths`, which looks like it forces private keys onto disk. It
@@ -101,28 +99,29 @@ x509-parser = "0.18"
 # call the BoringSSL API directly in 21 places, so this version is still a
 # promise a human has to keep. It must stay on the release quiche links
 # against; `cargo tree -i boring-sys` must show exactly one.
-boring = "4.22"
+boring = "5"
 # 🔓 The raw bindings, for the one thing `boring` does not wrap.
 #
 # BoringSSL can check that a certificate is actually allowed to be a *client*
 # certificate — extended key usage, key usage, the Netscape type — and it is
-# `X509_STORE_CTX_set_purpose` that turns that check on. `boring` 4.22 exposes
+# `X509_STORE_CTX_set_purpose` that turns that check on. `boring` 5.x exposes
 # no wrapper for it: `X509VerifyParamRef` has `set_flags`, `set_host`,
-# `set_depth` and no `set_purpose`, and its `boring_sys` is a private
-# `extern crate`. Verified against boring 4.22.0 on 2026-08-17.
+# `set_depth` and no `set_purpose`; its `boring_sys` is a private `extern crate`.
+# Verified against boring 5.2.0 on 2026-09-10.
 #
 # 🛡️ The version tracks `boring` above deliberately. Two `boring-sys` in one
 # tree means two BoringSSLs, which collide on libcrypto symbols and have
 # crashed this binary at startup — so `cargo tree -i boring-sys` must still
 # show exactly one. Matching caret ranges make them move together; the day
 # `boring` needs a new major, this line has to move with it.
-boring-sys = "4.22"
+boring-sys = "5"
 # 🔗 `boring` builds its types with this crate's macros but re-exports none of
 # it, so reaching a raw `X509_STORE_CTX *` needs the trait in scope. Version
 # tracks the one `boring` itself depends on.
 foreign-types = "0.5"
 # Pinned: the ConnectionHook/tls_cert behaviour documented above was read from
-# 0.19.1's source. A minor bump could start reading the sentinel paths.
+# `tokio-quiche 0.19.1`'s source. A minor bump could start reading the sentinel
+# paths.
 tokio-quiche = { version = "=0.19.1", default-features = false }
 
 # HTTP
@@ -154,33 +153,6 @@ bcrypt = "0.19"
 # Lock-free reads on hot paths
 arc-swap = "1"
 
-# ⚡ Performance fork (Pingclair-local, tracked under `vendor/`)
-#
-# `h2 0.4.15` is forked with one change: the HPACK encoder reuses a
-# per-connection scratch buffer for the encoded header block instead of
-# allocating a fresh `BytesMut` (with several capacity doublings) plus a
-# `Bytes` refcount header on every HEADERS frame. The common
-# no-continuation path now performs zero header-block allocations per
-# request. See `vendor/h2/PINGCLAIR_PATCH.md` for the exact diff.
-#
-# 🎯 This is the last fork standing, and the only one ever measured against
-# the upstream project's own benchmark rather than ours: +3.8 % on h2's
-# multi-threaded 100k-request bench, faster in 24 of 25 pairwise comparisons
-# (exact permutation test, p = 0.016).
-#
-# ✅ Upstream accepted it. hyperium/h2#929 was merged on 2026-08-03 as
-# `27b730ee2b10617bc79c4588b05e64afe2d1a432`, verbatim — `git diff` between
-# the submitted commit and h2 master is empty for both patched files. So this
-# directory is not a divergence from upstream any more; it is upstream, early.
-#
-# ⏳ Merged is not released. The newest h2 release is still `0.4.15`
-# (2026-06-15), which predates the merge, so deleting `vendor/h2` today would
-# give the optimization back until h2 cuts its next release. Keep the patch
-# until an h2 release contains the commit above, then delete `vendor/h2`,
-# this `[patch]` section, `scripts/check-vendored-h2.sh`, its `lint.yml` step,
-# and the second audit pass in `security-audit.yml` — the whole apparatus
-# exists only to hold this one fork safely.
-#
 # 🚫 Two other forks were evaluated and removed on 2026-08-04, both for the
 # same reason — a plausible mechanism that never showed up in a measurement
 # where the proxy was provably the bottleneck:
@@ -201,15 +173,23 @@ arc-swap = "1"
 # in. Vendoring also removes `source`/`checksum` from the lockfile entry,
 # which makes the crate invisible to `cargo audit` — verified directly.
 [patch.crates-io]
-# 🛡️ These compatibility crates remove GHSA-2gh3-rmm4-6rq5 and
-# GHSA-w9wp-h8wv-79jx without carrying full forks. Pingora 0.8.1 still requests
-# Prometheus 0.13 even though upstream fixed its protobuf advisory by moving to
-# 0.14, and tokio-quiche 0.19.1 requests Foundations tracing even though it only
-# consumes the settings, logging, metrics, and testing APIs. Remove each shim
-# when the next upstream release exposes the safe dependency graph directly.
+# 🧷 Cloudflare's BoringSSL 5 support is not released in `tokio-quiche 0.19.1`
+# yet. Pin the reviewed compatibility work from quiche#2446 until upstream
+# publishes it; the commit keeps the package versions at `quiche 0.29.3` and
+# `tokio-quiche 0.19.1`, so this patch can be removed without a code migration
+# once the released dependency graph accepts BoringSSL 5.
+#
+# This is deliberately an immutable commit, not a moving branch. It is the
+# only temporary bridge needed to keep Pingora 0.9 and Pingclair H3 on one
+# `boring-sys` major.
+quiche = { git = "https://github.com/cjpatton/quiche.git", rev = "82152d23d69a2ef77b734346f4bb2eee2475825d" }
+tokio-quiche = { git = "https://github.com/cjpatton/quiche.git", rev = "82152d23d69a2ef77b734346f4bb2eee2475825d" }
+
+# 🛡️ This compatibility crate removes GHSA-2gh3-rmm4-6rq5 without carrying a
+# full fork. `tokio-quiche 0.19.1` still requests Foundations tracing even
+# though it only consumes the settings, logging, metrics, and testing APIs.
+# Remove the shim when that upstream release exposes the safe graph directly.
 foundations = { path = "vendor/foundations-compat" }
-h2 = { path = "vendor/h2" }
-prometheus = { path = "vendor/prometheus-compat" }
 
 [profile.release]
 lto = "fat"
