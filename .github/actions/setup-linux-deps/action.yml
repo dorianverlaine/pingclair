@@ -14,6 +14,18 @@ runs:
         # archive that actually carries the runner's architecture:
         # archive.ubuntu.com serves amd64, while every other Ubuntu port
         # (arm64 among them) lives on ports.ubuntu.com.
+        #
+        # 📌 Keep the runner's own configuration aside first. The pin trades a
+        # geo-routed mirrorlist for a single host, so it needs an undo: the
+        # update step below falls back to exactly this copy when the pinned
+        # archive is the one misbehaving.
+        sudo mkdir -p /tmp/apt-original
+        if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
+          sudo cp -a /etc/apt/sources.list.d/ubuntu.sources /tmp/apt-original/ubuntu.sources
+        fi
+        if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+          sudo cp -a /etc/apt/apt-mirrors.txt /tmp/apt-original/apt-mirrors.txt
+        fi
         arch="$(dpkg --print-architecture 2>/dev/null || uname -m)"
         if [[ "${arch}" == "amd64" ]]; then
           ubuntu_url="http://archive.ubuntu.com/ubuntu/"
@@ -28,20 +40,47 @@ runs:
           sudo sed -i -E "s|https?://azure\.archive\.ubuntu\.com/ubuntu/?|${ubuntu_url}|g" /etc/apt/apt-mirrors.txt
         fi
 
-    - name: Update apt with a hard deadline and IPv4
+    - name: Update apt with a hard deadline, retrying the runner's own mirror
       shell: bash
       run: |
-        set -euo pipefail
-        # 🛡️ A hanging mirror must not stall the whole job. The hosted image
-        # ships current package lists, so a failed update is a warning, not a
-        # stop condition: installation below falls back to those lists.
-        if ! timeout 120 sudo apt-get update \
-          -o Acquire::ForceIPv4=true \
-          -o Acquire::Retries=2 \
-          -o Acquire::http::Timeout=30 \
-          -o Acquire::https::Timeout=30; then
-          echo "::warning::apt-get update failed or timed out; installing from the runner's existing package lists"
+        set -uo pipefail
+        # 🛡️ A hanging mirror must not stall the whole job, so the update runs
+        # under a deadline. But a killed update leaves the index **partially
+        # written**, and `apt-get install` then dies in a fifth of a second with
+        # a bare exit 100 — which reads like a missing dependency rather than a
+        # mirror fault. That is what failed every amd64 job on 2026-09-11 while
+        # aarch64 passed: archive.ubuntu.com was serving unusable indexes and
+        # ports.ubuntu.com was fine.
+        #
+        # 📌 So a failed update is retried against the runner's own
+        # configuration before anything is installed. The install is still
+        # attempted if both fail, because a slow-but-complete update can time out
+        # harmlessly, but by then the log says which fault to look for.
+        update_apt() {
+          timeout 120 sudo apt-get update \
+            -o Acquire::ForceIPv4=true \
+            -o Acquire::Retries=2 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30
+        }
+        if update_apt; then
+          exit 0
         fi
+        echo "::warning::apt-get update failed against the pinned archive; retrying the runner's own mirror"
+        restored=false
+        if [[ -f /tmp/apt-original/ubuntu.sources ]]; then
+          sudo cp -a /tmp/apt-original/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources
+          restored=true
+        fi
+        if [[ -f /tmp/apt-original/apt-mirrors.txt ]]; then
+          sudo cp -a /tmp/apt-original/apt-mirrors.txt /etc/apt/apt-mirrors.txt
+          restored=true
+        fi
+        if [[ "${restored}" == "true" ]] && update_apt; then
+          echo "::notice::apt-get update succeeded against the runner's own mirror"
+          exit 0
+        fi
+        echo "::warning::apt-get update failed against both the pinned archive and the runner's own mirror; the package lists may be incomplete, so a failure below is a mirror fault and not a dependency fault"
 
     - name: Install build dependencies
       shell: bash
