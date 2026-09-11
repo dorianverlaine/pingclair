@@ -2,9 +2,13 @@ http://plain.example {
 	respond "plain"
 }
 
-# 🧭 A port with no scheme: an explicit listener, and the site name still
-# selects the virtual host.
-plain.example:8080 {
+# 🧭 A port with no scheme is **not** a plaintext site. Upstream decides
+# automatic HTTPS by the port, not the scheme, so a hostname on anything but the
+# HTTP port is served over TLS — and the site name still selects the virtual
+# host. `http://` in front of the address is what asks for plaintext; that
+# spelling is pinned by `a_port_without_a_scheme_is_not_a_plaintext_listener`,
+# because two sites sharing a port must agree about TLS to compile at all.
+ported.example:8080 {
 	respond "ported"
 }
 
@@ -88,16 +92,23 @@ plain.example:8080 {
       "error_pages": {}
     },
     {
-      "name": "plain.example",
+      "name": "ported.example",
       "names": [
-        "plain.example"
+        "ported.example"
       ],
       "bind": null,
       "listen": [
         "[::]:8080"
       ],
       "proxy_protocol_listen": [],
-      "tls": null,
+      "tls": {
+        "auto": true,
+        "internal": false,
+        "cert": null,
+        "key": null,
+        "acme_email": null,
+        "http3": false
+      },
       "routes": [
         {
           "path": "/*",

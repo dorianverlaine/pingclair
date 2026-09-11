@@ -273,6 +273,15 @@ pas être lié (déjà utilisé, ou privilèges insuffisants), le listener autom
 est ignoré avec un avertissement et HTTPS continue de servir ; la validation
 HTTP-01 d'ACME, elle, ne fonctionnera pas.
 
+Une adresse qui nomme un port sans schéma est servie en **HTTPS** : un listener
+qui n'est pas sur le port HTTP n'est pas un listener en clair, et c'est la règle
+qu'applique l'implémentation de référence. `secure.example:8443` obtient donc un
+certificat automatique, exactement comme `secure.example`. `http://` devant
+l'adresse est la façon de demander le clair, sur n'importe quel port, et
+`tls off` fonctionne aussi. Deux sites qui partagent un port doivent s'accorder
+sur TLS, sinon la configuration est refusée plutôt que l'un des deux l'emportant
+en silence.
+
 Un même bloc peut mélanger des schémas explicites, par exemple
 `http://example.com, https://example.com { … }`. Pingclair partage les handlers
 mais conserve une politique indépendante par listener : HTTP reste en clair et

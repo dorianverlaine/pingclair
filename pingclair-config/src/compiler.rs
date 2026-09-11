@@ -70,12 +70,24 @@ pub fn compile_ast(ast: &Ast) -> CompileResult<PingclairConfig> {
         // internal authority from the adapter). An explicit `https://`
         // address qualifies exactly like a bare hostname, while `http://`
         // keeps its explicit plaintext listener.
-        let has_http_listener = block
-            .listens
-            .iter()
-            .any(|listen| listen.scheme == Scheme::Http);
+        //
+        // 🔢 The test upstream applies is the **port**, not the scheme:
+        // `automaticHTTPSPhase1` skips a server only when every listener it
+        // names is the HTTP port. Testing the scheme instead left a bare
+        // `secure.example:8443` — a hostname, a non-standard port, no scheme —
+        // with a `tls` block that enabled TLS and specified no way to obtain a
+        // certificate, so the handshake could never be completed. A site with
+        // no derived listener (the bare `example.com` spelling) is not
+        // affected either way, which is why the emptiness is spelled out:
+        // `all()` over nothing is `true`, and would read as "pinned to :80".
+        let http_port = config.global.http_port;
+        let every_listener_is_the_http_port = !block.listens.is_empty()
+            && block
+                .listens
+                .iter()
+                .all(|listen| listen.force_plaintext || listen.port == Some(http_port));
         if block.tls.is_none()
-            && !has_http_listener
+            && !every_listener_is_the_http_port
             && config.global.auto_https != CoreAutoHttpsMode::Off
             && block
                 .names

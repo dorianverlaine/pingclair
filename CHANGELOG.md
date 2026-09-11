@@ -76,6 +76,29 @@ immediately after the `101`, both ends seeing EOF with no error.
 
 ### ⚠️ Breaking
 
+- 🔢 **A site address with a port and no scheme is now served over HTTPS, as it
+  is upstream.** `secure.example:8443` — a hostname, a non-standard port, no
+  scheme — used to compile to a listener whose `tls` block said `auto: false,
+  internal: false`: TLS switched on, and no issuer, no certificate and no key
+  named. That is not "plaintext with a misleading block"; it is a listener that
+  can never complete a handshake, because nothing can resolve a certificate for
+  it. The gate deciding this tested the *scheme* of each listener, while
+  upstream's `automaticHTTPSPhase1` tests the **port** and skips a site only
+  when every listener it names is the HTTP port.
+
+  ⚠️ **This changes what an existing address means.** `example.com:8080` used to
+  be plaintext and is now HTTPS with automatic issuance. `http://` in front of
+  the address is the spelling that asks for plaintext on any port, and it is
+  unchanged — as are `localhost:8080` and `127.0.0.1:8080` (already on the local
+  authority), a bare `example.com` with no port, and anything pinned to the HTTP
+  port. Two sites sharing a port must still agree about TLS, or the whole
+  configuration is refused.
+
+  📌 The address-form fixture had frozen the old answer under a site named
+  `plain.example`, which is what a fixture is for and also what made a wrong
+  answer look deliberate.
+
+
 - 🧱 **A block must now open at the end of its line.** `route { respond "hi" 200`
   and `to 10.0.0.1:8080 { weight 3 }` used to compile; they are refused now, as
   the format refuses them — measured against v2.11.4, which answers

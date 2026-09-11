@@ -277,6 +277,14 @@ Pingclair then serves that port exactly as configured. If port 80 cannot be
 bound (already in use, or unprivileged), the automatic listener is skipped with
 a warning and HTTPS still serves; ACME HTTP-01 validation will not work.
 
+An address that names a port but no scheme is served over **HTTPS**: a listener
+that is not on the HTTP port is not a plaintext listener, which is the rule
+upstream applies. `secure.example:8443` therefore gets an automatic certificate
+just as `secure.example` does. `http://` in front of the address is how
+plaintext is asked for, on any port, and `tls off` also works. Two sites sharing
+a port must agree about TLS, or the configuration is refused rather than one of
+them silently winning.
+
 A block may mix explicit schemes, for example
 `http://example.com, https://example.com { … }`. Pingclair shares the handlers
 but keeps independent listener policy: HTTP stays plaintext and serves the

@@ -264,6 +264,12 @@ HTTP-01 挑戰——CA 是以**明文** HTTP 打在這個 port（RFC 8555 §8.3�
 的設定服務那個 port。若 port 80 無法綁定（已被占用，或權限不足），自動
 listener 會被跳過並留下警告，HTTPS 照常服務，但 ACME HTTP-01 驗證不會運作。
 
+只寫 port、不寫 scheme 的位址會以 **HTTPS** 服務：不在 HTTP port 上的 listener
+就不是明文 listener，這也是 upstream 的規則。因此 `secure.example:8443` 跟
+`secure.example` 一樣會取得自動憑證。要明文服務就寫 `http://`（任何 port 都
+適用），`tls off` 也可以。兩個 site 共用同一個 port 時，對 TLS 的立場必須一致，
+否則整份設定會被拒絕，而不是讓其中一個默默勝出。
+
 同一個 block 可以混用明確 scheme，例如
 `http://example.com, https://example.com { … }`。Pingclair 會共用 handler，
 但維持各 listener 的獨立策略：HTTP 保持明文並直接服務設定的 route，HTTPS

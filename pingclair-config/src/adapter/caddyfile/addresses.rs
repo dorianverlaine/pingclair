@@ -295,6 +295,44 @@ mod address_semantics_tests {
     }
 
     #[test]
+    fn a_port_without_a_scheme_is_not_a_plaintext_listener() {
+        // 🔢 Upstream's automatic-HTTPS test is the port, not the scheme, so a
+        // hostname on anything but the HTTP port is served over HTTPS. This
+        // used to be decided by the scheme, which left `secure.example:8443`
+        // with a `tls` block that turned TLS on and named no way to obtain a
+        // certificate — a listener that could never complete a handshake.
+        for address in ["secure.example:8443", "secure.example:8080"] {
+            let server = first_server(&format!("{address} {{\n    respond \"x\"\n}}"));
+            let tls = server
+                .tls
+                .unwrap_or_else(|| panic!("{address} must have a TLS policy, not a bare listener"));
+            assert!(
+                tls.auto,
+                "{address} must reach automatic HTTPS, not an empty TLS block"
+            );
+            assert!(
+                !tls.internal,
+                "{address} is a public name, so the issuer must not be the local authority"
+            );
+        }
+
+        // 📴 `http://` is what asks for plaintext, and it keeps doing so on a
+        // port automatic HTTPS would otherwise claim.
+        let plain = first_server("http://plain.example:8080 {\n    respond \"x\"\n}");
+        assert!(
+            plain.tls.is_none(),
+            "an explicit http:// scheme must stay plaintext whatever port it names"
+        );
+
+        // 🔢 A site pinned to the HTTP port is the one case upstream skips.
+        let on_http_port = first_server("example.com:80 {\n    respond \"x\"\n}");
+        assert!(
+            on_http_port.tls.is_none(),
+            "a listener on the HTTP port must stay plaintext"
+        );
+    }
+
+    #[test]
     fn explicit_listen_is_not_duplicated_or_augmented() {
         let server = first_server("example.com {\n    listen :80\n    tls auto\n}");
         assert_eq!(
