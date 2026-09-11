@@ -92,6 +92,13 @@ Une fois l'installation terminée, la commande `pingclair` est disponible dans v
 > pour les mesures et pour le seul défaut connu, l'échec des montées en
 > WebSocket sous charge. Le script affiche l'étiquette qu'il installe et vérifie
 > la somme de contrôle SHA-256 publiée avant de décompresser.
+>
+> 🪦 **`v0.1.x` n'est plus maintenue.** Il n'y aura pas de `v0.1.8` : aucune
+> correction, aucun rétroportage et aucun avis de sécurité pour cette branche.
+> Rester dessus, c'est rester sur une version que personne ne corrigera. L'une
+> des raisons de migrer : son API d'administration n'authentifiait rien — une
+> configuration `v0.1.x` analysait `api_key` puis ne la lisait jamais, donc ce
+> champ ne protégeait rien. Si vous exploitez `v0.1.7`, migrez.
 
 Sur n'importe quelle distribution Linux, le script d'installation fonctionne : il télécharge (ou compile) le binaire, met en place un service `systemd` et crée un utilisateur `pingclair` non privilégié, autorisé à se lier aux ports bas via `setcap`. Après l'installation, la commande `pc` (abréviation de `pingclair`) permet de gérer le service.
 

@@ -90,6 +90,13 @@ Once installed, the `pingclair` command is available on your `PATH`.
 > for the soak evidence and for the one known defect, WebSocket upgrades failing
 > under load. The script prints the tag it is installing and verifies the
 > published SHA-256 checksum before unpacking.
+>
+> 🪦 **`v0.1.x` is unmaintained.** There will be no `v0.1.8`: no fixes, no
+> backports and no security advisories for that line, so staying on it means
+> staying on a version nobody will patch. One of the reasons to move is that its
+> Admin API authenticated nothing — a `v0.1.x` configuration parsed `api_key` and
+> then never read it, so the field protected nothing. If you are running
+> `v0.1.7`, upgrade.
 
 On any Linux distribution the install script works — it downloads (or builds) the binary, sets up a `systemd` service, and creates an unprivileged `pingclair` user that binds low ports via `setcap`. After installation, manage the service with the `pc` command (short for `pingclair`).
 

@@ -19,6 +19,27 @@ reports `0.2.0-rc.1`, tagged as a release candidate on 2026-08-20. The scope is
 large because it covers 173 commits since `v0.1.7`. This section becomes
 `## [0.2.0]` when the non-goals below are decided.
 
+### 🪦 `v0.1.x` is unmaintained
+
+Stated here as well as in the READMEs, because somebody still running `v0.1.7`
+has no other way to find out. **There will be no `v0.1.8`**: that line receives
+no fixes, no backports and no security advisories, so a defect found in it is
+recorded and left alone. The upgrade target is `0.2.0`.
+
+⚠️ One difference worth naming, since it is the concrete reason not to wait.
+**The `v0.1.x` Admin API authenticated nothing.** That release parsed
+`admin.api_key` into its configuration and then never read it: the admin server
+started as `run_admin_server(addr, proxies)` with no key argument, `ApiKeyAuth`
+was never constructed anywhere in the tree, and the routes carried no
+authorisation layer. An operator who bound the admin listener to a routable
+address and set a key had an open admin API and a field that said otherwise. On
+`main`, an Admin API with no key configured logs a warning and admits loopback
+clients only.
+
+📌 No advisory accompanies this, by the 2026-08-17 decision: with no patch and
+no maintained branch, an advisory would only describe a hole nobody can close.
+The behaviour change is recorded; the abandoned release is not.
+
 ### 🚫 Non-goals for 0.2.0
 
 What this release deliberately does **not** try to do. A release with 51
