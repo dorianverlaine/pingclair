@@ -328,3 +328,27 @@ only `strip_prefix` differing, to see the real cause.
 condition that rule needs. A second instrument only adds information when
 **everything else is held fixed**. Otherwise it is just one more misleading
 measurement.
+
+## 🔍 Two static-path investigations that found nothing (2026-08-18)
+
+Recorded so the next round does not re-chase them. `sample` on static H2 on the
+dev machine (macOS/arm64) reported `__open` as the heaviest non-waiting symbol
+(6,110 samples), nearly four times `__sendto` (1,611). Both were investigated,
+and **neither is a defect.**
+
+- **Not repeated calls.** Each request is exactly one `std::fs::metadata()`
+  (`pingclair-static/src/file_server/serve.rs:161`) plus one `File::open()`
+  (`pingclair-static/src/file_server/stream.rs:303`). `sample` reports time, not
+  call count, so that ratio measures `open` being genuinely more expensive than
+  `stat` on APFS — it is not us opening the same file twice.
+- **The `stat` + `open` double path resolution stays.** It could collapse into
+  one by `fstat`-ing after `open`, but `stat` is only 12 % of `open`, and
+  `serve()` must have the metadata **before** it decides to open anything:
+  directories need a redirect or an index, a missing file needs a 404, and the
+  `hide` policy must reject first. Rearranging a path that the traversal and
+  hide checks depend on, for 1–2 %, does not pay.
+
+⚠️ That round did not advance the question it was meant to answer: no comparison
+target was set up locally (neither nginx nor a TLS-capable Rust static server),
+the load average was 3.3, and the client was emulated amd64. The open item is
+tracked as issue #35.

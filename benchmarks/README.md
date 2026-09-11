@@ -51,3 +51,28 @@ these three rules a script cannot do for you.
 
 The rest of rule 3 — matching concurrency, client threads and CPU limits — cannot
 be enforced by a script either, and is why this section exists.
+
+## 🎯 The static path has no line to fix
+
+A `perf` profile of 30,000 static requests served directly on athlon put the
+largest single user-space symbol at **`memcpy`, 0.96 %**. Nothing else reached
+1 %. Self time was 61.5 % in `pingclair`, 7.4 % in `libc` and 30.5 % in the
+kernel, and that 69 % of user space is spread across several hundred small
+functions — the ordinary shape of monomorphised, inlined async state machines.
+
+📌 **So the success criterion here cannot be "find the line and fix it".** There
+is no line. It is "re-measure a ratio that the section above says is
+trustworthy". A session that opens with `perf` and has no end condition will not
+converge, which is why this is written down rather than rediscovered.
+
+Two supporting measurements, both of which make the ratio *flatter* than the
+truth rather than more flattering:
+
+- `strace -f -c` shows **fewer syscalls per request than nginx** (5 versus 6),
+  spending the same time in them (0.118 s versus 0.117 s) once
+  `epoll_wait`/`clock_nanosleep`/`futex` are discounted on our side. The gap is
+  neither I/O nor any single function.
+- Container bridge networking eats nearly half the throughput — about
+  10,000 req/s inside the container against 18,695 on the host, with
+  `conntrack`/`seccomp` visible in the profile. Both candidates pay that fixed
+  cost, so **the real gap is worse than the measured one, not better**.
