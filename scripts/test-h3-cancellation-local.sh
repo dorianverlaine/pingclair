@@ -279,16 +279,35 @@ if [[ "${response_trailer_status}" != "502" ]] \
 fi
 
 set +e
-"${curl_bin}" --noproxy '*' --http3-only -kfsS --no-buffer \
-    --max-time 1.5 \
-    --resolve "${host_name}:${h3_port}:127.0.0.1" \
-    "https://${host_name}:${h3_port}/events" \
-    >"${client_output}" 2>"${client_error}" &
+# 🌊 The event has to become visible while the stream is still open, so the
+# observation window is the client's own lifetime rather than a fixed deadline.
+# The previous budget was 50 × 0.02 s = 1 s, which is *shorter* than the client's
+# 1.5 s: a cold QUIC handshake on a loaded runner expired it and the check
+# reported a buffering failure where there was none, which is how it cost a
+# round on 2026-08-13 and again in CI on 2026-09-11. A buffered body cannot pass
+# this at any speed — this upstream never finishes its response, so nothing would
+# ever arrive — which is what makes a generous window safe to give.
+client_done="${run_dir}/client.done"
+rm -f "${client_done}"
+(
+    "${curl_bin}" --noproxy '*' --http3-only -kfsS --no-buffer \
+        --max-time 5 \
+        --resolve "${host_name}:${h3_port}:127.0.0.1" \
+        "https://${host_name}:${h3_port}/events" \
+        >"${client_output}" 2>"${client_error}"
+    status=$?
+    : >"${client_done}"
+    exit "${status}"
+) &
 client_pid=$!
 set -e
 
 first_visible=false
-for _ in {1..50}; do
+# 🛡️ The client's own --max-time closes the window; this ceiling exists only so
+# that a wedged curl cannot hang the job, and it is far above that deadline so
+# it can never turn a healthy run red.
+deadline=$((SECONDS + 30))
+while [[ ! -f "${client_done}" ]] && ((SECONDS < deadline)); do
     if [[ -f "${first_marker}" ]] && grep -Fq 'data: first' "${client_output}"; then
         first_visible=true
         break
@@ -296,7 +315,11 @@ for _ in {1..50}; do
     sleep 0.02
 done
 if [[ "${first_visible}" != "true" ]]; then
-    log "❌ The first H3 SSE event was not delivered incrementally."
+    if [[ -f "${client_done}" ]]; then
+        log "❌ The first H3 SSE event never appeared: the stream ended before it was delivered."
+    else
+        log "❌ The first H3 SSE event was not delivered incrementally."
+    fi
     exit 1
 fi
 
