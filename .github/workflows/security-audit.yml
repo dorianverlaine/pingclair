@@ -19,10 +19,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust 1.97
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.97.1
+      - name: Install Rust 1.98
+        uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.1
         with:
-          toolchain: 1.97.1
+          toolchain: 1.98.1
 
       - name: Cache cargo-audit and the advisory database
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4

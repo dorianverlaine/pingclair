@@ -7,7 +7,7 @@
 set shell := ["bash", "-uc"]
 set positional-arguments
 
-rust := "1.97.1"
+rust := "1.98.1"
 
 # 📖 Show every recipe.
 help:

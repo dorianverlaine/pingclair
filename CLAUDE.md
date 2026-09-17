@@ -41,8 +41,8 @@ a snapshot validation failure blocks handoff.
 
 The canonical gate is `just ci` — fmt-check, clippy, cargo-shear, repo-lint,
 docs-lint, the full nextest suite, and bench smoke — and CI runs the same
-recipes. **`+1.97.1` is not decoration**: the workspace declares
-`rust-version = "1.97"` and CI pins 1.97.1. A different local compiler —
+recipes. **`+1.98.1` is not decoration**: the workspace declares
+`rust-version = "1.98"` and CI pins 1.98.1. A different local compiler —
 newer or older — has different inference and rustfmt line breaking;
 all-green locally followed by all-red in CI has already happened in both
 directions (newer-than-CI on 2026-07-29, an older toolchain in the release
@@ -56,9 +56,9 @@ Narrower runs:
 
 ```bash
 just test -p pingclair-proxy                               # one crate
-cargo +1.97.1 nextest run -p pingclair --test integration --no-fail-fast
-cargo +1.97.1 nextest run -p pingclair --test integration test_name -- --nocapture
-cargo +1.97.1 nextest run -p pingclair-proxy --test h3_end_to_end --no-fail-fast
+cargo +1.98.1 nextest run -p pingclair --test integration --no-fail-fast
+cargo +1.98.1 nextest run -p pingclair --test integration test_name -- --nocapture
+cargo +1.98.1 nextest run -p pingclair-proxy --test h3_end_to_end --no-fail-fast
 ```
 
 `pingclair/tests/integration.rs` spawns the real compiled binary and makes real
@@ -71,7 +71,7 @@ Some integration tests are load-sensitive rather than flaky in isolation.
 Reproduce with several concurrent full suites, not repeated single runs:
 
 ```bash
-cargo +1.97.1 build --tests -p pingclair
+cargo +1.98.1 build --tests -p pingclair
 BIN=$(find target/debug/deps -maxdepth 1 -name 'integration-*' -type f -perm -u+x ! -name '*.d' -exec ls -t {} + | head -1)
 for i in $(seq 1 6); do "$BIN" > /tmp/full_$i.log 2>&1 & done; wait
 ```
@@ -90,7 +90,7 @@ scripts/test-h3-client-auth-local.sh        # mutual TLS, and the SNI/:authority
 
 Both need a curl built with HTTP/3 (`brew install curl` provides one; the system
 curl does not). CI runs the Linux half post-merge on `ubuntu-24.04`; a manual
-Linux box can use `rust:1.97-bookworm`, which needs `cmake` for BoringSSL and
+Linux box can use `rust:1.98-bookworm`, which needs `cmake` for BoringSSL and
 `clang`/`libclang-dev` for bindgen — without them `boring-sys` fails in its
 build script.
 

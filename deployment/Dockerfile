@@ -4,7 +4,7 @@
 # floating `latest` tag lets the image drift to a newer release than the tests
 # ran under, which is the "green locally, red in production" trap one layer
 # further out. The toolchain comes from rustup rather than the distribution
-# because `rust-version = "1.97"` is pinned in Cargo.toml and CI verifies
+# because `rust-version = "1.98"` is pinned in Cargo.toml and CI verifies
 # exactly that.
 FROM ubuntu:24.04 AS builder
 
@@ -44,7 +44,7 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 # can build against a toolchain that silently never arrived.
 RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-connrefused -sSf \
         https://sh.rustup.rs -o /tmp/rustup-init.sh \
-    && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.97.1 \
+    && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.98.1 \
     && rm -f /tmp/rustup-init.sh \
     && cargo --version
 

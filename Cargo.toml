@@ -21,7 +21,7 @@ edition = "2024"
 authors = ["Dorian Verlaine <dorianverlaine@icloud.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/dorianverlaine/pingclair"
-rust-version = "1.97"
+rust-version = "1.98"
 
 [workspace.lints.rust]
 # 🛡️ The lint table exists so every crate can opt in through

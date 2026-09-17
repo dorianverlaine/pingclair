@@ -125,7 +125,7 @@ follow from it.
   (SSE, cancellation, trailers), and `scripts/test-h3-client-auth-local.sh`
   (mutual TLS, including the rule that the handshake name and `:authority` must
   agree — a rule that had no test at all before 2026-08-18). The Linux half runs
-  in docker `rust:1.97-bookworm`.
+  in docker `rust:1.98-bookworm`.
 
 > ✅ **The `ba37ffc` migration passed this gate** (2026-07-30, evidence in
 > `benchmarks/results/20260730_day28_f26d0a1/`): Linux release build, no
@@ -134,7 +134,7 @@ follow from it.
 > 14/14.
 
 > ⚠️ **Building on Linux needs `cmake` (BoringSSL) and `clang`/`libclang-dev`
-> (bindgen).** A clean `rust:1.97-bookworm` has neither, and without them
+> (bindgen).** A clean `rust:1.98-bookworm` has neither, and without them
 > `boring-sys` fails in its build script. Both release artefacts and the CI
 > environment must carry them.
 >

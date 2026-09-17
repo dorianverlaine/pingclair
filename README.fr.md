@@ -6,7 +6,7 @@
 *La performance brute de Cloudflare Pingora, dans une enveloppe aussi minimaliste que Caddy*
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.97%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.98%2B-orange.svg)](https://www.rust-lang.org/)
 [![Status](https://img.shields.io/badge/status-active-green.svg)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/dorianverlaine/pingclair/pulls)
 
@@ -62,7 +62,7 @@ et ne font pas partie du dépôt.
 
 ### Prérequis
 
-*   **Chaîne d'outils Rust** — Rust 1.97 ou plus récent.
+*   **Chaîne d'outils Rust** — Rust 1.98 ou plus récent.
 
 ### Compilation depuis les sources
 
@@ -115,7 +115,7 @@ Installer la dernière version de développement de main (binaire précompilé) 
 curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --dev
 ```
 
-Cloner main et le compiler localement (nécessite Rust 1.97+) :
+Cloner main et le compiler localement (nécessite Rust 1.98+) :
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --main

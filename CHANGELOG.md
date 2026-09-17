@@ -301,6 +301,11 @@ immediately after the `101`, both ends seeing EOF with no error.
 
 ### 🔄 Changed
 
+- 🦀 **Building from source now requires Rust 1.98 instead of 1.97.** The
+  workspace's `rust-version` is 1.98 and CI pins 1.98.1, so the toolchain is the
+  same one the tests ran under. `cargo install` picks the toolchain up from the
+  manifest; anyone on a pinned 1.97 needs `rustup update` first.
+
 - 🏷️ **An HTTP/3 request now reaches an HTTP/1 upstream with the same field-name
   spelling an HTTP/2 request does.** Both transports previously built the same
   request two different ways: the HTTP/2 path kept no record of field-name case,

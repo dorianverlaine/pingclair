@@ -30,7 +30,7 @@
 //! # ✍️ Updating a fixture
 //!
 //! ```bash
-//! UPDATE_GOLDEN=1 cargo +1.97.1 test -p pingclair-config --test golden
+//! UPDATE_GOLDEN=1 cargo +1.98.1 test -p pingclair-config --test golden
 //! ```
 //!
 //! Then **read the diff**. Regenerating is how a golden file is maintained;
@@ -139,7 +139,7 @@ fn every_fixture_compiles_to_exactly_what_it_says() {
     assert!(
         mismatches.is_empty(),
         "\n{}\n\nIf the change is intended, regenerate with:\n    \
-         UPDATE_GOLDEN=1 cargo +1.97.1 test -p pingclair-config --test golden\n",
+         UPDATE_GOLDEN=1 cargo +1.98.1 test -p pingclair-config --test golden\n",
         mismatches.join("\n\n")
     );
 }

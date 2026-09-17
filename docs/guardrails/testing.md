@@ -92,10 +92,10 @@
 - **A compression test's payload must be unique per chunk and incompressible.**
   Repeating one block lets zstd's window deduplicate it (64 MiB → 15 KB), which
   makes assertions like "output is flowing" **fail spuriously**.
-- **The local gate runs `cargo +1.97.1`, not the default toolchain.** CI pins
-  `1.97.1` (since the 2026-08-02 split that means the `blocking-ci.yml` fast gate
+- **The local gate runs `cargo +1.98.1`, not the default toolchain.** CI pins
+  `1.98.1` (since the 2026-08-02 split that means the `blocking-ci.yml` fast gate
   plus the `postmerge-ci.yml` full gate, each calling reusable workflows), and the
-  workspace declares `rust-version = "1.97"`. Locally, always enter through
+  workspace declares `rust-version = "1.98"`. Locally, always enter through
   `just ci` so it is the same gate. Get the toolchain version wrong and type
   inference and rustfmt's line breaking both change, giving all-green locally
   followed by all-red in CI — and this repository has fallen in from both
@@ -105,7 +105,7 @@
   ≥ 1.97 (`rustc 1.88.0 is not supported`).
 - 🎩 **CI runners are pinned to `ubuntu-24.04` / `ubuntu-24.04-arm`** (no more
   floating `ubuntu-latest`), matching `deployment/Dockerfile`'s `ubuntu:24.04` —
-  same base, same rustup pin at 1.97.1, same `apt` package list. This rule comes
+  same base, same rustup pin at 1.98.1, same `apt` package list. This rule comes
   from the 2026-07-31 incident: that Dockerfile **had not been built since the H3
   switch to tokio-quiche**, the image running in production had been built before
   the dependency tree changed, and its Rust version had long since diverged from

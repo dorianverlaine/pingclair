@@ -168,7 +168,7 @@ self-maintaining: the issue closes on merge, and nobody has to remember.
 ## 🚦 The gate
 
 Every commit on `main` passes the full CI gate. The canonical local command
-is the same one CI runs, pinned to Rust 1.97:
+is the same one CI runs, pinned to Rust 1.98:
 
 ```bash
 just ci

@@ -658,7 +658,7 @@ async fn handle_request_inner(
             // 📤 POST to the root upserts the whole document, like Caddy.
             let value = match read_json_body(req).await {
                 Ok(value) => value,
-                Err(error_response) => return Ok(error_response),
+                Err(error_response) => return Ok(*error_response),
             };
             apply_full_document(&ctx, value).await
         }
@@ -667,21 +667,21 @@ async fn handle_request_inner(
             // target, append to arrays, and `...` expands array bodies.
             let value = match read_json_body(req).await {
                 Ok(value) => value,
-                Err(error_response) => return Ok(error_response),
+                Err(error_response) => return Ok(*error_response),
             };
             apply_config_traversal(&ctx, Method::POST, path, Some(value)).await
         }
         (&Method::PUT, path) if path.starts_with("/config") => {
             let value = match read_json_body(req).await {
                 Ok(value) => value,
-                Err(error_response) => return Ok(error_response),
+                Err(error_response) => return Ok(*error_response),
             };
             apply_config_traversal(&ctx, Method::PUT, path, Some(value)).await
         }
         (&Method::PATCH, path) if path.starts_with("/config") => {
             let value = match read_json_body(req).await {
                 Ok(value) => value,
-                Err(error_response) => return Ok(error_response),
+                Err(error_response) => return Ok(*error_response),
             };
             apply_config_traversal(&ctx, Method::PATCH, path, Some(value)).await
         }
@@ -694,21 +694,21 @@ async fn handle_request_inner(
         (&Method::POST, path) if path.starts_with("/id/") => {
             let value = match read_json_body(req).await {
                 Ok(value) => value,
-                Err(error_response) => return Ok(error_response),
+                Err(error_response) => return Ok(*error_response),
             };
             apply_id_request(&ctx, Method::POST, path, Some(value)).await
         }
         (&Method::PUT, path) if path.starts_with("/id/") => {
             let value = match read_json_body(req).await {
                 Ok(value) => value,
-                Err(error_response) => return Ok(error_response),
+                Err(error_response) => return Ok(*error_response),
             };
             apply_id_request(&ctx, Method::PUT, path, Some(value)).await
         }
         (&Method::PATCH, path) if path.starts_with("/id/") => {
             let value = match read_json_body(req).await {
                 Ok(value) => value,
-                Err(error_response) => return Ok(error_response),
+                Err(error_response) => return Ok(*error_response),
             };
             apply_id_request(&ctx, Method::PATCH, path, Some(value)).await
         }
@@ -720,26 +720,36 @@ async fn handle_request_inner(
 }
 
 /// 📥 Reads a bounded request body and parses it as a JSON config node.
+///
+/// 🔒 The error is boxed because `Response<Full<Bytes>>` is 144 bytes and there
+/// are as many error returns here as call sites; every caller hands the
+/// response straight back to the client, so an unboxed error would widen each
+/// caller's stack frame to carry it. Errors are the rare path, so one
+/// allocation there is cheaper than the size everywhere.
 async fn read_json_body(
     req: Request<hyper::body::Incoming>,
-) -> Result<Value, Response<Full<Bytes>>> {
+) -> Result<Value, Box<Response<Full<Bytes>>>> {
     let body_bytes = match read_bounded_body(req).await {
         Ok(bytes) => bytes,
         Err(BodyError::TooLarge) => {
-            return Err(response(
+            return Err(Box::new(response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 &format!(r#"{{"error":"config body exceeds {MAX_CONFIG_BODY_BYTES} bytes"}}"#),
-            ));
+            )));
         }
         Err(BodyError::Incomplete) => {
-            return Err(response(
+            return Err(Box::new(response(
                 StatusCode::BAD_REQUEST,
                 r#"{"error":"could not read the request body"}"#,
-            ));
+            )));
         }
     };
-    serde_json::from_slice(&body_bytes)
-        .map_err(|error| response(StatusCode::BAD_REQUEST, &format!("Invalid JSON: {error}")))
+    serde_json::from_slice(&body_bytes).map_err(|error| {
+        Box::new(response(
+            StatusCode::BAD_REQUEST,
+            &format!("Invalid JSON: {error}"),
+        ))
+    })
 }
 
 /// 📤 Applies a full replacement document and commits it as the active tree.

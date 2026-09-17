@@ -65,9 +65,9 @@ is for continuous checking during development.
 
 ## 🦀 Rust toolchain is exact
 
-CI validation uses Rust **1.97.1**; the workspace declares
-`rust-version = "1.97"`. Use `cargo +1.97.1` for formatting checks, Clippy,
-formal builds, CI-parity tests, and release validation — `+1.97.1` is not
+CI validation uses Rust **1.98.1**; the workspace declares
+`rust-version = "1.98"`. Use `cargo +1.98.1` for formatting checks, Clippy,
+formal builds, CI-parity tests, and release validation — `+1.98.1` is not
 decoration. Different compilers produce different inference, warnings, and
 rustfmt line breaking; all-green locally followed by all-red in CI has
 happened in both directions (newer-than-CI on 2026-07-29, an older toolchain
@@ -84,12 +84,12 @@ When only one crate or test binary changed, run it first:
 
 ```bash
 just test -p pingclair-proxy
-cargo +1.97.1 nextest run -p pingclair --test integration --no-fail-fast
+cargo +1.98.1 nextest run -p pingclair --test integration --no-fail-fast
 ```
 
 Run the full suite before handoff when shared crates, configuration, or
 policy code changed. When Rust documentation examples change, run the
-relevant doctests explicitly (`cargo +1.97.1 test --doc`), because nextest
+relevant doctests explicitly (`cargo +1.98.1 test --doc`), because nextest
 does not run them.
 
 ## 💾 Persistent build caches
@@ -296,7 +296,7 @@ to core merely because many crates already depend on it.
   reproduce them with several concurrent full suites, not repeated single
   runs:
   ```bash
-  cargo +1.97.1 build --tests -p pingclair
+  cargo +1.98.1 build --tests -p pingclair
   BIN=$(find target/debug/deps -maxdepth 1 -name 'integration-*' -type f -perm -u+x ! -name '*.d' -exec ls -t {} + | head -1)
   for i in $(seq 1 6); do "$BIN" > /tmp/full_$i.log 2>&1 & done; wait
   ```
@@ -334,7 +334,7 @@ just h3
 which covers the three maintained scripts
 (`test-h3-day28-local.sh`, `test-h3-cancellation-local.sh`,
 `test-h3-client-auth-local.sh`). CI runs the Linux H3 gate post-merge on
-`ubuntu-24.04`; a manual Linux box can use `rust:1.97-bookworm` with `cmake`
+`ubuntu-24.04`; a manual Linux box can use `rust:1.98-bookworm` with `cmake`
 and `clang`/`libclang-dev` for BoringSSL/bindgen. The H3 client must be a
 curl built on ngtcp2/nghttp3 (Homebrew curl provides one; the macOS system
 curl does not).
