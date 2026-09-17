@@ -1264,6 +1264,17 @@ immediately after the `101`, both ends seeing EOF with no error.
 
 ### 🔐 Security
 
+- 🔒 **`rustls` moves to 0.23.45 for RUSTSEC-2026-0285.** Rustls accepted TLS
+  1.3 handshake messages sent at the wrong encryption level when they followed a
+  key-changing message in the same record — a plaintext `EncryptedExtensions`
+  packed alongside the `ServerHello` was taken as valid, where RFC 8446 §5.1
+  requires the connection be closed with an `unexpected_message` alert. The
+  handshake transcript stays authenticated, so the practical effect is that a
+  peer could send messages that should have been encrypted in the clear without
+  being rejected, not that a handshake could be completed by an attacker. The
+  bump also carries `rustls-webpki` 0.103.15 and `aws-lc-rs` 1.18.1, and cargo
+  audit reports the tree clean.
+
 - 💥 **A request path mixing a percent-escape with a non-ASCII character killed
   the process.** The URI normalizer copied unmatched input with a one-*byte* slice
   of a `str`, which panics when that byte falls inside a multi-byte character, and
