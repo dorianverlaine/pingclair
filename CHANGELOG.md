@@ -1691,6 +1691,15 @@ where nginx is still ahead.
 
 ### 🗑️ Removed
 
+- 🗑️ **The rolling development build channel is gone.** `dev.yml` rebuilt Linux
+  binaries, a `dev` GitHub release, and a `ghcr.io/.../pingclair:dev` image on
+  every push to `main`, and `install.sh --dev` installed from it. It was a
+  second prebuilt channel to keep verified, and `--main` already answers "give
+  me what is on main right now" by compiling it. The workflow is deleted, the
+  `--dev` flag with it, and the development-build section of the READMEs is
+  removed rather than left describing artifacts nothing publishes. Nothing
+  changes for release installs: the default path and `--main` are untouched.
+
 - 🗑️ Two vendored performance forks (`pingora-core`, `pingora-http`, 38,532
   lines) were evaluated and removed. Both had a sound mechanism and neither
   ever produced a measurement from a run where the component it patched was

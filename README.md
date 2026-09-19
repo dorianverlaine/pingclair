@@ -104,41 +104,12 @@ On any Linux distribution the install script works — it downloads (or builds) 
 curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash
 ```
 
-The script accepts two flags for tracking `main` instead of the stable release:
-
-Install the latest development build of main (prebuilt binary):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --dev
-```
-
+The script accepts one flag for tracking `main` instead of the stable release.
 Clone main and compile it locally (requires Rust 1.98+):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --main
 ```
-
-### Development builds (unstable)
-
-While Pingclair is in rapid iteration, every push to `main` also publishes
-snapshots for deployment testing — **not** stable releases:
-
-- **Container image** on GHCR: `dev` follows the latest push, and each build
-  is also tagged with its full commit SHA so a specific snapshot can be pinned.
-
-  ```bash
-  docker pull ghcr.io/dorianverlaine/pingclair:dev
-  docker run --rm -p 8080:80 \
-    -v "$PWD/Pingclairfile:/etc/pingclair/Pingclairfile:ro" \
-    ghcr.io/dorianverlaine/pingclair:dev
-  ```
-
-- **Linux binaries** (x86_64 and aarch64): attached to the corresponding
-  GitHub Actions run and kept for 14 days; download them from that run's
-  artifact list.
-
-Treat every development build as a snapshot of a moving tree — verify it
-before deploying anywhere that matters.
 
 ### Production deployment with Docker Compose
 
@@ -149,7 +120,7 @@ account keys, and the internal CA — deleting it means re-issuing everything):
 ```yaml
 services:
   pingclair:
-    image: ghcr.io/dorianverlaine/pingclair:dev
+    image: ghcr.io/dorianverlaine/pingclair:latest
     restart: unless-stopped
     ports:
       - "80:80"

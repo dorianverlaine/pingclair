@@ -8,24 +8,26 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # 0. Install mode
-# 🧭 Default is the latest stable release binary. `--dev` installs the
-# rolling development build of main (published by CI on every push);
-# `--main` clones the latest main and compiles it locally (requires Rust).
+# 🧭 Default is the latest stable release binary. `--main` clones the latest
+# main and compiles it locally (requires Rust).
+#
+# 📌 A `--dev` mode used to install a rolling development build that CI
+# republished on every push to main. It was removed with that workflow: a
+# second prebuilt channel meant a second set of artifacts to verify, and
+# `--main` already covers "give me what is on main right now".
 INSTALL_MODE="release"
 while [ $# -gt 0 ]; do
     case "$1" in
-        --dev) INSTALL_MODE="dev" ;;
         --main) INSTALL_MODE="main" ;;
         -h|--help)
-            echo "Usage: $0 [--dev|--main]"
+            echo "Usage: $0 [--main]"
             echo "  (default)  Install the latest stable release binary."
-            echo "  --dev      Install the latest development build of main."
             echo "  --main     Clone main and compile it locally (requires Rust 1.98+)."
             exit 0
             ;;
         *)
             echo -e "${RED}Unknown option: $1${NC}"
-            echo "Usage: $0 [--dev|--main]"
+            echo "Usage: $0 [--main]"
             exit 1
             ;;
     esac
@@ -88,7 +90,8 @@ if [ "$INSTALL_MODE" = "main" ]; then
     # versions the tests ran against.
     if ! command -v cargo >/dev/null 2>&1; then
         echo -e "${RED}Error: --main builds from source and requires Rust 1.98 or newer.${NC}"
-        echo "Install Rust first (https://rustup.rs) or use --dev for a prebuilt binary."
+        echo "Install Rust first (https://rustup.rs), or install a released binary"
+        echo "by running this script with no flag."
         exit 1
     fi
     # 🎯 The required minor is named once. It used to be written twice — `-lt 97`
@@ -115,29 +118,6 @@ if [ "$INSTALL_MODE" = "main" ]; then
     cp target/release/pingclair /usr/local/bin/pingclair
     rm -rf "$BUILD_DIR"
     cd /
-elif [ "$INSTALL_MODE" = "dev" ]; then
-    # 🚀 Rolling development build of main, republished by CI on every push.
-    echo "Fetching the latest development build of main..."
-    TAR_URL=$(curl -s "https://api.github.com/repos/$REPO/releases/tags/dev" | jq -r ".assets[] | select(.name == \"pingclair-linux-$ASSET_KEY-dev.tar.gz\") | .browser_download_url" | head -n 1)
-    SUM_URL=$(curl -s "https://api.github.com/repos/$REPO/releases/tags/dev" | jq -r ".assets[] | select(.name == \"SHA256SUMS-dev-$ASSET_KEY.txt\") | .browser_download_url" | head -n 1)
-    if [ -z "$TAR_URL" ] || [ "$TAR_URL" == "null" ] || [ -z "$SUM_URL" ] || [ "$SUM_URL" == "null" ]; then
-        echo -e "${RED}Error: no development build found for $ARCH in the rolling dev release.${NC}"
-        echo "CI publishes it on every push to main. If it is missing, re-run the workflow"
-        echo "or install from source with: sudo bash install.sh --main"
-        exit 1
-    fi
-    echo "Downloading $TAR_URL..."
-    curl -L -o "/tmp/pingclair-linux-$ASSET_KEY-dev.tar.gz" "$TAR_URL"
-    curl -L -o "/tmp/SHA256SUMS-dev-$ASSET_KEY.txt" "$SUM_URL"
-    # 🔐 Verify against the published checksum before installing.
-    if command -v sha256sum >/dev/null 2>&1; then
-        (cd /tmp && sha256sum -c "SHA256SUMS-dev-$ASSET_KEY.txt")
-    else
-        (cd /tmp && shasum -a 256 -c "SHA256SUMS-dev-$ASSET_KEY.txt")
-    fi
-    tar -xzf "/tmp/pingclair-linux-$ASSET_KEY-dev.tar.gz" -C /usr/local/bin/
-    rm -f "/tmp/pingclair-linux-$ASSET_KEY-dev.tar.gz" "/tmp/SHA256SUMS-dev-$ASSET_KEY.txt"
-    chmod +x /usr/local/bin/pingclair
 else
     echo "Fetching latest release from $REPO..."
 
@@ -173,9 +153,8 @@ else
         curl -L -o /tmp/pingclair.tar.gz "$LATEST_RELEASE_URL"
         # 🔐 Verify against the published checksum before unpacking anything
         # into /usr/local/bin. This runs as root from a piped script, so a
-        # truncated or substituted download must stop here, as it does on the
-        # `--dev` path. A release with no checksum file is refused rather than
-        # installed unverified.
+        # truncated or substituted download must stop here. A release with no
+        # checksum file is refused rather than installed unverified.
         if [ -z "$LATEST_SUM_URL" ] || [ "$LATEST_SUM_URL" == "null" ]; then
             echo -e "${RED}Error: $LATEST_TAG publishes no SHA256SUMS-$ASSET_KEY.txt, so the download cannot be verified.${NC}"
             rm -f /tmp/pingclair.tar.gz

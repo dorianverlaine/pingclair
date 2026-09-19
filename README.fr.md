@@ -107,42 +107,12 @@ Sur n'importe quelle distribution Linux, le script d'installation fonctionne : i
 curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash
 ```
 
-Le script accepte deux drapeaux pour suivre `main` au lieu de la version stable :
-
-Installer la dernière version de développement de main (binaire précompilé) :
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --dev
-```
-
+Le script accepte un drapeau pour suivre `main` au lieu de la version stable.
 Cloner main et le compiler localement (nécessite Rust 1.98+) :
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --main
 ```
-
-### Versions de développement (instables)
-
-Le projet est en itération rapide : chaque push sur `main` produit aussi des
-instantanés destinés aux tests de déploiement — **pas des versions stables**.
-
-- **Image conteneur** (GHCR) : le tag `dev` suit le dernier push, et chaque
-  build est aussi tagué avec le SHA complet du commit pour épingler un
-  instantané précis.
-
-  ```bash
-  docker pull ghcr.io/dorianverlaine/pingclair:dev
-  docker run --rm -p 8080:80 \
-    -v "$PWD/Pingclairfile:/etc/pingclair/Pingclairfile:ro" \
-    ghcr.io/dorianverlaine/pingclair:dev
-  ```
-
-- **Binaires Linux** (x86_64 et aarch64) : joints au run GitHub Actions
-  correspondant, conservés 14 jours, à télécharger depuis la liste des
-  artifacts de ce run.
-
-Chaque version de développement est un instantané d'un arbre en mouvement —
-vérifiez-la avant de déployer.
 
 ### Déploiement de production avec Docker Compose
 
@@ -153,7 +123,7 @@ et CA interne y sont stockés) :
 ```yaml
 services:
   pingclair:
-    image: ghcr.io/dorianverlaine/pingclair:dev
+    image: ghcr.io/dorianverlaine/pingclair:latest
     restart: unless-stopped
     ports:
       - "80:80"

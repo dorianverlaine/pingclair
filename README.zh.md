@@ -102,37 +102,12 @@ curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scrip
 
 腳本提供兩個旗標，可以追蹤 `main` 而非穩定版：
 
-安裝最新的 main 開發版建置（預先編譯好的 binary）：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --dev
-```
-
+腳本提供一個旗標，可以追蹤 `main` 而非穩定版。
 Clone main 並在本機編譯（需要 Rust 1.98+）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --main
 ```
-
-### 開發版建置（不穩定）
-
-專案仍在快速迭代，每次 push 到 `main` 都會產出供部署測試用的快照——
-**不是穩定版**：
-
-- **容器映像**（GHCR）：`dev` tag 跟隨最新 push，每個 build 另有完整的
-  commit SHA tag，可以釘住特定快照。
-
-  ```bash
-  docker pull ghcr.io/dorianverlaine/pingclair:dev
-  docker run --rm -p 8080:80 \
-    -v "$PWD/Pingclairfile:/etc/pingclair/Pingclairfile:ro" \
-    ghcr.io/dorianverlaine/pingclair:dev
-  ```
-
-- **Linux 二進位檔**（x86_64 與 aarch64）：附在對應的 GitHub Actions run，
-  保留 14 天，從該次 run 的 artifact 清單下載。
-
-每個開發版都是移動中的樹的快照，部署到重要環境前請自行驗證。
 
 ### 以 Docker Compose 做正式部署
 
@@ -142,7 +117,7 @@ curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scrip
 ```yaml
 services:
   pingclair:
-    image: ghcr.io/dorianverlaine/pingclair:dev
+    image: ghcr.io/dorianverlaine/pingclair:latest
     restart: unless-stopped
     ports:
       - "80:80"

@@ -105,8 +105,8 @@ smoke test, commit checks, security audit, cargo-deny, repo checks, codespell,
 docs lint, and the blob-size policy, then collapses them into one required
 status (`CI required`). After pushes to `main`, `postmerge-ci.yml` runs
 sharded nextest archives on x86_64 and aarch64, release-profile clippy, and
-the HTTP/3 suite; `dev.yml` publishes only after postmerge succeeds. Runners
-and the Dockerfile are pinned to Ubuntu 24.04, third-party actions are
+the HTTP/3 suite. Runners and the Dockerfile are pinned to Ubuntu 24.04,
+third-party actions are
 SHA-pinned, and `**full-ci**` branches or `workflow_dispatch` can run the
 full suite early. See `.github/workflows/README.md` for the workflow map.
 

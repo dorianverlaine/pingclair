@@ -236,7 +236,7 @@ jobs:
           # 🔐 The example names a certificate and a key, and validation is
           # fail-closed about paths it cannot open, so the smoke run needs the
           # two files to exist. Empty stubs are enough: only their presence is
-          # checked here. The binary job above and dev.yml do the same.
+          # checked here.
           certs="$(mktemp -d)"
           touch "$certs/example.com.pem" "$certs/example.com.key"
           docker run --rm \

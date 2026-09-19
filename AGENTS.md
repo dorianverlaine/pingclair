@@ -149,8 +149,7 @@ CI is split so PRs get fast signal and `main` gets full verification:
   cargo-deny, repo checks, codespell, docs lint, and the blob-size policy.
 - `postmerge-ci.yml` runs after pushes to `main`: sharded nextest archives on
   x86_64 and aarch64 (four shards each), release-profile clippy, and the
-  HTTP/3 suite. `dev.yml` publishes dev binaries and images only after
-  postmerge succeeds.
+  HTTP/3 suite.
 - Runners are `ubuntu-24.04` and `ubuntu-24.04-arm`; the Dockerfile is
   `ubuntu:24.04`, pinned the same way. Third-party actions are SHA-pinned
   with human-readable version comments, and checkouts use

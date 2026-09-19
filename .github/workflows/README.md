@@ -11,8 +11,7 @@ workflow, so a red result never masks another.
   collapses them into a single required status.
 - `postmerge-ci.yml`: the full gate after pushes to `main`. It runs the
   nextest shards, release-profile Clippy, and the HTTP/3 suite, then
-  collapses into `Postmerge CI results`. `dev.yml` waits for this gate before
-  publishing development artifacts.
+  collapses into `Postmerge CI results`.
 
 ## Workflow responsibilities
 
@@ -32,7 +31,6 @@ workflow, so a red result never masks another.
 | `docs-lint.yml` | workflow_call | Markdown structure check via markdownlint-cli2 |
 | `blob-size-policy.yml` | workflow_call | 512 KB blob budget with an explicit allowlist |
 | `h3.yml` | workflow_call, dispatch | Full HTTP/3 functional matrix |
-| `dev.yml` | workflow_run: postmerge-ci | Dev binaries, rolling release, and dev image |
 | `release.yml` | push tag | Tag verification, native builds, checksums, multi-arch image |
 
 ## Rules for adding or changing checks
