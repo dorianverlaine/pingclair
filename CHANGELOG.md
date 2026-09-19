@@ -14,9 +14,9 @@ fact.
 
 ## [Unreleased]
 
-Everything below is on `main` and not yet a final release; the workspace
-reports `0.2.0-rc.1`, tagged as a release candidate on 2026-08-20. The scope is
-large because it covers 173 commits since `v0.1.7`. This section becomes
+📦 Everything below is on `main` and not yet a final release; the workspace
+reports `0.2.0-rc.2`. The first release candidate, `0.2.0-rc.1`, was tagged on
+2026-08-20. This section covers changes since `v0.1.7` and becomes
 `## [0.2.0]` when the non-goals below are decided.
 
 ### 🪦 `v0.1.x` is unmaintained
