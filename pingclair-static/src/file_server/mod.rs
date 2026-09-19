@@ -47,7 +47,7 @@ use std::sync::{Arc, Mutex};
 
 use http::HeaderValue;
 
-use cache::{CompressCache, CompressKey, FileMeta, MetaKey};
+use cache::{BodyCache, FileKey, FileMeta, MetaKey};
 pub use stream::StreamingFile;
 
 /// Configuration for the file server
@@ -282,11 +282,19 @@ pub struct FileServer {
     /// only contended on a cache miss. Bounded by a hard entry cap.
     meta_cache: ArcSwap<HashMap<MetaKey, Arc<FileMeta>>>,
     meta_write: Mutex<()>,
-    /// Cache of already-compressed file bodies (see [`CompressCache`]).
+    /// Cache of already-compressed file bodies (see [`BodyCache`]).
     /// Behind a `Mutex` because `FileServer` is shared (`Arc`) across all
     /// worker threads; the lock is only ever held for a tiny map operation,
     /// never across an `.await`.
-    compress_cache: Mutex<CompressCache>,
+    compress_cache: Mutex<BodyCache>,
+    /// Cache of raw file bodies at or below the streaming threshold, keyed on
+    /// (path, mtime) (see [`BodyCache`]). Same locking rule as
+    /// `compress_cache`: a map lookup, never held across an `.await`.
+    ///
+    /// Only files small enough to buffer are eligible, so the budget bounds
+    /// what is retained, not what a request may cost. A file above the
+    /// threshold streams and never consults this.
+    content_cache: Mutex<BodyCache>,
     /// Per-key async locks for compressions currently in flight, keyed the
     /// same way as `compress_cache`. On a cold cache, concurrent requests
     /// for the same file would otherwise each read and compress it
@@ -294,7 +302,7 @@ pub struct FileServer {
     /// benchmarks/README.md). The first request takes the lock and does the
     /// work; the rest wait on it and then serve the shared cached result.
     /// The std `Mutex` around the map itself is never held across an await.
-    in_flight: Mutex<HashMap<CompressKey, Arc<tokio::sync::Mutex<()>>>>,
+    in_flight: Mutex<HashMap<FileKey, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// Response from file server
@@ -338,13 +346,23 @@ impl FileServer {
     /// Total compressed bytes to retain across all cached files.
     const COMPRESS_CACHE_BUDGET: usize = 64 * 1024 * 1024;
 
+    /// Total raw bytes to retain across all cached small files.
+    ///
+    /// Larger than the metadata cache and smaller than the compression cache:
+    /// this one holds actual bodies, and the files it can hold are by
+    /// definition below the streaming threshold. 16 MiB holds thousands of the
+    /// sub-256 KiB assets a document root is mostly made of, while staying a
+    /// bounded, predictable claim on a small host's memory.
+    const CONTENT_CACHE_BUDGET: usize = 16 * 1024 * 1024;
+
     /// Create a new file server
     pub fn new(config: FileServerConfig) -> Self {
         Self {
             config,
             meta_cache: ArcSwap::from_pointee(HashMap::new()),
             meta_write: Mutex::new(()),
-            compress_cache: Mutex::new(CompressCache::new(Self::COMPRESS_CACHE_BUDGET)),
+            compress_cache: Mutex::new(BodyCache::new(Self::COMPRESS_CACHE_BUDGET)),
+            content_cache: Mutex::new(BodyCache::new(Self::CONTENT_CACHE_BUDGET)),
             in_flight: Mutex::new(HashMap::new()),
         }
     }
