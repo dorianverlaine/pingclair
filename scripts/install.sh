@@ -91,12 +91,19 @@ if [ "$INSTALL_MODE" = "main" ]; then
         echo "Install Rust first (https://rustup.rs) or use --dev for a prebuilt binary."
         exit 1
     fi
+    # 🎯 The required minor is named once. It used to be written twice — `-lt 97`
+    # in the test and `1.98` in the message — so the check passed a toolchain the
+    # message promised to reject, and the build then failed deep inside
+    # BoringSSL with nothing pointing back here.
+    REQUIRED_RUST_MAJOR=1
+    REQUIRED_RUST_MINOR=98
     RUST_VERSION=$(cargo --version | sed -n 's/^cargo \([0-9]*\)\.\([0-9]*\).*/\1.\2/p')
     RUST_MAJOR=${RUST_VERSION%%.*}
     RUST_MINOR=${RUST_VERSION#*.}
     RUST_MINOR=${RUST_MINOR%%.*}
-    if [ "${RUST_MAJOR:-0}" -lt 1 ] || { [ "${RUST_MAJOR:-0}" -eq 1 ] && [ "${RUST_MINOR:-0}" -lt 97 ]; }; then
-        echo -e "${RED}Error: --main requires Rust 1.98 or newer (found ${RUST_VERSION:-unknown}).${NC}"
+    if [ "${RUST_MAJOR:-0}" -lt "${REQUIRED_RUST_MAJOR}" ] || \
+       { [ "${RUST_MAJOR:-0}" -eq "${REQUIRED_RUST_MAJOR}" ] && [ "${RUST_MINOR:-0}" -lt "${REQUIRED_RUST_MINOR}" ]; }; then
+        echo -e "${RED}Error: --main requires Rust ${REQUIRED_RUST_MAJOR}.${REQUIRED_RUST_MINOR} or newer (found ${RUST_VERSION:-unknown}).${NC}"
         exit 1
     fi
     echo "Cloning latest main from $REPO..."
@@ -203,6 +210,11 @@ echo "Configuring directories and assets..."
 mkdir -p /etc/Pingclair
 mkdir -p /var/lib/pingclair/html
 mkdir -p /var/log/pingclair
+# 🔐 The certificate store named by `scripts/pingclair.service`. It has to exist
+# and be owned by the service user, because that unit sets
+# `PINGCLAIR_TLS_STORE` here rather than letting the binary fall back to a
+# `$HOME` that a system account does not have.
+mkdir -p /var/lib/pingclair/certs
 
 # Download/Install Premium Assets
 BASE_RAW_URL="https://raw.githubusercontent.com/$REPO/main"
@@ -242,6 +254,12 @@ if [ -f "scripts/pingclair.service" ]; then
     cp scripts/pingclair.service /etc/systemd/system/
 else
     # Fallback to creating it here if script run standalone
+    # ⚠️ This is a reduced copy of `scripts/pingclair.service`, reached when the
+    # script is run without the repository beside it (the `curl | bash` path).
+    # Keep the two in step for anything the service cannot start without — the
+    # TLS store below is one, and its absence is what left a fresh install dead
+    # on arrival. Hardening options such as `ProtectSystem` and `NoNewPrivileges`
+    # are still only in the repository copy.
     cat > /etc/systemd/system/pingclair.service <<EOF
 [Unit]
 Description=Pingclair High-Performance Web Server
@@ -256,6 +274,9 @@ Group=pingclair
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 Environment="RUST_LOG=info"
+# 🔐 Required: the `pingclair` user has no home, so the binary's default store
+# under \$HOME cannot be created and startup fails. See scripts/pingclair.service.
+Environment="PINGCLAIR_TLS_STORE=/var/lib/pingclair/certs"
 ExecStartPre=/usr/local/bin/pingclair validate /etc/Pingclair/Pingclairfile
 ExecStart=/usr/local/bin/pingclair run /etc/Pingclair/Pingclairfile
 ExecReload=/bin/kill -HUP \$MAINPID
