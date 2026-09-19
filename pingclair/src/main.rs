@@ -42,6 +42,7 @@ mod addr;
 mod certs;
 mod cli;
 mod listen;
+mod logging;
 mod paths;
 mod resource_guard;
 mod run;
@@ -96,10 +97,26 @@ fn main() -> anyhow::Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         tracing_subscriber::EnvFilter::new(if cli.verbose { "debug" } else { "info" })
     });
+
+    // 📝 Hand records to a background thread instead of writing them on the
+    // worker thread. See [`logging`] for what this does and does not buy.
+    //
+    // 🚫 It has to be a *global* subscriber, not `set_default`: the latter
+    // installs a thread-local default, and the threads that actually serve
+    // requests are spawned later by the runtime, so they would resolve the
+    // current dispatcher to the no-op fallback and every access line would
+    // vanish. That is a real bug this file shipped for one build.
+    let (writer, writer_guard) = logging::NonBlockingWriter::spawn();
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_writer(writer))
         .with(filter)
         .init();
 
-    cli::dispatch::run(cli.command)
+    let exit = cli::dispatch::run(cli.command);
+
+    // 🧹 Flush and report on the way out. The guard joins the writer thread,
+    // which is what drains what the queue still holds — a non-blocking logger
+    // that never joins is a non-blocking logger that loses its last records.
+    drop(writer_guard);
+    exit
 }
