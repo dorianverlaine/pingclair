@@ -25,7 +25,7 @@ use http::HeaderValue;
 
 #[cfg(test)]
 use super::FileServerConfig;
-use super::cache::CompressKey;
+use super::cache::FileKey;
 use super::{FileServer, ServedFile, ServedResponse};
 
 impl FileServer {
@@ -319,10 +319,11 @@ impl FileServer {
         // whole point of the cache — a hot compressible file is compressed
         // once, then served from memory.
         if let (Some(enc), Some(mtime_ns)) = (cache_encoding, mtime_ns) {
-            let key = CompressKey {
+            let key = FileKey {
                 path: file_path.clone(),
                 mtime_ns,
                 encoding: enc,
+                body_len: length,
             };
             if let Some(cached) = self.compress_cache.lock().unwrap().get(&key) {
                 tracing::debug!(
@@ -442,10 +443,11 @@ impl FileServer {
         // own (the cold-cache stampede behind the benchmark's cold-start
         // memory spike — see benchmarks/README.md).
         let inflight = if let (Some(enc), Some(mtime_ns)) = (cache_encoding, mtime_ns) {
-            let key = CompressKey {
+            let key = FileKey {
                 path: file_path.clone(),
                 mtime_ns,
                 encoding: enc,
+                body_len: length,
             };
             let lock = {
                 let mut map = self.in_flight.lock().unwrap();
@@ -972,6 +974,106 @@ mod serve_cache_tests {
     }
 
     #[tokio::test]
+    async fn repeated_uncompressed_requests_are_served_from_the_content_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = vec![b'x'; 1024];
+        write_file(dir.path(), "small.bin", &body).await;
+
+        let fs = FileServer::new(FileServerConfig {
+            root: dir.path().to_path_buf(),
+            index: vec![],
+            browse: false,
+            browse_limit: None,
+            compress: false,
+            ..FileServerConfig::default()
+        });
+
+        // 🗂️ Miss: reads the file and stores the body.
+        let first = fs
+            .serve("/small.bin", None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.content, body, "first read must return the file");
+        assert_eq!(
+            fs.content_cache.lock().unwrap().entries.len(),
+            1,
+            "an uncompressed whole-file read should populate the content cache"
+        );
+
+        // 🎯 Hit: same bytes, served from memory.
+        let second = fs
+            .serve("/small.bin", None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.content, body, "cached body must match the file");
+        assert_eq!(
+            fs.content_cache.lock().unwrap().entries.len(),
+            1,
+            "a hit must not add a second entry"
+        );
+
+        // 🪟 A Range is a different body and must never be answered from the
+        // whole-file entry.
+        let ranged = fs
+            .serve("/small.bin", Some("bytes=0-9"), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ranged.content.len(), 10, "Range must return only its window");
+        assert_eq!(
+            ranged.content,
+            vec![b'x'; 10],
+            "Range must return the requested bytes, not the cached whole file"
+        );
+    }
+
+    #[tokio::test]
+    async fn editing_the_file_invalidates_the_cached_content() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "edit.bin", &vec![b'a'; 512]).await;
+
+        let fs = FileServer::new(FileServerConfig {
+            root: dir.path().to_path_buf(),
+            index: vec![],
+            browse: false,
+            browse_limit: None,
+            compress: false,
+            ..FileServerConfig::default()
+        });
+
+        let first = fs.serve("/edit.bin", None, None).await.unwrap().unwrap();
+        assert_eq!(first.content, vec![b'a'; 512]);
+
+        // 📌 The mtime is part of the key, so an edit must be visible even
+        // though the cache holds the previous bytes. The mtime is moved
+        // explicitly rather than by re-writing: a fast filesystem can stamp
+        // both writes with the same mtime, which would make this test pass for
+        // the wrong reason (nothing invalidated) instead of proving the key
+        // changed.
+        write_file(dir.path(), "edit.bin", &vec![b'b'; 512]).await;
+        let bumped = std::fs::metadata(dir.path().join("edit.bin"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            + std::time::Duration::from_secs(2);
+        let file = std::fs::File::options()
+            .write(true)
+            .open(dir.path().join("edit.bin"))
+            .unwrap();
+        file.set_modified(bumped).unwrap();
+        drop(file);
+
+        let second = fs.serve("/edit.bin", None, None).await.unwrap().unwrap();
+        assert_eq!(
+            second.content,
+            vec![b'b'; 512],
+            "an edited file must not be served from the stale cache entry"
+        );
+    }
+
+    #[tokio::test]
     async fn editing_the_file_invalidates_the_cached_compression() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_file(dir.path(), "f.txt", &vec![b'a'; 4096]).await;
@@ -1058,10 +1160,11 @@ mod serve_cache_tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let key = CompressKey {
+        let key = FileKey {
             path: resolved_path,
             mtime_ns,
             encoding: "gzip",
+            body_len: std::fs::metadata(&path).unwrap().len(),
         };
 
         // Simulate an in-flight compression: hold the per-key lock the way

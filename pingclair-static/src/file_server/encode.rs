@@ -14,7 +14,7 @@ use std::io::{Read as _, Seek as _, SeekFrom};
 use std::sync::Arc;
 
 use super::FileServer;
-use super::cache::CompressKey;
+use super::cache::FileKey;
 
 impl FileServer {
     // MARK: - Reading and compressing
@@ -23,6 +23,12 @@ impl FileServer {
     /// the body when `encoding` was negotiated. A compressible full-file
     /// result with a usable mtime is stored in `compress_cache` under
     /// (path, mtime, encoding) so later requests skip the read+compress.
+    ///
+    /// A complete, uncompressed body is stored in `content_cache` under
+    /// (path, mtime) instead, so a repeated request for the same small file
+    /// skips the `open` + `read` + `close` as well. Only whole files are
+    /// cached: a `Range` starts at a non-zero offset and is a different body,
+    /// and the streaming path never reaches here at all.
     pub(super) async fn read_and_maybe_compress(
         &self,
         file_path: &std::path::Path,
@@ -31,6 +37,34 @@ impl FileServer {
         encoding: Option<&'static str>,
         mtime_ns: Option<u128>,
     ) -> Result<(Vec<u8>, Option<String>)> {
+        // 🗂️ This is the read-syscall half of the gap to nginx. A file at or
+        // below the streaming threshold is read into a `Vec` here on *every*
+        // request, where nginx hands the same bytes to `sendfile` without
+        // entering user space at all. Caching does not remove the copy, but it
+        // does remove the repeated `open`/`read`/`close` for bytes this
+        // process has already read once.
+        //
+        // Files without a usable mtime are never cached: there would be no key
+        // for an edit to change, so a same-size overwrite could serve stale
+        // bytes.
+        let content_key = match (encoding, mtime_ns, start) {
+            (None, Some(mtime_ns), 0) => Some(FileKey {
+                path: file_path.to_path_buf(),
+                mtime_ns,
+                encoding: "",
+                body_len: length,
+            }),
+            _ => None,
+        };
+        if let Some(key) = &content_key
+            && let Some(cached) = self.content_cache.lock().unwrap().get(key)
+        {
+            // 📌 One copy per request remains: `ServedFile::content` is owned.
+            // Making a cache hit allocation-free means threading `Bytes`
+            // through the response type, which is a larger change than this.
+            return Ok(((*cached).clone(), None));
+        }
+
         // Synchronous read, intentionally: a local regular-file read served
         // from the page cache effectively never blocks (the nginx model), so
         // paying a spawn_blocking round trip per request via tokio::fs only
@@ -48,10 +82,11 @@ impl FileServer {
             Some(enc) => {
                 let compressed = Arc::new(Self::compress_with(&content, enc).await?);
                 if let Some(mtime_ns) = mtime_ns {
-                    let key = CompressKey {
+                    let key = FileKey {
                         path: file_path.to_path_buf(),
                         mtime_ns,
                         encoding: enc,
+                        body_len: length,
                     };
                     self.compress_cache
                         .lock()
@@ -60,7 +95,15 @@ impl FileServer {
                 }
                 Ok(((*compressed).clone(), Some(enc.to_string())))
             }
-            None => Ok((content, None)),
+            None => {
+                if let Some(key) = content_key {
+                    self.content_cache
+                        .lock()
+                        .unwrap()
+                        .insert(key, Arc::new(content.clone()));
+                }
+                Ok((content, None))
+            }
         }
     }
 
