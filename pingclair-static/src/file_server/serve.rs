@@ -989,11 +989,7 @@ mod serve_cache_tests {
         });
 
         // 🗂️ Miss: reads the file and stores the body.
-        let first = fs
-            .serve("/small.bin", None, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let first = fs.serve("/small.bin", None, None).await.unwrap().unwrap();
         assert_eq!(first.content, body, "first read must return the file");
         assert_eq!(
             fs.content_cache.lock().unwrap().entries.len(),
@@ -1002,11 +998,7 @@ mod serve_cache_tests {
         );
 
         // 🎯 Hit: same bytes, served from memory.
-        let second = fs
-            .serve("/small.bin", None, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let second = fs.serve("/small.bin", None, None).await.unwrap().unwrap();
         assert_eq!(second.content, body, "cached body must match the file");
         assert_eq!(
             fs.content_cache.lock().unwrap().entries.len(),
@@ -1021,7 +1013,11 @@ mod serve_cache_tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(ranged.content.len(), 10, "Range must return only its window");
+        assert_eq!(
+            ranged.content.len(),
+            10,
+            "Range must return only its window"
+        );
         assert_eq!(
             ranged.content,
             vec![b'x'; 10],
