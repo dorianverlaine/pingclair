@@ -19,7 +19,11 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS_DIR="${1:-$(mktemp -d)}"
 mkdir -p "$RESULTS_DIR"
 
-BIN=target/release/pingclair
+# 💾 Ask cargo where it put the binary rather than assuming `./target`: a
+# configured target directory (`CARGO_TARGET_DIR`, or `[build] target-dir` in
+# `.cargo/config.toml`) moves it, and this script would then run a stale binary
+# left behind by an earlier default-path build — or nothing at all.
+BIN="$(cargo metadata --format-version 1 --no-deps | jq -r '.target_directory')/release/pingclair"
 HTTP_PORT=19310
 ADMIN_PORT=19311
 FAILURES=0

@@ -7,6 +7,16 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# 💾 cargo decides where the binary lands; `./target` is only its default.
+# `CARGO_TARGET_DIR` and a `[build] target-dir` in `.cargo/config.toml` both
+# move it, and AGENTS.md asks developers to keep that cache outside the
+# checkout — so every "copy the binary we just built" step has to ask cargo
+# rather than re-derive the path. Under `set -e` a wrong path aborts the
+# installer halfway through, with the service files already written.
+release_binary() {
+    cargo metadata --format-version 1 --no-deps | jq -r '.target_directory + "/release/pingclair"'
+}
+
 # 0. Install mode
 # 🧭 Default is the latest stable release binary. `--main` clones the latest
 # main and compiles it locally (requires Rust).
@@ -115,7 +125,7 @@ if [ "$INSTALL_MODE" = "main" ]; then
     cd "$BUILD_DIR/pingclair"
     echo "Building the release binary (this takes a while)..."
     cargo build --release --locked
-    cp target/release/pingclair /usr/local/bin/pingclair
+    cp "$(release_binary)" /usr/local/bin/pingclair
     rm -rf "$BUILD_DIR"
     cd /
 else
@@ -142,7 +152,7 @@ else
         echo "Attempting cargo build fallback (requires Rust)..."
         if command -v cargo &> /dev/null; then
             cargo build --release
-            cp target/release/pingclair /usr/local/bin/pingclair
+            cp "$(release_binary)" /usr/local/bin/pingclair
         else
             echo -e "${RED}Error: Released binary not found and Cargo not installed.${NC}"
             echo "Please compile manually or create a GitHub Release with assets named 'pingclair-linux-$ASSET_KEY.tar.gz' or similar."
