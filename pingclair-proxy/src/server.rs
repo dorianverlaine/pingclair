@@ -7902,8 +7902,7 @@ impl ProxyHttp for PingclairProxy {
             .unwrap_or("-");
         let remote_ip = ctx
             .verified_client_ip
-            .unwrap_or_else(|| session_peer_ip(session))
-            .to_string();
+            .unwrap_or_else(|| session_peer_ip(session));
         let elapsed = ctx.start_time.elapsed();
 
         // 📊 Release exactly the gauge incremented at request entry, without
@@ -7972,107 +7971,99 @@ impl ProxyHttp for PingclairProxy {
         // configuration was compiled; here it is a walk over a precomputed
         // list. Only when the server configured nothing at all do we fall back
         // to the process-wide tracing output.
-        let state_ref = ctx.state.as_ref();
-        let selected: Vec<Arc<crate::access_log::AccessLogger>> = state_ref
-            .map(|state| state.log_targets.select(host).cloned().collect())
-            .unwrap_or_default();
-
-        if let Some(logger) = selected.first().cloned() {
-            let upstream_addr = ctx.upstream.as_ref().map(|u| u.addr.to_string());
-            let route = ctx.state.as_ref().and_then(|state| {
-                ctx.route_index
-                    .and_then(|index| state.config.routes.get(index))
-                    .map(|route| route.path.as_str())
-            });
-            let error_text = e.map(|err| err.to_string());
-
-            // 🙈 Log the full request target, but redact secret-looking query
-            // parameters first. Operators need the query to debug; a logged
-            // `?api_key=...` is a leaked credential.
-            let logged_path = match req_header.uri.path_and_query() {
-                Some(pq) => crate::redaction::redact_target(pq.as_str()),
-                None => req_header.uri.path().to_string(),
-            };
-            // Referer carries the *previous* page's URL, so it can leak a
-            // token this request never contained.
-            let redacted_referer = crate::redaction::redact_referer(referer);
-
-            // 🏷️ Only collected when the server named headers, so the common
-            // configuration allocates nothing. Sensitive names are masked
-            // inside `collect_headers` rather than here — this is the first
-            // caller of `is_sensitive_header`, which has been waiting since
-            // Day 3 for a feature that actually logs headers.
-            let logged_request_headers = crate::access_log::collect_headers(
-                logger.wanted_request_headers(),
-                &req_header.headers,
-            );
-            let logged_response_headers = session
-                .response_written()
-                .map(|response| {
-                    crate::access_log::collect_headers(
-                        logger.wanted_response_headers(),
-                        &response.headers,
-                    )
-                })
-                .unwrap_or_default();
-            // 🔐 `digest` carries the handshake result; a plaintext listener
-            // simply has none, which is why both fields are optional rather
-            // than empty strings.
-            let (tls_version, tls_cipher) = if logger.wants_tls() {
-                session
-                    .digest()
-                    .and_then(|digest| digest.ssl_digest.as_ref())
-                    .map(|ssl| (Some(ssl.version.clone()), Some(ssl.cipher.clone())))
-                    .unwrap_or((None, None))
+        if let Some(state) = ctx.state.as_ref() {
+            let mut selected = state.log_targets.select(host).peekable();
+            if selected.peek().is_none() {
+                // 🪵 No configured destination matched this host, so preserve
+                // the process-wide tracing fallback below.
             } else {
-                (None, None)
-            };
+                let upstream = ctx
+                    .upstream
+                    .as_ref()
+                    .map(|value| crate::access_log::LogUpstream::Address(&value.addr));
+                let route = ctx
+                    .route_index
+                    .and_then(|index| state.config.routes.get(index))
+                    .map(|route| route.path.as_str());
+                let error_text = e.map(|err| err.to_string());
 
-            let entry = crate::access_log::AccessEntry {
-                request_headers: &logged_request_headers,
-                response_headers: &logged_response_headers,
-                tls_version: tls_version.as_deref(),
-                tls_cipher: tls_cipher.as_deref(),
-                request_id: &ctx.request_id,
-                method,
-                host,
-                path: &logged_path,
-                status: response_code,
-                // 📏 Keep an explicit body-only counter, matching nginx's
-                // $body_bytes_sent, across H1, H2, and H3. Pingora 0.9.0's
-                // Session::body_bytes_sent() is body-only on H1 as well
-                // (`pingora-core` v1/server.rs:1101, regression test:2806),
-                // but this counter remains the cross-transport access-log
-                // contract owned by Pingclair.
-                bytes: ctx.response_bytes,
-                duration_ms: elapsed.as_millis(),
-                ttfb_ms: ctx
-                    .first_byte_at
-                    .map(|at| at.duration_since(ctx.start_time).as_millis()),
-                client_ip: &remote_ip,
-                route,
-                upstream: upstream_addr.as_deref(),
-                user_agent,
-                referer: &redacted_referer,
-                protocol: match session.req_header().version {
-                    http::Version::HTTP_09 => "HTTP/0.9",
-                    http::Version::HTTP_10 => "HTTP/1.0",
-                    http::Version::HTTP_11 => "HTTP/1.1",
-                    http::Version::HTTP_2 => "HTTP/2",
-                    http::Version::HTTP_3 => "HTTP/3",
-                    _ => "-",
-                },
-                error: error_text.as_deref(),
-            };
+                // 🙈 Log the full request target, but redact secret-looking query
+                // parameters first. Operators need the query to debug; a logged
+                // `?api_key=...` is a leaked credential.
+                let target = req_header
+                    .uri
+                    .path_and_query()
+                    .map_or_else(|| req_header.uri.path(), |value| value.as_str());
+                let logged_path = crate::redaction::redact_target(target);
+                // 🙈 Referer carries the *previous* page's URL, so it can leak a
+                // token this request never contained.
+                let redacted_referer = crate::redaction::redact_referer(referer);
 
-            // 🪵 One entry, formatted separately per destination, because
-            // destinations may differ in format and in which fields they drop.
-            // The first was already taken above to size the header collection.
-            logger.log(&entry);
-            for destination in selected.iter().skip(1) {
-                destination.log(&entry);
+                // 🏷️ The entry lends each destination the original maps. Each
+                // logger narrows and masks them while writing its own final buffer,
+                // avoiding dozens of temporary strings per request.
+                let logged_request_headers =
+                    crate::access_log::LogHeaders::new(&req_header.headers);
+                let logged_response_headers = session
+                    .response_written()
+                    .map(|response| crate::access_log::LogHeaders::new(&response.headers));
+                // 🔐 `digest` carries the handshake result; a plaintext listener
+                // simply has none, which is why both fields are optional rather
+                // than empty strings.
+                let (tls_version, tls_cipher) = if state.log_targets.includes_tls() {
+                    session
+                        .digest()
+                        .and_then(|digest| digest.ssl_digest.as_ref())
+                        .map(|ssl| (Some(ssl.version.as_ref()), Some(ssl.cipher.as_ref())))
+                        .unwrap_or((None, None))
+                } else {
+                    (None, None)
+                };
+
+                let entry = crate::access_log::AccessEntry {
+                    request_headers: Some(logged_request_headers),
+                    response_headers: logged_response_headers,
+                    tls_version,
+                    tls_cipher,
+                    request_id: &ctx.request_id,
+                    method,
+                    host,
+                    path: logged_path.as_ref(),
+                    status: response_code,
+                    // 📏 Keep an explicit body-only counter, matching nginx's
+                    // $body_bytes_sent, across H1, H2, and H3. Pingora 0.9.0's
+                    // Session::body_bytes_sent() is body-only on H1 as well
+                    // (`pingora-core` v1/server.rs:1101, regression test:2806),
+                    // but this counter remains the cross-transport access-log
+                    // contract owned by Pingclair.
+                    bytes: ctx.response_bytes,
+                    duration_ms: elapsed.as_millis(),
+                    ttfb_ms: ctx
+                        .first_byte_at
+                        .map(|at| at.duration_since(ctx.start_time).as_millis()),
+                    client_ip: remote_ip,
+                    route,
+                    upstream,
+                    user_agent,
+                    referer: redacted_referer.as_ref(),
+                    protocol: match session.req_header().version {
+                        http::Version::HTTP_09 => "HTTP/0.9",
+                        http::Version::HTTP_10 => "HTTP/1.0",
+                        http::Version::HTTP_11 => "HTTP/1.1",
+                        http::Version::HTTP_2 => "HTTP/2",
+                        http::Version::HTTP_3 => "HTTP/3",
+                        _ => "-",
+                    },
+                    error: error_text.as_deref(),
+                };
+
+                // 🪵 One borrowed entry is formatted separately per destination,
+                // because destinations may select different headers and fields.
+                for destination in selected {
+                    destination.log(&entry);
+                }
+                return;
             }
-            return;
         }
 
         // Structured access log

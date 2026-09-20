@@ -10,24 +10,12 @@
 //! [`NonBlockingWriter`] hands each formatted record to a background thread
 //! over a bounded channel and returns immediately.
 //!
-//! ⚠️ What this does and does not buy, measured on a 2-vCPU host with the same
-//! binary and payload at 32 connections (median of three interleaved rounds):
-//!
-//! | | static | reverse proxy |
-//! |---|---:|---:|
-//! | synchronous writer | 12,043 rps | 4,406 rps |
-//! | this writer | 12,556 rps | 4,650 rps |
-//! | change | **+4.3 %** | **+5.5 %** |
-//!
-//! 📌 It is *not* the whole cost of logging. Suppressing the access log
-//! entirely (`RUST_LOG=warn`) reaches **26,457 rps** — 2.2× the
-//! logging-enabled figure — so roughly 55 % of throughput is still being paid
-//! while this writer is in use. That remainder is the record being *built* on
-//! the worker thread: ten fields formatted and allocated per request before the
-//! writer ever sees them. Deferring the write moves the cheaper half. An
-//! earlier version of this comment claimed the 55 % as the win, which confused
-//! "turn logging off" with "make logging non-blocking"; they are not the same
-//! measurement.
+//! 🔍 Formatting still happens on the emitting thread. Its cost must be
+//! measured separately from the destination: a journal receiver also consumes
+//! CPU and performs work per line, even when the producer writes asynchronously.
+//! Comparing only logging enabled versus disabled cannot attribute that cost.
+//! For sustained access traffic, a configured file logger uses the dedicated
+//! buffered writer in `pingclair_proxy::access_log`.
 //!
 //! 🛡️ Why the queue is bounded and drops instead of blocking. An unbounded
 //! queue would turn a slow log consumer into unbounded memory growth, and a

@@ -800,6 +800,18 @@ sink d'accès par défaut du site. Les blocs `log` acceptent `hostnames`,
 fichier (`mode`, `dir_mode`, `roll_*`) ; `log_skip` exclut les requêtes
 correspondantes du journal d'accès.
 
+📝 Pour un trafic soutenu, utiliser
+`log { output file /var/log/pingclair/access.log }` avec une politique de rotation ;
+les diagnostics peuvent rester sur stderr. Les sorties d'accès configurées
+regroupent les entrées complètes par lots de 64 KiB au maximum, avec une vidange
+prévue après 5 ms, avant rotation ou lors d'une demande explicite de vidange.
+Les entrées individuelles plus grandes contournent le tampon. Les champs et les
+règles d'échantillonnage par défaut restent inchangés. Une file
+bornée compte les entrées perdues si la sortie ne suit plus
+(`pingclair_access_log_dropped_total`). L'arrêt normal accorde aux entrées acceptées
+un délai total de 250 ms, sans garantie de durabilité. Le journal système ajoute
+également son propre coût de traitement pour chaque requête.
+
 ### Ce qui n'est pas encore pris en charge
 
 Pingclair se dit compatible Caddyfile ; la moitié honnête de cette affirmation

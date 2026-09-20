@@ -16,6 +16,8 @@
 //!    page's URL, so a token that was never in this request's own URI can
 //!    still be logged through it.
 
+use std::borrow::Cow;
+
 /// Query parameter names whose values are replaced with `REDACTED`.
 ///
 /// Matched case-insensitively, and by substring for the `*_key` / `*_token`
@@ -51,16 +53,18 @@ const SENSITIVE_HEADERS: &[&str] = &[
 pub const REDACTED: &str = "REDACTED";
 
 fn is_sensitive_query_key(key: &str) -> bool {
-    let lower = key.to_ascii_lowercase();
-    SENSITIVE_QUERY_KEYS
-        .iter()
-        .any(|needle| lower.contains(needle))
+    SENSITIVE_QUERY_KEYS.iter().any(|needle| {
+        key.as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+    })
 }
 
-/// Whether a header must be redacted before being logged.
+/// 🙈 Whether a header must be redacted before being logged.
 pub fn is_sensitive_header(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    SENSITIVE_HEADERS.iter().any(|needle| lower == *needle)
+    SENSITIVE_HEADERS
+        .iter()
+        .any(|needle| name.eq_ignore_ascii_case(needle))
 }
 
 /// Redact secret-looking parameters out of a query string.
@@ -92,10 +96,22 @@ pub fn redact_query(query: &str) -> String {
 /// The path itself is left intact: it is the primary thing an operator needs,
 /// and secrets in a path segment are rare enough that blanket-redacting paths
 /// would destroy far more value than it protects.
-pub fn redact_target(target: &str) -> String {
+pub fn redact_target(target: &str) -> Cow<'_, str> {
     match target.split_once('?') {
-        Some((path, query)) => format!("{path}?{}", redact_query(query)),
-        None => target.to_string(),
+        Some((path, query))
+            if query.split('&').any(|pair| {
+                pair.split_once('=')
+                    .is_some_and(|(key, _)| is_sensitive_query_key(key))
+            }) =>
+        {
+            let redacted = redact_query(query);
+            let mut out = String::with_capacity(path.len() + 1 + redacted.len());
+            out.push_str(path);
+            out.push('?');
+            out.push_str(&redacted);
+            Cow::Owned(out)
+        }
+        _ => Cow::Borrowed(target),
     }
 }
 
@@ -104,7 +120,7 @@ pub fn redact_target(target: &str) -> String {
 /// Referer carries the previous page's full URL, so a token that never
 /// appeared in this request can still leak through it. Same query treatment,
 /// with the scheme/host left readable.
-pub fn redact_referer(referer: &str) -> String {
+pub fn redact_referer(referer: &str) -> Cow<'_, str> {
     redact_target(referer)
 }
 
@@ -185,7 +201,22 @@ mod tests {
         );
     }
 
-    /// Referer is the vector that leaks a token the current request never had.
+    /// ⚡ Ordinary request targets stay borrowed; redaction allocates only
+    /// when a sensitive value must actually be replaced.
+    #[test]
+    fn harmless_targets_do_not_allocate() {
+        assert!(matches!(redact_target("/v1/users"), Cow::Borrowed(_)));
+        assert!(matches!(
+            redact_target("/v1/users?page=2&sort=desc"),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            redact_target("/v1/users?token=secret"),
+            Cow::Owned(_)
+        ));
+    }
+
+    /// 🙈 Referer is the vector that leaks a token the current request never had.
     #[test]
     fn redacts_referer_query() {
         let out = redact_referer("https://app.example.com/callback?code=authcode123&state=x");

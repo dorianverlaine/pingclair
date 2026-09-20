@@ -781,6 +781,15 @@ enables the site's default access sink. Log blocks accept `hostnames`,
 (`mode`, `dir_mode`, `roll_*`); `log_skip` excludes matching requests from
 access logging.
 
+📝 For sustained access traffic, use `log { output file /var/log/pingclair/access.log }`
+with a rotation policy; runtime diagnostics can stay on stderr. Configured access
+sinks batch complete records up to 64 KiB and schedule a flush after 5 ms, before
+rotation, or at an explicit flush barrier. Larger individual records bypass the
+buffer. Fields and sampling defaults are unchanged. A bounded queue still drops and counts records if its sink cannot keep
+up (`pingclair_access_log_dropped_total`). Normal shutdown gives accepted records
+a shared 250 ms drain budget; this is not a durability guarantee. Writing every
+request to a system journal also incurs the journal receiver's processing cost.
+
 ### What is not supported yet
 
 Pingclair calls itself Caddyfile-compatible, so the honest half of that claim

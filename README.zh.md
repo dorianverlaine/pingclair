@@ -734,6 +734,15 @@ import 進來的片段定義，對之後的 import 都看得到。
 `exclude`（全域）、`sampling`，以及檔案輪替選項（`mode`、`dir_mode`、
 `roll_*`）；`log_skip` 會把符合的請求排除在 access log 之外。
 
+📝 持續高流量的訪問日誌可使用
+`log { output file /var/log/pingclair/access.log }` 並設定輪替；執行期診斷仍可留在
+stderr。已配置的訪問日誌輸出會把完整記錄合併為最多 64 KiB 的批次，並在 5 ms
+後安排寫出；輪替或明確 flush 前也會排空。超過緩衝區的單筆記錄會直接寫出，
+欄位與預設採樣行為不變。接收端追不上
+時，有界佇列仍會丟棄記錄並計入 `pingclair_access_log_dropped_total`。正常停止時，
+已接受的記錄共用 250 ms 的排空時間上限，這不是持久化保證。每筆請求都送進
+system journal，還需要支付 journal 接收端的處理成本。
+
 ### 尚未支援
 
 Pingclair 對外宣稱相容 Caddyfile，那麼這個宣稱誠實的另一半，就是講清楚它到哪裡
