@@ -119,6 +119,19 @@
   countermeasure to "a build script nobody runs is untested code" — had this job
   existed at the time, the Dockerfile drift above would have gone red on the first
   push.
+- 🛰️ **An `apt-get update` in a build path retries the whole update, and an
+  `apt-get install` runs only after an update that finished.** `Acquire::Retries`
+  retries a single file download, not a mirror serving a corrupt index, so a bad
+  mirror fails every retry *inside* one update — and an update killed at a
+  deadline leaves the index partially written, which turns the install into a
+  0.6-second exit 100 that reads like a missing package rather than a mirror
+  fault. On 2026-09-11 `archive.ubuntu.com` served unusable indexes and that
+  shape put a red required gate on a commit that touched only Markdown (#59).
+  The two surfaces need their own implementation, because they cannot share one:
+  `deployment/apt-retry.sh` for image builds, which both `deployment/Dockerfile`
+  stages call, and `.github/actions/setup-linux-deps` for runners, which retries
+  against the runner's own mirror. A new apt step should extend one of those
+  rather than writing `apt-get update && apt-get install` again.
 - 🚫 **Listener-topology rollback tests must no longer rely on "port 1 cannot be
   bound".** Since 2026-08-13, Admin and signal reload return `restart_required`
   for added or removed listeners before any bind is attempted; tests should use a

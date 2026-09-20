@@ -19,8 +19,12 @@ FROM ubuntu:24.04 AS builder
 #   curl, ca-certificates — fetching rustup below; the Ubuntu base ships no
 #                           CA bundle, so curl cannot verify sh.rustup.rs
 #                           without it
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+#
+# 🛰️ `apt-retry` retries a failed update as a whole and refuses to install
+# against a half-written index; `deployment/apt-retry.sh` carries the reasoning
+# and the 2026-09-11 incident (#59).
+COPY deployment/apt-retry.sh /usr/local/bin/apt-retry
+RUN apt-retry \
         cmake \
         make \
         g++ \
@@ -30,8 +34,7 @@ RUN apt-get update \
         libclang-dev \
         git \
         curl \
-        ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+        ca-certificates
 
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
@@ -58,9 +61,11 @@ RUN cargo build --release --locked
 # 🚀 Runtime Stage — same pinned LTS as the builder and the CI runners.
 FROM ubuntu:24.04
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# 🛰️ Same retry policy as the builder stage, and the helper does not stay in
+# the runtime image.
+COPY deployment/apt-retry.sh /usr/local/bin/apt-retry
+RUN apt-retry ca-certificates \
+    && rm -f /usr/local/bin/apt-retry
 
 COPY --from=builder /usr/src/pingclair/target/release/pingclair /usr/local/bin/pingclair
 
