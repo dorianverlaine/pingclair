@@ -9,6 +9,12 @@ set positional-arguments
 
 rust := "1.98.1"
 
+# 💾 Where cargo actually puts build artifacts for this checkout. Asking cargo
+# instead of assuming ./target keeps the H3 recipes working when the target
+# directory comes from .cargo/config.toml or CARGO_TARGET_DIR — the caches
+# AGENTS.md tells developers to keep outside the checkout.
+target-dir := `cargo metadata --format-version 1 --no-deps | jq -r .target_directory`
+
 # 📖 Show every recipe.
 help:
     just -l
@@ -62,14 +68,14 @@ bench-smoke:
 # 🛰️ Run the full HTTP/3 functional matrix against a fresh release binary.
 h3:
     cargo +{{ rust }} build --release --locked
-    PINGCLAIR_BINARY="${CARGO_TARGET_DIR:-target}/release/pingclair" scripts/test-h3-day28-local.sh
-    PINGCLAIR_BINARY="${CARGO_TARGET_DIR:-target}/release/pingclair" scripts/test-h3-cancellation-local.sh
-    PINGCLAIR_BINARY="${CARGO_TARGET_DIR:-target}/release/pingclair" scripts/test-h3-client-auth-local.sh
+    PINGCLAIR_BINARY="{{ target-dir }}/release/pingclair" scripts/test-h3-day28-local.sh
+    PINGCLAIR_BINARY="{{ target-dir }}/release/pingclair" scripts/test-h3-cancellation-local.sh
+    PINGCLAIR_BINARY="{{ target-dir }}/release/pingclair" scripts/test-h3-client-auth-local.sh
 
 # 💽 Report build-cache disk usage against the repository budget.
 disk:
     df -h .
-    du -sh target 2>/dev/null || true
+    du -sh "{{ target-dir }}" 2>/dev/null || true
     du -sh "$HOME/.cache/pingclair-build" 2>/dev/null || true
     du -sh "$HOME/.cache/pingclair-ci" 2>/dev/null || true
 
