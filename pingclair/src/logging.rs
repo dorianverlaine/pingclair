@@ -41,6 +41,7 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::time::{Duration, Instant};
 
 /// Depth of the hand-off queue, in log records.
 ///
@@ -63,10 +64,12 @@ impl NonBlockingWriter {
     /// Spawn the writer thread, returning the handle that logging feeds.
     ///
     /// The returned [`WriterGuard`] must be held for as long as logging should
-    /// work: dropping it closes the queue and joins the thread, which is also
-    /// how buffered records reach the journal on shutdown.
+    /// work. Dropping it asks the writer to finish and waits a bounded moment
+    /// for the queue to drain — see [`WriterGuard::shutdown`] for why the wait
+    /// is bounded rather than a plain `join`.
     pub(crate) fn spawn() -> (Self, WriterGuard) {
         let (tx, rx) = sync_channel::<Vec<u8>>(QUEUE_DEPTH);
+        let tx_guard = tx.clone();
         let dropped = Arc::new(AtomicU64::new(0));
 
         let thread = std::thread::Builder::new()
@@ -92,6 +95,7 @@ impl NonBlockingWriter {
             },
             WriterGuard {
                 dropped,
+                tx: Some(tx_guard),
                 thread: Some(thread),
             },
         )
@@ -155,26 +159,51 @@ impl Drop for QueueWriter {
     }
 }
 
-/// 🧹 Keeps the writer thread alive, and flushes what is queued on shutdown.
+/// 🧹 Keeps the writer thread alive, and drains what is queued on shutdown.
+///
+/// ⚠️ Shutdown does **not** join the writer, and that is not a shortcut. The
+/// subscriber is installed with `set_global_default`, which parks senders in a
+/// `OnceLock` that is never dropped, so the channel does not disconnect on its
+/// own. An earlier version joined unconditionally and hung every short-lived
+/// run — `pingclair adapt` and `pingclair validate`, which is most of the CLI
+/// test suite, sat there until the runner's timeout. A server that never exits
+/// would never notice; a command that should exit immediately notices at once.
+///
+/// So the guard drops its own sender and waits a bounded moment for the writer
+/// to drain, then stops waiting. Losing the tail of the log on an unclean exit
+/// is strictly better than never exiting.
 pub(crate) struct WriterGuard {
     dropped: Arc<AtomicU64>,
+    tx: Option<SyncSender<Vec<u8>>>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WriterGuard {
+    /// How long to let the writer drain before giving up on it.
+    const DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+
+    /// Close this guard's sender and wait briefly for the queue to drain.
+    pub(crate) fn shutdown(&mut self) {
+        // Dropping our sender is what asks the writer to finish; the process's
+        // exit removes the thread if the drain did not.
+        drop(self.tx.take());
+
+        if let Some(thread) = &self.thread {
+            let deadline = Instant::now() + Self::DRAIN_TIMEOUT;
+            while !thread.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        let dropped = self.dropped.load(Ordering::Relaxed);
+        if dropped > 0 {
+            eprintln!("📝 {dropped} log records were dropped: the log writer could not keep up");
+        }
+    }
 }
 
 impl Drop for WriterGuard {
     fn drop(&mut self) {
-        // Dropping the sender is what ends the writer thread's `recv` loop.
-        // The senders live in the subscriber, so the caller must drop the
-        // subscriber first — which `tracing::subscriber::set_global_default`'s
-        // owner does at process exit.
-        if let Some(thread) = self.thread.take() {
-            let dropped = self.dropped.load(Ordering::Relaxed);
-            if dropped > 0 {
-                eprintln!(
-                    "📝 {dropped} log records were dropped: the log writer could not keep up"
-                );
-            }
-            let _ = thread.join();
-        }
+        self.shutdown();
     }
 }
