@@ -19,6 +19,14 @@ reports `0.2.0-rc.2`. The first release candidate, `0.2.0-rc.1`, was tagged on
 2026-08-20. This section covers changes since `v0.1.7` and becomes
 `## [0.2.0]` when the non-goals below are decided.
 
+### 📝 Buffered access logging
+
+Configured access-log sinks now batch complete records up to 64 KiB, with a
+5 ms flush interval and flushes before rotation and explicit barriers. Formatting
+avoids temporary numeric strings. Fields, filtering, sampling, and the default
+tracing fallback are unchanged. Normal shutdown attempts a bounded 250 ms drain
+of accepted access records; a stalled sink cannot hold shutdown indefinitely.
+
 ### 🪦 `v0.1.x` is unmaintained
 
 Stated here as well as in the READMEs, because somebody still running `v0.1.7`

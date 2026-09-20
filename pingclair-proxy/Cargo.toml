@@ -30,6 +30,9 @@ tracing.workspace = true
 http.workspace = true
 bytes.workspace = true
 parking_lot = "0.12"
+# ♻️ Recycles formatted access-log buffers between request and writer threads.
+# Pingora already brings this crate into the graph, so this adds no new code.
+crossbeam-queue = "0.3"
 prometheus.workspace = true
 async-recursion = "1.0"
 ipnet.workspace = true

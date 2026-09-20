@@ -1180,6 +1180,11 @@ pub(crate) fn run_server(
             tracing::info!("🛑 Received Ctrl-C, shutting down");
         }
 
+        // 🚿 Drain accepted access records before exit bypasses Rust destructors.
+        // A stalled sink gets one bounded budget, not an unbounded shutdown.
+        if !pingclair_proxy::access_log::flush_all(Duration::from_millis(250)) {
+            tracing::warn!("⚠️ Access log drain exceeded the shutdown budget");
+        }
         std::process::exit(0);
     });
 

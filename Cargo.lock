@@ -2637,6 +2637,7 @@ dependencies = [
  "boring-sys",
  "bytes",
  "chrono",
+ "crossbeam-queue",
  "flate2",
  "foreign-types",
  "futures",

@@ -20,16 +20,22 @@
 //! are not implemented yet and are refused rather than accepted, so no
 //! configuration can quietly believe it is filtering.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::fmt::{self, Write as _};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::metrics;
+use crossbeam_queue::ArrayQueue;
+
+mod writer;
+pub use writer::flush_all;
 
 use pingclair_core::config::{LogConfig, LogFormat, LogOutput, LogRotation};
 
@@ -46,28 +52,25 @@ enum LogSink {
 }
 
 impl LogSink {
-    /// ✍️ Writes one line to the underlying sink. Called only from the
+    /// ✍️ Writes a complete batch to the underlying sink. Called only from the
     /// writer thread, never from a request.
-    fn write_line(&self, line: &str) -> std::io::Result<()> {
+    fn write_batch(&self, batch: &[u8]) -> std::io::Result<()> {
         match self {
             LogSink::Stdout => {
                 let stdout = std::io::stdout();
                 let mut handle = stdout.lock();
-                handle.write_all(line.as_bytes())?;
-                handle.write_all(b"\n")?;
+                handle.write_all(batch)?;
                 handle.flush()
             }
             LogSink::Stderr => {
                 let stderr = std::io::stderr();
                 let mut handle = stderr.lock();
-                handle.write_all(line.as_bytes())?;
-                handle.write_all(b"\n")?;
+                handle.write_all(batch)?;
                 handle.flush()
             }
             LogSink::File(file) => {
                 let mut guard = file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                guard.write_all(line.as_bytes())?;
-                guard.write_all(b"\n")?;
+                guard.write_all(batch)?;
                 guard.flush()
             }
         }
@@ -279,85 +282,65 @@ pub struct AccessEntry<'a> {
     pub ttfb_ms: Option<u128>,
     /// Client IP resolved through the trusted-proxy policy, not the raw
     /// socket peer — see `trusted_proxies`.
-    pub client_ip: &'a str,
+    pub client_ip: IpAddr,
     /// Matched route pattern, e.g. `/api/*`. `None` when no route matched.
     pub route: Option<&'a str>,
-    pub upstream: Option<&'a str>,
+    pub upstream: Option<LogUpstream<'a>>,
     pub user_agent: &'a str,
     pub referer: &'a str,
     pub protocol: &'a str,
     pub error: Option<&'a str>,
 
-    /// 🏷️ Selected request and response headers, already lowercased and
-    /// already masked where required. Empty unless the server asked for them.
-    ///
-    /// Masking happens at collection rather than here so this type cannot be
-    /// handed an unmasked secret in the first place — a log formatter that
-    /// *could* print a credential is one refactor away from doing it.
-    pub request_headers: &'a [(String, String)],
-    pub response_headers: &'a [(String, String)],
+    /// 🏷️ Borrowed request and response headers. The wrapper keeps raw values
+    /// private so every formatter must pass through the masking helper below.
+    pub request_headers: Option<LogHeaders<'a>>,
+    pub response_headers: Option<LogHeaders<'a>>,
 
-    /// 🔐 Negotiated TLS version and cipher, when the server asked for them
-    /// and the connection had any.
+    /// 🔐 Negotiated TLS version and cipher when the connection had any. Each
+    /// destination decides whether to emit them from its precompiled config.
     pub tls_version: Option<&'a str>,
     pub tls_cipher: Option<&'a str>,
 }
 
-/// 🙈 Collects the named headers, masking the ones that carry secrets.
-///
-/// Naming `authorization` here is deliberately safe: the field appears in the
-/// log so an operator can see the request was authenticated, and the value is
-/// replaced. That is the whole reason `is_sensitive_header` was written back on
-/// Day 3 — this is its first caller.
-pub fn collect_headers(wanted: &[String], headers: &http::HeaderMap) -> Vec<(String, String)> {
-    // 🌐 No list means every header, which is what Caddy does: its JSON access
-    // log carries the whole `request.headers` map with `Authorization` and
-    // `Cookie` replaced by `REDACTED`. Returning nothing here instead made the
-    // masking untestable — Day 26 asserted "the secret is not in the log" and
-    // it passed for the uninteresting reason that no header was there at all.
-    // A named list is therefore a *narrowing*, not a switch that turns logging
-    // on.
-    let render = |name: &str, value: &http::HeaderValue| {
-        if crate::redaction::is_sensitive_header(name) {
-            crate::redaction::REDACTED.to_string()
-        } else {
-            value.to_str().unwrap_or("<binary>").to_string()
-        }
-    };
+/// 🏷️ An access entry can lend its headers to a formatter without exposing
+/// their unmasked values to other modules.
+#[derive(Clone, Copy)]
+pub struct LogHeaders<'a>(&'a http::HeaderMap);
 
-    if wanted.is_empty() {
-        // 📌 `HeaderMap` has already lower-cased the names, so these read
-        // `authorization` where Caddy echoes the sender's own capitalisation.
-        // The set is identical; only the spelling differs.
-        return headers
-            .iter()
-            .map(|(name, value)| {
-                let name = name.as_str();
-                (name.to_string(), render(name, value))
-            })
-            .collect();
+impl<'a> LogHeaders<'a> {
+    pub fn new(headers: &'a http::HeaderMap) -> Self {
+        Self(headers)
     }
+}
 
-    wanted
-        .iter()
-        .filter_map(|name| {
-            let value = headers.get(name.as_str())?;
-            Some((name.clone(), render(name, value)))
-        })
-        .collect()
+/// 🧭 An upstream rendered from its typed address without first allocating a
+/// temporary `String`. The text variant keeps formatter tests lightweight.
+#[derive(Clone, Copy)]
+pub enum LogUpstream<'a> {
+    Address(&'a pingora_core::protocols::l4::socket::SocketAddr),
+    Text(&'a str),
+}
+
+impl fmt::Display for LogUpstream<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Address(address) => address.fmt(formatter),
+            Self::Text(value) => formatter.write_str(value),
+        }
+    }
 }
 
 /// 🧾 A configured per-server access logger.
 pub struct AccessLogger {
     format: LogFormat,
     /// Field names the config asked to drop (`format filter { fields { x delete } }`).
-    exclude: HashSet<String>,
+    exclude: Vec<String>,
     /// 🚚 Hands finished lines to the writer thread.
     ///
     /// Bounded and never blocking. See [`LogWriter`] for why both matter.
     writer: Arc<LogWriter>,
-    /// 🏷️ Header names to record, lowercased. Empty is the common case and
-    /// costs nothing.
+    /// 🏷️ Header names to record, lowercased. Empty means every header, matching
+    /// Caddy; serialization borrows the map so that default does not clone it.
     request_headers: Vec<String>,
     response_headers: Vec<String>,
     /// 🔐 Whether to record the negotiated TLS version and cipher.
@@ -608,6 +591,9 @@ pub struct LogTargets {
     unrestricted: Vec<Arc<AccessLogger>>,
     /// 🏠 Destinations restricted to particular hosts, most specific first.
     restricted: Vec<(HostPattern, Arc<AccessLogger>)>,
+    /// 🔐 Whether any destination needs handshake details. This is compiled
+    /// once so the request path skips the session digest in the common case.
+    include_tls: bool,
 }
 
 impl LogTargets {
@@ -617,6 +603,7 @@ impl LogTargets {
     pub fn new(entries: Vec<(Vec<String>, Arc<AccessLogger>)>) -> Self {
         let mut targets = Self::default();
         for (hostnames, logger) in entries {
+            targets.include_tls |= logger.include_tls;
             if hostnames.is_empty() {
                 targets.unrestricted.push(logger);
                 continue;
@@ -656,6 +643,11 @@ impl LogTargets {
     pub fn is_empty(&self) -> bool {
         self.unrestricted.is_empty() && self.restricted.is_empty()
     }
+
+    /// 🔐 Whether entries need to borrow negotiated TLS details.
+    pub fn includes_tls(&self) -> bool {
+        self.include_tls
+    }
 }
 
 /// 🚚 Owns the sink and drains a bounded queue from a dedicated thread.
@@ -674,6 +666,8 @@ impl LogTargets {
 /// [`metrics::ACCESS_LOG_DROPPED_TOTAL`] is how an operator finds out.
 pub struct LogWriter {
     queue: SyncSender<WriterMessage>,
+    /// ♻️ Finished records return their allocation here for the next request.
+    buffers: Arc<ArrayQueue<String>>,
     /// 🧮 Lines the queue could not accept. Mirrored into a metric, and kept
     /// here so a test can read it without scraping Prometheus.
     dropped: Arc<AtomicU64>,
@@ -685,6 +679,9 @@ enum WriterMessage {
     /// can wait for the sink to catch up without sleeping and hoping.
     Flush(std::sync::mpsc::SyncSender<()>),
 }
+
+/// 📦 Do not retain an attacker-inflated log record forever in the reuse pool.
+const MAX_REUSABLE_LINE_BYTES: usize = 8 * 1024;
 
 /// 🪵 Process-wide registry of named channels, so several servers referencing
 /// one channel share a single writer.
@@ -1050,6 +1047,8 @@ impl LogWriter {
     ) -> Arc<Self> {
         let (queue, receiver) = std::sync::mpsc::sync_channel::<WriterMessage>(capacity);
         let dropped = Arc::new(AtomicU64::new(0));
+        let buffers = Arc::new(ArrayQueue::new(capacity));
+        let writer_buffers = buffers.clone();
 
         // 🧵 A plain OS thread rather than a Tokio task: the work is blocking
         // file I/O, and putting it on the runtime would occupy a worker that
@@ -1057,47 +1056,16 @@ impl LogWriter {
         // the runtime has stopped accepting new tasks.
         std::thread::Builder::new()
             .name("pingclair-access-log".into())
-            .spawn(move || {
-                // 🔄 `sink` is rebound on rotation, so the loop keeps writing
-                // to whichever file is current without any shared state.
-                // 🔄 Rotation state lives here, on the writer thread, so no
-                // lock is needed to consult it.
-                let mut written = if rotation.is_enabled() {
-                    path.as_ref().and_then(|p| current_size(p)).unwrap_or(0)
-                } else {
-                    0
-                };
-                let mut opened_at = std::time::SystemTime::now();
-
-                for message in receiver {
-                    match message {
-                        WriterMessage::Line(line) => {
-                            if let (Some(path), LogSink::File(handle), true) =
-                                (path.as_ref(), &sink, rotation.is_enabled())
-                                && should_rotate(&rotation, written, opened_at)
-                                && rotate(handle, path, &rotation).is_some()
-                            {
-                                written = 0;
-                                opened_at = std::time::SystemTime::now();
-                            }
-                            written += line.len() as u64 + 1;
-                            if let Err(error) = sink.write_line(&line) {
-                                // 🚫 Reported once per failure and then
-                                // dropped. Retrying a broken sink here would
-                                // block the queue behind a device that is not
-                                // coming back.
-                                tracing::warn!(error = %error, "⚠️ Failed to write access log line");
-                            }
-                        }
-                        WriterMessage::Flush(ack) => {
-                            let _ = ack.send(());
-                        }
-                    }
-                }
-            })
+            .spawn(move || writer::run(receiver, sink, rotation, path, writer_buffers))
             .expect("access log writer thread can be spawned");
 
-        Arc::new(Self { queue, dropped })
+        let writer = Arc::new(Self {
+            queue,
+            buffers,
+            dropped,
+        });
+        writer::register(&writer);
+        writer
     }
 
     /// 📤 Queues a line, or drops it. **Never blocks.**
@@ -1105,10 +1073,37 @@ impl LogWriter {
     /// `try_send` is the whole point: `send` would block once the queue filled,
     /// which is exactly the stall this type exists to prevent.
     fn submit(&self, line: String) {
-        if self.queue.try_send(WriterMessage::Line(line)).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-            metrics::ACCESS_LOG_DROPPED_TOTAL.inc();
+        match self.queue.try_send(WriterMessage::Line(line)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(message) | TrySendError::Disconnected(message)) => {
+                let WriterMessage::Line(line) = message else {
+                    unreachable!("submit only sends access-log lines")
+                };
+                self.recycle_buffer(line);
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                metrics::ACCESS_LOG_DROPPED_TOTAL.inc();
+            }
         }
+    }
+
+    /// ♻️ Takes a cleared allocation returned by the writer, or creates one
+    /// while the pool is warming up.
+    fn take_buffer(&self, minimum_capacity: usize) -> String {
+        let mut buffer = self.buffers.pop().unwrap_or_default();
+        buffer.clear();
+        if buffer.capacity() < minimum_capacity {
+            buffer.reserve(minimum_capacity);
+        }
+        buffer
+    }
+
+    /// ♻️ Returns an ordinary record allocation to the bounded pool.
+    fn recycle_buffer(&self, mut buffer: String) {
+        if buffer.capacity() > MAX_REUSABLE_LINE_BYTES {
+            return;
+        }
+        buffer.clear();
+        let _ = self.buffers.push(buffer);
     }
 
     /// 🧮 How many lines have been dropped since start.
@@ -1152,7 +1147,7 @@ impl AccessLogger {
 
         Ok(Some(Self {
             format: config.format.clone(),
-            exclude: config.exclude_fields.iter().cloned().collect(),
+            exclude: config.exclude_fields.clone(),
             // 📏 1024 lines. Big enough to absorb a burst that a healthy sink
             // drains in milliseconds, small enough that a stalled sink costs
             // bounded memory rather than growing until the box dies.
@@ -1175,22 +1170,10 @@ impl AccessLogger {
         self.namespaces.admits(source)
     }
 
-    /// 🏷️ Header names this server asked to record, if any.
-    pub fn wanted_request_headers(&self) -> &[String] {
-        &self.request_headers
-    }
-
-    pub fn wanted_response_headers(&self) -> &[String] {
-        &self.response_headers
-    }
-
-    /// 🔐 Whether this server asked for TLS details in its access log.
-    pub fn wants_tls(&self) -> bool {
-        self.include_tls
-    }
-
     fn included(&self, field: &str) -> bool {
-        !self.exclude.contains(field)
+        // ⚡ Most loggers exclude nothing. A tiny linear list avoids hashing
+        // every field of every record and returns after one length check.
+        !self.exclude.iter().any(|excluded| excluded == field)
     }
 
     /// Format and write one entry.
@@ -1230,7 +1213,9 @@ impl AccessLogger {
     // again — inherent to a comma-separating flag, not a bug.
     #[allow(unused_assignments)]
     fn format_json(&self, entry: &AccessEntry<'_>) -> String {
-        let mut out = String::with_capacity(320);
+        // 📦 A normal Caddy-shaped record with both header maps is about 650
+        // bytes. Reserving 320 forced every request through a second allocation.
+        let mut out = self.writer.take_buffer(768);
         out.push('{');
         let mut first = true;
 
@@ -1244,7 +1229,7 @@ impl AccessLogger {
                     out.push('"');
                     out.push_str($name);
                     out.push_str("\":");
-                    out.push_str(&$value.to_string());
+                    let _ = write!(out, "{}", $value);
                 }
             };
         }
@@ -1263,6 +1248,21 @@ impl AccessLogger {
                 }
             };
         }
+        macro_rules! display_str_field {
+            ($name:literal, $value:expr) => {
+                if self.included($name) {
+                    if !first {
+                        out.push(',');
+                    }
+                    first = false;
+                    out.push('"');
+                    out.push_str($name);
+                    out.push_str("\":\"");
+                    write_json_display(&mut out, $value);
+                    out.push('"');
+                }
+            };
+        }
 
         str_field!("request_id", entry.request_id);
         str_field!("method", entry.method);
@@ -1274,12 +1274,12 @@ impl AccessLogger {
         if let Some(ttfb) = entry.ttfb_ms {
             raw_field!("ttfb_ms", ttfb);
         }
-        str_field!("client_ip", entry.client_ip);
+        display_str_field!("client_ip", entry.client_ip);
         if let Some(route) = entry.route {
             str_field!("route", route);
         }
         if let Some(upstream) = entry.upstream {
-            str_field!("upstream", upstream);
+            display_str_field!("upstream", upstream);
         }
         str_field!("protocol", entry.protocol);
         str_field!("user_agent", entry.user_agent);
@@ -1289,41 +1289,41 @@ impl AccessLogger {
         }
         // 🔐 TLS details go in as ordinary fields; they are already strings
         // from the handshake and carry nothing client-controlled.
-        if let Some(version) = entry.tls_version {
+        if self.include_tls
+            && let Some(version) = entry.tls_version
+        {
             str_field!("tls_version", version);
         }
-        if let Some(cipher) = entry.tls_cipher {
+        if self.include_tls
+            && let Some(cipher) = entry.tls_cipher
+        {
             str_field!("tls_cipher", cipher);
         }
 
         // 🏷️ Headers are nested under one object per direction rather than
         // flattened, so a header called `status` cannot collide with the
         // status field and quietly overwrite it.
-        for (label, headers) in [
-            ("request_headers", entry.request_headers),
-            ("response_headers", entry.response_headers),
-        ] {
-            if headers.is_empty() || !self.included(label) {
-                continue;
-            }
-            if !first {
-                out.push(',');
-            }
-            first = false;
-            out.push('"');
-            out.push_str(label);
-            out.push_str("\":{");
-            for (i, (name, value)) in headers.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                out.push('"');
-                escape_json_into(&mut out, name);
-                out.push_str("\":\"");
-                escape_json_into(&mut out, value);
-                out.push('"');
-            }
-            out.push('}');
+        if self.included("request_headers")
+            && let Some(headers) = entry.request_headers
+        {
+            write_headers_json(
+                &mut out,
+                "request_headers",
+                headers,
+                &self.request_headers,
+                &mut first,
+            );
+        }
+        if self.included("response_headers")
+            && let Some(headers) = entry.response_headers
+        {
+            write_headers_json(
+                &mut out,
+                "response_headers",
+                headers,
+                &self.response_headers,
+                &mut first,
+            );
         }
 
         out.push('}');
@@ -1331,11 +1331,10 @@ impl AccessLogger {
     }
 
     fn format_text(&self, entry: &AccessEntry<'_>) -> String {
-        let mut out = String::with_capacity(220);
+        let mut out = self.writer.take_buffer(220);
 
         if self.included("client_ip") {
-            out.push_str(entry.client_ip);
-            out.push(' ');
+            let _ = write!(out, "{} ", entry.client_ip);
         }
         if self.included("method") {
             out.push_str(entry.method);
@@ -1352,43 +1351,118 @@ impl AccessLogger {
             out.push_str(entry.protocol);
         }
         if self.included("status") {
-            out.push_str(&format!(" {}", entry.status));
+            let _ = write!(out, " {}", entry.status);
         }
         if self.included("bytes") {
-            out.push_str(&format!(" {}", entry.bytes));
+            let _ = write!(out, " {}", entry.bytes);
         }
         if self.included("duration_ms") {
-            out.push_str(&format!(" {}ms", entry.duration_ms));
+            let _ = write!(out, " {}ms", entry.duration_ms);
         }
         if let Some(ttfb) = entry.ttfb_ms
             && self.included("ttfb_ms")
         {
-            out.push_str(&format!(" ttfb={ttfb}ms"));
+            let _ = write!(out, " ttfb={ttfb}ms");
         }
         if let Some(route) = entry.route
             && self.included("route")
         {
-            out.push_str(&format!(" route={route}"));
+            let _ = write!(out, " route={route}");
         }
         if let Some(upstream) = entry.upstream
             && self.included("upstream")
         {
-            out.push_str(&format!(" upstream={upstream}"));
+            let _ = write!(out, " upstream={upstream}");
         }
         if self.included("request_id") {
-            out.push_str(&format!(" id={}", entry.request_id));
+            let _ = write!(out, " id={}", entry.request_id);
         }
         if self.included("user_agent") {
-            out.push_str(&format!(" ua=\"{}\"", entry.user_agent));
+            let _ = write!(out, " ua=\"{}\"", entry.user_agent);
         }
         if self.included("referer") && entry.referer != "-" {
-            out.push_str(&format!(" referer=\"{}\"", entry.referer));
+            let _ = write!(out, " referer=\"{}\"", entry.referer);
         }
         if let Some(error) = entry.error {
-            out.push_str(&format!(" error=\"{error}\""));
+            let _ = write!(out, " error=\"{error}\"");
         }
 
         out
+    }
+}
+
+/// 🙈 A formatting adapter that JSON-escapes every displayed fragment without
+/// materializing the complete value in a temporary string first.
+struct JsonEscapeWriter<'a>(&'a mut String);
+
+impl fmt::Write for JsonEscapeWriter<'_> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        escape_json_into(self.0, value);
+        Ok(())
+    }
+}
+
+fn write_json_display(out: &mut String, value: impl fmt::Display) {
+    let mut writer = JsonEscapeWriter(out);
+    let _ = write!(writer, "{value}");
+}
+
+/// 🏷️ Serializes a borrowed header map directly into the final JSON buffer.
+///
+/// An empty configured list means every header, matching Caddy. Named lists
+/// narrow that set. Sensitive values are replaced before any byte is appended.
+fn write_headers_json(
+    out: &mut String,
+    label: &str,
+    headers: LogHeaders<'_>,
+    wanted: &[String],
+    first_field: &mut bool,
+) {
+    let mut wrote_header = false;
+    {
+        let mut write_header = |name: &str, value: &http::HeaderValue| {
+            if !wrote_header {
+                if !*first_field {
+                    out.push(',');
+                }
+                *first_field = false;
+                out.push('"');
+                out.push_str(label);
+                out.push_str("\":{");
+                wrote_header = true;
+            } else {
+                out.push(',');
+            }
+
+            out.push('"');
+            escape_json_into(out, name);
+            out.push_str("\":\"");
+            let value = if crate::redaction::is_sensitive_header(name) {
+                crate::redaction::REDACTED
+            } else {
+                value.to_str().unwrap_or("<binary>")
+            };
+            escape_json_into(out, value);
+            out.push('"');
+        };
+
+        if wanted.is_empty() {
+            // 📌 `HeaderMap` already lowercases names. Caddy may preserve the
+            // sender's spelling, but the set and values are identical.
+            for (name, value) in headers.0 {
+                write_header(name.as_str(), value);
+            }
+        } else {
+            for name in wanted {
+                if let Some(value) = headers.0.get(name.as_str()) {
+                    write_header(name, value);
+                }
+            }
+        }
+    }
+
+    if wrote_header {
+        out.push('}');
     }
 }
 
@@ -1398,19 +1472,31 @@ impl AccessLogger {
 /// quote or control byte would let a client forge extra JSON fields in the
 /// log — a log-injection bug, not just a formatting one.
 fn escape_json_into(out: &mut String, value: &str) {
-    for c in value.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
+    let bytes = value.as_bytes();
+    let mut unescaped_start = 0;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        let escaped = match byte {
+            b'"' => Some("\\\""),
+            b'\\' => Some("\\\\"),
+            b'\n' => Some("\\n"),
+            b'\r' => Some("\\r"),
+            b'\t' => Some("\\t"),
+            0x00..=0x1f => Some(""),
+            _ => None,
+        };
+        let Some(escaped) = escaped else { continue };
+
+        // ⚡ Special JSON bytes are ASCII, so their indices are always UTF-8
+        // boundaries and the safe run can be copied in one operation.
+        out.push_str(&value[unescaped_start..index]);
+        if escaped.is_empty() {
+            let _ = write!(out, "\\u{byte:04x}");
+        } else {
+            out.push_str(escaped);
         }
+        unescaped_start = index + 1;
     }
+    out.push_str(&value[unescaped_start..]);
 }
 
 #[cfg(test)]
@@ -1427,15 +1513,15 @@ mod tests {
             bytes: 1234,
             duration_ms: 42,
             ttfb_ms: Some(7),
-            client_ip: "203.0.113.9",
+            client_ip: "203.0.113.9".parse().unwrap(),
             route: Some("/api/*"),
-            upstream: Some("10.0.0.2:8080"),
+            upstream: Some(LogUpstream::Text("10.0.0.2:8080")),
             user_agent: "curl/8",
             referer: "-",
             protocol: "HTTP/1.1",
             error: None,
-            request_headers: &[],
-            response_headers: &[],
+            request_headers: None,
+            response_headers: None,
             tls_version: None,
             tls_cipher: None,
         }
@@ -1444,7 +1530,7 @@ mod tests {
     pub(super) fn logger(format: LogFormat, exclude: Vec<String>) -> AccessLogger {
         AccessLogger {
             format,
-            exclude: exclude.into_iter().collect(),
+            exclude,
             writer: LogWriter::spawn(LogSink::Stdout, 1024),
             request_headers: Vec::new(),
             response_headers: Vec::new(),
@@ -1619,7 +1705,7 @@ mod tests {
     fn selected(targets: &LogTargets, host: &str) -> Vec<String> {
         targets
             .select(host)
-            .map(|logger| logger.exclude.iter().next().cloned().unwrap_or_default())
+            .map(|logger| logger.exclude.first().cloned().unwrap_or_default())
             .collect()
     }
 
@@ -2324,57 +2410,91 @@ mod header_logging_tests {
     /// to a log aggregator. The field appears; the secret does not.
     #[test]
     fn sensitive_headers_are_recorded_as_present_but_masked() {
-        let collected = collect_headers(
-            &["authorization".to_string(), "cookie".to_string()],
-            &headers(&[
-                ("authorization", "Bearer super-secret-token"),
-                ("cookie", "session=abc123"),
-            ]),
-        );
+        let logger = super::tests::logger(LogFormat::Json, vec![]);
+        let headers = headers(&[
+            ("authorization", "Bearer super-secret-token"),
+            ("cookie", "session=abc123"),
+        ]);
+        let mut entry = super::tests::entry();
+        entry.request_headers = Some(LogHeaders::new(&headers));
 
-        assert_eq!(collected.len(), 2, "both headers must appear");
-        for (name, value) in &collected {
-            assert_eq!(value, crate::redaction::REDACTED, "{name} leaked its value");
-        }
-        let rendered = format!("{collected:?}");
+        let rendered = logger.format_json(&entry);
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+        assert_eq!(parsed["request_headers"]["authorization"], "REDACTED");
+        assert_eq!(parsed["request_headers"]["cookie"], "REDACTED");
         assert!(
             !rendered.contains("super-secret-token") && !rendered.contains("abc123"),
             "a secret survived masking: {rendered}"
         );
     }
 
-    /// 🎯 The mirror case. Without it, a `collect_headers` that masked
-    /// everything would pass the test above and make the feature useless.
+    /// 🎯 The mirror case. A formatter that masked everything would pass the
+    /// test above and make the feature useless.
     #[test]
     fn ordinary_headers_keep_their_values() {
-        let collected = collect_headers(
-            &["x-request-id".to_string()],
-            &headers(&[("x-request-id", "abc-123")]),
-        );
-        assert_eq!(
-            collected,
-            vec![("x-request-id".to_string(), "abc-123".to_string())]
-        );
+        let logger = super::tests::logger(LogFormat::Json, vec![]);
+        let headers = headers(&[("x-request-id", "abc-123")]);
+        let mut entry = super::tests::entry();
+        entry.request_headers = Some(LogHeaders::new(&headers));
+
+        let rendered = logger.format_json(&entry);
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+        assert_eq!(parsed["request_headers"]["x-request-id"], "abc-123");
     }
 
     /// 🚫 A header the server did not ask for must never be recorded, however
     /// harmless it looks — the allow list is the privacy boundary.
     #[test]
     fn unrequested_headers_are_not_recorded() {
-        let collected = collect_headers(
-            &["x-request-id".to_string()],
-            &headers(&[("x-request-id", "abc"), ("x-secret-internal", "leak")]),
-        );
-        assert_eq!(collected.len(), 1);
-        assert!(!format!("{collected:?}").contains("leak"));
+        let mut logger = super::tests::logger(LogFormat::Json, vec![]);
+        logger.request_headers = vec!["x-request-id".to_string()];
+        let headers = headers(&[("x-request-id", "abc"), ("x-secret-internal", "leak")]);
+        let mut entry = super::tests::entry();
+        entry.request_headers = Some(LogHeaders::new(&headers));
+
+        let rendered = logger.format_json(&entry);
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+        assert_eq!(parsed["request_headers"]["x-request-id"], "abc");
+        assert!(parsed["request_headers"].get("x-secret-internal").is_none());
+        assert!(!rendered.contains("leak"));
     }
 
     /// 📭 Naming a header the request did not carry produces no field, rather
     /// than an empty one that reads as "the client sent nothing".
     #[test]
     fn absent_headers_produce_no_field() {
-        let collected = collect_headers(&["x-missing".to_string()], &headers(&[]));
-        assert!(collected.is_empty());
+        let mut logger = super::tests::logger(LogFormat::Json, vec![]);
+        logger.request_headers = vec!["x-missing".to_string()];
+        let headers = headers(&[]);
+        let mut entry = super::tests::entry();
+        entry.request_headers = Some(LogHeaders::new(&headers));
+
+        let rendered = logger.format_json(&entry);
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+        assert!(parsed.get("request_headers").is_none());
+    }
+
+    /// 🪵 Each destination applies its own header plan to the same borrowed
+    /// entry; the first logger must not decide what every later logger sees.
+    #[test]
+    fn destinations_select_headers_independently() {
+        let mut first = super::tests::logger(LogFormat::Json, vec![]);
+        first.request_headers = vec!["x-first".to_string()];
+        let mut second = super::tests::logger(LogFormat::Json, vec![]);
+        second.request_headers = vec!["x-second".to_string()];
+        let headers = headers(&[("x-first", "one"), ("x-second", "two")]);
+        let mut entry = super::tests::entry();
+        entry.request_headers = Some(LogHeaders::new(&headers));
+
+        let first: serde_json::Value =
+            serde_json::from_str(&first.format_json(&entry)).expect("valid JSON");
+        let second: serde_json::Value =
+            serde_json::from_str(&second.format_json(&entry)).expect("valid JSON");
+
+        assert_eq!(first["request_headers"]["x-first"], "one");
+        assert!(first["request_headers"].get("x-second").is_none());
+        assert_eq!(second["request_headers"]["x-second"], "two");
+        assert!(second["request_headers"].get("x-first").is_none());
     }
 
     /// 🏷️ Headers are nested, so a header named after a log field cannot
@@ -2382,9 +2502,9 @@ mod header_logging_tests {
     #[test]
     fn a_header_cannot_collide_with_a_log_field() {
         let logger = super::tests::logger(LogFormat::Json, vec![]);
-        let request_headers = vec![("status".to_string(), "not-a-status".to_string())];
+        let request_headers = headers(&[("status", "not-a-status")]);
         let mut entry = super::tests::entry();
-        entry.request_headers = &request_headers;
+        entry.request_headers = Some(LogHeaders::new(&request_headers));
 
         let line = logger.format_json(&entry);
         let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
