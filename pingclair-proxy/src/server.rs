@@ -8097,6 +8097,11 @@ impl ProxyHttp for PingclairProxy {
                 "❌ Access"
             );
         } else {
+            // 📌 Ten structured fields, not one pre-formatted string. Collapsing
+            // them was measured: it is worth ~6 % on the static path and nothing
+            // on the proxy path, and it changes the record's shape from fields a
+            // collector can index to a single quoted `access="…"` blob. The
+            // throughput does not buy that, so the structured form stays.
             tracing::info!(
                 request_id = %ctx.request_id,
                 method = method,
