@@ -666,6 +666,25 @@ async fn read_until_marker(
     .expect("timed out before the expected marker arrived")
 }
 
+/// 🪵 Waits for a line the server emitted to reach the captured stream.
+///
+/// The runtime formats a record on the thread that emitted it and writes it
+/// from a background thread, so a line the server has already decided to log
+/// can land in the file a moment later. Reading once, immediately after the
+/// request that produced the line, is a race that a loaded runner loses; this
+/// waits for it, bounded, and hands back whatever it saw so a failure can
+/// print the whole stream.
+async fn wait_for_captured_line(path: &std::path::Path, needle: &str, timeout: Duration) -> String {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let captured = std::fs::read_to_string(path).unwrap_or_default();
+        if captured.contains(needle) || std::time::Instant::now() >= deadline {
+            return captured;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// 🧾 Reads one connection-closing HTTP/1 response under a hard test deadline.
 async fn read_http1_to_end(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
     use tokio::io::AsyncReadExt;
@@ -3974,7 +3993,12 @@ async fn test_local_descriptor_exhaustion_does_not_mark_the_backend_down() {
         }
     }
 
-    let log = std::fs::read_to_string(&server.stdout_path).unwrap_or_default();
+    let log = wait_for_captured_line(
+        &server.stdout_path,
+        "Local resource failure",
+        Duration::from_secs(5),
+    )
+    .await;
 
     // 🚫 Guards against a vacuous pass. If the burst never exhausted the
     // budget, the assertion below holds for a reason that has nothing to do
@@ -4565,9 +4589,15 @@ async fn test_pingclairfile_unlimited_buffering_streams_past_the_server_ceiling(
         UPLOAD,
         "every uploaded byte must reach the backend"
     );
-    // 🪵 `tracing`'s fmt layer writes to stdout, and `TestServer` sets
-    // `RUST_LOG=info`, so a warning the runtime emits lands in this file.
-    let log = std::fs::read_to_string(&server.stdout_path).unwrap_or_default();
+    // 🪵 The runtime's records are written to stdout by a background thread,
+    // and `TestServer` sets `RUST_LOG=info`, so the warning the runtime emits
+    // lands in this file — a moment after the response, not before it.
+    let log = wait_for_captured_line(
+        &server.stdout_path,
+        "outgrew its buffer",
+        Duration::from_secs(5),
+    )
+    .await;
     assert!(
         log.contains("outgrew its buffer"),
         "the server must report the fall back to streaming: {log}"
@@ -7266,7 +7296,12 @@ async fn test_signal_reload_rejects_global_changes_then_applies_compatible_confi
 
     // 🚩 The global email change must be reported as restart-only.
     // 🧭 TestServer sets RUST_LOG=info, so the rejection lands here.
-    let stderr = std::fs::read_to_string(&server.stdout_path).unwrap_or_default();
+    let stderr = wait_for_captured_line(
+        &server.stdout_path,
+        "remains active, unchanged",
+        Duration::from_secs(5),
+    )
+    .await;
     assert!(
         stderr.contains("global options changed") && stderr.contains("remains active, unchanged"),
         "the reload must reject global settings without partial publication:\n{stderr}"
@@ -7518,7 +7553,12 @@ async fn test_signal_reload_marks_new_listener_restart_required() {
         body, "original",
         "a restart-required listener change must leave every existing route untouched"
     );
-    let output = std::fs::read_to_string(&server.stdout_path).unwrap_or_default();
+    let output = wait_for_captured_line(
+        &server.stdout_path,
+        "Previous configuration remains active, unchanged",
+        Duration::from_secs(5),
+    )
+    .await;
     assert!(
         output.contains("listener topology changed")
             && output.contains("Previous configuration remains active, unchanged"),
