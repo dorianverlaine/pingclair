@@ -5,7 +5,7 @@
 //!
 //! The access log is emitted per request at `info`, and the default
 //! `fmt::layer()` formats it and writes it *on the worker thread*. When stderr
-//! is a systemd journal — the normal case for the packaged service — that write
+//! is a service journal — the normal case for the packaged service — that write
 //! is synchronous, so every request waits on the log before it can finish.
 //! [`NonBlockingWriter`] hands each formatted record to a background thread
 //! over a bounded channel and returns immediately.

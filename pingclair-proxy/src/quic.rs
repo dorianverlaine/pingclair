@@ -3559,7 +3559,7 @@ async fn handle_request_inner(
                         response_handlers.as_deref(),
                         file.status,
                         hdrs,
-                        H3LocalBody::Bytes(Bytes::from(file.content)),
+                        H3LocalBody::Bytes(file.content),
                         response_policy,
                         request_id,
                         request_deadline,

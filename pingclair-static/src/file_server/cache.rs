@@ -12,11 +12,9 @@
 //! cache protects allocation (formatting one file's headers once instead of
 //! per request).
 //!
-//! 📌 Why a content cache exists at all: nginx answers a small file with
-//! `sendfile`, so the bytes never enter user space. This server has no
-//! zero-copy path — a sub-threshold file is read into a `Vec` and written out
-//! — so the read syscalls are per request. Removing the repetition is not the
-//! same as removing the copy, but it is the part that is ours to remove.
+//! 📌 Why a content cache exists at all: the response path has no zero-copy
+//! file-descriptor handoff. It reads a sub-threshold file once into shared
+//! [`Bytes`], then cache hits clone only that shared handle.
 
 use pingclair_core::error::Result;
 use std::collections::{HashMap, VecDeque};
@@ -24,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
+use bytes::Bytes;
 use http::HeaderValue;
 
 use super::FileServer;
@@ -89,16 +88,15 @@ pub(super) struct MetaKey {
 /// - **Compressed bodies.** On-the-fly compression under sustained concurrent
 ///   load against a large compressible file turned a 20s benchmark into a
 ///   16-minute one (see benchmarks/README.md).
-/// - **Raw bodies.** A file at or below the streaming threshold is read into a
-///   `Vec` per request, because this server has no `sendfile` path. That is an
-///   `open` + `read` + `close` for bytes that have not changed, on a payload
-///   size chosen precisely because it is hot (logos, CSS, small JS).
+/// - **Raw bodies.** A file at or below the streaming threshold is read once
+///   into shared bytes, because this server has no `sendfile` path. Cache hits
+///   avoid both `open` + `read` + `close` and a fresh whole-body allocation.
 ///
 /// Both key on (path, mtime, encoding), so editing a file invalidates its
 /// entries instead of serving old bytes. Bounded by total bytes so the cache
 /// cannot grow without limit; least-recently-used entries are evicted first.
 pub(super) struct BodyCache {
-    pub(super) entries: HashMap<FileKey, Arc<Vec<u8>>>,
+    pub(super) entries: HashMap<FileKey, Bytes>,
     /// Recency order, front = least recently used.
     lru: VecDeque<FileKey>,
     bytes: usize,
@@ -122,7 +120,7 @@ impl BodyCache {
         self.lru.push_back(key.clone());
     }
 
-    pub(super) fn get(&mut self, key: &FileKey) -> Option<Arc<Vec<u8>>> {
+    pub(super) fn get(&mut self, key: &FileKey) -> Option<Bytes> {
         if let Some(v) = self.entries.get(key).cloned() {
             self.touch(key);
             Some(v)
@@ -131,7 +129,7 @@ impl BodyCache {
         }
     }
 
-    pub(super) fn insert(&mut self, key: FileKey, value: Arc<Vec<u8>>) {
+    pub(super) fn insert(&mut self, key: FileKey, value: Bytes) {
         let size = value.len();
         // A single entry larger than the whole budget is never worth caching —
         // it would immediately evict everything including itself.
@@ -335,7 +333,7 @@ mod compress_cache_tests {
         let mut c = BodyCache::new(1024);
         let k = key("/a", 1, "gzip");
         assert!(c.get(&k).is_none(), "empty cache must miss");
-        c.insert(k.clone(), Arc::new(vec![0u8; 10]));
+        c.insert(k.clone(), Bytes::from(vec![0u8; 10]));
         assert_eq!(
             c.get(&k).map(|v| v.len()),
             Some(10),
@@ -346,8 +344,8 @@ mod compress_cache_tests {
     #[test]
     fn distinct_encodings_and_mtimes_are_distinct_entries() {
         let mut c = BodyCache::new(1024);
-        c.insert(key("/a", 1, "gzip"), Arc::new(vec![1u8; 4]));
-        c.insert(key("/a", 1, "br"), Arc::new(vec![2u8; 6]));
+        c.insert(key("/a", 1, "gzip"), Bytes::from(vec![1u8; 4]));
+        c.insert(key("/a", 1, "br"), Bytes::from(vec![2u8; 6]));
         // A newer mtime is a different key — the old compression is stale and
         // must not be served for the new one.
         assert!(
@@ -361,13 +359,13 @@ mod compress_cache_tests {
     #[test]
     fn evicts_least_recently_used_when_over_budget() {
         let mut c = BodyCache::new(30); // room for ~3x 10-byte entries
-        c.insert(key("/a", 1, "gzip"), Arc::new(vec![0u8; 10]));
-        c.insert(key("/b", 1, "gzip"), Arc::new(vec![0u8; 10]));
-        c.insert(key("/c", 1, "gzip"), Arc::new(vec![0u8; 10]));
+        c.insert(key("/a", 1, "gzip"), Bytes::from(vec![0u8; 10]));
+        c.insert(key("/b", 1, "gzip"), Bytes::from(vec![0u8; 10]));
+        c.insert(key("/c", 1, "gzip"), Bytes::from(vec![0u8; 10]));
         // Touch /a so /b becomes the least-recently-used.
         assert!(c.get(&key("/a", 1, "gzip")).is_some());
         // Insert a 4th entry, forcing one eviction.
-        c.insert(key("/d", 1, "gzip"), Arc::new(vec![0u8; 10]));
+        c.insert(key("/d", 1, "gzip"), Bytes::from(vec![0u8; 10]));
         assert!(
             c.get(&key("/b", 1, "gzip")).is_none(),
             "LRU entry /b should be evicted"
@@ -384,7 +382,7 @@ mod compress_cache_tests {
     fn total_bytes_never_exceed_budget() {
         let mut c = BodyCache::new(100);
         for i in 0..50 {
-            c.insert(key("/f", i, "gzip"), Arc::new(vec![0u8; 25]));
+            c.insert(key("/f", i, "gzip"), Bytes::from(vec![0u8; 25]));
             assert!(
                 c.bytes <= 100,
                 "budget exceeded at iteration {i}: {} bytes",
@@ -397,8 +395,8 @@ mod compress_cache_tests {
     fn reinsert_same_key_does_not_double_count_bytes() {
         let mut c = BodyCache::new(1000);
         let k = key("/a", 1, "gzip");
-        c.insert(k.clone(), Arc::new(vec![0u8; 10]));
-        c.insert(k.clone(), Arc::new(vec![0u8; 40]));
+        c.insert(k.clone(), Bytes::from(vec![0u8; 10]));
+        c.insert(k.clone(), Bytes::from(vec![0u8; 40]));
         assert_eq!(c.bytes, 40, "re-insert must replace, not accumulate");
         assert_eq!(c.get(&k).map(|v| v.len()), Some(40));
     }
@@ -406,7 +404,7 @@ mod compress_cache_tests {
     #[test]
     fn entry_larger_than_budget_is_not_cached() {
         let mut c = BodyCache::new(100);
-        c.insert(key("/big", 1, "gzip"), Arc::new(vec![0u8; 200]));
+        c.insert(key("/big", 1, "gzip"), Bytes::from(vec![0u8; 200]));
         assert!(c.get(&key("/big", 1, "gzip")).is_none());
         assert_eq!(c.bytes, 0);
     }

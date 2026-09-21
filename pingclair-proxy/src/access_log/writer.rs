@@ -15,8 +15,8 @@ use super::{
     should_rotate,
 };
 
-// 📦 Like nginx's buffered access log, one batch has a byte ceiling and an
-// independent deadline. A continuous stream must not postpone that deadline.
+// 📦 One batch has a byte ceiling and an independent deadline. A continuous
+// stream must not postpone that deadline.
 const BATCH_BYTES: usize = 64 * 1024;
 const FLUSH_INTERVAL: Duration = Duration::from_millis(5);
 

@@ -245,7 +245,7 @@ impl FileServer {
                     let listing_len = content.len() as u64;
 
                     return Ok(Some(ServedResponse::Buffered(ServedFile {
-                        content,
+                        content: content.into(),
                         content_type: HeaderValue::from_static("text/html; charset=utf-8"),
                         content_length: HeaderValue::from(listing_len),
                         path: file_path,
@@ -326,15 +326,16 @@ impl FileServer {
                 body_len: length,
             };
             if let Some(cached) = self.compress_cache.lock().unwrap().get(&key) {
+                let content_length = HeaderValue::from(cached.len() as u64);
                 tracing::debug!(
                     "✅ Serving cached {} compression: {}",
                     enc,
                     file_path.display()
                 );
                 return Ok(Some(ServedResponse::Buffered(ServedFile {
-                    content: (*cached).clone(),
+                    content: cached,
                     content_type: meta.content_type.clone(),
-                    content_length: HeaderValue::from((*cached).len() as u64),
+                    content_length,
                     path: file_path,
                     status,
                     content_range,
@@ -391,7 +392,7 @@ impl FileServer {
             };
             let precompressed_len = precompressed_content.len() as u64;
             return Ok(Some(ServedResponse::Buffered(ServedFile {
-                content: precompressed_content,
+                content: precompressed_content.into(),
                 content_type: meta.content_type.clone(),
                 content_length: HeaderValue::from(precompressed_len),
                 path: file_path,
@@ -460,6 +461,7 @@ impl FileServer {
             // Whoever held the lock before us may have populated the cache
             // while we waited — re-check before doing the work ourselves.
             if let Some(cached) = self.compress_cache.lock().unwrap().get(&key) {
+                let content_length = HeaderValue::from(cached.len() as u64);
                 drop(guard);
                 Self::release_inflight(&self.in_flight, &key, &lock);
                 tracing::debug!(
@@ -468,9 +470,9 @@ impl FileServer {
                     file_path.display()
                 );
                 return Ok(Some(ServedResponse::Buffered(ServedFile {
-                    content: (*cached).clone(),
+                    content: cached,
                     content_type: meta.content_type.clone(),
-                    content_length: HeaderValue::from((*cached).len() as u64),
+                    content_length,
                     path: file_path,
                     status,
                     content_range,
@@ -544,7 +546,7 @@ impl FileServer {
                     content.extend_from_slice(&chunk);
                 }
                 Ok(Some(ServedFile {
-                    content,
+                    content: content.into(),
                     content_type: stream.content_type,
                     content_length: stream.content_length,
                     path: stream.path,
@@ -732,7 +734,7 @@ mod traversal_tests {
             .unwrap();
         let fs = server(&f.root);
         let served = fs.serve("/link.txt", None, None).await.unwrap().unwrap();
-        assert_eq!(served.content, b"top secret");
+        assert_eq!(served.content, &b"top secret"[..]);
     }
 
     #[tokio::test]
@@ -746,7 +748,7 @@ mod traversal_tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(served.content, b"nested");
+        assert_eq!(served.content, &b"nested"[..]);
     }
 
     #[tokio::test]
@@ -754,13 +756,13 @@ mod traversal_tests {
         let f = fixture().await;
         let fs = server(&f.root);
         let index = fs.serve("/", None, None).await.unwrap().unwrap();
-        assert_eq!(index.content, b"hello");
+        assert_eq!(index.content, &b"hello"[..]);
         let nested = fs
             .serve("/sub/page.txt", None, None)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(nested.content, b"nested");
+        assert_eq!(nested.content, &b"nested"[..]);
         let streamed = fs.serve_streaming("/sub/page.txt").await.unwrap().unwrap();
         assert_eq!(streamed.body_len, 6);
     }
@@ -898,7 +900,7 @@ mod traversal_tests {
         });
 
         let served = fs.serve("/sub/", None, None).await.unwrap().unwrap();
-        assert_eq!(served.content, b"sub index");
+        assert_eq!(served.content, &b"sub index"[..]);
 
         // 📁 A nested index path is legitimate and must keep working; only `..`
         // and absolute forms are refused.
@@ -906,7 +908,7 @@ mod traversal_tests {
             .await
             .unwrap();
         let served = fs.serve("/sub/", None, None).await.unwrap().unwrap();
-        assert_eq!(served.content, b"deep default");
+        assert_eq!(served.content, &b"deep default"[..]);
     }
 }
 
@@ -1000,6 +1002,11 @@ mod serve_cache_tests {
         // 🎯 Hit: same bytes, served from memory.
         let second = fs.serve("/small.bin", None, None).await.unwrap().unwrap();
         assert_eq!(second.content, body, "cached body must match the file");
+        assert_eq!(
+            first.content.as_ptr(),
+            second.content.as_ptr(),
+            "a hot body must share its cached storage instead of copying 1 KiB"
+        );
         assert_eq!(
             fs.content_cache.lock().unwrap().entries.len(),
             1,
@@ -1193,7 +1200,7 @@ mod serve_cache_tests {
         fs.compress_cache
             .lock()
             .unwrap()
-            .insert(key.clone(), Arc::new(compressed.clone()));
+            .insert(key.clone(), bytes::Bytes::from(compressed.clone()));
         drop(leader_guard);
 
         let served = tokio::time::timeout(std::time::Duration::from_secs(5), &mut follower)

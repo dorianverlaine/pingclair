@@ -339,8 +339,8 @@ pub struct AccessLogger {
     ///
     /// Bounded and never blocking. See [`LogWriter`] for why both matter.
     writer: Arc<LogWriter>,
-    /// 🏷️ Header names to record, lowercased. Empty means every header, matching
-    /// Caddy; serialization borrows the map so that default does not clone it.
+    /// 🏷️ Header names to record, lowercased. Empty means every header;
+    /// serialization borrows the map so that default does not clone it.
     request_headers: Vec<String>,
     response_headers: Vec<String>,
     /// 🔐 Whether to record the negotiated TLS version and cipher.
@@ -1213,8 +1213,8 @@ impl AccessLogger {
     // again — inherent to a comma-separating flag, not a bug.
     #[allow(unused_assignments)]
     fn format_json(&self, entry: &AccessEntry<'_>) -> String {
-        // 📦 A normal Caddy-shaped record with both header maps is about 650
-        // bytes. Reserving 320 forced every request through a second allocation.
+        // 📦 A normal structured record with both header maps is about 650 bytes.
+        // Reserving 320 forced every request through a second allocation.
         let mut out = self.writer.take_buffer(768);
         out.push('{');
         let mut first = true;
@@ -1409,8 +1409,8 @@ fn write_json_display(out: &mut String, value: impl fmt::Display) {
 
 /// 🏷️ Serializes a borrowed header map directly into the final JSON buffer.
 ///
-/// An empty configured list means every header, matching Caddy. Named lists
-/// narrow that set. Sensitive values are replaced before any byte is appended.
+/// An empty configured list means every header. Named lists narrow that set.
+/// Sensitive values are replaced before any byte is appended.
 fn write_headers_json(
     out: &mut String,
     label: &str,
@@ -1447,8 +1447,8 @@ fn write_headers_json(
         };
 
         if wanted.is_empty() {
-            // 📌 `HeaderMap` already lowercases names. Caddy may preserve the
-            // sender's spelling, but the set and values are identical.
+            // 📌 `HeaderMap` already lowercases names. Recording that canonical
+            // spelling avoids allocating a second name per field.
             for (name, value) in headers.0 {
                 write_header(name.as_str(), value);
             }

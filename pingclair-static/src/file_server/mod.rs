@@ -41,6 +41,7 @@ mod serve;
 mod stream;
 
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -307,7 +308,9 @@ pub struct FileServer {
 
 /// Response from file server
 pub struct ServedFile {
-    pub content: Vec<u8>,
+    /// 🧊 Shared body bytes. Cache hits clone one reference instead of copying
+    /// the complete file into a fresh allocation for every request.
+    pub content: Bytes,
     /// Prebuilt Content-Type header value (clone is a shared-bytes bump).
     pub content_type: HeaderValue,
     /// Prebuilt Content-Length header value for the full response body.

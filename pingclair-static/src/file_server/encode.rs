@@ -9,9 +9,9 @@
 //! on-the-fly path is also the one that populates the compressed-body cache,
 //! because it is the only one that produces bytes worth keeping.
 
+use bytes::Bytes;
 use pingclair_core::error::Result;
 use std::io::{Read as _, Seek as _, SeekFrom};
-use std::sync::Arc;
 
 use super::FileServer;
 use super::cache::FileKey;
@@ -36,13 +36,10 @@ impl FileServer {
         length: u64,
         encoding: Option<&'static str>,
         mtime_ns: Option<u128>,
-    ) -> Result<(Vec<u8>, Option<String>)> {
-        // 🗂️ This is the read-syscall half of the gap to nginx. A file at or
-        // below the streaming threshold is read into a `Vec` here on *every*
-        // request, where nginx hands the same bytes to `sendfile` without
-        // entering user space at all. Caching does not remove the copy, but it
-        // does remove the repeated `open`/`read`/`close` for bytes this
-        // process has already read once.
+    ) -> Result<(Bytes, Option<String>)> {
+        // 🗂️ A file at or below the streaming threshold enters user space
+        // once. The cache returns shared `Bytes` after that first read, removing
+        // both repeated syscalls and whole-body copies.
         //
         // Files without a usable mtime are never cached: there would be no key
         // for an edit to change, so a same-size overwrite could serve stale
@@ -59,16 +56,12 @@ impl FileServer {
         if let Some(key) = &content_key
             && let Some(cached) = self.content_cache.lock().unwrap().get(key)
         {
-            // 📌 One copy per request remains: `ServedFile::content` is owned.
-            // Making a cache hit allocation-free means threading `Bytes`
-            // through the response type, which is a larger change than this.
-            return Ok(((*cached).clone(), None));
+            return Ok((cached, None));
         }
 
-        // Synchronous read, intentionally: a local regular-file read served
-        // from the page cache effectively never blocks (the nginx model), so
-        // paying a spawn_blocking round trip per request via tokio::fs only
-        // adds cross-thread wakeups on this hot path.
+        // 🗂️ Synchronous by design: a local regular-file read served from the
+        // page cache finishes immediately in the measured workload. Paying a
+        // blocking-pool round trip per request only adds cross-thread wakeups.
         let mut file = std::fs::File::open(file_path)?;
 
         if start > 0 {
@@ -77,10 +70,11 @@ impl FileServer {
 
         let mut content = vec![0u8; length as usize];
         file.read_exact(&mut content)?;
+        let content = Bytes::from(content);
 
         match encoding {
             Some(enc) => {
-                let compressed = Arc::new(Self::compress_with(&content, enc).await?);
+                let compressed = Bytes::from(Self::compress_with(&content, enc).await?);
                 if let Some(mtime_ns) = mtime_ns {
                     let key = FileKey {
                         path: file_path.to_path_buf(),
@@ -93,14 +87,14 @@ impl FileServer {
                         .unwrap()
                         .insert(key, compressed.clone());
                 }
-                Ok(((*compressed).clone(), Some(enc.to_string())))
+                Ok((compressed, Some(enc.to_string())))
             }
             None => {
                 if let Some(key) = content_key {
                     self.content_cache
                         .lock()
                         .unwrap()
-                        .insert(key, Arc::new(content.clone()));
+                        .insert(key, content.clone());
                 }
                 Ok((content, None))
             }
