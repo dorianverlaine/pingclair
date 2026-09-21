@@ -4,11 +4,17 @@
 //! 📝 Moving log output off the request path.
 //!
 //! The access log is emitted per request at `info`, and the default
-//! `fmt::layer()` formats it and writes it *on the worker thread*. When stderr
-//! is a service journal — the normal case for the packaged service — that write
-//! is synchronous, so every request waits on the log before it can finish.
-//! [`NonBlockingWriter`] hands each formatted record to a background thread
-//! over a bounded channel and returns immediately.
+//! `fmt::layer()` formats it and writes it *on the worker thread*. When the
+//! destination is a service journal — the normal case for the packaged service
+//! — that write is synchronous, so every request waits on the log before it can
+//! finish. [`NonBlockingWriter`] hands each formatted record to a background
+//! thread over a bounded channel and returns immediately.
+//!
+//! 📌 Records keep going to **stdout**, which is where the default `fmt::layer()`
+//! already sent them. Moving the hand-off off the request path is not a licence
+//! to change the destination: whoever pipes or captures the server's streams
+//! sees the same stream as before, and the integration tests that read back a
+//! captured stream for reload and limit diagnostics keep working.
 //!
 //! 🔍 Formatting still happens on the emitting thread. Its cost must be
 //! measured separately from the destination: a journal receiver also consumes
@@ -63,13 +69,13 @@ impl NonBlockingWriter {
         let thread = std::thread::Builder::new()
             .name("pingclair-log".to_string())
             .spawn(move || {
-                let stderr = io::stderr();
+                let stdout = io::stdout();
                 while let Ok(record) = rx.recv() {
                     // 🔐 One lock per record, not per byte: the escape
                     // sequences a formatter emits are only valid as a whole
                     // record, so records have to be written atomically relative
                     // to each other.
-                    let mut out = stderr.lock();
+                    let mut out = stdout.lock();
                     let _ = out.write_all(&record);
                     let _ = out.flush();
                 }
