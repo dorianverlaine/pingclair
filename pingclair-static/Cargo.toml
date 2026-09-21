@@ -13,6 +13,7 @@ pingclair-core = { path = "../pingclair-core" }
 tokio = { workspace = true, features = ["fs"] }
 tracing.workspace = true
 http.workspace = true
+bytes.workspace = true
 arc-swap.workspace = true
 mime_guess.workspace = true
 httpdate = "1.0"

@@ -806,6 +806,6 @@ mod bounded_memory_tests {
             panic!("a four-byte range must stay buffered");
         };
         assert_eq!(file.status, 206);
-        assert_eq!(file.content, b"2345");
+        assert_eq!(file.content, &b"2345"[..]);
     }
 }

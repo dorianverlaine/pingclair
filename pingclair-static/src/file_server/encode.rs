@@ -9,12 +9,12 @@
 //! on-the-fly path is also the one that populates the compressed-body cache,
 //! because it is the only one that produces bytes worth keeping.
 
+use bytes::Bytes;
 use pingclair_core::error::Result;
 use std::io::{Read as _, Seek as _, SeekFrom};
-use std::sync::Arc;
 
 use super::FileServer;
-use super::cache::CompressKey;
+use super::cache::FileKey;
 
 impl FileServer {
     // MARK: - Reading and compressing
@@ -23,6 +23,12 @@ impl FileServer {
     /// the body when `encoding` was negotiated. A compressible full-file
     /// result with a usable mtime is stored in `compress_cache` under
     /// (path, mtime, encoding) so later requests skip the read+compress.
+    ///
+    /// A complete, uncompressed body is stored in `content_cache` under
+    /// (path, mtime) instead, so a repeated request for the same small file
+    /// skips the `open` + `read` + `close` as well. Only whole files are
+    /// cached: a `Range` starts at a non-zero offset and is a different body,
+    /// and the streaming path never reaches here at all.
     pub(super) async fn read_and_maybe_compress(
         &self,
         file_path: &std::path::Path,
@@ -30,11 +36,32 @@ impl FileServer {
         length: u64,
         encoding: Option<&'static str>,
         mtime_ns: Option<u128>,
-    ) -> Result<(Vec<u8>, Option<String>)> {
-        // Synchronous read, intentionally: a local regular-file read served
-        // from the page cache effectively never blocks (the nginx model), so
-        // paying a spawn_blocking round trip per request via tokio::fs only
-        // adds cross-thread wakeups on this hot path.
+    ) -> Result<(Bytes, Option<String>)> {
+        // 🗂️ A file at or below the streaming threshold enters user space
+        // once. The cache returns shared `Bytes` after that first read, removing
+        // both repeated syscalls and whole-body copies.
+        //
+        // Files without a usable mtime are never cached: there would be no key
+        // for an edit to change, so a same-size overwrite could serve stale
+        // bytes.
+        let content_key = match (encoding, mtime_ns, start) {
+            (None, Some(mtime_ns), 0) => Some(FileKey {
+                path: file_path.to_path_buf(),
+                mtime_ns,
+                encoding: "",
+                body_len: length,
+            }),
+            _ => None,
+        };
+        if let Some(key) = &content_key
+            && let Some(cached) = self.content_cache.lock().unwrap().get(key)
+        {
+            return Ok((cached, None));
+        }
+
+        // 🗂️ Synchronous by design: a local regular-file read served from the
+        // page cache finishes immediately in the measured workload. Paying a
+        // blocking-pool round trip per request only adds cross-thread wakeups.
         let mut file = std::fs::File::open(file_path)?;
 
         if start > 0 {
@@ -43,24 +70,34 @@ impl FileServer {
 
         let mut content = vec![0u8; length as usize];
         file.read_exact(&mut content)?;
+        let content = Bytes::from(content);
 
         match encoding {
             Some(enc) => {
-                let compressed = Arc::new(Self::compress_with(&content, enc).await?);
+                let compressed = Bytes::from(Self::compress_with(&content, enc).await?);
                 if let Some(mtime_ns) = mtime_ns {
-                    let key = CompressKey {
+                    let key = FileKey {
                         path: file_path.to_path_buf(),
                         mtime_ns,
                         encoding: enc,
+                        body_len: length,
                     };
                     self.compress_cache
                         .lock()
                         .unwrap()
                         .insert(key, compressed.clone());
                 }
-                Ok(((*compressed).clone(), Some(enc.to_string())))
+                Ok((compressed, Some(enc.to_string())))
             }
-            None => Ok((content, None)),
+            None => {
+                if let Some(key) = content_key {
+                    self.content_cache
+                        .lock()
+                        .unwrap()
+                        .insert(key, content.clone());
+                }
+                Ok((content, None))
+            }
         }
     }
 

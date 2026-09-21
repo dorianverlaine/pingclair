@@ -30,6 +30,10 @@ tracing.workspace = true
 http.workspace = true
 bytes.workspace = true
 parking_lot = "0.12"
+# ♻️ Recycles formatted access-log buffers between request and writer threads.
+# The existing dependency graph already includes this crate, so this adds no
+# new code to the final binary.
+crossbeam-queue = "0.3"
 prometheus.workspace = true
 async-recursion = "1.0"
 ipnet.workspace = true
@@ -57,10 +61,10 @@ chrono = "0.4"
 # 📤 Derives the admin API's cache-status payload; the endpoint lives in
 # pingclair-api but the accounting it reports lives here.
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 
 [dev-dependencies]
 pingclair-config = { path = "../pingclair-config" }
-serde_json.workspace = true
 tempfile = "3"
 rcgen.workspace = true
 h2.workspace = true

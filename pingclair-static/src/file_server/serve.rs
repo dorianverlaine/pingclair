@@ -25,7 +25,7 @@ use http::HeaderValue;
 
 #[cfg(test)]
 use super::FileServerConfig;
-use super::cache::CompressKey;
+use super::cache::FileKey;
 use super::{FileServer, ServedFile, ServedResponse};
 
 impl FileServer {
@@ -245,7 +245,7 @@ impl FileServer {
                     let listing_len = content.len() as u64;
 
                     return Ok(Some(ServedResponse::Buffered(ServedFile {
-                        content,
+                        content: content.into(),
                         content_type: HeaderValue::from_static("text/html; charset=utf-8"),
                         content_length: HeaderValue::from(listing_len),
                         path: file_path,
@@ -319,21 +319,23 @@ impl FileServer {
         // whole point of the cache — a hot compressible file is compressed
         // once, then served from memory.
         if let (Some(enc), Some(mtime_ns)) = (cache_encoding, mtime_ns) {
-            let key = CompressKey {
+            let key = FileKey {
                 path: file_path.clone(),
                 mtime_ns,
                 encoding: enc,
+                body_len: length,
             };
             if let Some(cached) = self.compress_cache.lock().unwrap().get(&key) {
+                let content_length = HeaderValue::from(cached.len() as u64);
                 tracing::debug!(
                     "✅ Serving cached {} compression: {}",
                     enc,
                     file_path.display()
                 );
                 return Ok(Some(ServedResponse::Buffered(ServedFile {
-                    content: (*cached).clone(),
+                    content: cached,
                     content_type: meta.content_type.clone(),
-                    content_length: HeaderValue::from((*cached).len() as u64),
+                    content_length,
                     path: file_path,
                     status,
                     content_range,
@@ -390,7 +392,7 @@ impl FileServer {
             };
             let precompressed_len = precompressed_content.len() as u64;
             return Ok(Some(ServedResponse::Buffered(ServedFile {
-                content: precompressed_content,
+                content: precompressed_content.into(),
                 content_type: meta.content_type.clone(),
                 content_length: HeaderValue::from(precompressed_len),
                 path: file_path,
@@ -442,10 +444,11 @@ impl FileServer {
         // own (the cold-cache stampede behind the benchmark's cold-start
         // memory spike — see benchmarks/README.md).
         let inflight = if let (Some(enc), Some(mtime_ns)) = (cache_encoding, mtime_ns) {
-            let key = CompressKey {
+            let key = FileKey {
                 path: file_path.clone(),
                 mtime_ns,
                 encoding: enc,
+                body_len: length,
             };
             let lock = {
                 let mut map = self.in_flight.lock().unwrap();
@@ -458,6 +461,7 @@ impl FileServer {
             // Whoever held the lock before us may have populated the cache
             // while we waited — re-check before doing the work ourselves.
             if let Some(cached) = self.compress_cache.lock().unwrap().get(&key) {
+                let content_length = HeaderValue::from(cached.len() as u64);
                 drop(guard);
                 Self::release_inflight(&self.in_flight, &key, &lock);
                 tracing::debug!(
@@ -466,9 +470,9 @@ impl FileServer {
                     file_path.display()
                 );
                 return Ok(Some(ServedResponse::Buffered(ServedFile {
-                    content: (*cached).clone(),
+                    content: cached,
                     content_type: meta.content_type.clone(),
-                    content_length: HeaderValue::from((*cached).len() as u64),
+                    content_length,
                     path: file_path,
                     status,
                     content_range,
@@ -542,7 +546,7 @@ impl FileServer {
                     content.extend_from_slice(&chunk);
                 }
                 Ok(Some(ServedFile {
-                    content,
+                    content: content.into(),
                     content_type: stream.content_type,
                     content_length: stream.content_length,
                     path: stream.path,
@@ -730,7 +734,7 @@ mod traversal_tests {
             .unwrap();
         let fs = server(&f.root);
         let served = fs.serve("/link.txt", None, None).await.unwrap().unwrap();
-        assert_eq!(served.content, b"top secret");
+        assert_eq!(served.content, &b"top secret"[..]);
     }
 
     #[tokio::test]
@@ -744,7 +748,7 @@ mod traversal_tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(served.content, b"nested");
+        assert_eq!(served.content, &b"nested"[..]);
     }
 
     #[tokio::test]
@@ -752,13 +756,13 @@ mod traversal_tests {
         let f = fixture().await;
         let fs = server(&f.root);
         let index = fs.serve("/", None, None).await.unwrap().unwrap();
-        assert_eq!(index.content, b"hello");
+        assert_eq!(index.content, &b"hello"[..]);
         let nested = fs
             .serve("/sub/page.txt", None, None)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(nested.content, b"nested");
+        assert_eq!(nested.content, &b"nested"[..]);
         let streamed = fs.serve_streaming("/sub/page.txt").await.unwrap().unwrap();
         assert_eq!(streamed.body_len, 6);
     }
@@ -896,7 +900,7 @@ mod traversal_tests {
         });
 
         let served = fs.serve("/sub/", None, None).await.unwrap().unwrap();
-        assert_eq!(served.content, b"sub index");
+        assert_eq!(served.content, &b"sub index"[..]);
 
         // 📁 A nested index path is legitimate and must keep working; only `..`
         // and absolute forms are refused.
@@ -904,7 +908,7 @@ mod traversal_tests {
             .await
             .unwrap();
         let served = fs.serve("/sub/", None, None).await.unwrap().unwrap();
-        assert_eq!(served.content, b"deep default");
+        assert_eq!(served.content, &b"deep default"[..]);
     }
 }
 
@@ -968,6 +972,107 @@ mod serve_cache_tests {
         assert_eq!(
             out, body,
             "cached gzip must decompress to the original file"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_uncompressed_requests_are_served_from_the_content_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = vec![b'x'; 1024];
+        write_file(dir.path(), "small.bin", &body).await;
+
+        let fs = FileServer::new(FileServerConfig {
+            root: dir.path().to_path_buf(),
+            index: vec![],
+            browse: false,
+            browse_limit: None,
+            compress: false,
+            ..FileServerConfig::default()
+        });
+
+        // 🗂️ Miss: reads the file and stores the body.
+        let first = fs.serve("/small.bin", None, None).await.unwrap().unwrap();
+        assert_eq!(first.content, body, "first read must return the file");
+        assert_eq!(
+            fs.content_cache.lock().unwrap().entries.len(),
+            1,
+            "an uncompressed whole-file read should populate the content cache"
+        );
+
+        // 🎯 Hit: same bytes, served from memory.
+        let second = fs.serve("/small.bin", None, None).await.unwrap().unwrap();
+        assert_eq!(second.content, body, "cached body must match the file");
+        assert_eq!(
+            first.content.as_ptr(),
+            second.content.as_ptr(),
+            "a hot body must share its cached storage instead of copying 1 KiB"
+        );
+        assert_eq!(
+            fs.content_cache.lock().unwrap().entries.len(),
+            1,
+            "a hit must not add a second entry"
+        );
+
+        // 🪟 A Range is a different body and must never be answered from the
+        // whole-file entry.
+        let ranged = fs
+            .serve("/small.bin", Some("bytes=0-9"), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ranged.content.len(),
+            10,
+            "Range must return only its window"
+        );
+        assert_eq!(
+            ranged.content,
+            vec![b'x'; 10],
+            "Range must return the requested bytes, not the cached whole file"
+        );
+    }
+
+    #[tokio::test]
+    async fn editing_the_file_invalidates_the_cached_content() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "edit.bin", &vec![b'a'; 512]).await;
+
+        let fs = FileServer::new(FileServerConfig {
+            root: dir.path().to_path_buf(),
+            index: vec![],
+            browse: false,
+            browse_limit: None,
+            compress: false,
+            ..FileServerConfig::default()
+        });
+
+        let first = fs.serve("/edit.bin", None, None).await.unwrap().unwrap();
+        assert_eq!(first.content, vec![b'a'; 512]);
+
+        // 📌 The mtime is part of the key, so an edit must be visible even
+        // though the cache holds the previous bytes. The mtime is moved
+        // explicitly rather than by re-writing: a fast filesystem can stamp
+        // both writes with the same mtime, which would make this test pass for
+        // the wrong reason (nothing invalidated) instead of proving the key
+        // changed.
+        write_file(dir.path(), "edit.bin", &vec![b'b'; 512]).await;
+        let bumped = std::fs::metadata(dir.path().join("edit.bin"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            + std::time::Duration::from_secs(2);
+        let file = std::fs::File::options()
+            .write(true)
+            .open(dir.path().join("edit.bin"))
+            .unwrap();
+        file.set_modified(bumped).unwrap();
+        drop(file);
+
+        let second = fs.serve("/edit.bin", None, None).await.unwrap().unwrap();
+        assert_eq!(
+            second.content,
+            vec![b'b'; 512],
+            "an edited file must not be served from the stale cache entry"
         );
     }
 
@@ -1058,10 +1163,11 @@ mod serve_cache_tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let key = CompressKey {
+        let key = FileKey {
             path: resolved_path,
             mtime_ns,
             encoding: "gzip",
+            body_len: std::fs::metadata(&path).unwrap().len(),
         };
 
         // Simulate an in-flight compression: hold the per-key lock the way
@@ -1094,7 +1200,7 @@ mod serve_cache_tests {
         fs.compress_cache
             .lock()
             .unwrap()
-            .insert(key.clone(), Arc::new(compressed.clone()));
+            .insert(key.clone(), bytes::Bytes::from(compressed.clone()));
         drop(leader_guard);
 
         let served = tokio::time::timeout(std::time::Duration::from_secs(5), &mut follower)

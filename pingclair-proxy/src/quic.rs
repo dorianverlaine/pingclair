@@ -3050,24 +3050,24 @@ fn write_h3_access_log(
         request_id,
         method: &req.method,
         host,
-        path: &logged_path,
+        path: logged_path.as_ref(),
         status,
         bytes: body_bytes,
         duration_ms: request_started.elapsed().as_millis(),
         ttfb_ms,
-        client_ip: &remote_ip.to_string(),
+        client_ip: remote_ip,
         route,
         // 🧭 The upstream a request reached is not published out of the H3
         // handler yet, so this field is absent rather than wrong.
         upstream: None,
         user_agent: header("user-agent"),
-        referer: &redacted_referer,
+        referer: redacted_referer.as_ref(),
         protocol: "HTTP/3",
         error,
         // 🏷️ Header capture and TLS details are H1/H2-only for now; naming them
         // here with empty values would claim a parity this does not have.
-        request_headers: &[],
-        response_headers: &[],
+        request_headers: None,
+        response_headers: None,
         tls_version: None,
         tls_cipher: None,
     };
@@ -3559,7 +3559,7 @@ async fn handle_request_inner(
                         response_handlers.as_deref(),
                         file.status,
                         hdrs,
-                        H3LocalBody::Bytes(Bytes::from(file.content)),
+                        H3LocalBody::Bytes(file.content),
                         response_policy,
                         request_id,
                         request_deadline,
@@ -4507,7 +4507,7 @@ async fn reverse_proxy_upstream(
         };
         let mut peer = PingclairProxy::build_http_peer(
             &upstream,
-            proxy_config.as_ref(),
+            proxy_config,
             attempt_budget,
             attempt_budget,
             tls_policy,

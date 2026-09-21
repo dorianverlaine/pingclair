@@ -2637,6 +2637,7 @@ dependencies = [
  "boring-sys",
  "bytes",
  "chrono",
+ "crossbeam-queue",
  "flate2",
  "foreign-types",
  "futures",
@@ -2677,6 +2678,7 @@ version = "0.2.0-rc.2"
 dependencies = [
  "arc-swap",
  "async-compression",
+ "bytes",
  "flate2",
  "glob",
  "http",
