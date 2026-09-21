@@ -6,6 +6,7 @@
 *La performance brute de Cloudflare Pingora, dans une enveloppe aussi minimaliste que Caddy*
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Documentation](https://img.shields.io/badge/docs-pingclair.aqeo.dev-blue.svg)](https://pingclair.aqeo.dev)
 [![Rust](https://img.shields.io/badge/rust-1.98%2B-orange.svg)](https://www.rust-lang.org/)
 [![Status](https://img.shields.io/badge/status-active-green.svg)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/dorianverlaine/pingclair/pulls)
@@ -23,6 +24,9 @@
 La configuration de Nginx est réputée absconse, tandis que Caddy est agréable à utiliser mais repose sur Go. Pingclair vient combler ce vide : **100 % Rust**, **sûr en mémoire**, **performant** et **intuitif à configurer**.
 
 Que vous ayez besoin d'un simple serveur de fichiers statiques ou d'une passerelle d'entreprise avec répartition de charge, HTTPS automatique et HTTP/3, Pingclair fait le travail.
+
+La documentation publiée — installation, référence du Pingclairfile et
+méthodologie des benchmarks — se trouve sur <https://pingclair.aqeo.dev>.
 
 ## ✨ Fonctionnalités
 
