@@ -4507,7 +4507,7 @@ async fn reverse_proxy_upstream(
         };
         let mut peer = PingclairProxy::build_http_peer(
             &upstream,
-            proxy_config.as_ref(),
+            proxy_config,
             attempt_budget,
             attempt_budget,
             tls_policy,

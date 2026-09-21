@@ -2626,11 +2626,15 @@ impl PingclairProxy {
     }
 
     /// 🗄️ Returns the matched route's cache policy, if it configured one.
-    fn route_cache_config(&self, ctx: &RequestContext) -> Option<CacheConfig> {
+    ///
+    /// 🍃 Borrowed: the policy lives in the published snapshot for as long as
+    /// the request, and copying it here was the only reason this path touched
+    /// the allocator at all.
+    fn route_cache_config<'a>(&self, ctx: &'a RequestContext) -> Option<&'a CacheConfig> {
         let state = ctx.state.as_ref()?;
         let route_index = ctx.route_index?;
         let proxy = self.get_proxy_config(state, route_index)?;
-        proxy.cache.map(|cache| *cache)
+        proxy.cache.as_deref()
     }
 
     /// 🔎 Reports whether a shared copy of this request's response is meaningful.
@@ -2671,16 +2675,23 @@ impl PingclairProxy {
             })
     }
 
-    pub(crate) fn get_proxy_config(
+    /// 🔎 Borrows the matched route's reverse-proxy configuration.
+    ///
+    /// 🍃 Borrowed, not cloned: this runs several times per request, and the
+    /// configuration is immutable for the lifetime of the published snapshot
+    /// that owns it. Cloning here copied upstream vectors, header maps, and
+    /// boxed retry/overload state on every request to answer questions that
+    /// only ever read them.
+    pub(crate) fn get_proxy_config<'a>(
         &self,
-        state: &ProxyState,
+        state: &'a ProxyState,
         route_index: usize,
-    ) -> Option<ReverseProxyConfig> {
+    ) -> Option<&'a ReverseProxyConfig> {
         let route = state.config.routes.get(route_index)?;
         // Recurse into handle/route blocks so a nested reverse_proxy's
         // headers/timeouts are picked up, matching how ProxyState::new sets
         // up its load balancer.
-        find_reverse_proxy_config(&route.handler).cloned()
+        find_reverse_proxy_config(&route.handler)
     }
 
     /// 🌐 Builds an [`HttpPeer`] with the selected upstream protocol and timeouts.
@@ -5908,7 +5919,12 @@ impl ProxyHttp for PingclairProxy {
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> pingora_core::Result<()> {
-        let Some(cache) = self.route_cache_config(ctx) else {
+        // 🔢 Copied out of the borrowed policy immediately: the rest of this
+        // function mutates `ctx`, and there is nothing else to read from it.
+        let Some((cache_ttl_secs, cache_max_size_bytes)) = self
+            .route_cache_config(ctx)
+            .map(|cache| (cache.ttl_secs, cache.max_size_bytes))
+        else {
             return Ok(());
         };
 
@@ -5923,11 +5939,11 @@ impl ProxyHttp for PingclairProxy {
             return Ok(());
         }
 
-        ctx.cache_ttl_secs = Some(cache.ttl_secs);
+        ctx.cache_ttl_secs = Some(cache_ttl_secs);
 
         session.cache.enable(
             response_cache_storage(),
-            Some(response_cache_eviction(cache.max_size_bytes)),
+            Some(response_cache_eviction(cache_max_size_bytes)),
             Some(response_cache_predictor()),
             Some(response_cache_lock()),
             None,
@@ -5945,7 +5961,7 @@ impl ProxyHttp for PingclairProxy {
         //
         // ⚠️ Must come after `enable`: the setter panics while the cache is
         // still in the `Disabled` phase.
-        session.cache.set_max_file_size_bytes(cache.max_size_bytes);
+        session.cache.set_max_file_size_bytes(cache_max_size_bytes);
         ctx.cache_size_tracked = true;
         Ok(())
     }
@@ -6932,7 +6948,7 @@ impl ProxyHttp for PingclairProxy {
             };
             let mut peer = Self::build_http_peer(
                 &upstream,
-                proxy_config.as_ref(),
+                proxy_config,
                 attempt_budget,
                 read_budget,
                 tls_policy,
@@ -7016,7 +7032,7 @@ impl ProxyHttp for PingclairProxy {
             // 🌐 Builds the peer through the transport-neutral timeout policy.
             let mut peer = Self::build_http_peer(
                 &upstream,
-                proxy_config.as_ref(),
+                proxy_config,
                 attempt_budget,
                 read_budget,
                 tls_policy,
@@ -7239,7 +7255,7 @@ impl ProxyHttp for PingclairProxy {
             .as_ref()
             .zip(ctx.route_index)
             .and_then(|(state, route_index)| self.get_proxy_config(state, route_index))
-            .map(|config| config.retry)
+            .map(|config| config.retry.clone())
             .unwrap_or_default();
         let method = session.req_header().method.clone();
         let body_is_empty = session.as_mut().is_body_empty();
@@ -7680,7 +7696,7 @@ impl ProxyHttp for PingclairProxy {
             .as_ref()
             .zip(ctx.route_index)
             .and_then(|(state, route_index)| self.get_proxy_config(state, route_index))
-            .map(|config| config.retry)
+            .map(|config| config.retry.clone())
             .unwrap_or_default();
         let retry = crate::retry::permits_another_attempt(
             &retry_policy,
@@ -7718,7 +7734,7 @@ impl ProxyHttp for PingclairProxy {
             .as_ref()
             .zip(ctx.route_index)
             .and_then(|(state, route_index)| self.get_proxy_config(state, route_index))
-            .map(|config| config.retry)
+            .map(|config| config.retry.clone())
             .unwrap_or_default();
         let retry_buffer_truncated = session.as_ref().retry_buffer_truncated();
         let body_is_empty = session.as_mut().is_body_empty();
