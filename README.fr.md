@@ -44,28 +44,35 @@ même nombre de workers et la même charge utile de 1 Kio ; le backend du
 reverse proxy vit dans son propre conteneur sur le même réseau Docker et le
 générateur de charge tourne nativement. HTTP/1.1, HTTPS/1.1 et HTTP/2
 utilisent `h2load` en natif ; HTTP/3 utilise le `h2load` ngtcp2 dans le même
-réseau. Trois passes entrelacées de 50 000 requêtes par ligne, et une ligne ne
-compte que si toutes les requêtes ont réussi.
+réseau. Chaque valeur est la médiane de trois passes entrelacées de 50 000
+requêtes, et une ligne ne compte que si toutes les requêtes ont réussi.
 
 | Scénario | Pingclair | nginx 1.31.6 | Caddy 2.11.4 |
 | --- | ---: | ---: | ---: |
-| H1 statique | 46 125 | 39 478 | 18 266 |
-| H1S statique | 40 721 | 31 508 | 19 978 |
-| H2 statique | 92 369 | 41 972 | 17 424 |
-| H3 statique | 56 180 | 55 638 | 22 912 |
-| Reverse proxy H1 | 20 856 | 22 584 | 17 117 |
-| Reverse proxy H1S | 20 297 | 21 944 | 16 660 |
-| Reverse proxy H2 | 23 181 | 20 396 | non terminé |
-| Reverse proxy H3 | 28 078 | 22 213 | non terminé |
+| HTTP/1.1 statique | 46 125 | 39 478 | 18 266 |
+| HTTPS/1.1 statique | 40 721 | 31 508 | 19 978 |
+| HTTP/2 statique | 92 369 | 41 972 | 17 424 |
+| HTTP/3 statique | 56 180 | 55 638 | 22 912 |
+| Reverse proxy HTTP/1.1 | 20 856 | 22 584 | 17 117 |
+| Reverse proxy HTTPS/1.1 | 20 297 | 21 944 | 16 660 |
+| Reverse proxy HTTP/2 | 23 181 | 20 396 | non terminé |
+| Reverse proxy HTTP/3 | 28 078 | 22 213 | non terminé |
 
-Pingclair est en tête sur toutes les lignes statiques (1,2× en H1, 1,3× en
-H1S, 2,2× en H2, à égalité en H3) et sur les lignes proxy H2/H3 (+14 % et
-+26 %) ; le proxy H1/H1S accuse encore un retard d'environ 8 %. Caddy n'a pas
-terminé les lignes proxy H2/H3 sur cette machine — son renouvellement de
-connexions amont épuise les ports éphémères du conteneur à cette concurrence —
-donc ces deux cellules le disent au lieu de comparer deux charges différentes.
-Les requêtes par seconde absolues sur un portable ne sont pas une
-revendication de capacité ; le ratio l'est.
+Pingclair est en tête sur les lignes statiques HTTP/1.1, HTTPS/1.1 et HTTP/2
+(1,2×, 1,3× et 2,2× respectivement), tandis que HTTP/3 est pratiquement à
+égalité. Sur le reverse proxy, il devance nginx de 14 % en HTTP/2 et de 26 % en
+HTTP/3, alors que HTTP/1.1 et HTTPS/1.1 restent environ 8 % derrière.
+
+Sur cette machine et avec ce harnais, Caddy n'a pas terminé les lignes proxy
+HTTP/2 et HTTP/3, car le renouvellement de ses connexions amont a épuisé les
+ports éphémères disponibles du conteneur à la concurrence testée ; ces cellules
+sont donc signalées comme incomplètes plutôt que comparées sous une autre
+charge. Les requêtes par seconde absolues sur un portable ne constituent pas
+une revendication de capacité ; ces ratios ne décrivent la performance relative
+que dans le cadre de cette charge contrôlée, et chaque ligne ne vaut que pour
+une comparaison **entre serveurs d'un même protocole** : le générateur de
+charge HTTP/3 s'exécutant dans un autre environnement, les débits absolus ne
+doivent pas être comparés d'un protocole à l'autre.
 
 ## 📦 Installation
 

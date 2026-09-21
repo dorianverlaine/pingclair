@@ -43,27 +43,35 @@ candidate runs in a container capped at **2 CPUs** with the same worker count
 and the same 1 KiB payload; the reverse-proxy backend sits in its own
 container on the same Docker network; the load generator runs natively.
 HTTP/1.1, HTTPS/1.1 and HTTP/2 use a native `h2load`; HTTP/3 uses the
-ngtcp2-enabled `h2load` inside the same network. Three interleaved rounds of
-50,000 requests per row, and a row counts only when every request succeeded.
+ngtcp2-enabled `h2load` inside the same network. Each value is the median of
+three interleaved 50,000-request rounds, and a row counts only when every
+request succeeded.
 
 | Scenario | Pingclair | nginx 1.31.6 | Caddy 2.11.4 |
 | --- | ---: | ---: | ---: |
-| H1 static | 46,125 | 39,478 | 18,266 |
-| H1S static | 40,721 | 31,508 | 19,978 |
-| H2 static | 92,369 | 41,972 | 17,424 |
-| H3 static | 56,180 | 55,638 | 22,912 |
-| H1 reverse proxy | 20,856 | 22,584 | 17,117 |
-| H1S reverse proxy | 20,297 | 21,944 | 16,660 |
-| H2 reverse proxy | 23,181 | 20,396 | not completed |
-| H3 reverse proxy | 28,078 | 22,213 | not completed |
+| HTTP/1.1 static | 46,125 | 39,478 | 18,266 |
+| HTTPS/1.1 static | 40,721 | 31,508 | 19,978 |
+| HTTP/2 static | 92,369 | 41,972 | 17,424 |
+| HTTP/3 static | 56,180 | 55,638 | 22,912 |
+| HTTP/1.1 reverse proxy | 20,856 | 22,584 | 17,117 |
+| HTTPS/1.1 reverse proxy | 20,297 | 21,944 | 16,660 |
+| HTTP/2 reverse proxy | 23,181 | 20,396 | not completed |
+| HTTP/3 reverse proxy | 28,078 | 22,213 | not completed |
 
-Pingclair leads every static row (1.2× on H1, 1.3× on H1S, 2.2× on H2, and
-level on H3) and the H2/H3 proxied rows (+14 % and +26 %); plain H1/H1S
-proxying still trails by about 8 %. Caddy did not complete the proxied H2/H3
-rows on this host — its upstream connection churn exhausts the container's
-ephemeral ports at that concurrency — so those two cells say so instead of
-comparing two different workloads. Absolute requests per second on a laptop
-are not a capacity claim; the ratio is.
+Pingclair is ahead on the HTTP/1.1, HTTPS/1.1 and HTTP/2 static rows (1.2×,
+1.3× and 2.2× respectively), while HTTP/3 is effectively level. On the
+reverse-proxy workload it is 14 % ahead on HTTP/2 and 26 % ahead on HTTP/3,
+while HTTP/1.1 and HTTPS/1.1 remain about 8 % behind nginx.
+
+On this host and harness, Caddy did not complete the proxied HTTP/2 and HTTP/3
+rows because upstream connection churn exhausted the container's available
+ephemeral ports at the tested concurrency, so those cells are reported as
+incomplete rather than compared under a different workload. Absolute requests
+per second on this laptop are not capacity claims; these ratios describe
+relative performance under this specific controlled workload, and the rows are
+meant for within-protocol comparisons between servers — because the HTTP/3
+load generator runs in a different environment, absolute throughput should not
+be compared across protocols.
 
 ## 📦 Installation
 
