@@ -1858,6 +1858,15 @@ async fn test_listener_resource_limits_reject_before_dispatch_without_hanging() 
     assert_eq!(closed, 0);
 }
 
+// 🍎 This fixture builds a blackhole by over-filling a listener's accept queue
+// and relying on the kernel to leave the extra handshakes pending. macOS
+// answers those connects with RST instead, so no local listener can hold a
+// connect open there and the connect-timeout phase is untestable on that
+// platform without firewall rules. Linux keeps the coverage.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "macOS resets over-backlog connects, so the blackhole fixture cannot be built"
+)]
 #[tokio::test]
 async fn test_streamed_limits_and_timeout_phases_are_explicit_and_bounded() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
