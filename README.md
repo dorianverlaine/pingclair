@@ -63,9 +63,7 @@ proxying still trails by about 8 %. Caddy did not complete the proxied H2/H3
 rows on this host — its upstream connection churn exhausts the container's
 ephemeral ports at that concurrency — so those two cells say so instead of
 comparing two different workloads. Absolute requests per second on a laptop
-are not a capacity claim; the ratio is. Raw per-run evidence is kept locally
-under `benchmarks/results/20260922_mac_orbstack_2cpu/` and is not part of the
-repository.
+are not a capacity claim; the ratio is.
 
 ## 📦 Installation
 

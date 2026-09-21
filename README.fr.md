@@ -65,9 +65,7 @@ terminé les lignes proxy H2/H3 sur cette machine — son renouvellement de
 connexions amont épuise les ports éphémères du conteneur à cette concurrence —
 donc ces deux cellules le disent au lieu de comparer deux charges différentes.
 Les requêtes par seconde absolues sur un portable ne sont pas une
-revendication de capacité ; le ratio l'est. Les preuves brutes par passe sont
-conservées en local sous `benchmarks/results/20260922_mac_orbstack_2cpu/` et ne
-font pas partie du dépôt.
+revendication de capacité ; le ratio l'est.
 
 ## 📦 Installation
 
