@@ -81,17 +81,16 @@ Une fois l'installation terminée, la commande `pingclair` est disponible dans v
 
 ### Installation en une ligne sur Linux
 
-> 📦 **L'installation par défaut est `v0.2.0-rc.1`, une version candidate.**
+> 📦 **L'installation par défaut est `v0.2.0-rc.3`, une version candidate.**
 > C'est délibérément ce que `releases/latest` désigne désormais : `v0.1.7` est
 > antérieure à la parité HTTP/3, au TLS mutuel, à l'API d'administration et à la
 > plupart des corrections de sécurité listées dans
 > [`CHANGELOG.md`](CHANGELOG.md), et n'est pas une version par laquelle
-> commencer. La version candidate a tourné deux jours sans redémarrage sur les
-> trois transports — voir les
-> [notes de version](https://github.com/dorianverlaine/pingclair/releases/tag/v0.2.0-rc.1)
-> pour les mesures et pour le seul défaut connu, l'échec des montées en
-> WebSocket sous charge. Le script affiche l'étiquette qu'il installe et vérifie
-> la somme de contrôle SHA-256 publiée avant de décompresser.
+> commencer. Les
+> [notes de version](https://github.com/dorianverlaine/pingclair/releases/tag/v0.2.0-rc.3)
+> portent ce qui a changé dans cette candidate et les défauts connus au moment
+> du tag. Le script affiche l'étiquette qu'il installe et vérifie la somme de
+> contrôle SHA-256 publiée avant de décompresser.
 >
 > 🪦 **`v0.1.x` n'est plus maintenue.** Il n'y aura pas de `v0.1.8` : aucune
 > correction, aucun rétroportage et aucun avis de sécurité pour cette branche.

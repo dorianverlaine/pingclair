@@ -15,9 +15,20 @@ fact.
 ## [Unreleased]
 
 📦 Everything below is on `main` and not yet a final release; the workspace
-reports `0.2.0-rc.2`. The first release candidate, `0.2.0-rc.1`, was tagged on
-2026-08-20. This section covers changes since `v0.1.7` and becomes
-`## [0.2.0]` when the non-goals below are decided.
+reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
+2026-08-20 and the second, `0.2.0-rc.2`, on 2026-09-19. This section covers
+changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
+decided.
+
+### ⚡ Per-request work removed from the hot paths
+
+The reverse-proxy configuration is now borrowed from the published snapshot
+instead of copied several times per request; small uncompressed static bodies
+are answered from a cache keyed on path, mtime and length instead of being read
+per request; and the per-request copies of the request id, the original-URI
+variables, the client address rendering and cached bodies are gone. Runtime
+records keep going to the stream they always went to — the write itself is
+handed to a background thread, which is what keeps it off the request path.
 
 ### 📝 Buffered access logging
 

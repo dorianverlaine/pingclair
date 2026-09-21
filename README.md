@@ -81,15 +81,14 @@ Once installed, the `pingclair` command is available on your `PATH`.
 
 ### One-line install on Linux
 
-> 📦 **The default install is `v0.2.0-rc.1`, a release candidate.** It is what
+> 📦 **The default install is `v0.2.0-rc.3`, a release candidate.** It is what
 > `releases/latest` now resolves to, deliberately: `v0.1.7` predates HTTP/3
 > parity, mutual TLS, the Admin API and most of the security fixes listed in
-> [`CHANGELOG.md`](CHANGELOG.md), and is not a version to start from. The rc has
-> run for two days without a restart on all three transports — see the
-> [release notes](https://github.com/dorianverlaine/pingclair/releases/tag/v0.2.0-rc.1)
-> for the soak evidence and for the one known defect, WebSocket upgrades failing
-> under load. The script prints the tag it is installing and verifies the
-> published SHA-256 checksum before unpacking.
+> [`CHANGELOG.md`](CHANGELOG.md), and is not a version to start from. The
+> [release notes](https://github.com/dorianverlaine/pingclair/releases/tag/v0.2.0-rc.3)
+> carry what changed in this candidate and the defects known at tagging time.
+> The script prints the tag it is installing and verifies the published SHA-256
+> checksum before unpacking.
 >
 > 🪦 **`v0.1.x` is unmaintained.** There will be no `v0.1.8`: no fixes, no
 > backports and no security advisories for that line, so staying on it means
