@@ -37,26 +37,37 @@ Que vous ayez besoin d'un simple serveur de fichiers statiques ou d'une passerel
 
 ## ⚡ Benchmarks
 
-Comparaison la plus récente : Pingclair HEAD `43ec589` contre nginx 1.31.3,
-mesurée sur trois instances `c7i-flex.large` (2 vCPU chacune, non burstables)
-dans AWS `us-west-2a`, avec le backend du reverse proxy sur une machine
-dédiée. Fichier de 1 Kio ; H1 via `wrk -t2 -c100`, H2/H1S via
-`h2load -t2 -c50` ; toutes les passes enregistrées sont sans échec.
+Comparaison la plus récente : Pingclair `v0.2.0-rc.3` (le binaire publié)
+contre nginx 1.31.6 et Caddy 2.11.4, mesurée sur un portable Apple M2 avec
+OrbStack. Chaque candidat tourne dans un conteneur limité à **2 CPU** avec le
+même nombre de workers et la même charge utile de 1 Kio ; le backend du
+reverse proxy vit dans son propre conteneur sur le même réseau Docker et le
+générateur de charge tourne nativement. HTTP/1.1, HTTPS/1.1 et HTTP/2
+utilisent `h2load` en natif ; HTTP/3 utilise le `h2load` ngtcp2 dans le même
+réseau. Trois passes entrelacées de 50 000 requêtes par ligne, et une ligne ne
+compte que si toutes les requêtes ont réussi.
 
-| Scénario | Pingclair | nginx 1.31.3 |
-| --- | ---: | ---: |
-| H1 statique | 84 208 | 105 588 |
-| H2 statique (50×10) | 74 587 | 94 712 |
-| H1S statique | 70 004 | 55 304 |
-| Reverse proxy H1 | 38 938 | 85 744 |
-| Reverse proxy H2 (50×10) | 33 516 | 45 872 |
-| Reverse proxy H1S | 34 418 | 55 894 |
+| Scénario | Pingclair | nginx 1.31.6 | Caddy 2.11.4 |
+| --- | ---: | ---: | ---: |
+| H1 statique | 46 125 | 39 478 | 18 266 |
+| H1S statique | 40 721 | 31 508 | 19 978 |
+| H2 statique | 92 369 | 41 972 | 17 424 |
+| H3 statique | 56 180 | 55 638 | 22 912 |
+| Reverse proxy H1 | 20 856 | 22 584 | 17 117 |
+| Reverse proxy H1S | 20 297 | 21 944 | 16 660 |
+| Reverse proxy H2 | 23 181 | 20 396 | non terminé |
+| Reverse proxy H3 | 28 078 | 22 213 | non terminé |
 
-Pingclair est en tête sur le H1S statique (+27 %). Les H1/H2 statiques
-accusent un retard d'environ 20 % ; les reverse proxy H1/H1S restent les plus
-grands écarts, avec un H2 proxy à environ -27 %. Les preuves brutes par passe
-sont conservées en local sous `benchmarks/results/20260803_c7iflex_nocase/`
-et ne font pas partie du dépôt.
+Pingclair est en tête sur toutes les lignes statiques (1,2× en H1, 1,3× en
+H1S, 2,2× en H2, à égalité en H3) et sur les lignes proxy H2/H3 (+14 % et
++26 %) ; le proxy H1/H1S accuse encore un retard d'environ 8 %. Caddy n'a pas
+terminé les lignes proxy H2/H3 sur cette machine — son renouvellement de
+connexions amont épuise les ports éphémères du conteneur à cette concurrence —
+donc ces deux cellules le disent au lieu de comparer deux charges différentes.
+Les requêtes par seconde absolues sur un portable ne sont pas une
+revendication de capacité ; le ratio l'est. Les preuves brutes par passe sont
+conservées en local sous `benchmarks/results/20260922_mac_orbstack_2cpu/` et ne
+font pas partie du dépôt.
 
 ## 📦 Installation
 

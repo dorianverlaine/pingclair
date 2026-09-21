@@ -37,25 +37,34 @@ Whether you need a simple static file server or an enterprise gateway with load 
 
 ## ⚡ Benchmarks
 
-Latest comparison: Pingclair HEAD `43ec589` vs nginx 1.31.3, measured on
-three `c7i-flex.large` instances (2 vCPU each, non-burstable) in AWS
-`us-west-2a`, with the reverse-proxy backend on a dedicated host. 1 KiB
-file; H1 via `wrk -t2 -c100`, H2/H1S via `h2load -t2 -c50`; all recorded
-rounds had zero failures.
+Latest comparison: Pingclair `v0.2.0-rc.3` (the release binary) against nginx
+1.31.6 and Caddy 2.11.4, measured on one Apple M2 laptop with OrbStack. Every
+candidate runs in a container capped at **2 CPUs** with the same worker count
+and the same 1 KiB payload; the reverse-proxy backend sits in its own
+container on the same Docker network; the load generator runs natively.
+HTTP/1.1, HTTPS/1.1 and HTTP/2 use a native `h2load`; HTTP/3 uses the
+ngtcp2-enabled `h2load` inside the same network. Three interleaved rounds of
+50,000 requests per row, and a row counts only when every request succeeded.
 
-| Scenario | Pingclair | nginx 1.31.3 |
-| --- | ---: | ---: |
-| H1 static | 84,208 | 105,588 |
-| H2 static (50×10) | 74,587 | 94,712 |
-| H1S static | 70,004 | 55,304 |
-| H1 reverse proxy | 38,938 | 85,744 |
-| H2 reverse proxy (50×10) | 33,516 | 45,872 |
-| H1S reverse proxy | 34,418 | 55,894 |
+| Scenario | Pingclair | nginx 1.31.6 | Caddy 2.11.4 |
+| --- | ---: | ---: | ---: |
+| H1 static | 46,125 | 39,478 | 18,266 |
+| H1S static | 40,721 | 31,508 | 19,978 |
+| H2 static | 92,369 | 41,972 | 17,424 |
+| H3 static | 56,180 | 55,638 | 22,912 |
+| H1 reverse proxy | 20,856 | 22,584 | 17,117 |
+| H1S reverse proxy | 20,297 | 21,944 | 16,660 |
+| H2 reverse proxy | 23,181 | 20,396 | not completed |
+| H3 reverse proxy | 28,078 | 22,213 | not completed |
 
-Pingclair leads on H1S static (+27 %). Static H1/H2 trail about 20 %;
-reverse-proxy H1/H1S remain the largest gaps, with H2 proxy trailing about
-27 %. Raw per-run evidence is kept locally under
-`benchmarks/results/20260803_c7iflex_nocase/` and is not part of the
+Pingclair leads every static row (1.2× on H1, 1.3× on H1S, 2.2× on H2, and
+level on H3) and the H2/H3 proxied rows (+14 % and +26 %); plain H1/H1S
+proxying still trails by about 8 %. Caddy did not complete the proxied H2/H3
+rows on this host — its upstream connection churn exhausts the container's
+ephemeral ports at that concurrency — so those two cells say so instead of
+comparing two different workloads. Absolute requests per second on a laptop
+are not a capacity claim; the ratio is. Raw per-run evidence is kept locally
+under `benchmarks/results/20260922_mac_orbstack_2cpu/` and is not part of the
 repository.
 
 ## 📦 Installation
