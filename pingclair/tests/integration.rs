@@ -586,6 +586,28 @@ fn no_proxy_client() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
+/// 🔌 A port that is genuinely free right now, learned by binding and releasing
+/// it.
+///
+/// "Unbindable" is not a property a test should inherit from its environment:
+/// port 1 is bindable by root, and Docker sets
+/// `net.ipv4.ip_unprivileged_port_start=0`, which makes it bindable by anyone.
+/// A free dynamic port plus an assertion that it is **still** free after the
+/// refusal tests the contract — no socket was created — instead of the kernel's
+/// opinion of a low port.
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("learn a free port");
+    listener
+        .local_addr()
+        .expect("the probe listener has an address")
+        .port()
+}
+
+/// 🔎 Whether nothing is listening on `127.0.0.1:port` at this instant.
+fn port_is_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
 /// 🧭 Sends one raw HTTP request through a chosen PROXY protocol transport source.
 async fn proxy_protocol_request(
     address: SocketAddr,
@@ -5860,6 +5882,9 @@ async fn test_admin_adapt_export_and_load() {
 
     // 🛡️ A document changing listener topology is restart-required; the
     // process must not claim that only its TCP subset took effect.
+    // 🔌 A port this process knows is free, rather than port 1 — see
+    // `free_port`.
+    let new_listener_port = free_port();
     let bad = serde_json::json!({
         "admin": {
             "enabled": true,
@@ -5867,7 +5892,7 @@ async fn test_admin_adapt_export_and_load() {
         },
         "servers": [{
             "name": "bad",
-            "listen": ["127.0.0.1:1"],
+            "listen": [format!("127.0.0.1:{new_listener_port}")],
             "routes": []
         }]
     });
@@ -5880,6 +5905,12 @@ async fn test_admin_adapt_export_and_load() {
     assert_eq!(refused.status(), reqwest::StatusCode::CONFLICT);
     let refusal: serde_json::Value = refused.json().await.unwrap();
     assert_eq!(refusal["restart_required"], true);
+    // 🧭 The refused document must not have taken the socket it named — the
+    // contract, rather than the kernel's opinion of a low port.
+    assert!(
+        port_is_free(new_listener_port),
+        "a restart-required transaction must not bind its proposed listener"
+    );
     // 🧭 The previous config must still be live.
     let response = client.get(server.url(0, "/")).send().await.unwrap();
     assert_eq!(response.text().await.unwrap(), "loaded-ok");
@@ -6118,14 +6149,16 @@ async fn test_admin_config_traversal_expand_appends() {
 
 /// 🚫 A traversal that changes listener topology is refused wholesale.
 #[tokio::test]
-async fn test_admin_config_traversal_unbindable_listener_rolls_back() {
+async fn test_admin_config_traversal_new_listener_rolls_back() {
     let mut server = TestServer::new_pingclairfile(&admin_test_pingclairfile("/__ready_rb", "rb"));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
     // 🚫 No new socket is attempted: all H1, H2, H3, and TLS topology
     // changes are explicitly restart-required and roll the document back.
-    let new_server = serde_json::json!({"listen": ["127.0.0.1:1"], "routes": []});
+    let new_listener_port = free_port();
+    let new_server =
+        serde_json::json!({"listen": [format!("127.0.0.1:{new_listener_port}")], "routes": []});
     let resp = client
         .post(server.admin_url("/config/servers/..."))
         .json(&serde_json::json!([new_server]))
@@ -6135,6 +6168,12 @@ async fn test_admin_config_traversal_unbindable_listener_rolls_back() {
     assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
     let refusal = resp.json::<serde_json::Value>().await.unwrap();
     assert_eq!(refusal["restart_required"], true);
+    // 🧭 The refused document must not have taken the socket it named — the
+    // contract, rather than the kernel's opinion of a low port.
+    assert!(
+        port_is_free(new_listener_port),
+        "a restart-required transaction must not bind its proposed listener"
+    );
 
     // 🧭 The document and the running server are both unchanged.
     let resp = client
@@ -6228,6 +6267,7 @@ async fn test_admin_load_marks_listener_topology_restart_required() {
     assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
     let refusal = response.json::<serde_json::Value>().await.unwrap();
     assert_eq!(refusal["restart_required"], true);
+
     let reason = refusal["error"].as_str().unwrap_or_default();
     assert!(
         ["H1", "H2", "H3", "TLS"]
@@ -7845,8 +7885,9 @@ async fn test_admin_config_for_an_unknown_listener_applies_nothing() {
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
+    let new_listener_port = free_port();
     let half_valid = serde_json::json!({
-        "listen": [server.address(0).to_string(), "127.0.0.1:1"],
+        "listen": [server.address(0).to_string(), format!("127.0.0.1:{new_listener_port}")],
         "routes": [{
             "path": "/*",
             "handler": { "type": "respond", "status": 200, "body": "should-never-apply" }
@@ -7864,6 +7905,13 @@ async fn test_admin_config_for_an_unknown_listener_applies_nothing() {
     assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
     let refusal = response.json::<serde_json::Value>().await.unwrap();
     assert_eq!(refusal["restart_required"], true);
+
+    // 🧭 The refused document must not have taken the socket it named — the
+    // contract, rather than the kernel's opinion of a low port.
+    assert!(
+        port_is_free(new_listener_port),
+        "a restart-required transaction must not bind its proposed listener"
+    );
 
     // 🛡️ The live listener named first must not have been rewritten.
     let untouched = client

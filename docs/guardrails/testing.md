@@ -132,12 +132,15 @@
   stages call, and `.github/actions/setup-linux-deps` for runners, which retries
   against the runner's own mirror. A new apt step should extend one of those
   rather than writing `apt-get update && apt-get install` again.
-- 🚫 **Listener-topology rollback tests must no longer rely on "port 1 cannot be
-  bound".** Since 2026-08-13, Admin and signal reload return `restart_required`
-  for added or removed listeners before any bind is attempted; tests should use a
-  genuinely free dynamic port and assert that the program still has not taken it.
-  That verifies the product's contract rather than Docker's
-  `ip_unprivileged_port_start`, the running user, or `CAP_NET_BIND_SERVICE`.
+- 🚫 **A listener-topology rollback test asks for a free port, never for an
+  "unbindable" one.** Admin and signal reload return `restart_required` for
+  added or removed listeners before any bind is attempted, so the test's job is
+  to assert that the refused document left its socket alone — `free_port()` and
+  `port_is_free()` in `pingclair/tests/integration.rs` are the two helpers.
+  Port 1 was the old spelling of "cannot bind this", and it verifies Docker's
+  `ip_unprivileged_port_start`, the running user, or `CAP_NET_BIND_SERVICE`
+  instead of the product's contract. (It also stopped being *un*bindable in
+  containers, which is how the three tests that used it were found.)
 
   > 📌 The general shape: **any test whose assertion is "this operation will
   > fail" carries a hidden environmental premise.** When you can assert a stable
