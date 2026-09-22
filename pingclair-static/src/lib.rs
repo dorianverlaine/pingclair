@@ -9,11 +9,9 @@
 //! - Directory browsing
 //! - Index file handling
 
-mod compress;
 mod file_server;
 mod mime;
 
-pub use compress::CompressionLevel;
 pub use file_server::{
     FileServer, FileServerConfig, HidePolicy, PrecompressedFormat, ServedResponse, StreamingFile,
 };

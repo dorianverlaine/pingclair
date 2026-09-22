@@ -91,16 +91,6 @@ impl HandlerResponse {
             body: None,
         }
     }
-
-    /// Create not found response
-    pub fn not_found() -> Self {
-        Self::with_body(404, "Not Found")
-    }
-
-    /// Create internal server error response
-    pub fn internal_error() -> Self {
-        Self::with_body(500, "Internal Server Error")
-    }
 }
 
 /// Execute a handler configuration against an incoming request.
