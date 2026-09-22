@@ -84,7 +84,12 @@ jobs:
       - name: Place the checkout at the image's workspace path
         run: |
           set -euo pipefail
-          cp -a "${GITHUB_WORKSPACE}/." /workspace/pingclair/
+          # 🔑 `--no-preserve=ownership`: the mounted workspace belongs to the
+          # runner's user, and a copy that keeps that ownership is a tree the
+          # root-run container cannot read with git —
+          # `fatal: detected dubious ownership in repository at '/workspace/pingclair'`.
+          # Root builds root's copy.
+          cp -a --no-preserve=ownership "${GITHUB_WORKSPACE}/." /workspace/pingclair/
 
       - uses: ./.github/actions/setup-ci
 

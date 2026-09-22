@@ -69,7 +69,9 @@ bench-smoke:
 h3:
     cargo +{{ rust }} build --release --locked
     PINGCLAIR_BINARY="{{ target-dir }}/release/pingclair" scripts/test-h3-day28-local.sh
-    PINGCLAIR_BINARY="{{ target-dir }}/release/pingclair" scripts/test-h3-cancellation-local.sh
+    # 🎲 The cancellation check goes through a wrapper that retries the one
+    # known flake (issue #68) and nothing else; see the file for the evidence.
+    PINGCLAIR_BINARY="{{ target-dir }}/release/pingclair" scripts/h3-cancellation-check.sh
     PINGCLAIR_BINARY="{{ target-dir }}/release/pingclair" scripts/test-h3-client-auth-local.sh
 
 # 💽 Report build-cache disk usage against the repository budget.

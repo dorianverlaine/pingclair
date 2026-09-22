@@ -32,7 +32,7 @@ jobs:
       - name: Place the checkout at the image's workspace path
         run: |
           set -euo pipefail
-          cp -a "${GITHUB_WORKSPACE}/." /workspace/pingclair/
+          cp -a --no-preserve=ownership "${GITHUB_WORKSPACE}/." /workspace/pingclair/
 
       - uses: ./.github/actions/setup-ci
 
