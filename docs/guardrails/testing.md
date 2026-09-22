@@ -255,6 +255,19 @@ cost time when the machinery is touched.
   zip of its outputs) and reports credential-shaped strings plus this machine's
   home path and hostname; `--policy mac` is the variant for a machine's own
   bucket, where paths are expected. Credential canaries fail under both.
+  - 📌 The first run of that audit reported a clean bucket while the payloads
+    underneath were zstd-compressed: a scan of the stored bytes sees noise, not
+    paths. It decompresses now and counts how many payloads it could actually
+    read, so a sample it cannot see inside is reported as such instead of as a
+    pass.
+- **The shared bucket is not automatically the fast choice.** Reading one cached
+  object from R2 took roughly 0.87 s from a GitHub runner, so the H3 job's 849
+  objects cost about twelve minutes of wall clock — while the same job on the
+  Actions cache, in the runner's own region, finished in 6m30s including its
+  tests. R2 pays for *cross-machine* sharing, which is the point of the fabric;
+  a job whose artifacts no other machine can reuse — because it does not build
+  inside the builder image — is better off on the Actions cache, which is where
+  the H3 job stays until it moves into the image.
 
 ## 📁 Verification evidence
 
