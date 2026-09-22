@@ -217,24 +217,11 @@ pub(crate) fn permits_retry(
     {
         return false;
     }
-    if !policy.retry_match.is_empty() {
-        return retry_match_permits(&policy.retry_match, facts, regex);
-    }
-    // 🧭 Nothing configured, so the flat policy decides — which is also the
-    // path a JSON configuration written before predicates existed takes.
-    let Some(status) = facts.status else {
-        return false;
-    };
-    policy.status_codes.contains(&status)
-        && policy
-            .methods
-            .iter()
-            .any(|configured| configured.eq_ignore_ascii_case(facts.upstream_method.as_str()))
-        && (policy.path_patterns.is_empty()
-            || policy
-                .path_patterns
-                .iter()
-                .any(|pattern| glob_matches(pattern, facts.upstream_path)))
+    // 🧭 The predicate is the whole policy, including for a JSON document that
+    // was written before predicates existed: those flat lists are translated
+    // into one at load (`RetryConfigWire`), so this is the only place a retry
+    // decision is made. Nothing configured means no retry.
+    !policy.retry_match.is_empty() && retry_match_permits(&policy.retry_match, facts, regex)
 }
 
 /// 🧭 Matches one Caddy-style path glob (`/foo*`) against a request path.
@@ -303,8 +290,13 @@ mod tests {
     fn status_retry_requires_an_idempotent_bodyless_request() {
         let policy = RetryConfig {
             max_attempts: 3,
-            status_codes: vec![503],
-            methods: vec!["GET".to_string()],
+            retry_match: RetryPredicate::from_flat_lists(
+                vec![503],
+                vec!["GET".to_string()],
+                Vec::new(),
+            )
+            .into_iter()
+            .collect(),
             ..Default::default()
         };
         assert!(permits(&policy, &Method::GET, true, "/probe"));
@@ -316,9 +308,13 @@ mod tests {
     fn path_patterns_gate_status_redispatch_like_caddy() {
         let policy = RetryConfig {
             max_attempts: 3,
-            status_codes: vec![503],
-            methods: vec!["GET".to_string()],
-            path_patterns: vec!["/api/*".to_string()],
+            retry_match: RetryPredicate::from_flat_lists(
+                vec![503],
+                vec!["GET".to_string()],
+                vec!["/api/*".to_string()],
+            )
+            .into_iter()
+            .collect(),
             ..Default::default()
         };
         assert!(permits(&policy, &Method::GET, true, "/api/users"));

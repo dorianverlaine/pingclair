@@ -2283,8 +2283,14 @@ pub fn default_cache_max_size_bytes() -> usize {
 }
 
 /// 🔁 Controls safe, request-local upstream redispatch.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+///
+/// 🧭 The policy is the predicate, and only the predicate. Four flat fields
+/// (`status_codes`, `methods`, `path_patterns`, `expressions`) used to sit
+/// beside it, and the runtime read them as a *second* implementation whenever
+/// `retry_match` was empty — two implementations of one rule, which is two
+/// rules the moment they drift. They are still accepted from JSON through
+/// the wire shape and translated here; nothing at runtime consults them.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RetryConfig {
     /// 🔢 Maximum upstream attempts, including the initial attempt.
     #[serde(default = "default_retry_attempts")]
@@ -2295,24 +2301,6 @@ pub struct RetryConfig {
     /// 💤 Fixed delay before each retry.
     #[serde(default)]
     pub backoff_ms: u64,
-    /// 🔄 Upstream status codes that trigger redispatch before response commit.
-    #[serde(default)]
-    pub status_codes: Vec<u16>,
-    /// 🛡️ Idempotent methods eligible for status-code redispatch.
-    #[serde(default = "default_retry_methods")]
-    pub methods: Vec<String>,
-    /// 🧭 Request-path glob patterns (`/foo*`) that must match for a status
-    /// redispatch to be permitted, mirroring Caddy's `lb_retry_match path`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub path_patterns: Vec<String>,
-    /// 🧾 Retry-match expressions, kept verbatim for diagnostics only.
-    ///
-    /// ⚠️ Not evaluated — [`RetryConfig::retry_match`] is what decides. This
-    /// field exists so an operator can see the text they wrote next to the
-    /// predicate it became, and so a spelling nobody has taught the parser yet
-    /// is visible rather than absent.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub expressions: Vec<String>,
 
     /// 🔁 One entry per `lb_retry_match`, **any** of which permits a retry.
     ///
@@ -2396,6 +2384,59 @@ impl RetryPredicate {
 
     /// 🔤 Visits every regular expression in the tree, so the caller can
     /// compile them once at load instead of once per retry decision.
+    /// 🔄 The single predicate the flat retry lists stood for.
+    ///
+    /// `status_codes` / `methods` / `path_patterns` predate `lb_retry_match`:
+    /// the DSL's `retry` block still spells them, and a JSON configuration
+    /// written then still carries them. The old decision was
+    /// `status ∈ status_codes && method ∈ methods && (no path patterns || path
+    /// matches one)`, so that is exactly what this builds — with an empty
+    /// method list meaning "no method condition", and no status codes meaning
+    /// "no retry at all" (`None`).
+    ///
+    /// One implementation, used by both configuration paths, because the
+    /// failure this replaces was two of them.
+    pub fn from_flat_lists(
+        status_codes: Vec<u16>,
+        methods: Vec<String>,
+        path_patterns: Vec<String>,
+    ) -> Option<Self> {
+        if status_codes.is_empty() {
+            return None;
+        }
+        let mut of = vec![Self::Status {
+            any_of: status_codes,
+        }];
+        // 🛡️ Pushed even when empty, and an empty method list is refused by
+        // `validate_config` rather than read as "any method": "no method ever
+        // matches" is what the old comparison meant, and retrying a POST
+        // because the list was empty is the one direction nobody asked for.
+        of.push(Self::Method { any_of: methods });
+        if !path_patterns.is_empty() {
+            of.push(Self::Path {
+                any_of: path_patterns,
+            });
+        }
+        Some(if of.len() == 1 {
+            of.pop().expect("one condition")
+        } else {
+            Self::All { of }
+        })
+    }
+
+    /// 🌳 Visits every condition in this tree, including this one.
+    ///
+    /// The compiler bounds each shape with it — a status list and a method list
+    /// are as reachable from a posted JSON document as the tree's depth is.
+    pub fn for_each_condition(&self, visit: &mut impl FnMut(&RetryPredicate)) {
+        visit(self);
+        if let Self::All { of } | Self::Any { of } = self {
+            for child in of {
+                child.for_each_condition(visit);
+            }
+        }
+    }
+
     pub fn for_each_regex(&self, visit: &mut impl FnMut(&str)) {
         match self {
             Self::All { of } | Self::Any { of } => {
@@ -2415,11 +2456,80 @@ impl Default for RetryConfig {
             max_attempts: default_retry_attempts(),
             total_timeout_ms: None,
             backoff_ms: 0,
-            status_codes: Vec::new(),
-            methods: default_retry_methods(),
-            path_patterns: Vec::new(),
-            expressions: Vec::new(),
             retry_match: Vec::new(),
+        }
+    }
+}
+
+/// 🧭 A retry policy as it arrives from JSON, including the fields the
+/// pre-predicate era wrote.
+///
+/// `status_codes`, `methods` and `path_patterns` were the whole policy before
+/// `lb_retry_match` existed, and a configuration written then still carries
+/// them: reading them here and translating them into a predicate is what lets
+/// the runtime have a single implementation. `expressions` never took part in
+/// the decision — it existed so an operator could see the text they wrote next
+/// to the predicate it became — and is accepted and dropped, because the
+/// predicate is the record now.
+///
+/// `deny_unknown_fields` lives here rather than on `RetryConfig` because a
+/// hand-written `Deserialize` cannot carry the attribute; the wire shape is the
+/// one that has to refuse a field nobody reads.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetryConfigWire {
+    #[serde(default = "default_retry_attempts")]
+    max_attempts: usize,
+    #[serde(default)]
+    total_timeout_ms: Option<u64>,
+    #[serde(default)]
+    backoff_ms: u64,
+    #[serde(default)]
+    status_codes: Vec<u16>,
+    #[serde(default = "default_retry_methods")]
+    methods: Vec<String>,
+    #[serde(default)]
+    path_patterns: Vec<String>,
+    /// Accepted from older documents and dropped: `_` rather than an allow,
+    /// because the field exists to be *read* and nothing else.
+    #[serde(default, rename = "expressions")]
+    _expressions: Vec<String>,
+    #[serde(default)]
+    retry_match: Vec<RetryPredicate>,
+}
+
+impl<'de> Deserialize<'de> for RetryConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(RetryConfig::from(RetryConfigWire::deserialize(
+            deserializer,
+        )?))
+    }
+}
+
+impl From<RetryConfigWire> for RetryConfig {
+    fn from(wire: RetryConfigWire) -> Self {
+        // 🧭 Predicates win when both spellings are present: they are the
+        // newer shape, and the flat lists are the fallback for documents
+        // written before they existed.
+        let retry_match = if wire.retry_match.is_empty() {
+            RetryPredicate::from_flat_lists(
+                wire.status_codes.clone(),
+                wire.methods.clone(),
+                wire.path_patterns.clone(),
+            )
+            .into_iter()
+            .collect()
+        } else {
+            wire.retry_match
+        };
+        Self {
+            max_attempts: wire.max_attempts,
+            total_timeout_ms: wire.total_timeout_ms,
+            backoff_ms: wire.backoff_ms,
+            retry_match,
         }
     }
 }
@@ -3308,6 +3418,53 @@ mod tests {
         assert_eq!(parsed.servers[0].limits.max_connections, Some(512));
     }
 
+    /// 🔄 A retry policy written before `lb_retry_match` existed decides the
+    /// same way it always did: the flat fields become one predicate at load.
+    ///
+    /// That translation is the whole point of the change — the runtime used to
+    /// keep a *second* implementation for exactly these documents, and two
+    /// implementations of one rule drift.
+    #[test]
+    fn a_flat_retry_policy_becomes_a_predicate() {
+        let policy: RetryConfig = serde_json::from_str(
+            r#"{"max_attempts":3,"status_codes":[503],"methods":["GET"],
+                "path_patterns":["/api/*"],"expressions":["{rp.status_code} == 503"]}"#,
+        )
+        .expect("a pre-predicate policy must still load");
+
+        assert_eq!(
+            policy.retry_match,
+            vec![RetryPredicate::All {
+                of: vec![
+                    RetryPredicate::Status { any_of: vec![503] },
+                    RetryPredicate::Method {
+                        any_of: vec!["GET".to_string()]
+                    },
+                    RetryPredicate::Path {
+                        any_of: vec!["/api/*".to_string()]
+                    },
+                ],
+            }]
+        );
+
+        // 🛡️ Statuses without methods kept the idempotent default, not "no
+        // method condition" — that is what the old fallback compared against.
+        let statuses_only: RetryConfig =
+            serde_json::from_str(r#"{"status_codes":[502]}"#).expect("must load");
+        let condition = &statuses_only.retry_match[0];
+        assert!(
+            matches!(condition, RetryPredicate::All { of } if of.len() == 2),
+            "expected status and the default method list, got {condition:?}"
+        );
+
+        // 🚫 A field the wire shape does not know is a load failure, which is
+        // how a misspelling stays visible.
+        assert!(
+            serde_json::from_str::<RetryConfig>(r#"{"status_codess":[503]}"#).is_err(),
+            "an unknown retry field must be refused rather than ignored"
+        );
+    }
+
     #[test]
     fn test_server_config() {
         let config = ServerConfig {
@@ -3406,7 +3563,7 @@ mod tests {
         assert_eq!(config.between_reads_timeout, None);
         assert_eq!(*config.retry, RetryConfig::default());
         assert_eq!(config.retry.max_attempts, 16);
-        assert!(config.retry.status_codes.is_empty());
+        assert!(config.retry.retry_match.is_empty());
         assert_eq!(*config.overload, OverloadConfig::default());
         assert_eq!(*config.circuit_breaker, CircuitBreakerConfig::default());
     }

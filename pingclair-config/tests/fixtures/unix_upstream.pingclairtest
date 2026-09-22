@@ -55,16 +55,7 @@ grpc.example {
             "retry": {
               "max_attempts": 16,
               "total_timeout_ms": null,
-              "backoff_ms": 0,
-              "status_codes": [],
-              "methods": [
-                "GET",
-                "HEAD",
-                "OPTIONS",
-                "TRACE",
-                "PUT",
-                "DELETE"
-              ]
+              "backoff_ms": 0
             },
             "overload": {
               "max_in_flight": null,
@@ -186,16 +177,7 @@ grpc.example {
             "retry": {
               "max_attempts": 16,
               "total_timeout_ms": null,
-              "backoff_ms": 0,
-              "status_codes": [],
-              "methods": [
-                "GET",
-                "HEAD",
-                "OPTIONS",
-                "TRACE",
-                "PUT",
-                "DELETE"
-              ]
+              "backoff_ms": 0
             },
             "overload": {
               "max_in_flight": null,

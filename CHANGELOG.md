@@ -61,6 +61,26 @@ false: while it defaulted to false, "did not say" and "turned it off" were the
 same value, which is why nothing could read it. Whether a QUIC listener exists
 at all is still the global `servers { protocols … }` list.
 
+### 🔁 The retry policy has one implementation
+
+`status_codes`, `methods`, `path_patterns` and `expressions` are gone from the
+compiled configuration. The runtime used to keep **two** ways to decide whether a
+failed attempt may be retried — the `lb_retry_match` predicate, and the flat
+lists as a fallback whenever it was empty — and two implementations of one rule
+drift.
+
+A document that still spells the flat fields is translated at load into the
+predicate they stood for: status **and** method **and** (no path patterns **or**
+one of them). That covers both paths — the JSON shape a pre-predicate
+configuration carries, and the DSL's own `retry` block, which upstream spells
+that way. `expressions`, which never took part in the decision, is accepted and
+dropped.
+
+**Breaking:** the exported configuration changes shape. `GET /config` and
+`pingclair adapt` no longer print the flat fields, a misspelled field inside
+`retry` is now a load failure, and an explicitly empty `methods` list stays a
+load error rather than quietly becoming "any method".
+
 ### 🥇 `lb_policy first` means first
 
 The policy was accepted and mapped to round-robin, so a primary/secondary pair

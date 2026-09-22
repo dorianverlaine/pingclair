@@ -1451,36 +1451,6 @@ fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<(
                     message: "retry backoff_ms must be shorter than total_timeout_ms".to_string(),
                 });
             }
-            if retry
-                .status_codes
-                .iter()
-                .any(|status| !(400..=599).contains(status))
-            {
-                return Err(CompileError::InvalidRoute {
-                    message: "retry status_codes must contain only 4xx or 5xx values".to_string(),
-                });
-            }
-            if retry.status_codes.len() > 200
-                || retry.status_codes.iter().collect::<HashSet<_>>().len()
-                    != retry.status_codes.len()
-            {
-                return Err(CompileError::InvalidRoute {
-                    message: "retry status_codes must be unique and contain at most 200 values"
-                        .to_string(),
-                });
-            }
-            // 🧭 Non-idempotent methods are allowed when the operator names
-            // them explicitly via `lb_retry_match method`; the runtime still
-            // refuses to replay a request that carries a body, which is the
-            // actual safety property.
-            if retry.methods.is_empty()
-                || retry.methods.len() > 12
-                || retry.methods.iter().collect::<HashSet<_>>().len() != retry.methods.len()
-            {
-                return Err(CompileError::InvalidRoute {
-                    message: "retry methods must be non-empty, unique, and at most 12".to_string(),
-                });
-            }
 
             // 🧱 The predicate tree is recursive and reachable from the Admin
             // API, so both its depth and its width are bounded here rather than
@@ -1501,6 +1471,52 @@ fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<(
                         ),
                     });
                 }
+                // 🔢 The bounds the flat `status_codes` and `methods` lists
+                // used to carry now live on the shapes that replaced them, so
+                // both configuration paths get them: a list of hundreds of
+                // statuses is a typo, and 3xx is not a failure.
+                let mut out_of_bounds = None;
+                predicate.for_each_condition(&mut |condition| {
+                    if out_of_bounds.is_some() {
+                        return;
+                    }
+                    out_of_bounds = match condition {
+                        pingclair_core::config::RetryPredicate::Status { any_of } => {
+                            (any_of.is_empty()
+                                || any_of.len() > 200
+                                || any_of.iter().collect::<HashSet<_>>().len() != any_of.len()
+                                || any_of.iter().any(|status| !(400..=599).contains(status)))
+                            .then(|| {
+                                "retry_match status lists must be non-empty, unique, 4xx/5xx                                  only, and at most 200 entries"
+                                    .to_string()
+                            })
+                        }
+                        pingclair_core::config::RetryPredicate::StatusAtLeast { code } => {
+                            (!(400..=599).contains(code)).then(|| {
+                                "retry_match status thresholds must be a 4xx or 5xx value"
+                                    .to_string()
+                            })
+                        }
+                        // 🧭 Non-idempotent methods are allowed when the
+                        // operator names them explicitly; the runtime still
+                        // refuses to replay a request that carries a body,
+                        // which is the actual safety property.
+                        pingclair_core::config::RetryPredicate::Method { any_of } => {
+                            (any_of.is_empty()
+                                || any_of.len() > 12
+                                || any_of.iter().collect::<HashSet<_>>().len() != any_of.len())
+                            .then(|| {
+                                "retry_match method lists must be non-empty, unique, and at most                                  12 entries"
+                                    .to_string()
+                            })
+                        }
+                        _ => None,
+                    };
+                });
+                if let Some(message) = out_of_bounds {
+                    return Err(CompileError::InvalidRoute { message });
+                }
+
                 // 🔤 Compiled here so an invalid pattern is a load error rather
                 // than a surprise on the first failed attempt — the moment the
                 // server is least able to absorb one.
@@ -2496,11 +2512,21 @@ fn compile_handler(
                     max_attempts: proxy.retry.max_attempts,
                     total_timeout_ms: proxy.retry.total_timeout_ms,
                     backoff_ms: proxy.retry.backoff_ms,
-                    status_codes: proxy.retry.status_codes.clone(),
-                    methods: proxy.retry.methods.clone(),
-                    path_patterns: proxy.retry.path_patterns.clone(),
-                    expressions: proxy.retry.expressions.clone(),
-                    retry_match: proxy.retry.retry_match.clone(),
+                    // 🔄 A flat `retry { status_codes … methods … }` block is
+                    // upstream's spelling, not a second policy: it becomes one
+                    // predicate here, through the same constructor the JSON
+                    // path uses.
+                    retry_match: if proxy.retry.retry_match.is_empty() {
+                        pingclair_core::config::RetryPredicate::from_flat_lists(
+                            proxy.retry.status_codes.clone(),
+                            proxy.retry.methods.clone(),
+                            proxy.retry.path_patterns.clone(),
+                        )
+                        .into_iter()
+                        .collect()
+                    } else {
+                        proxy.retry.retry_match.clone()
+                    },
                 }),
                 overload: Box::new(pingclair_core::config::OverloadConfig {
                     max_in_flight: proxy.overload.max_in_flight,

@@ -5870,8 +5870,8 @@ async fn send_error_response(
 mod tests {
     use super::*;
     use pingclair_core::config::{
-        BasicAuthCredential, HandlerElement, Matcher, RetryConfig, ReverseProxyConfig, RouteConfig,
-        ServerConfig,
+        BasicAuthCredential, HandlerElement, Matcher, RetryConfig, RetryPredicate,
+        ReverseProxyConfig, RouteConfig, ServerConfig,
     };
 
     fn proxy_state(handler: HandlerConfig) -> ProxyState {
@@ -6562,8 +6562,14 @@ mod tests {
             upstreams: vec![format!("http://{upstream_address}")],
             retry: Box::new(RetryConfig {
                 max_attempts: 2,
-                status_codes: vec![503],
-                methods: vec!["GET".to_string()],
+                retry_match: vec![RetryPredicate::All {
+                    of: vec![
+                        RetryPredicate::Status { any_of: vec![503] },
+                        RetryPredicate::Method {
+                            any_of: vec!["GET".to_string()],
+                        },
+                    ],
+                }],
                 ..Default::default()
             }),
             ..Default::default()

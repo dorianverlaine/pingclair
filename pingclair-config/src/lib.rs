@@ -386,7 +386,7 @@ pub enum FullCompileError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pingclair_core::config::{HandlerConfig, LogFormat, LogOutput, Matcher};
+    use pingclair_core::config::{HandlerConfig, LogFormat, LogOutput, Matcher, RetryPredicate};
 
     #[test]
     fn test_full_compile() {
@@ -520,8 +520,21 @@ mod tests {
         assert_eq!(proxy.retry.max_attempts, 4);
         assert_eq!(proxy.retry.total_timeout_ms, Some(2_000));
         assert_eq!(proxy.retry.backoff_ms, 50);
-        assert_eq!(proxy.retry.status_codes, vec![429, 502, 503, 504]);
-        assert_eq!(proxy.retry.methods, vec!["GET", "HEAD", "PUT"]);
+        // 🔄 The flat `retry` block is translated into one predicate at load:
+        // status **and** method, which is what those two lines used to mean.
+        assert_eq!(
+            proxy.retry.retry_match,
+            vec![RetryPredicate::All {
+                of: vec![
+                    RetryPredicate::Status {
+                        any_of: vec![429, 502, 503, 504],
+                    },
+                    RetryPredicate::Method {
+                        any_of: vec!["GET".to_string(), "HEAD".to_string(), "PUT".to_string()],
+                    },
+                ],
+            }]
+        );
         assert_eq!(proxy.overload.max_in_flight, Some(32));
         assert_eq!(proxy.overload.max_pending, 8);
         assert_eq!(proxy.overload.pending_timeout_ms, 75);
@@ -589,7 +602,7 @@ mod tests {
             panic!("expected reverse proxy");
         };
         assert_eq!(proxy.retry.max_attempts, 16);
-        assert!(proxy.retry.status_codes.is_empty());
+        assert!(proxy.retry.retry_match.is_empty());
         assert_eq!(
             *proxy.overload,
             pingclair_core::config::OverloadConfig::default()
