@@ -73,6 +73,9 @@ h3:
     # known flake (issue #68) and nothing else; see the file for the evidence.
     PINGCLAIR_BINARY="{{ target-dir }}/release/pingclair" scripts/h3-cancellation-check.sh
     PINGCLAIR_BINARY="{{ target-dir }}/release/pingclair" scripts/test-h3-client-auth-local.sh
+    # 🧯 The local-failure matrix runs the real binary with a lowered descriptor
+    # limit, which is why it cannot live in the in-process H3 test suite.
+    PINGCLAIR_BINARY="{{ target-dir }}/release/pingclair" scripts/test-h3-local-resource-failure-local.sh
 
 # 💽 Report build-cache disk usage against the repository budget.
 disk:

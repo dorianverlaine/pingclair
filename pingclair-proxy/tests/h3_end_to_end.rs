@@ -1137,15 +1137,14 @@ async fn h3_response_buffers_hold_the_body_until_the_upstream_finishes() {
 /// disable passive health checking and failover on a transport whose tests
 /// nobody runs by hand.
 ///
-/// ⚠️ The matching **local**-failure case is not tested here, and that is a
-/// known gap rather than an oversight: driving a real descriptor exhaustion
-/// needs `setrlimit`, and these tests run the H3 server *in process*, so
-/// lowering the limit would poison every other test in this binary. The local
-/// path is covered by `upstream_failure`'s unit tests and by
-/// `test_local_descriptor_exhaustion_does_not_mark_the_backend_down` in
-/// `pingclair/tests/integration.rs`, which spawns the real binary and proves
-/// the error shape that both transports receive from the shared connector.
-/// Recorded in TRIAGE.
+/// ⚠️ The matching **local**-failure case cannot be tested in this file:
+/// driving a real descriptor exhaustion needs `setrlimit`, and these tests run
+/// the H3 server *in process*, so lowering the limit would poison every other
+/// test in this binary. It is covered by
+/// `scripts/test-h3-local-resource-failure-local.sh`, which runs the real
+/// binary with a lowered `RLIMIT_NOFILE`, drives it with a real HTTP/3 client,
+/// and asserts that the backend is never marked down — plus
+/// `upstream_failure`'s unit tests for the classifier itself.
 #[tokio::test]
 async fn h3_refused_backend_still_fails_closed() {
     // 🚪 Bind and immediately drop, so the address is real, local, and closed.
