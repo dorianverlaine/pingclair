@@ -866,9 +866,13 @@ Trois conséquences méritent d'être énoncées franchement, car elles déciden
 Pingclair convient, plutôt que d'être des détails découverts plus tard :
 
 - **DNS-01 ne livre qu'un seul fournisseur : Cloudflare.**
-  `tls { dns cloudflare <token> }` et l'option globale `acme_dns` obtiennent
-  des certificats génériques et fonctionnent sur un hôte dont le port 80 est
-  injoignable. Tout autre nom de fournisseur est refusé nommément au
+  Dans un bloc `tls { … }` propre à un site, indiquez à la fois `auto` et
+  `dns cloudflare <token>` : `auto` autorise l'émission publique, tandis que
+  `dns` choisit la preuve de contrôle. L'option globale `acme_dns` place tous
+  les sites automatiques sur DNS-01 et fonctionne sur un hôte dont le port 80
+  est injoignable. Un site `*.example.com` ne demande pas un seul certificat
+  générique : il prouve le contrôle par DNS-01 et obtient un certificat par nom
+  qu'il doit servir. Tout autre nom de fournisseur est refusé nommément au
   démarrage : le serveur ne se rabat pas sur HTTP-01, car HTTP-01 ne peut pas
   prouver le contrôle d'un nom générique et l'échec n'apparaîtrait qu'au
   renouvellement, dans un message qui ne mentionne jamais l'option choisie.

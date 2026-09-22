@@ -51,6 +51,22 @@ authority's rate limits. The container image names the same path for its
 declared volume, so a container and a package install keep their state in one
 place.
 
+### 📡 DNS-01 publishes the proof the authority expects
+
+DNS-01 now publishes the base64url-encoded SHA-256 digest of the ACME key
+authorization instead of HTTP-01's raw `token.thumbprint` value. The old value
+propagated successfully but could never satisfy the authority, so every DNS-01
+order ended `Invalid` and no certificate could be obtained through that
+challenge — on a host where port 80 is closed, that meant no certificate at
+all.
+
+When an order is invalid, Pingclair now refreshes the failed authorization and
+includes the authority's challenge error in the issuance failure. The TXT record
+stays present until that final status and diagnostic have been read, then is
+removed on every exit path. The DNS-01 documentation also makes the two jobs in
+an explicit TLS block clear: `auto` authorises issuance and `dns` selects its
+challenge.
+
 ### ⚡ Per-request work removed from the hot paths
 
 The reverse-proxy configuration is now borrowed from the published snapshot

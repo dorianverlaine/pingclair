@@ -381,6 +381,18 @@
   `*.example.com` and `example.com` share `_acme-challenge.example.com`; composing
   `_acme-challenge.*.example.com` literally produces a name no zone can hold.
 
+- 🧮 **DNS-01 publishes the digest, not the HTTP-01 response.** The ACME key
+  authorization is `token.thumbprint`; HTTP-01 serves that string verbatim,
+  while DNS-01 publishes its base64url-encoded SHA-256 digest. `instant-acme`
+  names the distinction directly: `KeyAuthorization::as_str()` is for HTTP-01
+  and `KeyAuthorization::dns_value()` is for DNS-01. Using the former in DNS
+  produces a TXT record that propagates perfectly and can never validate.
+
+- 🔎 **Read the failed authorization before removing its record.** An ACME order
+  may report only `Invalid`; the authority's useful reason lives on the failed
+  challenge. Refresh that authorization while the response is still published,
+  surface its problem document, and then clean up on every exit path.
+
 - 🔎 **The propagation check's resolver must have caching off.** The check exists
   to observe the record appearing, and a cached NXDOMAIN will keep saying "not
   there" for the whole propagation window.

@@ -59,9 +59,12 @@ pub enum AcmeError {
 pub enum ChallengeType {
     /// 🌐 HTTP-01: Validates control via file serving on port 80.
     Http01,
-    /// 📡 DNS-01: Validates control via DNS TXT records (Wildcards supported).
-    // TODO(v0.3): implement a DNS provider abstraction and TXT-record
-    // deployment; wildcard certificates depend on this.
+    /// 📡 DNS-01: proves control by publishing a TXT record.
+    ///
+    /// The provider abstraction lives in [`crate::dns01`], and this is the only
+    /// challenge a wildcard site can use: HTTP-01 cannot prove a `*.` name.
+    /// The name ordered is still the concrete one a client asked for — see
+    /// issue #69 for the wildcard leaf that is not yet requested.
     Dns01,
     /// 🔒 TLS-ALPN-01: Validates via TLS handshake on port 443.
     // TODO(v0.3): implement the acme-tls/1 ALPN responder in the TLS
@@ -81,8 +84,40 @@ pub struct ChallengeResponse {
     /// The challenge token (The filename/path).
     pub token: String,
 
-    /// The key authorization (The content).
+    /// The protocol-specific challenge response content.
+    ///
+    /// HTTP-01 uses the key authorization verbatim. DNS-01 uses its
+    /// base64url-encoded SHA-256 digest instead.
     pub key_authorization: String,
+}
+
+impl ChallengeResponse {
+    /// 🧩 Converts the ACME key authorization into the response format the
+    /// selected challenge actually publishes.
+    ///
+    /// The two values look equally opaque, which made it easy to publish the
+    /// HTTP-01 value in DNS. Keeping the conversion next to the challenge type
+    /// makes that protocol boundary explicit before a handler sees the value.
+    fn from_acme(
+        domain: String,
+        challenge_type: ChallengeType,
+        challenge: &instant_acme::ChallengeHandle<'_>,
+    ) -> Self {
+        let key_authorization = challenge.key_authorization();
+        let key_authorization = match challenge_type {
+            ChallengeType::Http01 | ChallengeType::TlsAlpn01 => {
+                key_authorization.as_str().to_string()
+            }
+            ChallengeType::Dns01 => key_authorization.dns_value(),
+        };
+
+        Self {
+            domain,
+            challenge_type,
+            token: challenge.token.clone(),
+            key_authorization,
+        }
+    }
 }
 
 /// A fully issued certificate bundle.
@@ -221,6 +256,48 @@ async fn cleanup_challenges<H: ChallengeHandler + ?Sized>(
             );
         }
     }
+}
+
+/// 🔎 Retrieves the authority's per-challenge reason after an order becomes
+/// invalid.
+///
+/// ACME order objects may say only `invalid`; the useful DNS error lives on
+/// the authorization's challenge. Refreshing it before cleanup keeps the TXT
+/// record present until the authority has returned its final explanation.
+async fn invalid_order_detail(
+    order: &mut instant_acme::Order,
+    challenge_type: &AcmeChallengeType,
+) -> Option<String> {
+    let mut details = Vec::new();
+    let mut authorizations = order.authorizations();
+
+    while let Some(result) = authorizations.next().await {
+        let mut authorization = match result {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                details.push(format!("authorization could not be read: {error}"));
+                continue;
+            }
+        };
+        let domain = authorization.identifier().to_string();
+        if let Err(error) = authorization.refresh().await {
+            details.push(format!(
+                "{domain}: authorization could not be refreshed: {error}"
+            ));
+            continue;
+        }
+
+        if let Some(error) = authorization
+            .challenges
+            .iter()
+            .find(|challenge| &challenge.r#type == challenge_type)
+            .and_then(|challenge| challenge.error.as_ref())
+        {
+            details.push(format!("{domain}: {error}"));
+        }
+    }
+
+    (!details.is_empty()).then(|| details.join("; "))
 }
 
 /// 📅 Reads the leaf certificate's authoritative X.509 expiration timestamp.
@@ -511,12 +588,8 @@ impl AcmeClient {
             })?;
 
             // 4b. Deploy Solution
-            let response = ChallengeResponse {
-                domain: domain.clone(),
-                challenge_type: solver.challenge_type,
-                token: challenge.token.clone(),
-                key_authorization: challenge.key_authorization().as_str().to_string(),
-            };
+            let response =
+                ChallengeResponse::from_acme(domain.clone(), solver.challenge_type, &challenge);
 
             if let Err(error) = handler.deploy(&response).await {
                 cleanup_challenges(handler, &active_challenges).await;
@@ -538,19 +611,34 @@ impl AcmeClient {
         // 5. Poll for Status
         tracing::info!("⏳ Polling order status...");
         let retry_policy = instant_acme::RetryPolicy::default(); // reasonable defaults
-        let state = order
-            .poll_ready(&retry_policy)
-            .await
-            .map_err(|error| AcmeError::OrderFailed(format!("Polling failed: {error}")));
+        let state = match order.poll_ready(&retry_policy).await {
+            Ok(state) => state,
+            Err(error) => {
+                cleanup_challenges(handler, &active_challenges).await;
+                return Err(AcmeError::OrderFailed(format!("Polling failed: {error}")));
+            }
+        };
 
-        // 🧹 Challenge tokens are removed even when polling fails.
+        let failure = if state != OrderStatus::Ready && state != OrderStatus::Valid {
+            let target_type = match solver.challenge_type {
+                ChallengeType::Http01 => AcmeChallengeType::Http01,
+                ChallengeType::Dns01 => AcmeChallengeType::Dns01,
+                ChallengeType::TlsAlpn01 => AcmeChallengeType::TlsAlpn01,
+            };
+            let detail = invalid_order_detail(&mut order, &target_type).await;
+            Some(match detail {
+                Some(detail) => format!("Order ended in state: {state:?}; {detail}"),
+                None => format!("Order ended in state: {state:?}"),
+            })
+        } else {
+            None
+        };
+
+        // 🧹 Challenge responses remain published through the authority's
+        // final status and error-detail reads, then leave on every path.
         cleanup_challenges(handler, &active_challenges).await;
-        let state = state?;
-
-        if state != OrderStatus::Ready && state != OrderStatus::Valid {
-            return Err(AcmeError::OrderFailed(format!(
-                "Order ended in state: {state:?}"
-            )));
+        if let Some(failure) = failure {
+            return Err(AcmeError::OrderFailed(failure));
         }
 
         // 6. Finalize & Download
@@ -706,6 +794,143 @@ impl Default for AcmeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper::body::Bytes;
+    use instant_acme::{AccountCredentials, BodyWrapper, BytesResponse, HttpClient};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 🧪 A tiny ACME transport that provides one pending DNS authorization,
+    /// then returns the authority's final challenge error when it is refreshed.
+    #[derive(Default)]
+    struct MockAcmeHttp {
+        authorization_reads: AtomicUsize,
+    }
+
+    impl HttpClient for MockAcmeHttp {
+        fn request(
+            &self,
+            request: hyper::Request<BodyWrapper<Bytes>>,
+        ) -> Pin<Box<dyn Future<Output = Result<BytesResponse, instant_acme::Error>> + Send>>
+        {
+            let target = request.uri().to_string();
+            let authorization_read = (target == "authz")
+                .then(|| self.authorization_reads.fetch_add(1, Ordering::SeqCst));
+
+            Box::pin(async move {
+                let (status, location, body) = match target.as_str() {
+                    "new-nonce" => (200, None, String::new()),
+                    "new-order" => (
+                        201,
+                        Some("order"),
+                        r#"{"status":"pending","authorizations":["authz"],"finalize":"finalize"}"#
+                            .to_string(),
+                    ),
+                    "authz" if authorization_read == Some(0) => (
+                        200,
+                        None,
+                        r#"{"identifier":{"type":"dns","value":"example.com"},"status":"pending","challenges":[{"type":"dns-01","url":"challenge","token":"test-token","status":"pending"}]}"#
+                            .to_string(),
+                    ),
+                    "authz" => (
+                        200,
+                        None,
+                        r#"{"identifier":{"type":"dns","value":"example.com"},"status":"invalid","challenges":[{"type":"dns-01","url":"challenge","token":"test-token","status":"invalid","error":{"type":"urn:ietf:params:acme:error:dns","detail":"DNS problem: incorrect TXT record","status":400}}]}"#
+                            .to_string(),
+                    ),
+                    unexpected => panic!("unexpected mock ACME request to {unexpected}"),
+                };
+
+                let mut response = hyper::Response::builder()
+                    .status(status)
+                    .header("replay-nonce", "next-nonce");
+                if let Some(location) = location {
+                    response = response.header("location", location);
+                }
+                Ok(BytesResponse::from(
+                    response
+                        .body(http_body_util::Full::new(Bytes::from(body)))
+                        .expect("mock ACME response"),
+                ))
+            })
+        }
+    }
+
+    /// 🔑 A fixed test account from instant-acme's compatibility fixture.
+    const MOCK_ACCOUNT_CREDENTIALS: &str = r#"{
+        "id":"account",
+        "key_pkcs8":"MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgJVWC_QzOTCS5vtsJp2IG-UDc8cdDfeoKtxSZxaznM-mhRANCAAQenCPoGgPFTdPJ7VLLKt56RxPlYT1wNXnHc54PEyBg3LxKaH0-sJkX0mL8LyPEdsfL_Oz4TxHkWLJGrXVtNhfH",
+        "urls":{"newNonce":"new-nonce","newAccount":"new-account","newOrder":"new-order","revokeCert":"revoke-cert"}
+    }"#;
+
+    async fn mock_dns_order() -> instant_acme::Order {
+        let credentials: AccountCredentials =
+            serde_json::from_str(MOCK_ACCOUNT_CREDENTIALS).expect("mock account credentials");
+        let account = Account::builder_with_http(Box::<MockAcmeHttp>::default())
+            .from_credentials(credentials)
+            .await
+            .expect("mock account");
+        account
+            .new_order(&NewOrder::new(&[Identifier::Dns(
+                "example.com".to_string(),
+            )]))
+            .await
+            .expect("mock order")
+    }
+
+    /// 📡 DNS-01 publishes the digest, never HTTP-01's raw key authorization.
+    #[tokio::test]
+    async fn dns01_uses_the_digest_of_the_key_authorization() {
+        let mut order = mock_dns_order().await;
+        let mut authorizations = order.authorizations();
+        let mut authorization = authorizations
+            .next()
+            .await
+            .expect("one authorization")
+            .expect("authorization response");
+        let challenge = authorization
+            .challenge(AcmeChallengeType::Dns01)
+            .expect("DNS-01 challenge");
+        let expected = challenge.key_authorization().dns_value();
+        let raw = challenge.key_authorization().as_str().to_string();
+
+        let response = ChallengeResponse::from_acme(
+            "example.com".to_string(),
+            ChallengeType::Dns01,
+            &challenge,
+        );
+
+        assert_eq!(response.key_authorization, expected);
+        assert_ne!(response.key_authorization, raw);
+    }
+
+    /// 🔎 An invalid order includes the authority's challenge-level reason.
+    #[tokio::test]
+    async fn invalid_order_reports_the_authority_challenge_error() {
+        let mut order = mock_dns_order().await;
+        {
+            let mut authorizations = order.authorizations();
+            authorizations
+                .next()
+                .await
+                .expect("one authorization")
+                .expect("pending authorization");
+        }
+
+        let detail = invalid_order_detail(&mut order, &AcmeChallengeType::Dns01)
+            .await
+            .expect("challenge detail");
+
+        assert!(detail.contains("example.com"), "{detail}");
+        assert!(
+            detail.contains("DNS problem: incorrect TXT record"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("urn:ietf:params:acme:error:dns"),
+            "{detail}"
+        );
+    }
 
     #[test]
     fn test_certificate_renewal_logic() {

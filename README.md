@@ -839,9 +839,13 @@ provider name is refused at startup rather than accepted and ignored.
 Three consequences worth stating plainly, because they decide whether
 Pingclair fits at all rather than being details you discover later:
 
-- **DNS-01 ships one provider: Cloudflare.** `tls { dns cloudflare <token> }`
-  and the global `acme_dns` obtain wildcard certificates and work on a host
-  where port 80 is unreachable. Any other provider name is refused at startup
+- **DNS-01 ships one provider: Cloudflare.** In a site-level `tls { … }` block,
+  include both `auto` and `dns cloudflare <token>`; `auto` authorises public
+  issuance, while `dns` selects how that issuance proves control. The global
+  `acme_dns` option moves every automatic site onto DNS-01 and works on a host
+  where port 80 is unreachable. A `*.example.com` site does not order a single
+  wildcard leaf: it proves control with DNS-01 and obtains one certificate per
+  name it is asked to serve. Any other provider name is refused at startup
   by name — the server will not fall back to HTTP-01, because HTTP-01 cannot
   prove control of a wildcard and the failure would surface at renewal as a
   validation error that never mentions the option you set.

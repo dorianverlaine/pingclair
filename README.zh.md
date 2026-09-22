@@ -785,8 +785,11 @@ Directive：
 其中三件值得直接講明白，因為它們決定的是「Pingclair 適不適合你」，
 而不是之後才會踩到的細節：
 
-- **DNS-01 只出貨一個 provider：Cloudflare。** `tls { dns cloudflare <token> }`
-  與全域 `acme_dns` 可以簽發萬用字元憑證，80 埠不通的機器也簽得到。
+- **DNS-01 只出貨一個 provider：Cloudflare。** 在站台層級的 `tls { … }`
+  區塊中，必須同時寫 `auto` 與 `dns cloudflare <token>`；`auto` 授權公開憑證
+  簽發，`dns` 則選擇用什麼方式證明控制權。全域 `acme_dns` 會把所有自動站台
+  移到 DNS-01，80 埠不通的機器照樣簽得到。`*.example.com` 站台不會只簽一張
+  萬用字元憑證：它用 DNS-01 證明控制權，並為每個要服務的名稱各簽一張。
   其他 provider 名字在啟動時**指名拒絕**——不會默默退回 HTTP-01，因為
   HTTP-01 證明不了萬用字元的控制權，而那個失敗會在續簽時才出現，
   訊息裡完全不會提到你設的那個選項。
