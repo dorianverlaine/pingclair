@@ -28,7 +28,7 @@ use crate::paths::tls_store_dir;
 use crate::runtime_listeners::{
     RuntimeListeners, RuntimePublisherInputs, prepare_listener_policies,
 };
-use crate::systemd::{notify_systemd_ready, notify_systemd_stopping};
+use crate::systemd::{notify_systemd_ready, notify_systemd_status, notify_systemd_stopping};
 use parking_lot::RwLock;
 use pingclair_proxy::client_auth::PublishedListenerPolicy;
 use pingora_core::listeners::tls::TlsSettings;
@@ -1032,6 +1032,12 @@ pub(crate) fn run_server(
                         "🚫 SIGUSR1 reload disabled: the configuration was changed through \
                          the Admin API after startup (Caddy semantics)"
                     );
+                    // 📣 An operator who sent the signal deserves to know it was
+                    // ignored rather than inferring it from a status line that
+                    // never changes.
+                    notify_systemd_status(
+                        "Serving (SIGUSR1 reload ignored: the Admin API owns the configuration since it last changed it)",
+                    );
                     continue;
                 }
                 let reload_start = std::time::Instant::now();
@@ -1064,6 +1070,12 @@ pub(crate) fn run_server(
                                     "✅ Configuration reloaded successfully ({success_count} \
                                      listeners updated in {reload_duration:?})"
                                 );
+                                // 📣 `systemctl reload` only learned that the
+                                // signal was delivered; this is where the answer
+                                // it can never see gets published.
+                                notify_systemd_status(&format!(
+                                    "Serving (reloaded {success_count} listener(s) in {reload_duration:?})"
+                                ));
                             }
                             Err(error) => {
                                 let reload_duration = reload_start.elapsed();
@@ -1078,6 +1090,7 @@ pub(crate) fn run_server(
                                 );
                                 eprintln!("❌ Configuration reload rejected: {error}");
                                 eprintln!("   💡 Previous configuration remains active, unchanged");
+                                notify_systemd_status(&format!("Reload rejected: {error}"));
                             }
                         }
                     }
@@ -1091,6 +1104,7 @@ pub(crate) fn run_server(
                         tracing::error!("   💡 Previous configuration remains active");
                         eprintln!("❌ Configuration reload failed: {e}");
                         eprintln!("   💡 Previous configuration remains active");
+                        notify_systemd_status(&format!("Reload failed: {e}"));
                     }
                 }
             }

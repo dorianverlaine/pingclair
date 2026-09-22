@@ -31,7 +31,13 @@ Environment="RUST_LOG=info"
 Environment="PINGCLAIR_TLS_STORE=/var/lib/pingclair/certs"
 ExecStartPre=/usr/local/bin/pingclair validate /etc/Pingclair/Pingclairfile
 ExecStart=/usr/local/bin/pingclair run /etc/Pingclair/Pingclairfile
-ExecReload=/bin/kill -HUP $MAINPID
+# 🔔 SIGUSR1 is the reload signal. SIGHUP is dropped on purpose — it is the
+# signal table Caddy uses — so the `kill -HUP` this unit used to send reported
+# success and applied nothing at all. systemd can only see whether `kill`
+# exited, never what the server then made of the file, so the reload's own
+# result lands on this unit's status line instead: `systemctl status pingclair`
+# reads `Serving (reloaded …)` or `Reload rejected: …` once the reload settles.
+ExecReload=/bin/kill -USR1 $MAINPID
 WorkingDirectory=/var/lib/pingclair
 
 # Restart Policy

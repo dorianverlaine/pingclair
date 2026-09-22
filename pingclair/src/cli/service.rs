@@ -33,14 +33,28 @@ pub(crate) fn manage_system_service(action: ServiceAction) -> anyhow::Result<()>
 
         match status {
             Ok(s) if s.success() => {
-                let past_tense = match action {
-                    ServiceAction::Start => "started",
-                    ServiceAction::Stop => "stopped",
-                    ServiceAction::Restart => "restarted",
-                    ServiceAction::Reload => "reloaded",
-                    ServiceAction::Status => "queried",
-                };
-                println!("✅ Service {past_tense} successfully");
+                if matches!(action, ServiceAction::Reload) {
+                    // 🔔 `systemctl reload` proves the signal reached the
+                    // process, not that the file was applied: the server reads
+                    // it afterwards, and its verdict is published on the unit's
+                    // status line and in the journal. Saying "reloaded" here
+                    // would be the same claim that was wrong when the unit sent
+                    // a signal the server drops.
+                    println!("✅ Reload signal delivered to pingclair.service");
+                    println!("ℹ️  The result lands a moment later: `systemctl status pingclair`");
+                    println!("   or `journalctl -u pingclair -n 20`");
+                } else {
+                    let past_tense = match action {
+                        ServiceAction::Start => "started",
+                        ServiceAction::Stop => "stopped",
+                        ServiceAction::Restart => "restarted",
+                        ServiceAction::Status => "queried",
+                        // Handled above; kept exhaustive so a new action cannot
+                        // silently inherit a wrong past tense.
+                        ServiceAction::Reload => "reloaded",
+                    };
+                    println!("✅ Service {past_tense} successfully");
+                }
             }
             Ok(s) => {
                 anyhow::bail!("❌ Failed to {cmd} service (exit code: {s})");

@@ -190,7 +190,7 @@ pingclair reverse-proxy --from :8080 --to localhost:3000
 pc service start    # 啟動
 pc service stop     # 停止
 pc service status   # 查詢狀態
-pc service reload   # 平滑重載設定（SIGHUP）
+pc service reload   # 平滑重載設定（SIGUSR1）
 pc service restart  # 重新啟動
 ```
 
@@ -389,7 +389,7 @@ status 進行重試。
 單一 backend request 占用上限；H2 多工也受同一上限約束，而不是猜測實體 socket
 數量。Circuit breaker 依具體 backend 分開計算，任一設定門檻成立就 open 並快速
 回 503；`open_for` 到期後只允許設定數量的 half-open probe。未列
-`failure_statuses` 時，所有 5xx 都算失敗。相容的 Admin／SIGHUP reload 會保留
+`failure_statuses` 時，所有 5xx 都算失敗。相容的 Admin／SIGUSR1 reload 會保留
 既有 circuit 狀態；變更保護政策或 upstream 集合則建立全新狀態。
 
 header、body 與整體 request 超限時，只要協議仍能送出回應，就會回傳明確的

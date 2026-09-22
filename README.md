@@ -201,7 +201,7 @@ After installation, the built-in commands manage the `systemd` unit:
 pc service start    # start
 pc service stop     # stop
 pc service status   # status
-pc service reload   # graceful config reload (SIGHUP)
+pc service reload   # graceful config reload (SIGUSR1)
 pc service restart  # restart
 ```
 
@@ -417,7 +417,7 @@ than attempting to count physical sockets. Circuit breakers track each
 concrete backend independently. They open on either configured threshold,
 fail fast with 503, and admit only the configured number of half-open probes
 after `open_for`. An empty `failure_statuses` list counts every 5xx response.
-Compatible Admin/SIGHUP reloads retain live circuit state; changing the
+Compatible Admin/SIGUSR1 reloads retain live circuit state; changing the
 protection policy or configured upstream set starts fresh state.
 
 Exceeded header, body, and request budgets receive an explicit HTTP error when

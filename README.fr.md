@@ -196,7 +196,7 @@ Après installation, les commandes intégrées pilotent l'unité `systemd` :
 pc service start    # démarrer
 pc service stop     # arrêter
 pc service status   # état
-pc service reload   # rechargement à chaud de la configuration (SIGHUP)
+pc service reload   # rechargement à chaud de la configuration (SIGUSR1)
 pc service restart  # redémarrer
 ```
 
@@ -420,7 +420,7 @@ backend concret possède son propre circuit breaker. Il s'ouvre dès qu'un des
 seuils configurés est atteint, répond rapidement 503, puis n'admet que le
 nombre configuré de sondes half-open après `open_for`. Sans
 `failure_statuses`, toutes les réponses 5xx sont des échecs. Un rechargement
-Admin/SIGHUP compatible conserve l'état ; modifier la politique de protection
+Admin/SIGUSR1 compatible conserve l'état ; modifier la politique de protection
 ou la liste des upstreams repart d'un état neuf.
 
 Les dépassements d'en-têtes, de body et de durée totale reçoivent une erreur

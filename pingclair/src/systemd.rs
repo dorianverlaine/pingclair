@@ -58,3 +58,60 @@ pub(crate) fn notify_systemd_ready() {
 pub(crate) fn notify_systemd_stopping() {
     notify_systemd("STOPPING=1\nSTATUS=Draining\n");
 }
+
+/// 📣 Replaces the unit's status line, which is what `systemctl status` shows
+/// next to `Status:`.
+///
+/// **Why it matters**: `systemctl reload pingclair` sends a signal and returns
+/// — systemd learns that `kill` exited, never whether the server accepted the
+/// file it read afterwards. For a unit whose reload is a signal, this line is
+/// the only place the outcome appears, so the reload path publishes
+/// `Serving (reloaded …)`, `Reload rejected: …`, or `Reload failed: …` here
+/// instead of leaving the status at whatever startup said.
+pub(crate) fn notify_systemd_status(status: &str) {
+    notify_systemd(&status_datagram(status));
+}
+
+/// 🧪 One `STATUS=` datagram, with newlines folded into spaces.
+///
+/// The text comes from error messages, and a compiler or validation error is
+/// routinely several lines long. `sd_notify` is line-oriented: a `\n` inside
+/// the value would start a second directive, so a rejection message would be
+/// able to say something other than what it meant.
+fn status_datagram(status: &str) -> String {
+    let folded: String = status
+        .chars()
+        .map(|character| match character {
+            '\n' | '\r' | '\t' => ' ',
+            other => other,
+        })
+        .collect();
+    format!("STATUS={folded}\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_status_line_is_one_directive() {
+        assert_eq!(status_datagram("Serving"), "STATUS=Serving\n");
+        assert_eq!(
+            status_datagram("Reload rejected: listener topology changed"),
+            "STATUS=Reload rejected: listener topology changed\n"
+        );
+    }
+
+    /// 🚫 A multi-line rejection must not be able to smuggle in a second
+    /// `sd_notify` directive, so the newline becomes a space.
+    #[test]
+    fn a_multiline_status_stays_one_line() {
+        let datagram = status_datagram("Reload failed: line one\nline two\nREADY=1");
+        assert_eq!(
+            datagram,
+            "STATUS=Reload failed: line one line two READY=1\n"
+        );
+        assert_eq!(datagram.matches('\n').count(), 1);
+        assert!(datagram.ends_with('\n'));
+    }
+}

@@ -830,6 +830,24 @@ immediately after the `101`, both ends seeing EOF with no error.
 
 ### 🐛 Fixed
 
+- 🔁 **`systemctl reload` applied nothing while reporting success.** The unit
+  installed by `scripts/install.sh` set `ExecReload=/bin/kill -HUP $MAINPID`,
+  and the server drops `SIGHUP` on purpose — `SIGUSR1` is the reload signal,
+  the same signal table Caddy keeps. `systemctl reload pingclair`, and
+  `pc service reload` which wraps it, therefore answered
+  `✅ Service reloaded successfully` while the old configuration kept serving,
+  and an operator editing `/etc/Pingclair/Pingclairfile` had no way to notice.
+  `scripts/pingclair.service` now sends `SIGUSR1`.
+
+  systemd can only see that `kill` exited, never what the server made of the
+  file it read afterwards, so the outcome is published where the operator is
+  already looking: the server sends `sd_notify` status lines, and
+  `systemctl status pingclair` reads `Serving (reloaded 2 listener(s) in
+  3.4ms)` or `Reload rejected: listener topology changed …`. `pc service reload`
+  says the same thing in words rather than claiming the file was applied. A
+  configuration the running server refuses still leaves the previous one
+  serving.
+
 - ⚡ **A `handle_response { file_server }` no longer rebuilds its file server for
   every response.** Each response constructed one and threw it away. The
   construction itself is cheap; the caches it carries are the point, and
