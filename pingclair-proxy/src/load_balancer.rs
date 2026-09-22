@@ -123,6 +123,15 @@ pub enum Strategy {
     LeastConn,
     /// Routes consistent client IPs to the same upstream (sticky sessions).
     IpHash,
+    /// 🥇 Always the first backend in configured order that can take the
+    /// request.
+    ///
+    /// Upstream's `first` policy, and the shape a primary/secondary pair is
+    /// written with: the primary answers until it stops, and the next backend
+    /// takes over only then. Deliberately *not* round-robin — spreading traffic
+    /// across the pair is exactly what an operator writing `first` is asking to
+    /// avoid.
+    First,
 }
 
 // MARK: - Passive Backend Health
@@ -275,6 +284,41 @@ impl LeastConnTracker {
         counter.fetch_add(1, Ordering::Relaxed);
         Some((upstream, counter))
     }
+
+    /// 🥇 The first backend in configured order that can take this request.
+    ///
+    /// The same predicate `select` uses, without the counter comparison: the
+    /// order in the configuration *is* the policy. `honour_slow_start` exists
+    /// for the same reason it does in `select` — a pool whose every member is
+    /// still inside its slow-start window must serve someone, so the caller
+    /// makes a second pass with the window ignored.
+    fn select_first(
+        &self,
+        excluded: &HashSet<SocketAddr>,
+        active: Option<&Arc<NativeLoadBalancer<RoundRobin>>>,
+        recovery_slots: &HashMap<SocketAddr, Arc<AtomicU64>>,
+        slow_start: Duration,
+        honour_slow_start: bool,
+    ) -> Option<(Upstream, Arc<AtomicUsize>)> {
+        for (index, (address, counter)) in self.counters.iter().enumerate() {
+            let selectable = address.is_none_or(|addr| {
+                self.health.is_up(&addr)
+                    && !excluded.contains(&addr)
+                    && (!honour_slow_start || slow_start_ready(&addr, recovery_slots, slow_start))
+            });
+            if selectable
+                && self
+                    .upstreams
+                    .get(index)
+                    .is_some_and(|backend| active_ready(active, backend))
+            {
+                let upstream = self.upstreams.get(index)?.clone();
+                counter.fetch_add(1, Ordering::Relaxed);
+                return Some((upstream, Arc::clone(counter)));
+            }
+        }
+        None
+    }
 }
 
 // MARK: - Backend Pool
@@ -287,7 +331,7 @@ impl LeastConnTracker {
 struct Pool {
     native_rr: Option<Arc<NativeLoadBalancer<RoundRobin>>>,
     native_ketama: Option<Arc<NativeLoadBalancer<KetamaHashing>>>,
-    least_conn: Option<LeastConnTracker>,
+    ordered_backends: Option<LeastConnTracker>,
     active_health: Option<Arc<NativeLoadBalancer<RoundRobin>>>,
     recovery_slots: HashMap<SocketAddr, Arc<AtomicU64>>,
     slow_start: Duration,
@@ -1074,11 +1118,39 @@ impl LoadBalancer {
     ) -> Option<Upstream> {
         let pool = self.pool.load();
         let primary = match self.strategy {
+            Strategy::First => {
+                // 🥇 The order in the configuration is the policy, so this is
+                // the ordered list rather than any counter: pick the first
+                // backend that can take the request, and only move on when it
+                // cannot. The second pass ignores the slow-start window for the
+                // same reason LeastConn's does — a pool whose every member is
+                // recovering must still serve somebody.
+                pool.ordered_backends.as_ref().and_then(|backends| {
+                    backends
+                        .select_first(
+                            excluded,
+                            pool.active_health.as_ref(),
+                            &pool.recovery_slots,
+                            pool.slow_start,
+                            true,
+                        )
+                        .or_else(|| {
+                            backends.select_first(
+                                excluded,
+                                pool.active_health.as_ref(),
+                                &pool.recovery_slots,
+                                Duration::ZERO,
+                                false,
+                            )
+                        })
+                        .map(|(upstream, _guard)| upstream)
+                })
+            }
             Strategy::LeastConn => {
                 // ⚡ LeastConn: pick minimum active-connection upstream.
                 // The counter slot is released immediately — for the simple
                 // select() API we count a "selection" as one request unit.
-                pool.least_conn.as_ref().and_then(|tracker| {
+                pool.ordered_backends.as_ref().and_then(|tracker| {
                     tracker
                         .select(
                             excluded,
@@ -1307,10 +1379,12 @@ fn build_pool(
     });
 
     match strategy {
-        Strategy::LeastConn => Pool {
+        // 🥇 `First` needs the same ordered backend list and health machinery
+        // LeastConn keeps — only the counter is never consulted.
+        Strategy::LeastConn | Strategy::First => Pool {
             native_rr: None,
             native_ketama: None,
-            least_conn: Some(LeastConnTracker::new(backends, health.clone())),
+            ordered_backends: Some(LeastConnTracker::new(backends, health.clone())),
             active_health,
             recovery_slots,
             slow_start,
@@ -1324,7 +1398,7 @@ fn build_pool(
             // `None` meant a keyless request selected nothing at all.
             native_rr: Some(Arc::new(build_native_load_balancer(backends.clone()))),
             native_ketama: Some(Arc::new(build_native_load_balancer(backends))),
-            least_conn: None,
+            ordered_backends: None,
             active_health,
             recovery_slots,
             slow_start,
@@ -1338,7 +1412,7 @@ fn build_pool(
             Pool {
                 native_rr: Some(Arc::new(native)),
                 native_ketama: None,
-                least_conn: None,
+                ordered_backends: None,
                 active_health,
                 recovery_slots,
                 slow_start,
@@ -1400,7 +1474,7 @@ mod tests {
 
         let pool = lb.pool.load();
         let tracker = pool
-            .least_conn
+            .ordered_backends
             .as_ref()
             .expect("Expected LeastConn tracker");
         // Manually inflate u1's counter to simulate a busy upstream
@@ -1453,7 +1527,10 @@ mod tests {
             Strategy::LeastConn,
         );
         let pool = lb.pool.load();
-        let tracker = pool.least_conn.as_ref().expect("least-conn tracker");
+        let tracker = pool
+            .ordered_backends
+            .as_ref()
+            .expect("the ordered backend list");
         assert_eq!(tracker.counters.len(), 1, "the socket must have a counter");
 
         let (selected, _guard) = tracker
@@ -2193,6 +2270,59 @@ mod tests {
         }
         assert_eq!(heavy, 30);
         assert_eq!(light, 10);
+    }
+}
+
+#[cfg(test)]
+mod first_policy_tests {
+    use super::*;
+
+    fn pool_of(count: usize) -> LoadBalancer {
+        let upstreams = (0..count)
+            .map(|i| Upstream::new(&format!("127.0.0.1:{}", 9100 + i)).unwrap())
+            .collect();
+        LoadBalancer::new(upstreams, Strategy::First)
+    }
+
+    /// 🥇 `first` is not round-robin: every request goes to the same backend
+    /// while that backend is healthy.
+    ///
+    /// This is the whole policy, and it is the thing that used to be wrong —
+    /// `lb_policy first` spread across the pool like round-robin, so the
+    /// primary/secondary pair its name promises was never what the operator got.
+    #[test]
+    fn first_policy_pins_to_the_first_backend() {
+        let lb = pool_of(3);
+        for round in 0..6 {
+            assert_eq!(
+                lb.select(None).unwrap().addr.to_string(),
+                "127.0.0.1:9100",
+                "request {round} left the first backend while it was healthy"
+            );
+        }
+    }
+
+    /// 🌤️ The next backend takes over only when the first cannot answer, and
+    /// the pair does not alternate while it is down.
+    #[test]
+    fn first_policy_fails_over_in_order() {
+        let lb = pool_of(3);
+        let first: SocketAddr = "127.0.0.1:9100".parse().unwrap();
+        let second: SocketAddr = "127.0.0.1:9101".parse().unwrap();
+
+        assert_eq!(lb.select(None).unwrap().addr.to_string(), "127.0.0.1:9100");
+
+        lb.mark_unhealthy(&first);
+        for round in 0..3 {
+            assert_eq!(
+                lb.select(None).unwrap().addr.to_string(),
+                "127.0.0.1:9101",
+                "request {round} did not stay on the second backend"
+            );
+        }
+
+        lb.mark_unhealthy(&second);
+        assert_eq!(lb.select(None).unwrap().addr.to_string(), "127.0.0.1:9102");
     }
 }
 

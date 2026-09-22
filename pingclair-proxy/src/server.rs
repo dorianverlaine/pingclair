@@ -1374,11 +1374,11 @@ impl ProxyState {
                     // ring; they differ only in what gets hashed, which the
                     // request path resolves through `hash_key_sources`.
                     "ip_hash" | "header" | "cookie" | "query" => Strategy::IpHash,
-                    // 🚧 `first` is not this: Caddy pins to the first available
-                    // upstream, while this spreads across all of them. Issue
-                    // #75 tracks the divergence; the arm stays because refusing
-                    // it here would break configurations that load today.
-                    "first" => Strategy::RoundRobin,
+                    // 🥇 Caddy's `first`: the first available upstream answers,
+                    // and the next one takes over only when it cannot. Used for
+                    // a primary/secondary pair, where spreading traffic across
+                    // both is the thing the operator asked to avoid.
+                    "first" => Strategy::First,
                     // 🚫 Only a hand-written JSON config can reach this, since
                     // the adapter validates the name against the list above.
                     // It means "the schema accepted a policy nobody implements",

@@ -61,6 +61,15 @@ false: while it defaulted to false, "did not say" and "turned it off" were the
 same value, which is why nothing could read it. Whether a QUIC listener exists
 at all is still the global `servers { protocols … }` list.
 
+### 🥇 `lb_policy first` means first
+
+The policy was accepted and mapped to round-robin, so a primary/secondary pair
+written the way upstream documents it sent half its traffic to the secondary.
+It now pins to the first backend that can take the request and moves to the next
+only when that one cannot — the same predicate the other strategies use, without
+the counter comparison, and the backup list still covers a pool where nothing is
+selectable.
+
 ### 🗂️ `file_server browse` takes upstream's listing options
 
 `browse` now parses its options block, and `file_limit <n>` — upstream's name
