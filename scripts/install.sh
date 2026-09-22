@@ -272,11 +272,35 @@ echo "Configuring directories and assets..."
 mkdir -p /etc/Pingclair
 mkdir -p /var/lib/pingclair/html
 mkdir -p /var/log/pingclair
-# 🔐 The certificate store named by `scripts/pingclair.service`. It has to exist
-# and be owned by the service user, because that unit sets
-# `PINGCLAIR_TLS_STORE` here rather than letting the binary fall back to a
-# `$HOME` that a system account does not have.
-mkdir -p /var/lib/pingclair/certs
+# 🔐 The certificate store, at the path the binary resolves for the service
+# account: `$XDG_DATA_HOME/pingclair`, then `$HOME/.local/share/pingclair`. The
+# account's home is `/var/lib/pingclair`, so the unit needs no environment
+# variable to name it and `pingclair environ`, the documentation and an operator
+# all agree on one path.
+store_dir="/var/lib/pingclair/.local/share/pingclair"
+mkdir -p "$store_dir"
+
+# 🚚 Installs made before this path was chosen keep their certificates: the
+# store holds the ACME account key and every issued certificate, and re-issuing
+# them runs into the certificate authority's rate limits, so the old directory
+# is copied, verified, and only then removed.
+previous_store="/var/lib/pingclair/certs"
+if [ -d "$previous_store" ] && [ -n "$(ls -A "$previous_store" 2>/dev/null)" ]; then
+    echo "Moving the certificate store to $store_dir..."
+    cp -a "$previous_store/." "$store_dir/"
+    if diff -r "$previous_store" "$store_dir" >/dev/null 2>&1; then
+        rm -rf "$previous_store"
+        echo "✅ Certificates moved; the old directory is gone."
+    else
+        echo -e "${RED}Error: the copy into $store_dir does not match $previous_store, so nothing was removed.${NC}"
+        echo "Compare the two directories and remove $previous_store by hand once you are satisfied."
+        exit 1
+    fi
+elif [ -d "$previous_store" ]; then
+    # ␀ The old path exists and is empty: it is the directory the previous
+    # installer created, and nothing was ever written to it.
+    rmdir "$previous_store" 2>/dev/null || true
+fi
 
 # Download/Install Premium Assets
 BASE_RAW_URL="https://raw.githubusercontent.com/$REPO/main"
@@ -351,15 +375,12 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 # Paths
 Environment="RUST_LOG=info"
-# 🔐 The certificate store must be named here, not left to the binary's
-# default. Without it Pingclair resolves `$XDG_DATA_HOME/pingclair`, then
-# `$HOME/.local/share/pingclair`, which for the `pingclair` account is
-# `/var/lib/pingclair/.local/share/pingclair` — a path the installer does not
-# create, that the documentation does not mention, and that an operator looking
-# for certificates would not guess. The named path is also what
-# `deployment/Dockerfile` mounts, so a container and a package install keep
-# their state in the same place.
-Environment="PINGCLAIR_TLS_STORE=/var/lib/pingclair/certs"
+# 🔐 No `PINGCLAIR_TLS_STORE` here on purpose. The service account's home is
+# `/var/lib/pingclair`, so the binary resolves its store to
+# `/var/lib/pingclair/.local/share/pingclair` — the directory the installer
+# creates and migrates certificates into, the one the documentation names, and
+# the one `pingclair environ` prints. Naming a different path here would be a
+# second answer to a question that already has one.
 # 🚫 Deliberately no `ExecStartPre=/usr/local/bin/pingclair validate …` here.
 # It looks like the safe place for the check and it is the trap: systemd applies
 # `RestartPreventExitStatus=` to the main process, not to a failing pre-command,

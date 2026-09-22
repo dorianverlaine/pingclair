@@ -21,15 +21,12 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 # Paths
 Environment="RUST_LOG=info"
-# 🔐 The certificate store must be named here, not left to the binary's
-# default. Without it Pingclair resolves `$XDG_DATA_HOME/pingclair`, then
-# `$HOME/.local/share/pingclair`, which for the `pingclair` account is
-# `/var/lib/pingclair/.local/share/pingclair` — a path the installer does not
-# create, that the documentation does not mention, and that an operator looking
-# for certificates would not guess. The named path is also what
-# `deployment/Dockerfile` mounts, so a container and a package install keep
-# their state in the same place.
-Environment="PINGCLAIR_TLS_STORE=/var/lib/pingclair/certs"
+# 🔐 No `PINGCLAIR_TLS_STORE` here on purpose. The service account's home is
+# `/var/lib/pingclair`, so the binary resolves its store to
+# `/var/lib/pingclair/.local/share/pingclair` — the directory the installer
+# creates and migrates certificates into, the one the documentation names, and
+# the one `pingclair environ` prints. Naming a different path here would be a
+# second answer to a question that already has one.
 # 🚫 Deliberately no `ExecStartPre=/usr/local/bin/pingclair validate …` here.
 # It looks like the safe place for the check and it is the trap: systemd applies
 # `RestartPreventExitStatus=` to the main process, not to a failing pre-command,

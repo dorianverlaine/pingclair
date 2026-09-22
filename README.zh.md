@@ -139,7 +139,7 @@ services:
     volumes:
       - ./conf:/etc/pingclair:ro
       - ./site:/srv
-      - pingclair_tls:/var/lib/pingclair/certs
+      - pingclair_tls:/var/lib/pingclair/.local/share/pingclair
     command: ["pingclair", "run", "/etc/pingclair/Pingclairfile"]
 
 volumes:
@@ -154,7 +154,7 @@ HTTP/3 的行為與主機部署完全一致。
 
 `tls internal` 用持久本機 CA 簽發 leaf。要驗證憑證的用戶端必須信任其根，
 位置在 `$PINGCLAIR_TLS_STORE/internal/root.crt`（容器內：
-`docker compose cp pingclair:/var/lib/pingclair/certs/internal/root.crt
+`docker compose cp pingclair:/var/lib/pingclair/.local/share/pingclair/internal/root.crt
 ./root.crt`）。安裝到系統信任庫：
 
 - Linux：複製到 `/usr/local/share/ca-certificates/root.crt` 後執行
@@ -291,7 +291,7 @@ https://origin.example.test:6688 {
 
 Pingclair 會在 `PINGCLAIR_TLS_STORE` 下持久化一個有效十年的本機 CA，以及
 可續期的 90 天 leaf 憑證——裸二進位預設 `$XDG_DATA_HOME/pingclair`
-（即 `~/.local/share/pingclair`），容器映像則為 `/var/lib/pingclair/certs`。
+（即 `~/.local/share/pingclair`），容器映像則為 `/var/lib/pingclair/.local/share/pingclair`。
 需要驗證源站的 client 應信任
 `$PINGCLAIR_TLS_STORE/internal/root.crt`；CA 私鑰則保存在僅 owner 可讀的
 `authority.json`。H1/H2 與 H3 共用同一份持久化 leaf。`tls internal`

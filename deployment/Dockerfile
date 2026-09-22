@@ -32,7 +32,12 @@ COPY --from=builder /cache/cargo-target/release/pingclair /usr/local/bin/pingcla
 # the image so the store lands on the declared volume and survives container
 # recreation. Without this, HOME=/root sends it to the container's writable
 # layer, which `docker compose up --force-recreate` silently drops.
-ENV PINGCLAIR_TLS_STORE=/var/lib/pingclair/certs
+#
+# 🧭 The path is the one a package install resolves too — the data directory
+# under the service user's home — so a container and a host keep their state in
+# the same place even though only the container needs it spelled out. The
+# declared volume is `/var/lib/pingclair`, which contains it.
+ENV PINGCLAIR_TLS_STORE=/var/lib/pingclair/.local/share/pingclair
 
 WORKDIR /var/lib/pingclair
 VOLUME ["/etc/pingclair", "/var/lib/pingclair"]

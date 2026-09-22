@@ -36,6 +36,21 @@ host cannot be reached. The one-liner in the READMEs and the documentation is
 now <https://pingclair.com/install.sh>, which the documentation Worker serves
 from that same single source rather than from a copy.
 
+### 🏠 The certificate store lives under the service account's home
+
+`/var/lib/pingclair/certs` is now `/var/lib/pingclair/.local/share/pingclair`:
+the data directory the binary resolves once the `pingclair` account has a home
+(`/var/lib/pingclair`), which it now does. The unit therefore names no
+`PINGCLAIR_TLS_STORE`, and the unit, `pingclair environ`, and the documentation
+all give the same answer to where certificates are.
+
+An upgrade moves an existing store — copy, compare, and only then remove —
+and stops if the copy does not match, because the store holds the ACME account
+key and every issued certificate, and re-issuing them runs into the certificate
+authority's rate limits. The container image names the same path for its
+declared volume, so a container and a package install keep their state in one
+place.
+
 ### ⚡ Per-request work removed from the hot paths
 
 The reverse-proxy configuration is now borrowed from the published snapshot

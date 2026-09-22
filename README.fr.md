@@ -151,7 +151,7 @@ services:
     volumes:
       - ./conf:/etc/pingclair:ro
       - ./site:/srv
-      - pingclair_tls:/var/lib/pingclair/certs
+      - pingclair_tls:/var/lib/pingclair/.local/share/pingclair
     command: ["pingclair", "run", "/etc/pingclair/Pingclairfile"]
 
 volumes:
@@ -166,7 +166,7 @@ HTTP/3 se comportent comme sur un hôte.
 
 La CA locale persistante publie sa racine dans
 `$PINGCLAIR_TLS_STORE/internal/root.crt` (dans un conteneur :
-`docker compose cp pingclair:/var/lib/pingclair/certs/internal/root.crt
+`docker compose cp pingclair:/var/lib/pingclair/.local/share/pingclair/internal/root.crt
 ./root.crt`). Installez-la dans le magasin de confiance système (Linux :
 `update-ca-certificates` ; macOS : `security add-trusted-cert`) ou importez-la
 manuellement dans les navigateurs à magasin propre (Firefox, Chrome). À ne
@@ -309,7 +309,7 @@ https://origin.example.test:6688 {
 Pingclair conserve une autorité locale valable dix ans et des certificats
 leaf renouvelables de 90 jours sous `PINGCLAIR_TLS_STORE` — un binaire nu
 utilise `$XDG_DATA_HOME/pingclair` (`~/.local/share/pingclair`), l'image
-conteneur `/var/lib/pingclair/certs`. Les clients qui vérifient l'origine
+conteneur `/var/lib/pingclair/.local/share/pingclair`. Les clients qui vérifient l'origine
 doivent faire
 confiance à `$PINGCLAIR_TLS_STORE/internal/root.crt` ; la clé privée de
 l'autorité reste dans `authority.json`, lisible uniquement par son

@@ -147,7 +147,7 @@ services:
     volumes:
       - ./conf:/etc/pingclair:ro
       - ./site:/srv
-      - pingclair_tls:/var/lib/pingclair/certs
+      - pingclair_tls:/var/lib/pingclair/.local/share/pingclair
     command: ["pingclair", "run", "/etc/pingclair/Pingclairfile"]
 
 volumes:
@@ -164,7 +164,7 @@ HTTP/3 all behave exactly like a host deployment.
 `tls internal` signs leaves with a persistent local CA. Clients that verify
 certificates must trust its root, published at
 `$PINGCLAIR_TLS_STORE/internal/root.crt` (inside a container:
-`docker compose cp pingclair:/var/lib/pingclair/certs/internal/root.crt
+`docker compose cp pingclair:/var/lib/pingclair/.local/share/pingclair/internal/root.crt
 ./root.crt`). Install it into the system trust store:
 
 - Linux: copy to `/usr/local/share/ca-certificates/root.crt` and run
@@ -310,7 +310,7 @@ https://origin.example.test:6688 {
 Pingclair persists one ten-year local authority and renewable 90-day leaf
 certificates below `PINGCLAIR_TLS_STORE` — a bare binary defaults to
 `$XDG_DATA_HOME/pingclair` (`~/.local/share/pingclair`), the container image
-to `/var/lib/pingclair/certs`. Install
+to `/var/lib/pingclair/.local/share/pingclair`. Install
 `$PINGCLAIR_TLS_STORE/internal/root.crt` in clients that verify the origin;
 the authority private key remains in the owner-only `authority.json`.
 H1/H2 and H3 use the same persisted leaf. `tls internal` requires a concrete
