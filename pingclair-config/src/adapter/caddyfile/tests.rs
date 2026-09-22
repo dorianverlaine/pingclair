@@ -4252,6 +4252,92 @@ mod matcher_inside_route_body_tests {
     }
 }
 
+// MARK: - file_server browse options
+
+/// 🔢 Upstream spells the directory-listing limit `file_limit`, inside a
+/// `browse` block, and Caddy accepts that block in two places: after the
+/// `browse` keyword and inside the `file_server` block. Both reach the same
+/// compiled field — the one the JSON configuration already had, which is why
+/// the DSL was the only way to *not* set it.
+#[cfg(test)]
+mod file_server_browse_tests {
+    use crate::compile;
+    use pingclair_core::config::HandlerConfig;
+
+    fn file_server_from(source: &str) -> HandlerConfig {
+        let config = compile(source).unwrap_or_else(|error| panic!("must compile: {error}"));
+        config.servers[0].routes[0].handler.clone()
+    }
+
+    /// 🧭 `file_server browse { file_limit n }` — the keyword form.
+    #[test]
+    fn browse_keyword_takes_a_file_limit() {
+        let HandlerConfig::FileServer {
+            browse,
+            browse_limit,
+            ..
+        } = file_server_from("example.com {\n\tfile_server browse {\n\t\tfile_limit 100\n\t}\n}")
+        else {
+            panic!("expected a file server");
+        };
+        assert!(browse, "the keyword form still turns listings on");
+        assert_eq!(browse_limit, Some(100));
+    }
+
+    /// 🗂️ `file_server { browse { file_limit n } }` — the block form.
+    #[test]
+    fn browse_block_takes_a_file_limit() {
+        let HandlerConfig::FileServer {
+            browse,
+            browse_limit,
+            ..
+        } = file_server_from(
+            "example.com {\n\tfile_server {\n\t\tbrowse {\n\t\t\tfile_limit 25\n\t\t}\n\t}\n}",
+        )
+        else {
+            panic!("expected a file server");
+        };
+        assert!(browse);
+        assert_eq!(browse_limit, Some(25));
+    }
+
+    /// 🚫 A template file and the two unimplemented listing options are refused
+    /// by name. Each of them changes what a listing looks like, so ignoring one
+    /// would answer with something the operator did not ask for.
+    #[test]
+    fn unimplemented_browse_options_are_refused_by_name() {
+        for (source, needle) in [
+            (
+                "example.com {\n\tfile_server browse custom.html\n}",
+                "custom.html",
+            ),
+            (
+                "example.com {\n\tfile_server browse {\n\t\tsort name desc\n\t}\n}",
+                "sort",
+            ),
+            (
+                "example.com {\n\tfile_server browse {\n\t\treveal_symlinks\n\t}\n}",
+                "reveal_symlinks",
+            ),
+        ] {
+            let error = compile(source).expect_err("must be refused");
+            assert!(
+                error.to_string().contains(needle),
+                "the refusal has to name what was refused, expected `{needle}` in: {error}"
+            );
+        }
+    }
+
+    /// 🔢 A limit that is not a number fails the load rather than silently
+    /// leaving the default in place.
+    #[test]
+    fn a_file_limit_must_be_a_number() {
+        let error = compile("example.com {\n\tfile_server browse {\n\t\tfile_limit plenty\n\t}\n}")
+            .expect_err("must be refused");
+        assert!(error.to_string().contains("plenty"), "{error}");
+    }
+}
+
 // MARK: - php_fastcgi
 
 /// 🐘 `php_fastcgi` expands into the guarded pipeline upstream's shortcut

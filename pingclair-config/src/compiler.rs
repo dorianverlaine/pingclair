@@ -2678,7 +2678,7 @@ fn compile_handler(
             root: fs.root.clone(),
             index: fs.index.clone(),
             browse: fs.browse,
-            browse_limit: None,
+            browse_limit: fs.browse_limit,
             compress: fs.compress,
             precompressed: fs.precompressed.clone(),
             hide: fs.hide.clone(),

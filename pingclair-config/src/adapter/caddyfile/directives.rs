@@ -22,8 +22,52 @@ use std::collections::{BTreeMap, HashMap};
 
 // MARK: - Handler Adaptation
 
+/// 🔢 Reads the options in a `browse` block, which is where Caddy's
+/// `file_limit` lives.
+///
+/// `file_limit` is the one option this server implements, and it is the reason
+/// the block is parsed at all: without it the only way to bound a directory
+/// listing was to write the configuration in JSON. `reveal_symlinks` and
+/// `sort` change what a listing shows or how it is ordered, so both are refused
+/// by name rather than dropped — a listing that silently ignores its sort order
+/// looks like a bug in the server, not in the configuration.
+fn apply_browse_options(
+    block: &Block,
+    browse_limit: &mut Option<usize>,
+) -> Result<(), AdapterError> {
+    for sub in &block.directives {
+        match sub.name.as_str() {
+            "file_limit" => {
+                let raw = super::args::expect_one_argument(sub)?;
+                let limit = raw.parse::<usize>().map_err(|_| {
+                    AdapterError::InvalidArgument(
+                        "file_server browse file_limit".into(),
+                        format!("`{raw}` is not a number of entries"),
+                    )
+                })?;
+                *browse_limit = Some(limit);
+            }
+            "reveal_symlinks" | "sort" => {
+                return Err(AdapterError::UnsupportedFeature(
+                    format!("file_server browse {}", sub.name),
+                    "this directory-listing option is not implemented yet".into(),
+                ));
+            }
+            other => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "file_server browse: {other}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn adapt_handler(
-    d: Directive,
+    // 🧭 One arm (file_server) takes the block apart, and the difference
+    // between `file_server browse { … }` and `file_server { browse { … } }`
+    // cannot be read without owning it.
+    mut d: Directive,
     matchers: &HashMap<String, Matcher>,
     order: &DirectiveOrder,
 ) -> Result<Handler, AdapterError> {
@@ -38,13 +82,38 @@ pub(super) fn adapt_handler(
         "file_server" => {
             let mut root = ".".to_string();
             let mut browse = false;
-            if let Some(arg) = d.args.first() {
-                if arg == "browse" {
-                    // 🧭 Caddy's `file_server browse` enables directory
-                    // listings without opening a block.
+            // 🚫 Upstream's `browse` takes an optional template file, and its
+            // block takes `reveal_symlinks` and `sort`. None of the three is
+            // implemented; each is refused by name below rather than ignored,
+            // because a listing that quietly ignores its template looks like a
+            // broken one.
+            let mut browse_limit = None;
+            // 🧭 `file_server [<matcher>] [browse] [<template_file>]`: the
+            // keyword can follow a matcher, and when it carries a block that
+            // block belongs to `browse` rather than to `file_server` — the
+            // parser cannot tell them apart, so this is where the difference is
+            // decided.
+            let mut block = d.block.take();
+            match d.args.iter().position(|arg| arg == "browse") {
+                Some(index) => {
                     browse = true;
-                } else if !arg.starts_with('@') {
-                    root = arg.clone();
+                    if let Some(template) = d.args.get(index + 1) {
+                        return Err(AdapterError::UnsupportedFeature(
+                            "file_server browse".into(),
+                            format!(
+                                "the directory-listing template `{template}` is not implemented; \
+                                 write `browse` without it"
+                            ),
+                        ));
+                    }
+                    if let Some(browse_block) = block.take() {
+                        apply_browse_options(&browse_block, &mut browse_limit)?;
+                    }
+                }
+                None => {
+                    if let Some(arg) = d.args.iter().find(|arg| !arg.starts_with('@')) {
+                        root = arg.clone();
+                    }
                 }
             }
 
@@ -52,6 +121,7 @@ pub(super) fn adapt_handler(
                 root,
                 index: vec!["index.html".into()],
                 browse,
+                browse_limit,
                 compress: true,
                 precompressed: Vec::new(),
                 hide: Vec::new(),
@@ -63,7 +133,9 @@ pub(super) fn adapt_handler(
                 etag_file_extensions: Vec::new(),
             };
 
-            if let Some(block) = d.block {
+            // Whatever is left is `file_server`'s own block; the `browse` form
+            // took it above when that is where it belonged.
+            if let Some(block) = block {
                 for sub in block.directives {
                     match sub.name.as_str() {
                         "root" => {
@@ -89,7 +161,10 @@ pub(super) fn adapt_handler(
                         }
                         "browse" => {
                             config.browse =
-                                browse || sub.args.first().map(|s| s == "true").unwrap_or(true)
+                                browse || sub.args.first().map(|s| s == "true").unwrap_or(true);
+                            if let Some(block) = &sub.block {
+                                apply_browse_options(block, &mut config.browse_limit)?;
+                            }
                         }
                         // 🗜️ Written with no arguments means upstream's own
                         // default order, and writing it at all is what turns

@@ -1100,6 +1100,9 @@ pub struct FileServerConfig {
     pub root: String,
     pub index: Vec<String>,
     pub browse: bool,
+    /// 🔢 Maximum entries a directory listing shows, from `browse { file_limit
+    /// <n> }`. `None` leaves the file server's own default in place.
+    pub browse_limit: Option<usize>,
     pub compress: bool,
     /// 🗜️ Encodings whose sidecar files may be served, in preference order.
     pub precompressed: Vec<String>,

@@ -61,6 +61,16 @@ false: while it defaulted to false, "did not say" and "turned it off" were the
 same value, which is why nothing could read it. Whether a QUIC listener exists
 at all is still the global `servers { protocols … }` list.
 
+### 🗂️ `file_server browse` takes upstream's listing options
+
+`browse` now parses its options block, and `file_limit <n>` — upstream's name
+for it, in the place upstream puts it — caps how many entries a directory
+listing shows. The field and its behaviour already existed (the JSON
+configuration and `pc file-server --file-limit` both reached it); the DSL was
+the one door that could not. A listing template, `reveal_symlinks` and `sort`
+are refused by name rather than ignored, and `browse` is now found after a
+matcher as upstream allows.
+
 ### 📦 Releases are served from `releases.pingclair.com`
 
 GitHub remains where a release is created — the tag, the notes, the assets — and
