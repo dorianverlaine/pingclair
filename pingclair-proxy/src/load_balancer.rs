@@ -110,9 +110,14 @@ fn slow_start_ready(
 #[derive(Debug, Clone, Copy, Default)]
 pub enum Strategy {
     /// Distributes requests sequentially across all healthy upstreams.
-    #[default]
     RoundRobin,
     /// Selects an upstream at random.
+    ///
+    /// 🌐 The default, because Caddy's documented default for `lb_policy` is
+    /// `random` and a migrated Caddyfile that names no policy has to send
+    /// traffic where it used to. `default_lb_strategy` in the config types says
+    /// the same thing for the JSON path; the two are one decision.
+    #[default]
     Random,
     /// ⚡ Routes to the upstream with fewest active connections.
     LeastConn,

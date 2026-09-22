@@ -2671,7 +2671,12 @@ pub struct AccessControlConfig {
 }
 
 fn default_lb_strategy() -> String {
-    "round_robin".to_string()
+    // 🌐 Caddy's documented default for `lb_policy` is `random`, and this field
+    // is the same decision one layer down: a configuration that names no policy
+    // should send traffic the way the Caddyfile it was migrated from did.
+    // Checked against <https://caddyserver.com/docs/caddyfile/directives/reverse_proxy>
+    // on 2026-09-22 ("Default: random").
+    "random".to_string()
 }
 
 /// 🩺 Active upstream health-check configuration.

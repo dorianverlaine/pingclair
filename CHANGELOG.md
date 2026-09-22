@@ -37,6 +37,15 @@ Certificate Transparency logs, which is the privacy argument for a wildcard in
 the first place. Reaching the wildcard from a concrete name is a store lookup,
 not an order.
 
+### ⚖️ The default load-balancing policy matches Caddy
+
+A `reverse_proxy` that names no `lb_policy` now picks an upstream **at random**,
+which is Caddy's documented default, instead of round-robin. Both are reasonable
+policies, but only one of them is what the Caddyfile a site migrated from was
+already doing — and the difference was invisible on the single-upstream
+configurations most sites have. Write `lb_policy round_robin` for the previous
+behaviour.
+
 ### 📦 Releases are served from `releases.pingclair.com`
 
 GitHub remains where a release is created — the tag, the notes, the assets — and

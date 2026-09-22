@@ -1361,14 +1361,29 @@ impl ProxyState {
                 let primary_is_empty = primary.is_empty();
 
                 let strategy = match proxy_config.load_balance.strategy.as_str() {
-                    "random" => Strategy::Random,
+                    // 🌐 Caddy's documented default, and what an unset policy
+                    // compiles to: the adapter writes an empty string when no
+                    // `lb_policy` was named, so this arm — not the serde default
+                    // on `LoadBalanceConfig` — is the one a Pingclairfile
+                    // actually reaches. Both spellings land here so the JSON and
+                    // DSL paths cannot disagree.
+                    "" | "random" => Strategy::Random,
+                    "round_robin" => Strategy::RoundRobin,
                     "least_conn" => Strategy::LeastConn,
                     // 🔑 Every hashing policy uses the same consistent-hash
                     // ring; they differ only in what gets hashed, which the
                     // request path resolves through `hash_key_sources`.
                     "ip_hash" | "header" | "cookie" | "query" => Strategy::IpHash,
+                    // 🚧 `first` is not this: Caddy pins to the first available
+                    // upstream, while this spreads across all of them. Issue
+                    // #75 tracks the divergence; the arm stays because refusing
+                    // it here would break configurations that load today.
                     "first" => Strategy::RoundRobin,
-                    _ => Strategy::RoundRobin,
+                    // 🚫 Only a hand-written JSON config can reach this, since
+                    // the adapter validates the name against the list above.
+                    // It means "the schema accepted a policy nobody implements",
+                    // and the honest answer to that is the documented default.
+                    _ => Strategy::Random,
                 };
 
                 let load_balancer = Arc::new(
