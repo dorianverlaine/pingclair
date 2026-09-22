@@ -1,5 +1,5 @@
 name: setup-rust-cache
-description: Restore Cargo's registry and enable the sccache GitHub Actions backend for one job.
+description: Restore Cargo's registry and point sccache at the shared R2 cache, or at the Actions cache when the job may not use R2.
 
 inputs:
   target:
@@ -13,6 +13,41 @@ inputs:
   cache-scope:
     description: Job-scoped cache namespace (for example "lint" or "nextest-archive").
     required: true
+  cargo-home:
+    description: Cargo home whose registry should be cached. The builder image sets /usr/local/cargo; a bare runner uses ~/.cargo.
+    required: false
+    default: ""
+  # 🔐 The shared cache inputs are optional as a group: a job that does not pass
+  # them (or is not allowed to use them) keeps the Actions cache it had before.
+  r2-endpoint:
+    description: S3 endpoint of the shared cache bucket, https://<account>.r2.cloudflarestorage.com. Empty disables the shared cache.
+    required: false
+    default: ""
+  r2-bucket:
+    description: Bucket holding the shared cache.
+    required: false
+    default: ""
+  r2-access-key-id:
+    description: Bucket-scoped R2 access key id for the shared cache.
+    required: false
+    default: ""
+  r2-secret-access-key:
+    description: Bucket-scoped R2 secret access key for the shared cache.
+    required: false
+    default: ""
+  r2-key-prefix:
+    description: Key prefix inside the bucket. `sccache/v1/shared` is only for builds of public sources; anything else belongs under `sccache/v1/native/<host>`.
+    required: false
+    default: sccache/v1/shared
+  r2-cache-size:
+    description: Size of the local disk layer (sccache calls it L0).
+    required: false
+    default: 5G
+
+outputs:
+  backend:
+    description: Which sccache backend this job ended up with, `r2` or `gha`.
+    value: ${{ steps.decide.outputs.backend }}
 
 runs:
   using: composite
@@ -23,25 +58,64 @@ runs:
       run: |
         set -euo pipefail
         echo "hash=$(sha256sum Cargo.lock | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+        # 🧊 Inside the builder image CARGO_HOME is fixed at /usr/local/cargo, so
+        # the registry cache has to follow it rather than assume ~/.cargo.
+        cargo_home="${{ inputs.cargo-home }}"
+        [[ -n "${cargo_home}" ]] || cargo_home="$HOME/.cargo"
+        echo "cargo-home=${cargo_home}" >> "$GITHUB_OUTPUT"
 
     - name: Restore and save cargo home
       uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
         path: |
-          ~/.cargo/bin
-          ~/.cargo/registry/index
-          ~/.cargo/registry/cache
-          ~/.cargo/git/db
+          ${{ steps.lockhash.outputs.cargo-home }}/bin
+          ${{ steps.lockhash.outputs.cargo-home }}/registry/index
+          ${{ steps.lockhash.outputs.cargo-home }}/registry/cache
+          ${{ steps.lockhash.outputs.cargo-home }}/git/db
         key: cargo-home-${{ inputs.cache-scope }}-${{ inputs.target }}-${{ inputs.profile }}-${{ steps.lockhash.outputs.hash }}
         restore-keys: |
           cargo-home-${{ inputs.cache-scope }}-${{ inputs.target }}-${{ inputs.profile }}-
 
-    - name: Install sccache and enable the GitHub Actions cache backend
+    - name: Choose the cache backend
+      id: decide
+      shell: bash
+      env:
+        R2_ENDPOINT: ${{ inputs.r2-endpoint }}
+        R2_BUCKET: ${{ inputs.r2-bucket }}
+        R2_ACCESS_KEY_ID: ${{ inputs.r2-access-key-id }}
+        R2_SECRET_ACCESS_KEY: ${{ inputs.r2-secret-access-key }}
+      run: |
+        set -euo pipefail
+        # 🚫 Pull requests never touch the shared cache, whatever credentials
+        # reached this job. A read credential is scoped to the whole bucket —
+        # R2 cannot scope a long-lived token to a prefix — so a pull request
+        # that could read it could read every artifact any branch has ever
+        # compiled. Pull requests keep the Actions cache instead.
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          echo "::notice title=sccache::pull request — using the GitHub Actions cache"
+          echo "backend=gha" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        if [[ -n "${R2_ENDPOINT}" && -n "${R2_BUCKET}" && -n "${R2_ACCESS_KEY_ID}" && -n "${R2_SECRET_ACCESS_KEY}" ]]; then
+          echo "::notice title=sccache::shared cache — bucket ${R2_BUCKET}, prefix ${{ inputs.r2-key-prefix }}"
+          echo "backend=r2" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        echo "::notice title=sccache::no shared-cache credentials in this context — using the GitHub Actions cache"
+        echo "backend=gha" >> "$GITHUB_OUTPUT"
+
+    - name: Install sccache
       uses: mozilla/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       with:
         version: v0.17.0
 
-    - name: Point Cargo at sccache
+    # 🧊 The action above exports the cache-service tokens the Actions cache
+    # backend needs, and it has no input to skip that. The shared-cache path
+    # therefore turns the Actions backend off explicitly: sccache reads
+    # `SCCACHE_GHA_ENABLED` as a boolean, and the multilevel chain below is what
+    # selects the storage.
+    - name: Point Cargo at sccache, Actions cache
+      if: steps.decide.outputs.backend == 'gha'
       shell: bash
       run: |
         set -euo pipefail
@@ -52,3 +126,38 @@ runs:
         # never persisted.
         echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
         echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+
+    - name: Point Cargo at sccache, shared R2 cache
+      if: steps.decide.outputs.backend == 'r2'
+      shell: bash
+      env:
+        R2_ENDPOINT: ${{ inputs.r2-endpoint }}
+        R2_BUCKET: ${{ inputs.r2-bucket }}
+        R2_ACCESS_KEY_ID: ${{ inputs.r2-access-key-id }}
+        R2_SECRET_ACCESS_KEY: ${{ inputs.r2-secret-access-key }}
+        R2_KEY_PREFIX: ${{ inputs.r2-key-prefix }}
+        R2_CACHE_SIZE: ${{ inputs.r2-cache-size }}
+      run: |
+        set -euo pipefail
+        echo "::add-mask::${R2_ACCESS_KEY_ID}"
+        echo "::add-mask::${R2_SECRET_ACCESS_KEY}"
+        # 🪜 Two levels, fastest first: the runner's own disk, then R2. A hit at
+        # either level answers the compile; a hit at R2 backfills L0 for the rest
+        # of the job. `l0` means a failing *remote* write is best-effort — a
+        # Cloudflare wobble must not turn a green build red — while a failing
+        # local write, which would mean a broken runner, still fails the job.
+        {
+          echo "SCCACHE_GHA_ENABLED=false"
+          echo "SCCACHE_MULTILEVEL_CHAIN=disk,s3"
+          echo "SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY=l0"
+          echo "SCCACHE_DIR=${RUNNER_TEMP}/sccache"
+          echo "SCCACHE_CACHE_SIZE=${R2_CACHE_SIZE}"
+          echo "SCCACHE_BUCKET=${R2_BUCKET}"
+          echo "SCCACHE_ENDPOINT=${R2_ENDPOINT}"
+          echo "SCCACHE_REGION=auto"
+          echo "SCCACHE_S3_USE_SSL=true"
+          echo "SCCACHE_S3_KEY_PREFIX=${R2_KEY_PREFIX}"
+          echo "RUSTC_WRAPPER=sccache"
+          echo "AWS_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}"
+          echo "AWS_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}"
+        } >> "$GITHUB_ENV"

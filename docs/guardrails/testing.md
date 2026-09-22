@@ -226,6 +226,36 @@
 
 ---
 
+## 🧊 The shared build cache (2026-09-22)
+
+Compiled artifacts are shared between machines through R2. AGENTS.md owns the
+policy (which store, which prefix, who may read it); these are the traps that
+cost time when the machinery is touched.
+
+- **`SCCACHE_GHA_ENABLED=false` is load-bearing on the shared-cache path.**
+  `mozilla/sccache-action` installs sccache and switches the Actions cache
+  backend on, and it has no input to skip that. sccache parses the variable as a
+  boolean (`src/config.rs`, `bool_from_env_var`), so writing `false` is what
+  leaves `SCCACHE_MULTILEVEL_CHAIN` as the thing that selects storage. Drop the
+  line and every job on the shared path silently keeps talking to the Actions
+  cache.
+- **`SCCACHE_BASEDIRS` does not cover Rust.** mozilla/sccache#2652 is still open;
+  the basedir work (PR #2521) handles C and C++ only. A Rust artifact from a
+  debug profile therefore carries the compiler's absolute paths, and the answer
+  is not path rewriting but bucket separation plus a fixed build root — the
+  builder image builds at `/workspace/pingclair`, so the shared prefix never sees
+  a home directory.
+- **A read credential is a whole-bucket credential.** R2 scopes long-lived
+  tokens per bucket, not per prefix; only temporary credentials can be
+  path-scoped, and a temporary credential cannot exceed its parent. That is why
+  `setup-rust-cache` refuses the shared cache on `pull_request` events itself,
+  rather than trusting every caller to pass or omit the right pair.
+- **The audit is a measurement, not a promise.** `just cache-audit --policy
+  shared` samples objects, unzips what sccache stored (a Rust compilation is a
+  zip of its outputs) and reports credential-shaped strings plus this machine's
+  home path and hostname; `--policy mac` is the variant for a machine's own
+  bucket, where paths are expected. Credential canaries fail under both.
+
 ## 📁 Verification evidence
 
 - Results go to local `benchmarks/results/<date>_<commit-prefix>/`

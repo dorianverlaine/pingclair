@@ -14,12 +14,19 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        # 🧊 A job that runs inside the builder image already has a target
+        # directory, and it is part of the cache key: the path appears in the
+        # compiler arguments, so every builder that shares artifacts has to
+        # agree on it. Respect what the image set and only invent a path on a
+        # bare runner.
+        cargo_target_dir="${CARGO_TARGET_DIR:-${CI_BUILD_ROOT:-$HOME/.cache/pingclair-ci}/cargo-target}"
         ci_root="${CI_BUILD_ROOT:-$HOME/.cache/pingclair-ci}"
         mkdir -p "${ci_root}/tmp"
-        echo "CARGO_TARGET_DIR=${ci_root}/cargo-target" >> "$GITHUB_ENV"
-        echo "cargo-target-dir=${ci_root}/cargo-target" >> "$GITHUB_OUTPUT"
+        echo "CARGO_TARGET_DIR=${cargo_target_dir}" >> "$GITHUB_ENV"
+        echo "cargo-target-dir=${cargo_target_dir}" >> "$GITHUB_OUTPUT"
         echo "TEMP=${ci_root}/tmp" >> "$GITHUB_ENV"
         echo "TMP=${ci_root}/tmp" >> "$GITHUB_ENV"
+        echo "🧊 CARGO_TARGET_DIR=${cargo_target_dir}"
 
     - name: Install just
       uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3

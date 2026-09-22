@@ -1,57 +1,16 @@
 # 🏗️ Build Stage
 #
-# Ubuntu 24.04 LTS, pinned the same way CI pins `ubuntu-24.04` runners: a
-# floating `latest` tag lets the image drift to a newer release than the tests
-# ran under, which is the "green locally, red in production" trap one layer
-# further out. The toolchain comes from rustup rather than the distribution
-# because `rust-version = "1.98"` is pinned in Cargo.toml and CI verifies
-# exactly that.
-FROM ubuntu:24.04 AS builder
-
-# 🔨 What each of these is for, because a missing one fails far from its cause:
-#   cmake, make, g++     — BoringSSL's own build; cmake on Ubuntu does not
-#                          pull `make`, so the "Unix Makefiles" generator
-#                          has nothing to run without it
-#   clang, libclang-dev  — bindgen needs libclang to generate the FFI bindings
-#   git                  — boring-sys runs `git init` on the vendored BoringSSL
-#                          source to apply its patches; without the binary it
-#                          panics as a bare `NotFound` that names no file
-#   curl, ca-certificates — fetching rustup below; the Ubuntu base ships no
-#                           CA bundle, so curl cannot verify sh.rustup.rs
-#                           without it
+# 🧊 The environment is `deployment/Builder.Dockerfile`, the same image CI and
+# every Linux builder runs — which is also what makes this image's build
+# artifacts interchangeable with theirs. It pins Ubuntu 24.04, Rust 1.98.1,
+# clang/cmake/BoringSSL's dependencies, and the workspace path; the apt list
+# that used to live here is defined once, there.
 #
-# 🛰️ `apt-retry` retries a failed update as a whole and refuses to install
-# against a half-written index; `deployment/apt-retry.sh` carries the reasoning
-# and the 2026-09-11 incident (#59).
-COPY deployment/apt-retry.sh /usr/local/bin/apt-retry
-RUN apt-retry \
-        cmake \
-        make \
-        g++ \
-        perl \
-        pkg-config \
-        clang \
-        libclang-dev \
-        git \
-        curl \
-        ca-certificates
+# 📌 `:v1` is a tag this repository controls and moves deliberately (the digest
+# of record is recorded in .github/workflows/builder-image.yml); the base image
+# is pinned the same way CI pins `ubuntu-24.04`.
+FROM ghcr.io/dorianverlaine/pingclair-builder:v1 AS builder
 
-ENV RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:$PATH
-# 🎯 Downloaded to a file rather than `curl | sh`: `RUN` execs a plain shell
-# with no `pipefail`, so a `curl` that dies mid-stream feeds `sh` an empty
-# script that exits 0, and the layer succeeds having installed nothing. The
-# next `RUN` would then fail on a plain `cargo: command not found` that names
-# no cause. The final `cargo --version` is the actual guard: no later layer
-# can build against a toolchain that silently never arrived.
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-connrefused -sSf \
-        https://sh.rustup.rs -o /tmp/rustup-init.sh \
-    && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.98.1 \
-    && rm -f /tmp/rustup-init.sh \
-    && cargo --version
-
-WORKDIR /usr/src/pingclair
 COPY . .
 
 # 🔒 `--locked` so the image is built from the resolved versions the tests ran
@@ -67,7 +26,7 @@ COPY deployment/apt-retry.sh /usr/local/bin/apt-retry
 RUN apt-retry ca-certificates \
     && rm -f /usr/local/bin/apt-retry
 
-COPY --from=builder /usr/src/pingclair/target/release/pingclair /usr/local/bin/pingclair
+COPY --from=builder /cache/cargo-target/release/pingclair /usr/local/bin/pingclair
 
 # 📂 Same convention as caddy's official image: bake a stable data path into
 # the image so the store lands on the declared volume and survives container

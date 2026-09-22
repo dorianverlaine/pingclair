@@ -61,26 +61,40 @@ jobs:
     needs: changed
     if: ${{ needs.changed.outputs.rust == 'true' || needs.changed.outputs.workflows == 'true' }}
     timeout-minutes: 60
+    # 🧊 The build environment is an image, not a list of apt packages: the same
+    # one the other Linux builders use, so their artifacts are interchangeable.
+    container:
+      image: ghcr.io/dorianverlaine/pingclair-builder:v1
+    defaults:
+      run:
+        working-directory: /workspace/pingclair
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-linux-deps
+      # 📌 Paths are part of every cache key, so the checkout is moved to the
+      # path the image fixes (/workspace/pingclair) instead of building wherever
+      # this runner happens to mount the workspace.
+      - name: Place the checkout at the image's workspace path
+        run: |
+          set -euo pipefail
+          cp -a "${GITHUB_WORKSPACE}/." /workspace/pingclair/
 
       - uses: ./.github/actions/setup-ci
-
-      - name: Install Rust 1.98
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1 (toolchain is an input; ignored on 1.98.x branch refs)
-        with:
-          toolchain: 1.98.1
-          components: rustfmt, clippy
 
       - uses: ./.github/actions/setup-rust-cache
         with:
           target: x86_64-unknown-linux-gnu
           profile: dev
           cache-scope: rust-ci
+          cargo-home: /usr/local/cargo
+          # 🧊 The shared cache; the action itself refuses it on pull requests,
+          # where the empty secrets leave the Actions cache in place anyway.
+          r2-endpoint: ${{ vars.R2_CACHE_ENDPOINT }}
+          r2-bucket: ${{ vars.R2_CACHE_BUCKET }}
+          r2-access-key-id: ${{ secrets.R2_CACHE_ACCESS_KEY_ID }}
+          r2-secret-access-key: ${{ secrets.R2_CACHE_SECRET_ACCESS_KEY }}
 
       - name: Install nextest
         uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3

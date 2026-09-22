@@ -78,6 +78,53 @@ disk:
     du -sh "{{ target-dir }}" 2>/dev/null || true
     du -sh "$HOME/.cache/pingclair-build" 2>/dev/null || true
     du -sh "$HOME/.cache/pingclair-ci" 2>/dev/null || true
+    du -sh "$HOME/Library/Caches/pingclair/sccache" 2>/dev/null || true
+    du -sh "$HOME/.cache/pingclair/sccache" 2>/dev/null || true
+
+# 📌 `cargo build` is untouched — this is the opt-in for a build whose artifacts
+# should be reusable by CI and by the other machines of the same architecture.
+# It builds `[profile.ci-test]` because that is the profile CI's test archives
+# already use; sharing needs the same compiler arguments, not just the same code.
+#
+# 🔐 Credentials come from ~/.config/pingclair/cache.env (mode 600), one file per
+# machine. AGENTS.md, "Shared build cache", says what belongs in it.
+#
+# 🧊 Build with the shared cache: this machine's disk first, then R2.
+shared-build *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source scripts/cache-env.sh
+    exec cargo +{{ rust }} build --locked --profile ci-test {{ args }}
+
+# 🚫 These artifacts are only valid on the machine that produced them, so they
+# never enter `sccache/v1/shared` — the prefix the other machines read.
+#
+# 🧊 Build into a host-specific prefix: benchmarks, `target-cpu=native`, and
+# anything that must not be shared.
+native-build *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source scripts/cache-env.sh
+    export SCCACHE_S3_KEY_PREFIX="sccache/v1/native/$(hostname -s)"
+    exec cargo +{{ rust }} build --locked --profile ci-test {{ args }}
+
+# 📊 What the cache has been doing on this machine.
+cache-stats:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source scripts/cache-env.sh
+    exec sccache --show-stats
+
+# 🔎 Sample the bucket and report what is inside the artifacts.
+#
+# 🛡️ Run with --policy shared for the shared bucket (machine paths and
+# credentials are both failures) and --policy mac for this machine's own bucket
+# (paths are expected there, credentials are not).
+cache-audit *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source scripts/cache-env.sh
+    exec python3 scripts/cache-audit.py {{ args }}
 
 # 📦 Report where persistent CI caches live.
 cache-report:

@@ -111,6 +111,45 @@ full rebuild is required, check whether the target dir, target triple,
 toolchain, feature set, profile, `RUSTFLAGS`, linker, build environment, or
 cache path changed — a path change alone can turn a warm build cold.
 
+### Shared build cache
+
+Compiled artifacts are shared between machines through Cloudflare R2, one level
+below the local disk cache, so the second build of the day does not start cold.
+`sccache` runs the hierarchy; the rules here are about *which* artifacts may be
+shared with whom, because a compiler cache carries more than object code: crate
+and symbol names, string literals, and the absolute paths a debug build recorded.
+
+| Store | Holds | Who may use it |
+| --- | --- | --- |
+| `pingclair-build-cache`, prefix `sccache/v1/shared` | Builds of **public** sources from the builder image's fixed path | Trusted CI (push, tag, dispatch) and the Linux machines |
+| `pingclair-build-cache`, prefix `sccache/v1/native/<host>` | Benchmarks, `target-cpu=native`, anything machine-specific | The machine that wrote it |
+| `pingclair-build-cache-mac` | This Mac's own builds | The Mac, whose paths are its own business |
+| `pingclair-releases` | Published release artifacts | Everyone (it is the public download channel) |
+
+Recipes: `just shared-build` (the opt-in; builds `[profile.ci-test]`, which is
+what CI's archives use), `just native-build` (host-specific prefix),
+`just cache-stats`, `just cache-audit`.
+
+**Rules that are not negotiable:**
+
+- 🔐 Credentials live in `~/.config/pingclair/cache.env`, one file per machine,
+  mode 600, outside the checkout, never committed and never printed. Each file
+  holds a bucket-scoped R2 token — a machine that leaks its copy costs one
+  revocation, not the fabric.
+- 🚫 **Pull requests never touch the shared cache.** R2 cannot scope a
+  long-lived token to a prefix, so read access is whole-bucket access; the
+  setup action refuses R2 on `pull_request` events whatever it is handed. Do
+  not add R2 inputs to a PR-triggered job "for speed".
+- 🚫 **A private repository never points at these buckets.** The shared prefix
+  is for public sources only; private work uses its own bucket.
+- 🗓️ Both cache buckets expire `sccache/` after 45 days — a cache is disposable.
+  Bumping the prefix (`v1` → `v2`) is the "start from nothing" lever; there is
+  deliberately no Bucket Lock, because duplicate PUTs of the same artifact are
+  normal.
+- 🔎 `just cache-audit --policy shared` is the evidence that the shared bucket
+  contains no machine paths and no credentials. Run it after a change to the
+  build environment, and paste the output where the change is reviewed.
+
 ### Build-cache disk budget
 
 Observe cache size with `just disk`. The normal budget is about **80 GiB**;

@@ -18,26 +18,33 @@ jobs:
     name: Clippy (release profile)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    container:
+      image: ghcr.io/dorianverlaine/pingclair-builder:v1
+    defaults:
+      run:
+        working-directory: /workspace/pingclair
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-linux-deps
+      - name: Place the checkout at the image's workspace path
+        run: |
+          set -euo pipefail
+          cp -a "${GITHUB_WORKSPACE}/." /workspace/pingclair/
 
       - uses: ./.github/actions/setup-ci
-
-      - name: Install Rust 1.98
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1 (toolchain is an input; ignored on 1.98.x branch refs)
-        with:
-          toolchain: 1.98.1
-          components: rustfmt, clippy
 
       - uses: ./.github/actions/setup-rust-cache
         with:
           target: x86_64-unknown-linux-gnu
           profile: release
           cache-scope: rust-ci-full
+          cargo-home: /usr/local/cargo
+          r2-endpoint: ${{ vars.R2_CACHE_ENDPOINT }}
+          r2-bucket: ${{ vars.R2_CACHE_BUCKET }}
+          r2-access-key-id: ${{ secrets.R2_CACHE_ACCESS_KEY_ID }}
+          r2-secret-access-key: ${{ secrets.R2_CACHE_SECRET_ACCESS_KEY }}
 
       - name: Check formatting
         run: cargo +1.98.1 fmt --all -- --check
