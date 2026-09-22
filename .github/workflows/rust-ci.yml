@@ -136,7 +136,13 @@ jobs:
           just bench-smoke
 
       - name: Run tests with the known-flaky retry policy
-        run: scripts/run-ci-tests.sh
+        # 🎯 Naming the host target explicitly is what lets this job reuse the
+        # test-profile artifacts the nextest archive job builds: cargo's default
+        # layout for a host build is `…/ci-test`, the archive's is
+        # `…/x86_64-unknown-linux-gnu/ci-test`, and the path is part of every
+        # cache key. With the target named, the two agree — measured at 3 % Rust
+        # hits before this and expected to be most of 961 misses after.
+        run: scripts/run-ci-tests.sh --target x86_64-unknown-linux-gnu
 
       - uses: ./.github/actions/check-clean-worktree
         with:
