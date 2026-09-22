@@ -142,6 +142,23 @@ class ServiceUnitTest(unittest.TestCase):
         unterminated = self.install_script(self.CANONICAL).replace("EOF\nfi\n", "fi\n")
         self.assertIsNone(embedded_unit(unterminated))
 
+    def test_a_pre_command_is_refused(self):
+        trapped = self.CANONICAL.replace(
+            "[Service]\n",
+            "[Service]\nExecStartPre=/usr/local/bin/pingclair validate /etc/pf\n",
+        )
+        errors = unit_errors(trapped)
+        self.assertTrue(any("ExecStartPre" in error for error in errors), errors)
+
+    def test_a_comment_naming_the_pre_command_is_allowed(self):
+        # 🚫 The unit's own comment explains why the directive is absent, so the
+        # check has to read directives rather than every substring.
+        documented = self.CANONICAL.replace(
+            "[Service]\n",
+            "[Service]\n# 🚫 No ExecStartPre=/usr/local/bin/pingclair here.\n",
+        )
+        self.assertEqual(unit_errors(documented), [])
+
 
 if __name__ == "__main__":
     unittest.main()

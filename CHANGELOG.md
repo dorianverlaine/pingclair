@@ -864,6 +864,21 @@ immediately after the `101`, both ends seeing EOF with no error.
   fresh one-liner install therefore gets `ProtectSystem=full`, `PrivateTmp`,
   `NoNewPrivileges` and `LimitNPROC` as well.
 
+- 🔁 **A refused configuration is no longer retried forever.** Matching the two
+  unit copies was not enough to fix this. `systemd` applies
+  `RestartPreventExitStatus=` to the main process, never to a failing
+  `ExecStartPre=`, and the unit ran `validate` as exactly that — so a file the
+  compiler refuses left the unit in `activating` while `NRestarts` climbed every
+  five seconds. Measured on Ubuntu 24.04 (systemd 255): `NRestarts` 0, 1, 2, 3, 4
+  over twenty seconds, with `Restart=on-failure` and
+  `RestartPreventExitStatus=1` already in place.
+
+  The unit no longer carries a pre-command. The server compiles the
+  configuration itself before it binds anything and exits 1 when it refuses it,
+  which is the exit code the restart policy was written for; the same
+  measurement then reads `is-active=failed` with `NRestarts=0`. `just repo-lint`
+  refuses a unit that grows an `ExecStartPre=` again, comments excepted.
+
 - ⚡ **A `handle_response { file_server }` no longer rebuilds its file server for
   every response.** Each response constructed one and threw it away. The
   construction itself is cheap; the caches it carries are the point, and

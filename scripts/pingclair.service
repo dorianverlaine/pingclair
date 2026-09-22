@@ -29,7 +29,15 @@ Environment="RUST_LOG=info"
 # is the same path `deployment/Dockerfile` sets, so both install paths persist
 # certificates in one place.
 Environment="PINGCLAIR_TLS_STORE=/var/lib/pingclair/certs"
-ExecStartPre=/usr/local/bin/pingclair validate /etc/Pingclair/Pingclairfile
+# 🚫 Deliberately no `ExecStartPre=/usr/local/bin/pingclair validate …` here.
+# It looks like the safe place for the check and it is the trap: systemd applies
+# `RestartPreventExitStatus=` to the main process, not to a failing pre-command,
+# so a configuration the compiler refuses was retried every five seconds instead
+# of leaving the unit failed. The server compiles the file itself before it binds
+# anything, and exits 1 when it refuses it — the exit code the restart policy
+# below was written for. Measured on Ubuntu 24.04 (systemd 255): pre-command
+# failure, `NRestarts` climbing with `is-active=activating`; server exit 1,
+# `is-active=failed` with `NRestarts=0`.
 ExecStart=/usr/local/bin/pingclair run /etc/Pingclair/Pingclairfile
 # 🔔 SIGUSR1 is the reload signal. SIGHUP is dropped on purpose — it is the
 # signal table Caddy uses — so the `kill -HUP` this unit used to send reported

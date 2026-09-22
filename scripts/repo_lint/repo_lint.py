@@ -38,6 +38,12 @@ REQUIRED_UNIT_LINES = (
     "Restart=on-failure",
     "RestartPreventExitStatus=1",
 )
+# 🚫 A directive the installed unit must not carry. `ExecStartPre` looks like the
+# safe place to check a configuration, and it is the trap: systemd applies
+# `RestartPreventExitStatus=` to the main process, not to a failing pre-command,
+# so a configuration the compiler refuses was retried every five seconds instead
+# of leaving the unit failed for an operator.
+FORBIDDEN_UNIT_LINE_PREFIXES = ("ExecStartPre=",)
 
 _SECTION_RE = re.compile(r"^\[(?P<name>[^\]]+)\]\s*$", re.MULTILINE)
 _FORBIDDEN_RE = re.compile(
@@ -90,13 +96,35 @@ def manifest_errors(text: str, is_root: bool) -> list[str]:
     return errors
 
 
+def active_unit_lines(text: str) -> list[str]:
+    """Return the unit's directives, with blank lines and comments dropped.
+
+    A comment may name a directive on purpose — the unit explains why
+    `ExecStartPre` is absent — so the forbidden check reads directives only.
+    """
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
 def unit_errors(text: str) -> list[str]:
     """Return the invariants the canonical service unit must keep."""
-    return [
+    errors = [
         f"the service unit must contain `{line}`"
         for line in REQUIRED_UNIT_LINES
         if line not in text
     ]
+    errors.extend(
+        f"the service unit must not carry `{line}…`: systemd does not apply "
+        "`RestartPreventExitStatus=` to a failing pre-command, so the unit "
+        "restarts a refused configuration forever"
+        for line in active_unit_lines(text)
+        for prefix in FORBIDDEN_UNIT_LINE_PREFIXES
+        if line.startswith(prefix)
+    )
+    return errors
 
 
 def embedded_unit(install_sh: str) -> str | None:
