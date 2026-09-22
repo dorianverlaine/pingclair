@@ -348,11 +348,19 @@ impl TlsManager {
             .collect();
     }
 
-    /// 🚦 Reports whether the configuration authorised public issuance for
-    /// this server name.
-    fn public_issuance_allowed(&self, domain: &str) -> bool {
-        let normalized = normalize_internal_domain(domain);
-        matching_pattern(&self.public_issuance_domains.read(), &normalized).is_some()
+    /// 🃏 The name to obtain a certificate for when a client asks for `domain`.
+    ///
+    /// The configuration's spelling wins over the client's: a site declared as
+    /// `*.example.com` orders `*.example.com`, one leaf for every name under it,
+    /// while a name the configuration lists explicitly orders exactly that name.
+    /// A wildcard site that also lists its apex covers both, because an exact
+    /// entry beats the wildcard — which is how a TLS client reads the two names
+    /// as well.
+    fn public_issuance_name(&self, domain: &str) -> Option<String> {
+        matching_pattern(
+            &self.public_issuance_domains.read(),
+            &normalize_internal_domain(domain),
+        )
     }
 
     /// 🌐 The single door to a public certificate authority.
@@ -371,7 +379,7 @@ impl TlsManager {
         // case-insensitive and the CA normalizes anyway, so the only thing
         // varied capitalisation could ever buy is repeated work here.
         let domain = normalize_internal_domain(domain);
-        if !self.public_issuance_allowed(&domain) {
+        let Some(issuance_name) = self.public_issuance_name(&domain) else {
             // 📉 `debug`, not `warn`: on a public listener this fires once per
             // stranger scanning the address, and a log line an unauthenticated
             // client can emit at will is its own denial of service.
@@ -380,14 +388,22 @@ impl TlsManager {
                 domain
             );
             return None;
-        }
+        };
         match auto
-            .get_certificate(&domain, self.challenge_policy.load().solver_for(&domain))
+            .get_certificate(
+                &issuance_name,
+                self.challenge_policy.load().solver_for(&issuance_name),
+            )
             .await
         {
             Ok(cert) => Some(cert),
             Err(error) => {
-                tracing::warn!("❌ Failed to obtain cert for {}: {}", domain, error);
+                tracing::warn!(
+                    "❌ Failed to obtain cert for {} (asked for by {}): {}",
+                    issuance_name,
+                    domain,
+                    error
+                );
                 None
             }
         }
@@ -915,23 +931,58 @@ mod tests {
         (cert.pem(), key.serialize_pem())
     }
 
-    /// 🃏 A wildcard site covers one label under it, and no more.
+    /// 🃏 A wildcard site orders the wildcard, and one leaf serves every name
+    /// under it.
     ///
-    /// `*.example.com` is a name a DNS-01 site legitimately serves, so it has
-    /// to authorise `a.example.com`. It must not authorise `a.b.example.com`
-    /// or `example.com` itself — no TLS client accepts a wildcard certificate
-    /// for either, so issuing one would spend quota on something unusable.
+    /// The configuration's spelling is what gets ordered, the way Caddy takes
+    /// site names literally: `*.example.com` orders `*.example.com`. The
+    /// alternative — ordering the name the client happened to send — spends one
+    /// order per subdomain against the CA's rate limit and publishes every
+    /// subdomain in Certificate Transparency logs, which is the trade a
+    /// wildcard exists to make in the other direction.
+    ///
+    /// The one-label rule is unchanged. `a.b.example.com` and `example.com` are
+    /// not covered by `*.example.com`, so nothing is ordered for them — no TLS
+    /// client would accept that leaf for either name.
     #[tokio::test]
-    async fn a_wildcard_authorises_exactly_one_label_under_it() {
+    async fn a_wildcard_site_orders_the_wildcard_for_every_name_under_it() {
         let directory = tempfile::tempdir().unwrap();
         let (manager, issuer) = issuing_manager(directory.path());
         manager.set_public_issuance_domains(["*.example.com"]);
 
         assert!(manager.resolve_pem("a.example.com").await.is_some());
+        assert!(
+            manager.resolve_pem("b.example.com").await.is_some(),
+            "the second name under the wildcard must be served by the same leaf"
+        );
         assert!(manager.resolve_pem("a.b.example.com").await.is_none());
         assert!(manager.resolve_pem("example.com").await.is_none());
         assert!(manager.resolve_pem("notexample.com").await.is_none());
-        assert_eq!(issuer.calls.lock().as_slice(), ["a.example.com"]);
+        assert_eq!(
+            issuer.calls.lock().as_slice(),
+            ["*.example.com"],
+            "one order for the wildcard, not one per name the client asked for"
+        );
+    }
+
+    /// 🧭 An explicitly listed name still gets its own certificate.
+    ///
+    /// A site that lists both its apex and the wildcard covers both, and the
+    /// apex is not served by the wildcard — no client would accept it there, so
+    /// the exact entry wins and orders its own leaf.
+    #[tokio::test]
+    async fn a_listed_apex_orders_its_own_certificate_beside_the_wildcard() {
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, issuer) = issuing_manager(directory.path());
+        manager.set_public_issuance_domains(["*.example.com", "example.com"]);
+
+        assert!(manager.resolve_pem("example.com").await.is_some());
+        assert!(manager.resolve_pem("a.example.com").await.is_some());
+        assert_eq!(
+            issuer.calls.lock().as_slice(),
+            ["example.com", "*.example.com"],
+            "the apex and the wildcard are two subjects, each ordered as written"
+        );
     }
 
     /// 🔤 A name is compared after normalisation, not as it arrived.

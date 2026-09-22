@@ -870,9 +870,10 @@ Pingclair convient, plutôt que d'être des détails découverts plus tard :
   `dns cloudflare <token>` : `auto` autorise l'émission publique, tandis que
   `dns` choisit la preuve de contrôle. L'option globale `acme_dns` place tous
   les sites automatiques sur DNS-01 et fonctionne sur un hôte dont le port 80
-  est injoignable. Un site `*.example.com` ne demande pas un seul certificat
-  générique : il prouve le contrôle par DNS-01 et obtient un certificat par nom
-  qu'il doit servir. Tout autre nom de fournisseur est refusé nommément au
+  est injoignable. Un site `*.example.com` demande ce certificat générique et
+  sert chaque nom qu'il couvre avec cette seule feuille ; indiquez aussi l'apex
+  (`example.com`) s'il doit répondre là, car un certificat générique couvre
+  exactement un label. Tout autre nom de fournisseur est refusé nommément au
   démarrage : le serveur ne se rabat pas sur HTTP-01, car HTTP-01 ne peut pas
   prouver le contrôle d'un nom générique et l'échec n'apparaîtrait qu'au
   renouvellement, dans un message qui ne mentionne jamais l'option choisie.

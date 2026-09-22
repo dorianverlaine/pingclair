@@ -208,9 +208,19 @@ impl CertStore {
     }
 
     /// Retrieves a certificate from the in-memory cache.
+    ///
+    /// 🃏 The exact name wins; failing that, a wildcard leaf answers for the one
+    /// label it covers. A certificate for `*.example.com` is stored under that
+    /// key and nowhere else, so without this fallback every handshake for a name
+    /// under a wildcard site would miss the store and order its own
+    /// certificate — which is exactly what the wildcard exists to avoid.
     pub async fn get(&self, domain: &str) -> Option<Certificate> {
         let cache = self.cache.read().await;
-        cache.get(domain).cloned()
+        if let Some(cert) = cache.get(domain) {
+            return Some(cert.clone());
+        }
+        let wildcard = wildcard_covering(domain)?;
+        cache.get(&wildcard).cloned()
     }
 
     /// Checks if a non-expired certificate exists for the domain.
@@ -277,9 +287,57 @@ impl CertStore {
     }
 }
 
+/// 🃏 The wildcard key that would cover `domain`, if one can exist.
+///
+/// `a.example.com` asks for `*.example.com`. The one-label rule is not checked
+/// here, it falls out of the construction: `a.b.example.com` asks for
+/// `*.b.example.com`, so a certificate for `*.example.com` cannot be reached
+/// from a two-label subdomain by this path.
+///
+/// A two-label name like `example.com` asks for nothing — there is no `*.com`
+/// to hold a certificate, and a wildcard has never covered a registrable name.
+fn wildcard_covering(domain: &str) -> Option<String> {
+    let (_, rest) = domain.split_once('.')?;
+    rest.contains('.').then(|| format!("*.{rest}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🃏 A wildcard leaf answers for the one label under it, and for nothing
+    /// that a TLS client would not accept it for.
+    ///
+    /// This is what lets one order for `*.example.com` serve every name beneath
+    /// it. Without it the store misses on every concrete name — the certificate
+    /// is filed under the wildcard — and each handshake orders its own
+    /// certificate, which is the cost the wildcard exists to remove.
+    #[tokio::test]
+    async fn a_wildcard_certificate_answers_for_one_label_under_it() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = CertStore::new(temp_dir.path());
+        store.init().await.expect("Init failed");
+
+        let cert = Certificate {
+            cert_pem: "CERT".into(),
+            key_pem: "KEY".into(),
+            domains: vec!["*.example.com".into()],
+            expires_at: 4_102_444_800,
+        };
+        store.store(&cert).await.expect("Store failed");
+
+        assert!(store.get("*.example.com").await.is_some());
+        assert!(store.get("a.example.com").await.is_some());
+        assert!(
+            store.get("a.b.example.com").await.is_none(),
+            "a wildcard covers one label"
+        );
+        assert!(
+            store.get("example.com").await.is_none(),
+            "the apex is not covered by its own wildcard"
+        );
+        assert!(store.get("notexample.com").await.is_none());
+    }
 
     #[tokio::test]
     async fn test_store_lifecycle() {

@@ -372,20 +372,17 @@ pub(crate) fn public_issuance_domains(
         .collect()
 }
 
-/// 🚀 Collects the hostnames that need eager ACME issuance: the authorised
-/// names above, minus the wildcards.
+/// 🚀 Collects the hostnames that need eager ACME issuance at startup.
 ///
-/// A wildcard is excluded here and not from the allowlist because the two
-/// answer different questions. "May we ask about this name" is yes for
-/// `*.example.com`; "should we ask at startup" is no, because a wildcard needs
-/// DNS-01 and there is nothing to issue until a concrete name appears.
+/// 🃏 Wildcards are included, because a wildcard site now orders the wildcard
+/// itself: `*.example.com` is one order and one leaf for every name the site
+/// serves, and obtaining it at startup is what keeps the first visitor from
+/// paying for it. A wildcard that needs DNS-01 therefore does its propagation
+/// wait during startup rather than inside somebody's handshake.
 pub(crate) fn eager_issuance_domains(
     config: &pingclair_core::config::PingclairConfig,
 ) -> Vec<String> {
     public_issuance_domains(config)
-        .into_iter()
-        .filter(|name| !name.contains('*'))
-        .collect()
 }
 
 /// Populate the HTTP/3 SNI certificate table from the TLS manager.
@@ -413,10 +410,10 @@ pub(crate) async fn refresh_h3_cert_table(
 mod tests {
     use super::*;
 
-    /// 🚀 Only `tls auto` hostnames qualify for eager issuance; internal,
-    /// manual and wildcard sites are excluded.
+    /// 🚀 Only `tls auto` hostnames qualify for eager issuance; internal and
+    /// manual sites are excluded, and a wildcard site is included as itself.
     #[test]
-    fn eager_issuance_domains_excludes_internal_manual_and_wildcards() {
+    fn eager_issuance_domains_excludes_internal_and_manual_only() {
         use pingclair_core::config::{ServerConfig, TlsConfig};
 
         let auto = ServerConfig {
@@ -475,12 +472,13 @@ mod tests {
         };
         assert_eq!(
             eager_issuance_domains(&config),
-            vec!["auto.example", "json.example"]
+            vec!["auto.example", "*.example.com", "json.example"],
+            "a wildcard site is issued at startup as one leaf for the names under it"
         );
 
-        // 🃏 The allowlist keeps the wildcard: `*.example.com` is a name a
-        // DNS-01 site legitimately serves, it just is not something to issue
-        // at startup.
+        // 🃏 The allowlist and the eager list now agree about the wildcard: it
+        // is a name the configuration asked for, not a pattern that only
+        // authorises others.
         assert_eq!(
             public_issuance_domains(&config),
             vec!["auto.example", "*.example.com", "json.example"]

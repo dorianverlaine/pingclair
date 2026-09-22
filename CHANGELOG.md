@@ -20,6 +20,23 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🃏 A wildcard site orders the wildcard, once
+
+A site configured as `*.example.com` now obtains one certificate for
+`*.example.com` and serves every name under it from that leaf, instead of
+ordering a separate certificate for each name a client happened to ask for.
+The name ordered is the one the configuration spelled — an exact entry still
+wins over the wildcard that would cover it, so listing `example.com` beside
+`*.example.com` obtains the apex's own certificate, because a wildcard covers
+exactly one label and never its own apex.
+
+Two consequences worth stating: the leaf is obtained at startup like any other
+`tls auto` name, so the first visitor does not pay for a DNS-01 propagation
+wait inside their handshake; and the subdomains this site serves stay out of
+Certificate Transparency logs, which is the privacy argument for a wildcard in
+the first place. Reaching the wildcard from a concrete name is a store lookup,
+not an order.
+
 ### 📦 Releases are served from `releases.pingclair.com`
 
 GitHub remains where a release is created — the tag, the notes, the assets — and

@@ -843,9 +843,10 @@ Pingclair fits at all rather than being details you discover later:
   include both `auto` and `dns cloudflare <token>`; `auto` authorises public
   issuance, while `dns` selects how that issuance proves control. The global
   `acme_dns` option moves every automatic site onto DNS-01 and works on a host
-  where port 80 is unreachable. A `*.example.com` site does not order a single
-  wildcard leaf: it proves control with DNS-01 and obtains one certificate per
-  name it is asked to serve. Any other provider name is refused at startup
+  where port 80 is unreachable. A `*.example.com` site orders that wildcard and
+  serves every name under it from the one leaf; list the apex beside it
+  (`example.com`) if the site answers there too, because a wildcard covers
+  exactly one label. Any other provider name is refused at startup
   by name — the server will not fall back to HTTP-01, because HTTP-01 cannot
   prove control of a wildcard and the failure would surface at renewal as a
   validation error that never mentions the option you set.

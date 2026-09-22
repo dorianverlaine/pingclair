@@ -388,6 +388,15 @@
   and `KeyAuthorization::dns_value()` is for DNS-01. Using the former in DNS
   produces a TXT record that propagates perfectly and can never validate.
 
+- 🃏 **The name ordered is the configured one, not the SNI.** A site declared
+  `*.example.com` orders `*.example.com` — one leaf for every name under it —
+  while a name the configuration lists exactly orders exactly itself, so
+  `example.com` beside the wildcard gets its own certificate. Ordering the SNI
+  instead spends one order per subdomain against the CA's rate limit and
+  publishes each subdomain in Certificate Transparency logs. `CertStore::get`
+  resolves a concrete name to its wildcard leaf; the one-label rule is
+  unchanged, so `a.b.example.com` is not covered by `*.example.com`.
+
 - 🔎 **Read the failed authorization before removing its record.** An ACME order
   may report only `Invalid`; the authority's useful reason lives on the failed
   challenge. Refresh that authorization while the response is still published,
