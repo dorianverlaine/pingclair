@@ -61,6 +61,26 @@ false: while it defaulted to false, "did not say" and "turned it off" were the
 same value, which is why nothing could read it. Whether a QUIC listener exists
 at all is still the global `servers { protocols … }` list.
 
+### 🧩 `adapt` converts; `validate` and `run` refuse what cannot be provisioned
+
+`pingclair adapt` and the Admin API's `POST /adapt` stop at proposing the
+document: the validation pass that used to run inside the shared compiler
+belongs to `validate` and `run`, which is where upstream draws the line too —
+`caddy adapt` does not validate. `adapt --validate` still runs the checks on
+request.
+
+Two settings that previously failed only at **startup** now fail validation,
+because that is where every configuring path meets:
+
+- `metrics { otlp }` — there is no OTLP exporter behind the switch, and metrics
+  are scraped only.
+- Any `dns` provider other than `cloudflare`, in the global `dns`, the global
+  `acme_dns`, or a site's own `tls { dns … }`.
+
+A document naming either still adapts — the compatibility corpus measures
+adaptation, not provisioning — while `pingclair validate` and `pingclair run`
+refuse it with a message that says what is missing.
+
 ### 🔁 The retry policy has one implementation
 
 `status_codes`, `methods`, `path_patterns` and `expressions` are gone from the

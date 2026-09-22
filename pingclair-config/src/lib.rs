@@ -43,6 +43,35 @@ pub fn compile(source: &str) -> Result<PingclairConfig, FullCompileError> {
     compile_named(source, None)
 }
 
+/// 🧩 Adapts a Pingclairfile into the JSON document **without validating it**.
+///
+/// `compile` is adapt *plus* validation, which is the right answer for anything
+/// about to run and the wrong one for a converter. A document can be
+/// structurally sound and still name something this build cannot provision —
+/// an unimplemented DNS provider, `metrics { otlp }` — and refusing it here
+/// would make `adapt` answer a question nobody asked it. Upstream draws the
+/// same line: `caddy adapt` converts, it does not validate.
+///
+/// `validate` and `run` still refuse those documents, because they are the
+/// paths that have to honour them.
+pub fn adapt(source: &str) -> Result<PingclairConfig, FullCompileError> {
+    compile_named_with(source, None, false)
+}
+
+/// 📄 The same, for a file: `.json` is parsed, anything else is adapted.
+pub fn adapt_file(path: impl AsRef<Path>) -> Result<PingclairConfig, FullCompileError> {
+    compile_file_with(path.as_ref(), false)
+}
+
+/// 🗂️ The same, for a directory of configuration files.
+///
+/// Merging is not validation: the files are folded together exactly as `run`
+/// would fold them, and the result is handed back unchecked.
+pub fn adapt_directory(dir_path: impl AsRef<Path>) -> Result<PingclairConfig, FullCompileError> {
+    let paths = configuration_paths(dir_path.as_ref())?;
+    merge_files(&paths, false)
+}
+
 /// 📍 Compiles a configuration, naming the file it came from in any error.
 ///
 /// The name is only ever used for error messages. Without it the compiler can
@@ -56,6 +85,15 @@ pub fn compile(source: &str) -> Result<PingclairConfig, FullCompileError> {
 pub fn compile_named(
     source: &str,
     name: Option<&Path>,
+) -> Result<PingclairConfig, FullCompileError> {
+    compile_named_with(source, name, true)
+}
+
+/// 🔧 One implementation, two callers: `compile*` validates, `adapt*` does not.
+fn compile_named_with(
+    source: &str,
+    name: Option<&Path>,
+    validate: bool,
 ) -> Result<PingclairConfig, FullCompileError> {
     // 🧩 Parse and analyze the human-readable configuration. The file's own
     // directory goes with it, because a relative `import` resolves against the
@@ -75,23 +113,31 @@ pub fn compile_named(
 
     // 🏗️ Compile the typed tree and enforce cross-field invariants.
     let config = compile_ast(&ast)?;
-    compiler::validate_config(&config)?;
+    if validate {
+        compiler::validate_config(&config)?;
+    }
 
     Ok(config)
 }
 
 /// 📄 Loads and compiles a supported configuration file from a path.
 pub fn compile_file(path: impl AsRef<Path>) -> Result<PingclairConfig, FullCompileError> {
-    let path = path.as_ref();
+    compile_file_with(path.as_ref(), true)
+}
+
+/// 🔧 The file loader behind both `compile_file` and `adapt_file`.
+fn compile_file_with(path: &Path, validate: bool) -> Result<PingclairConfig, FullCompileError> {
     let source = std::fs::read_to_string(path).map_err(|e| FullCompileError::Io(e.to_string()))?;
 
     if path.extension().is_some_and(|ext| ext == "json") {
-        let config = serde_json::from_str(&source)
+        let config: PingclairConfig = serde_json::from_str(&source)
             .map_err(|e| FullCompileError::Io(format!("JSON parse error: {e}")))?;
-        compiler::validate_config(&config)?;
+        if validate {
+            compiler::validate_config(&config)?;
+        }
         Ok(config)
     } else {
-        compile_named(&source, Some(path))
+        compile_named_with(&source, Some(path), validate)
     }
 }
 
@@ -104,6 +150,14 @@ pub fn compile_file(path: impl AsRef<Path>) -> Result<PingclairConfig, FullCompi
 /// them separately would reject that with an error naming the wrong file.
 pub fn compile_multiple_files(
     paths: &[impl AsRef<Path>],
+) -> Result<PingclairConfig, FullCompileError> {
+    merge_files(paths, true)
+}
+
+/// 🔧 Folds several files into one document, validating only when asked.
+fn merge_files(
+    paths: &[impl AsRef<Path>],
+    validate: bool,
 ) -> Result<PingclairConfig, FullCompileError> {
     let mut final_config = pingclair_core::config::PingclairConfig::default();
 
@@ -124,8 +178,11 @@ pub fn compile_multiple_files(
         merge_logging(&mut final_config.logging, config.logging, path.as_ref())?;
     }
 
-    // 🛡️ One validation pass, on what the runtime will actually receive.
-    compiler::validate_config(&final_config)?;
+    // 🛡️ One validation pass, on what the runtime will actually receive —
+    // skipped when the caller is adapting rather than provisioning.
+    if validate {
+        compiler::validate_config(&final_config)?;
+    }
     Ok(final_config)
 }
 
@@ -338,12 +395,19 @@ fn pingclair_config_compile_error(message: String) -> crate::compiler::CompileEr
 
 /// Load and merge configuration from directory (all .pingclair files)
 pub fn compile_directory(dir_path: impl AsRef<Path>) -> Result<PingclairConfig, FullCompileError> {
+    let paths = configuration_paths(dir_path.as_ref())?;
+    compile_multiple_files(&paths)
+}
+
+/// 🗂️ Every configuration file a directory holds, in load order.
+///
+/// Shared by `compile_directory` and `adapt_directory`, so a converter and the
+/// server agree about which files a directory configuration is.
+fn configuration_paths(dir_path: &Path) -> Result<Vec<std::path::PathBuf>, FullCompileError> {
     use std::ffi::OsStr;
     use std::fs;
 
-    let dir_path = dir_path.as_ref();
     let mut config_paths = Vec::new();
-
     for entry in fs::read_dir(dir_path).map_err(|e| FullCompileError::Io(e.to_string()))? {
         let entry = entry.map_err(|e| FullCompileError::Io(e.to_string()))?;
         let path = entry.path();
@@ -358,8 +422,7 @@ pub fn compile_directory(dir_path: impl AsRef<Path>) -> Result<PingclairConfig, 
 
     // Sort paths to ensure consistent loading order
     config_paths.sort();
-
-    compile_multiple_files(&config_paths)
+    Ok(config_paths)
 }
 
 /// Full compilation error
@@ -387,6 +450,54 @@ pub enum FullCompileError {
 mod tests {
     use super::*;
     use pingclair_core::config::{HandlerConfig, LogFormat, LogOutput, Matcher, RetryPredicate};
+
+    /// 🚫 A document this build cannot provision fails `validate`, and `adapt`
+    /// still converts it.
+    ///
+    /// The refusal used to happen only at startup, so `pingclair validate`
+    /// happily accepted a configuration the server would refuse to run with.
+    /// Moving it into `validate_config` puts it where every configuring path
+    /// meets — which is only possible because `adapt` no longer validates.
+    #[test]
+    fn unimplemented_provisioning_fails_validation_not_adaptation() {
+        for source in [
+            // 📡 One DNS provider is implemented.
+            "example.com {\n\ttls {\n\t\tauto\n\t\tdns route53 token\n\t}\n}",
+            // 📊 And there is no OTLP exporter behind the switch.
+            "{\n\tmetrics {\n\t\totlp\n\t}\n}\nexample.com {\n\trespond \"ok\"\n}",
+        ] {
+            assert!(
+                adapt(source).is_ok(),
+                "`adapt` converts a document it cannot provision: {source}"
+            );
+            let error = compile(source).expect_err("`compile` must refuse it");
+            assert!(
+                error.to_string().contains("cloudflare") || error.to_string().contains("OTLP"),
+                "the refusal has to say what is missing: {error}"
+            );
+        }
+    }
+
+    /// 🧩 `adapt` converts; `compile` also validates.
+    ///
+    /// The distinction is the point. A document can be structurally sound and
+    /// still name something this build cannot provision — an unimplemented DNS
+    /// provider, `metrics { otlp }` — and a converter that refused it would be
+    /// answering a question nobody asked it. Upstream draws the line in the
+    /// same place: `caddy adapt` does not validate.
+    #[test]
+    fn adapt_converts_what_compile_refuses() {
+        // 🔢 A retry bound the runtime will not honour: the adapter and the
+        // compiler accept it, `validate_config` refuses it.
+        let source = "example.com {\n\treverse_proxy 127.0.0.1:9000 {\n\t\tretry {\n\t\t\tmax_attempts 99\n\t\t}\n\t}\n}";
+
+        let adapted = adapt(source).expect("adapt must convert it");
+        assert_eq!(adapted.servers.len(), 1);
+        assert!(
+            compile(source).is_err(),
+            "compile must still refuse what the runtime cannot honour"
+        );
+    }
 
     #[test]
     fn test_full_compile() {

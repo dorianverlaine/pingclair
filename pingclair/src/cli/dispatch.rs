@@ -723,14 +723,18 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 std::io::stdin()
                     .read_to_string(&mut source)
                     .map_err(|error| anyhow::anyhow!("❌ Failed to read stdin: {error}"))?;
-                pingclair_config::compile(&source)
+                pingclair_config::adapt(&source)
                     .map_err(|error| anyhow::anyhow!("❌ Failed to adapt <stdin>: {error}"))?
             } else {
                 let config_path = resolve_config_path(config.as_deref());
+                // 🧩 `adapt` converts; it does not validate. That is the whole
+                // difference from `validate` and `run`, and it matches
+                // upstream's `caddy adapt` — `--validate` runs the checks for
+                // anyone who wants them here.
                 (if std::path::Path::new(&config_path).is_dir() {
-                    pingclair_config::compile_directory(&config_path)
+                    pingclair_config::adapt_directory(&config_path)
                 } else {
-                    pingclair_config::compile_file(&config_path)
+                    pingclair_config::adapt_file(&config_path)
                 })
                 .map_err(|error| anyhow::anyhow!("❌ Failed to adapt {config_path}: {error}"))?
             };

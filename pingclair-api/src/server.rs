@@ -621,7 +621,10 @@ async fn handle_request_inner(
                     ));
                 }
             };
-            let config = match pingclair_config::compile(source) {
+            // 🧩 `/adapt` converts, exactly like the CLI's `adapt`: validation
+            // is a separate question, and `POST /load` is where a document is
+            // checked before it runs.
+            let config = match pingclair_config::adapt(source) {
                 Ok(config) => config,
                 Err(error) => {
                     return Ok(response(

@@ -2445,7 +2445,10 @@ mod fail_closed_tests {
             "the nested block's answer survived the flattening"
         );
 
-        let config = crate::compile(
+        // 🧩 `adapt`, not `compile`: `otlp` is parsed and merged here, and
+        // ``validate_config`` is what refuses it — a document this build cannot
+        // provision is still adapted, which is the whole adapt/validate split.
+        let config = crate::adapt(
             "{\n    metrics {\n        observe_catchall_hosts\n        otlp\n    }\n}\n\
              :80 {\n    respond \"Hello\"\n}",
         )

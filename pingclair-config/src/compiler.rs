@@ -855,6 +855,50 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
         });
     }
 
+    // 🚫 A knob this build cannot honour fails closed **here**, not at startup,
+    // which is where `run` used to be the only thing that noticed:
+    // `pingclair validate` accepted a document the server would then refuse to
+    // start with. `adapt` still converts it — converting and provisioning are
+    // different questions, and the corpus that measures adaptation scores this
+    // shape — but nothing that has to honour the document accepts it.
+    if config.global.metrics_options.otlp {
+        return Err(CompileError::InvalidServer {
+            message: "`metrics { otlp }` is configured, but this build has no OTLP exporter \
+                      — metrics are exposed by scraping only. Remove `otlp`."
+                .to_string(),
+        });
+    }
+
+    // 📡 One DNS provider is implemented. Every other upstream name is a real
+    // module there and nothing here, so the refusal names what this build does
+    // ship rather than calling the word unknown — an operator told `route53` is
+    // unrecognised would go looking for the right spelling of something that
+    // does not exist. Checked on the global options and on every site, because
+    // a site may name its own.
+    let global_providers = config
+        .global
+        .dns
+        .iter()
+        .chain(config.global.acme_dns.iter().flatten())
+        .map(|provider| provider.name.as_str());
+    let site_providers = config.servers.iter().filter_map(|server| {
+        server
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.dns_challenge.as_ref())
+            .and_then(|challenge| challenge.provider.as_ref())
+            .map(|provider| provider.name.as_str())
+    });
+    for name in global_providers.chain(site_providers) {
+        if name != "cloudflare" {
+            return Err(CompileError::InvalidServer {
+                message: format!(
+                    "DNS provider `{name}` is not implemented; this build ships `cloudflare` only"
+                ),
+            });
+        }
+    }
+
     // 🔗 Refused rather than warned about. This build's ACME client downloads
     // whichever chain the authority offers first and cannot ask for another
     // (`instant-acme` 0.8.5, verified 2026-08-12), so honouring the setting is
