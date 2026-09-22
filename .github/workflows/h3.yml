@@ -34,6 +34,12 @@ jobs:
           r2-bucket: ${{ vars.R2_CACHE_BUCKET }}
           r2-access-key-id: ${{ secrets.R2_CACHE_ACCESS_KEY_ID }}
           r2-secret-access-key: ${{ secrets.R2_CACHE_SECRET_ACCESS_KEY }}
+          # 🧭 This job does not run inside the builder image yet, so it builds
+          # at the runner's own paths (`/home/runner/.cargo`, `$HOME/.cache/…`).
+          # Those artifacts can never be reused by an image build, and their
+          # paths are exactly what the shared prefix must not contain, so they
+          # go to the host-specific prefix that exists for this.
+          r2-key-prefix: sccache/v1/native/h3-runner
 
       - name: Install HTTP/3-capable curl
         run: |

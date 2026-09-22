@@ -146,9 +146,12 @@ what CI's archives use), `just native-build` (host-specific prefix),
   Bumping the prefix (`v1` → `v2`) is the "start from nothing" lever; there is
   deliberately no Bucket Lock, because duplicate PUTs of the same artifact are
   normal.
-- 🔎 `just cache-audit --policy shared` is the evidence that the shared bucket
-  contains no machine paths and no credentials. Run it after a change to the
-  build environment, and paste the output where the change is reviewed.
+- 🔎 `just cache-audit --policy shared` is the evidence that the shared *prefix*
+  contains no machine paths and that the bucket contains no credentials. (The
+  path canaries are scoped to `sccache/v1/shared`: `native/<host>` is allowed to
+  carry the paths of the machine that wrote it, which is why it is separate.)
+  Run it after a change to the build environment, and paste the output where the
+  change is reviewed.
 
 ### Build-cache disk budget
 

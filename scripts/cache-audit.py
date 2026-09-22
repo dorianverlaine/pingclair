@@ -189,6 +189,11 @@ def main() -> int:
 
     bucket = os.environ.get("SCCACHE_BUCKET", "")
     endpoint = os.environ.get("SCCACHE_ENDPOINT", "")
+    # 🎯 Path canaries apply to the prefix this machine writes and reads, not to
+    # the whole bucket: `sccache/v1/native/<host>` is *allowed* to carry the
+    # paths of the machine that produced it, which is why it exists. Credentials
+    # are a different matter and are checked everywhere.
+    shared_prefix = os.environ.get("SCCACHE_S3_KEY_PREFIX", "sccache/v1/shared").strip("/")
     secrets = [
         value
         for value in (
@@ -220,6 +225,10 @@ def main() -> int:
     print(f"🔎 bucket   s3://{bucket}")
     print(f"   endpoint {endpoint}")
     print(f"   policy   {args.policy} (path canaries {'forbidden' if args.policy == 'shared' else 'expected'})")
+    if args.policy == "shared":
+        print(f"   prefix   {shared_prefix}/ (where the path canaries apply)")
+    else:
+        print("   prefix   the whole bucket")
     print(f"   host     {host}")
 
     keys = list_keys(bucket, endpoint)
@@ -246,7 +255,10 @@ def main() -> int:
                 stem = crate_stem(name)
                 if stem and (stem in text or stem.replace("_", "-") in text):
                     scannable += 1
-                needles = list(SECRET_MARKERS) + path_markers + secrets
+                in_scope = args.policy != "shared" or key.startswith(f"{shared_prefix}/")
+                needles = list(SECRET_MARKERS) + secrets
+                if in_scope:
+                    needles += path_markers
                 for needle in needles:
                     if needle and needle in text:
                         label = needle
