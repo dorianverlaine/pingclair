@@ -372,6 +372,30 @@ pub(crate) fn public_issuance_domains(
         .collect()
 }
 
+/// 🚫 Collects the site names that asked to stay off HTTP/3.
+///
+/// A QUIC listener belongs to a port, not to a site, and it keeps serving every
+/// other name on that port — so the refusal has to be per name. The names land
+/// in the HTTP/3 certificate table, where a handshake for one of them finds no
+/// certificate: the client falls back to TCP instead of reaching a site that
+/// never asked to be served over QUIC.
+///
+/// Reads the same name fields as every other listener list, because a JSON
+/// document may carry hostnames in `names` while `name` stays the label.
+pub(crate) fn h3_excluded_domains(config: &pingclair_core::config::PingclairConfig) -> Vec<String> {
+    config
+        .servers
+        .iter()
+        .filter(|server| server.tls.as_ref().is_some_and(|tls| !tls.http3))
+        .flat_map(|server| {
+            let mut names = server.names.clone();
+            names.extend(server.name.clone());
+            names
+        })
+        .filter(|name| !name.is_empty() && name != "_" && name != "*" && !name.starts_with(':'))
+        .collect()
+}
+
 /// 🚀 Collects the hostnames that need eager ACME issuance at startup.
 ///
 /// 🃏 Wildcards are included, because a wildcard site now orders the wildcard
@@ -409,6 +433,63 @@ pub(crate) async fn refresh_h3_cert_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🚫 Only a site that said `http3 off` is excluded, and the catch-all
+    /// spellings are not names at all.
+    ///
+    /// The default is the point: while the per-site flag defaulted to false,
+    /// "did not say" and "turned it off" were the same value, which is why the
+    /// option did nothing. A site that says nothing keeps HTTP/3.
+    #[test]
+    fn h3_exclusions_name_only_the_sites_that_opted_out() {
+        use pingclair_core::config::{ServerConfig, TlsConfig};
+
+        let site = |name: &str, tls: Option<TlsConfig>| ServerConfig {
+            name: Some(name.to_string()),
+            tls,
+            ..Default::default()
+        };
+
+        let config = pingclair_core::config::PingclairConfig {
+            servers: vec![
+                // 🌐 Said nothing: keeps HTTP/3.
+                site("kept.example", Some(TlsConfig::default())),
+                // 🚫 Turned it off.
+                site(
+                    "opted-out.example",
+                    Some(TlsConfig {
+                        http3: false,
+                        ..Default::default()
+                    }),
+                ),
+                // ✅ Turned it on explicitly.
+                site(
+                    "explicit.example",
+                    Some(TlsConfig {
+                        http3: true,
+                        ..Default::default()
+                    }),
+                ),
+                // 🕳️ No TLS block at all: nothing to exclude.
+                site("plain.example", None),
+                // 🚫 A catch-all is routing, not a name.
+                site(
+                    "_",
+                    Some(TlsConfig {
+                        http3: false,
+                        ..Default::default()
+                    }),
+                ),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(h3_excluded_domains(&config), vec!["opted-out.example"]);
+        assert!(
+            TlsConfig::default().http3,
+            "the per-site default has to be on, or an unmentioned site is indistinguishable from one that opted out"
+        );
+    }
 
     /// 🚀 Only `tls auto` hostnames qualify for eager issuance; internal and
     /// manual sites are excluded, and a wildcard site is included as itself.

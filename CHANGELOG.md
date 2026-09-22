@@ -46,6 +46,21 @@ already doing — and the difference was invisible on the single-upstream
 configurations most sites have. Write `lb_policy round_robin` for the previous
 behaviour.
 
+### 🚫 `tls { http3 off }` keeps a site off QUIC, and now it means something
+
+The option was accepted, documented in the HTTP/3 guide, and inert: it reached
+the canonical configuration, and the only code that read it was the reload
+comparison. It now keeps that site off the QUIC listener while the listener
+stays up for every other name on the port — a handshake for the opted-out name
+finds no certificate, so a client that was told this port speaks HTTP/3 falls
+back to TCP instead of reaching a site that never asked to be served over it.
+HTTP/1.1 and HTTP/2 are untouched.
+
+The per-site flag also defaults to **on**, like the global switch, instead of
+false: while it defaulted to false, "did not say" and "turned it off" were the
+same value, which is why nothing could read it. Whether a QUIC listener exists
+at all is still the global `servers { protocols … }` list.
+
 ### 📦 Releases are served from `releases.pingclair.com`
 
 GitHub remains where a release is created — the tag, the notes, the assets — and

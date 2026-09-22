@@ -729,7 +729,7 @@ pub struct LongConnectionLimits {
 }
 
 /// 🔐 Configures downstream TLS for one server.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// 🌐 Enables automatic public certificate management.
@@ -749,8 +749,14 @@ pub struct TlsConfig {
     /// 📧 Identifies the ACME account email for Let's Encrypt.
     pub acme_email: Option<String>,
 
-    /// 🚀 Enables HTTP/3.
-    #[serde(default)]
+    /// 🚀 Serves this site over HTTP/3.
+    ///
+    /// 🌐 Defaults to true, like the global switch: whether a QUIC listener
+    /// exists at all is decided by [`GlobalConfig::http3`] (the `servers {
+    /// protocols … }` list), and this field is the per-site opt-out. Defaulting
+    /// it to false made "did not say" indistinguishable from "turned it off",
+    /// which is why the option used to do nothing at all — see issue #72.
+    #[serde(default = "default_bool_true")]
     pub http3: bool,
 
     /// 🪪 Mutual TLS: what to ask of the client's own certificate.
@@ -2668,6 +2674,28 @@ pub struct AccessControlConfig {
     /// Regular expressions that always reject the User-Agent header.
     #[serde(default)]
     pub denied_user_agents: Vec<String>,
+}
+
+/// 🌐 The hand-written default exists for one field: `http3` is on unless a
+/// site turns it off, and a derived `Default` would say false. `#[serde(default
+/// = "default_bool_true")]` covers the JSON path, but the compiler builds a
+/// site's TLS config from `TlsConfig::default()` before merging the directives
+/// into it, so the two have to agree or "did not say" turns into "turned off"
+/// before the configuration is even compiled.
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            auto: false,
+            internal: false,
+            cert: None,
+            key: None,
+            acme_email: None,
+            http3: true,
+            client_auth: None,
+            dns_challenge: None,
+            default_sni: None,
+        }
+    }
 }
 
 fn default_lb_strategy() -> String {

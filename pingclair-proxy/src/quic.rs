@@ -223,6 +223,10 @@ struct CertTableSnapshot {
     certs: HashMap<String, Arc<CertEntry>>,
     /// Fallback used when no exact/wildcard entry matches the SNI name.
     default_name: Option<String>,
+    /// 🚫 Names whose sites turned HTTP/3 off. Checked before any certificate is
+    /// chosen, so a handshake for one of them finds nothing at all rather than
+    /// the default entry.
+    excluded: HashSet<String>,
 }
 
 /// SNI → certificate table for the QUIC handshake callback.
@@ -327,6 +331,15 @@ impl CertTable {
     pub fn lookup(&self, servername: &str) -> Option<Arc<CertEntry>> {
         let snap = self.inner.load();
 
+        // 🚫 A site that turned HTTP/3 off resolves to no certificate: the
+        // handshake fails here, and a client that was told this port speaks
+        // HTTP/3 falls back to TCP instead of reaching a site that did not ask
+        // to be served over QUIC. It has to be checked before the default
+        // entry, or the fallback would quietly serve it anyway.
+        if covered_by(&snap.excluded, servername) {
+            return None;
+        }
+
         if let Some(entry) = snap.certs.get(servername) {
             return Some(entry.clone());
         }
@@ -344,6 +357,28 @@ impl CertTable {
             .and_then(|name| snap.certs.get(name).cloned())
     }
 
+    /// 🚫 Publishes the names whose sites turned HTTP/3 off.
+    ///
+    /// Set once at startup from the configuration, because a reload that
+    /// changes a site's HTTP/3 policy is refused as `restart_required`
+    /// (`runtime_listeners`), so the set cannot drift from the listeners it
+    /// belongs to.
+    pub fn set_excluded_names<I, S>(&self, names: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let excluded: HashSet<String> = names
+            .into_iter()
+            .map(|name| name.as_ref().to_string())
+            .collect();
+        self.inner.rcu(|current| {
+            let mut next = (**current).clone();
+            next.excluded = excluded.clone();
+            Arc::new(next)
+        });
+    }
+
     /// Number of entries currently published.
     pub fn len(&self) -> usize {
         self.inner.load().certs.len()
@@ -353,6 +388,22 @@ impl CertTable {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// 🧭 Whether any pattern in `patterns` covers `servername`.
+///
+/// The rule the certificate lookup already uses: an exact match, or a
+/// `*.suffix` pattern the name ends with. Kept next to `lookup` so the two
+/// cannot disagree about what a site name means.
+fn covered_by(patterns: &HashSet<String>, servername: &str) -> bool {
+    if patterns.contains(servername) {
+        return true;
+    }
+    patterns.iter().any(|pattern| {
+        pattern
+            .strip_prefix("*.")
+            .is_some_and(|suffix| servername.ends_with(&format!(".{suffix}")))
+    })
 }
 
 /// 🔐 Parses one certificate pair before it reaches the handshake table.
@@ -5888,6 +5939,52 @@ mod tests {
         let table = CertTable::new();
         assert!(table.lookup("example.com").is_none());
         assert!(table.is_empty());
+    }
+
+    /// 🚫 A site that turned HTTP/3 off must not be reachable over QUIC.
+    ///
+    /// The option was documented and inert: the guide tells an operator
+    /// `tls { http3 off }` takes one site out of HTTP/3 without stopping the
+    /// listener, and the site answered over HTTP/3 anyway. The listener staying
+    /// up is the point — it serves the other names on the port — so the
+    /// exclusion is per name and is checked before the default certificate,
+    /// which would otherwise serve the site the listener was told to skip.
+    #[test]
+    fn cert_table_refuses_a_site_that_turned_http3_off() {
+        let table = CertTable::new();
+        let (cert, key) = self_signed_pem(&["kept.local", "opted-out.local"]);
+        table.upsert_pem("kept.local", &cert, &key).unwrap();
+        table.upsert_pem("opted-out.local", &cert, &key).unwrap();
+
+        assert!(table.lookup("opted-out.local").is_some());
+        table.set_excluded_names(["opted-out.local"]);
+
+        assert!(
+            table.lookup("opted-out.local").is_none(),
+            "a site with `http3 off` must not resolve to a certificate"
+        );
+        // 🧭 The other site on the same listener is untouched, and an unknown
+        // name still reaches the default entry as it always did.
+        assert!(table.lookup("kept.local").is_some());
+        assert!(table.lookup("unknown.local").is_some());
+    }
+
+    /// 🃏 An exclusion follows the same name rule as the certificates it hides.
+    #[test]
+    fn cert_table_exclusion_covers_the_names_a_pattern_stands_for() {
+        let table = CertTable::new();
+        let (cert, key) = self_signed_pem(&["*.wild.local"]);
+        table.upsert_pem("*.wild.local", &cert, &key).unwrap();
+        table.set_excluded_names(["*.wild.local"]);
+
+        assert!(table.lookup("a.wild.local").is_none());
+        // 🧭 The exclusion is about the name that opted out, not about the
+        // entry: a name that merely falls back to the same certificate is
+        // unaffected, exactly as it was before the site opted out.
+        assert!(
+            table.lookup("other.local").is_some(),
+            "an unrelated name keeps the default fallback it always had"
+        );
     }
 
     #[test]

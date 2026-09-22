@@ -22,6 +22,7 @@ readonly binary="${PINGCLAIR_BINARY:-${repository_root}/target/debug/pingclair}"
 readonly run_dir="$(mktemp -d "${TMPDIR:-/tmp}/pingclair-h3-matrix.XXXXXX")"
 readonly primary_host="h3-primary.local"
 readonly secondary_host="h3-secondary.local"
+readonly opted_out_host="h3-opted-out.local"
 pingclair_pid=""
 upstream_pid=""
 checks_run=0
@@ -283,6 +284,24 @@ https://${secondary_host}:${h3_port} {
 		respond "secondary" 200
 	}
 }
+
+# 🚫 The third vhost is the per-site opt-out. `http3 off` inside a `tls` block
+# is a Pingclair extension rather than Caddy syntax, and this script exists to
+# check what Pingclair does — so it is exercised here because the guide promises
+# it, and the Caddy-compatible subset stays as it is everywhere else.
+https://${opted_out_host}:${h3_port} {
+	bind 127.0.0.1
+	tls {
+		internal
+		http3 off
+	}
+	handle /ready {
+		respond "ready" 200
+	}
+	handle /who {
+		respond "opted out" 200
+	}
+}
 EOF
 
 PINGCLAIR_TLS_STORE="${run_dir}/tls" "${binary}" run "${run_dir}/Pingclairfile" \
@@ -316,6 +335,19 @@ check_eq "primary SNI routes to its own vhost" "primary" \
     "$(h3 "${primary_host}" "https://${primary_host}:${h3_port}/who")"
 check_eq "secondary SNI routes to its own vhost" "secondary" \
     "$(h3 "${secondary_host}" "https://${secondary_host}:${h3_port}/who")"
+
+log ""
+log "🔎 A site that turned HTTP/3 off is not served over QUIC"
+# 🚫 The listener stays up for the other two names on the port, so the refusal
+# is per name: the handshake finds no certificate for this SNI and the client
+# falls back to TCP. A refused connection reports 000 — asserting on that rather
+# than on any failure is what stops "the server was down" from passing.
+check_eq "opted-out site refuses the H3 handshake" "000" \
+    "$(h3 "${opted_out_host}" -o /dev/null -w '%{http_code}' \
+        "https://${opted_out_host}:${h3_port}/who" 2>/dev/null || true)"
+check_eq "opted-out site still answers over HTTP/1.1" "opted out" \
+    "$("${curl_bin}" --noproxy '*' -ksS --resolve "${opted_out_host}:${h3_port}:127.0.0.1" \
+        "https://${opted_out_host}:${h3_port}/who")"
 
 log ""
 log "🔎 Host spelling — one name, however the client writes it"

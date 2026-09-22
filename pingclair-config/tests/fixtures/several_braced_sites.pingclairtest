@@ -23,7 +23,7 @@ b.example, www.b.example {
         "cert": null,
         "key": null,
         "acme_email": null,
-        "http3": false
+        "http3": true
       },
       "routes": [
         {
@@ -98,7 +98,7 @@ b.example, www.b.example {
         "cert": null,
         "key": null,
         "acme_email": null,
-        "http3": false
+        "http3": true
       },
       "routes": [
         {

@@ -21,7 +21,7 @@ https://example.com {
         "cert": null,
         "key": null,
         "acme_email": null,
-        "http3": false
+        "http3": true
       },
       "routes": [
         {

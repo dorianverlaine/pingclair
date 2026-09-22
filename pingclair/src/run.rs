@@ -18,7 +18,8 @@
 //! has a TRIAGE row instead of being smuggled in here.
 
 use crate::certs::{
-    DynamicCertResolver, eager_issuance_domains, public_issuance_domains, refresh_h3_cert_table,
+    DynamicCertResolver, eager_issuance_domains, h3_excluded_domains, public_issuance_domains,
+    refresh_h3_cert_table,
 };
 use crate::listen::{
     automatic_http_companion, can_bind_automatic_http_port, explicit_http_names,
@@ -531,6 +532,8 @@ pub(crate) fn run_server(
         .filter(|name| !manual_h3_domains.contains(name.as_str()))
         .cloned()
         .collect();
+    // 🚫 Sites that asked to stay off HTTP/3; see `h3_excluded_domains`.
+    let h3_excluded_domains = h3_excluded_domains(&config);
     let h3_pool_size = config.global.upstream_keepalive_pool_size.unwrap_or(512);
     let h3_blocked_ips = config.global.blocked_ips.clone();
     let trusted_proxies = config.global.trusted_proxies.clone();
@@ -841,6 +844,7 @@ pub(crate) fn run_server(
 
     // Start HTTP/3 (QUIC) servers for HTTPS ports
     if let Some(cert_table) = h3_cert_table.clone() {
+        cert_table.set_excluded_names(h3_excluded_domains.clone());
         tracing::info!(
             "🚀 Starting HTTP/3 servers for {} port(s)",
             https_ports.len()
