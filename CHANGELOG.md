@@ -183,7 +183,9 @@ Configured access-log sinks now batch complete records up to 64 KiB, with a
 5 ms flush interval and flushes before rotation and explicit barriers. Formatting
 avoids temporary numeric strings. Fields, filtering, sampling, and the default
 tracing fallback are unchanged. Normal shutdown attempts a bounded 250 ms drain
-of accepted access records; a stalled sink cannot hold shutdown indefinitely.
+of accepted access records, and offers every registered writer its barrier
+inside that one budget — a sink that fails does not cost the sinks behind it
+their flush — while a stalled sink still cannot hold shutdown indefinitely.
 
 ### 🪦 `v0.1.x` is unmaintained
 

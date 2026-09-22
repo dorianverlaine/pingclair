@@ -36,6 +36,12 @@ pub(super) fn register(writer: &Arc<LogWriter>) {
 /// Called off the request path before process exit. A blocked sink must not
 /// hang shutdown; `false` reports an incomplete drain. This does not wait for
 /// requests still executing or make file writes durable against power loss.
+///
+/// 🚫 Every writer is offered a barrier even after one of them fails. Stopping
+/// at the first failure would not drain the writers behind it late — it would
+/// skip them, and the records their queues still held would be lost without a
+/// write ever being attempted for them. One deadline is shared by the whole
+/// drain, so a stalled sink still bounds how long shutdown can take.
 pub fn flush_all(timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     let writers: Vec<_> = registry()
@@ -44,7 +50,13 @@ pub fn flush_all(timeout: Duration) -> bool {
         .iter()
         .filter_map(Weak::upgrade)
         .collect();
-    writers.iter().all(|writer| flush_writer(writer, deadline))
+    let mut complete = true;
+    for writer in &writers {
+        if !flush_writer(writer, deadline) {
+            complete = false;
+        }
+    }
+    complete
 }
 
 fn flush_writer(writer: &LogWriter, deadline: Instant) -> bool {
@@ -221,6 +233,48 @@ mod tests {
             Instant::now() + Duration::from_millis(10)
         ));
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    /// 🚫 A writer that fails must not cost the writers behind it their
+    /// barrier. Skipping them is not a late drain, it is a lost one, and the
+    /// `false` the drain returns says only that it did not complete.
+    #[test]
+    fn a_failed_writer_does_not_cost_the_next_one_its_barrier() {
+        // 🧱 The first sink is stalled past the budget: its queue is full and
+        // nothing consumes it, so no barrier can ever be delivered to it.
+        let (stalled_queue, _stalled_receive) = mpsc::sync_channel(1);
+        let stalled = Arc::new(LogWriter {
+            queue: stalled_queue,
+            buffers: Arc::new(ArrayQueue::new(1)),
+            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        });
+        stalled.submit("blocked".into());
+        register(&stalled);
+
+        // 📝 The second sink still holds a record. This test plays its writer
+        // thread, so the only thing that can drain that record is a barrier
+        // reaching this end of the queue.
+        let (queue, receive) = mpsc::sync_channel(4);
+        let held = Arc::new(LogWriter {
+            queue,
+            buffers: Arc::new(ArrayQueue::new(4)),
+            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        });
+        held.submit("held until the barrier".into());
+        register(&held);
+
+        assert!(
+            !flush_all(Duration::from_millis(20)),
+            "a stalled sink must still report the drain as incomplete"
+        );
+        assert!(matches!(
+            receive.try_recv(),
+            Ok(WriterMessage::Line(line)) if line == "held until the barrier"
+        ));
+        assert!(
+            matches!(receive.try_recv(), Ok(WriterMessage::Flush(_))),
+            "the writer behind a failed one never received a barrier"
+        );
     }
 
     #[test]
