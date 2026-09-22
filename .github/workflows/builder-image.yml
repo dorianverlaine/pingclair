@@ -1,0 +1,122 @@
+name: Builder image
+
+# 🧊 Publishes the Linux build environment that CI and every Linux builder use.
+#
+# Rebuild it when the toolchain, the package list, or the sccache version
+# changes. The `v1` tag it publishes is what the workflows and
+# `deployment/Dockerfile` refer to, so a rebuild moves every builder at once —
+# which is the point: the cache is only shared by machines that agree on the
+# environment, and this file is where the environment is decided.
+on:
+  push:
+    branches: [main]
+    paths:
+      - deployment/Builder.Dockerfile
+      - deployment/apt-retry.sh
+      - .github/workflows/builder-image.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform.name }})
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: amd64
+            runner: ubuntu-24.04
+            tag: amd64
+          - name: arm64
+            runner: ubuntu-24.04-arm
+            tag: arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Decide the version tag
+        id: version
+        run: echo "tag=v1-$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      # 🚫 `docker build` on the runner whose architecture this is, never a
+      # cross-platform build: an emulated image would hand the fabric a
+      # toolchain no real machine of that architecture ever ran.
+      - name: Build
+        run: |
+          set -euo pipefail
+          docker build \
+            -f deployment/Builder.Dockerfile \
+            -t "ghcr.io/dorianverlaine/pingclair-builder:${{ steps.version.outputs.tag }}-${{ matrix.platform.tag }}" \
+            .
+
+      - name: Smoke the image
+        run: |
+          set -euo pipefail
+          image="ghcr.io/dorianverlaine/pingclair-builder:${{ steps.version.outputs.tag }}-${{ matrix.platform.tag }}"
+          # 🎯 The three versions the environment is pinned to, from inside the
+          # image: a layer that silently installed nothing fails here rather
+          # than halfway through a build.
+          docker run --rm "$image" rustc --version
+          docker run --rm "$image" cargo --version
+          docker run --rm "$image" sccache --version
+          docker run --rm "$image" just --version
+          docker run --rm "$image" sh -c 'test "$CARGO_HOME" = /usr/local/cargo && test "$CARGO_TARGET_DIR" = /cache/cargo-target && test -w /cache && pwd'
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the per-architecture tag
+        run: |
+          set -euo pipefail
+          image="ghcr.io/dorianverlaine/pingclair-builder:${{ steps.version.outputs.tag }}-${{ matrix.platform.tag }}"
+          docker push "$image"
+          digest="$(docker inspect --format='{{index .RepoDigests 0}}' "$image")"
+          # 📌 The digest of record for this architecture, printed so the
+          # workflow log is the audit trail for what `:v1` pointed at.
+          echo "pushed ${digest}" >> "$GITHUB_STEP_SUMMARY"
+
+  manifest:
+    name: Publish :v1
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Decide the version tag
+        id: version
+        run: echo "tag=v1-$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 🧭 Registry metadata only: both images were built natively above, and
+      # this step just declares one tag that names both. No layer is rebuilt and
+      # no architecture is emulated.
+      - name: Assemble the multi-architecture tag
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          docker buildx imagetools create \
+            -t ghcr.io/dorianverlaine/pingclair-builder:v1 \
+            -t "ghcr.io/dorianverlaine/pingclair-builder:${tag}" \
+            "ghcr.io/dorianverlaine/pingclair-builder:${tag}-amd64" \
+            "ghcr.io/dorianverlaine/pingclair-builder:${tag}-arm64"
+          docker buildx imagetools inspect ghcr.io/dorianverlaine/pingclair-builder:v1
