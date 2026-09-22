@@ -106,7 +106,7 @@ fn main() -> anyhow::Result<()> {
     // requests are spawned later by the runtime, so they would resolve the
     // current dispatcher to the no-op fallback and every access line would
     // vanish. That is a real bug this file shipped for one build.
-    let (writer, writer_guard) = logging::NonBlockingWriter::spawn();
+    let writer = logging::NonBlockingWriter::spawn();
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_writer(writer))
         .with(filter)
@@ -114,9 +114,9 @@ fn main() -> anyhow::Result<()> {
 
     let exit = cli::dispatch::run(cli.command);
 
-    // 🧹 Flush and report on the way out. The guard joins the writer thread,
-    // which is what drains what the queue still holds — a non-blocking logger
-    // that never joins is a non-blocking logger that loses its last records.
-    drop(writer_guard);
+    // 🧹 Flush and report on the way out. Draining closes the writer's queue
+    // and waits for the thread to finish it — a non-blocking logger that never
+    // drains is a non-blocking logger that loses its last records.
+    logging::drain();
     exit
 }

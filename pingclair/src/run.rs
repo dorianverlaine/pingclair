@@ -1149,10 +1149,13 @@ pub(crate) fn run_server(
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("❌ Failed to create SIGTERM listener: {}", e);
-                    // Fall back to SIGINT-only handling.
+                    // Fall back to SIGINT-only handling, and leave through the
+                    // same shutdown as the ordinary path: a drain that only
+                    // covers the happy exit is missing exactly when something
+                    // has already gone wrong.
                     let _ = tokio::signal::ctrl_c().await;
                     tracing::info!("🛑 Received SIGINT, shutting down");
-                    std::process::exit(0);
+                    shutdown_and_exit();
                 }
             };
             let mut sigquit = match signal(SignalKind::quit()) {
@@ -1198,12 +1201,7 @@ pub(crate) fn run_server(
             tracing::info!("🛑 Received Ctrl-C, shutting down");
         }
 
-        // 🚿 Drain accepted access records before exit bypasses Rust destructors.
-        // A stalled sink gets one bounded budget, not an unbounded shutdown.
-        if !pingclair_proxy::access_log::flush_all(Duration::from_millis(250)) {
-            tracing::warn!("⚠️ Access log drain exceeded the shutdown budget");
-        }
-        std::process::exit(0);
+        shutdown_and_exit();
     });
 
     println!("🚀 Pingclair running...");
@@ -1226,6 +1224,29 @@ pub(crate) fn run_server(
     notify_systemd_ready();
 
     server.run_forever();
+}
+
+/// 🛑 The one graceful exit: drain both log paths, then leave.
+///
+/// `std::process::exit` runs no destructors, so neither queue can be left to a
+/// `Drop` that will never run, and both drains are bounded rather than
+/// unbounded: a blocked sink must not turn shutdown into a hang. Every
+/// graceful exit comes through here — the signal handlers, the admin API's
+/// request, and the fallback taken when a signal listener could not even be
+/// installed — so a new one cannot skip the drains by accident. The forced
+/// SIGQUIT exit deliberately does not: leaving immediately is the Caddy
+/// behavior it reproduces.
+fn shutdown_and_exit() -> ! {
+    // 🚿 Access records first, because the warning below travels through the
+    // tracing queue and would not survive the drain that follows it.
+    if !pingclair_proxy::access_log::flush_all(Duration::from_millis(250)) {
+        tracing::warn!("⚠️ Access log drain exceeded the shutdown budget");
+    }
+    // 🚿 Then the tracing queue itself — which is where the records about this
+    // shutdown live, and the reason the queue is drained rather than abandoned.
+    // A drain that could not finish reports what it dropped on stderr.
+    crate::logging::drain();
+    std::process::exit(0);
 }
 
 /// 📡 Builds the DNS provider a site named, or says why it cannot be used.

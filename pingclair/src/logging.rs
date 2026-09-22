@@ -32,9 +32,9 @@
 //! is worse than one that says it has a gap.
 
 use std::io::{self, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Depth of the hand-off queue, in log records.
@@ -57,11 +57,13 @@ pub(crate) struct NonBlockingWriter {
 impl NonBlockingWriter {
     /// Spawn the writer thread, returning the handle that logging feeds.
     ///
-    /// The returned [`WriterGuard`] must be held for as long as logging should
-    /// work. Dropping it asks the writer to finish and waits a bounded moment
-    /// for the queue to drain — see [`WriterGuard::shutdown`] for why the wait
-    /// is bounded rather than a plain `join`.
-    pub(crate) fn spawn() -> (Self, WriterGuard) {
+    /// The [`WriterGuard`] is kept by this module rather than handed back: the
+    /// server leaves through `std::process::exit`, which runs no destructors,
+    /// so a guard the caller had to remember to drop would be forgotten on
+    /// exactly the path that carries the most records. [`drain`] is the way to
+    /// finish the queue from such an exit — see `WriterGuard::shutdown` for why
+    /// the wait is bounded rather than a plain `join`.
+    pub(crate) fn spawn() -> Self {
         let (tx, rx) = sync_channel::<Vec<u8>>(QUEUE_DEPTH);
         let tx_guard = tx.clone();
         let dropped = Arc::new(AtomicU64::new(0));
@@ -82,18 +84,36 @@ impl NonBlockingWriter {
             })
             .expect("spawning the log writer thread");
 
-        (
-            Self {
-                tx,
-                dropped: Arc::clone(&dropped),
-            },
-            WriterGuard {
-                dropped,
-                tx: Some(tx_guard),
-                thread: Some(thread),
-            },
-        )
+        *PARKED.lock().unwrap_or_else(|e| e.into_inner()) = Some(WriterGuard {
+            dropped: Arc::clone(&dropped),
+            tx: Some(tx_guard),
+            thread: Some(thread),
+        });
+
+        Self { tx, dropped }
     }
+}
+
+/// 🚿 The writer this process drains on the way out, parked for its lifetime.
+///
+/// A slot rather than a plain value so that draining can *take* the guard out
+/// of it: a second drain is then a no-op, and the dropped-record count is
+/// reported once.
+static PARKED: Mutex<Option<WriterGuard>> = Mutex::new(None);
+
+/// 🚿 Finishes the log writer from an exit path that runs no destructors.
+///
+/// Closing the queue and waiting a bounded moment for it to drain is what
+/// [`WriterGuard`]'s own `Drop` does on every normal return, and the CLI
+/// subcommands leave that way. The server cannot: it ends at
+/// `std::process::exit`, whose whole purpose is to skip that work, so its
+/// shutdown path calls this instead — otherwise the records still queued when
+/// the process leaves are simply lost.
+pub(crate) fn drain() {
+    // 🧹 Taken out of the slot first. The wait inside is bounded at 250 ms, and
+    // holding the lock across it would block a `spawn` for that long.
+    let guard = PARKED.lock().unwrap_or_else(|e| e.into_inner()).take();
+    drop(guard);
 }
 
 impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for NonBlockingWriter {
@@ -166,6 +186,9 @@ impl Drop for QueueWriter {
 /// So the guard drops its own sender and waits a bounded moment for the writer
 /// to drain, then stops waiting. Losing the tail of the log on an unclean exit
 /// is strictly better than never exiting.
+///
+/// 📌 The guard lives in [`PARKED`] rather than in the caller's hand, so that
+/// the drain is reachable from an exit that drops nothing — see [`drain`].
 pub(crate) struct WriterGuard {
     dropped: Arc<AtomicU64>,
     tx: Option<SyncSender<Vec<u8>>>,
@@ -177,7 +200,11 @@ impl WriterGuard {
     const DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
     /// Close this guard's sender and wait briefly for the queue to drain.
-    pub(crate) fn shutdown(&mut self) {
+    ///
+    /// Named rather than inlined into `Drop` because it is the shutdown the
+    /// documentation above is about, and because it is the whole reason the
+    /// wait is bounded.
+    fn shutdown(&mut self) {
         // Dropping our sender is what asks the writer to finish; the process's
         // exit removes the thread if the drain did not.
         drop(self.tx.take());

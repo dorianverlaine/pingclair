@@ -187,6 +187,17 @@ of accepted access records, and offers every registered writer its barrier
 inside that one budget — a sink that fails does not cost the sinks behind it
 their flush — while a stalled sink still cannot hold shutdown indefinitely.
 
+### 🚿 The log queue is drained on the way out
+
+The server leaves through `std::process::exit`, which runs no destructors, so
+the tracing writer's queue used to be abandoned rather than drained: the last
+records — the ones describing the shutdown itself among them — could be
+missing from the log, and the reporter that would have said so was one of
+them. Graceful shutdown now drains that queue as well as the access log, and
+the fallback taken when a signal listener cannot be installed leaves through
+that same path instead of exiting bare. A forced SIGQUIT still exits
+immediately, which is the behavior it reproduces.
+
 ### 🪦 `v0.1.x` is unmaintained
 
 Stated here as well as in the READMEs, because somebody still running `v0.1.7`
