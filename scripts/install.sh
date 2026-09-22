@@ -354,7 +354,7 @@ else
     cat > /etc/systemd/system/pingclair.service <<'EOF'
 [Unit]
 Description=Pingclair High-Performance Web Server
-Documentation=https://github.com/dorianverlaine/pingclair
+Documentation=https://pingclair.com/start/service/
 After=network-online.target
 Wants=network-online.target
 
