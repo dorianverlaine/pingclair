@@ -26,6 +26,22 @@
 //! `acme_server` types, and the DNS-01 types that hold provider credentials.
 //! A typo there is a load failure, not a weaker server.
 //!
+//! The same rule covers the objects that say what the server *enforces* rather
+//! than who it trusts, because a bound an operator believes is in force is the
+//! same kind of lie: [`ResourceLimitsConfig`] and [`LongConnectionLimits`],
+//! [`AccessControlConfig`], [`SecurityConfig`] and [`HstsConfig`],
+//! [`LoadBalanceConfig`] and [`ProxyUpstream`], [`HealthCheckConfig`],
+//! [`RetryConfig`], [`CacheConfig`], [`OverloadConfig`] and
+//! [`CircuitBreakerConfig`]. The failure that added them: the H3 matrix script
+//! set a body limit with a field name the schema had dropped, serde ignored it,
+//! and the check passed against a default that happened to match.
+//!
+//! The document-shaped types — [`ServerConfig`], [`RouteConfig`], the handler
+//! and matcher enums, the global options — stay lenient on purpose: they mirror
+//! Caddy's own JSON, whose objects carry fields this server does not model, and
+//! refusing those would refuse the configurations `adapt` exists to accept.
+//! Strictness belongs to the objects we define.
+//!
 //! Two consequences worth knowing before adding a field. Renaming one is a
 //! breaking change, so a spelling that shipped has to stay reachable through
 //! an explicit `#[serde(alias = "…")]` rather than by leniency. And
@@ -677,6 +693,7 @@ fn default_body_limit() -> u64 {
 
 /// 🧱 Bounds one virtual host's downstream resource consumption.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceLimitsConfig {
     /// ⏱️ Maximum time spent reading an HTTP/1 request header.
     pub header_timeout_ms: Option<u64>,
@@ -703,6 +720,7 @@ pub struct ResourceLimitsConfig {
 
 /// 🌊 Deadline overrides for intentionally long-lived responses and tunnels.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LongConnectionLimits {
     /// 💤 Long-connection inactivity timeout; zero explicitly disables it.
     pub idle_timeout_ms: Option<u64>,
@@ -2230,6 +2248,7 @@ pub struct DynamicSrvUpstream {
 /// cache does not fail loudly — it serves the wrong bytes to the wrong person,
 /// and keeps doing it until the entry expires.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CacheConfig {
     /// ⏳ How long a stored response stays fresh, in seconds.
     ///
@@ -2259,6 +2278,7 @@ pub fn default_cache_max_size_bytes() -> usize {
 
 /// 🔁 Controls safe, request-local upstream redispatch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RetryConfig {
     /// 🔢 Maximum upstream attempts, including the initial attempt.
     #[serde(default = "default_retry_attempts")]
@@ -2411,6 +2431,7 @@ fn default_retry_methods() -> Vec<String> {
 
 /// 🚦 Bounds concurrent work before an upstream request starts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct OverloadConfig {
     /// 🧱 Maximum requests executing inside this reverse-proxy route.
     #[serde(default)]
@@ -2443,6 +2464,7 @@ fn default_pending_timeout_ms() -> u64 {
 
 /// 🔌 Opens a per-upstream circuit after bounded failure evidence.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CircuitBreakerConfig {
     /// 🔻 Consecutive failures required to open the circuit.
     #[serde(default)]
@@ -2588,6 +2610,7 @@ impl UpstreamTlsConfig {
 
 /// Load balancing configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct LoadBalanceConfig {
     /// Strategy: round_robin, random, least_conn, ip_hash, header, cookie,
     /// query, first
@@ -2606,6 +2629,7 @@ pub struct LoadBalanceConfig {
 
 /// An upstream's selection properties.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyUpstream {
     /// Dial address, including an optional http/https scheme.
     pub address: String,
@@ -2623,6 +2647,7 @@ fn default_upstream_weight() -> u32 {
 
 /// Route-level IP, Referer-host, and User-Agent access policy.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AccessControlConfig {
     /// CIDR or literal IP ranges that may access the route.
     #[serde(default)]
@@ -2651,6 +2676,7 @@ fn default_lb_strategy() -> String {
 
 /// 🩺 Active upstream health-check configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HealthCheckConfig {
     /// 🛣️ Request path sent to the probe endpoint.
     pub path: String,
@@ -2845,6 +2871,7 @@ pub struct LoggingConfig {
 
 /// Security headers configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     /// Enable basic security headers
     #[serde(default = "default_security_enabled")]
@@ -2885,6 +2912,7 @@ pub struct SecurityConfig {
 
 /// HSTS (HTTP Strict Transport Security) configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct HstsConfig {
     /// Max age in seconds
     #[serde(default = "default_hsts_max_age")]
@@ -3201,6 +3229,50 @@ mod tests {
             handlers: Vec::new(),
         };
         assert!(catch_all.matches(404) && catch_all.matches(503));
+    }
+
+    /// 🚫 A field the schema does not have must fail the load, not vanish.
+    ///
+    /// The H3 matrix script configured its body limit as
+    /// `"limits": {"max_request_body_bytes": 1048576}` — a name the schema has
+    /// not had for some time. Serde ignored it, the site default of 1 MiB
+    /// answered instead, and the script's own 413 check passed against a limit
+    /// nobody had configured: the two values happened to be equal, so the
+    /// mistake stayed invisible for as long as the field has been wrong. A JSON
+    /// configuration is now refused when it names something the schema does not
+    /// know, for the objects that bound resources, choose upstreams, or decide
+    /// retries, caching and access.
+    #[test]
+    fn an_unknown_limit_is_a_load_failure() {
+        let stale = r#"{
+            "servers": [{
+                "name": "example.com",
+                "listen": ["127.0.0.1:8080"],
+                "limits": { "max_request_body_bytes": 1048576 },
+                "routes": []
+            }]
+        }"#;
+
+        let error = serde_json::from_str::<PingclairConfig>(stale)
+            .expect_err("an unknown limit must be refused rather than ignored");
+        assert!(
+            error.to_string().contains("max_request_body_bytes"),
+            "the error has to name the field the operator wrote: {error}"
+        );
+
+        // 🧭 And the spelling that does exist keeps loading, so the strictness
+        // cannot be satisfied by refusing the whole object.
+        let current = r#"{
+            "servers": [{
+                "name": "example.com",
+                "listen": ["127.0.0.1:8080"],
+                "limits": { "max_connections": 512 },
+                "routes": []
+            }]
+        }"#;
+        let parsed: PingclairConfig =
+            serde_json::from_str(current).expect("a known limit must load");
+        assert_eq!(parsed.servers[0].limits.max_connections, Some(512));
     }
 
     #[test]
