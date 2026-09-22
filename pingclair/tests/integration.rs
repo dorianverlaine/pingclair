@@ -13543,6 +13543,196 @@ async fn test_tls_on_an_unusual_port_still_reports_https() {
     }
 }
 
+/// 🛑 SIGTERM drains the tracing queue before the process leaves.
+///
+/// The queue is drained by the exit path and never by `Drop`: the server ends
+/// at `std::process::exit`, which runs no destructors at all. An ordinary file
+/// sink cannot show the difference — a fast writer thread always catches up
+/// before the process is gone — so this fixture's stdout is a **FIFO the test
+/// fills to the brim**. Every record emitted after the fill stays in the queue
+/// with the writer thread blocked in `write()`: only a drain gets it out, and
+/// without one the process exits while the record about its own shutdown is
+/// still unwritten.
+///
+/// 🎯 Two details make this a measurement rather than a coin flip:
+///
+/// - the fill descriptor is a **second `open()`** of the same FIFO, because
+///   `O_NONBLOCK` lives on the open file description. Setting it on the
+///   child's stdout would make its writes fail instead of wait — the exact
+///   opposite of what this test needs.
+/// - the reader starts a beat after the signal, because the record has to be
+///   *inside* the write that cannot finish rather than merely queued behind
+///   it. Reading any earlier drains the pipe first and lets the writer
+///   through, which is the behavior under test; on a loaded machine the wait
+///   can only be too short (the test then misses the defect), never too long
+///   (it would have to outlast the writer's 250 ms drain budget to fail here).
+#[cfg(unix)]
+#[tokio::test]
+async fn test_sigterm_drains_the_log_queue_before_exit() {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::process::CommandExt as _;
+
+    let dir = tempfile::tempdir().expect("a test directory");
+    let fifo = dir.path().join("stdout.fifo");
+    let created = Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo must run");
+    assert!(
+        created.success(),
+        "mkfifo could not create the fixture fifo"
+    );
+
+    // 🚰 Opening a FIFO for writing waits for a reader, so the read end opens
+    // first and then holds still until the pipe is full and the signal has
+    // been sent. Reading before that would drain the fill and leave the writer
+    // thread with room, which is the one thing this test must not allow.
+    let reader_fifo = fifo.clone();
+    let (start_reading, go) = std::sync::mpsc::channel::<()>();
+    let reader = thread::spawn(move || {
+        let mut captured = Vec::new();
+        let mut file = std::fs::File::open(&reader_fifo).expect("the fifo read end opens");
+        go.recv().expect("the test signals when to read");
+        file.read_to_end(&mut captured)
+            .expect("the fifo reads to end of file");
+        captured
+    });
+
+    let port = free_port();
+    let readiness_path = format!("/__pingclair_test_ready_{}", uuid::Uuid::new_v4());
+    let readiness_token = format!("pingclair-ready-{}", uuid::Uuid::new_v4());
+    let config_path = dir.path().join("Pingclairfile");
+    std::fs::write(
+        &config_path,
+        format!(
+            "{{
+    admin off
+}}
+:{port} {{
+    @readiness path {readiness_path}
+    respond @readiness \"{readiness_token}\"
+    respond \"serving\"
+}}
+"
+        ),
+    )
+    .unwrap();
+    let tls_store = dir.path().join("tls");
+    std::fs::create_dir_all(&tls_store).expect("the TLS store directory");
+    let stderr_path = dir.path().join("stderr.log");
+    let stdout = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&fifo)
+        .expect("the fifo write end opens");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pingclair"))
+        .args(["run", config_path.to_str().unwrap()])
+        // 🧭 The record this test asserts on is logged at `info`, and the
+        // subscriber's floor without `RUST_LOG` is ERROR.
+        .env("RUST_LOG", "info")
+        .env("PINGCLAIR_TLS_STORE", &tls_store)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(
+            std::fs::File::create(&stderr_path).expect("the stderr capture"),
+        ))
+        .process_group(0)
+        .spawn()
+        .expect("the server must spawn");
+
+    // 🚦 Readiness comes first: the child's own startup still has to fit in the
+    // pipe, so the fill cannot happen until it is up and answering.
+    let client = no_proxy_client();
+    let url = format!("http://127.0.0.1:{port}{readiness_path}");
+    let mut ready = false;
+    for _ in 0..50 {
+        if let Ok(response) = client.get(&url).send().await
+            && response.text().await.ok().as_deref() == Some(readiness_token.as_str())
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !ready {
+        terminate_process_group(&mut child, "log drain fixture");
+        panic!(
+            "the server never answered its readiness probe; stderr:\n{}",
+            std::fs::read_to_string(&stderr_path).unwrap_or_default()
+        );
+    }
+
+    // 🚰 Fill the pipe. Chunks stay at the POSIX minimum so no write can be
+    // interleaved with one of the child's records, and the last bytes go one
+    // at a time: the write that finally refuses is the proof that the next
+    // record, whatever its size, has nowhere to go.
+    let mut filler = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .expect("the fifo fill end opens");
+    let chunk = [b'\n'; 512];
+    let mut filled = 0usize;
+    loop {
+        match filler.write(&chunk) {
+            Ok(0) => break,
+            Ok(written) => filled += written,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("filling the fifo failed: {error}"),
+        }
+    }
+    loop {
+        match filler.write(b"\n") {
+            Ok(0) => break,
+            Ok(_) => filled += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("filling the fifo failed: {error}"),
+        }
+    }
+    drop(filler);
+    assert!(
+        filled > 0,
+        "the fixture's fifo was already full before the test wrote to it"
+    );
+
+    // 🛑 SIGTERM is the graceful path under test; SIGKILL would leave nothing
+    // to drain.
+    // SAFETY: 🧯 `kill` is handed the pid of a child this test spawned, with a
+    // signal constant from libc; a refusal is reported, never ignored.
+    let sent = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    assert_eq!(sent, 0, "SIGTERM must reach the server");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    start_reading.send(()).expect("the reader is waiting");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait().expect("the server's status is readable") {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                terminate_process_group(&mut child, "log drain fixture");
+                panic!("the server did not exit after SIGTERM");
+            }
+            None => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    };
+    assert!(status.success(), "the server must leave cleanly: {status}");
+
+    // 🧾 The reader reached end of file, which is the child's stdout closing as
+    // it exited — every byte it wrote is in `captured` by then.
+    let captured = reader.join().expect("the reader thread must finish");
+    let captured = String::from_utf8_lossy(&captured);
+    // 🧹 The fill is a run of newlines; dropping the blank lines keeps a
+    // failure readable and cannot hide a record.
+    let visible: String = captured
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        visible.contains("Received SIGTERM, shutting down"),
+        "the record the shutdown logged never reached the stream; captured:\n{visible}"
+    );
+}
+
 /// 🧾 One raw HTTP/1 GET whose `Host` need not match the socket it was sent to.
 async fn raw_get_with_host(address: SocketAddr, target: &str, authority: &str) -> String {
     use tokio::io::AsyncWriteExt as _;
