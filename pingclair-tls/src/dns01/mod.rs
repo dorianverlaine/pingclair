@@ -67,6 +67,8 @@ pub trait DnsProvider: Send + Sync {
 pub enum DnsError {
     #[error("DNS provider request failed: {0}")]
     Transport(String),
+    #[error("DNS provider has no such record: {0}")]
+    NotFound(String),
     #[error("DNS provider rejected the request: {0}")]
     Api(String),
     #[error("no zone in the account covers {0}")]

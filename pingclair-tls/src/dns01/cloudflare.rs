@@ -19,7 +19,7 @@ use super::{DnsError, DnsProvider, RecordHandle};
 use async_trait::async_trait;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
-use hyper::{Method, Request};
+use hyper::{Method, Request, StatusCode};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use parking_lot::RwLock;
@@ -220,7 +220,15 @@ impl CloudflareProvider {
                 .get("errors")
                 .map(|errors| errors.to_string())
                 .unwrap_or_else(|| status.to_string());
-            return Err(DnsError::Api(format!("{path} failed ({status}): {detail}")));
+            let message = format!("{path} failed ({status}): {detail}");
+            // 🧹 A 404 says the thing is not there, which is a different fact
+            // from "the request was refused". A caller whose job is to remove
+            // something has to be able to tell them apart — see `delete_txt`.
+            return Err(if status == StatusCode::NOT_FOUND {
+                DnsError::NotFound(message)
+            } else {
+                DnsError::Api(message)
+            });
         }
 
         Ok(parsed)
@@ -339,12 +347,24 @@ impl DnsProvider for CloudflareProvider {
             // including the ones that failed before publishing anything.
             return Ok(());
         };
-        self.request(
-            Method::DELETE,
-            &format!("/zones/{zone}/dns_records/{record}"),
-            None,
-        )
-        .await?;
+        match self
+            .request(
+                Method::DELETE,
+                &format!("/zones/{zone}/dns_records/{record}"),
+                None,
+            )
+            .await
+        {
+            Ok(_) => {}
+            // 🧹 Somebody else removed it first: the state this call exists to
+            // reach, arriving from the other side. Debug rather than warn —
+            // during an incident a warning here made a cleanup that worked look
+            // like a second failure.
+            Err(DnsError::NotFound(_)) => {
+                tracing::debug!("🧹 The DNS record was already absent; nothing to delete");
+            }
+            Err(error) => return Err(error),
+        }
         // 🧹 Forgotten only now that the remote copy is actually gone.
         //
         // 🤡 This removal used to happen first. So a delete that failed left the
@@ -376,6 +396,9 @@ mod tests {
         Silent,
         /// 🚨 Answers every request with a 500, counting them.
         AlwaysFailing(Arc<AtomicUsize>),
+        /// 🫥 Answers every request the way Cloudflare answers a delete for a
+        /// record that is already gone: 404, with the reason in the body.
+        AlreadyGone,
     }
 
     /// 🧪 A loopback HTTP/1 mock. Raw TCP rather than a server crate, because
@@ -396,6 +419,7 @@ mod tests {
                 };
                 let silent = matches!(mode, Mode::Silent);
                 let oversized = matches!(mode, Mode::OversizedThenStall);
+                let already_gone = matches!(mode, Mode::AlreadyGone);
                 tokio::spawn(async move {
                     // 📥 Read just the head; the body does not matter here.
                     let mut head = Vec::new();
@@ -409,6 +433,23 @@ mod tests {
                     if silent {
                         // ⏱️ Hold the connection open, answering nothing.
                         std::future::pending::<()>().await;
+                    }
+                    if already_gone {
+                        let body = br#"{"success":false,"errors":[{"code":81044,"message":"Record does not exist."}]}"#;
+                        let _ = stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 404 Not Found\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\r\n",
+                                    body.len()
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        let _ = stream.write_all(body).await;
+                        let _ = stream.flush().await;
+                        return;
                     }
                     if oversized {
                         let claimed = 64 * 1024 * 1024;
@@ -544,6 +585,35 @@ mod tests {
             2,
             "the record was forgotten after the first failure, so the remote copy \
              would be orphaned"
+        );
+    }
+
+    /// 🧹 A record that is already gone is gone — the cleanup succeeded.
+    ///
+    /// Observed live: a third party deleted the challenge record between
+    /// publication and validation, and the order failed on its own. Cleanup
+    /// then reported a failure to delete what was already absent, which reads
+    /// as a second problem during an incident. A 404 is the state this call
+    /// exists to reach, so it stops being an error — and the handle is still
+    /// forgotten, because the remote copy really is gone.
+    #[tokio::test]
+    async fn a_record_that_is_already_gone_cleans_up_successfully() {
+        let base = mock_api(Mode::AlreadyGone).await;
+        let provider = CloudflareProvider::with_api_base("test-token".to_string(), base).unwrap();
+
+        let handle = "zone123/record456".to_string();
+        provider.records.write().insert(
+            handle.clone(),
+            ("zone123".to_string(), "record456".to_string()),
+        );
+
+        provider
+            .delete_txt(&handle)
+            .await
+            .expect("an absent record is the state cleanup wants");
+        assert!(
+            !provider.records.read().contains_key(&handle),
+            "the handle must not be kept for a record that is gone"
         );
     }
 
