@@ -279,6 +279,17 @@ cost time when the machinery is touched.
 - **Failed evidence is never overwritten.** After a fix, open a new directory and
   keep the old failure as the comparison.
 - Verification records the **full commit SHA**, never "latest".
+- 🧱 **An evidence directory holds results and method, not build output.** Logs,
+  `RESULT.md`, configurations and scripts are the evidence; a `target/`,
+  `linux-target/`, `node_modules/` or `.venv/` the run produced is not, and
+  `benchmarks/results/` is gitignored — so a build tree left there is invisible
+  in review and only surfaces when the disk is full. One run left 10 GB beside a
+  few MB of actual evidence (found 2026-08-18, with 1.8 GiB free).
+
+  > 🎯 **The operable rule**: when packing a run up, delete what it compiled.
+  > `just evidence-report` shows what the directories are holding, largest
+  > first, and `just evidence-sweep` removes build output while keeping the
+  > evidence — it prints every directory it deletes.
 
 ## 📊 Performance measurement: three ways to succeed at the wrong number
 

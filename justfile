@@ -85,6 +85,52 @@ disk:
     du -sh "$HOME/.cache/pingclair-ci" 2>/dev/null || true
     du -sh "$HOME/Library/Caches/pingclair/sccache" 2>/dev/null || true
     du -sh "$HOME/.cache/pingclair/sccache" 2>/dev/null || true
+    du -sh benchmarks/results 2>/dev/null || true
+
+# 📁 What the evidence directories hold, largest first.
+#
+# `benchmarks/results/` is gitignored, so a build tree left inside one is
+# invisible until the disk fills; this is the command that makes it visible.
+evidence-report:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ ! -d benchmarks/results ]]; then
+      echo "✅ no evidence directories on this machine"
+      exit 0
+    fi
+    du -sm benchmarks/results/* 2>/dev/null | sort -rn | head -20 |
+      awk '{ printf "%6d MB  %s\n", $1, $2 }'
+    du -sm benchmarks/results | awk '{ printf "%6d MB  %s (total)\n", $1, $2 }'
+
+# 🧹 Remove the build trees evidence runs leave behind, keeping the evidence.
+#
+# Results and method stay: `RESULT.md`, logs, configurations, scripts. What goes
+# is what those runs compiled — a 10 GB `linux-target/` next to a few MB of real
+# evidence is how one machine reached 1.8 GiB free without anyone noticing.
+# Prints every directory it deletes, and takes an optional root so the behaviour
+# can be exercised on a scratch tree.
+evidence-sweep root="benchmarks/results":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="{{ root }}"
+    if [[ ! -d "${root}" ]]; then
+      echo "✅ ${root} does not exist on this machine"
+      exit 0
+    fi
+    removed=0
+    while IFS= read -r directory; do
+      size="$(du -sh "${directory}" | cut -f1)"
+      printf '🧹 %s (%s)\n' "${directory}" "${size}"
+      rm -rf -- "${directory}"
+      removed=$((removed + 1))
+    done < <(find "${root}" -maxdepth 3 -type d \
+      \( -name target -o -name '*-target' -o -name node_modules -o -name .venv \) \
+      -prune -print | sort)
+    if [[ "${removed}" -eq 0 ]]; then
+      printf '✅ nothing to sweep under %s\n' "${root}"
+    else
+      printf '🧹 removed %d build director(ies); the evidence files are untouched\n' "${removed}"
+    fi
 
 # 📌 `cargo build` is untouched — this is the opt-in for a build whose artifacts
 # should be reusable by CI and by the other machines of the same architecture.
