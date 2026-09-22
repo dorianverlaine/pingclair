@@ -123,14 +123,14 @@ Sur n'importe quelle distribution Linux, le script d'installation fonctionne : i
 
 ```bash
 # Exécuter le script d'installation (droits sudo requis)
-curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash
+curl -fsSL https://pingclair.com/install.sh | sudo bash
 ```
 
 Le script accepte un drapeau pour suivre `main` au lieu de la version stable.
 Cloner main et le compiler localement (nécessite Rust 1.98+) :
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --main
+curl -fsSL https://pingclair.com/install.sh | sudo bash -s -- --main
 ```
 
 ### Déploiement de production avec Docker Compose

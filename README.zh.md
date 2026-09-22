@@ -110,7 +110,7 @@ cargo install --path ./pingclair
 
 ```bash
 # 執行安裝腳本（需要 sudo 權限）
-curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash
+curl -fsSL https://pingclair.com/install.sh | sudo bash
 ```
 
 腳本提供兩個旗標，可以追蹤 `main` 而非穩定版：
@@ -119,7 +119,7 @@ curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scrip
 Clone main 並在本機編譯（需要 Rust 1.98+）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --main
+curl -fsSL https://pingclair.com/install.sh | sudo bash -s -- --main
 ```
 
 ### 以 Docker Compose 做正式部署

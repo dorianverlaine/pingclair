@@ -294,6 +294,10 @@ def verify_object(key: str, size: int, sha256: str) -> None:
 def publish_assets(
     version: str, assets: list[ReleaseAsset], directory: Path, *, verify: bool
 ) -> dict[str, dict[str, Any]]:
+    # 🔁 A re-run finds everything already published and has nothing to upload;
+    # that is the normal path for "mirror this release again", not an error.
+    if not assets:
+        return {}
     published: dict[str, dict[str, Any]] = {}
 
     def publish(asset: ReleaseAsset) -> tuple[str, dict[str, Any]]:
@@ -354,20 +358,34 @@ def already_published(version: str, assets: list[ReleaseAsset]) -> dict[str, dic
     return found
 
 
-def fetch_installer(tag: str, destination: Path) -> tuple[int, str]:
-    """The installer as of this tag, straight from the repository."""
+def object_matches(key: str, size: int, sha256: str) -> bool:
+    """Whether an object is already there with exactly these bytes."""
+    try:
+        verify_object(key, size, sha256)
+    except PublishError as error:
+        cause = error.__cause__
+        if isinstance(cause, subprocess.CalledProcessError) and MISSING_OBJECT_RE.search(
+            cause.stderr or ""
+        ):
+            return False
+        raise
+    return True
+
+
+def fetch_installer(ref: str, destination: Path) -> tuple[int, str]:
+    """Fetch `scripts/install.sh` at a ref straight from the repository."""
     try:
         content = run(
             [
                 "gh",
                 "api",
-                f"repos/{REPOSITORY}/contents/{INSTALLER_SOURCE}?ref={tag}",
+                f"repos/{REPOSITORY}/contents/{INSTALLER_SOURCE}?ref={ref}",
                 "-H",
                 "Accept: application/vnd.github.raw",
             ]
         )
     except (OSError, subprocess.CalledProcessError) as error:
-        raise PublishError(f"reading {INSTALLER_SOURCE} at {tag} failed: {error}") from error
+        raise PublishError(f"reading {INSTALLER_SOURCE} at {ref} failed: {error}") from error
     destination.write_text(content, encoding="utf-8")
     return digest_of(destination)
 
@@ -400,6 +418,15 @@ def parse_args() -> argparse.Namespace:
         choices=("assets", "finalize"),
         required=True,
         help="`assets` mirrors early without verifying; `finalize` verifies, fills in the rest and moves the channels.",
+    )
+    parser.add_argument(
+        "--installer-ref",
+        default="main",
+        help=(
+            "Where `pingclair/install.sh` comes from. The versioned copy is always the "
+            "tag's own script, for the record; the alias users curl is a bootstrap that "
+            "has to know how to read today's channels, so it follows the default branch."
+        ),
     )
     return parser.parse_args()
 
@@ -471,25 +498,46 @@ def main() -> int:
                 file=sys.stderr,
             )
 
+            # 📌 Two installers, on purpose. The versioned one is the script this
+            # tag shipped — the record of what a user got from that release. The
+            # alias is the bootstrap users curl, which has to be the version that
+            # knows how to read today's channel documents, so it follows
+            # `--installer-ref` (the default branch).
             installer_path = work / "install.sh"
             installer_size, installer_sha256 = fetch_installer(args.tag, installer_path)
             installer_key = f"{PREFIX}/releases/{version}/install.sh"
-            put_object(installer_key, installer_path, installer_sha256, immutable=True)
-            verify_object(installer_key, installer_size, installer_sha256)
-            # 🧷 The alias is what `curl …/pingclair/install.sh` fetches. It moves
-            # on every release, prerelease or not: the script asks for a channel,
-            # and the channels are what keep prereleases out of `latest`.
+            if object_matches(installer_key, installer_size, installer_sha256):
+                print(
+                    f"already published and verified s3://{bucket()}/{installer_key}",
+                    file=sys.stderr,
+                )
+            else:
+                put_object(installer_key, installer_path, installer_sha256, immutable=True)
+                verify_object(installer_key, installer_size, installer_sha256)
+                print(
+                    f"published and verified s3://{bucket()}/{installer_key} "
+                    f"size={installer_size} sha256={installer_sha256}",
+                    file=sys.stderr,
+                )
+
+            alias_path = work / "install-alias.sh"
+            alias_size, alias_sha256 = fetch_installer(args.installer_ref, alias_path)
+            # 🧷 The alias is what `curl …/pingclair/install.sh` fetches: the
+            # installer from `--installer-ref` (the default branch), not the one
+            # this tag happened to ship. A bootstrap whose job is to read a
+            # channel document has to be the version that knows how, and the
+            # channel pointer is what keeps prereleases out of `latest`.
             put_object(
                 INSTALLER_ALIAS,
-                installer_path,
-                installer_sha256,
+                alias_path,
+                alias_sha256,
                 immutable=False,
                 content_type="text/x-shellscript",
             )
-            verify_object(INSTALLER_ALIAS, installer_size, installer_sha256)
+            verify_object(INSTALLER_ALIAS, alias_size, alias_sha256)
             print(
                 f"published and verified s3://{bucket()}/{INSTALLER_ALIAS} "
-                f"size={installer_size} sha256={installer_sha256}",
+                f"size={alias_size} sha256={alias_sha256}",
                 file=sys.stderr,
             )
 
@@ -527,7 +575,10 @@ def main() -> int:
                             "sha256": metadata_sha256,
                             "size": metadata_size,
                         },
-                        "installer": {"key": INSTALLER_ALIAS, "sha256": installer_sha256},
+                        "installer": {
+                            "alias": {"key": INSTALLER_ALIAS, "sha256": alias_sha256},
+                            "versioned": {"key": installer_key, "sha256": installer_sha256},
+                        },
                         "releasePrefix": f"{PREFIX}/releases/{version}/",
                     },
                     sort_keys=True,

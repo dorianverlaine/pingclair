@@ -119,14 +119,14 @@ Once installed, the `pingclair` command is available on your `PATH`.
 On any Linux distribution the install script works — it downloads (or builds) the binary, sets up a `systemd` service, and creates an unprivileged `pingclair` user that binds low ports via `setcap`. After installation, manage the service with the `pc` command (short for `pingclair`).
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash
+curl -fsSL https://pingclair.com/install.sh | sudo bash
 ```
 
 The script accepts one flag for tracking `main` instead of the stable release.
 Clone main and compile it locally (requires Rust 1.98+):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dorianverlaine/pingclair/main/scripts/install.sh | sudo bash -s -- --main
+curl -fsSL https://pingclair.com/install.sh | sudo bash -s -- --main
 ```
 
 ### Production deployment with Docker Compose
