@@ -291,7 +291,7 @@ client_done="${run_dir}/client.done"
 rm -f "${client_done}"
 (
     "${curl_bin}" --noproxy '*' --http3-only -kfsS --no-buffer \
-        --max-time 5 \
+        --max-time 20 \
         --resolve "${host_name}:${h3_port}:127.0.0.1" \
         "https://${host_name}:${h3_port}/events" \
         >"${client_output}" 2>"${client_error}"
@@ -306,7 +306,16 @@ first_visible=false
 # 🛡️ The client's own --max-time closes the window; this ceiling exists only so
 # that a wedged curl cannot hang the job, and it is far above that deadline so
 # it can never turn a healthy run red.
-deadline=$((SECONDS + 30))
+#
+# 📌 Two numbers, and the failure that moved them on 2026-09-22: the client's
+# window was 5 s, which a loaded container runner exceeded before the first
+# event arrived, so curl exited on its own timeout and the check reported "the
+# stream ended before it was delivered" — a healthy run turned red for the third
+# time (2026-08-13, 2026-09-11, now). Nothing here is timing-sensitive in the
+# assertion: a buffered body cannot pass at any speed, because this upstream
+# never finishes its response. The numbers only bound how long a real failure
+# takes to report.
+deadline=$((SECONDS + 45))
 while [[ ! -f "${client_done}" ]] && ((SECONDS < deadline)); do
     if [[ -f "${first_marker}" ]] && grep -Fq 'data: first' "${client_output}"; then
         first_visible=true

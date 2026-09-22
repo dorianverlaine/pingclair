@@ -103,6 +103,19 @@ jobs:
     needs: archive
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 60
+    # 🧊 The archive was built inside the builder image, at the paths that image
+    # fixes, so the shards run inside it too. A test binary carries
+    # `CARGO_BIN_EXE_…` and `CARGO_MANIFEST_DIR` as absolute paths compiled into
+    # it; unpacking that archive on a runner whose checkout lives somewhere else
+    # produced `failed to start the test server: No such file or directory` on
+    # every shard, which is what the first containerized run of this workflow
+    # reported.
+    container:
+      image: ghcr.io/dorianverlaine/pingclair-builder:v1
+    defaults:
+      run:
+        shell: bash
+        working-directory: /workspace/pingclair
     env:
       NEXTEST_ARCHIVE_FILE: nextest-${{ inputs.artifact_id }}.tar.zst
     strategy:
@@ -114,12 +127,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-ci
+      - name: Place the checkout at the image's workspace path
+        run: |
+          set -euo pipefail
+          cp -a "${GITHUB_WORKSPACE}/." /workspace/pingclair/
 
-      - name: Install Rust 1.98
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1 (toolchain is an input; ignored on 1.98.x branch refs)
-        with:
-          toolchain: 1.98.1
+      - uses: ./.github/actions/setup-ci
 
       - name: Install nextest
         uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
@@ -155,7 +168,7 @@ jobs:
             --no-fail-fast \
             --profile ci \
             --archive-file "${RUNNER_TEMP}/nextest-archive/${NEXTEST_ARCHIVE_FILE}" \
-            --workspace-remap "${GITHUB_WORKSPACE}" \
+            --workspace-remap /workspace/pingclair \
             --partition "hash:${{ matrix.shard }}/4"
 
       - name: Upload nextest JUnit report
