@@ -30,16 +30,16 @@ jobs:
           target: x86_64-unknown-linux-gnu
           profile: release
           cache-scope: h3
-          r2-endpoint: ${{ vars.R2_CACHE_ENDPOINT }}
-          r2-bucket: ${{ vars.R2_CACHE_BUCKET }}
-          r2-access-key-id: ${{ secrets.R2_CACHE_ACCESS_KEY_ID }}
-          r2-secret-access-key: ${{ secrets.R2_CACHE_SECRET_ACCESS_KEY }}
-          # 🧭 This job does not run inside the builder image yet, so it builds
-          # at the runner's own paths (`/home/runner/.cargo`, `$HOME/.cache/…`).
-          # Those artifacts can never be reused by an image build, and their
-          # paths are exactly what the shared prefix must not contain, so they
-          # go to the host-specific prefix that exists for this.
-          r2-key-prefix: sccache/v1/native/h3-runner
+          # 🚫 No shared cache here, on purpose. This job does not run inside the
+          # builder image yet, so it compiles at the runner's own paths and its
+          # objects can never be reused by an image build — the shared bucket
+          # would collect artifacts nobody can read, at 0.87 s per object, which
+          # measured *slower* than compiling them: 9–14 minutes on the shared
+          # cache against 6m30s on the Actions cache for the same job.
+          #
+          # The Actions cache is in the runner's own region and the H3 job's
+          # artifacts are only ever useful to the next H3 run, so it is the right
+          # store for this one job until it moves into the image too.
 
       - name: Install HTTP/3-capable curl
         run: |
