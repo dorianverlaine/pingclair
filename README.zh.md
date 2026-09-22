@@ -6,7 +6,7 @@
 *結合 Cloudflare Pingora 的極致效能與 Caddy 的極簡開發體驗*
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Documentation](https://img.shields.io/badge/docs-pingclair.aqeo.dev-blue.svg)](https://pingclair.aqeo.dev)
+[![Documentation](https://img.shields.io/badge/docs-pingclair.com-blue.svg)](https://pingclair.com)
 [![Rust](https://img.shields.io/badge/rust-1.98%2B-orange.svg)](https://www.rust-lang.org/)
 [![Status](https://img.shields.io/badge/status-active-green.svg)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/dorianverlaine/pingclair/pulls)
@@ -25,7 +25,7 @@
 
 無論你需要的是單純的靜態檔案伺服器，還是支援複雜負載平衡、自動 HTTPS 與 HTTP/3 的企業級閘道，Pingclair 都能勝任。
 
-完整文件 —— 安裝說明、Pingclairfile 指令參考，以及基準測試方法 —— 發佈於 <https://pingclair.aqeo.dev>。
+完整文件 —— 安裝說明、Pingclairfile 指令參考，以及基準測試方法 —— 發佈於 <https://pingclair.com>。
 
 ## ✨ 核心特性
 
