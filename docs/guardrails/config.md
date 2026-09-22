@@ -46,6 +46,32 @@
   compatibility, it is a lie — the only variable is how long it takes the
   operator to find out.
 
+- **Recursive types must never use `#[serde(untagged)]`.** Under untagged, a
+  newtype variant (`Not(Box<Self>)`) re-parses the entire payload as itself
+  **while consuming no input**, so any value that matches no other variant
+  recurses forever. serde's untagged replay never goes back through serde_json's
+  parser, so serde_json's recursion limit cannot catch it, and a release binary
+  with `panic = "abort"` simply dies. On `Matcher` this was a DoS remotely
+  triggerable through the Admin API (fixed 2026-07-28). Recursive enums are
+  always tagged.
+
+  📌 This rule sat in `tls.md` until 2026-09-22, and that is exactly how it
+  stopped being read: the type it protects is *configuration*, the door it came
+  through was the Admin API, and nobody changing either starts by reading the
+  TLS document.
+
+- **Sensitive configuration is masked by default.** API keys, ACME credentials,
+  DNS-provider tokens and passwords never reach a log line, a metric, an Admin
+  dump, or a panic message — `TlsConfig`, `DnsChallengeConfig` and the types
+  that hold them carry the masking themselves rather than relying on a caller to
+  remember. A field that newly holds a secret belongs in that list; the test is
+  whether a `Debug` derive on something containing it would print it.
+
+> 🔐 The rest of the secure-defaults list — forging `X-Forwarded-*` and
+> `X-Real-IP`, downgrade switches such as `insecure_skip_verify`, certificates
+> and trust material — lives in `docs/guardrails/tls.md` and
+> `docs/guardrails/proxy.md`, which is where those subsystems' work starts.
+
   > 🎯 **The operable rule**: if you accept a setting, use it at runtime. If you
   > cannot, reject it at load time with a message that says **why this build
   > cannot do it**. A warning line at startup **does not count** — that line is

@@ -65,14 +65,11 @@
   in logs, metrics, Admin dumps, and panic messages.
 - Downgrade switches such as `insecure_skip_verify` must be **conspicuous and off
   by default**.
-- **Recursive types must never use `#[serde(untagged)]`.** Under untagged, a
-  newtype variant (`Not(Box<Self>)`) re-parses the entire payload as itself
-  **while consuming no input**, so any value that matches no other variant
-  recurses forever. serde's untagged replay never goes back through serde_json's
-  parser, so serde_json's recursion limit cannot catch it, and a release binary
-  with `panic = "abort"` simply dies. On `Matcher` this was a DoS remotely
-  triggerable through the Admin API (fixed 2026-07-28). Recursive enums are always
-  tagged.
+- 📚 **`#[serde(untagged)]` on a recursive type, and the masking rules, are
+  config-layer rules** — they live in `docs/guardrails/config.md` now, because
+  the way they get broken is through the configuration path rather than through
+  anything this document covers. What remains here is the trust material: what
+  a certificate may say, and how a downgrade switch is spelled.
 - **Configuration rules belong in the core config layer, not only in the
   Pingclairfile adapter.** The Admin API deserialises a config document straight
   into the core types **with no adapter involved**. A check written only in
