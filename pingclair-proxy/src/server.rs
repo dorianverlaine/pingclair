@@ -7812,9 +7812,11 @@ impl ProxyHttp for PingclairProxy {
                 .as_ref()
                 .map(|upstream| upstream.addr.to_string())
                 .unwrap_or_else(|| "-".to_string());
-            // 🏷️ `ErrorType`'s Debug output is a fixed enum, so the reason
-            // label is bounded by the library rather than by traffic.
-            let reason = format!("{:?}", e.etype());
+            // 🏷️ The *deepest* type in the chain, not the one on top: Pingora
+            // reports descriptor exhaustion and ephemeral-port exhaustion as
+            // `InternalError` alike, which is exactly the distinction the
+            // operator needs this label to carry.
+            let reason = format!("{:?}", crate::upstream_failure::deepest_error_type(e));
             metrics::UPSTREAM_ERRORS_TOTAL
                 .with_label_values(&[route, &upstream, &reason])
                 .inc();

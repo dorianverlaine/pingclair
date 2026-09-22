@@ -71,6 +71,47 @@ impl FailureOrigin {
     }
 }
 
+/// 🏷️ The deepest `ErrorType` in an error's cause chain.
+///
+/// The top-level type is often the *wrapper*, not the problem: Pingora rewrites
+/// descriptor exhaustion (`SocketError`) and ephemeral-port exhaustion
+/// (`BindError`) into `InternalError` on the way out of its connector, so a
+/// metric labelled with `e.etype()` reports `InternalError` for both and
+/// carries no information. The two need opposite operator actions — raise
+/// `nofile`, or widen `net.ipv4.ip_local_port_range` and shorten TIME_WAIT —
+/// and the name that distinguishes them is one link down.
+///
+/// The walk stops at the first link that is not a Pingora error, which is the
+/// ordinary shape: the chain ends in the `std::io::Error` that actually failed,
+/// and that has no `ErrorType` to contribute.
+///
+/// 🪤 **Pingora chains a `BError`, and `BError` is `Box<Error>` — which is
+/// itself an `Error`, so the trait object in `cause` holds a *boxed* error.**
+/// Its concrete type is `Box<Error>`, and a `downcast_ref::<Error>()` against
+/// it returns `None`; a walk that only tries the unboxed type stops at the
+/// wrapper and reports exactly the `InternalError` this function exists to see
+/// past. Both shapes are tried, because a caller that hands over an unboxed
+/// error produces the other one.
+///
+/// 📉 Cardinality stays bounded: `ErrorType` is an enum whose only
+/// string-carrying variant takes a `&'static str`, so the label is bounded by
+/// this binary's own code paths rather than by traffic.
+pub fn deepest_error_type(error: &pingora_core::Error) -> &pingora_core::ErrorType {
+    let mut deepest = error;
+    while let Some(cause) = deepest.cause.as_deref() {
+        let next = cause.downcast_ref::<pingora_core::Error>().or_else(|| {
+            cause
+                .downcast_ref::<Box<pingora_core::Error>>()
+                .map(|boxed| &**boxed)
+        });
+        match next {
+            Some(inner) => deepest = inner,
+            None => break,
+        };
+    }
+    deepest.etype()
+}
+
 /// Classifies a failure returned by Pingora's connector.
 ///
 /// Every local failure traced through `pingora-core` 0.9.0 arrives as
@@ -241,6 +282,60 @@ mod tests {
 
         assert_eq!(classify_connect_error(&error), FailureOrigin::Local);
         assert!(!classify_connect_error(&error).implicates_backend());
+    }
+
+    /// 🏷️ The metric label must name the condition, not the wrapper it arrived
+    /// in.
+    ///
+    /// Both of these are `InternalError` at the top and something useful one
+    /// link down — and they are the two local failures that need *different*
+    /// operator actions, which is the whole point of the label. Before this,
+    /// `pingclair_upstream_errors_total` reported `InternalError` for both and
+    /// the `reason` label carried nothing.
+    #[test]
+    fn the_deepest_type_names_the_condition_that_actually_failed() {
+        let exhausted_descriptors = Error::because(
+            ErrorType::InternalError,
+            "Fail to connect to addr: 127.0.0.1:19000",
+            Error::because(
+                ErrorType::SocketError,
+                "failed to create socket",
+                std::io::Error::from_raw_os_error(libc::EMFILE),
+            ),
+        );
+        let exhausted_ports = Error::because(
+            ErrorType::InternalError,
+            "Fail to connect to addr: 127.0.0.1:19000",
+            Error::because(
+                ErrorType::BindError,
+                "failed to bind socket",
+                std::io::Error::from_raw_os_error(libc::EADDRNOTAVAIL),
+            ),
+        );
+
+        // 🪤 Both wrappers say the same thing; only the chain distinguishes them.
+        assert_eq!(exhausted_descriptors.etype(), &ErrorType::InternalError);
+        assert_eq!(exhausted_ports.etype(), &ErrorType::InternalError);
+        assert_eq!(
+            deepest_error_type(&exhausted_descriptors),
+            &ErrorType::SocketError
+        );
+        assert_eq!(deepest_error_type(&exhausted_ports), &ErrorType::BindError);
+    }
+
+    /// 🧭 With nothing to walk, the error names itself — and the walk stops at
+    /// the `io::Error` that has no `ErrorType` to contribute.
+    #[test]
+    fn a_bare_error_names_itself() {
+        let refused = Error::explain(ErrorType::ConnectRefused, "backend said no");
+        assert_eq!(deepest_error_type(&refused), &ErrorType::ConnectRefused);
+
+        let io_leaf = Error::because(
+            ErrorType::SocketError,
+            "failed to create socket",
+            std::io::Error::from_raw_os_error(libc::EMFILE),
+        );
+        assert_eq!(deepest_error_type(&io_leaf), &ErrorType::SocketError);
     }
 
     /// A backend that refuses is still the backend's problem, and must keep
