@@ -243,36 +243,76 @@ if [ -f "scripts/pingclair.service" ]; then
     cp scripts/pingclair.service /etc/systemd/system/
 else
     # Fallback to creating it here if script run standalone
-    # ⚠️ This is a reduced copy of `scripts/pingclair.service`, reached when the
-    # script is run without the repository beside it (the `curl | bash` path).
-    # Keep the two in step for anything the service cannot start without — the
-    # TLS store below is one, and its absence is what left a fresh install dead
-    # on arrival. Hardening options such as `ProtectSystem` and `NoNewPrivileges`
-    # are still only in the repository copy.
-    cat > /etc/systemd/system/pingclair.service <<EOF
+    # 🧭 This is a byte-for-byte copy of `scripts/pingclair.service`, reached
+    # when the script runs without the repository beside it (the `curl | bash`
+    # path). It used to be a *reduced* copy, and the two drifted: this one kept
+    # `Restart=always` without `RestartPreventExitStatus=1`, so a configuration
+    # the server refuses at startup was retried every five seconds instead of
+    # leaving the unit failed and visible. `just repo-lint` compares this block
+    # with the repository copy and fails when they differ, so edit one and the
+    # gate asks for the other.
+    # 🚫 The quoting around `EOF` is load-bearing: unquoted, the shell runs the
+    # binary while writing this section and expands whatever it prints into the
+    # unit file — 25 lines of `--help` output, once, until it was quoted.
+    cat > /etc/systemd/system/pingclair.service <<'EOF'
 [Unit]
 Description=Pingclair High-Performance Web Server
+Documentation=https://github.com/dorianverlaine/pingclair
 After=network-online.target
+Wants=network-online.target
 
 [Service]
-# 📣 Matches scripts/pingclair.service — see the comment there.
+# 📣 `notify` rather than `simple`: with `simple`, systemd considers the unit
+# started the instant the process is forked, so anything ordered `After=` races
+# against the listeners actually being bound. Pingclair sends READY=1 only after
+# every listener has been added, so `systemctl start` blocks until the proxy can
+# really answer — and STOPPING=1 on shutdown, so `systemctl stop` knows the
+# drain has begun rather than guessing from the process still being alive.
 Type=notify
 NotifyAccess=main
 User=pingclair
 Group=pingclair
+# Allow binding ports < 1024
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Paths
 Environment="RUST_LOG=info"
-# 🔐 Required: the `pingclair` user has no home, so the binary's default store
-# under \$HOME cannot be created and startup fails. See scripts/pingclair.service.
+# 🔐 The certificate store must be named here, not left to the binary's
+# default. Without it Pingclair resolves `$XDG_DATA_HOME/pingclair`, then
+# `$HOME/.local/share/pingclair` — and the `pingclair` user is a system account
+# with no home directory, so the service dies at startup with
+# `Permission denied` before `RestartPreventExitStatus=1` leaves it dead. This
+# is the same path `deployment/Dockerfile` sets, so both install paths persist
+# certificates in one place.
 Environment="PINGCLAIR_TLS_STORE=/var/lib/pingclair/certs"
 ExecStartPre=/usr/local/bin/pingclair validate /etc/Pingclair/Pingclairfile
 ExecStart=/usr/local/bin/pingclair run /etc/Pingclair/Pingclairfile
-ExecReload=/bin/kill -HUP \$MAINPID
+# 🔔 SIGUSR1 is the reload signal. SIGHUP is dropped on purpose — it is the
+# signal table Caddy uses — so the `kill -HUP` this unit used to send reported
+# success and applied nothing at all. systemd can only see whether `kill`
+# exited, never what the server then made of the file, so the reload's own
+# result lands on this unit's status line instead: `systemctl status pingclair`
+# reads `Serving (reloaded …)` or `Reload rejected: …` once the reload settles.
+ExecReload=/bin/kill -USR1 $MAINPID
 WorkingDirectory=/var/lib/pingclair
-Restart=always
+
+# Restart Policy
+# 🛡️ Exit code 1 means failed startup (bad config, missing cert files, ...).
+# Do not restart automatically in that case — the process will only fail
+# again; an operator must fix the configuration first.
+Restart=on-failure
+RestartPreventExitStatus=1
 RestartSec=5s
+
+# Performance
 LimitNOFILE=1048576
+LimitNPROC=512
+
+# Hardening
+ProtectSystem=full
+PrivateTmp=true
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target

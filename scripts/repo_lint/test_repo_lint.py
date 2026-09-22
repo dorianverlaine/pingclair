@@ -6,7 +6,14 @@
 
 import unittest
 
-from repo_lint import manifest_errors, section_body, sections
+from repo_lint import (
+    embedded_unit,
+    manifest_errors,
+    section_body,
+    sections,
+    unit_errors,
+    unit_parity_errors,
+)
 
 
 class ManifestErrorsTest(unittest.TestCase):
@@ -78,6 +85,62 @@ class SectionHelpersTest(unittest.TestCase):
         self.assertIn("x = 1", section_body(text, "a"))
         self.assertIn("y = 2", section_body(text, "b"))
         self.assertEqual(section_body(text, "missing"), "")
+
+
+class ServiceUnitTest(unittest.TestCase):
+    """🧪 The unit file is a deployment contract the CLI cannot enforce."""
+
+    CANONICAL = (
+        "[Service]\n"
+        "ExecReload=/bin/kill -USR1 $MAINPID\n"
+        "Restart=on-failure\n"
+        "RestartPreventExitStatus=1\n"
+    )
+
+    def install_script(self, unit: str) -> str:
+        return (
+            "if [ -f scripts/pingclair.service ]; then\n"
+            "    cp scripts/pingclair.service /etc/systemd/system/\n"
+            "else\n"
+            "    cat > /etc/systemd/system/pingclair.service <<'EOF'\n"
+            f"{unit}"
+            "EOF\n"
+            "fi\n"
+        )
+
+    def test_compliant_unit_passes(self):
+        self.assertEqual(unit_errors(self.CANONICAL), [])
+        self.assertEqual(
+            unit_parity_errors(self.CANONICAL, self.install_script(self.CANONICAL)),
+            [],
+        )
+
+    def test_the_dropped_signal_is_refused(self):
+        wrong = self.CANONICAL.replace("kill -USR1", "kill -HUP")
+        errors = unit_errors(wrong)
+        self.assertTrue(any("kill -USR1" in error for error in errors))
+
+    def test_a_drifting_restart_policy_is_refused(self):
+        reduced = self.CANONICAL.replace(
+            "Restart=on-failure\nRestartPreventExitStatus=1\n",
+            "Restart=always\n",
+        )
+        errors = unit_parity_errors(reduced, self.install_script(self.CANONICAL))
+        self.assertTrue(any("line 3" in error for error in errors), errors)
+
+    def test_a_missing_heredoc_is_refused(self):
+        install = (
+            "if [ -f scripts/pingclair.service ]; then\n"
+            "    cp scripts/pingclair.service /etc/systemd/system/\n"
+            "fi\n"
+        )
+        self.assertIsNone(embedded_unit(install))
+        errors = unit_parity_errors(self.CANONICAL, install)
+        self.assertTrue(any("standalone install path" in error for error in errors))
+
+    def test_an_unterminated_heredoc_is_refused(self):
+        unterminated = self.install_script(self.CANONICAL).replace("EOF\nfi\n", "fi\n")
+        self.assertIsNone(embedded_unit(unterminated))
 
 
 if __name__ == "__main__":

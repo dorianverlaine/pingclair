@@ -848,6 +848,22 @@ immediately after the `101`, both ends seeing EOF with no error.
   configuration the running server refuses still leaves the previous one
   serving.
 
+- 🧰 **The one-liner install wrote a unit the shell had been editing.** The
+  fallback heredoc in `scripts/install.sh` was unquoted and one of its comments
+  contained a backticked word, so installing through `curl … | sudo bash` ran
+  the binary during installation and substituted 25 lines of `--help` output
+  into `/etc/systemd/system/pingclair.service` — `systemd-analyze verify`
+  reported `Missing '=', ignoring line` for the unit it had just written. The
+  same copy carried `Restart=always` without `RestartPreventExitStatus=1`, so a
+  configuration the server refuses at startup was retried every five seconds
+  instead of leaving the unit failed and visible to the operator.
+
+  The embedded copy is now byte-identical to `scripts/pingclair.service` — the
+  reload signal and the hardened restart policy included — and `just repo-lint`
+  compares the two, so they cannot drift apart again without a red gate. A
+  fresh one-liner install therefore gets `ProtectSystem=full`, `PrivateTmp`,
+  `NoNewPrivileges` and `LimitNPROC` as well.
+
 - ⚡ **A `handle_response { file_server }` no longer rebuilds its file server for
   every response.** Each response constructed one and threw it away. The
   construction itself is cheap; the caches it carries are the point, and
