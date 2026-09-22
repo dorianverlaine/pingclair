@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# 🛰️ Day 28 functional matrix for HTTP/3, driven by a real HTTP/3 client.
+# 🛰️ HTTP/3 functional matrix, 22 septembre 2026, driven by a real HTTP/3 client.
 #
 # docs/guardrails/proxy.md requires this after any change to H3 or the TLS
 # dependency tree:
@@ -19,7 +19,7 @@ set -Eeuo pipefail
 
 readonly repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly binary="${PINGCLAIR_BINARY:-${repository_root}/target/debug/pingclair}"
-readonly run_dir="$(mktemp -d "${TMPDIR:-/tmp}/pingclair-h3-day28.XXXXXX")"
+readonly run_dir="$(mktemp -d "${TMPDIR:-/tmp}/pingclair-h3-matrix.XXXXXX")"
 readonly primary_host="h3-primary.local"
 readonly secondary_host="h3-secondary.local"
 pingclair_pid=""
@@ -227,66 +227,65 @@ printf 'Rendered: {{now | date "2006"}}\n' >"${run_dir}/tpl/範本.html"
 python3 "${run_dir}/upstream.py" "${upstream_port}" >"${run_dir}/upstream.log" 2>&1 &
 upstream_pid=$!
 
-cat >"${run_dir}/config.json" <<JSON
+# 🧾 A Pingclairfile, not JSON: the DSL is the half an operator's configuration
+# goes through, and the JSON path skips `adapter/caddyfile.rs` entirely — which
+# is where "the directive parsed into the wrong shape" lives.
+cat >"${run_dir}/Pingclairfile" <<EOF
 {
-  "global": { "auto_https": "off", "http3": true },
-  "servers": [
-    {
-      "name": "${primary_host}",
-      "listen": ["127.0.0.1:${h3_port}"],
-      "tls": { "internal": true, "http3": true },
-      "limits": { "max_request_body_bytes": 1048576 },
-      "routes": [
-        { "path": "/ready", "handler": { "type": "respond", "status": 200, "body": "ready" } },
-        { "path": "/who", "handler": { "type": "respond", "status": 200, "body": "primary" } },
-        { "path": "/static/*", "handler": { "type": "file_server", "root": "${run_dir}" } },
-        {
-          "path": "/tpl/*",
-          "handler": {
-            "type": "pipeline",
-            "handlers": [
-              { "type": "templates", "root": "${run_dir}" },
-              { "type": "file_server", "root": "${run_dir}" }
-            ]
-          }
-        },
-        {
-          "path": "/proxy/*",
-          "handler": {
-            "type": "reverse_proxy",
-            "upstreams": ["http://127.0.0.1:${upstream_port}"],
-            "load_balance": { "strategy": "round_robin" },
-            "headers_up": {},
-            "headers_down": {}
-          }
-        },
-        {
-          "path": "/scheme/*",
-          "handler": {
-            "type": "reverse_proxy",
-            "upstreams": ["http://127.0.0.1:${upstream_port}"],
-            "load_balance": { "strategy": "round_robin" },
-            "rewrite_uri": "/echo/{http.request.scheme}",
-            "headers_up": {},
-            "headers_down": {}
-          }
-        }
-      ]
-    },
-    {
-      "name": "${secondary_host}",
-      "listen": ["127.0.0.1:${h3_port}"],
-      "tls": { "internal": true, "http3": true },
-      "routes": [
-        { "path": "/ready", "handler": { "type": "respond", "status": 200, "body": "ready" } },
-        { "path": "/who", "handler": { "type": "respond", "status": 200, "body": "secondary" } }
-      ]
-    }
-  ]
+	auto_https off
+	servers {
+		protocols h1 h2 h3
+	}
 }
-JSON
 
-PINGCLAIR_TLS_STORE="${run_dir}/tls" "${binary}" run "${run_dir}/config.json" \
+https://${primary_host}:${h3_port} {
+	bind 127.0.0.1
+	root * ${run_dir}
+	tls internal
+	# 📥 The body ceiling this matrix checks a 5 MiB POST against, now written
+	# in the DSL instead of a JSON field the schema had renamed long ago.
+	request_body {
+		max_size 1MiB
+	}
+	handle /ready {
+		respond "ready" 200
+	}
+	handle /who {
+		respond "primary" 200
+	}
+	handle /static/* {
+		file_server
+	}
+	handle /tpl/* {
+		templates
+		file_server
+	}
+	handle /proxy/* {
+		reverse_proxy 127.0.0.1:${upstream_port}
+	}
+	handle /scheme/* {
+		reverse_proxy 127.0.0.1:${upstream_port} {
+			rewrite /echo/{http.request.scheme}
+		}
+	}
+}
+
+https://${secondary_host}:${h3_port} {
+	bind 127.0.0.1
+	tls internal
+	request_body {
+		max_size 1MiB
+	}
+	handle /ready {
+		respond "ready" 200
+	}
+	handle /who {
+		respond "secondary" 200
+	}
+}
+EOF
+
+PINGCLAIR_TLS_STORE="${run_dir}/tls" "${binary}" run "${run_dir}/Pingclairfile" \
     >"${run_dir}/pingclair.log" 2>&1 &
 pingclair_pid=$!
 
@@ -483,9 +482,9 @@ check_eq "escaped traversal refused on the H3 templates path" "404" "${tpl_escap
 log ""
 log "═══════════════════════════════════════════"
 if [[ "${checks_failed}" -eq 0 ]]; then
-    log "✅ Day 28 H3 functional matrix: ${checks_run}/${checks_run} passed."
+    log "✅ H3 functional matrix (22 septembre 2026): ${checks_run}/${checks_run} passed."
 else
-    log "❌ Day 28 H3 functional matrix: ${checks_failed} of ${checks_run} FAILED."
+    log "❌ H3 functional matrix (22 septembre 2026): ${checks_failed} of ${checks_run} FAILED."
     log "   Server log: ${run_dir}/pingclair.log"
     PINGCLAIR_H3_KEEP_TEMP=1
     exit 1

@@ -83,7 +83,7 @@ H3 or the TLS dependency tree, run `just h3` (the three maintained scripts)
 and the Linux half:
 
 ```bash
-scripts/test-h3-day28-local.sh              # SNI, Alt-Svc, body sizes, POST, 413, keepalive
+scripts/test-h3-22-septembre-2026-local.sh  # SNI, Alt-Svc, body sizes, POST, 413, keepalive
 scripts/test-h3-cancellation-local.sh       # SSE, downstream cancellation, trailer rejection
 scripts/test-h3-client-auth-local.sh        # mutual TLS, and the SNI/:authority rule that protects it
 ```

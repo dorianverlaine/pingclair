@@ -78,7 +78,7 @@ stop_owned_process() {
 
 cleanup() {
     stop_owned_process "${client_pid}" "https://${host_name}:${h3_port:-}/events"
-    stop_owned_process "${pingclair_pid}" "${run_dir}/config.json"
+    stop_owned_process "${pingclair_pid}" "${run_dir}/Pingclairfile"
     stop_owned_process "${upstream_pid}" "${run_dir}/upstream.py"
     if [[ "${PINGCLAIR_H3_KEEP_TEMP:-0}" == "1" ]]; then
         log "📁 Preserved local H3 artifacts at ${run_dir}."
@@ -93,7 +93,7 @@ readonly h3_port="$(reserve_tcp_udp_port)"
 readonly upstream_port="$(reserve_tcp_port)"
 
 # 🔨 Always, not only when the binary is missing — the same reason spelled out
-# in `test-h3-day28-local.sh`: a stale binary makes this script report on a
+# in `test-h3-22-septembre-2026-local.sh`: a stale binary makes this script report on a
 # change that is not in it. `cargo build` is a no-op when nothing changed.
 if [[ -z "${PINGCLAIR_BINARY:-}" ]]; then
     log "🔨 Building the local Pingclair binary."
@@ -179,52 +179,36 @@ python3 "${run_dir}/upstream.py" \
     >"${run_dir}/upstream.log" 2>&1 &
 upstream_pid=$!
 
-cat >"${run_dir}/config.json" <<JSON
+# 🧾 A Pingclairfile, not JSON: an operator's configuration goes through the
+# DSL, and JSON skips `adapter/caddyfile.rs` — the half where a directive can
+# parse into the wrong shape and nobody notices.
+cat >"${run_dir}/Pingclairfile" <<EOF
 {
-  "global": {
-    "auto_https": "off",
-    "http3": true
-  },
-  "servers": [{
-    "name": "${host_name}",
-    "listen": ["127.0.0.1:${h3_port}"],
-    "tls": {
-      "internal": true,
-      "http3": true
-    },
-    "routes": [
-      {
-        "path": "/ready",
-        "handler": { "type": "respond", "status": 200, "body": "ready" }
-      },
-      {
-        "path": "/events",
-        "handler": {
-          "type": "reverse_proxy",
-          "upstreams": ["http://127.0.0.1:${upstream_port}"],
-          "load_balance": { "strategy": "round_robin" },
-          "headers_up": {},
-          "headers_down": {},
-          "flush_interval": -1
-        }
-      },
-      {
-        "path": "/response-trailers",
-        "handler": {
-          "type": "reverse_proxy",
-          "upstreams": ["http://127.0.0.1:${upstream_port}"],
-          "load_balance": { "strategy": "round_robin" },
-          "headers_up": {},
-          "headers_down": {}
-        }
-      }
-    ]
-  }]
+	auto_https off
+	servers {
+		protocols h1 h2 h3
+	}
 }
-JSON
+
+https://${host_name}:${h3_port} {
+	bind 127.0.0.1
+	tls internal
+	handle /ready {
+		respond "ready" 200
+	}
+	handle /events {
+		reverse_proxy 127.0.0.1:${upstream_port} {
+			flush_interval -1
+		}
+	}
+	handle /response-trailers {
+		reverse_proxy 127.0.0.1:${upstream_port}
+	}
+}
+EOF
 
 PINGCLAIR_TLS_STORE="${run_dir}/tls" \
-    "${binary}" run "${run_dir}/config.json" \
+    "${binary}" run "${run_dir}/Pingclairfile" \
     >"${run_dir}/pingclair.log" 2>&1 &
 pingclair_pid=$!
 

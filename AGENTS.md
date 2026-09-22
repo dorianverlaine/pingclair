@@ -373,7 +373,7 @@ just h3
 ```
 
 which covers the three maintained scripts
-(`test-h3-day28-local.sh`, `test-h3-cancellation-local.sh`,
+(`test-h3-22-septembre-2026-local.sh`, `test-h3-cancellation-local.sh`,
 `test-h3-client-auth-local.sh`). CI runs the Linux H3 gate post-merge on
 `ubuntu-24.04`; a manual Linux box can use `rust:1.98-bookworm` with `cmake`
 and `clang`/`libclang-dev` for BoringSSL/bindgen. The H3 client must be a

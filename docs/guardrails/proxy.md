@@ -120,12 +120,14 @@ follow from it.
   keepalive.
 - **macOS unit tests are not sufficient to verify linking or QUIC behaviour.**
 
-- The scripts for this gate are `scripts/test-h3-day28-local.sh` (the functional
-  matrix; needs a curl built with HTTP/3), `scripts/test-h3-cancellation-local.sh`
-  (SSE, cancellation, trailers), and `scripts/test-h3-client-auth-local.sh`
-  (mutual TLS, including the rule that the handshake name and `:authority` must
-  agree — a rule that had no test at all before 2026-08-18). The Linux half runs
-  in docker `rust:1.98-bookworm`.
+- The scripts for this gate are `scripts/test-h3-22-septembre-2026-local.sh` (the
+  functional matrix; needs a curl built with HTTP/3),
+  `scripts/test-h3-cancellation-local.sh` (SSE, cancellation, trailers),
+  `scripts/test-h3-client-auth-local.sh` (mutual TLS, including the rule that
+  the handshake name and `:authority` must agree — a rule that had no test at
+  all before 2026-08-18). All three configure the server with a
+  **Pingclairfile**, not JSON: the DSL is the half an operator's configuration
+  goes through. The Linux half runs in docker `rust:1.98-bookworm`.
 
 > ✅ **The `ba37ffc` migration passed this gate** (2026-07-30, evidence in
 > `benchmarks/results/20260730_day28_f26d0a1/`): Linux release build, no
