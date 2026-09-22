@@ -164,7 +164,10 @@ jobs:
           RUST_BACKTRACE: 1
           RUST_MIN_STACK: "8388608"
         run: |
-          cargo +1.98.1 nextest run \
+          # 🎲 Through the shared policy: a partition that hits the known
+          # websocket flake retries it exactly as the whole suite does, instead
+          # of turning the shard red (2026-09-22).
+          scripts/retry-known-flakes.sh cargo +1.98.1 nextest run \
             --no-fail-fast \
             --profile ci \
             --archive-file "${RUNNER_TEMP}/nextest-archive/${NEXTEST_ARCHIVE_FILE}" \
