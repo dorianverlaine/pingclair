@@ -11,11 +11,14 @@ use crate::acme::{
 };
 use crate::cert_store::{CertStore, CertStoreError};
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio::sync::Notify;
 use tokio::sync::Semaphore;
+use tokio::sync::futures::OwnedNotified;
 
 // MARK: - Errors
 
@@ -120,6 +123,14 @@ impl AutoHttpsConfig {
 /// bounded by this number rather than by how fast a client can open sockets.
 const MAX_CONCURRENT_ISSUANCES: usize = 4;
 
+/// ⏳ How long a second caller waits for an issuance that is already running.
+///
+/// The wait is bounded because a TLS handshake is what waits, and a client that
+/// gives up first simply closes the connection. It is generous because the work
+/// being waited on is an ACME order: DNS-01 spends most of its time in the
+/// propagation poll, whose default budget alone is two minutes.
+const IN_FLIGHT_WAIT: Duration = Duration::from_secs(150);
+
 /// The high-level manager that automates the acquisition and renewal of TLS
 /// certificates.
 ///
@@ -130,8 +141,10 @@ const MAX_CONCURRENT_ISSUANCES: usize = 4;
 ///
 /// 🚦 Between steps 1 and 2 sit the gates that decide whether a certificate
 /// authority is contacted at all: the configuration's on/off switch, a
-/// per-name claim so two callers cannot open two orders for one site, and a
-/// process-wide ceiling on how many orders run at once. The allowlist that
+/// per-name claim so two callers cannot open two orders for one site — the
+/// second caller waits for the first rather than being told the name is
+/// broken — and a process-wide ceiling on how many orders run at once. The
+/// allowlist that
 /// decides *which names* may get this far lives one layer up, in
 /// [`TlsManager`](crate::manager::TlsManager), because it is the layer that
 /// knows what the configuration serves.
@@ -142,13 +155,14 @@ pub struct AutoHttps {
     issuer: Arc<dyn CertificateIssuer>,
     store: Arc<CertStore>,
 
-    /// 🔁 Domains with an ACME transaction in flight, so a second caller for
-    /// the same name does not open a second order.
+    /// 🔁 Domains with an ACME transaction in flight, with the handle a second
+    /// caller for the same name waits on instead of opening a second order —
+    /// or being refused.
     ///
     /// A plain `Mutex` rather than an async lock on purpose: it is held for one
     /// set insertion and never across an `await`, and [`IssuanceSlot`] has to
     /// be able to release it from `Drop`, where awaiting is not possible.
-    processing: Arc<Mutex<HashSet<String>>>,
+    processing: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
 
     /// 🚦 Bounds concurrent ACME work across the whole process.
     issuance_slots: Arc<Semaphore>,
@@ -164,20 +178,40 @@ pub struct AutoHttps {
 /// marked as in-flight forever, and every later attempt to issue for that name
 /// is refused for the lifetime of the process.
 struct IssuanceSlot {
-    processing: Arc<Mutex<HashSet<String>>>,
+    processing: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     domain: String,
 }
 
 impl IssuanceSlot {
-    /// 🔒 Claims `domain` if nothing else holds it, in one locked step.
+    /// 🔒 Claims `domain` if nothing else holds it, in one locked step — and
+    /// hands back a woken-on-release handle to a caller that arrives second.
     ///
-    /// Checking membership and then inserting under two separate locks is a
-    /// race with a real consequence: two handshakes for the same new name both
-    /// see an empty set, both start an order, and the CA counts both against
-    /// the account's rate limit. `HashSet::insert` answers both questions at
-    /// once — it returns `false` when the name was already there.
-    fn claim(processing: &Arc<Mutex<HashSet<String>>>, domain: &str) -> Option<Self> {
-        processing.lock().insert(domain.to_string()).then(|| Self {
+    /// Answering both questions under one lock is what keeps two handshakes for
+    /// the same new name from opening two orders: the CA counts both against
+    /// the account's rate limit, and doing it often enough is how an account
+    /// gets locked out of issuing anything at all.
+    fn claim(
+        processing: &Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+        domain: &str,
+    ) -> Result<Self, InFlightIssuance> {
+        let mut guard = processing.lock();
+
+        if let Some(notify) = guard.get(domain) {
+            let mut armed = Box::pin(Arc::clone(notify).notified_owned());
+            // 🔔 Armed here, under the lock the holder also needs to release
+            // the claim. Registering after letting go would leave a gap: the
+            // holder could finish inside it, and `notify_waiters` wakes only
+            // the waiters that exist at that instant — the missed wakeup would
+            // look like an issuance that never ends.
+            armed.as_mut().enable();
+            return Err(InFlightIssuance {
+                armed,
+                domain: domain.to_string(),
+            });
+        }
+
+        guard.insert(domain.to_string(), Arc::new(Notify::new()));
+        Ok(Self {
             processing: Arc::clone(processing),
             domain: domain.to_string(),
         })
@@ -186,7 +220,45 @@ impl IssuanceSlot {
 
 impl Drop for IssuanceSlot {
     fn drop(&mut self) {
-        self.processing.lock().remove(&self.domain);
+        // 🔔 Removal and wakeup happen under one lock, because that is the same
+        // lock a waiter arms itself under: it either sees this claim (and is
+        // woken here) or never sees it and claims the name itself.
+        let mut guard = self.processing.lock();
+        if let Some(notify) = guard.remove(&self.domain) {
+            notify.notify_waiters();
+        }
+    }
+}
+
+/// ⏳ A caller that arrived while another one was already issuing for the name.
+///
+/// Being turned away used to be the whole answer, and what the client saw was a
+/// TLS alert for a name whose certificate was already on its way — a window of
+/// seconds with DNS-01, not microseconds. Waiting instead means the second
+/// caller either returns the certificate the first one stored, or, if that
+/// issuance failed, tries for itself.
+struct InFlightIssuance {
+    armed: Pin<Box<OwnedNotified>>,
+    domain: String,
+}
+
+impl std::fmt::Debug for InFlightIssuance {
+    /// 🙈 The armed future has nothing useful to print — only the name does.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InFlightIssuance")
+            .field("domain", &self.domain)
+            .field("armed", &"<pending wakeup>")
+            .finish()
+    }
+}
+
+impl InFlightIssuance {
+    /// ⏳ Waits for the holder to release the claim, or for `deadline`.
+    ///
+    /// `true` means the holder finished — not that it succeeded; the caller
+    /// looks in the store to tell those apart.
+    async fn wait(self, deadline: tokio::time::Instant) -> bool {
+        tokio::time::timeout_at(deadline, self.armed).await.is_ok()
     }
 }
 
@@ -241,7 +313,7 @@ impl AutoHttps {
             config,
             issuer,
             store,
-            processing: Arc::new(Mutex::new(HashSet::new())),
+            processing: Arc::new(Mutex::new(HashMap::new())),
             issuance_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_ISSUANCES)),
         }
     }
@@ -294,11 +366,50 @@ impl AutoHttps {
             )));
         }
 
-        // 3. 🎟️ Claim the domain, atomically, for as long as this call lives.
-        let Some(_slot) = IssuanceSlot::claim(&self.processing, domain) else {
-            return Err(AutoHttpsError::Config(format!(
-                "🔄 Race Protection: Certificate for {domain} is already being issued"
-            )));
+        // 3. 🎟️ Claim the domain for as long as this call lives — or, if
+        // another caller already holds it, wait for that issuance instead of
+        // failing the handshake that is asking.
+        //
+        // 🔄 The wait is what a client sees as "the certificate takes a moment
+        // to appear" rather than as a broken name: with DNS-01 the order spends
+        // seconds in propagation polling, and every handshake arriving in that
+        // window used to be answered with a TLS alert.
+        let deadline = tokio::time::Instant::now() + IN_FLIGHT_WAIT;
+        let _slot = loop {
+            let in_flight = match IssuanceSlot::claim(&self.processing, domain) {
+                Ok(slot) => break slot,
+                Err(in_flight) => in_flight,
+            };
+            let waiting_for = in_flight.domain.clone();
+
+            if !in_flight.wait(deadline).await {
+                return Err(AutoHttpsError::Config(format!(
+                    "⏳ {waiting_for} has had an issuance in flight for more than {}s; \
+                     this handshake will not wait any longer",
+                    IN_FLIGHT_WAIT.as_secs()
+                )));
+            }
+
+            // 🎉 The other caller is done. If it succeeded, its certificate is
+            // in the store — and that is this caller's answer, without a second
+            // order. If it failed, the name is free again and the loop below
+            // tries for itself.
+            if let Some(cert) = self.store.get(domain).await
+                && !cert.needs_renewal(self.store.renewal_window_ratio())
+            {
+                tracing::info!(
+                    "🎉 Joined an in-flight issuance and reused its certificate for {domain}"
+                );
+                return Ok(cert);
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AutoHttpsError::Config(format!(
+                    "⏳ Certificate for {waiting_for} is still not available after {}s; \
+                     the issuance it was waiting on did not produce one",
+                    IN_FLIGHT_WAIT.as_secs()
+                )));
+            }
         };
 
         // 4. 🚦 Take a process-wide slot, or decline now rather than queue.
@@ -447,7 +558,18 @@ impl AutoHttps {
     /// abandoned task still completes and stores its certificate, which is
     /// harmless.
     pub async fn cancel_pending_issuance(&self) {
-        self.processing.lock().clear();
+        // 🔔 Waking the waiters matters as much as dropping the markers: a
+        // waiter that nobody wakes sits on a name no task is issuing for any
+        // more, until its own ceiling expires.
+        let waiters: Vec<Arc<Notify>> = self
+            .processing
+            .lock()
+            .drain()
+            .map(|(_, notify)| notify)
+            .collect();
+        for notify in waiters {
+            notify.notify_waiters();
+        }
     }
 
     /// Returns an already-issued certificate from the store's cache, if any.
@@ -511,6 +633,8 @@ mod tests {
         entered: mpsc::UnboundedSender<String>,
         release: Arc<Notify>,
         calls: AtomicUsize,
+        /// 🧪 How many calls fail before the issuer starts succeeding.
+        failures_before_success: AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -524,6 +648,12 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let _ = self.entered.send(domain.clone());
             self.release.notified().await;
+            if self.failures_before_success.load(Ordering::SeqCst) > 0 {
+                self.failures_before_success.fetch_sub(1, Ordering::SeqCst);
+                return Err(AcmeError::OrderFailed(
+                    "🧪 the gate refused the order".to_string(),
+                ));
+            }
             Ok(Certificate {
                 cert_pem: "CERT".to_string(),
                 key_pem: "KEY".to_string(),
@@ -549,6 +679,7 @@ mod tests {
             entered: entered_tx,
             release: release.clone(),
             calls: AtomicUsize::new(0),
+            failures_before_success: AtomicUsize::new(0),
         });
         let store = Arc::new(CertStore::new(directory.path()));
         let auto = Arc::new(AutoHttps::with_issuer(
@@ -616,18 +747,21 @@ mod tests {
     /// released on drop.
     #[test]
     fn a_claim_is_exclusive_until_it_is_dropped() {
-        let processing = Arc::new(Mutex::new(HashSet::new()));
+        let processing = Arc::new(Mutex::new(HashMap::new()));
 
         let first = IssuanceSlot::claim(&processing, "example.com").expect("a free name claims");
         assert!(
-            IssuanceSlot::claim(&processing, "example.com").is_none(),
-            "the same name was claimed twice at once"
+            IssuanceSlot::claim(&processing, "example.com").is_err(),
+            "the same name was claimed twice at once, so two orders would run"
         );
         // 🧭 A different name is unaffected; the claim is per-name, and the
         // process-wide bound is a separate mechanism.
         let other = IssuanceSlot::claim(&processing, "other.example").expect("a second name");
 
         drop(first);
+        // 🎉 A released name is claimable again, which is what lets the caller
+        // woken by that release start an order of its own when the first one
+        // produced nothing.
         let again =
             IssuanceSlot::claim(&processing, "example.com").expect("a released name claims again");
 
@@ -659,13 +793,19 @@ mod tests {
         assert_eq!(harness.issuer.calls.load(Ordering::SeqCst), 0);
     }
 
-    /// 🔁 Two callers for the same name produce one order, not two.
+    /// 🔁 Two callers for the same name produce one order, not two — and both
+    /// get a certificate.
     ///
     /// The in-flight check and the insertion used to happen under two separate
     /// locks, so two handshakes arriving together for a name with no
     /// certificate both saw an empty set and both opened an order. The CA
     /// counts both against the account, and doing it often enough is how an
     /// account gets rate-limited out of issuing anything at all.
+    ///
+    /// The second caller then had a second problem: it was *refused*, which the
+    /// client saw as a failed handshake for a name whose certificate was being
+    /// obtained at that moment. It waits now, and returns the certificate the
+    /// first caller stored.
     #[tokio::test]
     async fn the_same_name_is_only_ever_issued_once_at_a_time() {
         let mut harness = harness(true);
@@ -680,15 +820,97 @@ mod tests {
             "example.com"
         );
 
-        expect_refused(
-            harness.auto.get_certificate("example.com", &solver()),
-            "a second order was opened for a name already being issued",
-        )
-        .await;
+        let second = tokio::spawn({
+            let auto = harness.auto.clone();
+            async move { auto.get_certificate("example.com", &solver()).await }
+        });
+
+        // ⏳ The second caller is inside the wait, not inside the issuer: if it
+        // had opened its own order, the issuer would have reported a second
+        // entry before the first was released.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            harness.entered.try_recv().is_err(),
+            "a second order was opened for a name already being issued"
+        );
 
         harness.release.notify_waiters();
-        assert!(first.await.unwrap().is_ok());
-        assert_eq!(harness.issuer.calls.load(Ordering::SeqCst), 1);
+        let issued = first
+            .await
+            .expect("the first caller finished")
+            .expect("the first caller gets a certificate");
+        let joined = second
+            .await
+            .expect("the waiting caller finished")
+            .expect("the waiting caller gets a certificate");
+
+        assert_eq!(
+            joined.domains, issued.domains,
+            "the waiter must be given the certificate that was stored, not one of its own"
+        );
+        assert_eq!(
+            harness.issuer.calls.load(Ordering::SeqCst),
+            1,
+            "the second caller opened its own order"
+        );
+    }
+
+    /// 🧹 A failed issuance does not leave the name dead for the next caller.
+    ///
+    /// The waiter wakes when the claim is released whatever the outcome was. If
+    /// the first order failed there is nothing in the store, so the waiter
+    /// claims the name and tries for itself — otherwise the site would stay
+    /// without a certificate until some later handshake happened to ask again.
+    #[tokio::test]
+    async fn a_waiter_tries_for_itself_when_the_first_issuance_fails() {
+        let mut harness = harness(true);
+        harness
+            .issuer
+            .failures_before_success
+            .store(1, Ordering::SeqCst);
+
+        let first = tokio::spawn({
+            let auto = harness.auto.clone();
+            async move { auto.get_certificate("example.com", &solver()).await }
+        });
+        assert_eq!(
+            expect_entered(&mut harness.entered, "the first caller").await,
+            "example.com"
+        );
+
+        let second = tokio::spawn({
+            let auto = harness.auto.clone();
+            async move { auto.get_certificate("example.com", &solver()).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            harness.entered.try_recv().is_err(),
+            "the waiting caller opened an order of its own while one was in flight"
+        );
+
+        // 🧪 The first order fails, which is the case this test is about.
+        harness.release.notify_waiters();
+        assert!(
+            first.await.expect("the first caller finished").is_err(),
+            "the gated issuer was told to fail the first call"
+        );
+
+        // ⏳ The waiter is now issuing for itself; it needs its release too.
+        assert_eq!(
+            expect_entered(&mut harness.entered, "the retry").await,
+            "example.com"
+        );
+        harness.release.notify_waiters();
+        let retried = second
+            .await
+            .expect("the second caller finished")
+            .expect("the retry must be allowed to obtain the certificate");
+        assert_eq!(retried.domains, vec!["example.com".to_string()]);
+        assert_eq!(
+            harness.issuer.calls.load(Ordering::SeqCst),
+            2,
+            "the waiter neither gave up nor opened more than one order"
+        );
     }
 
     /// 🧹 An abandoned handshake releases its claim.
