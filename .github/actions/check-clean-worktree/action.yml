@@ -1,6 +1,12 @@
 name: check-clean-worktree
 description: Fail when a CI job leaves tracked or untracked files in the worktree.
 
+inputs:
+  worktree:
+    description: The checkout to inspect. A job that builds in a container copies the checkout to the image's fixed path and builds there, so that copy — not the mounted one it never touches — is the tree whose cleanliness means anything.
+    required: false
+    default: ""
+
 runs:
   using: composite
   steps:
@@ -8,7 +14,9 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        status="$(git -C "${GITHUB_WORKSPACE}" status --porcelain=v1 --untracked-files=normal --ignore-submodules=none)"
+        worktree="${{ inputs.worktree }}"
+        [[ -n "${worktree}" ]] || worktree="${GITHUB_WORKSPACE}"
+        status="$(git -C "${worktree}" status --porcelain=v1 --untracked-files=normal --ignore-submodules=none)"
         if [[ -z "${status}" ]]; then
           exit 0
         fi

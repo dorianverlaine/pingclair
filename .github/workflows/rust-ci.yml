@@ -134,6 +134,11 @@ jobs:
         run: scripts/run-ci-tests.sh
 
       - uses: ./.github/actions/check-clean-worktree
+        with:
+          # 🔍 The build happened in the image's copy of the checkout, so that
+          # is the tree whose leftovers matter. The mounted workspace is owned by
+          # the runner's user and git refuses to read it as root anyway.
+          worktree: /workspace/pingclair
 
   results:
     name: CI results (required)

@@ -54,6 +54,8 @@ jobs:
         run: cargo +1.98.1 clippy --locked --workspace --all-targets --profile release -- -D warnings
 
       - uses: ./.github/actions/check-clean-worktree
+        with:
+          worktree: /workspace/pingclair
 
   tests_x86_64:
     name: Tests — Linux x86_64
