@@ -142,6 +142,39 @@ def strings_of(blob: bytes) -> str:
     )
 
 
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def decompress(blob: bytes) -> bytes:
+    """Return a payload's real bytes.
+
+    sccache stores each compiler output zstd-compressed, so a scan of the stored
+    bytes sees compressed noise rather than the debug information this audit is
+    looking for — a comfortable negative that proves nothing. The first version
+    of this script made exactly that mistake: it grepped the container and
+    reported "no paths", while the payload underneath held tens of thousands of
+    the compiler's absolute paths.
+    """
+    if not blob.startswith(ZSTD_MAGIC):
+        return blob
+    try:
+        result = subprocess.run(
+            ["zstd", "-d", "-q", "-c"],
+            input=blob,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        return blob
+    return result.stdout if result.returncode == 0 and result.stdout else blob
+
+
+def crate_stem(name: str) -> str:
+    """`libserde_json-abc.rlib` → `serde_json`, or an empty string."""
+    match = re.match(r"^lib(?P<stem>.+)-[0-9a-f]{8,}\.(?:rlib|rmeta|so|dylib)$", name)
+    return match.group("stem").replace("-", "_") if match else ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -173,15 +206,16 @@ def main() -> int:
         )
         return 2
 
-    # 🔍 Path canaries are machine-specific: the audit looks for its *own* home
-    # directory and hostname, which is what a leak would carry.
+    # 🔍 Path canaries: the shared prefix is allowed exactly two roots — the
+    # builder image's `/workspace/pingclair` and `/usr/local/cargo` — so anything
+    # that looks like somebody's home directory is a failure there. A per-machine
+    # bucket is allowed to carry that machine's paths, which is why it has one.
     home = os.path.expanduser("~")
     host = os.uname().nodename.split(".")[0]
-    path_markers = [marker for marker in (home, f"/Users/", f"/home/") if marker]
-    if home.startswith("/Users/"):
-        # `/Users/` alone is too broad to be a useful report on a Linux audit;
-        # the home directory above is the precise one for this machine.
-        path_markers = [home]
+    if args.policy == "shared":
+        path_markers = ["/Users/", "/home/", "/root/", home, host]
+    else:
+        path_markers = [home, host]
 
     print(f"🔎 bucket   s3://{bucket}")
     print(f"   endpoint {endpoint}")
@@ -197,12 +231,21 @@ def main() -> int:
     sample = random.Random(args.seed).sample(keys, min(args.samples, len(keys)))
     hits: dict[str, list[str]] = {}
     entries: set[str] = set()
+    scannable = 0
+    payloads_seen = 0
     with tempfile.TemporaryDirectory(prefix="cache-audit.") as workdir:
         for key in sample:
             blob = download(key, bucket, endpoint, Path(workdir) / "object")
             for name, payload in payloads(blob):
                 entries.add(name)
-                text = strings_of(payload)
+                payloads_seen += 1
+                text = strings_of(decompress(payload))
+                # 🧪 Positive control: the crate's own name has to be visible
+                # somewhere in what we scanned, or a clean result means the
+                # scanner could not see inside rather than that nothing is there.
+                stem = crate_stem(name)
+                if stem and (stem in text or stem.replace("_", "-") in text):
+                    scannable += 1
                 needles = list(SECRET_MARKERS) + path_markers + secrets
                 for needle in needles:
                     if needle and needle in text:
@@ -221,6 +264,7 @@ def main() -> int:
     if entries:
         shown = ", ".join(sorted(entries)[:6])
         print(f"   entries  {shown}{' …' if len(entries) > 6 else ''}")
+    print(f"   visible  {scannable} of {payloads_seen} payload(s) showed their crate name")
 
     path_hits = {
         label: where
@@ -243,6 +287,13 @@ def main() -> int:
         if args.policy == "shared":
             verdict = 1
     if not hits:
+        if scannable == 0:
+            print(
+                "⚠️  nothing was scannable: the sample holds no payload this audit "
+                "could read, so this result says nothing. Re-run with more samples "
+                "or look at an object by hand."
+            )
+            return 2
         print("✅ no credential-shaped strings and no machine paths in the sample")
     elif verdict == 0:
         print("✅ credentials absent; paths present as expected for this bucket")

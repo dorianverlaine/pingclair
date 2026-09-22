@@ -4,6 +4,17 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  # 🪞 Mirrors an existing release into the R2 channel without cutting a new
+  # tag: the recovery path when a mirror run fails after the release is already
+  # published, and how an older release gets a channel pointer. Every other job
+  # in this workflow builds from the tag that was pushed, so they are skipped
+  # here.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to mirror, for example v0.2.0-rc.3'
+        required: true
+        type: string
 
 concurrency:
   group: release-${{ github.ref_name }}
@@ -15,6 +26,7 @@ permissions:
 jobs:
   verify-tag:
     name: Verify tag matches the workspace version
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     outputs:
@@ -282,3 +294,46 @@ jobs:
             -t ghcr.io/dorianverlaine/pingclair:latest \
             ghcr.io/dorianverlaine/pingclair:"$version"-amd64 \
             ghcr.io/dorianverlaine/pingclair:"$version"-arm64
+
+  publish-r2:
+    name: Mirror to R2
+    # 🧊 GitHub is where a release is created; R2 is where it is served from.
+    # `always()` here is about the dispatch path above, where the job this needs
+    # is skipped because there is nothing to build — the mirror still has to run.
+    needs: [publish-release]
+    if: ${{ always() && (github.event_name != 'push' || needs.publish-release.result == 'success') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # 🔐 The publisher credential lives in an environment rather than in the
+    # repository, so it is handed to exactly one job and can be reviewed there.
+    environment: pingclair-r2-publisher
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      R2_RELEASES_ENDPOINT: ${{ secrets.R2_RELEASES_ENDPOINT }}
+      R2_RELEASES_BUCKET: ${{ secrets.R2_RELEASES_BUCKET }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_RELEASES_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_RELEASES_SECRET_ACCESS_KEY }}
+      AWS_REGION: auto
+      # 🚦 R2 throttles parallel multipart uploads. The publisher parallelizes
+      # across objects instead, and keeps each object's parts serial.
+      AWS_RETRY_MODE: standard
+      AWS_MAX_ATTEMPTS: "6"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configure the transfer client for R2
+        run: |
+          set -euo pipefail
+          aws configure set default.s3.preferred_transfer_client classic
+          aws configure set default.s3.max_concurrent_requests 1
+
+      - name: Mirror the release
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/publish_r2_release.py --tag "${RELEASE_TAG}" --stage finalize

@@ -17,6 +17,15 @@ release_binary() {
     cargo metadata --format-version 1 --no-deps | jq -r '.target_directory + "/release/pingclair"'
 }
 
+# 🔐 One digest, whichever sha256 tool the distribution ships.
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    else
+        shasum -a 256 "$1" | cut -d' ' -f1
+    fi
+}
+
 # 0. Install mode
 # 🧭 Default is the latest stable release binary. `--main` clones the latest
 # main and compiles it locally (requires Rust).
@@ -129,15 +138,44 @@ if [ "$INSTALL_MODE" = "main" ]; then
     rm -rf "$BUILD_DIR"
     cd /
 else
-    echo "Fetching latest release from $REPO..."
+    # 🧊 releases.pingclair.com first. Its channel document names the tag, every
+    # asset, and the sha256 of each one, and the host has no egress fee and a CDN
+    # in front of it — which matters most to users far from GitHub. GitHub stays
+    # the fallback and remains where releases are created.
+    RELEASES_BASE_URL="${PINGCLAIR_RELEASES_BASE_URL:-https://releases.pingclair.com/pingclair}"
+    TAR_NAME="pingclair-linux-$ASSET_KEY.tar.gz"
+    RELEASE_SOURCE=""
+    EXPECTED_SHA256=""
+    LATEST_TAG=""
+    LATEST_RELEASE_URL=""
+    LATEST_SUM_URL=""
 
-    # 🧭 One fetch, not three: the release document names the tag and carries
-    # every asset URL, and asking the API again for each of them invites the
-    # anonymous rate limit to answer differently halfway through.
-    LATEST_RELEASE=$(curl -s "https://api.github.com/repos/$REPO/releases/latest")
-    LATEST_TAG=$(printf '%s' "$LATEST_RELEASE" | jq -r ".tag_name // empty")
-    LATEST_RELEASE_URL=$(printf '%s' "$LATEST_RELEASE" | jq -r ".assets[] | select(.name | contains(\"$ASSET_KEY\") and contains(\"linux\")) | .browser_download_url" | head -n 1)
-    LATEST_SUM_URL=$(printf '%s' "$LATEST_RELEASE" | jq -r ".assets[] | select(.name == \"SHA256SUMS-$ASSET_KEY.txt\") | .browser_download_url" | head -n 1)
+    CHANNEL_DOCUMENT=$(curl -fsSL --max-time 20 "$RELEASES_BASE_URL/channels/latest" 2>/dev/null || true)
+    if [ -n "$CHANNEL_DOCUMENT" ]; then
+        LATEST_TAG=$(printf '%s' "$CHANNEL_DOCUMENT" | jq -r ".tag_name // empty" 2>/dev/null || true)
+        LATEST_RELEASE_URL=$(printf '%s' "$CHANNEL_DOCUMENT" | jq -r ".assets[] | select(.name == \"$TAR_NAME\") | .browser_download_url" 2>/dev/null | head -n 1)
+        EXPECTED_SHA256=$(printf '%s' "$CHANNEL_DOCUMENT" | jq -r ".assets[] | select(.name == \"$TAR_NAME\") | .digest" 2>/dev/null | head -n 1 | sed 's/^sha256://')
+        if [ -n "$LATEST_RELEASE_URL" ] && [ "$LATEST_RELEASE_URL" != "null" ] \
+            && [ -n "$EXPECTED_SHA256" ] && [ "$EXPECTED_SHA256" != "null" ]; then
+            RELEASE_SOURCE="releases.pingclair.com"
+        fi
+    fi
+
+    if [ -z "$RELEASE_SOURCE" ]; then
+        echo -e "${YELLOW}releases.pingclair.com did not answer with a release channel; falling back to GitHub.${NC}"
+        echo "Fetching latest release from $REPO..."
+
+        # 🧭 One fetch, not three: the release document names the tag and carries
+        # every asset URL, and asking the API again for each of them invites the
+        # anonymous rate limit to answer differently halfway through.
+        LATEST_RELEASE=$(curl -s "https://api.github.com/repos/$REPO/releases/latest")
+        LATEST_TAG=$(printf '%s' "$LATEST_RELEASE" | jq -r ".tag_name // empty")
+        LATEST_RELEASE_URL=$(printf '%s' "$LATEST_RELEASE" | jq -r ".assets[] | select(.name | contains(\"$ASSET_KEY\") and contains(\"linux\")) | .browser_download_url" | head -n 1)
+        LATEST_SUM_URL=$(printf '%s' "$LATEST_RELEASE" | jq -r ".assets[] | select(.name == \"SHA256SUMS-$ASSET_KEY.txt\") | .browser_download_url" | head -n 1)
+        if [ -n "$LATEST_RELEASE_URL" ] && [ "$LATEST_RELEASE_URL" != "null" ]; then
+            RELEASE_SOURCE="github.com"
+        fi
+    fi
 
     # 🚧 A release candidate is the latest release while 0.2.0 is being cut.
     # Say so at install time: the tag is the only thing that distinguishes it
@@ -147,7 +185,7 @@ else
         ?*)  echo "Installing $LATEST_TAG..." ;;
     esac
 
-    if [ -z "$LATEST_RELEASE_URL" ] || [ "$LATEST_RELEASE_URL" == "null" ]; then
+    if [ -z "$RELEASE_SOURCE" ]; then
         echo -e "${YELLOW}No binary found for $ARCH in latest release.${NC}"
         echo "Attempting cargo build fallback (requires Rust)..."
         if command -v cargo &> /dev/null; then
@@ -159,27 +197,40 @@ else
             exit 1
         fi
     else
-        echo "Downloading $LATEST_RELEASE_URL..."
+        echo "Downloading $LATEST_RELEASE_URL (from $RELEASE_SOURCE)..."
         curl -L -o /tmp/pingclair.tar.gz "$LATEST_RELEASE_URL"
-        # 🔐 Verify against the published checksum before unpacking anything
-        # into /usr/local/bin. This runs as root from a piped script, so a
-        # truncated or substituted download must stop here. A release with no
-        # checksum file is refused rather than installed unverified.
-        if [ -z "$LATEST_SUM_URL" ] || [ "$LATEST_SUM_URL" == "null" ]; then
-            echo -e "${RED}Error: $LATEST_TAG publishes no SHA256SUMS-$ASSET_KEY.txt, so the download cannot be verified.${NC}"
-            rm -f /tmp/pingclair.tar.gz
-            exit 1
-        fi
-        TAR_NAME=$(basename "$LATEST_RELEASE_URL")
         mv /tmp/pingclair.tar.gz "/tmp/$TAR_NAME"
-        curl -L -o "/tmp/SHA256SUMS-$ASSET_KEY.txt" "$LATEST_SUM_URL"
-        if command -v sha256sum >/dev/null 2>&1; then
-            (cd /tmp && sha256sum -c "SHA256SUMS-$ASSET_KEY.txt")
+        # 🔐 Verify before unpacking anything into /usr/local/bin: this runs as
+        # root from a piped script, so a truncated or substituted download must
+        # stop here. The channel document carries one digest per asset; a
+        # release with no verifiable digest is refused rather than installed
+        # unverified.
+        if [ "$RELEASE_SOURCE" = "releases.pingclair.com" ]; then
+            ACTUAL_SHA256="$(sha256_of "/tmp/$TAR_NAME")"
+            if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+                echo -e "${RED}Error: $TAR_NAME does not match the digest in the release channel.${NC}"
+                echo "  expected sha256:$EXPECTED_SHA256"
+                echo "  got      sha256:$ACTUAL_SHA256"
+                rm -f "/tmp/$TAR_NAME"
+                exit 1
+            fi
+            echo "✅ sha256 matches the release channel document"
         else
-            (cd /tmp && shasum -a 256 -c "SHA256SUMS-$ASSET_KEY.txt")
+            if [ -z "$LATEST_SUM_URL" ] || [ "$LATEST_SUM_URL" == "null" ]; then
+                echo -e "${RED}Error: $LATEST_TAG publishes no SHA256SUMS-$ASSET_KEY.txt, so the download cannot be verified.${NC}"
+                rm -f "/tmp/$TAR_NAME"
+                exit 1
+            fi
+            curl -L -o "/tmp/SHA256SUMS-$ASSET_KEY.txt" "$LATEST_SUM_URL"
+            if command -v sha256sum >/dev/null 2>&1; then
+                (cd /tmp && sha256sum -c "SHA256SUMS-$ASSET_KEY.txt")
+            else
+                (cd /tmp && shasum -a 256 -c "SHA256SUMS-$ASSET_KEY.txt")
+            fi
+            rm -f "/tmp/SHA256SUMS-$ASSET_KEY.txt"
         fi
         tar -xzf "/tmp/$TAR_NAME" -C /usr/local/bin/
-        rm -f "/tmp/$TAR_NAME" "/tmp/SHA256SUMS-$ASSET_KEY.txt"
+        rm -f "/tmp/$TAR_NAME"
         chmod +x /usr/local/bin/pingclair
     fi
 fi
