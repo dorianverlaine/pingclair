@@ -67,6 +67,11 @@ jobs:
       image: ghcr.io/dorianverlaine/pingclair-builder:v1
     defaults:
       run:
+        # 🐚 A container job's default shell is the image's `/bin/sh`, which on
+        # Ubuntu is dash: `set -o pipefail` there is an illegal option, and a
+        # step written for the runner's bash dies on its first line. The image
+        # ships bash, so the job says so once instead of every step remembering.
+        shell: bash
         working-directory: /workspace/pingclair
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -28,6 +28,7 @@ jobs:
       image: ghcr.io/dorianverlaine/pingclair-builder:v1
     defaults:
       run:
+        shell: bash
         working-directory: /workspace/pingclair
     env:
       NEXTEST_ARCHIVE_FILE: nextest-${{ inputs.artifact_id }}.tar.zst

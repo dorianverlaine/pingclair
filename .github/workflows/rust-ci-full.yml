@@ -22,6 +22,7 @@ jobs:
       image: ghcr.io/dorianverlaine/pingclair-builder:v1
     defaults:
       run:
+        shell: bash
         working-directory: /workspace/pingclair
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
