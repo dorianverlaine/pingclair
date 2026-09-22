@@ -20,6 +20,22 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 📦 Releases are served from `releases.pingclair.com`
+
+GitHub remains where a release is created — the tag, the notes, the assets — and
+every release is mirrored to Cloudflare R2, which serves it from a bucket with
+no egress fee and a CDN in front of it. Each mirrored object carries the sha256
+GitHub reported for it and is read back before the mirror run is allowed to
+succeed; a release whose assets GitHub cannot digest is refused rather than
+mirrored unverifiable.
+
+The installer reads a channel document on that host — `latest` and `prerelease`,
+each naming a tag and a sha256 per asset — verifies the archive against the
+digest before extracting it, and falls back to the GitHub releases API when the
+host cannot be reached. The one-liner in the READMEs and the documentation is
+now <https://pingclair.com/install.sh>, which the documentation Worker serves
+from that same single source rather than from a copy.
+
 ### ⚡ Per-request work removed from the hot paths
 
 The reverse-proxy configuration is now borrowed from the published snapshot
