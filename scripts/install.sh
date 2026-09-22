@@ -238,7 +238,29 @@ fi
 # 5. Setup User
 if ! id "pingclair" &>/dev/null; then
     echo "Creating system user 'pingclair'..."
-    useradd -r -s /bin/false pingclair
+    # 🏠 A home the machine actually has. `useradd -r` records `/home/pingclair`
+    # and creates nothing, so anything that resolves a store from `$HOME` — a
+    # manual `sudo -u pingclair pingclair …`, most of all — was pointed at a
+    # directory that does not exist. `/var/lib/pingclair` is the directory this
+    # installer already owns for the service, so the account's home is that.
+    # 📌 `-m` is deliberately absent: the next steps create the directory with
+    # the ownership it needs, and a service account does not want `/etc/skel`.
+    useradd -r -d /var/lib/pingclair -s /bin/false pingclair
+else
+    # 🔁 Upgrades: point an existing account at the same directory, which also
+    # fixes installs made when the home field named a path that never existed.
+    # Without `-m`, so no files move and nothing is copied over the store.
+    current_home="$(getent passwd pingclair | cut -d: -f6)"
+    if [ "$current_home" != "/var/lib/pingclair" ]; then
+        echo "Pointing the 'pingclair' user's home at /var/lib/pingclair..."
+        # 🔁 `usermod` refuses to touch an account that has running processes,
+        # and on an upgrade the service *is* one of them:
+        #   usermod: user pingclair is currently used by process 2954
+        # So the service stops here and the restart at the end of this script
+        # brings it back — the same outage an upgrade already has.
+        systemctl stop pingclair >/dev/null 2>&1 || true
+        usermod -d /var/lib/pingclair pingclair
+    fi
 fi
 
 # 6. Capabilities (Bind Port 80/443)
@@ -331,11 +353,12 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 Environment="RUST_LOG=info"
 # 🔐 The certificate store must be named here, not left to the binary's
 # default. Without it Pingclair resolves `$XDG_DATA_HOME/pingclair`, then
-# `$HOME/.local/share/pingclair` — and the `pingclair` user is a system account
-# with no home directory, so the service dies at startup with
-# `Permission denied` before `RestartPreventExitStatus=1` leaves it dead. This
-# is the same path `deployment/Dockerfile` sets, so both install paths persist
-# certificates in one place.
+# `$HOME/.local/share/pingclair`, which for the `pingclair` account is
+# `/var/lib/pingclair/.local/share/pingclair` — a path the installer does not
+# create, that the documentation does not mention, and that an operator looking
+# for certificates would not guess. The named path is also what
+# `deployment/Dockerfile` mounts, so a container and a package install keep
+# their state in the same place.
 Environment="PINGCLAIR_TLS_STORE=/var/lib/pingclair/certs"
 # 🚫 Deliberately no `ExecStartPre=/usr/local/bin/pingclair validate …` here.
 # It looks like the safe place for the check and it is the trap: systemd applies
