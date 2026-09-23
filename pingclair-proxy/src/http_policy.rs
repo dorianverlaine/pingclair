@@ -21,6 +21,10 @@ pub(crate) use max_forwards::{ALLOWED_METHODS, forwarded_max_forwards, local_hop
 mod cookies;
 pub(crate) use cookies::CookieFold;
 
+// 🔐 `Strict-Transport-Security` only on encrypted responses, on every transport.
+mod strict_transport;
+pub(crate) use strict_transport::StrictTransport;
+
 /// 🧰 Request-scoped variables set by `vars` handlers and read by
 /// `{http.vars.*}` placeholders and the `vars` matcher.
 ///

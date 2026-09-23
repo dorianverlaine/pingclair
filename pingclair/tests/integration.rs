@@ -3895,9 +3895,14 @@ async fn test_production_cache_headers_compose_with_reverse_proxy() {
             response.headers()
         );
         assert_eq!(response.headers()["x-frame-options"], "DENY");
-        assert_eq!(
-            response.headers()["strict-transport-security"],
-            "max-age=31536000; includeSubDomains"
+        // 🚫 The site is plaintext, so RFC 6797 §7.2 keeps the configured
+        // `Strict-Transport-Security` off the wire; its TLS half is covered in
+        // `integration/strict_transport.rs`.
+        assert!(
+            response
+                .headers()
+                .get("strict-transport-security")
+                .is_none()
         );
         assert!(response.headers().get("server").is_none());
         assert_eq!(response.text().await.unwrap(), "ok");

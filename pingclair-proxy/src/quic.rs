@@ -6239,24 +6239,19 @@ fn apply_h3_response_policy(
     );
     set_h3_header(headers, "referrer-policy", &security.referrer_policy);
     set_h3_header(headers, "permissions-policy", &security.permissions_policy);
-    if state
-        .config
-        .tls
-        .as_ref()
-        .is_some_and(|tls| tls.auto || tls.cert.is_some())
-        && let Some(hsts) = &security.hsts
+    // 🔐 HTTP/3 is always encrypted, so the only question is whether a value
+    // is already there; an operator's `header` or the upstream's wins.
+    if let Some(value) = state.strict_transport.builtin()
+        && !headers.iter().any(|header| {
+            header
+                .name()
+                .eq_ignore_ascii_case(b"strict-transport-security")
+        })
     {
-        let value = format!(
-            "max-age={};{}{}",
-            hsts.max_age,
-            if hsts.include_subdomains {
-                " includeSubDomains;"
-            } else {
-                ""
-            },
-            if hsts.preload { " preload" } else { "" }
-        );
-        set_h3_header(headers, "strict-transport-security", &value);
+        headers.push(quiche::h3::Header::new(
+            b"strict-transport-security",
+            value.as_bytes(),
+        ));
     }
     if let Some(csp) = &security.csp {
         set_h3_header(headers, "content-security-policy", csp);
@@ -8229,6 +8224,43 @@ mod tests {
             panic!("expected the second respond terminal");
         };
         assert_eq!(body.as_deref(), Some("public"));
+    }
+
+    /// 🔐 HTTP/3 is always encrypted, so the built-in HSTS value reaches a
+    /// site with no ACME or certificate policy (the `tls internal` shape),
+    /// and yields to a value the operator already set.
+    #[test]
+    fn h3_builtin_hsts_needs_no_tls_policy_and_yields_to_the_operator() {
+        let state = ProxyState::new(ServerConfig {
+            tls: None,
+            security: pingclair_core::config::SecurityConfig {
+                enabled: true,
+                hsts: Some(pingclair_core::config::HstsConfig {
+                    max_age: 60,
+                    include_subdomains: false,
+                    preload: false,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let sts = |headers: &[quiche::h3::Header]| -> Vec<Vec<u8>> {
+            headers
+                .iter()
+                .filter(|header| header.name() == b"strict-transport-security")
+                .map(|header| header.value().to_vec())
+                .collect()
+        };
+        let policy = ResponseHeaderPolicy::default();
+        let mut headers = vec![quiche::h3::Header::new(b":status", b"200")];
+        apply_h3_response_policy(&mut headers, &policy, "request-123", Some(&state));
+        assert_eq!(sts(&headers), [b"max-age=60".to_vec()]);
+
+        let mut operator = ResponseHeaderPolicy::default();
+        operator.set("Strict-Transport-Security", "max-age=5");
+        let mut headers = vec![quiche::h3::Header::new(b":status", b"200")];
+        apply_h3_response_policy(&mut headers, &operator, "request-123", Some(&state));
+        assert_eq!(sts(&headers), [b"max-age=5".to_vec()]);
     }
 
     #[test]

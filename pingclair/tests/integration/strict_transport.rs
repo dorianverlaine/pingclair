@@ -74,3 +74,60 @@ async fn test_header_directive_sets_strict_transport_security_over_tls() {
         .collect();
     assert_eq!(values, ["max-age=60; includeSubDomains"]);
 }
+
+/// 🚫 One site served over both plaintext and TLS sends the header only on
+/// the TLS half (RFC 6797 §7.2).
+///
+/// 🤡 The site's `tls internal` block is cloned onto its `http://` half, and
+/// the header decision used to ask "does this site have TLS?" rather than
+/// "did this response travel over TLS?" — so the plaintext answer carried it
+/// too.
+#[tokio::test]
+async fn test_plaintext_half_of_a_site_never_sends_strict_transport_security() {
+    let config = r#"
+        {
+            admin off
+            http_port __PINGCLAIR_TEST_HTTP_PORT__
+            https_port __PINGCLAIR_TEST_HTTPS_PORT__
+        }
+
+        https://hsts.test:__PINGCLAIR_TEST_HTTPS_PORT__, http://hsts.test:__PINGCLAIR_TEST_HTTP_PORT__ {
+            tls internal
+            header Strict-Transport-Security "max-age=60"
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "hsts-ok"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(
+        server.wait_until_tls_ready("hsts.test").await,
+        "the mixed-scheme site did not start"
+    );
+
+    let tls = trusting_client(&server, "hsts.test", server.address(0))
+        .get(server.tls_url(0, "hsts.test", "/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tls.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        tls.headers().get("strict-transport-security").unwrap(),
+        "max-age=60"
+    );
+
+    let plain_address = server.listener_address(0, 1);
+    let plain = trusting_client(&server, "hsts.test", plain_address)
+        .get(format!("http://hsts.test:{}/", plain_address.port()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(plain.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        plain.headers().get("strict-transport-security"),
+        None,
+        "a plaintext response carried Strict-Transport-Security"
+    );
+    assert_eq!(plain.text().await.unwrap(), "hsts-ok");
+}

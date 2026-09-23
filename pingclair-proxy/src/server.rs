@@ -1046,6 +1046,8 @@ pub struct ProxyState {
     /// asks is not "which kind of logger is this" but "does this host belong
     /// here", and that is answered once, at configuration time.
     log_targets: crate::access_log::LogTargets,
+    /// 🔐 The built-in `Strict-Transport-Security` value, rendered once.
+    pub(crate) strict_transport: crate::http_policy::StrictTransport,
 }
 
 impl ProxyState {
@@ -1914,6 +1916,7 @@ impl ProxyState {
         }
         target_entries.extend(named_targets);
         let log_targets = crate::access_log::LogTargets::new(target_entries);
+        let strict_transport = crate::http_policy::StrictTransport::from_security(&config.security);
 
         Self {
             config: Arc::new(config),
@@ -1938,6 +1941,7 @@ impl ProxyState {
             route_buffering,
             needs_original_uri_vars,
             log_targets,
+            strict_transport,
         }
     }
 
@@ -4044,6 +4048,7 @@ impl PingclairProxy {
         if let Some(state) = &ctx.state {
             Self::apply_security_response_headers(response, state)?;
         }
+        Self::apply_strict_transport(response, ctx)?;
         // 🚫 Every local write site sets `Content-Length` from the body it
         // built, and a 204 or 1xx must not carry one at all (RFC 9110 §8.6).
         // Stripped here, after the header policy, because this is the one
@@ -4077,29 +4082,27 @@ impl PingclairProxy {
             "Permissions-Policy",
             &state.config.security.permissions_policy,
         )?;
-        if state
-            .config
-            .tls
-            .as_ref()
-            .is_some_and(|tls| tls.auto || tls.cert.is_some())
-            && let Some(hsts_config) = &state.config.security.hsts
-        {
-            let hsts_value = format!(
-                "max-age={};{}{}",
-                hsts_config.max_age,
-                if hsts_config.include_subdomains {
-                    " includeSubDomains;"
-                } else {
-                    ""
-                },
-                if hsts_config.preload { " preload" } else { "" }
-            );
-            response.insert_header("Strict-Transport-Security", &hsts_value)?;
-        }
         if let Some(csp) = &state.config.security.csp {
             response.insert_header("Content-Security-Policy", csp)?;
         }
         Ok(())
+    }
+
+    /// 🔐 Adds or strips `Strict-Transport-Security` by what this response
+    /// travels on, not by whether the site has a `tls` block.
+    ///
+    /// Kept outside the security policy on purpose: an operator's `header`
+    /// can set the field on a site with no security policy at all, and that
+    /// value must still be stripped from plaintext.
+    fn apply_strict_transport(
+        response: &mut ResponseHeader,
+        ctx: &RequestContext,
+    ) -> PingoraResult<()> {
+        crate::http_policy::StrictTransport::apply_pingora(
+            ctx.state.as_ref().map(|state| &state.strict_transport),
+            response,
+            ctx.request_scheme == "https",
+        )
     }
 
     /// Apply an internal rewrite to the downstream request before Pingora
@@ -7869,6 +7872,7 @@ impl ProxyHttp for PingclairProxy {
         if let Some(state) = &ctx.state {
             Self::apply_security_response_headers(upstream_response, state)?;
         }
+        Self::apply_strict_transport(upstream_response, ctx)?;
 
         // 🌊 A response-subroute file owns the downstream stream once its
         // header decision succeeds. Writing the complete bounded-chunk stream

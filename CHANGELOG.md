@@ -20,6 +20,24 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🔐 `Strict-Transport-Security` follows the connection, not the `tls` block
+
+The header tells a browser to use HTTPS only, and RFC 6797 forbids it on a
+plaintext response. Pingclair decided by asking whether the site had a `tls`
+policy, so a site with both an `http://` and an `https://` address sent it
+on its plaintext answers, and a `tls internal` site never got the built-in
+JSON `security.hsts` value even over TLS. The header is now stripped from
+every plaintext H1/H2 response, whether the built-in policy, an operator's
+`header Strict-Transport-Security …` or the upstream set it, and added on
+every encrypted one (HTTP/3 always counts as encrypted). In a Pingclairfile,
+`header Strict-Transport-Security "max-age=…"` is the way to turn HSTS on;
+when a response already carries the header, the built-in value no longer
+replaces it. The built-in value is now spelled `max-age=N; includeSubDomains`
+without the trailing `;`.
+**Upgrading:** behind a load balancer that terminates TLS and forwards
+plaintext, the header now appears only when that balancer is listed in
+`trusted_proxies` and sends `X-Forwarded-Proto: https`.
+
 ### 🧹 A trailing comma in a forwarding header no longer hides the client
 
 Behind a trusted proxy, `X-Forwarded-For: 203.0.113.7,` — a trailing comma,
