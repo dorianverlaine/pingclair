@@ -94,6 +94,37 @@ async fn test_h1_cors_preflight_204_carries_no_content_length() {
     assert!(body.is_empty(), "a 204 carries no content: {body:?}");
 }
 
+/// 🤐 `HEAD` over HTTP/2 gets the file's length and none of its bytes.
+///
+/// HTTP/1.1 had this from Pingora; its HTTP/2 writer has no method check, so
+/// every byte the handler wrote went out as DATA.
+#[tokio::test]
+async fn test_h2_head_of_a_file_sends_its_length_and_no_content() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("big.bin"), vec![b'x'; 256 * 1024]).unwrap();
+    let mut server = TestServer::new_pingclairfile(&site(&format!(
+        "root * {}\n            file_server",
+        root.path().display()
+    )));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    let response = client.head(server.url(0, "/big.bin")).send().await.unwrap();
+    let status = response.status().as_u16();
+    let content_length = response.headers().get("content-length").cloned();
+    let body = response.bytes().await.unwrap();
+    server.stop();
+
+    assert_eq!(
+        (status, content_length, body.len()),
+        (200, Some(http::HeaderValue::from_static("262144")), 0)
+    );
+}
+
 /// 🚫 `respond "x" 204` over HTTP/2 sends no DATA and no `Content-Length`.
 ///
 /// HTTP/2 has no transport rule that drops the byte the way HTTP/1.1 does, so

@@ -1464,7 +1464,8 @@ pub(crate) enum ResponseContent {
     /// 📦 Content follows the header, framed as usual.
     Allowed,
     /// 🤐 No content is sent, but `Content-Length` may still describe the
-    /// representation the client would have received (304, RFC 9110 §8.6).
+    /// representation the client would have received (304, or any answer to
+    /// `HEAD`; RFC 9110 §8.6, §9.3.2).
     Omitted,
     /// 🚫 No content, and no `Content-Length` either: RFC 9110 §8.6 forbids
     /// the field on 1xx and 204.
@@ -1478,6 +1479,16 @@ impl ResponseContent {
             100..=199 | 204 => Self::Forbidden,
             304 => Self::Omitted,
             _ => Self::Allowed,
+        }
+    }
+
+    /// 🧾 The rule for a response to a request, which adds `HEAD`: the same
+    /// header a `GET` would get, content length included, and no content
+    /// (RFC 9110 §9.3.2).
+    pub(crate) fn for_response(status: u16, head_request: bool) -> Self {
+        match Self::for_status(status) {
+            Self::Allowed if head_request => Self::Omitted,
+            content => content,
         }
     }
 

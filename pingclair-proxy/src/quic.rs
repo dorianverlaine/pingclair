@@ -1016,7 +1016,9 @@ struct StreamState {
     /// 🔪 The handler asked for this stream to be reset, with this code,
     /// instead of being finished with a FIN.
     abort_requested: Option<quiche::h3::WireErrorCode>,
-    /// 🤐 The response's status forbids content, so its header went out with
+    /// 🤐 The request was `HEAD`, so the response gets a header and no content.
+    head_request: bool,
+    /// 🤐 The response's status or method forbids content, so its header went out with
     /// the FIN and any body or trailers the handler still sends are dropped.
     no_content: bool,
     /// 🧹 Marks a terminated stream so later response messages are ignored.
@@ -1594,12 +1596,21 @@ impl H3App {
             self.reset_malformed_request(qconn, stream_id);
             return;
         };
+        // 🤐 Recorded once, before any response can be queued, so every exit
+        // below answers `HEAD` with a header and no content.
+        let head_request = req.method == "HEAD";
 
         // 🚧 Match the TCP path's publication gate: a request waits by being
         // refused, not by observing routing from one generation and client
         // authentication from another.
         if self.proxy.listener_policy_ref().is_publishing() {
-            self.queue_simple_response(qconn, stream_id, 503, "Configuration Reload In Progress");
+            self.queue_simple_response(
+                qconn,
+                stream_id,
+                503,
+                "Configuration Reload In Progress",
+                head_request,
+            );
             return;
         }
 
@@ -1645,7 +1656,7 @@ impl H3App {
                     authority = %req.authority,
                     "🚫 H3: rejected a request on a mutual-TLS listener: {reason}"
                 );
-                self.queue_simple_response(qconn, stream_id, 421, reason);
+                self.queue_simple_response(qconn, stream_id, 421, reason, head_request);
                 return;
             }
         }
@@ -1665,6 +1676,7 @@ impl H3App {
             StreamState {
                 req_body_tx: Some(req_body_tx),
                 cancel_tx: Some(cancel_tx),
+                head_request,
                 ..Default::default()
             },
         );
@@ -1742,6 +1754,7 @@ impl H3App {
         stream_id: u64,
         status: u16,
         body: &str,
+        head_request: bool,
     ) {
         let headers = vec![
             quiche::h3::Header::new(b":status", status.to_string().as_bytes()),
@@ -1756,6 +1769,7 @@ impl H3App {
                 pending_body: VecDeque::from([Bytes::copy_from_slice(body.as_bytes())]),
                 pending_body_bytes: body.len(),
                 body_fin: true,
+                head_request,
                 ..Default::default()
             },
         );
@@ -1990,10 +2004,10 @@ impl H3App {
             let status = response_status(&headers);
             stamp_date(&mut headers, status);
             // 🤐 Decided here, at the one exit every H3 response takes, rather
-            // than by each handler: a 204 or 304 ends with its header no matter
-            // what body was built for it. Whatever is queued behind the header,
+            // than by each handler: a 204, a 304 or an answer to `HEAD` ends
+            // with its header no matter what body was built for it. Whatever is queued behind the header,
             // or still on its way from the handler, is discarded.
-            let content = ResponseContent::for_status(status);
+            let content = ResponseContent::for_response(status, ss.head_request);
             if !content.has_body() {
                 if !content.allows_content_length() {
                     headers.retain(|header| !header.name().eq_ignore_ascii_case(b"content-length"));
@@ -5820,6 +5834,12 @@ async fn send_h3_local_response(
     }
     apply_h3_response_policy(&mut h3_headers, policy, request_id, Some(state));
     send_headers(resp_tx, stream_id, h3_headers, content_length == 0).await;
+
+    // 🤐 The worker would discard these bytes for `HEAD` anyway; returning
+    // here means a large file is never read just to be thrown away.
+    if request_header.method == http::Method::HEAD {
+        return Ok(());
+    }
 
     match body {
         H3LocalBody::Bytes(bytes) => {

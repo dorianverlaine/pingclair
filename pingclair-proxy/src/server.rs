@@ -3583,9 +3583,9 @@ impl PingclairProxy {
         end_of_stream: bool,
     ) -> PingoraResult<()> {
         Self::enforce_request_deadline(ctx)?;
-        // 🤐 A status that carries no content gets none, whatever the handler
-        // built. HTTP/1.1 would drop the bytes on its own, but HTTP/2 sends
-        // them as DATA after a 204. Only the end of the stream still goes out.
+        // 🤐 A status or a `HEAD` that carries no content gets none, whatever
+        // the handler built. HTTP/1.1 would drop the bytes on its own, but
+        // HTTP/2 sends them as DATA. Only the end of the stream still goes out.
         if !Self::written_response_content(session).has_body() {
             return if end_of_stream {
                 session.write_response_body(None, true).await
@@ -3614,12 +3614,14 @@ impl PingclairProxy {
     }
 
     /// 🧾 The content rule for the response header already written on this
-    /// session; a session with no header yet is treated as allowing content.
+    /// session and the request it answers; a session with no header yet is
+    /// treated as allowing content.
     fn written_response_content(session: &Session) -> ResponseContent {
+        let head_request = session.req_header().method == http::Method::HEAD;
         session
             .response_written()
             .map_or(ResponseContent::Allowed, |header| {
-                ResponseContent::for_status(header.status.as_u16())
+                ResponseContent::for_response(header.status.as_u16(), head_request)
             })
     }
 
@@ -3677,6 +3679,12 @@ impl PingclairProxy {
                 session
                     .write_response_header(Box::new(response), false)
                     .await?;
+                // 🤐 A `HEAD` for a large file must not read the file just to
+                // throw every chunk away in `write_local_body`.
+                if !Self::written_response_content(session).has_body() {
+                    session.write_response_body(None, true).await?;
+                    return Ok(true);
+                }
                 let mut wrote = false;
                 while let Some(chunk) = stream.read_chunk().map_err(|error| {
                     pingora_core::Error::because(
@@ -7455,14 +7463,19 @@ impl ProxyHttp for PingclairProxy {
             session
                 .write_response_header(Box::new(response), false)
                 .await?;
+            // 🤐 Nothing to read for a `HEAD` or a status without content:
+            // the file is never read, and only the end of stream goes out.
             let mut wrote = false;
-            while let Some(chunk) = stream.read_chunk().map_err(|error| {
-                pingora_core::Error::because(
-                    pingora_core::ErrorType::ReadError,
-                    "streaming intercepted proxy response file",
-                    error,
-                )
-            })? {
+            let has_body = Self::written_response_content(session).has_body();
+            while has_body
+                && let Some(chunk) = stream.read_chunk().map_err(|error| {
+                    pingora_core::Error::because(
+                        pingora_core::ErrorType::ReadError,
+                        "streaming intercepted proxy response file",
+                        error,
+                    )
+                })?
+            {
                 wrote = true;
                 let last = stream.is_complete();
                 Self::write_local_body(session, ctx, Bytes::from(chunk), last).await?;

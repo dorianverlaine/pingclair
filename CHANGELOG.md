@@ -20,6 +20,13 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🤐 `HEAD` gets no content over HTTP/2 and HTTP/3
+
+A `HEAD` answered by a local handler (a static file, `respond`, a redirect, an
+error page) sent the whole body over HTTP/2 and HTTP/3; only HTTP/1.1 dropped
+it. Every transport now sends the header, `Content-Length` included, and no
+content, and a large file is no longer read just to answer `HEAD`.
+
 ### 🚫 A local 204 carries no content and no `Content-Length`
 
 Locally generated responses set `Content-Length` from the body they were

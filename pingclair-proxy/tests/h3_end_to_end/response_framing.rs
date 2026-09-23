@@ -57,6 +57,39 @@ async fn h3_proxied_response_date_is_replaced() {
     assert_ne!(dates[0], "Sun, 06 Nov 1994 08:49:37 GMT");
 }
 
+/// 🤐 `HEAD` for a static file gets the file's length and none of its bytes.
+///
+/// RFC 9110 §9.3.2: the server MUST NOT send content in response to `HEAD`.
+/// Before the fix the H3 path streamed the whole file.
+#[tokio::test]
+async fn h3_head_of_a_file_sends_its_length_and_no_content() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("big.bin"), vec![b'x'; 256 * 1024]).unwrap();
+    let server = spawn_h3_from_pingclairfile(&format!(
+        ":443 {{\n root * {}\n file_server\n}}",
+        root.path().display()
+    ))
+    .await;
+
+    let response = h3_attempt(
+        H3Attempt {
+            method: "HEAD",
+            ..H3Attempt::to(server, "/big.bin")
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (
+            response.status,
+            fields(&response, "content-length"),
+            response.body.len()
+        ),
+        (200, vec!["262144"], 0)
+    );
+}
+
 /// 🚫 `respond "x" 204` ends with its header: no `content-length`, no byte.
 ///
 /// Before the fix the H3 path sent `content-length: 1` and the byte, so one
