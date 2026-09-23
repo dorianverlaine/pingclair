@@ -622,6 +622,7 @@ struct H3Request {
 ///    request that the TCP path's port-guessed scheme produced.
 /// 5. **`:authority` and `Host` must agree** when both are sent.
 /// 6. **`:method` must be a token.**
+/// 7. **No connection-specific fields** (§4.2), apart from `TE: trailers`.
 ///
 /// 📌 Classic `CONNECT` — which omits `:scheme` and `:path` — is still refused,
 /// exactly as before this change, because `path` was already mandatory. Extended
@@ -664,6 +665,20 @@ fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
         seen_regular_field = true;
         if name.iter().any(|byte| byte.is_ascii_uppercase()) {
             return None;
+        }
+        // 🔌 Connection-specific fields make the message malformed (§4.2).
+        // They describe one hop of an HTTP/1.1 connection, and HTTP/3 has no
+        // such hop. Refusing them here, rather than stripping them later,
+        // matters for `Connection: upgrade` plus `Upgrade: websocket`: the
+        // shared outbound filter keeps hop-by-hop fields for an upgrade, which
+        // is right for H1 and let an H3 client push them to the origin. HTTP/3
+        // has no Upgrade mechanism at all (§4.5), so there is nothing to keep.
+        // `TE` is the one exception, and only with the value `trailers`.
+        match name {
+            b"connection" | b"upgrade" | b"keep-alive" | b"proxy-connection"
+            | b"transfer-encoding" => return None,
+            b"te" if !h.value().trim_ascii().eq_ignore_ascii_case(b"trailers") => return None,
+            _ => {}
         }
         headers.push((
             String::from_utf8_lossy(name).into_owned(),

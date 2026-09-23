@@ -65,6 +65,61 @@ async fn h3_invalid_method_resets_with_message_error() {
     assert_eq!(outcome(attempt).await, message_error());
 }
 
+/// 🔌 Every connection-specific field is malformed on its own (§4.2), and so
+/// is a `TE` that asks for anything but `trailers`.
+#[tokio::test]
+async fn h3_connection_specific_fields_reset_with_message_error() {
+    let server = spawn_ok_site().await;
+    for field in [
+        ("connection", "keep-alive"),
+        ("upgrade", "websocket"),
+        ("keep-alive", "timeout=5"),
+        ("proxy-connection", "keep-alive"),
+        ("te", "gzip"),
+        ("te", "trailers, gzip"),
+    ] {
+        let attempt = H3Attempt {
+            extra_headers: &[field],
+            ..H3Attempt::to(server, "/")
+        };
+        assert_eq!(outcome(attempt).await, message_error(), "{field:?}");
+    }
+}
+
+/// 👍 `TE: trailers` is the one hop-by-hop field an HTTP/3 request may carry.
+#[tokio::test]
+async fn h3_te_trailers_is_accepted() {
+    let server = spawn_ok_site().await;
+    let attempt = H3Attempt {
+        extra_headers: &[("te", "trailers")],
+        ..H3Attempt::to(server, "/")
+    };
+    assert_eq!(outcome(attempt).await, Ok(200));
+}
+
+/// 🔌 A WebSocket-style upgrade is refused before it reaches the origin.
+///
+/// The shared outbound filter keeps `Connection` and `Upgrade` for an
+/// upgrade, which is right for HTTP/1.1. Before the fix an HTTP/3 client
+/// could use that to hand the origin a handshake HTTP/3 cannot carry (§4.5).
+#[tokio::test]
+async fn h3_websocket_upgrade_never_reaches_the_upstream() {
+    let (upstream, _, hits) = spawn_scripted_upstream(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    )
+    .await;
+    let server =
+        spawn_h3_from_pingclairfile(&format!(":443 {{\n reverse_proxy http://{upstream}\n}}"))
+            .await;
+
+    let attempt = H3Attempt {
+        extra_headers: &[("connection", "upgrade"), ("upgrade", "websocket")],
+        ..H3Attempt::to(server, "/ws")
+    };
+    assert_eq!(outcome(attempt).await, message_error());
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
 /// 👍 The control: the same site answers a well-formed request normally.
 #[tokio::test]
 async fn h3_well_formed_request_is_answered() {

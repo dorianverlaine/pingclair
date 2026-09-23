@@ -66,6 +66,15 @@ cannot tell apart from a site that chose to refuse. RFC 9114 §4.1.2 requires a
 stream error instead, so the stream is now reset with `H3_MESSAGE_ERROR` and no
 response. Other requests on the same connection are unaffected.
 
+### 🔌 HTTP/3 refuses connection-specific fields
+
+An HTTP/3 request carrying `Connection`, `Upgrade`, `Keep-Alive` or
+`Proxy-Connection`, or a `TE` other than `trailers`, was accepted. With
+`Connection: upgrade` and `Upgrade: websocket` the fields were even forwarded
+to the origin, as though HTTP/3 could carry an HTTP/1.1 upgrade. RFC 9114 §4.2
+makes such a request malformed, so it is now reset with `H3_MESSAGE_ERROR`
+before any upstream is contacted.
+
 ### 🌊 Compressed HTTP/1.1 responses keep the connection open
 
 A proxied response that Pingclair compressed for an HTTP/1.1 client lost its
