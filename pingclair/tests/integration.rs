@@ -9685,7 +9685,9 @@ async fn test_header_up_delete_form_removes_the_header_before_the_origin() {
         .expect("the proxy must answer");
     assert_eq!(response.status(), 200);
 
-    let recorded = origin_headers.await.expect("the origin must record the request");
+    let recorded = origin_headers
+        .await
+        .expect("the origin must record the request");
     let lowered = recorded.to_ascii_lowercase();
     assert!(
         lowered.contains("x-custom: up1"),
@@ -13263,6 +13265,97 @@ async fn test_range_request_for_an_empty_file_does_not_kill_the_worker() {
         .await
         .expect("the server died partway through");
     assert_eq!(after.status(), 200);
+}
+
+/// 🚫 A `Range` that starts past the end of the file is answered `416`, not
+/// `200` with the whole file.
+///
+/// 🤡 A resuming download client reads `416` plus `Content-Range: bytes */N` to
+/// learn the real length and restart correctly. A whole file under a `200` is
+/// the one answer such a client is least prepared for: it looks like a server
+/// that ignored the `Range` header, says nothing about why, and re-sends every
+/// byte `Range` exists to avoid.
+///
+/// 📌 The neighbouring cases are asserted together because the fix is a
+/// distinction, not a branch: "I understood this and cannot satisfy it" (416)
+/// and "I could not read this" (200, the whole file) were both `None` from the
+/// parser, so a change that turns the first into a `416` must not sweep in the
+/// second.
+#[tokio::test]
+async fn test_an_unsatisfiable_range_is_answered_416() {
+    let tree = tempfile::tempdir().expect("document root");
+    std::fs::write(tree.path().join("big.txt"), vec![b'x'; 20_000]).expect("write big file");
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+            file_server
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+        }}
+        "#,
+        root = tree.path().to_string_lossy()
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    // 🎯 The measured case: a resumption point past the end of a 20,000-byte
+    // file. Caddy answers `416`, `Content-Range: bytes */20000`, and
+    // `invalid range: failed to overlap`.
+    let unsatisfiable = client
+        .get(server.url(0, "/big.txt"))
+        .header("Range", "bytes=999999-")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(unsatisfiable.status(), 416);
+    assert_eq!(
+        unsatisfiable
+            .headers()
+            .get("content-range")
+            .map(|value| value.to_str().unwrap()),
+        Some("bytes */20000"),
+        "the 416 must name the real length"
+    );
+    assert_eq!(
+        unsatisfiable.text().await.unwrap(),
+        "invalid range: failed to overlap\n"
+    );
+
+    // 🚫 An unreadable header is still ignored, and still answered with the
+    // whole file. This is the half a careless fix would have broken.
+    let unreadable = client
+        .get(server.url(0, "/big.txt"))
+        .header("Range", "bytes=abc-99")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(unreadable.status(), 200);
+    assert_eq!(unreadable.text().await.unwrap().len(), 20_000);
+
+    // 🎯 …and a range whose start is *inside* the file but whose end is past
+    // EOF is still a `206` clamped to the last byte, not a 416.
+    let clamped = client
+        .get(server.url(0, "/big.txt"))
+        .header("Range", "bytes=19990-999999")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(clamped.status(), 206);
+    assert_eq!(
+        clamped
+            .headers()
+            .get("content-range")
+            .map(|value| value.to_str().unwrap()),
+        Some("bytes 19990-19999/20000")
+    );
 }
 
 /// 🗂️ The `try_files` surface that only exists because the directive expands

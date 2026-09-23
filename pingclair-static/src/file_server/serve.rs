@@ -16,6 +16,7 @@
 //! caller — `serve_streaming` — and it is the docroot confinement check, so it
 //! is the one function in this module worth reading before any other.
 
+use bytes::Bytes;
 use pingclair_core::error::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -303,12 +304,40 @@ impl FileServer {
                 meta.modified,
                 SystemTime::now(),
             )
-            && let Some((s, e)) = self.parse_range(range.range, file_size)
         {
-            start = s;
-            length = e - s + 1;
-            status = 206;
-            content_range = Some(format!("bytes {s}-{e}/{file_size}"));
+            match self.parse_range(range.range, file_size) {
+                RangeDecision::Satisfied { start: s, end: e } => {
+                    start = s;
+                    length = e - s + 1;
+                    status = 206;
+                    content_range = Some(format!("bytes {s}-{e}/{file_size}"));
+                }
+                // 🚫 A range that cannot be satisfied is answered, not ignored:
+                // the `Content-Range` names the real length so a resuming
+                // client can restart correctly, and the body says why. Caddy
+                // answers the same status, the same field and the same 33-byte
+                // body — Go's `http.ServeContent`, whose message for this case
+                // is `invalid range: failed to overlap` plus a newline.
+                RangeDecision::Unsatisfiable => {
+                    let body = UNSATISFIABLE_RANGE_BODY;
+                    return Ok(Some(ServedResponse::Buffered(ServedFile {
+                        content: Bytes::from_static(body),
+                        content_type: HeaderValue::from_static("text/plain; charset=utf-8"),
+                        content_length: HeaderValue::from(body.len() as u64),
+                        path: file_path,
+                        status: 416,
+                        content_range: Some(format!("bytes */{file_size}")),
+                        // 📌 No validators: this response carries none of the
+                        // entity, so `If-Range` and `If-None-Match` have
+                        // nothing to decide about and Caddy sends neither.
+                        last_modified: None,
+                        etag: None,
+                        content_encoding: None,
+                        vary_accept_encoding: self.config.varies_by_accept_encoding(),
+                    })));
+                }
+                RangeDecision::Ignored => {}
+            }
         }
 
         // Cache-key ingredients. Only full-file (200, non-range) responses
@@ -579,13 +608,21 @@ impl FileServer {
     }
 
     /// Parse Range header (bytes=start-end)
-    /// 📏 Reads a single-range `Range` header, or `None` to serve the whole
-    /// file.
+    /// 📏 Reads a single-range `Range` header.
     ///
-    /// `None` is not an error path — it is how an unsatisfiable or
-    /// unintelligible range is handled, and RFC 9110 §14.2 says exactly that:
-    /// a recipient that cannot understand a range request "MUST ignore" the
-    /// header. nginx and Caddy both answer 200 with the full body.
+    /// 🧭 The three answers are the three cases RFC 9110 §14.2 keeps apart, and
+    /// collapsing them is what made this server send 20,000 bytes to a client
+    /// that asked for a resumption point it could not have:
+    ///
+    /// - **Satisfied** — the header was understood and can be served.
+    /// - **Unsatisfiable** — the header was understood and cannot be served,
+    ///   which is a `416` with `Content-Range: bytes */<size>`, not a `200`.
+    ///   A resuming client reads those two fields to learn the real length and
+    ///   restart correctly; a whole file under a `200` is the one answer it is
+    ///   least prepared for.
+    /// - **Ignored** — the header could not be understood, and a recipient
+    ///   that cannot understand a range request `MUST ignore` it. That is the
+    ///   `200`-with-everything path, and it is right for `bytes=abc-99`.
     ///
     /// 🤡 Three defects lived in the previous version of this function, all
     /// found by executing it rather than reading it:
@@ -604,13 +641,22 @@ impl FileServer {
     ///    five bytes*; splitting on `-` produced an empty start that fell
     ///    through to 0, so the first six were served instead. Nothing in the
     ///    TRIAGE rows named this one; it surfaced while rewriting the rest.
-    fn parse_range(&self, header: &str, file_size: u64) -> Option<(u64, u64)> {
-        let spec = header.strip_prefix("bytes=")?.trim();
+    ///
+    /// 📌 And a fourth, which the doc comment here used to argue *for*: the
+    /// old text named Caddy as answering `200` to an unsatisfiable range,
+    /// which Caddy does not do. `start > last` and `bytes=abc-99` both
+    /// returned `None`, so "I understood this and it cannot be satisfied" was
+    /// indistinguishable from "I did not understand this" — and only the
+    /// second one means `200`.
+    fn parse_range(&self, header: &str, file_size: u64) -> RangeDecision {
+        let Some(spec) = header.strip_prefix("bytes=").map(str::trim) else {
+            return RangeDecision::Ignored;
+        };
 
         // 🕳️ Nothing can be satisfied in an empty file, and answering this
         // first is what keeps every subtraction below in range.
         if file_size == 0 {
-            return None;
+            return RangeDecision::Ignored;
         }
         let last = file_size - 1;
 
@@ -619,35 +665,82 @@ impl FileServer {
         // of the parse below too — `1,5-6` is not a number — but saying so
         // here is cheaper than leaving the reader to derive it.
         if spec.contains(',') {
-            return None;
+            return RangeDecision::Ignored;
         }
 
-        let (start_spec, end_spec) = spec.split_once('-')?;
+        let Some((start_spec, end_spec)) = spec.split_once('-') else {
+            return RangeDecision::Ignored;
+        };
         let start_spec = start_spec.trim();
         let end_spec = end_spec.trim();
 
         // 📐 `bytes=-N`: the last N bytes. An N past the file's length is not
         // an error — it means "as much as there is", per RFC 9110 §14.1.2.
         if start_spec.is_empty() {
-            let wanted: u64 = end_spec.parse().ok()?;
+            let Ok(wanted) = end_spec.parse::<u64>() else {
+                return RangeDecision::Ignored;
+            };
             if wanted == 0 {
-                return None;
+                return RangeDecision::Ignored;
             }
-            return Some((file_size.saturating_sub(wanted), last));
+            return RangeDecision::Satisfied {
+                start: file_size.saturating_sub(wanted),
+                end: last,
+            };
         }
 
-        let start: u64 = start_spec.parse().ok()?;
+        let Ok(start) = start_spec.parse::<u64>() else {
+            return RangeDecision::Ignored;
+        };
         let end: u64 = if end_spec.is_empty() {
             last
         } else {
-            end_spec.parse().ok()?
+            let Ok(end) = end_spec.parse::<u64>() else {
+                return RangeDecision::Ignored;
+            };
+            end
         };
 
-        if start > end || start > last {
-            return None;
+        // 🔢 A start past the end is a well-formed request that cannot be
+        // satisfied. It is *not* the unreadable case: the server understood
+        // exactly what was asked for and has nothing to give.
+        if start > last {
+            return RangeDecision::Unsatisfiable;
         }
-        Some((start, end.min(last)))
+        // 🚫 `bytes=5-1` is an invalid range-set rather than an unsatisfiable
+        // one — the two need different answers, and this one is "ignore it".
+        if start > end {
+            return RangeDecision::Ignored;
+        }
+        RangeDecision::Satisfied {
+            start,
+            end: end.min(last),
+        }
     }
+}
+
+/// 🚫 The body of a `416`, which is Go's `http.ServeContent` message for an
+/// unsatisfiable range followed by the newline `http.Error` appends.
+///
+/// 📌 It is reproduced rather than reworded because Caddy's answer is the
+/// reference this server is measured against, and the byte count is part of
+/// the comparison: 33 bytes, exactly what Caddy sends.
+const UNSATISFIABLE_RANGE_BODY: &[u8] = b"invalid range: failed to overlap\n";
+
+/// 📏 What one `Range` header asked for, in the three cases that need
+/// different answers.
+///
+/// 🧭 Collapsing the last two into a single "no slice" answer is what made a
+/// resuming download receive the whole file under a `200`; see
+/// [`FileServer::parse_range`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeDecision {
+    /// Serve this slice with `206`.
+    Satisfied { start: u64, end: u64 },
+    /// Answer `416` with `Content-Range: bytes */<size>`.
+    Unsatisfiable,
+    /// Serve the whole file with `200`, as if no `Range` had been sent.
+    Ignored,
 }
 
 #[cfg(test)]
@@ -1732,7 +1825,7 @@ mod range_tests {
         for header in ["bytes=0-5", "bytes=0-", "bytes=-5", "bytes=0-0"] {
             assert_eq!(
                 fs.parse_range(header, 0),
-                None,
+                RangeDecision::Ignored,
                 "{header} against an empty file must be ignored, not computed"
             );
         }
@@ -1755,7 +1848,11 @@ mod range_tests {
             "items=0-5",
             "bytes=0-1,5-6",
         ] {
-            assert_eq!(fs.parse_range(header, 100), None, "{header} was repaired");
+            assert_eq!(
+                fs.parse_range(header, 100),
+                RangeDecision::Ignored,
+                "{header} was repaired"
+            );
         }
     }
 
@@ -1767,11 +1864,17 @@ mod range_tests {
     fn a_suffix_range_counts_back_from_the_end() {
         let dir = tempfile::tempdir().unwrap();
         let fs = server(dir.path());
-        assert_eq!(fs.parse_range("bytes=-5", 100), Some((95, 99)));
+        assert_eq!(
+            fs.parse_range("bytes=-5", 100),
+            RangeDecision::Satisfied { start: 95, end: 99 }
+        );
         // 📏 More than the file holds is "as much as there is", not an error.
-        assert_eq!(fs.parse_range("bytes=-500", 100), Some((0, 99)));
+        assert_eq!(
+            fs.parse_range("bytes=-500", 100),
+            RangeDecision::Satisfied { start: 0, end: 99 }
+        );
         // 🚫 Zero bytes is not a range anyone can serve.
-        assert_eq!(fs.parse_range("bytes=-0", 100), None);
+        assert_eq!(fs.parse_range("bytes=-0", 100), RangeDecision::Ignored);
     }
 
     /// 👍 The ordinary forms still work, or the fixes above would have been
@@ -1780,13 +1883,34 @@ mod range_tests {
     fn ordinary_ranges_are_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let fs = server(dir.path());
-        assert_eq!(fs.parse_range("bytes=0-5", 100), Some((0, 5)));
-        assert_eq!(fs.parse_range("bytes=10-", 100), Some((10, 99)));
+        assert_eq!(
+            fs.parse_range("bytes=0-5", 100),
+            RangeDecision::Satisfied { start: 0, end: 5 }
+        );
+        assert_eq!(
+            fs.parse_range("bytes=10-", 100),
+            RangeDecision::Satisfied { start: 10, end: 99 }
+        );
         // 📏 An end past the file is clamped, which is what makes
         // `bytes=0-99999` a valid request for the whole thing.
-        assert_eq!(fs.parse_range("bytes=0-99999", 100), Some((0, 99)));
-        // 🚫 …but a start past the end is unsatisfiable.
-        assert_eq!(fs.parse_range("bytes=100-200", 100), None);
-        assert_eq!(fs.parse_range("bytes=5-1", 100), None);
+        assert_eq!(
+            fs.parse_range("bytes=0-99999", 100),
+            RangeDecision::Satisfied { start: 0, end: 99 }
+        );
+        // 🚫 A start past the end is *unsatisfiable*, which is a different
+        // answer from an unreadable header: the server understood the request
+        // and has nothing to give, so it answers 416 rather than the whole
+        // file.
+        assert_eq!(
+            fs.parse_range("bytes=100-200", 100),
+            RangeDecision::Unsatisfiable
+        );
+        assert_eq!(
+            fs.parse_range("bytes=999999-", 100),
+            RangeDecision::Unsatisfiable
+        );
+        // 🚫 `bytes=5-1` is an invalid range-set rather than an unsatisfiable
+        // one, and RFC 9110 §14.2 says to ignore it.
+        assert_eq!(fs.parse_range("bytes=5-1", 100), RangeDecision::Ignored);
     }
 }
