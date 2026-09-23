@@ -2731,6 +2731,13 @@ async fn plan_h3_handler_with_connector(
         // exactly as on H1/H2 — same default body, same placeholder rules —
         // but only after the matching error routes have had their say.
         HandlerConfig::Error { status, message } => {
+            // 🚨 The `{err.*}` values are published before the routes run, the
+            // same as on H1/H2 — an error page that names the status on one
+            // transport and not the other is exactly the parity gap this crate
+            // keeps having to close.
+            if !handling_error {
+                request_vars.set_error(*status, message.as_deref());
+            }
             let raw = message.as_deref().unwrap_or_else(|| {
                 http::StatusCode::from_u16(*status)
                     .ok()

@@ -45,6 +45,31 @@ impl RequestVars {
     pub(crate) fn values_mut(&mut self) -> &mut BTreeMap<String, String> {
         &mut self.values
     }
+
+    /// 🚨 Publishes the `{err.*}` values for the duration of an error route.
+    ///
+    /// Shared by both transports rather than written twice, because the values
+    /// are the *error's*, not the protocol's: without this the H1/H2 and H3
+    /// error pages would disagree about which status they are describing.
+    ///
+    /// 📌 The status text is always present; the message is whatever was
+    /// raised, which is `""` when nothing was. `{err.message}` does **not**
+    /// fall back to the status text, despite upstream's `WithError` appearing
+    /// to say so: that fallback fires only when `handlerErr.Err` is nil, and
+    /// the `error` directive never leaves it nil — it wraps its argument with
+    /// `fmt.Errorf("%s", …)` unconditionally
+    /// (`modules/caddyhttp/staticerror.go` at `ff6da121`), so `error 404`
+    /// answers `{err.message}` with the empty string. Measured against Caddy
+    /// v2.11.4, which prints `err=404 text=Not Found msg=`.
+    pub fn set_error(&mut self, status: u16, message: Option<&str>) {
+        let status_text = http::StatusCode::from_u16(status)
+            .ok()
+            .and_then(|code| code.canonical_reason())
+            .unwrap_or("");
+        self.set("err.status_code", status.to_string());
+        self.set("err.status_text", status_text.to_string());
+        self.set("err.message", message.unwrap_or("").to_string());
+    }
 }
 
 // MARK: - Response Interception

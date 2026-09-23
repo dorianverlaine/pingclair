@@ -4081,6 +4081,11 @@ impl PingclairProxy {
         status: u16,
     ) -> PingoraResult<()> {
         let message = ctx.error_message.take();
+        // 🚨 Published before the routes run, so a `respond "err={err.status_code}"`
+        // inside `handle_errors` renders the status that was raised rather than
+        // an empty string. The response's own status is independent of it:
+        // Caddy's `respond` still answers with the code it was written with.
+        ctx.request_vars.set_error(status, message.as_deref());
         // 📎 Cloned so `state` does not borrow `ctx`: the error routes below
         // need `&mut ctx` for the same handler machinery that matched them.
         let Some(state) = ctx.state.clone() else {
@@ -5562,6 +5567,27 @@ fn resolve_single_placeholder(
     // same request-scoped map.
     if name == "re" || name.starts_with("re.") {
         return vars.get(name).unwrap_or("").to_string();
+    }
+    // 🚨 `{err.*}` and its long form `{http.error.*}` describe the error that
+    // entered an error route. Caddy's Caddyfile adapter rewrites the short
+    // spelling into the long one before the config is stored, so a file may
+    // carry either; both read the same three values here.
+    //
+    // 🚧 `{err.trace}` and `{err.id}` are the error's origin and an identifier
+    // for this occurrence. Nothing here records either, so they resolve to the
+    // empty string — the format's behaviour for a name it does not know —
+    // rather than to an invented value.
+    if let Some(field) = name
+        .strip_prefix("err.")
+        .or_else(|| name.strip_prefix("http.error."))
+    {
+        let key = match field {
+            "status_code" | "status" => "err.status_code",
+            "status_text" => "err.status_text",
+            "message" => "err.message",
+            _ => return String::new(),
+        };
+        return vars.get(key).unwrap_or("").to_string();
     }
 
     // 🧭 Caddy's `{host}` shorthand is the hostname without the port; the

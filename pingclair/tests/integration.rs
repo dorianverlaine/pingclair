@@ -2764,6 +2764,70 @@ async fn test_handle_errors_intercepts_file_server_404() {
     assert_eq!(resp.text().await.unwrap(), "custom 404");
 }
 
+/// 🚨 `{err.status_code}` and `{err.message}` must carry the *raised* error
+/// into the error page rather than resolving to nothing.
+///
+/// 🤡 The block ran either way and the response status was the block's own
+/// `500` on both servers, so a test asserting only the status passed while the
+/// operator's error page read `err=`. The *body* is the assertion, and the
+/// neighbours in Caddy's own documentation (`rewrite /{err.status_code}.html`)
+/// are the lines a reader copies.
+#[tokio::test]
+async fn test_handle_errors_expands_error_placeholders_in_the_body() {
+    let config = r#"
+        {
+            admin off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            handle_errors {
+                respond "err={err.status_code} text={err.status_text} msg={err.message} long={http.error.status_code}/{http.error.message}" 500
+            }
+
+            handle /boom {
+                error "exploded" 503
+            }
+
+            handle /plain {
+                error 404
+            }
+
+            respond "fallback"
+        }
+        "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    // 🎯 The raised status is 503; the answered status is the block's own 500.
+    let response = client.get(server.url(0, "/boom")).send().await.unwrap();
+    assert_eq!(response.status(), 500);
+    assert_eq!(
+        response.text().await.unwrap(),
+        "err=503 text=Service Unavailable msg=exploded long=503/exploded",
+    );
+
+    // 📌 With no message of its own the message is empty, not the status
+    // text: the `error` directive always wraps its argument, so upstream never
+    // reaches the status-text fallback. Measured against Caddy v2.11.4, which
+    // answers `err=404 text=Not Found msg=`.
+    let response = client.get(server.url(0, "/plain")).send().await.unwrap();
+    assert_eq!(response.status(), 500);
+    assert_eq!(
+        response.text().await.unwrap(),
+        "err=404 text=Not Found msg= long=404/",
+    );
+
+    // 🧭 A healthy request never enters an error route, so the namespace stays
+    // empty there rather than leaking the last error's values.
+    let response = client.get(server.url(0, "/fallback")).send().await.unwrap();
+    assert_eq!(response.status(), 200, "a healthy request is untouched");
+    assert_eq!(response.text().await.unwrap(), "fallback");
+}
+
 #[tokio::test]
 async fn test_vars_rules_placeholders_and_matcher() {
     // 🧰 Request-scoped vars: a catch-all rule sets a value every request
