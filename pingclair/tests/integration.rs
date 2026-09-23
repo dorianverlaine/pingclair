@@ -5757,6 +5757,72 @@ async fn test_pingclairfile_internal_tls_serves_trusted_h1_and_h2() {
     );
 }
 
+/// 🗄️ `storage file_system <path>` is where the store goes, and the
+/// configuration outranks `$PINGCLAIR_TLS_STORE`.
+///
+/// 🤡 The option was refused outright, so the only ways to relocate the store
+/// were that environment variable and a platform convention — a configuration
+/// could not say where its own state lives, and two configurations on one host
+/// could not be pointed at two stores. This asserts the half a compiler test
+/// cannot reach: that the path survives as far as the code that writes files.
+///
+/// 🔐 The negative half is the point of the test. The harness exports
+/// `PINGCLAIR_TLS_STORE` for every server it starts, so a store landing under
+/// the environment's directory would prove the option had been parsed and then
+/// ignored — the failure mode that passes a compiler test untouched.
+#[tokio::test]
+async fn test_configured_storage_path_holds_the_store() {
+    let store = tempfile::tempdir().expect("a temporary directory for the store");
+    let configured = store.path().join("configured-store");
+    let config = r#"
+        {
+            admin off
+            http_port __PINGCLAIR_TEST_HTTP_PORT__
+            storage file_system __PINGCLAIR_TEST_STORE__
+        }
+
+        https://stored.sandbox.test:__PINGCLAIR_TEST_PORT__ {
+            tls internal
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "stored-ok"
+        }
+    "#
+    .replace("__PINGCLAIR_TEST_STORE__", configured.to_str().unwrap());
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(
+        server.wait_until_tls_ready("stored.sandbox.test").await,
+        "server failed to start with a configured store"
+    );
+
+    // 🏛️ The authority and the leaf are what this path writes. Neither existed
+    // before the server ran, so finding them is the store having moved rather
+    // than a directory having been created.
+    assert!(
+        configured.join("internal/authority.json").is_file(),
+        "the configured store must hold the internal authority, looked in {}",
+        configured.display()
+    );
+    assert!(
+        configured
+            .join("internal/certificates/stored_sandbox_test.json")
+            .is_file(),
+        "the issued leaf must be persisted under the configured store"
+    );
+
+    // 🚫 And the harness's own store — the one `PINGCLAIR_TLS_STORE` names —
+    // stays empty, which is what makes this a test of precedence and not just
+    // of a directory being writable.
+    let from_environment = server._temp_dir.path().join("tls");
+    assert!(
+        !from_environment.join("internal").exists(),
+        "the store followed $PINGCLAIR_TLS_STORE instead of the configuration: {}",
+        from_environment.display()
+    );
+    server.stop();
+}
+
 /// 🔐 A hostname-only site with TLS must derive the HTTPS listener from
 /// `https_port` and gain an automatic plaintext companion on `http_port`,
 /// exactly like Caddy's `example.com { tls auto }` shape — no `listen`
