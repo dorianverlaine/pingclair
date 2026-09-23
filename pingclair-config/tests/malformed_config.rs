@@ -202,10 +202,15 @@ fn deeply_nested_json_is_rejected_rather_than_overflowing() {
     for depth in [50usize, 500, 10_000, 200_000] {
         // A matcher nested through the tagged representation. Before the
         // representation was tagged, this recursed without consuming input.
-        let mut matcher = String::from(r#"{"type":"path","patterns":["/x"]}"#);
-        for _ in 0..depth {
-            matcher = format!(r#"{{"type":"not","matcher":{matcher}}}"#);
-        }
+        // 🏎️ Built as prefix + leaf + suffix in one pass. Wrapping the string
+        // one layer at a time copies the whole document per layer, which at
+        // 200,000 layers spent half a minute building input for a parser
+        // that rejects it in milliseconds.
+        let matcher = format!(
+            r#"{}{{"type":"path","patterns":["/x"]}}{}"#,
+            r#"{"type":"not","matcher":"#.repeat(depth),
+            "}".repeat(depth)
+        );
         let document = format!(
             r#"{{"servers":[{{"listen":["127.0.0.1:8080"],"routes":[{{"path":"/*","matcher":{matcher},"handler":{{"type":"respond","status":200}}}}]}}]}}"#
         );
