@@ -699,6 +699,20 @@ Une requête vers un vrai fichier obtient ce fichier ; tout le reste est réécr
 vers `/index.html` pour que l'application fasse son propre routage. La query
 string survit à la réécriture.
 
+📦 **La compression est active par défaut**, et l'exemple ci-dessus ne l'active
+pas : `encode gzip` y est redondant pour un site `file_server`, puisque l'encodeur
+défaut est `gzip`. Une réponse `text/*` est compressée
+dès que l'`Accept-Encoding` du client le permet, avec un `Content-Encoding` et un
+`ETag` suffixé `-gzip` identiques à ceux d'un `encode` explicite. C'est une
+différence délibérée avec Caddy, qui ne compresse que là où un `encode` le
+demande ; elle est écrite ici plutôt que laissée à la découverte, parce qu'un
+`Content-Encoding` que personne n'a configuré est exactement le genre de surprise
+qui « marchait en staging ». Pour servir des réponses identity — un amont qui a
+déjà compressé, ou un client qui gère le codage lui-même — écrivez `encode off`.
+La compression se désactive aussi pour un `file_server` précis avec
+`file_server { compress off }`, et seules les réponses au-dessus d'un seuil de
+taille sont compressées.
+
 Un candidat terminé par `/` ne correspond qu'à un répertoire, et un candidat
 sans `/` qu'à un fichier ordinaire — la barre oblique qui tranche est celle
 écrite dans la configuration, pas celle portée par la requête.

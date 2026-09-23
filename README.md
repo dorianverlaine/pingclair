@@ -701,6 +701,20 @@ A request for a real file gets that file; anything else is rewritten to
 `/index.html` so the application can route it. The query string survives the
 rewrite.
 
+📦 **Compression is on by default**, and that example does not turn it on:
+`encode gzip` above is redundant for a `file_server` site, because the default
+default encoder is `gzip`. A `text/*` response is compressed whenever
+the client's `Accept-Encoding` allows it, with `Content-Encoding` and a
+`Content-Encoding`-suffixed `ETag` that a configured `encode` produces
+identically. This is a deliberate difference from Caddy, which compresses only
+where an `encode` directive asks; it is stated here rather than left to be
+discovered because a `Content-Encoding` nobody configured is exactly the
+surprise that reads as "it worked in staging". To serve identity responses
+instead — an upstream that already compressed, or a client that handles the
+coding itself — write `encode off`. Compression can also be disabled for one
+`file_server` with `file_server { compress off }`, and only responses above a
+size floor are compressed at all.
+
 A candidate ending in `/` matches only a directory, and one without matches
 only a regular file — the trailing slash that decides is the one in the
 configuration, not the one the request arrived with.

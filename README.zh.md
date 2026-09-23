@@ -637,6 +637,16 @@ example.com {
 請求打到真實檔案就送那個檔案，其餘一律改寫成 `/index.html`，交給前端自己路由。
 改寫會保留 query string。
 
+📦 **壓縮預設就是開的**，上面那段範例並沒有把它打開：對 `file_server` 站台而言
+`encode gzip` 是多餘的，因為預設編碼器就是 `gzip`。只要用戶端的
+`Accept-Encoding` 允許，`text/*` 回應就會被壓縮，並帶上 `Content-Encoding` 與
+加了 `-gzip` 後綴的 `ETag`——與明寫 `encode` 時的輸出完全相同。這是與 Caddy
+刻意的差異（Caddy 只在有 `encode` 指示時才壓縮），寫在這裡而不是留給人踩，是
+因為「自己沒設卻出現 `Content-Encoding`」正是那種在 staging 看不出來的意外。
+要改回不壓縮——上游已經壓過，或客戶端自己處理編碼——寫 `encode off`；也可以只
+關掉某個 `file_server` 的壓縮：`file_server { compress off }`。另外，只有超過
+大小門檻的回應才會被壓縮。
+
 候選路徑結尾有 `/` 的只匹配目錄，沒有 `/` 的只匹配一般檔案——**決定的是設定檔裡
 寫的那個斜線，不是請求帶進來的那個**。
 
