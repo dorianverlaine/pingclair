@@ -149,6 +149,41 @@ A client may send `Connection` as two field lines, such as
 read only the first line, decided the request was not a WebSocket handshake,
 and stripped `Connection` and `Upgrade` before the origin saw them, so the
 upgrade silently failed. Every line is now read.
+### 🏛️ The local TLS store is filed the way Caddy files it
+
+**Breaking for anyone who has served a `tls internal` site with an earlier
+build, and nothing is migrated for them.**
+
+The store a local site writes is now the one an operator already has tooling
+for: `pki/authorities/local/{root,intermediate}.{crt,key}` for the authority,
+and `certificates/local/<site>/<site>.{crt,key,json}` for its leaves. A backup
+procedure, a "which certificates expire this month" report and a certificate
+audit written against a Caddy data directory read this one the same way. The old
+tree could not support that at any depth: below the store root the two layouts
+shared no name at all.
+
+**The old `internal/` layout is neither read nor moved** — unlike the move to
+the service account's home, which copied the store and compared before removing
+it. On the next start the server finds no authority where it now looks, creates
+a new one, and re-issues the certificates it needs. Every client that trusted
+the old root must be given the new one (`pingclair trust`). If your configuration
+also obtains certificates from a public CA, re-issuing them counts against that
+CA's rate limits.
+
+Two changes beyond the filenames. The authority is genuinely two tiers now:
+leaves are signed by an intermediate, which the root signs, and the chain served
+to a client is the leaf plus the intermediate, because the root is the trust
+anchor and a client that trusts it already has it. And the private key is no
+longer serialized into the metadata file: `<site>.json` carries the covered
+names and nothing secret, so it is safe to copy into an inventory, and the key
+exists only in `<site>.key`.
+
+A wildcard site is filed under Caddy's spelling of it — `*.example.com` becomes
+`certificates/local/wildcard_.example.com/`. An underscore is a legal character
+in a host name, so a site literally named `wildcard_.example.com` wants that
+same directory; it is now refused by name, with both names in the message,
+rather than overwriting the first site's certificate.
+
 ### 🩺 The admin API answers Caddy-shaped requests in Caddy's terms
 
 An operator pointing Caddy tooling at this server saw three answers that were

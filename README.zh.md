@@ -153,8 +153,8 @@ HTTP/3 的行為與主機部署完全一致。
 ### 信任 `tls internal` 的根憑證
 
 `tls internal` 用持久本機 CA 簽發 leaf。要驗證憑證的用戶端必須信任其根，
-位置在 `$PINGCLAIR_TLS_STORE/internal/root.crt`（容器內：
-`docker compose cp pingclair:/var/lib/pingclair/.local/share/pingclair/internal/root.crt
+位置在 `$PINGCLAIR_TLS_STORE/pki/authorities/local/root.crt`（容器內：
+`docker compose cp pingclair:/var/lib/pingclair/.local/share/pingclair/pki/authorities/local/root.crt
 ./root.crt`）。安裝到系統信任庫：
 
 - Linux：複製到 `/usr/local/share/ca-certificates/root.crt` 後執行
@@ -165,6 +165,29 @@ HTTP/3 的行為與主機部署完全一致。
   根憑證。
 
 只對你控制的來源做這件事；internal CA 不是公開憑證機構。
+
+### TLS 儲存目錄的長相
+
+這個目錄結構就是 Caddy 的：寫給 Caddy 資料目錄用的備份程序、到期報告或
+憑證盤點工具，讀這一份的方式完全相同。
+
+```
+<pki>        pki/authorities/local/root.crt          根憑證
+             pki/authorities/local/root.key          根私鑰
+             pki/authorities/local/intermediate.crt  簽發憑證
+             pki/authorities/local/intermediate.key  簽發私鑰
+certificates/local/<site>/<site>.crt                   leaf 鏈
+certificates/local/<site>/<site>.key                   leaf 私鑰
+certificates/local/<site>/<site>.json                  涵蓋的名稱，非機密
+```
+
+萬用字元站台採用 Caddy 的拼法：`*.example.com` 會放進
+`certificates/local/wildcard_.example.com/`。
+
+📌 **從這個結構之前的 store 升級。** 舊的 `internal/` 樹不讀也不搬，這是刻意的
+決定。下次啟動時，伺服器在新的位置找不到任何 CA，於是建立一個新的，並重新
+簽發它需要的憑證。每個信任舊根的用戶端都必須拿到新的根——上面那幾道指令就是
+這一步。如果你的設定同時向公開 CA 取得憑證，重新簽發會計入該 CA 的速率限制。
 
 ## 🏃 快速上手
 
@@ -303,8 +326,9 @@ Pingclair 會在 `PINGCLAIR_TLS_STORE` 下持久化一個有效十年的本機 C
 可續期的 90 天 leaf 憑證——裸二進位預設 `$XDG_DATA_HOME/pingclair`
 （即 `~/.local/share/pingclair`），容器映像則為 `/var/lib/pingclair/.local/share/pingclair`。
 需要驗證源站的 client 應信任
-`$PINGCLAIR_TLS_STORE/internal/root.crt`；CA 私鑰則保存在僅 owner 可讀的
-`authority.json`。H1/H2 與 H3 共用同一份持久化 leaf。`tls internal`
+`$PINGCLAIR_TLS_STORE/pki/authorities/local/root.crt`；CA 的私鑰則保存在
+旁邊僅 owner 可讀的 `root.key` 與 `intermediate.key`。H1/H2 與 H3 共用同一份
+持久化 leaf。`tls internal`
 必須搭配明確站台名稱，且不可和 `tls auto`、ACME email 或手動憑證路徑混用。
 
 全域的 `local_certs` 選項對所有沒有自己憑證管理的站台套用同一選擇：所有

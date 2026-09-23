@@ -165,12 +165,39 @@ HTTP/3 se comportent comme sur un hôte.
 ### Faire confiance à la racine `tls internal`
 
 La CA locale persistante publie sa racine dans
-`$PINGCLAIR_TLS_STORE/internal/root.crt` (dans un conteneur :
-`docker compose cp pingclair:/var/lib/pingclair/.local/share/pingclair/internal/root.crt
+`$PINGCLAIR_TLS_STORE/pki/authorities/local/root.crt` (dans un conteneur :
+`docker compose cp pingclair:/var/lib/pingclair/.local/share/pingclair/pki/authorities/local/root.crt
 ./root.crt`). Installez-la dans le magasin de confiance système (Linux :
 `update-ca-certificates` ; macOS : `security add-trusted-cert`) ou importez-la
 manuellement dans les navigateurs à magasin propre (Firefox, Chrome). À ne
 faire que pour des origines que vous contrôlez.
+
+### Où le dépôt TLS range ses fichiers
+
+L'arborescence est celle de Caddy : une sauvegarde, un rapport d'expiration ou
+un inventaire de certificats écrit pour un répertoire de données Caddy lit
+celui-ci de la même façon.
+
+```
+<pki>        pki/authorities/local/root.crt          certificat racine
+             pki/authorities/local/root.key          clé privée racine
+             pki/authorities/local/intermediate.crt  certificat de signature
+             pki/authorities/local/intermediate.key  clé privée de signature
+certificates/local/<site>/<site>.crt                   chaîne feuille
+certificates/local/<site>/<site>.key                   clé privée feuille
+certificates/local/<site>/<site>.json                  noms couverts, non secret
+```
+
+Un site à joker est rangé sous l'orthographe qu'en donne Caddy : `*.example.com`
+devient `certificates/local/wildcard_.example.com/`.
+
+📌 **Mise à niveau depuis un dépôt écrit avant cette arborescence.** L'ancien
+arbre `internal/` n'est ni lu ni migré, et c'est délibéré. Au démarrage suivant,
+le serveur ne trouve plus d'autorité là où il cherche désormais, en crée une
+nouvelle et réémet les certificats dont il a besoin. Chaque client qui faisait
+confiance à l'ancienne racine doit recevoir la nouvelle — les commandes
+ci-dessus sont cette étape. Si votre configuration obtient aussi des certificats
+auprès d'une AC publique, leur réémission est décomptée de ses limites de débit.
 
 ## 🏃 Démarrage rapide
 
@@ -324,9 +351,10 @@ leaf renouvelables de 90 jours sous `PINGCLAIR_TLS_STORE` — un binaire nu
 utilise `$XDG_DATA_HOME/pingclair` (`~/.local/share/pingclair`), l'image
 conteneur `/var/lib/pingclair/.local/share/pingclair`. Les clients qui vérifient l'origine
 doivent faire
-confiance à `$PINGCLAIR_TLS_STORE/internal/root.crt` ; la clé privée de
-l'autorité reste dans `authority.json`, lisible uniquement par son
-propriétaire. H1/H2 et H3 utilisent le même certificat leaf persistant.
+confiance à `$PINGCLAIR_TLS_STORE/pki/authorities/local/root.crt` ; les clés
+privées de l'autorité restent dans `root.key` et `intermediate.key`, à côté,
+lisibles uniquement par leur propriétaire. H1/H2 et H3 utilisent le même
+certificat leaf persistant.
 `tls internal` exige un nom de site concret et ne peut pas être combiné avec
 `tls auto`, un email ACME ou des chemins de certificat manuels.
 

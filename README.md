@@ -163,8 +163,8 @@ HTTP/3 all behave exactly like a host deployment.
 
 `tls internal` signs leaves with a persistent local CA. Clients that verify
 certificates must trust its root, published at
-`$PINGCLAIR_TLS_STORE/internal/root.crt` (inside a container:
-`docker compose cp pingclair:/var/lib/pingclair/.local/share/pingclair/internal/root.crt
+`$PINGCLAIR_TLS_STORE/pki/authorities/local/root.crt` (inside a container:
+`docker compose cp pingclair:/var/lib/pingclair/.local/share/pingclair/pki/authorities/local/root.crt
 ./root.crt`). Install it into the system trust store:
 
 - Linux: copy to `/usr/local/share/ca-certificates/root.crt` and run
@@ -176,6 +176,32 @@ certificates must trust its root, published at
 
 Only do this for origins you control; the internal CA is not a public
 authority.
+
+### Where the TLS store keeps things
+
+The layout is Caddy's, so a backup, an expiry report or a certificate audit
+written against a Caddy data directory reads this one the same way:
+
+```
+<pki>        pki/authorities/local/root.crt          root certificate
+             pki/authorities/local/root.key          root private key
+             pki/authorities/local/intermediate.crt  signing certificate
+             pki/authorities/local/intermediate.key  signing private key
+certificates/local/<site>/<site>.crt                   leaf chain
+certificates/local/<site>/<site>.key                   leaf private key
+certificates/local/<site>/<site>.json                  subject names, not secret
+```
+
+A wildcard site is filed under Caddy's spelling of it: `*.example.com` becomes
+`certificates/local/wildcard_.example.com/`.
+
+📌 **Upgrading from a store written before this layout.** The old `internal/`
+tree is neither read nor migrated, by design. On the next start the server finds
+no authority where it now looks, creates a new one, and re-issues the
+certificates it needs. Every client that trusted the old root must be given the
+new one — the commands above are that step. If your configuration also obtains
+certificates from a public CA, note that re-issuing them counts against that
+CA's rate limits.
 
 ## 🏃 Quick start
 
@@ -324,8 +350,9 @@ Pingclair persists one ten-year local authority and renewable 90-day leaf
 certificates below `PINGCLAIR_TLS_STORE` — a bare binary defaults to
 `$XDG_DATA_HOME/pingclair` (`~/.local/share/pingclair`), the container image
 to `/var/lib/pingclair/.local/share/pingclair`. Install
-`$PINGCLAIR_TLS_STORE/internal/root.crt` in clients that verify the origin;
-the authority private key remains in the owner-only `authority.json`.
+`$PINGCLAIR_TLS_STORE/pki/authorities/local/root.crt` in clients that verify
+the origin; the authority's private keys remain in the owner-only
+`root.key` and `intermediate.key` beside it.
 H1/H2 and H3 use the same persisted leaf. `tls internal` requires a concrete
 site name and cannot be combined with `tls auto`, ACME email, or manual
 certificate paths.
