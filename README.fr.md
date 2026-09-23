@@ -36,7 +36,7 @@ méthodologie des benchmarks — se trouve sur <https://pingclair.com>.
 *   ⚡ **HTTP/3 (QUIC) natif** — Bâti sur [quiche](https://github.com/cloudflare/quiche), la pile QUIC de production qui fait tourner l'edge de Cloudflare. Une latence réduite et une meilleure migration de connexion sur les réseaux instables. Une configuration `tls` explicite active HTTPS et H3 sur n'importe quel port d'écoute ; 443 et 8443 restent reconnus automatiquement. Les trailers de requête déclarés ne sont transférés par aucun protocole aval : Pingclair renvoie `501` avant l'envoi de la réponse ou réinitialise un flux H3 déjà engagé. Une réponse amont annonçant des trailers renvoie `502` tant que leur transfert de bout en bout n'est pas pris en charge. Les requêtes CONNECT et CONNECT étendu sur H3 renvoient `501` jusqu'à la prise en charge des tunnels.
 *   🔄 **Répartition de charge intelligente** — Plusieurs algorithmes intégrés (round-robin, least-connections, etc.), avec health checks et bascule automatique.
 *   🔐 **HTTPS automatique et privé** — ACME intégré (Let's Encrypt) émet les certificats publics, tandis que `tls internal` fournit une autorité locale persistante pour les origines privées et les tunnels.
-*   📁 **Service de fichiers statiques performant** — Compression Gzip/Brotli, requêtes Range et transfert de fichiers efficace.
+*   📁 **Service de fichiers statiques performant** — Compression Gzip et Zstandard, requêtes Range (y compris `416` quand la plage ne peut pas être satisfaite) et transfert de fichiers efficace. Brotli **n'est pas** implémenté : `encode br` est refusé par son nom, comme par un build Caddy standard.
 *   📊 **Observabilité** — Export de métriques Prometheus prêt à l'emploi.
 
 ## ⚡ Benchmarks
