@@ -22,6 +22,59 @@ use std::path::{Component, Path, PathBuf};
 /// writes it any more.
 const LEGACY_PREFIX: &str = "pingclair";
 
+/// 🏷️ Top-level names a store **this** build reads lives under.
+///
+/// `internal` is the local authority (`pingclair-tls/src/internal_ca.rs`),
+/// `acme` the ACME account store, and `acme-challenges.json` the challenge
+/// journal every start creates. Together they are what makes an archive
+/// recogniseable as ours rather than merely well-formed tar.
+///
+/// 📌 `certificates` is deliberately **not** in this list even though a store
+/// can contain it: `caddy storage export` writes `certificates/<host>/…` too,
+/// so accepting it would make the check below unable to tell the two apart —
+/// which is the whole defect it exists to catch.
+const OURS: [&str; 3] = ["internal", "acme", "acme-challenges.json"];
+
+/// 🏷️ Top-level names only a **Caddy** store export carries.
+///
+/// Each was read off a real `caddy storage export` tarball, and each is absent
+/// from this workspace's source: `pki/authorities/local/` is Caddy's PKI
+/// layout, `instance.uuid` and `last_clean.json` are Caddy's own bookkeeping.
+/// Nothing here writes any of them, so seeing one means the archive came from
+/// the other server.
+const THEIRS: [&str; 3] = ["pki", "instance.uuid", "last_clean.json"];
+
+/// 🏷️ Which server's store an archive turned out to hold.
+#[derive(Debug, PartialEq, Eq)]
+enum ArchiveKind {
+    /// Holds something this build reads.
+    Ours,
+    /// Holds a Caddy store, which this build never looks at.
+    Caddy,
+    /// Holds nothing either server's store layout uses.
+    Unrecognised,
+}
+
+/// 🏷️ Reads a store's owner off the top-level names an archive contains.
+fn classify(entries: &[PathBuf]) -> ArchiveKind {
+    let top_level = |path: &PathBuf| -> Option<String> {
+        path.components().find_map(|component| match component {
+            Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+    };
+    let names: Vec<String> = entries.iter().filter_map(top_level).collect();
+    // 🔁 Ours wins when both appear, because a Caddy tree imported once and
+    // re-exported from here is a store this build reads.
+    if names.iter().any(|name| OURS.contains(&name.as_str())) {
+        return ArchiveKind::Ours;
+    }
+    if names.iter().any(|name| THEIRS.contains(&name.as_str())) {
+        return ArchiveKind::Caddy;
+    }
+    ArchiveKind::Unrecognised
+}
+
 /// 📦 Writes the store's contents to `writer`, rooted at the archive root.
 ///
 /// 🤡 This used to prefix every entry with `pingclair/`, which is where the
@@ -49,12 +102,21 @@ pub(crate) fn export_store<W: Write>(dir: &Path, writer: W) -> anyhow::Result<W>
 /// 📦 A single leading `pingclair/` is dropped, which does two jobs: an archive
 /// written by the older export still restores to the right place, and a store
 /// that a previous import nested is repaired the next time one runs.
+///
+/// 🚫 The archive's *contents* decide whether the import succeeded. "The tar
+/// parsed" is not a success condition: an archive from the other server unpacks
+/// perfectly and holds nothing this build reads, so the previous version
+/// printed `✅ Store imported` and then let the server mint a fresh CA beside
+/// the imported one. Every client that trusted the old root stopped trusting
+/// this server, and nothing in the operator's logs said why — for a
+/// disaster-recovery path, worse than a refusal.
 pub(crate) fn import_store<R: Read>(dir: &Path, reader: R) -> anyhow::Result<()> {
     let mut archive = tar::Archive::new(reader);
     let entries = archive
         .entries()
         .map_err(|error| anyhow::anyhow!("❌ Import failed: {error}"))?;
 
+    let mut written: Vec<PathBuf> = Vec::new();
     for entry in entries {
         let mut entry = entry.map_err(|error| anyhow::anyhow!("❌ Import failed: {error}"))?;
         let path = entry
@@ -80,8 +142,26 @@ pub(crate) fn import_store<R: Read>(dir: &Path, reader: R) -> anyhow::Result<()>
         entry
             .unpack(&target)
             .map_err(|error| anyhow::anyhow!("❌ Import failed: {error}"))?;
+        written.push(relative);
     }
-    Ok(())
+
+    match classify(&written) {
+        ArchiveKind::Ours => Ok(()),
+        ArchiveKind::Caddy => Err(anyhow::anyhow!(
+            "❌ Import refused: this is a Caddy store export, not a Pingclair one. \
+             Caddy keeps its local authority under pki/authorities/ and its \
+             certificates under certificates/<host>/; this build reads neither, so \
+             importing it would leave the server to mint a fresh CA while every \
+             client kept trusting the old root. Export from a Pingclair store \
+             (`pingclair storage-export`) and import that instead."
+        )),
+        ArchiveKind::Unrecognised => Err(anyhow::anyhow!(
+            "❌ Import refused: the archive contains nothing this build reads. \
+             A Pingclair store holds internal/ (the local authority), acme/ (the \
+             ACME account) and acme-challenges.json (the challenge journal); this \
+             archive has none of them."
+        )),
+    }
 }
 
 /// 🛡️ The path an entry may be written to, or `None` if it must not be written.
@@ -218,6 +298,81 @@ mod tests {
         // 🏁 Two zero blocks end a tar stream.
         archive.extend_from_slice(&[0u8; 1024]);
         archive
+    }
+
+    /// 🚫 A Caddy store export must be refused, not silently unpacked.
+    ///
+    /// 🤡 The previous version printed `✅ Store imported into …` and exited 0
+    /// for this exact archive. Nothing was restored that the server reads, the
+    /// next request minted a fresh internal CA beside the imported `pki/` tree,
+    /// and every client that trusted the old root stopped trusting this server.
+    /// The archive names here are the ones a real `caddy storage export`
+    /// produces (`verify/repro/E/caddy-export.tar` in the audit).
+    #[test]
+    fn a_caddy_store_export_is_refused() {
+        let source = tempfile::tempdir().unwrap();
+        write(&source.path().join("pki/authorities/local/root.crt"), "ROOTCRT");
+        write(&source.path().join("pki/authorities/local/root.key"), "ROOTKEY");
+        write(
+            &source.path().join("certificates/local/localhost/localhost.crt"),
+            "LEAF",
+        );
+        write(&source.path().join("instance.uuid"), "uuid");
+        write(&source.path().join("last_clean.json"), "{}");
+
+        let archive = export_store(source.path(), Vec::new()).unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let error = import_store(destination.path(), archive.as_slice())
+            .expect_err("a Caddy store export must be refused");
+
+        let message = format!("{error}");
+        assert!(
+            message.contains("Caddy store export"),
+            "the refusal must name what the archive actually is: {message}"
+        );
+        assert!(
+            !message.contains("Import failed"),
+            "the archive unpacked fine; the refusal is about its contents: {message}"
+        );
+        assert!(
+            !destination.path().join("internal").exists(),
+            "no `internal/` tree may appear next to an imported foreign layout"
+        );
+    }
+
+    /// 🚫 An archive holding nothing either layout uses is refused too — the
+    /// success condition is "a store this build can read is present", not "the
+    /// tar parsed".
+    #[test]
+    fn an_archive_with_nothing_usable_in_it_is_refused() {
+        let source = tempfile::tempdir().unwrap();
+        write(&source.path().join("README.txt"), "not a store");
+        write(&source.path().join("random/data.bin"), "x");
+
+        let archive = export_store(source.path(), Vec::new()).unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let error = import_store(destination.path(), archive.as_slice())
+            .expect_err("an archive with nothing usable must be refused");
+        assert!(
+            format!("{error}").contains("nothing this build reads"),
+            "got {error}"
+        );
+    }
+
+    /// 📌 A store that has been served from carries the challenge journal, even
+    /// when the internal CA was never created — that is the case the
+    /// recognition has to keep working for, so it is asserted rather than
+    /// assumed.
+    #[test]
+    fn a_store_with_only_the_challenge_journal_still_imports() {
+        let source = tempfile::tempdir().unwrap();
+        write(&source.path().join("acme-challenges.json"), "{}");
+
+        let archive = export_store(source.path(), Vec::new()).unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        import_store(destination.path(), archive.as_slice())
+            .expect("a store this build wrote must import");
+        assert!(destination.path().join("acme-challenges.json").exists());
     }
 
     /// 🛡️ An entry naming a path outside the store is refused, not written.
