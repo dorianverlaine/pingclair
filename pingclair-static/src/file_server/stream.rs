@@ -691,7 +691,15 @@ mod bounded_memory_tests {
         // server could be asked for, because any Range disabled streaming.
         let (_dir, fs) = fixture(false, false);
         let response = fs
-            .serve_auto("/big.bin", "/big.bin", Some("bytes=0-"), None)
+            .serve_auto(
+                "/big.bin",
+                "/big.bin",
+                Some(crate::RangeRequest {
+                    range: "bytes=0-",
+                    if_range: None,
+                }),
+                None,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -749,7 +757,10 @@ mod bounded_memory_tests {
             .serve_auto(
                 "/big.bin",
                 "/big.bin",
-                Some(&format!("bytes={start}-{end}")),
+                Some(crate::RangeRequest {
+                    range: &format!("bytes={start}-{end}"),
+                    if_range: None,
+                }),
                 None,
             )
             .await
@@ -808,7 +819,15 @@ mod bounded_memory_tests {
         assert!(matches!(whole, ServedResponse::Buffered(_)));
 
         let ranged = fs
-            .serve_auto("/small.txt", "/small.txt", Some("bytes=2-5"), None)
+            .serve_auto(
+                "/small.txt",
+                "/small.txt",
+                Some(crate::RangeRequest {
+                    range: "bytes=2-5",
+                    if_range: None,
+                }),
+                None,
+            )
             .await
             .unwrap()
             .unwrap();

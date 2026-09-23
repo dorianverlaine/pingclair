@@ -111,3 +111,55 @@ async fn test_file_server_etag_changes_within_one_second() {
 
     assert_ne!(before, after, "a same-second, same-size edit kept its ETag");
 }
+
+/// 🪟 RFC 9110 §13.1.5: `If-Range` decides whether `Range` applies. A client
+/// resuming a download names the version it holds; when that is not the
+/// current file, it must get the whole current file (200), never a 206 whose
+/// bytes splice onto a different version.
+#[tokio::test]
+async fn test_file_server_if_range_gates_the_range() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("f.txt");
+    std::fs::write(&path, "0123456789").unwrap();
+    // 🕰️ An old mtime makes the one-second `Last-Modified` a strong validator.
+    set_mtime(&path, SystemTime::now() - Duration::from_secs(60));
+    let mut server = sidecar_site(root.path().to_str().unwrap());
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    let plain = client
+        .get(server.url(0, "/f.txt"))
+        .send()
+        .await
+        .expect("request");
+    let header = |name: &str| plain.headers()[name].to_str().unwrap().to_string();
+    let (etag, last_modified) = (header("etag"), header("last-modified"));
+
+    let mut outcomes = Vec::new();
+    for if_range in [
+        "\"definitely-not-the-etag\"".to_string(),
+        format!("W/{etag}"),
+        "Tue, 01 Jan 2002 00:00:00 GMT".to_string(),
+        etag.clone(),
+        last_modified.clone(),
+    ] {
+        let response = client
+            .get(server.url(0, "/f.txt"))
+            .header("Range", "bytes=0-4")
+            .header("If-Range", &if_range)
+            .send()
+            .await
+            .expect("request");
+        let status = response.status().as_u16();
+        outcomes.push((status, response.text().await.unwrap()));
+    }
+    server.stop();
+
+    let full = (200, "0123456789".to_string());
+    let partial = (206, "01234".to_string());
+    assert_eq!(
+        outcomes,
+        [full.clone(), full.clone(), full, partial.clone(), partial],
+        "stale tag, weak tag, stale date → 200; current tag, current date → 206"
+    );
+}

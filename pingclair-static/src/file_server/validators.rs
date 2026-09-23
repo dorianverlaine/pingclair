@@ -16,7 +16,11 @@
 //! `W/`: a weak tag can never satisfy the strong comparison `If-Range`
 //! requires, so every resumed download would restart from zero.
 //!
-//! Everything here runs on a metadata-cache miss, never per request.
+//! Tag derivation runs on a metadata-cache miss, never per request. The
+//! `If-Range` check does run per request, but only for the rare request that
+//! carries a `Range`, and it compares bytes in place without allocating.
+
+use std::time::{Duration, SystemTime};
 
 use http::HeaderValue;
 
@@ -80,9 +84,109 @@ impl EntityTags {
     }
 }
 
+// MARK: - If-Range
+
+/// 🪟 A byte-range request as the client sent it: the `Range` value, and the
+/// `If-Range` validator that says which version of the file the range is
+/// meant to extend.
+///
+/// The two travel together because `Range` alone is not safe to honour. A
+/// client resuming a download holds the first half of *some* version of the
+/// file; `If-Range` names that version, and when the file has changed since,
+/// splicing today's second half onto yesterday's first produces a corrupt
+/// file that no checksum in HTTP will catch.
+#[derive(Clone, Copy, Debug)]
+pub struct RangeRequest<'a> {
+    /// 📐 The `Range` header value, such as `bytes=0-499`.
+    pub range: &'a str,
+    /// 🏷️ The `If-Range` header value, when the client sent one.
+    pub if_range: Option<&'a str>,
+}
+
+/// 🏷️ Evaluates `If-Range` (RFC 9110 §13.1.5): `true` means honour `Range`,
+/// `false` means ignore it and send the whole file with 200.
+///
+/// - No `If-Range` at all is unconditional, so the range is honoured.
+/// - An entity tag must match `etag` under the *strong* comparison: byte for
+///   byte, and neither side weak. A `W/` tag never matches.
+/// - An HTTP date must equal the `Last-Modified` value exactly, and must be a
+///   strong validator. A one-second date is strong only if the file cannot
+///   have changed twice within that second; the file's current mtime is the
+///   only evidence available, so a date is trusted once `now` is at least one
+///   second past it. A file edited in the last second answers 200 — the safe
+///   side, since a full body is always correct.
+///
+/// 📌 Uncertain residue, stated plainly: a client that fetched the file in the
+/// very second it was edited, then edited again inside that same second, and
+/// later resumed with the date, would be trusted. RFC 9110 forbids that client
+/// from sending such a date (its `Date` and `Last-Modified` were within one
+/// second, so the date was never strong), and the entity tag — which every
+/// response here carries — has no such gap.
+pub(super) fn if_range_holds(
+    if_range: Option<&str>,
+    etag: &HeaderValue,
+    last_modified: Option<&HeaderValue>,
+    modified: Option<SystemTime>,
+    now: SystemTime,
+) -> bool {
+    let Some(value) = if_range.map(str::trim) else {
+        return true;
+    };
+    if value.starts_with("W/") {
+        return false;
+    }
+    if value.starts_with('"') {
+        let etag = etag.as_bytes();
+        return !etag.starts_with(b"W/") && etag == value.as_bytes();
+    }
+    let (Some(last_modified), Some(modified)) = (last_modified, modified) else {
+        return false;
+    };
+    last_modified.as_bytes() == value.as_bytes()
+        && now
+            .duration_since(modified)
+            .is_ok_and(|age| age >= Duration::from_secs(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DATE: &str = "Tue, 22 Sep 2026 10:00:00 GMT";
+
+    fn holds(if_range: Option<&str>, etag: &str, age: Duration) -> bool {
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        if_range_holds(
+            if_range,
+            &HeaderValue::from_str(etag).unwrap(),
+            Some(&HeaderValue::from_static(DATE)),
+            Some(modified),
+            modified + age,
+        )
+    }
+
+    #[test]
+    fn if_range_uses_strong_comparison_and_strong_dates_only() {
+        let old = Duration::from_secs(5);
+        // 🎯 Each row is one clause of §13.1.5.
+        let cases = [
+            (None, "\"a\"", old, true),
+            (Some("\"a\""), "\"a\"", old, true),
+            (Some("\"b\""), "\"a\"", old, false),
+            (Some("W/\"a\""), "\"a\"", old, false),
+            (Some("W/\"a\""), "W/\"a\"", old, false),
+            (Some("\"a\""), "W/\"a\"", old, false),
+            (Some(DATE), "\"a\"", old, true),
+            (Some("Tue, 22 Sep 2026 10:00:01 GMT"), "\"a\"", old, false),
+            (Some(DATE), "\"a\"", Duration::from_millis(300), false),
+        ];
+        let got: Vec<_> = cases
+            .iter()
+            .map(|&(if_range, etag, age, _)| holds(if_range, etag, age))
+            .collect();
+        let want: Vec<_> = cases.iter().map(|case| case.3).collect();
+        assert_eq!(got, want);
+    }
 
     #[test]
     fn representations_never_share_a_tag() {

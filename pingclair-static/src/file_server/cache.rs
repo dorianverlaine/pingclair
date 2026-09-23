@@ -70,6 +70,9 @@ pub(super) struct FileMeta {
     /// 🏷️ One strong tag per content coding; see [`EntityTags`].
     pub(super) etags: EntityTags,
     pub(super) content_length: HeaderValue,
+    /// 🕰️ The full-precision mtime behind `last_modified`, which `If-Range`
+    /// needs to judge whether a one-second date is a strong validator.
+    pub(super) modified: Option<std::time::SystemTime>,
 }
 
 /// Identity of one file's metadata, derived from a single `stat` per request.
@@ -235,10 +238,9 @@ impl FileServer {
         // `mime.rs` carried a blanket `allow(dead_code)` — which then hid
         // dead-code warnings on everything else in that file.
         let mime_type = crate::mime::guess_mime_type(&file_path.to_string_lossy());
-        let last_modified = metadata.modified().ok().map(httpdate::fmt_http_date);
-        let mtime_ns = metadata
-            .modified()
-            .ok()
+        let modified = metadata.modified().ok();
+        let last_modified = modified.map(httpdate::fmt_http_date);
+        let mtime_ns = modified
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_nanos());
         // 🏷️ A sidecar ETag wins when one exists. Build pipelines that hash
@@ -261,6 +263,7 @@ impl FileServer {
             last_modified: last_modified.map(|v| HeaderValue::from_str(&v).unwrap()),
             etags,
             content_length: HeaderValue::from(size),
+            modified,
         }
     }
 

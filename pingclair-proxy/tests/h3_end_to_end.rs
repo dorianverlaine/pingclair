@@ -2168,3 +2168,53 @@ async fn h3_try_files_falls_back_and_raises_a_status_code_candidate() {
         "`=410` must raise on HTTP/3 exactly as it does on HTTP/1.1 and HTTP/2"
     );
 }
+
+/// 🏷️ `If-Range` on HTTP/3 goes through the same pingclair-static decision as
+/// on HTTP/1.1: a stale validator turns the range into a full 200, and the
+/// current one keeps the 206. Before, the H3 path read only `Range`, so a
+/// client resuming a download of a file that had changed got a 206 whose
+/// bytes belonged to a different file.
+#[tokio::test]
+async fn h3_if_range_mismatch_serves_the_whole_file() {
+    let tree = tempfile::tempdir().expect("document root");
+    std::fs::write(tree.path().join("f.txt"), b"0123456789").expect("write file");
+    let root = tree.path().to_string_lossy().into_owned();
+    // 🧾 The DSL drives the handler, as a user's configuration would.
+    let source = format!(
+        r#":443 {{
+            root * {root}
+            file_server
+        }}"#
+    );
+    let config = pingclair_config::compile(&source).expect("the site compiles");
+    let handler = config.servers[0].routes[0].handler.clone();
+    let server = spawn_h3_server(handler).await;
+
+    let plain = h3_get(server, "/f.txt").await.expect("plain request");
+    let etag = plain
+        .headers
+        .iter()
+        .find(|(name, _)| name == "etag")
+        .map(|(_, value)| value.clone())
+        .expect("an ETag");
+
+    let stale = h3_get_with_headers(
+        server,
+        "/f.txt",
+        &[("range", "bytes=0-4"), ("if-range", "\"not-the-etag\"")],
+    )
+    .await
+    .expect("stale request");
+    let current = h3_get_with_headers(
+        server,
+        "/f.txt",
+        &[("range", "bytes=0-4"), ("if-range", etag.as_str())],
+    )
+    .await
+    .expect("current request");
+
+    assert_eq!(
+        [(stale.status, stale.body), (current.status, current.body)],
+        [(200, b"0123456789".to_vec()), (206, b"01234".to_vec())]
+    );
+}

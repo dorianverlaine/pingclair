@@ -51,6 +51,7 @@ use http::HeaderValue;
 
 use cache::{BodyCache, FileKey, FileMeta, MetaKey};
 pub use stream::StreamingFile;
+pub use validators::RangeRequest;
 
 /// Configuration for the file server
 #[derive(Debug, Clone)]

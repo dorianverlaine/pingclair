@@ -19,13 +19,14 @@
 use pingclair_core::error::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use http::HeaderValue;
 
 #[cfg(test)]
 use super::FileServerConfig;
 use super::cache::FileKey;
+use super::validators::{self, RangeRequest};
 use super::{FileServer, ServedFile, ServedResponse};
 
 impl FileServer {
@@ -137,7 +138,7 @@ impl FileServer {
         &self,
         path: &str,
         original_path: &str,
-        range_header: Option<&str>,
+        range: Option<RangeRequest<'_>>,
         accept_encoding: Option<&str>,
     ) -> Result<Option<ServedResponse>> {
         // Lexical docroot check (rejects `..` traversal; no syscalls)
@@ -236,7 +237,7 @@ impl FileServer {
                 if self.config.browse {
                     let listing = self.generate_listing(&file_path, path).await?;
                     // Compress listing if enabled
-                    let (content, encoding) = if self.config.compress && range_header.is_none() {
+                    let (content, encoding) = if self.config.compress && range.is_none() {
                         self.compress_content(listing.as_bytes(), accept_encoding)
                             .await?
                     } else {
@@ -287,8 +288,22 @@ impl FileServer {
         let mut start = 0;
         let mut length = file_size;
 
-        if let Some(range) = range_header
-            && let Some((s, e)) = self.parse_range(range, file_size)
+        //
+        // 🏷️ `If-Range` is evaluated before the range is parsed: when the
+        // client's copy is a different version of the file, its range is
+        // ignored and the whole current file goes out as 200. Honouring the
+        // range anyway would hand back bytes that splice onto nothing the
+        // client holds. A range response is never compressed, so the tag it is
+        // compared against is the identity one.
+        if let Some(range) = range
+            && validators::if_range_holds(
+                range.if_range,
+                meta.etags.for_coding(None),
+                meta.last_modified.as_ref(),
+                meta.modified,
+                SystemTime::now(),
+            )
+            && let Some((s, e)) = self.parse_range(range.range, file_size)
         {
             start = s;
             length = e - s + 1;
@@ -534,10 +549,11 @@ impl FileServer {
         range_header: Option<&str>,
         accept_encoding: Option<&str>,
     ) -> Result<Option<ServedFile>> {
-        match self
-            .serve_auto(path, path, range_header, accept_encoding)
-            .await?
-        {
+        let range = range_header.map(|range| RangeRequest {
+            range,
+            if_range: None,
+        });
+        match self.serve_auto(path, path, range, accept_encoding).await? {
             Some(ServedResponse::Buffered(file)) => Ok(Some(file)),
             Some(ServedResponse::Redirect(_)) => Ok(None),
             Some(ServedResponse::Stream(mut stream)) => {

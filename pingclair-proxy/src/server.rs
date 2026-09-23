@@ -4420,11 +4420,16 @@ impl PingclairProxy {
                 };
 
                 if let Some(file_server) = maybe_file_server {
-                    let range_header = session
-                        .req_header()
-                        .headers
+                    // 🏷️ `If-Range` rides with `Range`; pingclair-static
+                    // decides whether the range still applies.
+                    let headers = &session.req_header().headers;
+                    let range = headers
                         .get("Range")
-                        .and_then(|v| v.to_str().ok());
+                        .and_then(|v| v.to_str().ok())
+                        .map(|range| pingclair_static::RangeRequest {
+                            range,
+                            if_range: headers.get("If-Range").and_then(|v| v.to_str().ok()),
+                        });
                     let accept_encoding = session
                         .req_header()
                         .headers
@@ -4440,7 +4445,7 @@ impl PingclairProxy {
                     // it and points back to it — see `serve_auto`.
                     let original_path = ctx.orig_uri.path();
                     match file_server
-                        .serve_auto(path, original_path, range_header, accept_encoding)
+                        .serve_auto(path, original_path, range, accept_encoding)
                         .await
                     {
                         Ok(Some(pingclair_static::ServedResponse::Redirect(location))) => {

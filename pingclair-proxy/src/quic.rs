@@ -3501,7 +3501,16 @@ async fn handle_request_inner(
                 return Err((503, "File Server Unavailable"));
             };
 
-            let range_header = header.headers.get("range").and_then(|v| v.to_str().ok());
+            // 🏷️ `If-Range` rides with `Range`, exactly as on H1/H2;
+            // pingclair-static decides whether the range still applies.
+            let range = header
+                .headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .map(|range| pingclair_static::RangeRequest {
+                    range,
+                    if_range: header.headers.get("if-range").and_then(|v| v.to_str().ok()),
+                });
             let accept_encoding = header
                 .headers
                 .get("accept-encoding")
@@ -3514,7 +3523,7 @@ async fn handle_request_inner(
             // would be redirected away from — see `serve_auto`.
             let original_path = req.path.split('?').next().unwrap_or("/");
             match fs
-                .serve_auto(effective_path, original_path, range_header, accept_encoding)
+                .serve_auto(effective_path, original_path, range, accept_encoding)
                 .await
             {
                 Ok(Some(ServedResponse::Redirect(location))) => {

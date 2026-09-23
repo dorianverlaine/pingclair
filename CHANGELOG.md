@@ -20,6 +20,18 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🪟 `file_server` honours `If-Range`
+
+A client resuming a download sends `Range` with `If-Range`, naming the version
+of the file it already holds. `file_server` ignored `If-Range`, so after the
+file changed it still answered 206 with bytes from the new version, and the
+client stitched them onto the old one. The range is now honoured only when the
+`If-Range` entity tag matches the current `ETag` under strong comparison, or
+the date matches `Last-Modified` and the file is at least one second old;
+otherwise the whole current file is sent with 200. HTTP/1.1, HTTP/2, and
+HTTP/3 share the one decision. `If-None-Match` and `If-Modified-Since` are
+still not evaluated.
+
 ### 🏷️ Static-file ETags describe one exact body
 
 A strong `ETag` promises that every response carrying it has identical bytes.
