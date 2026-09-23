@@ -20,6 +20,16 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🗜️ Precompressed sidecars follow the client's quality values
+
+`file_server { precompressed … }` picked a `.gz`/`.zst`/`.br` sidecar by
+searching the raw `Accept-Encoding` text for the coding's name. A client that
+sent `gzip;q=0` — "never gzip" — got the `.gz` anyway, and one that sent `*`
+got no sidecar at all. Sidecars are now chosen by the same negotiation as
+on-the-fly compression: the client's quality values first, the configured
+order to break ties, and the next-ranked sidecar when the preferred one is
+missing on disk.
+
 ### 📥 No request-body ceiling unless the configuration asks for one
 
 A proxied request body one byte over 1 MiB was answered `413 Payload Too Large`

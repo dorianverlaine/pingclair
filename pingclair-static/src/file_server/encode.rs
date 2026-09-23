@@ -106,10 +106,16 @@ impl FileServer {
     /// 🗜️ Finds and loads a sidecar for this file, if one is allowed and the
     /// client accepts its encoding.
     ///
-    /// The order is the operator's, not ours: `precompressed zstd gzip` means
-    /// zstd is preferred, and a build that guessed would serve the wrong one.
-    /// Empty configuration never reaches here — the caller checks first, so a
-    /// site that did not ask for sidecars pays nothing.
+    /// 🥇 The client's quality values choose first and the operator's order
+    /// breaks ties: `precompressed zstd gzip` means zstd when the client does
+    /// not care, but `zstd;q=0.1, gzip` gets the `.gz`. This used to be
+    /// `accept.contains(encoding)`, which served the `.gz` to a client that
+    /// sent `gzip;q=0` and served nothing to one that sent `*`. It now walks
+    /// the same ranking live compression uses, so the two cannot drift again.
+    ///
+    /// 🔁 A missing sidecar falls through to the next-ranked coding rather
+    /// than giving up. Empty configuration never reaches here — the caller
+    /// checks first, so a site that did not ask for sidecars pays nothing.
     pub(super) async fn try_precompressed(
         &self,
         original_path: &std::path::Path,
@@ -117,11 +123,9 @@ impl FileServer {
     ) -> Option<(std::path::PathBuf, std::fs::Metadata, &'static str)> {
         let accept = accept_encoding?;
 
-        for format in &self.config.precompressed {
-            if !accept.contains(format.encoding) {
-                continue;
-            }
-
+        for format in
+            pingclair_core::encoding::ranked(accept, &self.config.precompressed, |f| f.encoding)
+        {
             // 🗜️ Built by appending to the OS string rather than through
             // `with_extension`, which would replace `.js` instead of adding to
             // it and ask for `app.br`.

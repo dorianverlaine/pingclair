@@ -21,6 +21,11 @@ mod static_validators;
 #[path = "integration/cache.rs"]
 mod cache;
 
+// 🗜️ `Accept-Encoding` negotiation tests live beside this file for the same
+// reason; they reuse its `TestServer` harness.
+#[path = "integration/content_negotiation.rs"]
+mod content_negotiation;
+
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather
 /// than against "some response arrived", so a 404 from a stale listener on the
