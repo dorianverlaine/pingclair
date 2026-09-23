@@ -32,6 +32,10 @@ mod malformed;
 #[path = "h3_end_to_end/response_framing.rs"]
 mod response_framing;
 
+// 🔤 SNI spelled with capital letters; a sibling file for the same reason.
+#[path = "h3_end_to_end/site_name_case.rs"]
+mod site_name_case;
+
 const ALPN: &[u8] = b"h3";
 
 fn self_signed_pem(names: &[&str]) -> (String, String) {

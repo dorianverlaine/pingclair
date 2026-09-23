@@ -218,6 +218,10 @@ pub struct CertEntry {
     pub key: boring::pkey::PKey<boring::pkey::Private>,
 }
 
+/// 🔤 Every name in a snapshot is canonical — lowercase, no trailing dot —
+/// because the handshake looks it up by the canonical SNI. The writers below
+/// normalize on the way in, so no caller can publish a spelling that a lookup
+/// would never find.
 #[derive(Clone, Default)]
 struct CertTableSnapshot {
     certs: HashMap<String, Arc<CertEntry>>,
@@ -323,7 +327,7 @@ impl CertTable {
 
         for (pattern, entry) in &snap.certs {
             if let Some(suffix) = pattern.strip_prefix("*.")
-                && servername.ends_with(&format!(".{suffix}"))
+                && covers_suffix(servername, suffix)
             {
                 return Some(entry.clone());
             }
@@ -387,8 +391,19 @@ fn covered_by(patterns: &HashSet<String>, servername: &str) -> bool {
     patterns.iter().any(|pattern| {
         pattern
             .strip_prefix("*.")
-            .is_some_and(|suffix| servername.ends_with(&format!(".{suffix}")))
+            .is_some_and(|suffix| covers_suffix(servername, suffix))
     })
+}
+
+/// 🃏 Whether `servername` sits under `suffix`, one or more labels deep.
+///
+/// 🏎️ Checked in place rather than by building `.{suffix}` with `format!`:
+/// this runs once per wildcard per handshake, including the handshakes that
+/// match nothing, which is exactly the traffic a stranger can generate.
+fn covers_suffix(servername: &str, suffix: &str) -> bool {
+    servername
+        .strip_suffix(suffix)
+        .is_some_and(|rest| rest.ends_with('.'))
 }
 
 /// 🔐 Parses one certificate pair before it reaches the handshake table.
@@ -462,11 +477,6 @@ fn build_ssl_context_builder(
 
     let table = certs;
     builder.set_select_certificate_callback(move |mut hello| {
-        let sni = hello
-            .servername(NameType::HOST_NAME)
-            .unwrap_or("")
-            .to_string();
-
         // 🪪 Installed before the certificate is chosen, which is well before
         // the `CertificateRequest` is written — the same window the TCP
         // listener uses, reached through a different callback because QUIC
@@ -479,29 +489,37 @@ fn build_ssl_context_builder(
             tracing::warn!("🚧 H3: refused a TLS handshake during policy publication");
             return Err(SelectCertError::ERROR);
         };
+
+        // 🔤 Everything the name decides is looked up inside this block, while
+        // the SNI is still borrowed from the hello, so a handshake no longer
+        // copies it; `hello.ssl_mut()` below needs the borrow to have ended.
+        // Both lookups canonicalize the spelling themselves.
+        let (client_auth, entry) = {
+            let sni = hello.servername(NameType::HOST_NAME).unwrap_or("");
+            // 🏷️ Only an absent SNI uses the listener's default. Authentication
+            // still uses the actual offered name, exactly as TCP does.
+            let certificate_name = if sni.is_empty() {
+                listener_policy.default_sni()
+            } else {
+                Some(sni)
+            };
+            let Some(entry) = certificate_name.and_then(|name| table.lookup(name)) else {
+                tracing::warn!(
+                    "🔐 H3: no certificate available for SNI '{}', rejecting handshake",
+                    sni
+                );
+                return Err(SelectCertError::ERROR);
+            };
+            (snapshot.client_auth().policy_for(sni).cloned(), entry)
+        };
         if let Err(error) = record_listener_security_revision(hello.ssl_mut(), snapshot.revision())
         {
             tracing::error!(%error, "❌ H3: failed to record the listener-security generation");
             return Err(SelectCertError::ERROR);
         }
-        if let Some(policy) = snapshot.client_auth().policy_for(&sni) {
+        if let Some(policy) = client_auth {
             policy.install(hello.ssl_mut());
         }
-
-        // 🏷️ Only an absent SNI uses the listener's default. Authentication
-        // above still uses the actual offered name, exactly as TCP does.
-        let certificate_name = if sni.is_empty() {
-            listener_policy.default_sni()
-        } else {
-            Some(sni.as_str())
-        };
-        let Some(entry) = certificate_name.and_then(|name| table.lookup(name)) else {
-            tracing::warn!(
-                "🔐 H3: no certificate available for SNI '{}', rejecting handshake",
-                sni
-            );
-            return Err(SelectCertError::ERROR);
-        };
 
         let ssl = hello.ssl_mut();
         let installed = (|| {
@@ -518,7 +536,7 @@ fn build_ssl_context_builder(
             Err(e) => {
                 tracing::warn!(
                     "🔐 H3: failed to install certificate for SNI '{}': {}",
-                    sni,
+                    ssl.servername(NameType::HOST_NAME).unwrap_or(""),
                     e
                 );
                 Err(SelectCertError::ERROR)
@@ -6290,6 +6308,46 @@ mod tests {
         table.set_excluded_names(["*.wild.local"]);
 
         assert!(table.lookup("a.wild.local").is_none());
+    }
+
+    /// 🔤 A site configured with a capital letter keeps its own certificate.
+    ///
+    /// The table used to be keyed on the configured spelling while the
+    /// handshake asks with the canonical one, so `Mixed.Example` missed its own
+    /// entry and fell through to the default: another site's certificate.
+    #[test]
+    fn cert_table_keys_a_mixed_case_name_canonically() {
+        let table = CertTable::new();
+        let (cert_default, key_default) = self_signed_pem(&["first.example"]);
+        let (cert_mixed, key_mixed) = self_signed_pem(&["mixed.example"]);
+        table
+            .upsert_pem("first.example", &cert_default, &key_default)
+            .unwrap();
+        table
+            .upsert_pem("Mixed.Example.", &cert_mixed, &key_mixed)
+            .unwrap();
+
+        let entry = table.lookup("mixed.example").unwrap();
+        let expected = boring::x509::X509::from_pem(cert_mixed.as_bytes())
+            .unwrap()
+            .to_der()
+            .unwrap();
+        assert_eq!(entry.chain[0].to_der().unwrap(), expected);
+    }
+
+    /// 🚫 An `http3 off` site spelled with a capital letter stays excluded.
+    ///
+    /// The exclusion set was compared byte for byte, so a lowercase SNI walked
+    /// past `Opted-Out.local` and reached the default certificate.
+    #[test]
+    fn cert_table_exclusion_ignores_the_configured_spelling() {
+        let table = CertTable::new();
+        let (cert, key) = self_signed_pem(&["kept.local", "opted-out.local"]);
+        table.upsert_pem("kept.local", &cert, &key).unwrap();
+        table.set_excluded_names(["Opted-Out.local"]);
+
+        assert!(table.lookup("opted-out.local").is_none());
+        assert!(table.lookup("kept.local").is_some());
     }
 
     #[test]
