@@ -12300,6 +12300,10 @@ fn mutual_tls_fixture(mode: &str) -> (TestServer, TestAuthority, TestAuthority, 
         r#"
         {{
             admin off
+            # 🔌 The automatic plaintext companion needs a port of its own. Left
+            # at the default, every fixture claims port 80, parallel tests race
+            # for it, and all but one exit on the failed bind.
+            http_port __PINGCLAIR_TEST_HTTP_PORT__
         }}
 
         https://open.test:__PINGCLAIR_TEST_PORT__ {{
