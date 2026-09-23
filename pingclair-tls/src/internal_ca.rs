@@ -28,8 +28,8 @@
 use crate::acme::Certificate;
 use crate::cert_store::{CertStore, CertStoreError};
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    Issuer, KeyPair, KeyUsagePurpose, PublicKeyData,
+    BasicConstraints, CertificateParams, CustomExtension, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -59,6 +59,14 @@ const CLOCK_SKEW_ALLOWANCE: Duration = Duration::from_secs(24 * 60 * 60);
 /// does not validate. A day is enough margin for the clock differences that
 /// already motivate [`CLOCK_SKEW_ALLOWANCE`].
 const INTERMEDIATE_ROOT_MARGIN: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// 📜 `id-ce-noRevAvail` (RFC 9608 §2): the leaf says outright that no CRL or
+/// OCSP answer will ever exist for it, so a relying party does not mistake
+/// "never published" for "temporarily unreachable". The 90-day lifetime is
+/// what bounds a leaked key instead.
+const NO_REV_AVAIL_OID: &[u64] = &[2, 5, 29, 56];
+/// 📜 The extension's value is a DER `NULL`.
+const DER_NULL: [u8; 2] = [0x05, 0x00];
 
 /// 🧯 Describes a local authority initialization or issuance failure.
 #[derive(Debug, Error)]
@@ -666,6 +674,13 @@ fn issue_leaf(
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     params.use_authority_key_identifier_extension = true;
+    // 🛡️ Leaves only: RFC 9608 §3 forbids the extension on a CA certificate,
+    // and it stays valid here only while leaves carry no CRL or OCSP pointer.
+    // `from_oid_content` leaves the extension non-critical, as §2 requires.
+    params.custom_extensions = vec![CustomExtension::from_oid_content(
+        NO_REV_AVAIL_OID,
+        DER_NULL.to_vec(),
+    )];
     let mut distinguished_name = DistinguishedName::new();
     distinguished_name.push(DnType::OrganizationName, "Pingclair");
     distinguished_name.push(DnType::CommonName, domain);
@@ -1045,6 +1060,42 @@ mod tests {
                 .join("certificates/local/wildcard_.sandbox.localhost")
                 .is_dir(),
             "the leaf must be filed under Caddy's spelling of the wildcard"
+        );
+    }
+
+    /// 📜 RFC 9608: the leaf carries a non-critical `noRevAvail` with a DER
+    /// `NULL` value, and the root never does.
+    #[tokio::test]
+    async fn only_leaves_declare_no_revocation_information() {
+        use x509_parser::oid_registry::Oid;
+        use x509_parser::prelude::{FromDer, X509Certificate};
+
+        let directory = tempfile::tempdir().unwrap();
+        let authority = InternalCa::new(directory.path());
+        let leaf = authority.get_or_issue("origin.example.test").await.unwrap();
+        let root = authority.root_certificate_pem().await.unwrap();
+        let no_rev_avail = Oid::from(NO_REV_AVAIL_OID).unwrap();
+
+        let (_, leaf_pem) = x509_parser::pem::parse_x509_pem(leaf.cert_pem.as_bytes()).unwrap();
+        let (_, leaf_cert) = X509Certificate::from_der(&leaf_pem.contents).unwrap();
+        let extension = leaf_cert
+            .extensions()
+            .iter()
+            .find(|extension| extension.oid == no_rev_avail)
+            .expect("the leaf must carry noRevAvail");
+        assert_eq!(
+            (extension.critical, extension.value),
+            (false, &DER_NULL[..])
+        );
+
+        let (_, root_pem) = x509_parser::pem::parse_x509_pem(root.as_bytes()).unwrap();
+        let (_, root_cert) = X509Certificate::from_der(&root_pem.contents).unwrap();
+        assert!(
+            root_cert
+                .extensions()
+                .iter()
+                .all(|extension| extension.oid != no_rev_avail),
+            "a CA certificate must never carry noRevAvail"
         );
     }
 

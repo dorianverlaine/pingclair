@@ -42,6 +42,14 @@ validated and startup reported success; only real clients failed. Site names
 are now lowercased and stripped of a trailing dot when the configuration is
 compiled, and the certificate table files every name in that one spelling.
 
+### 📜 Internal CA leaves say they have no revocation information
+
+Certificates from `tls internal` never had a CRL or OCSP responder, but nothing
+in them said so, so a relying party could not tell "never published" from
+"temporarily unreachable". New leaves carry the non-critical `noRevAvail`
+extension (RFC 9608); the root does not, and the 90-day lifetime is unchanged.
+Leaves already on disk gain it when they are next reissued.
+
 ### 🧊 HTTP/3 static files send `Vary: Accept-Encoding`
 
 A file served over HTTP/3 from a `precompressed` sidecar said
