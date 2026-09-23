@@ -2063,6 +2063,72 @@ mod fail_closed_tests {
         );
     }
 
+    /// ⏭️ `header { defer X-Foo bar }` is the block spelling of
+    /// `header defer X-Foo bar`, and both compile to the same header operation.
+    ///
+    /// 🤡 Only the bare `defer` was accepted inside a block, so the spelling
+    /// Caddy's own `header` documentation uses was refused as `Directive
+    /// 'header defer' expects 0 arguments, got 2` — a message that sends the
+    /// reader to count arguments, when the mistake was putting a working form
+    /// in the wrong place. `defer` means "apply this once the response is
+    /// finished", which is when every response header here is applied anyway,
+    /// so it changes nothing and the block form is accepted for the same reason
+    /// the top-level one is.
+    #[test]
+    fn header_defer_is_accepted_inside_a_block() {
+        for (source, want_set, want_removed) in [
+            (
+                ":8080 {\n\theader {\n\t\tdefer X-Foo bar\n\t}\n}",
+                Some(("X-Foo", "bar")),
+                None,
+            ),
+            (
+                ":8080 {\n\theader {\n\t\tdefer -X-Foo\n\t}\n}",
+                None,
+                Some("X-Foo"),
+            ),
+            // 👍 The bare form keeps working, and so does a block that mixes
+            // the two spellings.
+            (
+                ":8080 {\n\theader {\n\t\tdefer\n\t\tX-Foo bar\n\t}\n}",
+                Some(("X-Foo", "bar")),
+                None,
+            ),
+            (
+                ":8080 {\n\theader {\n\t\tdefer X-Foo bar\n\t\tX-Baz qux\n\t}\n}",
+                Some(("X-Foo", "bar")),
+                None,
+            ),
+        ] {
+            let config = crate::compile(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+            let headers = config
+                .servers
+                .iter()
+                .flat_map(|server| server.routes.iter())
+                .filter_map(|route| match &route.handler {
+                    HandlerConfig::Headers { set, remove, .. } => {
+                        Some((set.clone(), remove.clone()))
+                    }
+                    _ => None,
+                })
+                .next()
+                .unwrap_or_else(|| panic!("{source} must compile to a header handler"));
+            if let Some((name, value)) = want_set {
+                assert_eq!(
+                    headers.0.get(name).map(String::as_str),
+                    Some(value),
+                    "{source} must set {name}"
+                );
+            }
+            if let Some(name) = want_removed {
+                assert!(
+                    headers.1.iter().any(|removed| removed == name),
+                    "{source} must remove {name}"
+                );
+            }
+        }
+    }
+
     /// 🏷️ A `servers { … }` sub-option this build does not have is refused by
     /// name, not as an unknown word.
     ///

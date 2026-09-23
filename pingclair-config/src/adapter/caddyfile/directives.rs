@@ -1435,22 +1435,34 @@ pub(super) fn adapt_header_directive(d: &Directive) -> Result<Handler, AdapterEr
 
     if let Some(block) = &d.block {
         for sub in &block.directives {
-            match sub.name.as_str() {
-                // ⏭️ Response headers are already applied once, against the
-                // finished response, so asking for that explicitly changes
-                // nothing. Accepted rather than refused: a configuration
-                // carried over from upstream must keep loading, and it does
-                // here mean what it says.
-                "defer" => {
-                    if !sub.args.is_empty() {
-                        return Err(AdapterError::ArgumentCount(
-                            "header defer".into(),
-                            0,
-                            sub.args.len(),
-                        ));
-                    }
-                    continue;
+            // ⏭️ `defer` means "apply this once the response is finished",
+            // which is when every response header here is applied anyway, so it
+            // changes nothing and is accepted rather than refused: a
+            // configuration carried over from upstream must keep loading, and
+            // it does here mean what it says.
+            //
+            // 🤡 It used to accept only the *bare* form inside a block, so
+            // `header { defer X-Foo bar }` — the spelling Caddy's own `header`
+            // documentation uses — was refused as `Directive 'header defer'
+            // expects 0 arguments, got 2`, which sends the reader to count
+            // arguments. The top-level `header defer X-Foo bar` worked on both
+            // servers, so the mistake was the block, and that is the one thing
+            // the message did not say.
+            let deferred = sub.name == "defer";
+            let sub = if deferred && !sub.args.is_empty() {
+                // 🧭 The rest is an ordinary header operation, read from the
+                // same place the block reads it: the field, then the value.
+                &Directive {
+                    name: sub.args[0].clone(),
+                    args: sub.args[1..].to_vec(),
+                    block: None,
+                    tokens: TokenRun::synthetic(),
                 }
+            } else {
+                sub
+            };
+            match sub.name.as_str() {
+                "defer" => continue,
                 // 🚩 A response matcher gating the whole block. Same reason.
                 "match" => {
                     return Err(AdapterError::UnsupportedFeature(
