@@ -204,7 +204,7 @@ impl TestServer {
         admin_address: Option<SocketAddr>,
         readiness_path: String,
         readiness_token: String,
-        reservations: Vec<TcpListener>,
+        reservations: Vec<PortReservation>,
         // 🔻 Lowers the child's `RLIMIT_NOFILE` so a test can drive the process
         // into a real descriptor exhaustion. `None` inherits, which is what
         // every test but one wants.
@@ -540,21 +540,36 @@ done
     }
 }
 
-fn reserve_loopback_listener(reservations: &mut Vec<TcpListener>) -> SocketAddr {
-    let listener =
-        TcpListener::bind(("127.0.0.1", 0)).expect("failed to reserve a loopback test port");
-    let address = listener
-        .local_addr()
-        .expect("failed to read the reserved test address");
-    reservations.push(listener);
-    address
+/// 🔌 A test port held on both transports until the child is about to bind it.
+///
+/// A TLS site serves HTTP/3 on the UDP port with the same number as its TCP
+/// listener, and a failed UDP bind stops startup. Holding only the TCP half
+/// left the UDP number free for any other socket in the meantime, such as a
+/// QUIC test client's ephemeral port, and the fixture then failed to start.
+type PortReservation = (TcpListener, std::net::UdpSocket);
+
+fn reserve_loopback_listener(reservations: &mut Vec<PortReservation>) -> SocketAddr {
+    // 🔁 The kernel picks a free TCP port; the same number may already be taken
+    // on UDP, so draw again rather than hand out a half-free port.
+    for _ in 0..64 {
+        let listener =
+            TcpListener::bind(("127.0.0.1", 0)).expect("failed to reserve a loopback test port");
+        let address = listener
+            .local_addr()
+            .expect("failed to read the reserved test address");
+        if let Ok(udp) = std::net::UdpSocket::bind(address) {
+            reservations.push((listener, udp));
+            return address;
+        }
+    }
+    panic!("no loopback port was free on both TCP and UDP after 64 attempts");
 }
 
 fn prepare_server_listeners(
     config: &mut serde_json::Value,
     readiness_path: &str,
     readiness_token: &str,
-    reservations: &mut Vec<TcpListener>,
+    reservations: &mut Vec<PortReservation>,
 ) -> Vec<Vec<SocketAddr>> {
     let servers = config
         .get_mut("servers")
@@ -619,7 +634,7 @@ fn prepare_server_listeners(
 
 fn prepare_admin_listener(
     config: &mut serde_json::Value,
-    reservations: &mut Vec<TcpListener>,
+    reservations: &mut Vec<PortReservation>,
 ) -> Option<SocketAddr> {
     let admin = config.get_mut("admin")?.as_object_mut()?;
     if !admin
