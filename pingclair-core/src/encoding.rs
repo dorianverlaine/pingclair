@@ -114,6 +114,22 @@ fn same_coding(token: &str, coding: &str) -> bool {
 /// `zstd gzip` mean "zstd when the client does not care" without overriding a
 /// client that does. Refused codings are never yielded.
 ///
+/// 🪪 Identity — the unencoded body — takes part in the ranking too, per
+/// RFC 9110 §12.5.3:
+///
+/// - A coding the client rates *below* identity is never yielded:
+///   `gzip;q=0.5, identity` asks for the plain body, and gets it. An equal
+///   rating goes to the coding, because compressing is the server's
+///   preference whenever the client does not care.
+/// - When the client refuses identity (`identity;q=0`, or `*;q=0` with no
+///   `identity` entry), codings it never mentioned become acceptable last
+///   resorts, in the server's order, behind every coding it did rate. An
+///   explicitly refused coding stays refused.
+/// - When nothing is left, the caller sends identity anyway. §12.5.3 lets a
+///   server do that instead of answering `406 Not Acceptable`, and a readable
+///   body beats an error page for a client whose header was probably too
+///   strict rather than genuinely unable to decode plain bytes.
+///
 /// 🏎️ Allocation-free: codings already yielded are remembered in a 64-bit
 /// mask, and each step rescans the header instead of storing qualities. The
 /// offered lists are two or three codings long, so that rescan is a handful of
@@ -123,6 +139,18 @@ pub struct Ranked<'h, 'o, T, F> {
     offered: &'o [T],
     token: F,
     yielded: u64,
+    identity: Identity,
+}
+
+/// 🪪 How the header rates the unencoded body.
+#[derive(Clone, Copy)]
+enum Identity {
+    /// Neither `identity` nor `*` is mentioned: acceptable, least preferred.
+    Implicit,
+    /// Rated with this positive quality; a coding must match or beat it.
+    Rated(f32),
+    /// Rated `q=0`; unmentioned codings become acceptable last resorts.
+    Refused,
 }
 
 /// 🥇 Ranks `offered` against the header; `token` names each offered coding.
@@ -142,6 +170,11 @@ where
         offered,
         token,
         yielded: 0,
+        identity: match mentioned_quality(accept_encoding, "identity") {
+            None => Identity::Implicit,
+            Some(q) if q > 0.0 => Identity::Rated(q),
+            Some(_) => Identity::Refused,
+        },
     }
 }
 
@@ -157,8 +190,16 @@ where
             if self.yielded & (1 << rank) != 0 {
                 continue;
             }
-            let Some(q) = quality_for(self.accept_encoding, (self.token)(item)) else {
-                continue;
+            // 🪪 A last resort ranks at 0, below every rated coding, and the
+            // strict comparison below keeps last resorts in server order.
+            let q = match (
+                mentioned_quality(self.accept_encoding, (self.token)(item)),
+                self.identity,
+            ) {
+                (Some(q), Identity::Rated(floor)) if q >= floor => q,
+                (Some(q), Identity::Implicit | Identity::Refused) if q > 0.0 => q,
+                (None, Identity::Refused) => 0.0,
+                _ => continue,
             };
             // 📌 Strictly greater, so an equal quality keeps the earlier,
             // server-preferred coding.
@@ -263,5 +304,40 @@ mod tests {
     fn an_empty_header_selects_nothing() {
         assert_eq!(negotiate("", BOTH), None);
         assert_eq!(negotiate("   ", BOTH), None);
+    }
+
+    /// 🪪 #91: a client that rates the plain body above a coding gets the
+    /// plain body; an equal rating still goes to the coding.
+    #[test]
+    fn identity_rated_above_a_coding_wins() {
+        assert_eq!(negotiate("gzip;q=0.5, identity", BOTH), None);
+        assert_eq!(negotiate("gzip;q=0.5, *", &["gzip"]), None);
+        assert_eq!(negotiate("gzip, identity", BOTH), Some("gzip"));
+        assert_eq!(negotiate("*", BOTH), Some("zstd"));
+    }
+
+    /// 🪪 #91: `identity;q=0` was ignored. Refusing the plain body turns the
+    /// codings the client did not mention into last resorts, in server order,
+    /// but never revives one it refused by name.
+    #[test]
+    fn refusing_identity_admits_unmentioned_codings() {
+        assert_eq!(negotiate("identity;q=0", BOTH), Some("zstd"));
+        assert_eq!(negotiate("identity;q=0, zstd;q=0", BOTH), Some("gzip"));
+        assert_eq!(negotiate("identity;q=0, gzip;q=0.1", BOTH), Some("gzip"));
+        // 📌 `*;q=0` refuses identity and every unmentioned coding at once,
+        // so nothing is acceptable and the caller sends identity anyway.
+        assert_eq!(negotiate("*;q=0", BOTH), None);
+        assert_eq!(negotiate("*;q=0, identity;q=0", BOTH), None);
+    }
+
+    /// 🔁 The ranking walks every acceptable coding, best first, so a caller
+    /// whose first choice is unavailable can take the next.
+    #[test]
+    fn ranking_walks_every_acceptable_coding_best_first() {
+        let offered = ["br", "zstd", "gzip"];
+        let order: Vec<_> = ranked("gzip, br;q=0.5, zstd;q=0.9", &offered, |c| c).collect();
+        assert_eq!(order, [&"gzip", &"zstd", &"br"]);
+        let order: Vec<_> = ranked("gzip;q=0.4, identity;q=0.5, *", &offered, |c| c).collect();
+        assert_eq!(order, [&"br", &"zstd"]);
     }
 }

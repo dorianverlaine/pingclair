@@ -20,6 +20,17 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🪪 `identity` takes part in `Accept-Encoding` negotiation
+
+The unencoded body was never ranked against the codings, so a client's view of
+it was ignored. `gzip;q=0.5, identity` — "plain, preferably" — got gzip, and
+`identity;q=0` — "anything but plain" — got the plain body. Both static files
+and proxied responses now rank identity like any coding: a coding rated below
+identity is skipped, and refusing identity lets codings the client did not
+mention stand in as last resorts. When nothing acceptable is left (`*;q=0`),
+the plain body is still sent rather than a `406`, which RFC 9110 §12.5.3
+permits.
+
 ### 🗜️ Precompressed sidecars follow the client's quality values
 
 `file_server { precompressed … }` picked a `.gz`/`.zst`/`.br` sidecar by

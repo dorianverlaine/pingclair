@@ -75,6 +75,25 @@ async fn sidecar_selection_follows_quality_values() {
     );
 }
 
+/// 🪪 #91: identity is ranked like any coding. Refusing it selects the
+/// sidecar the client never named; rating it above gzip declines the sidecar.
+#[tokio::test]
+async fn identity_takes_part_in_sidecar_ranking() {
+    let root = tempfile::tempdir().unwrap();
+    write_site(root.path(), &[".gz"]);
+    let mut server = sidecar_site(root.path().to_str().unwrap());
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    assert_eq!(
+        fetch(&server, "identity;q=0").await,
+        (Some("gzip".into()), "sidecar.gz".into())
+    );
+    assert_eq!(
+        fetch(&server, "gzip;q=0.5, identity").await,
+        (None, "original".into())
+    );
+}
+
 /// 🥇 The client's quality beats the operator's order, and a missing sidecar
 /// falls through to the next-ranked one instead of to no coding at all.
 #[tokio::test]
