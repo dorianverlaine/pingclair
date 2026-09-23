@@ -9917,6 +9917,151 @@ async fn test_fail_fast_rejection_keeps_the_downstream_connection_reusable() {
     let _ = upstream_task.await;
 }
 
+/// 📥 An origin that reads a whole `Content-Length` body and answers with the
+/// number of bytes it actually received.
+///
+/// A fixture that only returns 200 cannot tell "the body was forwarded" from
+/// "the body was refused" — the refusal is a 413 the proxy produces before any
+/// upstream is contacted, and it is the count that proves the bytes arrived.
+async fn spawn_body_measuring_origin() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 16384];
+                // 📌 Read until the header terminator, then exactly the declared
+                // body length, so a truncated upload reports a short count.
+                let (head_len, content_length) = loop {
+                    let Ok(read) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                    if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buffer[..end]).to_string();
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        break (end + 4, length);
+                    }
+                };
+                while buffer.len() < head_len + content_length {
+                    let Ok(read) = stream.read(&mut chunk).await else {
+                        break;
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                }
+                let received = buffer.len().saturating_sub(head_len);
+                let body = format!("received={received}");
+                let _ = stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            });
+        }
+    });
+    (address, task)
+}
+
+/// 📥 An unconfigured site has no request-body ceiling, because the format it
+/// implements has none.
+///
+/// 🤡 A 1 MiB default refused the byte at 1,048,577 with `413 Payload Too
+/// Large` and `Connection: close`, silently: nothing in the configuration said
+/// 1 MiB and nothing in the startup log mentioned a body limit, so an upload
+/// path that worked in staging failed in production with no setting to change.
+/// Caddy serves the same request.
+///
+/// 📌 The neighbouring half is asserted too — a `request_body { max_size … }`
+/// ceiling must still refuse — because "remove the default" and "remove the
+/// feature" are one careless edit apart.
+#[tokio::test]
+async fn test_a_site_without_request_body_has_no_body_ceiling() {
+    let (origin, origin_task) = spawn_body_measuring_origin().await;
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            handle /limited/* {{
+                request_body {{
+                    max_size 1024
+                }}
+                reverse_proxy http://{origin}
+            }}
+
+            reverse_proxy http://{origin}
+        }}
+        "#
+    );
+
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    // 🎯 One byte over the old 2^20 ceiling, which is where the divergence was
+    // measured: 1,048,576 answered 200 and the next byte answered 413.
+    let oversized = vec![b'x'; 1_048_577];
+    let response = client
+        .post(server.url(0, "/echo"))
+        .body(oversized.clone())
+        .send()
+        .await
+        .expect("the proxy must answer");
+    assert_eq!(
+        response.status(),
+        200,
+        "an unconfigured site must accept a body larger than 1 MiB"
+    );
+    assert_eq!(
+        response.text().await.unwrap(),
+        format!("received={}", oversized.len()),
+        "the whole body must reach the origin"
+    );
+
+    // 🚫 The configured ceiling still applies, and still refuses.
+    let response = client
+        .post(server.url(0, "/limited/echo"))
+        .body(vec![b'x'; 4096])
+        .send()
+        .await
+        .expect("the proxy must answer");
+    assert_eq!(
+        response.status(),
+        413,
+        "`request_body {{ max_size 1024 }}` must still refuse 4096 bytes"
+    );
+
+    origin_task.abort();
+    let _ = origin_task.await;
+}
+
 /// 🧾 An origin that records every request line it ever receives.
 ///
 /// Unlike `spawn_header_reporting_origin`, this one keeps serving and keeps

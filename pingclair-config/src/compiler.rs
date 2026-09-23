@@ -380,7 +380,10 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         log: None,
         log_channels: server.log_channels.clone(),
         named_logs: Vec::new(),
-        client_max_body_size: 1024 * 1024, // 1MB default
+        // 📥 No ceiling by default: the default belongs to the format, and the
+        // format applies none. A site that wants one says so with
+        // `request_body { max_size … }` or `client_max_body_size`.
+        client_max_body_size: 0,
         limits: pingclair_core::config::ResourceLimitsConfig {
             header_timeout_ms: server.limits.header_timeout_ms,
             body_timeout_ms: server.limits.body_timeout_ms,

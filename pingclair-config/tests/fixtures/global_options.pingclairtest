@@ -35,7 +35,7 @@ example.com {
         }
       ],
       "log": null,
-      "client_max_body_size": 1048576,
+      "client_max_body_size": 0,
       "limits": {
         "header_timeout_ms": null,
         "body_timeout_ms": null,

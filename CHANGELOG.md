@@ -20,6 +20,17 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 📥 No request-body ceiling unless the configuration asks for one
+
+A proxied request body one byte over 1 MiB was answered `413 Payload Too Large`
+with `Connection: close`, from a default nothing in the configuration stated and
+nothing in the startup log mentioned. Caddy applies no request-body limit unless
+one is configured, so a Caddyfile that worked there refused uploads here. There
+is now no ceiling by default; `request_body { max_size … }` on a route, or
+`client_max_body_size` on a site, sets one as before, and `0` still means
+unlimited. **If you were relying on the 1 MiB default, set a limit explicitly**
+— the effective limit on an unconfigured site is now unbounded.
+
 ### 🔁 HTTP/3 waits past `103 Early Hints` for the real response
 
 An HTTP/3 request proxied to an HTTP/1.1 upstream that answered with

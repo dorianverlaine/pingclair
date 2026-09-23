@@ -576,7 +576,14 @@ pub struct ServerConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub named_logs: Vec<NamedLogConfig>,
 
-    /// Maximum request body size in bytes (default: 1MB)
+    /// 📥 Maximum request body size in bytes; `0` means no ceiling.
+    ///
+    /// The default is **no ceiling**, because that is what the format this
+    /// server implements has: Caddy applies no request-body limit unless a
+    /// configuration asks for one, so a 1 MiB default here refused an upload
+    /// Caddy would have served — with nothing in the configuration or the
+    /// startup log to say where the number came from. A site that wants a
+    /// ceiling writes `request_body { max_size … }` or sets this directly.
     #[serde(default = "default_body_limit")]
     pub client_max_body_size: u64,
 
@@ -658,9 +665,10 @@ pub struct VarsRule {
 
 /// Hand-written rather than derived so `ServerConfig::default()` agrees with
 /// what deserializing `{}` produces. `#[derive(Default)]` ignores the
-/// `#[serde(default = ...)]` attributes, which would silently hand out
-/// `client_max_body_size: 0` (unlimited) and an empty `encodings` list
-/// (compression off) — both the opposite of the documented default.
+/// `#[serde(default = ...)]` attributes, which would silently hand out an empty
+/// `encodings` list — compression off, the opposite of the documented default.
+/// (`client_max_body_size` agrees either way now that its default is also
+/// zero; it is still written out because the two must not drift apart.)
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -687,8 +695,9 @@ impl Default for ServerConfig {
     }
 }
 
+/// 📥 No ceiling unless a configuration asks for one, matching the format.
 fn default_body_limit() -> u64 {
-    1024 * 1024 // 1MB
+    0
 }
 
 /// 🧱 Bounds one virtual host's downstream resource consumption.
@@ -3544,7 +3553,10 @@ mod tests {
             defaulted.client_max_body_size,
             deserialized.client_max_body_size
         );
-        assert_eq!(defaulted.client_max_body_size, 1024 * 1024);
+        assert_eq!(
+            defaulted.client_max_body_size, 0,
+            "a site with no `request_body` has no request-body ceiling"
+        );
         assert_eq!(defaulted.encodings, deserialized.encodings);
         assert_eq!(defaulted.gzip_types, deserialized.gzip_types);
     }
