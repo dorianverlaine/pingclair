@@ -12,6 +12,9 @@ pub mod json;
 pub use caddyfile::registry::{
     implemented_names, is_implemented_directive, recognised_but_unimplemented,
 };
+// 🔐 The `tls { … }` block's refused options are a third list, kept beside the
+// other two because the READMEs name all three.
+pub use caddyfile::RECOGNISED_TLS_OPTIONS as recognised_tls_options;
 pub use caddyfile::{AdapterError, adapt};
 pub use json::JsonAdapter;
 

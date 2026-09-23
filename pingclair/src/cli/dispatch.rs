@@ -164,6 +164,22 @@ const NON_HANDLER_MODULES: [&str; 4] = [
 /// than a test.
 const ADMIN_API_MODULES: [&str; 2] = ["admin.api.load", "admin.api.metrics"];
 
+/// 📡 Modules a Caddy build gains from the DNS-provider plugin ecosystem.
+///
+/// 📌 Caddy's own listing does not carry these, because a DNS-01 provider is a
+/// plugin rather than a standard module — but `dns.providers.<name>` is the
+/// name the whole ecosystem uses and the name a migrated Caddyfile's
+/// `dns <provider>` corresponds to, so it is the useful answer to "can this
+/// build do DNS-01 with Cloudflare?".
+///
+/// 🛡️ The runtime half is unmeasured here, deliberately: proving an ACME
+/// DNS-01 challenge needs a public zone and an API token, and neither was
+/// available. What is claimed is narrower and checked — the provider is
+/// implemented (`pingclair-tls/src/dns01/cloudflare.rs`), the adapter accepts
+/// `dns cloudflare <token>`, and any other provider name is refused by name at
+/// startup.
+const PLUGIN_MODULES: [&str; 1] = ["dns.providers.cloudflare"];
+
 /// 🚩 Facts about this build that are not modules and have no Caddy module ID.
 ///
 /// They are printed under a `pingclair.features.` prefix rather than bare, so
@@ -185,7 +201,12 @@ fn module_ids() -> Vec<String> {
         })
         .chain(NON_HANDLER_MODULES.iter().map(|name| name.to_string()))
         .chain(ADMIN_API_MODULES.iter().map(|name| name.to_string()))
-        .chain(FEATURES.iter().map(|name| format!("pingclair.features.{name}")))
+        .chain(PLUGIN_MODULES.iter().map(|name| name.to_string()))
+        .chain(
+            FEATURES
+                .iter()
+                .map(|name| format!("pingclair.features.{name}")),
+        )
         .collect();
     ids.sort_unstable();
     ids.dedup();
@@ -1048,7 +1069,9 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FEATURES, HANDLER_MODULES, NON_HANDLER_MODULES, module_ids, module_type};
+    use super::{
+        FEATURES, HANDLER_MODULES, NON_HANDLER_MODULES, PLUGIN_MODULES, module_ids, module_type,
+    };
 
     /// 🎯 The check the list cannot do for itself: a module this binary tells
     /// an operator it has must be a directive the adapter accepts.
@@ -1124,6 +1147,12 @@ mod tests {
             "tls.issuance.acme",
             "tls.issuance.internal",
         ];
+        for name in PLUGIN_MODULES {
+            assert!(
+                name.starts_with("dns.providers."),
+                "`{name}` is not in the namespace Caddy's DNS providers register"
+            );
+        }
         for name in NON_HANDLER_MODULES {
             assert!(
                 CADDY_OTHER_MODULES.contains(&name),
@@ -1153,6 +1182,7 @@ mod tests {
                     || id.starts_with("pingclair.")
                     || id.starts_with("tls")
                     || id.starts_with("admin.api.")
+                    || id.starts_with("dns.providers.")
                     || id.starts_with("caddy."),
                 "`{id}` is neither a Caddy module ID nor namespaced as ours, so a reader \
                  cannot tell it from a module Caddy would also have"
@@ -1229,6 +1259,12 @@ mod tests {
                 .iter()
                 .all(|name| ids.contains(&name.to_string())),
             "the non-handler modules are missing from the listing"
+        );
+        assert!(
+            PLUGIN_MODULES
+                .iter()
+                .all(|name| ids.contains(&name.to_string())),
+            "the plugin modules are missing from the listing"
         );
     }
 }

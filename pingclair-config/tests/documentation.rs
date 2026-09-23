@@ -219,6 +219,8 @@ fn the_readme_limits_do_not_name_implemented_features() {
             let implemented = implemented.clone();
             listed_limit_names(&markdown)
                 .into_iter()
+                .filter(|(heading, _)| !is_tls_block(heading))
+                .map(|(_, listed)| listed)
                 .filter(move |listed| implemented.contains(listed))
                 .map(move |listed| format!("{name}: `{listed}`"))
         })
@@ -236,21 +238,90 @@ fn the_readme_limits_do_not_name_implemented_features() {
 ///
 /// A list line is indented and holds nothing but backticked names. Prose
 /// mentioning a directive always has words around it, so it never matches.
-fn listed_limit_names(markdown: &str) -> Vec<String> {
-    markdown
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim();
-            line.starts_with("  ")
-                && trimmed.starts_with('`')
-                && trimmed.ends_with('`')
-                && trimmed
-                    .split_whitespace()
-                    .all(|token| token.starts_with('`') && token.ends_with('`') && token.len() > 2)
+///
+/// 📌 `heading` selects one block by the line that introduces it. The three
+/// lists share a shape and two of them share two words: `protocols` and
+/// `renewal_window_ratio` are `tls { … }` options *and* names the global block
+/// implements, and only the second of those works. Reading the blocks apart is
+/// what keeps the "listed as unsupported but implemented" check from firing on
+/// a name that is genuinely refused in the block its own list belongs to.
+fn listed_limit_names(markdown: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut heading = String::new();
+    for line in markdown.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        // 🏷️ A non-indented line introduces whatever list follows it.
+        if !line.starts_with("  ") {
+            heading = line.trim().to_string();
+            continue;
+        }
+        let trimmed = line.trim();
+        if !trimmed.starts_with('`')
+            || !trimmed.ends_with('`')
+            || !trimmed
+                .split_whitespace()
+                .all(|token| token.starts_with('`') && token.ends_with('`') && token.len() > 2)
+        {
+            continue;
+        }
+        found.extend(
+            trimmed
+                .split_whitespace()
+                .map(|token| (heading.clone(), token.trim_matches('`').to_string())),
+        );
+    }
+    found
+}
+
+/// 🏷️ Whether a list line came from the `tls { … }` block's own list.
+///
+/// 📌 The three lists share a shape and two of them share two words:
+/// `protocols` and `renewal_window_ratio` are `tls { … }` options *and* names
+/// the global block implements, and only the second of those works. Telling the
+/// blocks apart is what keeps the "listed as unsupported but implemented" check
+/// from firing on a name that is genuinely refused where it is listed.
+fn is_tls_block(heading: &str) -> bool {
+    heading.contains("`tls`")
+}
+
+/// 🔐 The `tls { … }` block's refused options are named in the READMEs too.
+///
+/// 🤡 The other two lists have had a pairing test since 2026-08-13 and this one
+/// had nothing, which is why the gap was discoverable only one directive at a
+/// time: a migrated Caddyfile containing `tls { protocols tls1.3 }` failed at
+/// that line with a correct message, and nothing had said in advance that the
+/// whole option family was refused.
+///
+/// 📌 The list is read from [`recognised_tls_options`], so adding an option to
+/// the table fails this test until the three READMEs name it — the same
+/// one-source arrangement the directive and global-option lists use.
+///
+/// [`recognised_tls_options`]: pingclair_config::adapter::recognised_tls_options
+#[test]
+fn the_readme_lists_every_refused_tls_option() {
+    let root = workspace_root();
+    let missing: Vec<String> = ["README.md", "README.zh.md", "README.fr.md"]
+        .into_iter()
+        .flat_map(|name| {
+            let markdown = std::fs::read_to_string(root.join(name)).unwrap_or_default();
+            let listed: Vec<String> = listed_limit_names(&markdown)
+                .into_iter()
+                .filter(|(heading, _)| is_tls_block(heading))
+                .map(|(_, listed)| listed)
+                .collect();
+            pingclair_config::adapter::recognised_tls_options
+                .into_iter()
+                .filter(move |option| !listed.iter().any(|entry| entry == option))
+                .map(move |option| format!("{name}: `{option}`"))
         })
-        .flat_map(|line| {
-            line.split_whitespace()
-                .map(|token| token.trim_matches('`').to_string())
-        })
-        .collect()
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "the `tls` block refuses these, and the README does not say so:\n  {}\n\
+         (add them to the \"tls block options\" list, or implement them)",
+        missing.join("\n  ")
+    );
 }

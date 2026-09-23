@@ -402,26 +402,35 @@ pub(super) fn adapt_tls_directive(d: &Directive) -> Result<TlsDirective, Adapter
 /// subsystems rather than options, which is exactly why they need to be told
 /// apart from a misspelling.
 fn is_known_tls_option(name: &str) -> bool {
-    matches!(
-        name,
-        "protocols"
-            | "ciphers"
-            | "curves"
-            | "alpn"
-            | "load"
-            | "ca"
-            | "ca_root"
-            | "key_type"
-            | "eab"
-            | "issuer"
-            | "get_certificate"
-            | "on_demand"
-            | "reuse_private_keys"
-            | "insecure_secrets_log"
-            | "renewal_window_ratio"
-            | "force_automate"
-    )
+    RECOGNISED_TLS_OPTIONS.contains(&name)
 }
+
+/// 🚫 Every `tls { … }` option the format defines and this crate refuses, in
+/// the order the READMEs list them.
+///
+/// 📌 A table rather than a `matches!` because the list has a second reader: the
+/// READMEs name each of these so a migrated configuration does not discover
+/// them one directive at a time, and a list maintained by hand in three
+/// languages goes stale in the direction that flatters us. The doc test reads
+/// this array, so adding an option here fails until the READMEs say so.
+pub const RECOGNISED_TLS_OPTIONS: [&str; 16] = [
+    "protocols",
+    "ciphers",
+    "curves",
+    "alpn",
+    "load",
+    "ca",
+    "ca_root",
+    "key_type",
+    "eab",
+    "issuer",
+    "get_certificate",
+    "on_demand",
+    "reuse_private_keys",
+    "insecure_secrets_log",
+    "renewal_window_ratio",
+    "force_automate",
+];
 
 #[cfg(test)]
 mod client_auth_tests {

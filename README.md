@@ -317,6 +317,17 @@ H1/H2 and H3 use the same persisted leaf. `tls internal` requires a concrete
 site name and cannot be combined with `tls auto`, ACME email, or manual
 certificate paths.
 
+A `tls { … }` block accepts `auto`, `internal`, `cert`/`key`, `acme_email`
+(`email`), `http3`, `default_sni`, `client_auth`, and the DNS-01 cluster
+(`dns`, `resolvers`, `dns_ttl`, `propagation_delay`, `propagation_timeout`,
+`dns_challenge_override_domain`). Every other option Caddy defines is **refused
+by name** rather than ignored, and the full list is in
+[What is not supported yet](#what-is-not-supported-yet) — so a migrated
+configuration fails at the line that uses one instead of loading with a setting
+that was silently dropped. Protocol, cipher and curve selection is the largest
+of those gaps: there is no way to narrow what the listener negotiates from a
+Pingclairfile.
+
 The global `local_certs` option applies the same choice to every site that
 has no certificate management of its own: all default automation uses the
 persisted local authority instead of public ACME.
@@ -834,6 +845,14 @@ Global options:
   `filesystem` `frankenphp` `key_type` `ocsp_interval`
   `ocsp_stapling` `on_demand_tls` `preferred_chains` `renew_interval`
   `shutdown_delay` `storage` `storage_clean_interval`
+
+`tls` block options:
+
+  `protocols` `ciphers` `curves` `alpn`
+  `load` `ca` `ca_root` `key_type`
+  `eab` `issuer` `get_certificate` `on_demand`
+  `reuse_private_keys` `insecure_secrets_log` `renewal_window_ratio`
+  `force_automate`
 
 Two names sit between the lists above and full support, so they are named here
 rather than in either. `pki` and `acme_server` parse, validate and serialize —

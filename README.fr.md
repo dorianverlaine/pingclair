@@ -853,6 +853,14 @@ Options globales :
   `ocsp_stapling` `on_demand_tls` `preferred_chains` `renew_interval`
   `shutdown_delay` `storage` `storage_clean_interval`
 
+Options du bloc `tls` :
+
+  `protocols` `ciphers` `curves` `alpn`
+  `load` `ca` `ca_root` `key_type`
+  `eab` `issuer` `get_certificate` `on_demand`
+  `reuse_private_keys` `insecure_secrets_log` `renewal_window_ratio`
+  `force_automate`
+
 Deux noms se situent entre les listes ci-dessus et la prise en charge complète,
 et sont donc nommés ici plutôt que dans l'une ou l'autre. `pki` et
 `acme_server` s'analysent, se valident et se sérialisent — une configuration

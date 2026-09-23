@@ -776,6 +776,15 @@ Directive：
   `ocsp_stapling` `on_demand_tls` `preferred_chains` `renew_interval`
   `shutdown_delay` `storage` `storage_clean_interval`
 
+`tls` 區塊選項：
+
+  `protocols` `ciphers` `curves` `alpn`
+  `load` `ca` `ca_root` `key_type`
+  `eab` `issuer` `get_certificate` `on_demand`
+  `reuse_private_keys` `insecure_secrets_log` `renewal_window_ratio`
+  `force_automate`
+
+
 有兩個名字落在「上面兩張清單」與「完整支援」之間，所以寫在這裡而不是塞進任何一張。
 `pki` 與 `acme_server` 能解析、能驗證、能序列化——帶著它們的設定載入得了也跑得起來
 ——但 Pingclair **不會**作為憑證機構對其他客戶端簽發憑證，而且它會明說，不會安靜地

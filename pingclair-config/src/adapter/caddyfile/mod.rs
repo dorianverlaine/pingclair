@@ -54,6 +54,11 @@ use options::adapt_global;
 use registry::is_directive_name;
 use sites::adapt_server;
 
+// 🔐 The `tls { … }` block's refused options, re-exported because the READMEs
+// name them beside the other two "not supported" lists and a doc test checks
+// all three against their tables.
+pub use tls::RECOGNISED_TLS_OPTIONS;
+
 use crate::parser::ast::*;
 use crate::parser::caddy_ast::{Block, Directive};
 use crate::parser::lexer::Location;
