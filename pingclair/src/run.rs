@@ -815,14 +815,36 @@ pub(crate) fn run_server(
                 // through its own BoringSSL context, and enforces the same
                 // SNI-against-`:authority` rule. Suppressing HTTP/3 here was
                 // the fail-closed answer while that was not true.
-                if http3_globally_enabled {
-                    https_ports.push(addr.clone());
+                //
+                // 🚫 The UDP socket is bound here, synchronously and next to
+                // the TCP listener, and a failed bind stops startup. `Alt-Svc`
+                // is set only once the socket exists: it tells clients to
+                // come back over QUIC for a day, so publishing it for a port
+                // this process does not hold would send them to nothing.
+                //
+                // 📌 An address that is not a literal socket address never
+                // had HTTP/3 (the QUIC task refused it before, too); it stays
+                // a log line rather than a new reason to refuse startup.
+                let h3_address = http3_globally_enabled
+                    .then(|| addr.parse::<std::net::SocketAddr>())
+                    .and_then(|parsed| {
+                        parsed
+                            .inspect_err(|error| {
+                                tracing::error!(
+                                    "❌ Invalid HTTP/3 listen address {}: {}",
+                                    addr,
+                                    error
+                                );
+                            })
+                            .ok()
+                    });
+                if let Some(socket_addr) = h3_address {
+                    let socket = pingclair_proxy::quic::bind_udp(socket_addr).map_err(|error| {
+                        anyhow::anyhow!("failed to bind HTTP/3 (UDP) on {addr}: {error}")
+                    })?;
+                    https_ports.push((addr.clone(), socket_addr, socket));
                     http3_enabled = true;
-
-                    if let Some(port) = addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok())
-                    {
-                        proxy_logic.set_alt_svc(port);
-                    }
+                    proxy_logic.set_alt_svc(socket_addr.port());
                 }
             } else {
                 service.add_tcp(&service_address);
@@ -899,32 +921,41 @@ pub(crate) fn run_server(
         let periodic_domains_for_task = h3_periodic_domains.clone();
         let blocked_for_task = h3_blocked_ips.clone();
         bg_handle.spawn(async move {
-            for addr_str in &https_ports {
-                let Ok(socket_addr) = addr_str.parse::<std::net::SocketAddr>() else {
-                    tracing::error!("❌ Invalid HTTP/3 listen address: {}", addr_str);
-                    continue;
-                };
-
+            for (addr_str, socket_addr, socket) in https_ports {
                 let proxy = {
                     let guard = proxies_for_task.read();
-                    guard.get(addr_str).map(|p| std::sync::Arc::new(p.clone()))
+                    guard.get(&addr_str).map(|p| std::sync::Arc::new(p.clone()))
                 };
                 let Some(proxy) = proxy else {
                     tracing::error!("❌ No proxy found for HTTP/3 address {}", addr_str);
                     continue;
                 };
 
+                let advertiser = Arc::clone(&proxy);
                 let server = pingclair_proxy::quic::QuicServer::new(
                     socket_addr,
                     proxy,
                     table_for_task.clone(),
                     h3_pool_size,
                     blocked_for_task.clone(),
-                );
+                )
+                .with_socket(socket);
 
                 tokio::spawn(async move {
-                    if let Err(e) = server.run().await {
-                        tracing::error!("🌐 HTTP/3 server on {} failed: {}", socket_addr, e);
+                    let outcome = server.run().await;
+                    // 🚫 Whatever ended the QUIC server, the port no longer
+                    // answers it, so this listener stops saying it does.
+                    advertiser.clear_alt_svc();
+                    match outcome {
+                        Ok(()) => tracing::warn!(
+                            "🌐 HTTP/3 server on {} stopped; Alt-Svc withdrawn",
+                            socket_addr
+                        ),
+                        Err(e) => tracing::error!(
+                            "🌐 HTTP/3 server on {} failed; Alt-Svc withdrawn: {}",
+                            socket_addr,
+                            e
+                        ),
                     }
                 });
             }

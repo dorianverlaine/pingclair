@@ -2185,6 +2185,15 @@ impl PingclairProxy {
             .store(Arc::new(Some(crate::alt_svc::alt_svc_value(port))));
     }
 
+    /// 🚫 Stops advertising HTTP/3 on this listener.
+    ///
+    /// Called when the QUIC server for the port stops, for any reason. Every
+    /// response still carrying `Alt-Svc` after that would send clients to a
+    /// port nothing answers, and they would cache the claim for a day.
+    pub fn clear_alt_svc(&self) {
+        self.alt_svc.store(Arc::new(None));
+    }
+
     /// 🔐 Returns the listener policy used by both TLS transports and routing.
     pub fn listener_policy(&self) -> Arc<crate::client_auth::PublishedListenerPolicy> {
         Arc::clone(&self.listener_policy)

@@ -50,6 +50,10 @@ mod response_framing;
 #[path = "integration/site_name_case.rs"]
 mod site_name_case;
 
+// 🔌 HTTP/3 socket binding at startup; beside this file for the same reason.
+#[path = "integration/h3_bind.rs"]
+mod h3_bind;
+
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather
 /// than against "some response arrived", so a 404 from a stale listener on the

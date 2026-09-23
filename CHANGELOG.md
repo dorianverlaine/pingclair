@@ -20,6 +20,19 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🔌 A taken HTTP/3 port stops startup instead of being advertised
+
+The HTTP/3 UDP socket was bound in a background task after startup had
+reported success, and every HTTPS listener was already sending
+`Alt-Svc: h3=":PORT"; ma=86400`. If another process held the port, the only
+sign was a log line; clients cached a day-long promise of a service nobody
+ran. The socket is now bound during startup, next to the TCP listener, and a
+failed bind stops the process with `failed to bind HTTP/3 (UDP) on ADDR`.
+`Alt-Svc` is set only after the bind succeeds, and is withdrawn if the QUIC
+server ever stops. **Upgrading:** a deployment that was silently running
+without HTTP/3 on a taken port now refuses to start; free the port or turn
+HTTP/3 off.
+
 ### 🔤 A site name with a capital letter finds its own certificate
 
 A site written `Example.test` with `tls <cert> <key>` served no certificate at

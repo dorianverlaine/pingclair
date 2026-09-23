@@ -406,6 +406,21 @@ fn covers_suffix(servername: &str, suffix: &str) -> bool {
         .is_some_and(|rest| rest.ends_with('.'))
 }
 
+/// 🔌 Binds an HTTP/3 UDP socket synchronously, ready for [`QuicServer::with_socket`].
+///
+/// Only the bind happens here; nothing reads the socket until
+/// [`QuicServer::run`], and the kernel queues what arrives in between. Binding
+/// at startup is what lets the process answer "is this port served over QUIC"
+/// with a fact rather than an intention: a port someone else holds stops
+/// startup, instead of a log line beside a day-long `Alt-Svc` promise (#106).
+pub fn bind_udp(listen: SocketAddr) -> Result<std::net::UdpSocket, QuicError> {
+    let socket = std::net::UdpSocket::bind(listen)?;
+    // 🌊 Tokio requires a non-blocking socket; a blocking one would stall a
+    // runtime thread on the first empty read.
+    socket.set_nonblocking(true)?;
+    Ok(socket)
+}
+
 /// 🔐 Parses one certificate pair before it reaches the handshake table.
 fn parse_cert_entry(
     name: &str,
@@ -1330,6 +1345,11 @@ pub struct QuicServer {
     certs: Arc<CertTable>,
     connector: Arc<pingora_core::connectors::http::Connector>,
     filter: PingclairConnectionFilter,
+    /// 🔌 A socket bound ahead of time by [`bind_udp`]. Startup binds
+    /// it synchronously, next to the TCP listeners, so a port that is already
+    /// taken stops the process instead of leaving it advertising HTTP/3 it
+    /// cannot serve. `None` means `run` binds the address itself.
+    socket: Option<std::net::UdpSocket>,
 }
 
 impl QuicServer {
@@ -1358,7 +1378,14 @@ impl QuicServer {
                 options,
             ))),
             filter: PingclairConnectionFilter::new(&blocked_ips),
+            socket: None,
         }
+    }
+
+    /// 🔌 Serves on a socket the caller already bound with [`bind_udp`].
+    pub fn with_socket(mut self, socket: std::net::UdpSocket) -> Self {
+        self.socket = Some(socket);
+        self
     }
 
     /// Serve HTTP/3 on this listener until the task is aborted.
@@ -1368,7 +1395,7 @@ impl QuicServer {
     /// per-connection timers. Everything this server still decides — who is
     /// allowed to connect, how many at once, and what HTTP/3 means — lives in
     /// the accept loop below and in [`H3App`].
-    pub async fn run(self) -> Result<(), QuicError> {
+    pub async fn run(mut self) -> Result<(), QuicError> {
         use futures::StreamExt;
 
         let limits = self.proxy.listener_limits();
@@ -1420,7 +1447,10 @@ impl QuicServer {
         // are explicit.
         quic_settings.enable_early_data = false;
 
-        let socket = UdpSocket::bind(self.listen).await?;
+        let socket = match self.socket.take() {
+            Some(socket) => UdpSocket::from_std(socket)?,
+            None => UdpSocket::bind(self.listen).await?,
+        };
         let local_addr = socket.local_addr()?;
 
         let hooks = tokio_quiche::settings::Hooks {
