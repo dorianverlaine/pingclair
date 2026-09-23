@@ -40,16 +40,19 @@ const STAGING_DIRECTORY: &str = ".import-staging";
 
 /// 🏷️ Top-level names a store **this** build writes and Caddy's does not.
 ///
-/// `acme` is the ACME account store and `acme-challenges.json` the challenge
-/// journal every start creates. Together they are what makes an archive
-/// recogniseable as ours rather than merely well-formed tar.
+/// `acme-challenges.json` is the challenge journal every start creates, so it
+/// is in any store a server has run against — which is the only kind an export
+/// can come from.
 ///
-/// 📌 `pki` and `certificates` are deliberately **not** in this list. Both
-/// servers write them now, with the same names inside, so seeing either says
-/// nothing about which server produced an archive. Calling them ours would make
-/// every Caddy export importable; calling them Caddy's would make this build's
-/// own export unimportable.
-const OURS: [&str; 2] = ["acme", "acme-challenges.json"];
+/// 📌 Three names that look like they belong here deliberately do not. `pki`
+/// and `certificates` are written by both servers now, with the same names
+/// inside. `acme` is left out because this build cannot tell a name it owns
+/// from one it happens to share: Caddy stores an ACME account under some
+/// `acme/`-rooted key too, unverified here but plausible enough that relying on
+/// it would risk accepting exactly the archive class this check exists to
+/// refuse — and a check that fails open is worse than no check, because it is
+/// believed.
+const OURS: [&str; 1] = ["acme-challenges.json"];
 
 /// 🏷️ Top-level names only a **Caddy** store export carries.
 ///
@@ -155,6 +158,21 @@ pub(crate) fn import_store<R: Read>(dir: &Path, reader: R) -> anyhow::Result<()>
             continue;
         }
 
+        // 🚫 A store holds regular files and directories, and nothing else, so
+        // an archive entry that is anything else is refused before it is
+        // created. The one that matters is a symbolic link: `unpack` writes it
+        // naming whatever the archive chose, and `commit_staged_store` then
+        // walks *through* it, which would move the contents of the directory it
+        // points at into the store. A store this build wrote contains no links,
+        // so refusing them costs nothing a legitimate archive needs.
+        let kind = entry.header().entry_type();
+        if !matches!(kind, tar::EntryType::Regular | tar::EntryType::Directory) {
+            anyhow::bail!(
+                "❌ Import refused: the archive contains a {kind:?} entry, and a store holds \
+                 only files and directories"
+            );
+        }
+
         let target = staging.path().join(&relative);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)
@@ -210,9 +228,14 @@ impl Staging {
 }
 
 impl Drop for Staging {
-    /// 🧹 A refused import, a bad entry and a commit that failed all leave the
-    /// store as they found it, because the only thing this removes is the
-    /// directory the import itself created.
+    /// 🧹 Removes what is left in the staging directory.
+    ///
+    /// 🚫 This is what leaves the store untouched when an import is *refused*,
+    /// and it is not a transaction. A commit interrupted half way through has
+    /// already renamed some files into the store, and those stay — the store is
+    /// then repaired by whatever notices, rather than rolled back. The one that
+    /// notices is the certificate loader, which will not serve a leaf whose
+    /// chain does not belong to the authority it loaded.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
@@ -224,6 +247,12 @@ impl Drop for Staging {
 /// of a directory onto an existing one fails, and re-importing into a store
 /// that already has a `pki/` tree is the ordinary case. Each move is a rename
 /// within one filesystem, so no file is ever half-copied.
+///
+/// 🛡️ `symlink_metadata` rather than `is_dir`, and `read_dir` rather than a
+/// path join, so that nothing here follows a link out of the staging directory.
+/// [`import_store`] refuses link entries outright; this is the second lock on
+/// the same door, because the first one being forgotten should not silently
+/// turn a walk into "move the operator's home directory into the store".
 fn commit_staged_store(staging: &Path, dir: &Path) -> anyhow::Result<()> {
     let mut stack = vec![staging.to_path_buf()];
     while let Some(current) = stack.pop() {
@@ -236,7 +265,9 @@ fn commit_staged_store(staging: &Path, dir: &Path) -> anyhow::Result<()> {
                 .expect("staged entries are below the staging directory");
             let target = dir.join(relative);
 
-            if path.is_dir() {
+            // 🛡️ `DirEntry::file_type` reports what the directory entry is
+            // rather than what it points at, so a link is never descended into.
+            if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
                 std::fs::create_dir_all(&target)
                     .map_err(|error| anyhow::anyhow!("❌ Import failed: {error}"))?;
                 stack.push(path);
@@ -391,6 +422,15 @@ mod tests {
     /// test is one that arrived from somewhere else. So the 512-byte ustar
     /// header is assembled directly, which is what a hostile archive looks like.
     fn raw_tar_entry(name: &str, data: &[u8]) -> Vec<u8> {
+        raw_tar_member(name, data, b'0', "")
+    }
+
+    /// 🔗 The same, as a symbolic link naming `target` instead of a file.
+    fn raw_tar_symlink(name: &str, target: &str) -> Vec<u8> {
+        raw_tar_member(name, b"", b'2', target)
+    }
+
+    fn raw_tar_member(name: &str, data: &[u8], kind: u8, link: &str) -> Vec<u8> {
         let mut header = [0u8; 512];
         header[..name.len()].copy_from_slice(name.as_bytes());
         header[100..108].copy_from_slice(b"0000600\0");
@@ -398,7 +438,9 @@ mod tests {
         header[116..124].copy_from_slice(b"0000000\0");
         header[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
         header[136..148].copy_from_slice(b"00000000000\0");
-        header[156] = b'0';
+        header[156] = kind;
+        // 🔗 The link name has its own 100-byte field at 157.
+        header[157..157 + link.len()].copy_from_slice(link.as_bytes());
         header[257..263].copy_from_slice(b"ustar\0");
         header[263..265].copy_from_slice(b"00");
         // 🔢 The checksum is computed with its own field read as spaces.
@@ -413,6 +455,34 @@ mod tests {
         // 🏁 Two zero blocks end a tar stream.
         archive.extend_from_slice(&[0u8; 1024]);
         archive
+    }
+
+    /// 🚫 A link entry is refused instead of unpacked.
+    ///
+    /// 🔗 `unpack` writes a symbolic link naming whatever the archive chose, and
+    /// the commit walk would then descend through it — moving the contents of
+    /// the directory it points at into the store. A store this build wrote
+    /// holds only regular files and directories, so refusing links costs a
+    /// legitimate archive nothing.
+    #[test]
+    fn a_link_entry_is_refused() {
+        let destination = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        write(&elsewhere.path().join("personal.key"), "NOT OURS");
+
+        let archive = raw_tar_symlink("pki", elsewhere.path().to_str().unwrap());
+        let error = import_store(destination.path(), archive.as_slice())
+            .expect_err("a link entry must be refused");
+
+        assert!(
+            format!("{error}").contains("only files and directories"),
+            "the refusal must be about the entry's kind: {error}"
+        );
+        assert_untouched(destination.path());
+        assert!(
+            elsewhere.path().join("personal.key").is_file(),
+            "the directory the link named must not have been moved from"
+        );
     }
 
     /// 🚫 A Caddy store export must be refused, and must leave the store alone.

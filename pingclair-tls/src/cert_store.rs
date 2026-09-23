@@ -382,6 +382,15 @@ impl CertStore {
     /// Checked against the cache rather than the directory so that a stale file
     /// left by an interrupted write cannot block a legitimate re-issue, and so
     /// that the answer is the same before and after the write completes.
+    ///
+    /// 📌 The cache lock is released before the write, so two *different* names
+    /// that collide could both pass this check in the same instant and the
+    /// later one would take the file — the overwrite this replaced. Closing
+    /// that would mean holding a lock across an `await`, which this codebase
+    /// treats as a defect rather than a trade: the local authority serialises
+    /// its issuance behind its own state anyway, and a wildcard and a
+    /// look-alike hostname being issued in the same instant is not a case worth
+    /// one.
     async fn refuse_collision(&self, primary_domain: &str) -> Result<(), CertStoreError> {
         let key = self.layout.key_for(primary_domain);
         let cache = self.cache.read().await;
