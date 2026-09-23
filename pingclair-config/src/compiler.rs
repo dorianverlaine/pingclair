@@ -368,6 +368,11 @@ fn compile_encodings(server: &ServerBlock) -> CompileResult<Vec<CoreEncoding>> {
 }
 
 fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
+    // 🗜️ Resolved before the routes are built, because the file servers need the
+    // answer: `encode off` is the directive that opts a whole server out of
+    // response compression, and a file server that compressed anyway made it a
+    // setting that compiled and meant nothing.
+    let site_encodings = compile_encodings(server)?;
     let mut config = ServerConfig {
         name: Some(server.name.clone()),
         names: server.names.clone(),
@@ -405,7 +410,7 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         } else {
             server.gzip_types.clone()
         },
-        encodings: compile_encodings(server)?,
+        encodings: site_encodings,
         error_pages: server.error_pages.iter().cloned().collect(),
         error_routes: Vec::new(),
         vars_routes: Vec::new(),
@@ -566,6 +571,16 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         }
     }
 
+    // 🚫 The same walk downwards for `encode off`. It only ever lowers the flag:
+    // a site that asked for a coding must not have `file_server { compress }`
+    // re-enable compression for itself alone, and a `file_server { compress off }`
+    // is already false, so raising it would be wrong in the other direction.
+    if config.encodings.is_empty() {
+        for route in &mut config.routes {
+            apply_site_compression(&mut route.handler);
+        }
+    }
+
     // Process generic directives for settings like tls, client_max_body_size
     for directive in &server.directives {
         if let Directive::Setting { key, value } = directive {
@@ -614,6 +629,38 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
     }
 
     Ok(config)
+}
+
+/// 🚫 Recursively turns off compression on every file server below `handler`.
+///
+/// 🤡 `encode off` sets the server's coding list to empty and the file server
+/// went on gzipping regardless, because its `compress` flag is a separate
+/// setting with its own default. The directive compiled, the operator saw
+/// `Content-Encoding: gzip`, and nothing anywhere said the two settings were
+/// unrelated — the "silently ignoring a setting" shape this repository treats
+/// as a defect rather than a preference.
+///
+/// 📌 `file_server { compress off }` is unaffected: it is already false, and
+/// this pass never raises the flag, so a site with a coding still honours a file
+/// server that opted out on its own.
+fn apply_site_compression(handler: &mut pingclair_core::config::HandlerConfig) {
+    use pingclair_core::config::HandlerConfig;
+    match handler {
+        HandlerConfig::FileServer { compress, .. } => *compress = false,
+        HandlerConfig::Pipeline { handlers }
+        | HandlerConfig::FirstMatch { handlers }
+        | HandlerConfig::HandlePath { handlers, .. } => {
+            for element in handlers {
+                apply_site_compression(&mut element.handler);
+            }
+        }
+        HandlerConfig::TryFiles { fallback, .. } => {
+            if let Some(fallback) = fallback {
+                apply_site_compression(fallback);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 📂 Recursively replaces a file server's default root with the site root.

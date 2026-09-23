@@ -2959,6 +2959,40 @@ mod fail_closed_tests {
         assert!(file_server_compress(&on));
     }
 
+    /// 🚫 `encode off` is the site-level opt-out and must reach the file server.
+    ///
+    /// 🤡 The adapter's own comment calls `off` "the only way to opt a server
+    /// out of response compression", and the file server gzipped anyway: its
+    /// `compress` flag is a separate setting with its own default. The directive
+    /// compiled, the operator saw `Content-Encoding: gzip`, and nothing said the
+    /// two settings were unrelated.
+    #[test]
+    fn encode_off_reaches_the_file_server() {
+        let off = crate::compile(":80\nencode off\nfile_server")
+            .expect("`encode off` must be accepted at site level");
+        assert!(
+            !file_server_compress(&off),
+            "`encode off` must turn the file server's compression off"
+        );
+
+        // 👍 A site that asked for a coding keeps compressing, so the fix is a
+        // one-way pass rather than "compression is off whenever `encode` exists".
+        let on = crate::compile(":80\nencode gzip zstd\nfile_server").expect("compiles");
+        assert!(
+            file_server_compress(&on),
+            "a site with codings must still compress"
+        );
+
+        // 📌 A site with a coding still honours a file server that opted out on
+        // its own — the pass lowers the flag and never raises it.
+        let per_server = crate::compile(":80\nencode gzip\nfile_server {\n    compress off\n}")
+            .expect("compiles");
+        assert!(
+            !file_server_compress(&per_server),
+            "`file_server {{ compress off }}` must win over the site default"
+        );
+    }
+
     /// 🔎 The `compress` flag of the first `file_server` handler in a config.
     fn file_server_compress(config: &pingclair_core::config::PingclairConfig) -> bool {
         fn find(handler: &pingclair_core::config::HandlerConfig) -> Option<bool> {
