@@ -798,9 +798,14 @@ Directive：
   HTTP/3 在 H3 planner 自備 FastCGI client 之前，會對 FastCGI route 回 501。
 - **憑證與狀態只存在本機磁碟**（`storage`），多個實例無法共用同一份憑證儲存。
 
-`handle_errors` 值得單獨一行：這個型別在程式碼裡存在但什麼都不做，
-所以它是**被拒絕**而不是被接受。自訂錯誤頁請用 `error_page`——
-那是 Pingclair 自己的 directive，不是 Caddy 的。
+`handle_errors` 值得單獨一行，而這一段先前把它寫反了：原文說這個型別「在
+程式碼裡存在但什麼都不做，所以是被拒絕而不是被接受」。它**是被接受的，而且
+會執行**——區塊會處理被拋出的狀態，區塊內的 `{err.status_code}`、
+`{err.status_text}` 與 `{err.message}` 會帶入進入 handler 的那個錯誤。長拼法
+`{http.error.*}` 讀同一組值，因為 Caddy 自己的 adapter 就是在轉換時把短拼法
+改寫成長拼法。只有 `{err.trace}` 與 `{err.id}` 沒有實作：這裡沒有記錄錯誤的
+來源，也沒有這次發生的識別碼，所以那兩個會展開成空字串。自訂錯誤頁也可以用
+`error_page`——那是 Pingclair 自己的 directive，不是 Caddy 的。
 
 > 🔁 只要 parser 拒絕的名字沒出現在這份文件裡，測試就會紅，所以這份清單不會
 > 悄悄落後 parser 查的那張表。README 宣稱一個 binary 沒有的能力，比宣稱得少還糟。

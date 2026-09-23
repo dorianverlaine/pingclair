@@ -851,8 +851,7 @@ immediately after the `101`, both ends seeing EOF with no error.
 - 📝 **Caddyfile compatibility.** Complete directive syntax and matcher
   semantics, Caddy's directive ordering, `handle`/`handle_path` containers, a
   redirect DSL, response templates, and dual-stack (IPv4 + IPv6) wildcard
-  listeners. (`handle_errors` parses but does nothing yet, and is refused
-  rather than silently accepted.)
+  listeners.
 - 🗂️ **`try_files` and `uri` in the Pingclairfile.** The documented
   single-page-application pattern — `root * /srv`, `try_files {path}
   /index.html`, `file_server` — compiles and serves, on HTTP/1.1, HTTP/2 and

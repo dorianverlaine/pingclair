@@ -862,9 +862,17 @@ Pingclair fits at all rather than being details you discover later:
 - **Certificates and state are stored on local disk only** (`storage`), so
   several instances cannot share one certificate store.
 
-`handle_errors` deserves its own line: the type exists in this codebase and
-does nothing, so it is refused rather than accepted. A custom error page comes
-from `error_page`, which is a Pingclair directive rather than a Caddy one.
+`handle_errors` deserves its own line, and this paragraph previously got it
+backwards: it said the block "exists in this codebase and does nothing, so it
+is refused rather than accepted". It is accepted, and it runs — the block
+handles the raised status, and inside it `{err.status_code}`,
+`{err.status_text}` and `{err.message}` carry the error that entered the
+handler. The long spellings `{http.error.*}` resolve from the same values,
+because Caddy's own adapter rewrites the short form into them. `{err.trace}`
+and `{err.id}` are the two that are *not* implemented: nothing here records the
+error's origin or an occurrence identifier, so those two resolve to the empty
+string. A custom error page can also come from `error_page`, which is a
+Pingclair directive rather than a Caddy one.
 
 > 🔁 A test fails if the parser refuses a name this file never mentions, so
 > the list cannot quietly fall behind the table the parser consults. A README

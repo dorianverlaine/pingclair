@@ -883,10 +883,17 @@ Pingclair convient, plutôt que d'être des détails découverts plus tard :
 - **Certificats et état uniquement sur disque local** (`storage`) : plusieurs
   instances ne peuvent pas partager un même magasin de certificats.
 
-`handle_errors` mérite sa propre ligne : le type existe dans ce dépôt et ne
-fait rien, il est donc refusé plutôt qu'accepté. Une page d'erreur
-personnalisée passe par `error_page`, une directive de Pingclair et non de
-Caddy.
+`handle_errors` mérite sa propre ligne, et ce paragraphe disait auparavant
+l'inverse : il affirmait que le type « existe dans ce dépôt et ne fait rien, il
+est donc refusé plutôt qu'accepté ». Il est **accepté, et il s'exécute** — le
+bloc traite le statut remonté, et à l'intérieur `{err.status_code}`,
+`{err.status_text}` et `{err.message}` portent l'erreur qui est entrée dans le
+handler. Les formes longues `{http.error.*}` lisent les mêmes valeurs, parce que
+l'adaptateur de Caddy réécrit la forme courte en forme longue. Seuls
+`{err.trace}` et `{err.id}` ne sont pas implémentés : rien ici n'enregistre
+l'origine de l'erreur ni un identifiant d'occurrence, ils s'étendent donc en
+chaîne vide. Une page d'erreur personnalisée peut aussi passer par `error_page`,
+une directive de Pingclair et non de Caddy.
 
 > 🔁 Un test échoue dès que l'analyseur refuse un nom que ce fichier ne
 > mentionne pas : la liste ne peut donc pas prendre du retard sur la table que
