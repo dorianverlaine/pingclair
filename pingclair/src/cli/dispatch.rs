@@ -1003,10 +1003,6 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                     .map_err(|error| anyhow::anyhow!("❌ Failed to adapt <stdin>: {error}"))?
             } else {
                 let config_path = resolve_config_path(config.as_deref());
-                // 🧩 `adapt` converts; it does not validate. That is the whole
-                // difference from `validate` and `run`, and it matches
-                // upstream's `caddy adapt` — `--validate` runs the checks for
-                // anyone who wants them here.
                 (if std::path::Path::new(&config_path).is_dir() {
                     pingclair_config::adapt_directory(&config_path)
                 } else {
@@ -1014,10 +1010,24 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 })
                 .map_err(|error| anyhow::anyhow!("❌ Failed to adapt {config_path}: {error}"))?
             };
-            if validate {
-                pingclair_config::compiler::validate_config(&config)
-                    .map_err(|error| anyhow::anyhow!("❌ Validation failed: {error}"))?;
-            }
+            // 🧩 `adapt` checks what it prints.
+            //
+            // 🤡 It used to convert and stop there, which made a green `adapt`
+            // mean "this parses" and nothing more. A migration script that ran
+            // `adapt` to see whether a Caddyfile was ready got exit 0 for
+            // `preferred_chains`, loaded the server, and watched it refuse to
+            // start with `Cannot honour this setting` — the worst possible
+            // ordering, because the refusal arrives after the cutover.
+            //
+            // 📌 This is deliberately stricter than `caddy adapt`, which
+            // validates only when asked. The difference is that this tool's
+            // output is a document this server is expected to load, and a
+            // document that cannot be provisioned is not a useful thing to
+            // print. `--validate` is still accepted so an existing script that
+            // passes it keeps working; it no longer changes anything.
+            pingclair_config::compiler::validate_config(&config)
+                .map_err(|error| anyhow::anyhow!("❌ Validation failed: {error}"))?;
+            let _ = validate;
             let json = if pretty {
                 serde_json::to_string_pretty(&config)
             } else {

@@ -776,6 +776,24 @@ example.com {
 }
 ```
 
+### `adapt` 產出什麼、不產出什麼
+
+`pingclair adapt -c Pingclairfile` 把設定編譯後以 JSON 印出。那份文件是
+**Pingclair 自己的格式**，不是 Caddy 的：它的頂層是
+`debug`/`servers`/`admin`/`global`/`logging`，Caddy 的是 `{"apps":{…}}`；
+它的 handler 寫成 `{"type":"respond"}`，Caddy 的寫成
+`{"handler":"static_response"}`。兩者沒有共用的頂層鍵、也沒有共用的 handler
+名字，所以：
+
+- 這份輸出**可以**被本伺服器載入——`pingclair validate <檔案.json>`、
+  `run --config <檔案.json>`、`POST /load` 都吃這個格式，而 `adapt` 在印出前
+  先驗證過，正是為了保證這件事。
+- 這份輸出**不能**被 Caddy 載入，`caddy adapt` 的輸出在這裡也讀不了。放在
+  倉庫裡的 `caddy adapt` 產物是那份 Caddy 設定的紀錄，不是本伺服器讀得懂的
+  東西；要搬移就保留 Caddyfile，那是兩邊都解析的格式。
+- 把 Pingclairfile 手動改寫成 `adapt` 的輸出，可以在 Pingclair 之間搬移——
+  容器、GitOps 倉庫、另一台機器——那才是 JSON 格式存在的理由。
+
 ### 片段與 import
 
 片段（snippet）是以 `(name) { … }` 定義、用 `import name` 引用的可重用片段。

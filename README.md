@@ -861,6 +861,26 @@ example.com {
 }
 ```
 
+### What `adapt` produces, and what it does not
+
+`pingclair adapt -c Pingclairfile` compiles the configuration and prints it as
+JSON. That document is **Pingclair's own format**, not Caddy's: its top level is
+`debug`/`servers`/`admin`/`global`/`logging`, where Caddy's is `{"apps":{…}}`,
+and its handlers are named `{"type":"respond"}` where Caddy's are
+`{"handler":"static_response"}`. The two share no top-level key and no handler
+name, so:
+
+- The output **is** loadable by this server — `pingclair validate <file.json>`,
+  `run --config <file.json>`, and `POST /load` all take it, and `adapt` checks
+  it before printing for exactly that reason.
+- The output is **not** loadable by Caddy, and `caddy adapt`'s output is not
+  loadable here. A `caddy adapt` artifact kept in a repository is a record of
+  the Caddy configuration, not something this server can read; migrating means
+  keeping the Caddyfile, which is what both servers parse.
+- A `Pingclairfile` translated *by hand* into `pingclair adapt`'s output is
+  portable between Pingclair installations — a container, a GitOps repository,
+  another machine — which is the case the JSON format exists for.
+
 ### Snippets and imports
 
 A snippet is a reusable fragment `(name) { … }` pulled in with `import name`.

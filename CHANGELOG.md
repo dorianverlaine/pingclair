@@ -149,6 +149,24 @@ A client may send `Connection` as two field lines, such as
 read only the first line, decided the request was not a WebSocket handshake,
 and stripped `Connection` and `Upgrade` before the origin saw them, so the
 upgrade silently failed. Every line is now read.
+### 🧩 `adapt` validates what it prints
+
+`pingclair adapt` converted a Pingclairfile and exited 0 without checking the
+result, so a migration script that used it to decide whether a configuration was
+ready got a green light for a site the server then refused to start. The two
+commands disagreed in the direction that hurts: `adapt` accepted what `validate`
+rejected, and the refusal arrived after the cutover, not before it.
+
+`adapt` now runs the same validation `validate` does before printing anything,
+so an exit code of 0 means the document this build produced is one this build
+can load. `--validate` is still accepted and no longer changes anything, so a
+script that passes it keeps working.
+
+The output is Pingclair's own JSON, not Caddy's `{"apps":…}`, and the README now
+says so explicitly — including the consequence, which is that `caddy adapt`'s
+output cannot be loaded here and this output cannot be loaded by Caddy. Migrating
+means keeping the Caddyfile that both servers can read.
+
 ### 🗜️ A site compresses only where `encode` asks
 
 A static site — `root *` plus `file_server`, nothing else — answered

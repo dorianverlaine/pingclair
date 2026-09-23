@@ -6725,6 +6725,107 @@ fn cli_adapt_and_validate_read_stdin() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("is valid"));
 }
 
+/// 🔁 Whatever `adapt` prints must be a document `validate` accepts.
+///
+/// 🤡 The two commands used to answer different questions: `adapt` serialised
+/// its output and exited 0 for a site `validate` refuses, so a migration script
+/// that checked a Caddyfile with `adapt` got a green light for a server that
+/// would not start. Checking the round trip on every build is what keeps the
+/// two from drifting apart again — the assertion is not "adapt succeeds" but
+/// "adapt's stdout is a document this build can load".
+#[test]
+fn cli_adapt_output_loads_back_through_validate() {
+    use std::process::Command;
+
+    let bin = env!("CARGO_BIN_EXE_pingclair");
+    let dir = tempfile::tempdir().expect("test directory");
+    let source = dir.path().join("round-trip.Caddyfile");
+    let adapted_path = dir.path().join("round-trip.json");
+    std::fs::write(
+        &source,
+        ":8080 {\n\troot * /srv\n\tencode gzip\n\tfile_server\n}\n",
+    )
+    .expect("write the source file");
+
+    let adapted = Command::new(bin)
+        .args(["adapt", "-c"])
+        .arg(&source)
+        .output()
+        .expect("run adapt");
+    assert!(
+        adapted.status.success(),
+        "adapt failed: {}",
+        String::from_utf8_lossy(&adapted.stderr)
+    );
+    std::fs::write(&adapted_path, &adapted.stdout).expect("write adapt's output");
+
+    let validated = Command::new(bin)
+        .arg("validate")
+        .arg(&adapted_path)
+        .output()
+        .expect("run validate");
+    assert!(
+        validated.status.success(),
+        "adapt printed a document validate refuses, so the two disagree about \
+         what a loadable configuration is:\n{}",
+        String::from_utf8_lossy(&validated.stderr)
+    );
+}
+
+/// 🚫 `adapt` and `validate` agree about `preferred_chains`.
+///
+/// 🤡 They used to disagree, in the direction that hurts: `adapt` exited 0 for
+/// a site using a setting this build cannot honour, and `validate` — the step
+/// that decides whether the server can start — exited 1. A migration script
+/// that checked a Caddyfile with `adapt` therefore got a green light for a
+/// server that would refuse to start, and the refusal arrived after cutover.
+///
+/// 📌 Both commands are asserted here rather than just `adapt`, because the fix
+/// works by making `adapt` run the same validation `validate` does; a change
+/// that closed the gap by loosening `validate` instead would satisfy one half
+/// of this test and fail the other.
+#[test]
+fn cli_adapt_and_validate_both_refuse_preferred_chains() {
+    use std::process::Command;
+
+    let bin = env!("CARGO_BIN_EXE_pingclair");
+    let dir = tempfile::tempdir().expect("test directory");
+    let source = dir.path().join("preferred-chains.Caddyfile");
+    std::fs::write(
+        &source,
+        "{\n\tpreferred_chains smallest\n}\n:8080 {\n\trespond \"hi\"\n}\n",
+    )
+    .expect("write the source file");
+
+    let adapted = Command::new(bin)
+        .args(["adapt", "-c"])
+        .arg(&source)
+        .output()
+        .expect("run adapt");
+    assert!(
+        !adapted.status.success(),
+        "adapt must refuse a setting the server cannot honour, instead of \
+         printing a document `run` will reject. stderr: {}",
+        String::from_utf8_lossy(&adapted.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&adapted.stderr).contains("preferred_chains"),
+        "the refusal must name the setting: {}",
+        String::from_utf8_lossy(&adapted.stderr)
+    );
+
+    let validated = Command::new(bin)
+        .arg("validate")
+        .arg(&source)
+        .output()
+        .expect("run validate");
+    assert!(
+        !validated.status.success(),
+        "validate must keep refusing it. stderr: {}",
+        String::from_utf8_lossy(&validated.stderr)
+    );
+}
+
 /// 🧪 `hash-password --algorithm argon2id` emits a Caddy-compatible hash.
 #[test]
 fn cli_hash_password_argon2id() {

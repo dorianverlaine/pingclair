@@ -279,7 +279,13 @@ pub(crate) enum Commands {
         config: Option<String>,
     },
 
-    /// Adapt a Pingclairfile to JSON and print it, like `caddy adapt`
+    /// Adapt a Pingclairfile to JSON and print it in this server's own schema
+    ///
+    /// 🚫 Unlike `caddy adapt`, the output is not Caddy's `{"apps":…}` shape
+    /// and Caddy cannot load it: it is the configuration format that
+    /// `validate`, `run` and the admin API's `/load` all take. The two schemas
+    /// share no top-level key and no handler name, so `adapt`'s output is
+    /// portable between Pingclair installations and not between servers.
     Adapt {
         /// Path to the configuration file (defaults to Pingclairfile or
         /// Caddyfile in the current directory)
@@ -290,7 +296,7 @@ pub(crate) enum Commands {
         #[arg(short, long)]
         pretty: bool,
 
-        /// Validate the adapted configuration (certificate files etc.)
+        /// Accepted for compatibility; `adapt` always validates its output now
         #[arg(long)]
         validate: bool,
     },
