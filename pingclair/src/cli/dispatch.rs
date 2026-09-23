@@ -19,6 +19,7 @@ use crate::cli::admin::{admin_request, trust_internal_ca};
 use crate::cli::service::manage_system_service;
 use crate::paths::{
     CONFIG_CANDIDATES, DefaultConfig, resolve_config_path, resolve_default_config, tls_store_dir,
+    tls_store_dir_with,
 };
 use crate::run::run_server;
 
@@ -286,6 +287,91 @@ fn format_directives(directives: &[pingclair_config::parser::caddy_ast::Directiv
     out
 }
 
+/// 🗄️ The store a command should work on.
+///
+/// 📌 `--config` is Caddy's flag on both storage commands, and it is the only
+/// way to say *which* store without the environment: the configuration's
+/// `storage file_system <path>` decides, and without a configuration this
+/// resolves `$PINGCLAIR_TLS_STORE` and then the platform convention, exactly as
+/// it did before the flag existed.
+fn store_dir_for(config: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
+    let Some(path) = config.filter(|path| !path.is_empty()) else {
+        return Ok(tls_store_dir());
+    };
+    let compiled = pingclair_config::compile_file(path)
+        .map_err(|error| anyhow::anyhow!("❌ Cannot read {path}: {error}"))?;
+    Ok(tls_store_dir_with(compiled.global.storage_path.as_deref()))
+}
+
+/// 📦 `storage export` — one body for both spellings.
+fn storage_export(output: &str, config: Option<&str>) -> anyhow::Result<()> {
+    let dir = store_dir_for(config)?;
+    if !dir.is_dir() {
+        anyhow::bail!("❌ No store found at {}", dir.display());
+    }
+    if output == "-" {
+        return crate::cli::storage::export_store(&dir, std::io::stdout()).map(|_| ());
+    }
+    // 🔐 Owner-only from creation, not from a later `chmod`. This archive
+    // contains the TLS store — the internal CA's private key, every issued
+    // certificate's key, and the ACME account key. A plain `File::create` makes
+    // it `0644` under the ordinary umask, and even a `chmod` straight afterwards
+    // leaves a window in which another local user can open it and keep reading
+    // through the descriptor after the mode changes.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(output)
+        .map_err(|error| anyhow::anyhow!("❌ Cannot create {output}: {error}"))?;
+    // 🧹 An existing file keeps its own mode, because `mode` only applies at
+    // creation. Say so rather than leaving the operator to discover that
+    // overwriting a `0644` file kept it readable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = file
+            .metadata()
+            .map(|metadata| metadata.permissions().mode() & 0o777)
+            .unwrap_or(0);
+        if mode & 0o077 != 0 {
+            eprintln!(
+                "⚠️ {output} already existed with mode {mode:o}; it holds private keys and is \
+                 readable beyond its owner. Remove it and export again, or chmod 600 it now."
+            );
+        }
+    }
+    let file = crate::cli::storage::export_store(&dir, file)?;
+    // 💾 Durable before the success line: an operator who is told the export
+    // succeeded will delete the source.
+    file.sync_all()
+        .map_err(|error| anyhow::anyhow!("❌ Export could not be flushed: {error}"))?;
+    println!("✅ Store exported to {output}");
+    Ok(())
+}
+
+/// 📦 `storage import` — one body for both spellings.
+fn storage_import(input: &str, config: Option<&str>) -> anyhow::Result<()> {
+    let dir = store_dir_for(config)?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| anyhow::anyhow!("❌ Cannot create {}: {error}", dir.display()))?;
+    let file: Box<dyn std::io::Read> = if input == "-" {
+        Box::new(std::io::stdin())
+    } else {
+        Box::new(
+            std::fs::File::open(input)
+                .map_err(|error| anyhow::anyhow!("❌ Cannot open {input}: {error}"))?,
+        )
+    };
+    crate::cli::storage::import_store(&dir, file)?;
+    println!("✅ Store imported into {}", dir.display());
+    Ok(())
+}
+
 /// 🎛️ Runs one subcommand.
 pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
     match command {
@@ -523,71 +609,20 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
             println!("✅ Man page written to {}", path.display());
         }
 
-        Commands::StorageExport { output } => {
-            let dir = tls_store_dir();
-            if !dir.is_dir() {
-                anyhow::bail!("❌ No store found at {}", dir.display());
+        // 🗄️ The nested spelling, which is Caddy's. Both spellings call the
+        // same two functions, so a change to either cannot land on only one.
+        Commands::Storage { command } => match command {
+            super::StorageCommand::Export { output, config } => {
+                storage_export(&output, config.as_deref())?
             }
-            if output == "-" {
-                crate::cli::storage::export_store(&dir, std::io::stdout())?;
-            } else {
-                // 🔐 Owner-only from creation, not from a later `chmod`. This
-                // archive contains the TLS store — the internal CA's private key,
-                // every issued certificate's key, and the ACME account key. A
-                // plain `File::create` makes it `0644` under the ordinary umask,
-                // and even a `chmod` straight afterwards leaves a window in which
-                // another local user can open it and keep reading through the
-                // descriptor after the mode changes.
-                let mut options = std::fs::OpenOptions::new();
-                options.write(true).create(true).truncate(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(0o600);
-                }
-                let file = options
-                    .open(&output)
-                    .map_err(|error| anyhow::anyhow!("❌ Cannot create {output}: {error}"))?;
-                // 🧹 An existing file keeps its own mode, because `mode` only
-                // applies at creation. Say so rather than leaving the operator to
-                // discover that overwriting a `0644` file kept it readable.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    let mode = file
-                        .metadata()
-                        .map(|metadata| metadata.permissions().mode() & 0o777)
-                        .unwrap_or(0);
-                    if mode & 0o077 != 0 {
-                        eprintln!(
-                            "⚠️ {output} already existed with mode {mode:o}; it holds private                              keys and is readable beyond its owner. Remove it and export again,                              or chmod 600 it now."
-                        );
-                    }
-                }
-                let file = crate::cli::storage::export_store(&dir, file)?;
-                // 💾 Durable before the success line: an operator who is told the
-                // export succeeded will delete the source.
-                file.sync_all()
-                    .map_err(|error| anyhow::anyhow!("❌ Export could not be flushed: {error}"))?;
-                println!("✅ Store exported to {output}");
+            super::StorageCommand::Import { input, config } => {
+                storage_import(&input, config.as_deref())?
             }
-        }
+        },
 
-        Commands::StorageImport { input } => {
-            let dir = tls_store_dir();
-            std::fs::create_dir_all(&dir)
-                .map_err(|error| anyhow::anyhow!("❌ Cannot create {}: {error}", dir.display()))?;
-            let file: Box<dyn std::io::Read> = if input == "-" {
-                Box::new(std::io::stdin())
-            } else {
-                Box::new(
-                    std::fs::File::open(&input)
-                        .map_err(|error| anyhow::anyhow!("❌ Cannot open {input}: {error}"))?,
-                )
-            };
-            crate::cli::storage::import_store(&dir, file)?;
-            println!("✅ Store imported into {}", dir.display());
-        }
+        Commands::StorageExport { output, config } => storage_export(&output, config.as_deref())?,
+
+        Commands::StorageImport { input, config } => storage_import(&input, config.as_deref())?,
 
         Commands::Trust => trust_internal_ca(true)?,
         Commands::Untrust => trust_internal_ca(false)?,

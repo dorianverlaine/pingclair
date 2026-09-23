@@ -9986,6 +9986,89 @@ async fn spawn_body_measuring_origin() -> (SocketAddr, tokio::task::JoinHandle<(
     (address, task)
 }
 
+/// 🗄️ `storage export`/`import` are nested and take `--config`, like Caddy's.
+///
+/// 🤡 They were flat top-level commands with no configuration argument, so a
+/// runbook written against `caddy storage export --config …` broke on the shape
+/// before it ever reached the tarball format — and the store could only be
+/// chosen through `$PINGCLAIR_TLS_STORE`, which a script could not set from the
+/// configuration it was working with.
+///
+/// 📌 Both spellings are asserted, because the flat ones are kept for scripts
+/// that already use them and a fix that landed on only one would be invisible
+/// until someone's runbook failed.
+#[test]
+fn storage_commands_are_nested_and_read_the_config() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("thestore");
+    let config = directory.path().join("store.Caddyfile");
+    std::fs::write(
+        &config,
+        format!(
+            "{{\n\tstorage file_system {}\n}}\n:0 {{\n\trespond \"ok\"\n}}\n",
+            store.display()
+        ),
+    )
+    .unwrap();
+    // 🗂️ A store holding one file this build reads, enough to export.
+    std::fs::create_dir_all(store.join("internal")).unwrap();
+    std::fs::write(store.join("internal/root.crt"), "ROOTCRT").unwrap();
+
+    let tarball = directory.path().join("out.tar");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pingclair"))
+            .args(args)
+            .output()
+            .expect("the binary must run")
+    };
+
+    // 🧭 The nested spelling is the one a Caddy runbook uses.
+    assert!(
+        run(&[
+            "storage",
+            "export",
+            "--config",
+            config.to_str().unwrap(),
+            "--output",
+            tarball.to_str().unwrap(),
+        ])
+        .status
+        .success()
+    );
+
+    // 🎯 …and importing it back lands in the store the *configuration* names,
+    // not in the environment's default.
+    std::fs::remove_file(store.join("internal/root.crt")).unwrap();
+    let imported = run(&[
+        "storage",
+        "import",
+        "--config",
+        config.to_str().unwrap(),
+        "--input",
+        tarball.to_str().unwrap(),
+    ]);
+    assert!(imported.status.success());
+    assert_eq!(
+        std::fs::read_to_string(store.join("internal/root.crt")).unwrap(),
+        "ROOTCRT"
+    );
+
+    // 🔁 The flat spellings still work, with `--config` and without.
+    std::fs::remove_file(store.join("internal/root.crt")).unwrap();
+    assert!(
+        run(&[
+            "storage-import",
+            "--config",
+            config.to_str().unwrap(),
+            "--input",
+            tarball.to_str().unwrap(),
+        ])
+        .status
+        .success()
+    );
+    assert!(store.join("internal/root.crt").exists());
+}
+
 /// 🎨 `fmt` is a check as well as a formatter, and its flags are Caddy's.
 ///
 /// 🤡 It always exited 0, so a pipeline of the shape `caddy fmt --overwrite &&

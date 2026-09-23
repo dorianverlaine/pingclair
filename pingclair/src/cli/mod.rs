@@ -123,12 +123,30 @@ pub(crate) enum Commands {
         directory: String,
     },
 
+    /// Move the TLS/config store to a tarball and back, like `caddy storage`
+    ///
+    /// `pingclair storage export` / `pingclair storage import` are the same two
+    /// commands as the flat `storage-export` / `storage-import` spellings, which
+    /// are kept so existing scripts keep working.
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommand,
+    },
+
     /// Export the TLS/config store to a tarball, like `caddy storage export`
     #[command(name = "storage-export")]
     StorageExport {
         /// Output tarball path (`-` for stdout)
         #[arg(short, long)]
         output: String,
+
+        /// Configuration file naming the store to export
+        ///
+        /// The configuration's `storage file_system <path>` decides where the
+        /// store is; without one this resolves `$PINGCLAIR_TLS_STORE` and then
+        /// the platform convention, which is what it always did.
+        #[arg(short, long)]
+        config: Option<String>,
     },
 
     /// Import a previously exported store tarball, like `caddy storage import`
@@ -137,6 +155,10 @@ pub(crate) enum Commands {
         /// Input tarball path (`-` for stdin)
         #[arg(short, long)]
         input: String,
+
+        /// Configuration file naming the store to import into
+        #[arg(short, long)]
+        config: Option<String>,
     },
 
     /// Install the internal CA root certificate into the system trust store
@@ -320,6 +342,32 @@ pub(crate) enum Commands {
     Service {
         #[command(subcommand)]
         action: ServiceAction,
+    },
+}
+
+/// 🗄️ The two halves of `pingclair storage`, matching `caddy storage`.
+#[derive(Subcommand)]
+pub(crate) enum StorageCommand {
+    /// Export the configured store to a tarball, like `caddy storage export`
+    Export {
+        /// Output tarball path (`-` for stdout)
+        #[arg(short, long)]
+        output: String,
+
+        /// Configuration file naming the store to export
+        #[arg(short, long)]
+        config: Option<String>,
+    },
+
+    /// Import a tarball into the configured store, like `caddy storage import`
+    Import {
+        /// Input tarball path (`-` for stdin)
+        #[arg(short, long)]
+        input: String,
+
+        /// Configuration file naming the store to import into
+        #[arg(short, long)]
+        config: Option<String>,
     },
 }
 
