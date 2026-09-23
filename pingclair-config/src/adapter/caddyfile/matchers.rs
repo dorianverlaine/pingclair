@@ -114,11 +114,18 @@ pub(super) fn first_argument_is_data(d: &Directive) -> bool {
         // document root is an extension of ours, while the format it extends
         // reads that argument as a path matcher. Both cannot be true.
         //
-        // Narrowed to the non-glob form, because `file_server /downloads/*` has
-        // always been a matcher here and still is — so only the shape that is
-        // genuinely ambiguous stays on the extension's side. Until the conflict
-        // is decided, this is the place that records it.
-        "file_server" => !first.contains('*'),
+        // Narrowed to the non-glob, non-named form, because `file_server
+        // /downloads/*` has always been a matcher here and still is — so only
+        // the shape that is genuinely ambiguous stays on the extension's side.
+        // Until the conflict is decided, this is the place that records it.
+        //
+        // 📌 `@name` is excluded from the ambiguity rather than included in it:
+        // a `@`-prefixed token cannot be a filesystem path, so nothing is lost
+        // by reading it as a matcher, and the definition check then runs. The
+        // alternative is what this used to do — drop the token, compile a
+        // matcher-less file server, and serve every path in the site with
+        // nothing in the log to say a typo had widened the scope.
+        "file_server" => !first.contains('*') && !first.starts_with('@'),
         // 🗂️ `try_files` accepts no matcher token at all — upstream registers
         // it as a plain directive rather than a handler directive, so *every*
         // argument is a candidate ("notice no matcher tokens accepted",

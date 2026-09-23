@@ -661,6 +661,46 @@ mod global_tests {
         }
     }
 
+    /// 🚫 A misspelled matcher on `file_server` must fail the whole
+    /// configuration, not widen what the file server serves.
+    ///
+    /// 🤡 `file_server @nope` used to be accepted with empty stderr and a
+    /// matcher-less file server, which is the unsafe direction: the operator
+    /// believes one subtree is handled and the whole site is. A `@`-prefixed
+    /// token cannot be a filesystem path, so there is no ambiguity to preserve
+    /// here — it is a matcher, and an undefined one is an error.
+    #[test]
+    fn file_server_with_an_undefined_matcher_is_refused() {
+        let message = crate::compile(":8080 {\n\troot * /srv\n\tfile_server @nope\n}")
+            .expect_err("`file_server @nope` must be refused")
+            .to_string();
+        assert!(
+            message.contains("nope") && message.contains("not defined"),
+            "the refusal must name the undefined matcher: {message}"
+        );
+    }
+
+    /// 🧭 The scope check applies to a matcher that *is* defined, so the arm
+    /// above narrowed the first argument rather than removing the ability to
+    /// match at all: `file_server @files` still compiles with its path matcher
+    /// intact and its root untouched.
+    #[test]
+    fn file_server_with_a_defined_matcher_keeps_both() {
+        let routes = compiled_routes(
+            r#"
+            :8080 {
+                @files path /downloads/*
+                file_server @files
+            }
+        "#,
+        );
+        let matched = routes
+            .iter()
+            .find(|route| route.path.contains("downloads"))
+            .expect("the matcher must survive as the route path");
+        assert_eq!(matched.path, "/downloads/*");
+    }
+
     // ---- tls server directive ----
 
     #[test]
