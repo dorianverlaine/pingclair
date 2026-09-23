@@ -20,6 +20,16 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🧊 Compression adds to `Vary` instead of replacing it
+
+A proxied response that Pingclair compressed had its `Vary` field overwritten
+with `Vary: Accept-Encoding`, erasing whatever the origin or the CORS policy
+had put there — `Vary: Cookie` on a signed-in page, `Vary: Origin` on a CORS
+grant. A shared cache or CDN in front of Pingclair then stored the page keyed
+on the coding alone and could serve one user's response to another.
+Compression now appends `Accept-Encoding` to the existing list, never repeats
+it, and leaves `Vary: *` alone.
+
 ### 🪪 `identity` takes part in `Accept-Encoding` negotiation
 
 The unencoded body was never ranked against the codings, so a client's view of

@@ -17,7 +17,7 @@ use tokio::io::AsyncWriteExt;
 
 /// 🧪 Starts an origin that answers every connection with `response` and
 /// counts how many requests reached it.
-async fn spawn_scripted_origin(response: Vec<u8>) -> (SocketAddr, Arc<AtomicUsize>) {
+pub(super) async fn spawn_scripted_origin(response: Vec<u8>) -> (SocketAddr, Arc<AtomicUsize>) {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
@@ -44,7 +44,7 @@ async fn spawn_scripted_origin(response: Vec<u8>) -> (SocketAddr, Arc<AtomicUsiz
 }
 
 /// 📄 A single proxied site; `options` goes inside the `reverse_proxy` block.
-fn proxy_pingclairfile(upstream: SocketAddr, options: &str) -> String {
+pub(super) fn proxy_pingclairfile(upstream: SocketAddr, options: &str) -> String {
     format!(
         r#"
         {{
@@ -63,7 +63,7 @@ fn proxy_pingclairfile(upstream: SocketAddr, options: &str) -> String {
     )
 }
 
-fn gunzip(bytes: &[u8]) -> String {
+pub(super) fn gunzip(bytes: &[u8]) -> String {
     use std::io::Read;
     let mut decoded = String::new();
     flate2::read::GzDecoder::new(bytes)

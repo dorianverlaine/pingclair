@@ -7516,7 +7516,7 @@ impl ProxyHttp for PingclairProxy {
                         upstream_response.insert_header("Content-Encoding", token)?;
                         let _ = upstream_response.remove_header("Content-Length");
                         // Transfer-Encoding: chunked will be set by Pingora automatically
-                        upstream_response.insert_header("Vary", "Accept-Encoding")?;
+                        crate::response_encoding::vary_on_accept_encoding(upstream_response)?;
                     }
                     Err(e) => {
                         tracing::warn!(

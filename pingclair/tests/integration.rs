@@ -14334,3 +14334,9 @@ async fn raw_get_with_host(address: SocketAddr, target: &str, authority: &str) -
 // 🧬 Kept in a sibling file so this high-touch module does not keep growing.
 #[path = "integration/response_pipeline.rs"]
 mod response_pipeline;
+
+// MARK: - Compression gate
+
+// 🗜️ Which responses the proxy may re-encode, kept in a sibling file.
+#[path = "integration/compression_gate.rs"]
+mod compression_gate;

@@ -23,6 +23,7 @@
 
 use bytes::Bytes;
 use pingora_core::modules::http::{HttpModule, HttpModuleBuilder, HttpModuleCtx, Module};
+use pingora_http::ResponseHeader;
 
 use crate::encoding::{ResponseEncoder, stream_chunk};
 
@@ -57,6 +58,42 @@ pub(crate) fn install(modules: &mut HttpModuleCtx, encoder: ResponseEncoder) -> 
     }
 }
 
+/// 🔍 Yields every comma-separated token of every `name` field line,
+/// trimmed, without allocating.
+///
+/// 📌 A list-valued field may arrive as several lines or as one line with
+/// commas; both spellings mean the same list (RFC 9110 §5.3), so every
+/// question about such a field has to read all of them.
+fn field_tokens<'a>(header: &'a ResponseHeader, name: &'a str) -> impl Iterator<Item = &'a str> {
+    header
+        .headers
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+}
+
+/// 🧊 Adds `Accept-Encoding` to the response's `Vary` without disturbing what
+/// is already there.
+///
+/// 🛡️ Replacing the field instead erased `Vary: Origin` from a CORS response
+/// and `Vary: Cookie` from a personalised one. A shared cache then keyed the
+/// stored copy on the coding alone and handed one user's response — or one
+/// origin's CORS grant — to the next client that asked for the same coding.
+/// `Vary: *` already says no two requests share a response, so it is left
+/// alone, and a field that already names `Accept-Encoding` is not repeated.
+pub(crate) fn vary_on_accept_encoding(header: &mut ResponseHeader) -> pingora_core::Result<()> {
+    let covered = field_tokens(header, "vary")
+        .any(|token| token == "*" || token.eq_ignore_ascii_case("accept-encoding"));
+    if covered {
+        return Ok(());
+    }
+    // 🔗 A second field line joins the existing list; no need to rebuild it.
+    header.append_header("Vary", "Accept-Encoding")?;
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl HttpModule for ResponseEncodingModule {
     fn response_body_filter(
@@ -82,5 +119,49 @@ impl HttpModule for ResponseEncodingModule {
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(vary: &[&str]) -> ResponseHeader {
+        let mut header = ResponseHeader::build(200, None).unwrap();
+        for value in vary {
+            header.append_header("Vary", *value).unwrap();
+        }
+        header
+    }
+
+    fn vary_lines(header: &ResponseHeader) -> Vec<&str> {
+        header
+            .headers
+            .get_all("vary")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect()
+    }
+
+    /// 🛡️ Every rule the compressor has to respect when it announces that the
+    /// response now varies by coding.
+    #[test]
+    fn vary_keeps_existing_members_and_never_repeats_accept_encoding() {
+        let cases: [(&[&str], &[&str]); 6] = [
+            (&[], &["Accept-Encoding"]),
+            (&["Origin"], &["Origin", "Accept-Encoding"]),
+            (&["Cookie, Origin"], &["Cookie, Origin", "Accept-Encoding"]),
+            (
+                &["Origin", "accept-encoding"],
+                &["Origin", "accept-encoding"],
+            ),
+            (&["Origin, Accept-Encoding"], &["Origin, Accept-Encoding"]),
+            (&["*"], &["*"]),
+        ];
+        for (before, after) in cases {
+            let mut header = response(before);
+            vary_on_accept_encoding(&mut header).unwrap();
+            assert_eq!(vary_lines(&header), after, "starting from {before:?}");
+        }
     }
 }
