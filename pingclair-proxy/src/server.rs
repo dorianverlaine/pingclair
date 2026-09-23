@@ -2954,14 +2954,7 @@ impl PingclairProxy {
             return false;
         }
         // 🚫 A client asking to bypass the cache is asking the shared cache too.
-        request
-            .headers
-            .get("cache-control")
-            .and_then(|value| value.to_str().ok())
-            .is_none_or(|value| {
-                let value = value.to_ascii_lowercase();
-                !value.contains("no-store") && !value.contains("no-cache")
-            })
+        !request_cache_control_bypasses_cache(&request.headers)
     }
 
     /// 🔎 Borrows the matched route's reverse-proxy configuration.
@@ -5753,6 +5746,23 @@ fn cache_key_primary(host: &str, path_and_query: &str) -> Vec<u8> {
     primary.extend_from_slice(&(path_and_query.len() as u64).to_be_bytes());
     primary.extend_from_slice(path_and_query.as_bytes());
     primary
+}
+
+/// 🚫 Recognizes only cache-bypass directives, across every field line, without
+/// mistaking an extension name or a directive value for a request to bypass.
+fn request_cache_control_bypasses_cache(headers: &http::HeaderMap) -> bool {
+    headers
+        .get_all(http::header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|directive| {
+            let name = directive
+                .split_once('=')
+                .map_or(directive, |(name, _)| name);
+            let name = name.trim();
+            name.eq_ignore_ascii_case("no-store") || name.eq_ignore_ascii_case("no-cache")
+        })
 }
 
 /// 🔮 Remembers which keys turned out to be uncacheable, so the next request
@@ -10999,6 +11009,30 @@ mod response_cache_tests {
 
     fn fresh() -> SystemTime {
         SystemTime::now() + StdDuration::from_secs(3600)
+    }
+
+    /// 🚫 Only directive names request a bypass; values and extension names
+    /// must not turn an otherwise reusable response into an origin request.
+    #[test]
+    fn request_cache_control_matches_directive_names_across_field_lines() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            "cache-control",
+            "max-age=0, X-No-Cache-Foo".parse().unwrap(),
+        );
+        assert!(!request_cache_control_bypasses_cache(&headers));
+
+        headers.append("cache-control", "  NO-StOrE  ".parse().unwrap());
+        assert!(request_cache_control_bypasses_cache(&headers));
+
+        headers.clear();
+        headers.append("cache-control", "max-age=0".parse().unwrap());
+        headers.append("cache-control", " No-CaChE=\"field\" ".parse().unwrap());
+        assert!(request_cache_control_bypasses_cache(&headers));
+
+        headers.clear();
+        headers.append("cache-control", "extension=\"no-store\"".parse().unwrap());
+        assert!(!request_cache_control_bypasses_cache(&headers));
     }
 
     /// 📏 The ceiling has to actually evict, not merely be recorded.

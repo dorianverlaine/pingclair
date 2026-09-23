@@ -155,6 +155,14 @@ either does what it says or explains why it cannot.
   refused rather than served — which is the same thing `listen …
   proxy_protocol` has always done.
 
+### 🗄️ Request cache directives match by name across all field lines
+
+A request whose `Cache-Control` extension merely contained `no-cache` or
+`no-store` in its name or value bypassed the response cache. Pingclair now
+recognizes only those directive names, without a per-request lowercase copy,
+and checks every `Cache-Control` field line. A named `no-cache` directive also
+works with a field-name value.
+
 ### 🔌 A taken HTTP/3 port stops startup instead of being advertised
 
 The HTTP/3 UDP socket was bound in a background task after startup had
