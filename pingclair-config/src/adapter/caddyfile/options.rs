@@ -534,18 +534,16 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                         }
                     }
                 }
-                // 🚩 An unrecognised global directive is a typo, and a silently
-                // ignored typo is a silently missing setting. `trusted_proxis`
-                // would have meant "no trusted proxies at all" while reading
-                // like the opposite — the same shape as `encode gzipp` and
-                // `listen :443 proxy_protocol`, both of which were fixed for
-                // exactly this reason.
-                //
-                // 🚫 Options that are real Caddy syntax but not implemented
-                // here get a distinct message so a migrating Caddyfile is not
-                // mistaken for a typo.
                 // 🧢 `servers { listener_wrappers { … } }` names the wrappers
                 // that wrap every listener of every server declared here.
+                // `expand_servers_block` lifts the block's children to this
+                // level, so the option arrives here as if it had been written
+                // beside `protocols`.
+                //
+                // 📌 What it means is decided name by name in
+                // `parse_listener_wrappers`: the wrapper whose meaning this
+                // build has is honoured, and the rest are refused by name with
+                // the reason rather than accepted and dropped.
                 "listener_wrappers" => {
                     // 📌 No argument may precede the block: `listener_wrappers
                     // proxy_protocol { … }` is not a spelling upstream reads.
@@ -564,16 +562,27 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                     };
                     global.listener_proxy_protocol = parse_listener_wrappers(&block)?;
                 }
-                // 🏷️ `servers { … }` sub-options that belong to a listener
-                // rather than to the whole server. They read as typos before
+                // 🚩 An unrecognised global directive is a typo, and a silently
+                // ignored typo is a silently missing setting. `trusted_proxis`
+                // would have meant "no trusted proxies at all" while reading
+                // like the opposite — the same shape as `encode gzipp` and
+                // `listen :443 proxy_protocol`, both of which were fixed for
+                // exactly this reason.
+                //
+                // 🚫 Options that are real Caddy syntax but not implemented
+                // here get a distinct message so a migrating Caddyfile is not
+                // mistaken for a typo.
+                //
+                // 🏷️ `timeouts` is one of those, and it belongs to a listener
+                // rather than to the whole server: it read as a typo before
                 // because `expand_servers_block` lifts the block's children to
-                // this level, where no arm knew them and the fallback below
-                // found them in neither list — so the operator was told they
-                // had invented a word that Caddy loads.
+                // this level, where no arm knew it and the fallback below found
+                // it in neither list — so the operator was told they had
+                // invented a word that Caddy loads.
                 //
                 // 📌 Named and refused rather than implemented: per-listener
                 // timeouts need a capability this build does not have, and the
-                // message says which one rather than calling it unknown.
+                // message says so rather than calling it unknown.
                 "timeouts" => {
                     if sub.block.is_none() {
                         return Err(AdapterError::InvalidArgument(
