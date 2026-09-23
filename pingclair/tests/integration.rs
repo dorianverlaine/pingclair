@@ -131,6 +131,20 @@ impl TestServer {
             !config.contains("__PINGCLAIR_TEST_"),
             "Pingclairfile test fixture contains an unresolved placeholder"
         );
+        // 🔌 An HTTPS site gets an automatic plaintext companion, and without
+        // `http_port` that companion claims port 80. Parallel tests then race
+        // for one port and every loser exits on the failed bind, which shows up
+        // as "server failed to start" in whatever the test was really about.
+        assert!(
+            !config_template
+                .lines()
+                .any(|line| line.trim_start().starts_with("https://"))
+                || config_template.contains("__PINGCLAIR_TEST_HTTP_PORT__")
+                || config_template.contains("auto_https off"),
+            "a Pingclairfile fixture with an HTTPS site must set \
+             `http_port __PINGCLAIR_TEST_HTTP_PORT__` (or `auto_https off`), \
+             or its plaintext companion claims port 80"
+        );
 
         let mut file = std::fs::File::create(&config_path).unwrap();
         file.write_all(config.as_bytes()).unwrap();
@@ -5524,6 +5538,7 @@ async fn test_pingclairfile_wildcard_internal_tls_serves_subdomains() {
     let config = r#"
         {
             admin off
+            http_port __PINGCLAIR_TEST_HTTP_PORT__
         }
 
         https://*.sandbox.test:__PINGCLAIR_TEST_PORT__ {
@@ -5562,6 +5577,7 @@ async fn test_pingclairfile_internal_tls_serves_trusted_h1_and_h2() {
     let config = r#"
         {
             admin off
+            http_port __PINGCLAIR_TEST_HTTP_PORT__
         }
 
         https://portfolio.test:__PINGCLAIR_TEST_PORT__ {
@@ -8323,6 +8339,7 @@ async fn test_tls_handshake_sends_the_intermediate_not_just_the_leaf() {
         r#"
         {{
             admin off
+            http_port __PINGCLAIR_TEST_HTTP_PORT__
         }}
 
         https://chained.test:__PINGCLAIR_TEST_PORT__ {{
@@ -11984,6 +12001,7 @@ async fn test_default_sni_serves_clients_that_send_no_sni() {
     let with_default = r#"
         {
             admin off
+            http_port __PINGCLAIR_TEST_HTTP_PORT__
             default_sni sni.sandbox.test
         }
 
@@ -12029,6 +12047,7 @@ async fn test_default_sni_serves_clients_that_send_no_sni() {
     let without_default = r#"
         {
             admin off
+            http_port __PINGCLAIR_TEST_HTTP_PORT__
         }
 
         https://sni.sandbox.test:__PINGCLAIR_TEST_PORT__ {
@@ -14069,6 +14088,7 @@ async fn test_tls_on_an_unusual_port_still_reports_https() {
     let config = r#"
         {
             admin off
+            http_port __PINGCLAIR_TEST_HTTP_PORT__
         }
 
         https://scheme.test:__PINGCLAIR_TEST_PORT__ {
