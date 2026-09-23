@@ -20,6 +20,15 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🌊 Compressed HTTP/1.1 responses keep the connection open
+
+A proxied response that Pingclair compressed for an HTTP/1.1 client lost its
+`Content-Length` and gained no `Transfer-Encoding`, so its end was signalled by
+closing the connection — right after `Connection: keep-alive` had told the
+client it could reuse it. Every compressed response cost a new connection, and
+a client could not tell a complete body from a cut one. Compressed HTTP/1.1
+responses are now sent with `Transfer-Encoding: chunked`.
+
 ### 🧹 Compression drops the origin's digest fields
 
 When Pingclair compressed a proxied response it forwarded the origin's

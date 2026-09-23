@@ -230,3 +230,34 @@ async fn test_compression_drops_origin_digests() {
     }
     assert_eq!(gunzip(&reply.bytes().await.unwrap()), body);
 }
+
+/// 🌊 A compressed HTTP/1.1 response is chunked, so the keep-alive the
+/// proxy announced actually holds.
+///
+/// Dropping `Content-Length` without adding chunked framing left the body
+/// ending at connection close, right after `Connection: keep-alive` promised
+/// the client it could reuse the connection.
+#[tokio::test]
+async fn test_compressed_http1_response_is_chunked() {
+    let body = compressible_body();
+    let (origin, _hits) = spawn_scripted_origin(origin_reply("200 OK", "", &body)).await;
+    let mut server = TestServer::new_pingclairfile(&proxy_pingclairfile(origin, ""));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .http1_only()
+        .build()
+        .unwrap();
+
+    let reply = client
+        .get(server.url(0, "/page"))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.headers().get("content-encoding").unwrap(), "gzip");
+    assert_eq!(reply.headers().get("transfer-encoding").unwrap(), "chunked");
+    assert_eq!(reply.headers().get("connection").unwrap(), "keep-alive");
+    assert!(reply.headers().get("content-length").is_none());
+    assert_eq!(gunzip(&reply.bytes().await.unwrap()), body);
+}

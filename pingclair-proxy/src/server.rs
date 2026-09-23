@@ -7524,7 +7524,16 @@ impl ProxyHttp for PingclairProxy {
                         upstream_response.insert_header("Content-Encoding", token)?;
                         let _ = upstream_response.remove_header("Content-Length");
                         crate::response_encoding::drop_integrity_fields(upstream_response);
-                        // Transfer-Encoding: chunked will be set by Pingora automatically
+                        // 🌊 With Content-Length gone, HTTP/1.1 needs explicit
+                        // chunked framing. Pingora only adds it before this
+                        // filter runs, and has already promised keep-alive,
+                        // so leaving it out ends the body by closing a
+                        // connection the client was told would stay open.
+                        // HTTP/1.0 has no chunked coding and closes anyway;
+                        // Pingora's H2 writer strips the field itself.
+                        if session.req_header().version == http::Version::HTTP_11 {
+                            upstream_response.insert_header("Transfer-Encoding", "chunked")?;
+                        }
                         crate::response_encoding::vary_on_accept_encoding(upstream_response)?;
                     }
                     Err(e) => {
