@@ -900,10 +900,20 @@ un délai total de 250 ms, sans garantie de durabilité. Le journal système ajo
 ### Ce qui n'est pas encore pris en charge
 
 Pingclair se dit compatible Caddyfile ; la moitié honnête de cette affirmation
-consiste à dire où elle s'arrête. Chaque nom ci-dessous est **reconnu** :
-l'écrire produit une erreur disant que la fonctionnalité manque, jamais une
-faute de frappe supposée et jamais un silence. Une configuration qui les
-utilise ne démarre pas.
+consiste à dire où elle s'arrête. Les noms des listes ci-dessous sont
+**reconnus** : les écrire produit une erreur qui nomme la fonctionnalité plutôt
+que le mot, jamais un `Unknown directive`, et une configuration qui les utilise
+ne démarre pas.
+
+📌 La promesse porte sur **ces noms, et rien d'autre**. Elle ne dit rien d'une
+sous-option ni d'une orthographe *à l'intérieur* d'un bloc, et ce n'est pas une
+échappatoire : chacun de ces cas a son propre traitement, énoncé là où il
+appartient. Le bloc `tls { … }` liste plus bas les options qu'il refuse ; la
+section sur la grammaire des journaux dit quelles formes un bloc `log` accepte ;
+un `log { … }` global sans nom y est refusé ; et une directive peut être
+acceptée à un niveau et refusée à un autre. Une phrase qui prétendrait davantage
+promettrait une propriété de toute la surface de configuration, ce que cette
+section existe précisément pour éviter.
 
 Directives :
 

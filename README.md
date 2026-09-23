@@ -893,9 +893,18 @@ request to a system journal also incurs the journal receiver's processing cost.
 ### What is not supported yet
 
 Pingclair calls itself Caddyfile-compatible, so the honest half of that claim
-is saying where it stops. Every name below is **recognised**: writing one is
-refused with a message saying the feature is missing, never mistaken for a
-typo and never quietly ignored. A configuration using them does not start.
+is saying where it stops. The names in the lists below are **recognised**:
+writing one is an error that names the feature rather than the word, never an
+`Unknown directive`, and a configuration using one does not start.
+
+📌 The promise is about **these names and nothing else**. It says nothing about
+a sub-option or about a spelling *inside* a block, and that is not a loophole —
+each of those has its own treatment stated where it belongs. The `tls { … }`
+block lists its refused options below; the Logging grammar section says which
+shapes a `log` block takes; an unnamed global `log { … }` is refused there; and
+a directive can be accepted at one level and refused at another. A sentence that
+claimed more would be promising a property of the whole configuration surface,
+which is the kind of claim this section exists to avoid making.
 
 Directives:
 
