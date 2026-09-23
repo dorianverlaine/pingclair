@@ -44,13 +44,20 @@ use std::time::{Duration, Instant};
 /// meaningful memory.
 const QUEUE_DEPTH: usize = 8192;
 
+/// 🚿 A barrier acknowledges the records accepted before it, even though the
+/// global subscriber keeps its sender alive for the lifetime of the process.
+enum WriterMessage {
+    Record(Vec<u8>),
+    Flush(SyncSender<bool>),
+}
+
 /// 📝 A `MakeWriter` that enqueues each record for a background writer thread.
 ///
 /// Cloning shares one queue, which is what `fmt::layer` needs: it calls the
 /// make-writer once per event.
 #[derive(Clone)]
 pub(crate) struct NonBlockingWriter {
-    tx: SyncSender<Vec<u8>>,
+    tx: SyncSender<WriterMessage>,
     dropped: Arc<AtomicU64>,
 }
 
@@ -60,26 +67,32 @@ impl NonBlockingWriter {
     /// The [`WriterGuard`] is kept by this module rather than handed back: the
     /// server leaves through `std::process::exit`, which runs no destructors,
     /// so a guard the caller had to remember to drop would be forgotten on
-    /// exactly the path that carries the most records. [`drain`] is the way to
-    /// finish the queue from such an exit — see `WriterGuard::shutdown` for why
-    /// the wait is bounded rather than a plain `join`.
+    /// exactly the path that carries the most records. [`drain`] waits for an
+    /// acknowledged barrier without joining a thread whose sender is global.
     pub(crate) fn spawn() -> Self {
-        let (tx, rx) = sync_channel::<Vec<u8>>(QUEUE_DEPTH);
+        let (tx, rx) = sync_channel::<WriterMessage>(QUEUE_DEPTH);
         let tx_guard = tx.clone();
         let dropped = Arc::new(AtomicU64::new(0));
 
-        let thread = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("pingclair-log".to_string())
             .spawn(move || {
                 let stdout = io::stdout();
-                while let Ok(record) = rx.recv() {
-                    // 🔐 One lock per record, not per byte: the escape
-                    // sequences a formatter emits are only valid as a whole
-                    // record, so records have to be written atomically relative
-                    // to each other.
-                    let mut out = stdout.lock();
-                    let _ = out.write_all(&record);
-                    let _ = out.flush();
+                let mut healthy = true;
+                while let Ok(message) = rx.recv() {
+                    match message {
+                        WriterMessage::Record(record) => {
+                            // 🔐 One lock per record keeps concurrent stdout
+                            // writers from splitting a formatted log line.
+                            let mut out = stdout.lock();
+                            if out.write_all(&record).and_then(|_| out.flush()).is_err() {
+                                healthy = false;
+                            }
+                        }
+                        WriterMessage::Flush(ack) => {
+                            let _ = ack.send(healthy);
+                        }
+                    }
                 }
             })
             .expect("spawning the log writer thread");
@@ -87,7 +100,6 @@ impl NonBlockingWriter {
         *PARKED.lock().unwrap_or_else(|e| e.into_inner()) = Some(WriterGuard {
             dropped: Arc::clone(&dropped),
             tx: Some(tx_guard),
-            thread: Some(thread),
         });
 
         Self { tx, dropped }
@@ -103,12 +115,9 @@ static PARKED: Mutex<Option<WriterGuard>> = Mutex::new(None);
 
 /// 🚿 Finishes the log writer from an exit path that runs no destructors.
 ///
-/// Closing the queue and waiting a bounded moment for it to drain is what
-/// [`WriterGuard`]'s own `Drop` does on every normal return, and the CLI
-/// subcommands leave that way. The server cannot: it ends at
-/// `std::process::exit`, whose whole purpose is to skip that work, so its
-/// shutdown path calls this instead — otherwise the records still queued when
-/// the process leaves are simply lost.
+/// [`WriterGuard`] sends a barrier and waits a bounded moment for its reply.
+/// The server ends at `std::process::exit`, which skips `Drop`, so its shutdown
+/// path calls this explicitly rather than abandoning queued records.
 pub(crate) fn drain() {
     // 🧹 Taken out of the slot first. The wait inside is bounded at 250 ms, and
     // holding the lock across it would block a `spawn` for that long.
@@ -140,7 +149,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for NonBlockingWriter {
 /// matters, because the alternative is a mutex on the logging path this module
 /// exists to keep off the request path.
 pub(crate) struct QueueWriter {
-    tx: SyncSender<Vec<u8>>,
+    tx: SyncSender<WriterMessage>,
     dropped: Arc<AtomicU64>,
     buf: Vec<u8>,
 }
@@ -162,7 +171,7 @@ impl Drop for QueueWriter {
             return;
         }
         let record = std::mem::take(&mut self.buf);
-        match self.tx.try_send(record) {
+        match self.tx.try_send(WriterMessage::Record(record)) {
             Ok(()) => {}
             // 🛡️ Report and drop rather than block the caller.
             Err(TrySendError::Full(_)) => {
@@ -175,45 +184,55 @@ impl Drop for QueueWriter {
 
 /// 🧹 Keeps the writer thread alive, and drains what is queued on shutdown.
 ///
-/// ⚠️ Shutdown does **not** join the writer, and that is not a shortcut. The
-/// subscriber is installed with `set_global_default`, which parks senders in a
-/// `OnceLock` that is never dropped, so the channel does not disconnect on its
-/// own. An earlier version joined unconditionally and hung every short-lived
-/// run — `pingclair adapt` and `pingclair validate`, which is most of the CLI
-/// test suite, sat there until the runner's timeout. A server that never exits
-/// would never notice; a command that should exit immediately notices at once.
-///
-/// So the guard drops its own sender and waits a bounded moment for the writer
-/// to drain, then stops waiting. Losing the tail of the log on an unclean exit
-/// is strictly better than never exiting.
+/// ⚠️ The global subscriber retains senders in a `OnceLock`, so the worker
+/// cannot finish merely because this guard drops its sender. A barrier reports
+/// when preceding records have actually reached stdout; waiting for its reply
+/// is bounded so a blocked sink cannot hang shutdown.
 ///
 /// 📌 The guard lives in [`PARKED`] rather than in the caller's hand, so that
 /// the drain is reachable from an exit that drops nothing — see [`drain`].
 pub(crate) struct WriterGuard {
     dropped: Arc<AtomicU64>,
-    tx: Option<SyncSender<Vec<u8>>>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    tx: Option<SyncSender<WriterMessage>>,
 }
 
 impl WriterGuard {
     /// How long to let the writer drain before giving up on it.
     const DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
-    /// Close this guard's sender and wait briefly for the queue to drain.
+    /// 🚿 Wait for accepted records to reach stdout, then close this sender.
     ///
     /// Named rather than inlined into `Drop` because it is the shutdown the
     /// documentation above is about, and because it is the whole reason the
     /// wait is bounded.
     fn shutdown(&mut self) {
-        // Dropping our sender is what asks the writer to finish; the process's
-        // exit removes the thread if the drain did not.
+        let deadline = Instant::now() + Self::DRAIN_TIMEOUT;
+        let drained = if let Some(tx) = self.tx.as_ref() {
+            let (ack, wait) = sync_channel(1);
+            let mut message = WriterMessage::Flush(ack);
+            let sent = loop {
+                match tx.try_send(message) {
+                    Ok(()) => break true,
+                    Err(TrySendError::Full(returned)) => {
+                        if Instant::now() >= deadline {
+                            break false;
+                        }
+                        message = returned;
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(TrySendError::Disconnected(_)) => break false,
+                }
+            };
+            sent && matches!(
+                wait.recv_timeout(deadline.saturating_duration_since(Instant::now())),
+                Ok(true)
+            )
+        } else {
+            true
+        };
         drop(self.tx.take());
-
-        if let Some(thread) = &self.thread {
-            let deadline = Instant::now() + Self::DRAIN_TIMEOUT;
-            while !thread.is_finished() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(5));
-            }
+        if !drained {
+            eprintln!("⚠️ Trace log drain exceeded the shutdown budget or stdout failed");
         }
 
         let dropped = self.dropped.load(Ordering::Relaxed);
@@ -226,5 +245,30 @@ impl WriterGuard {
 impl Drop for WriterGuard {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_blocked_log_sink_cannot_hold_shutdown_open() {
+        let (tx, _receiver) = sync_channel(1);
+        assert!(
+            tx.try_send(WriterMessage::Record(vec![b'x'])).is_ok(),
+            "the one queue slot accepts a record"
+        );
+        let mut guard = WriterGuard {
+            dropped: Arc::new(AtomicU64::new(0)),
+            tx: Some(tx),
+        };
+
+        let started = Instant::now();
+        guard.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a blocked stdout must not hang shutdown"
+        );
     }
 }

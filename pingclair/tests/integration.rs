@@ -14822,16 +14822,14 @@ async fn test_tls_on_an_unusual_port_still_reports_https() {
 ///   `O_NONBLOCK` lives on the open file description. Setting it on the
 ///   child's stdout would make its writes fail instead of wait — the exact
 ///   opposite of what this test needs.
-/// - the reader starts a beat after the signal, because the record has to be
-///   *inside* the write that cannot finish rather than merely queued behind
-///   it. Reading any earlier drains the pipe first and lets the writer
-///   through, which is the behavior under test; on a loaded machine the wait
-///   can only be too short (the test then misses the defect), never too long
-///   (it would have to outlast the writer's 250 ms drain budget to fail here).
+/// - the reader starts after the server's `STOPPING=1` notification, which
+///   follows the shutdown log event. A fixed sleep can overrun the drain's
+///   250 ms budget on a busy CI runner and turn a successful shutdown red.
 #[cfg(unix)]
 #[tokio::test]
 async fn test_sigterm_drains_the_log_queue_before_exit() {
     use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::net::UnixDatagram;
     use std::os::unix::process::CommandExt as _;
 
     let dir = tempfile::tempdir().expect("a test directory");
@@ -14844,6 +14842,11 @@ async fn test_sigterm_drains_the_log_queue_before_exit() {
         created.success(),
         "mkfifo could not create the fixture fifo"
     );
+    let notify_path = dir.path().join("notify.sock");
+    let notify = UnixDatagram::bind(&notify_path).expect("the systemd notification socket binds");
+    notify
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("the notification socket timeout is set");
 
     // 🚰 Opening a FIFO for writing waits for a reader, so the read end opens
     // first and then holds still until the pipe is full and the signal has
@@ -14893,6 +14896,7 @@ async fn test_sigterm_drains_the_log_queue_before_exit() {
         // subscriber's floor without `RUST_LOG` is ERROR.
         .env("RUST_LOG", "info")
         .env("PINGCLAIR_TLS_STORE", &tls_store)
+        .env("NOTIFY_SOCKET", &notify_path)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(
             std::fs::File::create(&stderr_path).expect("the stderr capture"),
@@ -14962,7 +14966,20 @@ async fn test_sigterm_drains_the_log_queue_before_exit() {
     // signal constant from libc; a refusal is reported, never ignored.
     let sent = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     assert_eq!(sent, 0, "SIGTERM must reach the server");
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut notification = [0u8; 256];
+    loop {
+        let length = match notify.recv(&mut notification) {
+            Ok(length) => length,
+            Err(error) => {
+                terminate_process_group(&mut child, "log drain fixture");
+                start_reading.send(()).expect("the reader is waiting");
+                panic!("the server did not announce shutdown: {error}");
+            }
+        };
+        if notification[..length].starts_with(b"STOPPING=1") {
+            break;
+        }
+    }
     start_reading.send(()).expect("the reader is waiting");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
