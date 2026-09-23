@@ -711,6 +711,17 @@ Une requête vers un vrai fichier obtient ce fichier ; tout le reste est réécr
 vers `/index.html` pour que l'application fasse son propre routage. La query
 string survit à la réécriture.
 
+🏷️ L'`ETag` d'un fichier statique dérive de **sa taille et de son mtime en
+nanosecondes** — `"<taille hex>-<mtime ns hex>"`, avec `-gzip` et compagnie
+ajouté pour une représentation codée — ou d'un fichier sidecar quand le site en
+maintient un. Caddy envoie à la place un court hachage du contenu : déplacer un
+site de l'un à l'autre change donc le validateur de **tous** les fichiers d'un
+coup, et chaque `If-None-Match` qui aurait répondu `304` répond `200` à la
+requête suivante. S'aligner sur Caddy impliquerait de lire chaque fichier pour le
+hacher, un coût sur le chemin de requête qui n'a pas été mesuré ; le format est
+donc écrit ici pour que la migration soit un événement connu plutôt qu'une
+surprise de bande passante.
+
 📦 **La compression est active par défaut**, et l'exemple ci-dessus ne l'active
 pas : `encode gzip` y est redondant pour un site `file_server`, puisque l'encodeur
 défaut est `gzip`. Une réponse `text/*` est compressée

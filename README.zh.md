@@ -645,6 +645,13 @@ example.com {
 請求打到真實檔案就送那個檔案，其餘一律改寫成 `/index.html`，交給前端自己路由。
 改寫會保留 query string。
 
+🏷️ 靜態檔案的 `ETag` 由**檔案大小與奈秒級 mtime** 推導
+（`"<size hex>-<mtime nanos hex>"`；有編碼的回應會加上 `-gzip` 之類的後綴），
+若站台有 sidecar 檔則以它為準。Caddy 送的是內容的短雜湊，所以在兩者之間搬移
+站台會一次改變**每個檔案**的 validator，下一個請求裡所有本來該回 `304` 的
+`If-None-Match` 都會回 `200`。要對齊 Caddy 就得讀檔算雜湊，那是尚未量測過的
+請求路徑成本；格式寫在這裡，讓那次搬移是「已知事件」而不是頻寬意外。
+
 📦 **壓縮預設就是開的**，上面那段範例並沒有把它打開：對 `file_server` 站台而言
 `encode gzip` 是多餘的，因為預設編碼器就是 `gzip`。只要用戶端的
 `Accept-Encoding` 允許，`text/*` 回應就會被壓縮，並帶上 `Content-Encoding` 與

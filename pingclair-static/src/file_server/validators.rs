@@ -208,6 +208,44 @@ mod tests {
         );
     }
 
+    /// 🕰️ Two writes inside the same second must not share a tag.
+    ///
+    /// 🤡 The mtime component used to be whole seconds, so a deploy that wrote
+    /// the same file twice within one second left the second version with the
+    /// first one's validator: an `If-None-Match` from a client that had already
+    /// fetched the old bytes answered `304`, and the client kept the stale copy
+    /// for as long as the tag held. Nanoseconds are what buys the distinction,
+    /// and this is the assertion of that property rather than of the string
+    /// format.
+    #[test]
+    fn a_second_write_inside_the_same_second_gets_a_different_tag() {
+        // 🔢 Same size, same whole second, one nanosecond apart: this is the
+        // pair whole-second resolution could not tell apart, and the pair a
+        // deploy that writes a file twice in quick succession produces.
+        let first = EntityTags::derive(0x1f, 1_700_000_000_000_000_000, None);
+        let next_nanosecond = EntityTags::derive(0x1f, 1_700_000_000_000_000_001, None);
+        assert_eq!(
+            first.for_coding(None).to_str().unwrap().split('-').next(),
+            next_nanosecond
+                .for_coding(None)
+                .to_str()
+                .unwrap()
+                .split('-')
+                .next(),
+            "the size half is the same, so only the time half can distinguish these"
+        );
+        assert_ne!(
+            first.for_coding(None),
+            next_nanosecond.for_coding(None),
+            "a same-size edit inside one second must change the validator"
+        );
+
+        // 📌 And a later second still differs, so the fix was not bought by
+        // dropping the time component out of the tag.
+        let next_second = EntityTags::derive(0x1f, 1_700_000_001_000_000_000, None);
+        assert_ne!(first.for_coding(None), next_second.for_coding(None));
+    }
+
     #[test]
     fn a_sidecar_tag_keeps_its_own_shape_per_coding() {
         let strong = EntityTags::derive(1, 1, Some("\"abc\"".to_string()));

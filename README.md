@@ -713,6 +713,16 @@ A request for a real file gets that file; anything else is rewritten to
 `/index.html` so the application can route it. The query string survives the
 rewrite.
 
+🏷️ A static file's `ETag` is derived from **its size and its modification time
+in nanoseconds** — `"<size hex>-<mtime nanos hex>"`, with `-gzip` and friends
+appended for a coded representation — or from a sidecar file when the site keeps
+one. Caddy sends a short hash of the content instead, so moving a site between
+the two changes every file's validator at once and every `If-None-Match` that
+would have answered `304` answers `200` on the next request. Matching Caddy
+would mean reading each file to hash it, which is a request-path cost that has
+not been measured; the format is stated here so the migration is a known event
+rather than a bandwidth surprise.
+
 📦 **Compression is on by default**, and that example does not turn it on:
 `encode gzip` above is redundant for a `file_server` site, because the default
 default encoder is `gzip`. A `text/*` response is compressed whenever
