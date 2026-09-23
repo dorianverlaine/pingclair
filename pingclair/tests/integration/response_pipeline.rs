@@ -126,3 +126,37 @@ async fn test_cached_entry_is_stored_uncompressed_and_encoded_per_client() {
         "both later requests must have been cache hits"
     );
 }
+
+/// 💡 An upstream `103 Early Hints` cannot decide how the final body is coded.
+///
+/// The hint names a compressible type, the final response is a PNG. The
+/// compression decision used to run on the hint as well, arm an encoder for
+/// the whole request, and leave the PNG gzip-compressed under headers that
+/// announce no coding at all.
+#[tokio::test]
+async fn test_early_hints_do_not_choose_the_final_coding() {
+    let png: Vec<u8> = (0..300u32).map(|index| (index * 7 % 251) as u8).collect();
+    let mut response = format!(
+        "HTTP/1.1 103 Early Hints\r\nContent-Type: text/html\r\nLink: </a.css>; rel=preload\r\n\r\n\
+         HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        png.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(&png);
+    let (origin, _hits) = spawn_scripted_origin(response).await;
+    let mut server = TestServer::new_pingclairfile(&proxy_pingclairfile(origin, ""));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let reply = no_proxy_client()
+        .get(server.url(0, "/image.png"))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 200);
+    assert!(
+        reply.headers().get("content-encoding").is_none(),
+        "the final response declined compression and must say so"
+    );
+    assert_eq!(reply.bytes().await.unwrap().as_ref(), png.as_slice());
+}

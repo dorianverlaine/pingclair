@@ -7488,7 +7488,14 @@ impl ProxyHttp for PingclairProxy {
         //   - Response is not already compressed
         //   - Content type is compressible (text/*, application/json, etc.)
         //   - Body is not too small (> 256 bytes via Content-Length)
-        if let Some(encoding) = ctx.negotiated_encoding
+        //
+        // 💡 An informational response (a `103 Early Hints`, say) passes
+        // through this filter too, but it has no body and only predicts the
+        // final response's fields (RFC 8297 §2). Letting it decide would arm
+        // an encoder for the final body while leaving the final header, which
+        // may have declined compression, announcing no coding at all.
+        if !upstream_response.status.is_informational()
+            && let Some(encoding) = ctx.negotiated_encoding
             && !ctx.streaming_response
             && ctx.intercepted_response.is_none()
         {

@@ -29,6 +29,15 @@ bytes with another's headers. Compression now runs after the cache, on the way
 out to each client: the store keeps the origin's bytes, a client that asks for
 gzip gets gzip, and a client that asks for nothing gets the original body.
 
+### 💡 An upstream `103 Early Hints` no longer decides the final body's coding
+
+When an upstream sent a `103` naming a compressible type ahead of a final
+response that should not be compressed (an image, say), the H1/H2 proxy
+compressed the final body anyway and sent it under headers announcing no
+coding, so the client received bytes it could not read. Informational
+responses are now skipped by the compression decision; only the final
+response's own headers choose the coding.
+
 ### 🪟 `file_server` honours `If-Range`
 
 A client resuming a download sends `Range` with `If-Range`, naming the version
