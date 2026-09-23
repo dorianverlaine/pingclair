@@ -78,6 +78,14 @@ and error pages went out without it, and a proxied reply kept whatever the
 upstream sent. Every final HTTP/3 response now carries this server's `Date`,
 from the same clock the other transports use, replacing an upstream's value.
 
+### 🔐 `forward_auth` accepts upstream TLS in Pingclairfiles
+
+`forward_auth { transport http { … } }` now accepts the same TLS options as
+`reverse_proxy`: `tls`, `tls_server_name`, `tls_trusted_ca_certs`,
+`tls_client_auth`, and `tls_insecure_skip_verify`. The auth subrequest uses
+that policy for its upstream connection; unsupported transport options still
+fail configuration loading. Legacy JSON keeps its default TLS policy.
+
 ### 🧩 Site middleware reaches self-answering routes
 
 Unmatched site-level middleware such as `header`, `request_header`,
@@ -2223,11 +2231,6 @@ immediately after the `101`, both ends seeing EOF with no error.
   main route, including its fail-closed case: trust material that cannot be
   loaded refuses the exchange rather than quietly dialling with system trust and
   no identity. Found by review, and `0.2.0-dev` only.
-
-  📌 Only the JSON and Admin paths could reach this. The Caddyfile's
-  `forward_auth` accepts `uri` and `copy_headers` and rejects anything else, so
-  upstream TLS for a subrequest cannot be written in the DSL at all — a gap worth
-  closing separately, but one that fails closed today.
 
 - 🏠 **One capital letter in `Host` could move a request to a different site.**
   Virtual hosts were looked up by comparing the bytes of the client's `Host` or

@@ -157,45 +157,12 @@ pub(super) fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError>
                                             transport.write_timeout =
                                                 Some(parse_required_duration(t_sub)?);
                                         }
-                                        "tls" => {
-                                            expect_no_arguments(t_sub)?;
-                                            transport.tls.enable = true;
-                                        }
-                                        "tls_server_name" => {
-                                            transport.tls.server_name =
-                                                Some(expect_one_argument(t_sub)?.to_string());
-                                        }
-                                        "tls_trusted_ca_certs" => {
-                                            if t_sub.args.is_empty() {
-                                                return Err(AdapterError::ArgumentCount(
-                                                    "tls_trusted_ca_certs".into(),
-                                                    1,
-                                                    0,
-                                                ));
-                                            }
-                                            transport
-                                                .tls
-                                                .trusted_ca_certs
-                                                .extend(t_sub.args.iter().cloned());
-                                        }
-                                        "tls_client_auth" => {
-                                            // 🎫 Both halves are required together: a
-                                            // certificate without its key silently
-                                            // becomes an anonymous handshake that the
-                                            // upstream rejects much later.
-                                            if t_sub.args.len() != 2 {
-                                                return Err(AdapterError::ArgumentCount(
-                                                    "tls_client_auth".into(),
-                                                    2,
-                                                    t_sub.args.len(),
-                                                ));
-                                            }
-                                            transport.tls.client_cert = Some(t_sub.args[0].clone());
-                                            transport.tls.client_key = Some(t_sub.args[1].clone());
-                                        }
-                                        "tls_insecure_skip_verify" => {
-                                            expect_no_arguments(t_sub)?;
-                                            transport.tls.insecure_skip_verify = true;
+                                        "tls"
+                                        | "tls_server_name"
+                                        | "tls_trusted_ca_certs"
+                                        | "tls_client_auth"
+                                        | "tls_insecure_skip_verify" => {
+                                            parse_http_tls_option(t_sub, &mut transport.tls)?;
                                         }
                                         // 🔌 Caddy's transport spells the connect and
                                         // response-header timeouts under different
@@ -1106,6 +1073,53 @@ fn parse_upstream_versions(
         // token sets one of the two flags.
         (false, false) => Versions::Http11,
     })
+}
+
+/// 🔐 Applies one TLS option shared by `reverse_proxy` and `forward_auth`.
+/// Returns false for options outside the TLS group so each caller can reject
+/// unsupported transport settings in its own context.
+pub(super) fn parse_http_tls_option(
+    directive: &Directive,
+    tls: &mut UpstreamTlsConfig,
+) -> Result<bool, AdapterError> {
+    match directive.name.as_str() {
+        "tls" => {
+            expect_no_arguments(directive)?;
+            tls.enable = true;
+        }
+        "tls_server_name" => {
+            tls.server_name = Some(expect_one_argument(directive)?.to_string());
+        }
+        "tls_trusted_ca_certs" => {
+            if directive.args.is_empty() {
+                return Err(AdapterError::ArgumentCount(
+                    "tls_trusted_ca_certs".into(),
+                    1,
+                    0,
+                ));
+            }
+            tls.trusted_ca_certs.extend(directive.args.iter().cloned());
+        }
+        "tls_client_auth" => {
+            // 🎫 Both halves are required so the upstream never sees an
+            // anonymous handshake when mutual TLS was requested.
+            if directive.args.len() != 2 {
+                return Err(AdapterError::ArgumentCount(
+                    "tls_client_auth".into(),
+                    2,
+                    directive.args.len(),
+                ));
+            }
+            tls.client_cert = Some(directive.args[0].clone());
+            tls.client_key = Some(directive.args[1].clone());
+        }
+        "tls_insecure_skip_verify" => {
+            expect_no_arguments(directive)?;
+            tls.insecure_skip_verify = true;
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 pub(super) fn validate_upstream_tls(tls: &UpstreamTlsConfig) -> Result<(), AdapterError> {

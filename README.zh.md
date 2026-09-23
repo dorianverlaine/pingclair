@@ -653,6 +653,10 @@ route 內的 middleware 隨後執行，因此可以覆寫站台預設值。
 含 `_` 的傳入 header 名稱會被丟棄，與 Caddy 預設一致。這個語法糖會編譯成
 不帶 body 的 GET proxy 子請求，並轉送原始 method 與 URI；H1、H2、H3 共用
 同一套串流 exchange。
+區塊也接受 `transport http { … }`，可使用 `tls`、`tls_server_name`、
+`tls_trusted_ca_certs`、`tls_client_auth`、`tls_insecure_skip_verify`；
+上游 TLS 規則與 `reverse_proxy` 相同。`forward_auth` 的其他 transport 選項
+仍不支援。
 
 以主機名寫的 upstream 會在執行期間定期重解析，容器換 IP 重啟後不需 reload 即可跟上。
 解析失敗時會保留上一個位址繼續服務 —— resolver 故障不該讓站台跟著掛掉；啟動當下

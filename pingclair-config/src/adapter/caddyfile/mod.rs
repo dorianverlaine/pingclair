@@ -48,6 +48,8 @@ mod sites;
 mod tls;
 
 #[cfg(test)]
+mod forward_auth_tls_tests;
+#[cfg(test)]
 mod tests;
 
 use options::adapt_global;

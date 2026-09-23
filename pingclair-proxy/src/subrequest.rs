@@ -300,6 +300,7 @@ mod tests {
             upstream: "http://127.0.0.1:9000".to_string(),
             uri: "/auth/first".to_string(),
             copy_headers: Vec::new(),
+            upstream_tls: None,
         };
         let second = pingclair_core::config::ForwardAuthConfig {
             uri: "/auth/second".to_string(),
@@ -455,6 +456,7 @@ mod tests {
             upstream: format!("http://{address}"),
             uri: "/auth".to_string(),
             copy_headers: Vec::new(),
+            upstream_tls: None,
         };
         let config = legacy.as_reverse_proxy_subrequest();
         let prepared = PreparedSubrequest::new(config).unwrap();

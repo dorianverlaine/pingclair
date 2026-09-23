@@ -1838,6 +1838,9 @@ pub struct ForwardAuthConfig {
     /// Response headers copied onto the forwarded request, with renames.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub copy_headers: Vec<ForwardAuthHeaderMap>,
+    /// 🔐 Optional TLS policy for the auth gateway; absent in legacy JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_tls: Option<Box<UpstreamTlsConfig>>,
 }
 
 impl ForwardAuthConfig {
@@ -1861,6 +1864,7 @@ impl ForwardAuthConfig {
                 continue_status_classes: vec![2],
                 copy_headers: self.copy_headers.clone(),
             })),
+            upstream_tls: self.upstream_tls.clone().unwrap_or_default(),
             ..ReverseProxyConfig::default()
         }
     }

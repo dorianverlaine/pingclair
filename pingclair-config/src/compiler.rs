@@ -3695,6 +3695,7 @@ mod fail_closed_handler_tests {
             upstream: "http://127.0.0.1:9000".to_string(),
             uri: "/auth".to_string(),
             copy_headers: Vec::new(),
+            upstream_tls: None,
         }
         .as_reverse_proxy_subrequest();
         for (config, expected) in [

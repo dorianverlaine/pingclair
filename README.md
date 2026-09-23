@@ -722,6 +722,10 @@ answered to the client directly. Header names containing `_`
 are dropped from incoming requests, matching Caddy's default. The shortcut is
 compiled into a bodyless GET proxy subrequest that forwards the original
 method and URI; H1, H2, and H3 share the same streamed exchange.
+The block also accepts `transport http { … }` with `tls`, `tls_server_name`,
+`tls_trusted_ca_certs`, `tls_client_auth`, and `tls_insecure_skip_verify`, using
+the same upstream TLS rules as `reverse_proxy`. Other transport options remain
+unsupported in `forward_auth`.
 
 Upstreams written as hostnames are re-resolved while the server runs, so a
 container that restarts on a new address is picked up without a reload. A

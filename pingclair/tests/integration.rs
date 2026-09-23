@@ -58,6 +58,10 @@ mod h3_bind;
 #[path = "integration/site_middleware.rs"]
 mod site_middleware;
 
+// 🔐 The Pingclairfile auth gateway uses the same private-CA TLS path as JSON.
+#[path = "integration/forward_auth_tls.rs"]
+mod forward_auth_tls;
+
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather
 /// than against "some response arrived", so a 404 from a stale listener on the
@@ -9623,8 +9627,8 @@ async fn test_upstream_tls_verifies_by_default_and_honours_configured_trust() {
 /// configuration used to fail is what makes this a regression test rather than a
 /// demonstration.
 ///
-/// 🧾 JSON rather than a Pingclairfile, and that is a finding in itself — see the
-/// note at the end of the test.
+/// 🧾 JSON exercises the direct configuration path; the neighbouring
+/// Pingclairfile test exercises adaptation into that same subrequest policy.
 #[tokio::test]
 async fn test_an_inline_subrequest_dials_under_its_configured_tls_policy() {
     let mut params = rcgen::CertificateParams::new(vec!["auth.test".to_string()])
@@ -9756,15 +9760,6 @@ async fn test_an_inline_subrequest_dials_under_its_configured_tls_policy() {
         assert_ne!(response.text().await.unwrap(), "allowed");
         origin_task.abort();
     }
-
-    // 🧾 Why this test is JSON and not a Pingclairfile: the DSL's `forward_auth`
-    // accepts `uri` and `copy_headers` and rejects every other subdirective, so
-    // there is no way to write upstream TLS for a subrequest in the DSL at all.
-    // That is a real gap — an internal auth service behind a private CA is an
-    // ordinary shape — and it fails closed rather than silently, which is why it
-    // is a missing feature rather than a second instance of this defect. It is
-    // recorded as its own item; this test covers the JSON and Admin paths, which
-    // are the ones that accepted the configuration.
 }
 
 #[tokio::test]

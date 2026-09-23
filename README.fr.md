@@ -727,6 +727,10 @@ Les noms d'en-têtes entrants contenant `_` sont supprimés, comme par défaut
 chez Caddy. Ce raccourci est compilé en sous-requête proxy GET sans corps,
 qui transmet la méthode et l'URI d'origine ; H1, H2 et H3 partagent le même
 échange en streaming.
+Le bloc accepte aussi `transport http { … }` avec `tls`, `tls_server_name`,
+`tls_trusted_ca_certs`, `tls_client_auth` et `tls_insecure_skip_verify`, selon
+les mêmes règles TLS amont que `reverse_proxy`. Les autres options de transport
+restent non prises en charge dans `forward_auth`.
 
 Les amonts écrits sous forme de noms d'hôtes sont ré-résolus pendant l'exécution :
 un conteneur qui redémarre sur une nouvelle adresse est suivi sans rechargement.

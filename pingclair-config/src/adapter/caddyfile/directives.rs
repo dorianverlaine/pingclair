@@ -15,6 +15,7 @@ use super::order::DirectiveOrder;
 use super::reverse_proxy::adapt_intercept;
 use super::reverse_proxy::adapt_reverse_proxy;
 use super::reverse_proxy::validate_fastcgi_split_path;
+use super::reverse_proxy::{parse_http_tls_option, validate_upstream_tls};
 use crate::parser::ast::*;
 use crate::parser::caddy_ast::{Block, Directive, TokenRun};
 use pingclair_core::config::BasicAuthAlgorithm;
@@ -550,6 +551,7 @@ fn adapt_forward_auth(d: Directive) -> Result<Handler, AdapterError> {
 
     let mut uri: Option<String> = None;
     let mut copy_headers: Vec<pingclair_core::config::ForwardAuthHeaderMap> = Vec::new();
+    let mut transport_tls: Option<UpstreamTlsConfig> = None;
     for sub in &block.directives {
         match sub.name.as_str() {
             "uri" => {
@@ -588,6 +590,33 @@ fn adapt_forward_auth(d: Directive) -> Result<Handler, AdapterError> {
                     }
                 }
             }
+            "transport" => {
+                if transport_tls.is_some() {
+                    return Err(AdapterError::InvalidArgument(
+                        "forward_auth".into(),
+                        "`transport` cannot be declared twice".into(),
+                    ));
+                }
+                if sub.args.as_slice() != ["http"] {
+                    return Err(AdapterError::UnsupportedFeature(
+                        "forward_auth transport".into(),
+                        "only `transport http` with TLS options is supported".into(),
+                    ));
+                }
+                let mut tls = UpstreamTlsConfig::default();
+                if let Some(transport_block) = &sub.block {
+                    for option in &transport_block.directives {
+                        if !parse_http_tls_option(option, &mut tls)? {
+                            return Err(AdapterError::UnsupportedFeature(
+                                format!("forward_auth transport http {}", option.name),
+                                "only TLS transport options are supported".into(),
+                            ));
+                        }
+                    }
+                }
+                validate_upstream_tls(&tls)?;
+                transport_tls = Some(tls);
+            }
             other => {
                 return Err(AdapterError::UnknownDirective(format!(
                     "forward_auth: {other}"
@@ -607,6 +636,16 @@ fn adapt_forward_auth(d: Directive) -> Result<Handler, AdapterError> {
             upstream: upstream.clone(),
             uri,
             copy_headers,
+            upstream_tls: transport_tls.map(|tls| {
+                Box::new(pingclair_core::config::UpstreamTlsConfig {
+                    enable: tls.enable,
+                    server_name: tls.server_name,
+                    trusted_ca_certs: tls.trusted_ca_certs,
+                    client_cert: tls.client_cert,
+                    client_key: tls.client_key,
+                    insecure_skip_verify: tls.insecure_skip_verify,
+                })
+            }),
         },
     ))
 }
