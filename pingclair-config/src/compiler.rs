@@ -655,11 +655,10 @@ fn apply_site_compression(handler: &mut pingclair_core::config::HandlerConfig) {
                 apply_site_compression(&mut element.handler);
             }
         }
-        HandlerConfig::TryFiles { fallback, .. } => {
-            if let Some(fallback) = fallback {
-                apply_site_compression(fallback);
-            }
-        }
+        HandlerConfig::TryFiles {
+            fallback: Some(fallback),
+            ..
+        } => apply_site_compression(fallback),
         _ => {}
     }
 }
