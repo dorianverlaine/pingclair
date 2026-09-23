@@ -13,7 +13,8 @@
 use std::time::Duration;
 
 use http::StatusCode;
-use pingora_cache::cache_control::CacheControl;
+use pingora_cache::cache_control::{CacheControl, InterpretCacheControl};
+use pingora_cache::filters::calculate_expires_header_time;
 use pingora_cache::meta::CacheMetaDefaults;
 use pingora_http::ResponseHeader;
 
@@ -174,21 +175,52 @@ fn status_may_be_stored(status: u16) -> bool {
     )
 }
 
-/// ⏳ Reports whether the origin declared how long its response stays fresh.
+/// ⏳ What the origin's own headers say about how long a response stays fresh.
+pub(crate) enum OriginFreshness {
+    /// 📜 The origin gave a lifetime Pingora could use, so Pingora's answer
+    /// stands and the route's `ttl` does not apply.
+    Stated,
+    /// 🔁 The origin gave conflicting expiry times. Stored, but stale on arrival,
+    /// so every reuse is revalidated first.
+    StaleOnArrival,
+    /// 🤐 The origin gave nothing usable, so the route's `ttl` answers.
+    Silent,
+}
+
+/// ⏳ Classifies the origin's freshness headers the way Pingora read them.
 ///
-/// Only then does the origin's lifetime take precedence over the route's `ttl`.
+/// The question is whether there is a *usable* expiration time, not whether a
+/// field is present (RFC 9111 §4.2.2 speaks of "an explicit expiration time").
+/// Asking about presence meant `max-age=abc` counted as stated: the route's
+/// `ttl` was set aside, Pingora could not parse the value either, and the
+/// response quietly lived the 60-second placeholder instead of what the
+/// operator configured.
+///
+/// So this mirrors Pingora's own order in `calculate_fresh_until`
+/// (pingora-cache 0.9.0, `filters.rs`): a parseable `s-maxage` or `max-age`, or
+/// `no-cache`, first; then a single `Expires`, where an unparseable date means
+/// "already expired" as RFC 9111 §5.3 requires. Whenever this answers
+/// `Stated`, Pingora's lifetime came from the origin rather than the defaults.
+///
+/// 📌 Two `Expires` lines are the one case RFC 9111 §4.2.1 leaves open: use
+/// the first, or treat the response as stale. Pingora discards both, which
+/// would fall through to a default neither answer allows. Stale is chosen
+/// here, because an origin contradicting itself about expiry is safer
+/// rechecked than trusted.
+///
 /// `Age` alone does not count: it says how long a response has already been
 /// held, not how long it remains valid.
-pub(crate) fn origin_stated_its_own_freshness(
+pub(crate) fn origin_freshness(
     cache_control: Option<&CacheControl>,
     response: &ResponseHeader,
-) -> bool {
-    if let Some(cache_control) = cache_control
-        && (cache_control.has_key("max-age")
-            || cache_control.has_key("s-maxage")
-            || cache_control.no_cache())
+) -> OriginFreshness {
+    if cache_control.is_some_and(|cache_control| cache_control.fresh_duration().is_some())
+        || calculate_expires_header_time(response).is_some()
     {
-        return true;
+        return OriginFreshness::Stated;
     }
-    response.headers.contains_key("expires")
+    if response.headers.get_all("expires").iter().nth(1).is_some() {
+        return OriginFreshness::StaleOnArrival;
+    }
+    OriginFreshness::Silent
 }

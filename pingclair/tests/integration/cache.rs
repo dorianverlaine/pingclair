@@ -75,6 +75,12 @@ async fn spawn_status_origin() -> (SocketAddr, Arc<AtomicUsize>) {
                     let status = segments.next().unwrap_or("200");
                     let headers = match segments.next().unwrap_or("none") {
                         "max-age" => "Cache-Control: max-age=300\r\n",
+                        "bad-max-age" => "Cache-Control: max-age=abc\r\n",
+                        "bare-max-age" => "Cache-Control: max-age\r\n",
+                        "two-expires" => {
+                            "Expires: Thu, 01 Jan 2099 00:00:00 GMT\r\n\
+                             Expires: Fri, 02 Jan 2099 00:00:00 GMT\r\n"
+                        }
                         _ => "",
                     };
 
@@ -208,5 +214,54 @@ async fn test_a_silent_not_found_lives_seconds_not_the_route_ttl() {
         origin_hits_for(&server, &client, &hits, "/404/none", 1).await,
         1,
         "after ten seconds the 404 must be stale, even though the ttl is a minute"
+    );
+}
+
+/// 📜 An unusable `max-age` does not set the route's `ttl` aside.
+///
+/// `max-age=abc` and a bare `max-age` state no lifetime anyone can use, so the
+/// route's one-second `ttl` has to answer. It used to be skipped because the
+/// token was present, leaving the entry alive for a 60-second placeholder
+/// nobody configured.
+#[tokio::test]
+async fn test_an_unusable_max_age_falls_back_to_the_route_ttl() {
+    let (origin, hits) = spawn_status_origin().await;
+    let mut server = TestServer::new_pingclairfile(&cache_pingclairfile(origin, "1s"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    for path in ["/200/bad-max-age", "/200/bare-max-age"] {
+        assert_eq!(
+            origin_hits_for(&server, &client, &hits, path, 2).await,
+            1,
+            "{path} must still be cached, for the route's ttl"
+        );
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    for path in ["/200/bad-max-age", "/200/bare-max-age"] {
+        assert_eq!(
+            origin_hits_for(&server, &client, &hits, path, 1).await,
+            1,
+            "{path} must be stale once the route's ttl has passed"
+        );
+    }
+}
+
+/// 🔁 Two `Expires` lines make the response stale on arrival.
+///
+/// RFC 9111 §4.2.1 allows either the first value or "stale" here. This cache
+/// chooses stale, so each request is rechecked with the origin, rather than
+/// the response living a default lifetime neither answer allows.
+#[tokio::test]
+async fn test_conflicting_expires_is_treated_as_stale() {
+    let (origin, hits) = spawn_status_origin().await;
+    let mut server = TestServer::new_pingclairfile(&cache_pingclairfile(origin, "60s"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    assert_eq!(
+        origin_hits_for(&server, &client, &hits, "/200/two-expires", 2).await,
+        2,
+        "a response with two Expires lines must be rechecked on every reuse"
     );
 }

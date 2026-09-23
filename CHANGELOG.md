@@ -20,6 +20,16 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 📜 An unusable `max-age` no longer overrides `cache { ttl }`
+
+The cache treated the origin as having stated a lifetime whenever a `max-age`
+token or an `Expires` field was present, even when neither could be used. So
+`Cache-Control: max-age=abc` set the configured `ttl` aside, and the response
+lived a 60-second placeholder nobody configured. The `ttl` now applies unless
+the origin's lifetime actually parses. A response with two `Expires` lines,
+which contradict each other, is stored stale and rechecked on every reuse, one
+of the two answers RFC 9111 §4.2.1 allows.
+
 ### ⏳ A cached error no longer lives for the route's whole `ttl`
 
 `cache { ttl }` replaced the lifetime of every stored response, so a `503` the

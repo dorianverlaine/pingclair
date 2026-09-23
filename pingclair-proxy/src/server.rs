@@ -40,7 +40,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use crate::cache_policy::{
-    cache_defaults, heuristic_lifetime, origin_stated_its_own_freshness,
+    OriginFreshness, cache_defaults, heuristic_lifetime, origin_freshness,
     uncacheable_response_reason,
 };
 use crate::encoding::{ResponseEncoder, negotiate};
@@ -5956,8 +5956,25 @@ impl ProxyHttp for PingclairProxy {
         let RespCacheable::Cacheable(meta) = decision else {
             return Ok(decision);
         };
-        if origin_stated_its_own_freshness(cache_control.as_ref(), response) {
-            return Ok(RespCacheable::Cacheable(meta));
+        let created = SystemTime::now();
+        match origin_freshness(cache_control.as_ref(), response) {
+            OriginFreshness::Stated => return Ok(RespCacheable::Cacheable(meta)),
+            OriginFreshness::StaleOnArrival => {
+                // 🔁 One second in the past is how Pingora itself stores a
+                // response that must be revalidated before every reuse.
+                tracing::debug!(
+                    status = response.status.as_u16(),
+                    "🔁 origin sent conflicting Expires; stored stale, route ttl not applied"
+                );
+                return Ok(RespCacheable::Cacheable(CacheMeta::new(
+                    created - Duration::from_secs(1),
+                    created,
+                    meta.stale_while_revalidate_sec(),
+                    meta.stale_if_error_sec(),
+                    response.clone(),
+                )));
+            }
+            OriginFreshness::Silent => {}
         }
 
         // 🚫 Pingora only reaches here through `cache_defaults`, which lists the
@@ -5969,7 +5986,6 @@ impl ProxyHttp for PingclairProxy {
                 "no lifetime for this status",
             )));
         };
-        let created = SystemTime::now();
         let fresh_until = created + fresh_for;
         Ok(RespCacheable::Cacheable(CacheMeta::new(
             fresh_until,
