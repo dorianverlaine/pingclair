@@ -13,6 +13,10 @@ use pingora_core::Result as PingoraResult;
 use pingora_http::ResponseHeader;
 use regex::Regex;
 
+// 🧭 `TRACE` and `Max-Forwards` hop decisions, shared by every transport.
+mod max_forwards;
+pub(crate) use max_forwards::{ALLOWED_METHODS, forwarded_max_forwards, local_hop_answer};
+
 /// 🧰 Request-scoped variables set by `vars` handlers and read by
 /// `{http.vars.*}` placeholders and the `vars` matcher.
 ///

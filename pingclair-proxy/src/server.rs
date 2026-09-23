@@ -6677,6 +6677,21 @@ impl ProxyHttp for PingclairProxy {
                 .expect("sanitized request id is valid header bytes");
         }
 
+        // 🧭 RFC 9110 §7.6.2: `TRACE` is refused and `OPTIONS` with a spent
+        // `Max-Forwards` stops here, before any handler could forward either.
+        // HTTP/3 asks the same question at the same point in its dispatch.
+        if let Some(answer) = crate::http_policy::local_hop_answer(
+            &session.req_header().method,
+            &session.req_header().headers,
+        ) {
+            let mut header = Self::build_downstream_header(session, answer.status(), Some(2))?;
+            header.insert_header("Allow", crate::http_policy::ALLOWED_METHODS)?;
+            header.insert_header("Content-Length", "0")?;
+            self.write_local_response(session, ctx, header, LocalResponseBody::Empty, false)
+                .await?;
+            return Ok(true);
+        }
+
         // 🗜️ Negotiate the response coding against this server's `encode`
         // list. Done here, not in `response_filter`, so the decision is made
         // from the request alone — `response_filter` then only has to check
@@ -7417,6 +7432,15 @@ impl ProxyHttp for PingclairProxy {
         // about to speak upstream.
         if !ctx.response_headers.suppresses_via() {
             upstream_request.append_header("via", via_value(downstream_headers.version))?;
+        }
+
+        // 🧭 RFC 9110 §7.6.2: this hop spends one unit of an `OPTIONS`
+        // request's `Max-Forwards` budget. Zero never gets here.
+        if let Some(remaining) = crate::http_policy::forwarded_max_forwards(
+            &upstream_request.method,
+            &upstream_request.headers,
+        ) {
+            upstream_request.insert_header(http::header::MAX_FORWARDS, remaining)?;
         }
 
         Ok(())

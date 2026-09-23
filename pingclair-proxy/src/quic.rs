@@ -3446,6 +3446,19 @@ async fn handle_request_inner(
             .map(|route| route.index);
         (state, route_index)
     };
+    // 🧭 RFC 9110 §7.6.2: the same hop decision H1/H2 makes once the virtual
+    // host is known — `TRACE` refused, a spent `OPTIONS` answered here.
+    if let Some(answer) = crate::http_policy::local_hop_answer(&method, &header.headers) {
+        let mut headers = vec![
+            quiche::h3::Header::new(b":status", answer.status().to_string().as_bytes()),
+            quiche::h3::Header::new(b"allow", crate::http_policy::ALLOWED_METHODS.as_bytes()),
+            quiche::h3::Header::new(b"content-length", b"0"),
+        ];
+        apply_h3_response_policy(&mut headers, response_policy, request_id, Some(&state));
+        *error_state = Some(state);
+        send_headers(resp_tx, stream_id, headers, true).await;
+        return Ok(());
+    }
     let Some(route_index) = route_index else {
         *error_state = Some(state);
         return Err((404, "No Matching Route"));
@@ -5066,6 +5079,14 @@ async fn reverse_proxy_upstream(
         if !response_policy.suppresses_via() {
             up_req
                 .append_header("via", crate::http_policy::via_value(http::Version::HTTP_3))
+                .ok();
+        }
+        // 🧭 RFC 9110 §7.6.2: spend one unit of an `OPTIONS` hop budget, as H1/H2 do.
+        if let Some(remaining) =
+            crate::http_policy::forwarded_max_forwards(&up_req.method, &up_req.headers)
+        {
+            up_req
+                .insert_header(http::header::MAX_FORWARDS, remaining)
                 .ok();
         }
 

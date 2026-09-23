@@ -66,6 +66,10 @@ mod forward_auth_tls;
 #[path = "integration/admin_challenge.rs"]
 mod admin_challenge;
 
+// 🧭 `TRACE` and the `Max-Forwards` hop budget.
+#[path = "integration/max_forwards.rs"]
+mod max_forwards;
+
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather
 /// than against "some response arrived", so a 404 from a stale listener on the

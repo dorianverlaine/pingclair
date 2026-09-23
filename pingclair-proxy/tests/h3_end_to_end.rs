@@ -36,6 +36,10 @@ mod response_framing;
 #[path = "h3_end_to_end/site_name_case.rs"]
 mod site_name_case;
 
+// 🧭 `TRACE` and the `Max-Forwards` hop budget.
+#[path = "h3_end_to_end/max_forwards.rs"]
+mod max_forwards;
+
 const ALPN: &[u8] = b"h3";
 
 fn self_signed_pem(names: &[&str]) -> (String, String) {

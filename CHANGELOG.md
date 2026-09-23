@@ -42,6 +42,14 @@ validated and startup reported success; only real clients failed. Site names
 are now lowercased and stripped of a trailing dot when the configuration is
 compiled, and the certificate table files every name in that one spelling.
 
+### 🧭 `TRACE` is refused and `Max-Forwards` is honoured
+
+`Max-Forwards` was never read, so `TRACE` and `OPTIONS` went to the origin
+whatever hop budget they carried. On every transport, `TRACE` is now answered
+with 405 and an `Allow` list and never reflected or forwarded; `OPTIONS` with
+`Max-Forwards: 0` is answered here with 200 and `Allow`; and `OPTIONS` with a
+larger budget is forwarded with the value one smaller (RFC 9110 §7.6.2).
+
 ### 🔐 The admin API's 401 names the Bearer scheme
 
 A request to the admin API without the right `api_key` got a bare 401, which
