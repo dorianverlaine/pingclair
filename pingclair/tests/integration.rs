@@ -70,6 +70,10 @@ mod admin_challenge;
 #[path = "integration/max_forwards.rs"]
 mod max_forwards;
 
+// 🚫 What a locally raised error status says about itself.
+#[path = "integration/error_responses.rs"]
+mod error_responses;
+
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather
 /// than against "some response arrived", so a 404 from a stale listener on the

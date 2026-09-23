@@ -6802,11 +6802,12 @@ impl ProxyHttp for PingclairProxy {
                     ctx.response_headers.set(name, value);
                 }
                 if decision.reject {
-                    let mut header = pingora_http::ResponseHeader::build(429, Some(8)).unwrap();
-                    Self::apply_local_response_headers(&mut header, ctx)?;
-                    session
-                        .write_response_header(Box::new(header), true)
-                        .await?;
+                    // 🚫 Answered through the error-page path so the client
+                    // gets a body that explains the rejection (RFC 6585 §4),
+                    // or the site's configured page, instead of a bare status.
+                    // The `Retry-After` and `RateLimit` fields set above ride
+                    // along in `ctx.response_headers`.
+                    self.serve_error_page(session, ctx, 429).await?;
                     return Ok(true);
                 }
             }

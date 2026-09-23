@@ -40,6 +40,10 @@ mod site_name_case;
 #[path = "h3_end_to_end/max_forwards.rs"]
 mod max_forwards;
 
+// 🚫 What a locally raised error status says about itself.
+#[path = "h3_end_to_end/error_responses.rs"]
+mod error_responses;
+
 const ALPN: &[u8] = b"h3";
 
 fn self_signed_pem(names: &[&str]) -> (String, String) {

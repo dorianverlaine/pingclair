@@ -64,6 +64,15 @@ in them said so, so a relying party could not tell "never published" from
 extension (RFC 9608); the root does not, and the 90-day lifetime is unchanged.
 Leaves already on disk gain it when they are next reissued.
 
+### 🚦 A rate-limit rejection says why
+
+A request refused by `rate_limit` used to get a bare `429` status with no
+body; over HTTP/1.1 it also had no `Content-Length`, so the connection closed
+after it. The 429 now carries a `text/plain` body (`429 Too Many Requests`
+on HTTP/1.1 and HTTP/2, `Too Many Requests` on HTTP/3) or the site's
+`error_page 429` when one is configured, and still sends `Retry-After` and
+the `RateLimit-*` fields.
+
 ### 🔪 A compression failure ends the response instead of switching to plaintext
 
 If the encoder behind `encode` failed partway through a response, the rest of

@@ -3541,10 +3541,11 @@ async fn handle_request_inner(
             response_policy.set(name, value);
         }
         if decision.reject {
-            let mut headers = vec![quiche::h3::Header::new(b":status", b"429")];
-            apply_h3_response_policy(&mut headers, response_policy, request_id, Some(&state));
-            send_headers(resp_tx, stream_id, headers, true).await;
-            return Ok(());
+            // 🚫 Raised like any other early rejection so the answer carries
+            // a body that explains it (RFC 6585 §4) or the site's configured
+            // error page. The `Retry-After` and `RateLimit` fields set above
+            // live in the response policy, which the error path applies.
+            return Err((429, "Too Many Requests"));
         }
     }
 
