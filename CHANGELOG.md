@@ -20,6 +20,14 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🔐 HTTP/3 honours the listener's `default_sni`
+
+A QUIC client without SNI now receives the certificate selected by that
+listener's `default_sni`, just like TCP. Without a configured default, or when
+an explicit name has no matching certificate, the handshake is refused instead
+of presenting whichever site's certificate was inserted first. Defaults remain
+local to each listener while certificate rotations update the shared table.
+Client authentication still uses the name the client actually offered.
 ### ➕ DNS-01 no longer deletes other TXT records at the challenge name
 
 Publishing a Cloudflare DNS-01 challenge used to delete every TXT record at

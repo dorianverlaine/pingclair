@@ -476,9 +476,10 @@ pub(crate) fn run_server(
             .map(|(address, policy)| {
                 (
                     address.clone(),
-                    Arc::new(PublishedListenerPolicy::new(Arc::clone(
-                        &policy.client_auth,
-                    ))),
+                    Arc::new(
+                        PublishedListenerPolicy::new(Arc::clone(&policy.client_auth))
+                            .with_default_sni(policy.default_sni.as_deref()),
+                    ),
                 )
             })
             .collect();

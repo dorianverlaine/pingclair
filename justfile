@@ -71,6 +71,7 @@ h3:
     PINGCLAIR_BINARY="{{ target-dir }}/release/pingclair" scripts/test-h3-22-septembre-2026-local.sh
     PINGCLAIR_BINARY="{{ target-dir }}/release/pingclair" scripts/test-h3-cancellation-local.sh
     PINGCLAIR_BINARY="{{ target-dir }}/release/pingclair" scripts/test-h3-client-auth-local.sh
+    PINGCLAIR_BINARY="{{ target-dir }}/release/pingclair" python3 scripts/test-h3-default-sni.py
     # 🧯 The local-failure matrix runs the real binary with a lowered descriptor
     # limit, which is why it cannot live in the in-process H3 test suite.
     PINGCLAIR_BINARY="{{ target-dir }}/release/pingclair" scripts/test-h3-local-resource-failure-local.sh

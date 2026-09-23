@@ -316,6 +316,8 @@ pub struct PublishedListenerPolicy {
     current: ArcSwap<ListenerSecuritySnapshot>,
     publishing: AtomicBool,
     client_auth_reload_capable: bool,
+    /// 🏷️ Startup-only certificate name for a ClientHello without SNI.
+    default_sni: Option<Arc<str>>,
 }
 
 impl std::fmt::Debug for PublishedListenerPolicy {
@@ -343,7 +345,21 @@ impl PublishedListenerPolicy {
             }),
             publishing: AtomicBool::new(false),
             client_auth_reload_capable,
+            default_sni: None,
         }
+    }
+
+    /// 🏷️ Captures the listener's default without changing client authentication.
+    ///
+    /// Reloads that change this name require a restart, just as TCP does.
+    pub fn with_default_sni(mut self, name: Option<&str>) -> Self {
+        self.default_sni = name.filter(|name| !name.is_empty()).map(Arc::from);
+        self
+    }
+
+    /// 🏷️ Returns the certificate name to use only when the client omitted SNI.
+    pub(crate) fn default_sni(&self) -> Option<&str> {
+        self.default_sni.as_deref()
     }
 
     /// 🚦 Closes the listener's publication gate before any snapshot changes.

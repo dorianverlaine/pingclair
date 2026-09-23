@@ -84,7 +84,7 @@ impl ApplicationOverQuic for HandshakeOnlyApp {
 ///
 /// Returns the bound address. Note the `TlsCertificatePaths` given here point
 /// at [`IN_MEMORY_CERT_SENTINEL`], which is not a path that can be opened.
-async fn spawn_listener(table: Arc<CertTable>) -> SocketAddr {
+async fn spawn_listener(table: Arc<CertTable>, default_sni: Option<&str>) -> SocketAddr {
     let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = socket.local_addr().unwrap();
 
@@ -94,13 +94,24 @@ async fn spawn_listener(table: Arc<CertTable>) -> SocketAddr {
     // MASQUE or WebTransport, so they stay off.
     quic_settings.enable_dgram = false;
 
+    // 🧾 Read the default through the same DSL used by an operator.
+    let option = default_sni
+        .map(|name| format!("default_sni {name}"))
+        .unwrap_or_default();
+    let config = pingclair_config::compile(&format!(
+        "{{\n admin off\n {option}\n}}\nhttps://fixture.test:8443 {{\n tls internal\n}}"
+    ))
+    .unwrap();
+    let configured_default = config.servers[0]
+        .tls
+        .as_ref()
+        .unwrap()
+        .default_sni
+        .as_deref();
+    let policy = PublishedListenerPolicy::new(Arc::new(ClientAuthTable::default()))
+        .with_default_sni(configured_default);
     let hooks = Hooks {
-        connection_hook: Some(Arc::new(CertTableSslHook::new(
-            table,
-            Arc::new(PublishedListenerPolicy::new(Arc::new(
-                ClientAuthTable::default(),
-            ))),
-        ))),
+        connection_hook: Some(Arc::new(CertTableSslHook::new(table, Arc::new(policy)))),
     };
 
     let mut listeners = tokio_quiche::listen(
@@ -131,7 +142,10 @@ async fn spawn_listener(table: Arc<CertTable>) -> SocketAddr {
 
 /// Handshake against `server` with the given SNI, returning the leaf
 /// certificate DER the server presented.
-async fn handshake_and_capture_cert(server: SocketAddr, sni: &str) -> Result<Vec<u8>, String> {
+async fn handshake_and_capture_cert(
+    server: SocketAddr,
+    sni: Option<&str>,
+) -> Result<Vec<u8>, String> {
     let mut config = quiche::Config::with_boring_ssl_ctx_builder(
         quiche::PROTOCOL_VERSION,
         boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()).unwrap(),
@@ -155,7 +169,7 @@ async fn handshake_and_capture_cert(server: SocketAddr, sni: &str) -> Result<Vec
     getrandom(&mut scid);
     let scid = quiche::ConnectionId::from_ref(&scid);
 
-    let mut conn = quiche::connect(Some(sni), &scid, local, server, &mut config)
+    let mut conn = quiche::connect(sni, &scid, local, server, &mut config)
         .map_err(|e| format!("connect: {e}"))?;
 
     let mut out = [0u8; 1350];
@@ -232,18 +246,18 @@ async fn in_memory_cert_table_serves_the_sni_matched_certificate() {
     let (cert_a, key_a) = self_signed_pem(&["a.pingclair.test"]);
     let (cert_b, key_b) = self_signed_pem(&["b.pingclair.test"]);
     table
-        .upsert_pem("a.pingclair.test", &cert_a, &key_a)
+        .upsert_pem("A.PINGCLAIR.TEST.", &cert_a, &key_a)
         .unwrap();
     table
         .upsert_pem("b.pingclair.test", &cert_b, &key_b)
         .unwrap();
 
-    let server = spawn_listener(Arc::clone(&table)).await;
+    let server = spawn_listener(Arc::clone(&table), None).await;
 
-    let served_a = handshake_and_capture_cert(server, "a.pingclair.test")
+    let served_a = handshake_and_capture_cert(server, Some("a.pingclair.test"))
         .await
         .expect("handshake for a.pingclair.test should succeed");
-    let served_b = handshake_and_capture_cert(server, "b.pingclair.test")
+    let served_b = handshake_and_capture_cert(server, Some("b.pingclair.test"))
         .await
         .expect("handshake for b.pingclair.test should succeed");
 
@@ -280,8 +294,8 @@ async fn sentinel_certificate_path_is_never_opened() {
         .upsert_pem("only.pingclair.test", &cert, &key)
         .unwrap();
 
-    let server = spawn_listener(Arc::clone(&table)).await;
-    let served = handshake_and_capture_cert(server, "only.pingclair.test")
+    let server = spawn_listener(Arc::clone(&table), None).await;
+    let served = handshake_and_capture_cert(server, Some("only.pingclair.test"))
         .await
         .expect("handshake should succeed with certificates that exist only in memory");
 
@@ -298,9 +312,9 @@ async fn cert_table_publication_applies_to_the_next_handshake() {
         .upsert_pem("rotate.pingclair.test", &cert_v1, &key_v1)
         .unwrap();
 
-    let server = spawn_listener(Arc::clone(&table)).await;
+    let server = spawn_listener(Arc::clone(&table), None).await;
 
-    let before = handshake_and_capture_cert(server, "rotate.pingclair.test")
+    let before = handshake_and_capture_cert(server, Some("rotate.pingclair.test"))
         .await
         .expect("first handshake should succeed");
     assert_eq!(before, leaf_der(&cert_v1));
@@ -316,7 +330,7 @@ async fn cert_table_publication_applies_to_the_next_handshake() {
         .upsert_pem("rotate.pingclair.test", &cert_v2, &key_v2)
         .unwrap();
 
-    let after = handshake_and_capture_cert(server, "rotate.pingclair.test")
+    let after = handshake_and_capture_cert(server, Some("rotate.pingclair.test"))
         .await
         .expect("handshake after renewal should succeed");
     assert_eq!(
@@ -324,4 +338,108 @@ async fn cert_table_publication_applies_to_the_next_handshake() {
         leaf_der(&cert_v2),
         "a renewed certificate must be served without restarting the listener"
     );
+}
+
+/// 🔐 Unidentified clients must not receive whichever certificate arrived first.
+#[tokio::test]
+async fn no_sni_without_default_is_refused() {
+    let table = Arc::new(CertTable::new());
+    let (cert, key) = self_signed_pem(&["only.pingclair.test"]);
+    table
+        .upsert_pem("only.pingclair.test", &cert, &key)
+        .unwrap();
+    let server = spawn_listener(table, None).await;
+    assert!(handshake_and_capture_cert(server, None).await.is_err());
+}
+
+/// 🔐 An unknown explicit name must not borrow an unrelated site's certificate.
+#[tokio::test]
+async fn unknown_sni_is_refused() {
+    let table = Arc::new(CertTable::new());
+    let (cert, key) = self_signed_pem(&["only.pingclair.test"]);
+    table
+        .upsert_pem("only.pingclair.test", &cert, &key)
+        .unwrap();
+    let server = spawn_listener(table, None).await;
+    assert!(
+        handshake_and_capture_cert(server, Some("unknown.pingclair.test"))
+            .await
+            .is_err()
+    );
+}
+
+/// 🏷️ A shared renewable table does not make listener defaults global.
+#[tokio::test]
+async fn default_sni_is_local_to_each_listener_and_tracks_rotation() {
+    let table = Arc::new(CertTable::new());
+    let (cert_a, key_a) = self_signed_pem(&["a.pingclair.test"]);
+    let (cert_b, key_b) = self_signed_pem(&["b.pingclair.test"]);
+    table
+        .upsert_pem("a.pingclair.test", &cert_a, &key_a)
+        .unwrap();
+    table
+        .upsert_pem("b.pingclair.test", &cert_b, &key_b)
+        .unwrap();
+    let listener_a = spawn_listener(Arc::clone(&table), Some("a.pingclair.test")).await;
+    let listener_b = spawn_listener(Arc::clone(&table), Some("B.PINGCLAIR.TEST.")).await;
+
+    for (listener, expected) in [(listener_a, &cert_a), (listener_b, &cert_b)] {
+        assert_eq!(
+            handshake_and_capture_cert(listener, None).await.unwrap(),
+            leaf_der(expected)
+        );
+    }
+    assert_eq!(
+        handshake_and_capture_cert(listener_b, Some("A.PINGCLAIR.TEST."))
+            .await
+            .unwrap(),
+        leaf_der(&cert_a),
+        "an explicit name takes precedence over the listener default"
+    );
+    assert!(
+        handshake_and_capture_cert(listener_b, Some("unknown.pingclair.test"))
+            .await
+            .is_err()
+    );
+
+    let (rotated, rotated_key) = self_signed_pem(&["b.pingclair.test"]);
+    let update = table
+        .prepare_manual_update(
+            ["b.pingclair.test"],
+            [("b.pingclair.test", rotated.as_str(), rotated_key.as_str())],
+        )
+        .unwrap();
+    table.publish_manual_update(update);
+    assert_eq!(
+        handshake_and_capture_cert(listener_b, None).await.unwrap(),
+        leaf_der(&rotated)
+    );
+    assert_eq!(
+        handshake_and_capture_cert(listener_a, None).await.unwrap(),
+        leaf_der(&cert_a)
+    );
+
+    let removed = table
+        .prepare_manual_update(["B.PINGCLAIR.TEST."], [])
+        .unwrap();
+    table.publish_manual_update(removed);
+    assert!(handshake_and_capture_cert(listener_b, None).await.is_err());
+}
+
+/// 🚫 Missing and excluded defaults cannot fall through to another site's key.
+#[tokio::test]
+async fn default_sni_must_resolve_to_an_enabled_certificate() {
+    let table = Arc::new(CertTable::new());
+    let (cert, key) = self_signed_pem(&["*.pingclair.test"]);
+    table.upsert_pem("*.pingclair.test", &cert, &key).unwrap();
+    let wildcard = spawn_listener(Arc::clone(&table), Some("a.pingclair.test")).await;
+    assert_eq!(
+        handshake_and_capture_cert(wildcard, None).await.unwrap(),
+        leaf_der(&cert)
+    );
+
+    let missing = spawn_listener(Arc::clone(&table), Some("missing.other.test")).await;
+    assert!(handshake_and_capture_cert(missing, None).await.is_err());
+    table.set_excluded_names(["A.PINGCLAIR.TEST."]);
+    assert!(handshake_and_capture_cert(wildcard, None).await.is_err());
 }

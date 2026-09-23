@@ -221,11 +221,8 @@ pub struct CertEntry {
 #[derive(Clone, Default)]
 struct CertTableSnapshot {
     certs: HashMap<String, Arc<CertEntry>>,
-    /// Fallback used when no exact/wildcard entry matches the SNI name.
-    default_name: Option<String>,
     /// 🚫 Names whose sites turned HTTP/3 off. Checked before any certificate is
-    /// chosen, so a handshake for one of them finds nothing at all rather than
-    /// the default entry.
+    /// chosen, including when the listener's default names an excluded site.
     excluded: HashSet<String>,
 }
 
@@ -254,19 +251,13 @@ impl CertTable {
         }
     }
 
-    /// Parse a PEM chain + key and publish them under `name`.
-    ///
-    /// The first entry inserted becomes the default certificate (used when
-    /// the SNI name has no exact or wildcard match); use
-    /// [`CertTable::set_default`] to override.
+    /// 🔐 Publishes a PEM chain and key without changing any listener's default.
     pub fn upsert_pem(&self, name: &str, cert_pem: &str, key_pem: &str) -> Result<(), QuicError> {
         let entry = parse_cert_entry(name, cert_pem, key_pem)?;
         self.inner.rcu(|current| {
             let mut next = (**current).clone();
-            next.certs.insert(name.to_string(), entry.clone());
-            if next.default_name.is_none() {
-                next.default_name = Some(name.to_string());
-            }
+            next.certs
+                .insert(certificate_name(name).into_owned(), entry.clone());
             Arc::new(next)
         });
         Ok(())
@@ -280,13 +271,16 @@ impl CertTable {
     ) -> Result<PreparedCertTableUpdate, QuicError> {
         let mut entries = HashMap::new();
         for (name, cert_pem, key_pem) in next_entries {
-            entries.insert(name.to_string(), parse_cert_entry(name, cert_pem, key_pem)?);
+            entries.insert(
+                certificate_name(name).into_owned(),
+                parse_cert_entry(name, cert_pem, key_pem)?,
+            );
         }
         let next_names: HashSet<&str> = entries.keys().map(String::as_str).collect();
         let removed = previous_names
             .into_iter()
-            .filter(|name| !next_names.contains(name))
-            .map(str::to_string)
+            .map(|name| certificate_name(name).into_owned())
+            .filter(|name| !next_names.contains(name.as_str()))
             .collect();
         Ok(PreparedCertTableUpdate { entries, removed })
     }
@@ -297,45 +291,28 @@ impl CertTable {
             let mut next = (**current).clone();
             for name in &prepared.removed {
                 next.certs.remove(name);
-                if next.default_name.as_ref() == Some(name) {
-                    next.default_name = None;
-                }
             }
             for (name, entry) in &prepared.entries {
                 next.certs.insert(name.clone(), Arc::clone(entry));
             }
-            if next
-                .default_name
-                .as_ref()
-                .is_none_or(|name| !next.certs.contains_key(name))
-            {
-                next.default_name = next.certs.keys().next().cloned();
-            }
             Arc::new(next)
         });
     }
 
-    /// Choose which table entry serves as the default certificate.
-    pub fn set_default(&self, name: &str) {
-        self.inner.rcu(|current| {
-            let mut next = (**current).clone();
-            next.default_name = Some(name.to_string());
-            Arc::new(next)
-        });
-    }
-
-    /// Look up certificate material for a handshake SNI name.
+    /// 🔐 Looks up only the requested name, with exact matches before wildcards.
     ///
-    /// Resolution order: exact match → wildcard match (`*.example.com`,
-    /// same loose suffix semantics as the H1 router) → default entry.
+    /// A listener chooses its own `default_sni` before calling this method.
+    /// The shared table must never substitute another listener's certificate.
     pub fn lookup(&self, servername: &str) -> Option<Arc<CertEntry>> {
+        let normalized = certificate_name(servername);
+        let servername = normalized.as_ref();
         let snap = self.inner.load();
 
         // 🚫 A site that turned HTTP/3 off resolves to no certificate: the
         // handshake fails here, and a client that was told this port speaks
         // HTTP/3 falls back to TCP instead of reaching a site that did not ask
-        // to be served over QUIC. It has to be checked before the default
-        // entry, or the fallback would quietly serve it anyway.
+        // to be served over QUIC. This also applies when the listener's
+        // configured default names an excluded site.
         if covered_by(&snap.excluded, servername) {
             return None;
         }
@@ -352,9 +329,7 @@ impl CertTable {
             }
         }
 
-        snap.default_name
-            .as_ref()
-            .and_then(|name| snap.certs.get(name).cloned())
+        None
     }
 
     /// 🚫 Publishes the names whose sites turned HTTP/3 off.
@@ -370,7 +345,7 @@ impl CertTable {
     {
         let excluded: HashSet<String> = names
             .into_iter()
-            .map(|name| name.as_ref().to_string())
+            .map(|name| certificate_name(name.as_ref()).into_owned())
             .collect();
         self.inner.rcu(|current| {
             let mut next = (**current).clone();
@@ -387,6 +362,16 @@ impl CertTable {
     /// Whether the table has no entries at all.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// 🔤 DNS spelling must not change certificate selection or exclusion.
+fn certificate_name(name: &str) -> std::borrow::Cow<'_, str> {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(name)
     }
 }
 
@@ -503,7 +488,14 @@ fn build_ssl_context_builder(
             policy.install(hello.ssl_mut());
         }
 
-        let Some(entry) = table.lookup(&sni) else {
+        // 🏷️ Only an absent SNI uses the listener's default. Authentication
+        // above still uses the actual offered name, exactly as TCP does.
+        let certificate_name = if sni.is_empty() {
+            listener_policy.default_sni()
+        } else {
+            Some(sni.as_str())
+        };
+        let Some(entry) = certificate_name.and_then(|name| table.lookup(name)) else {
             tracing::warn!(
                 "🔐 H3: no certificate available for SNI '{}', rejecting handshake",
                 sni
@@ -6057,8 +6049,8 @@ mod tests {
         table.upsert_pem("example.com", &cert, &key).unwrap();
 
         assert!(table.lookup("example.com").is_some());
-        // Unknown name falls back to the default (first inserted) entry.
-        assert!(table.lookup("other.test").is_some());
+        // 🔐 An unrelated name cannot borrow the first site's certificate.
+        assert!(table.lookup("other.test").is_none());
         assert_eq!(table.len(), 1);
     }
 
@@ -6072,7 +6064,7 @@ mod tests {
     }
 
     #[test]
-    fn cert_table_prefers_exact_over_default() {
+    fn cert_table_selects_the_named_entry() {
         let table = CertTable::new();
         let (cert_a, key_a) = self_signed_pem(&["a.example.com"]);
         let (cert_b, key_b) = self_signed_pem(&["b.example.com"]);
@@ -6088,7 +6080,7 @@ mod tests {
     }
 
     #[test]
-    fn cert_table_miss_without_default() {
+    fn cert_table_miss_without_certificates() {
         // Empty table: nothing to serve, lookup must fail so the handshake
         // is rejected instead of silently serving the wrong certificate.
         let table = CertTable::new();
@@ -6102,8 +6094,7 @@ mod tests {
     /// `tls { http3 off }` takes one site out of HTTP/3 without stopping the
     /// listener, and the site answered over HTTP/3 anyway. The listener staying
     /// up is the point — it serves the other names on the port — so the
-    /// exclusion is per name and is checked before the default certificate,
-    /// which would otherwise serve the site the listener was told to skip.
+    /// exclusion is per name, including when `default_sni` names that site.
     #[test]
     fn cert_table_refuses_a_site_that_turned_http3_off() {
         let table = CertTable::new();
@@ -6118,10 +6109,8 @@ mod tests {
             table.lookup("opted-out.local").is_none(),
             "a site with `http3 off` must not resolve to a certificate"
         );
-        // 🧭 The other site on the same listener is untouched, and an unknown
-        // name still reaches the default entry as it always did.
+        // 🧭 The other site on the same listener remains available.
         assert!(table.lookup("kept.local").is_some());
-        assert!(table.lookup("unknown.local").is_some());
     }
 
     /// 🃏 An exclusion follows the same name rule as the certificates it hides.
@@ -6133,13 +6122,6 @@ mod tests {
         table.set_excluded_names(["*.wild.local"]);
 
         assert!(table.lookup("a.wild.local").is_none());
-        // 🧭 The exclusion is about the name that opted out, not about the
-        // entry: a name that merely falls back to the same certificate is
-        // unaffected, exactly as it was before the site opted out.
-        assert!(
-            table.lookup("other.local").is_some(),
-            "an unrelated name keeps the default fallback it always had"
-        );
     }
 
     #[test]
