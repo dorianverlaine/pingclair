@@ -764,9 +764,8 @@ Pingclair 對外宣稱相容 Caddyfile，那麼這個宣稱誠實的另一半，
 
 Directive：
 
-  `copy_response` `copy_response_headers` `fs` `invoke`
-  `log_append` `log_name` `map` `push`
-  `skip_log` `tracing`
+  `fs` `invoke` `log_append` `log_name` `map`
+  `push` `skip_log` `tracing`
 
 全域選項：
 
@@ -785,7 +784,10 @@ Directive：
   `force_automate`
 
 
-有兩個名字落在「上面兩張清單」與「完整支援」之間，所以寫在這裡而不是塞進任何一張。
+有些名字落在「上面兩張清單」與「完整支援」之間，所以寫在這裡而不是塞進任何一張。
+`copy_response` 與 `copy_response_headers` 是 `handle_response` 的子指令，
+寫在裡面可以運作；單獨當成一條 directive 寫則會被拒絕——這正是它們原本被放進
+清單的原因。
 `pki` 與 `acme_server` 能解析、能驗證、能序列化——帶著它們的設定載入得了也跑得起來
 ——但 Pingclair **不會**作為憑證機構對其他客戶端簽發憑證，而且它會明說，不會安靜地
 什麼都不簽。`dns` 與 `acme_dns` 只實作了 Cloudflare；其餘 provider 名稱在啟動時

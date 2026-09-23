@@ -834,9 +834,8 @@ typo and never quietly ignored. A configuration using them does not start.
 
 Directives:
 
-  `copy_response` `copy_response_headers` `fs` `invoke`
-  `log_append` `log_name` `map` `push`
-  `skip_log` `tracing`
+  `fs` `invoke` `log_append` `log_name` `map`
+  `push` `skip_log` `tracing`
 
 Global options:
 
@@ -854,8 +853,11 @@ Global options:
   `reuse_private_keys` `insecure_secrets_log` `renewal_window_ratio`
   `force_automate`
 
-Two names sit between the lists above and full support, so they are named here
-rather than in either. `pki` and `acme_server` parse, validate and serialize —
+Names sit between the lists above and full support, so they are named here
+rather than in either. `copy_response` and `copy_response_headers` are
+`handle_response` subdirectives and work there; written as directives of their
+own they are refused, which is why they were in the list. `pki` and
+`acme_server` parse, validate and serialize —
 a configuration carrying them loads and runs — but Pingclair will not act as a
 certificate authority for other clients, and says so instead of silently
 issuing nothing. `dns` and `acme_dns` are implemented for Cloudflare; any other

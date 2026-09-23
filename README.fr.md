@@ -841,9 +841,8 @@ utilise ne démarre pas.
 
 Directives :
 
-  `copy_response` `copy_response_headers` `fs` `invoke`
-  `log_append` `log_name` `map` `push`
-  `skip_log` `tracing`
+  `fs` `invoke` `log_append` `log_name` `map`
+  `push` `skip_log` `tracing`
 
 Options globales :
 
@@ -861,8 +860,11 @@ Options du bloc `tls` :
   `reuse_private_keys` `insecure_secrets_log` `renewal_window_ratio`
   `force_automate`
 
-Deux noms se situent entre les listes ci-dessus et la prise en charge complète,
-et sont donc nommés ici plutôt que dans l'une ou l'autre. `pki` et
+Des noms se situent entre les listes ci-dessus et la prise en charge complète,
+et sont donc nommés ici plutôt que dans l'une ou l'autre. `copy_response` et
+`copy_response_headers` sont des sous-directives de `handle_response` et
+fonctionnent à cet endroit ; écrites comme directives à part entière, elles sont
+refusées — c'est pourquoi elles figuraient dans la liste. `pki` et
 `acme_server` s'analysent, se valident et se sérialisent — une configuration
 qui les contient se charge et s'exécute — mais Pingclair n'agira pas comme
 autorité de certification pour d'autres clients, et le dit au lieu de n'émettre
