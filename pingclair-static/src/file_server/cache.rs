@@ -28,7 +28,7 @@ use http::HeaderValue;
 use super::FileServer;
 #[cfg(test)]
 use super::FileServerConfig;
-use super::validators::EntityTags;
+use super::validators::{EntityTags, SidecarTag};
 
 // MARK: - Keys
 
@@ -258,9 +258,14 @@ impl FileServer {
             read_sidecar_etag(file_path, etag_file_extensions),
         );
 
+        // 🛡️ Both values are the server's own ASCII, never file contents: the
+        // media type comes from `mime_guess`'s static table (plus a fixed
+        // charset suffix) and the date from `httpdate`'s fixed format.
         FileMeta {
-            content_type: HeaderValue::from_str(&mime_type).unwrap(),
-            last_modified: last_modified.map(|v| HeaderValue::from_str(&v).unwrap()),
+            content_type: HeaderValue::try_from(mime_type)
+                .expect("a mime_guess media type is a valid header value"),
+            last_modified: last_modified
+                .map(|v| HeaderValue::try_from(v).expect("an HTTP date is a valid header value")),
             etags,
             content_length: HeaderValue::from(size),
             modified,
@@ -275,7 +280,7 @@ impl FileServer {
 /// The value is used as written after trimming, and quoted when it is not
 /// already: an unquoted ETag is invalid per RFC 9110 and would be dropped by
 /// caches without a word, which is the silent failure this avoids.
-fn read_sidecar_etag(file_path: &Path, extensions: &[String]) -> Option<String> {
+fn read_sidecar_etag(file_path: &Path, extensions: &[String]) -> Option<SidecarTag> {
     // 🕳️ The overwhelmingly common case: nothing configured, no syscall.
     if extensions.is_empty() {
         return None;
@@ -287,7 +292,8 @@ fn read_sidecar_etag(file_path: &Path, extensions: &[String]) -> Option<String> 
             sidecar.push(".");
         }
         sidecar.push(extension);
-        let Ok(contents) = std::fs::read_to_string(std::path::PathBuf::from(sidecar)) else {
+        let sidecar_path = PathBuf::from(sidecar);
+        let Ok(contents) = std::fs::read_to_string(&sidecar_path) else {
             continue;
         };
         let value = contents.trim();
@@ -296,11 +302,23 @@ fn read_sidecar_etag(file_path: &Path, extensions: &[String]) -> Option<String> 
         if value.is_empty() {
             continue;
         }
-        return Some(if value.starts_with('"') || value.starts_with("W/") {
+        let tag = if value.starts_with('"') || value.starts_with("W/") {
             value.to_string()
         } else {
             format!("\"{value}\"")
-        });
+        };
+        // 🚫 A sidecar that is not an entity tag (an embedded line break, a
+        // stray quote, a control character) is skipped with a warning and the
+        // derived tag is used. Failing the request instead would let one bad
+        // build artifact take the file offline; emitting it would put an
+        // invalid header on the wire.
+        match SidecarTag::parse(tag) {
+            Some(tag) => return Some(tag),
+            None => tracing::warn!(
+                sidecar = %sidecar_path.display(),
+                "🚫 Ignoring a sidecar ETag that is not a valid entity tag"
+            ),
+        }
     }
     None
 }

@@ -64,6 +64,13 @@ in them said so, so a relying party could not tell "never published" from
 extension (RFC 9608); the root does not, and the 90-day lifetime is unchanged.
 Leaves already on disk gain it when they are next reissued.
 
+### 🚫 A malformed sidecar ETag no longer panics the file server
+
+With `etag_file_extensions` set, a sidecar such as `app.js.etag` holding
+something that is not an entity tag, for example two tags on two lines,
+panicked every request for that file. Such a sidecar is now skipped with a
+warning naming it, and the file is served with its derived `ETag`.
+
 ### 🔎 An HTTP/1.1 431 names the field that was too large
 
 When one header field alone is larger than `max_header_bytes`, the 431 body

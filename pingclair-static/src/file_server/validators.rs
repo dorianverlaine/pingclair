@@ -44,25 +44,33 @@ impl EntityTags {
     /// Nanoseconds rather than seconds because the second is exactly the
     /// window in which a deploy can write a file twice; the content caches in
     /// this module already key on nanoseconds for the same reason.
-    pub(super) fn derive(size: u64, mtime_ns: u128, sidecar: Option<String>) -> Self {
-        let identity = sidecar.unwrap_or_else(|| format!("\"{size:x}-{mtime_ns:x}\""));
+    ///
+    /// 🛡️ Every tag built here is a valid header value by construction: the
+    /// derived one is quotes around hex digits and a hyphen, and a sidecar one
+    /// has passed [`SidecarTag::parse`]. Appending `-br` and friends inside
+    /// the quotes keeps both properties, which is why the conversions below
+    /// cannot fail.
+    pub(super) fn derive(size: u64, mtime_ns: u128, sidecar: Option<SidecarTag>) -> Self {
+        let identity = sidecar.map_or_else(|| format!("\"{size:x}-{mtime_ns:x}\""), |tag| tag.0);
         Self {
             br: Self::coded(&identity, "br"),
             zstd: Self::coded(&identity, "zstd"),
             gzip: Self::coded(&identity, "gzip"),
-            identity: HeaderValue::from_str(&identity).unwrap(),
+            identity: Self::header(identity),
         }
     }
 
     /// 🗜️ Appends the coding inside the closing quote, which keeps a sidecar's
     /// `W/` prefix (if the operator wrote one) and keeps the result a valid
-    /// quoted entity tag.
+    /// quoted entity tag. Every identity reaching here ends in a quote.
     fn coded(identity: &str, coding: &str) -> HeaderValue {
-        let tag = match identity.strip_suffix('"') {
-            Some(stem) => format!("{stem}-{coding}\""),
-            None => format!("{identity}-{coding}"),
-        };
-        HeaderValue::from_str(&tag).unwrap()
+        let stem = identity.strip_suffix('"').unwrap_or(identity);
+        Self::header(format!("{stem}-{coding}\""))
+    }
+
+    /// 🛡️ Converts a tag already known to be a valid entity tag.
+    fn header(tag: String) -> HeaderValue {
+        HeaderValue::try_from(tag).expect("an entity tag is always a valid header value")
     }
 
     /// 🏷️ The tag for the body actually being sent: `None` is the file as it
@@ -81,6 +89,30 @@ impl EntityTags {
             Some("gzip") => &self.gzip,
             Some(_) => &self.identity,
         }
+    }
+}
+
+// MARK: - Sidecar tags
+
+/// 🏷️ An entity tag read from a sidecar file, checked against the RFC 9110
+/// §8.8.3 grammar before anything uses it.
+///
+/// The file is written by whoever can write into the document root, so its
+/// contents are untrusted. The only way to build one is [`SidecarTag::parse`],
+/// which is what lets [`EntityTags::derive`] treat the tag as a valid header.
+pub(super) struct SidecarTag(String);
+
+impl SidecarTag {
+    /// 🚫 Accepts `[W/]"<etagc>*"`, where `etagc` is any visible ASCII byte
+    /// other than `"`, or a non-ASCII byte (`obs-text`). Anything else, such
+    /// as an embedded line break, answers `None`.
+    pub(super) fn parse(tag: String) -> Option<Self> {
+        let opaque = tag.strip_prefix("W/").unwrap_or(&tag);
+        let inner = opaque.strip_prefix('"')?.strip_suffix('"')?;
+        inner
+            .bytes()
+            .all(|b| b == 0x21 || (0x23..=0x7e).contains(&b) || b >= 0x80)
+            .then_some(Self(tag))
     }
 }
 
@@ -248,10 +280,32 @@ mod tests {
 
     #[test]
     fn a_sidecar_tag_keeps_its_own_shape_per_coding() {
-        let strong = EntityTags::derive(1, 1, Some("\"abc\"".to_string()));
+        let strong = EntityTags::derive(1, 1, SidecarTag::parse("\"abc\"".to_string()));
         assert_eq!(strong.for_coding(Some("gzip")), "\"abc-gzip\"");
-        let weak = EntityTags::derive(1, 1, Some("W/\"abc\"".to_string()));
+        let weak = EntityTags::derive(1, 1, SidecarTag::parse("W/\"abc\"".to_string()));
         assert_eq!(weak.for_coding(Some("br")), "W/\"abc-br\"");
         assert_eq!(weak.for_coding(None), "W/\"abc\"");
+    }
+
+    #[test]
+    fn a_sidecar_tag_must_be_an_entity_tag() {
+        // 🎯 §8.8.3: a quoted run of visible bytes, optionally weak.
+        let cases = [
+            ("\"abc\"", true),
+            ("W/\"abc\"", true),
+            ("\"\"", true),
+            ("\"caf\u{e9}\"", true),
+            ("\"abc\"\n\"def\"", false),
+            ("\"a\rb\"", false),
+            ("\"a b\"", false),
+            ("\"a\"b\"", false),
+            ("\"abc", false),
+            ("abc", false),
+        ];
+        let got: Vec<_> = cases
+            .iter()
+            .map(|&(tag, _)| (tag, SidecarTag::parse(tag.to_string()).is_some()))
+            .collect();
+        assert_eq!(got, cases);
     }
 }

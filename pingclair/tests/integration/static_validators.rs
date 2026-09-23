@@ -163,3 +163,65 @@ async fn test_file_server_if_range_gates_the_range() {
         "stale tag, weak tag, stale date → 200; current tag, current date → 206"
     );
 }
+
+/// 🚫 A sidecar ETag that is not an entity tag is skipped, not served.
+///
+/// 🤡 The sidecar was trimmed and checked only for emptiness, then turned into
+/// a header with `unwrap()`. An embedded line break, which `trim()` leaves in
+/// place, panicked the request, and every later one, because the failed
+/// metadata entry was never cached. One bad build artifact took the file
+/// offline.
+#[tokio::test]
+async fn test_file_server_skips_a_sidecar_etag_that_is_not_an_entity_tag() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("app.js"), "source").unwrap();
+    std::fs::write(root.path().join("app.js.etag"), "\"abc\"\n\"def\"\n").unwrap();
+    std::fs::write(root.path().join("ok.js"), "source").unwrap();
+    std::fs::write(root.path().join("ok.js.etag"), "\"from-build\"\r\n").unwrap();
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+            file_server {{
+                etag_file_extensions .etag
+            }}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+        }}
+        "#,
+        root = root.path().display()
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let mut outcomes = Vec::new();
+    for path in ["/app.js", "/app.js", "/ok.js"] {
+        let response = no_proxy_client()
+            .get(server.url(0, path))
+            .send()
+            .await
+            .expect("request");
+        let status = response.status().as_u16();
+        let etag = response.headers()["etag"].to_str().unwrap().to_string();
+        let body = response.text().await.unwrap();
+        outcomes.push((status, etag == "\"from-build\"", body));
+    }
+    server.stop();
+
+    // 🎯 The bad sidecar falls back to the derived tag on every request; a
+    // good one next to it is still honoured.
+    let source = || "source".to_string();
+    assert_eq!(
+        outcomes,
+        [
+            (200, false, source()),
+            (200, false, source()),
+            (200, true, source())
+        ]
+    );
+}
