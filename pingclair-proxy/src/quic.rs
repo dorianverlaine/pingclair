@@ -4714,6 +4714,13 @@ async fn reverse_proxy_upstream(
             ) {
                 continue;
             }
+            // 🚫 This bridge writes the whole request body before it reads a
+            // single response header, so an upstream's `100 Continue` would
+            // arrive after the question it answers. Forwarding `Expect` only
+            // invites an interim response nobody is waiting for.
+            if name == "expect" {
+                continue;
+            }
             if outbound_filter.blocks(name) {
                 continue;
             }

@@ -2218,3 +2218,106 @@ async fn h3_if_range_mismatch_serves_the_whole_file() {
         [(200, b"0123456789".to_vec()), (206, b"01234".to_vec())]
     );
 }
+
+// MARK: - Scripted HTTP/1.1 upstreams
+
+/// 🎭 An HTTP/1.1 upstream that answers every connection with the same bytes.
+///
+/// The reply is written raw, so a test can put interim responses in front of
+/// the final one exactly as a real origin would. The request body is drained
+/// by `Content-Length` before replying, because a reply that races the body
+/// makes the proxy's write fail and the test would be measuring that instead.
+/// Each request head is sent back to the test, and the connection count is how
+/// a test tells a request the circuit breaker refused from one it let through.
+async fn spawn_scripted_upstream(
+    reply: &'static [u8],
+) -> (
+    SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let (heads_tx, heads_rx) = tokio::sync::mpsc::unbounded_channel();
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&hits);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let heads_tx = heads_tx.clone();
+            tokio::spawn(async move {
+                let request = read_http_head(&mut stream).await;
+                let (head, already_read) = request.split_once("\r\n\r\n").unwrap_or((&request, ""));
+                let content_length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                let mut remaining = content_length.saturating_sub(already_read.len());
+                let mut sink = [0u8; 1024];
+                while remaining > 0 {
+                    match stream.read(&mut sink).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => remaining = remaining.saturating_sub(read),
+                    }
+                }
+                let _ = heads_tx.send(head.to_string());
+                let _ = stream.write_all(reply).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    (address, heads_rx, hits)
+}
+
+/// 🧾 Compiles a one-site Pingclairfile and starts H3 on its first route.
+async fn spawn_h3_from_pingclairfile(source: &str) -> SocketAddr {
+    let config = pingclair_config::compile(source).unwrap();
+    let handler = config.servers[0].routes[0].handler.clone();
+    spawn_h3_server(handler).await
+}
+
+/// 🚫 `Expect: 100-continue` does not reach the upstream over HTTP/3.
+///
+/// The bridge has already written the whole body by the time it reads any
+/// response header, so the upstream's "go ahead" could only ever arrive late.
+#[tokio::test]
+async fn h3_drops_expect_before_forwarding() {
+    let (upstream, mut heads, _) = spawn_scripted_upstream(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    )
+    .await;
+    let server =
+        spawn_h3_from_pingclairfile(&format!(":443 {{\n reverse_proxy http://{upstream}\n}}"))
+            .await;
+
+    let response = h3_attempt(
+        H3Attempt {
+            method: "POST",
+            body: b"hello",
+            extra_headers: &[("expect", "100-continue"), ("content-length", "5")],
+            ..H3Attempt::to(server, "/upload")
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (response.status, response.body.as_slice()),
+        (200, &b"ok"[..])
+    );
+
+    let head = heads.recv().await.unwrap();
+    assert!(
+        !head.to_ascii_lowercase().contains("\r\nexpect:"),
+        "`Expect` must not be forwarded after the body is already sent: {head}"
+    );
+}

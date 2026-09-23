@@ -20,6 +20,13 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🚫 HTTP/3 no longer forwards `Expect`
+
+An HTTP/3 request proxied to an upstream has its whole body sent before the
+upstream's response is read, so an upstream's `100 Continue` could only arrive
+after the body it was meant to invite. Pingclair now drops `Expect` from HTTP/3
+requests before forwarding them.
+
 ### 📜 An unusable `max-age` no longer overrides `cache { ttl }`
 
 The cache treated the origin as having stated a lifetime whenever a `max-age`
