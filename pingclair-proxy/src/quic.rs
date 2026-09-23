@@ -3748,16 +3748,10 @@ async fn handle_request_inner(
                 return Err((503, "File Server Unavailable"));
             };
 
-            // 🏷️ `If-Range` rides with `Range`, exactly as on H1/H2;
-            // pingclair-static decides whether the range still applies.
-            let range = header
-                .headers
-                .get("range")
-                .and_then(|v| v.to_str().ok())
-                .map(|range| pingclair_static::RangeRequest {
-                    range,
-                    if_range: header.headers.get("if-range").and_then(|v| v.to_str().ok()),
-                });
+            // 🏷️ The method and header fields go over whole, exactly as on
+            // H1/H2; pingclair-static reads `Range`, `If-Range`, and the four
+            // preconditions from them itself.
+            let request = pingclair_static::FileRequest::new(&header.method, &header.headers);
             let accept_encoding = header
                 .headers
                 .get("accept-encoding")
@@ -3770,9 +3764,59 @@ async fn handle_request_inner(
             // would be redirected away from — see `serve_auto`.
             let original_path = req.path.split('?').next().unwrap_or("/");
             match fs
-                .serve_auto(effective_path, original_path, range, accept_encoding)
+                .serve_auto(effective_path, original_path, request, accept_encoding)
                 .await
             {
+                // 🧊 Same fields as the H1/H2 304: validators and `Vary`, no
+                // content and no `Content-Length`.
+                Ok(Some(ServedResponse::NotModified(not_modified))) => {
+                    let mut hdrs = http::HeaderMap::new();
+                    hdrs.insert("etag", not_modified.etag);
+                    if let Some(lm) = not_modified.last_modified {
+                        hdrs.insert("last-modified", lm);
+                    }
+                    if not_modified.vary_accept_encoding {
+                        crate::response_encoding::vary_map_on_accept_encoding(&mut hdrs);
+                    }
+                    send_h3_local_response(
+                        resp_tx,
+                        stream_id,
+                        &state,
+                        &header,
+                        &effective_uri,
+                        &verified_client_ip_text,
+                        &request_vars,
+                        response_handlers.as_deref(),
+                        304,
+                        hdrs,
+                        H3LocalBody::Bytes(Bytes::new()),
+                        response_policy,
+                        request_id,
+                        request_deadline,
+                        &mut download_pacer,
+                    )
+                    .await
+                }
+                Ok(Some(ServedResponse::PreconditionFailed)) => {
+                    send_h3_local_response(
+                        resp_tx,
+                        stream_id,
+                        &state,
+                        &header,
+                        &effective_uri,
+                        &verified_client_ip_text,
+                        &request_vars,
+                        response_handlers.as_deref(),
+                        412,
+                        http::HeaderMap::new(),
+                        H3LocalBody::Bytes(Bytes::new()),
+                        response_policy,
+                        request_id,
+                        request_deadline,
+                        &mut download_pacer,
+                    )
+                    .await
+                }
                 Ok(Some(ServedResponse::Redirect(location))) => {
                     let mut hdrs = http::HeaderMap::new();
                     if let Ok(value) = http::HeaderValue::from_str(&location) {
@@ -5911,11 +5955,17 @@ async fn send_h3_local_response(
         H3LocalBody::Bytes(bytes) => bytes.len() as u64,
         H3LocalBody::File(stream) => stream.content_length(),
     };
-    headers.insert(
-        "content-length",
-        http::HeaderValue::from_str(&content_length.to_string())
-            .map_err(|_| (500, "Invalid Response Content Length"))?,
-    );
+    // 🧊 Only a status that carries content gets a length measured from the
+    // body built here. A 304's empty body is not its representation, so
+    // `content-length: 0` on it would tell a cache the file is empty
+    // (RFC 9110 §8.6).
+    if ResponseContent::for_status(status).has_body() {
+        headers.insert(
+            "content-length",
+            http::HeaderValue::from_str(&content_length.to_string())
+                .map_err(|_| (500, "Invalid Response Content Length"))?,
+        );
+    }
     let mut h3_headers = vec![quiche::h3::Header::new(
         b":status",
         status.to_string().as_bytes(),

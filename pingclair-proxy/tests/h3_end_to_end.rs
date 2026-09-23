@@ -44,6 +44,10 @@ mod max_forwards;
 #[path = "h3_end_to_end/error_responses.rs"]
 mod error_responses;
 
+// 🏷️ Conditional requests against `file_server`: 304 and 412.
+#[path = "h3_end_to_end/preconditions.rs"]
+mod preconditions;
+
 const ALPN: &[u8] = b"h3";
 
 fn self_signed_pem(names: &[&str]) -> (String, String) {

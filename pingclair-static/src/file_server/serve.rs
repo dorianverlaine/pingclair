@@ -27,7 +27,8 @@ use http::HeaderValue;
 #[cfg(test)]
 use super::FileServerConfig;
 use super::cache::FileKey;
-use super::validators::{self, RangeRequest};
+use super::preconditions::FileRequest;
+use super::validators;
 use super::{FileServer, ServedFile, ServedResponse};
 
 impl FileServer {
@@ -135,13 +136,19 @@ impl FileServer {
     /// write them out in chunks; everything else is
     /// [`ServedResponse::Buffered`]. One path resolution + one stat per
     /// request either way — no probe-then-fall-back double work.
+    ///
+    /// 🏷️ `request` carries the method and the header fields this handler
+    /// reads: `Range` and `If-Range`, and the four preconditions, which are
+    /// answered with [`ServedResponse::NotModified`] or
+    /// [`ServedResponse::PreconditionFailed`] before any body is read.
     pub async fn serve_auto(
         &self,
         path: &str,
         original_path: &str,
-        range: Option<RangeRequest<'_>>,
+        request: FileRequest<'_>,
         accept_encoding: Option<&str>,
     ) -> Result<Option<ServedResponse>> {
+        let range = request.range();
         // Lexical docroot check (rejects `..` traversal; no syscalls)
         let mut file_path = match self.resolve_path(path) {
             Some(p) => p,
@@ -276,6 +283,20 @@ impl FileServer {
         // shared `HeaderValue`s instead of reformatting strings each time.
         let meta = self.file_meta(&file_path, &metadata)?;
 
+        // 🏷️ Preconditions come before `Range` (RFC 9110 §13.2.2): a client
+        // whose `If-Match` fails must hear 412, not 416 or 206.
+        //
+        // 🔢 Skipped under a `status` override. That is the maintenance-page
+        // shape, where every answer is meant to say 503; a 304 would tell a
+        // cache its old copy of the real page is still good.
+        if self.config.status.is_none()
+            && let Some(answer) = self
+                .evaluate_preconditions(&request, &file_path, file_size, &meta, accept_encoding)
+                .await
+        {
+            return Ok(Some(answer));
+        }
+
         // Handle Range Request
         //
         // 🔢 `status` overrides the success code — the maintenance-page shape,
@@ -298,14 +319,14 @@ impl FileServer {
         // compared against is the identity one.
         if let Some(range) = range
             && validators::if_range_holds(
-                range.if_range,
+                request.if_range(),
                 meta.etags.for_coding(None),
                 meta.last_modified.as_ref(),
                 meta.modified,
                 SystemTime::now(),
             )
         {
-            match self.parse_range(range.range, file_size) {
+            match self.parse_range(range, file_size) {
                 RangeDecision::Satisfied { start: s, end: e } => {
                     start = s;
                     length = e - s + 1;
@@ -578,13 +599,24 @@ impl FileServer {
         range_header: Option<&str>,
         accept_encoding: Option<&str>,
     ) -> Result<Option<ServedFile>> {
-        let range = range_header.map(|range| RangeRequest {
-            range,
-            if_range: None,
-        });
-        match self.serve_auto(path, path, range, accept_encoding).await? {
+        // 📌 Off the main request path (`try_files` and tests), so building a
+        // one-field map here is fine; the transports hand over theirs.
+        let mut headers = http::HeaderMap::new();
+        if let Some(range) = range_header.and_then(|range| HeaderValue::from_str(range).ok()) {
+            headers.insert(http::header::RANGE, range);
+        }
+        let request = FileRequest::new(&http::Method::GET, &headers);
+        match self
+            .serve_auto(path, path, request, accept_encoding)
+            .await?
+        {
             Some(ServedResponse::Buffered(file)) => Ok(Some(file)),
-            Some(ServedResponse::Redirect(_)) => Ok(None),
+            // 🕳️ No conditions are sent from here, so neither can happen.
+            Some(
+                ServedResponse::Redirect(_)
+                | ServedResponse::NotModified(_)
+                | ServedResponse::PreconditionFailed,
+            ) => Ok(None),
             Some(ServedResponse::Stream(mut stream)) => {
                 let mut content = Vec::with_capacity(stream.body_len as usize);
                 while let Some(chunk) = stream.read_chunk()? {
@@ -648,7 +680,7 @@ impl FileServer {
     /// returned `None`, so "I understood this and it cannot be satisfied" was
     /// indistinguishable from "I did not understand this" — and only the
     /// second one means `200`.
-    fn parse_range(&self, header: &str, file_size: u64) -> RangeDecision {
+    pub(super) fn parse_range(&self, header: &str, file_size: u64) -> RangeDecision {
         let Some(spec) = header.strip_prefix("bytes=").map(str::trim) else {
             return RangeDecision::Ignored;
         };
@@ -734,7 +766,7 @@ const UNSATISFIABLE_RANGE_BODY: &[u8] = b"invalid range: failed to overlap\n";
 /// resuming download receive the whole file under a `200`; see
 /// [`FileServer::parse_range`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RangeDecision {
+pub(super) enum RangeDecision {
     /// Serve this slice with `206`.
     Satisfied { start: u64, end: u64 },
     /// Answer `416` with `Content-Range: bytes */<size>`.
@@ -1345,10 +1377,15 @@ mod compression_floor_tests {
             compress: true,
             ..Default::default()
         });
-        fs.serve_auto("/small.json", "/small.json", None, Some("gzip"))
-            .await
-            .unwrap()
-            .expect("the file must be served")
+        fs.serve_auto(
+            "/small.json",
+            "/small.json",
+            crate::FileRequest::plain(),
+            Some("gzip"),
+        )
+        .await
+        .unwrap()
+        .expect("the file must be served")
     }
 
     fn encoding_of(served: &ServedResponse) -> Option<String> {
@@ -1358,7 +1395,7 @@ mod compression_floor_tests {
                 .content_encoding
                 .as_ref()
                 .map(|value| value.to_str().unwrap_or_default().to_string()),
-            ServedResponse::Redirect(target) => panic!("unexpected redirect to {target}"),
+            _ => panic!("expected a served body"),
         }
     }
 
@@ -1366,7 +1403,7 @@ mod compression_floor_tests {
         match served {
             ServedResponse::Buffered(file) => file.content.len(),
             ServedResponse::Stream(stream) => stream.body_len as usize,
-            ServedResponse::Redirect(target) => panic!("unexpected redirect to {target}"),
+            _ => panic!("expected a served body"),
         }
     }
 
@@ -1434,7 +1471,12 @@ mod vary_tests {
         });
 
         let served = fs
-            .serve_auto("/app.js", "/app.js", None, Some("gzip"))
+            .serve_auto(
+                "/app.js",
+                "/app.js",
+                crate::FileRequest::plain(),
+                Some("gzip"),
+            )
             .await
             .unwrap()
             .expect("the sidecar must be served");
@@ -1447,7 +1489,7 @@ mod vary_tests {
                     .map(|value| value.to_str().unwrap_or_default().to_string()),
                 stream.vary_accept_encoding,
             ),
-            ServedResponse::Redirect(target) => panic!("unexpected redirect to {target}"),
+            _ => panic!("expected a served body"),
         };
 
         assert_eq!(
@@ -1474,14 +1516,19 @@ mod vary_tests {
             ..Default::default()
         });
         let served = fs
-            .serve_auto("/app.js", "/app.js", None, Some("gzip"))
+            .serve_auto(
+                "/app.js",
+                "/app.js",
+                crate::FileRequest::plain(),
+                Some("gzip"),
+            )
             .await
             .unwrap()
             .expect("the file must be served");
         match served {
             ServedResponse::Buffered(file) => assert!(!file.vary_accept_encoding),
             ServedResponse::Stream(stream) => assert!(!stream.vary_accept_encoding),
-            ServedResponse::Redirect(target) => panic!("unexpected redirect to {target}"),
+            _ => panic!("expected a served body"),
         }
     }
 }
@@ -1614,7 +1661,12 @@ mod percent_decoding_tests {
         });
         assert!(
             visible
-                .serve_auto("/api%2Eenv", "/api%2Eenv", None, None)
+                .serve_auto(
+                    "/api%2Eenv",
+                    "/api%2Eenv",
+                    crate::FileRequest::plain(),
+                    None
+                )
                 .await
                 .unwrap()
                 .is_some(),
@@ -1628,7 +1680,12 @@ mod percent_decoding_tests {
         });
         assert!(
             hidden
-                .serve_auto("/api%2Eenv", "/api%2Eenv", None, None)
+                .serve_auto(
+                    "/api%2Eenv",
+                    "/api%2Eenv",
+                    crate::FileRequest::plain(),
+                    None
+                )
                 .await
                 .unwrap()
                 .is_none(),

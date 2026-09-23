@@ -4603,16 +4603,14 @@ impl PingclairProxy {
                 };
 
                 if let Some(file_server) = maybe_file_server {
-                    // 🏷️ `If-Range` rides with `Range`; pingclair-static
-                    // decides whether the range still applies.
-                    let headers = &session.req_header().headers;
-                    let range = headers
-                        .get("Range")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|range| pingclair_static::RangeRequest {
-                            range,
-                            if_range: headers.get("If-Range").and_then(|v| v.to_str().ok()),
-                        });
+                    // 🏷️ The method and header fields go over whole:
+                    // pingclair-static reads `Range`, `If-Range`, and the
+                    // four preconditions from them itself, the same way for
+                    // both transports.
+                    let request = pingclair_static::FileRequest::new(
+                        &session.req_header().method,
+                        &session.req_header().headers,
+                    );
                     let accept_encoding = session
                         .req_header()
                         .headers
@@ -4628,9 +4626,46 @@ impl PingclairProxy {
                     // it and points back to it — see `serve_auto`.
                     let original_path = ctx.orig_uri.path();
                     match file_server
-                        .serve_auto(path, original_path, range, accept_encoding)
+                        .serve_auto(path, original_path, request, accept_encoding)
                         .await
                     {
+                        // 🧊 A 304 carries the validators and `Vary` a 200
+                        // would have, and no `Content-Length`: there is no
+                        // content, and the header write strips nothing here.
+                        Ok(Some(pingclair_static::ServedResponse::NotModified(not_modified))) => {
+                            let mut header =
+                                Self::build_downstream_header(session, 304, Some(3)).unwrap();
+                            header.insert_header("ETag", not_modified.etag).unwrap();
+                            if let Some(lm) = not_modified.last_modified {
+                                header.insert_header("Last-Modified", lm).unwrap();
+                            }
+                            if not_modified.vary_accept_encoding {
+                                header.insert_header("Vary", "Accept-Encoding").unwrap();
+                            }
+                            self.write_local_response(
+                                session,
+                                ctx,
+                                header,
+                                LocalResponseBody::Empty,
+                                false,
+                            )
+                            .await?;
+                            return Ok(true);
+                        }
+                        Ok(Some(pingclair_static::ServedResponse::PreconditionFailed)) => {
+                            let mut header =
+                                Self::build_downstream_header(session, 412, Some(1)).unwrap();
+                            header.insert_header("Content-Length", "0").unwrap();
+                            self.write_local_response(
+                                session,
+                                ctx,
+                                header,
+                                LocalResponseBody::Empty,
+                                false,
+                            )
+                            .await?;
+                            return Ok(true);
+                        }
                         Ok(Some(pingclair_static::ServedResponse::Redirect(location))) => {
                             let mut header =
                                 Self::build_downstream_header(session, 308, Some(2)).unwrap();

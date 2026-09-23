@@ -23,9 +23,10 @@
 //! | [`listing`] | The browse page: what it may name, and how those names are encoded. |
 //! | [`stream`] | The chunked response: its type, its threshold, and the decision to take it. |
 //! | [`serve`] | The request handler, path resolution, and Range parsing. |
+//! | [`preconditions`] | Conditional requests: `If-Match`, `If-None-Match`, and their date forms. |
 //!
-//! This module keeps only what all five need: the configuration, the server
-//! itself, and the two buffered response types.
+//! This module keeps only what all of them need: the configuration, the server
+//! itself, and the response types.
 //!
 //! 🗺️ [`listing`] was the fifth to arrive, on 2026-08-17, and for the same
 //! reason as the original split rather than for length: a browse page is the
@@ -37,6 +38,7 @@
 mod cache;
 mod encode;
 mod listing;
+mod preconditions;
 mod serve;
 mod stream;
 mod validators;
@@ -50,8 +52,8 @@ use std::sync::{Arc, Mutex};
 use http::HeaderValue;
 
 use cache::{BodyCache, FileKey, FileMeta, MetaKey};
+pub use preconditions::FileRequest;
 pub use stream::StreamingFile;
-pub use validators::RangeRequest;
 
 /// Configuration for the file server
 #[derive(Debug, Clone)]
@@ -351,6 +353,27 @@ pub enum ServedResponse {
     /// 🔁 A canonical-URL redirect: directories get a trailing slash and
     /// files lose one, matching Caddy's file_server behavior.
     Redirect(String),
+    /// 🧊 `304 Not Modified`: the client's cached copy is current, so no
+    /// content goes out, only the validators it should keep using.
+    NotModified(NotModified),
+    /// 🚫 `412 Precondition Failed`: `If-Match` or `If-Unmodified-Since`
+    /// named a version that is no longer current, or `If-None-Match`
+    /// matched on a method other than `GET` or `HEAD`.
+    PreconditionFailed,
+}
+
+/// 🧊 The header fields a `304` carries (RFC 9110 §15.4.5): the ones a `200`
+/// would have sent that let a cache refresh the copy it holds. No
+/// `Content-Length`, `Content-Type`, or `Content-Encoding`: there is no
+/// content, and a stale length on a bodiless response is how HTTP/1.1
+/// connections get desynchronised.
+pub struct NotModified {
+    /// 🏷️ The tag of the representation the client would have received.
+    pub etag: HeaderValue,
+    pub last_modified: Option<HeaderValue>,
+    /// 🧊 Same meaning as [`ServedFile::vary_accept_encoding`]; a cache keys
+    /// the refreshed entry on it.
+    pub vary_accept_encoding: bool,
 }
 
 impl FileServer {

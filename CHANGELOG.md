@@ -64,6 +64,20 @@ in them said so, so a relying party could not tell "never published" from
 extension (RFC 9608); the root does not, and the 90-day lifetime is unchanged.
 Leaves already on disk gain it when they are next reissued.
 
+### 🏷️ `file_server` answers conditional requests
+
+`file_server` sent `ETag` and `Last-Modified` but never read them back, so a
+browser revalidating its cache downloaded the whole file again. It now
+evaluates `If-Match`, `If-Unmodified-Since`, `If-None-Match`, and
+`If-Modified-Since` in the order RFC 9110 §13.2.2 sets, on HTTP/1.1, HTTP/2,
+and HTTP/3 alike. A matching `If-None-Match` or a current `If-Modified-Since`
+answers `304 Not Modified` with the validators and no content; a failed
+`If-Match` or `If-Unmodified-Since` answers `412 Precondition Failed`. Each
+content coding has its own tag, so a cache's gzip copy is revalidated against
+the gzip tag. A `status` override (the maintenance-page shape) skips the
+evaluation and keeps its status. Proxied routes are unchanged: they still
+forward these fields to the upstream.
+
 ### 🚫 A malformed sidecar ETag no longer panics the file server
 
 With `etag_file_extensions` set, a sidecar such as `app.js.etag` holding

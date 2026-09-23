@@ -16,6 +16,10 @@ use tokio::io::AsyncWriteExt;
 #[path = "integration/static_validators.rs"]
 mod static_validators;
 
+// 🏷️ `If-Match`, `If-None-Match` and their date forms on `file_server`.
+#[path = "integration/preconditions.rs"]
+mod preconditions;
+
 // 🗄️ Response-cache lifetime tests live beside this file so the harness here
 // does not keep growing; they reuse its `TestServer` and helpers.
 #[path = "integration/cache.rs"]

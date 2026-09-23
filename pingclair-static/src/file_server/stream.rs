@@ -387,7 +387,7 @@ mod serve_auto_tests {
 
         let fs = server(dir.path(), false);
         match fs
-            .serve_auto("/big.bin", "/big.bin", None, None)
+            .serve_auto("/big.bin", "/big.bin", crate::FileRequest::plain(), None)
             .await
             .unwrap()
             .unwrap()
@@ -401,7 +401,7 @@ mod serve_auto_tests {
                 assert_eq!(got, body, "streamed bytes must equal the file");
             }
             ServedResponse::Buffered(_) => panic!("6MB uncompressed response must stream"),
-            ServedResponse::Redirect(_) => panic!("a regular file must not redirect"),
+            _ => panic!("a regular file must be served"),
         }
     }
 
@@ -418,7 +418,7 @@ mod serve_auto_tests {
 
         let fs = server(dir.path(), false);
         match fs
-            .serve_auto("/one.bin", "/one.bin", None, None)
+            .serve_auto("/one.bin", "/one.bin", crate::FileRequest::plain(), None)
             .await
             .unwrap()
             .unwrap()
@@ -432,7 +432,7 @@ mod serve_auto_tests {
                 assert_eq!(got, body, "streamed bytes must equal the file");
             }
             ServedResponse::Buffered(_) => panic!("1 MiB uncompressed response must stream"),
-            ServedResponse::Redirect(_) => panic!("a regular file must not redirect"),
+            _ => panic!("a regular file must be served"),
         }
     }
 
@@ -445,7 +445,12 @@ mod serve_auto_tests {
 
         let fs = server(dir.path(), true);
         match fs
-            .serve_auto("/big.txt", "/big.txt", None, Some("gzip"))
+            .serve_auto(
+                "/big.txt",
+                "/big.txt",
+                crate::FileRequest::plain(),
+                Some("gzip"),
+            )
             .await
             .unwrap()
             .unwrap()
@@ -456,7 +461,7 @@ mod serve_auto_tests {
             ServedResponse::Stream(_) => {
                 panic!("compressed responses must stay buffered for the cache")
             }
-            ServedResponse::Redirect(_) => panic!("a regular file must not redirect"),
+            _ => panic!("a regular file must be served"),
         }
     }
 
@@ -610,6 +615,13 @@ mod bounded_memory_tests {
     use super::*;
     use std::io::Write as _;
 
+    /// 🧪 A header map holding only `Range`.
+    fn range_headers(range: &str) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::RANGE, range.parse().unwrap());
+        headers
+    }
+
     /// 📏 Sixteen mebibytes: over the streaming threshold, over the compressible
     /// bound, and small enough to write in a test without being slow.
     const LARGE: usize = 16 * 1024 * 1024;
@@ -664,7 +676,9 @@ mod bounded_memory_tests {
                 largest
             }
             ServedResponse::Buffered(file) => file.content.len(),
-            ServedResponse::Redirect(_) => 0,
+            ServedResponse::Redirect(_)
+            | ServedResponse::NotModified(_)
+            | ServedResponse::PreconditionFailed => 0,
         }
     }
 
@@ -681,7 +695,7 @@ mod bounded_memory_tests {
         // 1️⃣ Identity — the case that already streamed, as the control.
         let (_dir, fs) = fixture(false, false);
         let response = fs
-            .serve_auto("/big.bin", "/big.bin", None, None)
+            .serve_auto("/big.bin", "/big.bin", crate::FileRequest::plain(), None)
             .await
             .unwrap()
             .unwrap();
@@ -694,10 +708,7 @@ mod bounded_memory_tests {
             .serve_auto(
                 "/big.bin",
                 "/big.bin",
-                Some(crate::RangeRequest {
-                    range: "bytes=0-",
-                    if_range: None,
-                }),
+                crate::FileRequest::new(&http::Method::GET, &range_headers("bytes=0-")),
                 None,
             )
             .await
@@ -709,7 +720,12 @@ mod bounded_memory_tests {
         // bound: streams uncompressed rather than buffering and compressing.
         let (_dir, fs) = fixture(true, false);
         let response = fs
-            .serve_auto("/big.bin", "/big.bin", None, Some("gzip"))
+            .serve_auto(
+                "/big.bin",
+                "/big.bin",
+                crate::FileRequest::plain(),
+                Some("gzip"),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -718,7 +734,12 @@ mod bounded_memory_tests {
         // 4️⃣ A pre-compressed sidecar: its bytes on disk are already the body.
         let (_dir, fs) = fixture(true, true);
         let response = fs
-            .serve_auto("/big.bin", "/big.bin", None, Some("gzip"))
+            .serve_auto(
+                "/big.bin",
+                "/big.bin",
+                crate::FileRequest::plain(),
+                Some("gzip"),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -757,10 +778,10 @@ mod bounded_memory_tests {
             .serve_auto(
                 "/big.bin",
                 "/big.bin",
-                Some(crate::RangeRequest {
-                    range: &format!("bytes={start}-{end}"),
-                    if_range: None,
-                }),
+                crate::FileRequest::new(
+                    &http::Method::GET,
+                    &range_headers(&format!("bytes={start}-{end}")),
+                ),
                 None,
             )
             .await
@@ -812,7 +833,12 @@ mod bounded_memory_tests {
         });
 
         let whole = fs
-            .serve_auto("/small.txt", "/small.txt", None, None)
+            .serve_auto(
+                "/small.txt",
+                "/small.txt",
+                crate::FileRequest::plain(),
+                None,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -822,10 +848,7 @@ mod bounded_memory_tests {
             .serve_auto(
                 "/small.txt",
                 "/small.txt",
-                Some(crate::RangeRequest {
-                    range: "bytes=2-5",
-                    if_range: None,
-                }),
+                crate::FileRequest::new(&http::Method::GET, &range_headers("bytes=2-5")),
                 None,
             )
             .await

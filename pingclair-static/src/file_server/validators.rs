@@ -118,23 +118,6 @@ impl SidecarTag {
 
 // MARK: - If-Range
 
-/// 🪟 A byte-range request as the client sent it: the `Range` value, and the
-/// `If-Range` validator that says which version of the file the range is
-/// meant to extend.
-///
-/// The two travel together because `Range` alone is not safe to honour. A
-/// client resuming a download holds the first half of *some* version of the
-/// file; `If-Range` names that version, and when the file has changed since,
-/// splicing today's second half onto yesterday's first produces a corrupt
-/// file that no checksum in HTTP will catch.
-#[derive(Clone, Copy, Debug)]
-pub struct RangeRequest<'a> {
-    /// 📐 The `Range` header value, such as `bytes=0-499`.
-    pub range: &'a str,
-    /// 🏷️ The `If-Range` header value, when the client sent one.
-    pub if_range: Option<&'a str>,
-}
-
 /// 🏷️ Evaluates `If-Range` (RFC 9110 §13.1.5): `true` means honour `Range`,
 /// `false` means ignore it and send the whole file with 200.
 ///
