@@ -4901,6 +4901,83 @@ async fn test_pingclairfile_request_body_max_size_limits_only_its_route() {
     }
 }
 
+/// 📥 A site-level `request_body` with no matcher limits every request in the
+/// site, including the ones a `handle` block answers.
+///
+/// The site-level limit used to reach only requests that fell through to the
+/// site's own `respond`: a `handle` route never ran that pipeline, so a 5 MiB
+/// upload to `/proxy/…` was accepted under a 1 MiB site limit. A `handle` that
+/// writes its own `request_body` still overrides the site for that route.
+#[tokio::test]
+async fn test_pingclairfile_site_request_body_limits_handle_routes_too() {
+    let config = r#"
+        {
+            admin off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            request_body {
+                max_size 1MiB
+            }
+
+            handle /proxy/* {
+                respond "inner" 200
+            }
+
+            handle /upload/* {
+                request_body {
+                    max_size 10MiB
+                }
+                respond "uploaded" 200
+            }
+
+            respond "top" 200
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    // 📏 Over the site's 1 MiB and under the upload route's 10 MiB.
+    let body = vec![b'x'; 5 * 1024 * 1024];
+
+    // 🔌 A client each, because a refusal closes its connection; see
+    // `test_pingclairfile_request_body_max_size_limits_only_its_route`.
+    for path in ["/top", "/proxy/echo"] {
+        let limited = no_proxy_client()
+            .post(server.url(0, path))
+            .body(body.clone())
+            .send()
+            .await;
+        match limited {
+            Ok(response) => assert_eq!(
+                response.status(),
+                413,
+                "the site-level 1 MiB limit must refuse a 5 MiB upload to {path}"
+            ),
+            Err(error) => assert!(
+                !error.is_timeout(),
+                "the upload to {path} should be refused, not left hanging: {error}"
+            ),
+        }
+    }
+
+    let uploaded = no_proxy_client()
+        .post(server.url(0, "/upload/thing"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        uploaded.status(),
+        200,
+        "the upload route raised its own limit to 10 MiB, so 5 MiB must be accepted"
+    );
+    assert_eq!(uploaded.text().await.unwrap(), "uploaded");
+}
+
 /// 🔪 `abort` gives the client nothing at all — not even a status.
 #[tokio::test]
 async fn test_pingclairfile_abort_answers_with_no_response() {

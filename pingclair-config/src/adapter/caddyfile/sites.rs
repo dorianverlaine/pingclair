@@ -722,10 +722,35 @@ pub(super) fn adapt_server(
                         .then_with(|| right_specificity.1.cmp(&left_specificity.1))
                 })
             });
+            // 📥 An unmatched site-level `request_body` limits every request in
+            // the site, not only the ones that fall through to the site's own
+            // handlers. A terminal route (`handle /api/* { respond … }`) never
+            // runs the default pipeline, so without this a 1 MiB site limit
+            // silently stopped at the first `handle` block. The site's limit
+            // goes first, which lets a `request_body` inside the route run
+            // later and override it for that route alone.
+            let site_body_limits: Vec<&Handler> = default_handlers
+                .iter()
+                .filter(|handler| matches!(handler, Handler::RequestBody(_)))
+                .collect();
             for arm in &mut routes.inner.arms {
                 if !handler_has_terminal(&arm.inner.handler) {
                     arm.inner.handler =
                         compose_with_default_handlers(arm.inner.handler.clone(), &default_handlers);
+                } else if !site_body_limits.is_empty() {
+                    let own =
+                        std::mem::replace(&mut arm.inner.handler, Handler::Pipeline(Vec::new()));
+                    arm.inner.handler = Handler::Pipeline(
+                        site_body_limits
+                            .iter()
+                            .map(|handler| (*handler).clone())
+                            .chain(std::iter::once(own))
+                            .map(|handler| HandlerElement {
+                                matcher: None,
+                                handler,
+                            })
+                            .collect(),
+                    );
                 }
             }
         }

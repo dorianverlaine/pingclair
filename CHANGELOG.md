@@ -98,6 +98,13 @@ is now no ceiling by default; `request_body { max_size … }` on a route, or
 unlimited. **If you were relying on the 1 MiB default, set a limit explicitly**
 — the effective limit on an unconfigured site is now unbounded.
 
+A site-level `request_body { max_size … }` written without a matcher now limits
+every request in the site, as it does in Caddy. It used to reach only requests
+that fell through to the site's own handlers: a request answered inside a
+`handle` block was unlimited, so a 5 MiB upload to `handle /api/* { … }` was
+accepted under a 1 MiB site limit. A `request_body` inside a `handle` still
+overrides the site's limit for that route, in either direction.
+
 ### 🔪 A broken HTTP/3 response now ends in a reset, not a clean finish
 
 When an upstream failed partway through a response body, or pacing ran past
