@@ -11,6 +11,11 @@ use std::thread;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
+// 🏷️ Static-file validator tests live beside this file so the gate stops
+// growing in one place; they reuse its `TestServer` harness.
+#[path = "integration/static_validators.rs"]
+mod static_validators;
+
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather
 /// than against "some response arrived", so a 404 from a stale listener on the

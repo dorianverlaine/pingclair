@@ -39,6 +39,7 @@ mod encode;
 mod listing;
 mod serve;
 mod stream;
+mod validators;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;

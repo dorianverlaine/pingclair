@@ -20,6 +20,18 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🏷️ Static-file ETags describe one exact body
+
+A strong `ETag` promises that every response carrying it has identical bytes.
+`file_server` broke that promise: the tag came from the file size and a
+whole-second modification time, so two same-size edits within one second kept
+one tag, and the plain file, its precompressed sidecar, and a live-compressed
+body all went out under the same tag. Tags are now built from the
+nanosecond modification time and differ per content coding — a gzip body is
+tagged `"…-gzip"`. They stay strong, so resumable downloads keep working.
+**Upgrade note:** every static ETag changes once, so clients revalidate each
+cached file one time after the upgrade.
+
 ### 🌊 HTTP/3 proxy streams keep moving across empty upstream reads
 
 An upstream can produce an empty body read before more data arrives. That empty

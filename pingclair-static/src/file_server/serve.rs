@@ -340,7 +340,7 @@ impl FileServer {
                     status,
                     content_range,
                     last_modified: meta.last_modified.clone(),
-                    etag: Some(meta.etag.clone()),
+                    etag: Some(meta.etags.for_coding(Some(enc)).clone()),
                     content_encoding: Some(enc.to_string()),
                     vary_accept_encoding: self.config.varies_by_accept_encoding(),
                 })));
@@ -383,7 +383,7 @@ impl FileServer {
                 // sidecar, whose own MIME type would be `application/gzip`.
                 stream.content_type = meta.content_type.clone();
                 stream.last_modified = meta.last_modified.clone();
-                stream.etag = Some(meta.etag.clone());
+                stream.etag = Some(meta.etags.for_coding(Some(encoding)).clone());
                 stream.path = file_path;
                 return Ok(Some(ServedResponse::Stream(stream)));
             }
@@ -399,7 +399,7 @@ impl FileServer {
                 status,
                 content_range,
                 last_modified: meta.last_modified.clone(),
-                etag: Some(meta.etag.clone()),
+                etag: Some(meta.etags.for_coding(Some(encoding)).clone()),
                 content_encoding: Some(encoding.to_string()),
                 vary_accept_encoding: self.config.varies_by_accept_encoding(),
             })));
@@ -477,7 +477,7 @@ impl FileServer {
                     status,
                     content_range,
                     last_modified: meta.last_modified.clone(),
-                    etag: Some(meta.etag.clone()),
+                    etag: Some(meta.etags.for_coding(Some(enc)).clone()),
                     content_encoding: Some(enc.to_string()),
                     vary_accept_encoding: self.config.varies_by_accept_encoding(),
                 })));
@@ -515,7 +515,7 @@ impl FileServer {
             status,
             content_range,
             last_modified: meta.last_modified.clone(),
-            etag: Some(meta.etag.clone()),
+            etag: Some(meta.etags.for_coding(content_encoding.as_deref()).clone()),
             content_encoding,
             vary_accept_encoding: self.config.varies_by_accept_encoding(),
         })))

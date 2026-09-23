@@ -28,6 +28,7 @@ use http::HeaderValue;
 use super::FileServer;
 #[cfg(test)]
 use super::FileServerConfig;
+use super::validators::EntityTags;
 
 // MARK: - Keys
 
@@ -66,7 +67,8 @@ pub(super) struct FileKey {
 pub(super) struct FileMeta {
     pub(super) content_type: HeaderValue,
     pub(super) last_modified: Option<HeaderValue>,
-    pub(super) etag: HeaderValue,
+    /// 🏷️ One strong tag per content coding; see [`EntityTags`].
+    pub(super) etags: EntityTags,
     pub(super) content_length: HeaderValue,
 }
 
@@ -234,11 +236,11 @@ impl FileServer {
         // dead-code warnings on everything else in that file.
         let mime_type = crate::mime::guess_mime_type(&file_path.to_string_lossy());
         let last_modified = metadata.modified().ok().map(httpdate::fmt_http_date);
-        let modified_secs = metadata
+        let mtime_ns = metadata
             .modified()
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_secs());
+            .map_or(0, |d| d.as_nanos());
         // 🏷️ A sidecar ETag wins when one exists. Build pipelines that hash
         // content write `app.js.etag` beside the file; deriving one from size
         // and mtime instead would change on every deploy that only touched
@@ -248,13 +250,16 @@ impl FileServer {
         // Read here rather than per request: this runs on a cache miss, and
         // the value is cached against the same (path, mtime, size) identity as
         // everything else in `FileMeta`.
-        let etag = read_sidecar_etag(file_path, etag_file_extensions)
-            .unwrap_or_else(|| format!("\"{size:x}-{modified_secs:x}\""));
+        let etags = EntityTags::derive(
+            size,
+            mtime_ns,
+            read_sidecar_etag(file_path, etag_file_extensions),
+        );
 
         FileMeta {
             content_type: HeaderValue::from_str(&mime_type).unwrap(),
             last_modified: last_modified.map(|v| HeaderValue::from_str(&v).unwrap()),
-            etag: HeaderValue::from_str(&etag).unwrap(),
+            etags,
             content_length: HeaderValue::from(size),
         }
     }
@@ -465,7 +470,7 @@ mod meta_cache_tests {
 
         let fs = server(dir.path());
         let before = meta_for(&fs, &path);
-        let before_etag = header_text(&before.etag);
+        let before_etag = header_text(before.etags.for_coding(None));
 
         // 🕰️ Filesystem timestamps are coarse enough that an immediate
         // rewrite can land on the same mtime; a longer body changes the size
@@ -476,7 +481,7 @@ mod meta_cache_tests {
         let after = meta_for(&fs, &path);
         assert_ne!(
             before_etag,
-            header_text(&after.etag),
+            header_text(after.etags.for_coding(None)),
             "an edited file must not keep its old ETag"
         );
         assert_eq!(
@@ -498,7 +503,10 @@ mod meta_cache_tests {
         let meta_a = meta_for(&fs, &a);
         let meta_b = meta_for(&fs, &b);
 
-        assert_ne!(header_text(&meta_a.etag), header_text(&meta_b.etag));
+        assert_ne!(
+            header_text(meta_a.etags.for_coding(None)),
+            header_text(meta_b.etags.for_coding(None))
+        );
         assert_eq!(header_text(&meta_a.content_length), "4");
         assert_eq!(header_text(&meta_b.content_length), "2");
         // 📄 Content-Type is derived per path, so the extension must survive.
@@ -558,7 +566,10 @@ mod meta_cache_tests {
         let cached = meta_for(&fs, &path);
         let rebuilt = FileServer::build_meta(&path, &metadata, metadata.len(), &[]);
 
-        assert_eq!(header_text(&cached.etag), header_text(&rebuilt.etag));
+        assert_eq!(
+            header_text(cached.etags.for_coding(None)),
+            header_text(rebuilt.etags.for_coding(None))
+        );
         assert_eq!(
             header_text(&cached.content_type),
             header_text(&rebuilt.content_type)

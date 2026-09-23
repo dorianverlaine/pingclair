@@ -321,7 +321,17 @@ impl FileServer {
             },
             path: file_path,
             last_modified: meta.last_modified.clone(),
-            etag: Some(meta.etag.clone()),
+            // 🏷️ A sidecar window carries its coding, and its tag must say so.
+            etag: Some(
+                meta.etags
+                    .for_coding(
+                        window
+                            .content_encoding
+                            .as_ref()
+                            .and_then(|v| v.to_str().ok()),
+                    )
+                    .clone(),
+            ),
             status: window.status,
             content_range: window.content_range,
             content_encoding: window.content_encoding,
