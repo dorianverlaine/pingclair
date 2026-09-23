@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
+//! 🧭 The client address a trusted proxy's forwarding headers resolve to.
+//!
+//! The test client connects from loopback and loopback is a trusted proxy, so
+//! whatever the client writes into `X-Forwarded-For` and `Forwarded` is read
+//! as a proxy's report. The site answers with `{remote_host}`, which is the
+//! verified address, so each response says exactly which identity won.
+
+use super::{TestServer, no_proxy_client};
+
+/// 🧾 A site that trusts loopback and echoes the verified client address.
+fn echo_identity_server() -> TestServer {
+    let config = r#"
+        {
+            admin off
+            servers {
+                trusted_proxies static 127.0.0.1/32
+            }
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            respond "{remote_host}"
+        }
+    "#;
+    TestServer::new_pingclairfile(config)
+}
+
+/// 🧹 A trailing comma is an empty list element, which RFC 9110 §5.6.1.2 says
+/// a recipient must ignore. Next to a valid `Forwarded` it used to fail the
+/// `X-Forwarded-For` parse and drop both headers, so the origin saw loopback.
+#[tokio::test]
+async fn test_empty_list_elements_keep_the_forwarded_client() {
+    let mut server = echo_identity_server();
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+    let url = server.url(0, "/whoami");
+
+    for (xff, forwarded) in [
+        ("203.0.113.7,", "for=203.0.113.7"),
+        ("203.0.113.7", "for=203.0.113.7,"),
+        ("203.0.113.7", "for=203.0.113.7"),
+    ] {
+        let body = client
+            .get(&url)
+            .header("X-Forwarded-For", xff)
+            .header("Forwarded", forwarded)
+            .send()
+            .await
+            .expect("request")
+            .text()
+            .await
+            .expect("body");
+        assert_eq!(
+            body, "203.0.113.7",
+            "X-Forwarded-For: {xff} / Forwarded: {forwarded}"
+        );
+    }
+}

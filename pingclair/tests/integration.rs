@@ -94,6 +94,10 @@ mod cookie_fold;
 #[path = "integration/cookie_affinity.rs"]
 mod cookie_affinity;
 
+// 🧭 Which client address a trusted proxy's forwarding headers resolve to.
+#[path = "integration/forwarded_identity.rs"]
+mod forwarded_identity;
+
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather
 /// than against "some response arrived", so a 404 from a stale listener on the

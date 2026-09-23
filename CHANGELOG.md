@@ -20,6 +20,17 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🧹 A trailing comma in a forwarding header no longer hides the client
+
+Behind a trusted proxy, `X-Forwarded-For: 203.0.113.7,` — a trailing comma,
+the usual leftover of merging two lists — made the whole header unreadable,
+and the next line of the identity logic then ignored a perfectly valid
+`Forwarded` beside it too. Access logs, rate limits and `remote_ip` rules saw
+the proxy's address instead of the client's. Empty list elements are now
+skipped in both `X-Forwarded-For` and `Forwarded`, as RFC 9110 §5.6.1.2
+requires, up to one per permitted hop (32); a header of nothing but commas is
+still rejected.
+
 ### 🍪 `lb_policy cookie` no longer depends on cookie order
 
 A browser holding two cookies with the same name, set for different paths,

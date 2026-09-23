@@ -607,6 +607,11 @@ impl TrustedProxyPolicy {
 }
 
 /// 🔎 Parses every `X-Forwarded-For` field into one bounded, normalized chain.
+///
+/// 🧹 Empty list elements are skipped, as RFC 9110 §5.6.1.2 requires of a
+/// recipient: a sender that merges two lists commonly leaves `a, , b` or a
+/// trailing comma behind. [`EmptyElementBudget`] keeps a field made only of
+/// commas from being accepted at any length.
 fn parse_forwarded_chain(headers: &http::HeaderMap) -> Result<Option<Vec<IpAddr>>, ()> {
     let values = headers.get_all("x-forwarded-for");
     if values.iter().next().is_none() {
@@ -614,9 +619,13 @@ fn parse_forwarded_chain(headers: &http::HeaderMap) -> Result<Option<Vec<IpAddr>
     }
 
     let mut chain = Vec::new();
+    let mut empty = EmptyElementBudget::default();
     for value in values.iter() {
         let value = value.to_str().map_err(|_| ())?;
         for item in value.split(',') {
+            if empty.skip(item)? {
+                continue;
+            }
             if chain.len() >= MAX_FORWARDED_HOPS {
                 return Err(());
             }
@@ -630,6 +639,33 @@ fn parse_forwarded_chain(headers: &http::HeaderMap) -> Result<Option<Vec<IpAddr>
     }
 }
 
+/// 🧹 Counts the empty list elements one forwarding header may carry.
+///
+/// 🛡️ RFC 9110 §5.6.1.2 asks for "a reasonable number" of empty elements and
+/// names the unbounded case as a denial-of-service vector. One empty element
+/// per permitted hop is far more than any merge mistake produces; past that
+/// the header is treated as malformed rather than walked.
+#[derive(Default)]
+struct EmptyElementBudget {
+    seen: usize,
+}
+
+impl EmptyElementBudget {
+    /// 🧹 Returns `Ok(true)` for an element to skip, and `Err` once the budget
+    /// is spent.
+    fn skip(&mut self, element: &str) -> Result<bool, ()> {
+        if !element.trim().is_empty() {
+            return Ok(false);
+        }
+        self.seen += 1;
+        if self.seen > MAX_FORWARDED_HOPS {
+            Err(())
+        } else {
+            Ok(true)
+        }
+    }
+}
+
 /// 🧭 Parses RFC 7239 `Forwarded` elements into one bounded `for` chain.
 fn parse_rfc_forwarded_chain(headers: &http::HeaderMap) -> Result<Option<Vec<IpAddr>>, ()> {
     let values = headers.get_all("forwarded");
@@ -639,18 +675,31 @@ fn parse_rfc_forwarded_chain(headers: &http::HeaderMap) -> Result<Option<Vec<IpA
 
     let mut chain = Vec::new();
     let mut total_bytes = 0usize;
+    let mut empty = EmptyElementBudget::default();
     for value in values.iter() {
         let value = value.to_str().map_err(|_| ())?;
         total_bytes = total_bytes.checked_add(value.len()).ok_or(())?;
         if total_bytes > 8_192 {
             return Err(());
         }
-        for element in split_quoted(value, ',')? {
+        for element in QuotedSplit::new(value, b',') {
+            let element = element?;
+            // 🧹 `forwarded-element = [ forwarded-pair ] *( ";" [ forwarded-pair ] )`
+            // makes an element with no pair legal, and such an element names no hop.
+            if empty.skip(element)? {
+                continue;
+            }
             if chain.len() >= MAX_FORWARDED_HOPS {
                 return Err(());
             }
             let mut forwarded_for = None;
-            for parameter in split_quoted(&element, ';')? {
+            for parameter in QuotedSplit::new(element, b';') {
+                let parameter = parameter?;
+                // 🧹 The pair between two semicolons is optional too. The
+                // 8 KiB field cap above already bounds how many there can be.
+                if parameter.is_empty() {
+                    continue;
+                }
                 let (name, raw_value) = parameter.split_once('=').ok_or(())?;
                 if !name.trim().eq_ignore_ascii_case("for") {
                     continue;
@@ -671,56 +720,74 @@ fn parse_rfc_forwarded_chain(headers: &http::HeaderMap) -> Result<Option<Vec<IpA
     }
 }
 
-fn split_quoted(value: &str, delimiter: char) -> Result<Vec<String>, ()> {
-    let mut values = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    let mut escaped = false;
-    for character in value.chars() {
-        if escaped {
-            current.push(character);
-            escaped = false;
-            continue;
-        }
-        if quoted && character == '\\' {
-            current.push(character);
-            escaped = true;
-            continue;
-        }
-        if character == '"' {
-            quoted = !quoted;
-            current.push(character);
-            continue;
-        }
-        if character == delimiter && !quoted {
-            if current.trim().is_empty() {
-                return Err(());
-            }
-            values.push(current.trim().to_string());
-            current.clear();
-        } else {
-            current.push(character);
-        }
-    }
-    if quoted || escaped || current.trim().is_empty() {
-        return Err(());
-    }
-    values.push(current.trim().to_string());
-    Ok(values)
+/// 🧭 Splits a header value on a delimiter that is not inside a quoted-string,
+/// yielding trimmed slices of the original value.
+///
+/// 🏎️ It borrows instead of copying each piece into a `String`, because it runs
+/// on every request from a trusted proxy. Scanning bytes is sound here: the
+/// delimiter, `"` and `\` are ASCII, and no byte of a multi-byte UTF-8
+/// character can equal one of them. An unterminated quote or a dangling escape
+/// ends the iteration with `Err`.
+struct QuotedSplit<'a> {
+    rest: Option<&'a str>,
+    delimiter: u8,
 }
 
-fn decode_forwarded_value(value: &str) -> Result<String, ()> {
-    if !value.starts_with('"') {
+impl<'a> QuotedSplit<'a> {
+    fn new(value: &'a str, delimiter: u8) -> Self {
+        Self {
+            rest: Some(value),
+            delimiter,
+        }
+    }
+}
+
+impl<'a> Iterator for QuotedSplit<'a> {
+    type Item = Result<&'a str, ()>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let rest = self.rest?;
+        let mut quoted = false;
+        let mut escaped = false;
+        for (index, &byte) in rest.as_bytes().iter().enumerate() {
+            if escaped {
+                escaped = false;
+            } else if quoted && byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = !quoted;
+            } else if byte == self.delimiter && !quoted {
+                self.rest = Some(&rest[index + 1..]);
+                return Some(Ok(rest[..index].trim()));
+            }
+        }
+        self.rest = None;
+        Some(if quoted || escaped {
+            Err(())
+        } else {
+            Ok(rest.trim())
+        })
+    }
+}
+
+/// 🧭 Decodes one `Forwarded` parameter value, borrowing unless a quoted-pair
+/// forces a copy.
+fn decode_forwarded_value(value: &str) -> Result<std::borrow::Cow<'_, str>, ()> {
+    let Some(inner) = value.strip_prefix('"') else {
         if value.bytes().any(|byte| byte.is_ascii_control()) {
             return Err(());
         }
-        return Ok(value.to_string());
+        return Ok(std::borrow::Cow::Borrowed(value));
+    };
+    let inner = inner.strip_suffix('"').ok_or(())?;
+    if inner.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(());
     }
-    let inner = value
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .ok_or(())?;
-    let mut decoded = String::new();
+    // 🏎️ An address never needs a quoted-pair, so the common case borrows.
+    if !inner.contains('\\') {
+        return Ok(std::borrow::Cow::Borrowed(inner));
+    }
+    let mut decoded = String::with_capacity(inner.len());
     let mut escaped = false;
     for character in inner.chars() {
         if escaped {
@@ -732,10 +799,10 @@ fn decode_forwarded_value(value: &str) -> Result<String, ()> {
             decoded.push(character);
         }
     }
-    if escaped || decoded.bytes().any(|byte| byte.is_ascii_control()) {
+    if escaped {
         Err(())
     } else {
-        Ok(decoded)
+        Ok(std::borrow::Cow::Owned(decoded))
     }
 }
 
@@ -9034,6 +9101,48 @@ mod forwarded_headers_tests {
             proxy.verified_client_ip(peer, &headers),
             "2001:db8::7".parse::<IpAddr>().unwrap()
         );
+    }
+
+    /// 🧹 RFC 9110 §5.6.1.2: a recipient must ignore empty list elements, so
+    /// a merge mistake in either header does not cost the client identity.
+    #[test]
+    fn empty_list_elements_are_skipped_in_both_headers() {
+        let proxy = PingclairProxy::with_trusted_proxies(&["10.0.0.0/8".to_string()]);
+        let peer: IpAddr = "10.0.0.5".parse().unwrap();
+        let client: IpAddr = "203.0.113.7".parse().unwrap();
+        for (name, value) in [
+            ("x-forwarded-for", "203.0.113.7,"),
+            ("x-forwarded-for", ", 203.0.113.7, , 10.1.2.3"),
+            ("forwarded", "for=203.0.113.7,"),
+            ("forwarded", ",for=203.0.113.7;;proto=https, ,for=10.1.2.3"),
+        ] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(name, value.parse().unwrap());
+            assert_eq!(
+                proxy.verified_client_ip(peer, &headers),
+                client,
+                "{name}: {value}"
+            );
+        }
+    }
+
+    /// 🛡️ The empty-element allowance is bounded, so a field of nothing but
+    /// commas is malformed rather than walked at any length.
+    #[test]
+    fn a_field_of_only_commas_fails_closed() {
+        let proxy = PingclairProxy::with_trusted_proxies(&["10.0.0.0/8".to_string()]);
+        let peer: IpAddr = "10.0.0.5".parse().unwrap();
+        let commas = format!("203.0.113.7{}", ",".repeat(MAX_FORWARDED_HOPS + 1));
+        for name in ["x-forwarded-for", "forwarded"] {
+            let mut headers = http::HeaderMap::new();
+            let value = if name == "forwarded" {
+                format!("for={commas}")
+            } else {
+                commas.clone()
+            };
+            headers.insert(name, value.parse().unwrap());
+            assert_eq!(proxy.verified_client_ip(peer, &headers), peer, "{name}");
+        }
     }
 
     // ---- CF-Connecting-IP (Cloudflare Tunnel deployments) ----
