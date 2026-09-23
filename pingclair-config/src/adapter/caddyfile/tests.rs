@@ -3410,6 +3410,57 @@ mod uri_and_try_files_tests {
         );
     }
 
+    /// 🎯 `rewrite <to>` with a single argument is the destination, not a
+    /// matcher, and the format says so by argument count: one argument is the
+    /// target, two are matcher-then-target.
+    ///
+    /// 🤡 Until this was fixed the leading `/` was read as a path matcher, the
+    /// directive was left with no arguments, and the whole configuration was
+    /// refused with "expected <replacement> or <regex> <replacement>" — an
+    /// error naming two shapes, one of which the operator had written.
+    #[test]
+    fn rewrite_with_one_argument_is_a_destination_not_a_matcher() {
+        // 📌 The placeholder form is the example Caddy's own `handle_errors`
+        // documentation uses, so it is the spelling a reader is most likely to
+        // copy — which is why it is asserted here rather than only the plain
+        // path. The unresolved `{err.status_code}` is passed through verbatim;
+        // expanding it is the request-time half of that story.
+        for target in ["/index.html", "/", "/{err.status_code}.html"] {
+            let handlers = handlers(&format!("example.com {{\n\trewrite {target}\n}}"));
+            assert!(
+                matches!(
+                    &handlers[0],
+                    HandlerConfig::Rewrite {
+                        replace: Some(replace),
+                        ..
+                    } if replace == target
+                ),
+                "`rewrite {target}` must compile to a replacement of {target}, got {:?}",
+                handlers[0]
+            );
+        }
+    }
+
+    /// 🧭 The two-argument form still reads its first argument as a matcher, so
+    /// adding the one-argument rule above cannot have swallowed it: `rewrite
+    /// /a /b` matches on `/a` and replaces with `/b`.
+    #[test]
+    fn rewrite_with_two_arguments_keeps_the_matcher() {
+        let config = compile("example.com {\n\trewrite /a /b\n}").expect("must compile");
+        let matched = config.servers[0]
+            .routes
+            .iter()
+            .find(|route| route.matcher.is_some())
+            .expect("`rewrite /a /b` must match on `/a`, so a matched route must exist");
+        assert_eq!(
+            matched.matcher,
+            Some(pingclair_core::config::Matcher::Path {
+                patterns: vec!["/a".into()]
+            }),
+            "the first of two arguments is the matcher"
+        );
+    }
+
     /// 🚫 `uri replace` substitutes a substring; this crate's rewrite replaces
     /// the whole path. Accepting it would compile and silently serve a
     /// different URL than the operator wrote, which is the one outcome worse

@@ -97,6 +97,19 @@ pub(super) fn first_argument_is_data(d: &Directive) -> bool {
         // 📂 `root <path>` with one argument is the document root. The optional
         // `*` form (`root * /srv`) is how an operator says so explicitly.
         "root" => d.args.len() == 1,
+        // 🪚 `rewrite <to>` with one argument is the destination; `rewrite
+        // <matcher> <to>` puts a matcher first. The count is what tells them
+        // apart, and upstream implements it the same way — `parseCaddyfileRewrite`
+        // branches on `CountRemainingArgs() == 1` before extracting a matcher
+        // (`modules/caddyhttp/rewrite/caddyfile.go` at `ff6da121`).
+        //
+        // 🤡 Without this the leading `/` of `rewrite /index.html` was read as a
+        // path matcher, the directive was left with nothing, and the whole
+        // configuration was refused with an error naming two shapes that the
+        // operator had written one of. It is also the spelling Caddy's own
+        // `handle_errors` example uses, so the form a reader copies from the
+        // documentation was the one that would not load.
+        "rewrite" => d.args.len() == 1,
         // 🚧 A conflict rather than a rule. `file_server /var/www` setting the
         // document root is an extension of ours, while the format it extends
         // reads that argument as a path matcher. Both cannot be true.
