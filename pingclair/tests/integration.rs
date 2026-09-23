@@ -50,6 +50,10 @@ mod websocket_upgrade;
 #[path = "integration/response_framing.rs"]
 mod response_framing;
 
+// 🔌 What a connection's first bytes decide: h2c detection and short requests.
+#[path = "integration/request_framing.rs"]
+mod request_framing;
+
 // 🔤 Site names written with capital letters live beside this file too.
 #[path = "integration/site_name_case.rs"]
 mod site_name_case;

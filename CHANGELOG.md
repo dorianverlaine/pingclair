@@ -20,6 +20,26 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🔌 A request shorter than the h2c preface is answered instead of ignored
+
+A connection whose first request was shorter than 24 bytes was answered with
+nothing at all, and the socket stayed open. Those 24 bytes are the HTTP/2
+connection preface, which this server reads to tell a prior-knowledge h2c
+client from an HTTP/1 one; the read asked for the whole preface before looking
+at what it had, and a short request never sends bytes 19 to 24. So
+`GET / HTTP/1.0\r\n\r\n` — 18 bytes, and perfectly legitimate — sat with no
+first byte until the client's own timeout, and so did an HTTP/1.1 request that
+omitted `Host`. The check now stops at the first byte that cannot belong to the
+preface, which settles an ordinary request in one or two bytes, keeps the
+waiting proportional to the evidence, and still gives a client that really is
+sending the preface the time it needs.
+
+**Upgrading:** a client that used to time out against these requests now gets
+an answer — `200` for HTTP/1.0 without `Host`, `400` for HTTP/1.1 without it.
+Setting `limits { header_timeout }` is no longer needed to stop a short request
+from holding a connection; that option still bounds a client that sends nothing
+at all.
+
 ### 🗄️ Where the TLS store lives, and two TLS options, are configuration now
 
 Three global options an ordinary Caddyfile carries were refused outright, so a

@@ -20,6 +20,45 @@ use tokio::sync::Semaphore;
 
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
+/// 🔁 Decides whether a plaintext connection opens with the h2c preface.
+///
+/// 🛡️ Pingora's `Stream::try_peek` is a `read_exact` of whatever buffer it is
+/// given (`pingora-core-0.9.0/src/protocols/l4/stream.rs:648`), so asking it for
+/// all 24 preface bytes waits for all 24 of them — and a short request never
+/// gets there. `GET / HTTP/1.0\r\n\r\n` is 18 bytes and *complete*: the client
+/// waits for a response, this server waits for bytes 19 to 24, and neither side
+/// moves until the client gives up. That was #165 — a socket held open in
+/// silence for a malformed request or an old HTTP/1.0 one.
+///
+/// 🌊 Asking for one more byte at a time stops at the first byte that cannot be
+/// part of the preface, so the wait is proportional to the evidence rather than
+/// to the buffer size. A request that begins `GET`, `POST` or any other method
+/// is settled by its second byte at the latest; only a client that really is
+/// sending the preface is ever waited on. `try_peek` rewinds what it read, so
+/// the HTTP/1 parser and the HTTP/2 handshake each see the connection from its
+/// first byte.
+///
+/// 📌 The cost is up to 24 peeks per *connection* — not per request — and only
+/// for a connection whose bytes match the preface so far.
+///
+/// 🚫 What is still unbounded is a peer that sends a matching prefix and then
+/// stops, which is genuinely ambiguous; `header_timeout_ms` is what bounds that
+/// when it is configured.
+async fn is_h2c_preface(stream: &mut Stream) -> std::io::Result<bool> {
+    let mut buffer = [0u8; H2_PREFACE.len()];
+    for length in 1..=H2_PREFACE.len() {
+        // A transport that cannot peek reports so by returning `false`; the
+        // trait's default implementation is exactly that.
+        if !stream.try_peek(&mut buffer[..length]).await? {
+            return Ok(false);
+        }
+        if buffer[..length] != H2_PREFACE[..length] {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// 🧱 Owns one Pingora proxy while bounding accepted transport connections and H1 headers.
 pub struct ResourceGuardedProxy {
     proxy: Arc<HttpProxy<PingclairProxy>>,
@@ -75,16 +114,17 @@ impl ResourceGuardedProxy {
         let custom = options.is_some_and(|options| options.force_custom);
 
         if h2c && !custom {
-            let mut buffer = [0u8; H2_PREFACE.len()];
-            let peek = stream.try_peek(&mut buffer);
-            let peeked = match self.limits.header_timeout_ms {
+            let peek = is_h2c_preface(&mut stream);
+            // 📌 A timeout here abandons a partially read preface, which would
+            // lose those bytes for any later parser -- safe only because the
+            // `?` below drops the connection instead of reusing the stream.
+            h2c = match self.limits.header_timeout_ms {
                 Some(timeout_ms) => tokio::time::timeout(Duration::from_millis(timeout_ms), peek)
                     .await
                     .ok()?
                     .ok()?,
                 None => peek.await.ok()?,
             };
-            h2c = peeked && buffer == H2_PREFACE;
         }
 
         if h2c || matches!(stream.selected_alpn_proto(), Some(ALPN::H2)) {
