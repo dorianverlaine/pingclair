@@ -147,6 +147,23 @@ const NON_HANDLER_MODULES: [&str; 4] = [
     "caddy.listeners.proxy_protocol",
 ];
 
+/// 📊 The admin API modules this build implements, under Caddy's own names.
+///
+/// 🚫 Caddy's standard build registers four — `load`, `metrics`, `pki` and
+/// `reverse_proxy` — and this build has two of them. The other two are **left
+/// out** rather than papered over: printing a bare `admin-api` tag, which is
+/// what this listing did, says something is there and gives nothing that can be
+/// asked a follow-up question. A migration checklist asking "does this build
+/// expose the admin pieces I depend on?" got "yes" from the listing and a 404
+/// from `/pki/`.
+///
+/// 📌 The authority for what is in this list is the route match in
+/// `pingclair-api/src/server.rs` — that is where `/load` and `/metrics` are
+/// answered, and where `/pki/` and `/reverse_proxy/` are not. There is no route
+/// table to derive it from, so the tie is a comment and a reviewer's eye rather
+/// than a test.
+const ADMIN_API_MODULES: [&str; 2] = ["admin.api.load", "admin.api.metrics"];
+
 /// 🚩 Facts about this build that are not modules and have no Caddy module ID.
 ///
 /// They are printed under a `pingclair.features.` prefix rather than bare, so
@@ -167,6 +184,7 @@ fn module_ids() -> Vec<String> {
             None => format!("pingclair.handlers.{}", module.directive),
         })
         .chain(NON_HANDLER_MODULES.iter().map(|name| name.to_string()))
+        .chain(ADMIN_API_MODULES.iter().map(|name| name.to_string()))
         .chain(FEATURES.iter().map(|name| format!("pingclair.features.{name}")))
         .collect();
     ids.sort_unstable();
@@ -1134,6 +1152,7 @@ mod tests {
                 id.starts_with("http.handlers.")
                     || id.starts_with("pingclair.")
                     || id.starts_with("tls")
+                    || id.starts_with("admin.api.")
                     || id.starts_with("caddy."),
                 "`{id}` is neither a Caddy module ID nor namespaced as ours, so a reader \
                  cannot tell it from a module Caddy would also have"
@@ -1154,6 +1173,34 @@ mod tests {
             .map(|module| module.directive)
             .collect();
         assert_eq!(directives, sorted, "the module table is out of order");
+    }
+
+    /// 📊 The admin API half of the listing names what is actually there.
+    ///
+    /// 🤡 The listing printed a bare `admin-api` tag, so a migration checklist
+    /// asking "do you expose `/pki/`?" got "yes, something admin-shaped" from
+    /// the inventory and a 404 from the endpoint. The four names Caddy
+    /// registers are `admin.api.load`, `admin.api.metrics`, `admin.api.pki` and
+    /// `admin.api.reverse_proxy`; this build answers two of them.
+    ///
+    /// 📌 Measured on 2026-09-23 against a running server: `POST /load` answers
+    /// 400 to a bad body — the endpoint exists — and `GET /metrics` answers
+    /// 200, while `GET /pki/` and `GET /reverse_proxy/upstreams` both answer
+    /// 404. The assertion below is the half of that which can be checked
+    /// without a server.
+    #[test]
+    fn the_admin_api_half_names_only_the_endpoints_that_answer() {
+        let ids = module_ids();
+        for present in ["admin.api.load", "admin.api.metrics"] {
+            assert!(ids.contains(&present.to_string()), "`{present}` is missing");
+        }
+        for absent in ["admin.api.pki", "admin.api.reverse_proxy"] {
+            assert!(
+                !ids.contains(&absent.to_string()),
+                "`{absent}` is listed, but this build answers 404 for that endpoint — \
+                 advertising it is the failure the bare `admin-api` tag already caused"
+            );
+        }
     }
 
     /// 🏷️ The three sources are labelled by namespace, not by a marker line,
