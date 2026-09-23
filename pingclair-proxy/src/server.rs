@@ -6263,24 +6263,19 @@ impl ProxyHttp for PingclairProxy {
         let request_header = session.req_header();
         let path = request_header.uri.path();
 
-        if path.starts_with("/.well-known/acme-challenge/")
+        // 🔐 Only the exact RFC 8555 §8.3 path shape is answered; a repeated
+        // prefix or a nested segment falls through to normal routing.
+        if let Some(token) = crate::acme_challenge::acme_challenge_token(path)
             && let Some(manager) = &self.tls_manager
         {
-            // Extract token
-            let token = path.trim_start_matches("/.well-known/acme-challenge/");
-
             // Lookup token in challenge handler
             let handler = manager.challenge_handler();
             if let Some(key_auth) = handler.get_token(token) {
                 tracing::info!("🔐 Serving ACME challenge for token: {}", token);
 
-                let mut header = pingora_http::ResponseHeader::build(200, Some(2)).unwrap();
-                header
-                    .insert_header("Content-Type", "application/octet-stream")
-                    .unwrap();
-                header
-                    .insert_header("Content-Length", key_auth.len().to_string())
-                    .unwrap();
+                let mut header = pingora_http::ResponseHeader::build(200, Some(2))?;
+                header.insert_header("Content-Type", "application/octet-stream")?;
+                header.insert_header("Content-Length", key_auth.len())?;
                 session
                     .write_response_header(Box::new(header), false)
                     .await?;

@@ -12,6 +12,7 @@
 // MARK: - Modules
 
 pub mod access_log;
+mod acme_challenge;
 pub mod alt_svc;
 mod body_buffer;
 mod cache_policy;

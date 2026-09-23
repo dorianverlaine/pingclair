@@ -20,6 +20,15 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🔐 The HTTP-01 responder answers only the path RFC 8555 defines
+
+The ACME HTTP-01 responder removed its `/.well-known/acme-challenge/` prefix
+as many times as it repeated, so a path such as
+`/.well-known/acme-challenge//.well-known/acme-challenge/TOKEN` returned the
+token's key authorization too. It now answers only the prefix followed by one
+non-empty token with no further `/`; every other path falls through to normal
+routing.
+
 ### 🌊 Compressed HTTP/1.1 responses keep the connection open
 
 A proxied response that Pingclair compressed for an HTTP/1.1 client lost its
