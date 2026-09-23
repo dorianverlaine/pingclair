@@ -458,7 +458,9 @@ protection policy or configured upstream set starts fresh state.
 There is **no request-body ceiling unless the configuration asks for one**,
 which is what Caddy does. A site that wants a limit writes
 `request_body { max_size <size> }` on the route that accepts uploads, or sets
-`client_max_body_size` on the site; `0` means unlimited. A body over a
+`request_body { max_size <size> }` at site level — the JSON field behind it is
+`client_max_body_size`, which has no Caddyfile spelling — and `0` means
+unlimited. A body over a
 configured limit is refused with `413` on the chunk that crosses it.
 
 Exceeded header, body, and request budgets receive an explicit HTTP error when

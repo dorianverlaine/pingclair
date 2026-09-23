@@ -370,6 +370,14 @@ PROXY protocol ne s'applique pas au listener HTTP/3 UDP.
 
 ### Limites de ressources et délais
 
+**Il n'y a pas de plafond de corps de requête, sauf si la configuration en
+demande un** — c'est ce que fait Caddy. Un site qui en veut un écrit
+`request_body { max_size <size> }` au niveau du site, ou sur la route qui
+accepte les téléversements (le champ JSON correspondant est
+`client_max_body_size`, qui n'a pas d'orthographe Caddyfile) ; `0` signifie
+aucune limite. Un corps au-delà du plafond configuré est refusé par un `413` sur
+le segment qui le franchit.
+
 Les limites en aval se configurent au niveau du site, et les phases de délai
 amont dans `reverse_proxy`. Une durée exige une unité. Les WebSocket upgrades,
 `flush_interval -1` et `text/event-stream` utilisent les paramètres de connexion

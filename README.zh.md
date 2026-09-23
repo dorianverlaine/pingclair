@@ -340,6 +340,12 @@ backend 會以名字被拒絕而不是被收下，因為收下只會讓 store �
 
 ### 資源上限與 timeout
 
+**除非設定要求，否則沒有請求 body 上限**，這是 Caddy 的行為。想要上限的站台
+在站台層級寫 `request_body { max_size <size> }`，或在會收上傳的那個 route 上
+寫（JSON 設定裡的欄位是 `client_max_body_size`，它沒有 Caddyfile 拼法）；
+`0` 代表無上限。超過所設上限的 body 會在跨越上限的那個 chunk 被以 `413`
+拒絕。
+
 下游上限設定在站台層級，上游各階段 timeout 則設定於 `reverse_proxy`。
 時間長度必須附帶單位。WebSocket upgrade、`flush_interval -1` 與
 `text/event-stream` 會套用長連線覆寫；`off` 代表明確移除該長連線期限。
