@@ -34,6 +34,9 @@ mod retry_idempotency;
 // 🔪 Responses that fail after they started live beside this file too.
 #[path = "integration/started_response.rs"]
 mod started_response;
+// 🔀 Multi-line variation tests share this real-binary harness.
+#[path = "integration/cache_vary.rs"]
+mod cache_vary;
 
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather

@@ -28,7 +28,7 @@ use pingora_cache::key::{CacheKey, HashBinary};
 use pingora_cache::eviction::{EvictionManager, simple_lru};
 use pingora_cache::lock::{CacheKeyLockImpl, CacheLock};
 use pingora_cache::predictor::Predictor;
-use pingora_cache::{CacheMeta, MemCache, NoCacheReason, RespCacheable, VarianceBuilder, filters};
+use pingora_cache::{CacheMeta, MemCache, NoCacheReason, RespCacheable, filters};
 
 use arc_swap::ArcSwap;
 use async_recursion::async_recursion;
@@ -6064,34 +6064,7 @@ impl ProxyHttp for PingclairProxy {
         _ctx: &mut Self::CTX,
         request: &RequestHeader,
     ) -> Option<HashBinary> {
-        let vary = meta.headers().get("vary")?.to_str().ok()?;
-
-        let mut variance = VarianceBuilder::new();
-        let mut names: Vec<String> = vary
-            .split(',')
-            .map(|name| name.trim().to_ascii_lowercase())
-            .filter(|name| !name.is_empty())
-            .collect();
-        // 🔑 The hash must not depend on the order the origin happened to list
-        // them, or the same variant would key differently between responses.
-        names.sort();
-        names.dedup();
-
-        let values: Vec<(String, Vec<u8>)> = names
-            .into_iter()
-            .map(|name| {
-                let value = request
-                    .headers
-                    .get(&name)
-                    .map(|value| value.as_bytes().to_vec())
-                    .unwrap_or_default();
-                (name, value)
-            })
-            .collect();
-        for (name, value) in &values {
-            variance.add_value(name, value);
-        }
-        variance.finalize()
+        crate::cache_vary::variance(meta.headers(), &request.headers)
     }
 
     /// Request filter (Handle static files and early return)

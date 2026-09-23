@@ -20,6 +20,16 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🔀 Cache variants include every `Vary` field line
+
+The H1/H2 response cache now reads all response `Vary` lines and every request
+field line they name. A second nominated field or repeated request field can
+no longer collapse into the first variant. Names are case-insensitive and
+order-independent; request values retain their order, boundaries, and presence.
+Invalid `Vary` fields, like `Vary: *`, prevent storage rather than silently
+weakening the key. Equivalent merged request fields may occupy separate entries
+because arbitrary field syntax is not normalized.
+
 ### 🔐 HTTP/3 honours the listener's `default_sni`
 
 A QUIC client without SNI now receives the certificate selected by that

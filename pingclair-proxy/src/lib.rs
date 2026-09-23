@@ -16,6 +16,7 @@ mod acme_challenge;
 pub mod alt_svc;
 mod body_buffer;
 mod cache_policy;
+mod cache_vary;
 pub mod client_auth;
 pub mod connection_filter;
 pub mod dns;

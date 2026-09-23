@@ -105,16 +105,9 @@ pub(crate) fn uncacheable_response_reason(response: &ResponseHeader) -> Option<&
         return Some("response is a stream");
     }
 
-    // 🔀 `Vary: *` says no two requests are interchangeable, so no stored copy
-    // can ever be reused. Named fields are handled by `cache_vary_filter`.
-    if response
-        .headers
-        .get_all("vary")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .any(|value| value.split(',').any(|name| name.trim() == "*"))
-    {
-        return Some("response varies on everything");
+    // 🔀 Every Vary line must be understood before reuse can be safe.
+    if let Some(reason) = crate::cache_vary::names(&response.headers).find_map(Result::err) {
+        return Some(reason);
     }
 
     // 🗜️ An origin that encoded the body itself produced one specific coding.
