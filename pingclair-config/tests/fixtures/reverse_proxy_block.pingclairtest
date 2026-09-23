@@ -163,9 +163,7 @@ api.example {
         "application/x-javascript",
         "image/svg+xml"
       ],
-      "encodings": [
-        "gzip"
-      ],
+      "encodings": [],
       "error_pages": {}
     }
   ],

@@ -144,14 +144,18 @@ pub(super) fn adapt_handler(
                             }
                         }
                         "index" => config.index = sub.args.clone(),
-                        // 🗜️ On-the-fly compression, which this server does and
-                        // upstream's `file_server` does not — there it is the
-                        // separate `encode` directive. Since we compress by
-                        // default, there has to be a way to say no; without this
-                        // subdirective the only way to reach `compress: false`
-                        // was to write the configuration in JSON, which is how the
-                        // divergence survived a whole performance campaign
-                        // unnoticed.
+                        // 🗜️ On-the-fly compression. The site-level decision is
+                        // the `encode` directive: no `encode` means no codings,
+                        // and the compiler then lowers this flag to false while
+                        // building the route tree. What this subdirective adds is
+                        // the other direction — a file server may opt itself out
+                        // on a site that did ask for a coding, for instance to
+                        // stream a large file it does not want to buffer.
+                        //
+                        // 📌 In Caddy there is no such subdirective at all:
+                        // `encode` alone decides. It exists here because a single
+                        // site can hold several file servers, and `compress off`
+                        // on one of them is the only way to say "not this one".
                         "compress" => {
                             config.compress = sub
                                 .args

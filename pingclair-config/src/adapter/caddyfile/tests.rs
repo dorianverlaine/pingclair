@@ -3072,18 +3072,25 @@ mod fail_closed_tests {
             "`compress off` must disable it"
         );
 
-        // 👍 The default is unchanged: turning it off has to be possible, but
-        // whether it *should* be off by default is a compatibility decision and
-        // not this change.
+        // 🎯 The default is now off, because the site has no codings: a bare
+        // `file_server` on a bare site serves the bytes on disk. Whether the
+        // flag defaults to true no longer decides anything on its own — see
+        // `a_site_without_encode_serves_identity`.
         let default = crate::compile(":80\nfile_server").expect("a bare file_server compiles");
         assert!(
-            file_server_compress(&default),
-            "the default must not change"
+            !file_server_compress(&default),
+            "a file server on a site with no `encode` must not compress"
         );
 
-        let on = crate::compile(":80\nfile_server {\n    compress\n}")
+        // 📌 The subdirective still means what it says on a site that did ask
+        // for a coding: it is the one-way pass that lowers this flag, so a
+        // `compress` written explicitly there survives.
+        let on = crate::compile(":80\nencode gzip\nfile_server {\n    compress\n}")
             .expect("a bare `compress` means on");
-        assert!(file_server_compress(&on));
+        assert!(
+            file_server_compress(&on),
+            "`compress` on a site with codings must leave compression on"
+        );
     }
 
     /// 🚫 `encode off` is the site-level opt-out and must reach the file server.
@@ -3117,6 +3124,42 @@ mod fail_closed_tests {
         assert!(
             !file_server_compress(&per_server),
             "`file_server {{ compress off }}` must win over the site default"
+        );
+    }
+
+    /// 🎯 A site compresses only where `encode` asks, which is what Caddy does.
+    ///
+    /// 🤡 The compiler used to fall back to gzip whenever a site had no `encode`
+    /// directive, so the smallest possible static site — a root and a file
+    /// server, nothing else — answered `Content-Encoding: gzip` to any client
+    /// that mentioned gzip. Nothing in the Caddyfile said so, and the two
+    /// settings that produced it (the site's coding list and the file server's
+    /// `compress` flag) had no visible relationship. An operator migrating a
+    /// deployment saw a `Content-Length`, an `ETag` and a stored copy that no
+    /// longer matched what Caddy had been serving for the same file.
+    #[test]
+    fn a_site_without_encode_serves_identity() {
+        let bare = crate::compile(":80\nroot * /srv\nfile_server").expect("a bare site compiles");
+        assert!(
+            bare.servers[0].encodings.is_empty(),
+            "a site with no `encode` must end up with no codings, not with a default"
+        );
+        assert!(
+            !file_server_compress(&bare),
+            "and its file server must not compress either, or the two settings disagree"
+        );
+
+        // 👍 The other direction, so this cannot be satisfied by turning
+        // compression off everywhere: asking for a coding still gets one.
+        let asked = crate::compile(":80\nencode gzip\nroot * /srv\nfile_server").expect("compiles");
+        assert_eq!(
+            asked.servers[0].encodings,
+            &[pingclair_core::config::Encoding::Gzip],
+            "`encode gzip` must still produce gzip and only gzip"
+        );
+        assert!(
+            file_server_compress(&asked),
+            "a site that asked for a coding must let its file server use it"
         );
     }
 

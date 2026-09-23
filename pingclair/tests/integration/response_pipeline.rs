@@ -55,6 +55,14 @@ pub(super) fn proxy_pingclairfile(upstream: SocketAddr, options: &str) -> String
             @readiness path __PINGCLAIR_TEST_READINESS_PATH__
             respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
 
+            # 🎯 Compression is opt-in, so a fixture whose tests assert anything
+            # about it has to ask for it. Writing `encode gzip` here rather than
+            # relying on a default is also what makes the negative cases mean
+            # something: a `HEAD` or a `no-transform` reply that comes back
+            # identity now does so because of its own rule, not because nothing
+            # was compressed in the first place.
+            encode gzip
+
             reverse_proxy {upstream} {{
                 {options}
             }}

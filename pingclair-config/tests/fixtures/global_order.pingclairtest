@@ -40,7 +40,7 @@ example.com {
                 ],
                 "browse": false,
                 "browse_limit": null,
-                "compress": true,
+                "compress": false,
                 "canonical_uris": true
               },
               {
@@ -95,9 +95,7 @@ example.com {
         "application/x-javascript",
         "image/svg+xml"
       ],
-      "encodings": [
-        "gzip"
-      ],
+      "encodings": [],
       "error_pages": {}
     }
   ],

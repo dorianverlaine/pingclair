@@ -670,20 +670,24 @@ example.com {
 `If-None-Match` 都會回 `200`。要對齊 Caddy 就得讀檔算雜湊，那是尚未量測過的
 請求路徑成本；格式寫在這裡，讓那次搬移是「已知事件」而不是頻寬意外。
 
-📦 **壓縮預設就是開的**，上面那段範例並沒有把它打開：對 `file_server` 站台而言
-`encode gzip` 是多餘的，因為預設編碼器就是 `gzip`。只要用戶端的
-`Accept-Encoding` 允許，`text/*` 回應就會被壓縮，並帶上 `Content-Encoding` 與
-加了 `-gzip` 後綴的 `ETag`——與明寫 `encode` 時的輸出完全相同。這是與 Caddy
-刻意的差異（Caddy 只在有 `encode` 指示時才壓縮），寫在這裡而不是留給人踩，是
-因為「自己沒設卻出現 `Content-Encoding`」正是那種在 staging 看不出來的意外。
-要改回不壓縮——上游已經壓過，或客戶端自己處理編碼——寫 `encode off`；也可以只
-關掉某個 `file_server` 的壓縮：`file_server { compress off }`。另外，只有超過
-大小門檻的回應才會被壓縮。代理的回應若是部分內容（`206`，或帶任何
+📦 **壓縮是 opt-in**，與 Caddy 一致：站台只在有 `encode` 指示時才壓縮，上面那段
+範例就是把它打開的那一行。`encode gzip`（或 `encode zstd gzip`，依序表示偏好）
+涵蓋整個站台；只要用戶端的 `Accept-Encoding` 允許，`text/*` 回應就會被壓縮，
+並帶上 `Content-Encoding` 與加了 `-gzip` 後綴的 `ETag`。只有超過大小門檻的回應
+才會被壓縮。沒有 `encode` 的站台就是送磁碟上的原樣位元組，即使客戶端送了
+`Accept-Encoding: gzip`；已經有編碼的站台要關掉壓縮寫 `encode off`，只想關掉
+某個 `file_server` 就在它裡面寫 `file_server { compress off }`。JSON 設定保留舊
+行為——沒有 `encodings` 欄位時預設 `gzip`——所以在那個欄位存在之前寫下的文件，
+行為與當初寫的完全一致。
+
+代理的回應若是部分內容（`206`，或帶任何
 `Content-Range`）、回應 `HEAD`、沒有 body（`204`、`304`），或帶
 `Cache-Control: no-transform`，就原樣轉送上游送來的內容；真的壓縮時，
 `Accept-Encoding` 會附加到既有的 `Vary` 而不是取代它，而上游的摘要欄位
 （`Content-Digest`、`Repr-Digest`、`Digest`、`Content-MD5`）會被移除，因為它們
-已經不再描述送出的位元組。
+已經不再描述送出的位元組。`Accept-Ranges: bytes` 在壓縮過的回應上也會送，而
+`Range` 請求仍然答得出來：要服務 range 時即時壓縮會被跳過，所以回來的 `206`
+是 identity 檔案在那個標頭承諾的位移上的位元組，而不是 gzip 串流裡的位移。
 
 候選路徑結尾有 `/` 的只匹配目錄，沒有 `/` 的只匹配一般檔案——**決定的是設定檔裡
 寫的那個斜線，不是請求帶進來的那個**。

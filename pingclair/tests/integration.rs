@@ -13171,6 +13171,168 @@ fn file_server_tree() -> tempfile::TempDir {
     dir
 }
 
+/// 📄 A document root holding one highly compressible text file.
+///
+/// Well above the 256-byte floor below which compression is skipped, so a
+/// response that comes back identity does so because nothing asked for a
+/// coding — not because the file was too small for the floor to matter.
+fn compressible_tree() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("document root");
+    std::fs::write(dir.path().join("big.txt"), "compressible text ".repeat(512))
+        .expect("write big.txt");
+    dir
+}
+
+/// 🧾 A `file_server` site over `root`, with `encode` written only if given.
+///
+/// `encode` is a whole line when present and empty when not, so the two sites
+/// differ by exactly the directive under test and nothing else.
+fn file_server_site(root: &str, encode: &str) -> TestServer {
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+            {encode}
+            file_server
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+        }}
+        "#
+    );
+    TestServer::new_pingclairfile(&config)
+}
+
+/// 🗜️ A site compresses only where `encode` asks, and that decision is the
+/// site's alone.
+///
+/// 🤡 The compiler used to fall back to gzip whenever a site had no `encode`
+/// directive, so the smallest possible static site — a root and a file server,
+/// nothing else — answered `Content-Encoding: gzip` to every client that
+/// mentioned gzip. Nothing in the Caddyfile said so. Caddy compresses only
+/// where `encode` asks, and the difference is visible to anyone migrating: the
+/// same file arrives with a different `Content-Length`, a different `ETag` and
+/// therefore a different stored object.
+///
+/// 👍 The second site is the control. Without it, a change that turned
+/// compression off everywhere — including for sites that asked — would satisfy
+/// the first half of this test.
+#[tokio::test]
+async fn test_a_site_without_encode_serves_identity_bytes() {
+    let tree = compressible_tree();
+    let root = tree.path().to_string_lossy().into_owned();
+    let client = no_proxy_client();
+
+    let mut bare = file_server_site(&root, "");
+    assert!(bare.wait_until_ready().await, "server failed to start");
+    let reply = client
+        .get(bare.url(0, "/big.txt"))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(reply.status(), 200);
+    assert!(
+        reply.headers().get("content-encoding").is_none(),
+        "a site with no `encode` must serve the bytes on disk, got {:?}",
+        reply.headers().get("content-encoding")
+    );
+    let identity = reply.bytes().await.unwrap();
+    assert_eq!(
+        identity,
+        std::fs::read(tree.path().join("big.txt")).unwrap(),
+        "and those bytes must be the file itself"
+    );
+    bare.stop();
+
+    let mut asked = file_server_site(&root, "encode gzip");
+    assert!(asked.wait_until_ready().await, "control server failed to start");
+    let reply = client
+        .get(asked.url(0, "/big.txt"))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        reply.headers().get("content-encoding").map(|v| v.to_str().unwrap()),
+        Some("gzip"),
+        "`encode gzip` must still compress, or the negative case proves nothing"
+    );
+    assert!(
+        reply.bytes().await.unwrap().len() < identity.len(),
+        "the compressed body must actually be smaller"
+    );
+    asked.stop();
+}
+
+/// 📐 A `Range` on a compressing file server is answered from the identity
+/// bytes, in the offsets its own `Content-Range` names.
+///
+/// 🤡 Compressing a `206` puts gzip bytes under a `Content-Range` that counts
+/// the bytes on disk, so a client assembling the file from ranges writes the
+/// wrong bytes at the wrong offsets — and a client told `Accept-Ranges: bytes`
+/// has every reason to do exactly that. The rule is that the two headers must
+/// agree: when an interval is served, the coding is dropped rather than the
+/// offsets rewritten.
+///
+/// 📌 The same request without a `Range` is asserted first, so this cannot pass
+/// by the site having stopped compressing altogether.
+#[tokio::test]
+async fn test_a_range_on_a_compressing_file_server_is_identity() {
+    let tree = compressible_tree();
+    let root = tree.path().to_string_lossy().into_owned();
+    let file = std::fs::read(tree.path().join("big.txt")).unwrap();
+    let mut server = file_server_site(&root, "encode gzip");
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let whole = client
+        .get(server.url(0, "/big.txt"))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        whole.headers().get("content-encoding").map(|v| v.to_str().unwrap()),
+        Some("gzip"),
+        "the site must be compressing at all for this test to mean anything"
+    );
+
+    let reply = client
+        .get(server.url(0, "/big.txt"))
+        .header("Accept-Encoding", "gzip")
+        .header("Range", "bytes=0-99")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(reply.status(), 206, "a satisfiable range is partial content");
+    assert!(
+        reply.headers().get("content-encoding").is_none(),
+        "a ranged response must not be compressed, got {:?}",
+        reply.headers().get("content-encoding")
+    );
+    assert_eq!(
+        reply.headers().get("content-range").unwrap(),
+        &format!("bytes 0-99/{}", file.len()),
+        "the range must be counted in the bytes on disk"
+    );
+    assert_eq!(
+        reply.headers().get("accept-ranges").map(|v| v.to_str().unwrap()),
+        Some("bytes"),
+        "and those are the offsets the range advertisement promises"
+    );
+    assert_eq!(
+        reply.bytes().await.unwrap().as_ref(),
+        &file[..100],
+        "the body must be the identity bytes the header describes"
+    );
+    server.stop();
+}
+
 /// 🗜️ Sidecars are served only when the site asks for them.
 ///
 /// This is the behaviour change M1 carries: lookup used to be unconditional,
@@ -13207,9 +13369,8 @@ async fn test_file_server_precompressed_is_opt_in() {
         .expect("request");
     assert_eq!(response.status(), 200);
     // 🎯 The sidecar must not be what came back. It is compared by bytes
-    // rather than by asserting the plain text, because with compression on the
-    // server legitimately gzips the *real* file on the fly — and that response
-    // is also not plain text. The question here is only which file was read.
+    // rather than by asserting the plain text, because the question here is
+    // only which file was read, not which coding the reply carries.
     assert_ne!(
         response.bytes().await.unwrap().as_ref(),
         b"stale-sidecar",

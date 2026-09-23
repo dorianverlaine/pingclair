@@ -260,6 +260,12 @@ impl Default for FileServerConfig {
             index: vec!["index.html".to_string(), "index.htm".to_string()],
             browse: false,
             browse_limit: None,
+            // 🗜️ Permission, not an instruction. A file server compresses only
+            // when the site it belongs to has codings — the `encode` directive
+            // in a Pingclairfile, or `encodings` in a JSON document — and the
+            // compiler lowers this flag to false when it does not. So `true` here
+            // means "may compress", and a site that says nothing about
+            // compression serves identity bytes even with this default.
             compress: true,
             // 🗜️ Off by default, like upstream. This server used to look for
             // sidecars unconditionally, so a stale `app.js.gz` was served in

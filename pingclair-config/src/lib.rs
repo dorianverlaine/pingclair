@@ -2026,7 +2026,14 @@ mod tests {
     fn test_compile_encode_defaults_and_off() {
         use pingclair_core::config::Encoding;
 
-        // No directive at all: gzip, matching every release through 0.1.7.
+        // 🎯 No directive at all: no codings, which is what Caddy does.
+        //
+        // 🤡 Every release through 0.1.7 fell back to gzip here, so the smallest
+        // possible site compressed any `text/*` response for a client that
+        // mentioned gzip — with nothing in the Caddyfile saying so. The JSON
+        // entry point keeps the old fallback, because a stored document that
+        // predates the `encodings` field must keep behaving as written; a
+        // Pingclairfile is read by someone who can see whether `encode` is there.
         let implicit = compile(
             r#"
             example.com {
@@ -2035,9 +2042,13 @@ mod tests {
         "#,
         )
         .unwrap();
-        assert_eq!(implicit.servers[0].encodings, vec![Encoding::Gzip]);
+        assert!(
+            implicit.servers[0].encodings.is_empty(),
+            "a site with no `encode` must not compress"
+        );
 
-        // Bare `encode`: also gzip.
+        // Bare `encode` is not the same thing: writing the directive is what
+        // asks for a coding, and upstream defaults it to gzip.
         let bare = compile(
             r#"
             example.com {
@@ -2049,8 +2060,8 @@ mod tests {
         .unwrap();
         assert_eq!(bare.servers[0].encodings, vec![Encoding::Gzip]);
 
-        // `encode off` is the only way to get an empty list — the runtime
-        // reads that as "never compress on this server".
+        // `encode off` reaches the same empty list as saying nothing, and it is
+        // still the spelling a site with other codings uses to stop.
         let off = compile(
             r#"
             example.com {

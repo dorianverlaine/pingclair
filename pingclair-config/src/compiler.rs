@@ -14,7 +14,7 @@ use pingclair_core::config::{
     LogConfig, LogFormat as CoreLogFormat, LogOutput as CoreLogOutput, Matcher as CoreMatcher,
     MatcherCondition, NamedLogConfig, PingclairConfig, ProxyUpstream,
     RateLimitKey as CoreRateLimitKey, ReverseProxyConfig, RouteConfig, ServerConfig, TlsConfig,
-    default_encodings, default_gzip_types,
+    default_gzip_types,
 };
 use pingclair_core::server::{
     FILE_MATCHER_PLACEHOLDER_PREFIXES, FILE_MATCHER_PLACEHOLDERS, MAX_BCRYPT_COST,
@@ -341,6 +341,21 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
 
 /// 🗜️ Lowers the `encode` directive into the runtime's coding preference list.
 ///
+/// 🎯 This function is where a Pingclairfile decides whether a site compresses
+/// at all, and it is the only place that decides it. A site with no `encode`
+/// directive gets no codings, which is what Caddy does; the file servers
+/// underneath then have their own `compress` flag lowered to match by
+/// [`apply_site_compression`]. The alternative — defaulting to gzip here and
+/// letting each file server keep its own `compress: true` — is how a site whose
+/// Caddyfile says nothing about compression came to answer
+/// `Content-Encoding: gzip`, which is the divergence this function now closes.
+///
+/// 📌 The JSON configuration keeps its own default. `ServerConfig::encodings`
+/// still falls back to gzip when the field is absent, because a `0.1.7`
+/// document predates the field and must keep behaving the way it was written.
+/// The two entry points are allowed to differ: a Pingclairfile is read by a
+/// person who can see the `encode` directive, a stored JSON document is not.
+///
 /// The grammar accepts `br` because Caddyfiles in the wild write it, but the
 /// reverse-proxy body filter has no streaming Brotli encoder. Rejecting it
 /// here is deliberate: the alternative is to drop it from the list and quietly
@@ -348,7 +363,7 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
 /// much later, from a `Content-Encoding` that was never asked for.
 fn compile_encodings(server: &ServerBlock) -> CompileResult<Vec<CoreEncoding>> {
     let Some(algos) = &server.compress else {
-        return Ok(default_encodings());
+        return Ok(Vec::new());
     };
 
     let mut encodings = Vec::with_capacity(algos.len());

@@ -747,25 +747,32 @@ hacher, un coût sur le chemin de requête qui n'a pas été mesuré ; le format
 donc écrit ici pour que la migration soit un événement connu plutôt qu'une
 surprise de bande passante.
 
-📦 **La compression est active par défaut**, et l'exemple ci-dessus ne l'active
-pas : `encode gzip` y est redondant pour un site `file_server`, puisque l'encodeur
-défaut est `gzip`. Une réponse `text/*` est compressée
-dès que l'`Accept-Encoding` du client le permet, avec un `Content-Encoding` et un
-`ETag` suffixé `-gzip` identiques à ceux d'un `encode` explicite. C'est une
-différence délibérée avec Caddy, qui ne compresse que là où un `encode` le
-demande ; elle est écrite ici plutôt que laissée à la découverte, parce qu'un
-`Content-Encoding` que personne n'a configuré est exactement le genre de surprise
-qui « marchait en staging ». Pour servir des réponses identity — un amont qui a
-déjà compressé, ou un client qui gère le codage lui-même — écrivez `encode off`.
-La compression se désactive aussi pour un `file_server` précis avec
-`file_server { compress off }`, et seules les réponses au-dessus d'un seuil de
-taille sont compressées. Une réponse proxifiée reste exactement telle que
+📦 **La compression est opt-in**, comme chez Caddy : un site ne compresse que là
+où une directive `encode` le demande, et l'exemple ci-dessus est ce qui l'active.
+`encode gzip` — ou `encode zstd gzip`, qui liste les préférences dans l'ordre —
+couvre tout le site ; une réponse `text/*` est alors compressée dès que
+l'`Accept-Encoding` du client le permet, avec un `Content-Encoding` et un `ETag`
+suffixé `-gzip`. Seules les réponses au-dessus d'un seuil de taille sont
+compressées. Un site sans `encode` sert les octets tels qu'ils sont sur le
+disque, même si le client annonce gzip ; pour désactiver la compression sur un
+site qui a des codages, écrivez `encode off`, et pour en exempter un
+`file_server` précis, mettez `file_server { compress off }` dedans. Une
+configuration JSON garde l'ancien comportement — `encodings` absent vaut gzip —
+pour qu'un document stocké écrit avant l'existence de ce champ continue de
+répondre exactement comme il a été écrit.
+
+Une réponse proxifiée reste exactement telle que
 l'amont l'a envoyée si elle est partielle (`206`, ou tout `Content-Range`),
 répond à un `HEAD`, n'a pas de corps (`204`, `304`) ou porte
 `Cache-Control: no-transform` ; quand elle est compressée, `Accept-Encoding`
 s'ajoute à son `Vary` existant au lieu de le remplacer, et les champs de
 condensat de l'origine (`Content-Digest`, `Repr-Digest`, `Digest`,
 `Content-MD5`) sont retirés, puisqu'ils ne décrivent plus les octets.
+`Accept-Ranges: bytes` est annoncé aussi sur une réponse compressée d'un
+`file_server`, et une requête `Range` reste résoluble : la compression à la
+volée est ignorée dès qu'un intervalle est servi, donc le `206` renvoyé contient
+les octets du fichier identity aux décalages promis par cet en-tête, et non des
+décalages dans le flux gzip.
 
 Un candidat terminé par `/` ne correspond qu'à un répertoire, et un candidat
 sans `/` qu'à un fichier ordinaire — la barre oblique qui tranche est celle

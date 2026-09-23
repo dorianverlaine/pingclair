@@ -78,9 +78,7 @@ b.example, www.b.example {
         "application/x-javascript",
         "image/svg+xml"
       ],
-      "encodings": [
-        "gzip"
-      ],
+      "encodings": [],
       "error_pages": {}
     },
     {
@@ -153,9 +151,7 @@ b.example, www.b.example {
         "application/x-javascript",
         "image/svg+xml"
       ],
-      "encodings": [
-        "gzip"
-      ],
+      "encodings": [],
       "error_pages": {}
     }
   ],

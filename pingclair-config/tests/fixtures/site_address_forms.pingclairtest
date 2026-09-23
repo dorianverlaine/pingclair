@@ -86,9 +86,7 @@ ported.example:8080 {
         "application/x-javascript",
         "image/svg+xml"
       ],
-      "encodings": [
-        "gzip"
-      ],
+      "encodings": [],
       "error_pages": {}
     },
     {
@@ -162,9 +160,7 @@ ported.example:8080 {
         "application/x-javascript",
         "image/svg+xml"
       ],
-      "encodings": [
-        "gzip"
-      ],
+      "encodings": [],
       "error_pages": {}
     },
     {
@@ -229,9 +225,7 @@ ported.example:8080 {
         "application/x-javascript",
         "image/svg+xml"
       ],
-      "encodings": [
-        "gzip"
-      ],
+      "encodings": [],
       "error_pages": {}
     }
   ],

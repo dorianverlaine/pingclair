@@ -30,7 +30,7 @@ file_server {
             ],
             "browse": true,
             "browse_limit": null,
-            "compress": true,
+            "compress": false,
             "canonical_uris": true
           },
           "methods": null,
@@ -88,9 +88,7 @@ file_server {
         "application/x-javascript",
         "image/svg+xml"
       ],
-      "encodings": [
-        "gzip"
-      ],
+      "encodings": [],
       "error_pages": {}
     }
   ],

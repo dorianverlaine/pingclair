@@ -744,25 +744,30 @@ would mean reading each file to hash it, which is a request-path cost that has
 not been measured; the format is stated here so the migration is a known event
 rather than a bandwidth surprise.
 
-📦 **Compression is on by default**, and that example does not turn it on:
-`encode gzip` above is redundant for a `file_server` site, because the default
-default encoder is `gzip`. A `text/*` response is compressed whenever
-the client's `Accept-Encoding` allows it, with `Content-Encoding` and a
-`Content-Encoding`-suffixed `ETag` that a configured `encode` produces
-identically. This is a deliberate difference from Caddy, which compresses only
-where an `encode` directive asks; it is stated here rather than left to be
-discovered because a `Content-Encoding` nobody configured is exactly the
-surprise that reads as "it worked in staging". To serve identity responses
-instead — an upstream that already compressed, or a client that handles the
-coding itself — write `encode off`. Compression can also be disabled for one
-`file_server` with `file_server { compress off }`, and only responses above a
-size floor are compressed at all. A proxied response is left exactly as the
+📦 **Compression is opt-in**, as it is in Caddy: a site compresses only where an
+`encode` directive asks for it, and the example above is what turns it on.
+`encode gzip` — or `encode zstd gzip`, which lists preferences in order — covers
+the whole site, and a `text/*` response is then compressed whenever the client's
+`Accept-Encoding` allows it, with `Content-Encoding` and a `-gzip`-suffixed
+`ETag`. Only responses above a size floor are compressed at all. A site with no
+`encode` serves the bytes as they sit on disk, even when the client offers gzip;
+to turn compression off again on a site that does have codings, write
+`encode off`, and to exempt a single file server put `file_server { compress off }`
+inside it. A JSON configuration keeps the older behaviour — `encodings` absent
+means gzip — so a stored document written before that field existed keeps
+answering exactly the way it was written.
+
+A proxied response is left exactly as the
 upstream sent it when it is partial (`206`, or any `Content-Range`), answers a
 `HEAD`, has no body (`204`, `304`), or carries `Cache-Control: no-transform`;
 when one is compressed, `Accept-Encoding` is added to its existing `Vary`
 rather than replacing it, and the origin's digest fields (`Content-Digest`,
 `Repr-Digest`, `Digest`, `Content-MD5`) are removed because they no longer
-describe the bytes.
+describe the bytes. `Accept-Ranges: bytes` is advertised on a file server's
+compressed response too, and a `Range` request is still answerable: an on-the-fly
+compression is skipped whenever a range is being served, so the `206` that comes
+back is the identity file's bytes at the offsets the header promised rather than
+offsets into the gzip stream.
 
 A candidate ending in `/` matches only a directory, and one without matches
 only a regular file — the trailing slash that decides is the one in the

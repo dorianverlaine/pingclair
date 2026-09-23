@@ -149,6 +149,32 @@ A client may send `Connection` as two field lines, such as
 read only the first line, decided the request was not a WebSocket handshake,
 and stripped `Connection` and `Upgrade` before the origin saw them, so the
 upgrade silently failed. Every line is now read.
+### 🗜️ A site compresses only where `encode` asks
+
+A static site — `root *` plus `file_server`, nothing else — answered
+`Content-Encoding: gzip` to every client whose `Accept-Encoding` allowed it.
+The Caddyfile said nothing about compression; the compiler simply fell back to
+gzip for a site with no `encode` directive, and each file server then treated
+that as permission. Caddy compresses only where an `encode` directive asks, so
+the same file reached a client with a different `Content-Length`, a different
+`ETag` and therefore a different stored object on the two servers.
+
+**This changes behaviour on upgrade.** A Caddyfile that was relying on the old
+default now serves the bytes on disk and compresses nothing. Write
+`encode gzip` — or `encode zstd gzip`, which lists the preferences in order —
+on the site to get it back. `encode off` still means what it did, and
+`file_server { compress off }` still exempts one file server on a site that
+does compress.
+
+A JSON configuration is deliberately unaffected: with `encodings` absent it
+still defaults to gzip, so a stored document written before that field existed
+keeps behaving the way it was written. The two entry points differ on purpose —
+a Caddyfile is read by someone who can see whether `encode` is there.
+
+A `Range` on a compressing file server is answered `206` from the bytes on
+disk, in the offsets its own `Content-Range` names, with no `Content-Encoding`:
+compressing the interval would put gzip bytes under an offset that counts the
+file.
 
 ### 🌊 Compressed HTTP/1.1 responses keep the connection open
 
