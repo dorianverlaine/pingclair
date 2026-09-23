@@ -120,6 +120,48 @@ async fn h3_websocket_upgrade_never_reaches_the_upstream() {
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
+/// 🧭 An empty `:path` or `:authority` is present but invalid (§4.3.1), and
+/// so is a `:path` that is not origin-form.
+///
+/// Before the fix none of the three was treated as malformed: each got an
+/// ordinary answer (the empty path a `400` from the handler) and a clean FIN.
+#[tokio::test]
+async fn h3_empty_or_relative_targets_reset_with_message_error() {
+    let server = spawn_ok_site().await;
+    for (path, authority) in [
+        ("", "h3.pingclair.test"),
+        ("/", ""),
+        ("index.html", "h3.pingclair.test"),
+    ] {
+        let attempt = H3Attempt {
+            authority,
+            ..H3Attempt::to(server, path)
+        };
+        assert_eq!(
+            outcome(attempt).await,
+            message_error(),
+            "path {path:?}, authority {authority:?}"
+        );
+    }
+}
+
+/// 🔌 `:protocol` without SETTINGS_ENABLE_CONNECT_PROTOCOL is malformed.
+///
+/// It used to be accepted and answered `501`, as though the request were
+/// well formed and merely unsupported.
+#[tokio::test]
+async fn h3_protocol_pseudo_header_resets_with_message_error() {
+    let server = spawn_ok_site().await;
+    // 📌 Sent straight after the other pseudo-headers, so the parser's
+    // pseudo-headers-first rule is not what refuses it.
+    let attempt = H3Attempt {
+        method: "CONNECT",
+        extra_headers: &[(":protocol", "websocket")],
+        ..H3Attempt::to(server, "/chat")
+    };
+    assert_eq!(outcome(attempt).await, message_error());
+}
+
 /// 👍 The control: the same site answers a well-formed request normally.
 #[tokio::test]
 async fn h3_well_formed_request_is_answered() {

@@ -75,6 +75,15 @@ to the origin, as though HTTP/3 could carry an HTTP/1.1 upgrade. RFC 9114 §4.2
 makes such a request malformed, so it is now reset with `H3_MESSAGE_ERROR`
 before any upstream is contacted.
 
+### 🧭 HTTP/3 refuses empty targets and `:protocol`
+
+An HTTP/3 request with an empty `:path` or `:authority`, or a `:path` that does
+not start with `/` (other than `*` for `OPTIONS`), was accepted, though RFC 9114
+§4.3.1 says these fields must not be empty. A `:protocol` pseudo-header was
+accepted and answered `501`, although extended CONNECT is only allowed after
+the server offers it, and Pingclair never does. All of these are now reset with
+`H3_MESSAGE_ERROR`.
+
 ### 🌊 Compressed HTTP/1.1 responses keep the connection open
 
 A proxied response that Pingclair compressed for an HTTP/1.1 client lost its

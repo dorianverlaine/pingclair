@@ -585,8 +585,6 @@ impl tokio_quiche::quic::ConnectionHook for CertTableSslHook {
 /// One parsed HTTP/3 request, handed to a handler task.
 struct H3Request {
     method: String,
-    /// 🔌 Preserves extended CONNECT protocols so unsupported tunnels fail clearly.
-    protocol: Option<String>,
     /// Path including the query string.
     path: String,
     /// `:authority` (or `host` header) value, may include a port.
@@ -623,13 +621,15 @@ struct H3Request {
 /// 5. **`:authority` and `Host` must agree** when both are sent.
 /// 6. **`:method` must be a token.**
 /// 7. **No connection-specific fields** (§4.2), apart from `TE: trailers`.
+/// 8. **`:path` and `:authority` must not be empty**, and `:path` must start
+///    with `/` (or be `*` for `OPTIONS`).
 ///
 /// 📌 Classic `CONNECT` — which omits `:scheme` and `:path` — is still refused,
 /// exactly as before this change, because `path` was already mandatory. Extended
-/// CONNECT (RFC 9220) sends both and keeps working.
+/// CONNECT (RFC 9220) is refused too, by rejecting `:protocol`: it was never
+/// served, and this server never offers it.
 fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
     let mut method = None;
-    let mut protocol = None;
     let mut path = None;
     let mut authority = None;
     let mut scheme = None;
@@ -646,8 +646,13 @@ fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
                 b":method" => &mut method,
                 b":path" => &mut path,
                 b":authority" => &mut authority,
-                b":protocol" => &mut protocol,
                 b":scheme" => &mut scheme,
+                // 🔌 `:protocol` exists only for extended CONNECT, which a
+                // client may use only after the server sent
+                // SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 9220 §3, RFC 8441 §3).
+                // This server never sends it, so the field is as unknown here
+                // as any other pseudo-header.
+                //
                 // 🚫 An unknown pseudo-header is malformed, and refusing it was
                 // already the one thing this function got right.
                 _ => return None,
@@ -716,11 +721,27 @@ fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
         return None;
     }
 
+    // 🧭 Present is not enough: an empty `:authority` (or an empty `Host` that
+    // stood in for it) names no site, and an empty `:path` names no resource
+    // (§4.3.1: "MUST NOT be empty"). The router used to match the empty path
+    // as-is while Pingora sent `/` upstream, so the two disagreed about which
+    // resource was asked for. Refused rather than repaired to `/`, because
+    // repairing is guessing and the RFC calls the request malformed.
+    // A path must also be origin-form; `*` is the one exception, and only
+    // for `OPTIONS` (RFC 9110 §7.1).
+    let path = path?;
+    let authority = authority?;
+    if authority.is_empty() {
+        return None;
+    }
+    if !(path.starts_with('/') || (path == "*" && method == "OPTIONS")) {
+        return None;
+    }
+
     Some(H3Request {
         method,
-        protocol,
-        path: path?,
-        authority: authority?,
+        path,
+        authority,
         headers,
     })
 }
@@ -3334,7 +3355,7 @@ async fn handle_request_inner(
     }
 
     // 🔌 Rejects CONNECT tunnels because the current H3 path is request-response only.
-    if method == http::Method::CONNECT || req.protocol.is_some() {
+    if method == http::Method::CONNECT {
         return Err((501, "CONNECT Not Supported Over HTTP/3"));
     }
 
@@ -6242,8 +6263,10 @@ mod tests {
         assert_eq!(req.authority, "fallback.example.com");
     }
 
+    /// 🔌 Extended CONNECT was never offered (no
+    /// SETTINGS_ENABLE_CONNECT_PROTOCOL), so `:protocol` is malformed.
     #[test]
-    fn parse_h3_request_preserves_extended_connect_protocol() {
+    fn parse_h3_request_refuses_extended_connect_protocol() {
         let list = vec![
             quiche::h3::Header::new(b":method", b"CONNECT"),
             quiche::h3::Header::new(b":protocol", b"websocket"),
@@ -6252,9 +6275,25 @@ mod tests {
             quiche::h3::Header::new(b":path", b"/socket"),
         ];
 
-        let req = parse_h3_request(&list).unwrap();
+        assert!(parse_h3_request(&list).is_none());
+    }
 
-        assert_eq!(req.protocol.as_deref(), Some("websocket"));
+    /// 🧭 `*` is a valid `:path` only for `OPTIONS`; any other path must be
+    /// origin-form.
+    #[test]
+    fn parse_h3_request_accepts_asterisk_only_for_options() {
+        let request = |method: &'static [u8], path: &'static [u8]| {
+            parse_h3_request(&[
+                quiche::h3::Header::new(b":method", method),
+                quiche::h3::Header::new(b":scheme", b"https"),
+                quiche::h3::Header::new(b":authority", b"example.com"),
+                quiche::h3::Header::new(b":path", path),
+            ])
+            .map(|req| req.path)
+        };
+        assert_eq!(request(b"OPTIONS", b"*"), Some("*".to_string()));
+        assert_eq!(request(b"GET", b"*"), None);
+        assert_eq!(request(b"GET", b"index.html"), None);
     }
 
     /// 🛡️ A duplicate pseudo-header is malformed (RFC 9114 §4.3.1) and must be
@@ -6397,7 +6436,6 @@ mod tests {
     fn h3_request_header_carries_no_case_table() {
         let req = H3Request {
             method: "GET".to_string(),
-            protocol: None,
             path: "/resource?q=1".to_string(),
             authority: "example.test".to_string(),
             headers: vec![
@@ -6459,7 +6497,6 @@ mod tests {
     fn a_cookie_split_across_field_lines_is_rejoined() {
         let req = H3Request {
             method: "GET".to_string(),
-            protocol: None,
             path: "/".to_string(),
             authority: "example.test".to_string(),
             headers: vec![
@@ -6490,7 +6527,6 @@ mod tests {
     fn a_repeatable_field_keeps_every_value() {
         let req = H3Request {
             method: "GET".to_string(),
-            protocol: None,
             path: "/".to_string(),
             authority: "example.test".to_string(),
             headers: vec![
@@ -6517,7 +6553,6 @@ mod tests {
     fn h3_request_header_keeps_a_client_sent_host() {
         let req = H3Request {
             method: "GET".to_string(),
-            protocol: None,
             path: "/".to_string(),
             authority: "example.test".to_string(),
             headers: vec![("host".to_string(), "example.test".to_string())],
@@ -6769,7 +6804,6 @@ mod tests {
         ));
         let request = H3Request {
             method: "GET".to_string(),
-            protocol: None,
             path: "/retry".to_string(),
             authority: "example.test".to_string(),
             headers: Vec::new(),
@@ -6890,7 +6924,6 @@ mod tests {
         ));
         let request = H3Request {
             method: "GET".to_string(),
-            protocol: None,
             path: "/probe".to_string(),
             authority: "example.test".to_string(),
             headers: Vec::new(),
@@ -7005,7 +7038,6 @@ mod tests {
         ));
         let request = H3Request {
             method: "GET".to_string(),
-            protocol: None,
             path: "/resource".to_string(),
             authority: "shop.example.test".to_string(),
             headers: vec![("host".to_string(), "shop.example.test".to_string())],
@@ -7094,7 +7126,6 @@ mod tests {
         ));
         let request = H3Request {
             method: "GET".to_string(),
-            protocol: None,
             path: "/circuit".to_string(),
             authority: "example.test".to_string(),
             headers: Vec::new(),
@@ -7207,7 +7238,6 @@ mod tests {
         ));
         let request = H3Request {
             method: "POST".to_string(),
-            protocol: None,
             path: "/grpc.health.v1.Health/Check".to_string(),
             authority: "example.test".to_string(),
             headers: vec![
