@@ -843,6 +843,11 @@ Directive：
   `force_automate`
 
 
+`servers { … }` 有兩個子選項也是**以名字拒絕**，而不是被當成拼錯：
+`listener_wrappers` 與 `timeouts`。Caddy 兩個都載得起來，所以遷移過來的設定
+一定會遇到；這個 build 兩者都沒有（逐選項的 listener wrapper 與逐 listener 的
+timeout），訊息會說明缺的是哪一個，而不是 `Unknown directive`。
+
 有些名字落在「上面兩張清單」與「完整支援」之間，所以寫在這裡而不是塞進任何一張。
 `copy_response` 與 `copy_response_headers` 是 `handle_response` 的子指令，
 寫在裡面可以運作；單獨當成一條 directive 寫則會被拒絕——這正是它們原本被放進

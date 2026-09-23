@@ -2063,6 +2063,35 @@ mod fail_closed_tests {
         );
     }
 
+    /// 🏷️ A `servers { … }` sub-option this build does not have is refused by
+    /// name, not as an unknown word.
+    ///
+    /// 🤡 `expand_servers_block` lifts the block's children to the global
+    /// level, where no arm knew them and the fallback found them in neither
+    /// list — so `listener_wrappers` and `timeouts`, both of which Caddy loads,
+    /// came back as `Unknown directive 'global: …'`. That is the message this
+    /// adapter uses for a misspelling, and it sends the reader looking for the
+    /// right spelling of an option that exists upstream.
+    #[test]
+    fn servers_suboptions_are_refused_by_name() {
+        for name in ["listener_wrappers", "timeouts"] {
+            let message = crate::compile(&format!(
+                "{{\n    servers {{\n        {name} {{\n            read_body 30s\n        }}\n    }}\n}}\n\
+                 :8080 {{\n    respond \"ok\"\n}}"
+            ))
+            .expect_err("an unimplemented sub-option must be refused")
+            .to_string();
+            assert!(
+                message.contains(name) && message.contains("not supported"),
+                "`{name}` must be refused by name rather than as a typo: {message}"
+            );
+            assert!(
+                !message.contains("Unknown directive"),
+                "`{name}` is part of the format: {message}"
+            );
+        }
+    }
+
     /// 🗄️ `storage file_system <path>` names the store; other backends are
     /// refused by name.
     ///

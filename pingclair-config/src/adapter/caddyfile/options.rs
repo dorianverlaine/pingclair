@@ -507,6 +507,23 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                 // 🚫 Options that are real Caddy syntax but not implemented
                 // here get a distinct message so a migrating Caddyfile is not
                 // mistaken for a typo.
+                // 🏷️ `servers { … }` sub-options that belong to a listener
+                // rather than to the whole server. They read as typos before
+                // because `expand_servers_block` lifts the block's children to
+                // this level, where no arm knew them and the fallback below
+                // found them in neither list — so the operator was told they
+                // had invented a word that Caddy loads.
+                //
+                // 📌 Named and refused rather than implemented: each needs a
+                // capability this build does not have (per-option listener
+                // wrapping and per-listener timeouts), and the message says
+                // which one rather than calling it unknown.
+                "listener_wrappers" | "timeouts" if sub.block.is_some() => {
+                    return Err(AdapterError::UnsupportedFeature(
+                        format!("global: {other}", other = sub.name),
+                        "this `servers` sub-option is not implemented yet".into(),
+                    ));
+                }
                 other => {
                     if super::registry::global_option(other).is_some() {
                         // TODO(v0.3): implement the remaining global options

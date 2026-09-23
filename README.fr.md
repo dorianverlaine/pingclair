@@ -944,6 +944,12 @@ Options du bloc `tls` :
   `reuse_private_keys` `insecure_secrets_log` `renewal_window_ratio`
   `force_automate`
 
+Deux sous-options de `servers { … }` sont elles aussi refusées **par leur nom**
+plutôt que prises pour des fautes de frappe : `listener_wrappers` et `timeouts`.
+Caddy charge les deux, donc une configuration migrée les rencontre ; ce build
+n'a ni enveloppe de listener par option ni délais par listener, et le message
+dit laquelle des deux manque au lieu d'un `Unknown directive`.
+
 Des noms se situent entre les listes ci-dessus et la prise en charge complète,
 et sont donc nommés ici plutôt que dans l'une ou l'autre. `copy_response` et
 `copy_response_headers` sont des sous-directives de `handle_response` et

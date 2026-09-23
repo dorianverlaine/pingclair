@@ -935,6 +935,12 @@ Global options:
   `reuse_private_keys` `insecure_secrets_log` `renewal_window_ratio`
   `force_automate`
 
+Two `servers { … }` sub-options are also refused **by name** rather than read
+as typos: `listener_wrappers` and `timeouts`. Caddy loads both, so a migrating
+configuration meets them; this build has neither per-option listener wrapping
+nor per-listener timeouts, and says which of the two is missing instead of
+`Unknown directive`.
+
 Names sit between the lists above and full support, so they are named here
 rather than in either. `copy_response` and `copy_response_headers` are
 `handle_response` subdirectives and work there; written as directives of their
