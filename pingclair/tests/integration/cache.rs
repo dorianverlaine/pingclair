@@ -125,3 +125,88 @@ async fn test_statuses_a_cache_must_not_store_are_refused_despite_max_age() {
         );
     }
 }
+
+/// 🔢 Counts the origin requests behind `requests` sequential GETs for `path`.
+async fn origin_hits_for(
+    server: &TestServer,
+    client: &reqwest::Client,
+    hits: &AtomicUsize,
+    path: &str,
+    requests: usize,
+) -> usize {
+    let before = hits.load(Ordering::SeqCst);
+    for _ in 0..requests {
+        let response = client.get(server.url(0, path)).send().await.unwrap();
+        let _ = response.bytes().await.unwrap();
+    }
+    hits.load(Ordering::SeqCst) - before
+}
+
+/// 🚫 A server error that states no lifetime is never stored.
+///
+/// The route asks for a minute. That minute is the operator's answer for
+/// content, not for failures: holding an unannounced 503 for it would pin one
+/// upstream hiccup in front of every visitor until the `ttl` ran out.
+#[tokio::test]
+async fn test_server_errors_without_a_stated_lifetime_are_not_stored() {
+    let (origin, hits) = spawn_status_origin().await;
+    let mut server = TestServer::new_pingclairfile(&cache_pingclairfile(origin, "60s"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    for status in [500, 502, 503, 504] {
+        assert_eq!(
+            origin_hits_for(&server, &client, &hits, &format!("/{status}/none"), 2).await,
+            2,
+            "a {status} with no caching headers must not be stored"
+        );
+    }
+}
+
+/// ⏳ A success the origin said nothing about lives exactly the route's `ttl`.
+///
+/// Two claims, both needed: it is served from cache inside the `ttl`, and the
+/// origin is asked again once the `ttl` has passed.
+#[tokio::test]
+async fn test_a_silent_success_lives_for_the_route_ttl() {
+    let (origin, hits) = spawn_status_origin().await;
+    let mut server = TestServer::new_pingclairfile(&cache_pingclairfile(origin, "1s"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    assert_eq!(
+        origin_hits_for(&server, &client, &hits, "/200/none", 2).await,
+        1,
+        "inside the ttl the second request must be a cache hit"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    assert_eq!(
+        origin_hits_for(&server, &client, &hits, "/200/none", 1).await,
+        1,
+        "after the ttl the entry must be stale and the origin asked again"
+    );
+}
+
+/// 🩹 A silent not-found lives ten seconds, not the route's `ttl`.
+///
+/// The route asks for a minute; a missing page held that long would hide a
+/// newly published page for a minute. The short lifetime is the point.
+#[tokio::test]
+async fn test_a_silent_not_found_lives_seconds_not_the_route_ttl() {
+    let (origin, hits) = spawn_status_origin().await;
+    let mut server = TestServer::new_pingclairfile(&cache_pingclairfile(origin, "60s"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    assert_eq!(
+        origin_hits_for(&server, &client, &hits, "/404/none", 2).await,
+        1,
+        "a repeated 404 must be absorbed by the cache"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(11_000)).await;
+    assert_eq!(
+        origin_hits_for(&server, &client, &hits, "/404/none", 1).await,
+        1,
+        "after ten seconds the 404 must be stale, even though the ttl is a minute"
+    );
+}

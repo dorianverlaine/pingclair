@@ -12,38 +12,57 @@
 
 use std::time::Duration;
 
+use http::StatusCode;
 use pingora_cache::cache_control::CacheControl;
 use pingora_cache::meta::CacheMetaDefaults;
 use pingora_http::ResponseHeader;
 
 use crate::server::is_streaming_content_type;
 
-/// 🗄️ Default freshness per status, used when the origin states none.
+/// 🩹 How long a not-found stays stored when the origin says nothing.
 ///
-/// The negative entries are the point. An origin that starts failing gets
-/// hammered by every client at once precisely when it can least afford it,
-/// so a not-found or a server error is worth holding briefly — long enough
-/// to absorb a stampede, short enough that a fix is visible almost at once.
-/// Ten and five seconds are deliberately small: this is a shock absorber,
-/// not a cache of failure.
+/// A shock absorber, not a cache of failure: long enough that a stampede of
+/// clients asking for a missing page reaches the origin once, short enough
+/// that publishing the page is visible almost at once.
+const NEGATIVE_LIFETIME: Duration = Duration::from_secs(10);
+
+/// 🗄️ Tells Pingora which statuses may be stored without an origin lifetime.
 ///
-/// A status absent from this table is never stored by default. That is why
-/// redirects, 206 and everything else fall through rather than being listed
-/// with a guessed lifetime.
+/// Only whether an entry exists matters here; the durations are replaced by
+/// [`heuristic_lifetime`], which also knows the route's `ttl`. Both must list
+/// the same statuses, which is why the numbers come from the same place.
+///
+/// A status absent from this table is stored only when the origin states a
+/// lifetime for it. Server errors are absent on purpose (RFC 9111 §4.2.2
+/// allows heuristic freshness only for heuristically cacheable statuses):
+/// holding an unannounced 503 would pin one upstream hiccup in the cache.
 pub(crate) fn cache_defaults() -> &'static CacheMetaDefaults {
     static DEFAULTS: CacheMetaDefaults = CacheMetaDefaults::new(
         |status| match status.as_u16() {
-            // 📄 Success uses a placeholder; the route's `ttl` replaces it
-            // whenever the origin did not state a lifetime of its own.
+            // 📄 A placeholder: `heuristic_lifetime` substitutes the route's `ttl`.
             200 => Some(Duration::from_secs(60)),
-            404 | 410 => Some(Duration::from_secs(10)),
-            500 | 502 | 503 | 504 => Some(Duration::from_secs(5)),
+            404 | 410 => Some(NEGATIVE_LIFETIME),
             _ => None,
         },
         0,
         0,
     );
     &DEFAULTS
+}
+
+/// ⏳ How long a response stays fresh when the origin stated no lifetime.
+///
+/// The route's `ttl` is the operator's answer for successful content, so a
+/// 200 lives exactly that long. A not-found keeps its short negative lifetime,
+/// capped by the `ttl` so a route asking for one second never holds anything
+/// for ten. Every other status gets `None`: the origin did not say, and
+/// guessing is how a 503 used to be stored for the route's whole `ttl`.
+pub(crate) fn heuristic_lifetime(status: StatusCode, route_ttl: Duration) -> Option<Duration> {
+    match status.as_u16() {
+        200 => Some(route_ttl),
+        404 | 410 => Some(NEGATIVE_LIFETIME.min(route_ttl)),
+        _ => None,
+    }
 }
 
 /// 🚫 Names the reason a response must not be stored, or `None` if it may be.

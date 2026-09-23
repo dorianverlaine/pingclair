@@ -40,7 +40,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use crate::cache_policy::{
-    cache_defaults, origin_stated_its_own_freshness, uncacheable_response_reason,
+    cache_defaults, heuristic_lifetime, origin_stated_its_own_freshness,
+    uncacheable_response_reason,
 };
 use crate::encoding::{ResponseEncoder, negotiate};
 use crate::http_policy::{
@@ -5959,8 +5960,17 @@ impl ProxyHttp for PingclairProxy {
             return Ok(RespCacheable::Cacheable(meta));
         }
 
+        // 🚫 Pingora only reaches here through `cache_defaults`, which lists the
+        // same statuses, so `None` means the two tables drifted apart. Refusing
+        // is the safe answer to that: nothing is stored for longer than meant.
+        let Some(fresh_for) = heuristic_lifetime(response.status, Duration::from_secs(ttl_secs))
+        else {
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
+                "no lifetime for this status",
+            )));
+        };
         let created = SystemTime::now();
-        let fresh_until = created + Duration::from_secs(ttl_secs);
+        let fresh_until = created + fresh_for;
         Ok(RespCacheable::Cacheable(CacheMeta::new(
             fresh_until,
             created,

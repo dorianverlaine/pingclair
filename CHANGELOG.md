@@ -20,6 +20,16 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### ⏳ A cached error no longer lives for the route's whole `ttl`
+
+`cache { ttl }` replaced the lifetime of every stored response, so a `503` the
+origin said nothing about was held for the full `ttl` — up to a year — and one
+upstream hiccup was served to every visitor until it ran out. The `ttl` now
+applies only to a `200` whose origin stated no lifetime. A silent `404` or `410`
+is held for ten seconds (or the `ttl`, if shorter), and a silent server error is
+not stored at all; an origin that wants its errors cached can still say so with
+`Cache-Control`.
+
 ### 🚫 The response cache no longer stores statuses it must not share
 
 A `429 Too Many Requests` carrying `Cache-Control: max-age=300` was stored and
