@@ -9966,23 +9966,12 @@ async fn origin_hits_for_two_requests(
     hits.load(Ordering::SeqCst) - before
 }
 
-/// 🗄️ Builds a reverse-proxy config whose route caches for a minute.
+/// 🗄️ Builds a Pingclairfile whose route caches for a minute.
+///
+/// Written in the DSL rather than JSON so `cache { ttl }` goes through the
+/// Caddyfile adapter, the half of the path a real configuration takes.
 fn cache_proxy_config(upstream: SocketAddr) -> String {
-    serde_json::json!({
-        "global": { "http3": false },
-        "servers": [{
-            "listen": ["127.0.0.1:0"],
-            "routes": [{
-                "path": "/*",
-                "handler": {
-                    "type": "reverse_proxy",
-                    "upstreams": [format!("http://{upstream}")],
-                    "cache": { "ttl_secs": 60 }
-                }
-            }]
-        }]
-    })
-    .to_string()
+    cache::cache_pingclairfile(upstream, "60s")
 }
 
 /// 🗄️ The second request for the same URL is answered without the origin.
@@ -9993,7 +9982,7 @@ fn cache_proxy_config(upstream: SocketAddr) -> String {
 #[tokio::test]
 async fn test_second_request_is_served_from_cache_without_touching_the_origin() {
     let (origin, hits) = spawn_counting_origin().await;
-    let mut server = TestServer::new(&cache_proxy_config(origin));
+    let mut server = TestServer::new_pingclairfile(&cache_proxy_config(origin));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
@@ -10023,7 +10012,7 @@ async fn test_second_request_is_served_from_cache_without_touching_the_origin() 
 #[tokio::test]
 async fn test_cache_key_separates_distinct_paths() {
     let (origin, hits) = spawn_counting_origin().await;
-    let mut server = TestServer::new(&cache_proxy_config(origin));
+    let mut server = TestServer::new_pingclairfile(&cache_proxy_config(origin));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
@@ -10051,7 +10040,7 @@ async fn test_cache_key_separates_distinct_paths() {
 #[tokio::test]
 async fn test_credentialed_requests_bypass_the_cache() {
     let (origin, hits) = spawn_counting_origin().await;
-    let mut server = TestServer::new(&cache_proxy_config(origin));
+    let mut server = TestServer::new_pingclairfile(&cache_proxy_config(origin));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
@@ -10092,7 +10081,7 @@ async fn test_credentialed_requests_bypass_the_cache() {
 #[tokio::test]
 async fn test_responses_the_origin_marked_unshareable_are_not_stored() {
     let (origin, hits) = spawn_header_scripted_origin().await;
-    let mut server = TestServer::new(&cache_proxy_config(origin));
+    let mut server = TestServer::new_pingclairfile(&cache_proxy_config(origin));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
@@ -10132,7 +10121,7 @@ async fn test_responses_the_origin_marked_unshareable_are_not_stored() {
 #[tokio::test]
 async fn test_no_cache_is_stored_and_revalidated_rather_than_refused() {
     let (origin, hits) = spawn_header_scripted_origin().await;
-    let mut server = TestServer::new(&cache_proxy_config(origin));
+    let mut server = TestServer::new_pingclairfile(&cache_proxy_config(origin));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
@@ -10160,7 +10149,7 @@ async fn test_no_cache_is_stored_and_revalidated_rather_than_refused() {
 #[tokio::test]
 async fn test_origin_max_age_overrides_the_route_ttl() {
     let (origin, hits) = spawn_header_scripted_origin().await;
-    let mut server = TestServer::new(&cache_proxy_config(origin));
+    let mut server = TestServer::new_pingclairfile(&cache_proxy_config(origin));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
@@ -10180,7 +10169,7 @@ async fn test_origin_max_age_overrides_the_route_ttl() {
 #[tokio::test]
 async fn test_vary_gives_each_variant_its_own_entry() {
     let (origin, hits) = spawn_header_scripted_origin().await;
-    let mut server = TestServer::new(&cache_proxy_config(origin));
+    let mut server = TestServer::new_pingclairfile(&cache_proxy_config(origin));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
@@ -10220,7 +10209,7 @@ async fn test_vary_gives_each_variant_its_own_entry() {
 #[tokio::test]
 async fn test_not_found_responses_are_negatively_cached() {
     let (origin, hits) = spawn_header_scripted_origin().await;
-    let mut server = TestServer::new(&cache_proxy_config(origin));
+    let mut server = TestServer::new_pingclairfile(&cache_proxy_config(origin));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
@@ -10245,7 +10234,7 @@ async fn test_not_found_responses_are_negatively_cached() {
 #[tokio::test]
 async fn test_a_ranged_request_does_not_poison_the_cache() {
     let (origin, hits) = spawn_header_scripted_origin().await;
-    let mut server = TestServer::new(&cache_proxy_config(origin));
+    let mut server = TestServer::new_pingclairfile(&cache_proxy_config(origin));
     assert!(server.wait_until_ready().await, "server failed to start");
     let client = no_proxy_client();
 
@@ -10314,7 +10303,7 @@ async fn test_upgrade_requests_never_enter_the_cache() {
         }
     });
 
-    let mut server = TestServer::new(&cache_proxy_config(upstream_address));
+    let mut server = TestServer::new_pingclairfile(&cache_proxy_config(upstream_address));
     assert!(server.wait_until_ready().await, "server failed to start");
 
     for _ in 0..2 {

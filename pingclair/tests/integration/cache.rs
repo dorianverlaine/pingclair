@@ -19,7 +19,7 @@ use super::{TestServer, no_proxy_client, origin_hits_for_two_requests};
 
 /// 🗄️ Builds a Pingclairfile whose one route proxies to `upstream` and caches
 /// for `ttl`, written exactly as an operator would write it.
-fn cache_pingclairfile(upstream: SocketAddr, ttl: &str) -> String {
+pub(super) fn cache_pingclairfile(upstream: SocketAddr, ttl: &str) -> String {
     format!(
         r#"
         {{
