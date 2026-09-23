@@ -30,8 +30,15 @@ refused, and HTTP/2 connections receive `GOAWAY`), running requests finish,
 the access log and tracing queue are flushed, and the process exits. It exits
 as soon as the last request is done, and cuts whatever is still running once
 `grace_period` (default 30 s) has passed. `SIGQUIT` still exits immediately
-with status 2. HTTP/3 is not covered yet: its requests are neither waited
-for nor sent `GOAWAY` (#98).
+with status 2.
+
+HTTP/3 takes part in the same stop. Each connection receives `GOAWAY` naming
+the first request it will not serve, so a client knows which requests ran and
+which it may retry elsewhere; a request opened after that is refused with
+`H3_REQUEST_REJECTED`; running requests finish; and the connection closes
+with `H3_NO_ERROR` once its last response has been acknowledged. New QUIC
+connections are ignored while the process drains. HTTP/3 never sent `GOAWAY`
+before, not even at shutdown.
 
 ### 🔌 A request shorter than the h2c preface is answered instead of ignored
 

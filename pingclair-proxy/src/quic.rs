@@ -1056,6 +1056,10 @@ struct StreamState {
     no_content: bool,
     /// 🧹 Marks a terminated stream so later response messages are ignored.
     dead: bool,
+    /// 🚰 Keeps a graceful stop waiting until this request's stream is gone;
+    /// see [`crate::drain`]. `None` for streams this server answered without
+    /// running a handler.
+    in_flight: Option<crate::drain::InFlight>,
 }
 
 /// 🚦 One connection's HTTP/3 layer, driven by tokio-quiche's worker loop.
@@ -1093,6 +1097,22 @@ struct H3App {
     tls_identity: Option<crate::tls_identity::DownstreamTlsIdentity>,
     /// 🔢 Releases this connection's slot against `limits.max_connections`.
     _slot: ConnectionSlot,
+    /// 🛑 The first request stream id this connection will no longer serve,
+    /// once it has sent `GOAWAY` during a graceful stop.
+    goaway_from: Option<u64>,
+    /// 🛑 The highest request stream id this connection accepted, which is
+    /// what `GOAWAY` has to promise is still being served.
+    last_request_stream: Option<u64>,
+    /// 🌊 Streams whose response is fully handed to quiche but not yet
+    /// acknowledged by the client, during a graceful stop.
+    ///
+    /// Handing the last bytes to quiche is not delivering them: they still
+    /// wait in its send buffer for the network and for loss recovery. If the
+    /// in-flight token ended there, the process could exit, or this
+    /// connection close, with the tail of a response unsent. So while
+    /// stopping, each finished stream keeps its token here until quiche has
+    /// collected the stream, which it does only once every byte is acked.
+    lingering: Vec<(u64, crate::drain::InFlight)>,
 }
 
 impl Drop for H3App {
@@ -1207,6 +1227,10 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
                 // A handler freed request-body channel capacity; the deferred
                 // drains are retried in `process_reads`.
             }
+            // 🛑 A graceful stop began. Waking the worker is all this does:
+            // `process_writes` sends `GOAWAY` on the iteration that follows.
+            // Only until it has, or every later wait would return at once.
+            _ = crate::drain::stopping(), if self.goaway_from.is_none() => {}
         }
         // 🧲 Applies anything that queued behind the event that woke us.
         self.apply_available_events();
@@ -1281,7 +1305,20 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
         // deferred events again before the worker goes back to waiting.
         self.apply_available_events();
 
-        self.streams.retain(|_, s| !s.dead);
+        if crate::drain::is_stopping() {
+            let lingering = &mut self.lingering;
+            self.streams.retain(|id, s| {
+                if s.dead
+                    && let Some(token) = s.in_flight.take()
+                {
+                    lingering.push((*id, token));
+                }
+                !s.dead
+            });
+        } else {
+            self.streams.retain(|_, s| !s.dead);
+        }
+        self.stop_gracefully(qconn);
         Ok(())
     }
 }
@@ -1492,6 +1529,13 @@ impl QuicServer {
                 }
             };
 
+            // 🛑 A draining process takes no new connections. The TCP listeners
+            // are closed outright; this socket cannot be, because the
+            // connections already open still receive their packets through it.
+            if crate::drain::is_stopping() {
+                continue;
+            }
+
             let remote_addr = connection.peer_addr();
 
             // 🚫 L4 blocklist, same semantics and same list as the TCP
@@ -1526,6 +1570,9 @@ impl QuicServer {
                 deferred: None,
                 body_notify: Arc::new(Notify::new()),
                 _slot: ConnectionSlot(Arc::clone(&live_connections)),
+                goaway_from: None,
+                last_request_stream: None,
+                lingering: Vec::new(),
             });
         }
 
@@ -1569,6 +1616,65 @@ impl H3App {
     /// can produce events even when no new packet arrived. Without the
     /// maintenance-pass pump a large request body would deadlock: the
     /// handler waits for end-of-body that never gets signaled.
+    /// 🛑 Sends `GOAWAY` once a graceful stop begins, and closes the
+    /// connection when its last request is done.
+    ///
+    /// `GOAWAY` tells the client which of its requests this server will still
+    /// answer and which it may safely retry elsewhere, so a restart never
+    /// leaves it guessing whether a request ran (RFC 9114 §5.2). The id is the
+    /// first stream *not* served: every request up to the last one accepted
+    /// finishes, and anything newer is refused. quiche documents the argument
+    /// as "the highest processed request", but its only check is that the id
+    /// is a multiple of four that never grows, and RFC 9114 §5.2 defines the
+    /// frame's id as the first refused one, so the RFC's meaning is used.
+    ///
+    /// 📌 Closing is what lets an idle connection go at once rather than when
+    /// the process exits; a busy one closes once its last response has been
+    /// acknowledged (see `lingering`).
+    fn stop_gracefully(&mut self, qconn: &mut tokio_quiche::quic::QuicheConnection) {
+        if !crate::drain::is_stopping() {
+            return;
+        }
+        let Some(h3) = self.h3.as_mut() else {
+            return;
+        };
+        if self.goaway_from.is_none() {
+            let first_refused = self.last_request_stream.map_or(0, |last| last + 4);
+            match h3.send_goaway(qconn, first_refused) {
+                Ok(()) => {
+                    tracing::debug!(
+                        "🛑 H3 {}: sent GOAWAY({}) for a graceful stop",
+                        qconn.trace_id(),
+                        first_refused
+                    );
+                    self.goaway_from = Some(first_refused);
+                }
+                // 🔁 A control stream without room this iteration is retried
+                // on the next one; the flag keeps this method coming back.
+                Err(quiche::h3::Error::StreamBlocked) => return,
+                Err(e) => {
+                    tracing::debug!("🛑 H3 {}: GOAWAY not sent: {:?}", qconn.trace_id(), e);
+                    self.goaway_from = Some(first_refused);
+                }
+            }
+        }
+        // 🌊 quiche forgets a stream once it is complete, so "no such stream"
+        // is the signal that every byte of that response was acknowledged.
+        self.lingering.retain(|(stream_id, _)| {
+            !matches!(
+                qconn.stream_capacity(*stream_id),
+                Err(quiche::Error::InvalidStreamState(_))
+            )
+        });
+        if self.streams.is_empty()
+            && self.lingering.is_empty()
+            && !qconn.is_closed()
+            && !qconn.is_draining()
+        {
+            let _ = qconn.close(true, quiche::h3::WireErrorCode::NoError as u64, b"");
+        }
+    }
+
     fn pump_h3_events(&mut self, qconn: &mut tokio_quiche::quic::QuicheConnection) {
         loop {
             let poll_result = {
@@ -1619,6 +1725,24 @@ impl H3App {
         if !stream_id.is_multiple_of(4) {
             return;
         }
+
+        // 🛑 A request the client opened before it read our `GOAWAY` is
+        // refused with REQUEST_REJECTED, which RFC 9114 §4.1.1 lets it retry
+        // elsewhere because nothing was processed.
+        if self
+            .goaway_from
+            .is_some_and(|first_refused| stream_id >= first_refused)
+            && !self.streams.contains_key(&stream_id)
+        {
+            let code = quiche::h3::WireErrorCode::RequestRejected as u64;
+            let _ = qconn.stream_shutdown(stream_id, quiche::Shutdown::Read, code);
+            let _ = qconn.stream_shutdown(stream_id, quiche::Shutdown::Write, code);
+            return;
+        }
+        self.last_request_stream = Some(
+            self.last_request_stream
+                .map_or(stream_id, |last| last.max(stream_id)),
+        );
 
         // 🚫 Rejects request trailers explicitly because upstream forwarding is unsupported.
         if let Some(stream) = self.streams.get_mut(&stream_id) {
@@ -1725,6 +1849,7 @@ impl H3App {
                 req_body_tx: Some(req_body_tx),
                 cancel_tx: Some(cancel_tx),
                 head_request,
+                in_flight: Some(crate::drain::InFlight::enter()),
                 ..Default::default()
             },
         );

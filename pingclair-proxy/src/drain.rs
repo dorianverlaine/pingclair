@@ -21,7 +21,7 @@
 //! walking every connection. Striping it per core would make the zero test a
 //! sum over stripes that can never be read atomically.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Notify;
@@ -33,6 +33,40 @@ static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 ///
 /// Only the transition to zero notifies, so a busy server never touches it.
 static IDLE: Notify = Notify::const_new();
+
+/// 🛑 Set once, when the process has stopped accepting and begins to drain.
+///
+/// Pingora tells its own listeners through its shutdown broadcast; this is the
+/// same news for the transports Pingora does not own, which today means the
+/// HTTP/3 server, so it can send `GOAWAY` on connections that stay open.
+static STOPPING: AtomicBool = AtomicBool::new(false);
+
+/// 🔔 Wakes everything waiting in [`stopping`] when [`begin_stopping`] runs.
+static STOP: Notify = Notify::const_new();
+
+/// 🛑 Announces that the process is draining. Idempotent.
+pub fn begin_stopping() {
+    STOPPING.store(true, Ordering::Release);
+    STOP.notify_waiters();
+}
+
+/// 🛑 Whether [`begin_stopping`] has run.
+pub fn is_stopping() -> bool {
+    STOPPING.load(Ordering::Acquire)
+}
+
+/// 🛑 Resolves once the process is draining; at once if it already is.
+pub async fn stopping() {
+    let stop = STOP.notified();
+    tokio::pin!(stop);
+    // 🧷 Armed before the flag is read, for the same lost-wake-up reason as
+    // in [`wait_idle`].
+    stop.as_mut().enable();
+    if is_stopping() {
+        return;
+    }
+    stop.await;
+}
 
 /// 🎟️ Proof that one request is being served; dropping it ends the request.
 ///

@@ -48,6 +48,10 @@ mod error_responses;
 #[path = "h3_end_to_end/preconditions.rs"]
 mod preconditions;
 
+// 🛑 `GOAWAY` and the running request during a graceful stop.
+#[path = "h3_end_to_end/goaway.rs"]
+mod goaway;
+
 const ALPN: &[u8] = b"h3";
 
 fn self_signed_pem(names: &[&str]) -> (String, String) {

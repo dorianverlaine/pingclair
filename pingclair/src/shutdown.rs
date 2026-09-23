@@ -152,6 +152,9 @@ pub(crate) async fn drain_then_exit(
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
+    // 📣 Pingora's broadcast reached only the transports it owns; this tells
+    // the HTTP/3 server to send `GOAWAY` and stop taking new requests.
+    pingclair_proxy::drain::begin_stopping();
     let running = pingclair_proxy::drain::in_flight();
     if running > 0 {
         tracing::info!(
