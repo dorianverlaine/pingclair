@@ -53,6 +53,17 @@ pub(crate) fn cache_defaults() -> &'static CacheMetaDefaults {
 /// anything not understood is refused by the caller's status check rather than
 /// guessed at.
 pub(crate) fn uncacheable_response_reason(response: &ResponseHeader) -> Option<&'static str> {
+    // 🚫 The status decides first, before any freshness directive is read.
+    // Pingora's `resp_cacheable` never looks at the status: one
+    // `Cache-Control: max-age=300` on a 429 was enough to store the "too many
+    // requests" page and replay it to every visitor for five minutes, turning
+    // one rate-limited moment into a site-wide outage. RFC 6585 says 428, 429,
+    // 431 and 511 "MUST NOT be stored by a cache", whatever they claim about
+    // their own freshness.
+    if !status_may_be_stored(response.status.as_u16()) {
+        return Some("status is never stored");
+    }
+
     // 🍪 A response that sets a cookie is establishing per-client state. Storing
     // it hands the same cookie to everyone who follows. RFC 9111 permits a
     // shared cache to store it; doing so safely means stripping the field, and
@@ -108,6 +119,40 @@ pub(crate) fn uncacheable_response_reason(response: &ResponseHeader) -> Option<&
     }
 
     None
+}
+
+/// 🛡️ Lists the statuses this cache may store at all.
+///
+/// An allowlist rather than a list of forbidden codes, because the dangerous
+/// statuses are the ones nobody thought of: a new code added to the protocol,
+/// or an origin inventing one, should be refused until someone decides what a
+/// shared copy of it means. The list is RFC 9110 §15.1's heuristically
+/// cacheable codes, plus the temporary redirects and gateway errors that may
+/// be stored when the origin states a lifetime for them.
+///
+/// 🧩 206 is absent on purpose: this cache does not assemble ranges, so a
+/// stored fragment would be served as if it were the whole body. So are 428,
+/// 429, 431 and 511 (RFC 6585 forbids storing them) and every 1xx.
+fn status_may_be_stored(status: u16) -> bool {
+    matches!(
+        status,
+        200 | 203
+            | 204
+            | 300
+            | 301
+            | 302
+            | 307
+            | 308
+            | 404
+            | 405
+            | 410
+            | 414
+            | 500
+            | 501
+            | 502
+            | 503
+            | 504
+    )
 }
 
 /// ⏳ Reports whether the origin declared how long its response stays fresh.

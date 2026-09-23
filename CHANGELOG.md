@@ -20,6 +20,16 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🚫 The response cache no longer stores statuses it must not share
+
+A `429 Too Many Requests` carrying `Cache-Control: max-age=300` was stored and
+replayed to every visitor for five minutes, so one rate-limited moment at the
+origin became a site-wide outage. The cache now stores only an explicit list of
+statuses: RFC 9110's heuristically cacheable codes plus `302`, `307` and the
+gateway errors. `428`, `429`, `431` and `511` (which RFC 6585 forbids a cache to
+store) and `206` (this cache does not assemble ranges) always reach the origin,
+whatever their caching headers say.
+
 ### 🗄️ A cached response is compressed per client, not per stored copy
 
 On a `reverse_proxy` route with `cache`, a compressible response above the
