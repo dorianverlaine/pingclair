@@ -4800,14 +4800,14 @@ async fn test_pingclairfile_response_buffers_hold_the_body_until_the_upstream_fi
     upstream_task.await.unwrap();
 }
 
-/// 📥 A route may raise the body limit for itself.
+/// 📥 A route's `request_body` limit belongs to that route alone.
 ///
-/// The site's limit is one megabyte and no Pingclairfile can change it, so
-/// this is the only way an operator accepts a larger upload — which is also
-/// how the format models it. The uploading route accepts what the plain route
-/// refuses, and the two differ by nothing but the `request_body` block.
+/// A site with no `request_body` has no ceiling (the format's default), so the
+/// limit an operator writes inside one `handle` must refuse that route's
+/// oversized uploads and leave every other route as unlimited as before. The
+/// two routes differ by nothing but the `request_body` block.
 #[tokio::test]
-async fn test_pingclairfile_request_body_max_size_raises_the_route_limit() {
+async fn test_pingclairfile_request_body_max_size_limits_only_its_route() {
     let config = r#"
         {
             admin off
@@ -4819,7 +4819,7 @@ async fn test_pingclairfile_request_body_max_size_raises_the_route_limit() {
 
             handle /upload/* {
                 request_body {
-                    max_size 8MB
+                    max_size 1MB
                 }
                 respond "uploaded" 200
             }
@@ -4830,24 +4830,24 @@ async fn test_pingclairfile_request_body_max_size_raises_the_route_limit() {
     let mut server = TestServer::new_pingclairfile(config);
     assert!(server.wait_until_ready().await, "server failed to start");
 
-    // 📏 Two mebibytes: over the one-megabyte site default, under the route's
-    // eight-megabyte allowance.
+    // 📏 Two mebibytes: over the upload route's one-megabyte limit, and
+    // unremarkable anywhere that sets none.
     let body = vec![b'x'; 2 * 1024 * 1024];
 
     // 🔌 A client each, because the rejection closes its connection: a pooled
-    // socket carried over from the accepted upload would be torn down while
-    // the second request was still writing, and the test would fail for a
-    // reason that has nothing to do with the limit.
-    let raised = no_proxy_client()
-        .post(server.url(0, "/upload/thing"))
+    // socket carried over from the refused upload would be torn down while the
+    // next request was still writing, and the test would fail for a reason
+    // that has nothing to do with the limit.
+    let plain = no_proxy_client()
+        .post(server.url(0, "/plain"))
         .body(body.clone())
         .send()
         .await
         .unwrap();
     assert_eq!(
-        raised.status(),
+        plain.status(),
         200,
-        "the route raised its own limit, so this upload must be accepted"
+        "a route without `request_body` has no ceiling, so this upload must be accepted"
     );
 
     // 🚫 The rejection can reach the client two ways, and which one depends on
@@ -4855,16 +4855,16 @@ async fn test_pingclairfile_request_body_max_size_raises_the_route_limit() {
     // closes, and if it does so while the client is still writing the two
     // megabytes, the client sees the write fail before it sees the response.
     // Both are the route refusing the upload. What must never happen is 200.
-    let plain = no_proxy_client()
-        .post(server.url(0, "/plain"))
+    let limited = no_proxy_client()
+        .post(server.url(0, "/upload/thing"))
         .body(body)
         .send()
         .await;
-    match plain {
+    match limited {
         Ok(response) => assert_eq!(
             response.status(),
             413,
-            "a route without `request_body` keeps the site limit"
+            "the upload route set its own limit, so this upload must be refused"
         ),
         Err(error) => assert!(
             !error.is_timeout(),
