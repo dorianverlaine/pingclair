@@ -4907,19 +4907,63 @@ async fn reverse_proxy_upstream(
         }
 
         // 📥 Reads upstream response metadata before committing an H3 response.
-        if let Err(error) = session.read_response_header().await {
-            tracing::error!("❌ H3 upstream read response header failed: {}", error);
-            session.shutdown().await;
-            if retry_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return Err((504, "Upstream Retry Timeout"));
+        //
+        // 🔁 An HTTP/1.1 upstream may send any number of interim responses
+        // (`100 Continue`, `103 Early Hints`) before the one that answers the
+        // request. Each read returns one of them, so stopping at the first
+        // read sent the client a bodiless `:status: 103` and threw the real
+        // answer away. Everything downstream of this loop — the `:status` the
+        // client sees, the circuit breaker's verdict, and the retry predicate —
+        // must be fed the final status and nothing earlier.
+        //
+        // 📌 Interim responses are dropped rather than relayed for now; the
+        // H3 client still gets the final response, only without the hint.
+        const MAX_INTERIM_RESPONSES: u32 = 32;
+        let mut interim_responses = 0u32;
+        let upstream_status = loop {
+            if let Err(error) = session.read_response_header().await {
+                tracing::error!("❌ H3 upstream read response header failed: {}", error);
+                session.shutdown().await;
+                if retry_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Err((504, "Upstream Retry Timeout"));
+                }
+                return Err((502, "Upstream Read Failed"));
             }
-            return Err((502, "Upstream Read Failed"));
-        }
-
-        let upstream_status = session
-            .response_header()
-            .map(|response| response.status.as_u16())
-            .unwrap_or(502);
+            let status = session
+                .response_header()
+                .map(|response| response.status.as_u16())
+                .unwrap_or(502);
+            match status {
+                // 🚫 The request asked for no upgrade (HTTP/3 has no
+                // `Upgrade`), so a `101` means the upstream now speaks some
+                // other protocol on this connection. There is nothing
+                // left to relay, and the connection must not be reused.
+                101 => {
+                    tracing::error!("🚫 H3 upstream switched protocols without being asked");
+                    if let Some(admission) = &mut admission {
+                        admission.report_failure();
+                    }
+                    session.shutdown().await;
+                    return Err((502, "Unexpected Upstream Upgrade"));
+                }
+                // 🛡️ Each interim read is cheap for the upstream, so an
+                // origin that never stops sending them would hold this
+                // request open forever. The ceiling is far above what any
+                // real origin sends in front of one response.
+                100..=199 if interim_responses < MAX_INTERIM_RESPONSES => {
+                    interim_responses += 1;
+                }
+                100..=199 => {
+                    tracing::error!("🚫 H3 upstream sent too many interim responses");
+                    if let Some(admission) = &mut admission {
+                        admission.report_failure();
+                    }
+                    session.shutdown().await;
+                    return Err((502, "Too Many Interim Responses"));
+                }
+                _ => break status,
+            }
+        };
         if let Some(admission) = &mut admission {
             admission.report_status(upstream_status);
         }

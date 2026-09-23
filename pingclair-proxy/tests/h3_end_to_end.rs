@@ -2321,3 +2321,86 @@ async fn h3_drops_expect_before_forwarding() {
         "`Expect` must not be forwarded after the body is already sent: {head}"
     );
 }
+
+/// 🔁 Interim responses in front of the final one are skipped, not relayed as
+/// the answer.
+///
+/// Reading only the first response head turned an origin's `103 Early Hints`
+/// into the whole reply: the client got a bodiless `:status: 103` and the
+/// `200` behind it was never read.
+#[tokio::test]
+async fn h3_skips_interim_responses_before_the_final_one() {
+    let replies: [(&str, &'static [u8]); 2] = [
+        (
+            "103 Early Hints",
+            b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\n\
+              HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        ),
+        (
+            "100 Continue",
+            b"HTTP/1.1 100 Continue\r\n\r\n\
+              HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        ),
+    ];
+    for (interim, reply) in replies {
+        let (upstream, _, _) = spawn_scripted_upstream(reply).await;
+        let server =
+            spawn_h3_from_pingclairfile(&format!(":443 {{\n reverse_proxy http://{upstream}\n}}"))
+                .await;
+
+        let response = h3_get(server, "/").await.unwrap();
+        assert_eq!(
+            (response.status, response.body.as_slice()),
+            (200, &b"ok"[..]),
+            "the final response must follow a {interim}"
+        );
+    }
+}
+
+/// 🚫 A `101` nobody asked for is a bad gateway, not a response to relay.
+#[tokio::test]
+async fn h3_refuses_an_unrequested_protocol_switch() {
+    let (upstream, _, _) = spawn_scripted_upstream(
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n",
+    )
+    .await;
+    let server =
+        spawn_h3_from_pingclairfile(&format!(":443 {{\n reverse_proxy http://{upstream}\n}}"))
+            .await;
+
+    assert_eq!(h3_get(server, "/").await.unwrap().status, 502);
+}
+
+/// ⚡ The circuit breaker judges the final status, not a hint in front of it.
+///
+/// The breaker latches on the first status it is told about. When that was a
+/// `103`, it counted as a success and the `503` behind it was never recorded,
+/// so an origin that sent hints before its failures could never be broken.
+#[tokio::test]
+async fn h3_circuit_breaker_counts_the_status_after_a_hint() {
+    let (upstream, _, hits) = spawn_scripted_upstream(
+        b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\n\
+          HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let server = spawn_h3_from_pingclairfile(&format!(
+        r#":443 {{
+            reverse_proxy http://{upstream} {{
+                circuit_breaker {{
+                    consecutive_failures 1
+                    open_for 30s
+                }}
+            }}
+        }}"#
+    ))
+    .await;
+
+    assert_eq!(h3_get(server, "/").await.unwrap().status, 503);
+    assert_eq!(h3_get(server, "/").await.unwrap().status, 503);
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the first 503 must open the circuit, so the second request never \
+         reaches the upstream"
+    );
+}

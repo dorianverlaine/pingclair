@@ -20,6 +20,18 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🔁 HTTP/3 waits past `103 Early Hints` for the real response
+
+An HTTP/3 request proxied to an HTTP/1.1 upstream that answered with
+`103 Early Hints` (or `100 Continue`) before its real response used to receive
+the interim response as its whole answer — a bodiless `103` — and never the
+response behind it. Pingclair now skips interim responses and relays the final
+one, and the circuit breaker and `lb_retry_match` judge that final status, so
+an upstream that sends hints in front of its `503`s is still broken. Hints are
+not yet forwarded to HTTP/3 clients. An upstream `101 Switching Protocols`,
+which an HTTP/3 request never asks for, now yields `502`, as does an upstream
+that sends more than 32 interim responses before its answer.
+
 ### 🚫 HTTP/3 no longer forwards `Expect`
 
 An HTTP/3 request proxied to an upstream has its whole body sent before the
