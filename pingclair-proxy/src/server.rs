@@ -8147,6 +8147,11 @@ impl ProxyHttp for PingclairProxy {
                     response_headers: logged_response_headers,
                     tls_version,
                     tls_cipher,
+                    // 🕰️ The record says when the request started, not when it
+                    // finished: a five-second request logged at its end would
+                    // otherwise sit in a shipper's timeline beside requests that
+                    // arrived after it.
+                    started_unix: crate::access_log::unix_started_at(ctx.start_time),
                     request_id: ctx.request_id(),
                     method,
                     host,

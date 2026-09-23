@@ -264,12 +264,43 @@ fn reopen_shared_file(
     Ok(())
 }
 
+/// 🕰️ The wall-clock time a request started, as Unix seconds with a fractional
+/// part — the value [`AccessEntry::started_unix`] carries and the JSON record
+/// renders as `ts`.
+///
+/// The runtime times a request with `Instant`, the monotonic clock, because that
+/// is the one that cannot jump when the system clock is stepped. A log record
+/// needs the other clock instead, and the honest way to get it would be a second
+/// clock read for every request plus a timestamp threaded through both
+/// transports. Deriving it here, at the moment the record is built, costs one
+/// read for requests that are actually logged and nothing for the rest: the
+/// start is simply now, minus how long this request has been running. The two
+/// reads are microseconds apart, which is far below the resolution anything
+/// reading a log file cares about.
+pub fn unix_started_at(started: std::time::Instant) -> f64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs_f64())
+        .unwrap_or(0.0);
+    // 🚫 A clock set before 1970 makes the subtraction negative; `max(0.0)`
+    // reports the epoch rather than a plausible-looking wrong instant.
+    (now - started.elapsed().as_secs_f64()).max(0.0)
+}
+
 /// 📋 One access-log record.
 ///
 /// Borrowed rather than owned so the hot path does not allocate a copy of
 /// every field just to format one line.
 pub struct AccessEntry<'a> {
     pub request_id: &'a str,
+    /// 🕰️ Unix seconds, with a fractional part, at which the request started.
+    ///
+    /// 📌 The key this renders under is `ts`, the same one a Caddy access record
+    /// uses, so a shipper that parses both servers' files does not need a
+    /// separate rule per server to place a record in time. Everything else about
+    /// this record keeps pingclair's own flat shape; `ts` is an addition, not the
+    /// start of a schema migration.
+    pub started_unix: f64,
     pub method: &'a str,
     pub host: &'a str,
     pub path: &'a str,
@@ -1264,6 +1295,12 @@ impl AccessLogger {
             };
         }
 
+        // 🕰️ First, matching the place a timestamp holds in Caddy's own record.
+        // Caddy's value is a float and so is this one: whole seconds would say a
+        // fast request happened in the same second as a thousand others, and a
+        // `jq` pipeline comparing the two servers' output should not have to
+        // contend with two numeric shapes.
+        raw_field!("ts", entry.started_unix);
         str_field!("request_id", entry.request_id);
         str_field!("method", entry.method);
         str_field!("host", entry.host);
@@ -1505,6 +1542,11 @@ mod tests {
 
     pub(super) fn entry<'a>() -> AccessEntry<'a> {
         AccessEntry {
+            // 🕰️ Fixed, so two records rendered from this fixture are
+            // byte-for-byte identical. That a live request gets a real clock
+            // reading is covered separately by
+            // `unix_started_at_places_a_record_when_its_request_started`.
+            started_unix: 1_758_600_000.125,
             request_id: "abc-1",
             method: "GET",
             host: "example.com",
@@ -1813,6 +1855,89 @@ mod tests {
             .unwrap_or_else(|e| panic!("emitted invalid JSON: {e}\n{out}"));
         assert_eq!(parsed["status"], 200);
         assert_eq!(parsed["route"], "/api/*");
+    }
+
+    /// 🕰️ A record says when its request started.
+    ///
+    /// 🤡 It used to say nothing about time at all. A collector reading arrival
+    /// time instead of the record is wrong after any restart, rotation or
+    /// buffering, and a timestamp is the one field a log line cannot recover
+    /// later — which is why its absence was worse than the rest of the schema
+    /// differences put together.
+    #[test]
+    fn json_carries_the_record_timestamp() {
+        let e = entry();
+        let out = logger(LogFormat::Json, vec![]).format_json(&e);
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|error| panic!("emitted invalid JSON: {error}\n{out}"));
+        let ts = parsed["ts"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("`ts` must be a number, got {}", parsed["ts"]));
+        assert_eq!(ts, e.started_unix, "`ts` must be the entry's start time");
+        // 📌 Seconds since the epoch with a fractional part is the shape Caddy
+        // writes. Whole seconds would mean the fraction had been dropped, which
+        // is the difference between this field and the one a Caddy dashboard
+        // already parses.
+        assert!(
+            out.contains("\"ts\":1758600000.125"),
+            "a fractional Unix timestamp must survive formatting: {out}"
+        );
+    }
+
+    /// 📌 `ts` is an addition, not a schema change: a pipeline reading the old
+    /// keys must see the identical record. The exact key set is what proves no
+    /// key was renamed, dropped or duplicated along the way — a schema drifts
+    /// one key at a time, which is why this asserts the whole object.
+    #[test]
+    fn the_timestamp_is_the_only_new_json_field() {
+        let out = logger(LogFormat::Json, vec![]).format_json(&entry());
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let mut keys: Vec<&str> = parsed
+            .as_object()
+            .expect("a record is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "bytes",
+                "client_ip",
+                "duration_ms",
+                "host",
+                "method",
+                "path",
+                "protocol",
+                "referer",
+                "request_id",
+                "route",
+                "status",
+                "ts",
+                "ttfb_ms",
+                "upstream",
+                "user_agent",
+            ],
+        );
+    }
+
+    /// 🕰️ The timestamp places a record where its request *started*, not where
+    /// its request finished. A slow request logged at its end would otherwise
+    /// appear in a shipper's timeline beside requests that arrived after it,
+    /// which is the ordering bug a timestamp exists to make impossible.
+    #[test]
+    fn unix_started_at_places_a_record_when_its_request_started() {
+        let started = std::time::Instant::now() - std::time::Duration::from_secs(5);
+        let ts = unix_started_at(started);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the test clock is after the epoch")
+            .as_secs_f64();
+        assert!(
+            (now - ts - 5.0).abs() < 0.5,
+            "a request started five seconds ago must be dated five seconds ago, \
+             got {ts} against {now}"
+        );
     }
 
     /// A client-controlled field must not be able to forge extra JSON keys.

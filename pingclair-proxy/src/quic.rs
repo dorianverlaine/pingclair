@@ -3320,6 +3320,11 @@ fn write_h3_access_log(
         .map(|route| route.path.as_str());
 
     let entry = crate::access_log::AccessEntry {
+        // 🕰️ Both transports derive `ts` the same way from their own start
+        // `Instant`, so the H3 record and the H1/H2 record place a request at the
+        // same moment. A timestamp produced only on one of them would be the
+        // parity gap this field exists to close.
+        started_unix: crate::access_log::unix_started_at(request_started),
         request_id,
         method: &req.method,
         host,

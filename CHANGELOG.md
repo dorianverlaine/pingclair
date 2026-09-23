@@ -149,6 +149,20 @@ A client may send `Connection` as two field lines, such as
 read only the first line, decided the request was not a WebSocket handshake,
 and stripped `Connection` and `Upgrade` before the origin saw them, so the
 upgrade silently failed. Every line is now read.
+### 🕰️ Access-log records carry a timestamp
+
+A JSON access-log record had no field saying when its request happened, so a
+collector had to substitute its own arrival time. That is wrong after any
+restart, rotation or buffering, and a timestamp is the one field a log line
+cannot recover later. The record now carries `ts`: seconds since the Unix epoch
+with a fractional part, named and shaped like Caddy's own timestamp.
+
+This is an addition, not a schema change — every other key keeps its name, its
+place and its shape. Both transports derive the value the same way, from the
+instant each one started timing the request, so a record is dated when its
+request began rather than when it finished and a slow request does not sit in a
+collector's timeline beside requests that arrived after it.
+
 ### 🧩 `adapt` validates what it prints
 
 `pingclair adapt` converted a Pingclairfile and exited 0 without checking the
