@@ -32,6 +32,12 @@ use self::admin::parse_header_pair;
 #[command(author, version, about, long_about = None)]
 pub(crate) struct Cli {
     /// Enable verbose logging
+    ///
+    /// 📌 `-v` is **not** `caddy -v`, which prints the version: here the version
+    /// is `-V` / `--version`, and `-v` is the verbose flag. The collision is
+    /// stated rather than resolved because `-v` for verbosity is the stronger
+    /// convention in this binary's own history, and quietly changing what the
+    /// flag does would turn a wrong guess into a silent one.
     #[arg(short, long, global = true)]
     pub(crate) verbose: bool,
 
@@ -89,7 +95,15 @@ pub(crate) enum Commands {
         shell: String,
     },
 
-    /// Print the environment as seen by Pingclair, like `caddy environ`
+    /// Print this process's environment, one NAME=value per line
+    ///
+    /// 📌 Not `caddy environ`, which is a different question with a similar
+    /// name: Caddy prints the paths and build facts *it* computed — its data
+    /// directory, its autosave path, its version — while this prints the
+    /// environment it inherited from whatever launched it. The store this build
+    /// resolved, which is the closest thing here to Caddy's answer, is logged at
+    /// startup and is set by the global `storage file_system <path>` option or
+    /// `$PINGCLAIR_TLS_STORE`.
     Environ,
 
     /// List the installed modules, like `caddy list-modules`
