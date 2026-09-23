@@ -283,6 +283,7 @@ fn metric_endpoint(path: &str) -> &'static str {
         "/config" | "/config/" => "config",
         "/cache" | "/cache/" => "cache",
         "/cache/purge" => "cache_purge",
+        "/reverse_proxy/upstreams" => "reverse_proxy_upstreams",
         "/load" => "load",
         "/adapt" => "adapt",
         "/stop" => "stop",
@@ -447,9 +448,36 @@ async fn handle_request_inner(
                 }
                 Err(error) => Ok(response(
                     StatusCode::NOT_FOUND,
-                    &format!(r#"{{"error":"{}"}}"#, error.message()),
+                    &format!(
+                        r#"{{"error":"{}"}}"#,
+                        missing_path_message(&guard, &segments, &error)
+                    ),
                 )),
             }
+        }
+        // 🩺 The upstream inventory.
+        //
+        // 📌 Caddy answers this from the live load balancers and includes
+        // per-upstream request and failure counters. Those are not published out
+        // of the proxy yet, so this reports the addresses the configuration
+        // names and nothing else. An address list is what a health check
+        // enumerates; a counter that reads `0` because nobody counts is worse
+        // than one that is absent, which is why they are left out.
+        //
+        // 🚫 The endpoint used to be missing, so the same health check got a
+        // `404` — indistinguishable from a deployment with no upstreams at all.
+        (&Method::GET, "/reverse_proxy/upstreams") => {
+            let guard = document.read();
+            let upstreams: Vec<serde_json::Value> = collected_upstreams(&guard)
+                .into_iter()
+                .map(|address| serde_json::json!({ "address": address }))
+                .collect();
+            let json = serde_json::to_string(&upstreams).unwrap_or_else(|_| "[]".to_string());
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .body(Full::new(Bytes::from(json)))
+                .unwrap())
         }
         // 🗄️ Read-only view of the shared response store. Answers the two
         // questions an operator has when caching misbehaves: how full is it,
@@ -564,10 +592,23 @@ async fn handle_request_inner(
                 match serde_json::from_slice(&body_bytes) {
                     Ok(config) => config,
                     Err(error) => {
-                        return Ok(response(
-                            StatusCode::BAD_REQUEST,
-                            &format!("Invalid config: {error}"),
-                        ));
+                        // 🚫 A Caddy document is the one rejection worth naming.
+                        // Handing the whole body to `PingclairConfig` makes serde
+                        // report the first key it did not expect — `apps` — and
+                        // the caller reads "unknown field" as a typo in a
+                        // document they copied from a working Caddy install. It
+                        // is not a typo; the two shapes are different, and the
+                        // message should say which one this endpoint takes.
+                        let message = if looks_like_caddy_document(&body_bytes) {
+                            "this admin API takes pingclair's own configuration JSON, \
+                             not Caddy's: `apps` is Caddy's top level. POST a Caddyfile \
+                             instead (Content-Type: text/caddyfile), or send the document \
+                             GET /config/ returns."
+                                .to_string()
+                        } else {
+                            format!("Invalid config: {error}")
+                        };
+                        return Ok(response(StatusCode::BAD_REQUEST, &message));
                     }
                 }
             };
@@ -795,6 +836,96 @@ async fn apply_config_traversal(
     let raw = path.strip_prefix("/config").unwrap_or(path);
     let segments = normalize_config_segments(config_tree::segments_from_path(raw));
     apply_segments(ctx, method, segments, body).await
+}
+
+/// 📣 Says *why* a `/config/<path>` lookup found nothing, in the terms the
+/// caller is thinking in.
+///
+/// 🚫 `config path does not exist` is true and useless. The path that brings
+/// people here is `apps`, the top level of Caddy's own document, and answering
+/// a caller who believes they are talking to Caddy with "that path does not
+/// exist" reads as a bug on their side. Naming the keys this document does have
+/// tells them the shape differs, which is the fact they are missing.
+///
+/// It stays a 404: the path genuinely is not in this document, and a 200 would
+/// claim a subtree that could not be returned.
+fn missing_path_message(
+    document: &Value,
+    segments: &[String],
+    error: &config_tree::TreeError,
+) -> String {
+    let config_tree::TreeError::NotFound = error else {
+        return error.message();
+    };
+    let top_level = document
+        .as_object()
+        .map(|map| {
+            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            keys.join(", ")
+        })
+        .unwrap_or_default();
+    let detail = match segments.first().map(String::as_str) {
+        Some("apps") => "`apps` is the top level of Caddy's JSON, and this admin API serves \
+             pingclair's own configuration shape. POST a Caddyfile instead \
+             (Content-Type: text/caddyfile), or read the running document from \
+             /config/."
+            .to_string(),
+        _ => format!("this document's top level is: {top_level}"),
+    };
+    format!("{} — {detail}", error.message())
+}
+
+/// 🔎 Is this body a Caddy configuration document rather than a pingclair one?
+///
+/// Only the top level is inspected. `apps` there is Caddy's envelope and never
+/// a pingclair key, so its presence is enough to tell the two apart without
+/// trying to interpret the rest — and a body that does not parse as JSON at all
+/// is not claimed as either.
+fn looks_like_caddy_document(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value.as_object().map(|map| map.contains_key("apps")))
+        .unwrap_or(false)
+}
+
+/// 🩺 Every upstream address the configuration names, in document order.
+///
+/// 🔁 The walk is recursive because a reverse proxy can sit inside a `handle`,
+/// a `route` or a `handle_path` block, and the document nests those rather than
+/// flattening them. Collecting only the top-level routes would report an empty
+/// list for a site whose upstreams are all inside a `handle` — an empty answer
+/// where a full one was available.
+fn collected_upstreams(document: &Value) -> Vec<String> {
+    fn walk(node: &Value, out: &mut Vec<String>) {
+        match node {
+            Value::Object(map) => {
+                if map.get("type").and_then(Value::as_str) == Some("reverse_proxy")
+                    && let Some(Value::Array(upstreams)) = map.get("upstreams")
+                {
+                    for upstream in upstreams {
+                        if let Some(address) = upstream.as_str()
+                            && !out.iter().any(|seen| seen == address)
+                        {
+                            out.push(address.to_string());
+                        }
+                    }
+                }
+                for child in map.values() {
+                    walk(child, out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    walk(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(document, &mut out);
+    out
 }
 
 /// 🏷️ Resolves `/id/<name>[/<tail...>]` to the tagged object's path and
@@ -1085,6 +1216,7 @@ mod metric_label_tests {
         "config_path",
         "cache",
         "cache_purge",
+        "reverse_proxy_upstreams",
         "load",
         "adapt",
         "stop",
@@ -1184,5 +1316,127 @@ mod metric_label_tests {
         ] {
             assert_eq!(metric_endpoint(path), expected, "for {path}");
         }
+    }
+}
+
+#[cfg(test)]
+mod caddy_document_tests {
+    use super::*;
+
+    /// 🚫 `{"apps":{}}` is the smallest possible Caddy config and the one a
+    /// caller is most likely to POST. It must be recognised as such rather than
+    /// reported as an unknown field in a document its author believes is valid.
+    #[test]
+    fn a_caddy_document_is_recognised_by_its_top_level() {
+        assert!(looks_like_caddy_document(br#"{"apps":{}}"#));
+        assert!(looks_like_caddy_document(
+            br#"{"apps":{"http":{"servers":{}}},"admin":{"listen":":2019"}}"#
+        ));
+    }
+
+    /// 🎯 A pingclair document, and anything that is not a JSON object, must not
+    /// be claimed as Caddy's — the message would then replace a precise parse
+    /// error with a misleading explanation of a different mistake.
+    #[test]
+    fn a_pingclair_document_is_not_mistaken_for_caddys() {
+        assert!(!looks_like_caddy_document(
+            br#"{"debug":false,"servers":[]}"#
+        ));
+        assert!(!looks_like_caddy_document(b"not json at all"));
+        assert!(!looks_like_caddy_document(b"[]"));
+        // 📌 A Caddyfile body reaches this only when the client sent the wrong
+        // Content-Type; it is not a JSON document at all.
+        assert!(!looks_like_caddy_document(b":8080 {\n\trespond \"hi\"\n}"));
+    }
+
+    /// 🔁 Upstreams nest inside `handle`, `route` and `handle_path` blocks, so
+    /// the walk has to descend. A top-level-only scan would answer `[]` for a
+    /// site whose upstreams are all inside a `handle` — an empty list where a
+    /// full one was available, which is the failure this endpoint exists to
+    /// avoid.
+    #[test]
+    fn upstreams_are_collected_from_nested_handlers() {
+        let document = serde_json::json!({
+            "servers": [
+                {
+                    "routes": [
+                        {
+                            "handler": {
+                                "type": "handle_path",
+                                "handlers": [
+                                    {
+                                        "handler": {
+                                            "type": "reverse_proxy",
+                                            "upstreams": ["10.0.1.1:8080", "10.0.1.2:8080"]
+                                        }
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "handler": {
+                                "type": "reverse_proxy",
+                                "upstreams": ["10.0.1.1:8080", "10.0.2.1:9000"]
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+        assert_eq!(
+            collected_upstreams(&document),
+            ["10.0.1.1:8080", "10.0.1.2:8080", "10.0.2.1:9000"],
+            "every upstream once, in document order"
+        );
+    }
+
+    /// 🩺 A configuration with no reverse proxy at all reports an empty list,
+    /// which is the answer a health check needs — and it is the one this
+    /// endpoint used to give as a `404`, indistinguishable from a missing route.
+    #[test]
+    fn a_site_without_upstreams_yields_an_empty_list() {
+        let document = serde_json::json!({
+            "servers": [{ "routes": [{ "handler": { "type": "respond", "body": "hi" } }] }]
+        });
+        assert!(collected_upstreams(&document).is_empty());
+    }
+
+    /// 📣 `apps` is the path that brings people here, and the answer must say
+    /// why it is not in this document rather than that the path does not exist.
+    #[test]
+    fn a_missing_apps_path_is_explained_not_just_denied() {
+        let document = serde_json::json!({
+            "debug": false,
+            "servers": [],
+            "admin": null,
+            "global": {},
+            "logging": {}
+        });
+        let message = missing_path_message(
+            &document,
+            &["apps".to_string()],
+            &config_tree::TreeError::NotFound,
+        );
+        assert!(
+            message.contains("Caddy"),
+            "must name whose shape this is: {message}"
+        );
+        assert!(
+            message.contains("text/caddyfile"),
+            "must point at the spelling this endpoint does take: {message}"
+        );
+    }
+
+    /// 🧭 Any other unknown key gets the document's real top level, which is the
+    /// fact the caller is missing.
+    #[test]
+    fn any_other_missing_path_names_the_documents_top_level() {
+        let document = serde_json::json!({ "debug": false, "servers": [] });
+        let message = missing_path_message(
+            &document,
+            &["nope".to_string()],
+            &config_tree::TreeError::NotFound,
+        );
+        assert!(message.contains("debug, servers"), "{message}");
     }
 }

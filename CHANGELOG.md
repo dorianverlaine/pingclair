@@ -149,6 +149,31 @@ A client may send `Connection` as two field lines, such as
 read only the first line, decided the request was not a WebSocket handshake,
 and stripped `Connection` and `Upgrade` before the origin saw them, so the
 upgrade silently failed. Every line is now read.
+### 🩺 The admin API answers Caddy-shaped requests in Caddy's terms
+
+An operator pointing Caddy tooling at this server saw three answers that were
+technically true and practically misleading.
+
+`POST /load` with a Caddy document — `{"apps":…}` — was refused with `unknown
+field `apps``. That is the report of a typo in a document its author copied from
+a working Caddy installation, and it sends them looking for a misspelling
+instead of at the shape this endpoint takes. The refusal now says which schema
+this is and points at the Caddyfile spelling that works. The body is still
+refused: the two schemas are different, and reading one as the other is the
+failure the `deny_unknown_fields` attribute exists to prevent.
+
+`GET /config/apps/` says the same thing in the same terms, and any other unknown
+path names the document's real top level rather than only reporting that the
+path is not there.
+
+`GET /reverse_proxy/upstreams` now exists, where it used to 404 — an answer a
+health check cannot tell apart from a deployment with no upstreams at all. It
+lists the addresses the configuration names, walking nested handlers so a
+reverse proxy inside a `handle` is found. The per-upstream request and failure
+counters Caddy includes are left out rather than reported as zero: the proxy
+does not publish them yet, and a counter nothing maintains is worse than a
+counter that is absent.
+
 ### 🔄 The plaintext listener redirects an unknown `Host` too
 
 The listener automatic HTTPS provisions on port 80 has one job — send plaintext

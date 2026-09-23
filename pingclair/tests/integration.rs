@@ -6300,9 +6300,22 @@ async fn test_admin_load_rejects_caddy_json() {
 
     assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
     let body = response.text().await.unwrap();
+    // 🚫 The refusal must name the difference, not the first key it tripped
+    // over. `unknown field `apps`` is true and reads as a typo in a document
+    // its author copied from a working Caddy installation — which sends them
+    // looking for the misspelling instead of at the spelling this endpoint
+    // takes.
     assert!(
-        body.contains("unknown field `apps`"),
-        "error must name the unknown field; got: {body}"
+        body.contains("not Caddy's"),
+        "the refusal must say whose shape this endpoint takes; got: {body}"
+    );
+    assert!(
+        body.contains("text/caddyfile"),
+        "the refusal must point at the spelling that does work; got: {body}"
+    );
+    assert!(
+        !body.contains("unknown field"),
+        "and must not report a valid Caddy key as a misspelling; got: {body}"
     );
 
     // 🧭 The previously loaded server must still be answering unchanged.
