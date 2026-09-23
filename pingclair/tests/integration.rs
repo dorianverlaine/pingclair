@@ -42,6 +42,10 @@ mod cache_vary;
 #[path = "integration/websocket_upgrade.rs"]
 mod websocket_upgrade;
 
+// 🧾 What a local response may carry for its status and method.
+#[path = "integration/response_framing.rs"]
+mod response_framing;
+
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather
 /// than against "some response arrived", so a 404 from a stale listener on the

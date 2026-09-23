@@ -20,6 +20,19 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🚫 A local 204 carries no content and no `Content-Length`
+
+Locally generated responses set `Content-Length` from the body they were
+given, whatever the status, so every CORS preflight answered `204 No Content`
+with `Content-Length: 0`, and `respond "x" 204` said `Content-Length: 1`. Over
+HTTP/2 and HTTP/3 the byte itself was sent as well. A 204 (and a 1xx) now goes
+out with neither, a 304 keeps its length but sends no content, and both
+transports decide this with the same rule.
+
+**Breaking:** `respond` with a 1xx status is now refused at load time. It used
+to compile, but a 1xx only announces that a final response is coming, and
+`respond` never sends one.
+
 ### 🕰️ HTTP/3 responses carry a `Date`
 
 HTTP/1.1 and HTTP/2 responses get `Date` from Pingora, but the HTTP/3 path

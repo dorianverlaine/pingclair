@@ -72,8 +72,8 @@ use crate::client_auth::{
 };
 use crate::connection_filter::PingclairConnectionFilter;
 use crate::http_policy::{
-    CorsDecision, ResponseHeaderPolicy, authority_host, evaluate_cors, resolve_request_id,
-    rewrite_uri,
+    CorsDecision, ResponseContent, ResponseHeaderPolicy, authority_host, evaluate_cors,
+    resolve_request_id, rewrite_uri,
 };
 use crate::server::{PingclairProxy, ProxyState, error_reason, resolve_caddy_placeholders};
 use crate::server::{is_streaming_content_type, wants_immediate_flush};
@@ -1016,6 +1016,9 @@ struct StreamState {
     /// 🔪 The handler asked for this stream to be reset, with this code,
     /// instead of being finished with a FIN.
     abort_requested: Option<quiche::h3::WireErrorCode>,
+    /// 🤐 The response's status forbids content, so its header went out with
+    /// the FIN and any body or trailers the handler still sends are dropped.
+    no_content: bool,
     /// 🧹 Marks a terminated stream so later response messages are ignored.
     dead: bool,
 }
@@ -1863,6 +1866,7 @@ impl H3App {
                     }
                     ss.pending_headers = Some((headers, fin));
                 }
+                RespMsg::Body(_, _) | RespMsg::Trailers(_) if ss.no_content => {}
                 RespMsg::Body(bytes, fin) => {
                     // 🌊 An empty chunk at the queue head makes quiche return
                     // `Done` forever, blocking every later non-empty chunk.
@@ -1980,10 +1984,28 @@ impl H3App {
         }
 
         if !ss.headers_sent {
-            let Some((mut headers, fin)) = ss.pending_headers.take() else {
+            let Some((mut headers, mut fin)) = ss.pending_headers.take() else {
                 return;
             };
-            stamp_date(&mut headers);
+            let status = response_status(&headers);
+            stamp_date(&mut headers, status);
+            // 🤐 Decided here, at the one exit every H3 response takes, rather
+            // than by each handler: a 204 or 304 ends with its header no matter
+            // what body was built for it. Whatever is queued behind the header,
+            // or still on its way from the handler, is discarded.
+            let content = ResponseContent::for_status(status);
+            if !content.has_body() {
+                if !content.allows_content_length() {
+                    headers.retain(|header| !header.name().eq_ignore_ascii_case(b"content-length"));
+                }
+                ss.no_content = true;
+                ss.pending_body.clear();
+                ss.pending_body_bytes = 0;
+                ss.pending_body_head = 0;
+                ss.pending_trailers = None;
+                ss.body_fin = true;
+                fin = true;
+            }
             // 🛑 An error response ends the exchange while the client may
             // still be uploading. Tell it to stop sending with H3_NO_ERROR —
             // ngtcp2/curl treat a `RequestRejected` STOP_SENDING as a
@@ -2111,16 +2133,27 @@ impl H3App {
 /// clock is Pingora's per-thread cache, so both transports read the same
 /// second and neither formats a date string per request. Interim (1xx)
 /// responses are left alone, as on H1/H2.
-fn stamp_date(headers: &mut Vec<quiche::h3::Header>) {
-    let informational = headers
-        .iter()
-        .any(|header| header.name() == b":status" && header.value().starts_with(b"1"));
-    if informational {
+fn stamp_date(headers: &mut Vec<quiche::h3::Header>, status: u16) {
+    if (100..200).contains(&status) {
         return;
     }
     headers.retain(|header| !header.name().eq_ignore_ascii_case(b"date"));
     let date = pingora_core::protocols::http::date::get_cached_date();
     headers.push(quiche::h3::Header::new(b"date", date.as_bytes()));
+}
+
+/// 🔢 The numeric `:status` of an outgoing header list.
+///
+/// Every list this file builds starts with `:status`, so the scan stops at
+/// the first entry in practice. A list without a parseable one is treated as
+/// `200`, the status that restricts nothing, because refusing to send it here
+/// would turn a formatting slip into a hung stream.
+fn response_status(headers: &[quiche::h3::Header]) -> u16 {
+    headers
+        .iter()
+        .find(|header| header.name() == b":status")
+        .and_then(|header| std::str::from_utf8(header.value()).ok()?.parse().ok())
+        .unwrap_or(200)
 }
 
 // MARK: - Handler task

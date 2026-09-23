@@ -56,3 +56,23 @@ async fn h3_proxied_response_date_is_replaced() {
     assert_eq!(dates.len(), 1, "exactly one `date`: {dates:?}");
     assert_ne!(dates[0], "Sun, 06 Nov 1994 08:49:37 GMT");
 }
+
+/// 🚫 `respond "x" 204` ends with its header: no `content-length`, no byte.
+///
+/// Before the fix the H3 path sent `content-length: 1` and the byte, so one
+/// configuration produced a different response on each transport. RFC 9110
+/// §8.6 forbids the field on a 204 outright.
+#[tokio::test]
+async fn h3_respond_204_carries_no_content() {
+    let server = spawn_h3_from_pingclairfile(":443 {\n respond \"x\" 204\n}").await;
+
+    let response = h3_get(server, "/").await.unwrap();
+    assert_eq!(
+        (
+            response.status,
+            fields(&response, "content-length"),
+            response.body.len()
+        ),
+        (204, Vec::new(), 0)
+    );
+}

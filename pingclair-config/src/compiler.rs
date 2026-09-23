@@ -1330,6 +1330,18 @@ fn reject_unimplemented_handler(handler: &HandlerConfig) -> CompileResult<()> {
             ),
         }),
         HandlerConfig::Templates { .. } => Ok(()),
+        // 🚫 A 1xx is an interim response: it announces that a final one is
+        // coming, and it carries no content (RFC 9110 §15.2). `respond` sends
+        // exactly one response and then ends the exchange, so a 1xx there
+        // would leave the client waiting for a final answer that never comes.
+        HandlerConfig::Respond { status, .. } if (100..200).contains(status) => {
+            Err(CompileError::InvalidRoute {
+                message: format!(
+                    "`respond` cannot send {status}: a 1xx status is informational and \
+                     must be followed by a final response, which `respond` never sends"
+                ),
+            })
+        }
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::FirstMatch { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
@@ -3595,6 +3607,23 @@ mod fail_closed_handler_tests {
             .is_err(),
             "a bad entry hidden behind a good one was accepted"
         );
+    }
+
+    /// 🚫 A 1xx `respond` is refused, from the DSL and from JSON alike.
+    ///
+    /// Both used to compile. An interim status promises a final response that
+    /// `respond` never sends, so the client would wait for an answer forever.
+    #[test]
+    fn respond_with_an_informational_status_is_refused() {
+        assert!(crate::compile(":80 {\n respond \"x\" 103\n}").is_err());
+        let informational = HandlerConfig::Respond {
+            status: 100,
+            body: None,
+            headers: std::collections::BTreeMap::new(),
+        };
+        assert!(validate_config(&config_with(informational)).is_err());
+        // 📌 The neighbour stays valid: 204 is a final response with no content.
+        assert!(crate::compile(":80 {\n respond 204\n}").is_ok());
     }
 
     #[test]

@@ -1448,6 +1448,50 @@ fn list_field_contains(headers: &http::HeaderMap, name: http::HeaderName, token:
         .any(|candidate| candidate.trim().eq_ignore_ascii_case(token))
 }
 
+// MARK: - Response content
+
+/// 🧾 Whether a response may carry content, and whether it may say how long
+/// that content is.
+///
+/// Some responses are defined to have no body at all, whatever the handler
+/// produced. Sending one anyway corrupts the connection: an HTTP/1.1 client
+/// reads the stray bytes as the start of the next response, and an HTTP/2 or
+/// HTTP/3 client treats DATA after them as a protocol error. Both transports
+/// ask this one question at the point where they write the header, so the
+/// answer cannot differ between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResponseContent {
+    /// 📦 Content follows the header, framed as usual.
+    Allowed,
+    /// 🤐 No content is sent, but `Content-Length` may still describe the
+    /// representation the client would have received (304, RFC 9110 §8.6).
+    Omitted,
+    /// 🚫 No content, and no `Content-Length` either: RFC 9110 §8.6 forbids
+    /// the field on 1xx and 204.
+    Forbidden,
+}
+
+impl ResponseContent {
+    /// 🧾 The rule for a status code (RFC 9110 §6.4.1, §15.3.5, §15.4.5).
+    pub(crate) fn for_status(status: u16) -> Self {
+        match status {
+            100..=199 | 204 => Self::Forbidden,
+            304 => Self::Omitted,
+            _ => Self::Allowed,
+        }
+    }
+
+    /// 📦 Whether body bytes may follow the header.
+    pub(crate) fn has_body(self) -> bool {
+        matches!(self, Self::Allowed)
+    }
+
+    /// 📏 Whether the header may carry `Content-Length`.
+    pub(crate) fn allows_content_length(self) -> bool {
+        !matches!(self, Self::Forbidden)
+    }
+}
+
 // MARK: - Request framing
 
 /// 🚫 Why a request's message framing cannot be trusted.

@@ -45,8 +45,8 @@ use crate::cache_policy::{
 };
 use crate::encoding::{ResponseEncoder, negotiate};
 use crate::http_policy::{
-    CorsDecision, ResponseHeaderPolicy, evaluate_cors, generate_request_id, is_websocket_upgrade,
-    rewrite_uri, sanitize_request_id, via_value,
+    CorsDecision, ResponseContent, ResponseHeaderPolicy, evaluate_cors, generate_request_id,
+    is_websocket_upgrade, rewrite_uri, sanitize_request_id, via_value,
 };
 use crate::metrics;
 use crate::overload::{AdmissionError, RouteAdmission, RouteProtection, UpstreamAdmission};
@@ -3583,6 +3583,16 @@ impl PingclairProxy {
         end_of_stream: bool,
     ) -> PingoraResult<()> {
         Self::enforce_request_deadline(ctx)?;
+        // 🤐 A status that carries no content gets none, whatever the handler
+        // built. HTTP/1.1 would drop the bytes on its own, but HTTP/2 sends
+        // them as DATA after a 204. Only the end of the stream still goes out.
+        if !Self::written_response_content(session).has_body() {
+            return if end_of_stream {
+                session.write_response_body(None, true).await
+            } else {
+                Ok(())
+            };
+        }
         if let Some(delay) = ctx
             .download_pacer
             .as_mut()
@@ -3601,6 +3611,16 @@ impl PingclairProxy {
         }
         ctx.response_bytes += body.len() as u64;
         session.write_response_body(Some(body), end_of_stream).await
+    }
+
+    /// 🧾 The content rule for the response header already written on this
+    /// session; a session with no header yet is treated as allowing content.
+    fn written_response_content(session: &Session) -> ResponseContent {
+        session
+            .response_written()
+            .map_or(ResponseContent::Allowed, |header| {
+                ResponseContent::for_status(header.status.as_u16())
+            })
     }
 
     /// 🧭 Runs a local response through the same interception decision as a proxy response.
@@ -3729,6 +3749,13 @@ impl PingclairProxy {
             .apply_pingora(response, &ctx.request_id_value, None)?;
         if let Some(state) = &ctx.state {
             Self::apply_security_response_headers(response, state)?;
+        }
+        // 🚫 Every local write site sets `Content-Length` from the body it
+        // built, and a 204 or 1xx must not carry one at all (RFC 9110 §8.6).
+        // Stripped here, after the header policy, because this is the one
+        // function every local response passes through on its way out.
+        if !ResponseContent::for_status(response.status.as_u16()).allows_content_length() {
+            response.remove_header(&http::header::CONTENT_LENGTH);
         }
         Ok(())
     }
