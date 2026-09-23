@@ -4098,6 +4098,7 @@ async fn fastcgi_upstream(
     let prepared_request = crate::fastcgi::prepare_request_header(
         request_header,
         &proxy_config.headers_up,
+        &proxy_config.headers_up_remove,
         Some(verified_client_ip),
         "https",
         request_vars,
@@ -4760,8 +4761,16 @@ async fn reverse_proxy_upstream(
                 );
                 up_req.insert_header(key.clone(), resolved.as_ref()).ok();
             }
+            // 🚫 Deletions run after the sets and before the automatic headers
+            // below, the order Caddy's `HeaderOps` applies them in, so
+            // `header_up -Name` also removes what the client sent.
+            for name in &config.headers_up_remove {
+                up_req.remove_header(name.as_str());
+            }
         }
 
+        // 🚫 A deleted name counts as configured, so the automatic header
+        // below is not re-added behind the operator's back.
         let has_header_up = |name: &str| {
             proxy_config
                 .as_ref()
@@ -4770,6 +4779,10 @@ async fn reverse_proxy_upstream(
                         .headers_up
                         .keys()
                         .any(|key| key.eq_ignore_ascii_case(name))
+                        || config
+                            .headers_up_remove
+                            .iter()
+                            .any(|key| key.eq_ignore_ascii_case(name))
                 })
                 .unwrap_or(false)
         };

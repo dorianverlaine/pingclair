@@ -788,6 +788,15 @@ pub struct ProxyConfig {
     /// Headers to add to upstream request
     pub header_up: BTreeMap<String, Expr>,
 
+    /// 🚫 Header names to take off the upstream request, which is what
+    /// Caddy's `header_up -Name` means.
+    ///
+    /// A list of names rather than a sentinel value in `header_up`: that map
+    /// is keyed by header name, so a deletion has no pair to be written as,
+    /// and an empty value would send `Name:` to the origin rather than remove
+    /// it — the silent-succeed failure this repository keeps finding.
+    pub header_up_remove: Vec<String>,
+
     /// Transport configuration
     pub transport: Option<TransportConfig>,
 
@@ -1244,6 +1253,7 @@ impl ProxyConfig {
             health_check: None,
             flush_interval: None,
             header_up: BTreeMap::new(),
+            header_up_remove: Vec::new(),
             transport: None,
             cache: None,
             retry: RetryConfig::default(),

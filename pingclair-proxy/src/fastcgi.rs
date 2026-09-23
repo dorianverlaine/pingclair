@@ -172,9 +172,15 @@ pub(crate) struct EnvironmentInput<'a> {
 }
 
 /// 🧰 Applies configured upstream header templates before CGI conversion.
+///
+/// 🚫 `headers_up_remove` is a separate list because a CGI environment has no
+/// notion of a header the request does not carry: `header_up -X` on a
+/// `php_fastcgi` route has to take the name out of the prepared request, or the
+/// directive would compile and mean nothing on this transport alone.
 pub(crate) fn prepare_request_header(
     request: &RequestHeader,
     headers_up: &BTreeMap<String, String>,
+    headers_up_remove: &[String],
     verified_client_ip: Option<&str>,
     scheme: &'static str,
     request_vars: &RequestVars,
@@ -191,6 +197,9 @@ pub(crate) fn prepare_request_header(
         prepared
             .insert_header(name.clone(), resolved.as_ref())
             .map_err(|_| ())?;
+    }
+    for name in headers_up_remove {
+        prepared.remove_header(name.as_str());
     }
     Ok(prepared)
 }
@@ -577,6 +586,7 @@ mod tests {
         let prepared = prepare_request_header(
             &request,
             &headers_up,
+            &[],
             Some("192.0.2.4"),
             "https",
             &variables,

@@ -2065,6 +2065,12 @@ pub struct ReverseProxyConfig {
     #[serde(default)]
     pub headers_down: BTreeMap<String, String>,
 
+    /// 🚫 Header names to take off the upstream request, from Caddy's
+    /// `header_up -Name`. Applied after `headers_up`, so a name in both is
+    /// removed — which is the order upstream's `HeaderOps` uses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers_up_remove: Vec<String>,
+
     /// Flush interval in milliseconds (-1 for immediate)
     pub flush_interval: Option<i64>,
 

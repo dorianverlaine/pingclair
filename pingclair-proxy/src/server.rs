@@ -146,6 +146,8 @@ pub struct RequestContext {
     pub upstream: Option<Upstream>,
     /// Extra headers to add upstream
     pub headers_upstream: BTreeMap<String, String>,
+    /// 🚫 Header names to take off the upstream request, from `header_up -Name`.
+    pub headers_upstream_remove: Vec<String>,
     /// 🧭 Transport-neutral downstream response header mutations.
     pub(crate) response_headers: ResponseHeaderPolicy,
     /// 🗜️ Coding agreed between this client's `Accept-Encoding` and the
@@ -266,6 +268,7 @@ impl Default for RequestContext {
             cache_size_tracked: false,
             upstream: None,
             headers_upstream: BTreeMap::new(),
+            headers_upstream_remove: Vec::new(),
             response_headers: ResponseHeaderPolicy::default(),
             negotiated_encoding: None,
             streaming_response: false,
@@ -3332,6 +3335,7 @@ impl PingclairProxy {
         let prepared_request = crate::fastcgi::prepare_request_header(
             session.req_header(),
             &config.headers_up,
+            &config.headers_up_remove,
             verified_client_ip.as_deref(),
             ctx.request_scheme,
             &ctx.request_vars,
@@ -6894,6 +6898,7 @@ impl ProxyHttp for PingclairProxy {
             };
             if let Some(proxy_config) = &proxy_config {
                 ctx.headers_upstream = proxy_config.headers_up.clone();
+                ctx.headers_upstream_remove = proxy_config.headers_up_remove.clone();
                 ctx.response_headers
                     .merge_proxy_set(&proxy_config.headers_down);
                 ctx.streaming_response = wants_immediate_flush(proxy_config.flush_interval);
@@ -6976,6 +6981,7 @@ impl ProxyHttp for PingclairProxy {
             Self::enforce_request_deadline(ctx)?;
             if let Some(proxy_config) = &proxy_config {
                 ctx.headers_upstream = proxy_config.headers_up.clone();
+                ctx.headers_upstream_remove = proxy_config.headers_up_remove.clone();
                 ctx.response_headers
                     .merge_proxy_set(&proxy_config.headers_down);
                 ctx.streaming_response = wants_immediate_flush(proxy_config.flush_interval);
@@ -7100,10 +7106,19 @@ impl ProxyHttp for PingclairProxy {
         strip_hop_by_hop_headers(session, upstream_request)?;
 
         let downstream_headers = session.req_header();
+        // 🚫 A name the operator deleted counts as configured, so the automatic
+        // forwarding header below is not re-added behind their back:
+        // `header_up -X-Forwarded-For` means the origin sees no
+        // `X-Forwarded-For`, not one this server put there after removing the
+        // client's.
         let has_header_up = |name: &str| {
             ctx.headers_upstream
                 .keys()
                 .any(|key| key.eq_ignore_ascii_case(name))
+                || ctx
+                    .headers_upstream_remove
+                    .iter()
+                    .any(|key| key.eq_ignore_ascii_case(name))
         };
 
         // Add configured upstream headers with variable resolution
@@ -7125,6 +7140,14 @@ impl ProxyHttp for PingclairProxy {
                 &ctx.request_vars,
             );
             upstream_request.insert_header(key.clone(), resolved.as_ref())?;
+        }
+
+        // 🚫 Deletions run after the sets and before the automatic headers
+        // below, which is the order Caddy's `HeaderOps` applies them in — so
+        // `header_up -Name` also removes whatever the client sent, rather than
+        // only declining to add one of our own.
+        for name in &ctx.headers_upstream_remove {
+            upstream_request.remove_header(name.as_str());
         }
 
         // Add standard proxy headers (only if not already configured by user)

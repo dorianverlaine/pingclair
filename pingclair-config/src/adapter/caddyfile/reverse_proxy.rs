@@ -72,6 +72,18 @@ pub(super) fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError>
                                 .header_up
                                 .insert(key.clone(), Expr::String(value.clone()));
                         }
+                        // 🚫 `header_up -Name` takes that header off the
+                        // request before it reaches the origin. It is one
+                        // argument, so it used to be refused as "expects 2
+                        // arguments, got 1" — an argument-count mistake the
+                        // operator had not made, reported for the most
+                        // ordinary spelling of a delete.
+                        //
+                        // 🧭 A lone `-` is not a name and still falls through
+                        // to the count error below.
+                        [key] if key.len() > 1 && key.starts_with('-') => {
+                            proxy.header_up_remove.push(key[1..].to_string());
+                        }
                         // 🚩 A third argument used to be silently dropped, so
                         // `header_up X-Foo a b` sent only `a` upstream while
                         // looking like it sent both.

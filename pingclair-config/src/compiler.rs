@@ -2539,6 +2539,7 @@ fn compile_handler(
                     })
                 }),
                 headers_up: BTreeMap::new(),
+                headers_up_remove: Vec::new(),
                 headers_down: BTreeMap::new(),
                 flush_interval: None,
                 read_timeout: None,
@@ -2612,6 +2613,7 @@ fn compile_handler(
                 };
                 config.headers_up.insert(key.clone(), value_str);
             }
+            config.headers_up_remove = proxy.header_up_remove.clone();
 
             // Transport
             if let Some(transport) = &proxy.transport {

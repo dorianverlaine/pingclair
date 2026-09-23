@@ -496,6 +496,9 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 health_check: None,
                 headers_up,
                 headers_down: headers_down.into_iter().collect(),
+                // 🚫 The one-liner has no `-Name` spelling to offer, so there
+                // is nothing for this to carry.
+                headers_up_remove: Vec::new(),
                 flush_interval: None,
                 read_timeout: None,
                 write_timeout: None,

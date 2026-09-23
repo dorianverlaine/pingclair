@@ -9641,6 +9641,70 @@ async fn spawn_header_reporting_origin() -> (SocketAddr, tokio::sync::oneshot::R
     (address, rx)
 }
 
+/// 🚫 `header_up -Name` deletes, and does not read as a two-argument mistake.
+///
+/// 🤡 The delete form is one argument, so this adapter reported `Directive
+/// 'header_up' expects 2 arguments, got 1` — an argument-count mistake the
+/// operator had not made, for the ordinary Caddy spelling of a delete. The
+/// whole site then refused to start.
+///
+/// 📌 The assertions are on the *origin's* view, not on the compiled config: a
+/// delete that compiles and does nothing is the failure this test exists to
+/// catch, and it is invisible from our side.
+#[tokio::test]
+async fn test_header_up_delete_form_removes_the_header_before_the_origin() {
+    let (origin, origin_headers) = spawn_header_reporting_origin().await;
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            reverse_proxy http://{origin} {{
+                header_up -User-Agent
+                header_up -X-Forwarded-For
+                header_up X-Custom up1
+            }}
+        }}
+        "#
+    );
+
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/"))
+        .header("User-Agent", "audit-curl")
+        .header("X-Forwarded-For", "203.0.113.9")
+        .send()
+        .await
+        .expect("the proxy must answer");
+    assert_eq!(response.status(), 200);
+
+    let recorded = origin_headers.await.expect("the origin must record the request");
+    let lowered = recorded.to_ascii_lowercase();
+    assert!(
+        lowered.contains("x-custom: up1"),
+        "the neighbouring set form must still reach the origin: {recorded}"
+    );
+    assert!(
+        !lowered.contains("audit-curl"),
+        "the client's own User-Agent must not reach the origin: {recorded}"
+    );
+    assert!(
+        !lowered.contains("x-forwarded-for"),
+        "a deleted forwarding header must not be re-added by us: {recorded}"
+    );
+    assert!(
+        !lowered.contains("203.0.113.9"),
+        "the client's forged chain must not survive the delete: {recorded}"
+    );
+}
+
 #[tokio::test]
 async fn test_hop_by_hop_headers_do_not_reach_the_origin() {
     // 🧹 RFC 9110 §7.6.1: a proxy removes the Connection field, every field it
