@@ -375,10 +375,20 @@ async fn handle_request_inner(
     match authorize(access_policy.auth.as_deref(), authorization, peer_addr.ip()) {
         AuthDecision::Allowed => {}
         AuthDecision::Unauthorized => {
-            return Ok(response(
-                StatusCode::UNAUTHORIZED,
-                r#"{"error":"unauthorized"}"#,
-            ));
+            // 🔐 RFC 9110 §15.5.2: a 401 must name the scheme that would
+            // succeed, and `authorize` accepts only `Authorization: Bearer`.
+            let mut unauthorized =
+                response(StatusCode::UNAUTHORIZED, r#"{"error":"unauthorized"}"#);
+            let headers = unauthorized.headers_mut();
+            headers.insert(
+                hyper::header::WWW_AUTHENTICATE,
+                hyper::header::HeaderValue::from_static("Bearer"),
+            );
+            headers.insert(
+                hyper::header::CONTENT_TYPE,
+                hyper::header::HeaderValue::from_static("application/json"),
+            );
+            return Ok(unauthorized);
         }
         AuthDecision::Forbidden => {
             return Ok(response(StatusCode::FORBIDDEN, r#"{"error":"forbidden"}"#));

@@ -62,6 +62,10 @@ mod site_middleware;
 #[path = "integration/forward_auth_tls.rs"]
 mod forward_auth_tls;
 
+// 🔐 What the admin API's 401 tells a client about how to authenticate.
+#[path = "integration/admin_challenge.rs"]
+mod admin_challenge;
+
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather
 /// than against "some response arrived", so a 404 from a stale listener on the

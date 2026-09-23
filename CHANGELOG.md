@@ -42,6 +42,12 @@ validated and startup reported success; only real clients failed. Site names
 are now lowercased and stripped of a trailing dot when the configuration is
 compiled, and the certificate table files every name in that one spelling.
 
+### 🔐 The admin API's 401 names the Bearer scheme
+
+A request to the admin API without the right `api_key` got a bare 401, which
+RFC 9110 forbids: a 401 must say how to authenticate. It now carries
+`WWW-Authenticate: Bearer` and labels its JSON body `application/json`.
+
 ### 📜 Internal CA leaves say they have no revocation information
 
 Certificates from `tls internal` never had a CRL or OCSP responder, but nothing
