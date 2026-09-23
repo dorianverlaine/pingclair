@@ -171,6 +171,21 @@ for _ in $(seq 1 60); do
     sleep 0.25
 done
 
+# 🛡️ The loop above proves the TCP listener answers; the QUIC listener binds
+# later, and the first `--http3-only` case would otherwise race a UDP socket
+# that does not exist yet. It loses that race outright rather than retrying: a
+# QUIC Initial sent to an unbound port comes back as ICMP port-unreachable, and
+# curl reports `000` instead of waiting. The open site is the probe because it
+# needs no client certificate — the secure one is meant to refuse here.
+for _ in $(seq 1 60); do
+    if "${curl_bin}" -sS --noproxy '*' --resolve "${open_name}:${port}:127.0.0.1" \
+        --cacert "${run_dir}/server.crt" --http3-only --max-time 3 -o /dev/null \
+        "https://${open_name}:${port}/" 2>/dev/null; then
+        break
+    fi
+    sleep 0.25
+done
+
 resolve_args=(
     --resolve "${secure_name}:${port}:127.0.0.1"
     --resolve "${open_name}:${port}:127.0.0.1"
