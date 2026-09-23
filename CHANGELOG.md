@@ -20,6 +20,16 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### ➕ DNS-01 no longer deletes other TXT records at the challenge name
+
+Publishing a Cloudflare DNS-01 challenge used to delete every TXT record at
+`_acme-challenge.<domain>` before writing its own. `example.com` and
+`*.example.com` share that name, so when both were being issued at once each
+order could erase the other's proof and fail validation; any unrelated TXT
+record at the name was deleted too. Pingclair now only adds its record, marks
+it with the Cloudflare `comment` `pingclair acme-challenge`, and on cleanup
+deletes only the record that order wrote.
+
 ### 🔐 The HTTP-01 responder answers only the path RFC 8555 defines
 
 The ACME HTTP-01 responder removed its `/.well-known/acme-challenge/` prefix

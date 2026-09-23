@@ -24,10 +24,23 @@ struct SeenRequest {
     body: String,
 }
 
+/// 📇 One TXT record held by the mock zone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MockRecord {
+    id: String,
+    name: String,
+    content: String,
+    comment: Option<String>,
+}
+
 /// ☁️ A stand-in for the Cloudflare API, speaking just enough HTTP/1.1.
+///
+/// 📇 It keeps a real record table, so a test can assert on what the zone
+/// holds afterwards rather than only on which calls went out.
 struct MockApi {
     address: SocketAddr,
     seen: Arc<Mutex<Vec<SeenRequest>>>,
+    records: Arc<Mutex<Vec<MockRecord>>>,
 }
 
 impl MockApi {
@@ -36,6 +49,8 @@ impl MockApi {
         let address = listener.local_addr().expect("mock address");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&seen);
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let zone = Arc::clone(&records);
 
         std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -76,12 +91,12 @@ impl MockApi {
                     method: method.clone(),
                     target: target.clone(),
                     authorization,
-                    body,
+                    body: body.clone(),
                 });
 
-                let payload = respond_to(&method, &target);
+                let (status, payload) = respond_to(&zone, &method, &target, &body);
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                     payload.len(),
                     payload
                 );
@@ -90,7 +105,11 @@ impl MockApi {
             }
         });
 
-        Self { address, seen }
+        Self {
+            address,
+            seen,
+            records,
+        }
     }
 
     fn base(&self) -> String {
@@ -100,34 +119,119 @@ impl MockApi {
     fn seen(&self) -> Vec<SeenRequest> {
         self.seen.lock().unwrap().clone()
     }
+
+    /// 🌱 Puts a record in the zone that Pingclair did not write.
+    fn seed_foreign(&self, id: &str, name: &str, content: &str) {
+        self.records.lock().unwrap().push(MockRecord {
+            id: id.into(),
+            name: name.into(),
+            content: content.into(),
+            comment: None,
+        });
+    }
+
+    /// 📇 The TXT values currently published at `name`, in creation order.
+    fn values_at(&self, name: &str) -> Vec<String> {
+        self.records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|record| record.name == name)
+            .map(|record| record.content.clone())
+            .collect()
+    }
 }
 
-/// ☁️ The smallest answers that are still shaped like Cloudflare's.
-fn respond_to(method: &str, target: &str) -> String {
+/// ☁️ The smallest answers that are still shaped like Cloudflare's, backed by
+/// the mock's record table.
+fn respond_to(
+    zone: &Mutex<Vec<MockRecord>>,
+    method: &str,
+    target: &str,
+    body: &str,
+) -> (&'static str, String) {
+    const OK: &str = "200 OK";
     if target.starts_with("/client/v4/zones?name=") {
         // 🔎 Only the registrable domain is a zone. The sub-domain lookups the
         // provider tries first must come back empty, or the test would never
         // exercise the suffix walk that finding a zone actually needs.
         if target.contains("name=example.com") {
-            return r#"{"success":true,"result":[{"id":"zone-1","name":"example.com"}]}"#.into();
+            return (
+                OK,
+                r#"{"success":true,"result":[{"id":"zone-1","name":"example.com"}]}"#.into(),
+            );
         }
-        return r#"{"success":true,"result":[]}"#.into();
+        return (OK, r#"{"success":true,"result":[]}"#.into());
     }
+    let mut records = zone.lock().unwrap();
     if method == "GET" && target.contains("/dns_records?") {
-        // 🧹 One stale challenge record, so the replace path is exercised.
-        return r#"{"success":true,"result":[{"id":"stale-record"}]}"#.into();
+        let name = target.rsplit("name=").next().unwrap_or_default();
+        let listed: Vec<serde_json::Value> = records
+            .iter()
+            .filter(|record| record.name == name)
+            .map(|record| {
+                serde_json::json!({
+                    "id": record.id,
+                    "name": record.name,
+                    "type": "TXT",
+                    // ☁️ Cloudflare returns TXT content quoted.
+                    "content": format!("\"{}\"", record.content),
+                    "comment": record.comment,
+                })
+            })
+            .collect();
+        return (
+            OK,
+            serde_json::json!({"success": true, "result": listed}).to_string(),
+        );
     }
     if method == "POST" {
-        return r#"{"success":true,"result":{"id":"new-record"}}"#.into();
+        let request: serde_json::Value = serde_json::from_str(body).expect("a JSON create");
+        let field = |key: &str| {
+            request
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        let id = format!("record-{}", records.len() + 1);
+        records.push(MockRecord {
+            id: id.clone(),
+            name: field("name").unwrap_or_default(),
+            content: field("content").unwrap_or_default(),
+            comment: field("comment"),
+        });
+        return (
+            OK,
+            serde_json::json!({"success": true, "result": {"id": id}}).to_string(),
+        );
     }
-    r#"{"success":true,"result":null}"#.into()
+    if method == "DELETE" {
+        let id = target.rsplit('/').next().unwrap_or_default();
+        let before = records.len();
+        records.retain(|record| record.id != id);
+        if records.len() == before {
+            return (
+                "404 Not Found",
+                r#"{"success":false,"errors":[{"code":81044,"message":"Record does not exist."}]}"#
+                    .into(),
+            );
+        }
+    }
+    (OK, r#"{"success":true,"result":null}"#.into())
 }
 
-/// ☁️ A published record is found in the right zone, replaces what was there,
-/// and can be taken away again.
+/// ☁️ A published record is found in the right zone, leaves what was already
+/// there alone, and can be taken away again.
 #[tokio::test]
 async fn a_txt_record_is_published_into_the_zone_that_holds_it() {
     let api = MockApi::start();
+    // 🌱 A record somebody else wrote at the same name, with the same value.
+    // It must be neither deleted nor adopted as ours.
+    api.seed_foreign(
+        "foreign-record",
+        "_acme-challenge.wild.example.com",
+        "proof-value",
+    );
     let provider = CloudflareProvider::with_api_base("cf-test-token".to_string(), api.base())
         .expect("provider");
 
@@ -154,19 +258,17 @@ async fn a_txt_record_is_published_into_the_zone_that_holds_it() {
         "the provider never found the real zone: {targets:?}"
     );
 
-    // 🧹 The stale record is deleted before the new one is written, or the
-    // name would carry two challenge values.
-    let stale = seen
-        .iter()
-        .position(|r| r.method == "DELETE" && r.target.contains("stale-record"));
-    let created = seen.iter().position(|r| r.method == "POST");
+    // 🛡️ Nothing we did not write is ever deleted (#105).
     assert!(
-        stale.is_some(),
-        "the existing record was left in place: {seen:#?}"
+        !seen
+            .iter()
+            .any(|r| r.method == "DELETE" && r.target.contains("foreign-record")),
+        "a record this provider did not write was deleted: {seen:#?}"
     );
-    assert!(
-        stale < created,
-        "the new record was written before the stale one was removed: {seen:#?}"
+    assert_eq!(
+        api.values_at("_acme-challenge.wild.example.com"),
+        vec!["proof-value".to_string()],
+        "only the foreign record should remain after cleanup"
     );
 
     // ✍️ The record itself.
@@ -178,11 +280,16 @@ async fn a_txt_record_is_published_into_the_zone_that_holds_it() {
     assert!(post.body.contains("\"type\":\"TXT\""), "{post:?}");
     assert!(post.body.contains("proof-value"), "{post:?}");
     assert!(post.body.contains("\"ttl\":60"), "{post:?}");
+    assert!(
+        post.body
+            .contains("\"comment\":\"pingclair acme-challenge\""),
+        "the record is not marked as ours: {post:?}"
+    );
 
-    // 🧹 Cleanup addresses the record it created, not the stale one again.
+    // 🧹 Cleanup addresses the record it created.
     assert!(
         seen.iter()
-            .any(|r| r.method == "DELETE" && r.target.contains("new-record")),
+            .any(|r| r.method == "DELETE" && r.target.contains("record-2")),
         "the published record was never removed: {seen:#?}"
     );
 
@@ -252,10 +359,70 @@ async fn the_handler_publishes_and_then_removes_the_challenge() {
     );
     assert!(post.body.contains("digest-value"), "{post:?}");
     assert!(
-        seen.iter()
-            .any(|r| r.method == "DELETE" && r.target.contains("new-record")),
+        api.values_at("_acme-challenge.example.com").is_empty(),
         "the challenge record outlived the order: {seen:#?}"
     );
+}
+
+/// ➕ Two values published at one name both stay published.
+///
+/// RFC 8555 §8.4 has the CA accept any one matching TXT value, so a second
+/// order at the same name must add its value rather than replace the first
+/// (#105). Publishing the same value again must not add a duplicate.
+#[tokio::test]
+async fn two_values_at_one_name_are_both_kept() {
+    let api = MockApi::start();
+    let provider = CloudflareProvider::with_api_base("cf-test-token".to_string(), api.base())
+        .expect("provider");
+    let name = "_acme-challenge.example.com";
+
+    let first = provider.upsert_txt(name, "apex-digest", 60).await.unwrap();
+    provider
+        .upsert_txt(name, "wildcard-digest", 60)
+        .await
+        .unwrap();
+    let again = provider.upsert_txt(name, "apex-digest", 60).await.unwrap();
+
+    assert_eq!(
+        (api.values_at(name), again),
+        (
+            vec!["apex-digest".to_string(), "wildcard-digest".to_string()],
+            first
+        ),
+    );
+}
+
+/// 🔑 The apex and its wildcard share one record name, and each order's
+/// cleanup removes only its own value (#105).
+#[tokio::test]
+async fn cleaning_up_the_apex_leaves_the_wildcard_record() {
+    let api = MockApi::start();
+    let provider = Arc::new(
+        CloudflareProvider::with_api_base("cf-test-token".to_string(), api.base())
+            .expect("provider"),
+    );
+    let handler = Dns01Handler::new(provider, PropagationPolicy::default());
+    let challenge = |domain: &str, digest: &str| ChallengeResponse {
+        domain: domain.to_string(),
+        challenge_type: ChallengeType::Dns01,
+        token: "token".to_string(),
+        key_authorization: digest.to_string(),
+    };
+    let apex = challenge("example.com", "apex-digest");
+    let wildcard = challenge("*.example.com", "wildcard-digest");
+
+    handler.deploy(&apex).await.expect("deploy apex");
+    handler.deploy(&wildcard).await.expect("deploy wildcard");
+    handler.cleanup(&apex).await.expect("clean up apex");
+
+    assert_eq!(
+        api.values_at("_acme-challenge.example.com"),
+        vec!["wildcard-digest".to_string()],
+        "the apex cleanup removed the wildcard's proof"
+    );
+
+    handler.cleanup(&wildcard).await.expect("clean up wildcard");
+    assert!(api.values_at("_acme-challenge.example.com").is_empty());
 }
 
 /// 🚫 A handler given the wrong kind of challenge must say so rather than

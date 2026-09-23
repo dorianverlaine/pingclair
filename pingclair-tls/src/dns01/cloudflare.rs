@@ -274,6 +274,26 @@ impl CloudflareProvider {
     }
 }
 
+/// 🏷️ The Cloudflare record `comment` that marks a TXT record as written by
+/// Pingclair, so a record someone else put at the same name is never mistaken
+/// for ours and reused.
+const OWNER_COMMENT: &str = "pingclair acme-challenge";
+
+/// 🔎 Whether a listed record is one Pingclair wrote carrying `value`.
+///
+/// ☁️ Cloudflare may hand TXT content back wrapped in double quotes, so one
+/// pair is stripped before comparing.
+fn is_our_record_with(record: &serde_json::Value, value: &str) -> bool {
+    let ours = record.get("comment").and_then(|c| c.as_str()) == Some(OWNER_COMMENT);
+    let content = record.get("content").and_then(|c| c.as_str());
+    let content = content.map(|c| {
+        c.strip_prefix('"')
+            .and_then(|c| c.strip_suffix('"'))
+            .unwrap_or(c)
+    });
+    ours && content == Some(value)
+}
+
 #[async_trait]
 impl DnsProvider for CloudflareProvider {
     fn name(&self) -> &'static str {
@@ -288,9 +308,14 @@ impl DnsProvider for CloudflareProvider {
     ) -> Result<RecordHandle, DnsError> {
         let zone = self.zone_for(fqdn).await?;
 
-        // 🧹 Replace rather than append. A retried order would otherwise leave
-        // the previous challenge value behind, and a name carrying two TXT
-        // values is a name some CAs refuse to read.
+        // ➕ Add, never clear. `example.com` and `*.example.com` share this
+        // name, and their orders can be in flight at once; RFC 8555 §8.4 has
+        // the CA accept any one matching TXT value, so each order's value
+        // simply sits beside the other's. Deleting what was here used to erase
+        // the other order's proof mid-validation (#105).
+        //
+        // 🔁 The one record reused is our own with this exact value, so
+        // deploying the same challenge twice leaves one record, not two.
         let existing = self
             .request(
                 Method::GET,
@@ -298,38 +323,40 @@ impl DnsProvider for CloudflareProvider {
                 None,
             )
             .await?;
-        if let Some(records) = existing.get("result").and_then(|r| r.as_array()) {
-            for record in records {
-                if let Some(id) = record.get("id").and_then(|id| id.as_str()) {
-                    let _ = self
-                        .request(
-                            Method::DELETE,
-                            &format!("/zones/{zone}/dns_records/{id}"),
-                            None,
-                        )
-                        .await;
-                }
-            }
-        }
-
-        let created = self
-            .request(
-                Method::POST,
-                &format!("/zones/{zone}/dns_records"),
-                Some(serde_json::json!({
-                    "type": "TXT",
-                    "name": fqdn,
-                    "content": value,
-                    "ttl": ttl_secs,
-                })),
-            )
-            .await?;
-        let record_id = created
+        let reused = existing
             .get("result")
-            .and_then(|result| result.get("id"))
+            .and_then(|result| result.as_array())
+            .into_iter()
+            .flatten()
+            .find(|record| is_our_record_with(record, value))
+            .and_then(|record| record.get("id"))
             .and_then(|id| id.as_str())
-            .ok_or_else(|| DnsError::Api("the created record has no id".into()))?
-            .to_string();
+            .map(str::to_string);
+
+        let record_id = match reused {
+            Some(id) => id,
+            None => {
+                let created = self
+                    .request(
+                        Method::POST,
+                        &format!("/zones/{zone}/dns_records"),
+                        Some(serde_json::json!({
+                            "type": "TXT",
+                            "name": fqdn,
+                            "content": value,
+                            "ttl": ttl_secs,
+                            "comment": OWNER_COMMENT,
+                        })),
+                    )
+                    .await?;
+                created
+                    .get("result")
+                    .and_then(|result| result.get("id"))
+                    .and_then(|id| id.as_str())
+                    .ok_or_else(|| DnsError::Api("the created record has no id".into()))?
+                    .to_string()
+            }
+        };
 
         let handle = format!("{zone}/{record_id}");
         self.records

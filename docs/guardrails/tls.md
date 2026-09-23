@@ -370,9 +370,16 @@
   account knows. Longest first is what lets a delegated child zone win over its
   parent — which is the entire point of delegation.
 
-- 🧹 **TXT records are replaced, not appended.** Otherwise a retried order leaves
-  the previous challenge value behind, and some CAs treat a name carrying two TXT
-  records as unreadable.
+- ➕ **TXT records are added, never cleared, and only our own are deleted.**
+  `example.com` and `*.example.com` share one challenge name, and their orders
+  can run at the same time. The old rule — delete every TXT record at the name,
+  then write ours — let each order erase the other's proof mid-validation
+  (#105). RFC 8555 §8.4 has the CA accept any one matching value, so two values
+  side by side are fine. Cloudflare records we write carry the `comment`
+  `pingclair acme-challenge`, and cleanup is keyed by name *and* value so the
+  apex order never removes the wildcard's record. 📌 A record left by a process
+  that died mid-order is not swept automatically: sweeping by the marker would
+  also delete a concurrent order's live record.
 
 - 🏷️ **A wildcard's challenge record goes on the parent domain.**
   `*.example.com` and `example.com` share `_acme-challenge.example.com`; composing

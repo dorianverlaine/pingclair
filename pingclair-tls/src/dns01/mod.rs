@@ -45,12 +45,17 @@ pub trait DnsProvider: Send + Sync {
     /// 🏷️ The provider's name as it is written in a configuration.
     fn name(&self) -> &'static str;
 
-    /// ✍️ Publishes `value` as a TXT record at `fqdn`, replacing any record
-    /// this provider previously wrote there.
+    /// ✍️ Publishes `value` as a TXT record at `fqdn`, beside whatever else is
+    /// already there, and returns a handle to that one record.
     ///
-    /// Replacing rather than appending matters: a retried issuance would
-    /// otherwise leave two challenge records, and some CAs treat a name with
-    /// several TXT values as ambiguous.
+    /// ➕ Adding rather than replacing is the contract: `example.com` and
+    /// `*.example.com` share one record name, their orders can run at the
+    /// same time, and RFC 8555 §8.4 has the CA accept any one matching TXT
+    /// value. A provider must never delete a record it did not write here.
+    ///
+    /// 🔁 Publishing the same `value` at the same `fqdn` twice must yield one
+    /// record, so a redeployed challenge does not leave a copy behind that its
+    /// single cleanup cannot reach.
     async fn upsert_txt(
         &self,
         fqdn: &str,
@@ -113,10 +118,12 @@ pub struct Dns01Handler {
     policy: PropagationPolicy,
     /// 🎫 Records this handler published, so cleanup can find them.
     ///
-    /// Keyed by the record name rather than the challenge token: the token is
-    /// what ACME calls it, but the record name is what has to be deleted, and
-    /// a retried order reuses the name with a new token.
-    deployed: Mutex<HashMap<String, RecordHandle>>,
+    /// 🔑 Keyed by record name *and* value. The name alone cannot tell the
+    /// apex order from the wildcard order — both write
+    /// `_acme-challenge.example.com` — so a name-keyed map let one order's
+    /// cleanup delete the other's record (#105). The value is the challenge's
+    /// own digest, which differs between the two.
+    deployed: Mutex<HashMap<(String, String), RecordHandle>>,
 }
 
 impl Dns01Handler {
@@ -155,7 +162,9 @@ impl ChallengeHandler for Dns01Handler {
             .upsert_txt(&name, &challenge.key_authorization, self.policy.ttl_secs)
             .await
             .map_err(|error| AcmeError::ChallengeFailed(error.to_string()))?;
-        self.deployed.lock().insert(name.clone(), handle);
+        self.deployed
+            .lock()
+            .insert((name.clone(), challenge.key_authorization.clone()), handle);
 
         tracing::info!(
             "📡 Published the DNS-01 record for {} via {}",
@@ -187,13 +196,19 @@ impl ChallengeHandler for Dns01Handler {
 
     async fn cleanup(&self, challenge: &ChallengeResponse) -> Result<(), AcmeError> {
         let name = Self::challenge_name(&challenge.domain);
-        let Some(handle) = self.deployed.lock().remove(&name) else {
+        let key = (name, challenge.key_authorization.clone());
+        // 🔒 Cloned out so the guard is dropped before the await below.
+        let Some(handle) = self.deployed.lock().get(&key).cloned() else {
             return Ok(());
         };
         self.provider
             .delete_txt(&handle)
             .await
             .map_err(|error| AcmeError::ChallengeFailed(error.to_string()))?;
+        // 🧹 Forgotten only after the delete succeeded, so a failed cleanup
+        // can be retried instead of orphaning the record.
+        self.deployed.lock().remove(&key);
+        let (name, _) = key;
         tracing::info!("🧹 Removed the DNS-01 record for {}", name);
         Ok(())
     }
