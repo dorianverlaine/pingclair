@@ -311,10 +311,18 @@ mod tests {
     #[test]
     fn a_caddy_store_export_is_refused() {
         let source = tempfile::tempdir().unwrap();
-        write(&source.path().join("pki/authorities/local/root.crt"), "ROOTCRT");
-        write(&source.path().join("pki/authorities/local/root.key"), "ROOTKEY");
         write(
-            &source.path().join("certificates/local/localhost/localhost.crt"),
+            &source.path().join("pki/authorities/local/root.crt"),
+            "ROOTCRT",
+        );
+        write(
+            &source.path().join("pki/authorities/local/root.key"),
+            "ROOTKEY",
+        );
+        write(
+            &source
+                .path()
+                .join("certificates/local/localhost/localhost.crt"),
             "LEAF",
         );
         write(&source.path().join("instance.uuid"), "uuid");
