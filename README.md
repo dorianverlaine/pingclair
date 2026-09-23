@@ -752,7 +752,13 @@ surprise that reads as "it worked in staging". To serve identity responses
 instead — an upstream that already compressed, or a client that handles the
 coding itself — write `encode off`. Compression can also be disabled for one
 `file_server` with `file_server { compress off }`, and only responses above a
-size floor are compressed at all.
+size floor are compressed at all. A proxied response is left exactly as the
+upstream sent it when it is partial (`206`, or any `Content-Range`), answers a
+`HEAD`, has no body (`204`, `304`), or carries `Cache-Control: no-transform`;
+when one is compressed, `Accept-Encoding` is added to its existing `Vary`
+rather than replacing it, and the origin's digest fields (`Content-Digest`,
+`Repr-Digest`, `Digest`, `Content-MD5`) are removed because they no longer
+describe the bytes.
 
 A candidate ending in `/` matches only a directory, and one without matches
 only a regular file — the trailing slash that decides is the one in the

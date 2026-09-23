@@ -672,7 +672,12 @@ example.com {
 因為「自己沒設卻出現 `Content-Encoding`」正是那種在 staging 看不出來的意外。
 要改回不壓縮——上游已經壓過，或客戶端自己處理編碼——寫 `encode off`；也可以只
 關掉某個 `file_server` 的壓縮：`file_server { compress off }`。另外，只有超過
-大小門檻的回應才會被壓縮。
+大小門檻的回應才會被壓縮。代理的回應若是部分內容（`206`，或帶任何
+`Content-Range`）、回應 `HEAD`、沒有 body（`204`、`304`），或帶
+`Cache-Control: no-transform`，就原樣轉送上游送來的內容；真的壓縮時，
+`Accept-Encoding` 會附加到既有的 `Vary` 而不是取代它，而上游的摘要欄位
+（`Content-Digest`、`Repr-Digest`、`Digest`、`Content-MD5`）會被移除，因為它們
+已經不再描述送出的位元組。
 
 候選路徑結尾有 `/` 的只匹配目錄，沒有 `/` 的只匹配一般檔案——**決定的是設定檔裡
 寫的那個斜線，不是請求帶進來的那個**。

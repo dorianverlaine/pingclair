@@ -751,7 +751,13 @@ qui « marchait en staging ». Pour servir des réponses identity — un amont q
 déjà compressé, ou un client qui gère le codage lui-même — écrivez `encode off`.
 La compression se désactive aussi pour un `file_server` précis avec
 `file_server { compress off }`, et seules les réponses au-dessus d'un seuil de
-taille sont compressées.
+taille sont compressées. Une réponse proxifiée reste exactement telle que
+l'amont l'a envoyée si elle est partielle (`206`, ou tout `Content-Range`),
+répond à un `HEAD`, n'a pas de corps (`204`, `304`) ou porte
+`Cache-Control: no-transform` ; quand elle est compressée, `Accept-Encoding`
+s'ajoute à son `Vary` existant au lieu de le remplacer, et les champs de
+condensat de l'origine (`Content-Digest`, `Repr-Digest`, `Digest`,
+`Content-MD5`) sont retirés, puisqu'ils ne décrivent plus les octets.
 
 Un candidat terminé par `/` ne correspond qu'à un répertoire, et un candidat
 sans `/` qu'à un fichier ordinaire — la barre oblique qui tranche est celle
