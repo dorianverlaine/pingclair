@@ -5920,7 +5920,10 @@ async fn test_hostname_tls_site_derives_https_and_http_companion() {
 /// carry `Host` values no resolver would produce, and a `Location` has to be
 /// read back exactly as it was written rather than after a client normalised
 /// it.
-async fn raw_get_status_and_location(addr: std::net::SocketAddr, host: &str) -> (String, Option<String>) {
+async fn raw_get_status_and_location(
+    addr: std::net::SocketAddr,
+    host: &str,
+) -> (String, Option<String>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut stream = tokio::net::TcpStream::connect(addr)
@@ -13569,7 +13572,10 @@ async fn test_a_site_without_encode_serves_identity_bytes() {
     bare.stop();
 
     let mut asked = file_server_site(&root, "encode gzip");
-    assert!(asked.wait_until_ready().await, "control server failed to start");
+    assert!(
+        asked.wait_until_ready().await,
+        "control server failed to start"
+    );
     let reply = client
         .get(asked.url(0, "/big.txt"))
         .header("Accept-Encoding", "gzip")
@@ -13577,7 +13583,10 @@ async fn test_a_site_without_encode_serves_identity_bytes() {
         .await
         .expect("request");
     assert_eq!(
-        reply.headers().get("content-encoding").map(|v| v.to_str().unwrap()),
+        reply
+            .headers()
+            .get("content-encoding")
+            .map(|v| v.to_str().unwrap()),
         Some("gzip"),
         "`encode gzip` must still compress, or the negative case proves nothing"
     );
@@ -13616,7 +13625,10 @@ async fn test_a_range_on_a_compressing_file_server_is_identity() {
         .await
         .expect("request");
     assert_eq!(
-        whole.headers().get("content-encoding").map(|v| v.to_str().unwrap()),
+        whole
+            .headers()
+            .get("content-encoding")
+            .map(|v| v.to_str().unwrap()),
         Some("gzip"),
         "the site must be compressing at all for this test to mean anything"
     );
@@ -13628,7 +13640,11 @@ async fn test_a_range_on_a_compressing_file_server_is_identity() {
         .send()
         .await
         .expect("request");
-    assert_eq!(reply.status(), 206, "a satisfiable range is partial content");
+    assert_eq!(
+        reply.status(),
+        206,
+        "a satisfiable range is partial content"
+    );
     assert!(
         reply.headers().get("content-encoding").is_none(),
         "a ranged response must not be compressed, got {:?}",
@@ -13640,7 +13656,10 @@ async fn test_a_range_on_a_compressing_file_server_is_identity() {
         "the range must be counted in the bytes on disk"
     );
     assert_eq!(
-        reply.headers().get("accept-ranges").map(|v| v.to_str().unwrap()),
+        reply
+            .headers()
+            .get("accept-ranges")
+            .map(|v| v.to_str().unwrap()),
         Some("bytes"),
         "and those are the offsets the range advertisement promises"
     );
