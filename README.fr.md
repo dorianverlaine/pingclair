@@ -373,6 +373,12 @@ donnant l'impression qu'il a déménagé. Le chemin résolu est journalisé au
 démarrage : deux déploiements qui nomment des dépôts différents créent deux
 racines de confiance distinctes, sans autre différence visible.
 
+Ce build n'effectue aucun agrafage OCSP. L'option globale `ocsp_stapling off`
+est acceptée parce qu'elle nomme exactement cet état, et une ligne au démarrage
+le dit lorsqu'elle est écrite ; `on` et l'option nue sont refusées, puisqu'elles
+demanderaient un agrafage qui n'existe pas ici. (Caddy refuse également ces deux
+orthographes, donc rien de ce qui se charge en amont n'est écarté ici.)
+
 Lorsque Pingclair se trouve derrière un load balancer ou un CDN que vous
 administrez, déclarez uniquement ces réseaux mandataires dans le bloc global.
 Un pair non approuvé ne peut pas fournir l'identité via `X-Forwarded-For`,
@@ -397,6 +403,16 @@ et rejette avant TLS ou HTTP tout pair de transport absent de
 `trusted_proxies`. Les chaînes XFF et RFC 7239 `Forwarded` sont bornées ; une
 syntaxe invalide ou des identités contradictoires échouent en mode fermé.
 PROXY protocol ne s'applique pas au listener HTTP/3 UDP.
+
+`servers { listener_wrappers { proxy_protocol } }` est l'orthographe Caddy pour
+« chaque listener que cette Caddyfile déclare », et elle est acceptée comme
+telle ; `listen … proxy_protocol` reste la façon d'exiger l'en-tête sur un seul
+listener. Seule la forme sans adresse est acceptée : `servers <address> { … }`
+est refusé, parce que ce build applique les options d'un bloc `servers` à chaque
+listener et que l'en-tête sur un port dont les clients ne l'envoient pas les
+rejette tous. Les deux orthographes signifient ici la même chose, et c'est la
+stricte : le `proxy_protocol { fallback_policy require }` d'en amont, où une
+connexion sans en-tête est refusée plutôt que servie.
 
 ### Limites de ressources et délais
 
@@ -1014,7 +1030,7 @@ Options globales :
   `acme_ca` `acme_ca_root` `acme_eab` `cert_issuer`
   `cert_lifetime` `ech` `events` `fallback_sni`
   `filesystem` `frankenphp` `key_type` `ocsp_interval`
-  `ocsp_stapling` `on_demand_tls` `preferred_chains` `renew_interval`
+  `on_demand_tls` `preferred_chains` `renew_interval`
   `shutdown_delay` `storage_clean_interval`
 
 Options du bloc `tls` :
@@ -1025,11 +1041,30 @@ Options du bloc `tls` :
   `reuse_private_keys` `insecure_secrets_log` `renewal_window_ratio`
   `force_automate`
 
-Deux sous-options de `servers { … }` sont elles aussi refusées **par leur nom**
-plutôt que prises pour des fautes de frappe : `listener_wrappers` et `timeouts`.
-Caddy charge les deux, donc une configuration migrée les rencontre ; ce build
-n'a ni enveloppe de listener par option ni délais par listener, et le message
-dit laquelle des deux manque au lieu d'un `Unknown directive`.
+Une sous-option de `servers { … }` est refusée **par son nom** plutôt que prise
+pour une faute de frappe : `timeouts`. Caddy la charge, donc une configuration
+migrée la rencontre ; ce build n'a pas de délais par listener, et le message dit
+quelle capacité manque au lieu d'un `Unknown directive`.
+
+`listener_wrappers` accepte une enveloppe et refuse les autres par leur nom.
+`proxy_protocol` exige un en-tête PROXY protocol sur chaque listener que la
+Caddyfile déclare, ce qui est le sens du bloc `servers` sans adresse en amont ;
+les sources dont l'en-tête est accepté sont les plages `trusted_proxies`, comme
+pour l'orthographe par listener. **C'est le `fallback_policy require` d'en
+amont**, et l'écart avec le nom nu mérite d'être connu avant de migrer : en
+amont, `proxy_protocol` seul vaut `fallback_policy ignore` et répond à une
+requête sans en-tête (mesuré sur `caddy v2.11.4`), alors qu'ici cette connexion
+est refusée. `fallback_policy require` est acceptée parce qu'elle nomme ce
+comportement ; les politiques permissives (`ignore`, `use`, `reject`, `skip`)
+ainsi que `timeout` et `allow`/`deny` sont refusées par leur nom avec la raison,
+jamais ignorées. `tls` et `http_redirect` sont refusées avec la raison : ici le
+TLS est choisi par site par le HTTPS automatique et non par une enveloppe de
+listener, et la redirection HTTP vers HTTPS appartient au port en clair
+compagnon que le HTTPS automatique crée — un listener déclaré avec `listen` ne
+redirigerait pas. `servers <address> { listener_wrappers { … } }` est refusé lui
+aussi : ce build applique les options d'un bloc `servers` à chaque listener, et
+exiger l'en-tête PROXY sur un port dont les clients ne l'envoient pas les rejette
+tous.
 
 Des noms se situent entre les listes ci-dessus et la prise en charge complète,
 et sont donc nommés ici plutôt que dans l'une ou l'autre. `copy_response` et

@@ -107,6 +107,16 @@ pub struct GlobalConfig {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skip_install_trust: bool,
 
+    /// 📴 Upstream's `ocsp_stapling off`, the only spelling this build accepts.
+    ///
+    /// It describes what this server already does rather than changing it: no
+    /// OCSP response is ever stapled onto a handshake here, so `off` is the
+    /// behaviour in force whether or not the option is written. Were stapling
+    /// implemented, this field would be the switch that turns it off; today it
+    /// is the record that an operator asked for the state we are in.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ocsp_stapling_off: bool,
+
     /// 📡 The DNS provider every site falls back to, from the global `dns`
     /// option. It answers two different questions upstream — DNS-01 challenges
     /// and general resolution — and this field is the first of those.
@@ -410,6 +420,7 @@ impl Default for GlobalConfig {
             metrics_options: MetricsOptions::default(),
             pki: Vec::new(),
             skip_install_trust: false,
+            ocsp_stapling_off: false,
             dns: None,
             acme_dns: None,
             tls_resolvers: Vec::new(),

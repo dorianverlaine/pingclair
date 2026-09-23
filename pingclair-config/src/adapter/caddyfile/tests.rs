@@ -2140,22 +2140,206 @@ mod fail_closed_tests {
     /// right spelling of an option that exists upstream.
     #[test]
     fn servers_suboptions_are_refused_by_name() {
-        for name in ["listener_wrappers", "timeouts"] {
+        // 📌 `listener_wrappers` left this list when `proxy_protocol` was
+        // implemented; the wrappers it cannot honour have their own test below,
+        // and the option's own block has one after that.
+        let name = "timeouts";
+        let message = crate::compile(&format!(
+            "{{\n    servers {{\n        {name} {{\n            read_body 30s\n        }}\n    }}\n}}\n\
+             :8080 {{\n    respond \"ok\"\n}}"
+        ))
+        .expect_err("an unimplemented sub-option must be refused")
+        .to_string();
+        assert!(
+            message.contains(name) && message.contains("not supported"),
+            "`{name}` must be refused by name rather than as a typo: {message}"
+        );
+        assert!(
+            !message.contains("Unknown directive"),
+            "`{name}` is part of the format: {message}"
+        );
+    }
+
+    /// 🧢 `servers { listener_wrappers { proxy_protocol } }` asks every listener
+    /// of every server for a PROXY protocol header.
+    ///
+    /// 📌 The addressless block is the one spelling that means "every listener"
+    /// — in Caddy as well — so the compiled config marks each server's own
+    /// listeners and nothing else.
+    ///
+    /// 🔐 `trusted_proxies` is required of any configuration that asks for the
+    /// header, here as everywhere: with no trusted source every peer would be
+    /// rejected, so the rule that refuses it is the existing one, reached
+    /// through the list this option writes.
+    #[test]
+    fn listener_wrappers_require_the_header_on_every_listener() {
+        let global = "{\n    trusted_proxies static 10.0.0.0/8\n    servers {\n        \
+                      listener_wrappers {\n            proxy_protocol\n        }\n    }\n}";
+        let config = crate::compile(&format!(
+            "{global}\nexample.com:8443 {{\n    respond \"ok\"\n}}\n:8080 {{\n    respond \"ok\"\n}}"
+        ))
+        .expect("`listener_wrappers { proxy_protocol }` must load");
+
+        assert_eq!(config.servers.len(), 2, "both sites must survive");
+        for server in &config.servers {
+            assert_eq!(
+                server.proxy_protocol_listen, server.listen,
+                "site {:?} must require the header on exactly the listeners it declares",
+                server.name
+            );
+            assert!(
+                !server.listen.is_empty(),
+                "the test is vacuous if the site declares no listener"
+            );
+        }
+
+        // 🚫 And the request is still governed by the rule that makes it
+        // meaningful: no trusted source, no header requirement.
+        let message = crate::compile(
+            "{\n    servers {\n        listener_wrappers {\n            proxy_protocol\n        }\n    }\n}\n\
+             :8080 {\n    respond \"ok\"\n}",
+        )
+        .expect_err("requiring the header without a trusted source must be refused")
+        .to_string();
+        assert!(
+            message.contains("trusted_proxies"),
+            "the refusal must name what is missing: {message}"
+        );
+    }
+
+    /// 🎯 The behaviour here is upstream's `fallback_policy require`, so that
+    /// spelling is accepted — and every other policy is refused, because each
+    /// of them names a server that answers a client which never sent the
+    /// header.
+    ///
+    /// 📌 The distinction is measured, not assumed: `caddy v2.11.4` with a bare
+    /// `proxy_protocol` answers a request with no header `200`, while this
+    /// build refuses the connection. An operator moving a configuration that
+    /// relied on that permissiveness has to hear about it, and writing
+    /// `fallback_policy require` is how they say what they want either way.
+    #[test]
+    fn proxy_protocol_options_are_read_only_for_the_policy_this_build_implements() {
+        let config = crate::compile(
+            "{\n    servers {\n        trusted_proxies static 10.0.0.0/8\n        \
+             listener_wrappers {\n            proxy_protocol {\n                \
+             fallback_policy require\n            }\n        }\n    }\n}\n\
+             :8080 {\n    respond \"ok\"\n}",
+        )
+        .expect("`fallback_policy require` names the behaviour this build has");
+        assert!(
+            config.servers[0].proxy_protocol_listen == config.servers[0].listen,
+            "the accepted block must still require the header"
+        );
+
+        for (option, needle) in [
+            ("fallback_policy ignore", "require"),
+            ("fallback_policy use", "require"),
+            ("fallback_policy reject", "require"),
+            ("fallback_policy skip", "require"),
+            ("allow 10.0.0.0/8", "trusted_proxies"),
+            ("deny 10.0.0.0/8", "trusted_proxies"),
+            ("timeout 2s", "deadline"),
+        ] {
             let message = crate::compile(&format!(
-                "{{\n    servers {{\n        {name} {{\n            read_body 30s\n        }}\n    }}\n}}\n\
+                "{{\n    servers {{\n        trusted_proxies static 10.0.0.0/8\n        \
+                 listener_wrappers {{\n            proxy_protocol {{\n                \
+                 {option}\n            }}\n        }}\n    }}\n}}\n\
                  :8080 {{\n    respond \"ok\"\n}}"
             ))
-            .expect_err("an unimplemented sub-option must be refused")
+            .expect_err("an option this build cannot honour must be refused")
+            .to_string();
+            assert!(
+                message.contains(needle),
+                "refusing `{option}` must say why, mentioning `{needle}`: {message}"
+            );
+        }
+    }
+
+    /// 🚫 The wrappers this build cannot honour are refused by name, with the
+    /// reason — never accepted into a listener that would not do what the name
+    /// says, and never reported as a misspelling.
+    ///
+    /// 🤡 `proxy_protocol` is the only wrapper with a meaning here. `http_redirect`
+    /// is the tempting one: this server does redirect HTTP to HTTPS, but from
+    /// automatic HTTPS on the companion port it creates, not from a wrapper a
+    /// listener can select — so a plaintext site declared with `listen` would
+    /// never redirect, and accepting the name would promise one.
+    #[test]
+    fn listener_wrappers_this_build_cannot_honour_are_refused_by_name() {
+        for name in ["tls", "http_redirect", "reticulate"] {
+            let message = crate::compile(&format!(
+                "{{\n    servers {{\n        listener_wrappers {{\n            {name}\n        }}\n    }}\n}}\n\
+                 :8080 {{\n    respond \"ok\"\n}}"
+            ))
+            .expect_err("a wrapper this build cannot honour must be refused")
             .to_string();
             assert!(
                 message.contains(name) && message.contains("not supported"),
-                "`{name}` must be refused by name rather than as a typo: {message}"
+                "`{name}` must be refused by name: {message}"
             );
             assert!(
                 !message.contains("Unknown directive"),
-                "`{name}` is part of the format: {message}"
+                "the wrapper set is open to plugins upstream, so a name this build \
+                 does not know is not evidence of a typo: {message}"
             );
         }
+    }
+
+    /// 🚫 A `servers <address>` block names one listener, and this build applies
+    /// a `servers` block's options to every listener. For the PROXY protocol
+    /// that is not a harmless approximation: the header would be demanded on a
+    /// port whose clients never send one, and a connection without it is
+    /// rejected — a working site would stop answering.
+    ///
+    /// 📌 Refused rather than guessed, and the message names the spelling that
+    /// means what the operator wrote.
+    #[test]
+    fn an_addressed_servers_block_may_not_ask_for_the_proxy_header() {
+        let message = crate::compile(
+            "{\n    servers :80 {\n        listener_wrappers {\n            proxy_protocol\n        }\n    }\n}\n\
+             :8080 {\n    respond \"ok\"\n}",
+        )
+        .expect_err("an addressed `servers` block must not widen the header requirement")
+        .to_string();
+        assert!(
+            message.contains("servers :80") && message.contains("every listener"),
+            "the refusal must name the block and say what it would have meant: {message}"
+        );
+    }
+
+    /// 📴 `ocsp_stapling off` is accepted and names behaviour this build already
+    /// has; every other spelling is refused, because this build staples no OCSP
+    /// response and `on` would read as though it did.
+    ///
+    /// 📌 Caddy refuses `on` and the bare option too (`invalid argument 'on'`
+    /// and a wrong-argument-count error, verified against v2.11.4), so nothing
+    /// that loads upstream is turned away here.
+    #[test]
+    fn ocsp_stapling_off_is_the_only_spelling_that_describes_this_build() {
+        let config =
+            crate::compile("{\n    ocsp_stapling off\n}\nexample.com {\n    respond \"ok\"\n}")
+                .expect("`ocsp_stapling off` must load");
+        assert!(config.global.ocsp_stapling_off);
+
+        // `on` asks for stapling outright, so the message says there is none.
+        let on = crate::compile("{\n    ocsp_stapling on\n}\nexample.com {\n    respond \"ok\"\n}")
+            .expect_err("`on` must be refused")
+            .to_string();
+        assert!(
+            on.contains("stapling") && on.contains("off"),
+            "the refusal must say what this build does instead: {on}"
+        );
+
+        // The bare option is a missing argument rather than a request for
+        // anything, and it is refused as one — which is upstream's own answer
+        // too ("wrong argument count or unexpected line ending").
+        let bare = crate::compile("{\n    ocsp_stapling\n}\nexample.com {\n    respond \"ok\"\n}")
+            .expect_err("the bare option must be refused")
+            .to_string();
+        assert!(
+            bare.contains("ocsp_stapling") && bare.contains("expects 1 argument"),
+            "the bare option must be refused as a missing argument: {bare}"
+        );
     }
 
     /// 🗄️ `storage file_system <path>` names the store; other backends are

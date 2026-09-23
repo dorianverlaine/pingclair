@@ -96,6 +96,20 @@ pub struct GlobalBlock {
     pub pki: Vec<pingclair_core::config::PkiAuthority>,
     /// 🤝 `skip_install_trust`, which describes what this build already does.
     pub skip_install_trust: bool,
+    /// 📴 `ocsp_stapling off`, likewise: this build staples no OCSP response
+    /// onto any handshake, so `off` names the behaviour already in force.
+    /// Caddy accepts the same single spelling, and refuses `on` and the bare
+    /// option — both of which would ask for stapling that does not exist here.
+    pub ocsp_stapling_off: bool,
+    /// 🔌 Whether `servers { listener_wrappers { proxy_protocol } }` asked for
+    /// a PROXY protocol header on every declared listener.
+    ///
+    /// 📌 Only the addressless `servers` block can set this. The addressed
+    /// spelling names one listener, and `expand_servers_block` drops the
+    /// address when it lifts the children — which for this wrapper would mean
+    /// demanding the header on ports whose clients never send it. That spelling
+    /// is refused there rather than quietly widened.
+    pub listener_proxy_protocol: bool,
     /// 🔄 How early to renew, as a fraction of the certificate's lifetime.
     pub renewal_window_ratio: Option<f64>,
     /// 🌐 Bind addresses inherited by sites that name none of their own.

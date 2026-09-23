@@ -47,6 +47,17 @@ pub fn compile_ast(ast: &Ast) -> CompileResult<PingclairConfig> {
         compile_global(&global.inner, &mut config)?;
     }
 
+    // 🔌 Read from the AST rather than kept beside the compiled global: what the
+    // runtime reads is each server's `proxy_protocol_listen`, and a global flag
+    // saying the same thing would be a second answer to keep in step with the
+    // first. The addressless `servers { listener_wrappers { proxy_protocol } }`
+    // is the only spelling that reaches this point — the addressed one is
+    // refused in the adapter, where the address is still visible.
+    let listener_proxy_protocol = ast
+        .global
+        .as_ref()
+        .is_some_and(|global| global.inner.listener_proxy_protocol);
+
     // Compile servers
     for server_node in &ast.servers {
         let block = &server_node.inner;
@@ -63,6 +74,26 @@ pub fn compile_ast(ast: &Ast) -> CompileResult<PingclairConfig> {
             && let Some(first) = config.global.default_bind.first()
         {
             server_config.bind = Some(first.clone());
+        }
+        // 🧢 `servers { listener_wrappers { proxy_protocol } }` applies to every
+        // listener of every server, so the flat list is built here — the same
+        // place `default_bind` above is applied, and for the same reason: this
+        // is where the global block is in scope.
+        //
+        // 📌 Only the listeners this block names are marked. The plaintext
+        // companion that automatic HTTPS creates for a hostname site is not one
+        // of them, which is upstream's behaviour too (`servers` applies to the
+        // servers the Caddyfile produced, not to the ones added at runtime).
+        //
+        // 📌 The list is built from `listen` itself, so the invariant
+        // `validate_config` enforces — every entry of `proxy_protocol_listen`
+        // also appears in `listen` — cannot be broken here.
+        if listener_proxy_protocol {
+            for addr in &server_config.listen {
+                if !server_config.proxy_protocol_listen.contains(addr) {
+                    server_config.proxy_protocol_listen.push(addr.clone());
+                }
+            }
         }
         // 🌐 Caddy serves any named site over HTTPS by default: a bare
         // hostname with no explicit scheme/listen and automatic HTTPS
@@ -241,6 +272,14 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
     }
     if global.skip_install_trust {
         config.global.skip_install_trust = true;
+    }
+    // 📴 Carried across like the line above, and for the same reason: it names
+    // behaviour this build already has. No OCSP response is stapled onto a
+    // handshake here, so `ocsp_stapling off` asks for nothing to change — the
+    // field is the record that the operator asked for the state we are in, and
+    // `run.rs` says so at startup rather than leaving it to be discovered.
+    if global.ocsp_stapling_off {
+        config.global.ocsp_stapling_off = true;
     }
 
     // 🔄 The renewal window, and the bind addresses sites inherit.

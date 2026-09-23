@@ -15054,3 +15054,10 @@ mod response_pipeline;
 // 🗜️ Which responses the proxy may re-encode, kept in a sibling file.
 #[path = "integration/compression_gate.rs"]
 mod compression_gate;
+
+// MARK: - Listener wrappers
+
+// 🧢 The global options that describe the socket rather than the routes:
+// `servers { listener_wrappers { … } }` and `ocsp_stapling off`.
+#[path = "integration/listener_wrappers.rs"]
+mod listener_wrappers;

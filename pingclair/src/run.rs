@@ -284,6 +284,19 @@ pub(crate) fn run_server(
     if let Some(ratio) = config.global.renewal_window_ratio {
         auto_https_config.renewal_window_ratio = ratio;
     }
+    // 📴 `ocsp_stapling off` is the one spelling this build accepts, and it
+    // names the behaviour already in force rather than changing it: no OCSP
+    // response is stapled onto a handshake here. That is worth one startup line
+    // because it is otherwise only discoverable by inspecting a handshake with
+    // an external tool, and because the operator asked for something — silence
+    // would leave them thinking the setting had taken effect on a stapler that
+    // exists.
+    if config.global.ocsp_stapling_off {
+        tracing::info!(
+            "📴 OCSP stapling: off — this build staples no OCSP response onto a handshake, \
+             so the option describes what the server already does"
+        );
+    }
     // 🔗 `preferred_chains` is refused by `validate_config` — the ACME client
     // this build uses downloads whichever chain the authority offers first and
     // cannot ask for another (`instant-acme` 0.8.5, verified 2026-08-12), so a

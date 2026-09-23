@@ -20,6 +20,45 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🗄️ Where the TLS store lives, and two TLS options, are configuration now
+
+Three global options an ordinary Caddyfile carries were refused outright, so a
+migrating configuration could not load at all. All three parse now, and each
+either does what it says or explains why it cannot.
+
+- **`storage file_system <path>`** names the directory the TLS store lives in,
+  and outranks `PINGCLAIR_TLS_STORE` and the platform convention. Two
+  deployments on one host can now be pointed at two stores from their own
+  configurations. A remote or shared backend is still refused by name:
+  accepting it would leave the store where it is while reading as if it had
+  moved.
+- **`ocsp_stapling off`** is accepted, and it names what this build already
+  does — no OCSP response is stapled onto a handshake here, so the option asks
+  for nothing to change and a startup line says so. `on` and the bare option
+  are refused rather than accepted into a stapler that does not exist; Caddy
+  refuses both spellings too (`invalid argument 'on'`), so nothing that loads
+  upstream is turned away.
+- **`servers { listener_wrappers { proxy_protocol } }`** requires a PROXY
+  protocol header on every listener the Caddyfile declares, which is what the
+  addressless block means upstream. This is upstream's `fallback_policy
+  require`, and it is stricter than the name upstream: there the bare
+  `proxy_protocol` defaults to `ignore` and answers a request that carries no
+  header (measured on `caddy v2.11.4`), where here that connection is refused.
+  `fallback_policy require` is accepted because it names this behaviour; the
+  permissive policies (`ignore`, `use`, `reject`, `skip`) and `timeout` and
+  `allow`/`deny` are refused by name with the reason. `tls` and `http_redirect`
+  are refused by name too — TLS here is chosen per site by automatic HTTPS and
+  the HTTP-to-HTTPS redirect belongs to the companion port automatic HTTPS
+  creates — and so is the addressed `servers <address> { … }` form, which would
+  demand the header on listeners the operator did not name.
+
+  **Upgrading:** a Caddyfile that wrote `listener_wrappers { tls }` or
+  `http_redirect` still does not load; it now says which wrapper is missing
+  instead of `Unknown directive`. One that wrote `proxy_protocol` loads, and
+  any client that reached the port without a header now has its connection
+  refused rather than served — which is the same thing `listen …
+  proxy_protocol` has always done.
+
 ### 🔌 A taken HTTP/3 port stops startup instead of being advertised
 
 The HTTP/3 UDP socket was bound in a background task after startup had

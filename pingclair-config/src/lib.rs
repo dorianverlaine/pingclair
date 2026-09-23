@@ -234,6 +234,7 @@ fn merge_globals(
         storage_path,
         pki,
         skip_install_trust,
+        ocsp_stapling_off,
         dns,
         acme_dns,
         tls_resolvers,
@@ -269,6 +270,9 @@ fn merge_globals(
     }
     if skip_install_trust {
         into.skip_install_trust = true;
+    }
+    if ocsp_stapling_off {
+        into.ocsp_stapling_off = true;
     }
     if dns.is_some() {
         into.dns = dns;

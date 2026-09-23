@@ -367,6 +367,12 @@ while reading as if it had moved. The resolved path is logged at startup, since
 two deployments that name different stores mint separate trust roots with no
 other visible difference.
 
+OCSP stapling is not performed by this build. The global `ocsp_stapling off` is
+accepted because it names precisely that state, and a startup line says so when
+it is written; `on` and the bare option are refused, since they would ask for
+stapling that does not exist here. (Caddy refuses those two spellings as well,
+so nothing that loads upstream is turned away.)
+
 A `tls { … }` block accepts `auto`, `internal`, `cert`/`key`, `acme_email`
 (`email`), `http3`, `default_sni`, `client_auth`, and the DNS-01 cluster
 (`dns`, `resolvers`, `dns_ttl`, `propagation_delay`, `propagation_timeout`,
@@ -406,6 +412,16 @@ so a port behind an L4 balancer and a port reached directly can coexist in one
 server. XFF and RFC 7239 `Forwarded`
 chains are bounded; malformed or conflicting identities fail closed. PROXY
 protocol does not apply to the UDP HTTP/3 listener.
+
+`servers { listener_wrappers { proxy_protocol } }` is the Caddy spelling of
+"every listener this Caddyfile declares", and it is accepted as exactly that;
+`listen … proxy_protocol` stays the way to require the header on one listener.
+The addressless block is the only accepted form: `servers <address> { … }` is
+refused, because this build applies a `servers` block's options to every
+listener and the header on a port whose clients do not send it rejects them all.
+Both spellings mean the same thing here, and it is the strict one: upstream's
+`proxy_protocol { fallback_policy require }`, under which a connection without
+the header is refused rather than served.
 
 ### Resource limits and timeouts
 
@@ -995,7 +1011,7 @@ Global options:
   `acme_ca` `acme_ca_root` `acme_eab` `cert_issuer`
   `cert_lifetime` `ech` `events` `fallback_sni`
   `filesystem` `frankenphp` `key_type` `ocsp_interval`
-  `ocsp_stapling` `on_demand_tls` `preferred_chains` `renew_interval`
+  `on_demand_tls` `preferred_chains` `renew_interval`
   `shutdown_delay` `storage_clean_interval`
 
 `tls` block options:
@@ -1006,11 +1022,29 @@ Global options:
   `reuse_private_keys` `insecure_secrets_log` `renewal_window_ratio`
   `force_automate`
 
-Two `servers { … }` sub-options are also refused **by name** rather than read
-as typos: `listener_wrappers` and `timeouts`. Caddy loads both, so a migrating
-configuration meets them; this build has neither per-option listener wrapping
-nor per-listener timeouts, and says which of the two is missing instead of
-`Unknown directive`.
+One `servers { … }` sub-option is refused **by name** rather than read as a
+typo: `timeouts`. Caddy loads it, so a migrating configuration meets it, and
+this build has no per-listener timeouts — the message says which capability is
+missing instead of `Unknown directive`.
+
+`listener_wrappers` is accepted for one wrapper and refuses the others by name.
+`proxy_protocol` requires a PROXY protocol header on every listener the
+Caddyfile declares, which is what the addressless block means upstream; the
+sources trusted to send it are the `trusted_proxies` ranges, as they are for the
+per-listener spelling. **This is upstream's `fallback_policy require`**, and the
+difference from the bare name upstream is worth knowing before migrating: there
+the bare `proxy_protocol` defaults to `fallback_policy ignore` and answers a
+request that carries no header (measured on `caddy v2.11.4`), where here that
+connection is refused. `fallback_policy require` is accepted because it names
+this behaviour; the permissive policies (`ignore`, `use`, `reject`, `skip`) and
+the `timeout` and `allow`/`deny` options are refused by name with the reason,
+never ignored. `tls` and `http_redirect` are refused with the reason: TLS here is
+chosen per site by automatic HTTPS rather than by a listener wrapper, and the
+HTTP-to-HTTPS redirect belongs to the companion plaintext port automatic HTTPS
+creates, so a listener declared with `listen` would not redirect.
+`servers <address> { listener_wrappers { … } }` is refused too — this build
+applies a `servers` block's options to every listener, and demanding the PROXY
+header on a port whose clients do not send it rejects them all.
 
 Names sit between the lists above and full support, so they are named here
 rather than in either. `copy_response` and `copy_response_headers` are

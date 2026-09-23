@@ -288,6 +288,43 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                         }
                     }
                 }
+                // 📴 `ocsp_stapling off` — the one spelling upstream accepts,
+                // and the one that matches what this build does. No OCSP
+                // response is stapled onto a handshake here, so `off` asks for
+                // nothing to change; `on` and the bare option would ask for
+                // stapling that does not exist, and a configuration that reads
+                // as if it were enabled while nothing is stapled is the failure
+                // this refusal exists to prevent.
+                //
+                // 📌 Upstream refuses both of those too, with `invalid argument
+                // 'on'` and a wrong-argument-count error, so nothing that loads
+                // in Caddy is turned away here. The message says more than
+                // "wrong argument", because the interesting fact for a
+                // migrating operator is that stapling is absent rather than
+                // misconfigured.
+                "ocsp_stapling" => match sub.args.as_slice() {
+                    [value] if value == "off" => global.ocsp_stapling_off = true,
+                    [value] => {
+                        return Err(AdapterError::UnsupportedFeature(
+                            "global: ocsp_stapling".into(),
+                            format!(
+                                "this build staples no OCSP response onto any handshake, so \
+                                 `off` is the only spelling that describes it; `{value}` asks \
+                                 for stapling that is not implemented"
+                            ),
+                        ));
+                    }
+                    [_, _, ..] => {
+                        return Err(AdapterError::ArgumentCount(
+                            "ocsp_stapling".into(),
+                            1,
+                            sub.args.len(),
+                        ));
+                    }
+                    [] => {
+                        return Err(AdapterError::ArgumentCount("ocsp_stapling".into(), 1, 0));
+                    }
+                },
                 "trusted_proxies" => {
                     if sub.args.is_empty() {
                         return Err(AdapterError::ArgumentCount("trusted_proxies".into(), 1, 0));
@@ -507,6 +544,26 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                 // 🚫 Options that are real Caddy syntax but not implemented
                 // here get a distinct message so a migrating Caddyfile is not
                 // mistaken for a typo.
+                // 🧢 `servers { listener_wrappers { … } }` names the wrappers
+                // that wrap every listener of every server declared here.
+                "listener_wrappers" => {
+                    // 📌 No argument may precede the block: `listener_wrappers
+                    // proxy_protocol { … }` is not a spelling upstream reads.
+                    if !sub.args.is_empty() {
+                        return Err(AdapterError::ArgumentCount(
+                            "listener_wrappers".into(),
+                            0,
+                            sub.args.len(),
+                        ));
+                    }
+                    let Some(block) = sub.block else {
+                        return Err(AdapterError::InvalidArgument(
+                            "global: listener_wrappers".into(),
+                            "the wrappers to apply are named in a block".into(),
+                        ));
+                    };
+                    global.listener_proxy_protocol = parse_listener_wrappers(&block)?;
+                }
                 // 🏷️ `servers { … }` sub-options that belong to a listener
                 // rather than to the whole server. They read as typos before
                 // because `expand_servers_block` lifts the block's children to
@@ -514,13 +571,18 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                 // found them in neither list — so the operator was told they
                 // had invented a word that Caddy loads.
                 //
-                // 📌 Named and refused rather than implemented: each needs a
-                // capability this build does not have (per-option listener
-                // wrapping and per-listener timeouts), and the message says
-                // which one rather than calling it unknown.
-                "listener_wrappers" | "timeouts" if sub.block.is_some() => {
+                // 📌 Named and refused rather than implemented: per-listener
+                // timeouts need a capability this build does not have, and the
+                // message says which one rather than calling it unknown.
+                "timeouts" => {
+                    if sub.block.is_none() {
+                        return Err(AdapterError::InvalidArgument(
+                            "global: timeouts".into(),
+                            "the timeouts to set are named in a block".into(),
+                        ));
+                    }
                     return Err(AdapterError::UnsupportedFeature(
-                        format!("global: {other}", other = sub.name),
+                        "global: timeouts".into(),
                         "this `servers` sub-option is not implemented yet".into(),
                     ));
                 }
@@ -611,6 +673,35 @@ pub(super) fn expand_servers_block(
                         parse_metrics_options(inner, MetricsScope::Server)?;
                     }
                 }
+                // 🚫 `servers <address> { … }` names one listener, and lifting
+                // the children to the global level drops that address: the
+                // options end up applying to every listener. That is harmless
+                // for the options this block usually carries, but not for
+                // `listener_wrappers { proxy_protocol }` — the PROXY protocol
+                // header would be demanded on a port whose clients never send
+                // one, and a connection without it is *rejected*, so the
+                // approximation would take a site offline rather than widen a
+                // setting.
+                //
+                // 📌 Refused rather than guessed. The addressless spelling means
+                // "every listener" in Caddy too, so the operator has a way to
+                // say what they meant.
+                if !d.args.is_empty()
+                    && block
+                        .directives
+                        .iter()
+                        .any(|child| child.name == "listener_wrappers")
+                {
+                    return Err(AdapterError::UnsupportedFeature(
+                        format!("global: servers {}", d.args.join(" ")),
+                        "a `servers <address>` block names one listener, and this build \
+                         applies a `servers` block's options to every listener; requiring \
+                         the PROXY protocol header on a port whose clients do not send it \
+                         rejects them all. Write `servers { listener_wrappers { … } }` \
+                         without an address to apply the wrappers to every listener"
+                            .into(),
+                    ));
+                }
                 result.extend(block.directives);
             }
         } else {
@@ -678,6 +769,145 @@ fn parse_metrics_options(
         }
     }
     Ok(options)
+}
+
+/// 🧢 Reads the names inside `servers { listener_wrappers { … } }`.
+///
+/// Returns whether a PROXY protocol header is required on every listener of
+/// every server the block applies to — the one wrapper whose meaning this build
+/// can honour. Caddy ships three (`caddy.listeners.*`), and the other two are
+/// refused here with the reason rather than accepted:
+///
+/// - `tls` is what upstream's own default chain starts with, so the first
+///   position is refused upstream as well ("it is unnecessary to specify the
+///   TLS listener wrapper in the first position because that is the default").
+///   Here TLS is chosen per site by automatic HTTPS rather than by a wrapper,
+///   so there is nothing for the name to select.
+/// - `http_redirect` is the wrapper that makes a plaintext listener answer a
+///   redirect to HTTPS. This build's redirect belongs to automatic HTTPS and
+///   covers the companion plaintext port it creates itself; a listener declared
+///   outright with `listen` is not wrapped, so accepting the name would promise
+///   a redirect that never happens.
+///
+/// 🚫 A name this build does not know is refused as unimplemented rather than as
+/// a typo: upstream's set of wrappers is open to plugins, so "not in the list"
+/// here is not evidence that the operator invented the word.
+fn parse_listener_wrappers(block: &Block) -> Result<bool, AdapterError> {
+    let mut proxy_protocol = false;
+    for wrapper in &block.directives {
+        match wrapper.name.as_str() {
+            "proxy_protocol" => {
+                if let Some(inner) = &wrapper.block {
+                    parse_proxy_protocol_options(inner)?;
+                }
+                proxy_protocol = true;
+            }
+            "tls" | "http_redirect" => {
+                let reason = if wrapper.name == "tls" {
+                    "TLS is chosen per site by automatic HTTPS, not by a listener wrapper, so \
+                     this name has nothing to select; Caddy refuses it in the first position \
+                     for the same reason"
+                } else {
+                    "the HTTP-to-HTTPS redirect here belongs to automatic HTTPS on the \
+                     plaintext companion port it creates, not to a wrapper that can be \
+                     selected per listener; a listener declared with `listen` would not \
+                     redirect"
+                };
+                return Err(AdapterError::UnsupportedFeature(
+                    format!("global: listener_wrappers {}", wrapper.name),
+                    reason.into(),
+                ));
+            }
+            other => {
+                return Err(AdapterError::UnsupportedFeature(
+                    format!("global: listener_wrappers {other}"),
+                    format!(
+                        "`{other}` is not a listener wrapper this build has; the ones Caddy \
+                         ships are `proxy_protocol`, `tls` and `http_redirect`"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(proxy_protocol)
+}
+
+/// 🧭 Reads `proxy_protocol`'s own block in a `listener_wrappers` list.
+///
+/// 🎯 The behaviour implemented here is upstream's `fallback_policy require`:
+/// a connection that arrives without a PROXY header is refused. That is the
+/// strict end of upstream's five policies, and it is the one this build's
+/// `listen … proxy_protocol` already had, so the bare wrapper name means the
+/// same thing — 📌 which is a real difference from upstream, where the bare
+/// name defaults to `ignore` and answers such a connection anyway (measured
+/// against `caddy v2.11.4`, see the README).
+///
+/// Refusing the permissive policies is the whole point of reading this block at
+/// all: `ignore` and `skip` name a server that answers a client which never
+/// sent the header, which is exactly what a configuration asking for
+/// `proxy_protocol` is trying to prevent — and accepting the name while doing
+/// the opposite would be a setting that silently means something else.
+fn parse_proxy_protocol_options(block: &Block) -> Result<(), AdapterError> {
+    for option in &block.directives {
+        match (option.name.as_str(), option.args.as_slice()) {
+            // 🔁 The spelling of what this build already does. Accepting it
+            // costs nothing and lets an operator say in upstream's own words
+            // what they are getting.
+            ("fallback_policy", [policy]) if policy == "require" => {}
+            ("fallback_policy", [policy]) => {
+                return Err(AdapterError::UnsupportedFeature(
+                    format!("global: listener_wrappers proxy_protocol fallback_policy {policy}"),
+                    format!(
+                        "`{policy}` is not the policy this build implements; a connection \
+                         without a PROXY header is refused here, which upstream spells \
+                         `require`. Accepting `{policy}` would answer a client that never \
+                         sent the header"
+                    ),
+                ));
+            }
+            ("fallback_policy", []) => {
+                return Err(AdapterError::ArgumentCount(
+                    "proxy_protocol fallback_policy".into(),
+                    1,
+                    0,
+                ));
+            }
+            // 🛡️ `allow`/`deny` narrow who may send a header. This build decides
+            // that with `trusted_proxies` — the same ranges the per-listener
+            // spelling uses — so an `allow` here would read as narrowing that
+            // trust while leaving it untouched.
+            ("allow" | "deny", _) => {
+                return Err(AdapterError::UnsupportedFeature(
+                    format!("global: listener_wrappers proxy_protocol {}", option.name),
+                    "the sources whose header is believed are the `trusted_proxies` ranges, \
+                     as they are for `listen … proxy_protocol`; a list here would read as \
+                     narrowing that trust while leaving it as it was"
+                        .into(),
+                ));
+            }
+            // 🕰️ Upstream waits five seconds for the header by default. The
+            // ingress here has its own read deadline, and there is no knob for
+            // it, so the name is refused rather than accepted as a no-op.
+            ("timeout", _) => {
+                return Err(AdapterError::UnsupportedFeature(
+                    "global: listener_wrappers proxy_protocol timeout".into(),
+                    "this build's PROXY header read has its own deadline and no per-listener \
+                     knob; the value would not be honoured"
+                        .into(),
+                ));
+            }
+            (other, _) => {
+                return Err(AdapterError::UnsupportedFeature(
+                    format!("global: listener_wrappers proxy_protocol {other}"),
+                    format!(
+                        "`{other}` is not a `proxy_protocol` option; the ones Caddy defines \
+                         are `timeout`, `allow`, `deny` and `fallback_policy`"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 🔗 Reads `preferred_chains smallest` or a block naming issuer common names.

@@ -357,11 +357,24 @@ example.com {
 `Forwarded` chain 都有上限；畸形或彼此衝突的身分會 fail closed。PROXY
 protocol 不適用於 UDP HTTP/3 listener。
 
+`servers { listener_wrappers { proxy_protocol } }` 是 Caddy 拼法的「這份 Caddyfile
+宣告的每一條 listener」，這裡就照這個意思收下；要在單一條 listener 上要求標頭，
+仍然寫 `listen … proxy_protocol`。只接受無位址的那個形式：`servers <address> { … }`
+會被拒絕，因為這個 build 會把 `servers` 區塊的選項套用到每一條 listener，而在
+客戶端不送標頭的埠上要求它會把連線全部拒絕。兩種拼法在這裡意思相同，而且都是
+嚴格的那一邊：上游的 `proxy_protocol { fallback_policy require }`——沒帶標頭的
+連線會被拒絕，而不是被服務。
+
 store 的位置是設定決定：全域的 `storage file_system <path>` 會指名那個目錄，
 優先序高於 `PINGCLAIR_TLS_STORE` 與平台慣例。只實作檔案後端——遠端或共享
 backend 會以名字被拒絕而不是被收下，因為收下只會讓 store 留在原地，讀起來卻像
 已經搬過去了。解析出來的路徑會寫在啟動日誌裡：兩個部署若指名不同的 store，會
 各自簽發自己的信任根，而除此之外沒有其他看得出來的差別。
+
+這個 build 不做 OCSP stapling。全域的 `ocsp_stapling off` 被收下，因為它指名的
+正是這個狀態，而且寫了它的時候啟動日誌會有一行說明；`on` 與不帶參數的寫法都會
+被拒絕，因為那等於要求這裡不存在的 stapling。（Caddy 對這兩種寫法同樣拒絕，所以
+上游載得起來的設定不會在這裡被擋下。）
 
 ### 資源上限與 timeout
 
@@ -897,7 +910,7 @@ Directive：
   `acme_ca` `acme_ca_root` `acme_eab` `cert_issuer`
   `cert_lifetime` `ech` `events` `fallback_sni`
   `filesystem` `frankenphp` `key_type` `ocsp_interval`
-  `ocsp_stapling` `on_demand_tls` `preferred_chains` `renew_interval`
+  `on_demand_tls` `preferred_chains` `renew_interval`
   `shutdown_delay` `storage_clean_interval`
 
 `tls` 區塊選項：
@@ -909,10 +922,25 @@ Directive：
   `force_automate`
 
 
-`servers { … }` 有兩個子選項也是**以名字拒絕**，而不是被當成拼錯：
-`listener_wrappers` 與 `timeouts`。Caddy 兩個都載得起來，所以遷移過來的設定
-一定會遇到；這個 build 兩者都沒有（逐選項的 listener wrapper 與逐 listener 的
-timeout），訊息會說明缺的是哪一個，而不是 `Unknown directive`。
+`servers { … }` 有一個子選項是**以名字拒絕**，而不是被當成拼錯：`timeouts`。
+Caddy 載得起來，所以遷移過來的設定一定會遇到；這個 build 沒有逐 listener 的
+timeout，訊息會說明缺的是哪個能力，而不是 `Unknown directive`。
+
+`listener_wrappers` 只收下一個 wrapper，其餘以名字拒絕並附理由。
+`proxy_protocol` 會要求這份 Caddyfile 宣告的每一條 listener 都帶 PROXY protocol
+標頭——這正是無位址的 `servers` 區塊在上游的意思；信任誰送這個標頭由
+`trusted_proxies` 範圍決定，與逐 listener 的拼法相同。**這等於上游的
+`fallback_policy require`**，而它與上游裸名之間的差別值得在遷移前知道：上游的裸
+`proxy_protocol` 預設是 `fallback_policy ignore`，沒有帶標頭的請求照樣會得到回應
+（對 `caddy v2.11.4` 實測），在這裡那種連線會被拒絕。`fallback_policy require`
+被收下，因為它指名的就是這個行為；寬鬆的那幾個（`ignore`、`use`、`reject`、
+`skip`）以及 `timeout` 與 `allow`／`deny` 都以名字拒絕並附理由，不會被忽略。
+`tls` 與 `http_redirect` 的拒絕訊息會說明理由：這裡的 TLS 是逐站台由自動 HTTPS
+選定的，不是由 listener wrapper 決定；而 HTTP→HTTPS 轉跳屬於自動 HTTPS 自己建立
+的那條明文 companion 埠，所以一條用 `listen` 直接宣告的 listener 不會轉跳。
+`servers <address> { listener_wrappers { … } }` 同樣被拒絕——這個 build 會把
+`servers` 區塊的選項套用到每一條 listener，而在客戶端不送標頭的埠上要求它會把
+連線全部拒絕。
 
 有些名字落在「上面兩張清單」與「完整支援」之間，所以寫在這裡而不是塞進任何一張。
 `copy_response` 與 `copy_response_headers` 是 `handle_response` 的子指令，
