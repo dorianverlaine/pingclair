@@ -2,6 +2,28 @@
 // Copyright 2026 Dorian Verlaine
 
 //! 🏛️ Provides a persistent local certificate authority for private origins.
+//!
+//! **The tree is Caddy's, because the tools that read it are.**
+//!
+//! ```text
+//! <store>/pki/authorities/local/root.crt          root certificate
+//! <store>/pki/authorities/local/root.key          root private key
+//! <store>/pki/authorities/local/intermediate.crt  signing certificate
+//! <store>/pki/authorities/local/intermediate.key  signing private key
+//! <store>/certificates/local/<site>/<site>.crt    leaf chain (leaf + intermediate)
+//! <store>/certificates/local/<site>/<site>.key    leaf private key
+//! <store>/certificates/local/<site>/<site>.json   subject names, not secret
+//! ```
+//!
+//! 🎯 The names are the deliverable, not decoration. A backup procedure, a
+//! "which certificates expire this month" report and a certificate audit are
+//! all written against this shape by other tools, and a store this server
+//! writes can be read by them without a translation step (#169, #173).
+//!
+//! 🌳 Two tiers rather than one, for the same reason: the files are named
+//! `root` and `intermediate`, and a single self-signed authority written into
+//! both would be a trust anchor wearing the wrong label. Leaves are signed by
+//! the intermediate, and the intermediate by the root.
 
 use crate::acme::Certificate;
 use crate::cert_store::{CertStore, CertStoreError};
@@ -9,15 +31,28 @@ use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose, PublicKeyData,
 };
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
+/// 📂 Where the authority's four files live, relative to the store root.
+const AUTHORITY_DIRECTORY: &str = "pki/authorities/local";
+
+/// 📂 Where the authority's leaf certificates live, relative to the store root.
+const CERTIFICATES_DIRECTORY: &str = "certificates/local";
+
 const AUTHORITY_LIFETIME: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
 const LEAF_LIFETIME: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 const CLOCK_SKEW_ALLOWANCE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// ⏳ How much of the root's remaining life an intermediate must leave unused.
+///
+/// The two tiers are checked separately by anything validating the chain, so an
+/// intermediate that expires after its root leaves a window in which the chain
+/// does not validate. A day is enough margin for the clock differences that
+/// already motivate [`CLOCK_SKEW_ALLOWANCE`].
+const INTERMEDIATE_ROOT_MARGIN: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// 🧯 Describes a local authority initialization or issuance failure.
 #[derive(Debug, Error)]
@@ -42,37 +77,78 @@ pub enum InternalCaError {
 
     #[error("🧯 Invalid internal certificate authority: {0}")]
     InvalidAuthority(String),
+
+    /// 🚫 The root is too close to expiry to sign an intermediate for it.
+    ///
+    /// Refused rather than repaired. Replacing the root would keep the server
+    /// answering while silently withdrawing the authority every client already
+    /// trusts, which is the failure the import guard exists to prevent — and
+    /// the operator is the only one who can decide whether to re-trust.
+    #[error("⏳ The internal root CA expires too soon to sign an intermediate for it")]
+    RootExpiringSoon,
 }
 
-/// 🔐 Keeps the authority certificate and private key in one atomic record.
-#[derive(Clone, Deserialize, Serialize)]
-struct AuthorityData {
+/// 🔐 One certificate and the private key that matches it.
+struct AuthorityKeyPair {
     cert_pem: String,
     key_pem: String,
+
+    /// ⏰ When the certificate stops being valid, read out of the certificate
+    /// rather than recomputed from the lifetime constant, so a pair that has
+    /// been on disk for years is measured against the date actually in it.
+    expires_at: SystemTime,
+}
+
+/// 🏛️ The two tiers a local authority is made of.
+struct LocalAuthority {
+    root: AuthorityKeyPair,
+    intermediate: AuthorityKeyPair,
+}
+
+/// 🏷️ Which tier of the authority is being loaded.
+///
+/// The two behave differently when half of a pair is on disk, because they mean
+/// different things. The root is the trust anchor: half of it is a damaged store,
+/// and replacing it silently would withdraw the authority every client trusts.
+/// The intermediate is derived material — it can be re-signed from the root,
+/// which leaves every client's trust intact.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tier {
+    Root,
+    Intermediate,
+}
+
+impl Tier {
+    /// 🩹 Whether a half-written pair can be rebuilt instead of refused.
+    fn is_repairable(self) -> bool {
+        matches!(self, Self::Intermediate)
+    }
 }
 
 /// 🧭 Serializes initialization and issuance around one authority snapshot.
 #[derive(Default)]
 struct AuthorityState {
-    authority: Option<AuthorityData>,
+    authority: Option<LocalAuthority>,
 }
 
 /// 🏛️ Issues and persists private leaf certificates under one local authority.
 pub struct InternalCa {
-    authority_path: PathBuf,
-    root_certificate_path: PathBuf,
+    /// 📂 The directory holding the four authority files.
+    authority_directory: PathBuf,
+
+    /// 📜 The leaves this authority has issued, in Caddy's layout.
     certificates: CertStore,
+
     state: Mutex<AuthorityState>,
 }
 
 impl InternalCa {
     /// 🏗️ Creates a lazy local authority rooted below the shared TLS store.
     pub fn new(store_path: impl AsRef<Path>) -> Self {
-        let internal_path = store_path.as_ref().join("internal");
+        let store_path = store_path.as_ref();
         Self {
-            authority_path: internal_path.join("authority.json"),
-            root_certificate_path: internal_path.join("root.crt"),
-            certificates: CertStore::new(internal_path.join("certificates")),
+            authority_directory: store_path.join(AUTHORITY_DIRECTORY),
+            certificates: CertStore::site_directories(store_path.join(CERTIFICATES_DIRECTORY)),
             state: Mutex::new(AuthorityState::default()),
         }
     }
@@ -93,52 +169,198 @@ impl InternalCa {
             return Ok(certificate);
         }
 
-        let certificate = issue_leaf(domain, authority)?;
+        let certificate = issue_leaf(domain, &authority.intermediate)?;
         self.certificates.store(&certificate).await?;
         tracing::info!("🏛️ Issued an internal TLS certificate for {}", domain);
         Ok(certificate)
     }
 
     /// 🌳 Returns the public root certificate for trust-store installation.
+    ///
+    /// 📌 The root and not the intermediate: this is the trust anchor an
+    /// operator installs, and it is the only file of the four that is meant to
+    /// leave the machine.
     pub async fn root_certificate_pem(&self) -> Result<String, InternalCaError> {
         let mut state = self.state.lock().await;
-        Ok(self.ensure_authority(&mut state).await?.cert_pem.clone())
+        Ok(self.ensure_authority(&mut state).await?.root.cert_pem.clone())
     }
 
-    /// 🔐 Initializes the certificate cache and loads one atomic authority record.
+    // MARK: - Paths
+
+    fn root_certificate_path(&self) -> PathBuf {
+        self.authority_directory.join("root.crt")
+    }
+
+    fn root_key_path(&self) -> PathBuf {
+        self.authority_directory.join("root.key")
+    }
+
+    fn intermediate_certificate_path(&self) -> PathBuf {
+        self.authority_directory.join("intermediate.crt")
+    }
+
+    fn intermediate_key_path(&self) -> PathBuf {
+        self.authority_directory.join("intermediate.key")
+    }
+
+    // MARK: - Loading
+
+    /// 🔐 Initializes the certificate cache and loads one atomic authority.
     async fn ensure_authority<'a>(
         &self,
         state: &'a mut AuthorityState,
-    ) -> Result<&'a AuthorityData, InternalCaError> {
+    ) -> Result<&'a LocalAuthority, InternalCaError> {
         if state.authority.is_none() {
             self.certificates.init().await?;
-            let authority = if self.authority_path.exists() {
-                let contents = tokio::fs::read_to_string(&self.authority_path).await?;
-                let authority: AuthorityData = serde_json::from_str(&contents)?;
-                validate_authority(&authority)?;
-                tracing::info!(
-                    "🏛️ Loaded the persistent internal CA from {:?}",
-                    self.authority_path
-                );
-                authority
-            } else {
-                let authority = generate_authority()?;
-                persist_authority(&self.authority_path, &authority).await?;
-                tracing::info!(
-                    "🏛️ Created a persistent internal CA at {:?}",
-                    self.authority_path
-                );
-                authority
-            };
-
-            publish_root_certificate(&self.root_certificate_path, &authority.cert_pem).await?;
-            state.authority = Some(authority);
+            state.authority = Some(self.load_or_create_authority().await?);
         }
 
         Ok(state
             .authority
             .as_ref()
             .expect("the internal authority was initialized"))
+    }
+
+    /// 🧭 Reads the four authority files, creating what is missing.
+    ///
+    /// 📌 The tiers are created independently. No root at all means the whole
+    /// authority is new. A root but no intermediate — a store whose
+    /// `intermediate.*` were deleted, or a write torn between the two files —
+    /// re-signs the intermediate from the root that is still there, which is
+    /// the one repair that leaves every client's trust intact.
+    async fn load_or_create_authority(&self) -> Result<LocalAuthority, InternalCaError> {
+        let root = match self
+            .load_pair(
+                Tier::Root,
+                &self.root_certificate_path(),
+                &self.root_key_path(),
+            )
+            .await?
+        {
+            Some(root) => {
+                tracing::info!(
+                    "🏛️ Loaded the persistent internal root CA from {:?}",
+                    self.root_certificate_path()
+                );
+                root
+            }
+            None => {
+                let root = generate_root()?;
+                self.persist_pair(
+                    &self.root_certificate_path(),
+                    &self.root_key_path(),
+                    &root,
+                )
+                .await?;
+                tracing::info!(
+                    "🏛️ Created a persistent internal root CA at {:?}",
+                    self.root_certificate_path()
+                );
+                root
+            }
+        };
+
+        let intermediate = match self
+            .load_pair(
+                Tier::Intermediate,
+                &self.intermediate_certificate_path(),
+                &self.intermediate_key_path(),
+            )
+            .await?
+        {
+            Some(intermediate) => intermediate,
+            None => {
+                let intermediate = issue_intermediate(&root)?;
+                self.persist_pair(
+                    &self.intermediate_certificate_path(),
+                    &self.intermediate_key_path(),
+                    &intermediate,
+                )
+                .await?;
+                tracing::info!(
+                    "🏛️ Signed an internal intermediate CA at {:?}",
+                    self.intermediate_certificate_path()
+                );
+                intermediate
+            }
+        };
+
+        Ok(LocalAuthority { root, intermediate })
+    }
+
+    /// 📂 Reads one tier's two files, or reports that it has none.
+    ///
+    /// 🚫 Both files present but not a matching pair is an error, not a
+    /// regeneration. Silently minting a replacement would leave the server
+    /// answering while every client that trusts the current root refuses it —
+    /// and nothing in the operator's logs would say why.
+    async fn load_pair(
+        &self,
+        tier: Tier,
+        certificate_path: &Path,
+        key_path: &Path,
+    ) -> Result<Option<AuthorityKeyPair>, InternalCaError> {
+        match (certificate_path.exists(), key_path.exists()) {
+            (false, false) => Ok(None),
+            (true, true) => {
+                let cert_pem = tokio::fs::read_to_string(certificate_path).await?;
+                let key_pem = tokio::fs::read_to_string(key_path).await?;
+                let expires_at = validate_pair(&cert_pem, &key_pem)?;
+                Ok(Some(AuthorityKeyPair {
+                    cert_pem,
+                    key_pem,
+                    expires_at,
+                }))
+            }
+            (has_certificate, _) if tier.is_repairable() => {
+                tracing::warn!(
+                    "⚠️ The internal intermediate CA is half-written ({} present, {} missing); \
+                     re-signing it from the root",
+                    if has_certificate { "certificate" } else { "key" },
+                    if has_certificate { "key" } else { "certificate" },
+                );
+                Ok(None)
+            }
+            (has_certificate, _) => Err(InternalCaError::InvalidAuthority(format!(
+                "{} exists but its counterpart does not, so the internal root CA cannot be used",
+                if has_certificate {
+                    certificate_path
+                } else {
+                    key_path
+                }
+                .display()
+            ))),
+        }
+    }
+
+    /// 💾 Writes a tier's certificate and key as two files.
+    ///
+    /// 🔁 One blocking task for both files rather than one each, so they are
+    /// written in order on one thread. Each write is atomic on its own; the pair
+    /// is not, which is why a half-written tier is a state the loader handles
+    /// rather than one it can rule out.
+    async fn persist_pair(
+        &self,
+        certificate_path: &Path,
+        key_path: &Path,
+        pair: &AuthorityKeyPair,
+    ) -> Result<(), InternalCaError> {
+        let files = vec![
+            (key_path.to_path_buf(), pair.key_pem.clone().into_bytes()),
+            (
+                certificate_path.to_path_buf(),
+                pair.cert_pem.clone().into_bytes(),
+            ),
+        ];
+        tokio::task::spawn_blocking(move || {
+            for (path, contents) in files {
+                crate::secure_file::write_private_file(&path, &contents)?;
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .map_err(|error| std::io::Error::other(format!("internal CA writer failed: {error}")))??;
+        Ok(())
     }
 }
 
@@ -158,14 +380,15 @@ fn validate_domain(domain: &str) -> Result<(), InternalCaError> {
     Ok(())
 }
 
-/// 🧪 Verifies that both authority components parse and contain the same public key.
-fn validate_authority(authority: &AuthorityData) -> Result<(), InternalCaError> {
+/// 🧪 Verifies that a certificate and its key belong together, and reads the
+/// certificate's expiry as it goes.
+fn validate_pair(cert_pem: &str, key_pem: &str) -> Result<SystemTime, InternalCaError> {
     use x509_parser::prelude::{FromDer, X509Certificate};
 
-    let key = KeyPair::from_pem(&authority.key_pem)?;
-    Issuer::from_ca_cert_pem(&authority.cert_pem, key)?;
-    let key = KeyPair::from_pem(&authority.key_pem)?;
-    let (_, pem) = x509_parser::pem::parse_x509_pem(authority.cert_pem.as_bytes())
+    let key = KeyPair::from_pem(key_pem)?;
+    Issuer::from_ca_cert_pem(cert_pem, key)?;
+    let key = KeyPair::from_pem(key_pem)?;
+    let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes())
         .map_err(|error| InternalCaError::InvalidAuthority(error.to_string()))?;
     let (_, certificate) = X509Certificate::from_der(&pem.contents)
         .map_err(|error| InternalCaError::InvalidAuthority(error.to_string()))?;
@@ -174,22 +397,29 @@ fn validate_authority(authority: &AuthorityData) -> Result<(), InternalCaError> 
             "the certificate and private key do not match".to_string(),
         ));
     }
-    Ok(())
+
+    let seconds = certificate.validity().not_after.timestamp();
+    let seconds = u64::try_from(seconds).map_err(|_| InternalCaError::InvalidClock)?;
+    Ok(UNIX_EPOCH + Duration::from_secs(seconds))
 }
 
-/// 🌳 Generates a ten-year local authority with certificate-signing usage.
-fn generate_authority() -> Result<AuthorityData, InternalCaError> {
+/// 🌳 Generates a ten-year root authority with certificate-signing usage.
+fn generate_root() -> Result<AuthorityKeyPair, InternalCaError> {
     let now = SystemTime::now();
+    let expires_at = now
+        .checked_add(AUTHORITY_LIFETIME)
+        .ok_or(InternalCaError::InvalidClock)?;
+
     let mut params = CertificateParams::new(Vec::<String>::new())?;
     params.not_before = now
         .checked_sub(CLOCK_SKEW_ALLOWANCE)
         .unwrap_or(UNIX_EPOCH)
         .into();
-    params.not_after = now
-        .checked_add(AUTHORITY_LIFETIME)
-        .ok_or(InternalCaError::InvalidClock)?
-        .into();
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.not_after = expires_at.into();
+    // 🛡️ The root signs intermediates and nothing below them. The limit is
+    // written into the certificate so that a client enforces it, which is the
+    // only kind that still holds if the root key is ever exposed.
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
     params.key_usages = vec![
         KeyUsagePurpose::DigitalSignature,
         KeyUsagePurpose::KeyCertSign,
@@ -197,19 +427,68 @@ fn generate_authority() -> Result<AuthorityData, InternalCaError> {
     ];
     let mut distinguished_name = DistinguishedName::new();
     distinguished_name.push(DnType::OrganizationName, "Pingclair");
-    distinguished_name.push(DnType::CommonName, "Pingclair Local Authority");
+    distinguished_name.push(DnType::CommonName, "Pingclair Local Authority Root");
     params.distinguished_name = distinguished_name;
 
     let key = KeyPair::generate()?;
     let certificate = params.self_signed(&key)?;
-    Ok(AuthorityData {
+    Ok(AuthorityKeyPair {
         cert_pem: certificate.pem(),
         key_pem: key.serialize_pem(),
+        expires_at,
+    })
+}
+
+/// 🌿 Signs the intermediate that leaf certificates are actually issued from.
+///
+/// 🛡️ `pathlen:0`, so the intermediate signs leaf certificates and no further
+/// authorities. Together with the root's `pathlen:1` that is what makes this a
+/// two-tier chain rather than an unbounded one.
+fn issue_intermediate(root: &AuthorityKeyPair) -> Result<AuthorityKeyPair, InternalCaError> {
+    let now = SystemTime::now();
+    let expires_at = root
+        .expires_at
+        .checked_sub(INTERMEDIATE_ROOT_MARGIN)
+        .filter(|expires_at| *expires_at > now)
+        .ok_or(InternalCaError::RootExpiringSoon)?;
+
+    let mut params = CertificateParams::new(Vec::<String>::new())?;
+    params.not_before = now
+        .checked_sub(CLOCK_SKEW_ALLOWANCE)
+        .unwrap_or(UNIX_EPOCH)
+        .into();
+    params.not_after = expires_at.into();
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+    ];
+    params.use_authority_key_identifier_extension = true;
+    let mut distinguished_name = DistinguishedName::new();
+    distinguished_name.push(DnType::OrganizationName, "Pingclair");
+    distinguished_name.push(DnType::CommonName, "Pingclair Local Authority Intermediate");
+    params.distinguished_name = distinguished_name;
+
+    let root_key = KeyPair::from_pem(&root.key_pem)?;
+    let issuer = Issuer::from_ca_cert_pem(&root.cert_pem, root_key)?;
+    let key = KeyPair::generate()?;
+    let certificate = params.signed_by(&key, &issuer)?;
+    Ok(AuthorityKeyPair {
+        cert_pem: certificate.pem(),
+        key_pem: key.serialize_pem(),
+        expires_at,
     })
 }
 
 /// 🍃 Signs a short-lived server certificate and returns its complete chain.
-fn issue_leaf(domain: &str, authority: &AuthorityData) -> Result<Certificate, InternalCaError> {
+///
+/// 🌊 The chain is the leaf followed by the intermediate, and **not** the root.
+/// A client that trusts the root already has it, so sending it again is a
+/// kilobyte per handshake that every client discards. Measured against `caddy`
+/// 2.11.4, whose `certificates/local/localhost/localhost.crt` holds exactly the
+/// leaf and the intermediate, in that order.
+fn issue_leaf(domain: &str, intermediate: &AuthorityKeyPair) -> Result<Certificate, InternalCaError> {
     let now = SystemTime::now();
     let expires_at = now
         .checked_add(LEAF_LIFETIME)
@@ -228,15 +507,15 @@ fn issue_leaf(domain: &str, authority: &AuthorityData) -> Result<Certificate, In
     distinguished_name.push(DnType::CommonName, domain);
     params.distinguished_name = distinguished_name;
 
-    let authority_key = KeyPair::from_pem(&authority.key_pem)?;
-    let issuer = Issuer::from_ca_cert_pem(&authority.cert_pem, authority_key)?;
+    let issuer_key = KeyPair::from_pem(&intermediate.key_pem)?;
+    let issuer = Issuer::from_ca_cert_pem(&intermediate.cert_pem, issuer_key)?;
     let leaf_key = KeyPair::generate()?;
     let leaf = params.signed_by(&leaf_key, &issuer)?;
     let mut cert_pem = leaf.pem();
     if !cert_pem.ends_with('\n') {
         cert_pem.push('\n');
     }
-    cert_pem.push_str(&authority.cert_pem);
+    cert_pem.push_str(&intermediate.cert_pem);
 
     Ok(Certificate {
         cert_pem,
@@ -249,38 +528,18 @@ fn issue_leaf(domain: &str, authority: &AuthorityData) -> Result<Certificate, In
     })
 }
 
-/// 💾 Persists the certificate and key together so a crash cannot mismatch them.
-async fn persist_authority(path: &Path, authority: &AuthorityData) -> Result<(), InternalCaError> {
-    let contents = serde_json::to_vec_pretty(authority)?;
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || crate::secure_file::write_private_file(&path, &contents))
-        .await
-        .map_err(|error| std::io::Error::other(format!("internal CA writer failed: {error}")))??;
-    Ok(())
-}
-
-/// 🌳 Publishes a stable root certificate path without treating it as authority state.
-async fn publish_root_certificate(path: &Path, cert_pem: &str) -> Result<(), InternalCaError> {
-    if tokio::fs::read_to_string(path)
-        .await
-        .is_ok_and(|current| current == cert_pem)
-    {
-        return Ok(());
-    }
-
-    let path = path.to_path_buf();
-    let cert_pem = cert_pem.as_bytes().to_vec();
-    tokio::task::spawn_blocking(move || crate::secure_file::write_private_file(&path, &cert_pem))
-        .await
-        .map_err(|error| {
-            std::io::Error::other(format!("internal root certificate writer failed: {error}"))
-        })??;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🧾 The subject and issuer of the first certificate in a PEM chain.
+    fn subject_and_issuer(cert_pem: &str) -> (String, String) {
+        use x509_parser::prelude::{FromDer, X509Certificate};
+
+        let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes()).unwrap();
+        let (_, certificate) = X509Certificate::from_der(&pem.contents).unwrap();
+        (certificate.subject().to_string(), certificate.issuer().to_string())
+    }
 
     #[tokio::test]
     async fn authority_and_leaf_survive_restart() {
@@ -299,8 +558,115 @@ mod tests {
         assert_eq!(first_leaf.key_pem, second_leaf.key_pem);
         assert_eq!(second_leaf.cert_pem.matches("BEGIN CERTIFICATE").count(), 2);
         assert_eq!(
-            std::fs::read_to_string(directory.path().join("internal/root.crt")).unwrap(),
+            std::fs::read_to_string(directory.path().join("pki/authorities/local/root.crt"))
+                .unwrap(),
             second_root
+        );
+    }
+
+    /// 🌳 The chain is a real two-tier one: the root signs the intermediate, the
+    /// intermediate signs the leaf, and the chain the client is served stops at
+    /// the intermediate.
+    ///
+    /// Asserted as whole subjects rather than by checking a signature, because
+    /// what the layout promises is *which file means what* — a store whose
+    /// `intermediate.crt` held a root would satisfy every path-based test and
+    /// still be a lying tree.
+    #[tokio::test]
+    async fn the_chain_runs_root_to_intermediate_to_leaf() {
+        let directory = tempfile::tempdir().unwrap();
+        let authority = InternalCa::new(directory.path());
+        let leaf = authority.get_or_issue("chain.example.test").await.unwrap();
+
+        let root_pem = authority.root_certificate_pem().await.unwrap();
+        let intermediate_pem = std::fs::read_to_string(
+            directory
+                .path()
+                .join("pki/authorities/local/intermediate.crt"),
+        )
+        .expect("the intermediate certificate must be on disk");
+
+        let (root_subject, root_issuer) = subject_and_issuer(&root_pem);
+        let (intermediate_subject, intermediate_issuer) = subject_and_issuer(&intermediate_pem);
+        let (leaf_subject, leaf_issuer) = subject_and_issuer(&leaf.cert_pem);
+
+        assert!(root_subject.contains("Local Authority Root"), "{root_subject}");
+        assert_eq!(root_subject, root_issuer, "the root is self-signed");
+        assert!(
+            intermediate_subject.contains("Local Authority Intermediate"),
+            "{intermediate_subject}"
+        );
+        assert_eq!(
+            intermediate_issuer, root_subject,
+            "the intermediate must be issued by the root"
+        );
+        assert!(
+            leaf_subject.contains("chain.example.test"),
+            "{leaf_subject}"
+        );
+        assert_eq!(
+            leaf_issuer, intermediate_subject,
+            "the leaf must be issued by the intermediate"
+        );
+
+        // 🌊 And the served chain is leaf + intermediate, with the root left out.
+        assert_eq!(leaf.cert_pem.matches("BEGIN CERTIFICATE").count(), 2);
+        assert_eq!(
+            subject_and_issuer(&leaf.cert_pem).1,
+            intermediate_subject,
+            "the second certificate of the chain is the intermediate"
+        );
+    }
+
+    /// 🩹 Deleting the intermediate re-signs it from the root that is still
+    /// there, so client trust survives what would otherwise look like a lost
+    /// authority.
+    #[tokio::test]
+    async fn a_missing_intermediate_is_resigned_by_the_same_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let authority = InternalCa::new(directory.path());
+        let original_root = authority.root_certificate_pem().await.unwrap();
+        let original_intermediate = std::fs::read_to_string(
+            directory
+                .path()
+                .join("pki/authorities/local/intermediate.crt"),
+        )
+        .unwrap();
+        drop(authority);
+
+        std::fs::remove_file(
+            directory
+                .path()
+                .join("pki/authorities/local/intermediate.crt"),
+        )
+        .unwrap();
+        std::fs::remove_file(
+            directory
+                .path()
+                .join("pki/authorities/local/intermediate.key"),
+        )
+        .unwrap();
+
+        let reloaded = InternalCa::new(directory.path());
+        assert_eq!(
+            reloaded.root_certificate_pem().await.unwrap(),
+            original_root,
+            "the trust anchor must survive"
+        );
+        let reissued_intermediate = std::fs::read_to_string(
+            directory
+                .path()
+                .join("pki/authorities/local/intermediate.crt"),
+        )
+        .unwrap();
+        assert_ne!(
+            reissued_intermediate, original_intermediate,
+            "the intermediate must actually have been re-signed"
+        );
+        assert_eq!(
+            subject_and_issuer(&reissued_intermediate).1,
+            subject_and_issuer(&original_root).0,
+            "the replacement must still chain to the same root"
         );
     }
 
@@ -313,10 +679,8 @@ mod tests {
         assert!(authority.get_or_issue("foo.*.bar").await.is_err());
         assert!(authority.get_or_issue("*.").await.is_err());
         assert!(
-            !directory
-                .path()
-                .join("internal/certificates/___escape.json")
-                .exists()
+            !directory.path().join("certificates").exists(),
+            "a refused domain must not touch the store"
         );
     }
 
@@ -355,6 +719,13 @@ mod tests {
             names.iter().any(|name| name == "*.sandbox.localhost"),
             "the leaf must carry the wildcard SAN: {names:?}"
         );
+        assert!(
+            directory
+                .path()
+                .join("certificates/local/wildcard_.sandbox.localhost")
+                .is_dir(),
+            "the leaf must be filed under Caddy's spelling of the wildcard"
+        );
     }
 
     #[tokio::test]
@@ -364,15 +735,31 @@ mod tests {
         authority.root_certificate_pem().await.unwrap();
         drop(authority);
 
-        let authority_path = directory.path().join("internal/authority.json");
-        let mut data: AuthorityData =
-            serde_json::from_slice(&std::fs::read(&authority_path).unwrap()).unwrap();
-        data.key_pem = KeyPair::generate().unwrap().serialize_pem();
+        let key_path = directory.path().join("pki/authorities/local/root.key");
         crate::secure_file::write_private_file(
-            &authority_path,
-            &serde_json::to_vec_pretty(&data).unwrap(),
+            &key_path,
+            KeyPair::generate().unwrap().serialize_pem().as_bytes(),
         )
         .unwrap();
+
+        let reloaded = InternalCa::new(directory.path());
+        assert!(matches!(
+            reloaded.root_certificate_pem().await,
+            Err(InternalCaError::InvalidAuthority(_))
+        ));
+    }
+
+    /// 🚫 A root with no key is a damaged store, not one to re-mint: replacing
+    /// it would withdraw the authority every client trusts, and only the
+    /// operator can decide to re-trust a new one.
+    #[tokio::test]
+    async fn a_half_written_root_is_refused_rather_than_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let authority = InternalCa::new(directory.path());
+        authority.root_certificate_pem().await.unwrap();
+        drop(authority);
+
+        std::fs::remove_file(directory.path().join("pki/authorities/local/root.key")).unwrap();
 
         let reloaded = InternalCa::new(directory.path());
         assert!(matches!(
@@ -390,11 +777,13 @@ mod tests {
         let authority = InternalCa::new(directory.path());
         authority.root_certificate_pem().await.unwrap();
 
-        let mode = std::fs::metadata(directory.path().join("internal/authority.json"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600);
+        for name in ["root.key", "intermediate.key", "root.crt", "intermediate.crt"] {
+            let mode = std::fs::metadata(directory.path().join("pki/authorities/local").join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{name}");
+        }
     }
 }

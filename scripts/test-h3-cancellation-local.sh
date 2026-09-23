@@ -252,9 +252,9 @@ if [[ "${ready}" != "true" ]]; then
     log "❌ Pingclair did not become ready over local HTTP/3."
     exit 1
 fi
-if [[ ! -f "${run_dir}/tls/internal/authority.json" ]] \
-    || [[ ! -f "${run_dir}/tls/internal/root.crt" ]] \
-    || [[ ! -f "${run_dir}/tls/internal/certificates/h3_local.json" ]]; then
+if [[ ! -f "${run_dir}/tls/pki/authorities/local/root.crt" ]] \
+    || [[ ! -f "${run_dir}/tls/pki/authorities/local/root.key" ]] \
+    || [[ ! -f "${run_dir}/tls/certificates/local/${host_name}/${host_name}.crt" ]]; then
     log "❌ Internal CA material was not persisted before H3 readiness."
     exit 1
 fi

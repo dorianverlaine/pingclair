@@ -6,9 +6,20 @@
 //! 💾 Handles the persistent storage and lifecycle of TLS certificates.
 //! Supports disk-based persistence with an in-memory readout cache for high performance.
 //!
-//! **Structure:**
-//! - Metadata + PEMs are stored as JSON files on disk.
-//! - Filenames are derived from the primary domain (sanitized).
+//! **Two on-disk shapes, because two kinds of store use this.**
+//!
+//! 🏠 A local authority's leaves follow Caddy:
+//! `certificates/local/<site>/<site>.{crt,key,json}`. The chain is a file that a
+//! `.crt` walker finds, the key is a file of its own, and the metadata is not
+//! secret — so a backup, an expiry report or an audit written against a Caddy
+//! tree reads this one the same way (#169, #173).
+//!
+//! 🧾 The public-ACME store still writes one `<site>.json` in the store root,
+//! holding the PEMs and the metadata together. That is a known divergence rather
+//! than an oversight: Caddy files an ACME certificate under
+//! `certificates/<issuer-directory>/…`, and which directory that is depends on
+//! which CA issued it — a naming question the `acme_ca` configuration item
+//! (#143) owns, not this change.
 
 use crate::acme::Certificate;
 use std::collections::HashMap;
@@ -29,17 +40,104 @@ pub enum CertStoreError {
 
     #[error("⚠️ Invalid Format: {0}")]
     Invalid(String),
+
+    /// 🚫 Two different sites must never be filed in one place.
+    ///
+    /// Caddy spells a wildcard's directory `wildcard_.example.com`, and a host
+    /// name may legally contain an underscore, so a site configured as
+    /// `*.example.com` and one configured as `wildcard_.example.com` both map to
+    /// that directory. Writing both leaves one site presenting the other's
+    /// certificate, which is a data-loss shape rather than a naming preference —
+    /// so the second one is refused and the operator is told which two names
+    /// collided.
+    #[error(
+        "🚫 Certificate storage collision: {requested} would be filed where {held_by} already \
+         is ({directory})"
+    )]
+    Collision {
+        directory: String,
+        held_by: String,
+        requested: String,
+    },
 }
 
-// MARK: - Data Structures
+// MARK: - On-disk shapes
 
-/// Internal serializable representation of a certificate on disk.
+/// 🗂️ How a store turns a certificate into files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Layout {
+    /// 🧾 One `<site>.json` in the store directory, holding chain, key and
+    /// metadata together. Used by the public-ACME store.
+    Flat,
+
+    /// 🏠 One directory per site, holding `<site>.crt`, `<site>.key` and
+    /// `<site>.json`. Used by the local authority.
+    SiteDirectories,
+}
+
+/// 🌐 The name Caddy files a site's directory and files under.
+///
+/// 📌 `*.example.com` becomes `wildcard_.example.com`. That spelling is measured
+/// rather than guessed — `caddy` 2.11.4 files a site configured as
+/// `*.wildcard.test` under `certificates/local/wildcard_.wildcard.test/`, and
+/// Caddy's source spells the substitution `"wildcard_" + name[1:]`. Every other
+/// name is used verbatim.
+///
+/// 🎯 Using the name verbatim is the point. The rule this replaces replaced
+/// every `.` with `_`, which is not reversible: `example.com` and `example_com`
+/// produced the same filename, so two sites shared one certificate file with
+/// nothing to say which had won (E-5).
+fn site_directory_name(domain: &str) -> String {
+    match domain.strip_prefix('*') {
+        Some(rest) => format!("wildcard_{rest}"),
+        None => domain.to_string(),
+    }
+}
+
+impl Layout {
+    /// 🏷️ The on-disk name a certificate's primary domain maps to.
+    fn key_for(self, primary_domain: &str) -> String {
+        match self {
+            Self::Flat => primary_domain.replace('.', "_"),
+            Self::SiteDirectories => site_directory_name(primary_domain),
+        }
+    }
+}
+
+// MARK: - Record formats
+
+/// 🧾 The single file a flat store writes for one certificate.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct CertificateData {
+struct FlatRecord {
     cert_pem: String,
     key_pem: String,
     domains: Vec<String>,
     expires_at: i64,
+}
+
+/// 🏷️ What `certificates/local/<site>/<site>.json` holds.
+///
+/// 🔐 Nothing secret. The chain lives in the sibling `.crt` and the key in the
+/// sibling `.key`, which is the whole purpose of the three-file shape: an
+/// operator can copy, diff or publish this file without handling the private
+/// key at the same time. So the private key is **not** serialized here — that
+/// was #173's open question, and the answer is Caddy's own: its metadata file
+/// carries the subject names and nothing else.
+///
+/// 🌐 The field names are Caddy's, so a reader written for a Caddy tree finds
+/// what it expects. `issuer_data` records which ACME account issued a
+/// certificate; a local authority has no account, so it is always `null` —
+/// written rather than omitted because Caddy's file has the key and a reader
+/// that looks for it should find it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SiteMetadata {
+    /// 🌐 Every name the chain covers; the first is the one the directory is
+    /// named after.
+    sans: Vec<String>,
+
+    /// 🔗 Always `null` for a local authority, which has no ACME account.
+    #[serde(default)]
+    issuer_data: Option<serde_json::Value>,
 }
 
 // MARK: - Certificate Store
@@ -48,6 +146,9 @@ struct CertificateData {
 pub struct CertStore {
     /// Root directory for persistence.
     path: PathBuf,
+
+    /// 🗂️ Which files one certificate occupies here.
+    layout: Layout,
 
     /// Write-through cache of loaded certificates.
     /// Key: Domain name (each SAN entry points to the cert).
@@ -62,13 +163,37 @@ pub struct CertStore {
 impl CertStore {
     /// Creates a new `CertStore` backed by the specified directory.
     pub fn new(path: impl AsRef<Path>) -> Self {
-        Self::with_renewal_window(path, crate::acme::DEFAULT_RENEWAL_WINDOW_RATIO)
+        Self::flat(path, crate::acme::DEFAULT_RENEWAL_WINDOW_RATIO)
     }
 
     /// 🔄 As [`Self::new`], with an explicit renewal window.
     pub fn with_renewal_window(path: impl AsRef<Path>, renewal_window_ratio: f64) -> Self {
+        Self::flat(path, renewal_window_ratio)
+    }
+
+    /// 🏠 A store that files each certificate the way Caddy files a local one.
+    ///
+    /// 📌 The renewal window is the default rather than a parameter because this
+    /// shape is only ever the local authority's, and a local authority issues
+    /// its own certificates with a lifetime it chooses — an operator's
+    /// `renewal_window_ratio` is about the public CA's certificates.
+    pub fn site_directories(path: impl AsRef<Path>) -> Self {
+        Self::with_layout(
+            path,
+            crate::acme::DEFAULT_RENEWAL_WINDOW_RATIO,
+            Layout::SiteDirectories,
+        )
+    }
+
+    /// 🧾 A store that writes one `<site>.json` per certificate.
+    fn flat(path: impl AsRef<Path>, renewal_window_ratio: f64) -> Self {
+        Self::with_layout(path, renewal_window_ratio, Layout::Flat)
+    }
+
+    fn with_layout(path: impl AsRef<Path>, renewal_window_ratio: f64, layout: Layout) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
+            layout,
             cache: Arc::new(RwLock::new(HashMap::new())),
             renewal_window_ratio,
         }
@@ -109,48 +234,19 @@ impl CertStore {
         Ok(())
     }
 
-    /// Loads all JSON certificate files from the storage directory into memory.
+    /// Loads every certificate the store directory holds into memory.
     async fn load_all(&self) -> Result<(), CertStoreError> {
-        let mut entries = tokio::fs::read_dir(&self.path).await?;
+        let loaded = match self.layout {
+            Layout::Flat => self.load_flat().await?,
+            Layout::SiteDirectories => self.load_site_directories().await?,
+        };
+
+        let count = loaded.len();
         let mut cache = self.cache.write().await;
-        let mut count = 0;
-
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false) {
-                // 📄 The persistent challenge journal lives in the store root
-                // but is not a certificate bundle; loading it as one would
-                // emit a misleading "corrupt cert" warning on every start.
-                if path.file_name().and_then(|name| name.to_str()) == Some("acme-challenges.json") {
-                    continue;
-                }
-                // Try processing the file
-                match tokio::fs::read_to_string(&path).await {
-                    Ok(content) => {
-                        match serde_json::from_str::<CertificateData>(&content) {
-                            Ok(data) => {
-                                let cert = Certificate {
-                                    cert_pem: data.cert_pem,
-                                    key_pem: data.key_pem,
-                                    domains: data.domains.clone(),
-                                    expires_at: data.expires_at,
-                                };
-
-                                // Map all domains in the cert to this entry
-                                for domain in &cert.domains {
-                                    cache.insert(domain.clone(), cert.clone());
-                                }
-                                count += 1;
-                            }
-                            Err(e) => {
-                                tracing::warn!("⚠️ Skipping corrupt cert file {:?}: {}", path, e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("⚠️ Failed to read cert file {:?}: {}", path, e);
-                    }
-                }
+        for certificate in loaded {
+            // Map all domains in the cert to this entry
+            for domain in &certificate.domains {
+                cache.insert(domain.clone(), certificate.clone());
             }
         }
 
@@ -160,6 +256,94 @@ impl CertStore {
         Ok(())
     }
 
+    /// 📚 Loads every `<site>.json` a flat store holds.
+    ///
+    /// A file that will not parse is reported and skipped, not fatal: one
+    /// unreadable certificate must not stop the process from serving the rest.
+    async fn load_flat(&self) -> Result<Vec<Certificate>, CertStoreError> {
+        let mut loaded = Vec::new();
+        let mut entries = tokio::fs::read_dir(&self.path).await?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path
+                .extension()
+                .map(|extension| extension != "json")
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            // 📄 The persistent challenge journal lives in the store root but is
+            // not a certificate bundle; loading it as one would emit a
+            // misleading "corrupt cert" warning on every start.
+            if path.file_name().and_then(|name| name.to_str()) == Some("acme-challenges.json") {
+                continue;
+            }
+
+            let contents = match tokio::fs::read_to_string(&path).await {
+                Ok(contents) => contents,
+                Err(error) => {
+                    tracing::warn!("⚠️ Failed to read cert file {:?}: {}", path, error);
+                    continue;
+                }
+            };
+            match serde_json::from_str::<FlatRecord>(&contents) {
+                Ok(record) => loaded.push(Certificate {
+                    cert_pem: record.cert_pem,
+                    key_pem: record.key_pem,
+                    domains: record.domains,
+                    expires_at: record.expires_at,
+                }),
+                Err(error) => {
+                    tracing::warn!("⚠️ Skipping corrupt cert file {:?}: {}", path, error);
+                }
+            }
+        }
+
+        Ok(loaded)
+    }
+
+    /// 📚 Loads every site directory a `certificates/local/` store holds.
+    ///
+    /// 🛡️ A site whose chain and key do not belong together is skipped rather
+    /// than loaded. The three files are written one at a time, so a crash
+    /// between two of the writes can leave a mismatched pair on disk — and a
+    /// server presenting it cannot complete a handshake. Skipping it re-issues
+    /// the site on the next request, which for a local authority costs one
+    /// signature; the same check also covers an operator who replaced a `.crt`
+    /// by hand and did not replace its `.key`.
+    async fn load_site_directories(&self) -> Result<Vec<Certificate>, CertStoreError> {
+        let mut loaded = Vec::new();
+        let mut entries = tokio::fs::read_dir(&self.path).await?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let directory = entry.path();
+            if !entry.file_type().await.map(|kind| kind.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let Some(stem) = directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+
+            match read_site_certificate(&directory, &stem).await {
+                Ok(certificate) => loaded.push(certificate),
+                Err(error) => {
+                    tracing::warn!(
+                        "⚠️ Skipping unusable certificate in {:?}: {}",
+                        directory,
+                        error
+                    );
+                }
+            }
+        }
+
+        Ok(loaded)
+    }
+
     /// Persists a certificate to disk and updates the cache.
     ///
     /// The filename is derived from the primary (first) domain in the list.
@@ -167,37 +351,18 @@ impl CertStore {
         let primary_domain = cert
             .domains
             .first()
-            .ok_or_else(|| CertStoreError::Invalid("Certificate has no domains".to_string()))?;
+            .ok_or_else(|| CertStoreError::Invalid("Certificate has no domains".to_string()))?
+            .clone();
 
         tracing::debug!("💾 Persisting certificate for {}", primary_domain);
+        self.refuse_collision(&primary_domain).await?;
 
-        // 1. Prepare Data
-        let data = CertificateData {
-            cert_pem: cert.cert_pem.clone(),
-            key_pem: cert.key_pem.clone(),
-            domains: cert.domains.clone(),
-            expires_at: cert.expires_at,
-        };
+        match self.layout {
+            Layout::Flat => self.store_flat(cert, &primary_domain).await?,
+            Layout::SiteDirectories => self.store_site_directory(cert, &primary_domain).await?,
+        }
 
-        let json = serde_json::to_string_pretty(&data)
-            .map_err(|e| CertStoreError::Invalid(e.to_string()))?;
-
-        // 2. Write to Disk
-        let safe_filename = primary_domain.replace('.', "_");
-        let file_path = self.path.join(format!("{safe_filename}.json"));
-
-        let private_file_path = file_path.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::secure_file::write_private_file(&private_file_path, json.as_bytes())
-        })
-        .await
-        .map_err(|error| {
-            CertStoreError::Io(std::io::Error::other(format!(
-                "certificate writer failed: {error}"
-            )))
-        })??;
-
-        // 3. Update Cache
+        // Update Cache
         let mut cache = self.cache.write().await;
         for domain in &cert.domains {
             cache.insert(domain.clone(), cert.clone());
@@ -205,6 +370,88 @@ impl CertStore {
 
         tracing::info!("✅ Certificate stored successfully: {}", primary_domain);
         Ok(())
+    }
+
+    /// 🚫 Refuses a certificate whose on-disk name another site already holds.
+    ///
+    /// Checked against the cache rather than the directory so that a stale file
+    /// left by an interrupted write cannot block a legitimate re-issue, and so
+    /// that the answer is the same before and after the write completes.
+    async fn refuse_collision(&self, primary_domain: &str) -> Result<(), CertStoreError> {
+        let key = self.layout.key_for(primary_domain);
+        let cache = self.cache.read().await;
+
+        let held_by = cache
+            .values()
+            .filter_map(|certificate| certificate.domains.first())
+            .find(|other| {
+                other.as_str() != primary_domain && self.layout.key_for(other) == key
+            });
+
+        match held_by {
+            Some(other) => Err(CertStoreError::Collision {
+                directory: key,
+                held_by: other.clone(),
+                requested: primary_domain.to_string(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// 🧾 Writes the one file a flat store uses.
+    async fn store_flat(
+        &self,
+        cert: &Certificate,
+        primary_domain: &str,
+    ) -> Result<(), CertStoreError> {
+        let record = FlatRecord {
+            cert_pem: cert.cert_pem.clone(),
+            key_pem: cert.key_pem.clone(),
+            domains: cert.domains.clone(),
+            expires_at: cert.expires_at,
+        };
+        let json = serde_json::to_string_pretty(&record)
+            .map_err(|error| CertStoreError::Invalid(error.to_string()))?;
+
+        let path = self
+            .path
+            .join(format!("{}.json", self.layout.key_for(primary_domain)));
+        write_private_files(vec![(path, json.into_bytes())]).await
+    }
+
+    /// 🏠 Writes `<site>/<site>.crt`, `<site>.key` and `<site>.json`.
+    ///
+    /// 📌 The three files are written with the metadata last, but that ordering
+    /// buys no atomicity across files — only [`write_private_files`] is atomic,
+    /// and only per file. What makes a torn write safe is the pair check in
+    /// [`load_site_directories`], which refuses to load a chain and a key that
+    /// disagree.
+    async fn store_site_directory(
+        &self,
+        cert: &Certificate,
+        primary_domain: &str,
+    ) -> Result<(), CertStoreError> {
+        let stem = site_directory_name(primary_domain);
+        let directory = self.path.join(&stem);
+        let metadata = SiteMetadata {
+            sans: cert.domains.clone(),
+            issuer_data: None,
+        };
+        let json = serde_json::to_string_pretty(&metadata)
+            .map_err(|error| CertStoreError::Invalid(error.to_string()))?;
+
+        write_private_files(vec![
+            (
+                directory.join(format!("{stem}.key")),
+                cert.key_pem.clone().into_bytes(),
+            ),
+            (
+                directory.join(format!("{stem}.crt")),
+                cert.cert_pem.clone().into_bytes(),
+            ),
+            (directory.join(format!("{stem}.json")), json.into_bytes()),
+        ])
+        .await
     }
 
     /// Retrieves a certificate from the in-memory cache.
@@ -263,17 +510,27 @@ impl CertStore {
         let mut cache = self.cache.write().await;
 
         if let Some(cert) = cache.get(domain).cloned() {
-            // 1. Delete File
             if let Some(primary) = cert.domains.first() {
-                let safe_filename = primary.replace('.', "_");
-                let file_path = self.path.join(format!("{safe_filename}.json"));
-
-                if file_path.exists() {
-                    tokio::fs::remove_file(&file_path).await?;
+                let key = self.layout.key_for(primary);
+                match self.layout {
+                    Layout::Flat => {
+                        let file_path = self.path.join(format!("{key}.json"));
+                        if file_path.exists() {
+                            tokio::fs::remove_file(&file_path).await?;
+                        }
+                    }
+                    // 🧹 The whole directory goes, so no `.crt` or `.key` is
+                    // left behind for a walker to find without its siblings.
+                    Layout::SiteDirectories => {
+                        let directory = self.path.join(&key);
+                        if directory.exists() {
+                            tokio::fs::remove_dir_all(&directory).await?;
+                        }
+                    }
                 }
             }
 
-            // 2. Clear Cache Entries
+            // Clear Cache Entries
             for d in &cert.domains {
                 cache.remove(d);
             }
@@ -285,6 +542,105 @@ impl CertStore {
 
         Ok(())
     }
+}
+
+// MARK: - Reading stored files
+
+/// 📜 Reads a site's three files back into one certificate.
+///
+/// 🛡️ The chain and the key are checked against each other before either is
+/// trusted: the files are separate, so nothing but this check stops a torn write
+/// or a hand-replaced `.crt` from producing a certificate that cannot complete a
+/// handshake.
+///
+/// ⏰ The expiry is read off the chain rather than off the metadata, so the
+/// served certificate and the stored expiry cannot drift apart — which is what
+/// makes it safe for an operator to replace a `.crt` and `.key` by hand, the
+/// workflow this layout exists to support.
+async fn read_site_certificate(directory: &Path, stem: &str) -> Result<Certificate, CertStoreError> {
+    let cert_pem = tokio::fs::read_to_string(directory.join(format!("{stem}.crt"))).await?;
+    let key_pem = tokio::fs::read_to_string(directory.join(format!("{stem}.key"))).await?;
+    let metadata = tokio::fs::read_to_string(directory.join(format!("{stem}.json"))).await?;
+
+    let facts = read_leaf(&cert_pem)?;
+    if facts.public_key != read_key_public_key(&key_pem)? {
+        return Err(CertStoreError::Invalid(format!(
+            "{stem}.crt and {stem}.key hold different keys"
+        )));
+    }
+
+    let metadata: SiteMetadata = serde_json::from_str(&metadata).map_err(|error| {
+        CertStoreError::Invalid(format!("{stem}.json is not certificate metadata: {error}"))
+    })?;
+    if metadata.sans.is_empty() {
+        return Err(CertStoreError::Invalid(format!(
+            "{stem}.json names no domains"
+        )));
+    }
+
+    Ok(Certificate {
+        cert_pem,
+        key_pem,
+        domains: metadata.sans,
+        expires_at: facts.expires_at,
+    })
+}
+
+/// 📜 The facts the store needs from the leaf end of a PEM chain.
+struct LeafFacts {
+    /// ⏰ When the leaf stops being valid, in Unix epoch seconds.
+    expires_at: i64,
+
+    /// 🔑 The leaf's public key, for checking the key file belongs to it.
+    public_key: Vec<u8>,
+}
+
+/// 📜 Reads the first certificate of a PEM chain.
+fn read_leaf(cert_pem: &str) -> Result<LeafFacts, CertStoreError> {
+    use x509_parser::prelude::{FromDer, X509Certificate};
+
+    let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes()).map_err(|error| {
+        CertStoreError::Invalid(format!("certificate chain is not PEM: {error}"))
+    })?;
+    let (_, certificate) = X509Certificate::from_der(&pem.contents).map_err(|error| {
+        CertStoreError::Invalid(format!("certificate chain is not X.509: {error}"))
+    })?;
+
+    Ok(LeafFacts {
+        expires_at: certificate.validity().not_after.timestamp(),
+        public_key: certificate.public_key().raw.to_vec(),
+    })
+}
+
+/// 🔑 Reads the public key out of a PEM private key.
+fn read_key_public_key(key_pem: &str) -> Result<Vec<u8>, CertStoreError> {
+    use rcgen::PublicKeyData;
+
+    let key = rcgen::KeyPair::from_pem(key_pem)
+        .map_err(|error| CertStoreError::Invalid(format!("private key is not PEM: {error}")))?;
+    Ok(key.subject_public_key_info())
+}
+
+// MARK: - Writing
+
+/// 🔒 Writes each file through the private-material writer, off the reactor.
+///
+/// 🔁 One spawn for the whole set rather than one per file: these are written
+/// together, and a single blocking task keeps them in order on one thread.
+async fn write_private_files(files: Vec<(PathBuf, Vec<u8>)>) -> Result<(), CertStoreError> {
+    tokio::task::spawn_blocking(move || {
+        for (path, contents) in files {
+            crate::secure_file::write_private_file(&path, &contents)?;
+        }
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .map_err(|error| {
+        CertStoreError::Io(std::io::Error::other(format!(
+            "certificate writer failed: {error}"
+        )))
+    })?
+    .map_err(CertStoreError::Io)
 }
 
 /// 🃏 The wildcard key that would cover `domain`, if one can exist.
@@ -304,6 +660,20 @@ fn wildcard_covering(domain: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🧪 A real self-signed certificate and its matching key.
+    ///
+    /// The store parses and cross-checks everything it loads, so a test that
+    /// stands in for a stored certificate needs a genuine pair rather than
+    /// placeholder strings.
+    fn self_signed(domain: &str) -> (String, String) {
+        use rcgen::{CertificateParams, KeyPair};
+
+        let key = KeyPair::generate().unwrap();
+        let params = CertificateParams::new(vec![domain.to_string()]).unwrap();
+        let certificate = params.self_signed(&key).unwrap();
+        (certificate.pem(), key.serialize_pem())
+    }
 
     /// 🃏 A wildcard leaf answers for the one label under it, and for nothing
     /// that a TLS client would not accept it for.
@@ -375,5 +745,155 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    /// 🌐 The three-file shape, end to end.
+    ///
+    /// It is asserted as a whole tree rather than file by file, because the
+    /// shape is the deliverable: `certificates/local/<site>/<site>.{crt,key,json}`
+    /// is what a Caddy-shaped backup or audit tool walks for.
+    #[tokio::test]
+    async fn a_site_directory_holds_the_three_files_caddy_names() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = CertStore::site_directories(temp_dir.path());
+        store.init().await.expect("Init failed");
+
+        let (cert_pem, key_pem) = self_signed("stored_sandbox.test");
+        let cert = Certificate {
+            cert_pem: cert_pem.clone(),
+            key_pem: key_pem.clone(),
+            domains: vec!["stored_sandbox.test".into()],
+            expires_at: 1234567890,
+        };
+        store.store(&cert).await.expect("Store failed");
+
+        let directory = temp_dir.path().join("stored_sandbox.test");
+        let mut found: Vec<String> = std::fs::read_dir(&directory)
+            .expect("the site directory must exist")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                "stored_sandbox.test.crt",
+                "stored_sandbox.test.json",
+                "stored_sandbox.test.key",
+            ]
+        );
+
+        // 🔐 The metadata must not carry the private key: the whole reason the
+        // three files are separate is that this one is not secret.
+        let metadata =
+            std::fs::read_to_string(directory.join("stored_sandbox.test.json")).unwrap();
+        assert!(
+            !metadata.contains("PRIVATE KEY"),
+            "the metadata file must hold no private key: {metadata}"
+        );
+        assert!(metadata.contains(r#""sans""#), "Caddy's field name: {metadata}");
+
+        // 🔁 And the pair survives a reload with the expiry read off the chain.
+        let reloaded = CertStore::site_directories(temp_dir.path());
+        reloaded.init().await.expect("Re-init failed");
+        let restored = reloaded
+            .get("stored_sandbox.test")
+            .await
+            .expect("the stored certificate must hydrate");
+        assert_eq!(restored.cert_pem, cert_pem);
+        assert_eq!(restored.key_pem, key_pem);
+        assert_eq!(restored.domains, vec!["stored_sandbox.test".to_string()]);
+        assert_ne!(
+            restored.expires_at, 1234567890,
+            "the expiry comes from the certificate, not from the metadata"
+        );
+    }
+
+    /// 🚫 A chain and a key that do not belong together are refused, not served.
+    ///
+    /// Two sites can be left in this state by a crash between the writes, and
+    /// one site reaches it whenever an operator replaces a `.crt` without its
+    /// `.key`. Loading it would hand a mismatched pair to the TLS layer, so the
+    /// store skips it and the site is re-issued instead.
+    #[tokio::test]
+    async fn a_mismatched_chain_and_key_are_not_loaded() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = CertStore::site_directories(temp_dir.path());
+        store.init().await.expect("Init failed");
+
+        let (cert_pem, _) = self_signed("mixed.test");
+        let (_, other_key) = self_signed("other.test");
+        let cert = Certificate {
+            cert_pem,
+            key_pem: other_key,
+            domains: vec!["mixed.test".into()],
+            expires_at: 1234567890,
+        };
+        store.store(&cert).await.expect("Store failed");
+
+        let reloaded = CertStore::site_directories(temp_dir.path());
+        reloaded.init().await.expect("Re-init failed");
+        assert!(
+            reloaded.get("mixed.test").await.is_none(),
+            "a chain whose key does not match it must not be loaded"
+        );
+    }
+
+    /// 🚫 Two sites that would share one directory are refused, and the message
+    /// says which two names collided.
+    ///
+    /// Caddy spells `*.example.com` as `wildcard_.example.com`, and an
+    /// underscore is legal in a host name — `rustls-pki-types` documents its
+    /// validation as "RFC1035, but with underscores allowed" — so a site
+    /// configured as `wildcard_.example.com` maps to the same directory. Filing
+    /// both would leave one site presenting the other's certificate.
+    #[tokio::test]
+    async fn a_wildcard_and_a_lookalike_hostname_may_not_share_a_directory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = CertStore::site_directories(temp_dir.path());
+        store.init().await.expect("Init failed");
+
+        let (cert_pem, key_pem) = self_signed("*.example.com");
+        store
+            .store(&Certificate {
+                cert_pem: cert_pem.clone(),
+                key_pem: key_pem.clone(),
+                domains: vec!["*.example.com".into()],
+                expires_at: 1234567890,
+            })
+            .await
+            .expect("the wildcard itself stores");
+
+        let error = store
+            .store(&Certificate {
+                cert_pem,
+                key_pem,
+                domains: vec!["wildcard_.example.com".into()],
+                expires_at: 1234567890,
+            })
+            .await
+            .expect_err("a collision must be refused");
+
+        let message = format!("{error}");
+        assert!(message.contains("wildcard_.example.com"), "{message}");
+        assert!(message.contains("*.example.com"), "{message}");
+    }
+
+    /// 🏷️ The old `.`-to-`_` substitution produced one filename for two
+    /// hostnames; Caddy's naming does not, and this pins that it has not
+    /// quietly come back for the names that motivated the change.
+    #[test]
+    fn a_site_directory_name_keeps_the_hostname_and_spells_wildcards_like_caddy() {
+        assert_eq!(site_directory_name("example.com"), "example.com");
+        assert_eq!(site_directory_name("example_com"), "example_com");
+        assert_ne!(
+            site_directory_name("example.com"),
+            site_directory_name("example_com"),
+            "two hostnames must not share one directory"
+        );
+        assert_eq!(
+            site_directory_name("*.wildcard.test"),
+            "wildcard_.wildcard.test"
+        );
     }
 }

@@ -70,7 +70,7 @@ pub(crate) fn admin_request(
 /// root CA copied under `/usr/local/share/ca-certificates` (hence sudo) and
 /// `update-ca-certificates`; macOS uses the `security` tool.
 pub(crate) fn trust_internal_ca(trust: bool) -> anyhow::Result<()> {
-    let root = tls_store_dir().join("internal/root.crt");
+    let root = tls_store_dir().join("pki/authorities/local/root.crt");
     if !root.is_file() {
         anyhow::bail!(
             "❌ No internal CA root at {} (start a localhost site first)",

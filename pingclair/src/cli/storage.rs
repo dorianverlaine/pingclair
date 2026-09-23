@@ -7,11 +7,20 @@
 //! two halves agree on where the archive root is. They did not: export wrote
 //! every entry under a `pingclair/` directory and import unpacked straight into
 //! the store root, so a round trip put the store one level below itself. The
-//! server looks in `<store>/internal`, found nothing at
-//! `<store>/pingclair/internal`, and quietly minted a fresh internal CA — so the
-//! restore that was supposed to preserve every client's trust silently broke it.
+//! server found nothing where its authority should be and quietly minted a
+//! fresh internal CA — so the restore that was supposed to preserve every
+//! client's trust silently broke it.
 //!
 //! They live together here so the next change to either has the other in view.
+//!
+//! 🧪 An import unpacks into a staging directory and only moves into the store
+//! once the archive is known to be one this build reads. That was not needed
+//! while the two servers had no top-level name in common, because a refused
+//! archive was inert — it unpacked, nothing looked at it, and the refusal was
+//! the whole story. The local authority moved to Caddy's layout, so both
+//! servers now write `pki/` and `certificates/`, and a refused archive would
+//! otherwise leave a tree this server reads while telling the operator it had
+//! refused it.
 
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -22,34 +31,41 @@ use std::path::{Component, Path, PathBuf};
 /// writes it any more.
 const LEGACY_PREFIX: &str = "pingclair";
 
-/// 🏷️ Top-level names a store **this** build reads lives under.
+/// 🧪 Where an import unpacks before it knows whether the archive is ours.
 ///
-/// `internal` is the local authority (`pingclair-tls/src/internal_ca.rs`),
-/// `acme` the ACME account store, and `acme-challenges.json` the challenge
+/// 📌 A leading dot and no `.json` anywhere inside it, so nothing that walks
+/// the store — the certificate loaders, the export — can mistake a
+/// half-finished import for store contents.
+const STAGING_DIRECTORY: &str = ".import-staging";
+
+/// 🏷️ Top-level names a store **this** build writes and Caddy's does not.
+///
+/// `acme` is the ACME account store and `acme-challenges.json` the challenge
 /// journal every start creates. Together they are what makes an archive
 /// recogniseable as ours rather than merely well-formed tar.
 ///
-/// 📌 `certificates` is deliberately **not** in this list even though a store
-/// can contain it: `caddy storage export` writes `certificates/<host>/…` too,
-/// so accepting it would make the check below unable to tell the two apart —
-/// which is the whole defect it exists to catch.
-const OURS: [&str; 3] = ["internal", "acme", "acme-challenges.json"];
+/// 📌 `pki` and `certificates` are deliberately **not** in this list. Both
+/// servers write them now, with the same names inside, so seeing either says
+/// nothing about which server produced an archive. Calling them ours would make
+/// every Caddy export importable; calling them Caddy's would make this build's
+/// own export unimportable.
+const OURS: [&str; 2] = ["acme", "acme-challenges.json"];
 
 /// 🏷️ Top-level names only a **Caddy** store export carries.
 ///
 /// Each was read off a real `caddy storage export` tarball, and each is absent
-/// from this workspace's source: `pki/authorities/local/` is Caddy's PKI
-/// layout, `instance.uuid` and `last_clean.json` are Caddy's own bookkeeping.
-/// Nothing here writes any of them, so seeing one means the archive came from
-/// the other server.
-const THEIRS: [&str; 3] = ["pki", "instance.uuid", "last_clean.json"];
+/// from this workspace's source: `instance.uuid` and `last_clean.json` are
+/// Caddy's own bookkeeping. Nothing here writes either, so seeing one means the
+/// archive came from the other server.
+const THEIRS: [&str; 2] = ["instance.uuid", "last_clean.json"];
 
 /// 🏷️ Which server's store an archive turned out to hold.
 #[derive(Debug, PartialEq, Eq)]
 enum ArchiveKind {
     /// Holds something this build reads.
     Ours,
-    /// Holds a Caddy store, which this build never looks at.
+    /// Holds a Caddy store. Told apart by Caddy's own bookkeeping files rather
+    /// than by `pki/`, which both servers write.
     Caddy,
     /// Holds nothing either server's store layout uses.
     Unrecognised,
@@ -64,8 +80,9 @@ fn classify(entries: &[PathBuf]) -> ArchiveKind {
         })
     };
     let names: Vec<String> = entries.iter().filter_map(top_level).collect();
-    // 🔁 Ours wins when both appear, because a Caddy tree imported once and
-    // re-exported from here is a store this build reads.
+    // 🔁 Ours wins when both appear, because both appearing means this store
+    // has served here — a Caddy tree unpacked beside it, or a backup taken
+    // after one was — and what it holds is what this build reads.
     if names.iter().any(|name| OURS.contains(&name.as_str())) {
         return ArchiveKind::Ours;
     }
@@ -110,7 +127,11 @@ pub(crate) fn export_store<W: Write>(dir: &Path, writer: W) -> anyhow::Result<W>
 /// the imported one. Every client that trusted the old root stopped trusting
 /// this server, and nothing in the operator's logs said why — for a
 /// disaster-recovery path, worse than a refusal.
+///
+/// 🧪 Nothing reaches the store until that decision is made. See
+/// [`STAGING_DIRECTORY`] for why the unpack can no longer happen in place.
 pub(crate) fn import_store<R: Read>(dir: &Path, reader: R) -> anyhow::Result<()> {
+    let staging = Staging::new(dir)?;
     let mut archive = tar::Archive::new(reader);
     let entries = archive
         .entries()
@@ -134,7 +155,7 @@ pub(crate) fn import_store<R: Read>(dir: &Path, reader: R) -> anyhow::Result<()>
             continue;
         }
 
-        let target = dir.join(&relative);
+        let target = staging.path().join(&relative);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| anyhow::anyhow!("❌ Import failed: {error}"))?;
@@ -146,22 +167,90 @@ pub(crate) fn import_store<R: Read>(dir: &Path, reader: R) -> anyhow::Result<()>
     }
 
     match classify(&written) {
-        ArchiveKind::Ours => Ok(()),
+        ArchiveKind::Ours => commit_staged_store(staging.path(), dir),
         ArchiveKind::Caddy => Err(anyhow::anyhow!(
-            "❌ Import refused: this is a Caddy store export, not a Pingclair one. \
-             Caddy keeps its local authority under pki/authorities/ and its \
-             certificates under certificates/<host>/; this build reads neither, so \
-             importing it would leave the server to mint a fresh CA while every \
-             client kept trusting the old root. Export from a Pingclair store \
-             (`pingclair storage-export`) and import that instead."
+            "❌ Import refused: this is a Caddy store export, not a Pingclair one, \
+             and `storage import` restores only stores this build wrote. A Caddy \
+             store can be served from as it stands — point PINGCLAIR_TLS_STORE at \
+             the directory, or copy it in — because the two layouts now agree. What \
+             this command will not do is half-apply it: certificates outside \
+             certificates/local/ are not read, so a site whose certificate came \
+             from a public CA is re-issued on first use, and that counts against \
+             that CA's rate limits."
         )),
         ArchiveKind::Unrecognised => Err(anyhow::anyhow!(
             "❌ Import refused: the archive contains nothing this build reads. \
-             A Pingclair store holds internal/ (the local authority), acme/ (the \
-             ACME account) and acme-challenges.json (the challenge journal); this \
-             archive has none of them."
+             A Pingclair store holds pki/authorities/local/ (the local authority), \
+             certificates/local/ (its leaves), acme/ (the ACME account) and \
+             acme-challenges.json (the challenge journal); this archive has none \
+             of them."
         )),
     }
+}
+
+/// 🧪 The directory an import unpacks into, removed however the import ends.
+struct Staging(PathBuf);
+
+impl Staging {
+    /// 🏗️ Empties any staging left by an interrupted run, then creates it.
+    fn new(dir: &Path) -> anyhow::Result<Self> {
+        let path = dir.join(STAGING_DIRECTORY);
+        if path.exists() {
+            std::fs::remove_dir_all(&path)
+                .map_err(|error| anyhow::anyhow!("❌ Import failed: {error}"))?;
+        }
+        std::fs::create_dir_all(&path)
+            .map_err(|error| anyhow::anyhow!("❌ Import failed: {error}"))?;
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Staging {
+    /// 🧹 A refused import, a bad entry and a commit that failed all leave the
+    /// store as they found it, because the only thing this removes is the
+    /// directory the import itself created.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// 📂 Moves everything the staging directory holds into the store.
+///
+/// 🛡️ File by file rather than one top-level directory at a time: `fs::rename`
+/// of a directory onto an existing one fails, and re-importing into a store
+/// that already has a `pki/` tree is the ordinary case. Each move is a rename
+/// within one filesystem, so no file is ever half-copied.
+fn commit_staged_store(staging: &Path, dir: &Path) -> anyhow::Result<()> {
+    let mut stack = vec![staging.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = std::fs::read_dir(&current)
+            .map_err(|error| anyhow::anyhow!("❌ Import failed: {error}"))?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(staging)
+                .expect("staged entries are below the staging directory");
+            let target = dir.join(relative);
+
+            if path.is_dir() {
+                std::fs::create_dir_all(&target)
+                    .map_err(|error| anyhow::anyhow!("❌ Import failed: {error}"))?;
+                stack.push(path);
+                continue;
+            }
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| anyhow::anyhow!("❌ Import failed: {error}"))?;
+            }
+            std::fs::rename(&path, &target)
+                .map_err(|error| anyhow::anyhow!("❌ Import failed: {error}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// 🛡️ The path an entry may be written to, or `None` if it must not be written.
@@ -213,14 +302,32 @@ mod tests {
         found
     }
 
+    /// 🧪 Asserts a refused import left the store exactly as it found it.
+    ///
+    /// 📌 The staging directory is checked separately because [`tree`] lists
+    /// files, and a staging directory that was never cleaned up would be an
+    /// empty one — the failure this is here to catch would pass unnoticed.
+    fn assert_untouched(dir: &Path) {
+        assert!(
+            tree(dir).is_empty(),
+            "a refused import must leave no files, found {:?}",
+            tree(dir)
+        );
+        assert!(
+            !dir.join(STAGING_DIRECTORY).exists(),
+            "the staging directory must be removed whatever the outcome"
+        );
+    }
+
     fn populated_store() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        write(&dir.path().join("internal/root.crt"), "ROOTCRT");
-        write(&dir.path().join("internal/root.key"), "ROOTKEY");
+        write(&dir.path().join("pki/authorities/local/root.crt"), "ROOTCRT");
+        write(&dir.path().join("pki/authorities/local/root.key"), "ROOTKEY");
         write(
-            &dir.path().join("certs/example.com/example.com.crt"),
+            &dir.path().join("certificates/local/example.com/example.com.crt"),
             "LEAF",
         );
+        write(&dir.path().join("acme-challenges.json"), "{}");
         dir
     }
 
@@ -247,7 +354,8 @@ mod tests {
             "the restored store is not the store that was exported"
         );
         assert_eq!(
-            std::fs::read_to_string(destination.path().join("internal/root.key")).unwrap(),
+            std::fs::read_to_string(destination.path().join("pki/authorities/local/root.key"))
+                .unwrap(),
             "ROOTKEY"
         );
     }
@@ -300,14 +408,22 @@ mod tests {
         archive
     }
 
-    /// 🚫 A Caddy store export must be refused, not silently unpacked.
+    /// 🚫 A Caddy store export must be refused, and must leave the store alone.
     ///
-    /// 🤡 The previous version printed `✅ Store imported into …` and exited 0
-    /// for this exact archive. Nothing was restored that the server reads, the
-    /// next request minted a fresh internal CA beside the imported `pki/` tree,
-    /// and every client that trusted the old root stopped trusting this server.
-    /// The archive names here are the ones a real `caddy storage export`
-    /// produces (`verify/repro/E/caddy-export.tar` in the audit).
+    /// 🤡 The version before this one printed `✅ Store imported into …` and
+    /// exited 0 for this exact archive. Nothing was restored that the server
+    /// reads, the next request minted a fresh internal CA beside the imported
+    /// `pki/` tree, and every client that trusted the old root stopped trusting
+    /// this server. The archive names here are the ones a real
+    /// `caddy storage export` produces (`verify/repro/E/caddy-export.tar` in
+    /// the audit).
+    ///
+    /// 🛡️ The empty-store assertion is the part that had to be added rather
+    /// than adjusted. While the two servers had no top-level name in common,
+    /// unpacking this archive first and refusing it afterwards was harmless —
+    /// nothing read what landed. Now that both write `pki/` and
+    /// `certificates/`, leaving it unpacked would hand the server a foreign
+    /// authority while the operator was told the import had been refused.
     #[test]
     fn a_caddy_store_export_is_refused() {
         let source = tempfile::tempdir().unwrap();
@@ -342,10 +458,7 @@ mod tests {
             !message.contains("Import failed"),
             "the archive unpacked fine; the refusal is about its contents: {message}"
         );
-        assert!(
-            !destination.path().join("internal").exists(),
-            "no `internal/` tree may appear next to an imported foreign layout"
-        );
+        assert_untouched(destination.path());
     }
 
     /// 🚫 An archive holding nothing either layout uses is refused too — the
@@ -365,6 +478,7 @@ mod tests {
             format!("{error}").contains("nothing this build reads"),
             "got {error}"
         );
+        assert_untouched(destination.path());
     }
 
     /// 📌 A store that has been served from carries the challenge journal, even
@@ -409,6 +523,7 @@ mod tests {
                 .exists(),
             "the entry was written outside the store"
         );
+        assert_untouched(destination.path());
     }
 
     /// 🛡️ …and so is an absolute one, which is the other way out.

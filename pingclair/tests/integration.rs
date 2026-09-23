@@ -5675,7 +5675,7 @@ async fn test_pingclairfile_wildcard_internal_tls_serves_subdomains() {
         "server failed to start with a wildcard internal certificate"
     );
 
-    let root_path = server._temp_dir.path().join("tls/internal/root.crt");
+    let root_path = server._temp_dir.path().join("tls/pki/authorities/local/root.crt");
     let root = reqwest::Certificate::from_pem(&std::fs::read(&root_path).unwrap()).unwrap();
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -5714,12 +5714,18 @@ async fn test_pingclairfile_internal_tls_serves_trusted_h1_and_h2() {
         "server failed to start with internal TLS"
     );
 
-    let root_path = server._temp_dir.path().join("tls/internal/root.crt");
-    let authority_path = server._temp_dir.path().join("tls/internal/authority.json");
+    let root_path = server
+        ._temp_dir
+        .path()
+        .join("tls/pki/authorities/local/root.crt");
+    let authority_key_path = server
+        ._temp_dir
+        .path()
+        .join("tls/pki/authorities/local/root.key");
     let leaf_path = server
         ._temp_dir
         .path()
-        .join("tls/internal/certificates/portfolio_test.json");
+        .join("tls/certificates/local/portfolio.test/portfolio.test.crt");
     let root = reqwest::Certificate::from_pem(&std::fs::read(&root_path).unwrap()).unwrap();
     let base_builder = || {
         reqwest::Client::builder()
@@ -5746,7 +5752,7 @@ async fn test_pingclairfile_internal_tls_serves_trusted_h1_and_h2() {
     assert_eq!(h2_response.version(), reqwest::Version::HTTP_2);
     assert_eq!(h2_response.text().await.unwrap(), "internal-ok");
 
-    assert!(authority_path.is_file());
+    assert!(authority_key_path.is_file());
     assert!(leaf_path.is_file());
     assert_eq!(
         std::fs::read_to_string(root_path)
@@ -5800,13 +5806,13 @@ async fn test_configured_storage_path_holds_the_store() {
     // before the server ran, so finding them is the store having moved rather
     // than a directory having been created.
     assert!(
-        configured.join("internal/authority.json").is_file(),
+        configured.join("pki/authorities/local/root.key").is_file(),
         "the configured store must hold the internal authority, looked in {}",
         configured.display()
     );
     assert!(
         configured
-            .join("internal/certificates/stored_sandbox_test.json")
+            .join("certificates/local/stored.sandbox.test/stored.sandbox.test.crt")
             .is_file(),
         "the issued leaf must be persisted under the configured store"
     );
@@ -5816,7 +5822,7 @@ async fn test_configured_storage_path_holds_the_store() {
     // of a directory being writable.
     let from_environment = server._temp_dir.path().join("tls");
     assert!(
-        !from_environment.join("internal").exists(),
+        !from_environment.join("pki").exists(),
         "the store followed $PINGCLAIR_TLS_STORE instead of the configuration: {}",
         from_environment.display()
     );
@@ -5851,7 +5857,7 @@ async fn test_hostname_tls_site_derives_https_and_http_companion() {
     );
 
     // 🔐 The derived HTTPS listener serves the site with the internal CA.
-    let root_path = server._temp_dir.path().join("tls/internal/root.crt");
+    let root_path = server._temp_dir.path().join("tls/pki/authorities/local/root.crt");
     let root = reqwest::Certificate::from_pem(&std::fs::read(&root_path).unwrap()).unwrap();
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -6082,7 +6088,7 @@ async fn test_mixed_scheme_site_keeps_http_plain_and_https_automatic() {
         "the HTTPS half did not start with its automatic internal certificate"
     );
 
-    let root_path = server._temp_dir.path().join("tls/internal/root.crt");
+    let root_path = server._temp_dir.path().join("tls/pki/authorities/local/root.crt");
     let root = reqwest::Certificate::from_pem(&std::fs::read(root_path).unwrap()).unwrap();
     let tls_client = reqwest::Client::builder()
         .no_proxy()
@@ -7147,8 +7153,9 @@ fn test_cli_surface_commands() {
 
     let tls = tempfile::tempdir().unwrap();
     let store = tls.path().join("store");
-    std::fs::create_dir_all(store.join("internal")).unwrap();
-    std::fs::write(store.join("internal/root.crt"), "fake-root").unwrap();
+    std::fs::create_dir_all(store.join("pki/authorities/local")).unwrap();
+    std::fs::write(store.join("pki/authorities/local/root.crt"), "fake-root").unwrap();
+    std::fs::write(store.join("acme-challenges.json"), "{}").unwrap();
     let out = tls.path().join("store.tar");
     let export = Command::new(bin)
         .args(["storage-export", "-o", out.to_str().unwrap()])
@@ -7189,11 +7196,11 @@ fn test_cli_surface_commands() {
     // 🤡 This assertion used to read `pingclair/internal/root.crt`, pinning the
     // defect it was written over: export prefixed every entry with `pingclair/`
     // and import unpacked into the store root, so a round trip nested the store
-    // inside itself. The server looks in `<store>/internal`, so the restore
+    // inside itself. The server looked in the wrong place, so the restore
     // reported success and left nothing where anything reads — and the next start
     // minted a fresh internal CA, breaking every client that trusted the old one.
     assert!(
-        store2.join("internal/root.crt").is_file(),
+        store2.join("pki/authorities/local/root.crt").is_file(),
         "the imported store must be usable where the server looks for it"
     );
     assert!(
@@ -8253,7 +8260,7 @@ async fn fetch_ordered_response(server: &mut TestServer) -> (reqwest::StatusCode
         server.wait_until_tls_ready("example.com").await,
         "server failed to start"
     );
-    let root_path = server._temp_dir.path().join("tls/internal/root.crt");
+    let root_path = server._temp_dir.path().join("tls/pki/authorities/local/root.crt");
     let root = reqwest::Certificate::from_pem(&std::fs::read(&root_path).unwrap()).unwrap();
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -10497,8 +10504,9 @@ fn storage_commands_are_nested_and_read_the_config() {
     )
     .unwrap();
     // 🗂️ A store holding one file this build reads, enough to export.
-    std::fs::create_dir_all(store.join("internal")).unwrap();
-    std::fs::write(store.join("internal/root.crt"), "ROOTCRT").unwrap();
+    std::fs::create_dir_all(store.join("pki/authorities/local")).unwrap();
+    std::fs::write(store.join("pki/authorities/local/root.crt"), "ROOTCRT").unwrap();
+    std::fs::write(store.join("acme-challenges.json"), "{}").unwrap();
 
     let tarball = directory.path().join("out.tar");
     let run = |args: &[&str]| {
@@ -10524,7 +10532,7 @@ fn storage_commands_are_nested_and_read_the_config() {
 
     // 🎯 …and importing it back lands in the store the *configuration* names,
     // not in the environment's default.
-    std::fs::remove_file(store.join("internal/root.crt")).unwrap();
+    std::fs::remove_file(store.join("pki/authorities/local/root.crt")).unwrap();
     let imported = run(&[
         "storage",
         "import",
@@ -10535,12 +10543,12 @@ fn storage_commands_are_nested_and_read_the_config() {
     ]);
     assert!(imported.status.success());
     assert_eq!(
-        std::fs::read_to_string(store.join("internal/root.crt")).unwrap(),
+        std::fs::read_to_string(store.join("pki/authorities/local/root.crt")).unwrap(),
         "ROOTCRT"
     );
 
     // 🔁 The flat spellings still work, with `--config` and without.
-    std::fs::remove_file(store.join("internal/root.crt")).unwrap();
+    std::fs::remove_file(store.join("pki/authorities/local/root.crt")).unwrap();
     assert!(
         run(&[
             "storage-import",
@@ -10552,7 +10560,7 @@ fn storage_commands_are_nested_and_read_the_config() {
         .status
         .success()
     );
-    assert!(store.join("internal/root.crt").exists());
+    assert!(store.join("pki/authorities/local/root.crt").exists());
 }
 
 /// 🎨 `fmt` is a check as well as a formatter, and its flags are Caddy's.
@@ -14751,7 +14759,7 @@ async fn test_tls_on_an_unusual_port_still_reports_https() {
         "this test is only meaningful on a port the heuristic did not special-case"
     );
 
-    let root_path = server._temp_dir.path().join("tls/internal/root.crt");
+    let root_path = server._temp_dir.path().join("tls/pki/authorities/local/root.crt");
     let root = reqwest::Certificate::from_pem(&std::fs::read(&root_path).unwrap()).unwrap();
 
     // 🎯 Both versions, and HTTP/1.1 is the one that matters. An HTTP/2 request
