@@ -92,12 +92,24 @@ pub(crate) enum Commands {
     /// Print the environment as seen by Pingclair, like `caddy environ`
     Environ,
 
-    /// List compiled-in modules and features, like `caddy list-modules`
+    /// List the installed modules, like `caddy list-modules`
     #[command(name = "list-modules")]
     ListModules {
-        /// Output as JSON
+        /// Print modules in JSON format
         #[arg(long)]
         json: bool,
+        /// Print version information
+        #[arg(long)]
+        versions: bool,
+        /// Print package paths
+        #[arg(long)]
+        packages: bool,
+        /// Skip printing standard modules
+        ///
+        /// Everything in this build is standard, so this prints nothing; the
+        /// flag exists so a script written for `caddy list-modules` runs.
+        #[arg(short = 's', long)]
+        skip_standard: bool,
     },
 
     /// Print build information, like `caddy build-info`

@@ -20,6 +20,33 @@ use crate::cli::service::manage_system_service;
 use crate::paths::{resolve_config_path, tls_store_dir};
 use crate::run::run_server;
 
+/// 🧩 One capability this build implements, and the Caddy module that provides
+/// it in a standard build.
+///
+/// The two are different strings, and that is the whole point of the pair: the
+/// listing exists so a capability check can intersect it with
+/// `caddy list-modules`, and printing this project's own directive name under
+/// `http.handlers.` made that intersection wrong in both directions. It
+/// reported `http.handlers.basic_auth` — a module no Caddy build registers,
+/// where Caddy spells the same capability `http.handlers.authentication` — and
+/// it reported `http.handlers.cors`, which no Caddy build has at all.
+struct HandlerModule {
+    /// The Caddyfile directive the adapter accepts. The tie test below checks
+    /// this against the adapter, which is what keeps the table from drifting
+    /// away from the binary.
+    directive: &'static str,
+    /// The `http.handlers.*` module providing this capability in Caddy
+    /// v2.11.4's standard build, read off `caddy list-modules`; `None` when
+    /// no Caddy build has one, which makes this an extension of ours.
+    ///
+    /// 📌 Several directives map to one module on purpose. `uri` and
+    /// `try_files` compile to a rewrite, and `handle`, `handle_path` and
+    /// `route` compile to a subroute — so the listing deduplicates rather than
+    /// repeating `rewrite` four times. A repeat is what put `templates` in the
+    /// list twice.
+    caddy_module: Option<&'static str>,
+}
+
 /// 🧩 The directives `list-modules` reports as request handlers.
 ///
 /// This is a curated subset rather than the whole directive table, because the
@@ -29,29 +56,148 @@ use crate::run::run_server;
 /// [`every_listed_module_is_an_implemented_directive`]: every name here must
 /// be one the adapter actually turns into configuration.
 ///
-/// 🤡 Why the test exists: until 2026-08-07 this list was hand-written with no
+/// 🤡 Why that test exists: until 2026-08-07 this list was hand-written with no
 /// tie to the adapter, and it advertised `try_files` for weeks while a
 /// Pingclairfile containing `try_files` was refused. Someone checking what
 /// their binary supports would have been told yes by the tool and no by the
 /// parser, which is worse than either answer alone.
-const HANDLER_MODULES: [&str; 16] = [
-    "access_control",
-    "basic_auth",
-    "cors",
-    "file_server",
-    "handle",
-    "handle_path",
-    "header",
-    "rate_limit",
-    "redir",
-    "respond",
-    "reverse_proxy",
-    "rewrite",
-    "route",
-    "templates",
-    "try_files",
-    "uri",
+const HANDLER_MODULES: [HandlerModule; 16] = [
+    HandlerModule {
+        directive: "access_control",
+        // 🧩 An extension: Caddy has no access-control handler module.
+        caddy_module: None,
+    },
+    HandlerModule {
+        directive: "basic_auth",
+        caddy_module: Some("authentication"),
+    },
+    HandlerModule {
+        directive: "cors",
+        caddy_module: None,
+    },
+    HandlerModule {
+        directive: "file_server",
+        caddy_module: Some("file_server"),
+    },
+    HandlerModule {
+        directive: "handle",
+        caddy_module: Some("subroute"),
+    },
+    HandlerModule {
+        directive: "handle_path",
+        caddy_module: Some("subroute"),
+    },
+    HandlerModule {
+        directive: "header",
+        caddy_module: Some("headers"),
+    },
+    HandlerModule {
+        directive: "rate_limit",
+        caddy_module: None,
+    },
+    HandlerModule {
+        directive: "redir",
+        // 🔁 `redir` and `respond` both compile to a static response upstream.
+        caddy_module: Some("static_response"),
+    },
+    HandlerModule {
+        directive: "respond",
+        caddy_module: Some("static_response"),
+    },
+    HandlerModule {
+        directive: "reverse_proxy",
+        caddy_module: Some("reverse_proxy"),
+    },
+    HandlerModule {
+        directive: "rewrite",
+        caddy_module: Some("rewrite"),
+    },
+    HandlerModule {
+        directive: "route",
+        caddy_module: Some("subroute"),
+    },
+    HandlerModule {
+        directive: "templates",
+        caddy_module: Some("templates"),
+    },
+    HandlerModule {
+        directive: "try_files",
+        // 🗂️ Expands to a `file` matcher plus a rewrite, which is what it is
+        // upstream, so the module it needs is the rewrite one.
+        caddy_module: Some("rewrite"),
+    },
+    HandlerModule {
+        directive: "uri",
+        caddy_module: Some("rewrite"),
+    },
 ];
+
+/// 🧩 Capabilities this build has that are **not** `http.handlers.*` modules.
+///
+/// Each is printed under the Caddy module ID that provides it, because that is
+/// the name a capability check looks for. `internal-ca` and `acme` were printed
+/// bare before, and neither is a module ID: Caddy spells them
+/// `tls.issuance.internal` and `tls.issuance.acme`.
+const NON_HANDLER_MODULES: [&str; 4] = [
+    // 🔐 Caddy registers the TLS app itself under the bare ID `tls`.
+    "tls",
+    "tls.issuance.acme",
+    "tls.issuance.internal",
+    // 🛡️ Both servers accept the PROXY protocol through this listener wrapper.
+    "caddy.listeners.proxy_protocol",
+];
+
+/// 🚩 Facts about this build that are not modules and have no Caddy module ID.
+///
+/// They are printed under a `pingclair.features.` prefix rather than bare, so
+/// nothing in the listing can be read as a module Caddy would also have. That
+/// ambiguity is what let a capability check conclude this build was missing
+/// `encode` while it believed a nonexistent `http.handlers.cors` was present.
+const FEATURES: [&str; 3] = ["http/1.1", "http/2", "http/3"];
+
+/// 🧩 Every name `list-modules` prints, in the sorted order it prints them.
+///
+/// Built rather than written out so the three sources cannot disagree with each
+/// other, and deduplicated because several handlers share one Caddy module.
+fn module_ids() -> Vec<String> {
+    let mut ids: Vec<String> = HANDLER_MODULES
+        .iter()
+        .map(|module| match module.caddy_module {
+            Some(name) => format!("http.handlers.{name}"),
+            None => format!("pingclair.handlers.{}", module.directive),
+        })
+        .chain(NON_HANDLER_MODULES.iter().map(|name| name.to_string()))
+        .chain(FEATURES.iter().map(|name| format!("pingclair.features.{name}")))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// 🏷️ What kind of thing one printed name is, in Caddy's own vocabulary.
+///
+/// `standard` means "a module a standard build of the server has", which is the
+/// only kind this build has: nothing here is a plugin.
+fn module_type(id: &str) -> &'static str {
+    if id.starts_with("pingclair.") {
+        "pingclair"
+    } else {
+        "standard"
+    }
+}
+
+/// 📦 The build string `--versions` prints, in Caddy's `v<version>` shape.
+fn module_version() -> String {
+    format!("v{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// 📦 The package a module comes from, for `--packages`.
+///
+/// 📌 This build is one package, so every name answers the same thing. The flag
+/// exists so a script written for `caddy list-modules --packages` runs against
+/// this binary instead of dying on argument parsing — which is what it did
+/// before, with exit 2.
+const MODULE_PACKAGE: &str = "pingclair";
 
 /// ✍️ Renders parsed directives back to canonical Pingclairfile text: two
 /// spaces per block level, one directive per line, arguments re-quoted only
@@ -234,31 +380,45 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
             }
         }
 
-        Commands::ListModules { json } => {
-            let modules = HANDLER_MODULES;
-            let features = [
-                "http/1.1",
-                "http/2",
-                "http/3",
-                "tls",
-                "acme",
-                "internal-ca",
-                "admin-api",
-                "metrics",
-                "proxy-protocol",
-                "templates",
-            ];
+        Commands::ListModules {
+            json,
+            versions,
+            packages,
+            skip_standard,
+        } => {
+            let ids = module_ids();
+            // 🚫 Every module here is standard, so `--skip-standard` prints
+            // nothing — the same answer a plugin-free Caddy build gives.
+            let ids: Vec<String> = ids
+                .into_iter()
+                .filter(|id| !(skip_standard && module_type(id) == "standard"))
+                .collect();
             if json {
-                println!(
-                    "{}",
-                    serde_json::json!({ "modules": modules, "features": features })
-                );
+                // 🧭 Caddy's own JSON shape, so a parser written for it reads
+                // this output too: an array of records, one per module.
+                let records: Vec<serde_json::Value> = ids
+                    .iter()
+                    .map(|id| {
+                        serde_json::json!({
+                            "module_name": id,
+                            "module_type": module_type(id),
+                            "version": module_version(),
+                            "package_url": MODULE_PACKAGE,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::Value::Array(records));
             } else {
-                for module in modules {
-                    println!("http.handlers.{module}");
-                }
-                for feature in features {
-                    println!("{feature}");
+                for id in &ids {
+                    // 📏 One column more than the plain listing, which is the
+                    // shape Caddy's own flags produce.
+                    if versions {
+                        println!("{id} {}", module_version());
+                    } else if packages {
+                        println!("{id} {MODULE_PACKAGE}");
+                    } else {
+                        println!("{id}");
+                    }
                 }
             }
         }
@@ -870,7 +1030,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::HANDLER_MODULES;
+    use super::{FEATURES, HANDLER_MODULES, NON_HANDLER_MODULES, module_ids, module_type};
 
     /// 🎯 The check the list cannot do for itself: a module this binary tells
     /// an operator it has must be a directive the adapter accepts.
@@ -878,18 +1038,150 @@ mod tests {
     fn every_listed_module_is_an_implemented_directive() {
         for module in HANDLER_MODULES {
             assert!(
-                pingclair_config::adapter::is_implemented_directive(module),
-                "`list-modules` advertises `{module}`, but the Caddyfile adapter does not \
-                 implement it — either wire the directive up or stop listing it"
+                pingclair_config::adapter::is_implemented_directive(module.directive),
+                "`list-modules` advertises `{}`, but the Caddyfile adapter does not \
+                 implement it — either wire the directive up or stop listing it",
+                module.directive
             );
         }
     }
 
-    /// 📌 Sorted so a new handler has one obvious home in the list.
+    /// 🧩 The `http.handlers.*` names this table claims must be modules a real
+    /// Caddy build registers.
+    ///
+    /// 🤡 This is the check the old listing needed and did not have. It printed
+    /// `http.handlers.basic_auth`, `http.handlers.cors` and
+    /// `http.handlers.rate_limit` — none of which a Caddy build registers — so
+    /// a capability check run against `caddy list-modules` reported a
+    /// CORS handler the migration target could never provide and missed the
+    /// basic-auth module it already has under `authentication`.
+    ///
+    /// 📌 The reference list is Caddy v2.11.4's `http.handlers.*` output, read
+    /// off the binary on 2026-09-23 and frozen here. A name that is not in it
+    /// is either a misspelling or a module no Caddy build has; both are things
+    /// this listing must not print under Caddy's prefix.
     #[test]
-    fn the_module_list_is_sorted() {
-        let mut sorted = HANDLER_MODULES;
+    fn every_claimed_caddy_module_is_one_caddy_registers() {
+        const CADDY_HTTP_HANDLERS: [&str; 22] = [
+            "acme_server",
+            "authentication",
+            "copy_response",
+            "copy_response_headers",
+            "encode",
+            "error",
+            "file_server",
+            "headers",
+            "intercept",
+            "invoke",
+            "log_append",
+            "map",
+            "metrics",
+            "push",
+            "request_body",
+            "reverse_proxy",
+            "rewrite",
+            "static_response",
+            "subroute",
+            "templates",
+            "tracing",
+            "vars",
+        ];
+        for module in HANDLER_MODULES {
+            let Some(name) = module.caddy_module else {
+                continue;
+            };
+            assert!(
+                CADDY_HTTP_HANDLERS.contains(&name),
+                "`list-modules` would print `http.handlers.{name}`, which no Caddy build \
+                 registers — a capability check reading both listings would look for a \
+                 module that does not exist"
+            );
+        }
+
+        // 🔐 …and the same check for the names outside the handler namespace,
+        // each of which was printed bare before and matched nothing.
+        const CADDY_OTHER_MODULES: [&str; 4] = [
+            "caddy.listeners.proxy_protocol",
+            "tls",
+            "tls.issuance.acme",
+            "tls.issuance.internal",
+        ];
+        for name in NON_HANDLER_MODULES {
+            assert!(
+                CADDY_OTHER_MODULES.contains(&name),
+                "`list-modules` would print `{name}`, which Caddy v2.11.4 does not \
+                 register — a capability check reading both listings would look for a \
+                 module that does not exist"
+            );
+        }
+    }
+
+    /// 🚩 No name may be printed that Caddy could also print while meaning
+    /// something else, and none may be printed twice.
+    ///
+    /// 🤡 `templates` appeared twice — once as a handler and once as a feature
+    /// tag — because the two lists were maintained by hand and nothing compared
+    /// them.
+    #[test]
+    fn the_listing_has_no_duplicate_and_no_bare_ambiguous_name() {
+        let ids = module_ids();
+        let mut sorted = ids.clone();
         sorted.sort_unstable();
-        assert_eq!(HANDLER_MODULES, sorted, "the module list is out of order");
+        sorted.dedup();
+        assert_eq!(ids, sorted, "the listing repeats a name");
+        for id in &ids {
+            assert!(
+                id.starts_with("http.handlers.")
+                    || id.starts_with("pingclair.")
+                    || id.starts_with("tls")
+                    || id.starts_with("caddy."),
+                "`{id}` is neither a Caddy module ID nor namespaced as ours, so a reader \
+                 cannot tell it from a module Caddy would also have"
+            );
+        }
+    }
+
+    /// 📌 Sorted so a new handler has one obvious home in the table.
+    #[test]
+    fn the_module_table_is_sorted() {
+        let mut sorted: Vec<&str> = HANDLER_MODULES
+            .iter()
+            .map(|module| module.directive)
+            .collect();
+        sorted.sort_unstable();
+        let directives: Vec<&str> = HANDLER_MODULES
+            .iter()
+            .map(|module| module.directive)
+            .collect();
+        assert_eq!(directives, sorted, "the module table is out of order");
+    }
+
+    /// 🏷️ The three sources are labelled by namespace, not by a marker line,
+    /// so nothing has to know where one list ends and the next begins.
+    #[test]
+    fn every_namespace_reports_the_right_kind() {
+        for id in module_ids() {
+            let expected = if id.starts_with("pingclair.") {
+                "pingclair"
+            } else {
+                "standard"
+            };
+            assert_eq!(module_type(&id), expected, "wrong kind for `{id}`");
+        }
+        // 🚩 And the three sources are all reachable — a listing that quietly
+        // lost its feature tags would still pass the checks above.
+        let ids = module_ids();
+        assert!(
+            FEATURES
+                .iter()
+                .all(|name| ids.contains(&format!("pingclair.features.{name}"))),
+            "the feature tags are missing from the listing"
+        );
+        assert!(
+            NON_HANDLER_MODULES
+                .iter()
+                .all(|name| ids.contains(&name.to_string())),
+            "the non-handler modules are missing from the listing"
+        );
     }
 }
