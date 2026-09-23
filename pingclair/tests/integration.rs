@@ -90,6 +90,10 @@ mod graceful_shutdown;
 #[path = "integration/cookie_fold.rs"]
 mod cookie_fold;
 
+// 🍪 `lb_policy cookie` independent of cookie order and line split.
+#[path = "integration/cookie_affinity.rs"]
+mod cookie_affinity;
+
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather
 /// than against "some response arrived", so a 404 from a stale listener on the

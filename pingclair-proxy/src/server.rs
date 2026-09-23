@@ -5481,38 +5481,55 @@ pub(crate) enum HashKeySource {
 /// same backend — a hot spot that looks like a load-balancing bug and is
 /// really a configuration one.
 fn extract_hash_key(request: &RequestHeader, source: &HashKeySource) -> Option<Vec<u8>> {
-    let value = match source {
+    // 🍃 Every arm borrows from the request; the one copy is made at the end,
+    // because the balancer takes an owned key.
+    let value: &str = match source {
         HashKeySource::Header(name) => request
             .headers
             .get(name.as_str())
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string),
+            .and_then(|value| value.to_str().ok())?,
 
-        // 🍪 `Cookie` arrives as one field of `name=value` pairs. Splitting on
-        // `;` and then on the first `=` keeps values that themselves contain
-        // `=`, which base64-encoded session identifiers routinely do.
-        HashKeySource::Cookie(name) => request
-            .headers
-            .get(http::header::COOKIE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|cookies| {
-                cookies.split(';').find_map(|pair| {
-                    let (key, value) = pair.split_once('=')?;
-                    (key.trim() == name).then(|| value.trim().to_string())
-                })
-            }),
+        HashKeySource::Cookie(name) => affinity_cookie(&request.headers, name)?,
 
         HashKeySource::Query(name) => request.uri.query().and_then(|query| {
             query.split('&').find_map(|pair| {
                 let (key, value) = pair.split_once('=')?;
-                (key == name).then(|| value.to_string())
+                (key == name).then_some(value)
             })
-        }),
-    }?;
+        })?,
+    };
 
     // 🚫 A present-but-empty value is the same hot-spot problem as an absent
     // one, so it is treated the same way.
-    (!value.is_empty()).then(|| value.into_bytes())
+    (!value.is_empty()).then(|| value.as_bytes().to_vec())
+}
+
+/// 🍪 The value of cookie `name` that session affinity hashes on.
+///
+/// Every `Cookie` field line is read, not only the first: an HTTP/1.1 client
+/// may send several, and a cookie on the second line is still a cookie the
+/// client sent. Splitting each pair on its first `=` keeps values that
+/// themselves contain `=`, which base64 session identifiers routinely do.
+///
+/// 🎯 A name can appear more than once — a browser holding `sid` for
+/// `Path=/` and another `sid` for `Path=/app` sends both — and RFC 6265
+/// §4.2.2 says a server should not rely on the order they arrive in. Taking
+/// the first match did exactly that, so the same user could be pinned to a
+/// different backend depending on how their client serialized the cookies.
+/// The rule is instead order-independent: among the non-empty values, the
+/// smallest by bytes wins. Any fixed choice would do; this one borrows.
+fn affinity_cookie<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get_all(http::header::COOKIE)
+        .iter()
+        .filter_map(|line| line.to_str().ok())
+        .flat_map(|line| line.split(';'))
+        .filter_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            let value = value.trim();
+            (key.trim() == name && !value.is_empty()).then_some(value)
+        })
+        .min()
 }
 
 /// 🗄️ A read-only snapshot of the shared response store, for the admin API.
@@ -10905,6 +10922,29 @@ mod hash_key_tests {
         });
         let key = extract_hash_key(&header, &HashKeySource::Cookie("sid".into()));
         assert_eq!(key.as_deref(), Some(&b"YWJjZA=="[..]));
+    }
+
+    /// 🎯 A repeated cookie name picks the same value whatever the order, and
+    /// a cookie on a later `Cookie` line is still seen.
+    #[test]
+    fn a_repeated_cookie_name_is_resolved_independent_of_order() {
+        let forward = request(|h| h.insert_header("Cookie", "sid=beta; sid=alpha").unwrap());
+        let reverse = request(|h| h.insert_header("Cookie", "sid=alpha; sid=beta").unwrap());
+        let split = request(|h| {
+            h.append_header("Cookie", "theme=dark").unwrap();
+            h.append_header("Cookie", "sid=beta").unwrap();
+            h.append_header("Cookie", "sid=alpha").unwrap();
+        });
+        let source = HashKeySource::Cookie("sid".into());
+        let keys = [&forward, &reverse, &split].map(|header| extract_hash_key(header, &source));
+        assert_eq!(
+            keys,
+            [
+                Some(b"alpha".to_vec()),
+                Some(b"alpha".to_vec()),
+                Some(b"alpha".to_vec())
+            ]
+        );
     }
 
     #[test]

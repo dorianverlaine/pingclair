@@ -20,6 +20,17 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🍪 `lb_policy cookie` no longer depends on cookie order
+
+A browser holding two cookies with the same name, set for different paths,
+sends both, and RFC 6265 §4.2.2 says their order is not something a server
+may rely on. `lb_policy cookie sid` took the first `sid` on the first
+`Cookie` line, so the same user could be pinned to a different backend
+depending on which client they used. It now reads every `Cookie` line and,
+when the name repeats, hashes the smallest non-empty value by bytes, so the
+same set of cookies always picks the same backend. This applies to HTTP/1.1,
+HTTP/2 and HTTP/3 alike.
+
 ### 🍪 A FastCGI script reads two `Cookie` lines as two cookies
 
 An HTTP/1.1 client that sent `Cookie: a=1` and `Cookie: b=2` on separate
