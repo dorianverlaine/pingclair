@@ -6637,13 +6637,16 @@ fn test_cli_surface_commands() {
     assert!(String::from_utf8_lossy(&environ.stdout).contains("PATH="));
 
     let modules = Command::new(bin).args(["list-modules"]).output().unwrap();
-    assert!(String::from_utf8_lossy(&modules.stdout).contains("http.handlers.respond"));
+    // 🧩 Caddy registers `respond` as `static_response`, and the list now uses
+    // the names Caddy itself prints.
+    assert!(String::from_utf8_lossy(&modules.stdout).contains("http.handlers.static_response"));
     let modules_json = Command::new(bin)
         .args(["list-modules", "--json"])
         .output()
         .unwrap();
     let modules_value: serde_json::Value = serde_json::from_slice(&modules_json.stdout).unwrap();
-    assert!(modules_value["modules"].as_array().unwrap().len() >= 5);
+    // 🧩 `--json` prints the bare array `caddy list-modules --json` does.
+    assert!(modules_value.as_array().unwrap().len() >= 5);
 
     let build = Command::new(bin).args(["build-info"]).output().unwrap();
     assert!(String::from_utf8_lossy(&build.stdout).contains("pingclair"));
