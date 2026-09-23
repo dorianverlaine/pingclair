@@ -20,6 +20,14 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🌊 HTTP/3 proxy streams keep moving across empty upstream reads
+
+An upstream can produce an empty body read before more data arrives. That empty
+read previously occupied the HTTP/3 send queue and could stall a live SSE or
+other streaming response. Pingclair now skips empty chunks while preserving the
+end-of-stream signal. The H3 cancellation check also verifies continued output
+without a retry.
+
 ### 🃏 A wildcard site orders the wildcard, once
 
 A site configured as `*.example.com` now obtains one certificate for
