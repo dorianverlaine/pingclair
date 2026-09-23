@@ -1980,9 +1980,10 @@ impl H3App {
         }
 
         if !ss.headers_sent {
-            let Some((headers, fin)) = ss.pending_headers.take() else {
+            let Some((mut headers, fin)) = ss.pending_headers.take() else {
                 return;
             };
+            stamp_date(&mut headers);
             // 🛑 An error response ends the exchange while the client may
             // still be uploading. Tell it to stop sending with H3_NO_ERROR —
             // ngtcp2/curl treat a `RequestRejected` STOP_SENDING as a
@@ -2097,6 +2098,29 @@ impl H3App {
             ss.dead = true;
         }
     }
+}
+
+/// 🕰️ Gives a final response the `Date` field RFC 9110 §6.6.1 requires.
+///
+/// Every H3 response, whether a handler built it or `queue_simple_response`
+/// did, passes through `flush_stream` exactly once on its way out, so stamping
+/// it here covers static files, `respond`, redirects, error pages and proxied
+/// replies without four copies at four write sites. An upstream's own `Date`
+/// is replaced rather than kept, matching what Pingora does on H1/H2: the
+/// field describes when this server produced the message it is sending. The
+/// clock is Pingora's per-thread cache, so both transports read the same
+/// second and neither formats a date string per request. Interim (1xx)
+/// responses are left alone, as on H1/H2.
+fn stamp_date(headers: &mut Vec<quiche::h3::Header>) {
+    let informational = headers
+        .iter()
+        .any(|header| header.name() == b":status" && header.value().starts_with(b"1"));
+    if informational {
+        return;
+    }
+    headers.retain(|header| !header.name().eq_ignore_ascii_case(b"date"));
+    let date = pingora_core::protocols::http::date::get_cached_date();
+    headers.push(quiche::h3::Header::new(b"date", date.as_bytes()));
 }
 
 // MARK: - Handler task

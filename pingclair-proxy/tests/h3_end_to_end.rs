@@ -28,6 +28,10 @@ mod truncation;
 #[path = "h3_end_to_end/malformed.rs"]
 mod malformed;
 
+// 🧾 Fields and content that a status or a method requires or forbids.
+#[path = "h3_end_to_end/response_framing.rs"]
+mod response_framing;
+
 const ALPN: &[u8] = b"h3";
 
 fn self_signed_pem(names: &[&str]) -> (String, String) {

@@ -20,6 +20,14 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🕰️ HTTP/3 responses carry a `Date`
+
+HTTP/1.1 and HTTP/2 responses get `Date` from Pingora, but the HTTP/3 path
+builds its own headers and never wrote one: static files, `respond`, redirects
+and error pages went out without it, and a proxied reply kept whatever the
+upstream sent. Every final HTTP/3 response now carries this server's `Date`,
+from the same clock the other transports use, replacing an upstream's value.
+
 ### 🔀 Cache variants include every `Vary` field line
 
 The H1/H2 response cache now reads all response `Vary` lines and every request
