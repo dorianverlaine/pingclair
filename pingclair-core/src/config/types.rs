@@ -3085,7 +3085,13 @@ pub struct SecurityConfig {
     #[serde(default = "default_permissions_policy")]
     pub permissions_policy: String,
 
-    /// Strict-Transport-Security header
+    /// 🔐 The built-in `Strict-Transport-Security` policy, reachable only from
+    /// a JSON configuration.
+    ///
+    /// 📌 A Pingclairfile has no dedicated spelling and does not need one: it
+    /// writes `header Strict-Transport-Security "max-age=…"`, the same as the
+    /// format it follows. The Pingclairfile compiler leaves this whole
+    /// security policy off, so the two never meet there.
     #[serde(default)]
     pub hsts: Option<HstsConfig>,
 

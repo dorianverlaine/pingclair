@@ -98,6 +98,10 @@ mod cookie_affinity;
 #[path = "integration/forwarded_identity.rs"]
 mod forwarded_identity;
 
+// 🔐 `Strict-Transport-Security` spelled as a `header` directive.
+#[path = "integration/strict_transport.rs"]
+mod strict_transport;
+
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather
 /// than against "some response arrived", so a 404 from a stale listener on the
