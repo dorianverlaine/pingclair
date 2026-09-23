@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use super::response_pipeline::{gunzip, proxy_pingclairfile, spawn_scripted_origin};
 use super::{TestServer, no_proxy_client, origin_hits_for_two_requests};
 
 /// 🗄️ Builds a Pingclairfile whose one route proxies to `upstream` and caches
@@ -38,6 +39,54 @@ pub(super) fn cache_pingclairfile(upstream: SocketAddr, ttl: &str) -> String {
         }}
         "#
     )
+}
+
+/// 🗄️ The cache keeps origin bytes, while `encode gzip` decides each client's
+/// representation on the way out. A gzip miss must not poison an identity hit.
+#[tokio::test]
+async fn test_cached_entry_is_stored_uncompressed_and_encoded_per_client() {
+    let body = "cacheable and compressible text ".repeat(64);
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (origin, hits) = spawn_scripted_origin(response.into_bytes()).await;
+    let mut server =
+        TestServer::new_pingclairfile(&proxy_pingclairfile(origin, "cache {\n ttl 60s\n }"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let miss = client
+        .get(server.url(0, "/page"))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(miss.status(), 200);
+    assert_eq!(miss.headers().get("content-encoding").unwrap(), "gzip");
+    assert_eq!(gunzip(&miss.bytes().await.unwrap()), body);
+
+    let identity_hit = client
+        .get(server.url(0, "/page"))
+        .header("Accept-Encoding", "identity")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(identity_hit.status(), 200);
+    assert!(identity_hit.headers().get("content-encoding").is_none());
+    assert_eq!(identity_hit.text().await.unwrap(), body);
+
+    let gzip_hit = client
+        .get(server.url(0, "/page"))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gzip_hit.status(), 200);
+    assert_eq!(gzip_hit.headers().get("content-encoding").unwrap(), "gzip");
+    assert_eq!(gunzip(&gzip_hit.bytes().await.unwrap()), body);
+
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "later replies must be hits");
 }
 
 /// 🎛️ An origin whose status and caching headers are chosen by the path.

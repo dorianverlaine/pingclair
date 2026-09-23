@@ -80,61 +80,6 @@ pub(super) fn gunzip(bytes: &[u8]) -> String {
     decoded
 }
 
-/// 🗄️ A cached entry holds the origin's bytes, and compression is applied per
-/// client on the way out.
-///
-/// The failure this guards: the body was compressed before the cache saw it,
-/// while the headers were rewritten after, so the store held gzip bytes under
-/// the origin's identity headers — including a `Content-Length` describing the
-/// uncompressed body. A later client that never asked for gzip got gzip.
-#[tokio::test]
-async fn test_cached_entry_is_stored_uncompressed_and_encoded_per_client() {
-    let body = "cacheable and compressible text ".repeat(64);
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let (origin, hits) = spawn_scripted_origin(response.into_bytes()).await;
-    let mut server =
-        TestServer::new_pingclairfile(&proxy_pingclairfile(origin, "cache {\n ttl 60s\n }"));
-    assert!(server.wait_until_ready().await, "server failed to start");
-    let client = no_proxy_client();
-
-    let miss = client
-        .get(server.url(0, "/page"))
-        .header("Accept-Encoding", "gzip")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(miss.status(), 200);
-    assert_eq!(miss.headers().get("content-encoding").unwrap(), "gzip");
-    let miss_bytes = miss.bytes().await.unwrap();
-    assert_eq!(gunzip(&miss_bytes), body);
-
-    let identity_hit = client.get(server.url(0, "/page")).send().await.unwrap();
-    assert_eq!(identity_hit.status(), 200);
-    assert!(
-        identity_hit.headers().get("content-encoding").is_none(),
-        "a client that asked for no coding must not be told about one"
-    );
-    assert_eq!(identity_hit.text().await.unwrap(), body);
-
-    let gzip_hit = client
-        .get(server.url(0, "/page"))
-        .header("Accept-Encoding", "gzip")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(gzip_hit.headers().get("content-encoding").unwrap(), "gzip");
-    assert_eq!(gunzip(&gzip_hit.bytes().await.unwrap()), body);
-
-    assert_eq!(
-        hits.load(Ordering::SeqCst),
-        1,
-        "both later requests must have been cache hits"
-    );
-}
-
 /// 💡 An upstream `103 Early Hints` cannot decide how the final body is coded.
 ///
 /// The hint names a compressible type, the final response is a PNG. The
