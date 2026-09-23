@@ -90,6 +90,35 @@ async fn h3_head_of_a_file_sends_its_length_and_no_content() {
     );
 }
 
+/// 🧊 A precompressed static file says it varies by `Accept-Encoding`.
+///
+/// RFC 9110 §12.5.5: a cache that stores the gzip variant without `Vary`
+/// hands it to the next client, whatever that client accepts. H1/H2 sent the
+/// field; the H3 static path sent `content-encoding` and never `vary`.
+#[tokio::test]
+async fn h3_precompressed_file_varies_by_accept_encoding() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("app.js"), b"console.log(1)").unwrap();
+    std::fs::write(root.path().join("app.js.gz"), b"not really gzip").unwrap();
+    let server = spawn_h3_from_pingclairfile(&format!(
+        ":443 {{\n root * {}\n file_server {{\n  precompressed gzip\n }}\n}}",
+        root.path().display()
+    ))
+    .await;
+
+    let response = h3_get_with_headers(server, "/app.js", &[("accept-encoding", "gzip")])
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            response.status,
+            fields(&response, "content-encoding"),
+            fields(&response, "vary")
+        ),
+        (200, vec!["gzip"], vec!["Accept-Encoding"])
+    );
+}
+
 /// 🚫 `respond "x" 204` ends with its header: no `content-length`, no byte.
 ///
 /// Before the fix the H3 path sent `content-length: 1` and the byte, so one

@@ -20,6 +20,14 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🧊 HTTP/3 static files send `Vary: Accept-Encoding`
+
+A file served over HTTP/3 from a `precompressed` sidecar said
+`Content-Encoding: gzip` but never `Vary`, so a cache could hand the gzip copy
+to a client that never asked for it. HTTP/3 now sends `Vary` from the same
+file-server decision HTTP/1.1 and HTTP/2 use, adding to any `Vary` already
+there rather than replacing it.
+
 ### 🤐 `HEAD` gets no content over HTTP/2 and HTTP/3
 
 A `HEAD` answered by a local handler (a static file, `respond`, a redirect, an

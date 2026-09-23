@@ -3740,6 +3740,12 @@ async fn handle_request_inner(
                     if let Some(encoding) = &stream.content_encoding {
                         hdrs.insert("content-encoding", encoding.clone());
                     }
+                    // 🧊 The file server already decided whether this path's
+                    // representation depends on `Accept-Encoding`; H1/H2 reads
+                    // the same flag, so a cache keys both transports alike.
+                    if stream.vary_accept_encoding {
+                        crate::response_encoding::vary_map_on_accept_encoding(&mut hdrs);
+                    }
                     if let Some(lm) = &stream.last_modified {
                         hdrs.insert("last-modified", lm.clone());
                     }
@@ -3786,6 +3792,10 @@ async fn handle_request_inner(
                         && let Ok(value) = http::HeaderValue::from_str(enc)
                     {
                         hdrs.insert("content-encoding", value);
+                    }
+                    // 🧊 Same flag, same rule as the streamed branch above.
+                    if file.vary_accept_encoding {
+                        crate::response_encoding::vary_map_on_accept_encoding(&mut hdrs);
                     }
                     send_h3_local_response(
                         resp_tx,
@@ -3986,6 +3996,10 @@ async fn stream_h3_subrequest_response(
                 }
                 if let Some(value) = &stream.etag {
                     headers.insert("etag", value.clone());
+                }
+                // 🧊 A response-side file server negotiates encodings too.
+                if stream.vary_accept_encoding {
+                    crate::response_encoding::vary_map_on_accept_encoding(&mut headers);
                 }
                 return send_h3_local_response(
                     resp_tx,
@@ -4421,6 +4435,10 @@ async fn fastcgi_upstream(
             }
             if let Some(value) = &stream.etag {
                 local_headers.insert("etag", value.clone());
+            }
+            // 🧊 A response-side file server negotiates encodings too.
+            if stream.vary_accept_encoding {
+                crate::response_encoding::vary_map_on_accept_encoding(&mut local_headers);
             }
             let mut download_pacer = limits.download_bytes_per_sec.map(StreamPacer::new);
             return send_h3_local_response(
@@ -5760,7 +5778,7 @@ async fn send_h3_local_response(
                     headers.insert("etag", value.clone());
                 }
                 if stream.vary_accept_encoding {
-                    headers.insert("vary", http::HeaderValue::from_static("Accept-Encoding"));
+                    crate::response_encoding::vary_map_on_accept_encoding(&mut headers);
                 }
                 body = H3LocalBody::File(Box::new(stream));
             } else if let Some(replacement) = outcome.replacement {

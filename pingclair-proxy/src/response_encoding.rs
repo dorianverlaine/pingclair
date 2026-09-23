@@ -64,9 +64,8 @@ pub(crate) fn install(modules: &mut HttpModuleCtx, encoder: ResponseEncoder) -> 
 /// 📌 A list-valued field may arrive as several lines or as one line with
 /// commas; both spellings mean the same list (RFC 9110 §5.3), so every
 /// question about such a field has to read all of them.
-fn field_tokens<'a>(header: &'a ResponseHeader, name: &'a str) -> impl Iterator<Item = &'a str> {
-    header
-        .headers
+fn field_tokens<'a>(headers: &'a http::HeaderMap, name: &'a str) -> impl Iterator<Item = &'a str> {
+    headers
         .get_all(name)
         .iter()
         .filter_map(|value| value.to_str().ok())
@@ -84,14 +83,29 @@ fn field_tokens<'a>(header: &'a ResponseHeader, name: &'a str) -> impl Iterator<
 /// `Vary: *` already says no two requests share a response, so it is left
 /// alone, and a field that already names `Accept-Encoding` is not repeated.
 pub(crate) fn vary_on_accept_encoding(header: &mut ResponseHeader) -> pingora_core::Result<()> {
-    let covered = field_tokens(header, "vary")
-        .any(|token| token == "*" || token.eq_ignore_ascii_case("accept-encoding"));
-    if covered {
+    if vary_covers_accept_encoding(&header.headers) {
         return Ok(());
     }
     // 🔗 A second field line joins the existing list; no need to rebuild it.
     header.append_header("Vary", "Accept-Encoding")?;
     Ok(())
+}
+
+/// 🧊 The same rule for a bare header map, which is what the HTTP/3 path
+/// assembles its local responses in before they become an H3 header list.
+pub(crate) fn vary_map_on_accept_encoding(headers: &mut http::HeaderMap) {
+    if !vary_covers_accept_encoding(headers) {
+        headers.append(
+            http::header::VARY,
+            http::HeaderValue::from_static("Accept-Encoding"),
+        );
+    }
+}
+
+/// 🔎 Whether `Vary` already names `Accept-Encoding`, or is `*`.
+fn vary_covers_accept_encoding(headers: &http::HeaderMap) -> bool {
+    field_tokens(headers, "vary")
+        .any(|token| token == "*" || token.eq_ignore_ascii_case("accept-encoding"))
 }
 
 /// 📐 Whether this response carries a complete representation that the
@@ -120,7 +134,8 @@ pub(crate) fn is_full_representation(method: &http::Method, header: &ResponseHea
 /// archive, a payload checked against a hash — and compressing one breaks
 /// that check with no error anywhere to explain it.
 pub(crate) fn forbids_transform(header: &ResponseHeader) -> bool {
-    field_tokens(header, "cache-control").any(|token| token.eq_ignore_ascii_case("no-transform"))
+    field_tokens(&header.headers, "cache-control")
+        .any(|token| token.eq_ignore_ascii_case("no-transform"))
 }
 
 /// 🧹 Removes the fields that vouch for the origin's exact bytes.
