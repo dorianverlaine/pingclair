@@ -154,13 +154,13 @@ upgrade silently failed. Every line is now read.
 An operator pointing Caddy tooling at this server saw three answers that were
 technically true and practically misleading.
 
-`POST /load` with a Caddy document — `{"apps":…}` — was refused with `unknown
-field `apps``. That is the report of a typo in a document its author copied from
-a working Caddy installation, and it sends them looking for a misspelling
-instead of at the shape this endpoint takes. The refusal now says which schema
-this is and points at the Caddyfile spelling that works. The body is still
-refused: the two schemas are different, and reading one as the other is the
-failure the `deny_unknown_fields` attribute exists to prevent.
+`POST /load` with a Caddy document — `{"apps":…}` — was refused with a message
+about an unknown field named `apps`. That is the report of a typo in a document
+its author copied from a working Caddy installation, and it sends them looking
+for a misspelling instead of at the shape this endpoint takes. The refusal now
+says which schema this is and points at the Caddyfile spelling that works. The
+body is still refused: the two schemas are different, and reading one as the
+other is the failure the `deny_unknown_fields` attribute exists to prevent.
 
 `GET /config/apps/` says the same thing in the same terms, and any other unknown
 path names the document's real top level rather than only reporting that the
