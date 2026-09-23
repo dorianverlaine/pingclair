@@ -21,6 +21,16 @@ mod static_validators;
 #[path = "integration/cache.rs"]
 mod cache;
 
+// 🗜️ `Accept-Encoding` negotiation tests live beside this file for the same
+// reason; they reuse its `TestServer` harness.
+#[path = "integration/content_negotiation.rs"]
+mod content_negotiation;
+
+// 🔁 Which methods a response-phase retry may repeat; kept beside this file so
+// the harness here does not keep growing.
+#[path = "integration/retry_idempotency.rs"]
+mod retry_idempotency;
+
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather
 /// than against "some response arrived", so a 404 from a stale listener on the
@@ -125,6 +135,20 @@ impl TestServer {
         assert!(
             !config.contains("__PINGCLAIR_TEST_"),
             "Pingclairfile test fixture contains an unresolved placeholder"
+        );
+        // 🔌 An HTTPS site gets an automatic plaintext companion, and without
+        // `http_port` that companion claims port 80. Parallel tests then race
+        // for one port and every loser exits on the failed bind, which shows up
+        // as "server failed to start" in whatever the test was really about.
+        assert!(
+            !config_template
+                .lines()
+                .any(|line| line.trim_start().starts_with("https://"))
+                || config_template.contains("__PINGCLAIR_TEST_HTTP_PORT__")
+                || config_template.contains("auto_https off"),
+            "a Pingclairfile fixture with an HTTPS site must set \
+             `http_port __PINGCLAIR_TEST_HTTP_PORT__` (or `auto_https off`), \
+             or its plaintext companion claims port 80"
         );
 
         let mut file = std::fs::File::create(&config_path).unwrap();
@@ -4800,21 +4824,14 @@ async fn test_pingclairfile_response_buffers_hold_the_body_until_the_upstream_fi
     upstream_task.await.unwrap();
 }
 
-/// 📥 A route may raise the body limit for itself.
+/// 📥 A route's `request_body` limit belongs to that route alone.
 ///
-/// A route's `request_body { max_size … }` raises the ceiling the site set, so
-/// the uploading route accepts what the plain route refuses and the two differ
-/// by nothing but that block. `request_body` is where a Caddyfile states the
-/// ceiling — at site level for the whole site, on a route to raise it there.
+/// A site with no `request_body` has no ceiling (the format's default), so the
+/// limit an operator writes inside one `handle` must refuse that route's
+/// oversized uploads and leave every other route as unlimited as before. The
+/// two routes differ by nothing but the `request_body` block.
 #[tokio::test]
-async fn test_pingclairfile_request_body_max_size_raises_the_route_limit() {
-    // 📌 The site ceiling is stated in the configuration rather than inherited
-    // from a default: there is no default ceiling any more (a site with no
-    // `request_body` accepts what the client sends, as Caddy does), so a test
-    // of "the route may raise what the site set" has to set the site's value.
-    // `request_body { max_size … }` at site level is the Caddyfile spelling of
-    // a site ceiling; `client_max_body_size` is the JSON field behind it and is
-    // not a directive.
+async fn test_pingclairfile_request_body_max_size_limits_only_its_route() {
     let config = r#"
         {
             admin off
@@ -4824,13 +4841,9 @@ async fn test_pingclairfile_request_body_max_size_raises_the_route_limit() {
             @readiness path __PINGCLAIR_TEST_READINESS_PATH__
             respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
 
-            request_body {
-                max_size 1MB
-            }
-
             handle /upload/* {
                 request_body {
-                    max_size 8MB
+                    max_size 1MB
                 }
                 respond "uploaded" 200
             }
@@ -4841,24 +4854,24 @@ async fn test_pingclairfile_request_body_max_size_raises_the_route_limit() {
     let mut server = TestServer::new_pingclairfile(config);
     assert!(server.wait_until_ready().await, "server failed to start");
 
-    // 📏 Two mebibytes: over the one-megabyte site ceiling, under the route's
-    // eight-megabyte allowance.
+    // 📏 Two mebibytes: over the upload route's one-megabyte limit, and
+    // unremarkable anywhere that sets none.
     let body = vec![b'x'; 2 * 1024 * 1024];
 
     // 🔌 A client each, because the rejection closes its connection: a pooled
-    // socket carried over from the accepted upload would be torn down while
-    // the second request was still writing, and the test would fail for a
-    // reason that has nothing to do with the limit.
-    let raised = no_proxy_client()
-        .post(server.url(0, "/upload/thing"))
+    // socket carried over from the refused upload would be torn down while the
+    // next request was still writing, and the test would fail for a reason
+    // that has nothing to do with the limit.
+    let plain = no_proxy_client()
+        .post(server.url(0, "/plain"))
         .body(body.clone())
         .send()
         .await
         .unwrap();
     assert_eq!(
-        raised.status(),
+        plain.status(),
         200,
-        "the route raised its own limit, so this upload must be accepted"
+        "a route without `request_body` has no ceiling, so this upload must be accepted"
     );
 
     // 🚫 The rejection can reach the client two ways, and which one depends on
@@ -4866,16 +4879,16 @@ async fn test_pingclairfile_request_body_max_size_raises_the_route_limit() {
     // closes, and if it does so while the client is still writing the two
     // megabytes, the client sees the write fail before it sees the response.
     // Both are the route refusing the upload. What must never happen is 200.
-    let plain = no_proxy_client()
-        .post(server.url(0, "/plain"))
+    let limited = no_proxy_client()
+        .post(server.url(0, "/upload/thing"))
         .body(body)
         .send()
         .await;
-    match plain {
+    match limited {
         Ok(response) => assert_eq!(
             response.status(),
             413,
-            "a route without `request_body` keeps the site limit"
+            "the upload route set its own limit, so this upload must be refused"
         ),
         Err(error) => assert!(
             !error.is_timeout(),
@@ -5530,6 +5543,7 @@ async fn test_pingclairfile_wildcard_internal_tls_serves_subdomains() {
     let config = r#"
         {
             admin off
+            http_port __PINGCLAIR_TEST_HTTP_PORT__
         }
 
         https://*.sandbox.test:__PINGCLAIR_TEST_PORT__ {
@@ -5568,6 +5582,7 @@ async fn test_pingclairfile_internal_tls_serves_trusted_h1_and_h2() {
     let config = r#"
         {
             admin off
+            http_port __PINGCLAIR_TEST_HTTP_PORT__
         }
 
         https://portfolio.test:__PINGCLAIR_TEST_PORT__ {
@@ -8348,6 +8363,7 @@ async fn test_tls_handshake_sends_the_intermediate_not_just_the_leaf() {
         r#"
         {{
             admin off
+            http_port __PINGCLAIR_TEST_HTTP_PORT__
         }}
 
         https://chained.test:__PINGCLAIR_TEST_PORT__ {{
@@ -12009,6 +12025,7 @@ async fn test_default_sni_serves_clients_that_send_no_sni() {
     let with_default = r#"
         {
             admin off
+            http_port __PINGCLAIR_TEST_HTTP_PORT__
             default_sni sni.sandbox.test
         }
 
@@ -12054,6 +12071,7 @@ async fn test_default_sni_serves_clients_that_send_no_sni() {
     let without_default = r#"
         {
             admin off
+            http_port __PINGCLAIR_TEST_HTTP_PORT__
         }
 
         https://sni.sandbox.test:__PINGCLAIR_TEST_PORT__ {
@@ -12330,6 +12348,10 @@ fn mutual_tls_fixture(mode: &str) -> (TestServer, TestAuthority, TestAuthority, 
         r#"
         {{
             admin off
+            # 🔌 The automatic plaintext companion needs a port of its own. Left
+            # at the default, every fixture claims port 80, parallel tests race
+            # for it, and all but one exit on the failed bind.
+            http_port __PINGCLAIR_TEST_HTTP_PORT__
         }}
 
         https://open.test:__PINGCLAIR_TEST_PORT__ {{
@@ -14090,6 +14112,7 @@ async fn test_tls_on_an_unusual_port_still_reports_https() {
     let config = r#"
         {
             admin off
+            http_port __PINGCLAIR_TEST_HTTP_PORT__
         }
 
         https://scheme.test:__PINGCLAIR_TEST_PORT__ {
@@ -14355,3 +14378,9 @@ async fn raw_get_with_host(address: SocketAddr, target: &str, authority: &str) -
 // 🧬 Kept in a sibling file so this high-touch module does not keep growing.
 #[path = "integration/response_pipeline.rs"]
 mod response_pipeline;
+
+// MARK: - Compression gate
+
+// 🗜️ Which responses the proxy may re-encode, kept in a sibling file.
+#[path = "integration/compression_gate.rs"]
+mod compression_gate;
