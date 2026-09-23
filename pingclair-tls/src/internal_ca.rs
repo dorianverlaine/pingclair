@@ -182,7 +182,12 @@ impl InternalCa {
     /// leave the machine.
     pub async fn root_certificate_pem(&self) -> Result<String, InternalCaError> {
         let mut state = self.state.lock().await;
-        Ok(self.ensure_authority(&mut state).await?.root.cert_pem.clone())
+        Ok(self
+            .ensure_authority(&mut state)
+            .await?
+            .root
+            .cert_pem
+            .clone())
     }
 
     // MARK: - Paths
@@ -246,12 +251,8 @@ impl InternalCa {
             }
             None => {
                 let root = generate_root()?;
-                self.persist_pair(
-                    &self.root_certificate_path(),
-                    &self.root_key_path(),
-                    &root,
-                )
-                .await?;
+                self.persist_pair(&self.root_certificate_path(), &self.root_key_path(), &root)
+                    .await?;
                 tracing::info!(
                     "🏛️ Created a persistent internal root CA at {:?}",
                     self.root_certificate_path()
@@ -316,8 +317,16 @@ impl InternalCa {
                 tracing::warn!(
                     "⚠️ The internal intermediate CA is half-written ({} present, {} missing); \
                      re-signing it from the root",
-                    if has_certificate { "certificate" } else { "key" },
-                    if has_certificate { "key" } else { "certificate" },
+                    if has_certificate {
+                        "certificate"
+                    } else {
+                        "key"
+                    },
+                    if has_certificate {
+                        "key"
+                    } else {
+                        "certificate"
+                    },
                 );
                 Ok(None)
             }
@@ -488,7 +497,10 @@ fn issue_intermediate(root: &AuthorityKeyPair) -> Result<AuthorityKeyPair, Inter
 /// kilobyte per handshake that every client discards. Measured against `caddy`
 /// 2.11.4, whose `certificates/local/localhost/localhost.crt` holds exactly the
 /// leaf and the intermediate, in that order.
-fn issue_leaf(domain: &str, intermediate: &AuthorityKeyPair) -> Result<Certificate, InternalCaError> {
+fn issue_leaf(
+    domain: &str,
+    intermediate: &AuthorityKeyPair,
+) -> Result<Certificate, InternalCaError> {
     let now = SystemTime::now();
     let expires_at = now
         .checked_add(LEAF_LIFETIME)
@@ -538,7 +550,10 @@ mod tests {
 
         let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes()).unwrap();
         let (_, certificate) = X509Certificate::from_der(&pem.contents).unwrap();
-        (certificate.subject().to_string(), certificate.issuer().to_string())
+        (
+            certificate.subject().to_string(),
+            certificate.issuer().to_string(),
+        )
     }
 
     #[tokio::test]
@@ -590,7 +605,10 @@ mod tests {
         let (intermediate_subject, intermediate_issuer) = subject_and_issuer(&intermediate_pem);
         let (leaf_subject, leaf_issuer) = subject_and_issuer(&leaf.cert_pem);
 
-        assert!(root_subject.contains("Local Authority Root"), "{root_subject}");
+        assert!(
+            root_subject.contains("Local Authority Root"),
+            "{root_subject}"
+        );
         assert_eq!(root_subject, root_issuer, "the root is self-signed");
         assert!(
             intermediate_subject.contains("Local Authority Intermediate"),
@@ -777,7 +795,12 @@ mod tests {
         let authority = InternalCa::new(directory.path());
         authority.root_certificate_pem().await.unwrap();
 
-        for name in ["root.key", "intermediate.key", "root.crt", "intermediate.crt"] {
+        for name in [
+            "root.key",
+            "intermediate.key",
+            "root.crt",
+            "intermediate.crt",
+        ] {
             let mode = std::fs::metadata(directory.path().join("pki/authorities/local").join(name))
                 .unwrap()
                 .permissions()

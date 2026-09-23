@@ -318,7 +318,12 @@ impl CertStore {
 
         while let Some(entry) = entries.next_entry().await? {
             let directory = entry.path();
-            if !entry.file_type().await.map(|kind| kind.is_dir()).unwrap_or(false) {
+            if !entry
+                .file_type()
+                .await
+                .map(|kind| kind.is_dir())
+                .unwrap_or(false)
+            {
                 continue;
             }
             let Some(stem) = directory
@@ -384,9 +389,7 @@ impl CertStore {
         let held_by = cache
             .values()
             .filter_map(|certificate| certificate.domains.first())
-            .find(|other| {
-                other.as_str() != primary_domain && self.layout.key_for(other) == key
-            });
+            .find(|other| other.as_str() != primary_domain && self.layout.key_for(other) == key);
 
         match held_by {
             Some(other) => Err(CertStoreError::Collision {
@@ -557,7 +560,10 @@ impl CertStore {
 /// served certificate and the stored expiry cannot drift apart — which is what
 /// makes it safe for an operator to replace a `.crt` and `.key` by hand, the
 /// workflow this layout exists to support.
-async fn read_site_certificate(directory: &Path, stem: &str) -> Result<Certificate, CertStoreError> {
+async fn read_site_certificate(
+    directory: &Path,
+    stem: &str,
+) -> Result<Certificate, CertStoreError> {
     let cert_pem = tokio::fs::read_to_string(directory.join(format!("{stem}.crt"))).await?;
     let key_pem = tokio::fs::read_to_string(directory.join(format!("{stem}.key"))).await?;
     let metadata = tokio::fs::read_to_string(directory.join(format!("{stem}.json"))).await?;
@@ -785,13 +791,15 @@ mod tests {
 
         // 🔐 The metadata must not carry the private key: the whole reason the
         // three files are separate is that this one is not secret.
-        let metadata =
-            std::fs::read_to_string(directory.join("stored_sandbox.test.json")).unwrap();
+        let metadata = std::fs::read_to_string(directory.join("stored_sandbox.test.json")).unwrap();
         assert!(
             !metadata.contains("PRIVATE KEY"),
             "the metadata file must hold no private key: {metadata}"
         );
-        assert!(metadata.contains(r#""sans""#), "Caddy's field name: {metadata}");
+        assert!(
+            metadata.contains(r#""sans""#),
+            "Caddy's field name: {metadata}"
+        );
 
         // 🔁 And the pair survives a reload with the expiry read off the chain.
         let reloaded = CertStore::site_directories(temp_dir.path());

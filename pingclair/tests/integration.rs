@@ -5675,7 +5675,10 @@ async fn test_pingclairfile_wildcard_internal_tls_serves_subdomains() {
         "server failed to start with a wildcard internal certificate"
     );
 
-    let root_path = server._temp_dir.path().join("tls/pki/authorities/local/root.crt");
+    let root_path = server
+        ._temp_dir
+        .path()
+        .join("tls/pki/authorities/local/root.crt");
     let root = reqwest::Certificate::from_pem(&std::fs::read(&root_path).unwrap()).unwrap();
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -5857,7 +5860,10 @@ async fn test_hostname_tls_site_derives_https_and_http_companion() {
     );
 
     // 🔐 The derived HTTPS listener serves the site with the internal CA.
-    let root_path = server._temp_dir.path().join("tls/pki/authorities/local/root.crt");
+    let root_path = server
+        ._temp_dir
+        .path()
+        .join("tls/pki/authorities/local/root.crt");
     let root = reqwest::Certificate::from_pem(&std::fs::read(&root_path).unwrap()).unwrap();
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -6088,7 +6094,10 @@ async fn test_mixed_scheme_site_keeps_http_plain_and_https_automatic() {
         "the HTTPS half did not start with its automatic internal certificate"
     );
 
-    let root_path = server._temp_dir.path().join("tls/pki/authorities/local/root.crt");
+    let root_path = server
+        ._temp_dir
+        .path()
+        .join("tls/pki/authorities/local/root.crt");
     let root = reqwest::Certificate::from_pem(&std::fs::read(root_path).unwrap()).unwrap();
     let tls_client = reqwest::Client::builder()
         .no_proxy()
@@ -8260,7 +8269,10 @@ async fn fetch_ordered_response(server: &mut TestServer) -> (reqwest::StatusCode
         server.wait_until_tls_ready("example.com").await,
         "server failed to start"
     );
-    let root_path = server._temp_dir.path().join("tls/pki/authorities/local/root.crt");
+    let root_path = server
+        ._temp_dir
+        .path()
+        .join("tls/pki/authorities/local/root.crt");
     let root = reqwest::Certificate::from_pem(&std::fs::read(&root_path).unwrap()).unwrap();
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -14759,7 +14771,10 @@ async fn test_tls_on_an_unusual_port_still_reports_https() {
         "this test is only meaningful on a port the heuristic did not special-case"
     );
 
-    let root_path = server._temp_dir.path().join("tls/pki/authorities/local/root.crt");
+    let root_path = server
+        ._temp_dir
+        .path()
+        .join("tls/pki/authorities/local/root.crt");
     let root = reqwest::Certificate::from_pem(&std::fs::read(&root_path).unwrap()).unwrap();
 
     // 🎯 Both versions, and HTTP/1.1 is the one that matters. An HTTP/2 request

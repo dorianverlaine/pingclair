@@ -321,10 +321,17 @@ mod tests {
 
     fn populated_store() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        write(&dir.path().join("pki/authorities/local/root.crt"), "ROOTCRT");
-        write(&dir.path().join("pki/authorities/local/root.key"), "ROOTKEY");
         write(
-            &dir.path().join("certificates/local/example.com/example.com.crt"),
+            &dir.path().join("pki/authorities/local/root.crt"),
+            "ROOTCRT",
+        );
+        write(
+            &dir.path().join("pki/authorities/local/root.key"),
+            "ROOTKEY",
+        );
+        write(
+            &dir.path()
+                .join("certificates/local/example.com/example.com.crt"),
             "LEAF",
         );
         write(&dir.path().join("acme-challenges.json"), "{}");
