@@ -141,13 +141,19 @@ const HANDLER_MODULES: [HandlerModule; 16] = [
 /// the name a capability check looks for. `internal-ca` and `acme` were printed
 /// bare before, and neither is a module ID: Caddy spells them
 /// `tls.issuance.internal` and `tls.issuance.acme`.
-const NON_HANDLER_MODULES: [&str; 4] = [
+const NON_HANDLER_MODULES: [&str; 6] = [
     // 🔐 Caddy registers the TLS app itself under the bare ID `tls`.
     "tls",
     "tls.issuance.acme",
     "tls.issuance.internal",
     // 🛡️ Both servers accept the PROXY protocol through this listener wrapper.
     "caddy.listeners.proxy_protocol",
+    // 🗜️ The codings `encode` accepts, under Caddy's own encoder IDs. Their
+    // absence is what made the inventory deny a feature the adapter accepts:
+    // `encode gzip` ran while `list-modules` said there was no gzip encoder,
+    // and a capability check reading the listing answered "unavailable".
+    "http.encoders.gzip",
+    "http.encoders.zstd",
 ];
 
 /// 📊 The admin API modules this build implements, under Caddy's own names.
@@ -1231,8 +1237,10 @@ mod tests {
 
         // 🔐 …and the same check for the names outside the handler namespace,
         // each of which was printed bare before and matched nothing.
-        const CADDY_OTHER_MODULES: [&str; 4] = [
+        const CADDY_OTHER_MODULES: [&str; 6] = [
             "caddy.listeners.proxy_protocol",
+            "http.encoders.gzip",
+            "http.encoders.zstd",
             "tls",
             "tls.issuance.acme",
             "tls.issuance.internal",
@@ -1269,6 +1277,7 @@ mod tests {
         for id in &ids {
             assert!(
                 id.starts_with("http.handlers.")
+                    || id.starts_with("http.encoders.")
                     || id.starts_with("pingclair.")
                     || id.starts_with("tls")
                     || id.starts_with("admin.api.")

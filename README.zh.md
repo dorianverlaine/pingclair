@@ -651,6 +651,12 @@ example.com {
 請求打到真實檔案就送那個檔案，其餘一律改寫成 `/index.html`，交給前端自己路由。
 改寫會保留 query string。
 
+🚫 這裡的 `encode` 不接受 matcher。Caddy 的格式是
+`encode [<matcher>] <formats…>`，而 matcher 會被拒絕，訊息會說明原因：
+壓縮是**每台 server** 的設定，沒有地方可以記錄「只在 `/assets` 底下用 gzip」。
+替代寫法只有一行——把那些路徑搬進自己的 site 區塊——而拒絕訊息就是這樣說的，
+而不是把 matcher 當成未知的編碼，那樣會讓 operator 去找一個不存在的拼字。
+
 🏷️ 靜態檔案的 `ETag` 由**檔案大小與奈秒級 mtime** 推導
 （`"<size hex>-<mtime nanos hex>"`；有編碼的回應會加上 `-gzip` 之類的後綴），
 若站台有 sidecar 檔則以它為準。Caddy 送的是內容的短雜湊，所以在兩者之間搬移

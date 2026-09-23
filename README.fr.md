@@ -720,6 +720,14 @@ Une requête vers un vrai fichier obtient ce fichier ; tout le reste est réécr
 vers `/index.html` pour que l'application fasse son propre routage. La query
 string survit à la réécriture.
 
+🚫 `encode` n'accepte pas de matcher ici. La forme documentée par Caddy est
+`encode [<matcher>] <formats…>`, et un matcher est refusé avec un message qui
+dit pourquoi : la compression est configurée **par serveur**, il n'y a donc nulle
+part où noter « gzip, mais seulement sous `/assets` ». Le contournement tient en
+une ligne — déplacer ces chemins dans leur propre bloc de site — et le refus le
+dit, plutôt que de rapporter le matcher comme un codage inconnu, ce qui
+enverrait chercher une faute d'orthographe.
+
 🏷️ L'`ETag` d'un fichier statique dérive de **sa taille et de son mtime en
 nanosecondes** — `"<taille hex>-<mtime ns hex>"`, avec `-gzip` et compagnie
 ajouté pour une représentation codée — ou d'un fichier sidecar quand le site en

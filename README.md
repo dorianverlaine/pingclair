@@ -722,6 +722,14 @@ A request for a real file gets that file; anything else is rewritten to
 `/index.html` so the application can route it. The query string survives the
 rewrite.
 
+🚫 `encode` takes no matcher here. Caddy's documented form is
+`encode [<matcher>] <formats…>`, and a matcher is refused with a message saying
+why: compression is configured **per server**, so there is nowhere to record
+"gzip, but only under `/assets`". The workaround is one line — move those paths
+into their own site block — and the refusal says so rather than reporting the
+matcher as an unknown coding, which would send the operator hunting for a
+spelling mistake.
+
 🏷️ A static file's `ETag` is derived from **its size and its modification time
 in nanoseconds** — `"<size hex>-<mtime nanos hex>"`, with `-gzip` and friends
 appended for a coded representation — or from a sidecar file when the site keeps
