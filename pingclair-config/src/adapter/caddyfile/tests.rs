@@ -2063,6 +2063,79 @@ mod fail_closed_tests {
         );
     }
 
+    /// 🌐 Caddy 2.11 reads the first `trusted_proxies` token as the name of an
+    /// ip_source module, so `static` must be stripped and its ranges kept.
+    ///
+    /// 🤡 Before this, `static` was read as an address and the whole
+    /// configuration was refused with "invalid IP or CIDR `static`" — a
+    /// message pointing at the one token a migrating operator copied from the
+    /// current documentation, and the workaround (dropping `static`) produced
+    /// a file Caddy 2.11 itself refuses. There was no spelling that loaded on
+    /// both.
+    #[test]
+    fn trusted_proxies_accepts_the_static_module() {
+        let config = crate::compile(
+            "{\n    servers {\n        trusted_proxies static 12.34.56.0/24 2001:db8::/32\n    }\n}\n\
+             example.com {\n    listen :80 proxy_protocol\n    respond \"x\"\n}",
+        )
+        .expect("`trusted_proxies static <cidr…>` must load");
+        assert_eq!(
+            config.global.trusted_proxies,
+            ["12.34.56.0/24", "2001:db8::/32"]
+        );
+    }
+
+    /// 🧭 `private_ranges` is a keyword inside `static` rather than a module of
+    /// its own, and it expands to Caddy's own six prefixes — `127.0.0.1/8` and
+    /// `::1` included, because loopback counts as private upstream.
+    #[test]
+    fn trusted_proxies_static_expands_private_ranges() {
+        let config = crate::compile(
+            "{\n    servers {\n        trusted_proxies static private_ranges\n    }\n}\n\
+             example.com {\n    listen :80 proxy_protocol\n    respond \"x\"\n}",
+        )
+        .expect("`trusted_proxies static private_ranges` must load");
+        assert_eq!(
+            config.global.trusted_proxies,
+            [
+                "192.168.0.0/16",
+                "172.16.0.0/12",
+                "10.0.0.0/8",
+                "127.0.0.1/8",
+                "fd00::/8",
+                "::1"
+            ]
+        );
+    }
+
+    /// 🚫 A module this build does not implement is refused by name rather than
+    /// reported as a malformed address, so the operator is not sent to look for
+    /// a typo in a token that is spelled correctly.
+    #[test]
+    fn trusted_proxies_refuses_an_unimplemented_ip_source_by_name() {
+        let error = compile_err(
+            "{\n    servers {\n        trusted_proxies cloudflare\n    }\n}\n\
+             example.com {\n    respond \"x\"\n}",
+        );
+        assert!(
+            error.contains("cloudflare") && error.contains("ip_source"),
+            "an unimplemented ip_source must be named as such; got {error}"
+        );
+    }
+
+    /// 📌 The bare address list is a compatibility spelling kept on purpose. It
+    /// is asserted so that a future change cannot flip it silently in either
+    /// direction.
+    #[test]
+    fn trusted_proxies_bare_address_list_still_loads() {
+        let config = crate::compile(
+            "{\n    trusted_proxies 10.0.0.0/8\n}\n\
+             example.com {\n    listen :80 proxy_protocol\n    respond \"x\"\n}",
+        )
+        .expect("the pre-2.11 bare spelling must keep loading");
+        assert_eq!(config.global.trusted_proxies, ["10.0.0.0/8"]);
+    }
+
     #[test]
     fn auto_https_disable_certs_is_reported_as_unsupported() {
         let error =

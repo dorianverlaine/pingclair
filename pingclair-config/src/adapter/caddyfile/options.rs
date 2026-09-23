@@ -280,16 +280,52 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                     if sub.args.is_empty() {
                         return Err(AdapterError::ArgumentCount("trusted_proxies".into(), 1, 0));
                     }
-                    for rule in sub.args {
-                        let valid = rule.parse::<ipnet::IpNet>().is_ok()
-                            || rule.parse::<std::net::IpAddr>().is_ok();
-                        if !valid {
+                    // 🌐 Caddy 2.11 reads the first token as the *name of an
+                    // ip_source module*, not as an address, so the ordinary
+                    // spelling of a current Caddyfile is `trusted_proxies
+                    // static 12.34.56.0/24`. Stock Caddy registers exactly one
+                    // such module — `http.ip_sources.static`, whose own
+                    // arguments are the ranges (`modules/caddyhttp/ip_range.go`
+                    // at `ff6da121`) — so `static` is stripped and its ranges
+                    // are what gets stored.
+                    //
+                    // 📌 The bare address list is kept as a compatibility
+                    // spelling: every Caddyfile written for an older Caddy, and
+                    // every configuration in this repository's own docs, uses
+                    // it, and Caddy only started refusing it in 2.11. It is a
+                    // divergence rather than a mistake, so it is named here
+                    // rather than removed quietly.
+                    let rules: &[String] = match sub.args.first().map(String::as_str) {
+                        Some("static") => &sub.args[1..],
+                        Some(other) if !looks_like_address(other) => {
+                            return Err(AdapterError::UnsupportedFeature(
+                                format!("trusted_proxies {other}"),
+                                format!(
+                                    "`{other}` names an ip_source module; this build implements \
+                                     the `static` one, whose arguments are the ranges themselves"
+                                ),
+                            ));
+                        }
+                        _ => &sub.args[..],
+                    };
+                    for rule in rules {
+                        // 🧭 `private_ranges` is a keyword *inside* `static`, not
+                        // a module of its own: upstream expands it in
+                        // `StaticIPRange.UnmarshalCaddyfile` to the six prefixes
+                        // of `internal.PrivateRangesCIDR()`.
+                        if rule == "private_ranges" {
+                            global
+                                .trusted_proxies
+                                .extend(PRIVATE_RANGES.iter().map(|range| (*range).to_string()));
+                            continue;
+                        }
+                        if !looks_like_address(rule) {
                             return Err(AdapterError::InvalidArgument(
                                 "trusted_proxies".into(),
                                 format!("invalid IP or CIDR `{rule}`"),
                             ));
                         }
-                        global.trusted_proxies.push(rule);
+                        global.trusted_proxies.push(rule.clone());
                     }
                 }
                 // 📡 `dns <provider> [args…]` names the provider used both for
@@ -444,6 +480,31 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
     }
     Ok(global)
 }
+
+/// 🏠 Whether a token is an address rather than the name of an ip_source
+/// module.
+///
+/// The two share one position — `trusted_proxies <first> …` — so telling them
+/// apart is what lets the bare compatibility spelling and the current
+/// `static`-prefixed one coexist without guessing.
+fn looks_like_address(token: &str) -> bool {
+    token.parse::<ipnet::IpNet>().is_ok() || token.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// 🌐 The six prefixes behind the `private_ranges` keyword, in Caddy's own
+/// order (`internal.PrivateRangesCIDR`, `internal/ranges.go` at `ff6da121`).
+///
+/// `127.0.0.1/8` and `::1` are in the list because loopback counts as private
+/// upstream, which is what makes `trusted_proxies static private_ranges` the
+/// ordinary single-line spelling for a server behind a local reverse proxy.
+const PRIVATE_RANGES: [&str; 6] = [
+    "192.168.0.0/16",
+    "172.16.0.0/12",
+    "10.0.0.0/8",
+    "127.0.0.1/8",
+    "fd00::/8",
+    "::1",
+];
 
 /// 🏠 Whether a host is a bind wildcard rather than a name a client can send.
 ///
