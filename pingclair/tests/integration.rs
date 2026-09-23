@@ -86,6 +86,10 @@ mod error_responses;
 #[path = "integration/graceful_shutdown.rs"]
 mod graceful_shutdown;
 
+// 🍪 Several `Cookie` field lines read as one cookie-string.
+#[path = "integration/cookie_fold.rs"]
+mod cookie_fold;
+
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather
 /// than against "some response arrived", so a 404 from a stale listener on the

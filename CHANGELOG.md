@@ -20,6 +20,14 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🍪 A FastCGI script reads two `Cookie` lines as two cookies
+
+An HTTP/1.1 client that sent `Cookie: a=1` and `Cookie: b=2` on separate
+lines reached a `php_fastcgi` application as `HTTP_COOKIE=a=1, b=2`. A comma
+is not a cookie separator, so the script saw one cookie `a` with the value
+`1, b=2`. The lines are now joined with `"; "`, the same rule the HTTP/2 and
+HTTP/3 paths already used, and all three share one implementation.
+
 ### 🛑 SIGTERM lets running requests finish within `grace_period`
 
 A graceful stop (`SIGTERM`, `SIGINT`, or `POST /stop`) exited the process

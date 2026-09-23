@@ -836,27 +836,12 @@ fn h3_request_header(req: &H3Request, method: http::Method) -> Result<RequestHea
     // `"; "` before the request reaches anything that is not HTTP/2 or
     // HTTP/3. An HTTP/1 upstream is exactly that.
     //
-    // 🍃 Two variables rather than always building a `String`: one cookie is
-    // the overwhelmingly common case and it borrows, so the join allocates
-    // only for a request that actually split it.
-    let mut only_cookie: Option<&str> = None;
-    let mut joined_cookie: Option<String> = None;
+    // 🍃 The fold borrows the one-cookie common case and allocates only for a
+    // request that actually split it.
+    let mut cookie = crate::http_policy::CookieFold::default();
     for (name, value) in &req.headers {
         if name == "cookie" {
-            match (&mut joined_cookie, only_cookie) {
-                (Some(joined), _) => {
-                    joined.push_str("; ");
-                    joined.push_str(value);
-                }
-                (None, Some(first)) => {
-                    let mut joined = String::with_capacity(first.len() + value.len() + 2);
-                    joined.push_str(first);
-                    joined.push_str("; ");
-                    joined.push_str(value);
-                    joined_cookie = Some(joined);
-                }
-                (None, None) => only_cookie = Some(value),
-            }
+            cookie.push(value);
             continue;
         }
         let Ok(name) = http::HeaderName::from_bytes(name.as_bytes()) else {
@@ -868,8 +853,10 @@ fn h3_request_header(req: &H3Request, method: http::Method) -> Result<RequestHea
         // origin describing something the client never said.
         header.append_header(name, value.as_str()).ok();
     }
-    if let Some(cookie) = joined_cookie.as_deref().or(only_cookie) {
-        header.insert_header(http::header::COOKIE, cookie).ok();
+    if let Some(cookie) = cookie.finish() {
+        header
+            .insert_header(http::header::COOKIE, cookie.as_ref())
+            .ok();
     }
     if !req.authority.is_empty() && !header.headers.contains_key("host") {
         header.insert_header("host", &req.authority).ok();

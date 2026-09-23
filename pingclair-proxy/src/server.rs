@@ -4125,7 +4125,7 @@ impl PingclairProxy {
         if header.headers.get_all(http::header::COOKIE).iter().count() < 2 {
             return;
         }
-        let mut joined = String::new();
+        let mut fold = crate::http_policy::CookieFold::default();
         for piece in header.headers.get_all(http::header::COOKIE) {
             let Ok(piece) = piece.to_str() else {
                 // 🚫 A cookie that is not text is not one this proxy can join,
@@ -4133,11 +4133,12 @@ impl PingclairProxy {
                 // request as the client sent it.
                 return;
             };
-            if !joined.is_empty() {
-                joined.push_str("; ");
-            }
-            joined.push_str(piece);
+            fold.push(piece);
         }
+        // 🍪 The fold owns its string, so the borrow of `header` ends here.
+        let Some(joined) = fold.finish().map(std::borrow::Cow::into_owned) else {
+            return;
+        };
         header
             .insert_header(http::header::COOKIE, joined.as_str())
             .ok();

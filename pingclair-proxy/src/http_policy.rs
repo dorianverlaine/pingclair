@@ -17,6 +17,10 @@ use regex::Regex;
 mod max_forwards;
 pub(crate) use max_forwards::{ALLOWED_METHODS, forwarded_max_forwards, local_hop_answer};
 
+// 🍪 Folding several `Cookie` field lines into one cookie-string.
+mod cookies;
+pub(crate) use cookies::CookieFold;
+
 /// 🧰 Request-scoped variables set by `vars` handlers and read by
 /// `{http.vars.*}` placeholders and the `vars` matcher.
 ///

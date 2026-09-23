@@ -362,13 +362,24 @@ pub(crate) fn build_environment(
             "HTTP_{}",
             name.as_str().to_ascii_uppercase().replace('-', "_")
         );
-        let joined = request
+        let values = request
             .headers
             .get_all(name)
             .iter()
-            .filter_map(|value| value.to_str().ok())
-            .collect::<Vec<_>>()
-            .join(", ");
+            .filter_map(|value| value.to_str().ok());
+        // 🍪 `Cookie` has its own separator. Only an HTTP/1.1 client can
+        // arrive here with several lines (HTTP/2 and HTTP/3 are folded
+        // earlier), and joining them with the list separator `", "` handed
+        // the script `a=1, b=2` — one cookie `a` with the value `1, b=2`.
+        let joined = if name == http::header::COOKIE {
+            let mut fold = crate::http_policy::CookieFold::default();
+            values.for_each(|value| fold.push(value));
+            fold.finish()
+                .map(std::borrow::Cow::into_owned)
+                .unwrap_or_default()
+        } else {
+            values.collect::<Vec<_>>().join(", ")
+        };
         environment.insert(variable, joined);
     }
     Ok(environment)
