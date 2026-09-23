@@ -31,6 +31,11 @@ known_flaky=(
   # #947 remains unmerged; Pingora 0.9.0/main still lacks the
   # `request_body_end_handled` state in `pingora-proxy/src/proxy_h1.rs`.
   "test_websocket_upgrade_tunnels_bytes_in_both_directions 2026-09-10"
+  # ⏱️ Admitted 2026-09-24 for #186: the test's 100 ms read delay can outlast
+  # the shutdown's own 250 ms drain budget on a stalled runner, which fails the
+  # test while the drain behaves as written. Failed once, Linux x86_64 shard,
+  # run 35876548711 at fef1369.
+  "test_sigterm_drains_the_log_queue_before_exit 2026-09-24"
 )
 
 now_epoch="$(date -u +%s)"
