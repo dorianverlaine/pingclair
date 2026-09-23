@@ -194,7 +194,9 @@ devient `certificates/local/wildcard_.example.com/`.
 📌 **Mise à niveau depuis un dépôt écrit avant cette arborescence.** L'ancien
 arbre `internal/` n'est ni lu ni migré, et c'est délibéré. Au démarrage suivant,
 le serveur ne trouve plus d'autorité là où il cherche désormais, en crée une
-nouvelle et réémet les certificats dont il a besoin. Chaque client qui faisait
+nouvelle et réémet les certificats dont il a besoin. Il journalise un
+avertissement lorsqu'il trouve l'ancien arbre, pour que le changement ne soit pas
+silencieux. Chaque client qui faisait
 confiance à l'ancienne racine doit recevoir la nouvelle — les commandes
 ci-dessus sont cette étape. Si votre configuration obtient aussi des certificats
 auprès d'une AC publique, leur réémission est décomptée de ses limites de débit.

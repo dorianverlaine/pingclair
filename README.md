@@ -198,7 +198,8 @@ A wildcard site is filed under Caddy's spelling of it: `*.example.com` becomes
 📌 **Upgrading from a store written before this layout.** The old `internal/`
 tree is neither read nor migrated, by design. On the next start the server finds
 no authority where it now looks, creates a new one, and re-issues the
-certificates it needs. Every client that trusted the old root must be given the
+certificates it needs. It logs a warning when it finds the old tree, so the
+change is not silent. Every client that trusted the old root must be given the
 new one — the commands above are that step. If your configuration also obtains
 certificates from a public CA, note that re-issuing them counts against that
 CA's rate limits.

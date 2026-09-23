@@ -165,7 +165,9 @@ shared no name at all.
 **The old `internal/` layout is neither read nor moved** — unlike the move to
 the service account's home, which copied the store and compared before removing
 it. On the next start the server finds no authority where it now looks, creates
-a new one, and re-issues the certificates it needs. Every client that trusted
+a new one, and re-issues the certificates it needs. It also logs a warning when
+it finds the old tree, because an operator who pulled a new container image
+reads no changelog. Every client that trusted
 the old root must be given the new one (`pingclair trust`). If your configuration
 also obtains certificates from a public CA, re-issuing them counts against that
 CA's rate limits.

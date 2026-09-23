@@ -534,19 +534,6 @@ fn signed_by(cert_pem: &str, issuer_cert_pem: &str) -> Result<bool, InternalCaEr
     })
 }
 
-/// 🧾 The subject and issuer of a PEM certificate, as RFC 2253 strings.
-fn subject_and_issuer(cert_pem: &str) -> Result<(String, String), InternalCaError> {
-    use x509_parser::prelude::{FromDer, X509Certificate};
-
-    let der = pem_contents(cert_pem)?;
-    let (_, certificate) = X509Certificate::from_der(&der)
-        .map_err(|error| InternalCaError::InvalidAuthority(error.to_string()))?;
-    Ok((
-        certificate.subject().to_string(),
-        certificate.issuer().to_string(),
-    ))
-}
-
 /// 📄 The DER bytes of the first certificate in a PEM chain.
 fn pem_contents(cert_pem: &str) -> Result<Vec<u8>, InternalCaError> {
     let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes())
@@ -711,8 +698,19 @@ mod tests {
 
     /// 🧾 The subject and issuer of the first certificate in a PEM chain, for
     /// the tests that assert which file means what.
+    ///
+    /// 📌 Test-only: production measures this relationship through the key
+    /// identifiers, because two authorities built by this server share a name.
+    /// A test that says "the leaf's issuer is the intermediate" wants the name.
     fn names(cert_pem: &str) -> (String, String) {
-        subject_and_issuer(cert_pem).unwrap()
+        use x509_parser::prelude::{FromDer, X509Certificate};
+
+        let der = pem_contents(cert_pem).unwrap();
+        let (_, certificate) = X509Certificate::from_der(&der).unwrap();
+        (
+            certificate.subject().to_string(),
+            certificate.issuer().to_string(),
+        )
     }
 
     #[tokio::test]
