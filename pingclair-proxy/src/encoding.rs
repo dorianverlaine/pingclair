@@ -50,12 +50,30 @@ pub fn negotiate(accept_encoding: &str, offered: &[Encoding]) -> Option<Encoding
 
 // MARK: - Streaming encoders
 
+/// 🪣 Where an encoder's compressed bytes collect between chunks.
+///
+/// Production always uses a `Vec<u8>` drained after every chunk. The trait
+/// exists because an in-memory `Vec` can never fail a write, which leaves the
+/// failure path in [`stream_chunk`] unreachable by any real request; a sink
+/// that refuses writes is the only way to prove that path ends the response
+/// rather than switching the body to plaintext mid-stream.
+pub trait CompressedSink: Write {
+    /// Takes everything written since the last drain, leaving the sink empty.
+    fn drain(&mut self) -> Vec<u8>;
+}
+
+impl CompressedSink for Vec<u8> {
+    fn drain(&mut self) -> Vec<u8> {
+        std::mem::take(self)
+    }
+}
+
 /// A streaming encoder for one response body, bounded to one chunk of memory.
-pub enum ResponseEncoder {
-    Gzip(GzEncoder<Vec<u8>>),
+pub enum ResponseEncoder<W: CompressedSink = Vec<u8>> {
+    Gzip(GzEncoder<W>),
     /// Boxed because `zstd`'s encoder holds a sizable internal context and
     /// this enum lives inline in every request's context.
-    Zstd(Box<zstd::stream::write::Encoder<'static, Vec<u8>>>),
+    Zstd(Box<zstd::stream::write::Encoder<'static, W>>),
 }
 
 impl ResponseEncoder {
@@ -65,11 +83,17 @@ impl ResponseEncoder {
     /// front; a failure here means the response goes out uncompressed, which
     /// is always a safe outcome.
     pub fn new(encoding: Encoding) -> std::io::Result<Self> {
+        Self::with_sink(encoding, Vec::new())
+    }
+}
+
+impl<W: CompressedSink> ResponseEncoder<W> {
+    /// 🪣 Creates the encoder for a negotiated coding, writing into `sink`.
+    pub fn with_sink(encoding: Encoding, sink: W) -> std::io::Result<Self> {
         Ok(match encoding {
-            Encoding::Gzip => Self::Gzip(GzEncoder::new(Vec::new(), Compression::fast())),
+            Encoding::Gzip => Self::Gzip(GzEncoder::new(sink, Compression::fast())),
             Encoding::Zstd => Self::Zstd(Box::new(zstd::stream::write::Encoder::new(
-                Vec::new(),
-                ZSTD_LEVEL,
+                sink, ZSTD_LEVEL,
             )?)),
         })
     }
@@ -92,8 +116,8 @@ impl ResponseEncoder {
     /// Drains whatever the encoder has flushed into its output buffer.
     fn take_output(&mut self) -> Vec<u8> {
         match self {
-            Self::Gzip(encoder) => std::mem::take(encoder.get_mut()),
-            Self::Zstd(encoder) => std::mem::take(encoder.get_mut()),
+            Self::Gzip(encoder) => encoder.get_mut().drain(),
+            Self::Zstd(encoder) => encoder.get_mut().drain(),
         }
     }
 
@@ -104,8 +128,8 @@ impl ResponseEncoder {
     /// decode.
     fn finish(self) -> std::io::Result<Vec<u8>> {
         match self {
-            Self::Gzip(encoder) => encoder.finish(),
-            Self::Zstd(encoder) => encoder.finish(),
+            Self::Gzip(encoder) => encoder.finish().map(|mut sink| sink.drain()),
+            Self::Zstd(encoder) => encoder.finish().map(|mut sink| sink.drain()),
         }
     }
 }
@@ -120,38 +144,39 @@ impl ResponseEncoder {
 /// first byte goes out: an OOM risk independent of how much of the response
 /// actually needs to be in flight at once. Here we force a sync flush after
 /// every chunk, pushing whatever the codec has buffered internally out into
-/// its small `Vec<u8>`, then drain that Vec as this chunk's output via
-/// `mem::take`. Memory use is bounded by one chunk's worth of compressed
-/// bytes, regardless of total response size.
+/// its small sink, then drain that sink as this chunk's output. Memory use is
+/// bounded by one chunk's worth of compressed bytes, regardless of total
+/// response size.
 ///
 /// The per-chunk flush costs some ratio — both codecs must close a block at
 /// every flush point — which is the deliberate trade for a proxy that must
 /// not let response size drive memory use.
-pub fn stream_chunk(
-    encoder_slot: &mut Option<ResponseEncoder>,
+///
+/// 🔪 A failure is returned, never absorbed. The client was already told
+/// `Content-Encoding` and may already hold part of the coded stream, so there
+/// is no honest way to continue: plaintext after a gzip member is bytes no
+/// decoder accepts (RFC 1952 §2.2), and a coded stream without its trailer is
+/// truncated. On error `body` is cleared and the caller must abandon the
+/// response. The encoder stays in its slot after a write or flush failure, so
+/// even a caller that ignored the error could never send a later chunk as
+/// plaintext — `None` in the slot only ever means "no coding negotiated" or
+/// "already finished".
+pub fn stream_chunk<W: CompressedSink>(
+    encoder_slot: &mut Option<ResponseEncoder<W>>,
     body: &mut Option<Bytes>,
     end_of_stream: bool,
-) {
-    if encoder_slot.is_none() {
-        return;
-    }
+) -> std::io::Result<()> {
+    let Some(encoder) = encoder_slot.as_mut() else {
+        return Ok(());
+    };
 
-    // Feed this chunk into the encoder.
-    if let Some(chunk) = body.as_ref()
-        && let Some(encoder) = encoder_slot.as_mut()
-        && let Err(e) = encoder.writer().write_all(chunk)
-    {
-        tracing::warn!(
-            "⚠️ Compression failed, aborting compression for the rest of this response: {}",
-            e
-        );
-        // Bail out of compression entirely; the client already received a
-        // Content-Encoding header for this response so we cannot fall back to
-        // plaintext mid-stream — better to end the response short than to send
-        // a client a body it can't decode.
-        *encoder_slot = None;
+    let fed = match body.as_ref() {
+        Some(chunk) => encoder.writer().write_all(chunk),
+        None => Ok(()),
+    };
+    if let Err(e) = fed {
         *body = None;
-        return;
+        return Err(e);
     }
 
     if end_of_stream {
@@ -159,21 +184,20 @@ pub fn stream_chunk(
             match encoder.finish() {
                 Ok(tail) => *body = Some(Bytes::from(tail)),
                 Err(e) => {
-                    tracing::warn!("⚠️ Compression finalize failed: {}", e);
-                    *body = Some(Bytes::new());
+                    *body = None;
+                    return Err(e);
                 }
             }
         }
-        return;
+        return Ok(());
     }
 
-    if let Some(encoder) = encoder_slot.as_mut() {
-        if let Err(e) = encoder.writer().flush() {
-            tracing::warn!("⚠️ Compression flush failed: {}", e);
-        }
-        let out = encoder.take_output();
-        *body = Some(Bytes::from(out));
+    if let Err(e) = encoder.writer().flush() {
+        *body = None;
+        return Err(e);
     }
+    *body = Some(Bytes::from(encoder.take_output()));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -281,14 +305,14 @@ mod tests {
 
         for chunk in chunks {
             let mut body = Some(Bytes::copy_from_slice(chunk));
-            stream_chunk(&mut slot, &mut body, false);
+            stream_chunk(&mut slot, &mut body, false).unwrap();
             let out = body.unwrap_or_default();
             largest_chunk = largest_chunk.max(out.len());
             wire.extend_from_slice(&out);
         }
 
         let mut tail = None;
-        stream_chunk(&mut slot, &mut tail, true);
+        stream_chunk(&mut slot, &mut tail, true).unwrap();
         wire.extend_from_slice(&tail.unwrap_or_default());
         (wire, largest_chunk)
     }
@@ -375,13 +399,13 @@ mod tests {
             let mut total = 0usize;
             for _ in 0..CHUNKS {
                 let mut body = Some(Bytes::from(next_chunk()));
-                stream_chunk(&mut slot, &mut body, false);
+                stream_chunk(&mut slot, &mut body, false).unwrap();
                 let out = body.unwrap_or_default();
                 largest = largest.max(out.len());
                 total += out.len();
             }
             let mut tail = None;
-            stream_chunk(&mut slot, &mut tail, true);
+            stream_chunk(&mut slot, &mut tail, true).unwrap();
 
             // Generous ceiling: a few chunks' worth. The failure mode this
             // catches is off by three orders of magnitude, not by a factor.
@@ -415,7 +439,7 @@ mod tests {
 
             for i in 0..8 {
                 let mut body = Some(Bytes::from(format!("event: tick {i}\n\n")));
-                stream_chunk(&mut slot, &mut body, false);
+                stream_chunk(&mut slot, &mut body, false).unwrap();
                 emitted_per_chunk.push(body.unwrap_or_default().len());
             }
 
@@ -437,7 +461,7 @@ mod tests {
             let mut wire = Vec::new();
             for i in 0..4 {
                 let mut body = Some(Bytes::from(format!("line {i}\n")));
-                stream_chunk(&mut slot, &mut body, false);
+                stream_chunk(&mut slot, &mut body, false).unwrap();
                 wire.extend_from_slice(&body.unwrap_or_default());
             }
 
@@ -465,11 +489,88 @@ mod tests {
     fn a_none_encoder_leaves_the_body_untouched() {
         let mut slot: Option<ResponseEncoder> = None;
         let mut body = Some(Bytes::from_static(b"plaintext"));
-        stream_chunk(&mut slot, &mut body, false);
+        stream_chunk(&mut slot, &mut body, false).unwrap();
         assert_eq!(body.as_deref(), Some(&b"plaintext"[..]));
 
-        stream_chunk(&mut slot, &mut body, true);
+        stream_chunk(&mut slot, &mut body, true).unwrap();
         assert_eq!(body.as_deref(), Some(&b"plaintext"[..]));
+    }
+
+    /// 🪣 A sink that accepts the first chunk's output, then refuses every
+    /// write, standing in for a codec failure no in-memory `Vec` can produce.
+    struct RefusingSink {
+        buf: Vec<u8>,
+        drained: bool,
+    }
+
+    impl Write for RefusingSink {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            if self.drained {
+                return Err(std::io::Error::other("sink refuses writes"));
+            }
+            self.buf.extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CompressedSink for RefusingSink {
+        fn drain(&mut self) -> Vec<u8> {
+            self.drained = true;
+            std::mem::take(&mut self.buf)
+        }
+    }
+
+    /// 🔪 After a compression failure no later chunk leaves as plaintext.
+    ///
+    /// The client was told `Content-Encoding` before the first byte, so a
+    /// plaintext tail behind the coded prefix is a body no decoder accepts.
+    /// Every call after the failure must report an error and emit nothing,
+    /// which is what lets the proxy abandon the response instead.
+    #[test]
+    fn a_failure_ends_the_body_instead_of_continuing_in_plaintext() {
+        for encoding in [Encoding::Gzip, Encoding::Zstd] {
+            let sink = RefusingSink {
+                buf: Vec::new(),
+                drained: false,
+            };
+            let mut slot = Some(ResponseEncoder::with_sink(encoding, sink).unwrap());
+            let mut wire = Vec::new();
+            let mut outcomes = Vec::new();
+            let chunks: [(&'static [u8], bool); 3] = [
+                (b"chunk one ", false),
+                (b"chunk two ", false),
+                (b"PLAINTEXT-TAIL", true),
+            ];
+            for (chunk, end) in chunks {
+                let mut body = Some(Bytes::from_static(chunk));
+                let outcome = stream_chunk(&mut slot, &mut body, end);
+                if outcome.is_err() {
+                    assert_eq!(
+                        body,
+                        None,
+                        "{}: a failed call emitted bytes",
+                        encoding.token()
+                    );
+                }
+                outcomes.push(outcome.is_ok());
+                wire.extend_from_slice(body.as_deref().unwrap_or_default());
+            }
+            assert_eq!(
+                outcomes,
+                [true, false, false],
+                "{}: every call after the failure must report it",
+                encoding.token()
+            );
+            assert!(
+                !wire.windows(14).any(|w| w == b"PLAINTEXT-TAIL"),
+                "{}: a chunk after the failure went out as plaintext: {wire:?}",
+                encoding.token()
+            );
+        }
     }
 
     #[test]

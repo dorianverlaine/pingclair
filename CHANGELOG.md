@@ -64,6 +64,15 @@ in them said so, so a relying party could not tell "never published" from
 extension (RFC 9608); the root does not, and the 90-day lifetime is unchanged.
 Leaves already on disk gain it when they are next reissued.
 
+### 🔪 A compression failure ends the response instead of switching to plaintext
+
+If the encoder behind `encode` failed partway through a response, the rest of
+the body went out uncompressed under the `Content-Encoding` header already
+sent — a stream no client can decode correctly. The response is now
+abandoned at the failure: the HTTP/2 stream is reset and an HTTP/1.1
+connection is closed. No real request is known to trigger such a failure;
+this closes the path, not an observed outage.
+
 ### 🧊 HTTP/3 static files send `Vary: Accept-Encoding`
 
 A file served over HTTP/3 from a `precompressed` sidecar said

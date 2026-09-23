@@ -58,6 +58,22 @@ pub(crate) fn install(modules: &mut HttpModuleCtx, encoder: ResponseEncoder) -> 
     }
 }
 
+/// 🔪 Turns a compression failure into an error that abandons the response.
+///
+/// The header already announced the coding, so neither plaintext nor an
+/// error page can follow the bytes already sent. Returning an error sends
+/// the request to `fail_to_proxy`, which sees the response has started and
+/// shuts the downstream session: RST_STREAM on H2, a closed connection on
+/// H1. The client then sees a broken message rather than a wrong one.
+fn abandon(error: std::io::Error) -> Box<pingora_core::Error> {
+    tracing::warn!(error = %error, "🔪 Response compression failed; abandoning the response");
+    pingora_core::Error::because(
+        pingora_core::ErrorType::InternalError,
+        "response compression failed",
+        error,
+    )
+}
+
 /// 🔍 Yields every comma-separated token of every `name` field line,
 /// trimmed, without allocating.
 ///
@@ -159,15 +175,14 @@ impl HttpModule for ResponseEncodingModule {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> pingora_core::Result<()> {
-        stream_chunk(&mut self.encoder, body, end_of_stream);
-        Ok(())
+        stream_chunk(&mut self.encoder, body, end_of_stream).map_err(abandon)
     }
 
     /// 🧹 Writes the coding's trailer for bodies that end with `Done` rather
     /// than with a chunk flagged as the last one.
     fn response_done_filter(&mut self) -> pingora_core::Result<Option<Bytes>> {
         let mut tail = None;
-        stream_chunk(&mut self.encoder, &mut tail, true);
+        stream_chunk(&mut self.encoder, &mut tail, true).map_err(abandon)?;
         Ok(tail)
     }
 
