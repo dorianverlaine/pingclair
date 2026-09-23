@@ -36,3 +36,35 @@ async fn h3_upstream_failing_mid_body_resets_the_stream() {
         "a truncated upstream body must reset the stream, not end it with a FIN"
     );
 }
+
+/// 🔪 A local file that runs out of time mid-body resets the stream instead
+/// of growing an error page on its tail.
+///
+/// Pacing at 128 KiB/s makes a 512 KiB file need four seconds, so three of
+/// its 64 KiB chunks leave before the two-second whole-request timeout
+/// fires. Before the fix the timeout became a `408` error page sent after the
+/// `200` had started: its headers were dropped, its body was appended to the
+/// file's bytes, and the stream ended cleanly.
+#[tokio::test]
+async fn h3_file_timing_out_mid_body_resets_instead_of_appending_an_error_page() {
+    let site = tempfile::tempdir().unwrap();
+    std::fs::write(site.path().join("big.bin"), vec![b'x'; 512 * 1024]).unwrap();
+    let source = format!(
+        ":443 {{\n limits {{\n  download_bytes_per_sec 131072\n  request_timeout 2s\n }}\n root * {}\n file_server\n}}",
+        site.path().display()
+    );
+    let compiled = pingclair_config::compile(&source).unwrap();
+    let site_config = compiled.servers[0].clone();
+    let server = spawn_h3_server_with(|address| ServerConfig {
+        listen: vec![address.to_string()],
+        ..site_config
+    })
+    .await;
+
+    let outcome = h3_get(server, "/big.bin").await;
+    assert_eq!(
+        outcome.map(|response| (response.status, response.body.len())),
+        Err(format!("stream reset with code {H3_INTERNAL_ERROR}")),
+        "a response that fails after it started must reset, not carry an error page"
+    );
+}

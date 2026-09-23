@@ -105,7 +105,10 @@ the whole-request deadline, HTTP/3 clients used to receive the headers, a
 short body, and a normal end of stream — a truncated response presented as a
 complete one. The stream is now reset with `H3_INTERNAL_ERROR`, so clients
 report a failed transfer instead of saving a short file. Proxied responses
-and subrequest responses both take the new path.
+and subrequest responses both take the new path. An error raised after a
+response started — a file whose pacing overran `request_timeout`, for one —
+also resets the stream now, where it used to append the error page's body to
+the bytes already sent.
 
 ### 🛡️ Retries after the upstream has answered repeat only idempotent methods
 

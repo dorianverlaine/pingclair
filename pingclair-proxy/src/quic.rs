@@ -905,6 +905,12 @@ impl ResponseSink {
         }
     }
 
+    /// 📟 Whether a response header block has already been sent, after which
+    /// the only way to report a failure is a reset.
+    fn response_started(&self) -> bool {
+        self.status.load(std::sync::atomic::Ordering::Relaxed) != 0
+    }
+
     /// 📏 Adds one body chunk to the byte count.
     fn observe_body(&self, len: usize) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1781,7 +1787,13 @@ impl H3App {
             }
             match ev.msg {
                 RespMsg::Headers(headers, fin) => {
-                    if ss.headers_sent {
+                    // 🔪 A second header block means someone tried to answer
+                    // again after the response started. Dropping it alone
+                    // would still let its body join the first response, so
+                    // the stream is reset instead; `flush_stream` checks the
+                    // reset before it writes any queued byte.
+                    if ss.headers_sent || ss.pending_headers.is_some() {
+                        ss.abort_requested = Some(quiche::h3::WireErrorCode::InternalError);
                         return;
                     }
                     ss.pending_headers = Some((headers, fin));
@@ -3028,6 +3040,22 @@ async fn handle_request(
     // that failed, or one the client abandoned, is exactly the one an operator
     // goes looking for afterwards.
     let error_text: Option<&str> = match result {
+        Some(Err((_, msg))) if resp_tx.response_started() => {
+            // 🔪 The response is already on the wire, so an error page can
+            // only be appended to it — a second header block the client
+            // never sees and a body glued onto the first one. Resetting is
+            // the one truthful signal left.
+            let _ = run_until_request_cancelled(
+                &mut cancel_rx,
+                send_reset(
+                    &resp_tx,
+                    stream_id,
+                    quiche::h3::WireErrorCode::InternalError,
+                ),
+            )
+            .await;
+            Some(msg)
+        }
         Some(Err((status, msg))) => {
             // 🧯 Applies the virtual host error policy only while the client
             // still owns the stream.
