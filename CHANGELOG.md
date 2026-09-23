@@ -108,7 +108,9 @@ report a failed transfer instead of saving a short file. Proxied responses
 and subrequest responses both take the new path. An error raised after a
 response started — a file whose pacing overran `request_timeout`, for one —
 also resets the stream now, where it used to append the error page's body to
-the bytes already sent.
+the bytes already sent. HTTP/1.1 and HTTP/2 no longer try to write an error
+page onto a response that already started either: the HTTP/2 stream is reset
+with `INTERNAL_ERROR` and an HTTP/1.1 connection is closed.
 
 ### 🛡️ Retries after the upstream has answered repeat only idempotent methods
 

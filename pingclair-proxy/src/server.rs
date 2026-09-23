@@ -7918,7 +7918,18 @@ impl ProxyHttp for PingclairProxy {
                 },
             }
         };
-        let served = if let Some(status) = ctx.response_decision_error.take() {
+        let served = if already_responded {
+            // 🔪 The original response is already on the wire, so an error
+            // page could only be spliced onto it: on H2 its header block is
+            // dropped and its body arrives as more DATA on the same stream,
+            // which then ends normally; on H1 it lands inside the first
+            // response's framing. Abandoning the message is the only honest
+            // signal left — RST_STREAM(INTERNAL_ERROR) on H2, a closed
+            // connection on H1 — and the access log keeps the status that
+            // actually went out.
+            session.downstream_session.shutdown().await;
+            false
+        } else if let Some(status) = ctx.response_decision_error.take() {
             // 🚫 A response subroute owns the original upstream response once
             // it matches. Its raised status may enter error routing once, but
             // the outer interceptor is cleared so the error response cannot

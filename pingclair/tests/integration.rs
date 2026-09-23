@@ -31,6 +31,10 @@ mod content_negotiation;
 #[path = "integration/retry_idempotency.rs"]
 mod retry_idempotency;
 
+// 🔪 Responses that fail after they started live beside this file too.
+#[path = "integration/started_response.rs"]
+mod started_response;
+
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather
 /// than against "some response arrived", so a 404 from a stale listener on the
