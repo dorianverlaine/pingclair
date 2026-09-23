@@ -13,6 +13,7 @@ readonly client_error="${run_dir}/client.err"
 pingclair_pid=""
 upstream_pid=""
 client_pid=""
+keep_failure=0
 
 log() {
     printf '%s\n' "$*"
@@ -77,16 +78,34 @@ stop_owned_process() {
 }
 
 cleanup() {
-    stop_owned_process "${client_pid}" "https://${host_name}:${h3_port:-}/events"
+    if [[ -f "${run_dir}/client.pid" ]]; then
+        stop_owned_process "$(<"${run_dir}/client.pid")" "https://${host_name}:${h3_port:-}/events"
+    fi
+    if [[ -n "${client_pid}" ]]; then
+        wait "${client_pid}" 2>/dev/null || true
+    fi
     stop_owned_process "${pingclair_pid}" "${run_dir}/Pingclairfile"
     stop_owned_process "${upstream_pid}" "${run_dir}/upstream.py"
-    if [[ "${PINGCLAIR_H3_KEEP_TEMP:-0}" == "1" ]]; then
+    if [[ "${PINGCLAIR_H3_KEEP_TEMP:-0}" == "1" ]] || [[ "${keep_failure}" == "1" ]]; then
         log "📁 Preserved local H3 artifacts at ${run_dir}."
     else
         rm -rf -- "${run_dir}"
     fi
 }
 trap cleanup EXIT INT TERM
+
+report_failure() {
+    keep_failure=1
+    log "🧭 H3 failure evidence: upstream_first=$([[ -f "${first_marker}" ]] && echo yes || echo no), client_bytes=$(wc -c <"${client_output}" 2>/dev/null || echo 0), client_done=$([[ -f "${run_dir}/client.done" ]] && echo yes || echo no)."
+    log "🧭 Curl response headers:"
+    tail -n 30 "${run_dir}/client.headers" 2>/dev/null || true
+    log "🧭 Curl timing and errors:"
+    tail -n 30 "${client_error}" 2>/dev/null || true
+    log "🧭 Upstream events:"
+    tail -n 30 "${run_dir}/upstream.log" 2>/dev/null || true
+    log "🧭 Pingclair log:"
+    tail -n 60 "${run_dir}/pingclair.log" 2>/dev/null || true
+}
 
 readonly curl_bin="$(find_h3_curl)"
 readonly h3_port="$(reserve_tcp_udp_port)"
@@ -123,6 +142,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/response-trailers":
             self._write_trailer_response()
             return
+        print(f"events-request {time.time_ns()}", flush=True)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Transfer-Encoding", "chunked")
@@ -132,6 +152,7 @@ class Handler(BaseHTTPRequestHandler):
             # 🌊 Flushes the first event immediately so buffering is observable.
             self._write_chunk(b"data: first\n\n")
             first_path.write_text("sent\n")
+            print(f"first-event-flushed {time.time_ns()}", flush=True)
             payload = b"data: " + (b"x" * (64 * 1024)) + b"\n\n"
             while True:
                 time.sleep(0.01)
@@ -276,9 +297,13 @@ rm -f "${client_done}"
 (
     "${curl_bin}" --noproxy '*' --http3-only -kfsS --no-buffer \
         --max-time 20 \
+        --dump-header "${run_dir}/client.headers" \
+        --write-out '%{stderr}🧭 curl http=%{http_code} total=%{time_total} first_byte=%{time_starttransfer} bytes=%{size_download}\n' \
         --resolve "${host_name}:${h3_port}:127.0.0.1" \
         "https://${host_name}:${h3_port}/events" \
-        >"${client_output}" 2>"${client_error}"
+        >"${client_output}" 2>"${client_error}" &
+    printf '%s\n' "$!" >"${run_dir}/client.pid"
+    wait "$!"
     status=$?
     : >"${client_done}"
     exit "${status}"
@@ -313,6 +338,25 @@ if [[ "${first_visible}" != "true" ]]; then
     else
         log "❌ The first H3 SSE event was not delivered incrementally."
     fi
+    report_failure
+    exit 1
+fi
+
+# 🌊 An empty upstream read must not park later non-empty chunks in the H3
+# queue. The upstream writes 64 KiB every 10 ms, so four chunks within five
+# seconds leave ample room for a loaded Linux runner while detecting a stall.
+progress_visible=false
+progress_deadline=$((SECONDS + 5))
+while [[ ! -f "${client_done}" ]] && ((SECONDS < progress_deadline)); do
+    if (( $(wc -c <"${client_output}") >= 4 * 64 * 1024 )); then
+        progress_visible=true
+        break
+    fi
+    sleep 0.02
+done
+if [[ "${progress_visible}" != "true" ]]; then
+    log "❌ The H3 SSE response stopped advancing."
+    report_failure
     exit 1
 fi
 

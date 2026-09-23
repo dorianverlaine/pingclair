@@ -1783,8 +1783,12 @@ impl H3App {
                     ss.pending_headers = Some((headers, fin));
                 }
                 RespMsg::Body(bytes, fin) => {
-                    ss.pending_body_bytes += bytes.len();
-                    ss.pending_body.push_back(bytes);
+                    // 🌊 An empty chunk at the queue head makes quiche return
+                    // `Done` forever, blocking every later non-empty chunk.
+                    if !bytes.is_empty() {
+                        ss.pending_body_bytes += bytes.len();
+                        ss.pending_body.push_back(bytes);
+                    }
                     if fin {
                         ss.body_fin = true;
                     }
