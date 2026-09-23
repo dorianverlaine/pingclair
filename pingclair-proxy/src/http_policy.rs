@@ -1425,19 +1425,27 @@ pub(crate) const SANITIZER_MATRIX: &[(&str, &str, bool)] = &[
 ];
 
 /// 🔌 Detects an HTTP/1 WebSocket upgrade before the response enters tunnel mode.
+///
+/// 📋 Both fields are lists, and a client may split a list across several
+/// field lines (RFC 9110 §5.3) or offer several protocols in one
+/// (`Upgrade: websocket, h2c`). Reading only the first line with `get` turned
+/// `Connection: keep-alive` + `Connection: Upgrade` into "not an upgrade", and
+/// the proxy then stripped the handshake it was meant to relay. Every line and
+/// every comma-separated token is read, the way `connection_tokens` does.
 pub(crate) fn is_websocket_upgrade(headers: &http::HeaderMap) -> bool {
+    list_field_contains(headers, http::header::UPGRADE, "websocket")
+        && list_field_contains(headers, http::header::CONNECTION, "upgrade")
+}
+
+/// 📋 Whether any line of a comma-separated list field carries `token`,
+/// compared case-insensitively. Borrows throughout; nothing is allocated.
+fn list_field_contains(headers: &http::HeaderMap, name: http::HeaderName, token: &str) -> bool {
     headers
-        .get("upgrade")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
-        && headers
-            .get("connection")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| {
-                value
-                    .split(',')
-                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
-            })
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|candidate| candidate.trim().eq_ignore_ascii_case(token))
 }
 
 // MARK: - Request framing

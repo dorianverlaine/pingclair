@@ -38,6 +38,10 @@ mod started_response;
 #[path = "integration/cache_vary.rs"]
 mod cache_vary;
 
+// 🔌 WebSocket handshakes spelled across several field lines.
+#[path = "integration/websocket_upgrade.rs"]
+mod websocket_upgrade;
+
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather
 /// than against "some response arrived", so a 404 from a stale listener on the

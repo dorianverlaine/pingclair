@@ -84,6 +84,14 @@ accepted and answered `501`, although extended CONNECT is only allowed after
 the server offers it, and Pingclair never does. All of these are now reset with
 `H3_MESSAGE_ERROR`.
 
+### 🔌 A WebSocket handshake with a split `Connection` header is relayed
+
+A client may send `Connection` as two field lines, such as
+`Connection: keep-alive` followed by `Connection: Upgrade`. The upgrade check
+read only the first line, decided the request was not a WebSocket handshake,
+and stripped `Connection` and `Upgrade` before the origin saw them, so the
+upgrade silently failed. Every line is now read.
+
 ### 🌊 Compressed HTTP/1.1 responses keep the connection open
 
 A proxied response that Pingclair compressed for an HTTP/1.1 client lost its
