@@ -5762,6 +5762,15 @@ macro_rules! log_at_level {
     };
 }
 
+/// 🔁 The policy a request without a proxy route is judged by.
+///
+/// Shared rather than built per failure: the retry decision runs on every
+/// upstream response, and cloning a route's policy there copied its whole
+/// predicate tree — a heap allocation per response for a question that only
+/// needs to borrow it.
+static DEFAULT_RETRY_POLICY: std::sync::LazyLock<RetryConfig> =
+    std::sync::LazyLock::new(RetryConfig::default);
+
 /// 🔁 Applies Pingora's reuse-safety rule, the replay-safety rule, and the route
 /// retry budget to an upstream error before the retry loop reads it.
 ///
@@ -7259,8 +7268,7 @@ impl ProxyHttp for PingclairProxy {
             .as_ref()
             .zip(ctx.route_index)
             .and_then(|(state, route_index)| self.get_proxy_config(state, route_index))
-            .map(|config| config.retry.clone())
-            .unwrap_or_default();
+            .map_or(&*DEFAULT_RETRY_POLICY, |config| &*config.retry);
         // 💡 An informational response is a prediction about the answer still
         // to come (RFC 8297 §2), not the answer. The breaker keeps only the
         // first verdict it is given, so reporting a `103` here would record
@@ -7319,7 +7327,7 @@ impl ProxyHttp for PingclairProxy {
                 .and_then(|(state, index)| state.route_regex_arc(index, pattern))
         };
         if crate::retry::permits_retry(
-            &retry_policy,
+            retry_policy,
             &facts,
             body_is_empty,
             ctx.retry_attempts,
@@ -7779,8 +7787,7 @@ impl ProxyHttp for PingclairProxy {
             .as_ref()
             .zip(ctx.route_index)
             .and_then(|(state, route_index)| self.get_proxy_config(state, route_index))
-            .map(|config| config.retry.clone())
-            .unwrap_or_default();
+            .map_or(&*DEFAULT_RETRY_POLICY, |config| &*config.retry);
         let retry_buffer_truncated = session.as_ref().retry_buffer_truncated();
         let body_is_empty = session.as_mut().is_body_empty();
         let retry = decide_upstream_error_retry(
@@ -7790,7 +7797,7 @@ impl ProxyHttp for PingclairProxy {
             // 📤 Already the upstream method: `reverse_proxy { method … }`
             // rewrote this header in place before the request went out.
             crate::retry::request_is_repeatable(&session.req_header().method, body_is_empty),
-            &retry_policy,
+            retry_policy,
             ctx.retry_attempts,
             ctx.retry_deadline,
         );
