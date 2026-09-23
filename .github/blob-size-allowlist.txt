@@ -1,4 +1,14 @@
-# 🧱 Deliberately large tracked artifacts: a 20 MiB benchmark payload and the
-# brand logo. Every entry must state why it is allowed to exceed the budget.
+# 🧱 Deliberately large tracked files. Every entry must state why it is allowed
+# to exceed the budget.
+#
+# - `benchmarks/payloads/large.html`: a 20 MiB benchmark payload; its size is
+#   the point.
+# - `assets/logo.png`: the brand logo.
+# - `pingclair/tests/integration.rs`: the end-to-end suite and the `TestServer`
+#   harness every sibling module under `pingclair/tests/integration/` reuses.
+#   It crossed 512,000 bytes on 2026-09-23. New tests should still go in a
+#   sibling module, so this file stops growing; the allowance is for the
+#   harness and the tests already here, not a place to add more.
 benchmarks/payloads/large.html
 assets/logo.png
+pingclair/tests/integration.rs
