@@ -101,6 +101,17 @@ async fn test_named_bodyless_post_is_not_repeated_after_an_upstream_status() {
         "a POST the origin had already answered was sent to it again"
     );
 
+    // ⚠️ The operator is told at load that `POST` will not be repeated here.
+    // 📋 Read from both streams: which one carries the log is the harness's
+    // business, not this test's.
+    let log = [&server.stderr_path, &server.stdout_path]
+        .map(|path| std::fs::read_to_string(path).unwrap_or_default())
+        .concat();
+    assert!(
+        log.contains("lb_retry_match names non-idempotent methods") && log.contains("POST"),
+        "loading a policy that names POST did not warn:\n{log}"
+    );
+
     let response = client.get(server.url(0, "/orders")).send().await.unwrap();
     assert_eq!(response.status(), 503);
     assert!(

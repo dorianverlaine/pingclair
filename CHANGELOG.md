@@ -108,7 +108,8 @@ place an order without one. Once the upstream may have seen the request,
 Pingclair now repeats only `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT` and
 `DELETE`, on both HTTP/1.1–2 and HTTP/3. A connection failure, where the
 upstream never received anything, is still retried for any method.
-`lb_retry_match method POST` still loads.
+`lb_retry_match method POST` still loads, with a warning at startup and on
+reload that the named non-idempotent methods apply only to connection failures.
 
 ### 🔁 HTTP/3 waits past `103 Early Hints` for the real response
 

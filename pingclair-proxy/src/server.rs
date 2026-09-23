@@ -1452,6 +1452,17 @@ impl ProxyState {
                     }
                 }
 
+                // ⚠️ Accepted, but only partly honoured, so it is said at load.
+                let non_idempotent = crate::retry::non_idempotent_methods(&proxy_config.retry);
+                if !non_idempotent.is_empty() {
+                    tracing::warn!(
+                        route = %route.path,
+                        methods = ?non_idempotent,
+                        "⚠️ lb_retry_match names non-idempotent methods; they are retried \
+                         only when connecting fails, never once the upstream has seen the request"
+                    );
+                }
+
                 // 🔐 Compile the route policy before its probe peer so health and
                 // ordinary traffic use identical trust roots, client identity, and SNI.
                 let route_tls = compile_route_upstream_tls(&route.path, &proxy_config.upstream_tls);

@@ -213,6 +213,34 @@ pub(crate) fn method_is_idempotent(method: &Method) -> bool {
     )
 }
 
+/// ⚠️ The methods a retry policy names that it can never repeat after the
+/// origin has seen the request.
+///
+/// `lb_retry_match method POST` still loads, because the format accepts it and
+/// refusing it would break configurations written for it. But the operator
+/// asked for something this server will only partly do, and they should hear
+/// that at load rather than find out from a request that was not retried.
+/// 📌 Load time only, so it is written for clarity: it walks every condition
+/// and uppercases each name rather than caching anything.
+pub(crate) fn non_idempotent_methods(policy: &RetryConfig) -> Vec<String> {
+    let mut named = Vec::new();
+    for predicate in &policy.retry_match {
+        predicate.for_each_condition(&mut |condition| {
+            if let RetryPredicate::Method { any_of } = condition {
+                for name in any_of {
+                    let upper = name.to_ascii_uppercase();
+                    let idempotent = Method::from_bytes(upper.as_bytes())
+                        .is_ok_and(|method| method_is_idempotent(&method));
+                    if !idempotent && !named.contains(&upper) {
+                        named.push(upper);
+                    }
+                }
+            }
+        });
+    }
+    named
+}
+
 /// 🛡️ Whether this request may be sent again once the origin may have seen it.
 ///
 /// Both halves have to hold: no body bytes to duplicate, and a method whose
@@ -479,6 +507,26 @@ mod tests {
             .map(|method| permits(&policy, method, true, "/"))
             .collect();
         assert_eq!(verdicts, [false, false, true, true]);
+    }
+
+    /// ⚠️ Only the non-idempotent names are reported, once each, from
+    /// wherever they sit in the predicate tree.
+    #[test]
+    fn non_idempotent_methods_are_found_anywhere_in_the_policy() {
+        let policy = RetryConfig {
+            retry_match: vec![
+                RetryPredicate::Method {
+                    any_of: vec!["get".into(), "post".into()],
+                },
+                RetryPredicate::All {
+                    of: vec![RetryPredicate::Method {
+                        any_of: vec!["PATCH".into(), "POST".into(), "DELETE".into()],
+                    }],
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(non_idempotent_methods(&policy), ["POST", "PATCH"]);
     }
 
     /// 🔤 A regex predicate uses the copy compiled at load, and answers `false`

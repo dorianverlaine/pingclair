@@ -1602,9 +1602,10 @@ fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<(
                             })
                         }
                         // 🧭 Non-idempotent methods are allowed when the
-                        // operator names them explicitly; the runtime still
-                        // refuses to replay a request that carries a body,
-                        // which is the actual safety property.
+                        // operator names them explicitly, because the format
+                        // accepts them. The runtime only honours them for
+                        // connection failures, and says so with a warning
+                        // when it builds the route (`retry::non_idempotent_methods`).
                         pingclair_core::config::RetryPredicate::Method { any_of } => {
                             (any_of.is_empty()
                                 || any_of.len() > 12
