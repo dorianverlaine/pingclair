@@ -84,9 +84,10 @@ impl<'a> FileRequest<'a> {
             || self.headers.contains_key(header::IF_NONE_MATCH)
     }
 
-    /// 🧭 `GET` and `HEAD`, the methods for which a failed `If-None-Match`
-    /// means "you already have it" rather than "refused".
-    fn is_retrieval(&self) -> bool {
+    /// 🧭 `GET` and `HEAD`: the methods a file is served to, and the ones for
+    /// which a failed `If-None-Match` means "you already have it" rather than
+    /// "refused".
+    pub(super) fn is_retrieval(&self) -> bool {
         matches!(*self.method, Method::GET | Method::HEAD)
     }
 

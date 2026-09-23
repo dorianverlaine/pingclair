@@ -64,6 +64,14 @@ in them said so, so a relying party could not tell "never published" from
 extension (RFC 9608); the root does not, and the 90-day lifetime is unchanged.
 Leaves already on disk gain it when they are next reissued.
 
+### 🚫 `file_server` answers 405 to methods other than `GET` and `HEAD`
+
+`file_server` never looked at the method, so a `POST` or `DELETE` to a static
+file got `200` and the file, as if the write had been accepted. Such a request
+now gets `405 Method Not Allowed` with `Allow: GET, HEAD`, on every transport.
+A missing file is still `404` whatever the method, and `pass_thru` still hands
+a miss to the next handler.
+
 ### 🏷️ `file_server` answers conditional requests
 
 `file_server` sent `ETag` and `Last-Modified` but never read them back, so a

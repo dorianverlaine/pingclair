@@ -56,3 +56,24 @@ async fn h3_file_server_evaluates_preconditions() {
         revalidated.headers
     );
 }
+
+/// 🚫 `POST` to a static file answers 405 with `Allow` on HTTP/3 too.
+#[tokio::test]
+async fn h3_file_server_refuses_post() {
+    let tree = tempfile::tempdir().expect("document root");
+    std::fs::write(tree.path().join("f.txt"), b"0123456789").expect("write file");
+    let root = tree.path().to_string_lossy().into_owned();
+    let server =
+        spawn_h3_from_pingclairfile(&format!(":443 {{\n root * {root}\n file_server\n}}")).await;
+
+    let response = h3_post(server, "/f.txt", b"payload").await.expect("post");
+    let allow = response
+        .headers
+        .iter()
+        .find(|(name, _)| name == "allow")
+        .map(|(_, value)| value.as_str());
+    assert_eq!(
+        (response.status, allow, response.body.as_slice()),
+        (405, Some("GET, HEAD"), &b""[..])
+    );
+}

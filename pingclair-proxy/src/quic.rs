@@ -3797,6 +3797,29 @@ async fn handle_request_inner(
                     )
                     .await
                 }
+                // 🚫 Same answer as H1/H2, `Allow` included.
+                Ok(Some(ServedResponse::MethodNotAllowed)) => {
+                    let mut hdrs = http::HeaderMap::new();
+                    hdrs.insert("allow", http::HeaderValue::from_static("GET, HEAD"));
+                    send_h3_local_response(
+                        resp_tx,
+                        stream_id,
+                        &state,
+                        &header,
+                        &effective_uri,
+                        &verified_client_ip_text,
+                        &request_vars,
+                        response_handlers.as_deref(),
+                        405,
+                        hdrs,
+                        H3LocalBody::Bytes(Bytes::new()),
+                        response_policy,
+                        request_id,
+                        request_deadline,
+                        &mut download_pacer,
+                    )
+                    .await
+                }
                 Ok(Some(ServedResponse::PreconditionFailed)) => {
                     send_h3_local_response(
                         resp_tx,

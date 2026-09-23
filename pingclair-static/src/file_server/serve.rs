@@ -278,6 +278,16 @@ impl FileServer {
         };
         let file_size = metadata.len();
 
+        // 🚫 A file is served to `GET` and `HEAD` only. Anything else used to
+        // get 200 and the file, so a `POST` or `DELETE` looked as if it had
+        // done something. Checked once the file is known to exist, so a
+        // missing path still answers 404, as Caddy's `file_server` does.
+        // This also means a precondition never sees another method, so the
+        // 412 that `If-None-Match` gives one is kept for completeness only.
+        if !request.is_retrieval() {
+            return Ok(Some(ServedResponse::MethodNotAllowed));
+        }
+
         // Reuse prebuilt response metadata (MIME, Last-Modified, ETag,
         // Content-Length) so repeated requests for the same file clone a few
         // shared `HeaderValue`s instead of reformatting strings each time.
@@ -611,11 +621,12 @@ impl FileServer {
             .await?
         {
             Some(ServedResponse::Buffered(file)) => Ok(Some(file)),
-            // 🕳️ No conditions are sent from here, so neither can happen.
+            // 🕳️ A plain `GET` with no conditions reaches none of these.
             Some(
                 ServedResponse::Redirect(_)
                 | ServedResponse::NotModified(_)
-                | ServedResponse::PreconditionFailed,
+                | ServedResponse::PreconditionFailed
+                | ServedResponse::MethodNotAllowed,
             ) => Ok(None),
             Some(ServedResponse::Stream(mut stream)) => {
                 let mut content = Vec::with_capacity(stream.body_len as usize);

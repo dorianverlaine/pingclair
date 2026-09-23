@@ -4652,6 +4652,22 @@ impl PingclairProxy {
                             .await?;
                             return Ok(true);
                         }
+                        // 🚫 `Allow` is required on a 405 (RFC 9110 §15.5.6).
+                        Ok(Some(pingclair_static::ServedResponse::MethodNotAllowed)) => {
+                            let mut header =
+                                Self::build_downstream_header(session, 405, Some(2)).unwrap();
+                            header.insert_header("Allow", "GET, HEAD").unwrap();
+                            header.insert_header("Content-Length", "0").unwrap();
+                            self.write_local_response(
+                                session,
+                                ctx,
+                                header,
+                                LocalResponseBody::Empty,
+                                false,
+                            )
+                            .await?;
+                            return Ok(true);
+                        }
                         Ok(Some(pingclair_static::ServedResponse::PreconditionFailed)) => {
                             let mut header =
                                 Self::build_downstream_header(session, 412, Some(1)).unwrap();

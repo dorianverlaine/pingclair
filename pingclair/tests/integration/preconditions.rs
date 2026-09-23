@@ -156,3 +156,51 @@ async fn test_file_server_evaluates_preconditions() {
          If-Match and If-Unmodified-Since → 412; a gzip tag matches gzip only"
     );
 }
+
+/// 🚫 A file is served to `GET` and `HEAD` only; any other method gets 405
+/// with `Allow`, and a missing file stays 404 whatever the method.
+///
+/// 🤡 The method was never looked at: `POST` and `DELETE` got 200 and the
+/// file, so a client could believe its write had been accepted.
+#[tokio::test]
+async fn test_file_server_refuses_methods_other_than_get_and_head() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("f.txt"), "0123456789").unwrap();
+    let mut server = site(root.path());
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    let mut outcomes = Vec::new();
+    for (method, path) in [
+        (reqwest::Method::GET, "/f.txt"),
+        (reqwest::Method::HEAD, "/f.txt"),
+        (reqwest::Method::POST, "/f.txt"),
+        (reqwest::Method::DELETE, "/f.txt"),
+        (reqwest::Method::POST, "/missing.txt"),
+    ] {
+        let response = client
+            .request(method, server.url(0, path))
+            .send()
+            .await
+            .expect("request");
+        let status = response.status().as_u16();
+        let allow = response
+            .headers()
+            .get("allow")
+            .map(|v| v.to_str().unwrap().to_string());
+        outcomes.push((status, allow, response.text().await.unwrap()));
+    }
+    server.stop();
+
+    let refused = || (405, Some("GET, HEAD".to_string()), String::new());
+    assert_eq!(
+        outcomes,
+        [
+            (200, None, "0123456789".to_string()),
+            (200, None, String::new()),
+            refused(),
+            refused(),
+            (404, None, "404 Not Found".to_string()),
+        ]
+    );
+}

@@ -678,7 +678,8 @@ mod bounded_memory_tests {
             ServedResponse::Buffered(file) => file.content.len(),
             ServedResponse::Redirect(_)
             | ServedResponse::NotModified(_)
-            | ServedResponse::PreconditionFailed => 0,
+            | ServedResponse::PreconditionFailed
+            | ServedResponse::MethodNotAllowed => 0,
         }
     }
 

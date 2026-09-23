@@ -360,6 +360,9 @@ pub enum ServedResponse {
     /// named a version that is no longer current, or `If-None-Match`
     /// matched on a method other than `GET` or `HEAD`.
     PreconditionFailed,
+    /// 🚫 `405 Method Not Allowed`: the file exists, and the method is
+    /// neither `GET` nor `HEAD`. The caller sends `Allow: GET, HEAD`.
+    MethodNotAllowed,
 }
 
 /// 🧊 The header fields a `304` carries (RFC 9110 §15.4.5): the ones a `200`
