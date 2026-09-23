@@ -30,6 +30,7 @@ pub mod quic;
 pub mod rate_limit;
 pub mod readiness;
 pub mod redaction;
+mod response_encoding;
 mod retry;
 pub mod server;
 mod subrequest;

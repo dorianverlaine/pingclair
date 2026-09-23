@@ -20,6 +20,15 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🗄️ A cached response is compressed per client, not per stored copy
+
+On a `reverse_proxy` route with `cache`, a compressible response above the
+compression threshold could reach the client as plain text under a
+`Content-Encoding: gzip` header, and the stored entry could pair one coding's
+bytes with another's headers. Compression now runs after the cache, on the way
+out to each client: the store keeps the origin's bytes, a client that asks for
+gzip gets gzip, and a client that asks for nothing gets the original body.
+
 ### 🪟 `file_server` honours `If-Range`
 
 A client resuming a download sends `Range` with `If-Range`, naming the version

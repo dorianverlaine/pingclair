@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
-use crate::encoding::{ResponseEncoder, negotiate, stream_chunk};
+use crate::encoding::{ResponseEncoder, negotiate};
 use crate::http_policy::{
     CorsDecision, ResponseHeaderPolicy, evaluate_cors, generate_request_id, is_websocket_upgrade,
     rewrite_uri, sanitize_request_id, via_value,
@@ -154,9 +154,6 @@ pub struct RequestContext {
     /// they arrive from upstream and response compression is disabled so
     /// SSE / LLM-style streaming endpoints work through the proxy.
     pub streaming_response: bool,
-    /// Streaming encoder for the response body, created in `response_filter`
-    /// once the upstream content type proves the body is worth compressing.
-    pub response_encoder: Option<ResponseEncoder>,
     /// 🛡️ Client IP resolved through the trusted-proxy policy.
     pub verified_client_ip: Option<IpAddr>,
     /// 🌐 Verified downstream request scheme forwarded to the upstream.
@@ -269,7 +266,6 @@ impl Default for RequestContext {
             response_headers: ResponseHeaderPolicy::default(),
             negotiated_encoding: None,
             streaming_response: false,
-            response_encoder: None,
             verified_client_ip: None,
             request_scheme: "http",
             response_status: 0,
@@ -5886,6 +5882,12 @@ impl ProxyHttp for PingclairProxy {
         modules.add_module(Box::new(crate::alt_svc::AltSvcModuleBuilder::new(
             self.alt_svc.clone(),
         )));
+        // 🗜️ Compression runs as a downstream module so it applies after the
+        // cache has stored the origin's bytes, and so it sees the `Done` that
+        // ends a body served out of the cache.
+        modules.add_module(Box::new(
+            crate::response_encoding::ResponseEncodingModuleBuilder,
+        ));
     }
 
     /// 🧾 Rejects decoded headers that exceed the selected virtual host's explicit bounds.
@@ -7516,11 +7518,18 @@ impl ProxyHttp for PingclairProxy {
             {
                 match ResponseEncoder::new(encoding) {
                     Ok(encoder) => {
-                        // Headers are only rewritten once the encoder exists.
-                        // Announcing a coding we then failed to construct
-                        // would hand the client a body it cannot decode.
-                        upstream_response.insert_header("Content-Encoding", encoder.token())?;
-                        ctx.response_encoder = Some(encoder);
+                        // 🛡️ Headers are only rewritten once the encoder is
+                        // in place. Announcing a coding that nothing then
+                        // applies would hand the client a body it cannot
+                        // decode.
+                        let token = encoder.token();
+                        if !crate::response_encoding::install(
+                            &mut session.downstream_modules_ctx,
+                            encoder,
+                        ) {
+                            return Ok(());
+                        }
+                        upstream_response.insert_header("Content-Encoding", token)?;
                         let _ = upstream_response.remove_header("Content-Length");
                         // Transfer-Encoding: chunked will be set by Pingora automatically
                         upstream_response.insert_header("Vary", "Accept-Encoding")?;
@@ -7539,13 +7548,12 @@ impl ProxyHttp for PingclairProxy {
         Ok(())
     }
 
-    /// Filter upstream response body chunks through the negotiated coding.
+    /// 📥 Filters upstream response body chunks before the cache stores them.
     ///
-    /// 🏗️ ARCHITECTURE: Streaming by default — see
-    /// [`crate::encoding::stream_chunk`]. Every chunk is written in,
-    /// sync-flushed and drained immediately, so memory use is bounded by one
-    /// chunk's worth of compressed output rather than by response size.
-    /// `end_of_stream` finalizes the encoder (trailer + final flush).
+    /// 🗄️ Pingora hands this filter's output to the cache, so nothing here may
+    /// change the body into something the stored headers do not describe.
+    /// Compression therefore lives in the downstream module in
+    /// `response_encoding.rs` instead.
     ///
     /// 🧱 A route that configured `response_buffers` holds the body first, and
     /// even then memory is bounded by the configured ceiling rather than by
@@ -7620,8 +7628,6 @@ impl ProxyHttp for PingclairProxy {
             _session.cache.disable(NoCacheReason::ResponseTooLarge);
             ctx.cache_size_tracked = false;
         }
-
-        stream_chunk(&mut ctx.response_encoder, body, end_of_stream);
 
         let delay = body.as_ref().and_then(|bytes| {
             ctx.download_pacer

@@ -13752,3 +13752,9 @@ async fn raw_get_with_host(address: SocketAddr, target: &str, authority: &str) -
         .unwrap();
     String::from_utf8_lossy(&read_http1_to_end(&mut stream).await).to_string()
 }
+
+// MARK: - Response pipeline
+
+// 🧬 Kept in a sibling file so this high-touch module does not keep growing.
+#[path = "integration/response_pipeline.rs"]
+mod response_pipeline;
