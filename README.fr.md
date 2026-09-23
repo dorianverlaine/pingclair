@@ -208,6 +208,19 @@ Créez un fichier nommé `Pingclairfile` à la racine du projet, puis lancez :
 pingclair run Pingclairfile
 ```
 
+`run` sans argument cherche `Pingclairfile` dans le répertoire courant, puis
+`Caddyfile`, pour qu'une configuration migrée fonctionne sans option. Si aucun
+des deux n'existe, **le processus se termine avec le code 1** et le message
+nomme les deux candidats ainsi que le répertoire parcouru.
+
+📌 C'est une différence délibérée avec Caddy : `caddy run` sans configuration
+démarre un serveur vide et attend que l'Admin API lui en fournisse une. Cela
+convient à l'orchestration qui démarre un processus puis lui envoie sa
+configuration. Ici le démarrage est refusé, parce qu'un opérateur qui a tapé
+`run` dans le mauvais répertoire reçoit une erreur plutôt qu'un serveur qui ne
+sert rien en silence. Si vous avez besoin du comportement de Caddy, démarrez
+avec une configuration minimale puis chargez la vraie via l'Admin API.
+
 ## 🛠️ Configuration (Pingclairfile)
 
 Le DSL Pingclair est un langage de configuration structuré conçu pour décrire le comportement du serveur. Comme le `Caddyfile` de Caddy, son nom de fichier conventionnel est `Pingclairfile`.

@@ -202,6 +202,16 @@ pc service restart  # 重新啟動
 pingclair run Pingclairfile
 ```
 
+不帶參數的 `run` 會先在工作目錄找 `Pingclairfile`，再找 `Caddyfile`，所以
+遷移過來的設定不必加旗標。**兩者都不存在時，行程以 1 結束**，訊息會指名這兩個
+候選檔名與它搜尋的目錄。
+
+📌 這是與 Caddy 刻意的差異：`caddy run` 在沒有設定時會啟動一個空伺服器，等
+Admin API 把設定送進來。那適合「先起行程、之後再送設定」的编排方式。這裡選擇
+拒絕啟動，因為在錯誤目錄下打 `run` 的人會拿到一個錯誤，而不是一個安靜地什麼都
+不服務的伺服器。若你需要 Caddy 的行為，先用一份最小的設定啟動，再透過 Admin API
+載入真正的設定。
+
 ## 🛠️ 設定詳解（Pingclairfile）
 
 Pingclair DSL 是專門用於描述伺服器行為的結構化設定語言；如同 Caddy 的 `Caddyfile`，其慣用檔名為 `Pingclairfile`。

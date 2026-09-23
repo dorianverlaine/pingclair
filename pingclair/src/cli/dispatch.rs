@@ -17,7 +17,9 @@ use super::{Cli, Commands};
 use crate::addr::{host_only, listen_for_site, upstream_hostport};
 use crate::cli::admin::{admin_request, trust_internal_ca};
 use crate::cli::service::manage_system_service;
-use crate::paths::{resolve_config_path, tls_store_dir};
+use crate::paths::{
+    CONFIG_CANDIDATES, DefaultConfig, resolve_config_path, resolve_default_config, tls_store_dir,
+};
 use crate::run::run_server;
 
 /// 🧩 One capability this build implements, and the Caddy module that provides
@@ -283,11 +285,37 @@ fn format_directives(directives: &[pingclair_config::parser::caddy_ast::Directiv
 pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
     match command {
         Commands::Run {
-            config: config_path,
+            config,
             resume,
             watch,
         } => {
-            let mut config_path = resolve_config_path(config_path.as_deref());
+            let mut config_path = resolve_config_path(config.as_deref());
+            // 🚫 No argument and no conventional file is the one case where the
+            // generic "Failed to load config: No such file or directory" sends
+            // the operator looking in the wrong place — it names no path, and
+            // the file its absence describes was never the mistake.
+            //
+            // 🧭 Caddy starts an empty server here and waits for the Admin API.
+            // This build refuses instead, which is the clearer answer for
+            // someone who typed `run` in the wrong directory and the wrong one
+            // for orchestration that posts its configuration later. The refusal
+            // says which of the two this is, and what to do about it.
+            if matches!(
+                resolve_default_config(config.as_deref()),
+                DefaultConfig::Missing
+            ) {
+                let directory = std::env::current_dir()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|_| "the working directory".to_string());
+                let candidates = CONFIG_CANDIDATES.join("`, then `");
+                tracing::error!(
+                    "❌ No configuration found in {directory}: looked for `{candidates}`. Pass a \
+                     path (`pingclair run <path>`), or create one of those files. Caddy starts an \
+                     empty server here and waits for the Admin API; this build does not start \
+                     with no configuration at all."
+                );
+                std::process::exit(1);
+            }
             if resume {
                 let autosave = tls_store_dir().join("autosave.json");
                 if autosave.is_file() {

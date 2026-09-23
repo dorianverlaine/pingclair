@@ -213,6 +213,19 @@ Create a file named `Pingclairfile` in your project root, then run:
 pingclair run Pingclairfile
 ```
 
+`run` with no argument looks for `Pingclairfile` in the working directory,
+then `Caddyfile`, so a migrated configuration works without a flag. If neither
+is there, **the process exits 1** with a message naming both candidates and the
+directory it searched.
+
+📌 Caddy differs here, deliberately: `caddy run` with no configuration starts an
+empty server and waits for the Admin API to be given one. That suits
+orchestration which starts a process and posts its configuration later. This
+build refuses instead, because an operator who typed `run` in the wrong
+directory gets an error rather than a server that quietly serves nothing. If you
+need Caddy's behaviour, start with any minimal configuration and load the real
+one over the Admin API.
+
 ## 🛠️ Configuration (Pingclairfile)
 
 The Pingclair DSL is a structured configuration language purpose-built for describing server behavior. Like Caddy's `Caddyfile`, its conventional filename is `Pingclairfile`.
