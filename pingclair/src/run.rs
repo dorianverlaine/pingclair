@@ -29,7 +29,7 @@ use crate::paths::tls_store_dir_with;
 use crate::runtime_listeners::{
     RuntimeListeners, RuntimePublisherInputs, prepare_listener_policies,
 };
-use crate::systemd::{notify_systemd_ready, notify_systemd_status, notify_systemd_stopping};
+use crate::systemd::{notify_systemd_ready, notify_systemd_status};
 use parking_lot::RwLock;
 use pingclair_proxy::client_auth::PublishedListenerPolicy;
 use pingora_core::listeners::tls::TlsSettings;
@@ -167,25 +167,18 @@ pub(crate) fn run_server(
     // directions and shipped a shutdown that hung:
     //
     //   grace_period_seconds          → `thread::sleep(...)` before teardown.
-    //                                   The window during which the runtimes
-    //                                   are still alive. Unconditional: every
-    //                                   shutdown costs exactly this.
+    //                                   Unconditional: an idle server would
+    //                                   still wait all of it.
     //   graceful_shutdown_timeout_secs → `rt.shutdown_timeout(t)` *and then*
     //                                   `thread::sleep(t)` again. A large value
     //                                   here does not extend the drain; it just
     //                                   makes the process refuse to exit.
     //
-    // So the configured grace belongs in the sleep, and the teardown budget
-    // stays at Pingora's own small default.
-    //
-    // 🚧 A bounded window is a deliberate choice, not the finished behaviour, and
-    // must not be described as "graceful shutdown works". The alternative —
-    // exiting as soon as the last in-flight request finishes, bounded by work
-    // remaining rather than by a clock — is not expressible with the knobs the
-    // transport exposes. Day 26 also measured that the sleep window does not by
-    // itself keep a large download alive, so something in the service layer ends
-    // the connection first. Until that is found, this bounds the damage rather
-    // than fixing it.
+    // 🚰 Neither is what actually ends the process. `crate::shutdown` waits for
+    // the running requests themselves and exits as soon as the last one is
+    // done, bounded by this same grace period; Pingora's sleep is only the
+    // backstop if that task never runs. So the configured grace goes in both
+    // places, and the teardown budget stays at Pingora's small default.
     server_conf.grace_period_seconds = Some(grace_period_secs);
     tracing::info!(
         "🚰 Shutdown grace period: {}s{}",
@@ -1226,75 +1219,23 @@ pub(crate) fn run_server(
     bg_handle.spawn(pingclair_proxy::dns::run(default_dns_interval));
 
     // ========================================
-    // 🛑 Signal Handling for Shutdown (SIGINT/SIGTERM)
+    // 🛑 Graceful shutdown (SIGINT, SIGTERM, admin `POST /stop`)
     // ========================================
-    // Pingora's `run_forever()` blocks indefinitely, so without explicit
-    // handlers the process only dies on SIGKILL. Install shutdown handlers
-    // on the background runtime before entering it.
-    let shutdown_for_task = admin_shutdown.clone();
-    bg_handle.spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-
-            let mut sigterm = match signal(SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("❌ Failed to create SIGTERM listener: {}", e);
-                    // Fall back to SIGINT-only handling, and leave through the
-                    // same shutdown as the ordinary path: a drain that only
-                    // covers the happy exit is missing exactly when something
-                    // has already gone wrong.
-                    let _ = tokio::signal::ctrl_c().await;
-                    tracing::info!("🛑 Received SIGINT, shutting down");
-                    shutdown_and_exit();
-                }
-            };
-            let mut sigquit = match signal(SignalKind::quit()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("❌ Failed to create SIGQUIT listener: {}", e);
-                    return;
-                }
-            };
-
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("🛑 Received SIGINT, shutting down");
-                    // 🚰 Stop being sent new traffic before the process starts
-                    // going away. A load balancer polling /ready gets a 503 on
-                    // its next check and routes around, so the connections
-                    // still in flight are the last ones this instance has to
-                    // finish rather than the first of a fresh wave.
-                    pingclair_proxy::readiness::mark_draining();
-                    notify_systemd_stopping();
-                }
-                _ = sigterm.recv() => {
-                    tracing::info!("🛑 Received SIGTERM, shutting down");
-                    pingclair_proxy::readiness::mark_draining();
-                    notify_systemd_stopping();
-                }
-                _ = sigquit.recv() => {
-                    // 🏃 Caddy exits immediately on SIGQUIT (code 2) after
-                    // cleaning storage locks; Pingora has no equivalent lock
-                    // step, so a prompt exit is the faithful behavior.
-                    tracing::info!("🏃 Received SIGQUIT, forced exit");
-                    std::process::exit(2);
-                }
-                _ = shutdown_for_task.notified() => {
-                    tracing::info!("🛑 Admin API requested shutdown");
-                }
-            }
-        }
-
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("🛑 Received Ctrl-C, shutting down");
-        }
-
-        shutdown_and_exit();
-    });
+    // 🧭 The order lives in `crate::shutdown`. The listener records a stop
+    // request from now on, Pingora reads it through `SignalWatch` and closes
+    // the listeners, and the drain task then waits for running requests,
+    // flushes the logs, and exits.
+    #[cfg(unix)]
+    let (stop_requested, stop_watch) = tokio::sync::watch::channel(false);
+    #[cfg(unix)]
+    bg_handle.spawn(crate::shutdown::listen_for_stop(
+        admin_shutdown.clone(),
+        stop_requested,
+    ));
+    bg_handle.spawn(crate::shutdown::drain_then_exit(
+        server.watch_execution_phase(),
+        Duration::from_secs(grace_period_secs),
+    ));
 
     println!("🚀 Pingclair running...");
     // 🔓 Releases every unique private address immediately before Pingora binds it.
@@ -1315,30 +1256,17 @@ pub(crate) fn run_server(
     pingclair_proxy::readiness::mark_ready();
     notify_systemd_ready();
 
-    server.run_forever();
-}
-
-/// 🛑 The one graceful exit: drain both log paths, then leave.
-///
-/// `std::process::exit` runs no destructors, so neither queue can be left to a
-/// `Drop` that will never run, and both drains are bounded rather than
-/// unbounded: a blocked sink must not turn shutdown into a hang. Every
-/// graceful exit comes through here — the signal handlers, the admin API's
-/// request, and the fallback taken when a signal listener could not even be
-/// installed — so a new one cannot skip the drains by accident. The forced
-/// SIGQUIT exit deliberately does not: leaving immediately is the Caddy
-/// behavior it reproduces.
-fn shutdown_and_exit() -> ! {
-    // 🚿 Access records first, because the warning below travels through the
-    // tracing queue and would not survive the drain that follows it.
-    if !pingclair_proxy::access_log::flush_all(Duration::from_millis(250)) {
-        tracing::warn!("⚠️ Access log drain exceeded the shutdown budget");
-    }
-    // 🚿 Then the tracing queue itself — which is where the records about this
-    // shutdown live, and the reason the queue is drained rather than abandoned.
-    // A drain that could not finish reports what it dropped on stderr.
-    crate::logging::drain();
-    std::process::exit(0);
+    #[cfg(unix)]
+    server.run(pingora::server::RunArgs {
+        shutdown_signal: Box::new(crate::shutdown::SignalWatch {
+            requested: stop_watch,
+        }),
+    });
+    #[cfg(not(unix))]
+    server.run(pingora::server::RunArgs::default());
+    // 🧯 Pingora returns only if the drain task above never ran; leave through
+    // the same log drains rather than its own bare `exit`.
+    crate::shutdown::shutdown_and_exit();
 }
 
 /// 📡 Builds the DNS provider a site named, or says why it cannot be used.

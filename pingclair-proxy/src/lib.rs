@@ -20,6 +20,7 @@ mod cache_vary;
 pub mod client_auth;
 pub mod connection_filter;
 pub mod dns;
+pub mod drain;
 pub mod dynamic_upstream;
 pub mod encoding;
 mod fastcgi;

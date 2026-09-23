@@ -188,6 +188,8 @@ pub struct RequestContext {
     pub first_byte_at: Option<std::time::Instant>,
     /// 📊 Resolved active-request gauge retained so completion needs no label lookup.
     active_connection_metric: Option<prometheus::IntGauge>,
+    /// 🚰 Keeps shutdown waiting until this request is finished; see [`crate::drain`].
+    _in_flight: Option<crate::drain::InFlight>,
     /// Path produced by the most recent rewrite handler. Pipelines consume
     /// this before invoking the next local handler.
     pub rewritten_path: Option<String>,
@@ -284,6 +286,7 @@ impl Default for RequestContext {
             start_time: std::time::Instant::now(),
             first_byte_at: None,
             active_connection_metric: None,
+            _in_flight: None,
             rewritten_path: None,
             request_body_bytes: 0,
             request_buffer: None,
@@ -6063,7 +6066,13 @@ impl ProxyHttp for PingclairProxy {
     type CTX = RequestContext;
 
     fn new_ctx(&self) -> Self::CTX {
-        RequestContext::default()
+        // 🚰 Counted here rather than in `Default`, so only a request Pingora
+        // actually hands over can hold shutdown open, and the token ends with
+        // the context whether the request finished, failed, or was abandoned.
+        RequestContext {
+            _in_flight: Some(crate::drain::InFlight::enter()),
+            ..RequestContext::default()
+        }
     }
 
     /// Register downstream modules that run on every response written

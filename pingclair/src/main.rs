@@ -47,6 +47,7 @@ mod paths;
 mod resource_guard;
 mod run;
 mod runtime_listeners;
+mod shutdown;
 mod systemd;
 
 use crate::cli::Cli;

@@ -20,6 +20,19 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🛑 SIGTERM lets running requests finish within `grace_period`
+
+A graceful stop (`SIGTERM`, `SIGINT`, or `POST /stop`) exited the process
+about a quarter of a second after the signal, whatever `grace_period` said, so
+every request still running was cut with no response. The stop now runs in
+one order: `/ready` turns 503, the listeners close (a new connection is
+refused, and HTTP/2 connections receive `GOAWAY`), running requests finish,
+the access log and tracing queue are flushed, and the process exits. It exits
+as soon as the last request is done, and cuts whatever is still running once
+`grace_period` (default 30 s) has passed. `SIGQUIT` still exits immediately
+with status 2. HTTP/3 is not covered yet: its requests are neither waited
+for nor sent `GOAWAY` (#98).
+
 ### 🔌 A request shorter than the h2c preface is answered instead of ignored
 
 A connection whose first request was shorter than 24 bytes was answered with
