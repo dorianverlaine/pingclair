@@ -203,6 +203,10 @@ pub struct RequestContext {
     pub error_status: Option<u16>,
     /// 💬 Message carried with the raised error status.
     pub error_message: Option<String>,
+    /// 🔎 What exactly went wrong, appended to the built-in error body when no
+    /// `error_page` is configured — for a 431, which field was too large.
+    /// Unlike `error_message` it never replaces the operator's page.
+    pub error_detail: Option<std::borrow::Cow<'static, str>>,
     /// 🧰 Request-scoped variables set by `vars` handlers.
     pub request_vars: crate::http_policy::RequestVars,
     /// 🧭 Response handlers registered by an `intercept` handler for this
@@ -286,6 +290,7 @@ impl Default for RequestContext {
             response_buffer: None,
             error_status: None,
             error_message: None,
+            error_detail: None,
             request_vars: crate::http_policy::RequestVars::default(),
             intercept_handlers: Vec::new(),
             intercepted_response: None,
@@ -1957,6 +1962,7 @@ pub(crate) fn error_reason(status: u16) -> &'static str {
         404 => "Not Found",
         413 => "Request Entity Too Large",
         429 => "Too Many Requests",
+        431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         501 => "Not Implemented",
         502 => "Bad Gateway",
@@ -4222,7 +4228,11 @@ impl PingclairProxy {
             return Ok(());
         }
         let reason = error_reason(status);
-        Self::write_simple_response(session, ctx, status, &format!("{status} {reason}")).await
+        let body = match ctx.error_detail.take() {
+            Some(detail) => format!("{status} {reason}: {detail}"),
+            None => format!("{status} {reason}"),
+        };
+        Self::write_simple_response(session, ctx, status, &body).await
     }
 
     /// 🚨 Writes the default response for a raised error status.
@@ -6024,27 +6034,28 @@ impl ProxyHttp for PingclairProxy {
     async fn early_request_filter(
         &self,
         session: &mut Session,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> pingora_core::Result<()> {
         let request = session.req_header();
         let host = crate::http_policy::request_host(crate::http_policy::request_authority(request));
         let Some(state) = self.get_state(host.as_ref()) else {
             return Ok(());
         };
-        let limits = &state.config.limits;
-        let header_count = request.headers.len();
-        let header_bytes = request.headers.iter().fold(0usize, |total, (name, value)| {
-            total
-                .saturating_add(name.as_str().len())
-                .saturating_add(value.as_bytes().len())
-        });
-        if limits
-            .max_header_count
-            .is_some_and(|limit| header_count > limit)
-            || limits
-                .max_header_bytes
-                .is_some_and(|limit| header_bytes > limit)
-        {
+        let breach = crate::header_limits::check(
+            &state.config.limits,
+            request.headers.len(),
+            request
+                .headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes().len())),
+        );
+        // 🧭 Kept for `request_filter`, which would otherwise look the host
+        // up again, and for the 431 below: without a state the error-page
+        // lookup finds no site and the configured page is unreachable.
+        let detail = breach.as_ref().and_then(|breach| breach.detail());
+        ctx.state = Some(state);
+        if breach.is_some() {
+            ctx.error_detail = detail;
             session.as_mut().set_keepalive(None);
             return pingora_core::Error::e_explain(
                 pingora_core::ErrorType::HTTPStatus(431),
@@ -6459,8 +6470,11 @@ impl ProxyHttp for PingclairProxy {
             let host = crate::http_policy::request_host(authority);
             let host = host.as_ref();
 
-            // Get state for this host
-            let state = match self.get_state(host) {
+            // 🧭 `early_request_filter` already resolved this same host from
+            // the same header, so its answer is reused rather than looked up
+            // twice. The fallback lookup keeps this phase correct on its own
+            // should a request ever reach it without that earlier phase.
+            let state = match ctx.state.clone().or_else(|| self.get_state(host)) {
                 Some(s) => s,
                 None => {
                     // 🔄 Before falling to 404: is this the request an automatic

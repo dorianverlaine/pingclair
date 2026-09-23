@@ -3473,20 +3473,25 @@ async fn handle_request_inner(
         .handler;
 
     // 🧾 Applies the selected virtual host's decoded H3 field bounds.
-    let header_count = req.headers.len();
-    let header_bytes = req.headers.iter().fold(0usize, |total, (name, value)| {
-        total.saturating_add(name.len()).saturating_add(value.len())
-    });
-    if state
-        .config
-        .limits
-        .max_header_count
-        .is_some_and(|limit| header_count > limit)
-        || state
-            .config
-            .limits
-            .max_header_bytes
-            .is_some_and(|limit| header_bytes > limit)
+    //
+    // 📌 Only the field-count limit can actually fire here. The byte limit is
+    // also advertised to the client as SETTINGS_MAX_FIELD_SECTION_SIZE (the
+    // strictest of the listener's sites, see `QuicServer::run`), and quiche
+    // enforces it before this code sees the request, counting 32 bytes more
+    // per field than this check does — so a section this check would refuse
+    // never gets this far, and no response names an oversized field over
+    // HTTP/3. Observed 2026-09-24 with the quiche pinned by tokio-quiche: a
+    // single 2000-byte field against `max_header_bytes 1024` closed the whole
+    // connection with H3_EXCESSIVE_LOAD. The shared check is still used so the
+    // two transports cannot disagree about what the limits mean.
+    if crate::header_limits::check(
+        &state.config.limits,
+        req.headers.len(),
+        req.headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.len())),
+    )
+    .is_some()
     {
         return Err((431, "Request Header Fields Too Large"));
     }

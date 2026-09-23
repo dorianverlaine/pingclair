@@ -23,6 +23,7 @@ pub mod dns;
 pub mod dynamic_upstream;
 pub mod encoding;
 mod fastcgi;
+mod header_limits;
 pub mod health_check;
 mod http_policy;
 pub mod load_balancer;

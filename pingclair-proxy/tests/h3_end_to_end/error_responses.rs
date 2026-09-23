@@ -13,7 +13,7 @@ fn field<'a>(response: &'a H3Response, name: &str) -> Option<&'a str> {
 }
 
 /// 🧾 Starts an H3 server for the first site of a Pingclairfile, keeping its
-/// site-level settings (`rate_limit`, `limits`, `error_page`) rather than only
+/// site-level settings such as `rate_limit` and `error_page` rather than only
 /// the first route's handler.
 async fn spawn_h3_site(source: &str) -> SocketAddr {
     let site = pingclair_config::compile(source).unwrap().servers[0].clone();

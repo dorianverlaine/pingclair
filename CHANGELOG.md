@@ -64,6 +64,17 @@ in them said so, so a relying party could not tell "never published" from
 extension (RFC 9608); the root does not, and the 90-day lifetime is unchanged.
 Leaves already on disk gain it when they are next reissued.
 
+### 🔎 An HTTP/1.1 431 names the field that was too large
+
+When one header field alone is larger than `max_header_bytes`, the 431 body
+now names that field (never its value), as RFC 6585 §5 asks; when only the
+total is too large, no field is named. The body used to read `431 Error`, and
+a site's `error_page 431` was never used because the check ran before the
+site had been recorded for the request; both are fixed. Over HTTP/2 and
+HTTP/3 the same limit is enforced earlier, by the protocol libraries, so an
+oversized field still gets a bodiless 431 on HTTP/2 and a closed connection
+on HTTP/3.
+
 ### 🚦 A rate-limit rejection says why
 
 A request refused by `rate_limit` used to get a bare `429` status with no
