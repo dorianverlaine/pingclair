@@ -819,13 +819,16 @@ enum RespMsg {
     /// drain observe the closed channel even when the client is blocked by
     /// QUIC flow control and sends no packets.
     HandlerDone,
-    /// 🔪 Reset this stream and write nothing (`abort`).
+    /// 🔪 Reset this stream with the given HTTP/3 error code.
     ///
     /// The handler task cannot touch the QUIC connection — only the worker
-    /// owns it — so aborting has to travel as an event like everything else.
+    /// owns it — so a reset has to travel as an event like everything else.
     /// It is a distinct variant rather than a status because every status is
-    /// an answer, and `abort` exists to give none.
-    Abort,
+    /// an answer, and a reset exists to give none. Two callers need it: the
+    /// `abort` handler, which answers nothing on purpose, and a response that
+    /// fails after its headers left, which can no longer answer truthfully.
+    /// A clean FIN there would tell the client a short body is complete.
+    Abort(quiche::h3::WireErrorCode),
 }
 
 /// One handler task's output, on this connection's own channel.
@@ -966,8 +969,9 @@ struct StreamState {
     cancel_tx: Option<watch::Sender<bool>>,
     /// 🚫 Prevents a rejected request from accepting late handler responses.
     handler_cancelled: bool,
-    /// 🔪 An `abort` handler asked for this stream to end with no response.
-    abort_requested: bool,
+    /// 🔪 The handler asked for this stream to be reset, with this code,
+    /// instead of being finished with a FIN.
+    abort_requested: Option<quiche::h3::WireErrorCode>,
     /// 🧹 Marks a terminated stream so later response messages are ignored.
     dead: bool,
 }
@@ -1797,11 +1801,11 @@ impl H3App {
                     ss.pending_trailers = Some(headers);
                 }
                 RespMsg::HandlerDone => {}
-                RespMsg::Abort => {
+                RespMsg::Abort(code) => {
                     // 🔪 Marked, not shut down here: this function only
                     // collects handler events, and the connection is not
                     // available to it. `flush_stream` performs the reset.
-                    ss.abort_requested = true;
+                    ss.abort_requested = Some(code);
                 }
             }
         }
@@ -1881,23 +1885,18 @@ impl H3App {
             return;
         }
 
-        // 🔪 `abort` resets this stream in both directions and writes nothing.
-        // Only this stream: an HTTP/3 connection carries other requests that
-        // did nothing wrong, and tearing the connection down would abort them
-        // too. That is the one place this transport must differ from H1/H2,
-        // where the request and the connection are the same thing.
-        if ss.abort_requested {
-            let _ = conn.stream_shutdown(
-                stream_id,
-                quiche::Shutdown::Write,
-                quiche::h3::WireErrorCode::RequestCancelled as u64,
-            );
+        // 🔪 A reset ends this stream in both directions, and any body still
+        // queued is discarded rather than flushed: RESET_STREAM abandons
+        // unsent data anyway, and the point is that the client sees an
+        // unfinished message. Only this stream: an HTTP/3 connection carries
+        // other requests that did nothing wrong, and tearing the connection
+        // down would abort them too. That is the one place this transport
+        // must differ from H1/H2, where the request and the connection are
+        // the same thing.
+        if let Some(code) = ss.abort_requested {
+            let _ = conn.stream_shutdown(stream_id, quiche::Shutdown::Write, code as u64);
             if !ss.req_stream_finished {
-                let _ = conn.stream_shutdown(
-                    stream_id,
-                    quiche::Shutdown::Read,
-                    quiche::h3::WireErrorCode::RequestCancelled as u64,
-                );
+                let _ = conn.stream_shutdown(stream_id, quiche::Shutdown::Read, code as u64);
             }
             ss.dead = true;
             return;
@@ -3375,7 +3374,12 @@ async fn handle_request_inner(
         H3Plan::Abort => {
             // 🔪 The worker owns the connection, so the reset travels as an
             // event. Nothing is written before it, which is the point.
-            send_abort(resp_tx, stream_id).await;
+            send_reset(
+                resp_tx,
+                stream_id,
+                quiche::h3::WireErrorCode::RequestCancelled,
+            )
+            .await;
             return Ok(());
         }
     };
@@ -3977,11 +3981,12 @@ async fn stream_h3_subrequest_response(
             }
         }
     }
-    if let Some(trailers) = trailers.filter(|trailers| !trailers.is_empty()) {
-        send_trailers(resp_tx, stream_id, trailers).await;
+    let completion = if clean {
+        H3BodyCompletion::Complete
     } else {
-        send_body(resp_tx, stream_id, Bytes::new(), true).await;
-    }
+        H3BodyCompletion::Truncated
+    };
+    finish_h3_response(resp_tx, stream_id, completion, trailers).await;
     if clean {
         connector
             .release_http_session(response.session, &response.peer, None)
@@ -5488,11 +5493,12 @@ async fn reverse_proxy_upstream(
         }
     }
 
-    if let Some(trailers) = response_trailers.filter(|trailers| !trailers.is_empty()) {
-        send_trailers(resp_tx, stream_id, trailers).await;
+    let completion = if clean {
+        H3BodyCompletion::Complete
     } else {
-        send_body(resp_tx, stream_id, Bytes::new(), true).await;
-    }
+        H3BodyCompletion::Truncated
+    };
+    finish_h3_response(resp_tx, stream_id, completion, response_trailers).await;
 
     if clean {
         // ♻️ Returns a fully consumed session to the keepalive pool.
@@ -5893,19 +5899,56 @@ async fn send_body(resp_tx: &ResponseSink, stream_id: u64, bytes: Bytes, fin: bo
         .await;
 }
 
-/// 🔪 Asks the worker to reset this stream without writing a response.
+/// 🔪 Asks the worker to reset this stream instead of finishing it.
 ///
-/// Deliberately does not call `observe_headers`/`observe_body`: nothing goes
-/// out, so the access log records a status of zero — which is the truthful
-/// record of an aborted request, and is how the H1/H2 side logs it too.
-async fn send_abort(resp_tx: &ResponseSink, stream_id: u64) {
+/// `RequestCancelled` is for `abort`, which declines to answer at all.
+/// `InternalError` is for a response that broke after it started (RFC 9114
+/// §8.1: "an internal error has occurred in the HTTP stack") — the upstream
+/// or a deadline failed, not the client, so no request-side code fits.
+///
+/// Deliberately does not call `observe_headers`/`observe_body`: nothing more
+/// goes out, so the access log keeps whatever status (possibly zero) was
+/// already sent — the truthful record, and how the H1/H2 side logs it too.
+async fn send_reset(resp_tx: &ResponseSink, stream_id: u64, code: quiche::h3::WireErrorCode) {
     let _ = resp_tx
         .tx
         .send(RespEvent {
             stream_id,
-            msg: RespMsg::Abort,
+            msg: RespMsg::Abort(code),
         })
         .await;
+}
+
+/// 🏁 Ends a streamed response: trailers or a clean FIN when every byte
+/// arrived, a reset when it did not.
+///
+/// 🚫 A failed upstream read or a missed deadline leaves the body short, and
+/// a FIN would frame that short body as the whole message — RFC 9114 §4.1.2
+/// makes it malformed when a `content-length` was sent, and without one the
+/// client cannot tell at all. Resetting is the only signal HTTP/3 has left
+/// once the headers are out.
+async fn finish_h3_response(
+    resp_tx: &ResponseSink,
+    stream_id: u64,
+    completion: H3BodyCompletion,
+    trailers: Option<Vec<quiche::h3::Header>>,
+) {
+    match completion {
+        H3BodyCompletion::Truncated => {
+            send_reset(resp_tx, stream_id, quiche::h3::WireErrorCode::InternalError).await;
+        }
+        H3BodyCompletion::Complete => match trailers.filter(|trailers| !trailers.is_empty()) {
+            Some(trailers) => send_trailers(resp_tx, stream_id, trailers).await,
+            None => send_body(resp_tx, stream_id, Bytes::new(), true).await,
+        },
+    }
+}
+
+/// 🏁 Whether a streamed response body reached its end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum H3BodyCompletion {
+    Complete,
+    Truncated,
 }
 
 /// 🧾 Queues H3 response trailers after every response body chunk.
@@ -6838,7 +6881,7 @@ mod tests {
                             break;
                         }
                     }
-                    RespMsg::Trailers(_) | RespMsg::HandlerDone | RespMsg::Abort => {}
+                    RespMsg::Trailers(_) | RespMsg::HandlerDone | RespMsg::Abort(_) => {}
                 }
             }
             (status, body)

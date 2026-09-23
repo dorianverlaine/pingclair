@@ -19,6 +19,11 @@ use pingclair_proxy::server::PingclairProxy;
 use tokio_quiche::quiche;
 use tokio_quiche::quiche::h3::NameValue;
 
+// 🔪 Responses that fail after they started. A sibling file rather than more
+// of this one, which is already a high-touch file.
+#[path = "h3_end_to_end/truncation.rs"]
+mod truncation;
+
 const ALPN: &[u8] = b"h3";
 
 fn self_signed_pem(names: &[&str]) -> (String, String) {

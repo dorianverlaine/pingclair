@@ -98,6 +98,15 @@ is now no ceiling by default; `request_body { max_size … }` on a route, or
 unlimited. **If you were relying on the 1 MiB default, set a limit explicitly**
 — the effective limit on an unconfigured site is now unbounded.
 
+### 🔪 A broken HTTP/3 response now ends in a reset, not a clean finish
+
+When an upstream failed partway through a response body, or pacing ran past
+the whole-request deadline, HTTP/3 clients used to receive the headers, a
+short body, and a normal end of stream — a truncated response presented as a
+complete one. The stream is now reset with `H3_INTERNAL_ERROR`, so clients
+report a failed transfer instead of saving a short file. Proxied responses
+and subrequest responses both take the new path.
+
 ### 🛡️ Retries after the upstream has answered repeat only idempotent methods
 
 A bodyless `POST` or `PATCH` that `lb_retry_match` named used to be sent again
