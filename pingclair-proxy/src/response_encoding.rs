@@ -94,6 +94,25 @@ pub(crate) fn vary_on_accept_encoding(header: &mut ResponseHeader) -> pingora_co
     Ok(())
 }
 
+/// 📐 Whether this response carries a complete representation that the
+/// proxy may re-encode for the client.
+///
+/// 🚫 A `206` or any response with `Content-Range` encloses a slice counted
+/// in the origin's identity bytes (RFC 9110 §14.1.2). Compressing it keeps a
+/// `Content-Range` that no longer describes the body, so a client splicing
+/// ranges together writes the wrong bytes at the wrong offsets. `HEAD`,
+/// `204` and `304` have no body to compress, and an informational response
+/// only predicts the final one.
+pub(crate) fn is_full_representation(method: &http::Method, header: &ResponseHeader) -> bool {
+    let status = header.status;
+    !(status.is_informational()
+        || status == http::StatusCode::NO_CONTENT
+        || status == http::StatusCode::PARTIAL_CONTENT
+        || status == http::StatusCode::NOT_MODIFIED
+        || *method == http::Method::HEAD
+        || header.headers.contains_key(http::header::CONTENT_RANGE))
+}
+
 #[async_trait::async_trait]
 impl HttpModule for ResponseEncodingModule {
     fn response_body_filter(
@@ -141,6 +160,34 @@ mod tests {
             .iter()
             .map(|value| value.to_str().unwrap())
             .collect()
+    }
+
+    /// 🚫 Partial, bodiless and interim responses are never re-encoded.
+    #[test]
+    fn only_complete_bodies_are_rewritable() {
+        let get = http::Method::GET;
+        for (status, method, range, expected) in [
+            (200, &get, false, true),
+            (404, &get, false, true),
+            (200, &get, true, false),
+            (206, &get, true, false),
+            (204, &get, false, false),
+            (304, &get, false, false),
+            (103, &get, false, false),
+            (200, &http::Method::HEAD, false, false),
+        ] {
+            let mut header = ResponseHeader::build(status, None).unwrap();
+            if range {
+                header
+                    .insert_header("Content-Range", "bytes 0-9/100")
+                    .unwrap();
+            }
+            assert_eq!(
+                is_full_representation(method, &header),
+                expected,
+                "{status} {method} range={range}"
+            );
+        }
     }
 
     /// 🛡️ Every rule the compressor has to respect when it announces that the

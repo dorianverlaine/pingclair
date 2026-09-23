@@ -20,6 +20,16 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 📐 Partial and bodiless proxied responses are no longer compressed
+
+A proxied `206 Partial Content` — from the origin, or sliced out of the cache
+for a `Range` request — was gzip-compressed while its `Content-Range` still
+counted the uncompressed bytes, so a client assembling the file from ranges
+wrote the wrong bytes at the wrong offsets. `HEAD`, `204` and `304` responses
+also lost their `Content-Length` to a coding that had no body to apply to.
+Compression now applies only to complete representations: never a `206`,
+never a response carrying `Content-Range`, never `HEAD`, `204` or `304`.
+
 ### 🧊 Compression adds to `Vary` instead of replacing it
 
 A proxied response that Pingclair compressed had its `Vary` field overwritten

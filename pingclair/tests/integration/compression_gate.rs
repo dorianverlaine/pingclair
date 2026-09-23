@@ -57,3 +57,109 @@ async fn test_compression_keeps_the_origin_vary_members() {
     assert_eq!(vary, ["cookie", "accept-encoding"]);
     assert_eq!(gunzip(&reply.bytes().await.unwrap()), body);
 }
+
+/// 📐 An origin's `206` reaches the client in the coding its `Content-Range`
+/// counts.
+///
+/// Compressing it kept the identity `Content-Range` above gzip bytes, so a
+/// client splicing ranges wrote the wrong bytes at the wrong offsets.
+#[tokio::test]
+async fn test_partial_content_is_not_compressed() {
+    let body = compressible_body();
+    let slice = &body[..300];
+    let (origin, _hits) = spawn_scripted_origin(origin_reply(
+        "206 Partial Content",
+        &format!("Content-Range: bytes 0-299/{}\r\n", body.len()),
+        slice,
+    ))
+    .await;
+    let mut server = TestServer::new_pingclairfile(&proxy_pingclairfile(origin, ""));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let reply = no_proxy_client()
+        .get(server.url(0, "/page"))
+        .header("Accept-Encoding", "gzip")
+        .header("Range", "bytes=0-299")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 206);
+    assert!(reply.headers().get("content-encoding").is_none());
+    assert_eq!(reply.headers().get("content-length").unwrap(), "300");
+    assert_eq!(reply.text().await.unwrap(), slice);
+}
+
+/// 📐 A range served out of the cache is sliced from the stored identity
+/// bytes and must not be compressed afterwards either.
+#[tokio::test]
+async fn test_cached_range_is_not_compressed() {
+    let body = compressible_body();
+    let (origin, _hits) = spawn_scripted_origin(origin_reply("200 OK", "", &body)).await;
+    let mut server =
+        TestServer::new_pingclairfile(&proxy_pingclairfile(origin, "cache {\n ttl 60s\n }"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let fill = client
+        .get(server.url(0, "/page"))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gunzip(&fill.bytes().await.unwrap()), body);
+
+    let reply = client
+        .get(server.url(0, "/page"))
+        .header("Accept-Encoding", "gzip")
+        .header("Range", "bytes=0-299")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 206);
+    assert!(reply.headers().get("content-encoding").is_none());
+    assert_eq!(
+        reply
+            .headers()
+            .get("content-range")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        format!("bytes 0-299/{}", body.len())
+    );
+    assert_eq!(reply.text().await.unwrap(), &body[..300]);
+}
+
+/// 📐 `HEAD` has no body to compress, so its headers keep describing the
+/// origin's identity representation.
+#[tokio::test]
+async fn test_head_is_not_compressed() {
+    let body = compressible_body();
+    let (origin, _hits) = spawn_scripted_origin(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes(),
+    )
+    .await;
+    let mut server = TestServer::new_pingclairfile(&proxy_pingclairfile(origin, ""));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let reply = no_proxy_client()
+        .head(server.url(0, "/page"))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 200);
+    assert!(reply.headers().get("content-encoding").is_none());
+    assert_eq!(
+        reply
+            .headers()
+            .get("content-length")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        body.len().to_string()
+    );
+}

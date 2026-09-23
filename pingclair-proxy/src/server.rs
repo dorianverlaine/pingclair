@@ -7471,8 +7471,14 @@ impl ProxyHttp for PingclairProxy {
         // final response's fields (RFC 8297 §2). Letting it decide would arm
         // an encoder for the final body while leaving the final header, which
         // may have declined compression, announcing no coding at all.
-        if !upstream_response.status.is_informational()
-            && let Some(encoding) = ctx.negotiated_encoding
+        //
+        // 📐 Partial and bodiless responses are excluded by
+        // `is_full_representation`: a re-encoded `206` would keep a
+        // `Content-Range` counted in identity bytes.
+        if crate::response_encoding::is_full_representation(
+            &session.req_header().method,
+            upstream_response,
+        ) && let Some(encoding) = ctx.negotiated_encoding
             && !ctx.streaming_response
             && ctx.intercepted_response.is_none()
         {
