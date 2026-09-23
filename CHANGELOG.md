@@ -57,6 +57,15 @@ token's key authorization too. It now answers only the prefix followed by one
 non-empty token with no further `/`; every other path falls through to normal
 routing.
 
+### 🚫 Malformed HTTP/3 requests are reset with `H3_MESSAGE_ERROR`
+
+An HTTP/3 request with a misplaced or unknown pseudo-header, forbidden
+`Transfer-Encoding`, a bad `Content-Length` or a `:method` that is not a token
+was answered with `400 Bad Request` and a clean end of stream, which a client
+cannot tell apart from a site that chose to refuse. RFC 9114 §4.1.2 requires a
+stream error instead, so the stream is now reset with `H3_MESSAGE_ERROR` and no
+response. Other requests on the same connection are unaffected.
+
 ### 🌊 Compressed HTTP/1.1 responses keep the connection open
 
 A proxied response that Pingclair compressed for an HTTP/1.1 client lost its

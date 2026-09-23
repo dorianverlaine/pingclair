@@ -599,8 +599,8 @@ struct H3Request {
 ///
 /// # 🛡️ Why this validates rather than merely extracts
 ///
-/// `None` becomes a 400, and a request this cannot read unambiguously has to get
-/// one. The previous version took the last copy of a repeated pseudo-header,
+/// `None` becomes a stream reset with `H3_MESSAGE_ERROR` (RFC 9114 §4.1.2),
+/// and a request this cannot read unambiguously has to get one. The previous version took the last copy of a repeated pseudo-header,
 /// never looked at `:scheme`, accepted pseudo-headers interleaved with regular
 /// fields, and let `:authority` silently outrank a contradicting `Host` that it
 /// then left in the field list. Every one of those is a way for this proxy and
@@ -621,6 +621,7 @@ struct H3Request {
 ///    everything downstream of this function — the same disagreement about one
 ///    request that the TCP path's port-guessed scheme produced.
 /// 5. **`:authority` and `Host` must agree** when both are sent.
+/// 6. **`:method` must be a token.**
 ///
 /// 📌 Classic `CONNECT` — which omits `:scheme` and `:path` — is still refused,
 /// exactly as before this change, because `path` was already mandatory. Extended
@@ -691,8 +692,17 @@ fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
         _ => {}
     }
 
+    // 🔤 A `:method` that is not a token is malformed too (RFC 9114 §4.3.1),
+    // and deciding that here keeps it on the same stream-reset path as every
+    // other malformed field instead of a `400` from inside the handler. Known
+    // methods parse without allocating.
+    let method = method?;
+    if http::Method::from_bytes(method.as_bytes()).is_err() {
+        return None;
+    }
+
     Some(H3Request {
-        method: method?,
+        method,
         protocol,
         path: path?,
         authority: authority?,
@@ -1541,7 +1551,8 @@ impl H3App {
         }
 
         let Some(req) = parse_h3_request(&list) else {
-            self.queue_simple_response(qconn, stream_id, 400, "Bad Request");
+            tracing::debug!("🚫 H3: malformed request headers on stream {}", stream_id);
+            self.reset_malformed_request(qconn, stream_id);
             return;
         };
 
@@ -1563,7 +1574,7 @@ impl H3App {
                 "🚫 H3: rejected a request with untrustworthy message framing: {}",
                 rejection.reason()
             );
-            self.queue_simple_response(qconn, stream_id, 400, rejection.reason());
+            self.reset_malformed_request(qconn, stream_id);
             return;
         }
 
@@ -1657,6 +1668,32 @@ impl H3App {
                 })
                 .await;
         });
+    }
+
+    /// 🚫 Resets a malformed request's stream with `H3_MESSAGE_ERROR`.
+    ///
+    /// RFC 9114 §4.1.2 says a malformed request "MUST be treated as a stream
+    /// error of type H3_MESSAGE_ERROR". A `400` followed by a clean FIN looked
+    /// to the client exactly like an application that chose to refuse, so a
+    /// client or intermediary could not tell "you broke the protocol" from
+    /// "the site said no". The optional error response the RFC allows is not
+    /// sent: a reset discards unsent data anyway, so it would rarely arrive.
+    ///
+    /// 📌 Every malformed-request site goes through this one function, so a
+    /// future rejection cannot quietly fall back to a FIN.
+    fn reset_malformed_request(
+        &mut self,
+        qconn: &mut tokio_quiche::quic::QuicheConnection,
+        stream_id: u64,
+    ) {
+        self.streams.insert(
+            stream_id,
+            StreamState {
+                abort_requested: Some(quiche::h3::WireErrorCode::MessageError),
+                ..Default::default()
+            },
+        );
+        self.flush_stream(qconn, stream_id);
     }
 
     /// 🚫 Queues a plain-text response without spawning a handler task.

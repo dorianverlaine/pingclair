@@ -24,6 +24,10 @@ use tokio_quiche::quiche::h3::NameValue;
 #[path = "h3_end_to_end/truncation.rs"]
 mod truncation;
 
+// 🚫 Malformed requests and the stream error they must end in.
+#[path = "h3_end_to_end/malformed.rs"]
+mod malformed;
+
 const ALPN: &[u8] = b"h3";
 
 fn self_signed_pem(names: &[&str]) -> (String, String) {
