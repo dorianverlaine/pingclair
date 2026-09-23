@@ -767,6 +767,11 @@ import 進來的片段定義，對之後的 import 都看得到。
 `exclude`（全域）、`sampling`，以及檔案輪替選項（`mode`、`dir_mode`、
 `roll_*`）；`log_skip` 會把符合的請求排除在 access log 之外。
 
+🚫 **不具名**的全域 `log { … }` 區塊（也就是 Caddy 用來設定行程級預設 logger 的
+那個寫法）會被拒絕。執行期診斷寫到 stderr，而成行程 logger 的輸出路徑目前無法
+設定，收下這個區塊只會編譯出一個永遠不會產生它所指名檔案的設定。想要 channel
+就給它名字（`log <name> { … }`），要記錄某個站台的請求就把區塊放進該站台。
+
 📝 持續高流量的訪問日誌可使用
 `log { output file /var/log/pingclair/access.log }` 並設定輪替；執行期診斷仍可留在
 stderr。已配置的訪問日誌輸出會把完整記錄合併為最多 64 KiB 的批次，並在 5 ms

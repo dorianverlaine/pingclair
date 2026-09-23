@@ -723,15 +723,33 @@ mod log_channel_tests {
         assert!(config.servers[0].log.is_some());
     }
 
-    /// 🪵 An unnamed global `log { … }` configures the default logger.
+    /// 🚫 An unnamed global `log { … }` is refused, not silently compiled.
+    ///
+    /// 🤡 It was accepted and compiled into `logging.default`, and nothing at
+    /// runtime ever read that field: no file appeared, no warning was logged,
+    /// and `validate` exited 0. That is the one shape this adapter accepted and
+    /// then did nothing with — the "silently ignoring a setting" defect the
+    /// house style fails closed on everywhere else.
+    ///
+    /// 📌 The refusal names what to write instead, because the operator's
+    /// intent — log this to a file — is expressible two other ways.
     #[test]
-    fn an_unnamed_global_log_configures_the_default_logger() {
-        let config = compile(
+    fn an_unnamed_global_log_is_refused() {
+        let message = compile(
             "{\n    log {\n        output stderr\n        format json\n    }\n}\n\
              http://:8080 {\n    respond \"ok\"\n}\n",
         )
-        .expect("an unnamed global log must compile");
-        assert!(config.logging.default.is_some());
+        .expect_err("an unnamed global log must be refused")
+        .to_string();
+        assert!(
+            message.contains("global: log") && message.contains("stderr"),
+            "the refusal must name the option and say where logging goes instead: {message}"
+        );
+        // 🧭 …and it must not read as a typo, because the word is spelled right.
+        assert!(
+            !message.contains("Unknown directive"),
+            "a defined option must not be refused as unknown: {message}"
+        );
     }
 
     /// 🔌 Global `include`/`exclude` reach the compiled default logger.
@@ -744,21 +762,28 @@ mod log_channel_tests {
     /// the other list". Confirmed by running that binary, not by reading.
     #[test]
     fn global_include_and_exclude_compile() {
+        // 🪵 A *named* channel is the vehicle: the include/exclude rules live in
+        // `adapt_log_block`, which both shapes share, and the unnamed one is now
+        // refused before its block is ever read.
         let config = compile(
-            "{\n    log {\n        output stderr\n        include http.log.access\n        exclude http.log.access.noisy\n    }\n}\n\
+            "{\n    log audit {\n        output stderr\n        include http.log.access\n        exclude http.log.access.noisy\n    }\n}\n\
              http://:8080 {\n    respond \"ok\"\n}\n",
         )
         .expect("include/exclude must compile");
-        let default = config.logging.default.expect("default logger");
-        assert_eq!(default.include, vec!["http.log.access".to_string()]);
-        assert_eq!(default.exclude, vec!["http.log.access.noisy".to_string()]);
+        let channel = config
+            .logging
+            .channels
+            .get("audit")
+            .expect("the channel must be declared");
+        assert_eq!(channel.include, vec!["http.log.access".to_string()]);
+        assert_eq!(channel.exclude, vec!["http.log.access.noisy".to_string()]);
     }
 
     /// 🚫 Two lists that contradict each other are refused, as upstream does.
     #[test]
     fn global_include_and_exclude_must_be_nested() {
         let error = compile(
-            "{\n    log {\n        output stderr\n        include some-source\n        exclude a.api b.api\n    }\n}\n\
+            "{\n    log audit {\n        output stderr\n        include some-source\n        exclude a.api b.api\n    }\n}\n\
              http://:8080 {\n    respond \"ok\"\n}\n",
         )
         .expect_err("an unrelated include/exclude pair cannot be honoured either way");

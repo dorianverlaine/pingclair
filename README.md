@@ -843,6 +843,13 @@ enables the site's default access sink. Log blocks accept `hostnames`,
 (`mode`, `dir_mode`, `roll_*`); `log_skip` excludes matching requests from
 access logging.
 
+🚫 An **unnamed** global `log { … }` block — the one that configures Caddy's
+process-wide default logger — is refused. Runtime diagnostics go to stderr and
+the process logger's output is not configurable yet, so accepting the block
+would compile a setting that never produced the file it named. Name the block
+to declare a channel a site can reference, or put it in a site block to log
+that site's requests.
+
 📝 For sustained access traffic, use `log { output file /var/log/pingclair/access.log }`
 with a rotation policy; runtime diagnostics can stay on stderr. Configured access
 sinks batch complete records up to 64 KiB and schedule a flush after 5 ms, before

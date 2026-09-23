@@ -846,6 +846,13 @@ sink d'accès par défaut du site. Les blocs `log` acceptent `hostnames`,
 fichier (`mode`, `dir_mode`, `roll_*`) ; `log_skip` exclut les requêtes
 correspondantes du journal d'accès.
 
+🚫 Un bloc `log { … }` global **sans nom** — celui qui configure le logger par
+défaut du processus chez Caddy — est refusé. Les diagnostics d'exécution vont sur
+stderr et la sortie du logger de processus n'est pas encore configurable :
+accepter le bloc compilerait un réglage qui ne produirait jamais le fichier qu'il
+nomme. Nommez le bloc pour déclarer un canal qu'un site peut référencer, ou
+placez-le dans un bloc de site pour journaliser les requêtes de ce site.
+
 📝 Pour un trafic soutenu, utiliser
 `log { output file /var/log/pingclair/access.log }` avec une politique de rotation ;
 les diagnostics peuvent rester sur stderr. Les sorties d'accès configurées
