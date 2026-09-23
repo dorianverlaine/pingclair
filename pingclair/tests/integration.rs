@@ -46,6 +46,10 @@ mod websocket_upgrade;
 #[path = "integration/response_framing.rs"]
 mod response_framing;
 
+// 🔤 Site names written with capital letters live beside this file too.
+#[path = "integration/site_name_case.rs"]
+mod site_name_case;
+
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather
 /// than against "some response arrived", so a 404 from a stale listener on the

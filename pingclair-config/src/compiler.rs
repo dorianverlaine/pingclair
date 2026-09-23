@@ -368,6 +368,21 @@ fn compile_encodings(server: &ServerBlock) -> CompileResult<Vec<CoreEncoding>> {
     Ok(encodings)
 }
 
+/// 🔤 Spells a site name the one way every runtime table keys on it.
+///
+/// DNS names are case-insensitive and may end in the dot of an absolute name,
+/// so `Example.test` and `example.test.` are the same site. The runtime looks
+/// names up by what a client sends — lowercase SNI, a canonical `Host` — and a
+/// table keyed on the operator's spelling instead never matches: a site written
+/// `Example.test` with `tls <cert> <key>` served no certificate at all. Doing
+/// it here, once, means no table has to guess which spelling it was given.
+///
+/// 📌 One dot, not every trailing dot: `example.test..` is not a name, and
+/// quietly repairing it would invent a spelling the DNS never had.
+fn canonical_site_name(name: &str) -> String {
+    name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase()
+}
+
 fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
     // 🗜️ Resolved before the routes are built, because the file servers need the
     // answer: `encode off` is the directive that opts a whole server out of
@@ -375,8 +390,12 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
     // setting that compiled and meant nothing.
     let site_encodings = compile_encodings(server)?;
     let mut config = ServerConfig {
-        name: Some(server.name.clone()),
-        names: server.names.clone(),
+        name: Some(canonical_site_name(&server.name)),
+        names: server
+            .names
+            .iter()
+            .map(|name| canonical_site_name(name))
+            .collect(),
         bind: server.bind.clone(),
         listen: Vec::new(),
         proxy_protocol_listen: Vec::new(),

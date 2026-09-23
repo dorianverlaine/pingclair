@@ -20,6 +20,15 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🔤 A site name with a capital letter finds its own certificate
+
+A site written `Example.test` with `tls <cert> <key>` served no certificate at
+all: the certificate was filed under `Example.test`, and every handshake asked
+for `example.test`, the lowercase name clients send. The configuration
+validated and startup reported success; only real clients failed. Site names
+are now lowercased and stripped of a trailing dot when the configuration is
+compiled, and the certificate table files every name in that one spelling.
+
 ### 🧊 HTTP/3 static files send `Vary: Accept-Encoding`
 
 A file served over HTTP/3 from a `precompressed` sidecar said

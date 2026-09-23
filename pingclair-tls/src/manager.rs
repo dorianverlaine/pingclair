@@ -49,6 +49,9 @@ pub struct TlsManager {
     /// 🚦 Publishes HTTP-01 challenges through memory or persistent storage.
     challenge_handler: Arc<dyn ChallengeHandler>,
     /// 📜 Stores explicitly configured PEM pairs with the highest precedence.
+    /// 🔤 Keyed on the canonical spelling (lowercase, no trailing dot), the
+    /// same one a handshake looks up. Every writer normalizes on the way in,
+    /// so a configured `Example.test` is found by an SNI of `example.test`.
     manual_pem_certs: RwLock<HashMap<String, (String, String)>>,
     /// 🏛️ Issues and persists certificates for explicitly enabled internal domains.
     internal_ca: Arc<InternalCa>,
@@ -228,7 +231,7 @@ impl TlsManager {
     pub fn add_manual_cert(&self, domain: &str, cert_pem: String, key_pem: String) {
         self.manual_pem_certs
             .write()
-            .insert(domain.to_string(), (cert_pem, key_pem));
+            .insert(normalize_internal_domain(domain), (cert_pem, key_pem));
     }
 
     /// 📜 Replaces the whole manual certificate table, or leaves it untouched.
@@ -286,7 +289,7 @@ impl TlsManager {
                 problems.push(format!("{domain}: {reason} ({cert_path}, {key_path})"));
                 continue;
             }
-            prepared.insert(domain.clone(), (cert_pem, key_pem));
+            prepared.insert(normalize_internal_domain(domain), (cert_pem, key_pem));
         }
 
         if !problems.is_empty() {
@@ -305,7 +308,9 @@ impl TlsManager {
 
     /// 📜 Whether a manual certificate is installed for `domain`.
     pub fn has_manual_cert(&self, domain: &str) -> bool {
-        self.manual_pem_certs.read().contains_key(domain)
+        self.manual_pem_certs
+            .read()
+            .contains_key(canonical_domain(domain).as_ref())
     }
 
     /// 🏛️ Enables local issuance for one configured domain and eagerly prepares its leaf.
@@ -420,7 +425,11 @@ impl TlsManager {
     /// public ACME issuance. HTTP/3 uses it to refresh the SNI certificate table.
     pub async fn peek_pem(&self, domain: &str) -> Option<(String, String)> {
         // 📜 Explicit PEM pairs always take precedence.
-        let manual = self.manual_pem_certs.read().get(domain).cloned();
+        let manual = self
+            .manual_pem_certs
+            .read()
+            .get(canonical_domain(domain).as_ref())
+            .cloned();
         if let Some(pems) = manual {
             return Some(pems);
         }
@@ -452,7 +461,11 @@ impl TlsManager {
     /// 🔍 Resolves a PEM pair for a client hello.
     pub async fn resolve_pem(&self, domain: &str) -> Option<(String, String)> {
         // 📜 Explicit PEM pairs always take precedence.
-        let manual = self.manual_pem_certs.read().get(domain).cloned();
+        let manual = self
+            .manual_pem_certs
+            .read()
+            .get(canonical_domain(domain).as_ref())
+            .cloned();
         if let Some(pems) = manual {
             return Some(pems);
         }
@@ -481,7 +494,11 @@ impl TlsManager {
     /// 🔍 Resolves a parsed rustls certificate for a client hello.
     pub async fn resolve_cert(&self, domain: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
         // 📜 Explicit PEM pairs always take precedence.
-        let manual = self.manual_pem_certs.read().get(domain).cloned();
+        let manual = self
+            .manual_pem_certs
+            .read()
+            .get(canonical_domain(domain).as_ref())
+            .cloned();
         if let Some((cert_pem, key_pem)) = manual {
             let cert = crate::Certificate {
                 cert_pem,
@@ -717,6 +734,20 @@ impl TlsManager {
 /// 🔤 Normalizes DNS case and a trailing absolute-name dot for SNI comparison.
 fn normalize_internal_domain(domain: &str) -> String {
     domain.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// 🔤 The same spelling as [`normalize_internal_domain`], borrowed when the
+/// name is already canonical.
+///
+/// 🏎️ Lookups run inside handshakes, and the name a handshake passes in is
+/// almost always lowercase already; only a mixed-case one pays for a copy.
+fn canonical_domain(domain: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = domain.trim_end_matches('.');
+    if trimmed.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(trimmed.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(trimmed)
+    }
 }
 
 /// 🧭 Finds the configured pattern that covers `normalized`: an exact name
@@ -1252,5 +1283,34 @@ mod manual_cert_refresh_tests {
             !manager.has_manual_cert("b.example"),
             "a certificate that failed validation was installed anyway"
         );
+    }
+
+    /// 🔤 A certificate configured under a mixed-case name answers the
+    /// lowercase SNI a client sends.
+    ///
+    /// The table used to be keyed on the operator's spelling and read with the
+    /// normalized one, so `Example.test` with `tls <cert> <key>` served no
+    /// certificate at all while validation and startup both reported success.
+    #[tokio::test]
+    async fn a_mixed_case_site_name_finds_its_manual_certificate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert, key) = real_pair();
+        let cert_path = dir.path().join("site.crt");
+        let key_path = dir.path().join("site.key");
+        std::fs::write(&cert_path, &cert).unwrap();
+        std::fs::write(&key_path, &key).unwrap();
+
+        let manager = TlsManager::new_with_memory_challenges(None, dir.path());
+        let entries = vec![(
+            "Example.test.".to_string(),
+            cert_path.to_string_lossy().into_owned(),
+            key_path.to_string_lossy().into_owned(),
+        )];
+        assert_eq!(manager.refresh_manual_certs(&entries).unwrap(), 1);
+
+        let expected = Some((cert.clone(), key.clone()));
+        assert_eq!(manager.resolve_pem("example.test").await, expected);
+        assert_eq!(manager.peek_pem("Example.test").await, expected);
+        assert!(manager.has_manual_cert("EXAMPLE.TEST"));
     }
 }
