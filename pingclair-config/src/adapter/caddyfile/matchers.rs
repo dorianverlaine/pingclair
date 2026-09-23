@@ -5,6 +5,7 @@ use super::AdapterError;
 use super::args::expect_one_argument;
 use crate::parser::ast::*;
 use crate::parser::caddy_ast::{Block, Directive, TokenRun};
+use crate::parser::lexer::Token;
 
 // MARK: - Matchers
 
@@ -214,6 +215,33 @@ pub(super) fn parse_matcher_definition(d: &Directive) -> Result<Matcher, Adapter
         // Inline matcher: @api path /v1/*
         if d.args.is_empty() {
             return Err(AdapterError::ArgumentCount(d.name.clone(), 1, 0));
+        }
+        // 🧭 The backtick spelling of the expression matcher, recognised here
+        // because this is where the first argument is read as the matcher's
+        // *name* — and the token it came from is still in view.
+        //
+        // 🤡 `@e `{method} == "GET"`` lexes the expression as a quoted string;
+        // reading it as a name left `d.name` set to the expression text, which
+        // no name table can contain, so the refusal fell through to
+        // `Unknown directive 'matcher: {method} == "GET"'`. That sentence names
+        // a *directive* that exists in neither server, sending the reader to
+        // look for a spelling in the wrong half of the language. The keyword
+        // spelling of the same matcher, refused by the very same code, already
+        // says "the expression matcher is not implemented yet".
+        //
+        // 📌 The lexical form is the signal rather than the text: no matcher is
+        // *named* with a quoted string, so the quoted arguments of `path`, `file`
+        // and the rest cannot reach this branch.
+        if matches!(
+            // 🔢 The directive's own name is the first token, so the first
+            // argument is the second.
+            d.tokens.tokens().get(1).map(|token| &token.value),
+            Some(Token::QuotedString(_))
+        ) {
+            return Err(AdapterError::UnsupportedFeature(
+                "expression matcher".into(),
+                "Pingclair does not implement this matcher yet".into(),
+            ));
         }
         let sub_directive = Directive {
             name: d.args[0].clone(),

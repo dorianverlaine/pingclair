@@ -3662,6 +3662,48 @@ mod uri_and_try_files_tests {
         );
     }
 
+    /// 🧭 The backtick spelling of the expression matcher is refused as the
+    /// expression matcher, not as a directive that does not exist.
+    ///
+    /// 🤡 The expression lexes to a quoted string, and reading it as the
+    /// matcher's *name* left `d.name` set to `{method} == "GET"` — so the
+    /// refusal fell through to `Unknown directive 'matcher: {method} == "GET"'`
+    /// and sent the reader looking for a spelling of a directive that no Caddy
+    /// build has either. The keyword spelling of the same matcher, refused by
+    /// the same code, already said the truth.
+    ///
+    /// 📌 Both spellings exit 1, so only an assertion on the message can see the
+    /// difference.
+    #[test]
+    fn the_backtick_expression_matcher_is_refused_by_name() {
+        for source in [
+            ":8080 {\n\t@e `{method} == \"GET\"`\n\trespond @e \"get\"\n}",
+            ":8080 {\n\t@e expression {method} == \"GET\"\n\trespond @e \"get\"\n}",
+        ] {
+            let message = compile(source)
+                .expect_err("neither spelling of the expression matcher is implemented")
+                .to_string();
+            assert!(
+                message.contains("expression matcher"),
+                "the refusal must name the matcher, not a directive: {message}"
+            );
+            assert!(
+                !message.contains("Unknown directive"),
+                "the expression matcher is part of the format, so it must not read as a \
+                 misspelling: {message}"
+            );
+        }
+    }
+
+    /// 🧭 …and a quoted *argument* is still an argument: the check reads the
+    /// position where a matcher's name goes, so `path "/exact path"` compiles.
+    #[test]
+    fn a_quoted_matcher_argument_is_not_mistaken_for_an_expression() {
+        let config = compile(":8080 {\n\t@m path \"/exact path\"\n\trespond @m \"hit\"\n}")
+            .expect("a quoted path pattern is ordinary");
+        assert_eq!(config.servers.len(), 1);
+    }
+
     /// 🚫 `uri replace` substitutes a substring; this crate's rewrite replaces
     /// the whole path. Accepting it would compile and silently serve a
     /// different URL than the operator wrote, which is the one outcome worse
