@@ -5768,11 +5768,17 @@ macro_rules! log_at_level {
 /// Pingora's `retry_buffer_truncated` only reports whether the body was *too
 /// large to buffer*; a body that fits is replayed happily, which turns one
 /// `POST` into two. "Ambiguous" has to resolve to "do not repeat it".
+///
+/// 🛡️ The body is only half of it: a bodyless `POST` can place an order just
+/// as well, so `request_is_repeatable` also requires an idempotent method (see
+/// `retry::request_is_repeatable`). Connection-phase failures do not come
+/// through here — `fail_to_connect` owns those, and the origin never saw the
+/// request, so any method stays retryable there.
 fn decide_upstream_error_retry(
     e: &mut pingora_core::Error,
     client_reused: bool,
     retry_buffer_truncated: bool,
-    body_is_empty: bool,
+    request_is_repeatable: bool,
     retry_policy: &RetryConfig,
     attempts: usize,
     retry_deadline: Option<std::time::Instant>,
@@ -5783,7 +5789,7 @@ fn decide_upstream_error_retry(
         .decide_reuse(client_reused && !retry_buffer_truncated);
     let budget_allows =
         crate::retry::permits_another_attempt(retry_policy, attempts, retry_deadline);
-    let retry = crate::retry::body_is_replay_safe(body_is_empty) && budget_allows && e.retry();
+    let retry = request_is_repeatable && budget_allows && e.retry();
     e.retry = retry.into();
     retry
 }
@@ -7770,7 +7776,9 @@ impl ProxyHttp for PingclairProxy {
             &mut e,
             client_reused,
             retry_buffer_truncated,
-            body_is_empty,
+            // 📤 Already the upstream method: `reverse_proxy { method … }`
+            // rewrote this header in place before the request went out.
+            crate::retry::request_is_repeatable(&session.req_header().method, body_is_empty),
             &retry_policy,
             ctx.retry_attempts,
             ctx.retry_deadline,

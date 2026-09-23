@@ -437,9 +437,11 @@ example.com {
 ```
 
 `max_attempts` includes the initial attempt. Connect failures remain safe to
-retry because no request bytes reached that peer. Status retries require a
-configured idempotent method and an actually bodyless request; Pingclair never
-buffers or replays a request body for this policy. Omitting `retry` preserves
+retry because no request bytes reached that peer, whatever the method. Once
+the upstream has seen the request, a retry needs an idempotent method (`GET`,
+`HEAD`, `OPTIONS`, `TRACE`, `PUT`, `DELETE`) and an actually bodyless request;
+a `POST` or `PATCH` named in `lb_retry_match` is honoured only for connection
+failures. Pingclair never buffers or replays a request body for this policy. Omitting `retry` preserves
 the legacy connect-failover limit and does not retry response statuses.
 
 `max_in_flight` bounds work executing inside the route, while `max_pending`

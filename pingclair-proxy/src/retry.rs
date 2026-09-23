@@ -195,13 +195,45 @@ pub(crate) fn body_is_replay_safe(body_is_empty: bool) -> bool {
     body_is_empty
 }
 
+/// 🛡️ Whether performing this method twice leaves the origin as once would.
+///
+/// Once the origin has seen a request, a retry is a second copy of it, and only
+/// an idempotent method (RFC 9110 §9.2.2) promises that a second copy is
+/// harmless. A bodyless `POST /orders/submit` can place an order just as well
+/// as one with a body, so an empty body is not enough on its own.
+///
+/// 📌 `lb_retry_match method POST` still loads. It can still decide a
+/// connection-phase retry, where the origin never received the request, but it
+/// cannot open this gate: the configuration layer warns at load that it only
+/// applies to that phase.
+pub(crate) fn method_is_idempotent(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE | Method::PUT | Method::DELETE
+    )
+}
+
+/// 🛡️ Whether this request may be sent again once the origin may have seen it.
+///
+/// Both halves have to hold: no body bytes to duplicate, and a method whose
+/// second copy is harmless. Every failure after the connection is up — a
+/// retryable status or a response that broke off — asks exactly this, which is
+/// why it is one function rather than two checks each caller has to remember.
+pub(crate) fn request_is_repeatable(upstream_method: &Method, body_is_empty: bool) -> bool {
+    body_is_replay_safe(body_is_empty) && method_is_idempotent(upstream_method)
+}
+
 /// 🛡️ The same decision, asked with everything a `lb_retry_match` can inspect.
 ///
-/// Two gates survive whichever matcher answers, because neither is about *when*
+/// Three gates survive whichever matcher answers, because none is about *when*
 /// an operator wants a retry:
 ///
 /// - **A request carrying a body is never replayed** — see
 ///   [`body_is_replay_safe`], which owns that argument.
+/// - **A non-idempotent method is never repeated** once the origin has seen it
+///   — see [`method_is_idempotent`]. This is asked of `upstream_method`, the
+///   method the origin received, so a route that rewrites `GET` into `POST` is
+///   judged as the `POST` it became.
 /// - **The attempt cap and deadline still bound it.** A predicate decides
 ///   whether this failure is the retryable kind, not how many times.
 pub(crate) fn permits_retry(
@@ -212,7 +244,7 @@ pub(crate) fn permits_retry(
     retry_deadline: Option<Instant>,
     regex: &dyn Fn(&str) -> Option<std::sync::Arc<regex::Regex>>,
 ) -> bool {
-    if !body_is_replay_safe(body_is_empty)
+    if !request_is_repeatable(facts.upstream_method, body_is_empty)
         || !permits_another_attempt(policy, attempts, retry_deadline)
     {
         return false;
@@ -332,7 +364,7 @@ mod tests {
                 RetryPredicate::All {
                     of: vec![
                         RetryPredicate::Method {
-                            any_of: vec!["POST".into()],
+                            any_of: vec!["PUT".into()],
                         },
                         RetryPredicate::Path {
                             any_of: vec!["/orders*".into()],
@@ -354,8 +386,8 @@ mod tests {
         // policy could never express: a 504 on any path, any method.
         assert!(permits(&Method::GET, "/anything", 504));
         // 🎯 And the first needs *both* of its conditions.
-        assert!(permits(&Method::POST, "/orders/1", 500));
-        assert!(!permits(&Method::POST, "/basket", 500));
+        assert!(permits(&Method::PUT, "/orders/1", 500));
+        assert!(!permits(&Method::PUT, "/basket", 500));
         assert!(!permits(&Method::GET, "/orders/1", 500));
     }
 
@@ -391,10 +423,11 @@ mod tests {
         assert!(permits_retry(&either, &facts, true, 1, None, &|_| None));
     }
 
-    /// 🛡️ A body is never replayed and the attempt cap always applies, no
-    /// matter how enthusiastically a predicate says yes.
+    /// 🛡️ A body is never replayed, a non-idempotent method is never
+    /// repeated, and the attempt cap always applies, no matter how
+    /// enthusiastically a predicate says yes.
     #[test]
-    fn a_predicate_cannot_override_the_body_and_attempt_gates() {
+    fn a_predicate_cannot_override_the_body_method_and_attempt_gates() {
         use pingclair_core::config::RetryPredicate;
         let policy = RetryConfig {
             max_attempts: 2,
@@ -403,8 +436,19 @@ mod tests {
             ..Default::default()
         };
         let headers = http::HeaderMap::new();
-        let facts = facts(&Method::POST, "/x", &headers);
+        let facts = facts(&Method::GET, "/x", &headers);
         assert!(permits_retry(&policy, &facts, true, 1, None, &|_| None));
+        assert!(
+            !permits_retry(
+                &policy,
+                &super::tests::facts(&Method::POST, "/x", &headers),
+                true,
+                1,
+                None,
+                &|_| None
+            ),
+            "a bodyless POST was repeated after the origin had seen it"
+        );
         assert!(
             !permits_retry(&policy, &facts, false, 1, None, &|_| None),
             "a request carrying a body is never replayed"
@@ -413,6 +457,28 @@ mod tests {
             !permits_retry(&policy, &facts, true, 2, None, &|_| None),
             "the attempt cap still bounds it"
         );
+    }
+
+    /// 🛡️ A policy that explicitly names POST still cannot repeat one after
+    /// the origin has answered; PUT and DELETE, which are idempotent, can.
+    #[test]
+    fn naming_a_non_idempotent_method_does_not_open_the_response_phase() {
+        let policy = RetryConfig {
+            max_attempts: 3,
+            retry_match: RetryPredicate::from_flat_lists(
+                vec![503],
+                vec!["POST".into(), "PATCH".into(), "PUT".into(), "DELETE".into()],
+                Vec::new(),
+            )
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let verdicts: Vec<bool> = [Method::POST, Method::PATCH, Method::PUT, Method::DELETE]
+            .iter()
+            .map(|method| permits(&policy, method, true, "/"))
+            .collect();
+        assert_eq!(verdicts, [false, false, true, true]);
     }
 
     /// 🔤 A regex predicate uses the copy compiled at load, and answers `false`

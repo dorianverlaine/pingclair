@@ -26,6 +26,11 @@ mod cache;
 #[path = "integration/content_negotiation.rs"]
 mod content_negotiation;
 
+// 🔁 Which methods a response-phase retry may repeat; kept beside this file so
+// the harness here does not keep growing.
+#[path = "integration/retry_idempotency.rs"]
+mod retry_idempotency;
+
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather
 /// than against "some response arrived", so a 404 from a stale listener on the

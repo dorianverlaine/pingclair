@@ -98,6 +98,18 @@ is now no ceiling by default; `request_body { max_size … }` on a route, or
 unlimited. **If you were relying on the 1 MiB default, set a limit explicitly**
 — the effective limit on an unconfigured site is now unbounded.
 
+### 🛡️ Retries after the upstream has answered repeat only idempotent methods
+
+A bodyless `POST` or `PATCH` that `lb_retry_match` named used to be sent again
+after the upstream answered with a retryable status or dropped the connection
+mid-response, because the retry gate asked only whether the request had a body.
+An empty body does not make a `POST` safe to repeat — `POST /orders/submit` can
+place an order without one. Once the upstream may have seen the request,
+Pingclair now repeats only `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT` and
+`DELETE`, on both HTTP/1.1–2 and HTTP/3. A connection failure, where the
+upstream never received anything, is still retried for any method.
+`lb_retry_match method POST` still loads.
+
 ### 🔁 HTTP/3 waits past `103 Early Hints` for the real response
 
 An HTTP/3 request proxied to an HTTP/1.1 upstream that answered with
