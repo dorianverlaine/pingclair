@@ -7279,6 +7279,18 @@ impl ProxyHttp for PingclairProxy {
             .and_then(|(state, route_index)| self.get_proxy_config(state, route_index))
             .map(|config| config.retry.clone())
             .unwrap_or_default();
+        // 💡 An informational response is a prediction about the answer still
+        // to come (RFC 8297 §2), not the answer. The breaker keeps only the
+        // first verdict it is given, so reporting a `103` here would record
+        // it as a success and discard the 503 behind it; letting it reach the
+        // retry predicate would redispatch on a status that is not a result.
+        // `101` is the exception: it is the final response of an upgrade.
+        if upstream_response.status.is_informational()
+            && upstream_response.status != http::StatusCode::SWITCHING_PROTOCOLS
+        {
+            return Ok(());
+        }
+
         let method = session.req_header().method.clone();
         let body_is_empty = session.as_mut().is_body_empty();
         let status = upstream_response.status.as_u16();

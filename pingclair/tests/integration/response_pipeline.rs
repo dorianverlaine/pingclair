@@ -160,3 +160,34 @@ async fn test_early_hints_do_not_choose_the_final_coding() {
     );
     assert_eq!(reply.bytes().await.unwrap().as_ref(), png.as_slice());
 }
+
+/// 🛡️ A failure that follows an upstream `103` still counts against the
+/// circuit breaker.
+///
+/// The breaker takes one verdict per request and ignores later ones. The
+/// hint used to be that verdict — a success, since 103 is not a 5xx — so the
+/// 503 behind it was discarded and the circuit never opened for an upstream
+/// that fails with a hint in front.
+#[tokio::test]
+async fn test_failure_after_early_hints_opens_the_circuit() {
+    let response = b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\n\
+        HTTP/1.1 503 Service Unavailable\r\nContent-Length: 7\r\nConnection: close\r\n\r\nfailure"
+        .to_vec();
+    let (origin, hits) = spawn_scripted_origin(response).await;
+    let mut server = TestServer::new_pingclairfile(&proxy_pingclairfile(
+        origin,
+        "circuit_breaker {\n consecutive_failures 2\n open_for 30s\n }",
+    ));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    for _ in 0..3 {
+        let reply = client.get(server.url(0, "/flaky")).send().await.unwrap();
+        assert_eq!(reply.status(), 503);
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "the third request must be refused by the open circuit, not sent upstream"
+    );
+}

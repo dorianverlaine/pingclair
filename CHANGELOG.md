@@ -38,6 +38,15 @@ coding, so the client received bytes it could not read. Informational
 responses are now skipped by the compression decision; only the final
 response's own headers choose the coding.
 
+### 🛡️ A failure behind an upstream `103` now counts against the circuit breaker
+
+The H1/H2 proxy reported an upstream's `103 Early Hints` to the circuit
+breaker as the request's outcome — a success — and then ignored the real
+status that followed. An upstream that sent a hint before every `503` never
+opened its circuit. Informational responses other than `101` are no longer
+reported or offered to `retry` status matching; the final status is. The
+HTTP/3 path is tracked separately.
+
 ### 🪟 `file_server` honours `If-Range`
 
 A client resuming a download sends `Range` with `If-Range`, naming the version
