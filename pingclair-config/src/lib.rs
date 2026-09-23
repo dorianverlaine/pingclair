@@ -1029,6 +1029,17 @@ mod tests {
         assert!(tls.cert.is_none());
     }
 
+    /// 🚫 A port-only site has no name to issue a certificate for.
+    ///
+    /// 🤡 The refusal said "tls internal requires a concrete server name",
+    /// which is true and unusable: a port-only site has no name to add to, so
+    /// the requirement named nothing the operator could act on. Caddy accepts
+    /// the configuration and picks a default name at handshake time, which the
+    /// message now says, so the reader is not left comparing two servers to
+    /// work out which of them is being unreasonable.
+    ///
+    /// 📌 The refusal itself is deliberate: issuing is per name, and choosing
+    /// one here would invent a name every client's handshake then depends on.
     #[test]
     fn test_compile_tls_internal_requires_concrete_name() {
         let error = compile(
@@ -1039,8 +1050,16 @@ mod tests {
                 }
             "#,
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("concrete server name"));
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("needs a site name to issue the certificate for"),
+            "the refusal must say what is missing: {error}"
+        );
+        assert!(
+            error.contains("localhost:8443"),
+            "…and show the shape that works, so the operator can act on it: {error}"
+        );
     }
 
     #[test]

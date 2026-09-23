@@ -1104,8 +1104,18 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
         let concrete_ok = !name.contains('*');
         if name.is_empty() || name == "_" || name.starts_with(':') || !(wildcard_ok || concrete_ok)
         {
+            // 🚫 A port-only site has no name to issue a certificate *for*, and
+            // the internal authority issues per name — there is no on-demand
+            // path that could pick one at handshake time. Caddy accepts this
+            // configuration and picks a default name; this build refuses it,
+            // deliberately, and the message has to say which name to write
+            // rather than name a requirement the operator cannot act on. The
+            // old wording ("tls internal requires a concrete server name") was
+            // true and unusable: a port-only site has no name to add to.
             return Err(CompileError::InvalidServer {
-                message: "tls internal requires a concrete server name".to_string(),
+                message: format!(
+                    "`tls internal` needs a site name to issue the certificate for, and `{name}` is not one. Write the name the clients will use — `localhost:8443 {{ tls internal }}`, or `example.test:8443` — or drop `tls internal` to serve this listener without TLS. Caddy answers this configuration by choosing a default name at handshake time; this build has no on-demand issuance, so it refuses rather than choosing one for you"
+                ),
             });
         }
     }
