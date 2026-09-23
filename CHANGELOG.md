@@ -78,6 +78,13 @@ and error pages went out without it, and a proxied reply kept whatever the
 upstream sent. Every final HTTP/3 response now carries this server's `Date`,
 from the same clock the other transports use, replacing an upstream's value.
 
+### 🧩 Site middleware reaches self-answering routes
+
+Unmatched site-level middleware such as `header`, `request_header`,
+`basic_auth`, and `request_body` now runs before terminal `handle` routes as
+well as the site's fallback route. Route-local middleware still runs afterward
+and can override site defaults.
+
 ### 🔀 Cache variants include every `Vary` field line
 
 The H1/H2 response cache now reads all response `Vary` lines and every request

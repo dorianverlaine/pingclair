@@ -722,26 +722,22 @@ pub(super) fn adapt_server(
                         .then_with(|| right_specificity.1.cmp(&left_specificity.1))
                 })
             });
-            // 📥 An unmatched site-level `request_body` limits every request in
-            // the site, not only the ones that fall through to the site's own
-            // handlers. A terminal route (`handle /api/* { respond … }`) never
-            // runs the default pipeline, so without this a 1 MiB site limit
-            // silently stopped at the first `handle` block. The site's limit
-            // goes first, which lets a `request_body` inside the route run
-            // later and override it for that route alone.
-            let site_body_limits: Vec<&Handler> = default_handlers
+            // 🧩 A terminal route skips the site's default pipeline. Prepend
+            // unmatched site middleware so it still applies to that route;
+            // route-local middleware runs afterward and can override it.
+            let site_middleware: Vec<&Handler> = default_handlers
                 .iter()
-                .filter(|handler| matches!(handler, Handler::RequestBody(_)))
+                .filter(|handler| is_site_middleware(handler))
                 .collect();
             for arm in &mut routes.inner.arms {
                 if !handler_has_terminal(&arm.inner.handler) {
                     arm.inner.handler =
                         compose_with_default_handlers(arm.inner.handler.clone(), &default_handlers);
-                } else if !site_body_limits.is_empty() {
+                } else if !site_middleware.is_empty() {
                     let own =
                         std::mem::replace(&mut arm.inner.handler, Handler::Pipeline(Vec::new()));
                     arm.inner.handler = Handler::Pipeline(
-                        site_body_limits
+                        site_middleware
                             .iter()
                             .map(|handler| (*handler).clone())
                             .chain(std::iter::once(own))
@@ -917,8 +913,7 @@ pub(super) fn handler_has_terminal(handler: &Handler) -> bool {
         | Handler::Abort
         // 📊 Terminal: it writes a whole scrape response and there is nothing
         // sensible for a later handler to add to it.
-        | Handler::Metrics { .. }
-        | Handler::ForwardAuth(_) => true,
+        | Handler::Metrics { .. } => true,
         Handler::Pipeline(handlers)
         | Handler::Handle(handlers)
         | Handler::HandlePath { handlers, .. } => handlers
@@ -939,6 +934,40 @@ pub(super) fn handler_has_terminal(handler: &Handler) -> bool {
         | Handler::LogSkip
         | Handler::Vars(_)
         | Handler::Intercept(_)
+        | Handler::ForwardAuth(_)
+        | Handler::Plugin { .. } => false,
+    }
+}
+
+/// 🧩 Site directives that transform or guard a request or response before a
+/// route answers. Response-producing handlers stay in the fallback pipeline.
+fn is_site_middleware(handler: &Handler) -> bool {
+    match handler {
+        Handler::Headers(_)
+        | Handler::RequestHeaders(_)
+        | Handler::RequestBody(_)
+        | Handler::BasicAuth(_)
+        | Handler::RateLimit(_)
+        | Handler::Rewrite(_)
+        | Handler::TryFiles(_)
+        | Handler::Cors(_)
+        | Handler::AccessControl(_)
+        | Handler::LogSkip
+        | Handler::Vars(_)
+        | Handler::Intercept(_)
+        | Handler::ForwardAuth(_) => true,
+        Handler::Proxy(_)
+        | Handler::Respond(_)
+        | Handler::Error(_)
+        | Handler::Redirect(_)
+        | Handler::FileServer(_)
+        | Handler::AcmeServer(_)
+        | Handler::Templates
+        | Handler::Abort
+        | Handler::Metrics { .. }
+        | Handler::Pipeline(_)
+        | Handler::Handle(_)
+        | Handler::HandlePath { .. }
         | Handler::Plugin { .. } => false,
     }
 }
@@ -987,6 +1016,32 @@ pub(super) fn add_route(server: &mut ServerBlock, matcher: Option<Matcher>, hand
 mod directive_order_tests {
     use crate::compile;
     use pingclair_core::config::HandlerConfig;
+
+    #[test]
+    fn unmatched_site_middleware_precedes_a_terminal_handle_once() {
+        let config = compile(
+            "example.com {\n    header X-Site on\n    request_header X-Trace site\n    handle /api/* {\n        header X-Route api\n        respond \"api\"\n    }\n    respond \"top\"\n}",
+        )
+        .expect("compile");
+        let route = &config.servers[0].routes[0];
+        assert_eq!(route.path, "/api/*");
+        let HandlerConfig::Pipeline { handlers } = &route.handler else {
+            panic!(
+                "site middleware should wrap the handle: {:?}",
+                route.handler
+            );
+        };
+        assert_eq!(handlers.len(), 3, "site middleware runs exactly once");
+        assert!(matches!(handlers[0].handler, HandlerConfig::Headers { .. }));
+        assert!(matches!(
+            handlers[1].handler,
+            HandlerConfig::RequestHeaders { .. }
+        ));
+        assert!(matches!(
+            handlers[2].handler,
+            HandlerConfig::Pipeline { .. }
+        ));
+    }
 
     #[test]
     fn header_runs_before_respond_regardless_of_file_order() {

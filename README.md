@@ -710,6 +710,10 @@ a replacement emits its static body once and discards the upstream body chunk
 by chunk, so interception never buffers a whole response. `intercept { … }`
 registers the same handlers for proxied responses.
 
+Site-level middleware without a matcher, such as `header`, `request_header`,
+`basic_auth`, and `request_body`, also runs for self-answering `handle` routes.
+Middleware inside a route runs afterward and can override site defaults.
+
 `forward_auth <gateway> { uri …; copy_headers … }` runs one auth round trip
 before the request continues to the backend. A 2xx copies the listed response
 headers onto their configured request destinations — deleting those

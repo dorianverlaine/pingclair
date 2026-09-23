@@ -713,6 +713,11 @@ corps amont morceau par morceau, donc l'interception ne met jamais en tampon une
 réponse entière. `intercept { … }` enregistre les mêmes handlers pour les
 réponses proxifiées.
 
+Les middlewares au niveau du site sans matcher, tels que `header`,
+`request_header`, `basic_auth` et `request_body`, s'appliquent aussi aux routes
+`handle` qui répondent elles-mêmes. Les middlewares de la route s'exécutent
+ensuite et peuvent remplacer les valeurs par défaut du site.
+
 `forward_auth <gateway> { uri …; copy_headers … }` effectue un aller-retour
 d'authentification avant que la requête continue vers le backend. Un 2xx copie
 les en-têtes de réponse listés vers leurs destinations configurées sur la

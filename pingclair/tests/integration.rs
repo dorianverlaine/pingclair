@@ -54,6 +54,10 @@ mod site_name_case;
 #[path = "integration/h3_bind.rs"]
 mod h3_bind;
 
+// 🧩 Site middleware must reach terminal `handle` routes as well as fallback routes.
+#[path = "integration/site_middleware.rs"]
+mod site_middleware;
+
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather
 /// than against "some response arrived", so a 404 from a stale listener on the
@@ -5574,7 +5578,8 @@ async fn test_pingclairfile_forward_auth_copies_headers_and_answers_denials() {
                 @denied status 403
                 replace_status @denied 401
             }}
-            forward_auth http://{auth} {{
+            @app path /app
+            forward_auth @app http://{auth} {{
                 uri /auth
                 copy_headers X-User-Id X-Role>X-Identity
             }}

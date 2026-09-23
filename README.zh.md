@@ -643,6 +643,10 @@ retry 政策接受 Caddy 的 `lb_retry_match` 拼法：`method`、`path`、`head
 其餘上游 body 逐塊丟棄，所以攔截絕不會整份緩衝。`intercept { … }` 會對
 proxied response 註冊同一組 handler。
 
+站台層級沒有 matcher 的 middleware（例如 `header`、`request_header`、
+`basic_auth`、`request_body`）也會套用到自行回應的 `handle` route。
+route 內的 middleware 隨後執行，因此可以覆寫站台預設值。
+
 `forward_auth <gateway> { uri …; copy_headers … }` 在請求繼續送往後端前先做
 一次 auth round trip：2xx 會把列出的回應 header 複製到設定的請求目標上
 （包含重新命名的目標，一律先刪掉客戶端自帶的值），其餘狀態直接回給客戶端。
