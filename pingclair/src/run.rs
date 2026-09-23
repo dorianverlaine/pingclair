@@ -720,6 +720,26 @@ pub(crate) fn run_server(
                 service.set_connection_filter(filter);
             }
 
+            // 🛡️ The address is bound here first, and the probe listener is
+            // dropped immediately so Pingora can bind it for real.
+            //
+            // 🤡 Without this, a second instance on an address the first one
+            // holds panicked inside Pingora's service runtime — `Failed to
+            // build listeners: … Address already in use` — and the process then
+            // stayed up, listening on nothing. Under systemd that is the worst
+            // of both: a liveness check can pass while no traffic is served,
+            // and the supervisor never learns the port was the problem. The
+            // PROXY-protocol ingress a few lines below already binds directly
+            // and reports the failure; this gives the ordinary listener the
+            // same answer, naming the address.
+            //
+            // 📌 The window between dropping the probe and Pingora's own bind is
+            // the one thing this cannot close, and it is the same window the
+            // kernel would have had anyway.
+            let probe = std::net::TcpListener::bind(addr)
+                .map_err(|error| anyhow::anyhow!("failed to bind {addr}: {error}"))?;
+            drop(probe);
+
             // 🔐 Explicit TLS configuration supports HTTPS and H3 on non-standard ports.
             let mut tls_enabled = false;
             let mut http3_enabled = false;

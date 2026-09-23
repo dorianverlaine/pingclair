@@ -9986,6 +9986,75 @@ async fn spawn_body_measuring_origin() -> (SocketAddr, tokio::task::JoinHandle<(
     (address, task)
 }
 
+/// 🛡️ A second instance on a port the first one holds must exit, not hang.
+///
+/// 🤡 It panicked inside Pingora's service runtime — `Failed to build
+/// listeners: … Address already in use` — and then stayed up, listening on
+/// nothing. Under systemd that is the worst of both: a liveness check can pass
+/// while no traffic is served, and the supervisor never learns the port was the
+/// problem. Caddy exits 1 with one line naming the address.
+///
+/// 📌 The assertions are the contract this issue asks for: non-zero exit, a
+/// message naming the address, and **the process gone within a bounded time**.
+/// A test that only checked the message would pass on the hanging version's
+/// output if the panic text happened to be in it.
+#[test]
+fn a_second_instance_on_a_held_port_exits_instead_of_hanging() {
+    // 🌐 Held on the wildcard address, because that is what a site address with
+    // no host binds — holding `127.0.0.1` instead would leave `[::]` free.
+    let held = TcpListener::bind(SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)))
+        .expect("bind the port to hold");
+    let port = held.local_addr().unwrap().port();
+
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("Pingclairfile");
+    std::fs::write(
+        &config,
+        format!("{{\n\tadmin off\n}}\n:{port} {{\n\trespond \"v1\"\n}}\n"),
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pingclair"))
+        .arg("run")
+        .arg(&config)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the binary must start");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait on the child") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            // 🧹 The child that would not exit is this test's own, verified by
+            // having spawned it — no other process is touched.
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the second instance never exited, which is the hang this pins");
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    assert!(
+        !status.success(),
+        "a start that could not bind must not report success"
+    );
+    assert!(
+        stderr.contains(&port.to_string()),
+        "the failure must name the address it could not bind: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "the failure must be reported, not panicked: {stderr}"
+    );
+}
+
 /// 📥 An unconfigured site has no request-body ceiling, because the format it
 /// implements has none.
 ///
