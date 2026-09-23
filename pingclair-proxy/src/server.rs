@@ -7463,6 +7463,7 @@ impl ProxyHttp for PingclairProxy {
         //   - Route did not request immediate flushing (`flush_interval: -1`)
         //   - Response is not a real-time stream (e.g. text/event-stream)
         //   - Response is not already compressed
+        //   - Response does not carry `Cache-Control: no-transform`
         //   - Content type is compressible (text/*, application/json, etc.)
         //   - Body is not too small (> 256 bytes via Content-Length)
         //
@@ -7478,7 +7479,8 @@ impl ProxyHttp for PingclairProxy {
         if crate::response_encoding::is_full_representation(
             &session.req_header().method,
             upstream_response,
-        ) && let Some(encoding) = ctx.negotiated_encoding
+        ) && !crate::response_encoding::forbids_transform(upstream_response)
+            && let Some(encoding) = ctx.negotiated_encoding
             && !ctx.streaming_response
             && ctx.intercepted_response.is_none()
         {

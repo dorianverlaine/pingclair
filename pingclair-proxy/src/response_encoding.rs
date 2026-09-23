@@ -113,6 +113,16 @@ pub(crate) fn is_full_representation(method: &http::Method, header: &ResponseHea
         || header.headers.contains_key(http::header::CONTENT_RANGE))
 }
 
+/// 🛡️ Whether the response's `Cache-Control` carries `no-transform`.
+///
+/// The directive binds every intermediary, cache or not (RFC 9111
+/// §5.2.2.6). It exists for bodies whose exact bytes matter — a signed
+/// archive, a payload checked against a hash — and compressing one breaks
+/// that check with no error anywhere to explain it.
+pub(crate) fn forbids_transform(header: &ResponseHeader) -> bool {
+    field_tokens(header, "cache-control").any(|token| token.eq_ignore_ascii_case("no-transform"))
+}
+
 #[async_trait::async_trait]
 impl HttpModule for ResponseEncodingModule {
     fn response_body_filter(
@@ -187,6 +197,25 @@ mod tests {
                 expected,
                 "{status} {method} range={range}"
             );
+        }
+    }
+
+    /// 🛡️ `no-transform` is found in any spelling the field allows.
+    #[test]
+    fn no_transform_is_read_from_every_cache_control_line() {
+        for (lines, expected) in [
+            (&[][..], false),
+            (&["max-age=60"][..], false),
+            (&["no-transform"][..], true),
+            (&["public, No-Transform"][..], true),
+            (&["max-age=60", "no-transform"][..], true),
+            (&["no-transformation"][..], false),
+        ] {
+            let mut header = ResponseHeader::build(200, None).unwrap();
+            for line in lines {
+                header.append_header("Cache-Control", *line).unwrap();
+            }
+            assert_eq!(forbids_transform(&header), expected, "{lines:?}");
         }
     }
 

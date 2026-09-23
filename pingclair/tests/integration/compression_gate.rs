@@ -163,3 +163,39 @@ async fn test_head_is_not_compressed() {
         body.len().to_string()
     );
 }
+
+/// 🛡️ `Cache-Control: no-transform` from the origin keeps the body byte-exact.
+///
+/// The directive binds every intermediary; compressing anyway replaced a
+/// body whose exact bytes a downstream signature or hash check depends on.
+#[tokio::test]
+async fn test_no_transform_is_not_compressed() {
+    let body = compressible_body();
+    let (origin, _hits) = spawn_scripted_origin(origin_reply(
+        "200 OK",
+        "Cache-Control: max-age=60, no-transform\r\n",
+        &body,
+    ))
+    .await;
+    let mut server = TestServer::new_pingclairfile(&proxy_pingclairfile(origin, ""));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let reply = no_proxy_client()
+        .get(server.url(0, "/page"))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 200);
+    assert!(reply.headers().get("content-encoding").is_none());
+    assert_eq!(
+        reply
+            .headers()
+            .get("content-length")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        body.len().to_string()
+    );
+    assert_eq!(reply.text().await.unwrap(), body);
+}
