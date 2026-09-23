@@ -41,13 +41,11 @@ const ZSTD_LEVEL: i32 = 1;
 /// production called it — while the static path used `header.contains("gzip")`
 /// and therefore compressed for a client that had sent `gzip;q=0`. One
 /// implementation, so a fix here cannot fail to reach a served file.
+///
+/// 🏎️ The configured `Encoding` values are ranked directly, so no token list
+/// is collected per response.
 pub fn negotiate(accept_encoding: &str, offered: &[Encoding]) -> Option<Encoding> {
-    if offered.is_empty() {
-        return None;
-    }
-    let tokens: Vec<&str> = offered.iter().map(|e| e.token()).collect();
-    let chosen = pingclair_core::encoding::negotiate(accept_encoding, &tokens)?;
-    offered.iter().copied().find(|e| e.token() == chosen)
+    pingclair_core::encoding::negotiate_by(accept_encoding, offered, |e| e.token()).copied()
 }
 
 // MARK: - Streaming encoders
