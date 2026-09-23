@@ -582,6 +582,18 @@ server "shop.example.com" {
 }
 ```
 
+A proxied response carries two identification headers, and **this proxy rewrites
+both**: the upstream's `Server` is replaced with `Pingclair` — not passed through
+— and `Via` carries `1.1 Pingclair`. A per-response `x-request-id` is added as
+well, on responses as well as requests. This is a deliberate difference from
+Caddy, which forwards the upstream's `Server` untouched and sends `Via: 1.1
+Caddy`; it is stated here because a monitoring rule that keys on either string
+gets a different answer without the configuration having changed. The strip
+direction is available from the DSL — `header -Server` removes the header
+entirely — and `header Server <value>` sets your own, but forwarding the
+upstream's exact value is not implemented: nothing exposes the upstream's
+response headers as a placeholder.
+
 Active checks run out of band, so an idle failed backend leaves rotation before
 a user request reaches it and rejoins after the configured successful probes.
 Checks support a custom method, Host, headers, status set, bounded body match,

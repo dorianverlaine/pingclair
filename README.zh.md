@@ -532,6 +532,14 @@ server "shop.example.com" {
 }
 ```
 
+代理後的回應會帶兩個身分標頭，而**這個代理兩個都會改寫**：上游的 `Server`
+會被換成 `Pingclair`（不是原樣轉送），`Via` 帶的是 `1.1 Pingclair`；此外每個
+回應都會被加上 `x-request-id`。這是與 Caddy 刻意的差異——Caddy 原樣轉送上游的
+`Server`、並送 `Via: 1.1 Caddy`——寫在這裡是因為，任何以這兩個字串為判斷依據的
+監控規則都會在設定沒變的情況下得到不同答案。移除的方向在 DSL 裡是可行的
+（`header -Server` 會把標頭整個拿掉，`header Server <value>` 可以設定自己的值），
+但**原樣轉送上游的值尚未實作**：目前沒有任何 placeholder 能讀到上游的回應標頭。
+
 主動健康檢查在請求之外執行，因此閒置的故障後端會在使用者請求碰到它之前退出
 輪詢，並在連續探測成功後重新加入。探測可設定 method、Host、header、狀態碼集合、
 有 byte 上限的 body 比對、獨立連接埠、連線重用、門檻與 slow-start。HTTPS 探測

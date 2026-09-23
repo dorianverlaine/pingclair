@@ -572,6 +572,18 @@ server "shop.example.com" {
 }
 ```
 
+Une réponse relayée porte deux en-têtes d'identification, et **ce proxy réécrit
+les deux** : le `Server` de l'amont est remplacé par `Pingclair` — il n'est pas
+transmis tel quel — et `Via` porte `1.1 Pingclair`. Un `x-request-id` est ajouté
+à chaque réponse en plus des requêtes. C'est une différence délibérée avec Caddy,
+qui transmet le `Server` de l'amont intact et envoie `Via: 1.1 Caddy` ; elle est
+écrite ici parce qu'une règle de supervision fondée sur l'une de ces chaînes
+obtient une réponse différente sans que la configuration ait changé. Le sens
+« supprimer » est disponible depuis le DSL (`header -Server` retire l'en-tête,
+`header Server <value>` pose le vôtre), mais transmettre la valeur exacte de
+l'amont n'est pas implémenté : rien n'expose les en-têtes de réponse de l'amont
+sous forme de placeholder.
+
 Les vérifications actives s'exécutent hors bande : un backend inactif en panne
 quitte la rotation avant de recevoir une requête utilisateur, puis la rejoint
 après les succès consécutifs configurés. Les sondes acceptent method, Host,
