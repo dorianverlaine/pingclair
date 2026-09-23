@@ -98,7 +98,11 @@ pub enum AdapterError {
 /// subject is read as "this message was not written carefully", which is the
 /// wrong frame for a message the operator has to act on.
 fn argument_count_message(directive: &str, expected: usize, got: usize) -> String {
-    let noun = if expected == 1 { "argument" } else { "arguments" };
+    let noun = if expected == 1 {
+        "argument"
+    } else {
+        "arguments"
+    };
     format!("Directive '{directive}' expects {expected} {noun}, got {got}")
 }
 
