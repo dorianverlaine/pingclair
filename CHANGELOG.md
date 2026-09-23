@@ -31,6 +31,14 @@ skipped in both `X-Forwarded-For` and `Forwarded`, as RFC 9110 §5.6.1.2
 requires, up to one per permitted hop (32); a header of nothing but commas is
 still rejected.
 
+A header that cannot be read no longer discards the other one either. Only two
+readable headers that name *different* clients still fail closed to the
+proxy's address. A `Forwarded` hop that hid its address (`for=unknown`, an
+obfuscated `for=_name`, or no `for=` at all) used to make the whole field
+unreadable; it now ends the trust walk at that hop, so nothing reported by the
+hidden party is believed, while `X-Forwarded-For` can still name the client.
+`X-Real-IP` is consulted only when neither chain header was sent.
+
 ### 🍪 `lb_policy cookie` no longer depends on cookie order
 
 A browser holding two cookies with the same name, set for different paths,

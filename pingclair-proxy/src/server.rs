@@ -542,20 +542,25 @@ impl TrustedProxyPolicy {
             return cf_ip;
         }
 
+        // 🧭 Each header is read on its own first. A header that fails to
+        // parse, or whose walk stops at a hop that hid its address, simply
+        // contributes nothing; the other header can still name the client.
+        // Only two headers that each name a client, and name different ones,
+        // are treated as tampering, because that is the one case where
+        // believing either would be a guess.
         let xff = parse_forwarded_chain(headers);
         let forwarded = parse_rfc_forwarded_chain(headers);
-        let client_from = |chain: &[IpAddr]| {
-            chain
-                .iter()
-                .rev()
-                .copied()
-                .find(|candidate| !self.contains(*candidate))
-                .unwrap_or(chain[0])
+        let both_absent = matches!((&xff, &forwarded), (Ok(None), Ok(None)));
+        let xff_client = match &xff {
+            Ok(Some(chain)) => self.client_from(chain.iter().copied().map(Some)),
+            Ok(None) | Err(()) => None,
         };
-        match (xff, forwarded) {
-            (Ok(Some(xff)), Ok(Some(forwarded))) => {
-                let xff_client = client_from(&xff);
-                let forwarded_client = client_from(&forwarded);
+        let forwarded_client = match &forwarded {
+            Ok(Some(chain)) => self.client_from(chain.iter().copied()),
+            Ok(None) | Err(()) => None,
+        };
+        match (xff_client, forwarded_client) {
+            (Some(xff_client), Some(forwarded_client)) => {
                 if xff_client == forwarded_client {
                     xff_client
                 } else {
@@ -567,14 +572,40 @@ impl TrustedProxyPolicy {
                     fallback
                 }
             }
-            (Ok(Some(chain)), Ok(None)) | (Ok(None), Ok(Some(chain))) => client_from(&chain),
-            (Ok(None), Ok(None)) => headers
+            (Some(client), None) | (None, Some(client)) => client,
+            // 🛡️ `X-Real-IP` is consulted only when no chain was sent at all.
+            // A chain that was sent and could not name anyone is an answer
+            // ("unknown"), not a gap for a third header to fill.
+            (None, None) if both_absent => headers
                 .get("x-real-ip")
                 .and_then(|value| value.to_str().ok())
                 .and_then(parse_forwarded_ip)
                 .unwrap_or(fallback),
-            _ => fallback,
+            (None, None) => fallback,
         }
+    }
+
+    /// 🧭 Walks a forwarding chain from the nearest hop outward and returns
+    /// the first address this server does not trust, which is the client.
+    ///
+    /// 🛡️ A hop that hid its address (`None`, from `for=unknown` or an
+    /// obfuscated `for=_name`) ends the walk with no answer: everything to its
+    /// left was reported by a party whose own address is unknown, so none of
+    /// it can be verified. When every hop is trusted, the leftmost one is the
+    /// client, as before.
+    fn client_from<I>(&self, chain: I) -> Option<IpAddr>
+    where
+        I: DoubleEndedIterator<Item = Option<IpAddr>>,
+    {
+        let mut leftmost = None;
+        for hop in chain.rev() {
+            let address = hop?;
+            if !self.contains(address) {
+                return Some(address);
+            }
+            leftmost = Some(address);
+        }
+        leftmost
     }
 
     fn forwarded_for_with_fallback(
@@ -667,7 +698,12 @@ impl EmptyElementBudget {
 }
 
 /// 🧭 Parses RFC 7239 `Forwarded` elements into one bounded `for` chain.
-fn parse_rfc_forwarded_chain(headers: &http::HeaderMap) -> Result<Option<Vec<IpAddr>>, ()> {
+///
+/// 🙈 A hop that did not disclose an address — `for=unknown`, an obfuscated
+/// `for=_name` (RFC 7239 §6), or an element with no `for=` at all — is kept
+/// as `None` rather than failing the whole header, so the trust walk can stop
+/// there. Anything else that is not an address is still malformed.
+fn parse_rfc_forwarded_chain(headers: &http::HeaderMap) -> Result<Option<Vec<Option<IpAddr>>>, ()> {
     let values = headers.get_all("forwarded");
     if values.iter().next().is_none() {
         return Ok(None);
@@ -708,9 +744,13 @@ fn parse_rfc_forwarded_chain(headers: &http::HeaderMap) -> Result<Option<Vec<IpA
                     return Err(());
                 }
                 let decoded = decode_forwarded_value(raw_value.trim())?;
-                forwarded_for = parse_forwarded_ip(&decoded);
+                forwarded_for = Some(match parse_forwarded_ip(&decoded) {
+                    Some(address) => Some(address),
+                    None if is_undisclosed_node(&decoded) => None,
+                    None => return Err(()),
+                });
             }
-            chain.push(forwarded_for.ok_or(())?);
+            chain.push(forwarded_for.flatten());
         }
     }
     if chain.is_empty() {
@@ -718,6 +758,28 @@ fn parse_rfc_forwarded_chain(headers: &http::HeaderMap) -> Result<Option<Vec<IpA
     } else {
         Ok(Some(chain))
     }
+}
+
+/// 🙈 Recognises an RFC 7239 §6 node that names no address: `unknown` or an
+/// obfuscated `_identifier`, each optionally followed by `:port`.
+fn is_undisclosed_node(node: &str) -> bool {
+    let (name, port) = match node.split_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (node, None),
+    };
+    let obfuscated = |value: &str| {
+        value.len() > 1
+            && value.starts_with('_')
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    };
+    let name_ok = name.eq_ignore_ascii_case("unknown") || obfuscated(name);
+    let port_ok = port.is_none_or(|port| {
+        (!port.is_empty() && port.len() <= 5 && port.bytes().all(|byte| byte.is_ascii_digit()))
+            || obfuscated(port)
+    });
+    name_ok && port_ok
 }
 
 /// 🧭 Splits a header value on a delimiter that is not inside a quoted-string,
@@ -9124,6 +9186,35 @@ mod forwarded_headers_tests {
                 "{name}: {value}"
             );
         }
+    }
+
+    /// 🙈 RFC 7239 §6 nodes that name no address are recognised, and only
+    /// those: any other non-address `for=` value is still malformed.
+    #[test]
+    fn undisclosed_nodes_follow_the_rfc_7239_grammar() {
+        let accepted: Vec<bool> = [
+            "unknown",
+            "UNKNOWN",
+            "_hidden",
+            "_a.b-c_d",
+            "_hidden:_port",
+            "unknown:8080",
+            "_",
+            "hidden",
+            "_bad!",
+            "_hidden:",
+            "unknown:123456",
+            "",
+        ]
+        .iter()
+        .map(|node| is_undisclosed_node(node))
+        .collect();
+        assert_eq!(
+            accepted,
+            [
+                true, true, true, true, true, true, false, false, false, false, false, false
+            ]
+        );
     }
 
     /// 🛡️ The empty-element allowance is bounded, so a field of nothing but
