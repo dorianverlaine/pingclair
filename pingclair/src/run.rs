@@ -679,6 +679,21 @@ pub(crate) fn run_server(
                 "{} (automatic HTTP)",
                 companion.name.as_deref().unwrap_or("default")
             ));
+            // 🔄 The redirect a request gets when its `Host` matches no site.
+            //
+            // 📌 Gated on the companion actually carrying routes. Under
+            // `auto_https disable_redirects` the listener is provisioned for
+            // ACME validation only, with no routes at all — and telling the
+            // proxy to redirect there would quietly undo the mode the operator
+            // asked for.
+            if !companion.routes.is_empty() {
+                proxy.automatic_https.store(std::sync::Arc::new(Some(
+                    pingclair_proxy::server::AutomaticHttpsRedirect {
+                        http_port,
+                        https_port,
+                    },
+                )));
+            }
             proxy.add_server(companion);
         }
     }

@@ -5848,6 +5848,145 @@ async fn test_hostname_tls_site_derives_https_and_http_companion() {
     );
 }
 
+/// 📡 Sends one raw request and returns the status line and the `Location`.
+///
+/// 🔌 A raw TCP exchange rather than a client: the probes here deliberately
+/// carry `Host` values no resolver would produce, and a `Location` has to be
+/// read back exactly as it was written rather than after a client normalised
+/// it.
+async fn raw_get_status_and_location(addr: std::net::SocketAddr, host: &str) -> (String, Option<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("the listener must accept connections");
+    let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    let status = response.lines().next().unwrap_or_default().to_string();
+    let location = response
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("location:"))
+        .map(|line| {
+            line.split_once(':')
+                .map(|(_, value)| value.trim().to_string())
+                .unwrap_or_default()
+        });
+    (status, location)
+}
+
+/// 🔄 The plaintext companion redirects a `Host` that matches no site, too.
+///
+/// 🤡 The listener exists to send plaintext visitors to HTTPS, and it did that
+/// only when the `Host` named a configured site. A visitor arriving by IP
+/// address, by a hostname that resolves to this box but is not in the
+/// configuration, or through a load balancer that sends its own `Host`, got a
+/// bare 404 from the very port whose job was to forward them — while typing
+/// `https://` by hand worked. Caddy answers the same request with the redirect.
+///
+/// 🔐 The security half is asserted here as well as the behaviour. The redirect
+/// echoes the caller's `Host`, so the port must always be this server's own and
+/// a `Host` that is not a host at all must produce no redirect rather than an
+/// escaped one.
+#[tokio::test]
+async fn test_plaintext_companion_redirects_an_unknown_host() {
+    let config = r#"
+        {
+            admin off
+            http_port __PINGCLAIR_TEST_HTTP_PORT__
+            https_port __PINGCLAIR_TEST_HTTPS_PORT__
+        }
+
+        example.com {
+            tls internal
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "https-ok"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(
+        server.wait_until_tls_ready("example.com").await,
+        "the site did not come up"
+    );
+
+    let companion = server.listener_address(0, 1);
+    let https_port = server.address(0).port();
+
+    // 📌 The known-host case, so a change here cannot be mistaken for a fix to
+    // the unknown-host one.
+    let (status, location) = raw_get_status_and_location(companion, "example.com").await;
+    assert!(
+        status.contains("308"),
+        "a configured host must still redirect, got `{status}`"
+    );
+    assert_eq!(
+        location.as_deref(),
+        Some(format!("https://example.com:{https_port}/").as_str()),
+        "the configured host must be sent to this server's HTTPS port"
+    );
+
+    // 🎯 The case this test exists for: a `Host` no site claims.
+    let (status, location) = raw_get_status_and_location(companion, "127.0.0.1").await;
+    assert!(
+        status.contains("308"),
+        "an unknown host on the redirect listener must be sent to HTTPS, got \
+         `{status}` — a 404 from this port tells a visitor nothing they can act \
+         on, while the redirect reaches the site"
+    );
+    assert_eq!(
+        location.as_deref(),
+        Some(format!("https://127.0.0.1:{https_port}/").as_str()),
+        "the redirect must name this server's HTTPS port, never the plaintext \
+         one the request arrived on"
+    );
+
+    // 🚫 A `Host` that is not an authority at all gets no redirect. Echoing a
+    // value containing a slash into a `Location` would let the request choose
+    // where the browser goes next, which is the open redirect this echo must
+    // not become.
+    let (status, location) = raw_get_status_and_location(companion, "evil.test/redirect-me").await;
+    assert!(
+        !status.contains("308") || location.is_none(),
+        "a `Host` that is not a host must not be reflected into a redirect: \
+         `{status}` `{location:?}`"
+    );
+
+    // 🚫 And the proxying path keeps its 404: a plaintext listener that is not
+    // the automatic companion has no redirect to offer, and turning every
+    // plaintext listener into a redirector would break it.
+    //
+    // 📌 The site is named by its own address rather than written as `:PORT`,
+    // because a port-only site is this server's catch-all and would answer
+    // `nobody.test` with its own response instead of the 404 a named site
+    // produces. The `http://` scheme is what keeps it plaintext: an address on
+    // a non-conventional port would otherwise still be a candidate for the
+    // automatic HTTPS the runtime applies to a named site.
+    let plain = r#"
+        {
+            admin off
+            auto_https off
+        }
+
+        http://127.0.0.1:__PINGCLAIR_TEST_PORT__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "plain"
+        }
+    "#;
+    let mut plain_server = TestServer::new_pingclairfile(plain);
+    plain_server.wait_until_ready().await;
+    let (status, location) =
+        raw_get_status_and_location(plain_server.address(0), "nobody.test").await;
+    assert!(
+        status.contains("404"),
+        "a listener with no automatic HTTPS must keep answering 404 to an \
+         unknown host, got `{status}` `{location:?}`"
+    );
+}
+
 /// 🌐 One site block may serve the same hostname over explicit HTTP and HTTPS.
 ///
 /// The HTTPS half must still obtain an automatic certificate, while the HTTP

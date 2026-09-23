@@ -149,6 +149,26 @@ A client may send `Connection` as two field lines, such as
 read only the first line, decided the request was not a WebSocket handshake,
 and stripped `Connection` and `Upgrade` before the origin saw them, so the
 upgrade silently failed. Every line is now read.
+### 🔄 The plaintext listener redirects an unknown `Host` too
+
+The listener automatic HTTPS provisions on port 80 has one job — send plaintext
+visitors to HTTPS — and it did that only when the request's `Host` named a
+configured site. A visitor arriving by IP address, by a hostname that resolves
+here but is not in the configuration, or through a load balancer that sends its
+own `Host`, got a bare 404 from the very port whose purpose was to forward them,
+while typing `https://` by hand worked. Caddy answers the same request with the
+308, which is what the README already promised.
+
+The redirect echoes the caller's `Host`, so the port in it is always this
+server's own HTTPS port and never one the request carried — a caller-chosen
+authority in a `Location` is an open redirect — and it names the port only when
+that port is not 443. A `Host` that is not an authority at all, one carrying a
+slash, an `@`, a space or a control character, produces no redirect rather than
+an escaped one, and falls through to the same 404 as before. `disable_redirects`
+still turns the whole behaviour off: the listener is then provisioned for ACME
+validation only, with no routes, and redirecting there would quietly undo the
+mode the operator asked for.
+
 ### 🕰️ Access-log records carry a timestamp
 
 A JSON access-log record had no field saying when its request happened, so a

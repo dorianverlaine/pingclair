@@ -1248,6 +1248,45 @@ fn session_inet_addresses(session: &Session) -> Option<(SocketAddr, SocketAddr)>
     Some((peer, listener))
 }
 
+/// 🔐 Narrows a request's host to something safe to put in a `Location`.
+///
+/// Returns the authority to use — a DNS name as written, an IPv6 literal
+/// re-bracketed — or `None` when the value is not a host at all.
+///
+/// 🚫 Nothing is escaped or percent-encoded on the way through. A `Host`
+/// carrying a slash, an `@`, a space or a control character is refused
+/// outright, because the alternative is a `Location` whose text means one thing
+/// to a browser and another to whoever reads the log line afterwards. Refusing
+/// produces no redirect, which is the safe direction: the request falls through
+/// to the ordinary 404.
+///
+/// 📌 `request_host` has already removed the port and the IPv6 brackets by the
+/// time this runs, so an IPv6 literal arrives here with its colons bare and has
+/// to be put back in brackets to be a valid authority.
+fn redirect_authority(host: &str) -> Option<String> {
+    if let Ok(address) = host.parse::<std::net::Ipv6Addr>() {
+        return Some(format!("[{address}]"));
+    }
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return Some(host.to_string());
+    }
+    if host.is_empty() || host.len() > 253 {
+        return None;
+    }
+    // 🔤 One label rule, applied to every label: letters, digits, `-` and `_`,
+    // never empty, never over the DNS length limit. A trailing dot is already
+    // gone — `canonical_host` strips exactly one — and a second one would leave
+    // an empty label here, which is what rejects `example.com..`.
+    let well_formed = host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    });
+    well_formed.then(|| host.to_string())
+}
+
 fn host_matches_rule(host: &str, rule: &str) -> bool {
     let host = host.to_ascii_lowercase();
     if let Some(suffix) = rule.strip_prefix("*.") {
@@ -1929,6 +1968,26 @@ pub(crate) fn error_reason(status: u16) -> &'static str {
 
 // MARK: - Server Implementation
 
+/// 🔄 Where the automatic HTTP→HTTPS redirect sends a request whose `Host`
+/// matches no configured site.
+///
+/// 🔐 Both ports come from the configuration, never from the request, and that
+/// is the point of the type. The redirect echoes the caller's `Host` back, and
+/// a redirect whose authority a caller can choose is an open redirect. Fixing
+/// the port here means the most a forged `Host` can achieve is naming a host
+/// the client already asked for, on *this* server's HTTPS port.
+#[derive(Debug, Clone, Copy)]
+pub struct AutomaticHttpsRedirect {
+    /// 🚪 The plaintext port a redirect is offered on.
+    ///
+    /// A request that arrived anywhere else is on a listener with a different
+    /// purpose, and redirecting there would turn every plaintext listener into
+    /// one.
+    pub http_port: u16,
+    /// 🔐 The port the redirect names, which is this server's own.
+    pub https_port: u16,
+}
+
 /// Pingclair reverse proxy
 ///
 /// `hosts`/`default` use `ArcSwap` rather than `RwLock` because they sit on
@@ -1943,6 +2002,21 @@ pub struct PingclairProxy {
     pub hosts: Arc<ArcSwap<HashMap<String, Arc<ProxyState>>>>,
     /// Default server state (catch-all)
     pub default: Arc<ArcSwap<Option<Arc<ProxyState>>>>,
+    /// 🔄 The automatic HTTP→HTTPS redirect, when this process took the plaintext
+    /// companion port.
+    ///
+    /// The redirect itself is an ordinary site — `automatic_http_companion` in
+    /// the `pingclair` crate builds one with a `308` route and the site's own
+    /// names — so a request whose `Host` matches gets the redirect through the
+    /// normal routing path. This field exists for the requests that match
+    /// nothing: they reach the unknown-host branch, which has no site to read
+    /// the listener's purpose from.
+    ///
+    /// 📌 Only the ports are stored, not a target template. The `Location` is
+    /// rebuilt per request from the validated `Host` and this server's own
+    /// HTTPS port, so there is no client-supplied string sitting in a stored
+    /// value waiting to be reflected.
+    pub automatic_https: Arc<ArcSwap<Option<AutomaticHttpsRedirect>>>,
     /// TLS Manager for certificate resolution
     pub tls_manager: Option<Arc<pingclair_tls::manager::TlsManager>>,
     /// Alt-Svc value advertised on this listener's responses when HTTP/3 is
@@ -1972,6 +2046,10 @@ impl Default for PingclairProxy {
         Self {
             hosts: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             default: Arc::new(ArcSwap::from_pointee(None)),
+            // 🔄 Off until the runtime that bound the plaintext companion port
+            // says otherwise. A proxy built by a test, or one whose
+            // configuration has no automatic HTTPS, must not redirect anything.
+            automatic_https: Arc::new(ArcSwap::from_pointee(None)),
             tls_manager: None,
             alt_svc: Arc::new(ArcSwap::from_pointee(None)),
             trusted_proxies: Arc::new(TrustedProxyPolicy::from_rules(&[])),
@@ -2062,6 +2140,10 @@ impl PingclairProxy {
         Self {
             hosts: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             default: Arc::new(ArcSwap::from_pointee(None)),
+            // 🔄 Off until the runtime that bound the plaintext companion port
+            // says otherwise. A proxy built by a test, or one whose
+            // configuration has no automatic HTTPS, must not redirect anything.
+            automatic_https: Arc::new(ArcSwap::from_pointee(None)),
             tls_manager: Some(tls_manager),
             alt_svc: Arc::new(ArcSwap::from_pointee(None)),
             trusted_proxies: Arc::new(TrustedProxyPolicy::from_rules(&[])),
@@ -2104,6 +2186,10 @@ impl PingclairProxy {
         Self {
             hosts: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             default: Arc::new(ArcSwap::from_pointee(None)),
+            // 🔄 Off until the runtime that bound the plaintext companion port
+            // says otherwise. A proxy built by a test, or one whose
+            // configuration has no automatic HTTPS, must not redirect anything.
+            automatic_https: Arc::new(ArcSwap::from_pointee(None)),
             tls_manager: Some(tls_manager),
             alt_svc: Arc::new(ArcSwap::from_pointee(None)),
             trusted_proxies: Arc::new(TrustedProxyPolicy::from_rules(trusted_proxies)),
@@ -2420,6 +2506,59 @@ impl PingclairProxy {
             )
             .map(|route| route.index);
         Some((state, route_index))
+    }
+
+    /// 🔄 The `Location` for a request whose `Host` matches no site, when it
+    /// arrived on the plaintext port an automatic HTTPS redirect owns.
+    ///
+    /// 🔐 Every part of the URL is decided here except the host, and the host is
+    /// the one thing the caller chose — so it is validated before being echoed.
+    /// The port is this server's own, never one the request carried, which is
+    /// what keeps a forged `Host` from turning this into an open redirect.
+    ///
+    /// 🚫 `None` for a request that did not arrive over plaintext on the
+    /// configured HTTP port. A process with no automatic HTTPS, a proxied
+    /// listener, a TLS listener — none of them has a redirect to offer, and
+    /// inventing one would send a working client somewhere it cannot be served.
+    fn automatic_https_redirect(
+        &self,
+        host: &str,
+        session: &Session,
+        orig_uri: &http::Uri,
+    ) -> Option<String> {
+        let configured = self.automatic_https.load();
+        // 🧯 Deref through the `ArcSwap` guard and the `Arc` in one step: the
+        // guard borrows the published snapshot and must be dropped before this
+        // returns, so the value is copied out rather than borrowed.
+        let configured = (**configured).as_ref().copied()?;
+
+        // 🔐 A completed handshake means the request is already secure.
+        // Redirecting it would be a loop, and this code also runs on the TLS
+        // listener, so the loop is the failure to guard against.
+        if session
+            .digest()
+            .is_some_and(|digest| digest.ssl_digest.is_some())
+        {
+            return None;
+        }
+
+        let (_, listener) = session_inet_addresses(session)?;
+        if listener.port() != configured.http_port {
+            return None;
+        }
+
+        let authority = redirect_authority(host)?;
+
+        // 🧭 The whole original target, query string included, so the redirect
+        // lands on the page that was asked for rather than the site root.
+        let uri = orig_uri
+            .path_and_query()
+            .map_or("/", http::uri::PathAndQuery::as_str);
+        Some(if configured.https_port == 443 {
+            format!("https://{authority}{uri}")
+        } else {
+            format!("https://{authority}:{}{uri}", configured.https_port)
+        })
     }
 
     // MARK: - Internal Helpers
@@ -6324,6 +6463,35 @@ impl ProxyHttp for PingclairProxy {
             let state = match self.get_state(host) {
                 Some(s) => s,
                 None => {
+                    // 🔄 Before falling to 404: is this the request an automatic
+                    // HTTPS redirect exists for?
+                    //
+                    // 🤡 The listener that holds the plaintext port has one job —
+                    // send plaintext visitors to HTTPS — and it did it only for
+                    //  `Host` values that named a site. A visitor who arrived by
+                    // IP, by an old hostname, or through a load balancer that
+                    // sends its own `Host` got a bare 404 from the port whose
+                    // entire purpose was to forward them, while `https://` typed
+                    // by hand worked. Caddy answers the same request with the
+                    // redirect.
+                    if let Some(redirect) =
+                        self.automatic_https_redirect(host, session, &ctx.orig_uri)
+                    {
+                        let mut header =
+                            Self::build_downstream_header(session, 308, Some(1)).unwrap();
+                        header.insert_header("Location", redirect.as_str()).unwrap();
+                        header.insert_header("Content-Length", "0").unwrap();
+                        self.write_local_response(
+                            session,
+                            ctx,
+                            header,
+                            LocalResponseBody::Empty,
+                            false,
+                        )
+                        .await?;
+                        return Ok(true);
+                    }
+
                     // Unknown virtual host: nothing could ever proxy this
                     // request, so answer 404 now. Returning Ok(false) here
                     // would land in upstream_peer with no state and surface
