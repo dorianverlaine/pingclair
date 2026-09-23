@@ -231,6 +231,8 @@ upstream_pid=$!
 # 🧾 A Pingclairfile, not JSON: the DSL is the half an operator's configuration
 # goes through, and the JSON path skips `adapter/caddyfile.rs` entirely — which
 # is where "the directive parsed into the wrong shape" lives.
+# 🛡️ The heredoc is unquoted so `${var}` expands, which also means a bare
+# backtick in a Pingclairfile comment runs as a command; escape each one.
 cat >"${run_dir}/Pingclairfile" <<EOF
 {
 	auto_https off
@@ -285,7 +287,7 @@ https://${secondary_host}:${h3_port} {
 	}
 }
 
-# 🚫 The third vhost is the per-site opt-out. `http3 off` inside a `tls` block
+# 🚫 The third vhost is the per-site opt-out. \`http3 off\` inside a \`tls\` block
 # is a Pingclair extension rather than Caddy syntax, and this script exists to
 # check what Pingclair does — so it is exercised here because the guide promises
 # it, and the Caddy-compatible subset stays as it is everywhere else.
