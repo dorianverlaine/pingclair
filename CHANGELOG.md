@@ -2052,3 +2052,15 @@ where nginx is still ahead.
   the saturated resource.
 
 [Unreleased]: https://github.com/dorianverlaine/pingclair/compare/v0.1.7...HEAD
+
+### 🎨 `fmt` is a check, and its flags are Caddy's
+
+`pingclair fmt` always exited 0, so it could not be used as the gate
+`caddy fmt --overwrite && git diff --exit-code` is. It now exits 1 when the
+input was not already formatted, keeps stdout as the preview, and still exits 0
+for `--overwrite`, which rewrites the file as its job. `--config <path>` and
+`-w` are accepted as Caddy's spellings of the positional path and `--overwrite`.
+**The indent is now one tab per level rather than two spaces**, so a file
+previously formatted by `pingclair fmt --overwrite` shows a whole-file diff the
+next time — and, in the other direction, `caddy fmt` reports a file this
+formats as clean.

@@ -257,7 +257,12 @@ fn format_directives(directives: &[pingclair_config::parser::caddy_ast::Directiv
         indent: usize,
         out: &mut String,
     ) {
-        let padding = " ".repeat(indent);
+        // 🗂️ One tab per level, which is what `caddy fmt` writes. Two spaces
+        // was this formatter's own choice, and it meant the two formatters
+        // rewrote each other's output forever: a CI gate that runs `caddy fmt`
+        // on a repository formatted by `pingclair fmt` reported a diff on every
+        // file.
+        let padding = "\t".repeat(indent);
         for directive in directives {
             out.push_str(&padding);
             out.push_str(&directive.name);
@@ -267,7 +272,7 @@ fn format_directives(directives: &[pingclair_config::parser::caddy_ast::Directiv
             }
             if let Some(block) = &directive.block {
                 out.push_str(" {\n");
-                format_block(&block.directives, indent + 2, out);
+                format_block(&block.directives, indent + 1, out);
                 out.push_str(&padding);
                 out.push_str("}\n");
             } else {
@@ -982,10 +987,18 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
         }
 
         Commands::Fmt {
+            config,
             path,
             overwrite,
             diff,
         } => {
+            // 🧭 `--config <path>` is `caddy fmt`'s spelling of the positional
+            // path, and a script written against it used to die on argument
+            // parsing with exit 2. The positional still wins if both are given,
+            // because that is the more specific thing to have typed.
+            let path = path
+                .or(config)
+                .unwrap_or_else(|| "Pingclairfile".to_string());
             let source = if path == "-" {
                 use std::io::Read;
                 let mut buffer = String::new();
@@ -1000,6 +1013,17 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
             let directives = pingclair_config::parser::parse(&source)
                 .map_err(|error| anyhow::anyhow!("❌ Failed to parse {path}: {error}"))?;
             let formatted = format_directives(&directives);
+            // 🎯 `caddy fmt` is a linter as well as a formatter: it exits
+            // non-zero when the input was not already formatted, which is the
+            // whole mechanism behind a `caddy fmt && git diff --exit-code` gate
+            // or a bare `caddy fmt --diff` check. This always exited 0, so a
+            // pipeline that swapped the two passed no matter what the input
+            // looked like.
+            //
+            // 📌 `--overwrite` is the exception on purpose: it rewrites the file
+            // as its job, so fixing the file and then failing would make the
+            // command unusable in the one shape the issue's own example uses.
+            let already_formatted = source == formatted;
             if overwrite {
                 if path == "-" {
                     anyhow::bail!("❌ --overwrite cannot be used with stdin");
@@ -1015,6 +1039,9 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 }
             } else {
                 print!("{formatted}");
+            }
+            if !overwrite && !already_formatted {
+                std::process::exit(1);
             }
         }
 

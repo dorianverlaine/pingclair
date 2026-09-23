@@ -9986,6 +9986,58 @@ async fn spawn_body_measuring_origin() -> (SocketAddr, tokio::task::JoinHandle<(
     (address, task)
 }
 
+/// 🎨 `fmt` is a check as well as a formatter, and its flags are Caddy's.
+///
+/// 🤡 It always exited 0, so a pipeline of the shape `caddy fmt --overwrite &&
+/// git diff --exit-code` — or a bare `caddy fmt --diff` gate — passed no matter
+/// what the input looked like. Nothing distinguishes "already formatted" from
+/// "here is what I changed" without it.
+///
+/// 📌 The indent is one tab per level, which is what `caddy fmt` writes and
+/// what makes the two formatters stop rewriting each other's output. The
+/// argument re-quoting still differs in one direction — this formatter drops
+/// quotes it does not need — and the assertion at the end records the direction
+/// that matters: a file this formats is *stable* under `caddy fmt`, because a
+/// bare word stays bare.
+#[test]
+fn fmt_exits_nonzero_when_the_input_was_not_formatted() {
+    let directory = tempfile::tempdir().unwrap();
+    let unformatted = directory.path().join("in.Caddyfile");
+    std::fs::write(&unformatted, ":18800 {\n      respond \"hi\"\n}\n").unwrap();
+    let path = unformatted.to_str().unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pingclair"))
+            .args(args)
+            .output()
+            .expect("the binary must run")
+    };
+
+    // 🎯 The finding: previewing an unformatted file is a failing check.
+    let preview = run(&["fmt", path]);
+    assert_eq!(
+        preview.status.code(),
+        Some(1),
+        "`fmt` on unformatted input must fail like `caddy fmt`"
+    );
+    assert!(
+        String::from_utf8_lossy(&preview.stdout).contains("\n\trespond"),
+        "the formatted text still goes to stdout in the same run"
+    );
+
+    // 🔁 `--overwrite` fixes the file and succeeds — that is its job.
+    assert!(run(&["fmt", "--overwrite", path]).status.success());
+    let formatted = std::fs::read_to_string(&unformatted).unwrap();
+    assert!(
+        formatted.contains("\n\trespond "),
+        "one tab per level, as `caddy fmt` writes: {formatted:?}"
+    );
+
+    // 👍 …and the same file now passes the check, which is the gate's signal.
+    assert!(run(&["fmt", path]).status.success());
+    // 🧭 `--config <path>` is Caddy's spelling of the positional path.
+    assert!(run(&["fmt", "--config", path]).status.success());
+}
+
 /// 🛡️ A second instance on a port the first one holds must exit, not hang.
 ///
 /// 🤡 It panicked inside Pingora's service runtime — `Failed to build

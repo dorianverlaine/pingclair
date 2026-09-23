@@ -259,14 +259,21 @@ pub(crate) enum Commands {
         validate: bool,
     },
 
-    /// Format a Pingclairfile and print the result, like `caddy fmt`
+    /// Format the configuration and print the result, like `caddy fmt`
+    ///
+    /// Exits non-zero when the input was not already formatted, so it can be
+    /// used as a check the way `caddy fmt` is. `--overwrite` rewrites the file
+    /// and exits 0.
     Fmt {
         /// Path to the configuration file (`-` reads stdin)
-        #[arg(default_value = "Pingclairfile")]
-        path: String,
+        path: Option<String>,
+
+        /// Path to the configuration file; `caddy fmt`'s spelling of the above
+        #[arg(long, value_name = "PATH")]
+        config: Option<String>,
 
         /// Overwrite the input file instead of printing
-        #[arg(short, long)]
+        #[arg(short, long, visible_short_alias = 'w')]
         overwrite: bool,
 
         /// Print a visual diff instead of the formatted output
