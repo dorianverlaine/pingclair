@@ -46,6 +46,13 @@ pub struct GlobalBlock {
     pub debug: Option<bool>,
     pub logging: Option<LoggingConfig>,
     pub email: Option<String>,
+    /// 🗄️ The store directory named by `storage file_system <path>`.
+    ///
+    /// Only the file-backed module is implemented, because it is the one a
+    /// configuration can actually describe: a remote or shared backend is a
+    /// module this build does not have, and accepting the name would leave the
+    /// operator believing their certificates live somewhere they do not.
+    pub storage_path: Option<String>,
     /// 🌐 Plaintext HTTP port override (Caddy `http_port`).
     pub http_port: Option<u16>,
     /// 🔐 HTTPS port override (Caddy `https_port`).

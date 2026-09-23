@@ -299,6 +299,7 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
     }
 
     config.global.trusted_proxies = global.trusted_proxies.clone();
+    config.global.storage_path = global.storage_path.clone();
 
     // 🚰 Left as `None` when unset, which is not "unconfigured" but the actual
     // Caddy behaviour: wait for in-flight requests however long they take.

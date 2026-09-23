@@ -332,6 +332,12 @@ example.com {
 `Forwarded` chain 都有上限；畸形或彼此衝突的身分會 fail closed。PROXY
 protocol 不適用於 UDP HTTP/3 listener。
 
+store 的位置是設定決定：全域的 `storage file_system <path>` 會指名那個目錄，
+優先序高於 `PINGCLAIR_TLS_STORE` 與平台慣例。只實作檔案後端——遠端或共享
+backend 會以名字被拒絕而不是被收下，因為收下只會讓 store 留在原地，讀起來卻像
+已經搬過去了。解析出來的路徑會寫在啟動日誌裡：兩個部署若指名不同的 store，會
+各自簽發自己的信任根，而除此之外沒有其他看得出來的差別。
+
 ### 資源上限與 timeout
 
 下游上限設定在站台層級，上游各階段 timeout 則設定於 `reverse_proxy`。
@@ -813,7 +819,7 @@ Directive：
   `cert_lifetime` `ech` `events` `fallback_sni`
   `filesystem` `frankenphp` `key_type` `ocsp_interval`
   `ocsp_stapling` `on_demand_tls` `preferred_chains` `renew_interval`
-  `shutdown_delay` `storage` `storage_clean_interval`
+  `shutdown_delay` `storage_clean_interval`
 
 `tls` 區塊選項：
 

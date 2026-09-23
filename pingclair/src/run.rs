@@ -25,7 +25,7 @@ use crate::listen::{
     automatic_http_companion, can_bind_automatic_http_port, explicit_http_names,
     normalize_listen_addr, reserve_private_listener_address, server_requires_tls,
 };
-use crate::paths::tls_store_dir;
+use crate::paths::tls_store_dir_with;
 use crate::runtime_listeners::{
     RuntimeListeners, RuntimePublisherInputs, prepare_listener_policies,
 };
@@ -240,8 +240,19 @@ pub(crate) fn run_server(
     ));
 
     // 🔐 Initialize every certificate source below one configurable persistent store.
-    let tls_store_path_str = tls_store_dir().to_string_lossy().to_string();
+    // 🗄️ The global `storage file_system <path>` option, when the config has
+    // one, decides where every certificate source below lives. It is resolved
+    // once here rather than at each reader, so the whole process agrees about
+    // which store it is using.
+    let tls_store_path_str = tls_store_dir_with(config.global.storage_path.as_deref())
+        .to_string_lossy()
+        .to_string();
     let tls_store_path = std::path::Path::new(&tls_store_path_str);
+    // 🗄️ Said out loud because it is the one setting whose effect is invisible
+    // from the outside: two deployments that name the same store share a trust
+    // root, and two that do not mint their own with no visible difference
+    // until a client refuses one of them.
+    tracing::info!("🗄️ TLS store: {tls_store_path_str}");
     if !tls_store_path.exists() {
         std::fs::create_dir_all(tls_store_path).map_err(|error| {
             anyhow::anyhow!(
@@ -976,7 +987,8 @@ pub(crate) fn run_server(
     {
         let listen = admin_config.listen.clone();
         let shutdown_for_admin = admin_shutdown.clone();
-        let autosave = tls_store_dir().join("autosave.json");
+        let autosave =
+            tls_store_dir_with(config.global.storage_path.as_deref()).join("autosave.json");
         // 🧭 The admin traversal endpoints read and write one shared config
         // document; it starts as the exact configuration that was loaded.
         let document = active_document.clone();

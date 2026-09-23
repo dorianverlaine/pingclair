@@ -441,6 +441,37 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                         }
                     }
                 }
+                // 🗄️ `storage <module> <args…>` names where certificates,
+                // ACME account keys and the internal CA live. Caddy ships the
+                // file-backed module as `file_system`, and that is the one a
+                // configuration can actually describe here; a remote or shared
+                // backend is a module this build does not have, so accepting
+                // the name would leave an operator believing their certificate
+                // store is somewhere it is not.
+                "storage" => match sub.args.as_slice() {
+                    [module, path] if module == "file_system" => {
+                        global.storage_path = Some(path.clone());
+                    }
+                    [module, _] => {
+                        return Err(AdapterError::UnsupportedFeature(
+                            format!("global: storage {module}"),
+                            "only the file_system storage module is implemented; a remote \
+                             or shared backend would leave the store where it is while \
+                             reading as if it had moved"
+                                .into(),
+                        ));
+                    }
+                    [] => {
+                        return Err(AdapterError::ArgumentCount("storage".into(), 2, 0));
+                    }
+                    _ => {
+                        return Err(AdapterError::ArgumentCount(
+                            "storage".into(),
+                            2,
+                            sub.args.len(),
+                        ));
+                    }
+                },
                 // 🌐 Addresses every site without its own `bind` inherits.
                 "default_bind" => {
                     if sub.args.is_empty() {

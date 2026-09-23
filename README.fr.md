@@ -334,6 +334,15 @@ L'option globale `local_certs` applique le même choix à chaque site sans
 gestion de certificats propre : toute l'automatisation par défaut utilise
 l'autorité locale persistante au lieu de l'ACME public.
 
+L'emplacement de ce dépôt est une décision de configuration : l'option globale
+`storage file_system <path>` nomme le répertoire, et elle prime sur
+`PINGCLAIR_TLS_STORE` et sur la convention de la plateforme. Seul le module
+fichier est implémenté — un backend distant ou partagé est refusé par son nom
+plutôt qu'accepté, parce que l'accepter laisserait le dépôt où il est tout en
+donnant l'impression qu'il a déménagé. Le chemin résolu est journalisé au
+démarrage : deux déploiements qui nomment des dépôts différents créent deux
+racines de confiance distinctes, sans autre différence visible.
+
 Lorsque Pingclair se trouve derrière un load balancer ou un CDN que vous
 administrez, déclarez uniquement ces réseaux mandataires dans le bloc global.
 Un pair non approuvé ne peut pas fournir l'identité via `X-Forwarded-For`,
@@ -907,7 +916,7 @@ Options globales :
   `cert_lifetime` `ech` `events` `fallback_sni`
   `filesystem` `frankenphp` `key_type` `ocsp_interval`
   `ocsp_stapling` `on_demand_tls` `preferred_chains` `renew_interval`
-  `shutdown_delay` `storage` `storage_clean_interval`
+  `shutdown_delay` `storage_clean_interval`
 
 Options du bloc `tls` :
 

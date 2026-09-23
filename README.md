@@ -330,6 +330,15 @@ H1/H2 and H3 use the same persisted leaf. `tls internal` requires a concrete
 site name and cannot be combined with `tls auto`, ACME email, or manual
 certificate paths.
 
+Where that store lives is a configuration decision: a global
+`storage file_system <path>` names the directory, and it takes precedence over
+`PINGCLAIR_TLS_STORE` and over the platform convention. Only the file-backed
+module is implemented — a remote or shared backend is refused by name rather
+than accepted, because accepting it would leave the store exactly where it is
+while reading as if it had moved. The resolved path is logged at startup, since
+two deployments that name different stores mint separate trust roots with no
+other visible difference.
+
 A `tls { … }` block accepts `auto`, `internal`, `cert`/`key`, `acme_email`
 (`email`), `http3`, `default_sni`, `client_auth`, and the DNS-01 cluster
 (`dns`, `resolvers`, `dns_ttl`, `propagation_delay`, `propagation_timeout`,
@@ -899,7 +908,7 @@ Global options:
   `cert_lifetime` `ech` `events` `fallback_sni`
   `filesystem` `frankenphp` `key_type` `ocsp_interval`
   `ocsp_stapling` `on_demand_tls` `preferred_chains` `renew_interval`
-  `shutdown_delay` `storage` `storage_clean_interval`
+  `shutdown_delay` `storage_clean_interval`
 
 `tls` block options:
 

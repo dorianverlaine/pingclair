@@ -231,6 +231,7 @@ fn merge_globals(
     let default = pingclair_core::config::GlobalConfig::default();
     let pingclair_core::config::GlobalConfig {
         email,
+        storage_path,
         pki,
         skip_install_trust,
         dns,
@@ -259,6 +260,9 @@ fn merge_globals(
     // the fields that are not `Option`.
     if email.is_some() {
         into.email = email;
+    }
+    if storage_path.is_some() {
+        into.storage_path = storage_path;
     }
     if !pki.is_empty() {
         into.pki = pki;

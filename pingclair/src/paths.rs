@@ -54,6 +54,19 @@ pub(crate) fn resolve_default_config(explicit: Option<&str>) -> DefaultConfig {
     DefaultConfig::Missing
 }
 
+/// 🔐 Resolves the store directory for a configuration that may name it.
+///
+/// 📌 The configuration wins over the environment, which wins over the
+/// convention, matching how the rest of the file treats a setting the operator
+/// wrote down: `storage file_system /srv/pingclair` in a Caddyfile is a more
+/// specific statement than a `PINGCLAIR_TLS_STORE` export.
+pub(crate) fn tls_store_dir_with(configured: Option<&str>) -> std::path::PathBuf {
+    if let Some(path) = configured.filter(|path| !path.is_empty()) {
+        return std::path::PathBuf::from(path);
+    }
+    tls_store_dir()
+}
+
 /// 🔐 Resolves the persistent TLS/config store directory.
 ///
 /// The Admin API autosaves the active document under this directory so

@@ -2063,6 +2063,38 @@ mod fail_closed_tests {
         );
     }
 
+    /// 🗄️ `storage file_system <path>` names the store; other backends are
+    /// refused by name.
+    ///
+    /// 🤡 The option was refused outright, so the only ways to relocate the
+    /// store were an environment variable and a platform convention — a
+    /// configuration could not say where its own state lives, and two
+    /// configurations on one host could not be pointed at two stores.
+    #[test]
+    fn the_global_storage_option_names_the_file_backed_store() {
+        let config = crate::compile(
+            "{\n    storage file_system /srv/pingclair-store\n}\n\
+             example.com {\n    respond \"ok\"\n}",
+        )
+        .expect("`storage file_system <path>` must load");
+        assert_eq!(
+            config.global.storage_path.as_deref(),
+            Some("/srv/pingclair-store")
+        );
+
+        // 🚫 A backend this build does not have is refused by name rather than
+        // accepted, because accepting it would leave the store exactly where it
+        // is while reading as if it had moved.
+        let message =
+            crate::compile("{\n    storage s3 bucket=x\n}\nexample.com {\n    respond \"ok\"\n}")
+                .expect_err("an unimplemented backend must be refused")
+                .to_string();
+        assert!(
+            message.contains("s3") && message.contains("file_system"),
+            "the refusal must name the module and the one that works: {message}"
+        );
+    }
+
     /// 🌐 Caddy 2.11 reads the first `trusted_proxies` token as the name of an
     /// ip_source module, so `static` must be stripped and its ranges kept.
     ///

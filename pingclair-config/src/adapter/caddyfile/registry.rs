@@ -157,6 +157,7 @@ pub(super) static GLOBAL_OPTIONS: &[Spec] = &[
     // what is accepted rather than to enforce it.
     implemented("servers"),
     implemented("skip_install_trust"),
+    implemented("storage"),
     implemented("tls_resolvers"),
     implemented("trusted_proxies"),
     // MARK: - Recognised, not implemented
@@ -177,7 +178,6 @@ pub(super) static GLOBAL_OPTIONS: &[Spec] = &[
     recognised("preferred_chains"),
     recognised("renew_interval"),
     recognised("shutdown_delay"),
-    recognised("storage"),
     recognised("storage_clean_interval"),
 ];
 

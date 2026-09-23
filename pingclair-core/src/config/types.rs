@@ -85,6 +85,16 @@ pub struct GlobalConfig {
     /// Global ACME email
     pub email: Option<String>,
 
+    /// 🗄️ Store directory named by the global `storage file_system <path>`
+    /// option, which takes precedence over `$PINGCLAIR_TLS_STORE` and over the
+    /// platform convention.
+    ///
+    /// The store holds certificates, ACME account keys and the internal CA, so
+    /// "which store" is the difference between two deployments on one host
+    /// sharing a trust root and not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_path: Option<String>,
+
     /// 🏛️ Certificate authorities declared by the global `pki` block.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pki: Vec<PkiAuthority>,
@@ -396,6 +406,7 @@ impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
             email: None,
+            storage_path: None,
             metrics_options: MetricsOptions::default(),
             pki: Vec::new(),
             skip_install_trust: false,
