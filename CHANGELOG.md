@@ -20,6 +20,14 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🧹 Compression drops the origin's digest fields
+
+When Pingclair compressed a proxied response it forwarded the origin's
+`Content-Digest`, `Repr-Digest`, `Digest` and `Content-MD5` unchanged, though
+they described the uncompressed bytes. Any client that verified them reported
+corruption that never happened. The fields are now removed whenever the proxy
+re-encodes a body; responses it leaves alone keep them.
+
 ### 🛡️ `Cache-Control: no-transform` stops compression
 
 An upstream response marked `Cache-Control: no-transform` was compressed

@@ -7523,6 +7523,7 @@ impl ProxyHttp for PingclairProxy {
                         }
                         upstream_response.insert_header("Content-Encoding", token)?;
                         let _ = upstream_response.remove_header("Content-Length");
+                        crate::response_encoding::drop_integrity_fields(upstream_response);
                         // Transfer-Encoding: chunked will be set by Pingora automatically
                         crate::response_encoding::vary_on_accept_encoding(upstream_response)?;
                     }

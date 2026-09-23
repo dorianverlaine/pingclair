@@ -199,3 +199,34 @@ async fn test_no_transform_is_not_compressed() {
     );
     assert_eq!(reply.text().await.unwrap(), body);
 }
+
+/// 🧹 Digests the origin computed over its identity bytes do not survive
+/// compression.
+///
+/// Forwarding them beside a gzip body made every client that checks them
+/// report corruption that never happened.
+#[tokio::test]
+async fn test_compression_drops_origin_digests() {
+    let body = compressible_body();
+    let (origin, _hits) = spawn_scripted_origin(origin_reply(
+        "200 OK",
+        "Content-Digest: sha-256=:AAAA:\r\nRepr-Digest: sha-256=:AAAA:\r\n\
+         Digest: SHA-256=AAAA\r\nContent-MD5: AAAA\r\n",
+        &body,
+    ))
+    .await;
+    let mut server = TestServer::new_pingclairfile(&proxy_pingclairfile(origin, ""));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let reply = no_proxy_client()
+        .get(server.url(0, "/page"))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.headers().get("content-encoding").unwrap(), "gzip");
+    for name in ["content-digest", "repr-digest", "digest", "content-md5"] {
+        assert!(reply.headers().get(name).is_none(), "{name} survived");
+    }
+    assert_eq!(gunzip(&reply.bytes().await.unwrap()), body);
+}

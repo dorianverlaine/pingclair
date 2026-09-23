@@ -123,6 +123,20 @@ pub(crate) fn forbids_transform(header: &ResponseHeader) -> bool {
     field_tokens(header, "cache-control").any(|token| token.eq_ignore_ascii_case("no-transform"))
 }
 
+/// 🧹 Removes the fields that vouch for the origin's exact bytes.
+///
+/// Once the body is re-encoded, a digest the origin computed over its
+/// identity bytes is false (RFC 9530 §2): a client that checks it sees a
+/// corruption that never happened, and the likeliest response is to turn
+/// the check off. `Repr-Digest` goes too, because the selected
+/// representation now includes the new content coding. The proxy cannot
+/// compute replacements without buffering the whole body, so it drops them.
+pub(crate) fn drop_integrity_fields(header: &mut ResponseHeader) {
+    for name in ["content-digest", "repr-digest", "digest", "content-md5"] {
+        let _ = header.remove_header(name);
+    }
+}
+
 #[async_trait::async_trait]
 impl HttpModule for ResponseEncodingModule {
     fn response_body_filter(
