@@ -201,6 +201,39 @@ pub(super) fn adapt_server(
                     } else {
                         &sub_d.args[..]
                     };
+                    // 🏷️ `root @m /var/www` names a matcher, and this used to
+                    // be counted as an ordinary argument — so the refusal read
+                    // "expects 1 arguments, got 2" and pointed at the path.
+                    // The natural reading of that message is "drop one of the
+                    // two", and the one an operator would drop is the name
+                    // Caddy would have resolved. Resolving it here is what
+                    // makes the failure describe the actual mistake.
+                    if let Some(name) = args.first().filter(|arg| arg.starts_with('@')) {
+                        if !server.matchers.contains_key(name) {
+                            return Err(AdapterError::InvalidArgument(
+                                "root".into(),
+                                format!(
+                                    "matcher `{}` is not defined in this scope; define it in \
+                                     the site block or in this route/handle block",
+                                    name.strip_prefix('@').unwrap_or(name)
+                                ),
+                            ));
+                        }
+                        // 🚧 A matcher-scoped root is a per-request value
+                        // upstream — it compiles to a route whose handler sets
+                        // `vars.root` — while a root here is one value for the
+                        // whole server. Serving the whole site from it would
+                        // widen what is served, which is the failure mode a
+                        // matcher exists to prevent, so the configuration is
+                        // refused until the per-request form exists.
+                        return Err(AdapterError::UnsupportedFeature(
+                            "root <matcher>".into(),
+                            "a matcher-scoped root applies to the requests it matches; this \
+                             build has one document root per site, so accepting it would \
+                             serve the whole site from that path"
+                                .into(),
+                        ));
+                    }
                     let path = args.first().ok_or_else(|| {
                         AdapterError::ArgumentCount("root".into(), 1, sub_d.args.len())
                     })?;

@@ -3215,6 +3215,60 @@ mod p3_syntax_tests {
         }
     }
 
+    /// 🏷️ `root @m /srv` names a matcher, so an undefined one must be reported
+    /// as an undefined matcher — not as "expects 1 arguments, got 2", which
+    /// points at the path and reads as "drop one of the two".
+    ///
+    /// 📌 The exit code is `1` either way, so only the message distinguishes
+    /// the two worlds and only an assertion on the text can see the
+    /// difference.
+    #[test]
+    fn root_with_an_undefined_matcher_names_the_matcher() {
+        let message = compile(":8080 {\n\troot @nope /srv\n}")
+            .expect_err("`root @nope /srv` must be refused")
+            .to_string();
+        assert!(
+            message.contains("nope") && message.contains("not defined"),
+            "the refusal must name the undefined matcher: {message}"
+        );
+        assert!(
+            !message.contains("expects"),
+            "an undefined matcher is not an argument-count mistake: {message}"
+        );
+    }
+
+    /// 🚧 A matcher that *is* defined is still refused, because a root here is
+    /// one value for the whole server and serving every path from it would
+    /// widen what the matcher was written to narrow. The refusal says so
+    /// rather than reporting a count.
+    #[test]
+    fn root_with_a_defined_matcher_is_refused_as_unimplemented() {
+        let message = compile(":8080 {\n\t@html path *.html\n\troot @html /srv\n}")
+            .expect_err("a matcher-scoped root must be refused until it is per-request")
+            .to_string();
+        assert!(
+            message.contains("matcher-scoped root") || message.contains("not supported"),
+            "the refusal must describe the missing feature: {message}"
+        );
+    }
+
+    /// 🔢 The count refusal agrees with its own number, so the one-argument
+    /// message that most mistakes produce does not read as careless.
+    #[test]
+    fn argument_count_refusal_agrees_with_its_number() {
+        let message = compile(":8080 {\n\tbind\n}")
+            .expect_err("`bind` takes one argument")
+            .to_string();
+        assert!(
+            message.contains("1 argument,") || message.contains("1 argument "),
+            "a count of one takes the singular noun: {message}"
+        );
+        assert!(
+            !message.contains("1 arguments"),
+            "`1 arguments` is the wording this fixes: {message}"
+        );
+    }
+
     #[test]
     fn file_server_browse_inline_enables_listings() {
         let config =

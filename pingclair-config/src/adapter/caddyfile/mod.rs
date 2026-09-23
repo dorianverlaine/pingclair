@@ -71,7 +71,7 @@ pub enum AdapterError {
     #[error("Caddy-compatible directive '{0}' is not supported by Pingclair yet: {1}")]
     UnsupportedFeature(String, String),
 
-    #[error("Directive '{0}' expects {1} arguments, got {2}")]
+    #[error("{}", argument_count_message(.0, *.1, *.2))]
     ArgumentCount(String, usize, usize),
 
     #[error("Invalid argument for '{0}': {1}")]
@@ -88,6 +88,18 @@ pub enum AdapterError {
 
     #[error("Recursive snippet import detected: '{0}'")]
     RecursiveSnippet(String),
+}
+
+/// 🔢 Renders the argument-count refusal with the noun agreeing with the
+/// number.
+///
+/// 📌 `expects 1 arguments` was the wording for every one-argument mistake,
+/// which is most of them — and a sentence that is visibly wrong about its own
+/// subject is read as "this message was not written carefully", which is the
+/// wrong frame for a message the operator has to act on.
+fn argument_count_message(directive: &str, expected: usize, got: usize) -> String {
+    let noun = if expected == 1 { "argument" } else { "arguments" };
+    format!("Directive '{directive}' expects {expected} {noun}, got {got}")
 }
 
 // MARK: - Snippet Expansion (Pass 1)
