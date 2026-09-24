@@ -8484,6 +8484,14 @@ async fn test_signal_reload_removes_a_virtual_host_from_shared_listener() {
         .expect("kill must run");
     assert!(status.success());
 
+    // 🚧 "The old body stopped" is not "the reload finished". While the
+    // publication gate is closed, *every* host on the listener is answered with
+    // `503 Configuration Reload In Progress` — a different body — so a poll that
+    // stopped at the first change would break on the gate closing and then race
+    // the window it just detected, reading the 503 as the new document. The
+    // deleted authority is gone once this listener answers the *retained*
+    // document's default instead, and that answer cannot arrive while the gate
+    // is closed, because a closed gate is checked before routing.
     let mut removed = false;
     for _ in 0..50 {
         let response = client
@@ -8492,7 +8500,7 @@ async fn test_signal_reload_removes_a_virtual_host_from_shared_listener() {
             .send()
             .await
             .unwrap();
-        if response.text().await.unwrap_or_default() != "gone" {
+        if response.text().await.unwrap_or_default() == "default" {
             removed = true;
             break;
         }
