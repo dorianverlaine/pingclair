@@ -723,32 +723,50 @@ mod log_channel_tests {
         assert!(config.servers[0].log.is_some());
     }
 
-    /// 🚫 An unnamed global `log { … }` is refused, not silently compiled.
+    /// 🧭 An unnamed global `log { … }` configures the default logger.
     ///
-    /// 🤡 It was accepted and compiled into `logging.default`, and nothing at
-    /// runtime ever read that field: no file appeared, no warning was logged,
-    /// and `validate` exited 0. That is the one shape this adapter accepted and
-    /// then did nothing with — the "silently ignoring a setting" defect the
-    /// house style fails closed on everywhere else.
-    ///
-    /// 📌 The refusal names what to write instead, because the operator's
-    /// intent — log this to a file — is expressible two other ways.
+    /// 🤡 It used to compile into `logging.default` while nothing at runtime
+    /// read that field: no file appeared, no line was logged, and `validate`
+    /// exited 0. The adapter then refused it instead, which at least said so.
+    /// Both are now gone — the runtime honours the block, so the assertions
+    /// here are about what the operator asked for surviving into the config.
     #[test]
-    fn an_unnamed_global_log_is_refused() {
-        let message = compile(
-            "{\n    log {\n        output stderr\n        format json\n    }\n}\n\
+    fn an_unnamed_global_log_configures_the_default_logger() {
+        let config = compile(
+            "{\n    log {\n        output stderr\n        format json\n        level warn\n    }\n}\n\
              http://:8080 {\n    respond \"ok\"\n}\n",
         )
-        .expect_err("an unnamed global log must be refused")
+        .expect("an unnamed global log must compile");
+        let default = config
+            .logging
+            .default
+            .as_ref()
+            .expect("the block must reach `logging.default`");
+        assert!(matches!(
+            default.output,
+            pingclair_core::config::LogOutput::Stderr
+        ));
+        assert!(matches!(
+            default.format,
+            pingclair_core::config::LogFormat::Json
+        ));
+        assert_eq!(default.level.as_deref(), Some("warn"));
+        // 🚫 …and not as a channel, which is what a name would have made it.
+        assert!(config.logging.channels.is_empty());
+    }
+
+    /// 🚫 A second unnamed global `log` is refused, like a redeclared channel.
+    #[test]
+    fn the_default_logger_may_not_be_declared_twice() {
+        let message = compile(
+            "{\n    log {\n        output stdout\n    }\n    log {\n        output stderr\n    }\n}\n\
+             http://:8080 {\n    respond \"ok\"\n}\n",
+        )
+        .expect_err("the second default logger must be refused")
         .to_string();
         assert!(
-            message.contains("global: log") && message.contains("stderr"),
-            "the refusal must name the option and say where logging goes instead: {message}"
-        );
-        // 🧭 …and it must not read as a typo, because the word is spelled right.
-        assert!(
-            !message.contains("Unknown directive"),
-            "a defined option must not be refused as unknown: {message}"
+            message.contains("default logger") && message.contains("twice"),
+            "the refusal has to say which setting was declared twice: {message}"
         );
     }
 
@@ -762,9 +780,9 @@ mod log_channel_tests {
     /// the other list". Confirmed by running that binary, not by reading.
     #[test]
     fn global_include_and_exclude_compile() {
-        // 🪵 A *named* channel is the vehicle: the include/exclude rules live in
-        // `adapt_log_block`, which both shapes share, and the unnamed one is now
-        // refused before its block is ever read.
+        // 🪵 A *named* channel is the vehicle here. `include`/`exclude` live in
+        // `adapt_log_block`, which both shapes share — the unnamed one keeps
+        // its own test above, which asserts the settings other than these two.
         let config = compile(
             "{\n    log audit {\n        output stderr\n        include http.log.access\n        exclude http.log.access.noisy\n    }\n}\n\
              http://:8080 {\n    respond \"ok\"\n}\n",

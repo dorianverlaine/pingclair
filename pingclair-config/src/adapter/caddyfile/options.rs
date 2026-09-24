@@ -50,30 +50,26 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                     }
                     let logging = global.logging.get_or_insert_with(Default::default);
                     let Some(name) = sub.args.first().cloned() else {
-                        // 🚫 An unnamed global `log` configures the *default*
+                        // 🧭 An unnamed global `log` configures the *default*
                         // logger — the process-wide sink, which is where Caddy
                         // sends its own lifecycle messages rather than access
-                        // records. Pingclair's process logger writes to stderr
-                        // and has no path from this field to a file writer, so
-                        // the block compiled, `validate` accepted it, and no
-                        // file ever appeared: the one shape this adapter
-                        // accepted and then did nothing with.
+                        // records. The compiled field existed and nothing read
+                        // it, so the block used to compile, validate, and write
+                        // nowhere: the one shape this adapter accepted and then
+                        // did nothing with. The runtime now honours it
+                        // (`pingclair::logging::apply_process_log`).
                         //
-                        // 📌 Refused rather than implemented. Pointing the
-                        // process logger at this sink means building the tracing
-                        // subscriber after the configuration is parsed, which is
-                        // a startup-order change rather than a missing branch —
-                        // and until it is decided, an operator who asked for a
-                        // file and got nothing has to be told.
-                        return Err(AdapterError::UnsupportedFeature(
-                            "global: log".into(),
-                            "the process-wide default logger is not configurable yet; \
-                             runtime diagnostics go to stderr. Name the block \
-                             (`log <name> { … }`) to declare a channel a site can \
-                             reference, or put the block in a site block to log that \
-                             site's requests"
-                                .into(),
-                        ));
+                        // 🚫 A second one is refused rather than merged, for the
+                        // same reason a redeclared channel is: the second would
+                        // silently win and the first would vanish.
+                        if logging.default.is_some() {
+                            return Err(AdapterError::InvalidArgument(
+                                "log".into(),
+                                "the default logger is declared twice".into(),
+                            ));
+                        }
+                        logging.default = Some(channel);
+                        continue;
                     };
                     // 🚫 A redeclared channel is a mistake, not a merge: the
                     // second block would silently win and the first one's

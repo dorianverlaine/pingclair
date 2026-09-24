@@ -1029,12 +1029,16 @@ enables the site's default access sink. Log blocks accept `hostnames`,
 (`mode`, `dir_mode`, `roll_*`); `log_skip` excludes matching requests from
 access logging.
 
-🚫 An **unnamed** global `log { … }` block — the one that configures Caddy's
-process-wide default logger — is refused. Runtime diagnostics go to stderr and
-the process logger's output is not configurable yet, so accepting the block
-would compile a setting that never produced the file it named. Name the block
-to declare a channel a site can reference, or put it in a site block to log
-that site's requests.
+🧭 An **unnamed** global `log { … }` block — the one that configures Caddy's
+process-wide default logger — points this server's own records at a sink:
+`output file <path>` (created if missing, mode 0600, no colour escapes),
+`output stdout`, `output stderr`, `format json|text`, and `level`. It is applied
+when the configuration is read and again on every reload, and one line names the
+destination at startup. `RUST_LOG` still outranks a configured `level`, which is
+what makes it usable to quieten one module without editing the configuration.
+The `🚀 Pingclair running...` banner stays on stdout either way — supervisors
+read it there, and a configuration that sends its records to a file must not
+blind the thing watching the process.
 
 📝 For sustained access traffic, use `log { output file /var/log/pingclair/access.log }`
 with a rotation policy; runtime diagnostics can stay on stderr. Configured access
@@ -1082,7 +1086,7 @@ writing one is an error that names the feature rather than the word, never an
 a sub-option or about a spelling *inside* a block, and that is not a loophole —
 each of those has its own treatment stated where it belongs. The `tls { … }`
 block lists its refused options below; the Logging grammar section says which
-shapes a `log` block takes; an unnamed global `log { … }` is refused there; and
+shapes a `log` block takes; and
 a directive can be accepted at one level and refused at another. A sentence that
 claimed more would be promising a property of the whole configuration surface,
 which is the kind of claim this section exists to avoid making.

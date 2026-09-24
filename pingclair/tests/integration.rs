@@ -14,6 +14,11 @@ use std::thread;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
+// 🪵 A global `log { output … }` block moves the process log, so its tests
+// wait for the startup banner where it went rather than on stdout.
+#[path = "integration/process_log.rs"]
+mod process_log;
+
 // 🏷️ Static-file validator tests live beside this file so the gate stops
 // growing in one place; they reuse its `TestServer` harness.
 #[path = "integration/static_validators.rs"]

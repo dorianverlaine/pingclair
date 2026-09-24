@@ -482,6 +482,11 @@ impl ConfigPublisher for RuntimeListeners {
         }
         self.admin_policy.publish(prepared_admin);
         pingclair_proxy::access_log::register_channels(&config.logging.channels);
+        // 🔀 A reload can move the process log or take it off a file, and
+        // Caddy re-provisions its loggers on reload for the same reason: a
+        // configuration that could not undo a `log { output file … }` would
+        // leave the file growing for a listener set that no longer mentions it.
+        crate::logging::apply_process_log(&config.logging);
         pingclair_proxy::metrics::configure_host_labels(
             &config.global.metrics_options,
             config

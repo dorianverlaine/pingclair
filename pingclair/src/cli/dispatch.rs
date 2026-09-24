@@ -451,6 +451,12 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 }
             };
 
+            // 🔀 A global `log { output … }` block points the process log at a
+            // file, so it has to be applied here — where the configuration
+            // first exists — and not where the subscriber was built, which is
+            // before the file has been read. See `crate::logging`.
+            crate::logging::apply_process_log(&config.logging);
+
             if watch {
                 // 👀 `--watch` reloads the config file after every change,
                 // like Caddy's local-development flag. Polling the mtime is

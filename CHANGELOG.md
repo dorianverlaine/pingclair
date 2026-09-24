@@ -102,6 +102,32 @@ or the image's `:latest` tag, which an rc used to move as well. The channels
 and the procedure for cutting a release are in `CONTRIBUTING.md` under
 "Releasing".
 
+### 🪵 An unnamed global `log { … }` block configures the process log
+
+The block — Caddy's spelling for the process-wide default logger — used to
+compile into a field nothing read: no file appeared, no line was logged, and
+`validate` exited 0. It was then refused by name, which at least said so. It now
+works, and points this server's own records where the operator asked: `output
+file <path>` (created if missing, mode 0600, no colour escapes), `output stdout`,
+`output stderr`, `format json|text`, and `level`.
+
+The setting is applied when the configuration is read and again on every reload,
+so a reload can move the log to a file and a later one can move it back —
+Caddy re-provisions its loggers for the same reason. One startup line names the
+destination, as Caddy's own "redirected default logger" does. `RUST_LOG` still
+outranks a configured `level`.
+
+📌 Two things deliberately do not move with it. The `🚀 Pingclair running...`
+banner stays on stdout, because supervisors — including this repository's own
+integration harness — read it there to know the process came up. And stdout
+keeps its colour escapes: a file sink turns them off, a terminal is where the
+rest lands.
+
+🧹 Three fields that no code ever read are gone from `LoggingConfig` — `level`,
+`format` and `file`. A JSON document carrying them was silently ignored before
+and is silently ignored now, which is the defect rather than the fix; the
+unnamed global `log` block is the spelling that does something.
+
 ### 🧭 `header { match { … } }` gates a response header block
 
 A `header` block that wrote `match { … }` was refused by name, so a block meant

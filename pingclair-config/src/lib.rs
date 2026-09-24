@@ -356,24 +356,8 @@ fn merge_logging(
     from: pingclair_core::config::LoggingConfig,
     path: &Path,
 ) -> Result<(), FullCompileError> {
-    let base = pingclair_core::config::LoggingConfig::default();
-    let pingclair_core::config::LoggingConfig {
-        level,
-        format,
-        file,
-        channels,
-        default,
-    } = from;
+    let pingclair_core::config::LoggingConfig { channels, default } = from;
 
-    if level != base.level {
-        into.level = level;
-    }
-    if format != base.format {
-        into.format = format;
-    }
-    if file.is_some() {
-        into.file = file;
-    }
     for (name, channel) in channels {
         if into.channels.contains_key(&name) {
             return Err(FullCompileError::Compile(pingclair_config_compile_error(

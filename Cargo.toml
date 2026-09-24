@@ -134,7 +134,10 @@ libc = "0.2"
 
 # Logging and metrics
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 📌 `json` is here for the process logger's `format json`, which a global
+# `log` block can ask for: Caddy's own default logger writes JSON records, and
+# a file an operator asked for should be the format they asked for.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 prometheus = "0.14"
 
 # Error handling

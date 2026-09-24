@@ -96,9 +96,15 @@ fn main() -> anyhow::Result<()> {
     //
     // 📌 `RUST_LOG` still wins outright when it is set, so the escape hatch for
     // "quieter than this" and "one module louder" is unchanged.
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new(if cli.verbose { "debug" } else { "info" })
-    });
+    let from_env = tracing_subscriber::EnvFilter::try_from_default_env().is_ok();
+    let base = if from_env {
+        std::env::var("RUST_LOG").unwrap_or_default()
+    } else if cli.verbose {
+        "debug".to_string()
+    } else {
+        "info".to_string()
+    };
+    let filter = tracing_subscriber::EnvFilter::new(base.clone());
 
     // 📝 Hand records to a background thread instead of writing them on the
     // worker thread. See [`logging`] for what this does and does not buy.
@@ -108,11 +114,31 @@ fn main() -> anyhow::Result<()> {
     // requests are spawned later by the runtime, so they would resolve the
     // current dispatcher to the no-op fallback and every access line would
     // vanish. That is a real bug this file shipped for one build.
+    //
+    // 🔁 The filter goes in behind a reload handle, and the formatter is a
+    // dispatcher over a flag, because both are configured by a global `log`
+    // block — which is read *after* this runs. The subscriber cannot wait for
+    // it: the message that reports an unparseable configuration has to be
+    // visible, and that message is emitted before any configuration exists.
+    let (filter, filter_handle) = tracing_subscriber::reload::Layer::new(filter);
     let writer = logging::NonBlockingWriter::spawn();
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_writer(writer))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .event_format(logging::ProcessLogFormat),
+        )
         .with(filter)
         .init();
+    logging::remember_filter(
+        move |directives| {
+            filter_handle
+                .reload(tracing_subscriber::EnvFilter::new(directives))
+                .is_ok()
+        },
+        base,
+        from_env,
+    );
 
     let exit = cli::dispatch::run(cli.command);
 

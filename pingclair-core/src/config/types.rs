@@ -3104,19 +3104,16 @@ fn default_admin_enabled() -> bool {
 }
 
 /// Global logging configuration
+///
+/// 📌 There used to be three more fields here — `level`, `format` and `file` —
+/// and nothing in the workspace ever read them: a global logging block written
+/// in JSON could set all three and be silently ignored, which is the shape this
+/// repository fails closed on. Removed rather than wired, because the unnamed
+/// global `log { … }` block already carries exactly these three settings into
+/// [`Self::default`], and one setting with two spellings is how a configuration
+/// drifts.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LoggingConfig {
-    /// Log level
-    #[serde(default = "default_log_level")]
-    pub level: String,
-
-    /// Log format (json, pretty)
-    #[serde(default = "default_log_format")]
-    pub format: String,
-
-    /// Log file path
-    pub file: Option<String>,
-
     /// 🪵 Named access-log channels declared in the global block.
     ///
     /// A channel is a sink plus its format, rotation and header policy. Servers
@@ -3239,14 +3236,6 @@ fn default_hsts_include_subdomains() -> bool {
 
 fn default_hsts_preload() -> bool {
     false
-}
-
-fn default_log_level() -> String {
-    "info".to_string()
-}
-
-fn default_log_format() -> String {
-    "pretty".to_string()
 }
 
 /// Per-server log configuration
