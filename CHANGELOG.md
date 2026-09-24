@@ -20,6 +20,17 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🚫 An addressed `servers` block may only carry `metrics`
+
+`servers :80 { … }` names one listener, but its options were applied to
+every listener, so two addressed blocks that disagreed (`protocols h1` on
+one, `protocols h1 h2` on the other) resolved silently to the second one
+everywhere. An addressed block that sets anything other than `metrics` is
+now refused, naming the option and the address. Write the option in an
+addressless `servers { … }` block to apply it to every listener, which is
+what it already did. `metrics` stays accepted because it is app-wide
+wherever it is written.
+
 ### 🛡️ A malformed `blocked_ips` entry is refused
 
 An entry in the global `blocked_ips` list that is neither an address nor a

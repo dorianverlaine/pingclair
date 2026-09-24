@@ -2307,6 +2307,38 @@ mod fail_closed_tests {
         );
     }
 
+    /// 🚫 Two addressed `servers` blocks that disagree used to resolve to the
+    /// second one for every listener, silently. Any option but `metrics` under
+    /// an address is refused, naming the option and the address.
+    #[test]
+    fn an_addressed_servers_block_refuses_options_it_cannot_scope() {
+        let message = crate::compile(
+            "{\n    servers :80 {\n        protocols h1\n    }\n    \
+             servers :443 {\n        protocols h1 h2\n    }\n}\n\
+             :8080 {\n    respond \"ok\"\n}",
+        )
+        .expect_err("an addressed `servers` block must not set a listener option globally")
+        .to_string();
+        assert!(
+            message.contains("servers :80 { protocols }")
+                && message.contains("`protocols` would reach listeners other than `:80`"),
+            "the refusal must name the option and the address: {message}"
+        );
+    }
+
+    /// 📊 `metrics` is the one option an addressed block keeps, because it is
+    /// app-wide wherever it is written; the addressless block keeps the rest.
+    #[test]
+    fn an_addressed_servers_block_keeps_metrics_and_the_addressless_block_keeps_the_rest() {
+        let config = crate::compile(
+            "{\n    servers :80 {\n        metrics\n    }\n    \
+             servers {\n        protocols h1 h2\n    }\n}\n\
+             :8080 {\n    respond \"ok\"\n}",
+        )
+        .expect("metrics under an address and options without one both compile");
+        assert!(config.global.metrics);
+    }
+
     /// 📴 `ocsp_stapling off` is accepted and names behaviour this build already
     /// has; every other spelling is refused, because this build staples no OCSP
     /// response and `on` would read as though it did.

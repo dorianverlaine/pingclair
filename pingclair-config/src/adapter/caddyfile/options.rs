@@ -650,18 +650,18 @@ pub(super) fn is_wildcard_host(host: &str) -> bool {
 ///
 /// ```text
 /// {
-///     servers :80 {
+///     servers {
 ///         protocols h1 h2
 ///     }
 /// }
 /// ```
 ///
-/// The children are lifted to the global level, which means the optional
-/// address is **dropped**: an option written for one listener applies to every
-/// listener here. For `metrics` that is exactly right — upstream hoists it to
-/// the app either way, so the address never selected anything to begin with.
-/// For the rest it is an approximation, and one worth knowing about before
-/// writing two `servers` blocks that disagree.
+/// 🚫 The children are lifted to the global level, which would **drop** the
+/// optional address: an option written for one listener would apply to every
+/// listener. For `metrics` that is exactly right — upstream hoists it to the
+/// app either way, so the address never selected anything to begin with. Any
+/// other option under an address is refused by name, because two addressed
+/// blocks that disagree would otherwise resolve silently to the second one.
 ///
 /// 🚫 The nested `metrics` block is checked here rather than after flattening,
 /// because flattening is what destroys the distinction: upstream accepts only
@@ -684,31 +684,34 @@ pub(super) fn expand_servers_block(
                 }
                 // 🚫 `servers <address> { … }` names one listener, and lifting
                 // the children to the global level drops that address: the
-                // options end up applying to every listener. That is harmless
-                // for the options this block usually carries, but not for
-                // `listener_wrappers { proxy_protocol }` — the PROXY protocol
-                // header would be demanded on a port whose clients never send
-                // one, and a connection without it is *rejected*, so the
-                // approximation would take a site offline rather than widen a
-                // setting.
+                // options end up applying to every listener. Two addressed
+                // blocks that disagree then resolve silently to whichever came
+                // second, and `listener_wrappers { proxy_protocol }` would
+                // demand the PROXY header on ports whose clients never send
+                // it, rejecting every connection there.
                 //
-                // 📌 Refused rather than guessed. The addressless spelling means
-                // "every listener" in Caddy too, so the operator has a way to
-                // say what they meant.
+                // 📌 Only `metrics` is kept, because upstream hoists it to the
+                // whole app anyway, so the address never selected anything.
+                // Everything else is refused rather than guessed: the
+                // addressless spelling means "every listener" in Caddy too, so
+                // the operator has a way to say what the build can honour.
                 if !d.args.is_empty()
-                    && block
+                    && let Some(child) = block
                         .directives
                         .iter()
-                        .any(|child| child.name == "listener_wrappers")
+                        .find(|child| child.name != "metrics")
                 {
+                    let address = d.args.join(" ");
                     return Err(AdapterError::UnsupportedFeature(
-                        format!("global: servers {}", d.args.join(" ")),
-                        "a `servers <address>` block names one listener, and this build \
-                         applies a `servers` block's options to every listener; requiring \
-                         the PROXY protocol header on a port whose clients do not send it \
-                         rejects them all. Write `servers { listener_wrappers { … } }` \
-                         without an address to apply the wrappers to every listener"
-                            .into(),
+                        format!("global: servers {address} {{ {} }}", child.name),
+                        format!(
+                            "a `servers <address>` block names one listener, and this build \
+                             applies a `servers` block's options to every listener, so \
+                             `{option}` would reach listeners other than `{address}`. Write \
+                             `servers {{ {option} … }}` without an address to apply it to \
+                             every listener",
+                            option = child.name,
+                        ),
                     ));
                 }
                 result.extend(block.directives);
