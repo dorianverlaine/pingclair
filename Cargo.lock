@@ -2593,7 +2593,6 @@ dependencies = [
  "bcrypt",
  "bytes",
  "divan",
- "glob",
  "http",
  "ipnet",
  "matchit",

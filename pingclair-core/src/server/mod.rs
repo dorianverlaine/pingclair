@@ -3,6 +3,7 @@
 
 //! HTTP Server implementation
 
+mod file_glob;
 mod handlers;
 mod redirect;
 mod router;

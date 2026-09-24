@@ -20,6 +20,19 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 📁 A globbed `try_files` candidate sees every file in the directory
+
+A `file` matcher or `try_files` candidate containing a glob could not
+match a filename that is not valid UTF-8 — legal on Linux, and served
+by `file_server` without complaint. The glob library skipped such
+names, and the matches it did return were then converted to text
+lossily. Candidates are now expanded by walking the directory and
+matching names as bytes, with the same `*`, `?`, `[...]` and `**`
+syntax. `{http.matchers.file.relative}` spells a globbed match in
+percent-escapes, so a name with a space is no longer pasted raw into
+the rewritten request line, and metacharacters in the configured
+`root` are no longer expanded as part of the pattern. (#12)
+
 ### 🧱 Body buffering reaches the FastCGI transport
 
 `request_buffers` and `response_buffers` were accepted on a `fastcgi`

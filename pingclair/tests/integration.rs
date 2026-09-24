@@ -130,6 +130,11 @@ mod alt_svc_opt_out;
 #[path = "integration/blocked_ips.rs"]
 mod blocked_ips;
 
+// 📁 Filenames that are not valid UTF-8; 🐧 Linux only, APFS refuses them.
+#[cfg(target_os = "linux")]
+#[path = "integration/non_utf8_paths.rs"]
+mod non_utf8_paths;
+
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather
 /// than against "some response arrived", so a 404 from a stale listener on the

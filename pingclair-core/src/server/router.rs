@@ -645,7 +645,7 @@ pub fn evaluate_file_matcher(
             for pattern in try_files {
                 let candidates = file_candidates(request, pattern, path, root, split_path);
                 for candidate in candidates.as_slice() {
-                    let Ok(metadata) = Path::new(&candidate.full_path).metadata() else {
+                    let Ok(metadata) = candidate.full_path.metadata() else {
                         continue;
                     };
                     let key = match policy {
@@ -678,7 +678,9 @@ pub fn evaluate_file_matcher(
 /// 📂 One resolved `file` matcher candidate.
 #[derive(Clone)]
 struct FileCandidate {
-    full_path: String,
+    /// 📁 Kept as a path, not text: on Unix a filename is bytes, and the
+    /// existence probe has to ask about the same bytes the directory holds.
+    full_path: std::path::PathBuf,
     relative: String,
     remainder: String,
     is_dir: bool,
@@ -735,14 +737,13 @@ fn file_candidates(
         split_path_part.push('/');
     }
     let globs = pattern_globs(pattern);
-    let Some(full_path) = join_under_root(root, &split_path_part, !globs) else {
-        return FileCandidates::Single(None);
-    };
-
     if !globs {
+        let Some(full_path) = join_under_root(root, &split_path_part, true) else {
+            return FileCandidates::Single(None);
+        };
         let relative = format!("/{}", split_path_part.trim_start_matches('/'));
         return FileCandidates::Single(Some(FileCandidate {
-            full_path,
+            full_path: full_path.into(),
             relative,
             remainder,
             is_dir: wants_directory,
@@ -751,20 +752,27 @@ fn file_candidates(
 
     // 🔍 A glob only ever names paths that already exist, so the results are
     // whatever the filesystem holds; the strict directory-or-file check still
-    // runs on each of them afterwards.
-    let Ok(matches) = glob::glob(&full_path) else {
-        return FileCandidates::Globbed(Vec::new());
-    };
-    let root_prefix = root.to_string_lossy().into_owned();
+    // runs on each of them afterwards. Escapes are *not* decoded here: `%2A`
+    // becoming `*` would let a request choose which files the pattern matches.
+    let matches = super::file_glob::expand(root, &split_path_part, MAX_GLOB_CANDIDATES);
+    // 🔗 Each match is a name read from disk, so it stays a path and its
+    // relative form is percent-encoded from the raw bytes. Converting it to
+    // text lossily turned a name that is not valid UTF-8 into U+FFFD, and the
+    // probe and the rewrite then asked about a file that does not exist.
     let mut expanded = Vec::new();
-    for entry in matches.flatten().take(MAX_GLOB_CANDIDATES) {
-        let full = entry.to_string_lossy().into_owned();
-        let relative = full
-            .strip_prefix(&root_prefix)
-            .map(|relative| format!("/{}", relative.trim_start_matches('/')))
-            .unwrap_or_else(|| full.clone());
+    for entry in matches {
+        let Some(below_root) = entry
+            .strip_prefix(root)
+            .ok()
+            .and_then(crate::percent::path_bytes)
+        else {
+            continue;
+        };
+        let mut relative = String::with_capacity(below_root.len() + 1);
+        relative.push('/');
+        crate::percent::push_encoded_path(&mut relative, below_root);
         expanded.push(FileCandidate {
-            full_path: full,
+            full_path: entry,
             relative,
             remainder: remainder.clone(),
             is_dir: wants_directory,
@@ -782,10 +790,15 @@ fn set_file_placeholders(request: &mut MatcherRequest<'_>, candidate: &FileCandi
         "http.matchers.file.relative".to_string(),
         candidate.relative.clone(),
     );
-    vars.insert(
-        "http.matchers.file.absolute".to_string(),
-        candidate.full_path.clone(),
-    );
+    // 📌 Placeholders are text. A filesystem path that is not valid UTF-8 has
+    // no faithful text spelling, so it is left unpublished rather than
+    // published as a different, U+FFFD-bearing path.
+    if let Some(absolute) = candidate.full_path.to_str() {
+        vars.insert(
+            "http.matchers.file.absolute".to_string(),
+            absolute.to_string(),
+        );
+    }
     vars.insert(
         "http.matchers.file.type".to_string(),
         if candidate.is_dir {
@@ -1112,8 +1125,8 @@ fn join_under_root(root: &Path, path: &str, decode_escapes: bool) -> Option<Stri
 
 /// 📏 Strict existence: a trailing slash demands a directory, otherwise a
 /// regular file, exactly like the upstream matcher.
-fn file_exists_strict(full_path: &str, wants_directory: bool) -> bool {
-    let Ok(metadata) = Path::new(full_path).metadata() else {
+fn file_exists_strict(full_path: &Path, wants_directory: bool) -> bool {
+    let Ok(metadata) = full_path.metadata() else {
         return false;
     };
     metadata.is_dir() == wants_directory
@@ -2127,6 +2140,42 @@ mod tests {
             try_files_target(&["/build/style.*.css"], root, "/anything"),
             None,
             "a glob that matches nothing must fall through, not match itself"
+        );
+    }
+
+    /// 🔗 A globbed match is a name read from disk, and its relative form goes
+    /// back into the request line, so it is percent-encoded rather than pasted
+    /// in raw. A raw space there is a malformed request, not a path.
+    #[test]
+    fn a_globbed_match_is_published_as_an_encoded_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("build")).unwrap();
+        std::fs::write(dir.path().join("build/app 1.js"), "bundle").unwrap();
+
+        assert_eq!(
+            try_files_target(&["/build/app*.js"], dir.path().to_str(), "/anything"),
+            Some("/build/app%201.js".to_string())
+        );
+    }
+
+    /// 📁 A globbed name that is not valid UTF-8 is still the file on disk.
+    ///
+    /// The glob results used to go through `to_string_lossy`, so this name
+    /// became `caf\u{FFFD}.js`: the existence probe asked about a file that
+    /// does not exist and the candidate never matched. 🐧 Linux only, because
+    /// APFS refuses to create a name that is not valid UTF-8.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_globbed_non_utf8_name_matches_the_file_on_disk() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("build")).unwrap();
+        let name = std::ffi::OsStr::from_bytes(b"caf\xe9.js");
+        std::fs::write(dir.path().join("build").join(name), "bundle").unwrap();
+
+        assert_eq!(
+            try_files_target(&["/build/caf*.js"], dir.path().to_str(), "/anything"),
+            Some("/build/caf%E9.js".to_string())
         );
     }
 

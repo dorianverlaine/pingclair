@@ -132,6 +132,49 @@ fn component_os_str(component: &[u8]) -> Option<&std::ffi::OsStr> {
         .map(std::ffi::OsStr::new)
 }
 
+// MARK: - Filenames back into URLs
+
+/// 🔗 Appends a filename below a root to `out` as a URI path, escaping every
+/// byte that could not stand in a URI literally.
+///
+/// This is [`decode_path_component`] run backwards, and it exists for the one
+/// place a name travels from disk into a URL: a globbed `file` matcher
+/// candidate, whose `{http.matchers.file.relative}` is rewritten into the
+/// request path. Encoding from the raw bytes is what lets a name that is not
+/// valid UTF-8 survive the trip — the file server decodes the escapes back to
+/// the very same bytes. A lossy conversion here would publish U+FFFD and the
+/// rewrite would ask for a file that does not exist.
+///
+/// `/` stays literal because it separates the components this path already
+/// has. `%` is escaped, so a name that happens to contain `%41` does not turn
+/// into `A` when the escapes are decoded again.
+pub fn push_encoded_path(out: &mut String, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &byte in bytes {
+        if byte.is_ascii_alphanumeric() || b"-._~/!$&'()*+,;=:@".contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            out.push('%');
+            out.push(char::from(HEX[usize::from(byte >> 4)]));
+            out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+}
+
+/// 📁 The bytes of a path, which on Unix is exactly what the filesystem holds.
+#[cfg(unix)]
+pub fn path_bytes(path: &std::path::Path) -> Option<&[u8]> {
+    use std::os::unix::ffi::OsStrExt as _;
+    Some(path.as_os_str().as_bytes())
+}
+
+/// 🪟 Elsewhere a path is text; one that is not has no byte spelling a URL can
+/// carry, so it is reported as absent rather than lossily repaired.
+#[cfg(not(unix))]
+pub fn path_bytes(path: &std::path::Path) -> Option<&[u8]> {
+    path.to_str().map(str::as_bytes)
+}
+
 /// 🔤 The byte a three-character escape at `index` stands for, or `None` when
 /// there is no well-formed escape there.
 ///
@@ -263,5 +306,43 @@ mod tests {
     #[test]
     fn invalid_utf8_survives_as_bytes() {
         assert_eq!(decode("a%FFb"), Some(vec![b'a', 0xff, b'b']));
+    }
+
+    fn encode(bytes: &[u8]) -> String {
+        let mut out = String::new();
+        push_encoded_path(&mut out, bytes);
+        out
+    }
+
+    /// 🔁 Encoding then decoding each component gives back the bytes on disk,
+    /// including bytes that are not valid UTF-8 and a literal `%`.
+    #[test]
+    fn encoded_names_decode_to_the_same_bytes() {
+        let names: [&[u8]; 5] = [
+            b"plain-name_1.txt",
+            b"with space.txt",
+            b"caf\xe9.txt",
+            b"100%41.txt",
+            "文件?#.txt".as_bytes(),
+        ];
+        for name in names {
+            let encoded = encode(name);
+            assert!(
+                encoded.bytes().all(|byte| byte.is_ascii_graphic()),
+                "{encoded} is not a literal-safe URI path"
+            );
+            assert_eq!(decode(&encoded).as_deref(), Some(name), "via {encoded}");
+        }
+        assert_eq!(encode(b"caf\xe9.txt"), "caf%E9.txt");
+        assert_eq!(encode(b"a/b c"), "a/b%20c");
+    }
+
+    /// 📁 A Unix path that is not valid UTF-8 still has its exact bytes.
+    #[cfg(unix)]
+    #[test]
+    fn path_bytes_are_not_lossy() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(b"dir/caf\xe9"));
+        assert_eq!(path_bytes(path), Some(&b"dir/caf\xe9"[..]));
     }
 }
