@@ -15,7 +15,7 @@ use super::order::DirectiveOrder;
 use super::reverse_proxy::adapt_intercept;
 use super::reverse_proxy::adapt_reverse_proxy;
 use super::reverse_proxy::validate_fastcgi_split_path;
-use super::reverse_proxy::{parse_http_tls_option, validate_upstream_tls};
+use super::reverse_proxy::{parse_http_tls_option, parse_response_matcher, validate_upstream_tls};
 use crate::parser::ast::*;
 use crate::parser::caddy_ast::{Block, Directive, TokenRun};
 use pingclair_core::config::BasicAuthAlgorithm;
@@ -1514,12 +1514,27 @@ pub(super) fn adapt_header_directive(d: &Directive) -> Result<Handler, AdapterEr
             };
             match sub.name.as_str() {
                 "defer" => continue,
-                // 🚩 A response matcher gating the whole block. Same reason.
+                // 🧭 A response matcher gating the whole block — every
+                // operation written above it as well as below, because that is
+                // what it does upstream: the matcher and the operations are two
+                // fields of one handler, not one handler per group.
                 "match" => {
-                    return Err(AdapterError::UnsupportedFeature(
-                        "header match".into(),
-                        "a response matcher on a header block is not implemented yet".into(),
-                    ));
+                    // 🚫 Upstream refuses a second `match` in the same block
+                    // ("matcher is defined more than once"), because the field
+                    // holds one gate and a second would silently replace the
+                    // first. Nothing else here needs a response-side check:
+                    // `request_header` refuses a block outright, so this loop
+                    // only ever sees response headers.
+                    if config.require.is_some() {
+                        return Err(AdapterError::InvalidArgument(
+                            "header match".into(),
+                            "the block already has a `match`; one block has one gate, so the \
+                             second would quietly replace the first"
+                                .into(),
+                        ));
+                    }
+                    config.require = Some(parse_response_matcher(sub)?);
+                    continue;
                 }
                 _ => {}
             }

@@ -189,6 +189,10 @@ pub fn evaluate_response_handlers(
                 // finished response to look at.
                 replace: _,
                 default_set: _,
+                // 🧭 A gated block is skipped here for the same reason the two
+                // other unread fields are: the gate is evaluated against the
+                // finished response, which this pass does not have.
+                require: _,
             } => {
                 for (name, value) in set.iter().chain(add.iter()) {
                     outcome.header_set.push((name.clone(), value.clone()));
@@ -331,8 +335,25 @@ pub fn evaluate_response_handlers(
     Some(outcome)
 }
 
+/// 🎯 Matches one response matcher against a Pingora response being finished.
+///
+/// The status is read from the response itself, not passed in: every caller
+/// that applies a policy already holds this type, and a second copy of the
+/// status travelling beside it would be a second answer to keep in step.
+fn matches_finished_response(matcher: &ResponseMatcher, response: &ResponseHeader) -> bool {
+    response_matcher_matches(matcher, response.status.as_u16(), &response.headers)
+}
+
 /// 🎯 Matches one response matcher against an upstream status and headers.
-fn response_matcher_matches(matcher: &ResponseMatcher, status: u16, headers: &HeaderMap) -> bool {
+///
+/// `pub(crate)` because HTTP/3 evaluates this same function against its own
+/// response representation: two transports, one definition of what a response
+/// matcher means.
+pub(crate) fn response_matcher_matches(
+    matcher: &ResponseMatcher,
+    status: u16,
+    headers: &HeaderMap,
+) -> bool {
     let status_ok = matcher.status_codes.is_empty()
         || matcher.status_codes.contains(&status)
         || matcher.status_codes.contains(&(status / 100));
@@ -458,6 +479,7 @@ mod response_interception_tests {
                     remove: vec![],
                     replace: Vec::new(),
                     default_set: Default::default(),
+                    require: None,
                 },
                 HandlerConfig::Respond {
                     status: 403,
@@ -821,6 +843,28 @@ pub(crate) struct ResponseHeaderPolicy {
     replace: Vec<HeaderReplacement>,
     suppress_server: bool,
     suppress_via: bool,
+    /// 🧭 Blocks written with `match { … }`, in the order they were written.
+    ///
+    /// Kept whole rather than folded in: a gated block's operations apply only
+    /// when its matcher matches the finished response, which is the only moment
+    /// its status and headers exist. Empty for nearly every configuration, and
+    /// the emptiness test is what the unconditional path costs.
+    gated: Vec<GatedHeaderOps>,
+}
+
+/// 🧭 One `header` block whose whole operation set sits behind `match { … }`.
+///
+/// The operations live in a policy of their own so that applying them is the
+/// same code as applying an unconditional block — the alternative, a second
+/// copy of the set/add/replace/remove sequence, is how the two paths would
+/// drift apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GatedHeaderOps {
+    /// The gate. One per block: a second `match` in the same block is refused
+    /// by the adapter, because upstream keeps the field singular too.
+    pub(crate) require: ResponseMatcher,
+    /// The block's operations. Its own `gated` is always empty, one level.
+    pub(crate) ops: ResponseHeaderPolicy,
 }
 
 /// 🔁 One compiled header replacement, ready to run against a response.
@@ -872,6 +916,33 @@ impl ResponseHeaderPolicy {
             name,
             value,
         });
+    }
+
+    /// 🧭 Folds one `header` block into the policy.
+    ///
+    /// A block without a matcher merges into the unconditional operations —
+    /// the common case, and the one whose cost stays at a single test on the
+    /// response path. A block with one is kept aside, gate and all, and
+    /// applied only if its matcher matches the response being finished.
+    pub(crate) fn merge_block(
+        &mut self,
+        require: Option<ResponseMatcher>,
+        ops: ResponseHeaderPolicy,
+    ) {
+        match require {
+            None => self.merge(ops),
+            Some(require) => self.gated.push(GatedHeaderOps { require, ops }),
+        }
+    }
+
+    /// 🌐 Exposes the gated blocks in application order.
+    ///
+    /// Exposed so HTTP/3 can drive its own response list through them without
+    /// this module having to know what an H3 header is. The order is *reverse*
+    /// of the written order, which is what upstream does and what
+    /// [`Self::apply_pingora`] documents.
+    pub(crate) fn gated_blocks(&self) -> impl DoubleEndedIterator<Item = &GatedHeaderOps> {
+        self.gated.iter().rev()
     }
 
     /// 🧹 Removes a downstream header after every set and append mutation.
@@ -1015,15 +1086,55 @@ impl ResponseHeaderPolicy {
         }
         self.suppress_server |= other.suppress_server;
         self.suppress_via |= other.suppress_via;
+        // 🧭 Gated blocks travel with the merge: a policy that dropped them
+        // would turn `match { … }` into a no-op wherever two policies meet.
+        self.gated.extend(other.gated);
     }
 
     /// 🍎 Applies the shared policy to a Pingora response.
+    ///
+    /// 🧭 Gated blocks run after the unconditional operations and in reverse of
+    /// the order they were written. Both halves of that rule are upstream's,
+    /// measured rather than assumed: a block with a matcher defers its work to
+    /// the moment the response header is written (`headers.go`, `ServeHTTP`),
+    /// so the block written *last* is the first to apply, and the one written
+    /// first ends up overwriting it (`X-Foo: first` won in
+    /// `verify/impl-gaps-ab/runtime/41/caddy/case-two-gated-sets`). Each gate is
+    /// evaluated as its turn comes, so it sees the operations that already
+    /// applied — including those of later-written blocks, which upstream's
+    /// wrapper nesting also leaves in place by then.
     pub(crate) fn apply_pingora(
         &self,
         response: &mut ResponseHeader,
         request_id: &http::HeaderValue,
         via_hop: Option<http::Version>,
     ) -> PingoraResult<()> {
+        self.apply_ops(response)?;
+
+        let mut suppress_server = self.suppress_server;
+        let mut suppress_via = self.suppress_via;
+        for block in self.gated_blocks() {
+            if !matches_finished_response(&block.require, response) {
+                continue;
+            }
+            block.ops.apply_ops(response)?;
+            // 🧭 `-Server` inside a block that did not apply must not remove the
+            // field, which is why the flag is read from the *block* here rather
+            // than from the policy that carries it.
+            suppress_server |= block.ops.suppress_server;
+            suppress_via |= block.ops.suppress_via;
+        }
+
+        self.finish_pingora(response, request_id, via_hop, suppress_server, suppress_via)
+    }
+
+    /// 🧩 One block's operations, in the order upstream applies them.
+    ///
+    /// Split out of [`Self::apply_pingora`] so a gated block runs the same code
+    /// as an unconditional one. Everything here is decided by `self` alone: the
+    /// response is the only input, which is what lets one block be applied on
+    /// its own.
+    fn apply_ops(&self, response: &mut ResponseHeader) -> PingoraResult<()> {
         for entry in self.set.values() {
             match &entry.header_value {
                 Some(header_value) => {
@@ -1081,7 +1192,24 @@ impl ResponseHeaderPolicy {
         for name in &self.remove {
             let _ = response.remove_header(name);
         }
-        if self.suppress_server {
+        Ok(())
+    }
+
+    /// 🏁 The fields every response carries, whatever the block asked for.
+    ///
+    /// Split out so the unconditional operations and every gated block can
+    /// reach them once, at the end: `match` decides whether the
+    /// *configuration's* operations apply, never whether this server identifies
+    /// itself.
+    fn finish_pingora(
+        &self,
+        response: &mut ResponseHeader,
+        request_id: &http::HeaderValue,
+        via_hop: Option<http::Version>,
+        suppress_server: bool,
+        suppress_via: bool,
+    ) -> PingoraResult<()> {
+        if suppress_server {
             let _ = response.remove_header("server");
         } else {
             response.insert_header("server", "Pingclair")?;
@@ -1091,7 +1219,7 @@ impl ResponseHeaderPolicy {
         // chain of intermediaries, so replacing it would erase whoever sits
         // in front of us. `via_hop` is `None` for a response this server
         // produced itself — there was no hop, and claiming one would be a lie.
-        if let Some(version) = via_hop.filter(|_| !self.suppress_via) {
+        if let Some(version) = via_hop.filter(|_| !suppress_via) {
             response.append_header("via", via_value(version))?;
         }
 
@@ -2587,11 +2715,38 @@ mod tests {
     }
 
     fn applied(policy: &ResponseHeaderPolicy, hop: Option<http::Version>) -> ResponseHeader {
-        let mut response = ResponseHeader::build(200, None).unwrap();
+        applied_to(policy, 200, hop)
+    }
+
+    fn applied_to(
+        policy: &ResponseHeaderPolicy,
+        status: u16,
+        hop: Option<http::Version>,
+    ) -> ResponseHeader {
+        let mut response = ResponseHeader::build(status, None).unwrap();
         policy
             .apply_pingora(&mut response, &http::HeaderValue::from_static("req-1"), hop)
             .unwrap();
         response
+    }
+
+    /// 🧭 One `header` block written with `match { status … }`, in the shape the
+    /// transports hand over: the operations collected by themselves, then
+    /// merged with the gate that was written beside them.
+    fn gated_block(
+        policy: &mut ResponseHeaderPolicy,
+        statuses: &[u16],
+        build: impl FnOnce(&mut ResponseHeaderPolicy),
+    ) {
+        let mut ops = ResponseHeaderPolicy::default();
+        build(&mut ops);
+        policy.merge_block(
+            Some(ResponseMatcher {
+                status_codes: statuses.to_vec(),
+                headers: std::collections::BTreeMap::new(),
+            }),
+            ops,
+        );
     }
 
     fn via_values(response: &ResponseHeader) -> Vec<String> {
@@ -2676,6 +2831,105 @@ mod tests {
         inner.remove("via");
         outer.merge(inner);
         assert!(outer.suppresses_via());
+    }
+
+    #[test]
+    fn a_gated_block_applies_only_to_the_response_it_names() {
+        let mut policy = ResponseHeaderPolicy::default();
+        gated_block(&mut policy, &[404], |ops| ops.set("X-Conditional", "yes"));
+
+        let not_found = applied_to(&policy, 404, None);
+        assert_eq!(header_values(&not_found, "x-conditional"), ["yes"]);
+
+        // 🚫 The same block on a response it does not name must do nothing —
+        // including nothing to the headers it would otherwise have set.
+        let ok = applied_to(&policy, 200, None);
+        assert!(header_values(&ok, "x-conditional").is_empty());
+    }
+
+    #[test]
+    fn a_gate_reads_the_response_the_unconditional_operations_produced() {
+        // 🧭 Upstream evaluates each matcher as its turn comes, so a gate may
+        // name a header an unconditional block set earlier in the same request.
+        let mut policy = ResponseHeaderPolicy::default();
+        policy.set("X-Origin", "yes");
+        let mut ops = ResponseHeaderPolicy::default();
+        ops.set("X-On-Origin", "seen");
+        policy.merge_block(
+            Some(ResponseMatcher {
+                status_codes: Vec::new(),
+                headers: [("X-Origin".to_string(), vec!["yes".to_string()])]
+                    .into_iter()
+                    .collect(),
+            }),
+            ops,
+        );
+
+        let response = applied_to(&policy, 200, None);
+        assert_eq!(header_values(&response, "x-on-origin"), ["seen"]);
+    }
+
+    #[test]
+    fn a_gated_block_outranks_an_unconditional_one() {
+        // 🧭 Measured against Caddy: the gated block's work is deferred to the
+        // moment the response header is written, so it lands last and wins the
+        // field. `runtime/41/caddy/case-gated-and-ungated-set` is the transcript.
+        let mut policy = ResponseHeaderPolicy::default();
+        policy.set("X-Foo", "ungated");
+        gated_block(&mut policy, &[404], |ops| ops.set("X-Foo", "gated"));
+
+        assert_eq!(
+            header_values(&applied_to(&policy, 404, None), "x-foo"),
+            ["gated"]
+        );
+        assert_eq!(header_values(&applied(&policy, None), "x-foo"), ["ungated"]);
+    }
+
+    #[test]
+    fn the_first_written_gated_block_wins_a_conflict() {
+        // 🧭 Also measured: each block wraps the writer of the one before it, so
+        // the block written last applies first and the first-written block ends
+        // up overwriting it (`runtime/41/caddy/case-two-gated-sets`). Reversing
+        // this loop would silently flip which block an operator's configuration
+        // obeys.
+        let mut policy = ResponseHeaderPolicy::default();
+        gated_block(&mut policy, &[404], |ops| ops.set("X-Foo", "first"));
+        gated_block(&mut policy, &[4], |ops| ops.set("X-Foo", "second"));
+
+        assert_eq!(
+            header_values(&applied_to(&policy, 404, None), "x-foo"),
+            ["first"]
+        );
+    }
+
+    #[test]
+    fn a_gated_server_removal_only_applies_when_its_gate_matches() {
+        let mut policy = ResponseHeaderPolicy::default();
+        gated_block(&mut policy, &[404], |ops| ops.remove("server"));
+
+        assert!(header_values(&applied_to(&policy, 404, None), "server").is_empty());
+        assert_eq!(
+            header_values(&applied_to(&policy, 200, None), "server"),
+            ["Pingclair"]
+        );
+    }
+
+    #[test]
+    fn gated_blocks_survive_a_middleware_merge() {
+        // 🧭 `merge` is how a route's policy meets a middleware decision; a
+        // merge that kept only the flat fields would drop the gate and apply the
+        // block to every response.
+        let mut route = ResponseHeaderPolicy::default();
+        gated_block(&mut route, &[404], |ops| ops.set("X-Foo", "gated"));
+
+        let mut outer = ResponseHeaderPolicy::default();
+        outer.merge(route);
+
+        assert!(header_values(&applied_to(&outer, 200, None), "x-foo").is_empty());
+        assert_eq!(
+            header_values(&applied_to(&outer, 404, None), "x-foo"),
+            ["gated"]
+        );
     }
 }
 

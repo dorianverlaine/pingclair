@@ -1128,6 +1128,7 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
                 validate_matcher(matcher)?;
             }
             validate_matchers_under(&route.handler)?;
+            validate_gated_headers(&route.handler, false)?;
         }
         for error_route in &server.error_routes {
             for element in &error_route.handlers {
@@ -1138,6 +1139,7 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
                     validate_matcher(matcher)?;
                 }
                 validate_matchers_under(&element.handler)?;
+                validate_gated_headers(&element.handler, false)?;
             }
         }
 
@@ -1988,6 +1990,73 @@ fn validate_matchers_under(handler: &HandlerConfig) -> CompileResult<()> {
         _ => {}
     }
     Ok(())
+}
+
+/// 🧭 Refuses `match { … }` inside a response subroute's `header` block.
+///
+/// Upstream evaluates such a gate against the response the *subroute* produces,
+/// not the one it was handed. Measured 2026-09-24 against an origin answering
+/// 500: `handle_response @err { header { match { status 502 } … } respond
+/// "handled" 502 }` applies its header, while the same block gated on
+/// `status 500` — the upstream's status — does not
+/// (`verify/impl-gaps-ab/runtime/41/caddy/case-inner-status502/` and
+/// `case-inner-status500/`). Honouring that here means evaluating the gate once
+/// the subroute has composed its answer, which this build does not do, and
+/// dropping the gate instead would turn a written matcher into a silent no-op.
+///
+/// 🚪 The Caddyfile adapter refuses this shape too. This walk is what stops a
+/// hand-written JSON document from taking the door the adapter closed, which is
+/// the rule `validate_config` exists to keep.
+fn validate_gated_headers(
+    handler: &HandlerConfig,
+    in_response_subroute: bool,
+) -> CompileResult<()> {
+    match handler {
+        HandlerConfig::Headers {
+            require: Some(_), ..
+        } if in_response_subroute => Err(CompileError::InvalidServer {
+            message: "`header { match { … } }` inside `handle_response` is not implemented: \
+                      the matcher would have to be judged against the response the \
+                      subroute itself produces, not the upstream response it was handed. \
+                      Move the gated block to the site level, or drop the `match`."
+                .to_string(),
+        }),
+        HandlerConfig::Pipeline { handlers }
+        | HandlerConfig::FirstMatch { handlers }
+        | HandlerConfig::HandlePath { handlers, .. } => {
+            for element in handlers {
+                validate_gated_headers(&element.handler, in_response_subroute)?;
+            }
+            Ok(())
+        }
+        HandlerConfig::HandleErrors { errors } => {
+            for handlers in errors.values() {
+                for handler in handlers {
+                    validate_gated_headers(handler, in_response_subroute)?;
+                }
+            }
+            Ok(())
+        }
+        // 🧭 The two doors into a response subroute: `intercept`, and
+        // `reverse_proxy`'s `handle_response` entries.
+        HandlerConfig::Intercept { handlers } => {
+            for entry in handlers {
+                for handler in &entry.handlers {
+                    validate_gated_headers(handler, true)?;
+                }
+            }
+            Ok(())
+        }
+        HandlerConfig::ReverseProxy(proxy) => {
+            for entry in &proxy.handle_response {
+                for handler in &entry.handlers {
+                    validate_gated_headers(handler, true)?;
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// 🛡️ Validates every rule this build has about the matchers in one tree.
@@ -2945,6 +3014,7 @@ fn compile_handler(
                 remove: headers.remove.clone(),
                 replace: headers.replace.clone(),
                 default_set: headers.default_set.clone(),
+                require: headers.require.clone(),
             })
         }
 
@@ -3258,6 +3328,46 @@ mod tests {
         assert!(
             error.contains("audit") && error.contains("hostnames"),
             "the message must name the channel and the setting: {error}"
+        );
+    }
+
+    /// 🚫 A gated `header` block inside a response subroute is refused for JSON too.
+    ///
+    /// The Caddyfile adapter refuses the shape, but the Admin API deserialises
+    /// straight into `PingclairConfig` and never runs the adapter — so without
+    /// this the gate would be accepted from JSON and silently ignored, which is
+    /// the failure mode the refusal exists to prevent (`validate_gated_headers`
+    /// carries the measurement).
+    #[test]
+    fn a_gated_header_block_in_a_response_subroute_is_refused_from_json() {
+        let config: PingclairConfig = serde_json::from_str(
+            r#"{
+                "servers": [{
+                    "routes": [{
+                        "path": "/",
+                        "handler": {
+                            "type": "reverse_proxy",
+                            "upstreams": ["localhost:8080"],
+                            "handle_response": [{
+                                "handlers": [{
+                                    "type": "headers",
+                                    "set": {"X-Gated": "yes"},
+                                    "require": {"status_code": [500]}
+                                }]
+                            }]
+                        }
+                    }]
+                }]
+            }"#,
+        )
+        .expect("the document parses; it is the gate that has to be refused");
+
+        let error = validate_config(&config)
+            .expect_err("a gate in a response subroute must be refused")
+            .to_string();
+        assert!(
+            error.contains("handle_response") && error.contains("match"),
+            "the message must name the shape and the setting: {error}"
         );
     }
 

@@ -102,6 +102,28 @@ or the image's `:latest` tag, which an rc used to move as well. The channels
 and the procedure for cutting a release are in `CONTRIBUTING.md` under
 "Releasing".
 
+### 🧭 `header { match { … } }` gates a response header block
+
+A `header` block that wrote `match { … }` was refused by name, so a block meant
+to apply to some responses and not others did not load at all. It now works:
+the matcher is judged against the finished response — the only moment its
+status and headers exist — and the block's operations, including `-Server` and
+`-Via`, apply only when it matches. On both HTTP/1.1–2 and HTTP/3.
+
+The gate covers the **whole** block wherever the `match` line was written in
+it, and a gated block's operations land after the block's unconditional ones.
+Both are upstream's behaviour, measured rather than assumed: Caddy keeps the
+matcher and the operations as two fields of one handler and defers a gated
+block's work to the moment the response header is written. Two gated blocks
+that write the same field therefore resolve the way they do there — the one
+written first wins — and `match` accepts what upstream accepts and nothing
+else: `status` (bare codes and the `2xx` class shorthand) and `header`.
+
+🚫 `handle_response { header { match { … } } }` stays refused, now by a message
+that names it. Caddy judges that gate against the response the subroute itself
+produces, which this build does not compose at that point; dropping the gate
+instead would accept a configuration that reads as conditional and is not.
+
 ### 📥 All four `request_body` options are implemented
 
 `request_body` accepted only `max_size`; `read_timeout`, `write_timeout` and

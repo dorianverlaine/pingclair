@@ -2798,11 +2798,17 @@ async fn plan_h3_handler_with_connector(
             remove,
             replace,
             default_set,
+            require,
         } => {
+            // 🧭 Collected apart from the route's policy and merged at the end,
+            // the same shape the H1/H2 path uses: a block written with
+            // `match { … }` has to stay identifiable as one block, or its gate
+            // would end up gating everything the route sets.
+            let mut block = ResponseHeaderPolicy::default();
             for entry in replace {
                 match state.route_regex_arc(route_index, &entry.search_regexp) {
                     Some(pattern) => {
-                        response_policy.replace(entry.field.clone(), pattern, entry.replace.clone())
+                        block.replace(entry.field.clone(), pattern, entry.replace.clone())
                     }
                     None => tracing::warn!(
                         pattern = %entry.search_regexp,
@@ -2811,17 +2817,18 @@ async fn plan_h3_handler_with_connector(
                 }
             }
             for (name, value) in set {
-                response_policy.set(name, value.clone());
+                block.set(name, value.clone());
             }
             for (name, value) in add {
-                response_policy.add(name, value.clone());
+                block.add(name, value.clone());
             }
             for (name, value) in default_set {
-                response_policy.set_if_absent(name, value.clone());
+                block.set_if_absent(name, value.clone());
             }
             for name in remove {
-                response_policy.remove(name);
+                block.remove(name);
             }
+            response_policy.merge_block(require.clone(), block);
             Ok(H3Plan::Continue)
         }
         HandlerConfig::RequestHeaders {
@@ -6404,13 +6411,77 @@ fn set_h3_header(headers: &mut Vec<quiche::h3::Header>, name: &str, value: &str)
     ));
 }
 
+/// 🔎 The header view a response matcher asks for, and nothing else.
+///
+/// 📌 Only the names the matcher mentions are copied. A `match { header
+/// Content-Type … }` gate does not need the other fifteen fields of the
+/// response, and copying all of them would put a map allocation on every gated
+/// H3 response — on the transport whose whole point is that the response is
+/// handed over as a list of borrowed byte slices.
+fn gate_header_view(
+    headers: &[quiche::h3::Header],
+    matcher: &pingclair_core::config::ResponseMatcher,
+) -> http::HeaderMap {
+    let mut view = http::HeaderMap::new();
+    for name in matcher.headers.keys() {
+        let Ok(header_name) = http::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        for header in headers {
+            if header.name().eq_ignore_ascii_case(name.as_bytes())
+                && let Ok(value) = http::HeaderValue::from_bytes(header.value())
+            {
+                view.append(header_name.clone(), value);
+            }
+        }
+    }
+    view
+}
+
 /// 🛡️ Applies transport-neutral middleware and vhost security headers to H3.
+///
+/// Mirrors [`ResponseHeaderPolicy::apply_pingora`] step for step — unconditional
+/// operations, then gated blocks in application order, then the fields every
+/// response carries — because a configuration has to mean one thing on both
+/// transports.
 fn apply_h3_response_policy(
     headers: &mut Vec<quiche::h3::Header>,
     policy: &ResponseHeaderPolicy,
     request_id: &str,
     state: Option<&ProxyState>,
 ) {
+    apply_h3_ops(headers, policy);
+
+    let mut suppress_server = policy.suppresses_server();
+    for block in policy.gated_blocks() {
+        // 🧭 The gate is evaluated against the response as it stands, which is
+        // what upstream's wrapper nesting leaves in place by the time each
+        // block's turn comes. H3's response *is* this list: `:status` is
+        // written into it before the policy is applied, so the status is read
+        // back rather than threaded through eleven call sites as a second copy
+        // of the same fact.
+        let matches = crate::http_policy::response_matcher_matches(
+            &block.require,
+            response_status(headers),
+            &gate_header_view(headers, &block.require),
+        );
+        if !matches {
+            continue;
+        }
+        apply_h3_ops(headers, &block.ops);
+        // 🧭 `-Server` inside a block that did not apply must not remove the
+        // field, so the flag is read from the block rather than the policy.
+        suppress_server |= block.ops.suppresses_server();
+    }
+
+    apply_h3_trailer_headers(headers, suppress_server, request_id, state);
+}
+
+/// 🧩 One block's operations on an H3 response, in upstream's order.
+///
+/// Split out so a gated block runs the same code as an unconditional one; the
+/// two would otherwise be a pair of sequences to keep in step by hand.
+fn apply_h3_ops(headers: &mut Vec<quiche::h3::Header>, policy: &ResponseHeaderPolicy) {
     for (name, value) in policy.set_headers() {
         set_h3_header(headers, name, value);
     }
@@ -6445,7 +6516,20 @@ fn apply_h3_response_policy(
     for name in policy.removed_headers() {
         headers.retain(|header| !header.name().eq_ignore_ascii_case(name.as_bytes()));
     }
-    if policy.suppresses_server() {
+}
+
+/// 🏁 The fields that go on every H3 response once the policy has run.
+///
+/// `suppress_server` arrives decided rather than read from the policy, because
+/// only the caller knows which gated blocks matched: a `-Server` inside a block
+/// that did not apply must not remove the field.
+fn apply_h3_trailer_headers(
+    headers: &mut Vec<quiche::h3::Header>,
+    suppress_server: bool,
+    request_id: &str,
+    state: Option<&ProxyState>,
+) {
+    if suppress_server {
         headers.retain(|header| !header.name().eq_ignore_ascii_case(b"server"));
     } else {
         set_h3_header(headers, "server", "Pingclair");
@@ -8162,6 +8246,7 @@ mod tests {
                     remove: Vec::new(),
                     replace: Vec::new(),
                     default_set: Default::default(),
+                    require: None,
                 }),
                 HandlerElement::plain(HandlerConfig::BasicAuth {
                     realm: "Restricted".to_string(),
@@ -8205,6 +8290,80 @@ mod tests {
                 .set_headers()
                 .any(|(name, value)| name == "x-policy" && value == "active")
         );
+    }
+
+    /// 🧭 A `header` block gated by `match { … }` on the HTTP/3 side.
+    ///
+    /// The two transports must not disagree about what one configuration
+    /// means, and this is the half the H1/H2 unit tests cannot see: H3's
+    /// response is a header list rather than a `ResponseHeader`, so the gate is
+    /// evaluated through `gate_header_view` instead.
+    #[test]
+    fn a_gated_header_block_applies_on_h3_only_to_the_response_it_names() {
+        let mut policy = ResponseHeaderPolicy::default();
+        let mut ops = ResponseHeaderPolicy::default();
+        ops.set("x-conditional", "yes");
+        policy.merge_block(
+            Some(pingclair_core::config::ResponseMatcher {
+                status_codes: vec![404],
+                headers: std::collections::BTreeMap::new(),
+            }),
+            ops,
+        );
+
+        let mut not_found = vec![quiche::h3::Header::new(b":status", b"404")];
+        apply_h3_response_policy(&mut not_found, &policy, "req-1", None);
+        assert!(
+            h3_values(&not_found, "x-conditional") == ["yes"],
+            "the gate named 404, so the block applies: {not_found:?}"
+        );
+
+        let mut ok = vec![quiche::h3::Header::new(b":status", b"200")];
+        apply_h3_response_policy(&mut ok, &policy, "req-1", None);
+        assert!(
+            h3_values(&ok, "x-conditional").is_empty(),
+            "the same block on a 200 must do nothing: {ok:?}"
+        );
+    }
+
+    /// 🧭 The `header` form of the gate, on the transport that reads it back.
+    #[test]
+    fn an_h3_gate_can_name_a_response_header() {
+        let mut policy = ResponseHeaderPolicy::default();
+        let mut ops = ResponseHeaderPolicy::default();
+        ops.set("x-follows", "yes");
+        policy.merge_block(
+            Some(pingclair_core::config::ResponseMatcher {
+                status_codes: Vec::new(),
+                headers: [("x-backend".to_string(), vec!["plain".to_string()])]
+                    .into_iter()
+                    .collect(),
+            }),
+            ops,
+        );
+
+        let mut tagged = vec![
+            quiche::h3::Header::new(b":status", b"200"),
+            quiche::h3::Header::new(b"x-backend", b"plain"),
+        ];
+        apply_h3_response_policy(&mut tagged, &policy, "req-1", None);
+        assert_eq!(h3_values(&tagged, "x-follows"), ["yes"]);
+
+        let mut untagged = vec![quiche::h3::Header::new(b":status", b"200")];
+        apply_h3_response_policy(&mut untagged, &policy, "req-1", None);
+        assert!(
+            h3_values(&untagged, "x-follows").is_empty(),
+            "a response without the named header must not be edited: {untagged:?}"
+        );
+    }
+
+    /// 🔎 The values one H3 header carries, in order.
+    fn h3_values(headers: &[quiche::h3::Header], name: &str) -> Vec<String> {
+        headers
+            .iter()
+            .filter(|header| header.name().eq_ignore_ascii_case(name.as_bytes()))
+            .map(|header| String::from_utf8_lossy(header.value()).into_owned())
+            .collect()
     }
 
     #[tokio::test]

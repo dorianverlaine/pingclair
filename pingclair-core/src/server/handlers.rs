@@ -140,6 +140,15 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
         // loosened without this being finished.
         HandlerConfig::AcmeServer(_) => Ok(HandlerResponse::status(501)),
 
+        // 🧭 A block gated by `match { … }` is applied by the transports, against
+        // the response they are about to send. This function fabricates one
+        // locally, with a status it chose rather than one a client will see, so
+        // it has nothing to evaluate the gate against — and applying the
+        // operations anyway would apply a block upstream might not have run.
+        HandlerConfig::Headers {
+            require: Some(_), ..
+        } => Ok(HandlerResponse::status(200)),
+
         HandlerConfig::Headers {
             set,
             add,
@@ -150,6 +159,7 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             // defer to either.
             replace: _,
             default_set,
+            require: _,
         } => {
             // Headers handler modifies existing response
             // Return a passthrough response
@@ -584,6 +594,7 @@ mod tests {
             remove: Vec::new(),
             replace: Vec::new(),
             default_set: BTreeMap::new(),
+            require: None,
         };
 
         let response = execute_handler(&config, &empty_headers()).unwrap();

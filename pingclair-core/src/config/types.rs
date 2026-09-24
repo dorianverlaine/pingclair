@@ -1722,6 +1722,14 @@ pub enum HandlerConfig {
         /// look at. The request-side equivalent is a matcher.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         default_set: BTreeMap<String, String>,
+        /// 🧭 `match { … }` inside the block: the gate the whole block's
+        /// operations are behind, evaluated against the finished response.
+        ///
+        /// `None` is the common case and costs one pointer test on the
+        /// response path; the matcher is only consulted when a configuration
+        /// asked for one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        require: Option<ResponseMatcher>,
     },
 
     /// 🚫 Marks the request as excluded from access logging (`log_skip`).

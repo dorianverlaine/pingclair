@@ -2718,18 +2718,42 @@ mod fail_closed_tests {
     #[test]
     fn header_names_the_shapes_it_cannot_express() {
         for source in [
-            // 🚩 A response matcher gating the block: not implemented, and
-            // named rather than treated as a header called `match`.
-            "example.com {\n header {\n match {\n status 2xx\n }\n }\n}",
             // 🚩 Both at once has no defined order, so upstream refuses it.
             "example.com {\n header X-Foo bar {\n X-Baz qux\n }\n}",
+            // 🚩 One block has one gate: a second `match` would silently
+            // replace the first, which is what upstream refuses it for.
+            "example.com {\n header {\n match {\n status 2xx\n }\n match {\n \
+             status 404\n }\n }\n}",
+            // 🚩 Upstream knows two response matchers, `status` and `header`.
+            // A third must be named rather than ignored, or the block would
+            // apply to every response while reading as though it did not.
+            "example.com {\n header {\n match {\n body foo\n }\n X-Foo bar\n }\n}",
         ] {
             let error = compile_err(source);
             assert!(
-                error.contains("header"),
+                error.contains("header") || error.contains("match"),
                 "must be named rather than mangled; got {error} for {source}"
             );
         }
+    }
+
+    /// 🚫 A response subroute's `header` block cannot carry a gate.
+    ///
+    /// Upstream judges such a matcher against the response the subroute itself
+    /// produces (`runtime/41/caddy/case-inner-status502`), which this build
+    /// does not compose at that point — so the shape is refused rather than
+    /// accepted with the gate dropped.
+    #[test]
+    fn a_gated_header_block_inside_handle_response_is_refused() {
+        let error = compile_err(
+            "example.com {\n reverse_proxy localhost:8080 {\n @err status 500\n \
+             handle_response @err {\n header {\n match {\n status 500\n }\n \
+             X-Gated yes\n }\n }\n }\n}",
+        );
+        assert!(
+            error.contains("handle_response"),
+            "the refusal has to name the shape that is not implemented; got {error}"
+        );
     }
 
     /// 🔤 `method` is a rewrite of one field, not a handler of its own.
@@ -3665,6 +3689,128 @@ mod fail_closed_tests {
             "example.com {\n    respond /health \"ok\" 200\n}",
         ] {
             crate::compile(source).unwrap_or_else(|e| panic!("must compile:\n{source}\ngot {e}"));
+        }
+    }
+}
+
+// MARK: - Conditional response header groups (`header { match { … } }`)
+
+/// 🧭 One `header` block's gate, from the Caddyfile to the compiled handler.
+///
+/// The gate is carried, not resolved: it is judged against the finished
+/// response, which only the transports hold.
+#[cfg(test)]
+mod header_match_tests {
+    use pingclair_core::config::HandlerConfig;
+
+    /// 🧭 The `Headers` handlers of a route, flattened.
+    fn headers_handlers<'a>(handler: &'a HandlerConfig, out: &mut Vec<&'a HandlerConfig>) {
+        match handler {
+            HandlerConfig::Pipeline { handlers }
+            | HandlerConfig::FirstMatch { handlers }
+            | HandlerConfig::HandlePath { handlers, .. } => {
+                for element in handlers {
+                    headers_handlers(&element.handler, out);
+                }
+            }
+            HandlerConfig::Headers { .. } => out.push(handler),
+            _ => {}
+        }
+    }
+
+    fn only_headers_handler(source: &str) -> HandlerConfig {
+        let config = crate::compile(source).unwrap();
+        let mut found = Vec::new();
+        for route in &config.servers[0].routes {
+            headers_handlers(&route.handler, &mut found);
+        }
+        let mut found: Vec<HandlerConfig> = found.into_iter().cloned().collect();
+        assert_eq!(found.len(), 1, "expected one header block in {source}");
+        found.remove(0)
+    }
+
+    fn require_of(handler: &HandlerConfig) -> pingclair_core::config::ResponseMatcher {
+        match handler {
+            HandlerConfig::Headers { require, .. } => {
+                require.clone().expect("the block wrote a `match`")
+            }
+            other => panic!("expected a header block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_gated_block_compiles_with_its_gate_and_its_operations() {
+        let handler = only_headers_handler(
+            "example.com {\n header {\n match {\n status 404\n }\n X-Conditional yes\n }\n}",
+        );
+        let require = require_of(&handler);
+        assert_eq!(require.status_codes, [404]);
+        let HandlerConfig::Headers { set, .. } = &handler else {
+            unreachable!()
+        };
+        assert_eq!(set.get("X-Conditional").map(String::as_str), Some("yes"));
+    }
+
+    #[test]
+    fn the_gate_covers_the_operations_written_above_it() {
+        // 🧭 Upstream keeps the matcher and the operations as two fields of one
+        // handler, so the `match` line's position inside the block does not
+        // decide what it gates — measured in
+        // `runtime/41/caddy/case-match-last/transcript.txt`, where the header
+        // set above the matcher still appears only on 404.
+        let handler = only_headers_handler(
+            "example.com {\n header {\n X-After yes\n match {\n status 404\n }\n }\n}",
+        );
+        assert_eq!(require_of(&handler).status_codes, [404]);
+        let HandlerConfig::Headers { set, .. } = &handler else {
+            unreachable!()
+        };
+        assert_eq!(set.get("X-After").map(String::as_str), Some("yes"));
+    }
+
+    #[test]
+    fn a_gate_may_be_the_whole_block() {
+        // 🧩 No operations at all: upstream adapts this to a handler carrying
+        // only a matcher, so it has to load rather than be refused as empty.
+        let handler =
+            only_headers_handler("example.com {\n header {\n match {\n status 2xx\n }\n }\n}");
+        assert_eq!(require_of(&handler).status_codes, [2]);
+    }
+
+    #[test]
+    fn a_gate_may_name_a_response_header() {
+        let handler = only_headers_handler(
+            "example.com {\n header {\n match {\n header X-Backend plain\n }\n \
+             X-Gated yes\n }\n}",
+        );
+        let require = require_of(&handler);
+        assert_eq!(
+            require.headers.get("X-Backend"),
+            Some(&vec!["plain".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_route_matcher_and_a_gate_are_two_different_things() {
+        // 🧭 The issue's own example is `header @images { … match { … } }`, and
+        // the two matchers answer different questions: `@images` decides which
+        // requests reach the block, `match` decides which responses it edits.
+        // Collapsing them would silently widen a block to every request the
+        // route serves.
+        let config = crate::compile(
+            "example.com {\n @images path /img/*\n header @images {\n \
+             X-Images yes\n match {\n status 200\n }\n }\n}",
+        )
+        .unwrap();
+        let route = &config.servers[0].routes[0];
+        let mut found = Vec::new();
+        headers_handlers(&route.handler, &mut found);
+        assert!(
+            !found.is_empty(),
+            "the block under a route matcher must still compile to a handler"
+        );
+        for handler in found {
+            assert_eq!(require_of(handler).status_codes, [200]);
         }
     }
 }

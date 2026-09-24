@@ -5261,7 +5261,13 @@ impl PingclairProxy {
                 remove,
                 replace,
                 default_set,
+                require,
             } => {
+                // 🧭 This block's operations are collected apart from the
+                // route's policy and merged at the end, because a block written
+                // with `match { … }` has to stay identifiable as one block —
+                // folded in, its gate would end up gating the whole route.
+                let mut block = ResponseHeaderPolicy::default();
                 // 🔁 Patterns come from the per-route table compiled when the
                 // configuration was published, so this is a lookup.
                 let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
@@ -5278,8 +5284,7 @@ impl PingclairProxy {
                         )
                     });
                     if let Some((pattern, replacement)) = resolved {
-                        ctx.response_headers
-                            .replace(entry.field.clone(), pattern, replacement);
+                        block.replace(entry.field.clone(), pattern, replacement);
                     }
                 }
                 // 🏷️ `header X-Trace {host}` is ordinary syntax, and the value used
@@ -5321,25 +5326,26 @@ impl PingclairProxy {
                         .map(|(k, v)| (k.clone(), resolve(v, session, ctx)))
                         .collect();
                     for (k, v) in resolved_set {
-                        ctx.response_headers.set(k, v);
+                        block.set(k, v);
                     }
                     for (k, v) in resolved_add {
-                        ctx.response_headers.add(k, v);
+                        block.add(k, v);
                     }
                 } else {
                     for (k, v) in set {
-                        ctx.response_headers.set(k, v.clone());
+                        block.set(k, v.clone());
                     }
                     for (k, v) in add {
-                        ctx.response_headers.add(k, v.clone());
+                        block.add(k, v.clone());
                     }
                 }
                 for name in remove {
-                    ctx.response_headers.remove(name);
+                    block.remove(name);
                 }
                 for (name, value) in default_set {
-                    ctx.response_headers.set_if_absent(name, value.clone());
+                    block.set_if_absent(name, value.clone());
                 }
+                ctx.response_headers.merge_block(require.clone(), block);
                 Ok(false)
             }
             HandlerConfig::RequestHeaders {

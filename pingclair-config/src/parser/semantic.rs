@@ -239,6 +239,10 @@ impl SemanticAnalyzer {
                 remove: headers.remove.clone(),
                 replace: headers.replace.clone(),
                 default_set: headers.default_set.clone(),
+                // 🔎 Snippets substitute into values, never into a matcher's
+                // structure: `match { status {status} }` would have to
+                // reparse after substitution to mean anything.
+                require: headers.require.clone(),
             }),
             Directive::Setting { key, value } => Directive::Setting {
                 key: key.clone(),

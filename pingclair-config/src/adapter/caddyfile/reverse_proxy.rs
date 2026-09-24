@@ -1703,7 +1703,7 @@ pub(super) fn adapt_intercept(d: Directive) -> Result<Handler, AdapterError> {
 
 /// 🧭 Parses one named response matcher (`@name status 500` or a block of
 /// `status`/`header` lines).
-fn parse_response_matcher(d: &Directive) -> Result<ResponseMatcher, AdapterError> {
+pub(super) fn parse_response_matcher(d: &Directive) -> Result<ResponseMatcher, AdapterError> {
     let mut matcher = ResponseMatcher::default();
     let mut status = |args: &[String]| -> Result<(), AdapterError> {
         if args.is_empty() {
@@ -1933,6 +1933,21 @@ fn adapt_response_handler(
             let Handler::Headers(config) = handler else {
                 unreachable!("the header adapter returns a Headers handler")
             };
+            // 🚫 Refused rather than dropped. Upstream judged this matcher
+            // against the response the subroute itself produces — measured, see
+            // `validate_gated_headers` — and this build has nothing to judge it
+            // against here. Carrying `require: None` instead would accept the
+            // block and ignore the gate, which reads as working configuration
+            // and is not one.
+            if config.require.is_some() {
+                return Err(AdapterError::UnsupportedFeature(
+                    "header match".into(),
+                    "a `match { … }` inside a `handle_response` subroute would be judged \
+                     against the subroute's own response, which this build does not \
+                     implement. Move the gated block to the site level, or drop the `match`."
+                        .into(),
+                ));
+            }
             Ok(pingclair_core::config::HandlerConfig::Headers {
                 set: config.set,
                 add: config.add,
@@ -1940,6 +1955,7 @@ fn adapt_response_handler(
                 // 🔁 The response-subroute form takes set/add/remove only.
                 replace: Vec::new(),
                 default_set: std::collections::BTreeMap::new(),
+                require: None,
             })
         }
         "error" => {

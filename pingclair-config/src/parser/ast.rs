@@ -1139,6 +1139,13 @@ pub struct HeadersConfig {
     pub replace: Vec<pingclair_core::config::HeaderReplacement>,
     /// ❓ Values written only if the response does not already carry them.
     pub default_set: BTreeMap<String, String>,
+    /// 🧭 A response matcher written as `match { … }` inside the block.
+    ///
+    /// One per block, gating every operation in it — not one per group of
+    /// operations. Caddy keeps it as a single `Require` field beside the
+    /// operations, which is why a `match` written in the middle of a block
+    /// still gates the lines above it.
+    pub require: Option<pingclair_core::config::ResponseMatcher>,
 }
 
 /// 📥 One route's handling of its request body: a bound, deadlines, or a
