@@ -931,6 +931,11 @@ pub(crate) struct ResponseSink {
     /// ⏱️ Microseconds from request start to the first response event, or 0
     /// when nothing was ever sent.
     first_byte_us: std::sync::atomic::AtomicU64,
+    /// 🏷️ Why the latest upstream attempt failed, as a `ProxyError`
+    /// discriminant, or 0 when it has not. Read only by the generated error
+    /// response, so a `Proxy-Status` field is tied to the failure that caused
+    /// it rather than to every error this stream could produce.
+    proxy_error: std::sync::atomic::AtomicU8,
 }
 
 impl ResponseSink {
@@ -941,7 +946,29 @@ impl ResponseSink {
             status: std::sync::atomic::AtomicU16::new(0),
             body_bytes: std::sync::atomic::AtomicU64::new(0),
             first_byte_us: std::sync::atomic::AtomicU64::new(0),
+            proxy_error: std::sync::atomic::AtomicU8::new(0),
         }
+    }
+
+    /// 🏷️ Records why an upstream exchange failed, for `Proxy-Status`.
+    fn note_upstream_failure(&self, error: &pingora_core::Error) {
+        let error = crate::proxy_status::ProxyError::from_upstream_error(error);
+        self.proxy_error
+            .store(error as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 🧹 Forgets an earlier attempt's failure once a later attempt
+    /// connects, so an error unrelated to the next hop is not blamed on it.
+    fn clear_upstream_failure(&self) {
+        self.proxy_error
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 🏷️ The recorded upstream failure, if any.
+    fn upstream_failure(&self) -> Option<crate::proxy_status::ProxyError> {
+        crate::proxy_status::ProxyError::from_u8(
+            self.proxy_error.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// ⏱️ Stamps the first byte, if this is the first thing to leave.
@@ -5055,7 +5082,14 @@ async fn reverse_proxy_upstream(
         };
 
         let (mut session, _reused) = match connector.get_http_session(&peer).await {
-            Ok(result) => result,
+            Ok(result) => {
+                // 🧹 This attempt reached its backend, so an earlier attempt's
+                // failure no longer explains how the request ends. Cleared
+                // here rather than at the top of the loop: a retry that finds
+                // no backend left must still report why the last one failed.
+                resp_tx.clear_upstream_failure();
+                result
+            }
             Err(error) => {
                 if let Some(admission) = &mut admission {
                     admission.report_failure();
@@ -5065,6 +5099,7 @@ async fn reverse_proxy_upstream(
                     error = %error,
                     "🔌 H3 upstream connection attempt failed"
                 );
+                resp_tx.note_upstream_failure(&error);
                 // 🩺 Same policy as H1/H2, from the same function, because
                 // these two paths reach the identical error: H3 dials through
                 // Pingora's connector too, so a local `EMFILE` arrives here as
@@ -5304,6 +5339,7 @@ async fn reverse_proxy_upstream(
             .await
             .map_err(|error| {
                 tracing::error!("❌ H3 upstream write header failed: {}", error);
+                resp_tx.note_upstream_failure(&error);
                 (502, "Upstream Write Failed")
             })?;
 
@@ -5365,6 +5401,7 @@ async fn reverse_proxy_upstream(
             let Some(chunk) = outgoing else { continue };
             if let Err(error) = session.write_request_body(chunk, false).await {
                 tracing::error!("❌ H3 upstream write body failed: {}", error);
+                resp_tx.note_upstream_failure(&error);
                 session.shutdown().await;
                 return Err((502, "Upstream Write Failed"));
             }
@@ -5374,6 +5411,7 @@ async fn reverse_proxy_upstream(
             && let Err(error) = session.write_request_body(chunk, false).await
         {
             tracing::error!("❌ H3 upstream write buffered body failed: {}", error);
+            resp_tx.note_upstream_failure(&error);
             session.shutdown().await;
             return Err((502, "Upstream Write Failed"));
         }
@@ -5392,6 +5430,7 @@ async fn reverse_proxy_upstream(
 
         if let Err(error) = session.finish_request_body().await {
             tracing::error!("❌ H3 upstream finish body failed: {}", error);
+            resp_tx.note_upstream_failure(&error);
             session.shutdown().await;
             return Err((502, "Upstream Write Failed"));
         }
@@ -5413,6 +5452,7 @@ async fn reverse_proxy_upstream(
         let upstream_status = loop {
             if let Err(error) = session.read_response_header().await {
                 tracing::error!("❌ H3 upstream read response header failed: {}", error);
+                resp_tx.note_upstream_failure(&error);
                 session.shutdown().await;
                 if retry_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                     return Err((504, "Upstream Retry Timeout"));
@@ -6457,6 +6497,18 @@ async fn send_error_response(
         quiche::h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
     ];
     apply_h3_response_policy(&mut headers, policy, request_id, state);
+    // 🏷️ After the site policy, as on H1/H2, so a `header` rule cannot strip
+    // the one field that says this error is this hop's own. Only on a gateway
+    // status: a 408 or 413 raised after a failed attempt is about the client,
+    // and blaming the earlier attempt for it would be false.
+    if (502..=504).contains(&status)
+        && let Some(error) = resp_tx.upstream_failure()
+    {
+        headers.push(quiche::h3::Header::new(
+            crate::proxy_status::HEADER_NAME.as_bytes(),
+            error.header_value().as_bytes(),
+        ));
+    }
     send_headers(resp_tx, stream_id, headers, body.is_empty()).await;
     if !body.is_empty() {
         send_body(resp_tx, stream_id, body, true).await;

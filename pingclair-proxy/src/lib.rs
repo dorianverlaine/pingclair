@@ -31,6 +31,7 @@ pub mod load_balancer;
 pub mod metrics;
 pub mod overload;
 pub mod proxy_protocol;
+mod proxy_status;
 pub mod quic;
 pub mod rate_limit;
 pub mod readiness;

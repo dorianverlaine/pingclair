@@ -20,6 +20,18 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🏷️ A gateway error this proxy wrote says so with `Proxy-Status`
+
+A 502 or 504 that Pingclair generated because it could not get an answer
+from a backend looked exactly like one the backend sent itself. Those
+responses now carry an RFC 9209 `Proxy-Status` field, such as
+`Proxy-Status: pingclair; error=connection_refused`, on HTTP/1.1, HTTP/2
+and HTTP/3. The member name is the fixed token `pingclair`, and only the
+error type is included: no backend address and no OS error text, because
+those would describe internal topology to any client. Responses forwarded
+from a backend, including its own 502s, are unchanged, and so are local
+responses that involve no backend, such as `respond` or a rate-limit 429.
+
 ### 🚫 An addressed `servers` block may only carry `metrics`
 
 `servers :80 { … }` names one listener, but its options were applied to

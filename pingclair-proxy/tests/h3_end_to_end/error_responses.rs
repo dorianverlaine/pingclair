@@ -51,3 +51,32 @@ async fn h3_rate_limit_rejection_carries_a_body() {
         rejected.headers
     );
 }
+
+/// 🏷️ A refused backend's 502 over HTTP/3 names this hop and the cause
+/// (RFC 9209 `Proxy-Status`), exactly as HTTP/1.1 and HTTP/2 do, while a
+/// local rejection with no next hop involved carries no member.
+#[tokio::test]
+async fn h3_refused_backend_502_carries_proxy_status() {
+    // 🚪 Bound and dropped, so `connect()` meets `ECONNREFUSED`.
+    let dead_address = {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        listener.local_addr().unwrap()
+    };
+    let server = spawn_h3_site(&format!(
+        ":443 {{\n handle /proxied* {{\n reverse_proxy http://{dead_address}\n }}\n respond \"local\" 404\n}}"
+    ))
+    .await;
+
+    let refused = h3_get(server, "/proxied").await.unwrap();
+    assert_eq!(
+        (refused.status, field(&refused, "proxy-status")),
+        (502, Some("pingclair; error=connection_refused")),
+        "headers: {:?}",
+        refused.headers
+    );
+
+    let local = h3_get(server, "/elsewhere").await.unwrap();
+    assert_eq!((local.status, field(&local, "proxy-status")), (404, None));
+}

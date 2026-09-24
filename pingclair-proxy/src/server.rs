@@ -209,6 +209,12 @@ pub struct RequestContext {
     /// `error_page` is configured — for a 431, which field was too large.
     /// Unlike `error_message` it never replaces the operator's page.
     pub error_detail: Option<std::borrow::Cow<'static, str>>,
+    /// 🏷️ Why the latest upstream attempt failed. Recorded by
+    /// `fail_to_connect` and `error_while_proxy`, cleared once an attempt
+    /// connects, and settled by `fail_to_proxy`; only the error page that
+    /// hook writes consumes it, so `Proxy-Status` never lands on an ordinary
+    /// local response.
+    pub(crate) proxy_error: Option<crate::proxy_status::ProxyError>,
     /// 🧰 Request-scoped variables set by `vars` handlers.
     pub request_vars: crate::http_policy::RequestVars,
     /// 🧭 Response handlers registered by an `intercept` handler for this
@@ -294,6 +300,7 @@ impl Default for RequestContext {
             error_status: None,
             error_message: None,
             error_detail: None,
+            proxy_error: None,
             request_vars: crate::http_policy::RequestVars::default(),
             intercept_handlers: Vec::new(),
             intercepted_response: None,
@@ -4012,11 +4019,26 @@ impl PingclairProxy {
             .insert_header("Content-Length", body.len().to_string())
             .unwrap();
         Self::apply_local_response_headers(&mut response, ctx)?;
+        Self::insert_proxy_status(&mut response, ctx);
         session
             .write_response_header(Box::new(response), false)
             .await?;
         Self::write_local_body(session, ctx, Bytes::copy_from_slice(body.as_bytes()), true).await?;
         Ok(())
+    }
+
+    /// 🏷️ Marks a generated error as this hop's own (RFC 9209), when
+    /// `fail_to_proxy` settled why the upstream exchange failed.
+    ///
+    /// Taken rather than read, so the field is written at most once, and
+    /// inserted after the site's header policy so a `header` directive cannot
+    /// make an origin failure look like a forwarded answer.
+    fn insert_proxy_status(response: &mut ResponseHeader, ctx: &mut RequestContext) {
+        if let Some(error) = ctx.proxy_error.take() {
+            response
+                .insert_header(crate::proxy_status::HEADER_NAME, error.header_value())
+                .ok();
+        }
     }
 
     /// Build a downstream response header using the cheapest case strategy.
@@ -4357,6 +4379,7 @@ impl PingclairProxy {
                 .insert_header("Content-Length", content.len().to_string())
                 .unwrap();
             Self::apply_local_response_headers(&mut response, ctx)?;
+            Self::insert_proxy_status(&mut response, ctx);
             session
                 .write_response_header(Box::new(response), false)
                 .await?;
@@ -7507,6 +7530,9 @@ impl ProxyHttp for PingclairProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // 🧹 This attempt reached its backend, so an earlier attempt's
+        // failure no longer explains how the request ends.
+        ctx.proxy_error = None;
         // 🔗 Every `new` is a TCP handshake, plus a TLS negotiation for
         // secure upstreams. The ratio against `reused` shows a keepalive pool
         // that is too small long before it shows up as latency. A fixed
@@ -8153,6 +8179,10 @@ impl ProxyHttp for PingclairProxy {
             pingora_core::ErrorType::ConnectTimedout
                 | pingora_core::ErrorType::TLSHandshakeTimedout
         );
+        // 🏷️ Remembered for `Proxy-Status`: when this was the only backend,
+        // the retry that follows ends in a bare "no upstream available", and
+        // this is the last place that still knows the backend refused.
+        ctx.proxy_error = Some(crate::proxy_status::ProxyError::from_upstream_error(&e));
         // 🩺 A connect failure this process caused says nothing about the
         // backend. Descriptor exhaustion fails `socket()` before a packet
         // leaves the machine, so the backend is healthy, idle, and unaware —
@@ -8225,6 +8255,9 @@ impl ProxyHttp for PingclairProxy {
         if let Some(mut admission) = ctx.upstream_admission.take() {
             admission.report_failure();
         }
+        // 🏷️ The same memory as in `fail_to_connect`, for a failure after
+        // the connection was made.
+        ctx.proxy_error = Some(crate::proxy_status::ProxyError::from_upstream_error(&e));
         let elapsed = ctx.start_time.elapsed();
         log_at_level!(
             failure_severity(&e),
@@ -8369,6 +8402,21 @@ impl ProxyHttp for PingclairProxy {
                     ErrorSource::Internal | ErrorSource::Unset => 500,
                 },
             }
+        };
+        // 🏷️ `Proxy-Status` goes only on an error this hop generated because
+        // the next hop failed: an upstream-sourced error, or the gateway
+        // status a retry ends with after an attempt already recorded why
+        // (`fail_to_connect`, `error_while_proxy`). Anything else — a deadline
+        // 408, a downstream fault, a handler's own status — is cleared, so a
+        // stale attempt is never blamed for it.
+        ctx.proxy_error = match (e.esource(), e.etype()) {
+            _ if code == 408 => None,
+            (ErrorSource::Upstream, ErrorType::HTTPStatus(_)) => ctx.proxy_error,
+            (ErrorSource::Upstream, _) => {
+                Some(crate::proxy_status::ProxyError::from_upstream_error(e))
+            }
+            (_, ErrorType::HTTPStatus(502..=504)) => ctx.proxy_error,
+            _ => None,
         };
         let served = if already_responded {
             // 🔪 The original response is already on the wire, so an error

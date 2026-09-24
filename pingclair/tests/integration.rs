@@ -78,6 +78,10 @@ mod site_middleware;
 #[path = "integration/forward_auth_tls.rs"]
 mod forward_auth_tls;
 
+// 🏷️ Which errors say they were generated here (RFC 9209 `Proxy-Status`).
+#[path = "integration/proxy_status.rs"]
+mod proxy_status;
+
 // 🔐 What the admin API's 401 tells a client about how to authenticate.
 #[path = "integration/admin_challenge.rs"]
 mod admin_challenge;
