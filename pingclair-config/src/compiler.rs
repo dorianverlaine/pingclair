@@ -2978,6 +2978,11 @@ fn compile_handler(
 
         Handler::RequestBody(config) => Ok(HandlerConfig::RequestBody {
             max_size: config.max_size,
+            read_timeout_ms: config.read_timeout_ms,
+            write_timeout_ms: config.write_timeout_ms,
+            // 📌 Compiled once at load, never per request, so the clone costs
+            // nothing that matters; the AST is borrowed for the whole walk.
+            set: config.set.clone(),
         }),
 
         Handler::Abort => Ok(HandlerConfig::Abort),

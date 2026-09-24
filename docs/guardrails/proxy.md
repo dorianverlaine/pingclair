@@ -224,6 +224,24 @@ gzip), both caused by buffering a body whole.
 > inserting a second writer breaks chunked framing — in a way no test would catch
 > reliably.
 
+> 🧾 **Replacing a request body discards the client's, it does not read it.**
+> `request_body { set … }` (2026-09-24) discards each chunk as it arrives and
+> sends the configured replacement as the final chunk, so a 20 MB upload
+> replaced by `set "tiny"` costs four bytes of upstream body and no buffer at
+> all. The tempting implementation — read the body, then swap it — is the same
+> full-body-buffering bug this section is about, wearing a new directive's
+> clothes. The one thing the direction costs is that the client's declared
+> `Content-Length` has to be rewritten in `upstream_request_filter`
+> (`pingclair-proxy/src/server.rs`); forwarding the client's length while
+> sending other bytes hangs the origin, and no test on a small body would show
+> it.
+
+> 🪤 **A replaced body has to be released on the call that *ends* the stream,
+> not the first one.** Pingora computes `end_of_body || data.is_none()`
+> *before* and *after* `request_body_filter`, so a replacement emitted on the
+> first call lands ahead of the client's remaining body instead of in its
+> place. Withhold with an empty `Bytes` until the stream ends — the rule above.
+
 ---
 
 ## 🩺 Upstream health: only a remote failure may mark a backend unhealthy

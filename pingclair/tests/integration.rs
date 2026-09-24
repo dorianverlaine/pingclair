@@ -15261,3 +15261,10 @@ mod compression_gate;
 // `servers { listener_wrappers { … } }` and `ocsp_stapling off`.
 #[path = "integration/listener_wrappers.rs"]
 mod listener_wrappers;
+
+// MARK: - Request body handling
+
+// 📥 What a route's `request_body` does to the request, asserted at the origin:
+// the replacement's bytes, its declared length, and how long a stall is allowed.
+#[path = "integration/request_body_plan.rs"]
+mod request_body_plan;

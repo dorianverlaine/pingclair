@@ -1669,6 +1669,18 @@ pub enum HandlerConfig {
         /// Maximum body size in bytes. `None` leaves the site's limit alone.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_size: Option<u64>,
+        /// Deadline for reading the request body, in milliseconds. `None`
+        /// leaves it to the site's `limits`, which is what bounds it today.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        read_timeout_ms: Option<u64>,
+        /// Deadline for writing the response, in milliseconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        write_timeout_ms: Option<u64>,
+        /// Replacement body template. Placeholders are expanded per request; an
+        /// empty string is not a replacement, which is why this is `Option` and
+        /// an empty value is normalised away by the adapter.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        set: Option<String>,
     },
 
     /// Respond with static content

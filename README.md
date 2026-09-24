@@ -509,6 +509,17 @@ which is what Caddy does. A site that wants a limit writes
 unlimited. A body over a
 configured limit is refused with `413` on the chunk that crosses it.
 
+The same block carries the other three options Caddy gives it.
+`read_timeout` and `write_timeout` bound reading the body and writing the
+response for that route; a stalled upload is answered with `408` once the
+read deadline passes, instead of holding the connection until the client
+gives up. `set "<body>"` replaces the request body outright — placeholders in
+the value are expanded for the request, and the length sent upstream is the
+replacement's. The replaced bytes are discarded as they arrive rather than
+read into memory, so a 20 MB upload replaced by `set "tiny"` costs four bytes
+of upstream body and no buffer, and the site's body limit still bounds what
+the client may send.
+
 Exceeded header, body, and request budgets receive an explicit HTTP error when
 the protocol can still send one; idle transports and excess HTTP/2 or HTTP/3
 connections are closed. Pingora 0.9.0 exposes one upstream read timer for H1/H2,

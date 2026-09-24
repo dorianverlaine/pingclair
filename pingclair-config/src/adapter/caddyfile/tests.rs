@@ -2854,7 +2854,8 @@ mod fail_closed_tests {
             matches!(
                 handler,
                 HandlerConfig::RequestBody {
-                    max_size: Some(1_000_000)
+                    max_size: Some(1_000_000),
+                    ..
                 }
             )
         });
@@ -2871,24 +2872,104 @@ mod fail_closed_tests {
             matches!(
                 handler,
                 HandlerConfig::RequestBody {
-                    max_size: Some(1_048_576)
+                    max_size: Some(1_048_576),
+                    ..
                 }
             )
         });
         assert!(found, "`max_size 1MiB` is 1,048,576 bytes");
     }
 
+    /// ⏱️ The two deadlines and the replacement parse into the handler.
+    ///
+    /// 🤡 These three used to be refused by name — `request_body
+    /// read_timeout` and friends — so every configuration that used them
+    /// failed to load here while Caddy served it. Each is asserted with the
+    /// value the format spells, because "it parsed" is not the property that
+    /// was missing: the value reaching the handler is.
     #[test]
-    fn request_body_names_the_options_it_does_not_implement() {
-        for option in ["read_timeout 5s", "write_timeout 5s", "set hello"] {
-            let error = compile_err(&format!(
-                "example.com {{\n request_body {{\n {option}\n }}\n}}"
-            ));
-            assert!(
-                error.contains("request_body"),
-                "`{option}` must be named, not dropped; got {error}"
-            );
-        }
+    fn request_body_deadlines_and_replacement_reach_the_handler() {
+        let config = crate::compile(
+            "example.com {\n    request_body {\n        read_timeout 5s\n        \
+             write_timeout 1500ms\n        set \"hello\"\n    }\n}",
+        )
+        .unwrap();
+        let route = &config.servers[0].routes[0];
+        let found = handlers_of(&route.handler).into_iter().any(|handler| {
+            matches!(
+                handler,
+                HandlerConfig::RequestBody {
+                    read_timeout_ms: Some(5_000),
+                    write_timeout_ms: Some(1_500),
+                    set: Some(replacement),
+                    ..
+                } if replacement == "hello"
+            )
+        });
+        assert!(
+            found,
+            "`read_timeout 5s`, `write_timeout 1500ms` and `set \"hello\"` must all \
+             reach the handler with their values"
+        );
+    }
+
+    /// 🧾 An empty replacement is the absence of one, which is what Caddy's
+    /// `Set != ""` gate means.
+    #[test]
+    fn an_empty_request_body_replacement_is_no_replacement() {
+        let config =
+            crate::compile("example.com {\n    request_body {\n        set \"\"\n    }\n}")
+                .unwrap();
+        let route = &config.servers[0].routes[0];
+        let found = handlers_of(&route.handler).into_iter().any(|handler| {
+            matches!(
+                handler,
+                HandlerConfig::RequestBody {
+                    set: None,
+                    read_timeout_ms: None,
+                    write_timeout_ms: None,
+                    ..
+                }
+            )
+        });
+        assert!(
+            found,
+            "`set \"\"` must compile to the same thing as leaving `set` out"
+        );
+    }
+
+    /// 🧾 An empty `request_body` block is a handler that does nothing, which
+    /// is what Caddy adapts it to — so it loads rather than failing the route.
+    #[test]
+    fn an_empty_request_body_block_loads_as_a_no_op() {
+        let config = crate::compile("example.com {\n    request_body {\n    }\n}").unwrap();
+        let route = &config.servers[0].routes[0];
+        let found = handlers_of(&route.handler).into_iter().any(|handler| {
+            matches!(
+                handler,
+                HandlerConfig::RequestBody {
+                    max_size: None,
+                    read_timeout_ms: None,
+                    write_timeout_ms: None,
+                    set: None,
+                }
+            )
+        });
+        assert!(
+            found,
+            "an empty block adapts to a `request_body` that does nothing"
+        );
+    }
+
+    /// 🚫 A misspelled subdirective is unknown, not silently ignored.
+    #[test]
+    fn request_body_unknown_subdirectives_are_refused() {
+        let error =
+            compile_err("example.com {\n    request_body {\n        max_bytes 1MB\n    }\n}");
+        assert!(
+            error.contains("request_body"),
+            "the unknown name must be reported against `request_body`; got {error}"
+        );
     }
 
     /// 🔪 `abort` takes nothing at all.

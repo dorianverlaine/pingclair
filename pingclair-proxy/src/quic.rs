@@ -2575,10 +2575,10 @@ async fn h3_raise_status(
         request_vars,
         response_handlers,
         // 📥 An error route runs after the request body is finished with, so a
-        // `request_body` handler inside one has nothing left to bound. The
-        // limit it would set is discarded rather than leaking back into the
-        // request that raised the status.
-        &mut None,
+        // `request_body` handler inside one has nothing left to bound or
+        // replace. What it decides is discarded rather than leaking back into
+        // the request that raised the status.
+        &mut RequestBodyPlan::default(),
     )
     .await
 }
@@ -2600,9 +2600,8 @@ async fn plan_h3_handler_with_connector(
     handling_error: bool,
     request_vars: &mut crate::http_policy::RequestVars,
     response_handlers: &mut Option<Vec<pingclair_core::config::ResponseHandlerConfig>>,
-    // 📥 Raised by a `request_body` handler for this request only; `None`
-    // leaves the site's `client_max_body_size` in charge.
-    request_body_limit: &mut Option<u64>,
+    // 📥 What this request's `request_body` handlers decided, if any ran.
+    body_plan: &mut RequestBodyPlan,
 ) -> Result<H3Plan, HandlerError> {
     match handler {
         HandlerConfig::Pipeline { handlers } => {
@@ -2656,7 +2655,7 @@ async fn plan_h3_handler_with_connector(
                     handling_error,
                     request_vars,
                     response_handlers,
-                    request_body_limit,
+                    body_plan,
                 )
                 .await?
                 {
@@ -2718,7 +2717,7 @@ async fn plan_h3_handler_with_connector(
                     handling_error,
                     request_vars,
                     response_handlers,
-                    request_body_limit,
+                    body_plan,
                 )
                 .await;
             }
@@ -2787,7 +2786,7 @@ async fn plan_h3_handler_with_connector(
                     handling_error,
                     request_vars,
                     response_handlers,
-                    request_body_limit,
+                    body_plan,
                 )
                 .await;
             }
@@ -2903,9 +2902,27 @@ async fn plan_h3_handler_with_connector(
             }
             Ok(H3Plan::Continue)
         }
-        HandlerConfig::RequestBody { max_size } => {
+        HandlerConfig::RequestBody {
+            max_size,
+            read_timeout_ms,
+            write_timeout_ms,
+            set,
+        } => {
             if let Some(limit) = max_size {
-                *request_body_limit = Some(*limit);
+                body_plan.limit = Some(*limit);
+            }
+            if let Some(millis) = read_timeout_ms {
+                body_plan.read_timeout_ms = Some(*millis);
+            }
+            if let Some(millis) = write_timeout_ms {
+                body_plan.write_timeout_ms = Some(*millis);
+            }
+            if let Some(template) = set {
+                // 🧾 The template stays unresolved here: this function has the
+                // request header but the replacement is used after planning
+                // finishes, where the request vars are final. See
+                // `handle_request_inner`.
+                body_plan.set_template = Some(template.clone());
             }
             Ok(H3Plan::Continue)
         }
@@ -3147,7 +3164,7 @@ async fn plan_h3_handler_with_connector(
                         true,
                         request_vars,
                         response_handlers,
-                        request_body_limit,
+                        body_plan,
                     )
                     .await?;
                     return Ok(match plan {
@@ -3271,7 +3288,7 @@ async fn plan_h3_handler_with_connector(
                         handling_error,
                         request_vars,
                         response_handlers,
-                        request_body_limit,
+                        body_plan,
                     )
                     .await
                 }
@@ -3301,9 +3318,8 @@ async fn plan_h3_handler(
     handling_error: bool,
     request_vars: &mut crate::http_policy::RequestVars,
     response_handlers: &mut Option<Vec<pingclair_core::config::ResponseHandlerConfig>>,
-    // 📥 Raised by a `request_body` handler for this request only; `None`
-    // leaves the site's `client_max_body_size` in charge.
-    request_body_limit: &mut Option<u64>,
+    // 📥 What this request's `request_body` handlers decided, if any ran.
+    body_plan: &mut RequestBodyPlan,
 ) -> Result<H3Plan, HandlerError> {
     plan_h3_handler_with_connector(
         handler,
@@ -3327,9 +3343,33 @@ async fn plan_h3_handler(
         handling_error,
         request_vars,
         response_handlers,
-        request_body_limit,
+        body_plan,
     )
     .await
+}
+
+/// 📥 What the `request_body` handlers that actually ran decided for one
+/// request.
+///
+/// One value rather than four threaded parameters: the handlers are walked
+/// recursively, so each field is "whichever matching block ran last wins", and
+/// keeping them together is what makes that order visible. `None` everywhere
+/// means no `request_body` handler ran, which is the common case and leaves the
+/// site's `limits` in charge.
+#[derive(Default)]
+struct RequestBodyPlan {
+    /// Per-request override of the site's `client_max_body_size`.
+    limit: Option<u64>,
+    /// Deadline for reading the body. Honoured on the H3 path as the body-read
+    /// timeout, which is the transport's only place a deadline can land —
+    /// QUIC has no socket write deadline for `write_timeout` to set.
+    read_timeout_ms: Option<u64>,
+    /// Deadline for writing the response. Accepted and carried, so the plan is
+    /// the whole decision, but H3 has no per-stream write deadline to arm.
+    write_timeout_ms: Option<u64>,
+    /// Replacement body template, unresolved because placeholders need the
+    /// request vars to be final.
+    set_template: Option<String>,
 }
 
 /// 🛑 Waits for an explicit abort while allowing normal sender cleanup to finish.
@@ -3759,7 +3799,7 @@ async fn handle_request_inner(
         .compiled_route(route_index)
         .map(|route| &route.matcher_precompile);
     let mut response_handlers = None;
-    let mut request_body_limit = None;
+    let mut body_plan = RequestBodyPlan::default();
     let plan = plan_h3_handler_with_connector(
         handler,
         &state,
@@ -3774,13 +3814,49 @@ async fn handle_request_inner(
         false,
         &mut request_vars,
         &mut response_handlers,
-        &mut request_body_limit,
+        &mut body_plan,
     )
     .await?;
 
     // 📥 Planning is done, so whichever `request_body` handler actually ran
-    // has had its say. Everything that reads the body from here on uses this.
-    let body_limit = request_body_limit.unwrap_or(site_body_limit);
+    // has had its say. Everything that reads the body from here on uses these.
+    let body_limit = body_plan.limit.unwrap_or(site_body_limit);
+    let body_timeout_ms = body_plan
+        .read_timeout_ms
+        .or(state.config.limits.body_timeout_ms);
+
+    // 🧾 A `request_body { set … }` handler replaces the body, so the rest of
+    // this function reads from a channel that yields the configured string
+    // instead of the connection's bytes. Swapping the *source* here — rather
+    // than teaching each consumer about a replacement — is what keeps the
+    // streaming property: every consumer downstream still pulls from a bounded
+    // channel, the replacement is one small configured string, and the only
+    // price is that the client's own bytes are never read.
+    //
+    // 📌 Not reading them is deliberate, and is the one place this differs from
+    // Caddy: Caddy discards up to 256 KiB of the original body after the
+    // response and then closes the connection. QUIC flow control makes the same
+    // thing happen here for free — the body channel fills, the event loop stops
+    // draining quiche, and the peer is pushed back on.
+    let mut replacement_rx = None;
+    if let Some(template) = body_plan.set_template.as_deref() {
+        let resolved = resolve_caddy_placeholders(
+            template,
+            &header,
+            Some(&verified_client_ip_text),
+            "https",
+            &request_vars,
+        );
+        let (tx, rx) = mpsc::channel::<Bytes>(1);
+        // 🔔 Capacity 1 holds exactly the one chunk, so this cannot block, and
+        // dropping `tx` at the end of this scope closes the stream after it.
+        let _ = tx.try_send(Bytes::from(resolved.into_owned()));
+        replacement_rx = Some(rx);
+    }
+    let body_rx = match replacement_rx.as_mut() {
+        Some(rx) => rx,
+        None => body_rx,
+    };
 
     let request_deadline = state
         .config
@@ -3825,7 +3901,7 @@ async fn handle_request_inner(
             body_rx,
             body_notify,
             body_limit,
-            state.config.limits.body_timeout_ms,
+            body_timeout_ms,
             state.config.limits.upload_bytes_per_sec,
             request_deadline,
         )
@@ -4216,6 +4292,7 @@ async fn handle_request_inner(
                 request_id,
                 response_policy,
                 body_limit,
+                body_timeout_ms,
                 stream_id,
                 body_rx,
                 resp_tx,
@@ -4240,6 +4317,7 @@ async fn handle_request_inner(
                 request_id,
                 response_policy,
                 body_limit,
+                body_timeout_ms,
                 stream_id,
                 body_rx,
                 resp_tx,
@@ -4529,6 +4607,7 @@ async fn fastcgi_upstream(
     request_id: &str,
     response_policy: &ResponseHeaderPolicy,
     body_limit: u64,
+    body_timeout_ms: Option<u64>,
     stream_id: u64,
     body_rx: &mut mpsc::Receiver<Bytes>,
     resp_tx: &ResponseSink,
@@ -4666,7 +4745,7 @@ async fn fastcgi_upstream(
     let mut request_buffer = buffering.request.map(crate::body_buffer::BufferedBody::new);
     if !bodyless {
         loop {
-            let next = match limits.body_timeout_ms {
+            let next = match body_timeout_ms {
                 Some(timeout_ms) => {
                     tokio::time::timeout(Duration::from_millis(timeout_ms), body_rx.recv())
                         .await
@@ -4977,6 +5056,7 @@ async fn reverse_proxy_upstream(
     request_id: &str,
     response_policy: &ResponseHeaderPolicy,
     body_limit: u64,
+    body_timeout_ms: Option<u64>,
     stream_id: u64,
     body_rx: &mut mpsc::Receiver<Bytes>,
     resp_tx: &ResponseSink,
@@ -5435,7 +5515,7 @@ async fn reverse_proxy_upstream(
             .request
             .map(crate::body_buffer::BufferedBody::new);
         loop {
-            let next = match limits.body_timeout_ms {
+            let next = match body_timeout_ms {
                 Some(timeout_ms) => {
                     tokio::time::timeout(Duration::from_millis(timeout_ms), body_rx.recv())
                         .await
@@ -7423,6 +7503,7 @@ mod tests {
             "retry-request-id",
             &ResponseHeaderPolicy::default(),
             0,
+            None,
             0,
             &mut body_rx,
             &resp_tx,
@@ -7545,6 +7626,7 @@ mod tests {
             "response-file-request-id",
             &response_policy,
             0,
+            None,
             0,
             &mut body_rx,
             &resp_tx,
@@ -7656,6 +7738,7 @@ mod tests {
             "test-request-id",
             &ResponseHeaderPolicy::default(),
             0,
+            None,
             0,
             &mut body_rx,
             &resp_tx,
@@ -7744,6 +7827,7 @@ mod tests {
             "circuit-request-id",
             &ResponseHeaderPolicy::default(),
             0,
+            None,
             0,
             &mut body_rx,
             &resp_tx,
@@ -7774,6 +7858,7 @@ mod tests {
             "circuit-request-id",
             &ResponseHeaderPolicy::default(),
             0,
+            None,
             4,
             &mut body_rx,
             &resp_tx,
@@ -7866,6 +7951,7 @@ mod tests {
             "test-request-id",
             &ResponseHeaderPolicy::default(),
             0,
+            None,
             0,
             &mut body_rx,
             &resp_tx,
@@ -7950,7 +8036,7 @@ mod tests {
             false,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
-            &mut None,
+            &mut RequestBodyPlan::default(),
         )
         .await
         .unwrap();
@@ -8011,7 +8097,7 @@ mod tests {
             false,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
-            &mut None,
+            &mut RequestBodyPlan::default(),
         )
         .await
         .unwrap();
@@ -8053,7 +8139,7 @@ mod tests {
             false,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
-            &mut None,
+            &mut RequestBodyPlan::default(),
         )
         .await
         .unwrap();
@@ -8105,7 +8191,7 @@ mod tests {
             false,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
-            &mut None,
+            &mut RequestBodyPlan::default(),
         )
         .await
         .unwrap();
@@ -8146,7 +8232,7 @@ mod tests {
             false,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
-            &mut None,
+            &mut RequestBodyPlan::default(),
         )
         .await
         .unwrap();
@@ -8192,7 +8278,7 @@ mod tests {
             false,
             &mut crate::http_policy::RequestVars::default(),
             &mut registered,
-            &mut None,
+            &mut RequestBodyPlan::default(),
         )
         .await
         .unwrap();
@@ -8296,7 +8382,7 @@ mod tests {
             false,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
-            &mut None,
+            &mut RequestBodyPlan::default(),
         )
         .await
         .unwrap();
@@ -8336,7 +8422,7 @@ mod tests {
             false,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
-            &mut None,
+            &mut RequestBodyPlan::default(),
         )
         .await
         .unwrap();
@@ -8391,7 +8477,7 @@ mod tests {
             false,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
-            &mut None,
+            &mut RequestBodyPlan::default(),
         )
         .await
         .unwrap();
@@ -8415,7 +8501,7 @@ mod tests {
             false,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
-            &mut None,
+            &mut RequestBodyPlan::default(),
         )
         .await
         .unwrap();

@@ -102,6 +102,26 @@ or the image's `:latest` tag, which an rc used to move as well. The channels
 and the procedure for cutting a release are in `CONTRIBUTING.md` under
 "Releasing".
 
+### 📥 All four `request_body` options are implemented
+
+`request_body` accepted only `max_size`; `read_timeout`, `write_timeout` and
+`set` were refused by name, so a configuration using them did not load at all.
+All three now work, on both HTTP/1.1–2 and HTTP/3.
+
+`read_timeout` and `write_timeout` bound reading the body and writing the
+response for that route. A stalled upload is answered with `408` once the
+deadline passes instead of holding the connection open. `set "<body>"` replaces
+the request body: placeholders in the value are expanded for the request, and
+the `Content-Length` sent upstream is the replacement's. The client's own bytes
+are discarded as they arrive rather than read into memory, so replacing a 20 MB
+upload costs the replacement's length in upstream body and no buffer. (#38)
+
+Two consequences worth knowing. A response to a body read or write deadline is
+now `408` rather than `500` — a client that stopped sending is the client's
+fault, and HTTP/3 already said so, so the two transports disagreed. And an
+empty `request_body { }` block, or `set ""`, now loads as a handler that does
+nothing, which is what Caddy adapts them to.
+
 ### 🔌 `remote_ip` matches the connection's peer, `client_ip` the client
 
 **Breaking for `remote_ip` behind `trusted_proxies`.** The two matchers now

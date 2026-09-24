@@ -264,6 +264,17 @@ pub struct RequestContext {
     /// 📥 Per-route override of the site's `client_max_body_size`, set by the
     /// `request_body` handler. `None` means the site's limit still applies.
     request_body_limit: Option<u64>,
+    /// 🧾 Replacement body from `request_body { set … }`, already resolved for
+    /// this request. While this is `Some`, the client's own bytes are discarded
+    /// as they arrive and this string is what the upstream receives: the
+    /// replacement is what the configuration wrote, so nothing in this path
+    /// grows with the size of the upload being replaced.
+    request_body_set: Option<Bytes>,
+    /// ⏱️ Per-route `request_body` deadlines in milliseconds, seeded from the
+    /// route's declaration before the first byte is read and overwritten with
+    /// the exact value when the handler runs.
+    request_body_read_timeout_ms: Option<u64>,
+    request_body_write_timeout_ms: Option<u64>,
     /// 🚦 Route execution slot retained until this request context is dropped.
     route_admission: Option<RouteAdmission>,
     /// 🔌 Selected backend capacity and circuit admission for the active attempt.
@@ -326,6 +337,9 @@ impl Default for RequestContext {
             retry_pending: false,
             retry_excluded: HashSet::new(),
             request_body_limit: None,
+            request_body_set: None,
+            request_body_read_timeout_ms: None,
+            request_body_write_timeout_ms: None,
             route_admission: None,
             upstream_admission: None,
             preadmitted_upstream: None,
@@ -1040,6 +1054,10 @@ pub struct ProxyState {
     route_regexes: Vec<HashMap<String, Arc<Regex>>>,
     /// 📥 Per route, the widest `request_body` limit it could grant.
     route_body_ceilings: Vec<Option<u64>>,
+    /// ⏱️ Per route, the longest `request_body` read and write deadlines it
+    /// declares. Resolved once here for the same reason as the ceiling above:
+    /// the local body drain runs before the handler that would set them.
+    route_body_timeouts: Vec<RouteBodyTimeouts>,
     /// 🧱 Per route, how many body bytes `request_buffers`/`response_buffers`
     /// hold before the rest streams. Resolved once here because the answer
     /// cannot differ between two requests on the same route, and because the
@@ -1521,6 +1539,7 @@ impl ProxyState {
         let mut access_controls = Vec::new();
         let mut route_regexes = Vec::new();
         let mut route_body_ceilings = Vec::new();
+        let mut route_body_timeouts = Vec::new();
         let mut route_buffering = Vec::new();
 
         for (route_index, route) in config.routes.iter().enumerate() {
@@ -1826,6 +1845,7 @@ impl ProxyState {
             collect_route_regexes(&route.handler, &mut compiled);
             route_regexes.push(compiled);
             route_body_ceilings.push(collect_request_body_ceiling(&route.handler));
+            route_body_timeouts.push(collect_request_body_timeouts(&route.handler));
             // 🧱 Found by the same recursive walk as every other proxy slot,
             // so a `reverse_proxy` nested inside `handle { … }` buffers too.
             route_buffering.push(
@@ -1937,6 +1957,7 @@ impl ProxyState {
             access_controls,
             route_regexes,
             route_body_ceilings,
+            route_body_timeouts,
             route_buffering,
             needs_original_uri_vars,
             log_targets,
@@ -2012,6 +2033,15 @@ impl ProxyState {
     /// check, which runs with the real limit.
     pub(crate) fn route_body_ceiling(&self, route_index: usize) -> Option<u64> {
         self.route_body_ceilings.get(route_index).copied().flatten()
+    }
+
+    /// ⏱️ This route's declared `request_body` deadlines, for the seed applied
+    /// before the first byte is read.
+    pub(crate) fn route_body_timeouts(&self, route_index: usize) -> RouteBodyTimeouts {
+        self.route_body_timeouts
+            .get(route_index)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// ⚡ One of this route's patterns, compiled when the configuration was
@@ -3129,6 +3159,7 @@ impl PingclairProxy {
         session: &mut Session,
         ctx: &mut RequestContext,
         state: &ProxyState,
+        route_index: Option<usize>,
     ) {
         let limits = &state.config.limits;
         ctx.request_deadline = limits
@@ -3138,14 +3169,34 @@ impl PingclairProxy {
         ctx.upload_pacer = limits.upload_bytes_per_sec.map(BandwidthPacer::new);
         ctx.download_pacer = limits.download_bytes_per_sec.map(BandwidthPacer::new);
 
-        let read_timeout = shortest_duration(
-            limits.body_timeout_ms.map(Duration::from_millis),
-            limits.idle_timeout_ms.map(Duration::from_millis),
-        );
+        // ⏱️ A route that declares `request_body { read_timeout … }` means it
+        // for every request on that route, so it has to be in force here — the
+        // locally answered body drain runs before dispatch, and a handler that
+        // ran later could not bound a read that already happened. The seed is
+        // the route's widest declaration; the handler overwrites it with the
+        // exact value, and re-arms the socket, when it actually runs.
+        let route_timeouts = route_index
+            .map(|index| state.route_body_timeouts(index))
+            .unwrap_or_default();
+        ctx.request_body_read_timeout_ms = route_timeouts.read_ms;
+        ctx.request_body_write_timeout_ms = route_timeouts.write_ms;
+
+        let read_timeout = route_timeouts
+            .read_ms
+            .map(Duration::from_millis)
+            .or_else(|| {
+                shortest_duration(
+                    limits.body_timeout_ms.map(Duration::from_millis),
+                    limits.idle_timeout_ms.map(Duration::from_millis),
+                )
+            });
         session.as_mut().set_read_timeout(read_timeout);
-        session
-            .as_mut()
-            .set_write_timeout(limits.idle_timeout_ms.map(Duration::from_millis));
+        session.as_mut().set_write_timeout(
+            route_timeouts
+                .write_ms
+                .map(Duration::from_millis)
+                .or_else(|| limits.idle_timeout_ms.map(Duration::from_millis)),
+        );
         session.as_mut().set_total_drain_timeout(read_timeout);
         session.as_mut().set_keepalive(Some(
             limits
@@ -5300,12 +5351,53 @@ impl PingclairProxy {
                 self.apply_request_headers(session, ctx, route_index, set, add, remove, replace)?;
                 Ok(false)
             }
-            HandlerConfig::RequestBody { max_size } => {
+            HandlerConfig::RequestBody {
+                max_size,
+                read_timeout_ms,
+                write_timeout_ms,
+                set,
+            } => {
                 // 📥 Recorded rather than enforced here: the body has not been
                 // read yet, and the places that do read it already know how to
                 // stop. Enforcing twice would mean two limits to keep in step.
                 if let Some(limit) = max_size {
                     ctx.request_body_limit = Some(*limit);
+                }
+                // ⏱️ Re-armed here with the exact value, because the seed that
+                // `initialize_request_limits` applied was the route's widest
+                // declaration and a matcher may have selected a narrower one.
+                if let Some(millis) = read_timeout_ms {
+                    ctx.request_body_read_timeout_ms = Some(*millis);
+                    session
+                        .as_mut()
+                        .set_read_timeout(Some(Duration::from_millis(*millis)));
+                    session
+                        .as_mut()
+                        .set_total_drain_timeout(Some(Duration::from_millis(*millis)));
+                }
+                if let Some(millis) = write_timeout_ms {
+                    ctx.request_body_write_timeout_ms = Some(*millis);
+                    session
+                        .as_mut()
+                        .set_write_timeout(Some(Duration::from_millis(*millis)));
+                }
+                // 🧾 `set` expands its placeholders once, here, where the
+                // request and the replacer are both in hand — the same shape
+                // and the same reason as a `header` value above. Caddy does the
+                // same at this point in its chain, so `{http.request.method}`
+                // inside the template means the method of *this* request.
+                if let Some(template) = set {
+                    // 🔒 Bound before the call so `ctx` is not borrowed while it
+                    // is read — the same shape the header handler uses.
+                    let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
+                    let resolved = resolve_caddy_placeholders(
+                        template,
+                        session.req_header(),
+                        verified_client_ip.as_deref(),
+                        ctx.request_scheme,
+                        &ctx.request_vars,
+                    );
+                    ctx.request_body_set = Some(Bytes::from(resolved.into_owned()));
                 }
                 Ok(false)
             }
@@ -6974,7 +7066,7 @@ impl ProxyHttp for PingclairProxy {
         ctx.request_scheme = request_scheme;
 
         if let Some(state) = ctx.state.clone() {
-            Self::initialize_request_limits(session, ctx, &state);
+            Self::initialize_request_limits(session, ctx, &state, route_index);
         }
 
         // Honor a client-supplied request ID so traces can be correlated
@@ -7211,6 +7303,35 @@ impl ProxyHttp for PingclairProxy {
     {
         if let Some(bytes) = body.as_ref() {
             Self::enforce_request_body_chunk(session, ctx, bytes.len()).await?;
+        }
+
+        // 🧾 A `request_body { set … }` handler replaces the body outright, so
+        // the client's bytes are discarded one chunk at a time and the
+        // replacement goes up in their place. Bounded on both sides: nothing
+        // accumulates the upload, and the replacement is the configured string.
+        //
+        // 📌 It has to be released on the *last* chunk rather than the first.
+        // `pingora-proxy 0.9.0` decides the upstream body is finished from
+        // `end_of_body || data.is_none()` (`proxy_h1.rs:1044`), and a body that
+        // exists downstream arrives chunk by chunk — so emitting early would
+        // send the replacement *ahead of* the client's body rather than instead
+        // of it. Withholding keeps the upstream request a single body: the
+        // replacement, sent on the call that ends the stream, with the framing
+        // rewritten to match in `upstream_request_filter`.
+        if let Some(replacement) = ctx.request_body_set.clone() {
+            // 🪤 "Last" is `end_of_stream || body.is_none()`, which is exactly
+            // how pingora computes the flag it will use, so the release can
+            // never land on a call that leaves the upstream body open. And
+            // withholding is `Some(Bytes::new())`, never `None`: a `None` here
+            // would end the upstream body before the replacement was written,
+            // the failure the buffering path below documents.
+            let last = end_of_stream || body.is_none();
+            *body = if last {
+                Some(replacement)
+            } else {
+                Some(Bytes::new())
+            };
+            return Ok(());
         }
 
         let Some(buffer) = ctx.request_buffer.as_mut() else {
@@ -7664,6 +7785,22 @@ impl ProxyHttp for PingclairProxy {
         // including `Proxy-Authorization` — a credential addressed to this
         // proxy, handed to the origin.
         strip_hop_by_hop_headers(session, upstream_request)?;
+
+        // 🧾 A replaced body is a different length from the one the client
+        // declared, so the framing is rewritten here or the origin waits for
+        // bytes that are never coming. This is the only place that can do it:
+        // the body filter runs after this, and by then the request line is
+        // already committed.
+        if let Some(replacement) = &ctx.request_body_set {
+            // 🚫 Never alongside `Transfer-Encoding`. A message carrying both is
+            // the framing ambiguity request smuggling lives in, and the
+            // hop-by-hop pass above deliberately leaves `Transfer-Encoding` for
+            // pingora to own. A chunked request keeps its chunked framing, and
+            // pingora terminates the body after the single chunk we emit.
+            if upstream_request.headers.get("transfer-encoding").is_none() {
+                upstream_request.insert_header("content-length", replacement.len().to_string())?;
+            }
+        }
 
         let downstream_headers = session.req_header();
         // 🚫 A name the operator deleted counts as configured, so the automatic
@@ -8470,7 +8607,19 @@ impl ProxyHttp for PingclairProxy {
                         ErrorType::ReadTimedout | ErrorType::WriteTimedout => 408,
                         _ => 400,
                     },
-                    ErrorSource::Internal | ErrorSource::Unset => 500,
+                    // ⏱️ A read or write deadline that fired is this connection's
+                    // own, whichever side of it pingora happened to attribute:
+                    // the site's `limits` and a route's `request_body {
+                    // read_timeout }` both arm the session, and an *upstream*
+                    // timeout arrives above with `ErrorSource::Upstream` and
+                    // stays a 504. 500 blamed this server for a client that
+                    // stopped sending, and the H3 path already answers 408 for
+                    // the same event (`drain_local_h3_body`), so the two
+                    // transports disagreed on the status of one failure.
+                    ErrorSource::Internal | ErrorSource::Unset => match e.etype() {
+                        ErrorType::ReadTimedout | ErrorType::WriteTimedout => 408,
+                        _ => 500,
+                    },
                 },
             }
         };
@@ -8946,7 +9095,7 @@ fn collect_subrequest_plans(
 /// exactly what a check that runs before the matchers do is able to use.
 fn collect_request_body_ceiling(handler: &HandlerConfig) -> Option<u64> {
     match handler {
-        HandlerConfig::RequestBody { max_size } => *max_size,
+        HandlerConfig::RequestBody { max_size, .. } => *max_size,
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::FirstMatch { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => handlers
@@ -8962,6 +9111,60 @@ fn collect_request_body_ceiling(handler: &HandlerConfig) -> Option<u64> {
                 }
             }),
         _ => None,
+    }
+}
+
+/// ⏱️ The deadlines a route's `request_body` handlers could set, in
+/// milliseconds, for the seeding described at `initialize_request_limits`.
+///
+/// Both fields are the *longest* declared value, not the shortest. The seed is
+/// what applies when the handler has not run yet — the locally answered body
+/// drain runs before dispatch — and a route that says "this upload may take up
+/// to 10 minutes" must not be cut off at 2 because a second, matcher-guarded
+/// block in the same route mentioned 2.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RouteBodyTimeouts {
+    pub(crate) read_ms: Option<u64>,
+    pub(crate) write_ms: Option<u64>,
+}
+
+impl RouteBodyTimeouts {
+    /// 🔗 Keeps the longer of two candidates per field.
+    fn merge(self, other: Self) -> Self {
+        Self {
+            read_ms: longest(self.read_ms, other.read_ms),
+            write_ms: longest(self.write_ms, other.write_ms),
+        }
+    }
+}
+
+/// 🔓 Zero would mean "no deadline" in Caddy's vocabulary, but durations here
+/// are already positive-only, so an absent value is the only "unset".
+fn longest(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (value, None) | (None, value) => value,
+    }
+}
+
+/// ⏱️ The widest deadlines any `request_body` handler in this tree could set.
+fn collect_request_body_timeouts(handler: &HandlerConfig) -> RouteBodyTimeouts {
+    match handler {
+        HandlerConfig::RequestBody {
+            read_timeout_ms,
+            write_timeout_ms,
+            ..
+        } => RouteBodyTimeouts {
+            read_ms: *read_timeout_ms,
+            write_ms: *write_timeout_ms,
+        },
+        HandlerConfig::Pipeline { handlers }
+        | HandlerConfig::FirstMatch { handlers }
+        | HandlerConfig::HandlePath { handlers, .. } => handlers
+            .iter()
+            .map(|element| collect_request_body_timeouts(&element.handler))
+            .fold(RouteBodyTimeouts::default(), RouteBodyTimeouts::merge),
+        _ => RouteBodyTimeouts::default(),
     }
 }
 

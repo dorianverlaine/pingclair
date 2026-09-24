@@ -1141,11 +1141,25 @@ pub struct HeadersConfig {
     pub default_set: BTreeMap<String, String>,
 }
 
-/// 📥 One route's request-body bound, from `request_body { max_size … }`.
+/// 📥 One route's handling of its request body: a bound, deadlines, or a
+/// replacement.
+///
+/// `read_timeout` and `write_timeout` are deadlines on reading the body and on
+/// writing the response, not idle timers: Caddy arms them once when this
+/// handler runs, and they are `None` here when the site's `limits` should keep
+/// deciding, which is the common case.
 #[derive(Debug, Clone, Default)]
 pub struct RequestBodyConfig {
     /// Maximum body size in bytes; `None` leaves the site's limit in place.
     pub max_size: Option<u64>,
+    /// Deadline for reading the request body, in milliseconds.
+    pub read_timeout_ms: Option<u64>,
+    /// Deadline for writing the response, in milliseconds.
+    pub write_timeout_ms: Option<u64>,
+    /// Replacement body, as written in the configuration. Placeholders are
+    /// expanded per request, as Caddy's replacer does, so this stays a template
+    /// until a request exists.
+    pub set: Option<String>,
 }
 
 /// File server configuration (placeholder)

@@ -1743,23 +1743,9 @@ pub(super) fn adapt_request_body_directive(d: &Directive) -> Result<Handler, Ada
     for sub in &block.directives {
         match sub.name.as_str() {
             "max_size" => config.max_size = Some(parse_byte_size(sub)?),
-            // 🚩 Named individually rather than falling through to "unknown".
-            // An operator who wrote `read_timeout` spelled it correctly, and
-            // "unknown subdirective" would send them hunting for a typo.
-            "read_timeout" | "write_timeout" => {
-                return Err(AdapterError::UnsupportedFeature(
-                    format!("request_body {}", sub.name),
-                    "per-route body read and write deadlines are not implemented yet; \
-                     the site-level `limits` block bounds them for now"
-                        .into(),
-                ));
-            }
-            "set" => {
-                return Err(AdapterError::UnsupportedFeature(
-                    "request_body set".into(),
-                    "replacing the request body with a fixed string is not implemented yet".into(),
-                ));
-            }
+            "read_timeout" => config.read_timeout_ms = Some(parse_required_duration(sub)?),
+            "write_timeout" => config.write_timeout_ms = Some(parse_required_duration(sub)?),
+            "set" => config.set = parse_body_replacement(sub)?,
             other => {
                 return Err(AdapterError::UnknownDirective(format!(
                     "request_body: {other}"
@@ -1767,15 +1753,35 @@ pub(super) fn adapt_request_body_directive(d: &Directive) -> Result<Handler, Ada
             }
         }
     }
-    if config.max_size.is_none() {
-        return Err(AdapterError::InvalidArgument(
-            "request_body".into(),
-            "the block sets nothing; `max_size <size>` is the only option this \
-             build implements"
-                .into(),
+    // 📌 An empty block is accepted, and so is `set ""`. Both adapt to a
+    // `request_body` handler that does nothing, which is what Caddy does with
+    // them (`caddy adapt` returns the bare handler for `request_body { }`), and
+    // a handler that does nothing is not a mistake worth failing a load over.
+    // The refusal that used to be here said "the block sets nothing; `max_size`
+    // is the only option this build implements" — true only while the other
+    // three were refused, and the reason it named has since gone away.
+    Ok(Handler::RequestBody(config))
+}
+
+/// 🧾 Reads `set <body>` inside a `request_body` block.
+///
+/// Caddy takes exactly one argument here, and its replacement branch is gated on
+/// the string being non-empty (`Set != ""`), so `set ""` is a configuration that
+/// parses and then replaces nothing. That is accepted rather than refused — it
+/// is the same server behaviour as leaving `set` out, and refusing a
+/// configuration Caddy loads is the gap this directive was meant to close — but
+/// it is normalised to "no replacement" here so nothing downstream has to know
+/// that an empty template means what an absent one means.
+fn parse_body_replacement(sub: &Directive) -> Result<Option<String>, AdapterError> {
+    if sub.args.len() != 1 {
+        return Err(AdapterError::ArgumentCount(
+            "request_body set".into(),
+            1,
+            sub.args.len(),
         ));
     }
-    Ok(Handler::RequestBody(config))
+    let body = sub.args[0].clone();
+    Ok(if body.is_empty() { None } else { Some(body) })
 }
 
 /// 🔪 Adapts `abort`, which closes the connection without writing anything.
