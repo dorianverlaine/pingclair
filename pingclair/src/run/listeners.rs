@@ -17,7 +17,7 @@ use crate::runtime_listeners::PreparedListenerPolicy;
 use parking_lot::RwLock;
 use pingclair_proxy::server::PingclairProxy;
 use pingora_core::listeners::tls::TlsSettings;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 /// 🛡️ What the listener phase reads, all of it decided by earlier phases.
@@ -30,6 +30,9 @@ pub(super) struct ListenerInputs<'a> {
     pub(super) proxy_protocol_networks: &'a [ipnet::IpNet],
     pub(super) blocked_client_networks: &'a [ipnet::IpNet],
     pub(super) http3_globally_enabled: bool,
+    /// 🧭 Options an addressed `servers <address> { … }` block set, so a
+    /// listener can be opted out of HTTP/3 (or into it) on its own.
+    pub(super) listener_options: &'a BTreeMap<String, pingclair_core::config::ListenerOptions>,
     pub(super) h3_excluded_domains: &'a [String],
     pub(super) bg_handle: &'a tokio::runtime::Handle,
 }
@@ -57,6 +60,7 @@ pub(super) fn register(
         proxy_protocol_networks,
         blocked_client_networks,
         http3_globally_enabled,
+        listener_options,
         h3_excluded_domains,
         bg_handle,
     } = inputs;
@@ -209,7 +213,16 @@ pub(super) fn register(
                 // 📌 An address that is not a literal socket address never
                 // had HTTP/3 (the QUIC task refused it before, too); it stays
                 // a log line rather than a new reason to refuse startup.
-                let h3_address = http3_globally_enabled
+                // 🧭 `servers <address> { protocols h1 h2 }` takes HTTP/3 off
+                // that one listener, and `protocols … h3` puts it back on a
+                // listener the global list left off. Bound here rather than
+                // afterwards because the UDP socket — and the `Alt-Svc`
+                // advertisement that sends clients to it for a day — belong to
+                // the listener, not to the process.
+                let h3_here = pingclair_core::config::listener_options_for(listener_options, addr)
+                    .and_then(|options| options.http3)
+                    .unwrap_or(http3_globally_enabled);
+                let h3_address = h3_here
                     .then(|| addr.parse::<std::net::SocketAddr>())
                     .and_then(|parsed| {
                         parsed

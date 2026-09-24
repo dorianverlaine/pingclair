@@ -174,7 +174,7 @@ fn merge_files(
             final_config.admin = Some(admin);
         }
 
-        merge_globals(&mut final_config.global, config.global);
+        merge_globals(&mut final_config.global, config.global, path.as_ref())?;
         merge_logging(&mut final_config.logging, config.logging, path.as_ref())?;
     }
 
@@ -227,7 +227,8 @@ fn compile_file_unvalidated(path: &Path) -> Result<PingclairConfig, FullCompileE
 fn merge_globals(
     into: &mut pingclair_core::config::GlobalConfig,
     from: pingclair_core::config::GlobalConfig,
-) {
+    path: &Path,
+) -> Result<(), FullCompileError> {
     let default = pingclair_core::config::GlobalConfig::default();
     let pingclair_core::config::GlobalConfig {
         email,
@@ -246,6 +247,7 @@ fn merge_globals(
         local_certs,
         blocked_ips,
         trusted_proxies,
+        listener_options,
         upstream_keepalive_pool_size,
         http3,
         worker_threads,
@@ -336,6 +338,22 @@ fn merge_globals(
         into.http3 = false;
     }
 
+    // 🧭 One listener's options per address, accumulated like the channels in
+    // `merge_logging`. An address declared in two files is refused for the same
+    // reason it is refused twice in one file: the second declaration would
+    // silently win and the first one's settings would vanish.
+    for (address, options) in listener_options {
+        if into.listener_options.contains_key(&address) {
+            return Err(FullCompileError::Compile(pingclair_config_compile_error(
+                format!(
+                    "`servers {address} {{ … }}` is declared in more than one file (seen again in {})",
+                    path.display()
+                ),
+            )));
+        }
+        into.listener_options.insert(address, options);
+    }
+
     // 🧩 Lists accumulate rather than replace. Two files each adding blocked
     // ranges must end up blocking both sets — last-one-wins would turn a split
     // configuration into a blocklist that silently forgot half its entries.
@@ -343,6 +361,7 @@ fn merge_globals(
     into.trusted_proxies.extend(trusted_proxies);
     into.blocked_ips.dedup();
     into.trusted_proxies.dedup();
+    Ok(())
 }
 
 /// 🪵 Folds one file's logging configuration into the accumulated set.

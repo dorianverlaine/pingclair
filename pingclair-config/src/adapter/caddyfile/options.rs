@@ -18,7 +18,7 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
         // 🧭 Lift any nested `servers { … }` children to this level first, so
         // the loop below sees one flat list of options regardless of how the
         // operator chose to group them.
-        let directives = expand_servers_block(block.directives)?;
+        let directives = expand_servers_block(&mut global, block.directives)?;
 
         for sub in directives {
             match sub.name.as_str() {
@@ -335,56 +335,7 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                     }
                 },
                 "trusted_proxies" => {
-                    if sub.args.is_empty() {
-                        return Err(AdapterError::ArgumentCount("trusted_proxies".into(), 1, 0));
-                    }
-                    // 🌐 Caddy 2.11 reads the first token as the *name of an
-                    // ip_source module*, not as an address, so the ordinary
-                    // spelling of a current Caddyfile is `trusted_proxies
-                    // static 12.34.56.0/24`. Stock Caddy registers exactly one
-                    // such module — `http.ip_sources.static`, whose own
-                    // arguments are the ranges (`modules/caddyhttp/ip_range.go`
-                    // at `ff6da121`) — so `static` is stripped and its ranges
-                    // are what gets stored.
-                    //
-                    // 📌 The bare address list is kept as a compatibility
-                    // spelling: every Caddyfile written for an older Caddy, and
-                    // every configuration in this repository's own docs, uses
-                    // it, and Caddy only started refusing it in 2.11. It is a
-                    // divergence rather than a mistake, so it is named here
-                    // rather than removed quietly.
-                    let rules: &[String] = match sub.args.first().map(String::as_str) {
-                        Some("static") => &sub.args[1..],
-                        Some(other) if !looks_like_address(other) => {
-                            return Err(AdapterError::UnsupportedFeature(
-                                format!("trusted_proxies {other}"),
-                                format!(
-                                    "`{other}` names an ip_source module; this build implements \
-                                     the `static` one, whose arguments are the ranges themselves"
-                                ),
-                            ));
-                        }
-                        _ => &sub.args[..],
-                    };
-                    for rule in rules {
-                        // 🧭 `private_ranges` is a keyword *inside* `static`, not
-                        // a module of its own: upstream expands it in
-                        // `StaticIPRange.UnmarshalCaddyfile` to the six prefixes
-                        // of `internal.PrivateRangesCIDR()`.
-                        if rule == "private_ranges" {
-                            global
-                                .trusted_proxies
-                                .extend(PRIVATE_RANGES.iter().map(|range| (*range).to_string()));
-                            continue;
-                        }
-                        if !looks_like_address(rule) {
-                            return Err(AdapterError::InvalidArgument(
-                                "trusted_proxies".into(),
-                                format!("invalid IP or CIDR `{rule}`"),
-                            ));
-                        }
-                        global.trusted_proxies.push(rule.clone());
-                    }
+                    parse_trusted_proxies(&sub.args, &mut global.trusted_proxies)?;
                 }
                 // 📡 `dns <provider> [args…]` names the provider used both for
                 // DNS-01 challenges and, upstream, for general resolution. We
@@ -511,19 +462,7 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                     global.preferred_chains = Some(parse_preferred_chains(&sub)?);
                 }
                 "protocols" => {
-                    for arg in &sub.args {
-                        match arg.to_lowercase().as_str() {
-                            "h1" => global.protocols.push(Protocol::H1),
-                            "h2" => global.protocols.push(Protocol::H2),
-                            "h3" => global.protocols.push(Protocol::H3),
-                            other => {
-                                return Err(AdapterError::InvalidArgument(
-                                    "protocols".into(),
-                                    other.to_string(),
-                                ));
-                            }
-                        }
-                    }
+                    parse_protocols(&sub.args, &mut global.protocols)?;
                 }
                 // 🧢 `servers { listener_wrappers { … } }` names the wrappers
                 // that wrap every listener of every server declared here.
@@ -660,58 +599,182 @@ pub(super) fn is_wildcard_host(host: &str) -> bool {
 /// indistinguishable from a global one that accepts three more names. Checking
 /// afterwards would silently widen what a `servers` block may say.
 pub(super) fn expand_servers_block(
+    global: &mut GlobalBlock,
     directives: Vec<Directive>,
 ) -> Result<Vec<Directive>, AdapterError> {
     let mut result = Vec::new();
     for d in directives {
-        if d.name == "servers" {
-            if let Some(block) = d.block {
-                for child in &block.directives {
-                    if child.name == "metrics"
-                        && let Some(inner) = &child.block
-                    {
-                        parse_metrics_options(inner, MetricsScope::Server)?;
+        if d.name != "servers" {
+            result.push(d);
+            continue;
+        }
+        let Some(block) = d.block else {
+            continue;
+        };
+        for child in &block.directives {
+            if child.name == "metrics"
+                && let Some(inner) = &child.block
+            {
+                parse_metrics_options(inner, MetricsScope::Server)?;
+            }
+        }
+        // 🧭 The addressless form means "every listener", upstream included, so
+        // its children are lifted to the global level exactly as written.
+        if d.args.is_empty() {
+            result.extend(block.directives);
+            continue;
+        }
+        let address = d.args.join(" ");
+        // 🚫 A duplicate is refused rather than merged: the second block would
+        // silently win and the first one's settings would vanish, which is the
+        // shape this whole option exists to stop. Upstream refuses it too
+        // ("cannot have 'servers' global options with duplicate listener
+        // addresses").
+        if global.listener_options.contains_key(&address) {
+            return Err(AdapterError::InvalidArgument(
+                "servers".into(),
+                format!("`servers {address}` is declared twice"),
+            ));
+        }
+        let mut options = ListenerOptions::default();
+        for child in &block.directives {
+            match child.name.as_str() {
+                // 📊 Upstream lifts `metrics` to the whole app whatever the
+                // address says, so it selects nothing here — but it still has
+                // to be *merged*, not swallowed, or the nested block's options
+                // would vanish with the address that was never theirs.
+                "metrics" => {
+                    global.metrics = Some(true);
+                    if let Some(inner) = &child.block {
+                        let parsed = parse_metrics_options(inner, MetricsScope::Server)?;
+                        global.metrics_options.merge(&parsed);
                     }
                 }
-                // 🚫 `servers <address> { … }` names one listener, and lifting
-                // the children to the global level drops that address: the
-                // options end up applying to every listener. Two addressed
-                // blocks that disagree then resolve silently to whichever came
-                // second, and `listener_wrappers { proxy_protocol }` would
-                // demand the PROXY header on ports whose clients never send
-                // it, rejecting every connection there.
-                //
-                // 📌 Only `metrics` is kept, because upstream hoists it to the
-                // whole app anyway, so the address never selected anything.
-                // Everything else is refused rather than guessed: the
-                // addressless spelling means "every listener" in Caddy too, so
-                // the operator has a way to say what the build can honour.
-                if !d.args.is_empty()
-                    && let Some(child) = block
-                        .directives
-                        .iter()
-                        .find(|child| child.name != "metrics")
-                {
-                    let address = d.args.join(" ");
+                "listener_wrappers" => {
+                    options.proxy_protocol = Some(parse_listener_wrappers_child(child)?);
+                }
+                "protocols" => {
+                    let mut protocols = Vec::new();
+                    parse_protocols(&child.args, &mut protocols)?;
+                    options.http3 = Some(protocols.contains(&Protocol::H3));
+                }
+                "trusted_proxies" => {
+                    let mut rules = Vec::new();
+                    parse_trusted_proxies(&child.args, &mut rules)?;
+                    options.trusted_proxies = Some(rules);
+                }
+                // 🚫 Everything else has no meaning for one listener — `admin`,
+                // `email`, `pki`, `storage` are process-wide — or is a setting
+                // this build does not implement at all. Applying it to every
+                // listener would widen what the operator asked for; dropping it
+                // would be silent. Refused, and the message names the options
+                // that do work here, because those are the ones an operator
+                // migrating a Caddyfile can move inside the block.
+                other => {
                     return Err(AdapterError::UnsupportedFeature(
-                        format!("global: servers {address} {{ {} }}", child.name),
+                        format!("global: servers {address} {{ {other} }}"),
                         format!(
-                            "a `servers <address>` block names one listener, and this build \
-                             applies a `servers` block's options to every listener, so \
-                             `{option}` would reach listeners other than `{address}`. Write \
-                             `servers {{ {option} … }}` without an address to apply it to \
-                             every listener",
-                            option = child.name,
+                            "only `listener_wrappers`, `protocols`, `trusted_proxies` and \
+                             `metrics` can be set for one listener; `{other}` is process-wide, \
+                             so write it without an address (`servers {{ {other} … }}`) to apply \
+                             it to every listener"
                         ),
                     ));
                 }
-                result.extend(block.directives);
             }
-        } else {
-            result.push(d);
         }
+        global.listener_options.insert(address, options);
     }
     Ok(result)
+}
+
+/// 🔌 One `listener_wrappers` child of an addressed `servers` block.
+///
+/// 🧭 Upstream's addressed spelling puts the wrapper in a block; the global
+/// spelling this repository already parses is the same shape, so the meaning is
+/// decided in one place and the address only decides *where* it applies.
+fn parse_listener_wrappers_child(child: &Directive) -> Result<bool, AdapterError> {
+    if !child.args.is_empty() {
+        return Err(AdapterError::ArgumentCount(
+            "listener_wrappers".into(),
+            0,
+            child.args.len(),
+        ));
+    }
+    let Some(block) = &child.block else {
+        return Err(AdapterError::InvalidArgument(
+            "global: listener_wrappers".into(),
+            "the wrappers to apply are named in a block".into(),
+        ));
+    };
+    parse_listener_wrappers(block)
+}
+
+/// 🛡️ Parses one `trusted_proxies` line's rules into `into`.
+///
+/// 🌐 Caddy 2.11 reads the first token as the *name of an ip_source module*, not
+/// as an address, so the ordinary spelling of a current Caddyfile is
+/// `trusted_proxies static 12.34.56.0/24`. Stock Caddy registers exactly one
+/// such module — `http.ip_sources.static`, whose own arguments are the ranges
+/// (`modules/caddyhttp/ip_range.go` at `ff6da121`) — so `static` is stripped and
+/// its ranges are what gets stored.
+///
+/// 📌 The bare address list is kept as a compatibility spelling: every Caddyfile
+/// written for an older Caddy, and every configuration in this repository's own
+/// docs, uses it, and Caddy only started refusing it in 2.11. It is a divergence
+/// rather than a mistake, so it is named here rather than removed quietly.
+fn parse_trusted_proxies(args: &[String], into: &mut Vec<String>) -> Result<(), AdapterError> {
+    if args.is_empty() {
+        return Err(AdapterError::ArgumentCount("trusted_proxies".into(), 1, 0));
+    }
+    let rules: &[String] = match args.first().map(String::as_str) {
+        Some("static") => &args[1..],
+        Some(other) if !looks_like_address(other) => {
+            return Err(AdapterError::UnsupportedFeature(
+                format!("trusted_proxies {other}"),
+                format!(
+                    "`{other}` names an ip_source module; this build implements \
+                     the `static` one, whose arguments are the ranges themselves"
+                ),
+            ));
+        }
+        _ => args,
+    };
+    for rule in rules {
+        // 🧭 `private_ranges` is a keyword *inside* `static`, not a module of
+        // its own: upstream expands it in `StaticIPRange.UnmarshalCaddyfile` to
+        // the six prefixes of `internal.PrivateRangesCIDR()`.
+        if rule == "private_ranges" {
+            into.extend(PRIVATE_RANGES.iter().map(|range| (*range).to_string()));
+            continue;
+        }
+        if !looks_like_address(rule) {
+            return Err(AdapterError::InvalidArgument(
+                "trusted_proxies".into(),
+                format!("invalid IP or CIDR `{rule}`"),
+            ));
+        }
+        into.push(rule.clone());
+    }
+    Ok(())
+}
+
+/// 🌐 Parses one `protocols` line into `into`.
+fn parse_protocols(args: &[String], into: &mut Vec<Protocol>) -> Result<(), AdapterError> {
+    for arg in args {
+        match arg.to_lowercase().as_str() {
+            "h1" => into.push(Protocol::H1),
+            "h2" => into.push(Protocol::H2),
+            "h3" => into.push(Protocol::H3),
+            other => {
+                return Err(AdapterError::InvalidArgument(
+                    "protocols".into(),
+                    other.to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 📊 Where a `metrics` block was written, which decides what it may say.

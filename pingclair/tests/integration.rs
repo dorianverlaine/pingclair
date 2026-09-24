@@ -19,6 +19,10 @@ use tokio::io::AsyncWriteExt;
 #[path = "integration/process_log.rs"]
 mod process_log;
 
+// 🧭 An addressed `servers <address> { … }` block has to reach one listener.
+#[path = "integration/addressed_servers.rs"]
+mod addressed_servers;
+
 // 🏷️ Static-file validator tests live beside this file so the gate stops
 // growing in one place; they reuse its `TestServer` harness.
 #[path = "integration/static_validators.rs"]

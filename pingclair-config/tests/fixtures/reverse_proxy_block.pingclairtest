@@ -182,9 +182,5 @@ api.example {
     "dns_refresh_secs": 30,
     "grace_period_secs": null
   },
-  "logging": {
-    "level": "",
-    "format": "",
-    "file": null
-  }
+  "logging": {}
 }

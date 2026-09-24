@@ -360,9 +360,13 @@ protocol 不適用於 UDP HTTP/3 listener。
 
 `servers { listener_wrappers { proxy_protocol } }` 是 Caddy 拼法的「這份 Caddyfile
 宣告的每一條 listener」，這裡就照這個意思收下；要在單一條 listener 上要求標頭，
-仍然寫 `listen … proxy_protocol`。只接受無位址的那個形式：`servers <address> { … }`
-會被拒絕，因為這個 build 會把 `servers` 區塊的選項套用到每一條 listener，而在
-客戶端不送標頭的埠上要求它會把連線全部拒絕。兩種拼法在這裡意思相同，而且都是
+仍然寫 `listen … proxy_protocol`；`servers <address> { listener_wrappers {
+proxy_protocol } }` 則是在那一條 listener 上要求它——當一個部署只在一條埠上終結
+PROXY protocol、另一條直接服務時，這是該用的寫法。位址必須指出這份設定真的擁有的
+listener：對不到任何 listener 的位址會被拒絕而不是被忽略，因為「一個區塊默默套用到
+零條 listener」正是這個選項存在的理由。同一個位址只能寫一次，而它能帶的選項是
+`listener_wrappers`、`protocols`、`trusted_proxies` 與 `metrics`；行程級的選項寫在
+那裡會被拒絕。兩種拼法在這裡意思相同，而且都是
 嚴格的那一邊：上游的 `proxy_protocol { fallback_policy require }`——沒帶標頭的
 連線會被拒絕，而不是被服務。
 
@@ -975,9 +979,9 @@ timeout，訊息會說明缺的是哪個能力，而不是 `Unknown directive`�
 `tls` 與 `http_redirect` 的拒絕訊息會說明理由：這裡的 TLS 是逐站台由自動 HTTPS
 選定的，不是由 listener wrapper 決定；而 HTTP→HTTPS 轉跳屬於自動 HTTPS 自己建立
 的那條明文 companion 埠，所以一條用 `listen` 直接宣告的 listener 不會轉跳。
-`servers <address> { listener_wrappers { … } }` 同樣被拒絕——這個 build 會把
-`servers` 區塊的選項套用到每一條 listener，而在客戶端不送標頭的埠上要求它會把
-連線全部拒絕。
+`servers <address> { listener_wrappers { … } }` 接受 `proxy_protocol`，其餘的
+wrapper 則按名字拒絕：`servers` 區塊的選項只能到達一條 listener，而這個 build
+沒有實作的 wrapper 沒有地方可以作用。
 
 有些名字落在「上面兩張清單」與「完整支援」之間，所以寫在這裡而不是塞進任何一張。
 `copy_response` 與 `copy_response_headers` 是 `handle_response` 的子指令，

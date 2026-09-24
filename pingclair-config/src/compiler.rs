@@ -85,14 +85,28 @@ pub fn compile_ast(ast: &Ast) -> CompileResult<PingclairConfig> {
         // of them, which is upstream's behaviour too (`servers` applies to the
         // servers the Caddyfile produced, not to the ones added at runtime).
         //
-        // 📌 The list is built from `listen` itself, so the invariant
-        // `validate_config` enforces — every entry of `proxy_protocol_listen`
-        // also appears in `listen` — cannot be broken here.
-        if listener_proxy_protocol {
-            for addr in &server_config.listen {
-                if !server_config.proxy_protocol_listen.contains(addr) {
-                    server_config.proxy_protocol_listen.push(addr.clone());
-                }
+        // 📌 The list is built from the site's *effective* addresses, so the
+        // invariant `validate_config` enforces — every entry also names an
+        // address the site listens on — cannot be broken here, whether the site
+        // said `listen :8443` or said nothing and lands on the derived port.
+        //
+        // 🧭 An addressed `servers <address> { … }` block marks that address
+        // wherever it appears, and `Some(false)` takes it back — which is the
+        // only way to say "the header everywhere except this port".
+        let addresses =
+            server_config.listen_addresses(config.global.http_port, config.global.https_port);
+        for addr in &addresses {
+            let named = |wanted: bool| {
+                config.global.listener_options.iter().any(|(key, options)| {
+                    options.proxy_protocol == Some(wanted)
+                        && pingclair_core::config::normalize_listen_addr(key) == *addr
+                })
+            };
+            if (listener_proxy_protocol || named(true))
+                && !named(false)
+                && !server_config.proxy_protocol_listen.contains(addr)
+            {
+                server_config.proxy_protocol_listen.push(addr.clone());
             }
         }
         // 🌐 Caddy serves any named site over HTTPS by default: a bare
@@ -375,6 +389,29 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
     if !global.protocols.is_empty() {
         config.global.http3 = global.protocols.contains(&Protocol::H3);
     }
+
+    // 🧭 One listener's options, keyed by the address the operator wrote. A
+    // block that selected only `metrics` has nothing to say to a listener, and
+    // is dropped here rather than stored as an entry that means nothing.
+    config.global.listener_options = global
+        .listener_options
+        .iter()
+        .filter(|(_, options)| {
+            options.proxy_protocol.is_some()
+                || options.http3.is_some()
+                || options.trusted_proxies.is_some()
+        })
+        .map(|(address, options)| {
+            (
+                address.clone(),
+                pingclair_core::config::ListenerOptions {
+                    proxy_protocol: options.proxy_protocol,
+                    http3: options.http3,
+                    trusted_proxies: options.trusted_proxies.clone(),
+                },
+            )
+        })
+        .collect();
 
     Ok(())
 }
@@ -1056,6 +1093,7 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
     }
 
     validate_proxy_protocol_listeners(config)?;
+    validate_listener_options(config)?;
     validate_plaintext_listeners(config)?;
     validate_cache_ceiling_agrees(config)?;
     validate_log_channels_exist(config)?;
@@ -2377,6 +2415,50 @@ fn validate_health_check(health: &pingclair_core::config::HealthCheckConfig) -> 
     Ok(())
 }
 
+/// 🧭 Every address an addressed `servers <address> { … }` block named must be
+/// a listener this configuration actually has.
+///
+/// 🚫 Upstream silently ignores a block that matches nothing
+/// (`serveroptions.go`, `slices.IndexFunc` → `continue`), which is the shape
+/// this option exists to stop being: an operator who typed `:8443` where their
+/// site listens on `:443` gets no listener optioned, no message, and a server
+/// that behaves as though the block were never written. This build refuses it,
+/// which is a deliberate divergence and the same choice made for the other
+/// silent no-ops in this compiler.
+///
+/// 📌 The comparison uses the site's effective addresses, so a site that named
+/// no `listen` still matches the port it lands on.
+fn validate_listener_options(config: &PingclairConfig) -> CompileResult<()> {
+    if config.global.listener_options.is_empty() {
+        return Ok(());
+    }
+    let mut listeners: HashSet<String> = HashSet::new();
+    for server in &config.servers {
+        listeners
+            .extend(server.listen_addresses(config.global.http_port, config.global.https_port));
+    }
+    // 🔁 The automatic plaintext companion is a listener too: an HTTPS site on
+    // :443 also answers on :80, and `servers :80 { … }` is a way to say so.
+    listeners.insert(format!("[::]:{}", config.global.http_port));
+
+    for address in config.global.listener_options.keys() {
+        let normalized = pingclair_core::config::normalize_listen_addr(address);
+        if !listeners.contains(&normalized) {
+            let mut known: Vec<&str> = listeners.iter().map(String::as_str).collect();
+            known.sort_unstable();
+            return Err(CompileError::InvalidServer {
+                message: format!(
+                    "`servers {address} {{ … }}` names a listener this configuration does not \
+                     have, so none of its options would apply. It listens on: {}. This build \
+                     refuses the block rather than ignoring it (Caddy ignores it silently)",
+                    known.join(", ")
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// 🧭 Rejects PROXY protocol listener declarations that cannot be honoured.
 ///
 /// Three ways this can be written wrong, each of which would otherwise leave a
@@ -2388,22 +2470,28 @@ fn validate_health_check(health: &pingclair_core::config::HealthCheckConfig) -> 
 /// - requiring the header with no `trusted_proxies`, which would reject every
 ///   connection because no peer can ever be authorised to send one.
 fn validate_proxy_protocol_listeners(config: &PingclairConfig) -> CompileResult<()> {
-    let mut requires: HashSet<&str> = HashSet::new();
-    let mut listens: HashSet<&str> = HashSet::new();
+    // 📌 Addresses are compared *normalized*: `:8443` and `[::]:8443` are one
+    // socket, and a site that named no `listen` still listens on the derived
+    // port. Comparing the raw strings made both answers "not the same listener",
+    // so `servers :8443 { listener_wrappers { proxy_protocol } }` could never
+    // mark the site it was written for.
+    let effective = |server: &pingclair_core::config::ServerConfig| {
+        server.listen_addresses(config.global.http_port, config.global.https_port)
+    };
 
+    let mut requires: HashSet<String> = HashSet::new();
     for server in &config.servers {
-        for address in &server.listen {
-            listens.insert(address.as_str());
-        }
+        let addresses = effective(server);
         for address in &server.proxy_protocol_listen {
-            if !server.listen.iter().any(|listen| listen == address) {
+            let normalized = pingclair_core::config::normalize_listen_addr(address);
+            if !addresses.contains(&normalized) {
                 return Err(CompileError::InvalidServer {
                     message: format!(
                         "proxy_protocol is declared on `{address}`, which this server does not listen on"
                     ),
                 });
             }
-            requires.insert(address.as_str());
+            requires.insert(normalized);
         }
     }
 
@@ -2412,9 +2500,12 @@ fn validate_proxy_protocol_listeners(config: &PingclairConfig) -> CompileResult<
     // picking either one silently would be a security decision made by
     // accident.
     for server in &config.servers {
-        for address in &server.listen {
-            let declared = server.proxy_protocol_listen.iter().any(|a| a == address);
-            if requires.contains(address.as_str()) && !declared {
+        for address in effective(server) {
+            let declared = server
+                .proxy_protocol_listen
+                .iter()
+                .any(|a| pingclair_core::config::normalize_listen_addr(a) == address);
+            if requires.contains(&address) && !declared {
                 return Err(CompileError::InvalidServer {
                     message: format!(
                         "listener `{address}` is shared by servers that disagree about \

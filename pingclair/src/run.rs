@@ -245,6 +245,7 @@ pub(crate) fn run_server(
         automatic_http_available,
         &tls_manager,
         &trusted_proxies,
+        &config.global.listener_options,
         &proxy_protocol_addresses,
     )?;
     let port_proxies = Arc::new(RwLock::new(port_proxies));
@@ -264,6 +265,7 @@ pub(crate) fn run_server(
             proxy_protocol_networks: &proxy_protocol_networks,
             blocked_client_networks: &blocked_client_networks,
             http3_globally_enabled,
+            listener_options: &config.global.listener_options,
             h3_excluded_domains: &h3_excluded_domains,
             bg_handle: &bg_handle,
         },

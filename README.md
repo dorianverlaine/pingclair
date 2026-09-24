@@ -417,10 +417,15 @@ protocol does not apply to the UDP HTTP/3 listener.
 
 `servers { listener_wrappers { proxy_protocol } }` is the Caddy spelling of
 "every listener this Caddyfile declares", and it is accepted as exactly that;
-`listen … proxy_protocol` stays the way to require the header on one listener.
-The addressless block is the only accepted form: `servers <address> { … }` is
-refused, because this build applies a `servers` block's options to every
-listener and the header on a port whose clients do not send it rejects them all.
+`listen … proxy_protocol` stays the way to require the header on one listener,
+and `servers <address> { listener_wrappers { proxy_protocol } }` demands it on
+that one listener — which is the spelling to use when a deployment terminates
+PROXY protocol on one port and serves another directly. The address must name a
+listener the configuration has: an address that matches nothing is refused
+rather than ignored, because a block that silently applies to no listener is
+exactly the shape this option exists to stop being. One addressed block per
+address, and the options it can carry are `listener_wrappers`, `protocols`,
+`trusted_proxies` and `metrics`; anything process-wide written there is refused.
 Both spellings mean the same thing here, and it is the strict one: upstream's
 `proxy_protocol { fallback_policy require }`, under which a connection without
 the header is refused rather than served.
@@ -1131,9 +1136,10 @@ never ignored. `tls` and `http_redirect` are refused with the reason: TLS here i
 chosen per site by automatic HTTPS rather than by a listener wrapper, and the
 HTTP-to-HTTPS redirect belongs to the companion plaintext port automatic HTTPS
 creates, so a listener declared with `listen` would not redirect.
-`servers <address> { listener_wrappers { … } }` is refused too — this build
-applies a `servers` block's options to every listener, and demanding the PROXY
-header on a port whose clients do not send it rejects them all.
+`servers <address> { listener_wrappers { … } }` accepts `proxy_protocol` and
+refuses the other wrappers by name, because a `servers` block's options can only
+reach one listener and a wrapper this build does not implement has nowhere to
+apply.
 
 Names sit between the lists above and full support, so they are named here
 rather than in either. `copy_response` and `copy_response_headers` are

@@ -2342,38 +2342,128 @@ mod fail_closed_tests {
     /// port whose clients never send one, and a connection without it is
     /// rejected — a working site would stop answering.
     ///
-    /// 📌 Refused rather than guessed, and the message names the spelling that
-    /// means what the operator wrote.
+    /// 🔌 An addressed block asks for the PROXY header on *its* listener.
+    ///
+    /// 🤡 The address used to be dropped when the children were lifted, so the
+    /// header would have been demanded on every listener — a connection without
+    /// it is rejected, so a working site would have stopped answering. The
+    /// block is refused outright when its address names no listener, which is
+    /// the one shape that cannot be scoped and would otherwise do nothing.
     #[test]
-    fn an_addressed_servers_block_may_not_ask_for_the_proxy_header() {
-        let message = crate::compile(
-            "{\n    servers :80 {\n        listener_wrappers {\n            proxy_protocol\n        }\n    }\n}\n\
-             :8080 {\n    respond \"ok\"\n}",
+    fn an_addressed_servers_block_scopes_the_proxy_header() {
+        let config = crate::compile(
+            "{\n    servers :8080 {\n        listener_wrappers {\n            proxy_protocol\n        }\n    }\n    \
+             servers {\n        trusted_proxies static 10.0.0.0/8\n    }\n}\n\
+             :8080 {\n    respond \"ok\"\n}\n\
+             :9090 {\n    respond \"other\"\n}",
         )
-        .expect_err("an addressed `servers` block must not widen the header requirement")
-        .to_string();
+        .expect("an addressed `servers` block must compile");
+        assert_eq!(
+            config.servers[0].proxy_protocol_listen,
+            ["[::]:8080"],
+            "only the named listener requires the header"
+        );
         assert!(
-            message.contains("servers :80") && message.contains("every listener"),
-            "the refusal must name the block and say what it would have meant: {message}"
+            config.servers[1].proxy_protocol_listen.is_empty(),
+            "the other listener must not have been marked"
         );
     }
 
-    /// 🚫 Two addressed `servers` blocks that disagree used to resolve to the
-    /// second one for every listener, silently. Any option but `metrics` under
-    /// an address is refused, naming the option and the address.
+    /// 🌐 An addressed block's `protocols` decides HTTP/3 for that listener.
     #[test]
-    fn an_addressed_servers_block_refuses_options_it_cannot_scope() {
-        let message = crate::compile(
-            "{\n    servers :80 {\n        protocols h1\n    }\n    \
-             servers :443 {\n        protocols h1 h2\n    }\n}\n\
+    fn an_addressed_servers_block_scopes_http3() {
+        let config = crate::compile(
+            "{\n    servers :8443 {\n        protocols h1 h2\n    }\n}\n\
+             :8443 {\n    respond \"ok\"\n}\n\
+             :9443 {\n    respond \"other\"\n}",
+        )
+        .expect("an addressed `protocols` must compile");
+        assert!(
+            config.global.http3,
+            "the process-wide setting is untouched by one listener's block"
+        );
+        let options = config
+            .global
+            .listener_options
+            .get(":8443")
+            .expect("the addressed block must be carried");
+        assert_eq!(options.http3, Some(false));
+        assert!(
+            !config.global.listener_options.contains_key(":9443"),
+            "a listener the operator said nothing about has no entry"
+        );
+    }
+
+    /// 🛡️ An addressed block's `trusted_proxies` replaces the global list for
+    /// that listener — the case the address exists to separate: two deployments
+    /// behind different load balancers.
+    #[test]
+    fn an_addressed_servers_block_scopes_trusted_proxies() {
+        let config = crate::compile(
+            "{\n    trusted_proxies static 10.0.0.0/8\n    servers :8080 {\n        \
+             trusted_proxies static 192.168.0.0/16\n    }\n}\n\
              :8080 {\n    respond \"ok\"\n}",
         )
-        .expect_err("an addressed `servers` block must not set a listener option globally")
+        .expect("an addressed `trusted_proxies` must compile");
+        assert_eq!(config.global.trusted_proxies, ["10.0.0.0/8"]);
+        assert_eq!(
+            config.global.listener_options[":8080"]
+                .trusted_proxies
+                .as_deref(),
+            Some(["192.168.0.0/16".to_string()].as_slice())
+        );
+    }
+
+    /// 🚫 A block whose address names no listener is refused.
+    ///
+    /// 📌 A deliberate divergence: Caddy ignores it silently
+    /// (`serveroptions.go` looks for a matching listener and `continue`s), so
+    /// the operator gets a server that behaves as though the block were never
+    /// written. This build refuses and lists the listeners it does have.
+    #[test]
+    fn an_addressed_servers_block_that_names_no_listener_is_refused() {
+        let message = crate::compile(
+            "{\n    servers :9999 {\n        protocols h1 h2\n    }\n}\n\
+             :8080 {\n    respond \"ok\"\n}",
+        )
+        .expect_err("an address no listener has must be refused")
         .to_string();
         assert!(
-            message.contains("servers :80 { protocols }")
-                && message.contains("`protocols` would reach listeners other than `:80`"),
-            "the refusal must name the option and the address: {message}"
+            message.contains("servers :9999") && message.contains("[::]:8080"),
+            "the refusal must name the address and the listeners that exist: {message}"
+        );
+    }
+
+    /// 🚫 A process-wide option under an address is refused, and the message
+    /// says which options can be scoped.
+    #[test]
+    fn an_addressed_servers_block_refuses_process_wide_options() {
+        let message = crate::compile(
+            "{\n    servers :8080 {\n        admin off\n    }\n}\n\
+             :8080 {\n    respond \"ok\"\n}",
+        )
+        .expect_err("a process-wide option under an address must be refused")
+        .to_string();
+        assert!(
+            message.contains("servers :8080 { admin }")
+                && message.contains("`listener_wrappers`, `protocols`, `trusted_proxies`"),
+            "the refusal must name the option and the ones that do work there: {message}"
+        );
+    }
+
+    /// 🚫 The same address twice is a conflict, not a merge.
+    #[test]
+    fn an_address_may_only_be_declared_once() {
+        let message = crate::compile(
+            "{\n    servers :8080 {\n        protocols h1 h2\n    }\n    \
+             servers :8080 {\n        protocols h1\n    }\n}\n\
+             :8080 {\n    respond \"ok\"\n}",
+        )
+        .expect_err("a duplicate address must be refused")
+        .to_string();
+        assert!(
+            message.contains("servers :8080") && message.contains("twice"),
+            "the refusal must name the address: {message}"
         );
     }
 

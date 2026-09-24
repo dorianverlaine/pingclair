@@ -102,6 +102,30 @@ or the image's `:latest` tag, which an rc used to move as well. The channels
 and the procedure for cutting a release are in `CONTRIBUTING.md` under
 "Releasing".
 
+### 🧭 `servers <address> { … }` optioned the listener it names
+
+An addressed `servers` block used to lose its address: the children were lifted
+to the global level, so `servers :8443 { listener_wrappers { proxy_protocol } }`
+demanded the PROXY header on **every** listener — and a port whose clients do not
+send it rejects every connection, so a working site would stop answering. Two
+addressed blocks that disagreed silently resolved to whichever came second. The
+block was then refused outright, which at least said so.
+
+It now works, and the address selects one listener: `listener_wrappers`,
+`protocols` and `trusted_proxies` apply to the address the block names, and to
+nothing else. `trusted_proxies` is the sharpest example — believing a forwarded
+client address is a decision about who sits in front of *that* socket, and two
+deployments behind different load balancers is the case the address exists to
+separate. 📌 Upstream's behaviour was measured rather than assumed: a
+`client_ip` matcher answers differently on the two listeners, and the same four
+requests appear in `compat-audit/verify/impl-gaps-ab/runtime/47/`.
+
+🚫 Two shapes are refused rather than guessed at. An address that names no
+listener of this configuration — Caddy ignores it silently, so the block would
+option nothing and say nothing — and any option that is process-wide by nature
+(`admin`, `email`, `pki`), which has no meaning for one socket and would have to
+widen to all of them to apply at all.
+
 ### 🪵 An unnamed global `log { … }` block configures the process log
 
 The block — Caddy's spelling for the process-wide default logger — used to
@@ -320,16 +344,17 @@ those would describe internal topology to any client. Responses forwarded
 from a backend, including its own 502s, are unchanged, and so are local
 responses that involve no backend, such as `respond` or a rate-limit 429.
 
-### 🚫 An addressed `servers` block may only carry `metrics`
+### 🚫 An addressed `servers` block may only carry the options a listener has
 
 `servers :80 { … }` names one listener, but its options were applied to
 every listener, so two addressed blocks that disagreed (`protocols h1` on
 one, `protocols h1 h2` on the other) resolved silently to the second one
-everywhere. An addressed block that sets anything other than `metrics` is
-now refused, naming the option and the address. Write the option in an
-addressless `servers { … }` block to apply it to every listener, which is
-what it already did. `metrics` stays accepted because it is app-wide
-wherever it is written.
+everywhere. An addressed block that sets an option this build cannot scope to
+one listener is refused, naming the option and the address. The options that
+*can* be scoped — `listener_wrappers`, `protocols`, `trusted_proxies` — now
+reach the listener the block names, which is what the section above this one
+describes; `metrics` stays accepted because it is app-wide wherever it is
+written.
 
 ### 🛡️ A malformed `blocked_ips` entry is refused
 

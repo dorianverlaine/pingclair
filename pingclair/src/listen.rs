@@ -18,14 +18,11 @@ use std::collections::{HashMap, HashSet};
 
 /// 🌐 Pingora requires a full `IP:port` socket address.
 ///
-/// This helper accepts Caddy-style `:port` shorthand by binding the wildcard
-/// address, so JSON configurations match the Pingclair DSL adapter's behavior.
-pub(crate) fn normalize_listen_addr(addr: &str) -> String {
-    match addr.strip_prefix(':') {
-        Some(port) => format!("[::]:{port}"),
-        None => addr.to_string(),
-    }
-}
+/// The rule itself lives in `pingclair_core::config`, because the compiler and
+/// the binder have to reach the same answer: an addressed `servers <address>`
+/// block is refused unless its address names a listener, and a second copy of
+/// this function here is how the two would come to disagree.
+pub(crate) use pingclair_core::config::normalize_listen_addr;
 
 /// 🧭 Reserves a unique private loopback address for one PROXY protocol ingress hop.
 pub(crate) fn reserve_private_listener_address()

@@ -80,6 +80,24 @@ pub struct PingclairConfig {
     pub logging: LoggingConfig,
 }
 
+/// 🧭 What an addressed `servers <address> { … }` block asked of one listener.
+///
+/// 📌 `None` means "the operator said nothing about this listener", which is
+/// what makes it different from `Some(false)`: the process-wide setting applies
+/// in the first case and is overridden in the second.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ListenerOptions {
+    /// 🔌 Whether this listener requires a PROXY protocol header before HTTP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_protocol: Option<bool>,
+    /// 🌐 Whether this listener offers HTTP/3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http3: Option<bool>,
+    /// 🛡️ Proxies whose forwarded client address this listener believes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_proxies: Option<Vec<String>>,
+}
+
 /// Global configuration options
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GlobalConfig {
@@ -185,6 +203,16 @@ pub struct GlobalConfig {
     /// 🛡️ Proxy IP or CIDR ranges allowed to supply client identity headers.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+
+    /// 🧭 Options an addressed `servers <address> { … }` block set, keyed by
+    /// the address the operator wrote.
+    ///
+    /// 📌 Keyed by the address *as written*, because that is the string the
+    /// operator can see and the one the message names when it does not match a
+    /// listener. Every reader normalizes both sides before comparing, so
+    /// `:8443` and `[::]:8443` are the same listener to all of them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub listener_options: BTreeMap<String, ListenerOptions>,
 
     /// Max number of idle upstream connections Pingora keeps open per
     /// worker thread for reuse. Explicitly configurable rather than left
@@ -439,6 +467,7 @@ impl Default for GlobalConfig {
             local_certs: false,
             blocked_ips: Vec::new(),
             trusted_proxies: Vec::new(),
+            listener_options: BTreeMap::new(),
             upstream_keepalive_pool_size: None,
             http3: true,
             worker_threads: None,
@@ -3072,6 +3101,66 @@ pub struct AdminConfig {
     /// unusable from the command line for no security gain.
     #[serde(default)]
     pub enforce_origin: bool,
+}
+
+/// 🔎 The options an addressed `servers` block set for one normalized address.
+///
+/// 📌 A scan rather than a map lookup, on purpose: the block is keyed by the
+/// address as the operator wrote it, and `:8443` and `[::]:8443` are the same
+/// listener. The map holds one entry per addressed block — usually none — and
+/// every caller runs on the startup or reload path, never per request.
+pub fn listener_options_for<'a>(
+    all: &'a BTreeMap<String, ListenerOptions>,
+    address: &str,
+) -> Option<&'a ListenerOptions> {
+    all.iter()
+        .find(|(key, _)| normalize_listen_addr(key) == address)
+        .map(|(_, options)| options)
+}
+
+/// 🌐 The socket address a Caddy-style `:port` stands for.
+///
+/// 📌 Pingora wants a full `IP:port`; `:8443` means "every interface" and is
+/// spelled `[::]:8443` once it reaches a socket. One definition, because the
+/// binder, the addressed-`servers` matcher and the reload path all compare
+/// these strings, and a configuration that matched in one of them and not the
+/// others would apply an option to a listener that never got it.
+pub fn normalize_listen_addr(addr: &str) -> String {
+    match addr.strip_prefix(':') {
+        Some(port) => format!("[::]:{port}"),
+        None => addr.to_string(),
+    }
+}
+
+impl ServerConfig {
+    /// 🧭 Every address this site listens on, normalized.
+    ///
+    /// A site with no `listen` of its own gets the derived one: TLS sites on
+    /// the HTTPS port, plaintext sites on the HTTP port, on the `bind` host (or
+    /// the wildcard). 📌 The derivation lives here rather than in the binder
+    /// because `validate_config` has to reach the same answer — an addressed
+    /// `servers` block is refused unless its address names a listener, and a
+    /// validator that could not see a derived listener would refuse a correct
+    /// configuration.
+    pub fn listen_addresses(&self, http_port: u16, https_port: u16) -> Vec<String> {
+        if self.listen.is_empty() {
+            let host = self
+                .bind
+                .as_deref()
+                .filter(|host| !host.is_empty())
+                .unwrap_or("[::]");
+            let port = if self.tls.is_some() {
+                https_port
+            } else {
+                http_port
+            };
+            return vec![format!("{host}:{port}")];
+        }
+        self.listen
+            .iter()
+            .map(|address| normalize_listen_addr(address))
+            .collect()
+    }
 }
 
 /// 🎧 Reads a listen address the way this project spells them.

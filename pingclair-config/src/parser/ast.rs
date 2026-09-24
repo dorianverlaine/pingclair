@@ -104,12 +104,19 @@ pub struct GlobalBlock {
     /// 🔌 Whether `servers { listener_wrappers { proxy_protocol } }` asked for
     /// a PROXY protocol header on every declared listener.
     ///
-    /// 📌 Only the addressless `servers` block can set this. The addressed
-    /// spelling names one listener, and `expand_servers_block` drops the
-    /// address when it lifts the children — which for this wrapper would mean
-    /// demanding the header on ports whose clients never send it. That spelling
-    /// is refused there rather than quietly widened.
+    /// 📌 This is the addressless spelling, which means "every listener". The
+    /// addressed one names a single listener and lives in
+    /// [`Self::listener_options`].
     pub listener_proxy_protocol: bool,
+    /// 🧭 Options an addressed `servers <address> { … }` block set, keyed by
+    /// the address the operator wrote.
+    ///
+    /// 📌 Kept per address all the way to the socket, because that is what the
+    /// address means: `servers :8443 { listener_wrappers { proxy_protocol } }`
+    /// demands the PROXY header on 8443 and nowhere else, and a build that
+    /// applied it to every listener would reject every connection on the ports
+    /// whose clients never send one.
+    pub listener_options: std::collections::BTreeMap<String, ListenerOptions>,
     /// 🔄 How early to renew, as a fraction of the certificate's lifetime.
     pub renewal_window_ratio: Option<f64>,
     /// 🌐 Bind addresses inherited by sites that name none of their own.
@@ -117,6 +124,22 @@ pub struct GlobalBlock {
     /// 🔗 The issuer chain an operator prefers. Recorded, never acted on.
     pub preferred_chains: Option<pingclair_core::config::PreferredChains>,
     pub directives: Vec<Directive>,
+}
+
+/// 🧭 What an addressed `servers <address> { … }` block asked of one listener.
+///
+/// 📌 Only the options that genuinely belong to a single socket are here. An
+/// option that is process-wide by nature — `admin`, `email`, `pki` — has no
+/// meaning for one listener, and `expand_servers_block` refuses it there rather
+/// than applying it to all of them.
+#[derive(Debug, Clone, Default)]
+pub struct ListenerOptions {
+    /// 🔌 Whether this listener requires a PROXY protocol header before HTTP.
+    pub proxy_protocol: Option<bool>,
+    /// 🌐 Whether this listener offers HTTP/3.
+    pub http3: Option<bool>,
+    /// 🛡️ Proxies whose forwarded client address this listener believes.
+    pub trusted_proxies: Option<Vec<String>>,
 }
 
 /// Admin API configuration (from the global `admin` directive)

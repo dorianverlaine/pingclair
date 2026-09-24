@@ -10,12 +10,10 @@
 //! addresses that must speak TLS. Nothing is bound here; that is the next
 //! phase, and it needs this whole picture first.
 
-use crate::listen::{
-    automatic_http_companion, explicit_http_names, normalize_listen_addr, server_requires_tls,
-};
+use crate::listen::{automatic_http_companion, explicit_http_names, server_requires_tls};
 use pingclair_proxy::client_auth::PublishedListenerPolicy;
 use pingclair_proxy::server::PingclairProxy;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 /// 📍 Sites grouped by listen address.
@@ -33,6 +31,7 @@ pub(super) fn group_by_address(
     automatic_http_available: bool,
     tls_manager: &Arc<pingclair_tls::manager::TlsManager>,
     trusted_proxies: &[String],
+    listener_options: &BTreeMap<String, pingclair_core::config::ListenerOptions>,
     proxy_protocol_addresses: &HashSet<String>,
 ) -> anyhow::Result<SiteGroups> {
     let mut port_proxies: HashMap<String, PingclairProxy> = HashMap::new();
@@ -55,27 +54,11 @@ pub(super) fn group_by_address(
             server_config.listen
         );
 
-        let listen_addrs: Vec<String> = if server_config.listen.is_empty() {
-            // 🔐 A site that configures TLS but no port means HTTPS, so it
-            // belongs on 443. Defaulting it to 80 would quietly serve a site
-            // the operator asked to encrypt on the plaintext port instead.
-            let host = server_config
-                .bind
-                .as_deref()
-                .filter(|h| !h.is_empty())
-                .unwrap_or("[::]");
-            if server_config.tls.is_some() {
-                vec![format!("{host}:{https_port}")]
-            } else {
-                vec![format!("{host}:{http_port}")]
-            }
-        } else {
-            server_config
-                .listen
-                .iter()
-                .map(|a| normalize_listen_addr(a))
-                .collect()
-        };
+        // 🔐 The derivation is in `pingclair_core::config`, next to the
+        // validator that has to agree with it: a site that configures TLS but
+        // no port means HTTPS, and defaulting it to 80 would quietly serve a
+        // site the operator asked to encrypt on the plaintext port instead.
+        let listen_addrs: Vec<String> = server_config.listen_addresses(http_port, https_port);
 
         // 🔁 Automatic HTTPS: give an HTTPS site its plaintext port-80 companion
         // so ACME validation and the HTTP→HTTPS redirect both work unattended.
@@ -111,10 +94,18 @@ pub(super) fn group_by_address(
                 .get(&addr)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("no prepared listener policy for {addr}"))?;
+            // 🛡️ An addressed `servers <address> { trusted_proxies … }` block
+            // replaces the global list for that one listener: believing a
+            // forwarded address is a decision about who is in front of *this*
+            // socket, and two deployments behind different load balancers is
+            // the case the address exists to separate.
+            let trusted = pingclair_core::config::listener_options_for(listener_options, &addr)
+                .and_then(|options| options.trusted_proxies.as_deref())
+                .unwrap_or(trusted_proxies);
             let proxy = port_proxies.entry(addr.clone()).or_insert_with(|| {
                 pingclair_proxy::server::PingclairProxy::with_listener_policy(
                     tls_manager.clone(),
-                    trusted_proxies,
+                    trusted,
                     proxy_protocol_addresses.contains(&addr),
                     listener_policy,
                 )
