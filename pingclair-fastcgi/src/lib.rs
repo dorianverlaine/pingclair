@@ -228,19 +228,24 @@ where
     /// A single name-value pair can exceed the record ceiling; the pair is
     /// then truncated rather than dropped, matching Caddy's client. The
     /// final empty `PARAMS` record ends the stream.
-    pub async fn send_params(
+    ///
+    /// 📁 Values are bytes, not text: `SCRIPT_FILENAME` names a file, and on
+    /// Unix a filename that is not valid UTF-8 is still a real file. The
+    /// protocol carries raw bytes, so nothing here should force it into text.
+    pub async fn send_params<V: AsRef<[u8]>>(
         &mut self,
-        params: &BTreeMap<String, String>,
+        params: &BTreeMap<String, V>,
     ) -> Result<(), FastCgiError> {
         let mut record = Vec::with_capacity(MAX_RECORD_CONTENT);
         for (name, value) in params {
+            let value = value.as_ref();
             let mut pair = Vec::with_capacity(1 + 1 + name.len() + value.len());
             encode_size(&mut pair, name.len());
             encode_size(&mut pair, value.len());
             pair.extend_from_slice(name.as_bytes());
             // 🧮 A value longer than the record ceiling is truncated, not
             // dropped, so the earlier pairs still reach the responder.
-            let value = &value.as_bytes()[..value.len().min(MAX_RECORD_CONTENT - pair.len())];
+            let value = &value[..value.len().min(MAX_RECORD_CONTENT - pair.len())];
             pair.extend_from_slice(value);
             if record.len() + pair.len() > MAX_RECORD_CONTENT {
                 self.write_record(RecordType::Params, &record).await?;
@@ -700,7 +705,10 @@ mod tests {
 
         let mut client = Client::new(client_half, 1, Some(Duration::from_secs(5)), None, false);
         client.begin_request().await.unwrap();
-        client.send_params(&BTreeMap::new()).await.unwrap();
+        client
+            .send_params(&BTreeMap::<String, String>::new())
+            .await
+            .unwrap();
         client.finish_stdin().await.unwrap();
         let header = client.read_response_header().await.unwrap();
         assert_eq!(header.status, 200);
@@ -736,7 +744,10 @@ mod tests {
 
         let mut client = Client::new(client_half, 1, Some(Duration::from_secs(5)), None, true);
         client.begin_request().await.unwrap();
-        client.send_params(&BTreeMap::new()).await.unwrap();
+        client
+            .send_params(&BTreeMap::<String, String>::new())
+            .await
+            .unwrap();
         client.finish_stdin().await.unwrap();
         let header = client.read_response_header().await.unwrap();
         assert_eq!(header.status, 200);
@@ -773,7 +784,10 @@ mod tests {
 
         let mut client = Client::new(client_half, 1, Some(Duration::from_secs(5)), None, false);
         client.begin_request().await.unwrap();
-        client.send_params(&BTreeMap::new()).await.unwrap();
+        client
+            .send_params(&BTreeMap::<String, String>::new())
+            .await
+            .unwrap();
         client.finish_stdin().await.unwrap();
         let header = client.read_response_header().await.unwrap();
         assert_eq!(header.status, 503);
@@ -813,7 +827,10 @@ mod tests {
 
         let mut client = Client::new(client_half, 1, Some(Duration::from_secs(5)), None, false);
         client.begin_request().await.unwrap();
-        client.send_params(&BTreeMap::new()).await.unwrap();
+        client
+            .send_params(&BTreeMap::<String, String>::new())
+            .await
+            .unwrap();
         client.finish_stdin().await.unwrap();
         let error = client
             .read_response_header()
@@ -892,7 +909,10 @@ mod tests {
         // without the deadline.
         let mut client = Client::new(client_half, 1, Some(Duration::from_millis(50)), None, false);
         client.begin_request().await.unwrap();
-        client.send_params(&BTreeMap::new()).await.unwrap();
+        client
+            .send_params(&BTreeMap::<String, String>::new())
+            .await
+            .unwrap();
         client.finish_stdin().await.unwrap();
         let error = client
             .read_response_header()

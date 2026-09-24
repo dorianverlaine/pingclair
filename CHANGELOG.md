@@ -42,6 +42,14 @@ request fell through to the next candidate. The matcher now resolves
 candidates to filesystem paths with the same helper `templates` and
 FastCGI use, so all of them agree on which file a request names. (#12)
 
+### 🐘 FastCGI names a non-UTF-8 script by its real bytes
+
+`SCRIPT_FILENAME`, `PATH_TRANSLATED` and `DOCUMENT_ROOT` were converted
+to text lossily before they reached the responder, so a request for
+`/na%EFve.php` told PHP-FPM to run `na\u{FFFD}ve.php`, a file that does
+not exist. The CGI environment now carries these values as the bytes
+on disk. (#12)
+
 ### 🧱 Body buffering reaches the FastCGI transport
 
 `request_buffers` and `response_buffers` were accepted on a `fastcgi`

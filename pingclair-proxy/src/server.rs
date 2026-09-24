@@ -3654,11 +3654,11 @@ impl PingclairProxy {
             tracing::warn!(%error, "⚠️ FastCGI environment preparation failed");
             proxy_error(502, "FastCGI document root could not be resolved")
         })?;
-        env.insert("REQUEST_METHOD".to_string(), method.clone());
+        env.insert("REQUEST_METHOD".to_string(), method.clone().into());
         if bodyless {
-            env.insert("CONTENT_LENGTH".to_string(), "0".to_string());
+            env.insert("CONTENT_LENGTH".to_string(), b"0".to_vec());
         } else if let Some(length) = content_length {
-            env.insert("CONTENT_LENGTH".to_string(), length.to_string());
+            env.insert("CONTENT_LENGTH".to_string(), length.to_string().into());
         }
 
         let protocol_error = |error: crate::fastcgi::ExchangeError| {

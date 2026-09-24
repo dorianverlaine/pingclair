@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -119,10 +120,7 @@ impl Exchange {
     }
 
     /// 🚀 Opens the responder request and sends its complete CGI environment.
-    pub(crate) async fn begin(
-        &mut self,
-        environment: &BTreeMap<String, String>,
-    ) -> Result<(), ExchangeError> {
+    pub(crate) async fn begin(&mut self, environment: &Environment) -> Result<(), ExchangeError> {
         self.client.begin_request().await?;
         self.client.send_params(environment).await?;
         Ok(())
@@ -204,18 +202,26 @@ pub(crate) fn prepare_request_header(
     Ok(prepared)
 }
 
+/// 🧾 The CGI environment, name to value.
+///
+/// 📁 Values are bytes because two of them are filenames. `SCRIPT_FILENAME`
+/// and `PATH_TRANSLATED` name files on disk, and on Unix a filename is bytes:
+/// a script called `caf\xE9.php` exists, and handing the backend a lossy
+/// `caf\u{FFFD}.php` instead would ask it to run a file that does not.
+pub(crate) type Environment = BTreeMap<String, Vec<u8>>;
+
 /// 🧾 Builds the CGI variables shared by every downstream HTTP version.
 pub(crate) fn build_environment(
     input: EnvironmentInput<'_>,
     config: &FastCgiTransportConfig,
-) -> std::io::Result<BTreeMap<String, String>> {
+) -> std::io::Result<Environment> {
     let request = input.request;
     let path = request.uri.path();
-    let mut root = config.root.clone().unwrap_or_else(|| ".".to_string());
+    let mut root = PathBuf::from(config.root.as_deref().unwrap_or("."));
     if config.resolve_root_symlink {
         // 🔗 This option deliberately resolves on each request: deployment
         // symlinks may move while PHP opcache keeps the resolved script path.
-        root = std::fs::canonicalize(&root)?.to_string_lossy().into_owned();
+        root = std::fs::canonicalize(&root)?;
     }
 
     let split_position = split_position(path, &config.split_path);
@@ -259,7 +265,7 @@ pub(crate) fn build_environment(
     };
 
     let mut environment = BTreeMap::new();
-    environment.insert("AUTH_TYPE".to_string(), String::new());
+    environment.insert("AUTH_TYPE".to_string(), String::new().into());
     environment.insert(
         "CONTENT_TYPE".to_string(),
         request
@@ -267,57 +273,75 @@ pub(crate) fn build_environment(
             .get("content-type")
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
-            .to_string(),
+            .to_string()
+            .into(),
     );
-    environment.insert("GATEWAY_INTERFACE".to_string(), "CGI/1.1".to_string());
-    environment.insert("PATH_INFO".to_string(), path_info.clone());
+    environment.insert(
+        "GATEWAY_INTERFACE".to_string(),
+        "CGI/1.1".to_string().into(),
+    );
+    environment.insert("PATH_INFO".to_string(), path_info.clone().into());
     environment.insert(
         "QUERY_STRING".to_string(),
-        request.uri.query().unwrap_or("").to_string(),
+        request.uri.query().unwrap_or("").to_string().into(),
     );
-    environment.insert("REMOTE_ADDR".to_string(), input.remote_ip.to_string());
-    environment.insert("REMOTE_HOST".to_string(), input.remote_ip.to_string());
+    environment.insert(
+        "REMOTE_ADDR".to_string(),
+        input.remote_ip.to_string().into(),
+    );
+    environment.insert(
+        "REMOTE_HOST".to_string(),
+        input.remote_ip.to_string().into(),
+    );
     environment.insert(
         "REMOTE_PORT".to_string(),
         input
             .remote_port
-            .map_or_else(String::new, |port| port.to_string()),
+            .map_or_else(String::new, |port| port.to_string())
+            .into(),
     );
-    environment.insert("REMOTE_IDENT".to_string(), String::new());
+    environment.insert("REMOTE_IDENT".to_string(), String::new().into());
     environment.insert(
         "REMOTE_USER".to_string(),
         input
             .request_vars
             .get("http.auth.user.id")
             .unwrap_or("")
-            .to_string(),
+            .to_string()
+            .into(),
     );
     environment.insert(
         "REQUEST_METHOD".to_string(),
-        request.method.as_str().to_string(),
+        request.method.as_str().to_string().into(),
     );
-    environment.insert("REQUEST_SCHEME".to_string(), input.scheme.to_string());
-    environment.insert("SERVER_NAME".to_string(), host.to_string());
-    environment.insert("SERVER_PORT".to_string(), port.to_string());
-    environment.insert("SERVER_PROTOCOL".to_string(), protocol.to_string());
+    environment.insert(
+        "REQUEST_SCHEME".to_string(),
+        input.scheme.to_string().into(),
+    );
+    environment.insert("SERVER_NAME".to_string(), host.to_string().into());
+    environment.insert("SERVER_PORT".to_string(), port.to_string().into());
+    environment.insert("SERVER_PROTOCOL".to_string(), protocol.to_string().into());
     environment.insert(
         "SERVER_SOFTWARE".to_string(),
-        format!("Pingclair/{}", env!("CARGO_PKG_VERSION")),
+        format!("Pingclair/{}", env!("CARGO_PKG_VERSION")).into(),
     );
-    environment.insert("DOCUMENT_ROOT".to_string(), root.clone());
-    environment.insert("DOCUMENT_URI".to_string(), document_uri.to_string());
-    environment.insert("HTTP_HOST".to_string(), authority.to_string());
-    environment.insert("REQUEST_URI".to_string(), request_uri);
+    environment.insert("DOCUMENT_ROOT".to_string(), path_value(&root));
+    environment.insert("DOCUMENT_URI".to_string(), document_uri.to_string().into());
+    environment.insert("HTTP_HOST".to_string(), authority.to_string().into());
+    environment.insert("REQUEST_URI".to_string(), request_uri.into());
     environment.insert(
         "SCRIPT_FILENAME".to_string(),
-        join_root(&root, &script_name),
+        path_value(&join_root(&root, &script_name)),
     );
-    environment.insert("SCRIPT_NAME".to_string(), script_name.to_string());
+    environment.insert("SCRIPT_NAME".to_string(), script_name.to_string().into());
     if !path_info.is_empty() {
-        environment.insert("PATH_TRANSLATED".to_string(), join_root(&root, &path_info));
+        environment.insert(
+            "PATH_TRANSLATED".to_string(),
+            path_value(&join_root(&root, &path_info)),
+        );
     }
     if input.scheme == "https" {
-        environment.insert("HTTPS".to_string(), "on".to_string());
+        environment.insert("HTTPS".to_string(), "on".to_string().into());
     }
 
     // 🧰 Operator variables override CGI defaults after placeholder expansion.
@@ -330,7 +354,7 @@ pub(crate) fn build_environment(
             input.scheme,
             input.request_vars,
         );
-        environment.insert(key.clone(), resolved.into_owned());
+        environment.insert(key.clone(), resolved.into_owned().into());
     }
 
     // 🧾 End-to-end fields exclude hop-by-hop and dedicated CGI variables.
@@ -380,7 +404,7 @@ pub(crate) fn build_environment(
         } else {
             values.collect::<Vec<_>>().join(", ")
         };
-        environment.insert(variable, joined);
+        environment.insert(variable, joined.into());
     }
     Ok(environment)
 }
@@ -418,20 +442,49 @@ fn split_position(path: &str, split_path: &[String]) -> Option<usize> {
 /// answer this function has always given for a plain `..`. The backend then
 /// fails to execute a directory — a clear failure rather than one chosen by
 /// whoever wrote the escapes.
-fn join_root(root: &str, path: &str) -> String {
-    let root_path = std::path::Path::new(root.trim_end_matches('/'));
-    match pingclair_core::percent::resolve_under_root(root_path, path) {
-        Some(resolved) => resolved.to_string_lossy().into_owned(),
-        None => {
-            tracing::warn!("🚫 Refused a CGI script path that could not stay under the root");
-            root.to_string()
-        }
-    }
+///
+/// 📁 The result stays a path, the same byte path the `file` matcher and
+/// `templates` resolve for this request, so `try_files` and the backend agree
+/// on which script a request names.
+fn join_root(root: &Path, path: &str) -> PathBuf {
+    pingclair_core::percent::resolve_under_root(root, path).unwrap_or_else(|| {
+        tracing::warn!("🚫 Refused a CGI script path that could not stay under the root");
+        root.to_path_buf()
+    })
+}
+
+/// 📁 A filesystem path as a CGI value, byte for byte.
+///
+/// Off Unix a path has no byte view unless it is text, and there
+/// `resolve_under_root` has already refused anything that is not, so the empty
+/// fallback is not reached by a resolved script path.
+fn path_value(path: &Path) -> Vec<u8> {
+    pingclair_core::percent::path_bytes(path).map_or_else(Vec::new, <[u8]>::to_vec)
 }
 
 #[cfg(test)]
 mod join_root_tests {
-    use super::join_root;
+    use std::path::Path;
+
+    /// 🧪 The joined path as text, for readable assertions on text names.
+    fn join_root(root: &str, path: &str) -> String {
+        super::join_root(Path::new(root), path)
+            .to_str()
+            .expect("a text name joins to text")
+            .to_string()
+    }
+
+    /// 📁 A script whose name is not valid UTF-8 reaches the backend as the
+    /// exact bytes on disk. It used to go through `to_string_lossy`, so the
+    /// backend was told to run `caf\u{FFFD}.php`, a file that does not exist.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_script_name_is_sent_as_its_bytes() {
+        assert_eq!(
+            super::path_value(&super::join_root(Path::new("/srv/www"), "/caf%E9.php")),
+            b"/srv/www/caf\xe9.php"
+        );
+    }
 
     /// 🔤 `SCRIPT_FILENAME` is a filesystem path, not a URI, so the escapes are
     /// decoded before the backend is told which file to execute.
@@ -530,12 +583,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(environment["SERVER_PROTOCOL"], "HTTP/3.0");
-        assert_eq!(environment["SCRIPT_FILENAME"], "/srv/www/index.php");
-        assert_eq!(environment["PATH_INFO"], "/tail");
-        assert_eq!(environment["REQUEST_URI"], "/original.php?x=1");
-        assert_eq!(environment["REMOTE_PORT"], "44321");
-        assert_eq!(environment["HTTP_X_ROLE"], "admin");
+        assert_eq!(environment["SERVER_PROTOCOL"], b"HTTP/3.0");
+        assert_eq!(environment["SCRIPT_FILENAME"], b"/srv/www/index.php");
+        assert_eq!(environment["PATH_INFO"], b"/tail");
+        assert_eq!(environment["REQUEST_URI"], b"/original.php?x=1");
+        assert_eq!(environment["REMOTE_PORT"], b"44321");
+        assert_eq!(environment["HTTP_X_ROLE"], b"admin");
     }
 
     /// 🛡️ No client field becomes an environment variable it should not.
@@ -581,7 +634,7 @@ mod tests {
 
         // 🧭 The verified identity is still what the script is told, and it
         // comes from the socket rather than from anything the client wrote.
-        assert_eq!(environment["REMOTE_ADDR"], "192.0.2.4");
+        assert_eq!(environment["REMOTE_ADDR"], b"192.0.2.4");
     }
 
     /// 🧰 Header templates are resolved once before they become CGI variables.
@@ -616,7 +669,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(environment["HTTP_X_REQUEST_METHOD"], "GET");
+        assert_eq!(environment["HTTP_X_REQUEST_METHOD"], b"GET");
     }
 
     /// 🛑 Both downstream transports emit an explicit responder abort before teardown.

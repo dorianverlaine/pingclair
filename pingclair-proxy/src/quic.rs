@@ -4614,10 +4614,10 @@ async fn fastcgi_upstream(
         tracing::warn!(%error, "⚠️ H3 FastCGI environment preparation failed");
         (502, "FastCGI Document Root Could Not Be Resolved")
     })?;
-    environment.insert("REQUEST_METHOD".to_string(), method);
+    environment.insert("REQUEST_METHOD".to_string(), method.into());
     environment.insert(
         "CONTENT_LENGTH".to_string(),
-        content_length.unwrap_or(0).to_string(),
+        content_length.unwrap_or(0).to_string().into(),
     );
 
     let exchange_error = |error: crate::fastcgi::ExchangeError| {
