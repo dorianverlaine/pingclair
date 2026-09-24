@@ -315,6 +315,24 @@ which it may retry elsewhere; a request opened after that is refused with
 with `H3_NO_ERROR` once its last response has been acknowledged. New QUIC
 connections are ignored while the process drains. HTTP/3 never sent `GOAWAY`
 before, not even at shutdown.
+||||||| parent of be037b7 (🔐 feat(config): honour auto_https ignore_loaded_certs)
+### 🔐 `auto_https ignore_loaded_certs` loads, and does what it names
+
+A Caddyfile carrying this option was refused outright, so a configuration using
+it could not load at all. It parses now, and it changes the decision it names:
+a site that loaded its own certificate — `tls <cert> <key>` — is put in front
+of a certificate authority instead of being skipped because the operator
+already has a certificate for that name.
+
+**Upgrading:** the option means what it says, so read it before adding it. A
+site whose certificate file was the whole answer will now be issued one, which
+is traffic to a third party. Operator-supplied certificates are still what a
+handshake serves — the manual file keeps precedence — so the visible effect is
+that the name is obtained for and kept fresh, not that the served certificate
+changes.
+
+`auto_https disable_certs` remains refused by name, and the refusal now names
+only itself.
 
 ### 🔌 A request shorter than the h2c preface is answered instead of ignored
 

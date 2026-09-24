@@ -2489,6 +2489,27 @@ mod fail_closed_tests {
         );
     }
 
+    /// 🔐 `auto_https ignore_loaded_certs` loads, and loads as itself.
+    ///
+    /// 🚩 It used to be refused alongside `disable_certs` — one arm for two
+    /// spellings that mean different things. The assertion is on the mode that
+    /// reaches the compiled configuration rather than on the absence of an
+    /// error, because the cheaper regression is not "it stops loading": it is
+    /// that the spelling keeps loading while being mapped onto `On`, which
+    /// drops the one thing the operator asked for and looks like success.
+    #[test]
+    fn auto_https_ignore_loaded_certs_loads_as_its_own_mode() {
+        let config = crate::compile(
+            "{\n    auto_https ignore_loaded_certs\n}\nexample.com {\n    respond \"x\"\n}",
+        )
+        .expect("ignore_loaded_certs must be accepted");
+        assert_eq!(
+            config.global.auto_https,
+            pingclair_core::config::AutoHttpsMode::IgnoreLoadedCerts,
+            "the spelling has to survive compilation as its own mode, not as `on`"
+        );
+    }
+
     #[test]
     fn method_matcher_rejects_unknown_verbs() {
         let error =

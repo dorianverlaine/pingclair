@@ -323,6 +323,7 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
             AutoHttpsMode::On => CoreMode::On,
             AutoHttpsMode::Off => CoreMode::Off,
             AutoHttpsMode::DisableRedirects => CoreMode::DisableRedirects,
+            AutoHttpsMode::IgnoreLoadedCerts => CoreMode::IgnoreLoadedCerts,
         };
     }
 

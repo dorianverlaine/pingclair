@@ -112,7 +112,19 @@ pub(crate) fn run_server(
     pingclair_proxy::metrics::CONFIG_VERSION.set(1);
 
     if config.global.auto_https != pingclair_core::config::AutoHttpsMode::Off {
-        tracing::info!("🔐 Auto HTTPS: enabled");
+        // 🔐 The mode is named, not just "enabled": `ignore_loaded_certs`
+        // changes which sites reach a certificate authority, so an operator
+        // reading the startup log has to be able to tell it apart from the
+        // default without diffing the config they just loaded.
+        match config.global.auto_https {
+            pingclair_core::config::AutoHttpsMode::IgnoreLoadedCerts => {
+                tracing::info!("🔐 Auto HTTPS: enabled (ignore_loaded_certs)");
+            }
+            pingclair_core::config::AutoHttpsMode::DisableRedirects => {
+                tracing::info!("🔐 Auto HTTPS: enabled (disable_redirects)");
+            }
+            _ => tracing::info!("🔐 Auto HTTPS: enabled"),
+        }
         if let Some(email) = &config.global.email {
             tracing::info!("📧 ACME email: {}", email);
         }

@@ -145,15 +145,26 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                         "disable_redirects" => {
                             global.auto_https = Some(AutoHttpsMode::DisableRedirects)
                         }
-                        // 🚫 Caddy's `disable_certs` and `ignore_loaded_certs`
-                        // modes are real syntax; name them explicitly instead
-                        // of reporting a bare invalid argument.
-                        "disable_certs" | "ignore_loaded_certs" => {
-                            // TODO(v0.3): implement certificate-only and
-                            // ignore-loaded-certificates automation modes.
+                        // 🔐 `ignore_loaded_certs` asks for the opposite of the
+                        // default skip: a site that already has a certificate
+                        // loaded is automated anyway, so the certificate
+                        // authority is still consulted for its name. Caddy
+                        // reaches this by inverting the `HasCertificateForSubject`
+                        // skip (caddy v2.11.4, modules/caddyhttp/autohttps.go:208-214);
+                        // this build inverts the matching clause in
+                        // `public_issuance_domains`.
+                        "ignore_loaded_certs" => {
+                            global.auto_https = Some(AutoHttpsMode::IgnoreLoadedCerts)
+                        }
+                        // 🚫 `disable_certs` is real Caddy syntax this build
+                        // does not implement; named explicitly rather than
+                        // reported as a bare invalid argument.
+                        "disable_certs" => {
                             return Err(AdapterError::UnsupportedFeature(
                                 format!("auto_https {arg}"),
-                                "only on, off and disable_redirects are implemented".into(),
+                                "only on, off, disable_redirects and ignore_loaded_certs \
+                                 are implemented"
+                                    .into(),
                             ));
                         }
                         _ => {

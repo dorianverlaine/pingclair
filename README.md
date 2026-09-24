@@ -299,6 +299,7 @@ Control it from the global block:
 | --- | --- |
 | `on` (default) | Provision port 80, answer ACME challenges, redirect to HTTPS. |
 | `disable_redirects` | Provision port 80 and answer ACME challenges, but do not redirect. |
+| `ignore_loaded_certs` | As `on`, except that a site which loaded its own certificate is automated anyway instead of being left to that file. |
 | `off` | Provision nothing; certificate management is disabled too. |
 
 Writing your own `listen :80` in the block opts out of the automatic listener —

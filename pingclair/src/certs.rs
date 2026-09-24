@@ -360,14 +360,41 @@ impl TlsAccept for DynamicCertResolver {
 pub(crate) fn public_issuance_domains(
     config: &pingclair_core::config::PingclairConfig,
 ) -> Vec<String> {
+    // 🔐 `auto_https ignore_loaded_certs` changes which names are *candidates*
+    // for automation, which is why this reads as two questions rather than one
+    // loosened clause. Caddy asks them separately (v2.11.4,
+    // `modules/caddyhttp/autohttps.go:199-214`): every hostname of the server
+    // is a candidate, and a name with a certificate already loaded is skipped
+    // unless this flag is set. The two halves matter apart, because a site that
+    // names its own certificate file is exactly the site Caddy would skip — so
+    // "relax the skip but still require `tls.auto`" would describe a
+    // configuration nobody can write, and the flag would do nothing for an
+    // operator migrating a Caddyfile.
+    //
+    // 🛡️ The consequence is real and intended: with the flag, a site that
+    // loaded its own certificate does talk to a certificate authority. That is
+    // what the option is for — a placeholder certificate that is about to be
+    // replaced by a real one — and it is why the flag is opt-in and explicit
+    // rather than inferred.
+    //
+    // 📌 Read once, here, rather than per site: the answer is the same for
+    // every site and cannot change while this function runs.
+    let ignore_loaded =
+        config.global.auto_https == pingclair_core::config::AutoHttpsMode::IgnoreLoadedCerts;
     config
         .servers
         .iter()
         .filter(|server| {
-            server
-                .tls
-                .as_ref()
-                .is_some_and(|tls| tls.auto && !tls.internal && tls.cert.is_none())
+            server.tls.as_ref().is_some_and(|tls| {
+                if tls.internal {
+                    return false;
+                }
+                if ignore_loaded {
+                    tls.auto || tls.cert.is_some()
+                } else {
+                    tls.auto && tls.cert.is_none()
+                }
+            })
         })
         .flat_map(|server| {
             // 🧭 JSON documents may carry hostnames in `names` while `name`
@@ -584,6 +611,75 @@ mod tests {
         assert_eq!(
             public_issuance_domains(&config),
             vec!["auto.example", "*.example.com", "json.example"]
+        );
+    }
+
+    /// 🔐 `ignore_loaded_certs` un-skips the site Caddy would have skipped.
+    ///
+    /// The site under test spells its certificate the way both Caddy and this
+    /// build accept it — `tls <cert> <key>`, which leaves `auto` alone. That
+    /// detail is the test: an implementation that merely stopped checking
+    /// `tls.cert` would still require `tls.auto`, and no such site can be
+    /// written in the DSL, so the flag would look implemented while doing
+    /// nothing for the configurations it exists for.
+    ///
+    /// 🛡️ The last case pins the other half. `internal` names come from the
+    /// local authority and must never reach a public one, flag or no flag —
+    /// that is an authority boundary, not an automation preference.
+    #[test]
+    fn ignore_loaded_certs_automates_a_site_that_loaded_its_own_certificate() {
+        use pingclair_core::config::{AutoHttpsMode, PingclairConfig, ServerConfig, TlsConfig};
+
+        let loaded = || ServerConfig {
+            name: Some("loaded.example".to_string()),
+            tls: Some(TlsConfig {
+                auto: false,
+                cert: Some("/certs/fullchain.pem".to_string()),
+                key: Some("/certs/key.pem".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let plain_auto = || ServerConfig {
+            name: Some("auto.example".to_string()),
+            tls: Some(TlsConfig {
+                auto: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let internal = || ServerConfig {
+            name: Some("internal.example".to_string()),
+            tls: Some(TlsConfig {
+                internal: true,
+                cert: Some("/certs/fullchain.pem".to_string()),
+                key: Some("/certs/key.pem".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let config = |mode| PingclairConfig {
+            global: pingclair_core::config::GlobalConfig {
+                auto_https: mode,
+                ..Default::default()
+            },
+            servers: vec![loaded(), plain_auto(), internal()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            public_issuance_domains(&config(AutoHttpsMode::On)),
+            vec!["auto.example"],
+            "by default a loaded certificate is the operator's answer, and the \
+             certificate authority is not consulted about that name"
+        );
+        assert_eq!(
+            public_issuance_domains(&config(AutoHttpsMode::IgnoreLoadedCerts)),
+            vec!["loaded.example", "auto.example"],
+            "with the flag the loaded certificate no longer excuses the name, \
+             and the internal site is still out — its authority is local, so \
+             un-skipping it can never mean asking a public CA"
         );
     }
 

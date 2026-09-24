@@ -144,6 +144,10 @@ pub enum AutoHttpsMode {
     On,
     Off,
     DisableRedirects,
+    /// 🔐 Caddy's `ignore_loaded_certs`: keep automating a site that already
+    /// has a certificate loaded, instead of treating the loaded certificate as
+    /// the answer and skipping the certificate authority entirely.
+    IgnoreLoadedCerts,
 }
 
 /// Protocol types

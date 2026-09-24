@@ -280,6 +280,7 @@ HTTP-01 挑戰——CA 是以**明文** HTTP 打在這個 port（RFC 8555 §8.3�
 | --- | --- |
 | `on`（預設） | 自動開 port 80、回應 ACME 挑戰、重導到 HTTPS。 |
 | `disable_redirects` | 自動開 port 80 並回應 ACME 挑戰，但不重導。 |
+| `ignore_loaded_certs` | 同 `on`，但自己載入了憑證的站台仍會被自動化，而不是就只靠那個檔案。 |
 | `off` | 什麼都不開，憑證管理也一併關閉。 |
 
 在 block 裡自己寫 `listen :80` 就等於放棄自動 listener，Pingclair 會完全照你

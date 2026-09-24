@@ -461,6 +461,12 @@ pub enum AutoHttpsMode {
     On,
     Off,
     DisableRedirects,
+    /// 🔐 Caddy spells this `ignore_loaded_certs` in a Caddyfile and
+    /// `ignore_loaded_certificates` in JSON — the two differ, and the serde
+    /// rename below carries the JSON spelling because that is what a config
+    /// migrated from Caddy's admin API contains.
+    #[serde(rename = "ignore_loaded_certificates")]
+    IgnoreLoadedCerts,
 }
 
 /// 🗜️ Default MIME patterns eligible for reverse-proxy gzip compression.

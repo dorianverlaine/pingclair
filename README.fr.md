@@ -296,6 +296,7 @@ Le comportement se pilote depuis le bloc global :
 | --- | --- |
 | `on` (par défaut) | Provisionne le port 80, répond aux challenges ACME, redirige vers HTTPS. |
 | `disable_redirects` | Provisionne le port 80 et répond aux challenges ACME, sans rediriger. |
+| `ignore_loaded_certs` | Comme `on`, sauf qu'un site ayant chargé son propre certificat est tout de même automatisé au lieu de s'en tenir à ce fichier. |
 | `off` | Ne provisionne rien ; la gestion des certificats est également désactivée. |
 
 Écrire votre propre `listen :80` dans le bloc désactive le listener automatique :
