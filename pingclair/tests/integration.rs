@@ -23,6 +23,10 @@ mod static_validators;
 #[path = "integration/preconditions.rs"]
 mod preconditions;
 
+// 🏷️ The dev-build and release version strings every CLI surface reports.
+#[path = "integration/version.rs"]
+mod version;
+
 // 🗄️ Response-cache lifetime tests live beside this file so the harness here
 // does not keep growing; they reuse its `TestServer` and helpers.
 #[path = "integration/cache.rs"]

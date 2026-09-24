@@ -236,7 +236,7 @@ fn module_type(id: &str) -> &'static str {
 
 /// 📦 The build string `--versions` prints, in Caddy's `v<version>` shape.
 fn module_version() -> String {
-    format!("v{}", env!("CARGO_PKG_VERSION"))
+    format!("v{}", env!("PINGCLAIR_VERSION"))
 }
 
 /// 📦 The package a module comes from, for `--packages`.
@@ -588,7 +588,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
         }
 
         Commands::BuildInfo => {
-            println!("pingclair v{}", env!("CARGO_PKG_VERSION"));
+            println!("pingclair v{}", env!("PINGCLAIR_VERSION"));
             println!("rust edition 2024");
             println!(
                 "profile: {}",
@@ -1171,7 +1171,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
         }
 
         Commands::Version => {
-            println!("v{}", env!("CARGO_PKG_VERSION"));
+            println!("v{}", env!("PINGCLAIR_VERSION"));
         }
 
         Commands::Service { action } => manage_system_service(action)?,

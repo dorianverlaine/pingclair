@@ -14,11 +14,28 @@ fact.
 
 ## [Unreleased]
 
-📦 Everything below is on `main` and not yet a final release; the workspace
-reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
-2026-08-20 and the second, `0.2.0-rc.2`, on 2026-09-19. This section covers
-changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
-decided.
+📦 Everything below is on `main` and not yet a final release. The first
+release candidate, `0.2.0-rc.1`, was tagged on 2026-08-20, the second,
+`0.2.0-rc.2`, on 2026-09-19, and the third was `0.2.0-rc.3`. This section
+covers changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals
+below are decided.
+
+### 🏷️ A build of `main` says it is a dev build
+
+`main` now carries version `0.0.0`, and a release is a single commit off
+`main` that sets the real number. A binary built from `main` therefore
+reports `v0.0.0-dev+<commit>` from `pingclair version`, `build-info` and
+`list-modules --versions`, and `pingclair 0.0.0-dev+<commit>` from
+`--version`, or plain `v0.0.0-dev` when it was built
+without a git checkout, such as from a source tarball or in the Docker
+image's build context. A release binary reports exactly its version, as
+before.
+
+📌 Upgrading: nothing changes for anyone installing a release. A script that
+parsed the version of a source build to decide what it is must now expect
+`0.0.0-dev`. Previews for the next minor are published as prereleases named
+`X.Y.Z-alpha.N`; only a stable `X.Y.Z` becomes the "Latest" GitHub release
+or the image's `:latest` tag, which an rc used to move as well.
 
 ### 🔌 `remote_ip` matches the connection's peer, `client_ip` the client
 

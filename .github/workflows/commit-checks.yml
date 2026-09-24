@@ -58,38 +58,24 @@ jobs:
           fi
           echo "✅ all commit subjects open with emoji + conventional type"
 
-  check-version-bump:
-    name: Workspace version is ahead of the newest release tag
+  check-dev-version:
+    name: Workspace version on main is 0.0.0
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
 
-      - name: Compare the workspace version against the newest release tag
+      - name: Require the dev version
         run: |
           set -Eeuo pipefail
           crate_version="$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"/\1/')"
-          git fetch --quiet --tags --force
-          # 🏷️ Pre-release tags are excluded on purpose. `sort -V` orders
-          # `0.2.0-rc.1` *after* `0.2.0`, the opposite of SemVer, so leaving
-          # an rc tag in the list makes every PR fail with "behind the newest
-          # release tag" the moment a release candidate is cut.
-          latest_tag="$(git tag -l 'v*.*.*' | sed 's/^v//' | grep -v -- '-' | sort -V | tail -1)"
-          if [ -z "${latest_tag}" ]; then
-            echo "✅ no release tag yet; nothing to be ahead of"
-            exit 0
-          fi
-          echo "workspace: ${crate_version}    newest release tag: v${latest_tag}"
-          release_part="${crate_version%%-*}"
-          if [ "${release_part}" = "${latest_tag}" ]; then
-            echo "::error::the workspace release version ${release_part} is the newest release tag v${latest_tag}; bump it so a source build is distinguishable from the release"
+          # 🏷️ Only a release commit, cut off main by scripts/cut-release.sh,
+          # carries a real version. Keeping main at 0.0.0 means no pull
+          # request ever conflicts on a version bump, and a binary built from
+          # main reports itself as `0.0.0-dev+<sha>` rather than as a release.
+          if [ "${crate_version}" != "0.0.0" ]; then
+            echo "::error::main carries version 0.0.0, but Cargo.toml says ${crate_version}; set versions with scripts/cut-release.sh on a release commit instead"
             exit 1
           fi
-          newest="$(printf '%s\n%s\n' "${release_part}" "${latest_tag}" | sort -V | tail -1)"
-          if [ "${newest}" != "${release_part}" ]; then
-            echo "::error::the workspace version ${crate_version} is behind the newest release tag v${latest_tag}"
-            exit 1
-          fi
-          echo "✅ ${crate_version} is ahead of the newest release tag v${latest_tag}"
+          echo "🏷️ workspace version is the dev placeholder 0.0.0"

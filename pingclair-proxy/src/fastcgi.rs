@@ -323,7 +323,7 @@ pub(crate) fn build_environment(
     environment.insert("SERVER_PROTOCOL".to_string(), protocol.to_string().into());
     environment.insert(
         "SERVER_SOFTWARE".to_string(),
-        format!("Pingclair/{}", env!("CARGO_PKG_VERSION")).into(),
+        pingclair_core::SERVER_SOFTWARE.into(),
     );
     environment.insert("DOCUMENT_ROOT".to_string(), path_value(&root));
     environment.insert("DOCUMENT_URI".to_string(), document_uri.to_string().into());

@@ -29,7 +29,7 @@ use self::admin::parse_header_pair;
 /// Pingclair - Modern web server inspired by Caddy, powered by Pingora
 #[derive(Parser)]
 #[command(name = "pingclair")]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = env!("PINGCLAIR_VERSION"), about, long_about = None)]
 pub(crate) struct Cli {
     /// Enable verbose logging
     ///

@@ -65,7 +65,7 @@ pub(crate) fn run_server(
     });
 
     // Enhanced diagnostic logging
-    tracing::info!("🚀 Starting Pingclair v{}", env!("CARGO_PKG_VERSION"));
+    tracing::info!("🚀 Starting Pingclair v{}", env!("PINGCLAIR_VERSION"));
     tracing::info!("📄 Loaded configuration from: {}", config_path);
     tracing::info!("🔧 Configured {} server(s)", config.servers.len());
 

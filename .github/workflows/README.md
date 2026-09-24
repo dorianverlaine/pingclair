@@ -23,7 +23,7 @@ workflow, so a red result never masks another.
 | `rust-ci-full.yml` | workflow_call, dispatch, `**full-ci**` | Full orchestration: release Clippy, nextest shards |
 | `rust-ci-full-nextest-platform.yml` | workflow_call | Nextest archive + 4 shards + JUnit for one platform |
 | `docker.yml` | workflow_call | Builds the production image; boots it and validates a real Pingclairfile |
-| `commit-checks.yml` | workflow_call | Whitespace, commit subjects, version ahead of the newest tag |
+| `commit-checks.yml` | workflow_call | Whitespace, commit subjects, main carries the 0.0.0 dev version |
 | `security-audit.yml` | workflow_call, nightly schedule | `cargo audit` plus a re-resolved audit of patched crates |
 | `cargo-deny.yml` | workflow_call | License, ban, and duplicate-version policy |
 | `repo-checks.yml` | workflow_call | Mechanical repository invariants and their unit tests |
