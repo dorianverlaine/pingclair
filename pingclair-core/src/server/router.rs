@@ -5,7 +5,9 @@
 //!
 //! Provides O(log n) path matching with support for wildcards and parameters.
 
-use crate::config::{HandlerConfig, HandlerElement, Matcher, MatcherCondition, RouteConfig};
+use crate::config::{
+    HandlerConfig, HandlerElement, IpRanges, Matcher, MatcherCondition, RouteConfig,
+};
 use matchit::Router as RadixRouter;
 use std::collections::HashMap;
 use std::path::Path;
@@ -1107,19 +1109,14 @@ fn evaluate_condition(
     }
 }
 
-/// 🌐 Matches the remote/client IP against exact literals and CIDR
-/// ranges, as Caddy's `remote_ip`/`client_ip` matchers do.
-fn remote_ip_matches(patterns: &[String], remote_ip: &str) -> bool {
-    let Ok(remote) = remote_ip.parse::<std::net::IpAddr>() else {
-        return false;
-    };
-    patterns.iter().any(|pattern| {
-        if let Ok(net) = pattern.parse::<ipnet::IpNet>() {
-            net.contains(&remote)
-        } else {
-            pattern.parse::<std::net::IpAddr>().ok() == Some(remote)
-        }
-    })
+/// 🌐 Matches the remote/client IP against ranges parsed when the
+/// configuration loaded, as Caddy's `remote_ip`/`client_ip` matchers do.
+/// Only the request's own address is parsed here; an address that does not
+/// parse matches nothing.
+fn remote_ip_matches(ranges: &IpRanges, remote_ip: &str) -> bool {
+    remote_ip
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|remote| ranges.contains(remote))
 }
 
 /// Check if path matches a glob pattern
@@ -1622,7 +1619,9 @@ mod tests {
                 headers: BTreeMap::new(),
             },
             methods: None,
-            matcher: Some(Matcher::RemoteIp(vec!["10.0.0.0/8".to_string()])),
+            matcher: Some(Matcher::RemoteIp(
+                crate::config::IpRanges::parse(["10.0.0.0/8"]).unwrap(),
+            )),
         };
         let router = Router::new(vec![route]);
         let headers = HeaderMap::new();

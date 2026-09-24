@@ -2603,7 +2603,15 @@ fn compile_matcher(
             }
         }
         Matcher::Host(hosts) => CoreMatcher::Host(hosts.clone()),
-        Matcher::RemoteIp(ips) => CoreMatcher::RemoteIp(ips.clone()),
+        // 🚫 Parsed here, once, so a malformed range stops the configuration
+        // instead of becoming a range that silently matches nothing.
+        Matcher::RemoteIp(ips) => CoreMatcher::RemoteIp(
+            pingclair_core::config::IpRanges::parse(ips.iter().map(String::as_str)).map_err(
+                |error| CompileError::InvalidRoute {
+                    message: format!("remote_ip/client_ip matcher: {error}"),
+                },
+            )?,
+        ),
         Matcher::Protocol(protocols) => CoreMatcher::Protocol(protocols.clone()),
         Matcher::Vars { name, values } => CoreMatcher::Vars {
             name: name.clone(),

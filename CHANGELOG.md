@@ -20,6 +20,16 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🌐 IP matcher ranges are parsed once, and a malformed one is refused
+
+`remote_ip` and `client_ip` ranges are now parsed when the configuration
+loads rather than on every request. A range that does not parse, such as
+`10.0.0.0/33`, now stops the configuration with an error naming it — from a
+Pingclairfile, a JSON config, or an Admin API reload alike. It used to load
+and then match nothing, so a block list with a typo let the address through.
+Matching an address against a four-range guard went from about 106 ns to
+about 23 ns in the router microbenchmark. (#192)
+
 ### 🧮 Static-file cache budgets are shared across routes
 
 All `file_server` instances now share process-wide limits of 64 MiB for

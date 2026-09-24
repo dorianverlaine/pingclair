@@ -9,7 +9,7 @@
 //! kind of request it slowed down rather than as one blended number.
 
 use divan::black_box;
-use pingclair_core::config::{HandlerConfig, Matcher, MatcherCondition, RouteConfig};
+use pingclair_core::config::{HandlerConfig, IpRanges, Matcher, MatcherCondition, RouteConfig};
 use pingclair_core::server::Router;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -18,6 +18,7 @@ fn main() {
     // 🏗️ Build the table before timing starts, so the first sample of
     // whichever benchmark runs first does not pay for construction.
     LazyLock::force(&ROUTER);
+    LazyLock::force(&IP_GUARDED);
     divan::main();
 }
 
@@ -95,4 +96,44 @@ fn shallow_glob() -> Option<usize> {
 #[divan::bench]
 fn catch_all() -> Option<usize> {
     select("/blog/2026/09/hello")
+}
+
+/// 🌐 A `remote_ip` matcher over the given ranges.
+fn ip_matcher(ranges: &[&str]) -> Matcher {
+    Matcher::RemoteIp(IpRanges::parse(ranges.iter().copied()).expect("benchmark ranges parse"))
+}
+
+/// 🌐 The address-blocking shape: a `remote_ip` guard in front of the site,
+/// listing several ranges the request is in none of, so every range is
+/// checked before the catch-all answers. This is the cost every request pays
+/// on a site that blocks addresses.
+static IP_GUARDED: LazyLock<Router> = LazyLock::new(|| {
+    Router::new(vec![
+        route(
+            "/*",
+            Some(ip_matcher(&[
+                "10.0.0.0/8",
+                "172.16.0.0/12",
+                "192.168.0.0/16",
+                "2001:db8::/32",
+            ])),
+        ),
+        route("/*", None),
+    ])
+});
+
+#[divan::bench]
+fn ip_guard_miss() -> Option<usize> {
+    let headers = http::HeaderMap::new();
+    IP_GUARDED
+        .match_normalized_request(
+            black_box("/index.html"),
+            "GET",
+            &headers,
+            "example.com",
+            black_box("203.0.113.9"),
+            "HTTP/1.1",
+            None,
+        )
+        .map(|route| route.index)
 }

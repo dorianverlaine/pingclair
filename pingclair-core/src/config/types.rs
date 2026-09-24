@@ -48,6 +48,7 @@
 //! `deny_unknown_fields` cannot coexist with `#[serde(flatten)]`, which is why
 //! [`HandlerElement`] and [`NamedLogConfig`] are not on the list.
 
+use super::IpRanges;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -1137,7 +1138,7 @@ pub enum Matcher {
     Host(Vec<String>),
 
     /// Match by remote IP
-    RemoteIp(Vec<String>),
+    RemoteIp(IpRanges),
 
     /// Match by protocol
     Protocol(Vec<String>),
@@ -1298,7 +1299,11 @@ impl<'de> Deserialize<'de> for Matcher {
             Repr::Tagged(Tagged::Method { methods }) => Matcher::Method { methods },
             Repr::Tagged(Tagged::Query { name, condition }) => Matcher::Query { name, condition },
             Repr::Tagged(Tagged::Host(hosts)) => Matcher::Host(hosts),
-            Repr::Tagged(Tagged::RemoteIp(ips)) => Matcher::RemoteIp(ips),
+            Repr::Tagged(Tagged::RemoteIp(ips)) => {
+                // 🚫 Parsed after the shape is recognized, so a bad range is
+                // reported by name instead of as "not a matcher at all".
+                Matcher::RemoteIp(IpRanges::parse(ips).map_err(serde::de::Error::custom)?)
+            }
             Repr::Tagged(Tagged::Protocol(protocols)) => Matcher::Protocol(protocols),
             Repr::Tagged(Tagged::Vars { name, values }) => Matcher::Vars { name, values },
             Repr::Tagged(Tagged::PathRegexp { name, pattern }) => {
@@ -3691,7 +3696,7 @@ mod tests {
                 condition: condition.clone(),
             },
             Matcher::Host(vec!["example.com".into()]),
-            Matcher::RemoteIp(vec!["10.0.0.1".into()]),
+            Matcher::RemoteIp(IpRanges::parse(["10.0.0.1"]).unwrap()),
             Matcher::Protocol(vec!["https".into()]),
             Matcher::And(Box::new(path("/a")), Box::new(path("/b"))),
             Matcher::Or(Box::new(path("/a")), Box::new(path("/b"))),
@@ -3806,7 +3811,9 @@ mod tests {
 
         let addresses = vec!["10.0.0.1".to_string()];
         assert!(matches!(
-            round_trip(&Matcher::RemoteIp(addresses.clone())),
+            round_trip(&Matcher::RemoteIp(
+                IpRanges::parse(addresses.clone()).unwrap()
+            )),
             Matcher::RemoteIp(_)
         ));
         assert!(matches!(
