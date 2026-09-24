@@ -560,6 +560,41 @@ example.com {
 }
 ```
 
+#### 🧭 Which route answers
+
+A site's directives form one list, and the first entry that matches the
+request answers. The list is sorted by directive, not by how specific a
+path is, so `respond "hello"` answers `/assets/a.txt` even when
+`file_server /assets/*` is written beside it: `respond` comes earlier in
+the directive order. The order puts `redir`, `rewrite`, `handle` and `route`
+ahead of `respond`, and `respond` ahead of `reverse_proxy`, `php_fastcgi`
+and `file_server`; the `order` global option moves a directive, and a
+`route` block keeps what it contains in written order.
+
+Between two entries of the same directive, the one whose single path is
+longer once a trailing `*` is removed goes first (`/foobar*` before
+`/foo`), then an exact path before a wildcard (`/foo` before `/foo*`), then
+file order. A matcher with several paths, or none, goes after every
+single-path sibling. `handle` blocks sort their contents the same way.
+
+Three kinds of entry take the rank of something other than their own name:
+
+- 🧩 A matched middleware directive such as `header @api …` has nothing to
+  answer with, so it runs in front of the site's unmatched directives and
+  ranks where their answering directive does — usually `reverse_proxy` or
+  `file_server`.
+- 🐘 `php_fastcgi` expands into several steps but ranks as `php_fastcgi`,
+  after `respond`.
+- 📄 `templates` only rewrites what `file_server` produces, so a site whose
+  unmatched directives are `templates` and `file_server` ranks as
+  `file_server`.
+
+📌 One deliberate difference from Caddy: two different paths of equal
+length (after removing a trailing `*`) keep file order, where Caddy sorts
+them alphabetically. Two such paths can only match the same request when a
+`*` sits in the middle of one, which route paths do not support yet, so the
+difference is not observable today.
+
 ### Advanced: macros
 
 Macros are one of Pingclair's most powerful features. Define a macro to encapsulate a repeated configuration fragment, then reuse it across servers and routes to keep configuration DRY.

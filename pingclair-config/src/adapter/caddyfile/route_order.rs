@@ -3,13 +3,13 @@
 
 //! 🧭 A site's routes as one ordered list, the way the reference format reads them.
 //!
-//! Two models of "which route answers" disagree here. The router picks the
-//! **most specific path**: `file_server /assets/*` beats a catch-all `respond`
-//! for `/assets/a.txt` wherever the two were written. The format picks the
-//! **first route in directive order** that matches and answers: `respond`
-//! sorts ahead of `file_server` in the order table, so the catch-all wins and
-//! the file is never served. Issue #18 records the decision to adopt the
-//! second model.
+//! Two models of "which route answers" used to disagree here. The router
+//! picked the **most specific path**: `file_server /assets/*` beat a
+//! catch-all `respond` for `/assets/a.txt` wherever the two were written.
+//! The format picks the **first route in directive order** that matches and
+//! answers: `respond` sorts ahead of `file_server` in the order table, so the
+//! catch-all wins and the file is never served. Issue #18 adopted the second
+//! model; the router has followed it since the stage-2 commit.
 //!
 //! 📌 The site adapter sorts its routes by [`RouteOrderKey`] once, at load,
 //! and emits them in that order (issue #18, stage 2). The router tries them
@@ -44,7 +44,9 @@
 //! - Two different trimmed patterns of equal length are ordered
 //!   alphabetically there; here they stay in file order, per the decision.
 //!   The two can only disagree for patterns with a `*` in the middle — two
-//!   different prefixes of the same length never match the same request.
+//!   different prefixes of the same length never match the same request —
+//!   and a route path does not match a mid-pattern `*` today, so no request
+//!   can tell them apart yet.
 
 use super::order::DirectiveOrder;
 use super::sites::{handler_directive_name, handler_has_terminal};

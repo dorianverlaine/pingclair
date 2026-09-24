@@ -52,6 +52,15 @@ before `/foo`), then exact before wildcard (`/foo` before `/foo*`), then
 file order. A matcher with several paths, or none, goes after every
 single-path sibling. `handle` blocks sort their contents by the same rule.
 
+Three entries rank as something other than their own name: a matched
+middleware directive (`header @api …`) ranks where the site's answering
+directive does, since that is what answers for it; `php_fastcgi` ranks as
+itself, after `respond`; and `templates` beside `file_server` ranks as
+`file_server`. Two different paths of equal length keep file order, where
+Caddy sorts them alphabetically — not observable yet, because only a `*`
+in the middle of a path lets two such paths match one request, and route
+paths do not support that.
+
 **Upgrading:** a configuration where a narrower directive sits below a
 broader one of an earlier rank now answers differently. To keep the old
 answer, give the narrower route an earlier rank — wrap both in `handle`
