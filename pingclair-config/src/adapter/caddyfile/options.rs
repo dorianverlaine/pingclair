@@ -2,7 +2,9 @@
 // Copyright 2026 Dorian Verlaine
 
 use super::AdapterError;
-use super::args::{expect_one_argument, parse_dns_refresh, parse_required_duration};
+use super::args::{
+    expect_one_argument, parse_dns_refresh, parse_renewal_window_ratio, parse_required_duration,
+};
 use super::logs::adapt_log_block;
 use crate::parser::ast::*;
 use crate::parser::caddy_ast::{Block, Directive};
@@ -469,25 +471,7 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                 // window renews a short-lived certificate the moment it is
                 // issued, over and over.
                 "renewal_window_ratio" => {
-                    let raw = expect_one_argument(&sub)?;
-                    let ratio = raw.parse::<f64>().ok().filter(|value| {
-                        // 🚫 Zero would mean "renew when it has already
-                        // expired", and one would mean "renew continuously".
-                        // Both are configurations nobody means to write.
-                        value.is_finite() && *value > 0.0 && *value < 1.0
-                    });
-                    match ratio {
-                        Some(ratio) => global.renewal_window_ratio = Some(ratio),
-                        None => {
-                            return Err(AdapterError::InvalidArgument(
-                                "renewal_window_ratio".into(),
-                                format!(
-                                    "`{raw}` is not a fraction between 0 and 1; \
-                                     0.3333 renews once a third of the lifetime remains"
-                                ),
-                            ));
-                        }
-                    }
+                    global.renewal_window_ratio = Some(parse_renewal_window_ratio(&sub)?);
                 }
                 // 🗄️ `storage <module> <args…>` names where certificates,
                 // ACME account keys and the internal CA live. Caddy ships the

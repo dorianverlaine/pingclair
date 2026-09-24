@@ -2,7 +2,7 @@
 // Copyright 2026 Dorian Verlaine
 
 use super::AdapterError;
-use super::args::parse_required_duration;
+use super::args::{parse_renewal_window_ratio, parse_required_duration};
 use crate::parser::ast::*;
 use crate::parser::caddy_ast::Directive;
 use pingclair_core::config::{ClientAuthConfig, ClientAuthMode, DnsProviderConfig, TrustPool};
@@ -343,6 +343,15 @@ pub(super) fn adapt_tls_directive(d: &Directive) -> Result<TlsDirective, Adapter
                         .challenge_override_domain =
                         Some(expect_single(sub, "tls dns_challenge_override_domain")?);
                 }
+                // 🔄 A renewal window for this site's certificate. Caddy turns
+                // this into its own automation policy for the site's subjects
+                // (caddy v2.11.4, `caddyconfig/httpcaddyfile/tlsapp.go:146-149`
+                // reading the pile `builtins.go:602-607` filled), which is why
+                // it does not simply override the global value: the global one
+                // stays the answer for every other name.
+                "renewal_window_ratio" => {
+                    tls.renewal_window_ratio = Some(parse_renewal_window_ratio(sub)?);
+                }
                 // 🚫 TLS options the format defines and this crate does not
                 // implement. Almost all of them belong to two subsystems we do
                 // not have — certificate issuance beyond the built-in local
@@ -413,7 +422,7 @@ fn is_known_tls_option(name: &str) -> bool {
 /// them one directive at a time, and a list maintained by hand in three
 /// languages goes stale in the direction that flatters us. The doc test reads
 /// this array, so adding an option here fails until the READMEs say so.
-pub const RECOGNISED_TLS_OPTIONS: [&str; 16] = [
+pub const RECOGNISED_TLS_OPTIONS: [&str; 15] = [
     "protocols",
     "ciphers",
     "curves",
@@ -428,7 +437,6 @@ pub const RECOGNISED_TLS_OPTIONS: [&str; 16] = [
     "on_demand",
     "reuse_private_keys",
     "insecure_secrets_log",
-    "renewal_window_ratio",
     "force_automate",
 ];
 

@@ -11,7 +11,7 @@
 //! source — an `acme_server` site, a DNS provider it does not ship — are
 //! refused here rather than discovered at the first renewal.
 
-use crate::certs::public_issuance_domains;
+use crate::certs::{public_issuance_domains, site_renewal_windows};
 use crate::paths::tls_store_dir_with;
 use std::sync::Arc;
 
@@ -73,8 +73,26 @@ pub(super) fn prepare(
         auto_https_config.enabled = false;
     }
     // 🔄 How early to renew, as a fraction of each certificate's own lifetime.
+    // The global value is the default; a site that named its own keeps it as a
+    // policy for that site's names, which is why the two are separate fields
+    // rather than one value that gets overwritten.
     if let Some(ratio) = config.global.renewal_window_ratio {
         auto_https_config.renewal_window_ratio = ratio;
+    }
+    auto_https_config.renewal_windows = site_renewal_windows(config);
+    if !auto_https_config.renewal_windows.is_empty() {
+        // 📌 Named at startup because a renewal window is invisible until it
+        // fires, and "why did this certificate renew on Tuesday" is otherwise
+        // answered by reading a configuration that has since changed.
+        tracing::info!(
+            "🔄 Per-site renewal windows: {}",
+            auto_https_config
+                .renewal_windows
+                .iter()
+                .map(|(name, ratio)| format!("{name}={ratio}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     // 📴 `ocsp_stapling off` is the one spelling this build accepts, and it
     // names the behaviour already in force rather than changing it: no OCSP

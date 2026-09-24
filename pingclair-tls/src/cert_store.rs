@@ -158,6 +158,18 @@ pub struct CertStore {
     /// renewed. Lives on the store because the store is what decides which
     /// certificates need attention.
     renewal_window_ratio: f64,
+
+    /// 🔄 Per-name renewal windows, each written for the site that asked for it.
+    ///
+    /// The scalar above is what every name used before this map existed, and it
+    /// stays the answer for every name the map does not cover — a site that
+    /// sets a ratio gets its own policy rather than replacing anyone else's,
+    /// which is how Caddy models the same option.
+    ///
+    /// ⚡ Empty is the overwhelmingly common case, and it is checked first: the
+    /// lookup below runs on every handshake through `has_valid`, so with nothing
+    /// configured it must cost one comparison and no hashing.
+    per_domain_renewal_window: HashMap<String, f64>,
 }
 
 impl CertStore {
@@ -196,14 +208,70 @@ impl CertStore {
             layout,
             cache: Arc::new(RwLock::new(HashMap::new())),
             renewal_window_ratio,
+            per_domain_renewal_window: HashMap::new(),
         }
     }
 
-    /// 🔄 The renewal window this store applies, so callers that hold a
-    /// certificate can ask the same question the scan does rather than
+    /// 🔄 A store whose renewal windows are the ones this configuration asked
+    /// for: a default for every name, and one policy per site that named its
+    /// own.
+    pub fn from_auto_https(
+        config: &crate::auto_https::AutoHttpsConfig,
+        path: impl AsRef<Path>,
+    ) -> Self {
+        let mut store = Self::with_renewal_window(path, config.renewal_window_ratio);
+        store.per_domain_renewal_window = config.renewal_windows.clone();
+        store
+    }
+
+    /// 🔄 The renewal window this store applies by default, so callers that
+    /// hold a certificate can ask the same question the scan does rather than
     /// inventing a second threshold.
     pub fn renewal_window_ratio(&self) -> f64 {
         self.renewal_window_ratio
+    }
+
+    /// 🔄 The renewal window that applies to one name.
+    ///
+    /// A site that wrote its own ratio gets it; anything else gets the default.
+    /// The wildcard rule is the one the handshake uses — `*.example.com` covers
+    /// `a.example.com` and nothing deeper — so a site and the certificate issued
+    /// for it agree about which policy is theirs.
+    pub fn renewal_window_ratio_for(&self, domain: &str) -> f64 {
+        self.window_covering(domain)
+            .unwrap_or(self.renewal_window_ratio)
+    }
+
+    /// 🔄 The window covering one name, if the configuration named one.
+    fn window_covering(&self, domain: &str) -> Option<f64> {
+        if self.per_domain_renewal_window.is_empty() {
+            return None;
+        }
+        if let Some(ratio) = self.per_domain_renewal_window.get(domain) {
+            return Some(*ratio);
+        }
+        self.per_domain_renewal_window
+            .iter()
+            .find_map(|(pattern, ratio)| {
+                crate::acme::pattern_covers(pattern, domain).then_some(*ratio)
+            })
+    }
+
+    /// 🔄 The window that applies to one certificate.
+    ///
+    /// A certificate carries several names, and the policy that matters is the
+    /// one written for a name it actually serves — the first such name wins,
+    /// which puts the certificate's own primary subject ahead of a SAN that
+    /// merely happens to be listed first in the map.
+    fn window_for_certificate(&self, certificate: &Certificate) -> f64 {
+        if self.per_domain_renewal_window.is_empty() {
+            return self.renewal_window_ratio;
+        }
+        certificate
+            .domains
+            .iter()
+            .find_map(|domain| self.window_covering(domain))
+            .unwrap_or(self.renewal_window_ratio)
     }
 
     /// Returns the root directory backing this store.
@@ -485,7 +553,7 @@ impl CertStore {
     /// Checks if a non-expired certificate exists for the domain.
     pub async fn has_valid(&self, domain: &str) -> bool {
         if let Some(cert) = self.get(domain).await {
-            !cert.needs_renewal(self.renewal_window_ratio)
+            !cert.needs_renewal(self.renewal_window_ratio_for(domain))
         } else {
             false
         }
@@ -505,7 +573,7 @@ impl CertStore {
 
             if !primary_key.is_empty()
                 && !seen_primary_keys.contains(&primary_key)
-                && cert.needs_renewal(self.renewal_window_ratio)
+                && cert.needs_renewal(self.window_for_certificate(cert))
             {
                 seen_primary_keys.insert(primary_key);
                 candidates.push(cert.clone());
@@ -688,6 +756,89 @@ mod tests {
         let params = CertificateParams::new(vec![domain.to_string()]).unwrap();
         let certificate = params.self_signed(&key).unwrap();
         (certificate.pem(), key.serialize_pem())
+    }
+
+    /// 🔄 A site's own renewal window covers that site's names, and only those.
+    ///
+    /// Two halves, and the second is the one worth pinning. A site that wrote a
+    /// ratio has to get it, or the option does nothing. And a site that wrote
+    /// none has to keep the process-wide default, because the tempting
+    /// implementation — one value that the site-level option overwrites — makes
+    /// the last site in the configuration decide for every other one.
+    #[test]
+    fn a_site_renewal_window_covers_its_names_by_the_handshakes_wildcard_rule() {
+        use crate::auto_https::AutoHttpsConfig;
+
+        let mut config = AutoHttpsConfig::default();
+        config.renewal_window_ratio = 0.5;
+        config
+            .renewal_windows
+            .insert("short.example".to_string(), 0.1);
+        config
+            .renewal_windows
+            .insert("*.wild.example".to_string(), 0.2);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = CertStore::from_auto_https(&config, temp_dir.path());
+
+        assert_eq!(
+            store.renewal_window_ratio_for("short.example"),
+            0.1,
+            "the site that asked for a window gets it"
+        );
+        assert_eq!(
+            store.renewal_window_ratio_for("a.wild.example"),
+            0.2,
+            "a wildcard policy covers the one label under it, as a wildcard certificate does"
+        );
+        assert_eq!(
+            store.renewal_window_ratio_for("deep.a.wild.example"),
+            0.5,
+            "and nothing deeper, so a name no such certificate could serve does not \
+             silently inherit the policy written for one that is"
+        );
+        assert_eq!(
+            store.renewal_window_ratio_for("other.example"),
+            0.5,
+            "a site that named no window keeps the default"
+        );
+    }
+
+    /// 🔄 A certificate's window comes from a name it actually serves.
+    ///
+    /// The choice matters when one certificate carries several names and the
+    /// configuration named a window for one of them: picking by the order the
+    /// map happens to iterate in would make the answer depend on hashing.
+    #[test]
+    fn a_certificates_window_comes_from_a_name_it_serves() {
+        use crate::auto_https::AutoHttpsConfig;
+
+        let mut config = AutoHttpsConfig::default();
+        config.renewal_window_ratio = 0.5;
+        config
+            .renewal_windows
+            .insert("second.example".to_string(), 0.25);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = CertStore::from_auto_https(&config, temp_dir.path());
+
+        let certificate = |domains: &[&str]| Certificate {
+            cert_pem: "CERT".into(),
+            key_pem: "KEY".into(),
+            domains: domains.iter().map(|name| name.to_string()).collect(),
+            expires_at: 4_102_444_800,
+        };
+
+        assert_eq!(
+            store.window_for_certificate(&certificate(&["first.example", "second.example"])),
+            0.25,
+            "a window written for a name the certificate serves applies to it"
+        );
+        assert_eq!(
+            store.window_for_certificate(&certificate(&["first.example", "third.example"])),
+            0.5,
+            "a certificate serving none of the configured names keeps the default"
+        );
     }
 
     /// 🃏 A wildcard leaf answers for the one label under it, and for nothing

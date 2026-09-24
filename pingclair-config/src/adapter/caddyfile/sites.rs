@@ -822,17 +822,13 @@ pub(super) fn adapt_server(
         && !d.name.starts_with("http://")
         && is_local_https_default(&server.name)
     {
+        // 🧭 Defaulted rather than enumerated: this directive turns exactly one
+        // thing on and everything else off, and spelling every field out meant
+        // each new `tls` option broke this line for a reason it had nothing to
+        // do with.
         server.tls = Some(TlsDirective {
-            off: false,
-            auto: false,
             internal: true,
-            cert: None,
-            key: None,
-            acme_email: None,
-            http3: None,
-            default_sni: None,
-            client_auth: None,
-            dns_challenge: None,
+            ..TlsDirective::default()
         });
     }
 

@@ -57,6 +57,15 @@ pub struct AutoHttpsConfig {
     /// look — two different questions that are easy to confuse.
     pub renewal_window_ratio: f64,
 
+    /// 🔄 Renewal windows written per site, keyed by the name each one is for.
+    ///
+    /// 🚫 Not an override of the field above: a site that asked for its own
+    /// window gets its own policy, and `renewal_window_ratio` stays the answer
+    /// for every other name. That is Caddy's model, where a site-level
+    /// `renewal_window_ratio` becomes an automation policy for that site's
+    /// subjects and leaves the global policy in place for everything else.
+    pub renewal_windows: std::collections::HashMap<String, f64>,
+
     /// Whether to enforce HTTP Strict Transport Security (HSTS).
     pub hsts: bool,
 
@@ -78,6 +87,7 @@ impl Default for AutoHttpsConfig {
             email: None,
             renewal_interval: Duration::from_secs(12 * 60 * 60), // Check every 12 hours
             renewal_window_ratio: crate::acme::DEFAULT_RENEWAL_WINDOW_RATIO,
+            renewal_windows: std::collections::HashMap::new(),
             hsts: true,
             hsts_max_age: 31536000, // 1 year recommendation
             hsts_include_subdomains: true,
@@ -343,7 +353,7 @@ impl AutoHttps {
     ) -> Result<Certificate, AutoHttpsError> {
         // 1. Fast Path: Check Store
         if let Some(cert) = self.store.get(domain).await {
-            if !cert.needs_renewal(self.store.renewal_window_ratio()) {
+            if !cert.needs_renewal(self.store.renewal_window_ratio_for(domain)) {
                 tracing::debug!("✅ Cache Hit: Valid certificate found for {}", domain);
                 return Ok(cert);
             }
@@ -395,7 +405,7 @@ impl AutoHttps {
             // order. If it failed, the name is free again and the loop below
             // tries for itself.
             if let Some(cert) = self.store.get(domain).await
-                && !cert.needs_renewal(self.store.renewal_window_ratio())
+                && !cert.needs_renewal(self.store.renewal_window_ratio_for(domain))
             {
                 tracing::info!(
                     "🎉 Joined an in-flight issuance and reused its certificate for {domain}"

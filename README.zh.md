@@ -952,8 +952,7 @@ Directive：
   `protocols` `ciphers` `curves` `alpn`
   `load` `ca` `ca_root` `key_type`
   `eab` `issuer` `get_certificate` `on_demand`
-  `reuse_private_keys` `insecure_secrets_log` `renewal_window_ratio`
-  `force_automate`
+  `reuse_private_keys` `insecure_secrets_log` `force_automate`
 
 
 `servers { … }` 有一個子選項是**以名字拒絕**，而不是被當成拼錯：`timeouts`。

@@ -457,6 +457,35 @@ pub(crate) fn eager_issuance_domains(
     public_issuance_domains(config)
 }
 
+/// 🔄 Collects the per-site renewal windows this configuration asked for.
+///
+/// The keys are names a certificate can actually carry — the site's hostnames,
+/// not its listener label — because that is what the store matches a
+/// certificate against when it decides which policy is whose. A site with no
+/// names of its own falls back to `name`, the same way issuance does, and a
+/// site that wrote no ratio contributes nothing and keeps the global default.
+pub(crate) fn site_renewal_windows(
+    config: &pingclair_core::config::PingclairConfig,
+) -> HashMap<String, f64> {
+    let mut windows = HashMap::new();
+    for server in &config.servers {
+        let Some(ratio) = server.tls.as_ref().and_then(|tls| tls.renewal_window_ratio) else {
+            continue;
+        };
+        let names = if server.names.is_empty() {
+            server.name.iter().cloned().collect::<Vec<_>>()
+        } else {
+            server.names.clone()
+        };
+        for name in names {
+            if !name.is_empty() {
+                windows.insert(name, ratio);
+            }
+        }
+    }
+    windows
+}
+
 /// Populate the HTTP/3 SNI certificate table from the TLS manager.
 ///
 /// Uses `peek_pem`, which only returns certificates that already exist
@@ -680,6 +709,58 @@ mod tests {
             "with the flag the loaded certificate no longer excuses the name, \
              and the internal site is still out — its authority is local, so \
              un-skipping it can never mean asking a public CA"
+        );
+    }
+
+    /// 🔄 Per-site renewal windows are keyed by hostname, not by listener label.
+    ///
+    /// 🚩 The key is the whole test. A site's `name` is a listener label — `_`
+    /// for a port-only site, or a JSON document's arbitrary label — and the
+    /// store matches a policy against a *certificate's* names. Keying by the
+    /// label would produce a map that always misses, so the option would look
+    /// implemented and change nothing, which is the failure mode this whole
+    /// batch exists to remove.
+    #[test]
+    fn site_renewal_windows_are_keyed_by_hostname() {
+        use pingclair_core::config::{PingclairConfig, ServerConfig, TlsConfig};
+
+        let with_window = |names: Vec<&str>, name: &str, ratio: f64| ServerConfig {
+            name: Some(name.to_string()),
+            names: names.into_iter().map(|n| n.to_string()).collect(),
+            tls: Some(TlsConfig {
+                renewal_window_ratio: Some(ratio),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let config = PingclairConfig {
+            servers: vec![
+                // 🧭 A JSON-shaped site: a label in `name`, hostnames in `names`.
+                with_window(vec!["a.example", "b.example"], "srv0", 0.25),
+                // 🧭 A DSL site: the hostname is both.
+                with_window(Vec::new(), "c.example", 0.5),
+                // 🚫 No ratio: contributes nothing, so it keeps the default.
+                ServerConfig {
+                    name: Some("d.example".to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let windows = site_renewal_windows(&config);
+        assert_eq!(windows.get("a.example"), Some(&0.25));
+        assert_eq!(windows.get("b.example"), Some(&0.25));
+        assert_eq!(
+            windows.get("c.example"),
+            Some(&0.5),
+            "a site with no names of its own falls back to its name, as issuance does"
+        );
+        assert_eq!(
+            windows.len(),
+            3,
+            "only the sites that asked for a window: {windows:?}"
         );
     }
 

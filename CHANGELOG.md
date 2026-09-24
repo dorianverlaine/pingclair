@@ -315,6 +315,25 @@ which it may retry elsewhere; a request opened after that is refused with
 with `H3_NO_ERROR` once its last response has been acknowledged. New QUIC
 connections are ignored while the process drains. HTTP/3 never sent `GOAWAY`
 before, not even at shutdown.
+### 🔄 A site can set its own renewal window
+
+`tls { renewal_window_ratio … }` was refused at site level while the same
+option worked in the global block, so a Caddyfile that moved the value one line
+up or down changed from loading to not loading. It is accepted in both
+positions now, and parsed by one function so the two cannot drift apart.
+
+The site value is a **policy for that site's names**, not a replacement for the
+global one. Caddy models it as one automation policy per set of subjects, and
+this build follows: `renewal_window_ratio` stays the answer for every name no
+site claimed, which is why a site writing `0.25` does not make every other site
+renew differently. The certificate store resolves the policy by name, using the
+same wildcard rule the handshake uses, so a `*.example.com` policy covers the
+one label under it and nothing deeper.
+
+**Upgrading:** nothing to do. A site that writes no ratio keeps the process-wide
+value exactly as before, and a site that writes one announces itself in the
+startup log with the names it covers.
+
 ### 🧰 A `vars` matcher key may be a placeholder
 
 `@m vars {http.request.method} GET` was refused, so a Caddyfile using a

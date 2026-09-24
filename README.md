@@ -375,7 +375,8 @@ stapling that does not exist here. (Caddy refuses those two spellings as well,
 so nothing that loads upstream is turned away.)
 
 A `tls { … }` block accepts `auto`, `internal`, `cert`/`key`, `acme_email`
-(`email`), `http3`, `default_sni`, `client_auth`, and the DNS-01 cluster
+(`email`), `http3`, `default_sni`, `client_auth`, `renewal_window_ratio`, and
+the DNS-01 cluster
 (`dns`, `resolvers`, `dns_ttl`, `propagation_delay`, `propagation_timeout`,
 `dns_challenge_override_domain`). Every other option Caddy defines is **refused
 by name** rather than ignored, and the full list is in
@@ -1093,8 +1094,7 @@ Global options:
   `protocols` `ciphers` `curves` `alpn`
   `load` `ca` `ca_root` `key_type`
   `eab` `issuer` `get_certificate` `on_demand`
-  `reuse_private_keys` `insecure_secrets_log` `renewal_window_ratio`
-  `force_automate`
+  `reuse_private_keys` `insecure_secrets_log` `force_automate`
 
 One `servers { … }` sub-option is refused **by name** rather than read as a
 typo: `timeouts`. Caddy loads it, so a migrating configuration meets it, and

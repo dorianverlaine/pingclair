@@ -3043,6 +3043,45 @@ mod fail_closed_tests {
         }
     }
 
+    /// 🔄 A site's renewal window reaches the compiled configuration, and the
+    /// same range and message apply as in the global position.
+    ///
+    /// 🚩 This is the compat gap: the site-level spelling was refused as
+    /// unimplemented while the global one worked, so a Caddyfile that moved the
+    /// value one line up or down changed from loading to not loading. The
+    /// assertion is on the compiled value rather than on the absence of an
+    /// error, because the cheaper regression is a site block that parses and
+    /// then drops the option on the floor.
+    #[test]
+    fn a_site_renewal_window_reaches_the_compiled_configuration() {
+        let config = crate::compile(
+            "example.com {\n tls {\n  renewal_window_ratio 0.25\n }\n respond \"x\"\n}",
+        )
+        .expect("a site-level renewal window must be accepted");
+        assert_eq!(
+            config.servers[0]
+                .tls
+                .as_ref()
+                .expect("the site has TLS")
+                .renewal_window_ratio,
+            Some(0.25)
+        );
+        assert_eq!(
+            config.global.renewal_window_ratio, None,
+            "a site's policy is not the global one — the two decide different names"
+        );
+
+        for bad in ["0", "1", "-0.5", "1.5", "soon"] {
+            let error = compile_err(&format!(
+                "example.com {{\n tls {{\n  renewal_window_ratio {bad}\n }}\n respond \"x\"\n}}"
+            ));
+            assert!(
+                error.contains("renewal_window_ratio"),
+                "`{bad}` must be refused at site level too; got {error}"
+            );
+        }
+    }
+
     /// 🔗 The two `preferred_chains` spellings, and the combinations upstream
     /// refuses because they contradict each other.
     #[test]

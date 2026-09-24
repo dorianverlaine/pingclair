@@ -824,6 +824,16 @@ pub struct TlsConfig {
     /// between "this endpoint does not work for that client" and "it does".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_sni: Option<String>,
+
+    /// 🔄 This site's renewal window, as a fraction of the certificate's
+    /// lifetime. `None` means the process-wide default applies, which is what
+    /// every site got before this field existed.
+    ///
+    /// 📌 Caddy models this as one automation policy per set of subjects, so a
+    /// site that sets it does not replace the default for any other site — the
+    /// two policies sit side by side, and which one applies is decided by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewal_window_ratio: Option<f64>,
 }
 
 /// 🏛️ One certificate authority declared by the global `pki` block.
@@ -2874,6 +2884,7 @@ impl Default for TlsConfig {
             client_auth: None,
             dns_challenge: None,
             default_sni: None,
+            renewal_window_ratio: None,
         }
     }
 }

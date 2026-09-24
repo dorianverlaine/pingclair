@@ -337,6 +337,10 @@ pub struct TlsDirective {
     /// 📡 DNS-01 settings. Present means this site asks for the DNS challenge
     /// rather than HTTP-01 — which a wildcard site has no alternative to.
     pub dns_challenge: Option<pingclair_core::config::DnsChallengeConfig>,
+
+    /// 🔄 How much of this site's certificate lifetime must remain before it is
+    /// renewed, as a fraction. `None` means the process-wide default.
+    pub renewal_window_ratio: Option<f64>,
 }
 
 /// Listen address

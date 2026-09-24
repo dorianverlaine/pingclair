@@ -81,6 +81,35 @@ pub(super) fn parse_required_duration(directive: &Directive) -> Result<u64, Adap
         .ok_or_else(|| AdapterError::InvalidArgument(directive.name.clone(), value.clone()))
 }
 
+/// 🔄 Parses one renewal-window ratio, which is a fraction and not a duration.
+///
+/// A fraction of the certificate's lifetime rather than a fixed window: a fixed
+/// one renews a short-lived certificate the moment it is issued, over and over.
+/// The open interval is upstream's, and both bounds are configurations nobody
+/// means to write — zero renews only once the certificate has already expired,
+/// and one renews continuously. See `caddyconfig/httpcaddyfile/builtins.go`
+/// around line 486 for the site-level check and `options.go` around line 641
+/// for the global one; both spell the same range.
+///
+/// 📌 Shared by the global option and the site-level one so the two cannot
+/// drift — an operator who moves a working value between the two positions
+/// should not discover that only one of them has an opinion about it.
+pub(super) fn parse_renewal_window_ratio(directive: &Directive) -> Result<f64, AdapterError> {
+    let raw = expect_one_argument(directive)?;
+    raw.parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value > 0.0 && *value < 1.0)
+        .ok_or_else(|| {
+            AdapterError::InvalidArgument(
+                directive.name.clone(),
+                format!(
+                    "`{raw}` is not a fraction between 0 and 1; \
+                     0.3333 renews once a third of the lifetime remains"
+                ),
+            )
+        })
+}
+
 /// 🔢 Parses one mandatory positive `usize` argument.
 pub(super) fn parse_positive_usize(directive: &Directive) -> Result<usize, AdapterError> {
     parse_positive_u64(directive).and_then(|value| {

@@ -545,6 +545,12 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
             if tls.default_sni.is_some() {
                 merged.default_sni = tls.default_sni.clone();
             }
+            // 🔄 A site's renewal window is its own policy, so it is carried
+            // rather than merged with the global one — the two decide different
+            // names, and the runtime picks between them by name.
+            if tls.renewal_window_ratio.is_some() {
+                merged.renewal_window_ratio = tls.renewal_window_ratio;
+            }
             if tls.dns_challenge.is_some() {
                 merged.dns_challenge = tls.dns_challenge.clone();
             }

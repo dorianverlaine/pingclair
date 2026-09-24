@@ -1079,8 +1079,7 @@ Options du bloc `tls` :
   `protocols` `ciphers` `curves` `alpn`
   `load` `ca` `ca_root` `key_type`
   `eab` `issuer` `get_certificate` `on_demand`
-  `reuse_private_keys` `insecure_secrets_log` `renewal_window_ratio`
-  `force_automate`
+  `reuse_private_keys` `insecure_secrets_log` `force_automate`
 
 Une sous-option de `servers { … }` est refusée **par son nom** plutôt que prise
 pour une faute de frappe : `timeouts`. Caddy la charge, donc une configuration
