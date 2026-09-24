@@ -313,6 +313,27 @@ impl TlsManager {
             .contains_key(canonical_domain(domain).as_ref())
     }
 
+    /// 🏷️ Whether a handshake naming `domain` has any certificate to be given.
+    ///
+    /// This is the question the TLS layer needs answered before it picks an
+    /// alert: a name nobody configured deserves `unrecognized_name`, while a
+    /// configured name whose certificate could not be produced is our fault
+    /// and deserves `internal_error`. It mirrors the three doors of
+    /// [`Self::resolve_pem`] — manual, internal, then the public allowlist —
+    /// without walking through any of them.
+    ///
+    /// 🏎️ It runs once per handshake, including every handshake a stranger
+    /// sends with a made-up name, so the usual lowercase spelling is compared
+    /// in place and nothing is allocated.
+    pub fn serves_name(&self, domain: &str) -> bool {
+        let domain = canonical_domain(domain);
+        let domain = domain.as_ref();
+        self.manual_pem_certs.read().contains_key(domain)
+            || covered_by_any(&self.internal_domains.read(), domain)
+            || (self.auto_https.is_some()
+                && covered_by_any(&self.public_issuance_domains.read(), domain))
+    }
+
     /// 🏛️ Enables local issuance for one configured domain and eagerly prepares its leaf.
     pub async fn enable_internal_domain(
         &self,
@@ -771,6 +792,15 @@ fn matching_pattern(patterns: &HashSet<String>, normalized: &str) -> Option<Stri
     })
 }
 
+/// 🧭 Whether any pattern covers `normalized`, by the same rule as
+/// [`matching_pattern`] but without copying out the pattern that matched.
+fn covered_by_any(patterns: &HashSet<String>, normalized: &str) -> bool {
+    patterns.contains(normalized)
+        || patterns
+            .iter()
+            .any(|pattern| crate::acme::pattern_covers(pattern, normalized))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -855,6 +885,33 @@ mod tests {
             ))
         );
         assert_eq!(issuer.calls.lock().as_slice(), ["configured.example"]);
+    }
+
+    /// 🏷️ `serves_name` agrees with `resolve_pem` about which names exist.
+    ///
+    /// The TLS layer sends `unrecognized_name` on the strength of this answer,
+    /// so a disagreement is a wrong alert in one direction and a refused
+    /// customer in the other. Spelling does not matter, a wildcard covers one
+    /// label, and a name nobody configured is not served.
+    #[test]
+    fn serves_name_covers_manual_and_allowlisted_names_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, _issuer) = issuing_manager(directory.path());
+        manager.set_public_issuance_domains(["*.public.example"]);
+        manager.add_manual_cert("manual.example", "CERT".to_string(), "KEY".to_string());
+
+        let served: Vec<bool> = [
+            "manual.example",
+            "MANUAL.example.",
+            "a.public.example",
+            "a.b.public.example",
+            "public.example",
+            "stranger.example",
+        ]
+        .iter()
+        .map(|name| manager.serves_name(name))
+        .collect();
+        assert_eq!(served, [true, true, true, false, false, false]);
     }
 
     /// 🕳️ An empty allowlist authorises nothing.

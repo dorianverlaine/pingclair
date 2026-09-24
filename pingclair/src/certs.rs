@@ -24,13 +24,14 @@
 //! and Java. Hence a whole chain everywhere, never a single certificate.
 
 use boring::pkey::{PKey, Private};
-use boring::ssl::NameType;
+use boring::ssl::{NameType, SslContextBuilder};
 use boring::x509::X509;
 use parking_lot::RwLock;
 use pingclair_proxy::client_auth::{
     PublishedListenerPolicy, listener_security_revision, record_listener_security_revision,
 };
 use pingclair_proxy::tls_identity::DownstreamTlsIdentity;
+use pingclair_proxy::tls_name_alert::install_name_alert;
 use pingclair_tls::manager::TlsManager;
 use pingora_core::listeners::TlsAccept;
 use pingora_core::protocols::tls::TlsRef;
@@ -119,6 +120,27 @@ impl DynamicCertResolver {
     ) -> Self {
         self.listener_policy = Some(listener_policy);
         self
+    }
+
+    /// 🚫 Returns the step that makes this listener refuse an unservable name
+    /// with the alert that names it, for the caller to apply to the TLS
+    /// context once the resolver itself has been handed to Pingora.
+    ///
+    /// Without it, an unknown name reached `certificate_callback` below,
+    /// found nothing, and left BoringSSL with an empty credential list, which
+    /// it reports as `internal_error` — a server fault, for what was a
+    /// client asking for the wrong host. The question is asked of the
+    /// certificate manager's configuration rather than its certificates,
+    /// because the callback that can choose the alert runs before the
+    /// asynchronous one that fetches or issues a certificate.
+    pub(crate) fn name_alert_installer(&self) -> impl FnOnce(&mut SslContextBuilder) + use<> {
+        let tls_manager = Arc::clone(&self.tls_manager);
+        let default_sni = self.default_sni.clone();
+        move |builder| {
+            install_name_alert(builder, default_sni, move |_ssl, name| {
+                tls_manager.serves_name(name)
+            });
+        }
     }
 
     /// Get current unix timestamp
@@ -229,12 +251,11 @@ impl TlsAccept for DynamicCertResolver {
             // so the handshake failed with nothing to explain it. With a
             // configured name there is something to select by.
             (None, Some(default)) => default,
-            (None, None) => {
-                tracing::debug!(
-                    "🔐 No SNI and no default_sni configured; no certificate can be selected"
-                );
-                return;
-            }
+            // 🚫 Unreachable in a listener built by `run.rs`: the servername
+            // callback from `name_alert_installer` has already refused this
+            // handshake with `missing_extension`. Kept as a quiet return for
+            // resolvers built without that callback, such as unit tests.
+            (None, None) => return,
         };
 
         tracing::debug!("🔐 Resolving cert for SNI: {}", sni);

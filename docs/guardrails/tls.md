@@ -156,7 +156,7 @@
   leaving `cert_cb` without a certificate ends in `internal_error`; both used to
   answer "wrong hostname" with "broken server" (#99). In `boring-sys` 5.2.0 the
   order is select-certificate, then the servername callback, then `cert_cb`, so
-  HTTP/3 can ask "was a certificate installed?" while TCP will have to ask the
+  HTTP/3 can ask "was a certificate installed?" while TCP has to ask the
   certificate manager whether the name is configured
   (`pingclair-proxy/src/tls_name_alert.rs`).
 

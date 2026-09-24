@@ -22,13 +22,13 @@ decided.
 
 ### 🏷️ A handshake for a name this server does not serve says so
 
-An HTTP/3 client asking for a hostname no site configures used to be
-refused with `handshake_failure` (QUIC error `0x128`), an alert about
-something else. It now ends with `unrecognized_name` (`0x170`), as RFC 9846
-§6.2 asks, so the client's error names the
-wrong hostname instead of suggesting a broken server. A client that sends
-no name at all, on a listener without `default_sni`, now gets
-`missing_extension` (§9.2). A `default_sni` whose own certificate is
+A TLS client asking for a hostname no site configures used to be refused
+with an alert about something else: `internal_error` over TCP, and
+`handshake_failure` (QUIC error `0x128`) over HTTP/3. Both now end with
+`unrecognized_name` (`0x170` on QUIC), as RFC 9846 §6.2 asks, so the
+client's error names the wrong hostname instead of suggesting a broken
+server. A client that sends no name at all, on a listener without
+`default_sni`, now gets `missing_extension` (§9.2) on both. A `default_sni` whose own certificate is
 missing ends with `internal_error`, because that one is the
 configuration's fault. Which handshakes succeed is unchanged. A served
 name is now also acknowledged with an empty `server_name` extension in the

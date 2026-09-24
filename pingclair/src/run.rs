@@ -794,8 +794,10 @@ pub(crate) fn run_server(
                             .and_then(|policy| policy.default_sni.as_deref()),
                     )
                     .with_listener_policy(listener_policy);
+                let install_name_alert = acceptor.name_alert_installer();
                 match TlsSettings::with_callbacks(Box::new(acceptor)) {
                     Ok(mut tls_settings) => {
+                        install_name_alert(&mut tls_settings);
                         tls_settings.enable_h2();
                         if requires_client_auth {
                             // 🚫 Session resumption is turned off for the whole

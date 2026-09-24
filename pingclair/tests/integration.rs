@@ -58,6 +58,10 @@ mod request_framing;
 #[path = "integration/site_name_case.rs"]
 mod site_name_case;
 
+// 🏷️ Which TLS alert an unservable server name is refused with.
+#[path = "integration/sni_alerts.rs"]
+mod sni_alerts;
+
 // 🔌 HTTP/3 socket binding at startup; beside this file for the same reason.
 #[path = "integration/h3_bind.rs"]
 mod h3_bind;
