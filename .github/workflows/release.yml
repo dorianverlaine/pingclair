@@ -31,6 +31,8 @@ jobs:
     timeout-minutes: 20
     outputs:
       version: ${{ steps.info.outputs.version }}
+      prerelease: ${{ steps.info.outputs.prerelease }}
+      make_latest: ${{ steps.info.outputs.make_latest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -40,26 +42,51 @@ jobs:
       - name: Extract version information
         id: info
         run: |
+          set -euo pipefail
           tag="${GITHUB_REF#refs/tags/}"
+          version="${tag#v}"
+          # 🏷️ The shape rules and the prerelease/latest decision live in one
+          # tested script, so this workflow and scripts/cut-release.sh cannot
+          # disagree about what a tag means.
+          if [ "$tag" = "$version" ] || ! python3 scripts/release/versions.py check "$version"; then
+            echo "::error::tag ${tag} is not a release tag (vX.Y.Z, vX.Y.Z-alpha.N[.M], vX.Y.Z-beta.N or vX.Y.Z-rc.N)"
+            exit 1
+          fi
           crate_version="$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"/\1/')"
+          if [ "${version}" != "${crate_version}" ]; then
+            echo "::error::tag ${tag} does not match workspace version ${crate_version} at the tagged commit — cut releases with scripts/cut-release.sh"
+            exit 1
+          fi
           echo "version=${tag}" >> "$GITHUB_OUTPUT"
-          echo "crate_version=${crate_version}" >> "$GITHUB_OUTPUT"
-          if [ "${tag#v}" != "${crate_version}" ]; then
-            echo "::error::tag ${tag} does not match workspace version ${crate_version} — bump Cargo.toml before tagging"
-            exit 1
-          fi
-          echo "✅ tag ${tag} matches workspace version ${crate_version}"
+          python3 scripts/release/versions.py github-flags "$version" >> "$GITHUB_OUTPUT"
+          echo "🏷️ tag ${tag} matches workspace version ${crate_version}"
 
-      - name: Verify the tag points at main
+      - name: Verify the release commit sits on a reviewed branch
         run: |
-          tag_sha="$(git rev-list -1 "${GITHUB_REF#refs/tags/}")"
-          git fetch --quiet origin main --depth=1
-          main_sha="$(git rev-list -1 FETCH_HEAD)"
-          if [ "$tag_sha" != "$main_sha" ]; then
-            echo "::error::tag ${GITHUB_REF#refs/tags/} points at ${tag_sha}, but main is at ${main_sha}"
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          version="${tag#v}"
+          # 📌 main always says 0.0.0, so a release commit is never on main:
+          # it is one commit on top of it that only sets the version. What
+          # must be reviewed is therefore its parent — on main, or on a
+          # release/X.Y branch for a patch to an older stable line.
+          changed="$(git diff --name-only "${tag}^" "${tag}" | sort | tr '\n' ' ')"
+          if [ "$changed" != "Cargo.lock Cargo.toml " ]; then
+            echo "::error::a release commit changes only Cargo.toml and Cargo.lock, but ${tag} changes: ${changed}"
             exit 1
           fi
-          echo "✅ tag points at the tip of main"
+          line="$(echo "$version" | cut -d- -f1 | cut -d. -f1-2)"
+          git fetch --quiet origin main
+          git fetch --quiet origin "+refs/heads/release/${line}:refs/remotes/origin/release/${line}" 2>/dev/null || true
+          for base in origin/main "origin/release/${line}"; do
+            if git rev-parse --verify --quiet "$base" >/dev/null \
+              && git merge-base --is-ancestor "${tag}^" "$base"; then
+              echo "🏷️ ${tag} is one version commit on top of ${base}"
+              exit 0
+            fi
+          done
+          echo "::error::the parent of ${tag} is on neither origin/main nor origin/release/${line}"
+          exit 1
 
   build-binaries:
     name: Build release binary (${{ matrix.platform.name }})
@@ -115,7 +142,12 @@ jobs:
           binary="${CARGO_TARGET_DIR}/${{ matrix.platform.target }}/release/pingclair"
           version_output="$("$binary" version)"
           echo "$version_output"
-          echo "$version_output" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'
+          # 🏷️ A release binary names exactly its tag. Anything else, such as a
+          # `v0.0.0-dev+<sha>`, means the build never saw the release commit.
+          if [ "$version_output" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::binary reports ${version_output}, expected ${GITHUB_REF_NAME}"
+            exit 1
+          fi
           sudo mkdir -p /etc/pingclair/certs
           sudo touch /etc/pingclair/certs/example.com.pem /etc/pingclair/certs/example.com.key
           "$binary" validate examples/full_featured.pingclair
@@ -171,6 +203,14 @@ jobs:
             SHA256SUMS-aarch64.txt
           )
 
+          # 🚧 Every suffixed version is a prerelease and never "Latest", so a
+          # link that resolves the latest release only ever reaches a stable
+          # build. versions.py made both decisions in verify-tag.
+          flags=(
+            "--prerelease=${{ needs.verify-tag.outputs.prerelease }}"
+            "--latest=${{ needs.verify-tag.outputs.make_latest }}"
+          )
+
           # 📝 A release worth announcing is written by hand before the tag is
           # pushed, and this job must not destroy those notes or fail because
           # they exist. So: attach the binaries to whatever is already there,
@@ -178,28 +218,18 @@ jobs:
           if gh release view "$version" >/dev/null 2>&1; then
             echo "📎 Release $version already exists — attaching binaries to it."
             gh release upload "$version" "${assets[@]}" --clobber
+            gh release edit "$version" "${flags[@]}"
             exit 0
           fi
 
-          previous="$(git describe --abbrev=0 --tags --match 'v*.*.*' HEAD~1 2>/dev/null || true)"
-          if [ -n "$previous" ]; then
-            notes="$(git log --format='- %s' "${previous}..HEAD")"
-          else
-            notes="First release."
-          fi
-
-          # 🚧 A semver pre-release tag carries a hyphen after the version
-          # triple (v0.2.0-rc.1). Such a build must not become the "Latest"
-          # release that a download link resolves to.
-          prerelease=()
-          case "$version" in
-            *-*) prerelease=(--prerelease) ;;
-          esac
-
+          # 📝 The annotated tag's message is the CHANGELOG's Unreleased
+          # section, written into it by scripts/cut-release.sh. A commit log
+          # would not work here: earlier release commits are off main, so no
+          # previous tag is an ancestor of this one.
           gh release create "$version" "${assets[@]}" \
             --title "Pingclair $version" \
-            --notes "$notes" \
-            "${prerelease[@]}"
+            --notes-from-tag \
+            "${flags[@]}"
 
   publish-image:
     name: Publish release image (${{ matrix.platform.name }})
@@ -252,7 +282,10 @@ jobs:
           image="ghcr.io/dorianverlaine/pingclair:${{ needs.verify-tag.outputs.version }}-${{ matrix.platform.tag }}"
           version_output="$(docker run --rm "$image" version)"
           echo "$version_output"
-          echo "$version_output" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'
+          if [ "$version_output" != "${{ needs.verify-tag.outputs.version }}" ]; then
+            echo "::error::image reports ${version_output}, expected ${{ needs.verify-tag.outputs.version }}"
+            exit 1
+          fi
           # 🔐 The example names a certificate and a key, and validation is
           # fail-closed about paths it cannot open, so the smoke run needs the
           # two files to exist. Empty stubs are enough: only their presence is
@@ -289,10 +322,16 @@ jobs:
 
       - name: Create the multi-arch manifest
         run: |
+          set -Eeuo pipefail
           version="${{ needs.verify-tag.outputs.version }}"
+          # 🚧 `:latest` follows the GitHub release: only a stable version
+          # moves it, so a plain `docker pull` never lands on a preview.
+          tags=(-t ghcr.io/dorianverlaine/pingclair:"$version")
+          if [ "${{ needs.verify-tag.outputs.make_latest }}" = "true" ]; then
+            tags+=(-t ghcr.io/dorianverlaine/pingclair:latest)
+          fi
           docker buildx imagetools create \
-            -t ghcr.io/dorianverlaine/pingclair:"$version" \
-            -t ghcr.io/dorianverlaine/pingclair:latest \
+            "${tags[@]}" \
             ghcr.io/dorianverlaine/pingclair:"$version"-amd64 \
             ghcr.io/dorianverlaine/pingclair:"$version"-arm64
 
