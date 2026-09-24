@@ -150,6 +150,15 @@
   round trip — `Not` disappears entirely, inverting the routing decision. Any
   configuration type that will be serialised back out (Admin dump → post, config
   files) must be tagged.
+- 🏷️ **Refuse an unservable server name from the servername callback, and only
+  there.** It is the one BoringSSL callback that lets a server choose the alert.
+  Refusing from `select_certificate_cb` always sends `handshake_failure`, and
+  leaving `cert_cb` without a certificate ends in `internal_error`; both used to
+  answer "wrong hostname" with "broken server" (#99). In `boring-sys` 5.2.0 the
+  order is select-certificate, then the servername callback, then `cert_cb`, so
+  HTTP/3 can ask "was a certificate installed?" while TCP will have to ask the
+  certificate manager whether the name is configured
+  (`pingclair-proxy/src/tls_name_alert.rs`).
 
 ---
 

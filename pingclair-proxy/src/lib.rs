@@ -40,6 +40,7 @@ mod retry;
 pub mod server;
 mod subrequest;
 pub mod tls_identity;
+pub mod tls_name_alert;
 pub mod upstream;
 pub mod upstream_failure;
 pub mod upstream_tls;

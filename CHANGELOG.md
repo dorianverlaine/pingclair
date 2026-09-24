@@ -20,6 +20,20 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🏷️ A handshake for a name this server does not serve says so
+
+An HTTP/3 client asking for a hostname no site configures used to be
+refused with `handshake_failure` (QUIC error `0x128`), an alert about
+something else. It now ends with `unrecognized_name` (`0x170`), as RFC 9846
+§6.2 asks, so the client's error names the
+wrong hostname instead of suggesting a broken server. A client that sends
+no name at all, on a listener without `default_sni`, now gets
+`missing_extension` (§9.2). A `default_sni` whose own certificate is
+missing ends with `internal_error`, because that one is the
+configuration's fault. Which handshakes succeed is unchanged. A served
+name is now also acknowledged with an empty `server_name` extension in the
+server's reply, as RFC 6066 §3 asks.
+
 ### 🧾 An oversized header section gets a named 431 on HTTP/2 and HTTP/3
 
 `max_header_bytes` was handed to the protocol libraries as their own

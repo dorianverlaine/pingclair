@@ -22,6 +22,11 @@ use tokio_quiche::{ApplicationOverQuic, ConnectionParams};
 
 const TEST_ALPN: &[u8] = b"h3";
 
+// 🏷️ Which alert a refused name is refused with. A sibling file so this one
+// keeps to the question of where certificates come from.
+#[path = "h3_in_memory_certs/sni_alerts.rs"]
+mod sni_alerts;
+
 /// Generate a self-signed cert+key for `names`.
 fn self_signed_pem(names: &[&str]) -> (String, String) {
     let rcgen::CertifiedKey { cert, signing_key } =

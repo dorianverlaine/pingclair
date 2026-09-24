@@ -77,6 +77,7 @@ use crate::http_policy::{
 };
 use crate::server::{PingclairProxy, ProxyState, error_reason, resolve_caddy_placeholders};
 use crate::server::{is_streaming_content_type, wants_immediate_flush};
+use crate::tls_name_alert::install_name_alert;
 use pingclair_core::server::{
     MatcherPrecompile, MatcherRequest, MatcherVerdict, evaluate, evaluate_verdict,
 };
@@ -492,6 +493,7 @@ fn build_ssl_context_builder(
     }
 
     let table = certs;
+    let default_sni: Option<Arc<str>> = listener_policy.default_sni().map(Arc::from);
     builder.set_select_certificate_callback(move |mut hello| {
         // 🪪 Installed before the certificate is chosen, which is well before
         // the `CertificateRequest` is written — the same window the TCP
@@ -519,12 +521,12 @@ fn build_ssl_context_builder(
             } else {
                 Some(sni)
             };
+            // 🏷️ No certificate is not refused here. Refusing from this
+            // callback can only ever send `handshake_failure`; returning
+            // without a certificate lets the servername callback installed
+            // below refuse with the alert that names the problem.
             let Some(entry) = certificate_name.and_then(|name| table.lookup(name)) else {
-                tracing::warn!(
-                    "🔐 H3: no certificate available for SNI '{}', rejecting handshake",
-                    sni
-                );
-                return Err(SelectCertError::ERROR);
+                return Ok(());
             };
             (snapshot.client_auth().policy_for(sni).cloned(), entry)
         };
@@ -558,6 +560,14 @@ fn build_ssl_context_builder(
                 Err(SelectCertError::ERROR)
             }
         }
+    });
+
+    // 🚫 Runs after the selection above, so "a certificate was installed" is
+    // exactly "this name is served here". The default is copied out once per
+    // context rather than read per handshake; a reload that changes it is
+    // refused as `restart_required`, so the copy cannot go stale.
+    install_name_alert(&mut builder, default_sni, |ssl, _name| {
+        ssl.certificate().is_some()
     });
 
     Ok(builder)
