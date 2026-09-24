@@ -78,13 +78,13 @@ pub fn decode_path_component(component: &str, out: &mut Vec<u8>) -> bool {
 /// plain `../` is refused without doing any work, and once on the decoded bytes,
 /// because `%2e%2e` does not look like a traversal until it has been decoded.
 ///
-/// 📌 Three callers share this: the `templates` handler on both transports, and
-/// the FastCGI script-filename join. The static file server does *not* — it
+/// 📌 The callers that share this: the `templates` handler on both transports,
+/// the FastCGI script-filename join, and the `file` matcher (so `try_files`)
+/// for every pattern that does not glob. The static file server does *not* — it
 /// resolves `..` by popping rather than refusing, because a request path may
-/// legitimately climb back down inside the document root, and the `file` matcher
-/// does not because it has to skip decoding for globbing patterns. What all of
-/// them share is [`decode_path_component`], which is where the rule about
-/// untrusted bytes actually lives.
+/// legitimately climb back down inside the document root. What all of them
+/// share is [`decode_path_component`], which is where the rule about untrusted
+/// bytes actually lives.
 pub fn resolve_under_root(root: &std::path::Path, path: &str) -> Option<std::path::PathBuf> {
     let mut resolved = root.to_path_buf();
     let mut decoded = Vec::new();

@@ -71,3 +71,27 @@ async fn test_try_files_glob_reaches_a_non_utf8_name() {
 
     assert_eq!(response, (200, "latin-1 bundle".to_string()));
 }
+
+/// 🔤 `try_files {path}` reaches a file whose name is not valid UTF-8.
+///
+/// The file server could already serve `/caf%E9.txt`, but the `file` matcher
+/// in front of it joined paths as `String` and gave up on the decoded byte
+/// `0xE9`, so the canonical single-page-application shape fell through to
+/// `/index.html` for a file that exists.
+#[tokio::test]
+async fn test_try_files_path_reaches_a_non_utf8_name() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("index.html"), "shell").unwrap();
+    std::fs::write(
+        root.path().join(OsStr::from_bytes(b"caf\xe9.txt")),
+        "latin-1",
+    )
+    .unwrap();
+    let mut server = try_files_site(root.path().to_str().unwrap(), "{path} /index.html");
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = get(&server, "/caf%E9.txt").await;
+    server.stop();
+
+    assert_eq!(response, (200, "latin-1".to_string()));
+}

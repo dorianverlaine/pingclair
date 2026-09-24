@@ -738,12 +738,21 @@ fn file_candidates(
     }
     let globs = pattern_globs(pattern);
     if !globs {
-        let Some(full_path) = join_under_root(root, &split_path_part, true) else {
+        // 🔤 This is the second place a URL becomes a filename — the first is
+        // the static file server's `resolve_path` — so it decodes escapes with
+        // the rule `templates` and FastCGI share. Only the path the filesystem
+        // is *asked about* is decoded; `relative` stays encoded because it goes
+        // back into the request line, where a raw space is a malformed request.
+        //
+        // 📁 The result is a path, never text: on Unix a filename is bytes, so
+        // `/caf%E9.txt` probes exactly the name `caf\xE9.txt` holds on disk.
+        // A `..` before or after decoding names nothing.
+        let Some(full_path) = crate::percent::resolve_under_root(root, &split_path_part) else {
             return FileCandidates::Single(None);
         };
         let relative = format!("/{}", split_path_part.trim_start_matches('/'));
         return FileCandidates::Single(Some(FileCandidate {
-            full_path: full_path.into(),
+            full_path,
             relative,
             remainder,
             is_dir: wants_directory,
@@ -1070,57 +1079,6 @@ fn first_split(path: &str, split_path: &[String]) -> (String, String) {
         }
     }
     (path.to_string(), String::new())
-}
-
-/// 📂 Joins a filesystem root with a cleaned URI path, refusing `..` escape.
-///
-/// 🔤 This is the second place a URL becomes a filename — the first is the static
-/// file server's `resolve_path` — so it decodes percent-escapes for the same
-/// reason and with the same shared rule. Only the path the filesystem is *asked
-/// about* is decoded; the caller's `relative` value stays encoded because it is a
-/// URI that goes back into the request line, and a raw space there is not a path,
-/// it is a malformed request.
-///
-/// `decode_escapes` is false when the configured pattern globs. Decoding would
-/// then hand the client a metacharacter inside a glob — `%2A` becoming `*` — and
-/// letting a request choose which files a pattern matches is the exact defect
-/// [`expand_file_pattern`] escapes placeholders to prevent. A globbing pattern
-/// keeps the older, literal behaviour rather than trading that away for encoded
-/// filename support it did not ask for.
-///
-/// 📌 A decoded name that is not valid UTF-8 does not match. On Unix such a file
-/// really exists and the static file server reaches it, because it works in
-/// bytes; this matcher works in `String` and cannot represent it. The gap is
-/// narrow and recorded rather than papered over with a lossy conversion, which
-/// would probe a *different* filename than the one requested.
-fn join_under_root(root: &Path, path: &str, decode_escapes: bool) -> Option<String> {
-    if path.split('/').any(|segment| segment == "..") {
-        return None;
-    }
-    let relative = path.trim_start_matches('/');
-
-    // 🍃 Byte-for-byte the previous behaviour when there is nothing to decode,
-    // which is every request that does not carry an escape.
-    if !decode_escapes || !relative.contains('%') {
-        return Some(root.join(relative).to_string_lossy().into_owned());
-    }
-
-    let mut joined = root.to_path_buf();
-    let mut decoded = Vec::new();
-    for component in relative.split('/') {
-        decoded.clear();
-        if !crate::percent::decode_path_component(component, &mut decoded) {
-            return None;
-        }
-        match decoded.as_slice() {
-            b"" | b"." => {}
-            // 🛡️ Re-checked after decoding, not only before: the guard above ran
-            // on the encoded text, where `%2e%2e` does not look like a traversal.
-            b".." => return None,
-            other => joined.push(std::str::from_utf8(other).ok()?),
-        }
-    }
-    Some(joined.to_string_lossy().into_owned())
 }
 
 /// 📏 Strict existence: a trailing slash demands a directory, otherwise a
@@ -2176,6 +2134,66 @@ mod tests {
         assert_eq!(
             try_files_target(&["/build/caf*.js"], dir.path().to_str(), "/anything"),
             Some("/build/caf%E9.js".to_string())
+        );
+    }
+
+    /// 📁 An escape that decodes to bytes that are not valid UTF-8 still yields
+    /// a candidate, rather than no candidate at all.
+    ///
+    /// `first_exist_fallback` claims its last candidate without touching the
+    /// filesystem, so this runs anywhere. Until the matcher worked in paths the
+    /// join gave up on `0xE9` and there was nothing to claim, which is also why
+    /// `try_files {path}` could never match such a file on disk.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_escape_still_yields_a_candidate() {
+        let headers = HeaderMap::new();
+        let mut vars = BTreeMap::new();
+        let mut request = MatcherRequest {
+            path: "/caf%E9.php",
+            method: "GET",
+            headers: &headers,
+            host: "example.com",
+            remote_ip: "10.0.0.1",
+            protocol: "http",
+            vars: Some(&mut vars),
+        };
+        let candidates = ["{path}".to_string()];
+        assert_eq!(
+            evaluate_file_matcher(
+                &mut request,
+                &candidates,
+                Some("/nonexistent-root"),
+                Some("first_exist_fallback"),
+                &[],
+            ),
+            MatcherVerdict::Match
+        );
+        assert_eq!(
+            vars.get("http.matchers.file.relative").map(String::as_str),
+            Some("/caf%E9.php"),
+            "the rewrite target keeps the request's own encoded spelling"
+        );
+    }
+
+    /// 📁 `try_files {path}` matches a file whose name is not valid UTF-8, and
+    /// publishes the request's own encoded spelling for the rewrite.
+    /// 🐧 Linux only, because APFS refuses to create such a name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn try_files_matches_a_non_utf8_name() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let root = spa_root();
+        let name = std::ffi::OsStr::from_bytes(b"caf\xe9.txt");
+        std::fs::write(root.path().join(name), "latin-1").unwrap();
+
+        assert_eq!(
+            try_files_target(
+                &["{path}", "/index.html"],
+                root.path().to_str(),
+                "/caf%E9.txt"
+            ),
+            Some("/caf%E9.txt".to_string())
         );
     }
 

@@ -33,6 +33,15 @@ percent-escapes, so a name with a space is no longer pasted raw into
 the rewritten request line, and metacharacters in the configured
 `root` are no longer expanded as part of the pattern. (#12)
 
+### 🔤 `try_files {path}` reaches a filename that is not valid UTF-8
+
+`file_server` already served `/na%EFve.txt` from a file whose name holds
+the Latin-1 byte `0xEF`, but the `file` matcher in front of it — and so
+`try_files` — gave up on any escape that decoded to such bytes, and the
+request fell through to the next candidate. The matcher now resolves
+candidates to filesystem paths with the same helper `templates` and
+FastCGI use, so all of them agree on which file a request names. (#12)
+
 ### 🧱 Body buffering reaches the FastCGI transport
 
 `request_buffers` and `response_buffers` were accepted on a `fastcgi`
