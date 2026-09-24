@@ -1607,7 +1607,7 @@ pub(super) fn adapt_method_directive(d: &Directive) -> Result<Handler, AdapterEr
 /// always wins and a replacement argument beside one is discarded:
 /// `+Foo bar baz` appends `bar` and never reads `baz`
 /// (`modules/caddyhttp/headers/caddyfile.go`, `applyHeaderOp`).
-fn apply_header_op(
+pub(super) fn apply_header_op(
     directive: &str,
     config: &mut HeadersConfig,
     field: &str,

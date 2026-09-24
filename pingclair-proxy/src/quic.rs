@@ -4737,7 +4737,15 @@ async fn fastcgi_upstream(
         }
     }
     let mut effective_response_policy = response_policy.clone();
-    effective_response_policy.merge_proxy_set(&proxy_config.headers_down);
+    effective_response_policy.merge_proxy_response_ops(
+        &proxy_config.headers_down,
+        &proxy_config.headers_down_add,
+        &proxy_config.headers_down_remove,
+        &proxy_config.headers_down_default,
+    );
+    if !proxy_config.headers_down_replace.is_empty() {
+        effective_response_policy.merge_proxy_replacements(&proxy_config.headers_down_replace);
+    }
     let handlers = (!proxy_config.handle_response.is_empty())
         .then_some(proxy_config.handle_response.as_slice())
         .or(standalone_response_handlers)
@@ -5888,7 +5896,15 @@ async fn reverse_proxy_upstream(
     // 🧩 Proxy-owned replacements fill gaps without overriding outer middleware.
     let mut effective_policy = response_policy.clone();
     if let Some(cfg) = &proxy_config {
-        effective_policy.merge_proxy_set(&cfg.headers_down);
+        effective_policy.merge_proxy_response_ops(
+            &cfg.headers_down,
+            &cfg.headers_down_add,
+            &cfg.headers_down_remove,
+            &cfg.headers_down_default,
+        );
+        if !cfg.headers_down_replace.is_empty() {
+            effective_policy.merge_proxy_replacements(&cfg.headers_down_replace);
+        }
     }
     // 🔀 Only the proxied path gets a `Via`: the other H3 responses are
     // produced by this server, so there is no hop to record. Appended after

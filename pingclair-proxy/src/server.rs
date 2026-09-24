@@ -3724,7 +3724,16 @@ impl PingclairProxy {
         ctx.response_status = header.status;
         // 🧩 FastCGI never enters `upstream_peer`, so proxy-owned response
         // fields must join the local policy before the response decision runs.
-        ctx.response_headers.merge_proxy_set(&config.headers_down);
+        ctx.response_headers.merge_proxy_response_ops(
+            &config.headers_down,
+            &config.headers_down_add,
+            &config.headers_down_remove,
+            &config.headers_down_default,
+        );
+        if !config.headers_down_replace.is_empty() {
+            ctx.response_headers
+                .merge_proxy_replacements(&config.headers_down_replace);
+        }
         ctx.streaming_response = wants_immediate_flush(config.flush_interval);
 
         // 🧭 `handle_response`/`intercept` evaluate before the client sees
@@ -7431,8 +7440,16 @@ impl ProxyHttp for PingclairProxy {
             if let Some(proxy_config) = &proxy_config {
                 ctx.headers_upstream = proxy_config.headers_up.clone();
                 ctx.headers_upstream_remove = proxy_config.headers_up_remove.clone();
-                ctx.response_headers
-                    .merge_proxy_set(&proxy_config.headers_down);
+                ctx.response_headers.merge_proxy_response_ops(
+                    &proxy_config.headers_down,
+                    &proxy_config.headers_down_add,
+                    &proxy_config.headers_down_remove,
+                    &proxy_config.headers_down_default,
+                );
+                if !proxy_config.headers_down_replace.is_empty() {
+                    ctx.response_headers
+                        .merge_proxy_replacements(&proxy_config.headers_down_replace);
+                }
                 ctx.streaming_response = wants_immediate_flush(proxy_config.flush_interval);
             }
             let request_budget = ctx
@@ -7514,8 +7531,16 @@ impl ProxyHttp for PingclairProxy {
             if let Some(proxy_config) = &proxy_config {
                 ctx.headers_upstream = proxy_config.headers_up.clone();
                 ctx.headers_upstream_remove = proxy_config.headers_up_remove.clone();
-                ctx.response_headers
-                    .merge_proxy_set(&proxy_config.headers_down);
+                ctx.response_headers.merge_proxy_response_ops(
+                    &proxy_config.headers_down,
+                    &proxy_config.headers_down_add,
+                    &proxy_config.headers_down_remove,
+                    &proxy_config.headers_down_default,
+                );
+                if !proxy_config.headers_down_replace.is_empty() {
+                    ctx.response_headers
+                        .merge_proxy_replacements(&proxy_config.headers_down_replace);
+                }
                 ctx.streaming_response = wants_immediate_flush(proxy_config.flush_interval);
             }
             let request_budget = ctx

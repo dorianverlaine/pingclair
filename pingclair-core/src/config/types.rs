@@ -2139,6 +2139,30 @@ pub struct ReverseProxyConfig {
     #[serde(default)]
     pub headers_down: BTreeMap<String, String>,
 
+    /// 🗄️ Response headers to append rather than replace, from `header_down
+    /// +Name`.
+    ///
+    /// 📌 Four flat fields rather than one op-set struct, because that is how
+    /// this struct already spells the request side: `headers_up` is the set
+    /// half and `headers_up_remove` is the delete half. A second, nested
+    /// shape here would be a second way to say the same thing.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers_down_add: BTreeMap<String, String>,
+
+    /// 🚫 Response header names to remove, from `header_down -Name`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers_down_remove: Vec<String>,
+
+    /// ❓ Response headers written only when the response does not already
+    /// carry them, from `header_down ?Name Value`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers_down_default: BTreeMap<String, String>,
+
+    /// 🔁 Search-and-replace over a response header's existing value, from
+    /// `header_down Name Search Replace`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers_down_replace: Vec<HeaderReplacement>,
+
     /// 🚫 Header names to take off the upstream request, from Caddy's
     /// `header_up -Name`. Applied after `headers_up`, so a name in both is
     /// removed — which is the order upstream's `HeaderOps` uses.

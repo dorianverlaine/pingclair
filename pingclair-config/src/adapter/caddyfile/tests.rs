@@ -1105,19 +1105,70 @@ mod fail_closed_tests {
         );
     }
 
+    /// 🗄️ `header_down` reaches the compiled proxy, in all four of Caddy's
+    /// shapes.
+    ///
+    /// 🚩 The assertion is on the four flat fields rather than on "it compiles",
+    /// because that is exactly how this went wrong before: the fields existed,
+    /// the JSON configuration and `--header-down` filled them, and the DSL
+    /// branch wrote them empty — so a test that only checked the config loaded
+    /// would have passed while the option did nothing at all.
     #[test]
-    fn reverse_proxy_rejects_header_down_as_unsupported() {
+    fn reverse_proxy_header_down_reaches_the_compiled_proxy() {
+        let config = crate::compile(
+            r#"example.com {
+                reverse_proxy localhost:8080 {
+                    header_down X-Set set-by-caddy
+                    header_down +X-Add added
+                    header_down -X-Remove
+                    header_down ?X-Default only-if-absent
+                    header_down X-Replace find found
+                }
+            }"#,
+        )
+        .expect("every header_down shape must be accepted");
+        let pingclair_core::config::HandlerConfig::ReverseProxy(proxy) =
+            &config.servers[0].routes[0].handler
+        else {
+            panic!(
+                "expected a reverse proxy, got {:?}",
+                config.servers[0].routes[0].handler
+            );
+        };
+        assert_eq!(
+            proxy.headers_down.get("X-Set"),
+            Some(&"set-by-caddy".to_string())
+        );
+        assert_eq!(
+            proxy.headers_down_add.get("X-Add"),
+            Some(&"added".to_string())
+        );
+        assert_eq!(proxy.headers_down_remove, vec!["X-Remove".to_string()]);
+        assert_eq!(
+            proxy.headers_down_default.get("X-Default"),
+            Some(&"only-if-absent".to_string())
+        );
+        assert_eq!(proxy.headers_down_replace.len(), 1);
+        assert_eq!(proxy.headers_down_replace[0].field, "X-Replace");
+        assert_eq!(proxy.headers_down_replace[0].search_regexp, "find");
+        assert_eq!(proxy.headers_down_replace[0].replace, "found");
+    }
+
+    /// 🚫 A bare `header_down X-Foo` is refused, as it is for `header`.
+    ///
+    /// 📌 A deliberate divergence, carried over from the `header` directive: a
+    /// response header whose value is empty is almost always a removal typed
+    /// without its `-`. Caddy sets an empty value here.
+    #[test]
+    fn reverse_proxy_header_down_refuses_a_bare_field() {
         let error = compile_err(
             r#"example.com {
                 reverse_proxy localhost:8080 {
-                    header_down X-Foo bar
+                    header_down X-Bare
                 }
             }"#,
         );
-        assert!(
-            error.contains("header_down") && error.contains("not supported"),
-            "header_down must fail with a named unsupported error; got {error}"
-        );
+        assert!(error.contains("header_down"), "{error}");
     }
 
     #[test]

@@ -933,6 +933,77 @@ impl ResponseHeaderPolicy {
         }
     }
 
+    /// 🗄️ Folds one proxy's configured response-header operations into the
+    /// policy, except the replacements, which need a compiled pattern and so
+    /// belong with the caller that owns the regex table.
+    ///
+    /// ⚡ The emptiness test is the point of the shape: most configurations
+    /// write no `header_down` at all, and one comparison per field costs less
+    /// than constructing a policy to merge nothing into.
+    ///
+    /// 📌 `set` goes through [`Self::merge_proxy_set`] and therefore keeps its
+    /// `or_insert` rule, while the other three are unconditional. That
+    /// difference is deliberate and is the one place a `header_down` can lose:
+    /// `set` is the only operation that can name a header an outer `header`
+    /// directive already decided, and within one policy the outer decision wins.
+    pub(crate) fn merge_proxy_response_ops(
+        &mut self,
+        set: &BTreeMap<String, String>,
+        add: &BTreeMap<String, String>,
+        remove: &[String],
+        default_set: &BTreeMap<String, String>,
+    ) {
+        if set.is_empty() && add.is_empty() && remove.is_empty() && default_set.is_empty() {
+            return;
+        }
+        self.merge_proxy_set(set);
+        for (name, value) in add {
+            self.add(name.clone(), value.clone());
+        }
+        for name in remove {
+            self.remove(name.clone());
+        }
+        for (name, value) in default_set {
+            self.set_if_absent(name.clone(), value.clone());
+        }
+    }
+
+    /// 🔁 Folds a proxy's configured replacements in, compiling their patterns.
+    ///
+    /// ⚠️ Compiling here puts a `Regex::new` on the request path, which this
+    /// repository normally refuses — and it is accepted only because it is what
+    /// the `header` directive already does for the same operation
+    /// (`server.rs`, `apply_request_headers`). Leaving `header_down` without it
+    /// would mean the three-argument spelling compiles into a field nothing
+    /// reads, which is the silent no-op this whole option was fixed to stop
+    /// being. Moving both callers onto a compiled-at-publication table is the
+    /// precompilation work the issue tracks on its own.
+    pub(crate) fn merge_proxy_replacements(
+        &mut self,
+        replacements: &[pingclair_core::config::HeaderReplacement],
+    ) {
+        for entry in replacements {
+            match Regex::new(&entry.search_regexp) {
+                Ok(pattern) => self.replace(
+                    entry.field.clone(),
+                    std::sync::Arc::new(pattern),
+                    entry.replace.clone(),
+                ),
+                Err(error) => {
+                    // 🚫 A pattern that does not compile must not rewrite
+                    // nothing quietly: the operator asked for a rewrite and gets
+                    // the original value, so say so.
+                    tracing::warn!(
+                        field = %entry.field,
+                        pattern = %entry.search_regexp,
+                        %error,
+                        "🚫 header_down replacement pattern did not compile"
+                    );
+                }
+            }
+        }
+    }
+
     /// 🔗 Merges a middleware decision into the active response policy.
     pub(crate) fn merge(&mut self, other: ResponseHeaderPolicy) {
         self.set.extend(other.set);

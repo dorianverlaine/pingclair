@@ -829,6 +829,16 @@ pub struct ProxyConfig {
     /// it — the silent-succeed failure this repository keeps finding.
     pub header_up_remove: Vec<String>,
 
+    /// 🗄️ Headers to write on the response on its way back to the client,
+    /// collected from `header_down`.
+    ///
+    /// 🧩 The same op set the `header` directive builds, and for the same
+    /// reason: Caddy's `header_down` supports `+`, `-`, `?` and a three-argument
+    /// replacement, so a `BTreeMap<String, String>` cannot express it. What it
+    /// compiles into is a set of flat fields beside `header_up_remove`, which
+    /// is how this struct already spells "one field per operation".
+    pub header_down: HeadersConfig,
+
     /// Transport configuration
     pub transport: Option<TransportConfig>,
 
@@ -1286,6 +1296,7 @@ impl ProxyConfig {
             flush_interval: None,
             header_up: BTreeMap::new(),
             header_up_remove: Vec::new(),
+            header_down: HeadersConfig::default(),
             transport: None,
             cache: None,
             retry: RetryConfig::default(),

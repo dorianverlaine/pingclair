@@ -6,6 +6,7 @@ use super::args::{
     expect_no_arguments, expect_one_argument, parse_duration_ms, parse_positive_u64,
     parse_positive_usize, parse_required_duration,
 };
+use super::directives::apply_header_op;
 use crate::parser::ast::*;
 use crate::parser::caddy_ast::Directive;
 use pingclair_core::config::{ResponseHandlerConfig, ResponseMatcher};
@@ -97,14 +98,48 @@ pub(super) fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError>
                     }
                 }
                 "header_down" => {
-                    // 🚫 Caddy's `header_down` used to be silently dropped,
-                    // leaving the operator certain a response header was being
-                    // rewritten while the proxy forwarded it untouched.
-                    // TODO(v0.3): implement response header rewriting.
-                    return Err(AdapterError::UnsupportedFeature(
-                        "reverse_proxy header_down".into(),
-                        "response header rewriting is not implemented yet".into(),
-                    ));
+                    // 🗄️ The four shapes Caddy's `header_down` takes are the
+                    // ones `apply_header_op` already knows, because they are the
+                    // same four shapes its `header` directive takes:
+                    //
+                    //     header_down -X-Remove              (one argument)
+                    //     header_down X-Set hello            (two)
+                    //     header_down >X-Replace find found  (three)
+                    //
+                    // 📌 Sharing the parser rather than writing a second one is
+                    // what keeps the two directives from drifting — the corpus
+                    // that made `header` reject a bare field without a prefix,
+                    // and the arm order that makes a prefix beat a third
+                    // argument, both apply here for free.
+                    let args = &sub.args;
+                    let (Some(field), replacement) = (args.first(), args.get(2)) else {
+                        return Err(AdapterError::ArgumentCount(
+                            "header_down".into(),
+                            2,
+                            args.len(),
+                        ));
+                    };
+                    if args.len() > 3 {
+                        return Err(AdapterError::ArgumentCount(
+                            "header_down".into(),
+                            3,
+                            args.len(),
+                        ));
+                    }
+                    // 🚩 Same deliberate divergence as the `header` directive,
+                    // for the same reason: a response header whose value is
+                    // empty is almost always a removal typed without its `-`.
+                    if args.len() == 1 && !field.starts_with(['-', '+', '?', '>']) {
+                        return Err(AdapterError::ArgumentCount("header_down".into(), 2, 1));
+                    }
+                    apply_header_op(
+                        "header_down",
+                        &mut proxy.header_down,
+                        field,
+                        args.get(1).cloned().unwrap_or_default(),
+                        replacement,
+                        true,
+                    )?;
                 }
                 "dynamic" => {
                     // 🧭 DNS-driven upstreams replace the fixed peer list:

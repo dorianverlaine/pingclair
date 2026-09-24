@@ -2763,6 +2763,10 @@ fn compile_handler(
                 headers_up: BTreeMap::new(),
                 headers_up_remove: Vec::new(),
                 headers_down: BTreeMap::new(),
+                headers_down_add: BTreeMap::new(),
+                headers_down_remove: Vec::new(),
+                headers_down_default: BTreeMap::new(),
+                headers_down_replace: Vec::new(),
                 flush_interval: None,
                 read_timeout: None,
                 write_timeout: None,
@@ -2836,6 +2840,18 @@ fn compile_handler(
                 config.headers_up.insert(key.clone(), value_str);
             }
             config.headers_up_remove = proxy.header_up_remove.clone();
+
+            // 🗄️ Header down. The op set the DSL built is spread back into the
+            // flat fields the runtime reads — the same fields the JSON
+            // configuration and `--header-down` already filled. Before this
+            // block existed, all of them were written empty, so a Pingclairfile
+            // could not say what a JSON configuration could; the fields being
+            // present is what made that read as an implemented feature.
+            config.headers_down = proxy.header_down.set.clone();
+            config.headers_down_add = proxy.header_down.add.clone();
+            config.headers_down_remove = proxy.header_down.remove.clone();
+            config.headers_down_default = proxy.header_down.default_set.clone();
+            config.headers_down_replace = proxy.header_down.replace.clone();
 
             // Transport
             if let Some(transport) = &proxy.transport {

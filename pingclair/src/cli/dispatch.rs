@@ -769,6 +769,13 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 health_check: None,
                 headers_up,
                 headers_down: headers_down.into_iter().collect(),
+                // 🚫 The one-liner has no `+Name`/`?Name`/`-Name` spelling and
+                // no three-argument replacement to offer, so there is nothing
+                // for these to carry.
+                headers_down_add: Default::default(),
+                headers_down_remove: Vec::new(),
+                headers_down_default: Default::default(),
+                headers_down_replace: Vec::new(),
                 // 🚫 The one-liner has no `-Name` spelling to offer, so there
                 // is nothing for this to carry.
                 headers_up_remove: Vec::new(),
