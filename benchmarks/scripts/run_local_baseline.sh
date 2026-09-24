@@ -14,8 +14,8 @@
 # 🧾 The candidate is configured from a **Pingclairfile**, not JSON. The JSON
 # the earlier runs used skips the Caddyfile adapter entirely, so it measured a
 # shape no operator can produce — see `benchmarks/configs/pingclair/Pingclairfile.bench`
-# for the four settings that turned out to differ, two of them in the
-# direction that flatters us.
+# for the four settings that once differed; since #32 all four are either
+# written in the DSL or equal to its defaults.
 #
 # 🗜️ The `gzip` workload is new on 2026-08-11. `h2load` and `wrk` send no
 # `Accept-Encoding`, so every previous row measured a server that never

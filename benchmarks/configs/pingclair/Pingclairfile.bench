@@ -9,30 +9,30 @@
 #
 # ⚖️ Fairness notes, so the comparison against nginx and pingap stays honest:
 #
-# - `compress` is OFF. The nginx and pingap benchmark configs do not compress
-#   either, and a 1 KiB body would spend more time being deflated than sent.
+# - Compression is OFF, by saying nothing: there is no `encode`, and
+#   `file_server` compresses only where `encode` asks (the same rule as
+#   Caddy). The nginx and pingap benchmark configs do not compress either,
+#   and a 1 KiB body would spend more time being deflated than sent.
 #   (The general-purpose `configs/pingclair/Pingclairfile` DOES enable gzip;
 #   it is not the benchmark config, and using it here would have measured
 #   Pingclair doing work the others were not asked to do.)
+# - Metrics are OFF, also by saying nothing: collection runs only when the
+#   global options say `metrics` (the same rule as Caddy), which is what the
+#   JSON's `"metrics": false` asks for.
 # - `flush_interval -1` matches the JSON: flush every write straight through
 #   rather than buffering, which is what nginx's `proxy_buffering off` does.
 # - Two knobs the JSON sets explicitly have no DSL spelling yet:
 #   `worker_threads` and `upstream_keepalive_pool_size`. Both are omitted here
 #   rather than worked around, because their defaults already are the values
 #   the JSON names: threads follow `available_parallelism()` (2 in a 2-vCPU
-#   container) and the pool defaults to 512 (`run.rs`). Verified, not assumed
+#   container) and the pool defaults to 512 (`run/server_conf.rs`). Verified, not assumed
 #   — see the equivalence check in the run log.
 #
-# 🔥 A third knob is a real difference, not a matching default. The JSON sets
-#   `"metrics": false`; the DSL's `metrics` is an on-only toggle and the
-#   compiled default is ON. So this file cannot turn metrics off, and every
-#   Pingclair configured from a Pingclairfile — which is every real operator —
-#   pays whatever per-request cost metrics collection has, while the numbers
-#   published on 2026-08-03 were measured with it off. That makes those
-#   numbers a measurement of a configuration nobody can write. Recorded in
-#   TRIAGE.md on 2026-08-11; this run measures the shape operators actually
-#   get, and the difference from the old figures is therefore expected and
-#   is itself a finding.
+# 📌 Until 2026-09-25 this file could not say what the JSON says about
+#   metrics: collection was on by default and the DSL could only switch it on,
+#   so runs from this file between 2026-08-11 and then measured Pingclair with
+#   metrics ON while the 2026-08-03 figures had them off. Keep that in mind
+#   when comparing across those dates (#32).
 #
 # 🌐 The upstream is the container network alias `bench-backend` rather than
 #   the JSON's `127.0.0.1:9000`. The AWS harness ran the backend on the same
