@@ -15,7 +15,9 @@ use regex::Regex;
 
 // 🧭 `TRACE` and `Max-Forwards` hop decisions, shared by every transport.
 mod max_forwards;
-pub(crate) use max_forwards::{ALLOWED_METHODS, forwarded_max_forwards, local_hop_answer};
+pub(crate) use max_forwards::{
+    ALLOWED_METHODS, LocalHopAnswer, forwarded_max_forwards, local_hop_answer,
+};
 
 // 🍪 Folding several `Cookie` field lines into one cookie-string.
 mod cookies;

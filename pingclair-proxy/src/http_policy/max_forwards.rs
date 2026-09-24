@@ -12,6 +12,12 @@
 //! `TRACE` is refused outright rather than reflected. A reflected `TRACE`
 //! echoes the request's `Cookie` and `Authorization` back in a response body,
 //! which is how cross-site tracing read cookies a script was not allowed to.
+//!
+//! 🔌 `CONNECT` stops here too. It asks this hop to become a blind tunnel to
+//! another host (RFC 9110 §9.3.6), which is a forward proxy's job; this server
+//! is a reverse proxy and never opens one. The method is understood and simply
+//! not offered, so the answer is 405 with `Allow` on every transport rather
+//! than a 404 from routing or a 501 on one protocol only.
 
 use http::{HeaderMap, Method, header::MAX_FORWARDS};
 
@@ -30,13 +36,15 @@ pub(crate) enum LocalHopAnswer {
     /// 🧭 `OPTIONS` with `Max-Forwards: 0`: this hop is the final recipient
     /// and answers 200 with `Allow`.
     OptionsFinalRecipient,
+    /// 🔌 `CONNECT`: this server opens no tunnels, so 405 with `Allow`.
+    ConnectRefused,
 }
 
 impl LocalHopAnswer {
     /// 🧭 The status code the local answer carries.
     pub(crate) fn status(self) -> u16 {
         match self {
-            Self::TraceRefused => 405,
+            Self::TraceRefused | Self::ConnectRefused => 405,
             Self::OptionsFinalRecipient => 200,
         }
     }
@@ -46,6 +54,9 @@ impl LocalHopAnswer {
 pub(crate) fn local_hop_answer(method: &Method, headers: &HeaderMap) -> Option<LocalHopAnswer> {
     if method == Method::TRACE {
         return Some(LocalHopAnswer::TraceRefused);
+    }
+    if method == Method::CONNECT {
+        return Some(LocalHopAnswer::ConnectRefused);
     }
     if method == Method::OPTIONS && max_forwards(headers) == Some(0) {
         return Some(LocalHopAnswer::OptionsFinalRecipient);
@@ -107,6 +118,16 @@ mod tests {
                 "{value:?}"
             );
         }
+    }
+
+    /// 🔌 `CONNECT` stops here whatever else the request carries.
+    #[test]
+    fn connect_is_always_refused() {
+        assert_eq!(
+            local_hop_answer(&Method::CONNECT, &headers(Some("5"))),
+            Some(LocalHopAnswer::ConnectRefused)
+        );
+        assert_eq!(LocalHopAnswer::ConnectRefused.status(), 405);
     }
 
     /// 🧭 Only a zero budget makes this hop the final recipient of `OPTIONS`,

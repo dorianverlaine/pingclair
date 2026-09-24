@@ -6941,13 +6941,18 @@ impl ProxyHttp for PingclairProxy {
                 .expect("sanitized request id is valid header bytes");
         }
 
-        // 🧭 RFC 9110 §7.6.2: `TRACE` is refused and `OPTIONS` with a spent
-        // `Max-Forwards` stops here, before any handler could forward either.
+        // 🧭 RFC 9110 §7.6.2: `TRACE` and `CONNECT` are refused and `OPTIONS`
+        // with a spent `Max-Forwards` stops here, before any handler could forward either.
         // HTTP/3 asks the same question at the same point in its dispatch.
         if let Some(answer) = crate::http_policy::local_hop_answer(
             &session.req_header().method,
             &session.req_header().headers,
         ) {
+            // 🔌 A refused `CONNECT` client may already be sending tunnel bytes
+            // behind its request, and those must not be read as the next one.
+            if answer == crate::http_policy::LocalHopAnswer::ConnectRefused {
+                session.as_mut().set_keepalive(None);
+            }
             let mut header = Self::build_downstream_header(session, answer.status(), Some(2))?;
             header.insert_header("Allow", crate::http_policy::ALLOWED_METHODS)?;
             header.insert_header("Content-Length", "0")?;

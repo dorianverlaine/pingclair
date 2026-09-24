@@ -40,6 +40,10 @@ mod site_name_case;
 #[path = "h3_end_to_end/max_forwards.rs"]
 mod max_forwards;
 
+// 🔌 `CONNECT`: 405 with `Allow` when well-formed, a reset when not.
+#[path = "h3_end_to_end/connect.rs"]
+mod connect;
+
 // 🚫 What a locally raised error status says about itself.
 #[path = "h3_end_to_end/error_responses.rs"]
 mod error_responses;
@@ -508,12 +512,21 @@ async fn h3_attempt(
 
         if let Some(h3) = h3.as_mut() {
             if !sent {
-                let mut request = vec![
-                    quiche::h3::Header::new(b":method", method.as_bytes()),
-                    quiche::h3::Header::new(b":scheme", b"https"),
-                    quiche::h3::Header::new(b":authority", authority.as_bytes()),
-                    quiche::h3::Header::new(b":path", path.as_bytes()),
-                ];
+                // 🔌 An empty path on a `CONNECT` sends the RFC 9114 §4.4
+                // shape, which carries neither `:scheme` nor `:path`.
+                let mut request = if method == "CONNECT" && path.is_empty() {
+                    vec![
+                        quiche::h3::Header::new(b":method", method.as_bytes()),
+                        quiche::h3::Header::new(b":authority", authority.as_bytes()),
+                    ]
+                } else {
+                    vec![
+                        quiche::h3::Header::new(b":method", method.as_bytes()),
+                        quiche::h3::Header::new(b":scheme", b"https"),
+                        quiche::h3::Header::new(b":authority", authority.as_bytes()),
+                        quiche::h3::Header::new(b":path", path.as_bytes()),
+                    ]
+                };
                 request.extend(extra_headers.iter().map(|(name, value)| {
                     quiche::h3::Header::new(name.as_bytes(), value.as_bytes())
                 }));

@@ -90,6 +90,10 @@ mod admin_challenge;
 #[path = "integration/max_forwards.rs"]
 mod max_forwards;
 
+// 🔌 `CONNECT` is refused with 405 and `Allow`, and logged.
+#[path = "integration/connect.rs"]
+mod connect;
+
 // 🚫 What a locally raised error status says about itself.
 #[path = "integration/error_responses.rs"]
 mod error_responses;

@@ -668,10 +668,10 @@ struct H3Request {
 /// 8. **`:path` and `:authority` must not be empty**, and `:path` must start
 ///    with `/` (or be `*` for `OPTIONS`).
 ///
-/// 📌 Classic `CONNECT` — which omits `:scheme` and `:path` — is still refused,
-/// exactly as before this change, because `path` was already mandatory. Extended
-/// CONNECT (RFC 9220) is refused too, by rejecting `:protocol`: it was never
-/// served, and this server never offers it.
+/// 🔌 Classic `CONNECT` is the one request without `:scheme` and `:path`
+/// (§4.4); it is accepted here so the handler can refuse it with 405, and a
+/// `CONNECT` that sends either field is malformed. Extended CONNECT (RFC 9220)
+/// is refused by rejecting `:protocol`: this server never offers it.
 fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
     let mut method = None;
     let mut path = None;
@@ -735,11 +735,26 @@ fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
         ));
     }
 
+    // 🔌 RFC 9114 §4.4: a `CONNECT` carries only `:method` and `:authority`,
+    // and one that also sends `:scheme` or `:path` is malformed. A well-formed
+    // one is not malformed at all — it asks for a tunnel this server does not
+    // open — so it continues to the handler and gets the same 405 with `Allow`
+    // as on HTTP/1.1 and HTTP/2. Its authority stands in for the path, which
+    // is what the authority-form target of an HTTP/1.1 `CONNECT` does too.
+    let connect = method.as_deref() == Some("CONNECT");
+    if connect {
+        if scheme.is_some() || path.is_some() {
+            return None;
+        }
+        path.clone_from(&authority);
+    }
+
     // 🔐 A scheme is case-insensitive per RFC 3986, so `HTTPS` is the same
     // request and refusing it would be stricter than the specification.
-    if !scheme
-        .as_deref()
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
+    if !connect
+        && !scheme
+            .as_deref()
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
     {
         return None;
     }
@@ -778,7 +793,7 @@ fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
     if authority.is_empty() {
         return None;
     }
-    if !(path.starts_with('/') || (path == "*" && method == "OPTIONS")) {
+    if !(connect || path.starts_with('/') || (path == "*" && method == "OPTIONS")) {
         return None;
     }
 
@@ -3657,11 +3672,6 @@ async fn handle_request_inner(
         )
         .await;
         return Ok(());
-    }
-
-    // 🔌 Rejects CONNECT tunnels because the current H3 path is request-response only.
-    if method == http::Method::CONNECT {
-        return Err((501, "CONNECT Not Supported Over HTTP/3"));
     }
 
     // 🚫 Rejects advertised request trailers before a handler can consume an incomplete message.
@@ -6747,6 +6757,42 @@ mod tests {
         ];
 
         assert!(parse_h3_request(&list).is_none());
+    }
+
+    /// 🔌 A §4.4 `CONNECT` parses, with its authority standing in for the
+    /// path; one that also sends `:scheme` or `:path` is malformed.
+    #[test]
+    fn parse_h3_request_accepts_only_a_well_formed_connect() {
+        let connect = parse_h3_request(&[
+            quiche::h3::Header::new(b":method", b"CONNECT"),
+            quiche::h3::Header::new(b":authority", b"example.com:443"),
+        ])
+        .expect("a well-formed CONNECT is not malformed");
+        assert_eq!(
+            (
+                connect.method.as_str(),
+                connect.path.as_str(),
+                connect.authority.as_str()
+            ),
+            ("CONNECT", "example.com:443", "example.com:443")
+        );
+        for extra in [
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":path", b"/"),
+        ] {
+            assert!(
+                parse_h3_request(&[
+                    quiche::h3::Header::new(b":method", b"CONNECT"),
+                    quiche::h3::Header::new(b":authority", b"example.com:443"),
+                    extra,
+                ])
+                .is_none()
+            );
+        }
+        assert!(
+            parse_h3_request(&[quiche::h3::Header::new(b":method", b"CONNECT")]).is_none(),
+            "CONNECT without :authority names no destination"
+        );
     }
 
     /// 🧭 `*` is a valid `:path` only for `OPTIONS`; any other path must be

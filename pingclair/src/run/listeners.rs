@@ -83,6 +83,12 @@ pub(super) fn register(
             // 🌐 Enables prior-knowledge h2c only on plaintext listeners while TLS uses ALPN.
             let mut server_options = pingora_core::apps::HttpServerOptions::default();
             server_options.h2c = !is_https;
+            // 🔌 Pingora refuses `CONNECT` itself unless this is set, with a
+            // bare 405: no `Allow`, no access-log line, and no hook ever runs.
+            // Letting it through does not open a tunnel — `request_filter`
+            // refuses every `CONNECT` through the same local-hop answer as
+            // HTTP/3 — it only moves the refusal to where it is logged.
+            server_options.allow_connect_method_proxying = true;
             let listener_limits = proxy_logic.listener_limits();
             // 🧱 Captured before the guard consumes the limits, so the public
             // PROXY ingress can carry the same ceiling as the private hop.

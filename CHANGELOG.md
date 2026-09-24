@@ -20,6 +20,18 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🔌 `CONNECT` gets the same 405 on every protocol
+
+This server is a reverse proxy and opens no tunnels, but each transport
+refused `CONNECT` differently. HTTP/1.1 and HTTP/2 answered a bare `405`
+from inside Pingora, naming no allowed methods and leaving no access-log
+line. HTTP/3 reset a well-formed `CONNECT` as malformed, and answered
+`501` only to a nonstandard one carrying `:scheme` and `:path`. Every
+protocol now answers `405` with `Allow` (RFC 9110 §9.3.6), logs it, and
+closes an HTTP/1.1 connection afterwards so tunnel bytes the client sent
+early are never read as a request. On HTTP/3 the nonstandard shape is now
+the malformed one (RFC 9114 §4.4). (#86)
+
 ### 🏷️ A gateway error this proxy wrote says so with `Proxy-Status`
 
 A 502 or 504 that Pingclair generated because it could not get an answer
