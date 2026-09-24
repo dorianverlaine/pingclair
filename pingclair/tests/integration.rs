@@ -122,11 +122,60 @@ struct TestServer {
     stdout_path: PathBuf,
     stderr_path: PathBuf,
     stopped: bool,
+    /// 🔁 How this server was built, so a lost port race can rebuild it.
+    recipe: LaunchRecipe,
+    /// 🔁 Respawns spent on lost port races; bounded by [`MAX_BIND_RACE_RESPAWNS`].
+    bind_race_respawns: u32,
     _temp_dir: tempfile::TempDir,
+}
+
+/// 🔁 The configuration a [`TestServer`] was built from, kept so the harness
+/// can build it again on fresh ports.
+///
+/// The harness reserves each port, then releases it a moment before the child
+/// binds it. In that gap another test in the same process can open its own
+/// fixture on `127.0.0.1:0` and be handed the very same number. On Linux the
+/// child binds `[::]:port`, collides with that fixture, and exits with
+/// "Address already in use" (a lost admin port is logged the same way but
+/// leaves the process running). Nothing the child did was wrong, so the readiness
+/// waits respawn it on fresh ports instead of failing the test (issue #184).
+#[derive(Clone)]
+enum LaunchRecipe {
+    Json(String),
+    Pingclairfile {
+        template: String,
+        nofile_limit: Option<u64>,
+    },
+}
+
+/// 🛡️ A real bind defect fails every attempt, so a small bound still reports
+/// it; each discarded attempt prints its stderr first.
+const MAX_BIND_RACE_RESPAWNS: u32 = 3;
+
+/// 🔎 What one readiness wait ended with, before any respawn decision.
+enum Readiness {
+    Ready,
+    Exited,
+    TimedOut,
 }
 
 impl TestServer {
     fn new(config_body: &str) -> Self {
+        Self::launch(LaunchRecipe::Json(config_body.to_owned()))
+    }
+
+    /// 🔁 Builds and spawns a server from `recipe` on freshly reserved ports.
+    fn launch(recipe: LaunchRecipe) -> Self {
+        match &recipe {
+            LaunchRecipe::Json(body) => Self::launch_json(body, recipe.clone()),
+            LaunchRecipe::Pingclairfile {
+                template,
+                nofile_limit,
+            } => Self::launch_pingclairfile(template, *nofile_limit, recipe.clone()),
+        }
+    }
+
+    fn launch_json(config_body: &str, recipe: LaunchRecipe) -> Self {
         let temp_dir = tempfile::tempdir().expect("failed to create the test directory");
         let config_path = temp_dir.path().join("config.json");
 
@@ -158,6 +207,7 @@ impl TestServer {
             readiness_token,
             reservations,
             None,
+            recipe,
         )
     }
 
@@ -169,6 +219,17 @@ impl TestServer {
     /// 🔻 As [`Self::new_pingclairfile`], with a descriptor budget small enough
     /// that load can exhaust it. Only the classification test needs this.
     fn new_pingclairfile_with_nofile(config_template: &str, nofile_limit: Option<u64>) -> Self {
+        Self::launch(LaunchRecipe::Pingclairfile {
+            template: config_template.to_owned(),
+            nofile_limit,
+        })
+    }
+
+    fn launch_pingclairfile(
+        config_template: &str,
+        nofile_limit: Option<u64>,
+        recipe: LaunchRecipe,
+    ) -> Self {
         let temp_dir = tempfile::tempdir().expect("failed to create the test directory");
         let config_path = temp_dir.path().join("Pingclairfile");
         let readiness_id = uuid::Uuid::new_v4();
@@ -240,6 +301,7 @@ impl TestServer {
             readiness_token,
             reservations,
             nofile_limit,
+            recipe,
         )
     }
 
@@ -257,6 +319,7 @@ impl TestServer {
         // into a real descriptor exhaustion. `None` inherits, which is what
         // every test but one wants.
         nofile_limit: Option<u64>,
+        recipe: LaunchRecipe,
     ) -> Self {
         let tls_store_path = temp_dir.path().join("tls");
         let stdout_path = temp_dir.path().join("stdout.log");
@@ -330,8 +393,40 @@ impl TestServer {
             stdout_path,
             stderr_path,
             stopped: false,
+            recipe,
+            bind_race_respawns: 0,
             _temp_dir: temp_dir,
         }
+    }
+
+    /// 🔁 Replaces a stopped child with a fresh one when it lost a port race.
+    ///
+    /// Returns `false`, leaving the server stopped, when its output shows no
+    /// bind collision or the respawn budget is spent. Only the readiness
+    /// waits call this: a caller that read an address before waiting would
+    /// hold a port the new child no longer uses.
+    fn respawn_after_bind_race(&mut self) -> bool {
+        // 🔎 A startup bind failure lands on stderr, but the admin listener's
+        // is a tracing line, and tracing writes to stdout.
+        let lost_race = [&self.stderr_path, &self.stdout_path]
+            .into_iter()
+            .any(|path| {
+                std::fs::read_to_string(path)
+                    .is_ok_and(|output| output.contains("Address already in use"))
+            });
+        if self.bind_race_respawns >= MAX_BIND_RACE_RESPAWNS || !lost_race {
+            return false;
+        }
+        let attempt = self.bind_race_respawns + 1;
+        eprintln!(
+            "🔁 Test server lost a port race (attempt {attempt}/{MAX_BIND_RACE_RESPAWNS}); \
+             respawning on fresh ports."
+        );
+        let mut fresh = Self::launch(self.recipe.clone());
+        fresh.admin_key = self.admin_key.take();
+        fresh.bind_race_respawns = attempt;
+        *self = fresh;
+        true
     }
 
     /// 🔐 Declares the `api_key` this fixture configured, so the readiness probe
@@ -412,6 +507,21 @@ impl TestServer {
     }
 
     async fn wait_until_ready(&mut self) -> bool {
+        loop {
+            match self.wait_until_ready_once().await {
+                Readiness::Ready => return true,
+                // 🔁 A lost admin port does not end the process; it only
+                // keeps the admin probe from ever answering, so a timeout
+                // with a bind collision in stderr is the same race.
+                Readiness::Exited | Readiness::TimedOut if self.respawn_after_bind_race() => {
+                    continue;
+                }
+                Readiness::Exited | Readiness::TimedOut => return false,
+            }
+        }
+    }
+
+    async fn wait_until_ready_once(&mut self) -> Readiness {
         let client = no_proxy_client();
         let url = self.url(0, &self.readiness_path);
         let admin_url = self
@@ -424,7 +534,7 @@ impl TestServer {
                 eprintln!("❌ Server exited unexpectedly with status: {status}");
                 self.stop();
                 self.print_diagnostics();
-                return false;
+                return Readiness::Exited;
             }
 
             if !server_ready
@@ -448,7 +558,7 @@ impl TestServer {
                 admin_ready = body == ADMIN_HEALTH_BODY;
             }
             if server_ready && admin_ready {
-                return true;
+                return Readiness::Ready;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -458,11 +568,26 @@ impl TestServer {
         );
         self.stop();
         self.print_diagnostics();
-        false
+        Readiness::TimedOut
     }
 
     /// 🔐 Waits for TLS readiness and the configured Admin listener together.
     async fn wait_until_tls_ready(&mut self, host: &str) -> bool {
+        loop {
+            match self.wait_until_tls_ready_once(host).await {
+                Readiness::Ready => return true,
+                // 🔁 A lost admin port does not end the process; it only
+                // keeps the admin probe from ever answering, so a timeout
+                // with a bind collision in stderr is the same race.
+                Readiness::Exited | Readiness::TimedOut if self.respawn_after_bind_race() => {
+                    continue;
+                }
+                Readiness::Exited | Readiness::TimedOut => return false,
+            }
+        }
+    }
+
+    async fn wait_until_tls_ready_once(&mut self, host: &str) -> Readiness {
         let client = reqwest::Client::builder()
             .no_proxy()
             .danger_accept_invalid_certs(true)
@@ -482,7 +607,7 @@ impl TestServer {
                 eprintln!("❌ Server exited unexpectedly with status: {status}");
                 self.stop();
                 self.print_diagnostics();
-                return false;
+                return Readiness::Exited;
             }
 
             if !tls_ready
@@ -503,7 +628,7 @@ impl TestServer {
                 admin_ready = true;
             }
             if tls_ready && admin_ready {
-                return true;
+                return Readiness::Ready;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -511,7 +636,7 @@ impl TestServer {
         eprintln!("⏳ Timed out waiting for TLS test readiness.");
         self.stop();
         self.print_diagnostics();
-        false
+        Readiness::TimedOut
     }
 }
 
@@ -10116,8 +10241,6 @@ async fn test_proxy_protocol_is_required_per_listener_not_process_wide() {
     .to_string();
 
     let mut server = TestServer::new(&config);
-    let direct = server.listener_address(0, 0);
-    let behind_balancer = server.listener_address(0, 1);
     let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
 
     // The direct listener must be reachable with no PROXY header at all.
@@ -10125,6 +10248,9 @@ async fn test_proxy_protocol_is_required_per_listener_not_process_wide() {
         server.wait_until_ready().await,
         "the direct listener must come up and serve plain HTTP"
     );
+    // 🔁 Read only after readiness: a lost port race respawns on new ports.
+    let direct = server.listener_address(0, 0);
+    let behind_balancer = server.listener_address(0, 1);
     let plain = no_proxy_client()
         .get(format!("http://{direct}/"))
         .send()
