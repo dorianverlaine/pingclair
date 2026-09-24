@@ -19,16 +19,37 @@
 //!
 //! 1. The directive's rank in the order table ([`DirectiveOrder`]), which the
 //!    `order` global option can rearrange.
-//! 2. Within one rank, a route with a matcher before one without, so a
-//!    catch-all never hides a narrower sibling of the same directive.
-//! 3. Then matcher specificity — exact paths before globs, longer before
-//!    shorter — the same comparison the router's route sort uses today.
-//! 4. Then file order, which is what is left when nothing else decides.
+//! 2. Within one rank, the route whose single path pattern is longer once a
+//!    trailing `*` is removed goes first: `/foobar*` before `/foo`, because
+//!    it names more of the path. A route with one path pattern goes before
+//!    any route without one.
+//! 3. Between two routes with no single path pattern, one with a matcher
+//!    (say, a header) goes before one without, so a catch-all never hides a
+//!    narrower sibling of the same directive.
+//! 4. Between two patterns that are equal once trimmed, the exact one goes
+//!    first: `/foo` before `/foo*`.
+//! 5. Then file order, which is what is left when nothing else decides.
+//!
+//! 📜 Where this comes from: steps 2–5 reproduce `sortRoutes` in the
+//! reference's Caddyfile adapter (`caddyconfig/httpcaddyfile/httptype.go`),
+//! as the issue #18 decision of 2026-09-24 requires. That function was not
+//! re-read for this change; the rule is written from memory of it, including
+//! two details worth checking against the source if this ever disagrees with
+//! a measurement:
+//!
+//! - Only a matcher with exactly **one** path pattern has a length. Several
+//!   patterns (`path /a /b`), a pattern under `not`, or no path condition at
+//!   all count as having none (the reference's issue #5037 case).
+//! - Two different trimmed patterns of equal length are ordered
+//!   alphabetically there; here they stay in file order, per the decision.
+//!   The two can only disagree for patterns with a `*` in the middle — two
+//!   different prefixes of the same length never match the same request.
 
 use super::order::DirectiveOrder;
-use super::sites::{handler_directive_name, handler_has_terminal, route_specificity};
-use crate::parser::ast::{Handler, RouteArm};
+use super::sites::{handler_directive_name, handler_has_terminal};
+use crate::parser::ast::{Handler, Matcher, RouteArm};
 use std::cmp::Reverse;
+use std::collections::HashMap;
 
 /// 🔢 Where one route sits in the ordered list.
 ///
@@ -37,23 +58,34 @@ use std::cmp::Reverse;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct RouteOrderKey {
     rank: usize,
+    /// 📏 Trimmed length of the route's single path pattern. `Reverse` puts
+    /// longer first, and `None` (no single pattern) after every `Some`.
+    path_length: Reverse<Option<usize>>,
     unmatched: bool,
-    glob: usize,
-    length: Reverse<usize>,
+    wildcard: bool,
     file_index: usize,
 }
 
 impl RouteOrderKey {
     /// 🧭 The key for a route that one directive produced, before any site
     /// middleware is composed into it — composition hides which directive it
-    /// was.
-    pub(super) fn for_arm(order: &DirectiveOrder, arm: &RouteArm, file_index: usize) -> Self {
-        let (glob, length) = route_specificity(&arm.matcher);
+    /// was. Named matchers resolve through `matchers`, the way the reference
+    /// reads the path out of the matcher set a name stands for.
+    pub(super) fn for_arm(
+        order: &DirectiveOrder,
+        matchers: &HashMap<String, Matcher>,
+        arm: &RouteArm,
+        file_index: usize,
+    ) -> Self {
+        let pattern = arm
+            .matcher
+            .as_ref()
+            .and_then(|matcher| sort_path(matcher, matchers));
         Self {
             rank: order.rank(handler_directive_name(&arm.handler)),
+            path_length: Reverse(pattern.map(|pattern| trim_wildcard(pattern).len())),
             unmatched: arm.matcher.is_none(),
-            glob,
-            length: Reverse(length),
+            wildcard: pattern.is_some_and(|pattern| pattern.ends_with('*')),
             file_index,
         }
     }
@@ -73,11 +105,67 @@ impl RouteOrderKey {
             });
         Self {
             rank,
+            path_length: Reverse(None),
             unmatched: true,
-            glob: 0,
-            length: Reverse(0),
+            wildcard: false,
             file_index: usize::MAX,
         }
+    }
+}
+
+/// ✂️ A pattern without its trailing `*`: the part that names a path.
+fn trim_wildcard(pattern: &str) -> &str {
+    pattern.strip_suffix('*').unwrap_or(pattern)
+}
+
+/// 📏 The one path pattern a matcher sorts by, if it has exactly one.
+///
+/// A named matcher is one matcher set whose conditions are `and`ed, so its
+/// path patterns are collected across the `and` tree. `or` and `not` are not
+/// descended: the reference does not read either as a plain path condition.
+fn sort_path<'a>(matcher: &'a Matcher, matchers: &'a HashMap<String, Matcher>) -> Option<&'a str> {
+    let mut patterns = Vec::new();
+    collect_paths(matcher, matchers, &mut patterns, 0);
+    match patterns.as_slice() {
+        [pattern] => Some(pattern),
+        _ => None,
+    }
+}
+
+fn collect_paths<'a>(
+    matcher: &'a Matcher,
+    matchers: &'a HashMap<String, Matcher>,
+    patterns: &mut Vec<&'a str>,
+    depth: usize,
+) {
+    // 🛡️ A named matcher can name itself. The compiler rejects that later,
+    // but this runs first and must not recurse forever on the way there.
+    if depth > 16 {
+        return;
+    }
+    match matcher {
+        Matcher::Path(path) => patterns.extend(path.patterns.iter().map(String::as_str)),
+        Matcher::Named(name) => {
+            if let Some(named) = matchers.get(name) {
+                collect_paths(named, matchers, patterns, depth + 1);
+            }
+        }
+        Matcher::And(left, right) => {
+            collect_paths(left, matchers, patterns, depth + 1);
+            collect_paths(right, matchers, patterns, depth + 1);
+        }
+        Matcher::Header(_)
+        | Matcher::Method(_)
+        | Matcher::Query(_)
+        | Matcher::Host(_)
+        | Matcher::RemoteIp(_)
+        | Matcher::Protocol(_)
+        | Matcher::Vars { .. }
+        | Matcher::PathRegexp { .. }
+        | Matcher::HeaderRegexp { .. }
+        | Matcher::File { .. }
+        | Matcher::Or(..)
+        | Matcher::Not(_) => {}
     }
 }
 
@@ -205,6 +293,28 @@ mod tests {
             Some(catch_all)
         );
         assert_eq!(router_pick(&routes, "/assets/a.txt"), Some(assets));
+    }
+
+    #[test]
+    fn siblings_of_one_directive_sort_by_trimmed_path_length_first() {
+        // 📏 The 2026-09-24 tie-break: `/foobar*` names more of the path
+        // than `/foo`, so it goes first even though `/foo` is exact; `/foo`
+        // beats `/foo*` because they are equal once trimmed; a header-only
+        // matcher has no path length and goes after every path route.
+        let (order, routes) = site(concat!(
+            "example.com {\n",
+            "    @canary header X-Canary 1\n",
+            "    respond @canary \"canary\"\n",
+            "    respond /foo* \"foo glob\"\n",
+            "    respond /foo \"foo\"\n",
+            "    respond /foobar* \"foobar\"\n",
+            "}",
+        ));
+        let paths: Vec<&str> = order
+            .iter()
+            .map(|&index| routes[index].path.as_str())
+            .collect();
+        assert_eq!(paths, ["/foobar*", "/foo", "/foo*", "/*"]);
     }
 
     #[test]

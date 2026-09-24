@@ -714,7 +714,8 @@ pub(super) fn adapt_server(
                     .into_iter()
                     .enumerate()
                     .map(|(file_index, arm)| {
-                        let key = RouteOrderKey::for_arm(order, &arm.inner, file_index);
+                        let key =
+                            RouteOrderKey::for_arm(order, &server.matchers, &arm.inner, file_index);
                         (arm, key)
                     })
                     .collect();
