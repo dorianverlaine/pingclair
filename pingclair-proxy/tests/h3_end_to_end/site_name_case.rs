@@ -11,10 +11,10 @@ use super::*;
 #[tokio::test]
 async fn h3_exclusion_holds_for_a_mixed_case_sni() {
     let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    // 🔌 Bind first so the test knows the port; `QuicServer` rebinds it.
-    let probe = std::net::UdpSocket::bind(listen).unwrap();
-    let address = probe.local_addr().unwrap();
-    drop(probe);
+    // 🔌 The server takes this bound socket, so no parallel test can claim the
+    // port between probing and serving (#184).
+    let socket = bind_udp(listen).unwrap();
+    let address = socket.local_addr().unwrap();
 
     let proxy = PingclairProxy::with_published_listener_policy(Arc::new(
         PublishedListenerPolicy::new(Arc::new(ClientAuthTable::default())),
@@ -42,14 +42,13 @@ async fn h3_exclusion_holds_for_a_mixed_case_sni() {
     certs.upsert_pem("opted-out.h3.test", &cert, &key).unwrap();
     certs.set_excluded_names(["opted-out.h3.test"]);
 
-    let server = QuicServer::new(address, Arc::new(proxy), certs, 8, Vec::new());
+    let server =
+        QuicServer::new(address, Arc::new(proxy), certs, 8, Vec::new()).with_socket(socket);
     tokio::spawn(async move {
         if let Err(e) = server.run().await {
             eprintln!("H3 server stopped: {e}");
         }
     });
-    // 🕰️ The listener binds inside `run()`; give it a moment before probing.
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let kept = h3_attempt(
         H3Attempt {

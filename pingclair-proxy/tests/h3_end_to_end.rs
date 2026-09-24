@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use pingclair_core::config::{HandlerConfig, RouteConfig, ServerConfig};
 use pingclair_proxy::client_auth::{ClientAuthTable, CompiledClientAuth, PublishedListenerPolicy};
-use pingclair_proxy::quic::{CertTable, QuicServer};
+use pingclair_proxy::quic::{CertTable, QuicServer, bind_udp};
 use pingclair_proxy::server::PingclairProxy;
 // 🔗 Through `tokio-quiche`, so the test client and the server under test are
 // provably the same quiche. See the note in `quic.rs`.
@@ -122,11 +122,12 @@ async fn spawn_h3_listener_with_policy(
 ) -> (SocketAddr, Arc<PublishedListenerPolicy>) {
     let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-    // 🔌 Bind first so the test knows the port; `QuicServer` rebinds the same
-    // address once this probe socket is dropped.
-    let probe = std::net::UdpSocket::bind(listen).unwrap();
-    let address = probe.local_addr().unwrap();
-    drop(probe);
+    // 🔌 Bind here and hand the socket to `QuicServer`, the way startup does.
+    // Releasing a probe port for the server to rebind left a gap in which a
+    // parallel test's `bind(0)` could take the number, and the server then
+    // stopped with "Address already in use" (#184).
+    let socket = bind_udp(listen).unwrap();
+    let address = socket.local_addr().unwrap();
 
     let listener_policy = Arc::new(PublishedListenerPolicy::new(
         client_auth.unwrap_or_else(|| Arc::new(ClientAuthTable::default())),
@@ -140,15 +141,16 @@ async fn spawn_h3_listener_with_policy(
         certs.upsert_pem(name, &cert, &key).unwrap();
     }
 
-    let server = QuicServer::new(address, Arc::new(proxy), certs, 8, Vec::new());
+    let server =
+        QuicServer::new(address, Arc::new(proxy), certs, 8, Vec::new()).with_socket(socket);
     tokio::spawn(async move {
         if let Err(e) = server.run().await {
             eprintln!("H3 server stopped: {e}");
         }
     });
 
-    // 🕰️ The listener binds inside `run()`; give it a moment before probing.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // 📬 No readiness sleep: the socket is already bound, so the kernel queues
+    // a client's first packet until `run()` starts reading.
     (address, listener_policy)
 }
 
