@@ -180,14 +180,22 @@ struct ApplyContext<'a> {
     authorized_revision: u64,
 }
 
-/// Run the admin server
+/// 🔧 Serves the admin API on a listener the caller has already bound.
+///
+/// 🚫 The bind happens at startup, next to the data-plane listeners, so a taken
+/// admin port stops the process instead of leaving a server that looks healthy
+/// and refuses every admin call. This function only adopts the socket.
 pub async fn run_admin_server(
-    addr: SocketAddr,
+    listener: std::net::TcpListener,
     options: AdminServerOptions,
 ) -> pingclair_core::Result<()> {
-    let listener = TcpListener::bind(addr)
-        .await
-        .map_err(|e| pingclair_core::Error::Server(format!("Failed to bind admin API: {e}")))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| pingclair_core::Error::Server(format!("Admin API listener: {e}")))?;
+    let listener = listener
+        .set_nonblocking(true)
+        .and_then(|()| TcpListener::from_std(listener))
+        .map_err(|e| pingclair_core::Error::Server(format!("Admin API listener: {e}")))?;
 
     let initial_policy = options.policy.snapshot();
     if initial_policy.auth.is_none() {

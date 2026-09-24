@@ -20,6 +20,18 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🔧 A taken admin port stops startup instead of being logged
+
+The admin API bound its address in its own thread after startup had
+succeeded. If another process held the port, the only sign was a line on
+stdout, and the server ran on without `/load`, `/config`, or `/metrics`. The
+admin listener is now bound during startup, next to the data-plane
+listeners, and a failed bind stops the process with
+`failed to bind admin API on ADDR`. `admin off` still binds nothing.
+**Upgrading:** a deployment that was silently running without its admin API
+now refuses to start; free the port, move the admin address, or turn the
+admin API off.
+
 ### 🚫 A site with `http3 off` is no longer advertised over HTTP/3
 
 `tls { http3 off }` made the QUIC handshake for that site fail on purpose,

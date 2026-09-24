@@ -62,6 +62,10 @@ mod site_name_case;
 #[path = "integration/h3_bind.rs"]
 mod h3_bind;
 
+// 🔧 Admin listener binding at startup; the same shape as the HTTP/3 case.
+#[path = "integration/admin_bind.rs"]
+mod admin_bind;
+
 // 🧩 Site middleware must reach terminal `handle` routes as well as fallback routes.
 #[path = "integration/site_middleware.rs"]
 mod site_middleware;
@@ -140,8 +144,8 @@ struct TestServer {
 /// binds it. In that gap another test in the same process can open its own
 /// fixture on `127.0.0.1:0` and be handed the very same number. On Linux the
 /// child binds `[::]:port`, collides with that fixture, and exits with
-/// "Address already in use" (a lost admin port is logged the same way but
-/// leaves the process running). Nothing the child did was wrong, so the readiness
+/// "Address already in use" — the admin port included, since #188 made that
+/// bind stop startup too. Nothing the child did was wrong, so the readiness
 /// waits respawn it on fresh ports instead of failing the test (issue #184).
 #[derive(Clone)]
 enum LaunchRecipe {
@@ -410,14 +414,10 @@ impl TestServer {
     /// waits call this: a caller that read an address before waiting would
     /// hold a port the new child no longer uses.
     fn respawn_after_bind_race(&mut self) -> bool {
-        // 🔎 A startup bind failure lands on stderr, but the admin listener's
-        // is a tracing line, and tracing writes to stdout.
-        let lost_race = [&self.stderr_path, &self.stdout_path]
-            .into_iter()
-            .any(|path| {
-                std::fs::read_to_string(path)
-                    .is_ok_and(|output| output.contains("Address already in use"))
-            });
+        // 🔎 Every startup bind failure, admin listener included, ends the
+        // process with the error on stderr.
+        let lost_race = std::fs::read_to_string(&self.stderr_path)
+            .is_ok_and(|output| output.contains("Address already in use"));
         if self.bind_race_respawns >= MAX_BIND_RACE_RESPAWNS || !lost_race {
             return false;
         }
@@ -514,12 +514,9 @@ impl TestServer {
         loop {
             match self.wait_until_ready_once().await {
                 Readiness::Ready => return true,
-                // 🔁 A lost admin port does not end the process; it only
-                // keeps the admin probe from ever answering, so a timeout
-                // with a bind collision in stderr is the same race.
-                Readiness::Exited | Readiness::TimedOut if self.respawn_after_bind_race() => {
-                    continue;
-                }
+                // 🔁 A lost port race always ends the process, so only an
+                // exit can be one; a timeout is a real failure.
+                Readiness::Exited if self.respawn_after_bind_race() => continue,
                 Readiness::Exited | Readiness::TimedOut => return false,
             }
         }
@@ -580,12 +577,9 @@ impl TestServer {
         loop {
             match self.wait_until_tls_ready_once(host).await {
                 Readiness::Ready => return true,
-                // 🔁 A lost admin port does not end the process; it only
-                // keeps the admin probe from ever answering, so a timeout
-                // with a bind collision in stderr is the same race.
-                Readiness::Exited | Readiness::TimedOut if self.respawn_after_bind_race() => {
-                    continue;
-                }
+                // 🔁 A lost port race always ends the process, so only an
+                // exit can be one; a timeout is a real failure.
+                Readiness::Exited if self.respawn_after_bind_race() => continue,
                 Readiness::Exited | Readiness::TimedOut => return false,
             }
         }
