@@ -41,6 +41,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod addr;
 mod certs;
 mod cli;
+mod fd_budget;
 mod listen;
 mod logging;
 mod paths;

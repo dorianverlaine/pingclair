@@ -20,6 +20,18 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### ⚠️ Startup warns when keepalive pools can outgrow the descriptor limit
+
+Every idle upstream connection kept for reuse holds a file descriptor, and
+there is one keepalive pool per TCP listener, sized at
+`upstream_keepalive_pool_size` times the worker threads, plus one per HTTP/3
+port. On a 4-core box, `:80` + `:443` + HTTP/3 may keep 4,608 idle upstream
+connections, past the 1,024 descriptors a container usually starts with.
+Startup now adds these up, with the listening sockets, and logs a warning
+with the numbers as structured fields when the total exceeds the soft
+`RLIMIT_NOFILE`. It does not refuse to start. The pools are still sized per
+listener; sharing one budget across them is still open.
+
 ### 🔧 A taken admin port stops startup instead of being logged
 
 The admin API bound its address in its own thread after startup had

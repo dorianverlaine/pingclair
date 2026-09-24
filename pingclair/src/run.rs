@@ -912,6 +912,16 @@ pub(crate) fn run_server(
         }
     }
 
+    // ⚠️ Every listener is known now, so this is the first point where the
+    // descriptors the keepalive pools may hold can be compared with the limit.
+    crate::fd_budget::warn_if_over_limit(crate::fd_budget::DescriptorReservation {
+        pool_size: server.configuration.upstream_keepalive_pool_size,
+        worker_threads: server.configuration.threads,
+        tcp_listeners: port_proxies.read().len(),
+        h3_ports: https_ports.len(),
+        admin_listener: config.admin.as_ref().is_some_and(|admin| admin.enabled),
+    });
+
     // 📜 One certificate table is retained by the runtime publisher so a
     // manual rotation reaches QUIC in the same transaction as TCP TLS.
     let h3_cert_table =

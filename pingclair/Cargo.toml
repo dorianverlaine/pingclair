@@ -47,6 +47,8 @@ parking_lot = "0.12"
 
 [target.'cfg(unix)'.dependencies]
 tikv-jemallocator = "0.6"
+# 📐 `getrlimit` for the startup descriptor-budget warning (issue #33).
+libc.workspace = true
 
 [dev-dependencies]
 # default-features = false: reqwest's default-tls (native-tls) pulls in
@@ -63,7 +65,6 @@ tokio = { workspace = true, features = ["full"] }
 tempfile = "3.8"
 uuid = { version = "1.0", features = ["v4"] }
 flate2 = "1.0"
-libc.workspace = true
 h2.workspace = true
 rcgen.workspace = true
 bytes.workspace = true
