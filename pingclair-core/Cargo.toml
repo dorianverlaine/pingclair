@@ -32,5 +32,10 @@ pingclair-tls = { path = "../pingclair-tls" }
 tempfile = "3"
 divan = "0.1.21"
 
+# ⚡ Divan owns `main`, so the libtest harness must stay out of the way.
+[[bench]]
+name = "router"
+harness = false
+
 [lints]
 workspace = true
