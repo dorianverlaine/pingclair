@@ -21,6 +21,9 @@ jobs:
       - name: Test the repository lint helpers
         run: python3 -m unittest discover -s scripts/repo_lint -p 'test_*.py'
 
+      - name: Test the release-version rules
+        run: python3 -m unittest discover -s scripts/release -p 'test_*.py'
+
       - name: Run repository invariant checks
         run: just repo-lint
 
