@@ -37,5 +37,9 @@ divan = "0.1.21"
 name = "router"
 harness = false
 
+[[bench]]
+name = "percent"
+harness = false
+
 [lints]
 workspace = true
