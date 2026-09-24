@@ -751,24 +751,32 @@ fn collect_subroute_elements(
         elements.push(HandlerElement { matcher, handler });
     }
     if sorted {
-        sort_handle_elements(&mut elements, order);
+        sort_handle_elements(&mut elements, &local, order);
     }
     Ok(elements)
 }
 
-/// 🔢 Sorts `handle` elements the way Caddy's `sortRoutes` does: directive
-/// order first, then path-matcher specificity (exact before glob, longer
-/// before shorter). `route` never calls this.
-fn sort_handle_elements(elements: &mut [HandlerElement], order: &DirectiveOrder) {
-    elements.sort_by(|a, b| {
-        let rank =
-            |element: &HandlerElement| super::sites::caddy_handler_rank(order, &element.handler);
-        rank(a).cmp(&rank(b)).then_with(|| {
-            let (a_exact, a_len) = super::sites::route_specificity(&a.matcher);
-            let (b_exact, b_len) = super::sites::route_specificity(&b.matcher);
-            a_exact.cmp(&b_exact).then_with(|| b_len.cmp(&a_len))
+/// 🔢 Sorts `handle` elements the way the reference's `sortRoutes` does:
+/// directive order first, then the path tie-break documented on
+/// [`RouteOrderKey`](super::route_order::RouteOrderKey), then file order.
+/// `route` never calls this.
+fn sort_handle_elements(
+    elements: &mut Vec<HandlerElement>,
+    matchers: &HashMap<String, Matcher>,
+    order: &DirectiveOrder,
+) {
+    let mut keyed: Vec<_> = std::mem::take(elements)
+        .into_iter()
+        .enumerate()
+        .map(|(file_index, element)| {
+            let key = super::route_order::RouteOrderKey::for_element(
+                order, matchers, &element, file_index,
+            );
+            (key, element)
         })
-    });
+        .collect();
+    keyed.sort_by_key(|(key, _)| *key);
+    elements.extend(keyed.into_iter().map(|(_, element)| element));
 }
 
 /// 🚦 Adapts an exact local rate-limit policy and rejects ambiguous options.

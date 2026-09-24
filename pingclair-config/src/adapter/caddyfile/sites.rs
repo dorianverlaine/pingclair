@@ -16,7 +16,7 @@ use super::matchers::{
 };
 use super::options::is_wildcard_host;
 use super::order::DirectiveOrder;
-use super::route_order::{RouteOrderKey, directive_order};
+use super::route_order::RouteOrderKey;
 use super::tls::adapt_tls_directive;
 use crate::parser::ast::*;
 use crate::parser::caddy_ast::Directive;
@@ -703,76 +703,70 @@ pub(super) fn adapt_server(
             )
         };
 
-        // 🧭 Keys for the ordered route list (issue #18, stage 1), one per
-        // arm, aligned with the arms through the sort below.
-        let mut route_keys: Vec<RouteOrderKey> = Vec::new();
-        if let Some(routes) = server.routes.as_mut() {
-            // 🏷️ Keyed while the arms are still in file order and before site
-            // middleware is composed in, because both erase what the key reads.
-            let mut keyed: Vec<(Node<RouteArm>, RouteOrderKey)> =
-                std::mem::take(&mut routes.inner.arms)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(file_index, arm)| {
-                        let key =
-                            RouteOrderKey::for_arm(order, &server.matchers, &arm.inner, file_index);
-                        (arm, key)
-                    })
-                    .collect();
-            // 🧭 Matched routes sort the same way, with middleware first: a
-            // non-terminal route must run before a terminal route that would
-            // otherwise shadow it, and equally ranked routes order by matcher
-            // specificity (exact before glob, longer before shorter) like
-            // Caddy's sorting algorithm.
-            keyed.sort_by(|(left, _), (right, _)| {
-                let left_terminal = handler_has_terminal(&left.inner.handler);
-                let right_terminal = handler_has_terminal(&right.inner.handler);
-                left_terminal.cmp(&right_terminal).then_with(|| {
-                    let left_specificity = route_specificity(&left.inner.matcher);
-                    let right_specificity = route_specificity(&right.inner.matcher);
-                    // 🧭 Exact patterns (no `*`) first; within the same
-                    // kind the longer pattern wins.
-                    left_specificity
-                        .0
-                        .cmp(&right_specificity.0)
-                        .then_with(|| right_specificity.1.cmp(&left_specificity.1))
-                })
-            });
-            (routes.inner.arms, route_keys) = keyed.into_iter().unzip();
-            // 🧩 A terminal route skips the site's default pipeline. Prepend
-            // unmatched site middleware so it still applies to that route;
-            // route-local middleware runs afterward and can override it.
-            let site_middleware: Vec<&Handler> = default_handlers
-                .iter()
-                .filter(|handler| is_site_middleware(handler))
-                .collect();
-            for arm in &mut routes.inner.arms {
-                if !handler_has_terminal(&arm.inner.handler) {
-                    arm.inner.handler =
-                        compose_with_default_handlers(arm.inner.handler.clone(), &default_handlers);
-                } else if !site_middleware.is_empty() {
-                    let own =
-                        std::mem::replace(&mut arm.inner.handler, Handler::Pipeline(Vec::new()));
-                    arm.inner.handler = Handler::Pipeline(
-                        site_middleware
-                            .iter()
-                            .map(|handler| (*handler).clone())
-                            .chain(std::iter::once(own))
-                            .map(|handler| HandlerElement {
-                                matcher: None,
-                                handler,
-                            })
-                            .collect(),
-                    );
-                }
+        // 🧭 The site's routes become one list in directive order (issue #18):
+        // the reference tries them first to last and the first that matches
+        // answers. Each arm is keyed while the arms are still in file order
+        // and before site middleware is composed in, because both erase what
+        // the key reads.
+        let pipeline_rank = RouteOrderKey::pipeline_rank(order, &default_handlers);
+        let arms = server
+            .routes
+            .as_mut()
+            .map(|routes| std::mem::take(&mut routes.inner.arms))
+            .unwrap_or_default();
+        let mut keyed: Vec<(RouteArm, RouteOrderKey)> = arms
+            .into_iter()
+            .enumerate()
+            .map(|(file_index, arm)| {
+                let key = RouteOrderKey::for_arm(
+                    order,
+                    &server.matchers,
+                    &arm.inner,
+                    file_index,
+                    pipeline_rank,
+                );
+                (arm.inner, key)
+            })
+            .collect();
+        // 🧩 A terminal route skips the site's default pipeline. Prepend
+        // unmatched site middleware so it still applies to that route;
+        // route-local middleware runs afterward and can override it.
+        let site_middleware: Vec<&Handler> = default_handlers
+            .iter()
+            .filter(|handler| is_site_middleware(handler))
+            .collect();
+        for (arm, _) in &mut keyed {
+            if !handler_has_terminal(&arm.handler) {
+                arm.handler = compose_with_default_handlers(arm.handler.clone(), &default_handlers);
+            } else if !site_middleware.is_empty() {
+                let own = std::mem::replace(&mut arm.handler, Handler::Pipeline(Vec::new()));
+                arm.handler = Handler::Pipeline(
+                    site_middleware
+                        .iter()
+                        .map(|handler| (*handler).clone())
+                        .chain(std::iter::once(own))
+                        .map(|handler| HandlerElement {
+                            matcher: None,
+                            handler,
+                        })
+                        .collect(),
+                );
             }
         }
-
         if !default_handlers.is_empty() {
-            route_keys.push(RouteOrderKey::for_catch_all(order, &default_handlers));
-            add_route(&mut server, None, final_handler);
+            keyed.push((
+                RouteArm {
+                    matcher: None,
+                    handler: final_handler,
+                },
+                RouteOrderKey::for_catch_all(pipeline_rank),
+            ));
         }
-        server.directive_order = directive_order(&route_keys);
+        // 🏗️ One sort per site per load; the router keeps this order.
+        keyed.sort_by_key(|(_, key)| *key);
+        for (arm, _) in keyed {
+            add_route(&mut server, arm.matcher, arm.handler);
+        }
 
         // 🧰 `vars` rules sort least specific first, the reverse of route
         // priority: every matching rule runs, so the most specific value is
@@ -875,6 +869,19 @@ pub(super) fn handler_directive_name(handler: &Handler) -> &'static str {
         Handler::Templates => "templates",
         Handler::Handle(_) => "handle",
         Handler::HandlePath { .. } => "handle_path",
+        // 🐘 `php_fastcgi` expands to a pipeline too, but it ranks as itself,
+        // after `respond`; ranking it as `route` let it answer requests a
+        // `respond` beside it should (issue #18). Its expansion always ends
+        // in the FastCGI proxy. 📌 A hand-written `route` block ending in a
+        // FastCGI `reverse_proxy` is read the same way; the AST keeps no
+        // other record of which directive wrote a pipeline.
+        Handler::Pipeline(elements)
+            if elements.last().is_some_and(|element| {
+                matches!(&element.handler, Handler::Proxy(proxy) if proxy.fastcgi.is_some())
+            }) =>
+        {
+            "php_fastcgi"
+        }
         Handler::Pipeline(_) => "route",
         Handler::Respond(_) => "respond",
         Handler::Proxy(_) => "reverse_proxy",
@@ -894,21 +901,6 @@ pub(super) fn handler_directive_name(handler: &Handler) -> &'static str {
 /// 🔢 Where a handler sits in the chain, under the order this configuration uses.
 pub(super) fn caddy_handler_rank(order: &DirectiveOrder, handler: &Handler) -> usize {
     order.rank(handler_directive_name(handler))
-}
-
-pub(super) fn route_specificity(matcher: &Option<Matcher>) -> (usize, usize) {
-    let Some(matcher) = matcher else {
-        return (0, 0);
-    };
-    match matcher {
-        Matcher::Path(path) => {
-            let pattern = path.patterns.first().map_or("", |p| p.as_str());
-            // 🧭 Exact patterns outrank globs of any length; between two
-            // patterns of the same kind the longer one wins.
-            (pattern.contains('*') as usize, pattern.len())
-        }
-        _ => (0, 0),
-    }
 }
 
 // MARK: - Helpers
@@ -1029,8 +1021,8 @@ pub(super) fn add_route(server: &mut ServerBlock, matcher: Option<Matcher>, hand
 // MARK: - P4 Directive Order Tests
 
 /// 🧭 P4 regressions: Caddy's directive order must make file order
-/// irrelevant, middleware must not be shadowed by terminal routes, and
-/// same-name routes must sort by matcher specificity.
+/// irrelevant, and routes of one directive must sort by the path tie-break in
+/// `route_order` (issue #18).
 #[cfg(test)]
 mod directive_order_tests {
     use crate::compile;
@@ -1174,19 +1166,22 @@ mod directive_order_tests {
     }
 
     #[test]
-    fn middleware_route_precedes_terminal_route_with_same_matcher() {
+    fn a_middleware_route_with_nothing_to_answer_goes_after_a_terminal_one() {
+        // 🧩 A matched `header` answers through the site's default pipeline.
+        // This site has none, so that route can answer nothing at all, and
+        // it sorts after the `handle` that does answer (issue #18). It used
+        // to sort first and win `/api/x` without a body.
         let config = compile(
             "example.com {\n    @api path /api/*\n    handle /api/* {\n respond \"api\"\n }\n    header @api X-A b\n}",
         )
         .expect("compile");
         let routes = &config.servers[0].routes;
         assert!(
-            matches!(&routes[0].handler, HandlerConfig::Headers { .. })
-                || matches!(
-                    &routes[0].handler,
-                    HandlerConfig::Pipeline { handlers } if handlers.iter().any(|element| matches!(&element.handler, HandlerConfig::Headers { .. }))
-                ),
-            "the middleware route must come first, got {:?}",
+            matches!(
+                &routes[0].handler,
+                HandlerConfig::Pipeline { handlers } if handlers.iter().any(|element| matches!(&element.handler, HandlerConfig::Respond { .. }))
+            ),
+            "the answering route must come first, got {:?}",
             routes[0].handler
         );
     }

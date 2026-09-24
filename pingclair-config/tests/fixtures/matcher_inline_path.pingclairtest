@@ -26,6 +26,22 @@ example.com {
       },
       "routes": [
         {
+          "path": "/old",
+          "handler": {
+            "type": "redirect",
+            "to": "/new",
+            "code": 302
+          },
+          "methods": null,
+          "matcher": {
+            "path": {
+              "patterns": [
+                "/old"
+              ]
+            }
+          }
+        },
+        {
           "path": "/assets/*",
           "handler": {
             "type": "pipeline",
@@ -68,22 +84,6 @@ example.com {
             "path": {
               "patterns": [
                 "/health"
-              ]
-            }
-          }
-        },
-        {
-          "path": "/old",
-          "handler": {
-            "type": "redirect",
-            "to": "/new",
-            "code": 302
-          },
-          "methods": null,
-          "matcher": {
-            "path": {
-              "patterns": [
-                "/old"
               ]
             }
           }

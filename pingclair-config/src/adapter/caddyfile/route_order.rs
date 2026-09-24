@@ -11,9 +11,10 @@
 //! the file is never served. Issue #18 records the decision to adopt the
 //! second model.
 //!
-//! 📌 This module is stage 1 of three. It only *builds* the ordered list, at
-//! configuration time, beside the router; nothing consults it yet, so no
-//! request is answered differently. Stage 2 switches selection over to it.
+//! 📌 The site adapter sorts its routes by [`RouteOrderKey`] once, at load,
+//! and emits them in that order (issue #18, stage 2). The router still picks
+//! the most specific path first and reads this order only among routes of
+//! one path.
 //!
 //! The ordering key, in priority order:
 //!
@@ -47,7 +48,7 @@
 
 use super::order::DirectiveOrder;
 use super::sites::{handler_directive_name, handler_has_terminal};
-use crate::parser::ast::{Handler, Matcher, RouteArm};
+use crate::parser::ast::{Handler, HandlerElement, Matcher, RouteArm};
 use std::cmp::Reverse;
 use std::collections::HashMap;
 
@@ -71,44 +72,86 @@ impl RouteOrderKey {
     /// middleware is composed into it — composition hides which directive it
     /// was. Named matchers resolve through `matchers`, the way the reference
     /// reads the path out of the matcher set a name stands for.
+    ///
+    /// 🧩 A route that does not answer by itself (a matched `header`, say) is
+    /// composed with the site's default pipeline and answers through that
+    /// pipeline's terminal handler, so it takes `pipeline_rank`, the rank of
+    /// that handler. Ranking it as `header` would put it ahead of every
+    /// `respond` and let it answer requests those routes should answer.
     pub(super) fn for_arm(
         order: &DirectiveOrder,
         matchers: &HashMap<String, Matcher>,
         arm: &RouteArm,
         file_index: usize,
+        pipeline_rank: usize,
     ) -> Self {
-        let pattern = arm
-            .matcher
-            .as_ref()
-            .and_then(|matcher| sort_path(matcher, matchers));
-        Self {
-            rank: order.rank(handler_directive_name(&arm.handler)),
-            path_length: Reverse(pattern.map(|pattern| trim_wildcard(pattern).len())),
-            unmatched: arm.matcher.is_none(),
-            wildcard: pattern.is_some_and(|pattern| pattern.ends_with('*')),
-            file_index,
-        }
+        let rank = if handler_has_terminal(&arm.handler) {
+            order.rank(handler_directive_name(&arm.handler))
+        } else {
+            pipeline_rank
+        };
+        Self::new(rank, matchers, arm.matcher.as_ref(), file_index)
     }
 
-    /// 🧺 The key for the site's matcher-less pipeline.
-    ///
-    /// That pipeline bundles every unmatched directive into one route, and it
-    /// answers through its first terminal handler, so that handler's rank is
-    /// where the whole pipeline sits. A pipeline with nothing that answers
-    /// sorts last, after every route that does.
-    pub(super) fn for_catch_all(order: &DirectiveOrder, sorted_defaults: &[Handler]) -> Self {
-        let rank = sorted_defaults
-            .iter()
-            .find(|handler| handler_has_terminal(handler))
-            .map_or(usize::MAX, |handler| {
-                order.rank(handler_directive_name(handler))
-            });
+    /// 🧩 The key for one element inside a `handle` block, where every
+    /// element runs as a step and none is composed with anything.
+    pub(super) fn for_element(
+        order: &DirectiveOrder,
+        matchers: &HashMap<String, Matcher>,
+        element: &HandlerElement,
+        file_index: usize,
+    ) -> Self {
+        let rank = order.rank(handler_directive_name(&element.handler));
+        Self::new(rank, matchers, element.matcher.as_ref(), file_index)
+    }
+
+    /// 🧺 The key for the site's matcher-less pipeline, which sorts after
+    /// every matched route of the same rank.
+    pub(super) fn for_catch_all(pipeline_rank: usize) -> Self {
         Self {
-            rank,
+            rank: pipeline_rank,
             path_length: Reverse(None),
             unmatched: true,
             wildcard: false,
             file_index: usize::MAX,
+        }
+    }
+
+    /// 🔢 The rank the default pipeline answers at.
+    ///
+    /// That pipeline bundles every unmatched directive, and it answers
+    /// through its first terminal handler, so that handler's rank is where
+    /// the whole pipeline sits. A pipeline with nothing that answers sorts
+    /// last, after every route that does.
+    ///
+    /// 📄 `templates` is skipped: it counts as terminal here because it reads
+    /// the file itself, but in the reference it only rewrites the response of
+    /// the handler after it (`file_server`, usually), and that handler's rank
+    /// is where the pair answers. Ranking the pair as `templates` would put a
+    /// catch-all ahead of every `respond`.
+    pub(super) fn pipeline_rank(order: &DirectiveOrder, sorted_defaults: &[Handler]) -> usize {
+        sorted_defaults
+            .iter()
+            .filter(|handler| !matches!(handler, Handler::Templates))
+            .find(|handler| handler_has_terminal(handler))
+            .map_or(usize::MAX, |handler| {
+                order.rank(handler_directive_name(handler))
+            })
+    }
+
+    fn new(
+        rank: usize,
+        matchers: &HashMap<String, Matcher>,
+        matcher: Option<&Matcher>,
+        file_index: usize,
+    ) -> Self {
+        let pattern = matcher.and_then(|matcher| sort_path(matcher, matchers));
+        Self {
+            rank,
+            path_length: Reverse(pattern.map(|pattern| trim_wildcard(pattern).len())),
+            unmatched: matcher.is_none(),
+            wildcard: pattern.is_some_and(|pattern| pattern.ends_with('*')),
+            file_index,
         }
     }
 }
@@ -169,130 +212,56 @@ fn collect_paths<'a>(
     }
 }
 
-/// 📋 Route indices in the order they would be tried, first entry first.
-///
-/// 🏗️ Configuration time only; the cost is a sort over a handful of routes
-/// once per load, never per request.
-pub(super) fn directive_order(keys: &[RouteOrderKey]) -> Vec<usize> {
-    let mut indices: Vec<usize> = (0..keys.len()).collect();
-    indices.sort_by_key(|&index| keys[index]);
-    indices
-}
-
 // MARK: - Tests
 
-/// 🧪 The ordered list against the router it will replace.
-///
-/// Where the two models already agree, the first route in the list that
-/// matches must be the route the router picks today. Where they disagree — a
-/// narrower directive that sorts after a catch-all — the list must pick what
-/// the reference picks, which is the behaviour stage 2 switches to.
+/// 🧪 The order a site's compiled routes come out in, which is the order the
+/// router will try them.
 #[cfg(test)]
 mod tests {
-    use pingclair_core::server::Router;
+    use pingclair_core::config::{HandlerConfig, RouteConfig};
 
-    /// 🔎 The site's ordered list, next to the routes the full compile made
-    /// from the same arms.
-    fn site(source: &str) -> (Vec<usize>, Vec<pingclair_core::config::RouteConfig>) {
-        let ast = crate::parser::compile(source).expect("parse");
-        let server = &ast.servers[0].inner;
-        let arms = server
+    fn routes(source: &str) -> Vec<RouteConfig> {
+        crate::compile(source).expect("compile").servers[0]
             .routes
-            .as_ref()
-            .map_or(0, |routes| routes.inner.arms.len());
-        let routes = crate::compile(source).expect("compile").servers[0]
-            .routes
-            .clone();
-        // 📏 One pattern per arm keeps arm indices and route indices equal;
-        // multi-pattern matchers are stage 2's mapping to solve.
-        assert_eq!(routes.len(), arms, "every arm compiled to one route");
-        (server.directive_order.clone(), routes)
+            .clone()
     }
 
-    fn router_pick(routes: &[pingclair_core::config::RouteConfig], path: &str) -> Option<usize> {
-        let headers = http::HeaderMap::new();
-        Router::new(routes.to_vec())
-            .match_request(
-                path,
-                "GET",
-                &headers,
-                "example.com",
-                "127.0.0.1",
-                "HTTP/1.1",
-                None,
-            )
-            .map(|route| route.index)
+    fn paths(source: &str) -> Vec<String> {
+        routes(source).into_iter().map(|route| route.path).collect()
     }
 
-    /// 🧭 First route in the ordered list whose own matcher accepts the path,
-    /// using a one-route router so path matching is the real one.
-    fn ordered_pick(
-        order: &[usize],
-        routes: &[pingclair_core::config::RouteConfig],
-        path: &str,
-    ) -> Option<usize> {
-        order
-            .iter()
-            .copied()
-            .find(|&index| router_pick(std::slice::from_ref(&routes[index]), path).is_some())
-    }
-
-    #[test]
-    fn the_list_agrees_with_the_router_where_the_models_already_agree() {
-        let sources = [
-            // 🎯 Narrower directive sorted ahead of the catch-all.
-            "example.com {\n    redir /old /new\n    respond \"hello\" 200\n}",
-            // 🎯 Two siblings of one directive: specificity is the tie-break.
-            "example.com {\n    respond /api/* \"api\"\n    respond /api/v2/* \"v2\"\n    respond \"top\"\n}",
-            // 🎯 A matched terminal ahead of a catch-all of a later rank.
-            "example.com {\n    root * /srv\n    respond /health \"ok\"\n    file_server\n}",
-            // 🎯 `handle` blocks, the common real-world shape.
-            "example.com {\n    handle /api/* {\n        respond \"api\"\n    }\n    handle {\n        respond \"spa\"\n    }\n}",
-            // 🎯 Middleware on a path, answered by the catch-all.
-            "example.com {\n    header /x X-Scoped yes\n    respond \"hello\"\n}",
-        ];
-        for source in sources {
-            let (order, routes) = site(source);
-            for path in [
-                "/",
-                "/old",
-                "/api/x",
-                "/api/v2/x",
-                "/health",
-                "/x",
-                "/other",
-            ] {
-                assert_eq!(
-                    ordered_pick(&order, &routes, path),
-                    router_pick(&routes, path),
-                    "{path} in:\n{source}"
-                );
+    /// 💬 The first `respond` body in a route's handler tree, which is how
+    /// these fixtures label their routes; `proxy` when there is none.
+    fn body(handler: &HandlerConfig) -> Option<&str> {
+        match handler {
+            HandlerConfig::Respond { body, .. } => body.as_deref(),
+            HandlerConfig::Pipeline { handlers } => {
+                handlers.iter().find_map(|element| body(&element.handler))
             }
+            _ => None,
         }
     }
 
+    fn bodies(source: &str) -> Vec<String> {
+        routes(source)
+            .iter()
+            .map(|route| body(&route.handler).unwrap_or("proxy").to_string())
+            .collect()
+    }
+
     #[test]
-    fn the_list_puts_an_earlier_directive_ahead_of_a_more_specific_one() {
+    fn an_earlier_directive_goes_before_a_more_specific_one() {
         // 🔥 The reproduction from issue #18: `respond` ranks ahead of
-        // `file_server`, so the reference answers `hello` for the asset. The
-        // router still answers with the file; stage 2 closes that gap.
-        let (order, routes) = site(
-            "example.com {\n    root * /srv\n    file_server /assets/*\n    respond \"hello\" 200\n}",
-        );
-        let catch_all = routes
-            .iter()
-            .position(|route| route.path == "/*")
-            .expect("catch-all route");
-        let assets = routes
-            .iter()
-            .position(|route| route.path == "/assets/*")
-            .expect("asset route");
-        assert_eq!(order, vec![catch_all, assets]);
-        assert_eq!(
-            ordered_pick(&order, &routes, "/assets/a.txt"),
-            Some(catch_all)
-        );
-        assert_eq!(router_pick(&routes, "/assets/a.txt"), Some(assets));
+        // `file_server`, so the catch-all comes first.
+        let source = "example.com {\n    root * /srv\n    file_server /assets/*\n    respond \"hello\" 200\n}";
+        assert_eq!(paths(source), ["/*", "/assets/*"]);
+    }
+
+    #[test]
+    fn the_order_option_moves_a_route_in_the_list() {
+        // 🔀 With `file_server` moved first, the asset route leads again.
+        let source = "{\n    order file_server first\n}\nexample.com {\n    root * /srv\n    file_server /assets/*\n    respond \"hello\" 200\n}";
+        assert_eq!(paths(source), ["/assets/*", "/*"]);
     }
 
     #[test]
@@ -301,7 +270,7 @@ mod tests {
         // than `/foo`, so it goes first even though `/foo` is exact; `/foo`
         // beats `/foo*` because they are equal once trimmed; a header-only
         // matcher has no path length and goes after every path route.
-        let (order, routes) = site(concat!(
+        let source = concat!(
             "example.com {\n",
             "    @canary header X-Canary 1\n",
             "    respond @canary \"canary\"\n",
@@ -309,27 +278,57 @@ mod tests {
             "    respond /foo \"foo\"\n",
             "    respond /foobar* \"foobar\"\n",
             "}",
-        ));
-        let paths: Vec<&str> = order
-            .iter()
-            .map(|&index| routes[index].path.as_str())
-            .collect();
-        assert_eq!(paths, ["/foobar*", "/foo", "/foo*", "/*"]);
+        );
+        assert_eq!(bodies(source), ["foobar", "foo", "foo glob", "canary"]);
     }
 
     #[test]
-    fn the_order_option_moves_a_route_in_the_list() {
-        // 🔀 With `file_server` moved first, the reference serves the asset,
-        // which is also what the router does: the models agree again.
-        let (order, routes) = site(
-            "{\n    order file_server first\n}\nexample.com {\n    root * /srv\n    file_server /assets/*\n    respond \"hello\" 200\n}",
+    fn a_matcher_with_several_paths_has_no_path_length() {
+        // 🧮 `path /a /b` compiles to one route per pattern, but it sorts as
+        // one route with no length, so the single-path glob goes first and
+        // the two patterns stay together after it.
+        let source = concat!(
+            "example.com {\n",
+            "    @both path /a /b\n",
+            "    respond @both \"both\"\n",
+            "    respond /a* \"a glob\"\n",
+            "}",
         );
-        for path in ["/assets/a.txt", "/other"] {
-            assert_eq!(
-                ordered_pick(&order, &routes, path),
-                router_pick(&routes, path),
-                "{path}"
-            );
-        }
+        assert_eq!(paths(source), ["/a*", "/a", "/b"]);
+    }
+
+    #[test]
+    fn a_matched_middleware_route_sorts_at_its_pipelines_rank() {
+        // 🧩 `header @rest` is composed with the proxy, so it answers where
+        // `reverse_proxy` ranks — after `respond`, ahead of the plain
+        // catch-all. Ranked as `header` it would lead the list and answer
+        // the readiness path with the proxy.
+        let source = concat!(
+            "example.com {\n",
+            "    @ready path /ready\n",
+            "    respond @ready \"ready\"\n",
+            "    @rest not path /api/*\n",
+            "    header @rest Cache-Control no-cache\n",
+            "    reverse_proxy 127.0.0.1:9\n",
+            "}",
+        );
+        let routes = routes(source);
+        assert_eq!(body(&routes[0].handler), Some("ready"));
+        assert!(routes[1].matcher.is_some(), "the `header @rest` route");
+        assert!(routes[2].matcher.is_none(), "the catch-all");
+    }
+
+    #[test]
+    fn php_fastcgi_ranks_as_itself() {
+        // 🐘 Its expansion is a pipeline, which would otherwise rank as
+        // `route`, ahead of `respond`; as itself it ranks after.
+        let source = concat!(
+            "example.com {\n",
+            "    root * /srv\n",
+            "    php_fastcgi /app/* 127.0.0.1:9000\n",
+            "    respond \"hello\"\n",
+            "}",
+        );
+        assert_eq!(bodies(source), ["hello", "proxy"]);
     }
 }
