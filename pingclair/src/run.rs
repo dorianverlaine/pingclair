@@ -18,10 +18,7 @@
 //! has a TRIAGE row instead of being smuggled in here.
 
 use crate::certs::{DynamicCertResolver, eager_issuance_domains, h3_excluded_domains};
-use crate::listen::{
-    automatic_http_companion, can_bind_automatic_http_port, explicit_http_names,
-    normalize_listen_addr, reserve_private_listener_address, server_requires_tls,
-};
+use crate::listen::{can_bind_automatic_http_port, reserve_private_listener_address};
 use crate::runtime_listeners::{
     RuntimeListeners, RuntimePublisherInputs, prepare_listener_policies,
 };
@@ -29,7 +26,7 @@ use crate::systemd::notify_systemd_ready;
 use parking_lot::RwLock;
 use pingclair_proxy::client_auth::PublishedListenerPolicy;
 use pingora_core::listeners::tls::TlsSettings;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,6 +36,7 @@ mod http3;
 #[cfg(unix)]
 mod reload;
 mod server_conf;
+mod sites;
 
 pub(crate) fn run_server(
     config_path: String,
@@ -197,10 +195,6 @@ pub(crate) fn run_server(
         tls_manager_for_tasks.start_background_issuance(eager_domains);
     });
 
-    // Group servers by listen address
-    let port_proxies = std::collections::HashMap::new();
-    let port_proxies = std::sync::Arc::new(parking_lot::RwLock::new(port_proxies));
-
     // 🚫 Sites that asked to stay off HTTP/3; see `h3_excluded_domains`.
     let h3_excluded_domains = h3_excluded_domains(&config);
     let http3_globally_enabled = config.global.http3;
@@ -218,147 +212,20 @@ pub(crate) fn run_server(
     let blocked_client_networks =
         pingclair_proxy::proxy_protocol::parse_networks(&config.global.blocked_ips)?;
 
-    // Track binding information for diagnostic logging
-    let mut binding_info: HashMap<String, Vec<String>> = HashMap::new();
-    let mut tls_listeners = HashSet::new();
-
-    // 🔎 Probed once, before any listener is registered: whether an automatic
-    // port-80 companion is even possible here. Doing it per site would probe a
-    // privileged port repeatedly for one unchanging answer.
-    let auto_https_mode = config.global.auto_https.clone();
-    let http_port = config.global.http_port;
-    let https_port = config.global.https_port;
-    let explicit_http_names = explicit_http_names(&config);
-
-    for server_config in &config.servers {
-        tracing::debug!(
-            "🚀 Processing ServerConfig: name={:?}, listens={:?}",
-            server_config.name,
-            server_config.listen
-        );
-
-        let listen_addrs: Vec<String> = if server_config.listen.is_empty() {
-            // 🔐 A site that configures TLS but no port means HTTPS, so it
-            // belongs on 443. Defaulting it to 80 would quietly serve a site
-            // the operator asked to encrypt on the plaintext port instead.
-            let host = server_config
-                .bind
-                .as_deref()
-                .filter(|h| !h.is_empty())
-                .unwrap_or("[::]");
-            if server_config.tls.is_some() {
-                vec![format!("{host}:{https_port}")]
-            } else {
-                vec![format!("{host}:{http_port}")]
-            }
-        } else {
-            server_config
-                .listen
-                .iter()
-                .map(|a| normalize_listen_addr(a))
-                .collect()
-        };
-
-        // 🔁 Automatic HTTPS: give an HTTPS site its plaintext port-80 companion
-        // so ACME validation and the HTTP→HTTPS redirect both work unattended.
-        let companion = automatic_http_companion(
-            server_config,
-            auto_https_mode.clone(),
-            &listen_addrs,
-            &explicit_http_names,
-            http_port,
-            https_port,
-        )
-        .filter(|_| {
-            if automatic_http_available {
-                true
-            } else {
-                tracing::warn!(
-                    "🚫 Automatic HTTPS could not take {} for {:?}: HTTP→HTTPS \
-                     redirects and ACME HTTP-01 validation are unavailable. \
-                     Free the port, run with CAP_NET_BIND_SERVICE, or add an \
-                     explicit `listen` for the plaintext port.",
-                    format!("[::]:{http_port}"),
-                    server_config.name
-                );
-                false
-            }
-        });
-
-        for addr in listen_addrs {
-            if server_requires_tls(server_config, &addr, http_port, https_port) {
-                tls_listeners.insert(addr.clone());
-            }
-            let listener_policy = listener_security_by_address
-                .get(&addr)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("no prepared listener policy for {addr}"))?;
-            let mut proxies_guard = port_proxies.write();
-            let proxy = proxies_guard.entry(addr.clone()).or_insert_with(|| {
-                pingclair_proxy::server::PingclairProxy::with_listener_policy(
-                    tls_manager.clone(),
-                    &trusted_proxies,
-                    proxy_protocol_addresses.contains(&addr),
-                    listener_policy,
-                )
-            });
-
-            // Track what sites are bound to what addresses
-            let site_name = server_config
-                .name
-                .clone()
-                .unwrap_or_else(|| "default".to_string());
-            binding_info
-                .entry(addr.clone())
-                .or_default()
-                .push(site_name);
-
-            proxy.add_server(server_config.clone());
-        }
-
-        if let Some(companion) = companion {
-            let addr = format!("[::]:{http_port}");
-            let listener_policy = listener_security_by_address
-                .get(&addr)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("no prepared listener policy for {addr}"))?;
-            let mut proxies_guard = port_proxies.write();
-            let proxy = proxies_guard.entry(addr.clone()).or_insert_with(|| {
-                pingclair_proxy::server::PingclairProxy::with_listener_policy(
-                    tls_manager.clone(),
-                    &trusted_proxies,
-                    proxy_protocol_addresses.contains(&addr),
-                    listener_policy,
-                )
-            });
-            binding_info.entry(addr).or_default().push(format!(
-                "{} (automatic HTTP)",
-                companion.name.as_deref().unwrap_or("default")
-            ));
-            // 🔄 The redirect a request gets when its `Host` matches no site.
-            //
-            // 📌 Gated on the companion actually carrying routes. Under
-            // `auto_https disable_redirects` the listener is provisioned for
-            // ACME validation only, with no routes at all — and telling the
-            // proxy to redirect there would quietly undo the mode the operator
-            // asked for.
-            if !companion.routes.is_empty() {
-                proxy.automatic_https.store(std::sync::Arc::new(Some(
-                    pingclair_proxy::server::AutomaticHttpsRedirect {
-                        http_port,
-                        https_port,
-                    },
-                )));
-            }
-            proxy.add_server(companion);
-        }
-    }
-
-    // Log binding information for diagnostics
-    tracing::info!("🌐 Server binding information:");
-    for (addr, sites) in &binding_info {
-        tracing::info!("   📍 {} -> [{}]", addr, sites.join(", "));
-    }
+    // 📍 Place every site on its addresses before anything is bound; see
+    // `sites`.
+    let sites::SiteGroups {
+        port_proxies,
+        tls_listeners,
+    } = sites::group_by_address(
+        &config,
+        &listener_security_by_address,
+        automatic_http_available,
+        &tls_manager,
+        &trusted_proxies,
+        &proxy_protocol_addresses,
+    )?;
+    let port_proxies = Arc::new(RwLock::new(port_proxies));
 
     // Create services for each proxy
     let mut https_ports = Vec::new();
