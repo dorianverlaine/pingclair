@@ -185,6 +185,10 @@ enum LaunchRecipe {
 /// it; each discarded attempt prints its stderr first.
 const MAX_BIND_RACE_RESPAWNS: u32 = 3;
 
+/// 🚀 Printed by `pingclair run` once its admin and site listeners are bound
+/// (`pingclair/src/run.rs`); readiness probes wait for it.
+const STARTUP_BANNER: &str = "🚀 Pingclair running...";
+
 /// 🔎 What one readiness wait ended with, before any respawn decision.
 enum Readiness {
     Ready,
@@ -535,6 +539,21 @@ impl TestServer {
         }
     }
 
+    /// 🚦 Whether the child has printed its startup banner, which it does only
+    /// after every site listener and the admin listener are bound.
+    ///
+    /// A probe sent before that can reach whoever holds the port instead. The
+    /// harness releases its reservations just before the child starts, so
+    /// another test's one-shot upstream can be handed the same number; the
+    /// child then exits with "Address already in use", but the probe has
+    /// already connected to that upstream, consumed the single request it was
+    /// waiting for, and made the other test fail with a 502 or a miscounted
+    /// cache hit (#184). A child that loses a bind exits before printing.
+    fn announced_its_listeners(&self) -> bool {
+        std::fs::read_to_string(&self.stdout_path)
+            .is_ok_and(|output| output.contains(STARTUP_BANNER))
+    }
+
     async fn wait_until_ready(&mut self) -> bool {
         loop {
             match self.wait_until_ready_once().await {
@@ -561,6 +580,10 @@ impl TestServer {
                 self.stop();
                 self.print_diagnostics();
                 return Readiness::Exited;
+            }
+            if !self.announced_its_listeners() {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
             }
 
             if !server_ready
@@ -631,6 +654,10 @@ impl TestServer {
                 self.stop();
                 self.print_diagnostics();
                 return Readiness::Exited;
+            }
+            if !self.announced_its_listeners() {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
             }
 
             if !tls_ready
