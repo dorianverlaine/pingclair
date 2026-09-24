@@ -482,11 +482,6 @@ impl ConfigPublisher for RuntimeListeners {
         }
         self.admin_policy.publish(prepared_admin);
         pingclair_proxy::access_log::register_channels(&config.logging.channels);
-        // 🔀 A reload can move the process log or take it off a file, and
-        // Caddy re-provisions its loggers on reload for the same reason: a
-        // configuration that could not undo a `log { output file … }` would
-        // leave the file growing for a listener set that no longer mentions it.
-        crate::logging::apply_process_log(&config.logging);
         pingclair_proxy::metrics::configure_host_labels(
             &config.global.metrics_options,
             config
@@ -501,6 +496,18 @@ impl ConfigPublisher for RuntimeListeners {
         };
         *self.document.write() = prepared_document;
         drop(gate);
+
+        // 🔀 A reload can move the process log or take it off a file, and
+        // Caddy re-provisions its loggers on reload for the same reason: a
+        // configuration that could not undo a `log { output file … }` would
+        // leave the file growing for a listener set that no longer mentions it.
+        //
+        // 📌 Deliberately *after* the gate reopens. Opening a file and
+        // rebuilding a filter are not part of "routes, TLS and Admin access all
+        // name the same generation", and holding the gate through them widens
+        // the window in which a request is answered with "reload in progress"
+        // — which is a real answer a client can see.
+        crate::logging::apply_process_log(&config.logging);
 
         // 🚫 Claim the Admin-owned generation before releasing the same
         // publication mutex that a signal reload must acquire. Setting this in
