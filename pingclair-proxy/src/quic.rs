@@ -1432,8 +1432,12 @@ impl QuicServer {
             .unwrap_or(30_000);
 
         let mut h3_config = quiche::h3::Config::new().map_err(|e| QuicError::H3(e.to_string()))?;
-        if let Some(max_header_bytes) = limits.max_header_bytes {
-            h3_config.set_max_field_section_size(max_header_bytes as u64);
+        // 🧾 Deliberately looser than `max_header_bytes`: quiche answers an
+        // oversized section by closing the whole connection, so the real
+        // per-site check runs in `handle_request_inner` and refuses only the
+        // one stream. See `protocol_header_list_limit` for the bound.
+        if let Some(section_limit) = crate::header_limits::protocol_header_list_limit(&limits) {
+            h3_config.set_max_field_section_size(section_limit as u64);
         }
         let h3_config = Arc::new(h3_config);
 
@@ -3587,26 +3591,35 @@ async fn handle_request_inner(
 
     // 🧾 Applies the selected virtual host's decoded H3 field bounds.
     //
-    // 📌 Only the field-count limit can actually fire here. The byte limit is
-    // also advertised to the client as SETTINGS_MAX_FIELD_SECTION_SIZE (the
-    // strictest of the listener's sites, see `QuicServer::run`), and quiche
-    // enforces it before this code sees the request, counting 32 bytes more
-    // per field than this check does — so a section this check would refuse
-    // never gets this far, and no response names an oversized field over
-    // HTTP/3. Observed 2026-09-24 with the quiche pinned by tokio-quiche: a
-    // single 2000-byte field against `max_header_bytes 1024` closed the whole
-    // connection with H3_EXCESSIVE_LOAD. The shared check is still used so the
-    // two transports cannot disagree about what the limits mean.
-    if crate::header_limits::check(
+    // 📌 quiche was given a looser section limit (`QuicServer::run`), so an
+    // oversized section reaches this check and is refused on this stream
+    // alone, instead of quiche closing the connection with H3_EXCESSIVE_LOAD
+    // and failing every other request on it.
+    if let Some(breach) = crate::header_limits::check(
         &state.config.limits,
         req.headers.len(),
         req.headers
             .iter()
             .map(|(name, value)| (name.as_str(), value.len())),
-    )
-    .is_some()
-    {
-        return Err((431, "Request Header Fields Too Large"));
+    ) {
+        let Some(detail) = breach.detail() else {
+            return Err((431, "Request Header Fields Too Large"));
+        };
+        // 🔎 RFC 6585 §5: name the one field at fault. The sentence is built
+        // only here, on the rejection path, and sent directly because the
+        // shared error type carries static text only.
+        let message = format!("Request Header Fields Too Large: {detail}");
+        send_error_response(
+            resp_tx,
+            stream_id,
+            431,
+            &message,
+            Some(&state),
+            response_policy,
+            request_id,
+        )
+        .await;
+        return Ok(());
     }
 
     // 🔌 Rejects CONNECT tunnels because the current H3 path is request-response only.

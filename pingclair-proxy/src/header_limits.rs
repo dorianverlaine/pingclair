@@ -90,6 +90,45 @@ pub(crate) fn check<'a>(
     })
 }
 
+/// 📏 What HTTP/2 and HTTP/3 count per field line beyond its name and value
+/// (RFC 7541 §4.1, RFC 9114 §4.2.2). This check does not count it, so the
+/// protocol libraries' idea of a section's size is always the larger one.
+const PROTOCOL_FIELD_OVERHEAD: usize = 32;
+
+/// 🔢 The most field lines a site may allow (`max_headers`, validated in the
+/// compiler). Used as the field count when a site sets none.
+const MAX_CONFIGURABLE_FIELDS: usize = 256;
+
+/// 🧮 The header-list size to hand the HTTP/2 and HTTP/3 libraries, given the
+/// listener's `max_header_bytes`.
+///
+/// Both libraries refuse an oversized section themselves, before this proxy
+/// sees the request: h2 with a bodiless 431, quiche by closing the whole
+/// connection with H3_EXCESSIVE_LOAD, taking every other request on it down
+/// too. Neither can say which field was at fault. So the libraries get a
+/// looser limit and [`check`] makes the real decision, answering 431 on the
+/// one request with the field named.
+///
+/// 🛡️ Looser is still bounded. The allowance is twice the configured limit,
+/// which is enough for [`check`] to see and name a field that overshoots it,
+/// plus the libraries' 32-byte per-field overhead for as many fields as the
+/// site may send. Past that a peer is refused by the library as before, so
+/// no client can make the proxy buffer an unbounded header section. With
+/// the compiler's ceilings (1 MiB, 256 fields) the result is under 2.1 MiB.
+///
+/// 📌 Computed once per listener at startup, never per request.
+pub(crate) fn protocol_header_list_limit(limits: &ResourceLimitsConfig) -> Option<usize> {
+    let fields = limits
+        .max_header_count
+        .unwrap_or(MAX_CONFIGURABLE_FIELDS)
+        .min(MAX_CONFIGURABLE_FIELDS);
+    limits.max_header_bytes.map(|limit| {
+        limit
+            .saturating_mul(2)
+            .saturating_add(fields.saturating_mul(PROTOCOL_FIELD_OVERHEAD))
+    })
+}
+
 /// 🔤 RFC 9110 §5.6.2 `tchar`.
 fn is_tchar(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
@@ -127,6 +166,21 @@ mod tests {
             Some(HeaderLimitBreach::TooLarge)
         );
         assert_eq!(run(&limits, &[("host", 10)]), None);
+    }
+
+    #[test]
+    fn protocol_limit_leaves_room_for_the_check_to_answer() {
+        // 🎯 1024 bytes and 10 fields: twice the limit, plus 32 per field.
+        assert_eq!(
+            protocol_header_list_limit(&limits(Some(10), Some(1024))),
+            Some(2048 + 320)
+        );
+        // 📌 No field count configured: the compiler's ceiling of 256 fields.
+        assert_eq!(
+            protocol_header_list_limit(&limits(None, Some(1024))),
+            Some(2048 + 256 * 32)
+        );
+        assert_eq!(protocol_header_list_limit(&limits(Some(10), None)), None);
     }
 
     #[test]

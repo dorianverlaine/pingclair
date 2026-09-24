@@ -20,6 +20,17 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🧾 An oversized HTTP/3 header section no longer closes the connection
+
+`max_header_bytes` was handed to quiche as the HTTP/3 field-section limit,
+and quiche answers a section over it by closing the whole connection with
+`H3_EXCESSIVE_LOAD`, failing every other request sharing it. quiche now gets
+a looser but still bounded limit (twice `max_header_bytes`, plus 32 bytes
+for each field the site allows), so the site's own check decides: the one
+request gets a 431, naming the field when a single field is at fault, and
+the rest of the connection carries on. A section beyond the looser limit
+is still refused by quiche as before.
+
 ### ⚠️ Startup warns when keepalive pools can outgrow the descriptor limit
 
 Every idle upstream connection kept for reuse holds a file descriptor, and

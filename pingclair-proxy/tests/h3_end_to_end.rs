@@ -52,6 +52,10 @@ mod preconditions;
 #[path = "h3_end_to_end/goaway.rs"]
 mod goaway;
 
+// 🧾 `max_header_bytes`: one oversized request, one connection that survives.
+#[path = "h3_end_to_end/header_limits.rs"]
+mod header_limits;
+
 const ALPN: &[u8] = b"h3";
 
 fn self_signed_pem(names: &[&str]) -> (String, String) {
