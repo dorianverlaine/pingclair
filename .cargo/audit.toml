@@ -35,9 +35,8 @@ ignore = [
 
     # yaml-rust 0.4.5 — RUSTSEC-2024-0320 (unmaintained, no CVE). Reaches us
     # via `serde_yaml 0.8` → `foundations` → `qlog` → `quiche`/`tokio-quiche`
-    # — the same tracing dependency chain already documented in docs/TODO.md
-    # (the tokio-quiche H3 migration pulls in `cf-rustracing` whether or not
-    # tracing is ever enabled). `tokio-quiche` is exact-pinned per
+    # — the tokio-quiche H3 migration pulls in `cf-rustracing` whether or not
+    # tracing is ever enabled. `tokio-quiche` is exact-pinned per
     # docs/guardrails/proxy.md.
     "RUSTSEC-2024-0320",
 
@@ -47,7 +46,7 @@ ignore = [
     # this was a CI-fix session, not a dependency-audit sweep — but it is the
     # one entry here we could actually remove ourselves, most likely by
     # reading PEM material through `rustls-pki-types`'s iterator directly.
-    # Real follow-up, not a permanent exception; tracked in the local
-    # docs/TODO.md rather than left only in this comment.
+    # Real follow-up, not a permanent exception; tracked in GitHub issues
+    # rather than left only in this comment.
     "RUSTSEC-2025-0134",
 ]

@@ -15,7 +15,7 @@
 benchmarks/results
 docs
 
-# 🌐 The doc site's own dependency tree, once it has one (docs/SITE.md).
+# 🌐 The documentation site's dependency tree is not part of the server image.
 site/node_modules
 
 .DS_Store

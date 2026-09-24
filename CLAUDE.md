@@ -15,27 +15,20 @@ defect:
 
 | Document | Owns |
 | --- | --- |
-| GitHub issues | Everything outstanding: the plan, defects found and left alone, compatibility gaps. One item, one issue, one place. Templates and labels are in `CONTRIBUTING.md`; `Closes #123` in a PR is what closes the item. **Replaced `docs/TODO.md` and `TRIAGE.md` in August 2026** — a stale copy of either in a checkout is history, not the answer. |
+| GitHub issues | Everything outstanding: the plan, defects found and left alone, compatibility gaps. One item, one issue, one place. Templates and labels are in `CONTRIBUTING.md`; `Closes #123` in a PR is what closes the item. **Replaced the local TODO and triage trackers in August 2026.** |
 | `docs/STATUS.md` | Which public claim has evidence behind it, and where. Three levels: code exists, local tests pass, verified on clean Linux. 🔒 Local only. |
 | `docs/guardrails/{testing,config,tls,proxy}.md` | Environment constraints and implementation rules, one file per subsystem. Every entry is a failure that already happened. `docs/GUARDRAILS.md` is the index over them, nothing more. |
 | `benchmarks/README.md` | Performance claims and methodology. Raw per-run evidence stays local under `benchmarks/results/`, never committed. |
 | `CHANGELOG.md` | What changed between releases, for someone upgrading. Written the same day as the change. |
 
-Two more are 🔒 local reference rather than working documents:
-`docs/CADDYFILE_COMPATIBILITY_MASTER.md` answers "does Pingclair support this
-Caddy directive"; the other `docs/CADDYFILE_*.md` files are frozen 2026-08-01
-audit records, deliberately excluded from `documentation.rs` because they are
-full of configurations that must *not* compile. Do not read any of them as
-current behavior — check the code.
+Historical Caddyfile audit documents were retired in September 2026 because
+they lagged behind the implementation. Check the current code and GitHub issues
+for compatibility behavior and remaining gaps.
 
 Implemented is not verified. The verification ledger deliberately separates
 "code exists", "local tests pass", and "verified on Linux/VPS"; never promote
 an item between those without evidence under
 `benchmarks/results/<date>_<commit>/` (kept locally, not committed).
-
-When the maintainer planning files are present, run
-`scripts/snapshot-sensitive-plans.sh start` before and `end` after a session;
-a snapshot validation failure blocks handoff.
 
 ## Commands
 
@@ -322,11 +315,10 @@ test that finished it. Do not use it for "good", "correct", "recommended", or
 the same discipline applies to checkboxes: `- [x]` is shipped, `- [ ]` is
 outstanding.
 
-> 🤡 The cost of getting this wrong, 2026-08-04: a sweep counted `✅` to work
-> out which Caddyfile tracking documents were still current, found none in
-> `docs/TODO_CADDYFILE_FIXES.md`, and reported it as abandoned. It was
-> 43-of-46 complete and tracked with `- [x]`; its `✅` characters meant
-> something else entirely. A marker that means two things cannot be counted.
+> 🤡 The cost of getting this wrong, 2026-08-04: a sweep counted `✅` in a
+> retired Caddyfile tracker and reported it as abandoned. It was 43-of-46
+> complete and tracked with `- [x]`; its `✅` characters meant something else
+> entirely. A marker that means two things cannot be counted.
 
 ### 🍎 Apple-style comments
 

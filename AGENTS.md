@@ -442,34 +442,29 @@ Additional ownership semantics that prevent real mistakes:
   left alone, compatibility gaps. One item, one issue, one place. Templates and
   the label scheme are in `CONTRIBUTING.md`; `Closes #123` in a pull request is
   what closes the item, so nobody has to remember.
-  📌 This replaced `docs/TODO.md` and `TRIAGE.md` in August 2026. Those two
+  📌 This replaced the local TODO and triage trackers in August 2026. Those
   files went stale between sittings and let one problem accumulate three
-  descriptions in three places. **If you find a stale copy in a checkout,
-  it is history — the issue tracker is the answer.**
+  descriptions in three places. **The issue tracker is the answer.**
 - `docs/STATUS.md` owns which public claim has evidence behind it, at three
   levels: code exists, local tests pass, verified on clean Linux. 🔒 Local.
   It did **not** move to issues, and the distinction is worth holding on to:
   it maps claims to evidence rather than listing work, so there is nothing
   for a pull request to close.
-- `docs/CADDYFILE_*.md` are frozen 2026-08-01 audit records, deliberately
-  excluded from `documentation.rs` because they are full of configurations
-  that must not compile. Do not read them as current behavior — check the
-  code.
+- Historical Caddyfile audit documents were retired in September 2026 because
+  they lagged behind the implementation. Check the current code and GitHub
+  issues for compatibility behavior and remaining gaps.
 
 User-facing documentation changes with the behavior it describes; update
-README.md, README.zh.md, README.fr.md, and CHANGELOG.md together when
+README.md, README.zh.md, and CHANGELOG.md together when
 applicable.
 
 ## 🔒 Maintainer planning workflow
 
-These files may exist only in the maintainer's local checkout:
-`docs/STATUS.md`, `docs/CADDYFILE_COMPATIBILITY_MASTER.md`,
-`benchmarks/results/`, and `.plan-snapshots/`. Their absence in a public
-clone is expected and must not block a user-scoped task. When present, run
-`scripts/snapshot-sensitive-plans.sh start` before reading the active Day and
-`end` after finishing; a snapshot validation failure blocks handoff. Never
-publish private planning snapshots, private verification-ledger contents,
-or private benchmark evidence.
+These paths may exist only in the maintainer's local checkout:
+`docs/STATUS.md`, `benchmarks/results/`, and `.plan-snapshots/`. Their absence
+in a public clone is expected and must not block a user-scoped task. Never
+publish private planning snapshots, private verification-ledger contents, or
+private benchmark evidence.
 
 ## 🧱 Change discipline
 

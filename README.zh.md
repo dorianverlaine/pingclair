@@ -11,7 +11,7 @@
 [![Status](https://img.shields.io/badge/status-active-green.svg)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/dorianverlaine/pingclair/pulls)
 
-[English](README.md) · **中文** · [Français](README.fr.md)
+[English](README.md) · **繁體中文**
 
 </div>
 

@@ -152,7 +152,7 @@ fn every_documented_configuration_still_compiles() {
     println!("checked {checked} documented configuration block(s)");
 }
 
-/// 🚩 Every directive the parser refuses must be named in all three READMEs.
+/// 🚩 Every directive the parser refuses must be named in both READMEs.
 ///
 /// 📏 What this checks, exactly: the name appears *somewhere* in each file, not
 /// that it appears in the limits list. That catches the drift that matters —
@@ -172,7 +172,7 @@ fn every_documented_configuration_still_compiles() {
 #[test]
 fn the_readme_limits_match_the_registry() {
     let root = workspace_root();
-    let missing: Vec<String> = ["README.md", "README.zh.md", "README.fr.md"]
+    let missing: Vec<String> = ["README.md", "README.zh.md"]
         .into_iter()
         .flat_map(|name| {
             let markdown = std::fs::read_to_string(root.join(name)).unwrap_or_default();
@@ -196,14 +196,15 @@ fn the_readme_limits_match_the_registry() {
 /// things that have since been implemented" — and then only checked the other
 /// direction. It drifted exactly as predicted: on 2026-08-13 the lists were
 /// still refusing `acme_server`, `intercept`, `acme_dns`, `default_sni`, `dns`,
-/// `pki` and `skip_install_trust`, all seven of them working, in all three
-/// languages. A test that names a risk it does not cover reads like coverage.
+/// `pki` and `skip_install_trust`, all seven of them working, in every
+/// translated README. A test that names a risk it does not cover reads like
+/// coverage.
 ///
 /// 📏 Unlike its counterpart this one reads the *list block* rather than the
 /// whole file, because an implemented directive is supposed to appear elsewhere
 /// in the README — `intercept` has its own section. The block is found by shape
 /// rather than by heading: an indented line made only of backticked names. That
-/// is the one thing the English, Chinese and French files have in common.
+/// is the one thing the English and Chinese files have in common.
 #[test]
 fn the_readme_limits_do_not_name_implemented_features() {
     let root = workspace_root();
@@ -212,7 +213,7 @@ fn the_readme_limits_do_not_name_implemented_features() {
             .map(str::to_string)
             .collect();
 
-    let stale: Vec<String> = ["README.md", "README.zh.md", "README.fr.md"]
+    let stale: Vec<String> = ["README.md", "README.zh.md"]
         .into_iter()
         .flat_map(|name| {
             let markdown = std::fs::read_to_string(root.join(name)).unwrap_or_default();
@@ -295,14 +296,14 @@ fn is_tls_block(heading: &str) -> bool {
 /// whole option family was refused.
 ///
 /// 📌 The list is read from [`recognised_tls_options`], so adding an option to
-/// the table fails this test until the three READMEs name it — the same
+/// the table fails this test until both READMEs name it — the same
 /// one-source arrangement the directive and global-option lists use.
 ///
 /// [`recognised_tls_options`]: pingclair_config::adapter::recognised_tls_options
 #[test]
 fn the_readme_lists_every_refused_tls_option() {
     let root = workspace_root();
-    let missing: Vec<String> = ["README.md", "README.zh.md", "README.fr.md"]
+    let missing: Vec<String> = ["README.md", "README.zh.md"]
         .into_iter()
         .flat_map(|name| {
             let markdown = std::fs::read_to_string(root.join(name)).unwrap_or_default();

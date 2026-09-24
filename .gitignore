@@ -36,15 +36,7 @@ logs/
 # byte-for-byte, and the conclusions are published in benchmarks/README.md.
 benchmarks/results/
 
-# 📋 Planning documents are working material, kept local.
-#
-# TODO.md tracks known-but-unfixed weaknesses day by day, including
-# reproducible ones in already-released code. A public, prioritised list of
-# your own unpatched defects is a target list; publish the fix, not the queue.
-#
-# SITE.md is the website plan. Same shelf for the same reason plans belong
-# there: they contradict themselves as facts arrive, and a plan read as a
-# promise is worse than no plan. Publish the site, not the sketch of it.
+# 📋 Private verification material is kept local.
 #
 # STATUS.md is the verification ledger: which public claim has evidence
 # behind it and which does not. The second half of that sentence is the
@@ -58,15 +50,8 @@ benchmarks/results/
 # docs/GUARDRAILS.md may say the inbox exists and how to use it — the
 # method is fine to publish. The inbox is not.
 #
-# docs/refactor/ holds the split queue and the agent prompts driving it,
-# including commit-ratio and per-file defect-density figures. Working
-# material about how the work gets done, and unflattering out of context.
-docs/TODO.md
-docs/SITE.md
 docs/STATUS.md
-docs/TODO_CADDYFILE*.md
 TRIAGE.md
-docs/refactor/
 /.plan-snapshots/
 # 🧹 The same two notes also exist as loose copies at the repository root.
 # Ignored by name so a stray `git add -A` cannot publish what the entry
@@ -100,10 +85,6 @@ __pycache__/
 
 # Stray test output
 **/test_output.txt
-
-# 🔒 Local Caddy reference and audit docs — kept on disk for the audit
-# session but not part of the shipped repository.
-docs/CADDYFILE*.md
 
 # ⚡ The Foundations compatibility crate ships with the repository; anything
 # else under vendor/ is local scratch space.
