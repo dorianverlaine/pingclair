@@ -35,7 +35,9 @@ before.
 parsed the version of a source build to decide what it is must now expect
 `0.0.0-dev`. Previews for the next minor are published as prereleases named
 `X.Y.Z-alpha.N`; only a stable `X.Y.Z` becomes the "Latest" GitHub release
-or the image's `:latest` tag, which an rc used to move as well.
+or the image's `:latest` tag, which an rc used to move as well. The channels
+and the procedure for cutting a release are in `CONTRIBUTING.md` under
+"Releasing".
 
 ### 🔌 `remote_ip` matches the connection's peer, `client_ip` the client
 

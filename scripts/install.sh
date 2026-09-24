@@ -177,11 +177,12 @@ else
         fi
     fi
 
-    # 🚧 A release candidate is the latest release while 0.2.0 is being cut.
-    # Say so at install time: the tag is the only thing that distinguishes it
-    # from a final release once the binary is on the box.
+    # 🚧 Until the first stable release exists, the newest release can still
+    # be a prerelease (an rc, beta or alpha). Say so at install time: the tag
+    # is the only thing that distinguishes it from a stable release once the
+    # binary is on the box.
     case "$LATEST_TAG" in
-        *-*) echo -e "${YELLOW}Installing $LATEST_TAG — a release candidate, not a final release.${NC}" ;;
+        *-*) echo -e "${YELLOW}Installing $LATEST_TAG — a prerelease, not a stable release.${NC}" ;;
         ?*)  echo "Installing $LATEST_TAG..." ;;
     esac
 

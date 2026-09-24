@@ -319,6 +319,75 @@ confident prose.
 
 ---
 
+## 🔖 Releasing
+
+### Why `main` says `0.0.0`
+
+The workspace version on `main` is always `0.0.0`, and CI refuses anything
+else. A release is **one commit off `main`** that sets the real number in
+`Cargo.toml` and `Cargo.lock` and nothing more; the tag points at that
+commit, and the commit is never merged back.
+
+Two things follow. No pull request ever touches the version, so none ever
+conflicts on it. And a binary built from `main` cannot pass for a release: it
+reports `v0.0.0-dev+<commit>` (or `v0.0.0-dev` without a git checkout), while
+a release binary reports exactly its tag.
+
+### Channels
+
+| Version | What it is | GitHub release |
+| --- | --- | --- |
+| `X.Y.Z` | Stable. Patch releases (`X.Y.1`, …) fix a stable line. | "Latest", image `:latest` |
+| `X.Y.Z-alpha.N` | A preview of the next minor, cut from `main` whenever it is worth trying. | Prerelease |
+| `X.Y.Z-alpha.N.M` | A hotfix of preview `alpha.N`. | Prerelease |
+| `X.Y.Z-beta.N`, `X.Y.Z-rc.N` | Later stages before a stable, when a minor needs them. | Prerelease |
+
+Within one `X.Y.Z` the order is alpha < beta < rc < stable. Tags carry a `v`
+prefix (`v0.3.0-alpha.1`). `scripts/release/versions.py` is the single
+definition of these rules, with its own tests; the release workflow uses it
+to validate a tag and to decide the prerelease and "Latest" flags, so a
+preview can never become what a download link or `docker pull` resolves to.
+
+### Cutting a release
+
+`scripts/cut-release.sh` does the work locally and **never pushes**. It
+refuses a malformed version, a version not newer than the newest release tag,
+a dirty tree, and a base branch that differs from its remote copy. The tag's
+message is the `[Unreleased]` section of `CHANGELOG.md`, and that becomes the
+GitHub release notes, so write the changelog first.
+
+A stable release or a preview, from `main`:
+
+```bash
+git switch main && git pull --ff-only
+scripts/cut-release.sh 0.2.0            # or 0.3.0-alpha.1
+git show --stat v0.2.0                  # review the one-commit diff and the notes
+git push origin v0.2.0                  # pushing the tag starts release.yml
+```
+
+After a **stable** release, open a pull request on `main` that renames
+`## [Unreleased]` to `## [X.Y.Z]` and starts a fresh `[Unreleased]` section.
+After a preview, leave the section alone: the next preview's notes are
+cumulative since the last stable release.
+
+A patch to an older stable line, once `main` has moved on: create
+`release/X.Y` from the last stable tag's parent, land the fixes on it by pull
+request, push it, then cut from it:
+
+```bash
+git switch release/0.2 && git pull --ff-only
+scripts/cut-release.sh 0.2.1 --base release/0.2
+git push origin v0.2.1
+```
+
+`release.yml` then checks that the tag is valid, that it equals the version
+at the tagged commit, that the tagged commit changes only `Cargo.toml` and
+`Cargo.lock`, and that its parent is on `main` or `release/X.Y`; builds and
+smoke-tests the binaries and images; and publishes the release. To discard a
+cut that has not been pushed, `git tag -d vX.Y.Z` is enough.
+
+---
+
 ## 🔒 Security issues
 
 Do not open a public issue for a vulnerability. Report it privately through
