@@ -1035,15 +1035,18 @@ mod tests {
 
     /// 🚫 A port-only site has no name to issue a certificate for.
     ///
-    /// 🤡 The refusal said "tls internal requires a concrete server name",
-    /// which is true and unusable: a port-only site has no name to add to, so
-    /// the requirement named nothing the operator could act on. Caddy accepts
-    /// the configuration and picks a default name at handshake time, which the
-    /// message now says, so the reader is not left comparing two servers to
-    /// work out which of them is being unreasonable.
+    /// 🤡 The refusal used to say Caddy "picks a default name at handshake
+    /// time, which the message now says" — an unverified claim that the runtime
+    /// probe disproved: Caddy accepts the configuration and then fails every
+    /// handshake with `tlsv1 alert internal error`, because it has no name to
+    /// issue for either. The message had explained the difference between the
+    /// two servers by inventing Caddy behaviour; it now states the reason and
+    /// records that refusing is the decision.
     ///
-    /// 📌 The refusal itself is deliberate: issuing is per name, and choosing
-    /// one here would invent a name every client's handshake then depends on.
+    /// 📌 The refusal is deliberate (maintainer, 2026-09-24): issuing is per
+    /// name, and choosing one here would invent a name every client's handshake
+    /// then depends on. A listener that accepts connections and drops them is
+    /// worse than a configuration that does not load.
     #[test]
     fn test_compile_tls_internal_requires_concrete_name() {
         let error = compile(
@@ -1057,12 +1060,24 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            error.contains("needs a site name to issue the certificate for"),
-            "the refusal must say what is missing: {error}"
+            error.contains("this site has no name"),
+            "the refusal must say what is missing, in the operator's terms: {error}"
+        );
+        assert!(
+            error.contains("nothing for the internal authority to issue for"),
+            "…and why nothing can be issued, rather than only that a name is required: {error}"
         );
         assert!(
             error.contains("localhost:8443"),
             "…and show the shape that works, so the operator can act on it: {error}"
+        );
+        assert!(
+            error.contains("Refusing is deliberate"),
+            "…and say the refusal is the decision, so it does not read as a missing feature: {error}"
+        );
+        assert!(
+            error.contains("fails every handshake"),
+            "…and state what Caddy measurably does here, so nobody reopens it to 'match': {error}"
         );
     }
 

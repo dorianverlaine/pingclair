@@ -1194,17 +1194,34 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
         let concrete_ok = !name.contains('*');
         if name.is_empty() || name == "_" || name.starts_with(':') || !(wildcard_ok || concrete_ok)
         {
-            // 🚫 A port-only site has no name to issue a certificate *for*, and
-            // the internal authority issues per name — there is no on-demand
-            // path that could pick one at handshake time. Caddy accepts this
-            // configuration and picks a default name; this build refuses it,
-            // deliberately, and the message has to say which name to write
-            // rather than name a requirement the operator cannot act on. The
-            // old wording ("tls internal requires a concrete server name") was
-            // true and unusable: a port-only site has no name to add to.
+            // 🚫 **Deliberate refusal, decided 2026-09-24 by the maintainer.**
+            //
+            // The internal authority issues one certificate per *name*. A
+            // port-only site (`:8443`) has no name, so an issued certificate
+            // would have to carry a name nobody asked for — and every client's
+            // handshake would then depend on our guess. The issue asked what a
+            // port-only site should be issued a certificate *for*; the answer
+            // is "nothing", and this refuses rather than guessing.
+            //
+            // 📌 What Caddy does here was measured, and it is not a reason to
+            // copy: `caddy adapt` accepts the configuration (rc=0), Caddy starts
+            // and serves, and then **every** handshake fails with
+            // `tlsv1 alert internal error` (alert 80) — six of six retries,
+            // with and without SNI, because it also has no name to issue for.
+            // The transcript is in
+            // `compat-audit/verify/impl-gaps-ab/runtime/162/case-port-only/`.
+            //
+            // 📌 This is not a "not implemented yet". Do not add a default name
+            // here without re-opening the issue: the failure mode is a listener
+            // that accepts connections and drops them, which is worse than a
+            // configuration that does not load.
+            //
+            // 🧭 The old wording ("tls internal requires a concrete server
+            // name") was true and unusable: a port-only site has no name to add
+            // to, so the message has to name the shape that works.
             return Err(CompileError::InvalidServer {
                 message: format!(
-                    "`tls internal` needs a site name to issue the certificate for, and `{name}` is not one. Write the name the clients will use — `localhost:8443 {{ tls internal }}`, or `example.test:8443` — or drop `tls internal` to serve this listener without TLS. Caddy answers this configuration by choosing a default name at handshake time; this build has no on-demand issuance, so it refuses rather than choosing one for you"
+                    "`tls internal` issues one certificate per site name, and this site has no name — `{name}` is only a port, so there is nothing for the internal authority to issue for. Write the name the clients will use, as in `localhost:8443 {{ tls internal }}` or `example.test:8443`, or drop `tls internal` to serve this listener without TLS. Refusing is deliberate: Caddy accepts this configuration and then fails every handshake with `tlsv1 alert internal error`, for the same reason, and a listener that accepts connections and drops them is worse than one that does not load"
                 ),
             });
         }
